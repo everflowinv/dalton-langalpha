@@ -496,6 +496,45 @@ async def computer_remove(
     await gate(request, principal, build)
 
 
+# --- DALTON-HOOK(cos-settings-tools): begin ---
+async def computer_archive(
+    request: Request,
+    principal: Principal,
+    computer: dict[str, Any],
+    *,
+    workspace_id: str | None = None,
+    body: Any = None,
+) -> None:
+    """Before a computer's token archives another computer (whole-computer confirmation)."""
+    from src.server.database.computer import get_live_workspaces_for_archive_snapshot
+
+    computer_id = str(computer["computer_id"])
+
+    async def build(call: CliCall | None) -> Ask:
+        snapshot = await get_live_workspaces_for_archive_snapshot(computer_id)
+        visible = [w for w in snapshot if not w.get("is_stand_in")]
+        path: dict[str, Any] = (
+            {"workspace_id": workspace_id}
+            if workspace_id is not None
+            else {"computer_id": computer_id}
+        )
+        return _ask(
+            "computer_archive",
+            path=path,
+            body=body,
+            target={"id": computer_id, "name": computer.get("name")},
+            details={
+                "workspace_id": workspace_id,
+                "workspace_ids": [w["workspace_id"] for w in visible],
+                "workspace_names": [w["name"] for w in visible],
+            },
+            computer_id=computer_id,
+        )
+
+    await gate(request, principal, build)
+# --- DALTON-HOOK(cos-settings-tools): end ---
+
+
 # -- work started on another computer ---------------------------------------------
 
 

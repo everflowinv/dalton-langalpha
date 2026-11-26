@@ -520,6 +520,22 @@ async def lifespan(app: FastAPI):
             config=agent_config,
             cleanup_interval=300,  # 5 minutes
         )
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        try:
+            recovered_archiving = (
+                await workspace_manager.recover_archiving_computers_on_startup()
+            )
+            if recovered_archiving:
+                logger.info(
+                    "startup_recovered_archiving_computers count=%d",
+                    recovered_archiving,
+                )
+        except Exception as exc:
+            logger.warning(
+                "startup_recover_archiving_computers_failed exc_type=%s",
+                type(exc).__name__,
+            )
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         await workspace_manager.start_cleanup_task()
         logger.info("Workspace Manager initialized")
 

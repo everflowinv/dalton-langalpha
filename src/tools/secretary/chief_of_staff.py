@@ -42,6 +42,7 @@ from src.tools.secretary.tools import (
     workspace_file_read_cos,
     workspace_file_write_cos,
     workspace_files_list_cos,
+    workspaces_archive,
     workspaces_create,
     workspaces_list,
     workspaces_update,
@@ -95,10 +96,10 @@ async def chief_of_staff_workspaces(
     create the user's own workspace first.
 
     Args:
-        action: "list", "create", "update", "delete", "list_files", "read_file", "copy_file", or "write_file". Use "delete" only on explicit user request after verifying the name and waiting for confirmation.
+        action: "list", "create", "update", "archive", "delete", "list_files", "read_file", "copy_file", or "write_file". Use "archive" only for a stopped Daytona cloud computer (archives the whole computer with all its workspaces after web confirmation; if the computer is running this turn, guide the user to stop and archive it from the web Sandbox Overview panel). Use "delete" only on explicit user request after verifying the name and waiting for confirmation.
         name: Workspace name; required for "create", optional for "update" (omit to keep current; "update" needs name or description). Renaming also changes its folder name on its computer; Home cannot be renamed.
         description: Optional description (up to 1,000 chars) for "create"/"update" (omit on "update" to keep current).
-        workspace_id: Target workspace ID; required for "update", "delete", and file actions. Home cannot be deleted.
+        workspace_id: Target workspace ID; required for "update", "archive", "delete", and file actions. Home cannot be archived or deleted.
         computer: Optional target computer for "create": display name from `<activity>` or `manage_workspaces(action="list")`, full UUID, or unique 8+ char prefix. Omit for primary computer (or first-time cloud primary setup when supported). Own machines always show a confirmation card.
         path: Relative path inside workspace_id's own folder (e.g. sources/x.md, never prefixed with a workspace folder name); optional prefix for "list_files", required for "read_file", "copy_file", and "write_file".
         content: Full UTF-8 text for "write_file" (requires "rw" access).
@@ -140,6 +141,13 @@ async def chief_of_staff_workspaces(
         return await workspaces_update(
             user_id, workspace_id, name, description, tool_call_id
         )
+    if action == "archive":
+        return await workspaces_archive(
+            user_id,
+            workspace_id,
+            tool_call_id,
+            snapshot=approval_snapshot(state, tool_call_id),
+        )
     # --- DALTON-HOOK(cos-settings-tools): end ---
     if action == "delete":
         return await _workspaces_delete(user_id, workspace_id, tool_call_id)
@@ -162,9 +170,9 @@ async def chief_of_staff_workspaces(
             user_id, workspace_id, path, content, tool_call_id
         )
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
-    # DALTON-HOOK(cos-settings-tools): list update in unknown-action error
+    # DALTON-HOOK(cos-settings-tools): list update and archive in unknown-action error
     return error_command(
-        f"Unknown action: {action}. Use list, create, update, delete, list_files, "
+        f"Unknown action: {action}. Use list, create, update, archive, delete, list_files, "
         "read_file, copy_file, or write_file.",
         tool_call_id,
     )

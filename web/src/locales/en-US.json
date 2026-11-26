@@ -774,6 +774,20 @@
       "refreshAria": "Refresh sandbox status",
       "refresh": "Refresh status",
       "archive": "Archive",
+      "archiveDialog": {
+        "title": "Confirm computer archive",
+        "description": "Archiving moves this entire computer and every workspace on it to cold storage. Starting it again takes longer (~1–5 minutes) and uses no compute while archived.",
+        "computerLabel": "Target computer:",
+        "affectedTitle": "Workspaces on this computer ({{count}})",
+        "loading": "Loading workspaces on this computer...",
+        "loadFailed": "Failed to load workspaces on this computer. Please try again.",
+        "scopeChanged": "情况已变化，请重新发起",
+        "confirm": "Confirm archive",
+        "archiving": "Archiving...",
+        "cancel": "Cancel",
+        "expandWorkspaces": "Show all {{count}} workspaces",
+        "collapseWorkspaces": "Show fewer workspaces"
+      },
       "sandboxId": "Sandbox ID:"
     },
     "ssh": {
@@ -1916,6 +1930,21 @@
         "title": "Delete Thread",
         "approved": "Thread deleted",
         "rejected": "Thread deletion declined"
+      },
+      "archiveWorkspace": {
+        "title": "Archive Computer",
+        "approved": "Archived computer {{computer}} ({{count}} workspaces)",
+        "rejected": "Archive cancelled",
+        "failed": "Archive failed",
+        "failedWithReason": "Archive failed: {{reason}}",
+        "scopeChanged": "情况已变化，请重新发起",
+        "computerLabel": "Target computer:",
+        "affectedHint": "All {{count}} workspaces on this computer will be archived:",
+        "confirm": "Confirm archive",
+        "archiving": "Archiving...",
+        "decline": "Cancel",
+        "expandWorkspaces": "Show all {{count}} workspaces",
+        "collapseWorkspaces": "Show fewer workspaces"
       },
       "workspaceLabel": "Workspace:",
       "threadLabel": "Thread:",

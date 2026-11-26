@@ -771,6 +771,20 @@
       "refreshAria": "刷新沙箱状态",
       "refresh": "刷新状态",
       "archive": "归档",
+      "archiveDialog": {
+        "title": "确认归档整台电脑",
+        "description": "归档会将整台电脑及其上的全部工作区移入冷存储。下次启动需要更长时间（约 1–5 分钟），归档期间不会占用计算资源。",
+        "computerLabel": "目标电脑：",
+        "affectedTitle": "同机受影响工作区（共 {{count}} 个）",
+        "loading": "正在获取同机工作区列表...",
+        "loadFailed": "获取同机工作区列表失败，请重试。",
+        "scopeChanged": "情况已变化，请重新发起",
+        "confirm": "确认归档",
+        "archiving": "归档中...",
+        "cancel": "取消",
+        "expandWorkspaces": "展开查看全部 {{count}} 个工作区",
+        "collapseWorkspaces": "收起工作区列表"
+      },
       "sandboxId": "沙箱 ID："
     },
     "ssh": {
@@ -1899,6 +1913,21 @@
         "title": "删除对话",
         "approved": "对话已删除",
         "rejected": "已拒绝删除对话"
+      },
+      "archiveWorkspace": {
+        "title": "归档电脑",
+        "approved": "已归档电脑 {{computer}}（含 {{count}} 个工作区）",
+        "rejected": "已取消归档",
+        "failed": "归档失败",
+        "failedWithReason": "归档失败：{{reason}}",
+        "scopeChanged": "情况已变化，请重新发起",
+        "computerLabel": "目标电脑：",
+        "affectedHint": "将归档该电脑上的全部 {{count}} 个工作区：",
+        "confirm": "确认归档",
+        "archiving": "归档中...",
+        "decline": "取消",
+        "expandWorkspaces": "展开查看全部 {{count}} 个工作区",
+        "collapseWorkspaces": "收起工作区列表"
       },
       "workspaceLabel": "工作区：",
       "threadLabel": "对话：",

@@ -628,7 +628,10 @@ class SessionLifecycleMixin:
             await self._retire_session(
                 computer_id, session, reason="the stop could not reach its machine"
             )
-        await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
+        # DALTON-HOOK(cos-settings-tools): owner machines never archive; clear any stale fence
+        await self._settle_machine_stop(
+            computer_id, ComputerStatus.STOPPED, clear_archiving=True
+        )
 
     async def _reconcile_provider_stop(self, binding: ComputerBinding) -> bool:
         """Keep a failed stop retryable without guessing whether the provider stopped.
@@ -641,7 +644,10 @@ class SessionLifecycleMixin:
         if not sandbox_id:
             # Nothing to probe: the stop had no sandbox to take down, so the
             # row is settled to 'stopped' and a start rebuilds from scratch.
-            await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
+            # DALTON-HOOK(cos-settings-tools): no sandbox means archiving ended; clear fence
+            await self._settle_machine_stop(
+                computer_id, ComputerStatus.STOPPED, clear_archiving=True
+            )
             return False
         if not binding.provider.recreatable:
             actual_state = await self._owner_machine_state(binding)
@@ -652,12 +658,16 @@ class SessionLifecycleMixin:
             try:
                 async with self._detached_runtime(sandbox_id, binding=binding) as runtime:
                     actual_state = await runtime.get_state()
-            except SandboxGoneError as e:
+            except SandboxGoneError:
+                # DALTON-HOOK(cos-settings-tools): whitelisted structured log and terminal fence clear
                 logger.warning(
-                    f"Sandbox {sandbox_id} is gone for computer {computer_id} during "
-                    f"stopping-state recovery ({e}); settling the row to 'stopped'"
+                    "stopping_reconcile_sandbox_gone computer_id=%s sandbox_id=%s",
+                    computer_id,
+                    sandbox_id,
                 )
-                await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
+                await self._settle_machine_stop(
+                    computer_id, ComputerStatus.STOPPED, clear_archiving=True
+                )
                 return False
 
         state = actual_state.value
@@ -671,10 +681,21 @@ class SessionLifecycleMixin:
         # the start's reconnect is what recovers it or rebuilds from the backup,
         # so a row left 'stopping' would refuse that start forever. An archive
         # in progress only ends down, and one has been seen to run for days.
-        if state in ("stopped", "archived", "archiving", "error"):
-            await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        if state == "archiving":
+            # Provider is still archiving: settle status to 'stopped' per state
+            # machine while keeping config.archiving=true to block new/moved workspaces.
+            await self._settle_machine_stop(
+                computer_id, ComputerStatus.STOPPED, clear_archiving=False
+            )
+        elif state in ("stopped", "archived", "error"):
+            await self._settle_machine_stop(
+                computer_id, ComputerStatus.STOPPED, clear_archiving=True
+            )
         elif state == "running":
-            await self._settle_machine_stop(computer_id, ComputerStatus.RUNNING)
+            await self._settle_machine_stop(
+                computer_id, ComputerStatus.RUNNING, clear_archiving=True
+            )
             # The idle sweep reads this stamp, and a just-corrected machine must
             # not look like it has been idle for the whole stuck window.
             await update_computer_activity(computer_id)
@@ -683,6 +704,7 @@ class SessionLifecycleMixin:
                 f"Workspace {binding.workspace_id} sandbox is in transient "
                 f"state {state!r}. Please wait and try again."
             )
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         return False
 
     async def _await_in_flight_start(
@@ -1971,20 +1993,35 @@ class SessionLifecycleMixin:
             raise ValueError(f"Computer {computer_id} not found")
         return row
 
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
     async def _archive_machine(
-        self, computer_id: str, *, workspace_id: str | None = None
+        self,
+        computer_id: str,
+        *,
+        workspace_id: str | None = None,
+        expected_workspaces: Any = None,
+        expected_workspace_id: str | None = None,
     ) -> Dict[str, Any]:
-        """Archive moves the machine's disk to storage; its row is the only gate."""
+        """Archive moves the machine's disk to storage; transactional DB fences guard it."""
+        from src.server.services.computer_errors import (
+            ArchiveUnsupportedError,
+            ComputerBusyError,
+        )
+
         async with self._observed_lock(computer_id, "computer.archive"):
             # Gate across the machine so archive cannot freeze a sibling's live run.
             if await self._machine_has_active_tasks(
                 computer_id, workspace_id=workspace_id
             ):
-                raise RuntimeError(
+                raise ComputerBusyError(
                     "Cannot archive a computer that still has work running"
                 )
 
-            computer = await self._claim_machine_for_archive(computer_id)
+            computer = await self._claim_machine_for_archive(
+                computer_id,
+                expected_workspaces=expected_workspaces,
+                expected_workspace_id=expected_workspace_id,
+            )
             binding = self._binding_from_computer(workspace_id or "", computer)
             sandbox_id = computer["provider_ref"]
 
@@ -1992,19 +2029,41 @@ class SessionLifecycleMixin:
                 try:
                     async with self._detached_runtime(sandbox_id, binding=binding) as runtime:
                         if not runtime.archives:
-                            raise RuntimeError("Provider does not support archiving")
+                            raise ArchiveUnsupportedError(
+                                "Provider does not support archiving"
+                            )
                         await runtime.archive()
-                    await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
-                except Exception:
+                    await self._settle_machine_stop(
+                        computer_id, ComputerStatus.STOPPED, clear_archiving=True
+                    )
+                except Exception as exc:
+                    category = (
+                        "archive_unsupported"
+                        if isinstance(exc, ArchiveUnsupportedError)
+                        else "sandbox_gone"
+                        if isinstance(exc, SandboxGoneError)
+                        else "sandbox_transient"
+                        if isinstance(exc, SandboxTransientError)
+                        else "archive_failed"
+                    )
+                    logger.warning(
+                        "archive_machine_failed category=%s computer_id=%s workspace_id=%s exc_type=%s",
+                        category,
+                        computer_id,
+                        workspace_id or "",
+                        type(exc).__name__,
+                    )
                     try:
                         await self._reconcile_provider_stop(binding)
-                    except Exception:
+                    except Exception as rec_exc:
                         logger.warning(
-                            "Could not reconcile failed archive for computer %s",
+                            "archive_reconcile_failed computer_id=%s workspace_id=%s exc_type=%s",
                             computer_id,
-                            exc_info=True,
+                            workspace_id or "",
+                            type(rec_exc).__name__,
                         )
                     raise
 
-            logger.info(f"Computer {computer_id} archived successfully")
+            logger.info("archive_machine_completed computer_id=%s", computer_id)
             return await self._stop_result(computer_id, workspace_id)
+    # --- DALTON-HOOK(cos-settings-tools): end ---

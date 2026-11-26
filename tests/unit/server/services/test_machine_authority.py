@@ -414,17 +414,24 @@ class TestStopEntersThroughTheMachine(_Base):
     @pytest.mark.asyncio
     async def test_archive_reads_the_machines_status_too(self):
         """A stopped project shadow cannot authorize archiving a running machine."""
+        from src.server.services.computer_errors import ComputerNotStoppedError
+
         ws_id = str(uuid.uuid4())
         manager = self._manager()
         manager._machine_has_active_tasks = AsyncMock(return_value=False)
+        # DALTON-HOOK(cos-settings-tools): transactional archive claim enforces stopped machine status
         with (
             cm_patch(
                 "db_get_workspace",
                 AsyncMock(return_value=_workspace(ws_id, status="stopped")),
             ),
             patch(
-                f"{_MACHINES}.get_computer",
-                AsyncMock(return_value=_computer(shadowed=[ws_id])),
+                f"{_MACHINES}.claim_computer_for_archive",
+                AsyncMock(
+                    side_effect=ComputerNotStoppedError(
+                        "Cannot archive computer in 'running' state."
+                    )
+                ),
             ),
         ):
             with pytest.raises(RuntimeError, match="Cannot archive computer"):
@@ -498,8 +505,9 @@ class TestStopOwnershipFence(_Base):
 
         if settles:
             await manager._reconcile_provider_stop(_binding("ws-1"))
+            # DALTON-HOOK(cos-settings-tools): keep config.archiving fence while provider state is 'archiving'
             manager._settle_machine_stop.assert_awaited_once_with(
-                COMPUTER_ID, "stopped"
+                COMPUTER_ID, "stopped", clear_archiving=(state != "archiving")
             )
         else:
             with pytest.raises(RuntimeError, match="transient state"):
@@ -834,24 +842,31 @@ class TestArchiveClaim(_Base):
         manager = self._manager()
         manager._machine_has_active_tasks = AsyncMock(return_value=False)
         row = _computer(shadowed=[], status="stopped")
-        status = AsyncMock(return_value={**row, "status": "stopping"} if wins else None)
+        claimed_row = {**row, "status": "stopping", "config": {"archiving": True}}
+        claim = AsyncMock(
+            return_value=claimed_row
+            if wins
+            else None
+        )
+        if not wins:
+            claim.side_effect = RuntimeError("Computer changed while preparing archive; retry")
+        status = AsyncMock(return_value=row)
         runtime = SimpleNamespace(archives=True, archive=AsyncMock())
 
         @asynccontextmanager
         async def detached(*_args, **_kwargs):
-            # DALTON-HOOK(cos-settings-tools): archive claim stamps config.archiving=True under the stopping CAS
-            status.assert_awaited_once_with(
+            # DALTON-HOOK(cos-settings-tools): transactional archive claim runs before provider call
+            claim.assert_awaited_once_with(
                 COMPUTER_ID,
-                "stopping",
-                expected="stopped",
-                merge_config={"archiving": True},
+                expected_workspaces=None,
+                expected_workspace_id=None,
             )
             yield runtime
 
         manager._detached_runtime = detached
         manager._stop_result = AsyncMock(return_value=row)
         with (
-            patch(f"{_MACHINES}.get_computer", AsyncMock(return_value=row)),
+            patch(f"{_MACHINES}.claim_computer_for_archive", claim),
             patch(f"{_MACHINES}.update_computer_status", status),
         ):
             if wins:

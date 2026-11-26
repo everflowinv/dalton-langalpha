@@ -1327,3 +1327,33 @@ class ComputerSessionResponse(BaseModel):
         None,
         description="What this worker's session is bound to, if it holds one",
     )
+
+
+# --- DALTON-HOOK(cos-settings-tools): begin ---
+class ArchiveWorkspaceSnapshotItem(BaseModel):
+    """One live workspace on a computer in an archive confirmation snapshot."""
+
+    workspace_id: str
+    name: str = ""
+    dir_name: str = ""
+    status: str = ""
+    is_stand_in: bool = False
+
+
+class ArchiveRequest(BaseModel):
+    """Optional confirmation snapshot passed to archive endpoints."""
+
+    expected_computer_id: Optional[str] = None
+    expected_workspaces: Optional[List[ArchiveWorkspaceSnapshotItem]] = None
+
+
+class ArchivePreviewResponse(BaseModel):
+    """Whole-computer archive preview snapshot shown before confirming archive."""
+
+    computer_id: str
+    computer_name: str
+    computer_kind: str
+    computer_status: str
+    archivable: bool
+    expected_workspaces: List[ArchiveWorkspaceSnapshotItem]
+# --- DALTON-HOOK(cos-settings-tools): end ---

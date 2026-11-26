@@ -147,9 +147,10 @@ export function settleResumedInterrupts(
   }
 
   // --- DALTON-HOOK(cos-settings-tools): begin ---
-  // Settle create_workspace cards whose interrupt was already consumed by a
-  // resume turn so a reload while submitting shows "submitting" (never
-  // clickable pending buttons) until tool_call_result finalizes the outcome.
+  // Settle create_workspace and archive_workspace cards whose interrupt was
+  // already consumed by a resume turn so a reload while submitting shows
+  // "submitting" (never clickable pending buttons) until tool_call_result
+  // finalizes the outcome.
   {
     const resumedIds = event.metadata?.hitl_interrupt_ids as string[] | undefined;
     const hitlAnswers = event.metadata?.hitl_answers as Record<string, unknown> | undefined;
@@ -159,7 +160,7 @@ export function settleResumedInterrupts(
       for (const interruptId of resumedIds) {
         const idx = pendingHistoryInterrupts.findIndex(
           (p) =>
-            p.type === 'create_workspace'
+            (p.type === 'create_workspace' || p.type === 'archive_workspace')
             && p.interruptId === interruptId
             && !!p.toolCallId,
         );
@@ -167,10 +168,13 @@ export function settleResumedInterrupts(
         const [matched] = pendingHistoryInterrupts.splice(idx, 1);
         const answer = hitlAnswers ? hitlAnswers[interruptId] : undefined;
         const rejected = answer === null || (answer === undefined && !!content && !batched);
+        const targetBucket = matched.type === 'archive_workspace'
+          ? 'secretaryActionProposals'
+          : 'workspaceProposals';
         rt.setMessages((prev) =>
           setCardStatus(
             prev,
-            'workspaceProposals',
+            targetBucket,
             matched.proposalId!,
             rejected ? 'rejected' : 'submitting',
           ),

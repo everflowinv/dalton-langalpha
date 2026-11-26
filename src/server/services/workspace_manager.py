@@ -23,6 +23,8 @@ from src.server.database.computer import (
     DEFAULT_ROOT_DIR,
     REMOVAL_INTENT,
     end_removal_intent,
+    # DALTON-HOOK(cos-settings-tools): startup/sweep reconciliation of archiving computers
+    get_archiving_computers_by_status,
     get_computer,
     get_computer_for_workspace,
     get_computers_by_status,
@@ -64,6 +66,7 @@ from src.server.services.computer_usage.events import note_start_failure
 from src.server.services.path_lock_coordination import STOP_HEARTBEAT_UNAVAILABLE_RECOVERY_S
 from src.server.services.computer_errors import (
     ApprovalScopeChangedError,  # DALTON-HOOK(cos-settings-tools)
+    ArchiveScopeChangedError,  # DALTON-HOOK(cos-settings-tools)
     ComputerArchivingError,  # DALTON-HOOK(cos-settings-tools)
     ComputerNotFoundError,
     ComputerPreparingError,
@@ -208,7 +211,26 @@ class WorkspaceManager(ComputerManager):
         elif chosen:
             try:
                 computer = await self._chosen_computer(user_id, computer_id)
-            except (ComputerNotFoundError, ComputerArchivingError):
+            except ComputerArchivingError:
+                current = await get_computer(computer_id)
+                reconciled = (
+                    await self.reconcile_archiving_computer(computer_id)
+                    if current is not None
+                    and current.get("status") == ComputerStatus.STOPPED
+                    else current
+                )
+                if (
+                    reconciled is not None
+                    and str(reconciled.get("user_id")) == str(user_id)
+                    and not (reconciled.get("config") or {}).get("archiving")
+                    and not (reconciled.get("config") or {}).get("retire_when_empty")
+                ):
+                    computer = reconciled
+                elif verify_snapshot:
+                    raise ApprovalScopeChangedError("情况已变化，请重新发起") from None
+                else:
+                    raise
+            except ComputerNotFoundError:
                 if verify_snapshot:
                     raise ApprovalScopeChangedError("情况已变化，请重新发起") from None
                 raise
@@ -230,11 +252,18 @@ class WorkspaceManager(ComputerManager):
                 user_id, default_name=name, resource_tier=resource_tier
             )
             if (computer.get("config") or {}).get("archiving"):
-                if verify_snapshot:
-                    raise ApprovalScopeChangedError("情况已变化，请重新发起")
-                raise ComputerArchivingError(
-                    "This computer is currently being archived and cannot accept new workspaces."
-                )
+                if computer.get("status") == ComputerStatus.STOPPED:
+                    reconciled = await self.reconcile_archiving_computer(
+                        str(computer["computer_id"])
+                    )
+                    if reconciled is not None:
+                        computer = reconciled
+                if (computer.get("config") or {}).get("archiving"):
+                    if verify_snapshot:
+                        raise ApprovalScopeChangedError("情况已变化，请重新发起")
+                    raise ComputerArchivingError(
+                        "This computer is currently being archived and cannot accept new workspaces."
+                    )
         # Never had a sandbox and one is being built. A workspace placed on it
         # now would make its first request wait out that build, so it waits here.
         if computer.get("status") in (
@@ -571,12 +600,42 @@ class WorkspaceManager(ComputerManager):
             await self._ensure_project_attached(binding, session, user_id=binding.user_id)
             return True
 
-    async def archive_workspace(self, workspace_id: str) -> Dict[str, Any]:
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    async def archive_workspace(
+        self,
+        workspace_id: str,
+        *,
+        expected_computer_id: str | None = None,
+        expected_workspaces: Any = None,
+    ) -> Dict[str, Any]:
         """Archive a stopped machine (moves its sandbox to object storage)."""
-        binding = await self.resolve_binding(workspace_id)
+        if expected_computer_id is not None or expected_workspaces is not None:
+            computer = await get_computer_for_workspace(workspace_id)
+            if computer is None:
+                raise ArchiveScopeChangedError("情况已变化，请重新发起")
+            computer_id = str(computer["computer_id"])
+            if expected_computer_id is not None and computer_id != str(
+                expected_computer_id
+            ):
+                raise ArchiveScopeChangedError("情况已变化，请重新发起")
+            return await self._archive_machine(
+                computer_id,
+                workspace_id=workspace_id,
+                expected_workspaces=expected_workspaces,
+                expected_workspace_id=workspace_id,
+            )
+        computer = await get_computer_for_workspace(workspace_id)
+        if computer is not None:
+            computer_id = str(computer["computer_id"])
+        else:
+            binding = await self.resolve_binding(workspace_id)
+            computer_id = binding.computer_id
         return await self._archive_machine(
-            binding.computer_id, workspace_id=workspace_id
+            computer_id,
+            workspace_id=workspace_id,
+            expected_workspace_id=workspace_id,
         )
+    # --- DALTON-HOOK(cos-settings-tools): end ---
 
     async def delete_workspace(
         self,
@@ -1407,7 +1466,64 @@ class WorkspaceManager(ComputerManager):
             if after is not None and after.get("status") != ComputerStatus.STOPPING:
                 logger.info(f"Settled computer {computer_id}, stuck in 'stopping', as {after.get('status')!r}")
                 settled += 1
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        # Also probe stopped computers carrying a residual config.archiving
+        # fence inside the existing sweep (no new background loop) so the fence
+        # clears once the provider reaches a terminal state.
+        for computer in await get_archiving_computers_by_status("stopped", limit=1000):
+            computer_id = str(computer["computer_id"])
+            try:
+                async with asyncio.timeout(STUCK_STOP_RECONCILE_TIMEOUT_S):
+                    after = await self.reconcile_archiving_computer(computer_id)
+            except Exception as e:
+                logger.warning(
+                    "archive_fence_sweep_failed computer_id=%s exc_type=%s",
+                    computer_id,
+                    type(e).__name__,
+                )
+                continue
+            if after is not None and not (after.get("config") or {}).get("archiving"):
+                logger.info(
+                    "archive_fence_cleared_by_sweep computer_id=%s status=%s",
+                    computer_id,
+                    after.get("status"),
+                )
+                settled += 1
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         return settled
+
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    async def recover_archiving_computers_on_startup(self) -> int:
+        """Reset computers left in ``stopping`` with ``config.archiving=true`` back to ``stopped`` on startup.
+
+        Invoked once from the existing server startup hook so a process restart
+        never leaves a computer permanently wedged in ``stopping`` / archiving.
+        ``config.archiving`` is intentionally kept until the provider confirms a
+        terminal state via ``reconcile_archiving_computer`` or ``start_computer``.
+        """
+        recovered = 0
+        for computer in await get_archiving_computers_by_status("stopping", limit=1000):
+            computer_id = str(computer["computer_id"])
+            try:
+                updated = await update_computer_status(
+                    computer_id,
+                    ComputerStatus.STOPPED,
+                    expected=ComputerStatus.STOPPING,
+                )
+                if updated is not None:
+                    recovered += 1
+                    logger.info(
+                        "startup_reset_archiving_computer computer_id=%s",
+                        computer_id,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "startup_reset_archiving_computer_failed computer_id=%s exc_type=%s",
+                    computer_id,
+                    type(exc).__name__,
+                )
+        return recovered
+    # --- DALTON-HOOK(cos-settings-tools): end ---
 
     async def start_cleanup_task(self) -> None:
         """Start the background cleanup task, and the left-folder, usage,

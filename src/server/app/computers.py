@@ -64,6 +64,8 @@ from src.server.dependencies.usage_limits import (
 )
 from src.server.database.user import get_user
 from src.server.models.computer import (
+    # DALTON-HOOK(cos-settings-tools): archive confirmation snapshot payload
+    ArchiveRequest,
     CLAIMABLE_FOR_START,
     ComputerActionResponse,
     ComputerAlwaysOnRequest,
@@ -144,6 +146,7 @@ from src.server.dependencies import cli_approval
 from src.server.dependencies.principal import (
     ComputerAddPrincipal,
     ComputerWritePrincipal,
+    ComputerEndPrincipal,  # DALTON-HOOK(cos-settings-tools)
     ComputerEndUserId,
     ComputerRemovePrincipal,
     ComputerWriteUserId,
@@ -1104,18 +1107,50 @@ async def stop_computer(computer_id: str, x_user_id: ComputerEndUserId):
         )
 
 
+# --- DALTON-HOOK(cos-settings-tools): begin ---
 @router.post("/{computer_id}/archive", response_model=ComputerActionResponse)
-async def archive_computer(computer_id: str, x_user_id: ComputerEndUserId):
-    async with _computer_action_errors("archive", computer_id):
-        await _reached_computer(computer_id, x_user_id, manage=True)
+async def archive_computer(
+    computer_id: str,
+    request: Request,
+    principal: ComputerEndPrincipal,
+    body: Optional[ArchiveRequest] = None,
+):
+    from src.dalton.services.archive_http import archive_http_errors
+    from src.server.services.computer_errors import ArchiveScopeChangedError
+
+    async with archive_http_errors(
+        target_kind="computer",
+        computer_id=computer_id,
+    ):
+        computer = await _reached_computer(computer_id, principal.user_id, manage=True)
+        if principal.computer_id is not None:
+            await cli_approval.computer_archive(
+                request, principal, computer, body=body
+            )
+        if (
+            body is not None
+            and body.expected_computer_id is not None
+            and str(body.expected_computer_id) != str(computer_id)
+        ):
+            raise ArchiveScopeChangedError("情况已变化，请重新发起")
+        manager = _computer_manager()
         with computer_cause("archive"):
-            updated = await _computer_manager().archive_computer(computer_id)
-        logger.info(f"Archived computer {computer_id}")
+            if body is not None and body.expected_workspaces is not None:
+                updated = await manager.archive_computer(
+                    computer_id,
+                    expected_workspaces=[
+                        w.model_dump() for w in body.expected_workspaces
+                    ],
+                )
+            else:
+                updated = await manager.archive_computer(computer_id)
+        logger.info("archive_computer_completed computer_id=%s", computer_id)
         return ComputerActionResponse(
             computer_id=computer_id,
             status=(updated or {}).get("status") or "stopped",
             message="Computer archived successfully",
         )
+# --- DALTON-HOOK(cos-settings-tools): end ---
 
 
 @router.post(

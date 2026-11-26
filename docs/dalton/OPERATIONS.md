@@ -74,6 +74,7 @@ bash scripts/dalton/ops/prod/deploy_main.sh --reuse-backup-minutes 60
     - **复位代码前先设定 `RESET_SHA` 并运行 `target_migration_heads "$RESET_SHA"` 打印所选提交的双链 head，核对与数据库双链版本完全一致后再执行 `git reset --keep "$RESET_SHA"`**、重建前端、强制重建容器、恢复宿主机服务（含 `--bridge` 桥接）与健康/公网验证，全部通过后用 `launchctl bootstrap` 恢复看门狗。脚本以非零状态码退出。
   - **多账号微信迁移（`d049`）部署后外键校验**：`d049` 热表外键以 `NOT VALID` 建约束避免停机长锁；部署恢复服务后，执行 `bash scripts/dalton/ops/prod/validate_d049_fks.sh` 在独立短事务中逐条执行 `VALIDATE CONSTRAINT` 并验证 `pg_constraint.convalidated = true`。
 - **边缘代理（`edge`）重载**：快进合并后通过 `deploy/dalton/Caddyfile` 差异及 `docker compose config` 解析后的 `edge` 服务配置对比，检测到任一变化时会在健康检查前执行 `docker compose up -d --no-deps --force-recreate edge`，随后以 60 秒统一截止时间循环探测 `http://127.0.0.1:8088/`（端口由 `DALTON_EDGE_PORT` 控制，要求 `curl` 成功且返回 `200`）；超时直接触发回滚并以非零退出，就绪后再运行 `check_public_edge.sh`。
+- **启用渠道网关部署的同步发布（含研究总监归档确认卡片）**：本批归档与栅栏改动无新增数据库迁移；启用了 `channel_gateway` 能力的部署（如 Everflow）发布时，须通过 `scripts/dalton/ops/prod/deploy_main.sh` 同步更新后端、前端静态包与 `integrations/dalton-channel-gateway`（确保新增的 `archive_workspace` 仅网页确认文案与前后端快照协议一致）；后端启动钩子会在重启时自动将遗留在归档过渡态的电脑写回 `stopped`，待提供商确认终态后再清除 `config.archiving` 栅栏。独立核心安装（无渠道网关）按 [STANDALONE-DEPLOY.md](./dev-guide/STANDALONE-DEPLOY.md) 通过 `scripts/standalone/upgrade.sh` 同步更新 `backend` 与 `edge` 即可。
 - **配套宿主机脚本与 `launchd` 模板**：`scripts/dalton/ops/prod/` 下同时收拢了 `wait_backend_idle.sh`、`backup.sh`、`watchdog.sh`、`colima_launch.sh` 以及 `launchd/` 下的三份模板（`com.dalton.backend-watchdog.plist.template`、`com.dalton.colima.plist.template`、`com.dalton.pg-backup.plist.template`）。
 
 ## 2. `.env` 与叠加配置文件改动生效规则

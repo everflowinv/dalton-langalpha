@@ -203,6 +203,18 @@ class ComputerArchivingError(RuntimeError):
 
 class ApprovalScopeChangedError(RuntimeError):
     """The confirmed target computer or workspace scope changed before execution."""
+
+
+class ArchiveScopeChangedError(ApprovalScopeChangedError):
+    """The computer or workspaces on it changed since the archive confirmation snapshot."""
+
+
+class ArchiveUnsupportedError(RuntimeError):
+    """The computer's sandbox provider does not support cold archiving."""
+
+
+class ComputerNotStoppedError(RuntimeError):
+    """The computer must be stopped before it can be archived."""
 # --- DALTON-HOOK(cos-settings-tools): end ---
 
 

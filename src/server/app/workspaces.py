@@ -85,7 +85,12 @@ from src.server.models.workspace import (
     WorkspaceSpecRequest,
     WorkspaceUpdate,
 )
-from src.server.models.computer import CLAIMABLE_FOR_START
+from src.server.models.computer import (
+    # DALTON-HOOK(cos-settings-tools): archive snapshot models
+    ArchivePreviewResponse,
+    ArchiveRequest,
+    CLAIMABLE_FOR_START,
+)
 from src.server.models.workspace_move import WorkspaceMoveOut, WorkspaceMoveRequest
 from src.server.app.computers import accept_workspace_move
 from src.server.services.workspace_move import move_error_detail, move_from_row
@@ -948,36 +953,104 @@ async def start_workspace(
         )
 
 
+# --- DALTON-HOOK(cos-settings-tools): begin ---
+@router.get("/{workspace_id}/archive-preview", response_model=ArchivePreviewResponse)
+async def archive_workspace_preview(
+    workspace_id: str,
+    x_user_id: WorkspaceWriteUserId,
+):
+    """Read-only whole-computer snapshot shown before confirming archive."""
+    from ptc_agent.core.sandbox.providers import provider_supports_archive
+    from src.server.database.computer import (
+        get_computer_for_workspace,
+        get_live_workspaces_for_archive_snapshot,
+    )
+
+    workspace = await db_get_workspace(workspace_id)
+    await workspace_access(workspace, x_user_id, manage=True)
+    computer = await get_computer_for_workspace(workspace_id)
+    if computer is None:
+        raise HTTPException(status_code=404, detail="Computer not found")
+    computer_id = str(computer["computer_id"])
+    workspaces = await get_live_workspaces_for_archive_snapshot(computer_id)
+    return ArchivePreviewResponse(
+        computer_id=computer_id,
+        computer_name=computer.get("name") or "",
+        computer_kind=str(computer.get("kind") or ""),
+        computer_status=str(computer.get("status") or ""),
+        archivable=provider_supports_archive(computer.get("kind")),
+        expected_workspaces=workspaces,
+    )
+
+
 @router.post("/{workspace_id}/archive", response_model=WorkspaceActionResponse)
 async def archive_workspace(
     workspace_id: str,
-    x_user_id: WorkspaceWriteUserId,
+    request: Request,
+    principal: WorkspaceWritePrincipal,
+    body: Optional[ArchiveRequest] = None,
 ):
     """
     Archive a stopped workspace (moves sandbox to object storage).
 
     The workspace must be in 'stopped' state. Archived sandboxes take longer
     to start (~60-300s) but use no compute resources.
-
-    Args:
-        workspace_id: Workspace UUID
-
-    Returns:
-        Action result
     """
-    async with _workspace_action_errors("archive", workspace_id):
+    from src.dalton.services.archive_http import archive_http_errors
+    from src.server.database.computer import get_computer_for_workspace
+    from src.server.dependencies.principal import forbidden
+
+    computer_id_for_log = (
+        body.expected_computer_id if body is not None else None
+    )
+    async with archive_http_errors(
+        target_kind="workspace",
+        workspace_id=workspace_id,
+        computer_id=computer_id_for_log,
+    ):
         workspace = await db_get_workspace(workspace_id)
-        await workspace_access(workspace, x_user_id, manage=True)
+        await workspace_access(workspace, principal.user_id, manage=True)
 
+        if principal.computer_id is not None:
+            computer = await get_computer_for_workspace(workspace_id)
+            if computer is not None:
+                if str(computer["computer_id"]) == str(principal.computer_id):
+                    raise forbidden(
+                        "A computer cannot stop, archive or remove itself"
+                    )
+                await cli_approval.computer_archive(
+                    request,
+                    principal,
+                    computer,
+                    workspace_id=workspace_id,
+                    body=body,
+                )
+
+        manager = WorkspaceManager.get_instance()
         with computer_cause("archive"):
-            await WorkspaceManager.get_instance().archive_workspace(workspace_id)
+            if body is not None and (
+                body.expected_computer_id is not None
+                or body.expected_workspaces is not None
+            ):
+                await manager.archive_workspace(
+                    workspace_id,
+                    expected_computer_id=body.expected_computer_id,
+                    expected_workspaces=(
+                        [w.model_dump() for w in body.expected_workspaces]
+                        if body.expected_workspaces is not None
+                        else None
+                    ),
+                )
+            else:
+                await manager.archive_workspace(workspace_id)
 
-        logger.info(f"Archived workspace {workspace_id}")
+        logger.info("archive_workspace_completed workspace_id=%s", workspace_id)
         return WorkspaceActionResponse(
             workspace_id=workspace_id,
             status="stopped",
             message="Workspace archived successfully",
         )
+# --- DALTON-HOOK(cos-settings-tools): end ---
 
 
 @router.post("/{workspace_id}/spec", response_model=WorkspaceResponse)

@@ -367,9 +367,21 @@ def _snapshot_matches_action(
             == bool(action_req.get("duplicate_check_unavailable"))
         )
     if action_type == "archive_workspace":
+        from src.server.database.computer import normalize_archive_workspace_snapshot
+
+        snap_ws = snapshot.get("expected_workspaces")
+        req_ws = action_req.get("expected_workspaces")
+        if not isinstance(snap_ws, list) or not isinstance(req_ws, list):
+            return False
         return (
             snapshot.get("workspace_id") == action_req.get("workspace_id")
+            and (snapshot.get("workspace_name") or "")
+            == (action_req.get("workspace_name") or "")
             and snapshot.get("computer_id") == action_req.get("computer_id")
+            and (snapshot.get("computer_name") or "")
+            == (action_req.get("computer_name") or "")
+            and normalize_archive_workspace_snapshot(snap_ws)
+            == normalize_archive_workspace_snapshot(req_ws)
         )
     return False
 

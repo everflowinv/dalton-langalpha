@@ -7,9 +7,14 @@ import { useBackdropDismiss, useDialogA11y } from '@/hooks/useDialogA11y';
 import { useWorkspace } from '@/hooks/useWorkspace';
 import { queryKeys } from '@/lib/queryKeys';
 import {
-  formatApiErrorDetail, getSandboxStats, refreshWorkspace,
+  apiErrorObject, apiErrorStatus, archiveWorkspaceWithSnapshot, formatApiErrorDetail,
+  getSandboxStats, getWorkspaceArchivePreview, refreshWorkspace,
   startComputer, stopComputer,
+  type ArchivePreviewResponse,
 } from '../utils/api';
+import { Button } from '@/components/ui/button';
+import { Loader } from '@/components/ui/loader';
+import { ModalShell } from '@/components/ui/ModalShell';
 import { patchComputerStatusInCaches, useComputers } from '../hooks/useComputers';
 import { isComputerPreparing } from '../utils/computerStatus';
 import { denialMessage } from '../utils/denialMessage';
@@ -46,6 +51,18 @@ export function SandboxSettingsContent({ workspaceId }: { workspaceId: string })
 
   // Start/stop
   const [actionLoading, setActionLoading] = useState(false);
+
+  // --- DALTON-HOOK(cos-settings-tools): begin ---
+  // Whole-computer archive confirmation dialog state
+  const [archiveDialogOpen, setArchiveDialogOpen] = useState(false);
+  const [archivePreview, setArchivePreview] = useState<ArchivePreviewResponse | null>(null);
+  const [archivePreviewLoading, setArchivePreviewLoading] = useState(false);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
+  const [archiveSubmitting, setArchiveSubmitting] = useState(false);
+  const [archiveExpanded, setArchiveExpanded] = useState(false);
+  const archiveTitleId = useId();
+  const archivePreviewReqRef = useRef(0);
+  // --- DALTON-HOOK(cos-settings-tools): end ---
 
   const queryClient = useQueryClient();
   const { t } = useTranslation();
@@ -112,6 +129,67 @@ export function SandboxSettingsContent({ workspaceId }: { workspaceId: string })
       setActionLoading(false);
     }
   }
+
+  // --- DALTON-HOOK(cos-settings-tools): begin ---
+  const loadArchivePreview = useCallback(async (preserveError = false) => {
+    const reqId = ++archivePreviewReqRef.current;
+    setArchivePreviewLoading(true);
+    if (!preserveError) setArchiveError(null);
+    try {
+      const data = await getWorkspaceArchivePreview(workspaceId);
+      if (reqId !== archivePreviewReqRef.current) return;
+      setArchivePreview(data);
+    } catch (err) {
+      if (reqId !== archivePreviewReqRef.current) return;
+      setArchiveError(formatApiErrorDetail(err) || t('computer.overview.archiveDialog.loadFailed'));
+    } finally {
+      if (reqId === archivePreviewReqRef.current) setArchivePreviewLoading(false);
+    }
+  }, [workspaceId, t]);
+
+  function handleOpenArchiveDialog() {
+    setArchiveExpanded(false);
+    setArchivePreview(null);
+    setArchiveError(null);
+    setArchiveDialogOpen(true);
+    void loadArchivePreview();
+  }
+
+  function handleCloseArchiveDialog() {
+    if (archiveSubmitting) return;
+    setArchiveDialogOpen(false);
+    setArchiveError(null);
+  }
+
+  async function handleConfirmArchive() {
+    if (!archivePreview || archiveSubmitting) return;
+    setArchiveSubmitting(true);
+    setArchiveError(null);
+    try {
+      await archiveWorkspaceWithSnapshot(workspaceId, {
+        expected_computer_id: archivePreview.computer_id,
+        expected_workspaces: archivePreview.expected_workspaces,
+      });
+      setArchiveDialogOpen(false);
+      if (computerId) {
+        patchComputerStatusInCaches(queryClient, computerId, 'stopped');
+      }
+      void queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.all });
+      await loadStats();
+    } catch (err) {
+      const status = apiErrorStatus(err);
+      const detailObj = apiErrorObject(err);
+      if (status === 409 && detailObj?.code === 'scope_changed') {
+        setArchiveError(t('computer.overview.archiveDialog.scopeChanged'));
+        void loadArchivePreview(true);
+      } else {
+        setArchiveError(denialMessage(err, t));
+      }
+    } finally {
+      setArchiveSubmitting(false);
+    }
+  }
+  // --- DALTON-HOOK(cos-settings-tools): end ---
 
   async function handleRefresh() {
     setRefreshing(true);
@@ -187,6 +265,9 @@ export function SandboxSettingsContent({ workspaceId }: { workspaceId: string })
               recoverableCreating={computer?.status === 'creating'}
               preparing={isComputerPreparing(computer)}
               dirName={workspace?.dir_name ?? null}
+              // DALTON-HOOK(cos-settings-tools): gate Archive button on archivable === true and open whole-computer modal
+              archivable={displayStats?.archivable === true}
+              onArchiveClick={handleOpenArchiveDialog}
             />
           )}
           {activeTab === 'mcp' && <McpTab workspaceId={workspaceId} />}
@@ -229,6 +310,103 @@ export function SandboxSettingsContent({ workspaceId }: { workspaceId: string })
         </>
       )}
       </div>
+      {/* --- DALTON-HOOK(cos-settings-tools): begin --- */}
+      {archiveDialogOpen && (() => {
+        const visibleWorkspaces = (archivePreview?.expected_workspaces ?? []).filter((w) => !w.is_stand_in);
+        const shownWorkspaces = archiveExpanded ? visibleWorkspaces : visibleWorkspaces.slice(0, 5);
+        const hasMore = visibleWorkspaces.length > 5;
+        return (
+          <ModalShell
+            labelId={archiveTitleId}
+            title={t('computer.overview.archiveDialog.title')}
+            onClose={handleCloseArchiveDialog}
+            closeDisabled={archiveSubmitting}
+            width="narrow"
+            density="form"
+            stacked
+            footer={(
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={handleCloseArchiveDialog}
+                  disabled={archiveSubmitting}
+                  className="min-h-9"
+                >
+                  {t('computer.overview.archiveDialog.cancel')}
+                </Button>
+                <Button
+                  type="button"
+                  onClick={handleConfirmArchive}
+                  disabled={archiveSubmitting || archivePreviewLoading || !archivePreview}
+                  aria-busy={archiveSubmitting}
+                  className="min-h-9"
+                >
+                  {archiveSubmitting
+                    ? t('computer.overview.archiveDialog.archiving')
+                    : t('computer.overview.archiveDialog.confirm')}
+                </Button>
+              </div>
+            )}
+          >
+            <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
+              {t('computer.overview.archiveDialog.description')}
+            </p>
+            {archivePreviewLoading && !archivePreview && (
+              <p className="flex items-center gap-2 text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
+                <Loader size={12} style={{ color: 'var(--color-accent-primary)' }} />
+                {t('computer.overview.archiveDialog.loading')}
+              </p>
+            )}
+            {archivePreview && (
+              <div className="flex flex-col gap-2 text-sm min-w-0">
+                <div className="break-words min-w-0" style={{ color: 'var(--color-text-primary)' }}>
+                  <span className="font-medium">{t('computer.overview.archiveDialog.computerLabel')}</span>{' '}
+                  <span>{archivePreview.computer_name || archivePreview.computer_id}</span>
+                </div>
+                <div className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
+                  {t('computer.overview.archiveDialog.affectedTitle', { count: visibleWorkspaces.length })}
+                </div>
+                {visibleWorkspaces.length > 0 && (
+                  <ul
+                    className="flex flex-col gap-1 rounded-md border px-3 py-2 text-xs min-w-0"
+                    style={{ borderColor: 'var(--color-border-muted)', color: 'var(--color-text-primary)' }}
+                  >
+                    {shownWorkspaces.map((ws) => (
+                      <li key={ws.workspace_id} className="flex items-center justify-between gap-2 min-w-0">
+                        <span className="break-words min-w-0 font-medium">{ws.name || ws.workspace_id}</span>
+                        {ws.status && (
+                          <span className="shrink-0" style={{ color: 'var(--color-text-tertiary)' }}>
+                            {ws.status}
+                          </span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {hasMore && (
+                  <button
+                    type="button"
+                    onClick={() => setArchiveExpanded((v) => !v)}
+                    className="self-start text-xs underline"
+                    style={{ color: 'var(--color-text-tertiary)' }}
+                  >
+                    {archiveExpanded
+                      ? t('computer.overview.archiveDialog.collapseWorkspaces')
+                      : t('computer.overview.archiveDialog.expandWorkspaces', { count: visibleWorkspaces.length })}
+                  </button>
+                )}
+              </div>
+            )}
+            {archiveError && (
+              <p className="text-sm" role="alert" style={{ color: 'var(--color-icon-danger, var(--color-loss))' }}>
+                {archiveError}
+              </p>
+            )}
+          </ModalShell>
+        );
+      })()}
+      {/* --- DALTON-HOOK(cos-settings-tools): end --- */}
     </div>
   );
 }
