@@ -52,15 +52,31 @@ def _ensure_multipart_lifecycle_rule(
     Preserves any existing lifecycle rules while guaranteeing coverage for
     ``uploads/`` (and prefixed keys) via a bucket-wide rule.
     """
+    get_lifecycle = getattr(client, "get_bucket_lifecycle_configuration", None)
+    put_lifecycle = getattr(client, "put_bucket_lifecycle_configuration", None)
+    if not callable(get_lifecycle) or not callable(put_lifecycle):
+        print(
+            f"[minio-init] WARNING: S3 client does not expose lifecycle APIs; "
+            f"skipping multipart abort rule on '{bucket}'.",
+            file=sys.stderr,
+        )
+        return 0
+
     existing_rules: list[dict[str, object]] = []
     try:
-        cfg = client.get_bucket_lifecycle_configuration(Bucket=bucket)  # type: ignore[attr-defined]
+        cfg = get_lifecycle(Bucket=bucket)
         raw_rules = cfg.get("Rules") if isinstance(cfg, dict) else None
         if isinstance(raw_rules, list):
             existing_rules = [r for r in raw_rules if isinstance(r, dict)]
     except ClientError as exc:
         code = str(exc.response.get("Error", {}).get("Code", ""))
         status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0) or 0)
+        if code in ("NotImplemented", "MethodNotAllowed"):
+            print(
+                f"[minio-init] WARNING: lifecycle API unsupported on '{bucket}' ({code}); skipping.",
+                file=sys.stderr,
+            )
+            return 0
         if code != "NoSuchLifecycleConfiguration" and status != 404:
             print(
                 f"[minio-init] ERROR reading lifecycle rules on '{bucket}': {exc}",
@@ -105,10 +121,23 @@ def _ensure_multipart_lifecycle_rule(
         }
     )
     try:
-        client.put_bucket_lifecycle_configuration(  # type: ignore[attr-defined]
+        put_lifecycle(
             Bucket=bucket,
             LifecycleConfiguration={"Rules": kept_rules},
         )
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in ("NotImplemented", "MethodNotAllowed"):
+            print(
+                f"[minio-init] WARNING: lifecycle API unsupported on '{bucket}' ({code}); skipping.",
+                file=sys.stderr,
+            )
+            return 0
+        print(
+            f"[minio-init] ERROR setting lifecycle rule on '{bucket}': {exc}",
+            file=sys.stderr,
+        )
+        return 1
     except Exception as exc:
         print(
             f"[minio-init] ERROR setting lifecycle rule on '{bucket}': {exc}",

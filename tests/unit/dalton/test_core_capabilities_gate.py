@@ -1241,6 +1241,7 @@ class TestSetupBackgroundLoopsGate:
         assert "if is_transcription_reconciliation_enabled():" in setup_source
         assert "if is_data_jobs_scheduler_enabled():" in setup_source
         assert "start_mcp_builtin_reconnect_task(logger)" in setup_source
+        assert 'if is_feature_enabled_system("drive"):' in setup_source
 
     def test_background_loop_gates_follow_profile_capabilities(
         self,
@@ -1541,12 +1542,13 @@ class TestSetupBackgroundLoopsGate:
                 pass
             return list(created_tasks)
 
-        # 1) Everflow all enabled -> all 3 capability-gated background loops launch
+        # 1) Everflow all enabled -> all 3 capability-gated background loops launch; DriveTrashSweep stays off (drive feature default off)
         _enable_all_capabilities(monkeypatch)
         names_all_on = await _run_lifespan()
         assert "dalton-transcription-reconcile" in names_all_on
         assert "dalton-data-task-scheduler" in names_all_on
         assert "mcp-builtin-reconnect" in names_all_on
+        assert "drive_trash_sweep" not in names_all_on
 
         # 2) Disable TRANSCRIPTION only -> transcription reconcile does NOT launch
         _enable_all_capabilities(monkeypatch)
@@ -1573,12 +1575,13 @@ class TestSetupBackgroundLoopsGate:
         assert "dalton-transcription-reconcile" in names_no_bridge
         assert "dalton-data-task-scheduler" in names_no_bridge
 
-        # 5) Core profile (default) -> none of the 3 launch
+        # 5) Core profile (default) -> none of the 3 launch, and DriveTrashSweep stays off
         _clean_cap_env(monkeypatch, app_env="core")
         names_core = await _run_lifespan()
         assert "dalton-transcription-reconcile" not in names_core
         assert "dalton-data-task-scheduler" not in names_core
         assert "mcp-builtin-reconnect" not in names_core
+        assert "drive_trash_sweep" not in names_core
 
         # 6) Core profile with explicit transcription enabled + storage -> only transcription reconcile launches (§6.3)
         monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")

@@ -13,8 +13,10 @@ from src.dalton.knowledge import reconcile as knowledge_reconcile
 from src.dalton.knowledge import service as knowledge_service
 from src.dalton.migrations.versions import d020_colleague_dispatch_threads as d020
 from ptc_agent.agent import filesystem_routes
+from ptc_agent.agent.backends import StoreBackend
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 from ptc_agent.agent.middleware.tool.leak_detection import LeakDetectionMiddleware
+from ptc_agent.core.paths import MEMO_USER_DIR
 from src.server.services.brokerage_capabilities import CapabilityGroup
 from src.server.services.egress import direct_tools
 from src.server.services.egress.relay_jwt import MintedJwt
@@ -54,8 +56,14 @@ def test_filesystem_backend_uses_workspace_owner_id_for_store_namespaces() -> No
         "ws-owner-b",
         "memory",
     )
-    assert baseline.memo is not None
-    assert baseline.memo.namespace_factory() == ("u-owner-b", "memos")
+    memo_routes = [
+        r
+        for r in getattr(composite, "_routes", [])
+        if isinstance(r, StoreBackend) and r.root_prefix == f"/home/daytona/{MEMO_USER_DIR}/"
+    ]
+    assert len(memo_routes) == 1
+    assert memo_routes[0]._namespace_factory() == ("u-owner-b", "memos")
+    assert memo_routes[0]._read_only is True
     user_data_routes = [
         r for r in getattr(composite, "_routes", []) if hasattr(r, "_user_id")
     ]

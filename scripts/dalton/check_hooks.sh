@@ -504,6 +504,9 @@ ALLOWED_HOOKS=(
   "mobile-web"
   # Channel sandbox link rewriting: preserve validated ?redirect= deep links across login in App.tsx.
   "channel-links"
+  # SYNC13 S2 (#872): deployment kill switch for Drive — skips starting
+  # DriveTrashSweep in lifespan when features.drive.enabled is false.
+  "drive-kill-switch"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

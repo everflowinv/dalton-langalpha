@@ -851,13 +851,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to start ProvenanceGCService: {e}")
 
-    # Start the Drive's trash sweep (purges what the trash has kept long enough)
-    try:
-        from src.server.services.drive.sweep import DriveTrashSweep
+    # DALTON-HOOK(drive-kill-switch): do not start DriveTrashSweep when Drive feature is disabled
+    from src.config.features import is_feature_enabled_system
 
-        await DriveTrashSweep.get_instance().start()
-    except Exception as e:
-        logger.warning(f"Failed to start DriveTrashSweep: {e}")
+    if is_feature_enabled_system("drive"):
+        # Start the Drive's trash sweep (purges what the trash has kept long enough)
+        try:
+            from src.server.services.drive.sweep import DriveTrashSweep
+
+            await DriveTrashSweep.get_instance().start()
+        except Exception as e:
+            logger.warning(f"Failed to start DriveTrashSweep: {e}")
 
     # Start WorkspaceFileGCService (condemn-then-reap of unreferenced file blobs)
     try:

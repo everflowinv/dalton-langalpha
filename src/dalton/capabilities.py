@@ -895,6 +895,8 @@ BACKGROUND_LOOP_REGISTRY: Mapping[str, CapabilityId | None] = MappingProxyType(
         "InsightService": CORE_CAPABILITY,
         "NewsRefreshService": CORE_CAPABILITY,
         "ProvenanceGCService": CORE_CAPABILITY,
+        # Gated in setup.py by is_feature_enabled_system("drive") (default off in Everflow & Core)
+        "DriveTrashSweep": CORE_CAPABILITY,
         "WorkspaceFileGCService": CORE_CAPABILITY,
         "SetupSettings": CORE_CAPABILITY,
     }

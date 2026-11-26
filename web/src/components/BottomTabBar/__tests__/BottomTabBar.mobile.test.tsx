@@ -14,9 +14,18 @@ vi.mock('@/components/CommandPalette/CommandPaletteProvider', () => ({
   }),
 }));
 
-vi.mock('@/hooks/useFeatures', () => ({
-  useFeatureEnabled: () => true,
-}));
+vi.mock('@/hooks/useFeatures', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/hooks/useFeatures')>();
+  return {
+    ...actual,
+    useFeatures: () => ({
+      data: [
+        { key: 'org_library', enabled: true },
+        { key: 'drive', enabled: false },
+      ],
+    }),
+  };
+});
 
 describe('BottomTabBar mobile overflow menu', () => {
   it('caps direct bottom-bar buttons to <= 5, uses Radix DropdownMenu with keyboard navigation, and opens Search', async () => {
@@ -43,6 +52,8 @@ describe('BottomTabBar mobile overflow menu', () => {
     // Overflow items (e.g. Plugins) and global search live inside the Radix DropdownMenu
     const items = screen.getAllByRole('menuitem');
     expect(items.length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByRole('menuitem', { name: /^Drive$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Drive$/i })).not.toBeInTheDocument();
 
     // Arrow-key roving focus & Escape close work natively via Radix DropdownMenu
     await user.keyboard('{ArrowDown}');
