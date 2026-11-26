@@ -519,6 +519,14 @@ ALLOWED_HOOKS=(
   "channel-chart-snapshot"
   # Channel phase 2 batch 2: web deep-link query params (?chart=&layer= and ?widget=) in ChatView.
   "channel-deep-links"
+  # BY4: stop-path temporary running-only sandbox attach for session-less workers,
+  # plus skipped workspace count in stop result and logs (stop_backup.py, _lifecycle.py,
+  # _machine_backup.py, ptc_sandbox.py).
+  "stop-backup-attach"
+  # BY4: protect .wsfiles-relay-* staging files against concurrent orphan sweeps and
+  # ambient ProjectContext path folding (relay_staging_guard.py, restore.py, transfer.py,
+  # wsfiles_transfer_runtime.py).
+  "relay-staging-race"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

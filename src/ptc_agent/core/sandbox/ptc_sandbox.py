@@ -47,6 +47,7 @@ from ptc_agent.core.sandbox.runtime import (
     RuntimeState,
     SandboxFailureKind,
     SandboxGoneError,
+    SandboxProvider,  # DALTON-HOOK(stop-backup-attach): allow passing an already-opened provider
     SandboxRuntime,
     SandboxTransientError,
 )
@@ -88,6 +89,8 @@ class PTCSandbox:
         self, config: CoreConfig, mcp_registry: MCPRegistry | None = None,
         *, resource_tier: str | None = None,
         host_unavailable_policy: HostUnavailablePolicy | None = None,
+        # DALTON-HOOK(stop-backup-attach): reuse an existing provider on temporary stop-backup attach
+        provider: SandboxProvider | None = None,
     ) -> None:
         """``mcp_registry`` may be None when reconnecting to an existing sandbox.
 
@@ -99,7 +102,8 @@ class PTCSandbox:
         self.mcp_registry = mcp_registry
 
         # Provider-based sandbox management
-        self.provider = create_provider(config)
+        # DALTON-HOOK(stop-backup-attach): avoid opening a second provider client when one is supplied
+        self.provider = provider if provider is not None else create_provider(config)
         self.runtime: SandboxRuntime | None = None
         self.sandbox_id: str | None = None
         self.tool_generator = ToolFunctionGenerator()

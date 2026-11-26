@@ -466,6 +466,7 @@ class DaltonConfig(BaseModel):
     )
     network: DaltonNetworkConfig = Field(default_factory=DaltonNetworkConfig)
     weixin: DaltonWeixinConfig = Field(default_factory=DaltonWeixinConfig)
+    stop_backup_attach_timeout_s: float = Field(default=60.0, gt=0)
 
 
 def _parse_env_pm_user_ids() -> list[str] | None:
@@ -1935,6 +1936,15 @@ def is_chat_upload_cleanup_enabled() -> bool:
     if raw is None or not raw.strip():
         return True
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def get_stop_backup_attach_timeout_s() -> float:
+    """Timeout in seconds for temporary sandbox attach during stop-time backup."""
+    cfg = get_dalton_config()
+    return _positive_float_env(
+        "DALTON_STOP_BACKUP_ATTACH_TIMEOUT_S",
+        cfg.stop_backup_attach_timeout_s,
+    )
 
 
 

@@ -635,3 +635,6 @@ web/src/pages/ChatAgent/components/__tests__/ChatView.channelDeepLinks.test.tsx
 web/src/pages/Settings/utils/priceSource.ts
 web/src/pages/Settings/utils/__tests__/priceSource.test.ts
 web/src/components/ui/__tests__/chat-input.priceSource.dalton.test.tsx
+# BY4: stop-path temporary attach backup and concurrent relay staging race tests.
+tests/unit/server/services/test_stop_backup_attach.py
+tests/unit/ptc_agent/core/sandbox/test_wsfiles_relay_race.py

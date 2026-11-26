@@ -1858,21 +1858,37 @@ class SessionLifecycleMixin:
 
             # A machine its owner chose not to back up keeps its last backup.
             backup_ms = None
+            backup_skipped_workspaces: int | None = None
             if binding.files_backup and back_up:
                 backup_started = time.monotonic()
-                folder_count = await self._backup_machine_files_to_db(
-                    computer_id,
+                # DALTON-HOOK(stop-backup-attach): temporarily attach a running-only session when this worker holds none
+                from src.dalton.services.stop_backup import run_stop_backup
+
+                outcome = await run_stop_backup(
+                    self,
+                    binding,
                     workspace_id=workspace_id,
-                    expected_sandbox_id=durable_sandbox_id,
-                    routine=True,
+                    durable_sandbox_id=durable_sandbox_id,
                 )
+                folder_count = outcome.mirrored
+                backup_skipped_workspaces = outcome.skipped
                 backup_ms = round((time.monotonic() - backup_started) * 1000)
-                logger.info(
-                    "Computer %s stop backup mirrored %d folder(s) in %dms",
-                    computer_id,
-                    int(folder_count or 0),
-                    backup_ms,
-                )
+                if backup_skipped_workspaces > 0:
+                    logger.warning(
+                        "Computer %s stop backup mirrored %d folder(s), skipped %d workspace(s) in %dms",
+                        computer_id,
+                        int(folder_count or 0),
+                        backup_skipped_workspaces,
+                        backup_ms,
+                    )
+                else:
+                    logger.info(
+                        "Computer %s stop backup mirrored %d folder(s), skipped %d workspace(s) in %dms",
+                        computer_id,
+                        int(folder_count or 0),
+                        backup_skipped_workspaces,
+                        backup_ms,
+                    )
 
             # The last chance to read the disk before it is unreachable, so the
             # stopped machine still shows how full it is.
@@ -1941,13 +1957,21 @@ class SessionLifecycleMixin:
 
             await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
             logger.info(f"Computer {computer_id} stopped successfully")
-            return await self._stop_result(computer_id, workspace_id)
+            stop_result = await self._stop_result(computer_id, workspace_id)
+            # DALTON-HOOK(stop-backup-attach): include skipped workspace count in stop result
+            if backup_skipped_workspaces is not None and isinstance(stop_result, dict):
+                return {**stop_result, "backup_skipped_workspaces": backup_skipped_workspaces}
+            return stop_result
 
         except Exception as e:
             logger.error(f"Error stopping computer {computer_id}: {e}")
             try:
                 if await self._reconcile_provider_stop(binding):
-                    return await self._stop_result(computer_id, workspace_id)
+                    stop_result = await self._stop_result(computer_id, workspace_id)
+                    # DALTON-HOOK(stop-backup-attach): include skipped workspace count in reconciled stop result
+                    if backup_skipped_workspaces is not None and isinstance(stop_result, dict):
+                        return {**stop_result, "backup_skipped_workspaces": backup_skipped_workspaces}
+                    return stop_result
             except Exception:
                 # Leave the durable stopping claim for the existing recovery
                 # path once this owner releases its heartbeat.

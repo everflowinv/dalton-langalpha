@@ -146,6 +146,10 @@ class MachineBackupMixin:
                 f"File backup mirrored {mirrored} of {len(ordered)} project(s) "
                 f"on computer {computer_id}; the rest keep their last mirror"
             )
+        # DALTON-HOOK(stop-backup-attach): report mirrored/skipped counts to active stop-backup scope
+        from src.dalton.services.stop_backup import record_mirror_outcome
+
+        record_mirror_outcome(total=len(ordered), mirrored=mirrored)
         return mirrored
 
     async def backup_changed_projects(
