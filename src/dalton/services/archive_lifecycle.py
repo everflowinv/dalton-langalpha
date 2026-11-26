@@ -285,21 +285,120 @@ def sanitize_reconcile_exception(exc: Exception) -> ArchiveProviderError:
 async def reconcile_stopping_locked(
     manager: Any, computer_id: str
 ) -> dict[str, Any] | None:
-    """Locked body of ``reconcile_stopping_computer`` with span/SDK exception containment."""
+    """Locked body of ``reconcile_stopping_computer`` with span/SDK exception containment.
+
+    Only archiving rows convert provider exceptions into ``ArchiveProviderError``;
+    ordinary stop/start reconciliations (e.g. Docker) preserve their original
+    exception type and HTTP status mapping while still suppressing raw Daytona
+    SDK child spans.
+    """
     from src.server.services.computer_manager import _lifecycle
 
     computer = await _lifecycle.get_computer(computer_id)
     if not computer or computer.get("status") != ComputerStatus.STOPPING:
         return computer
+    is_archiving = bool((computer.get("config") or {}).get("archiving"))
     with suppress_daytona_raw_spans():
         try:
             await manager._correct_stuck_stopping(
                 manager._binding_from_computer("", computer)
             )
         except Exception as exc:
+            if not is_archiving:
+                raise
             sanitized = sanitize_reconcile_exception(exc)
             raise sanitized from None
     return await _lifecycle.get_computer(computer_id)
+
+
+async def reconcile_failed_stop_sanitized(
+    manager: Any,
+    binding: Any,
+    *,
+    computer_id: str,
+    workspace_id: str | None,
+    exc: Exception,
+) -> bool:
+    """Log a failed stop with whitelisted fields only and reconcile under raw-span suppression."""
+    category, _, _ = classify_archive_provider_error(
+        exc, default_category="stop_failed"
+    )
+    logger.error(
+        "stop_computer_failed category=%s computer_id=%s workspace_id=%s exc_type=%s",
+        category,
+        computer_id,
+        workspace_id or "",
+        type(exc).__name__,
+    )
+    try:
+        with suppress_daytona_raw_spans():
+            return bool(await manager._reconcile_provider_stop(binding))
+    except Exception as rec_exc:
+        # Leave the durable stopping claim for the existing recovery
+        # path once this owner releases its heartbeat.
+        rec_category, _, _ = classify_archive_provider_error(
+            rec_exc, default_category="reconcile_failed"
+        )
+        logger.warning(
+            "stop_reconcile_failed category=%s computer_id=%s workspace_id=%s exc_type=%s",
+            rec_category,
+            computer_id,
+            workspace_id or "",
+            type(rec_exc).__name__,
+        )
+        return False
+
+
+async def settle_machine_stop_impl(
+    manager: Any,
+    computer_id: str,
+    status: str,
+    *,
+    clear_archiving: bool = True,
+    expected_archiving_owner: str | None = None,
+) -> None:
+    """CAS from 'stopping' so a teardown's tail cannot stomp a peer's transition.
+
+    ``clear_archiving`` defaults to True so ordinary stops and terminal
+    reconciliations keep the upstream 2-argument call contract and clear
+    any residual ``config.archiving`` fence. Pass ``clear_archiving=False``
+    only while the provider still reports ``archiving``.
+    """
+    from src.server.services.computer_manager import _machines
+
+    if status == ComputerStatus.STOPPED:
+        # While the row still reads 'stopping', so no start can have minted
+        # a token this would end.
+        await manager._revoke_computer_tokens(computer_id)
+        await manager._revoke_livefs(computer_id)
+    kwargs: dict[str, Any] = {"expected": "stopping"}
+    if clear_archiving:
+        kwargs["drop_config_key"] = "archiving"
+    if expected_archiving_owner is not None:
+        kwargs["expected_archiving_owner"] = expected_archiving_owner
+    settled = await _machines.update_computer_status(
+        computer_id,
+        status,
+        **kwargs,
+    )
+    if settled is None:
+        if clear_archiving and status == ComputerStatus.STOPPED:
+            # Startup recovery or a peer may already have settled status to
+            # 'stopped' while preserving config.archiving; a confirmed
+            # terminal provider state still clears the fence under the same owner CAS.
+            if expected_archiving_owner is not None:
+                await _machines.clear_computer_archiving(
+                    computer_id,
+                    expected_archiving_owner=expected_archiving_owner,
+                )
+            else:
+                await _machines.clear_computer_archiving(computer_id)
+        logger.info(
+            "Computer %s was moved out of 'stopping' by another worker; "
+            "leaving it rather than writing %r",
+            computer_id,
+            status,
+        )
 
 
 async def archive_machine_impl(

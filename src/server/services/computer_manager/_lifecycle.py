@@ -578,13 +578,18 @@ class SessionLifecycleMixin:
                 )
                 return
         # --- DALTON-HOOK(cos-settings-tools): begin ---
-        elif heartbeat is False:
-            from src.dalton.services.archive_lifecycle import archive_claim_in_grace_window
+        from src.dalton.services.archive_lifecycle import (
+            archive_claim_in_grace_window,
+            suppress_daytona_raw_spans,
+        )
 
-            if archive_claim_in_grace_window(await get_computer(computer_id), heartbeat=False):
-                return
+        if heartbeat is False and archive_claim_in_grace_window(
+            await get_computer(computer_id), heartbeat=False
+        ):
+            return
+        with suppress_daytona_raw_spans():
+            await self._reconcile_provider_stop(binding)
         # --- DALTON-HOOK(cos-settings-tools): end ---
-        await self._reconcile_provider_stop(binding)
 
     async def reconcile_stopping_computer(
         self, computer_id: str
@@ -666,9 +671,13 @@ class SessionLifecycleMixin:
                 await self._settle_unanswered_stop(computer_id)
                 return True
         else:
+            # DALTON-HOOK(cos-settings-tools): suppress raw Daytona SDK spans during stop reconciliation
+            from src.dalton.services.archive_lifecycle import suppress_daytona_raw_spans
+
             try:
-                async with self._detached_runtime(sandbox_id, binding=binding) as runtime:
-                    actual_state = await runtime.get_state()
+                with suppress_daytona_raw_spans():
+                    async with self._detached_runtime(sandbox_id, binding=binding) as runtime:
+                        actual_state = await runtime.get_state()
             except SandboxGoneError:
                 # DALTON-HOOK(cos-settings-tools): whitelisted structured log on missing sandbox
                 logger.warning(
@@ -1969,18 +1978,16 @@ class SessionLifecycleMixin:
             return await self._stop_result(computer_id, workspace_id)
 
         except Exception as e:
-            logger.error(f"Error stopping computer {computer_id}: {e}")
-            try:
-                if await self._reconcile_provider_stop(binding):
-                    return await self._stop_result(computer_id, workspace_id)
-            except Exception:
-                # Leave the durable stopping claim for the existing recovery
-                # path once this owner releases its heartbeat.
-                logger.warning(
-                    "Could not reconcile failed stop for computer %s",
-                    computer_id,
-                    exc_info=True,
-                )
+            # --- DALTON-HOOK(cos-settings-tools): begin ---
+            from src.dalton.services.archive_lifecycle import (
+                reconcile_failed_stop_sanitized,
+            )
+
+            if await reconcile_failed_stop_sanitized(
+                self, binding, computer_id=computer_id, workspace_id=workspace_id, exc=e
+            ):
+                return await self._stop_result(computer_id, workspace_id)
+            # --- DALTON-HOOK(cos-settings-tools): end ---
             raise
 
     async def _stop_result(

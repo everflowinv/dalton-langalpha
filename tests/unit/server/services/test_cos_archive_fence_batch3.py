@@ -1989,3 +1989,341 @@ async def test_archive_machine_daytona_sdk_post_submit_refresh_404_succeeds_and_
     sdk_api2.archive_sandbox.assert_awaited_once()
     sdk_api2.get_sandbox.assert_not_awaited()
     cm._reconcile_provider_stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_docker_normal_stop_reconcile_failure_preserves_original_error_and_http_status(
+    monkeypatch,
+):
+    """Non-archiving Docker stop reconciliation keeps original error type & HTTP status (no 400 regression).
+
+    Archiving reconciliation keeps ArchiveProviderError and preserves its http_status (e.g. 503)
+    at both /computers/{id}/start and /workspaces/{id}/start.
+    """
+    from src.server.app import computers as computers_app
+    from src.server.app import setup as setup_app
+    from src.server.app import workspaces as workspaces_app
+    from src.server.services.computer_manager import _lifecycle
+    from src.server.services.computer_manager._types import ComputerBinding
+    from src.server.utils.error_sanitization import SANDBOX_UNREACHABLE_PREFIX
+
+    @asynccontextmanager
+    async def _noop_lock(*_a, **_kw):
+        yield
+
+    def _make_docker_manager(exc_to_raise: Exception) -> WorkspaceManager:
+        wm = object.__new__(WorkspaceManager)
+        wm._machines = {}
+        wm._observed_lock = create_autospec(
+            wm._observed_lock,
+            side_effect=lambda *_a, **_kw: _noop_lock(),
+        )
+        wm._binding_from_computer = create_autospec(
+            wm._binding_from_computer,
+            side_effect=lambda ws_id, row: ComputerBinding(
+                workspace_id=ws_id,
+                computer_id=str(row["computer_id"]),
+                kind=str(row["kind"]),
+                provider_ref=row.get("provider_ref"),
+            ),
+        )
+
+        @asynccontextmanager
+        async def _failing_detached(*_a, **_kw):
+            raise exc_to_raise
+            yield  # pragma: no cover
+
+        wm._detached_runtime = create_autospec(
+            wm._detached_runtime,
+            side_effect=lambda *_a, **_kw: _failing_detached(),
+        )
+        return wm
+
+    docker_stopping = _computer_row(
+        kind="docker",
+        status="stopping",
+        provider_ref="ctr-docker-1",
+        config={},
+    )
+    ws_stopping = {
+        "workspace_id": WS_1,
+        "user_id": USER_ID,
+        "name": "NVDA",
+        "status": "stopping",
+        "computer_id": COMP_A,
+    }
+    monkeypatch.setattr(
+        _lifecycle,
+        "get_computer",
+        create_autospec(computer_db.get_computer, return_value=docker_stopping),
+    )
+    monkeypatch.setattr(
+        _lifecycle,
+        "computer_stop_heartbeat_present",
+        create_autospec(_lifecycle.computer_stop_heartbeat_present, return_value=False),
+    )
+
+    app = FastAPI()
+    app.add_exception_handler(SandboxGoneError, setup_app._sandbox_failure_handler)
+    app.add_exception_handler(SandboxTransientError, setup_app._sandbox_failure_handler)
+    app.add_exception_handler(SSHConnectError, setup_app._sandbox_failure_handler)
+    app.include_router(computers_app.router)
+    app.include_router(workspaces_app.router)
+    principal = Principal(user_id=USER_ID, auth="session", scopes=frozenset({"*"}))
+    app.dependency_overrides[get_principal] = lambda: principal
+
+    reached_mock = create_autospec(
+        computers_app._reached_computer, return_value=docker_stopping
+    )
+    comp_mgr_mock = create_autospec(computers_app._computer_manager)
+    monkeypatch.setattr(computers_app, "_reached_computer", reached_mock)
+    monkeypatch.setattr(computers_app, "_computer_manager", comp_mgr_mock)
+    monkeypatch.setattr(
+        workspaces_app,
+        "db_get_workspace",
+        create_autospec(workspaces_app.db_get_workspace, return_value=ws_stopping),
+    )
+    monkeypatch.setattr(
+        workspaces_app,
+        "workspace_access",
+        create_autospec(workspaces_app.workspace_access, return_value=None),
+    )
+    from src.server.services import home_placement
+
+    monkeypatch.setattr(
+        home_placement,
+        "runs_in",
+        create_autospec(home_placement.runs_in, return_value=WS_1),
+    )
+
+    # 1. Docker SandboxTransientError -> re-raised untouched -> 503 via _sandbox_failure_handler (NOT 400).
+    transient_err = SandboxTransientError("docker daemon timed out")
+    wm_transient = _make_docker_manager(transient_err)
+    with pytest.raises(SandboxTransientError) as exc_direct:
+        await wm_transient.reconcile_stopping_computer(COMP_A)
+    assert not isinstance(exc_direct.value, ArchiveProviderError)
+
+    comp_mgr_mock.return_value = wm_transient
+    monkeypatch.setattr(
+        workspaces_app.WorkspaceManager,
+        "get_instance",
+        classmethod(lambda cls: wm_transient),
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        comp_503 = await client.post(f"/api/v1/computers/{COMP_A}/start")
+        ws_503 = await client.post(f"/api/v1/workspaces/{WS_1}/start")
+    assert comp_503.status_code == 503
+    assert SANDBOX_UNREACHABLE_PREFIX in comp_503.json()["detail"]
+    assert ws_503.status_code == 503
+    assert SANDBOX_UNREACHABLE_PREFIX in ws_503.json()["detail"]
+
+    # 2. Docker unexpected ConnectionError -> re-raised untouched -> 500 (NOT 400).
+    conn_err = ConnectionError("docker socket closed")
+    wm_conn = _make_docker_manager(conn_err)
+    with pytest.raises(ConnectionError):
+        await wm_conn.reconcile_stopping_computer(COMP_A)
+
+    comp_mgr_mock.return_value = wm_conn
+    monkeypatch.setattr(
+        workspaces_app.WorkspaceManager,
+        "get_instance",
+        classmethod(lambda cls: wm_conn),
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        comp_500 = await client.post(f"/api/v1/computers/{COMP_A}/start")
+        ws_500 = await client.post(f"/api/v1/workspaces/{WS_1}/start")
+    assert comp_500.status_code == 500
+    assert comp_500.json()["detail"] == "Failed to start computer"
+    assert ws_500.status_code == 500
+    assert ws_500.json()["detail"] == "Failed to start workspace"
+
+    # 3. Archiving Daytona computer with 503 -> sanitized ArchiveProviderError(http_status=503)
+    #    preserves 503 on both start endpoints instead of falling through RuntimeError -> 400.
+    old_ts = datetime.now(timezone.utc) - timedelta(seconds=600)
+    archiving_stopping = _computer_row(
+        kind="daytona",
+        status="stopping",
+        provider_ref="sbx-daytona-1",
+        config={
+            "archiving": True,
+            "archiving_owner": "owner-503",
+            "archiving_claimed_at": old_ts.isoformat(),
+        },
+    )
+    archiving_stopping["updated_at"] = old_ts
+    monkeypatch.setattr(
+        _lifecycle,
+        "get_computer",
+        create_autospec(computer_db.get_computer, return_value=archiving_stopping),
+    )
+    reached_mock.return_value = archiving_stopping
+    wm_archive_503 = _make_docker_manager(SandboxTransientError(FAKE_SECRET_BODY))
+    with pytest.raises(ArchiveProviderError) as exc_arch:
+        await wm_archive_503.reconcile_stopping_computer(COMP_A)
+    assert exc_arch.value.http_status == 503
+    assert exc_arch.value.category == "sandbox_transient"
+
+    comp_mgr_mock.return_value = wm_archive_503
+    monkeypatch.setattr(
+        workspaces_app.WorkspaceManager,
+        "get_instance",
+        classmethod(lambda cls: wm_archive_503),
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        arch_comp_503 = await client.post(f"/api/v1/computers/{COMP_A}/start")
+        arch_ws_503 = await client.post(f"/api/v1/workspaces/{WS_1}/start")
+    assert arch_comp_503.status_code == 503
+    assert arch_ws_503.status_code == 503
+    for body_text in (arch_comp_503.text, arch_ws_503.text):
+        for secret in ("DO_NOT_LOG", "sk-proj_", "s3cr3tP4ss", "AIzaSyA", "eyJhbGci"):
+            assert secret not in body_text
+
+
+@pytest.mark.asyncio
+async def test_await_stop_and_retry_and_failed_stop_reconcile_suppress_daytona_raw_spans_and_logs(
+    monkeypatch, caplog
+):
+    """Both session-attach _correct_stuck_stopping and failed-stop _reconcile_provider_stop
+    suppress raw Daytona SDK child spans and log only whitelisted fields (no {e} or exc_info).
+    """
+    import asyncio
+
+    import daytona._utils.otel_decorator as daytona_otel
+    from daytona._async.daytona import AsyncDaytona
+    from daytona_api_client_async.api.sandbox_api import SandboxApi
+    from daytona_api_client_async.exceptions import ApiException
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
+    from ptc_agent.core.session import Session
+    from src.observability import tracing as tracing_mod
+    from src.server.services.computer_manager import _lifecycle
+    from src.server.services.computer_manager._types import ComputerBinding
+
+    exporter = InMemorySpanExporter()
+    provider_tp = TracerProvider()
+    provider_tp.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(tracing_mod, "tracer", provider_tp.get_tracer("test-stop-paths"))
+    monkeypatch.setattr(
+        daytona_otel, "_tracer", provider_tp.get_tracer("daytona-sdk-python")
+    )
+
+    sdk_client = AsyncDaytona.__new__(AsyncDaytona)
+    sdk_api = create_autospec(SandboxApi, instance=True)
+    sdk_api.get_sandbox.side_effect = ApiException(status=503, body=FAKE_SECRET_BODY)
+    sdk_client._sandbox_api = sdk_api
+
+    daytona_provider = DaytonaProvider.__new__(DaytonaProvider)
+    daytona_provider._working_dir = "/home/workspace"
+    daytona_provider._client = sdk_client
+
+    @asynccontextmanager
+    async def _detached_real_daytona(sandbox_id, binding=None):
+        yield await daytona_provider.get(sandbox_id)
+
+    binding = ComputerBinding(
+        workspace_id=WS_1,
+        computer_id=COMP_A,
+        kind="daytona",
+        provider_ref="sbx-daytona-1",
+        files_backup=False,
+    )
+    stopping_row = _computer_row(
+        kind="daytona",
+        status="stopping",
+        provider_ref="sbx-daytona-1",
+        config={},
+    )
+
+    cm = object.__new__(ComputerManager)
+    cm._machines = {}
+    cm._detached_runtime = create_autospec(
+        cm._detached_runtime,
+        side_effect=_detached_real_daytona,
+    )
+    monkeypatch.setattr(
+        _lifecycle,
+        "get_computer",
+        create_autospec(computer_db.get_computer, return_value=stopping_row),
+    )
+    monkeypatch.setattr(
+        _lifecycle,
+        "computer_stop_heartbeat_present",
+        create_autospec(_lifecycle.computer_stop_heartbeat_present, return_value=False),
+    )
+    monkeypatch.setattr(
+        _lifecycle,
+        "refuse_start",
+        create_autospec(_lifecycle.refuse_start, return_value=None),
+    )
+    monkeypatch.setattr(
+        asyncio,
+        "sleep",
+        create_autospec(asyncio.sleep, return_value=None),
+    )
+
+    # Path A: session attach _await_stop_and_retry -> _correct_stuck_stopping -> _reconcile_provider_stop
+    from daytona import DaytonaError
+
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
+    with pytest.raises(DaytonaError):
+        await cm._await_stop_and_retry(
+            binding,
+            user_id=USER_ID,
+            workspace_user_id=USER_ID,
+            on_state_observed=None,
+            attempt=0,
+        )
+    assert sdk_api.get_sandbox.await_count == 1
+    assert len(exporter.get_finished_spans()) == 0
+
+    # Path B: _finish_claimed_stop fails with secrets in exception, then _reconcile_provider_stop
+    # hits Daytona 503 with secrets -> original SandboxTransientError re-raised, zero secrets in
+    # spans or logs, and neither log record carries exc_info.
+    mock_session = create_autospec(Session, instance=True)
+    mock_session.stop.side_effect = SandboxTransientError(FAKE_SECRET_BODY)
+    cm.refresh_computer_disk = create_autospec(cm.refresh_computer_disk, return_value=None)
+    cm._cached_session = create_autospec(cm._cached_session, return_value=mock_session)
+    cm._session_sandbox_id = create_autospec(
+        cm._session_sandbox_id, return_value="sbx-daytona-1"
+    )
+    cm._machine_has_active_tasks = create_autospec(
+        cm._machine_has_active_tasks, return_value=False
+    )
+    cm._retain_machine_stop_claim = create_autospec(
+        cm._retain_machine_stop_claim, return_value=True
+    )
+    cm._drop_session = create_autospec(cm._drop_session, return_value=None)
+
+    caplog.clear()
+    with pytest.raises(SandboxTransientError):
+        await cm._finish_claimed_stop(
+            binding,
+            workspace_id=WS_1,
+            durable_sandbox_id="sbx-daytona-1",
+            back_up=False,
+        )
+
+    assert sdk_api.get_sandbox.await_count == 2
+    assert len(exporter.get_finished_spans()) == 0
+
+    error_msgs = [r.getMessage() for r in caplog.records]
+    assert any("stop_computer_failed" in m for m in error_msgs)
+    assert any("stop_reconcile_failed" in m for m in error_msgs)
+    for rec in caplog.records:
+        if "stop_computer_failed" in rec.getMessage() or "stop_reconcile_failed" in rec.getMessage():
+            assert rec.exc_info is None
+        msg = rec.getMessage()
+        for secret in ("DO_NOT_LOG", "sk-proj_", "s3cr3tP4ss", "AIzaSyA", "eyJhbGci"):
+            assert secret not in msg, f"Leaked {secret!r} in log: {msg}"

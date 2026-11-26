@@ -95,6 +95,7 @@ from src.server.models.workspace_move import WorkspaceMoveOut, WorkspaceMoveRequ
 from src.server.app.computers import accept_workspace_move
 from src.server.services.workspace_move import move_error_detail, move_from_row
 from src.server.services.computer_errors import (
+    ArchiveProviderError,  # DALTON-HOOK(cos-settings-tools)
     ComputerArchivingError,  # DALTON-HOOK(cos-settings-tools)
     ComputerNotFoundError,
     ComputerPreparingError,
@@ -166,6 +167,14 @@ async def _workspace_action_errors(action: str, workspace_id: str):
         raise HTTPException(
             status_code=409,
             detail={"code": "computer_archiving", "message": str(e)},
+        ) from None
+    except ArchiveProviderError as e:
+        raise HTTPException(
+            status_code=e.http_status,
+            detail={
+                "code": e.category,
+                "message": e.user_message or "Sandbox provider reconciliation failed.",
+            },
         ) from None
     # --- DALTON-HOOK(cos-settings-tools): end ---
     except ValueError as e:

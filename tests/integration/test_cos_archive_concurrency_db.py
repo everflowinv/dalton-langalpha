@@ -194,6 +194,9 @@ async def test_dual_conn_archiving_fence_blocks_create_start_and_move_and_surviv
         assert row_after_restart is not None
         assert row_after_restart["status"] == "stopped"
         assert (row_after_restart.get("config") or {}).get("archiving") is True
+        ws_after_restart = await workspace_db.get_workspace(ws_1)
+        assert ws_after_restart is not None
+        assert ws_after_restart["status"] == "stopping"
 
         # Start claim is atomically refused by SQL fence while config.archiving=true.
         start_claim = await computer_db.try_claim_computer_for_start(
@@ -209,6 +212,9 @@ async def test_dual_conn_archiving_fence_blocks_create_start_and_move_and_surviv
 
         # Once terminal provider state clears fence, create and start succeed again.
         assert await computer_db.clear_computer_archiving(comp_a) is True
+        ws_after_clear = await workspace_db.get_workspace(ws_1)
+        assert ws_after_clear is not None
+        assert ws_after_clear["status"] == "stopped"
         created_after_clear = await workspace_db.create_workspace_on_computer(
             user_id, f"GOOG-{uuid.uuid4().hex[:6]}", comp_a
         )
@@ -310,74 +316,107 @@ async def test_dual_conn_staging_and_archive_interleave_without_deadlock(
         holder_pid_box: list[int] = []
 
         async def _hold_high_row():
-            async with patched_get_db_connection() as conn, conn.transaction():
-                async with conn.cursor() as cur:
-                    await cur.execute("SELECT pg_backend_pid()")
-                    pid_row = await cur.fetchone()
-                    if pid_row:
-                        holder_pid_box.append(int(pid_row[0]))
-                    await cur.execute(
-                        "SELECT 1 FROM workspaces WHERE workspace_id = %s FOR UPDATE",
-                        (high_id,),
-                    )
+            try:
+                async with patched_get_db_connection() as conn, conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute("SELECT pg_backend_pid() AS pid")
+                        pid_row = await cur.fetchone()
+                        if pid_row is not None:
+                            holder_pid_box.append(int(pid_row["pid"]))
+                        await cur.execute(
+                            "SELECT 1 FROM workspaces WHERE workspace_id = %s FOR UPDATE",
+                            (high_id,),
+                        )
+                    gate_locked.set()
+                    await release_gate.wait()
+            finally:
                 gate_locked.set()
-                await release_gate.wait()
 
         holder = asyncio.create_task(_hold_high_row())
-        await asyncio.wait_for(gate_locked.wait(), timeout=5.0)
-        assert holder_pid_box, "holder backend pid should be recorded"
-        holder_pid = holder_pid_box[0]
-
-        stage_task = asyncio.create_task(
-            move_db.stage_workspace_move(
-                move_id, runner_id, source_folder="NVDA", leftovers_path=None
-            )
-        )
-        archive_task = asyncio.create_task(
-            computer_db.claim_computer_for_archive(
-                comp_a, expected_workspaces=snapshot, expected_workspace_id=low_id
-            )
-        )
-        # Wait deterministically until BOTH business transactions are actually
-        # blocked in PostgreSQL lock waits (bounded timeout, no blind sleep).
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + 5.0
-        waiting_count = 0
+        stage_task: asyncio.Task | None = None
+        archive_task: asyncio.Task | None = None
         try:
+            await asyncio.wait_for(gate_locked.wait(), timeout=5.0)
+            if holder.done():
+                holder.result()
+            assert holder_pid_box, "holder backend pid should be recorded"
+            holder_pid = holder_pid_box[0]
+
+            stage_task = asyncio.create_task(
+                move_db.stage_workspace_move(
+                    move_id, runner_id, source_folder="NVDA", leftovers_path=None
+                )
+            )
+            archive_task = asyncio.create_task(
+                computer_db.claim_computer_for_archive(
+                    comp_a, expected_workspaces=snapshot, expected_workspace_id=low_id
+                )
+            )
+            # Wait deterministically until BOTH business transactions are actually
+            # blocked in PostgreSQL's lock wait chain rooted at holder_pid
+            # (ignoring unrelated lock waits elsewhere in the database).
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 5.0
+            waiting_count = 0
             async with patched_get_db_connection() as obs_conn:
                 while loop.time() < deadline:
                     async with obs_conn.cursor() as cur:
                         await cur.execute(
                             """
-                            SELECT COUNT(*)
-                            FROM pg_stat_activity
-                            WHERE datname = current_database()
-                              AND state = 'active'
-                              AND wait_event_type = 'Lock'
-                              AND pid NOT IN (pg_backend_pid(), %s)
+                            WITH RECURSIVE wait_chain(pid) AS (
+                                SELECT a.pid
+                                FROM pg_stat_activity a
+                                WHERE a.datname = current_database()
+                                  AND a.state = 'active'
+                                  AND a.wait_event_type = 'Lock'
+                                  AND %(holder_pid)s = ANY(pg_blocking_pids(a.pid))
+                                UNION
+                                SELECT a.pid
+                                FROM pg_stat_activity a
+                                JOIN wait_chain w ON w.pid = ANY(pg_blocking_pids(a.pid))
+                                WHERE a.datname = current_database()
+                                  AND a.state = 'active'
+                                  AND a.wait_event_type = 'Lock'
+                            )
+                            SELECT COUNT(DISTINCT pid) AS waiting_count
+                            FROM wait_chain
                             """,
-                            (holder_pid,),
+                            {"holder_pid": holder_pid},
                         )
                         row = await cur.fetchone()
-                        waiting_count = int(row[0]) if row else 0
+                        waiting_count = int(row["waiting_count"]) if row is not None else 0
                     if waiting_count >= 2:
                         break
                     await asyncio.sleep(0.02)
             assert waiting_count >= 2, (
-                f"Expected both stage and archive transactions to enter PG lock wait, "
-                f"observed waiting_count={waiting_count}"
+                f"Expected both stage and archive transactions to enter PG lock wait "
+                f"chain behind holder_pid={holder_pid}, observed waiting_count={waiting_count}"
             )
+
+            release_gate.set()
+            await asyncio.wait_for(holder, timeout=5.0)
+            stage_res, archive_res = await asyncio.wait_for(
+                asyncio.gather(stage_task, archive_task, return_exceptions=True),
+                timeout=5.0,
+            )
+            assert not isinstance(stage_res, Exception), f"stage failed: {stage_res!r}"
+            assert stage_res is not None
+            assert stage_res["phase"] == "staged"
+            assert isinstance(archive_res, ComputerBusyError)
         finally:
             release_gate.set()
-
-        await asyncio.wait_for(holder, timeout=5.0)
-        stage_res, archive_res = await asyncio.wait_for(
-            asyncio.gather(stage_task, archive_task, return_exceptions=True),
-            timeout=5.0,
-        )
-        assert not isinstance(stage_res, Exception), f"stage failed: {stage_res!r}"
-        assert stage_res is not None
-        assert stage_res["phase"] == "staged"
-        assert isinstance(archive_res, ComputerBusyError)
+            pending = [
+                t for t in (holder, stage_task, archive_task) if t is not None and not t.done()
+            ]
+            if pending:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    for t in pending:
+                        t.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
     finally:
         await _cleanup_user(patched_get_db_connection, user_id)

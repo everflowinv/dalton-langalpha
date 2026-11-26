@@ -726,44 +726,15 @@ class MachineLifecycleMixin:
         clear_archiving: bool = True,
         expected_archiving_owner: str | None = None,
     ) -> None:
-        """CAS from 'stopping' so a teardown's tail cannot stomp a peer's transition.
+        from src.dalton.services.archive_lifecycle import settle_machine_stop_impl
 
-        ``clear_archiving`` defaults to True so ordinary stops and terminal
-        reconciliations keep the upstream 2-argument call contract and clear
-        any residual ``config.archiving`` fence. Pass ``clear_archiving=False``
-        only while the provider still reports ``archiving``.
-        """
-        if status == ComputerStatus.STOPPED:
-            # While the row still reads 'stopping', so no start can have minted
-            # a token this would end.
-            await self._revoke_computer_tokens(computer_id)
-            await self._revoke_livefs(computer_id)
-        kwargs: Dict[str, Any] = {"expected": "stopping"}
-        if clear_archiving:
-            kwargs["drop_config_key"] = "archiving"
-        if expected_archiving_owner is not None:
-            kwargs["expected_archiving_owner"] = expected_archiving_owner
-        settled = await update_computer_status(
+        await settle_machine_stop_impl(
+            self,
             computer_id,
             status,
-            **kwargs,
+            clear_archiving=clear_archiving,
+            expected_archiving_owner=expected_archiving_owner,
         )
-        if settled is None:
-            if clear_archiving and status == ComputerStatus.STOPPED:
-                # Startup recovery or a peer may already have settled status to
-                # 'stopped' while preserving config.archiving; a confirmed
-                # terminal provider state still clears the fence under the same owner CAS.
-                if expected_archiving_owner is not None:
-                    await clear_computer_archiving(
-                        computer_id,
-                        expected_archiving_owner=expected_archiving_owner,
-                    )
-                else:
-                    await clear_computer_archiving(computer_id)
-            logger.info(
-                f"Computer {computer_id} was moved out of 'stopping' by another "
-                f"worker; leaving it rather than writing {status!r}"
-            )
     # --- DALTON-HOOK(cos-settings-tools): end ---
 
     async def _retain_machine_stop_claim(self, computer_id: str) -> bool:
@@ -781,7 +752,6 @@ class MachineLifecycleMixin:
     async def _retain_machine_archive_claim(
         self, computer_id: str, *, archiving_owner: str
     ) -> bool:
-        """Re-verify the durable archive owner claim before contacting the provider."""
         return await retain_computer_archive_claim(
             computer_id, archiving_owner=archiving_owner
         )
@@ -793,44 +763,30 @@ class MachineLifecycleMixin:
         expected_workspaces: Any = None,
         expected_workspace_id: str | None = None,
     ) -> Dict[str, Any]:
-        """Atomically lock computer + workspaces, verify snapshot/moves, and fence archiving."""
         return await claim_computer_for_archive(
             computer_id,
             expected_workspaces=expected_workspaces,
             expected_workspace_id=expected_workspace_id,
         )
 
-    async def _reconcile_stopped_archiving_locked(
-        self, computer: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        from src.dalton.services.archive_lifecycle import (
-            reconcile_stopped_archiving_locked_impl,
-        )
+    # DALTON-HOOK(cos-settings-tools): thin delegates to Dalton archive lifecycle
+    async def _reconcile_stopped_archiving_locked(self, computer: Dict[str, Any]) -> Dict[str, Any]:
+        from src.dalton.services.archive_lifecycle import reconcile_stopped_archiving_locked_impl
 
         return await reconcile_stopped_archiving_locked_impl(self, computer)
 
-    async def _ensure_not_archiving_locked(
-        self, computer: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        from src.dalton.services.archive_lifecycle import (
-            ensure_not_archiving_locked_impl,
-        )
+    async def _ensure_not_archiving_locked(self, computer: Dict[str, Any]) -> Dict[str, Any]:
+        from src.dalton.services.archive_lifecycle import ensure_not_archiving_locked_impl
 
         return await ensure_not_archiving_locked_impl(self, computer)
 
     async def ensure_computer_not_archiving(self, computer_id: str) -> bool:
-        from src.dalton.services.archive_lifecycle import (
-            ensure_computer_not_archiving_impl,
-        )
+        from src.dalton.services.archive_lifecycle import ensure_computer_not_archiving_impl
 
         return await ensure_computer_not_archiving_impl(self, computer_id)
 
-    async def reconcile_archiving_computer(
-        self, computer_id: str
-    ) -> Dict[str, Any] | None:
-        from src.dalton.services.archive_lifecycle import (
-            reconcile_archiving_computer_impl,
-        )
+    async def reconcile_archiving_computer(self, computer_id: str) -> Dict[str, Any] | None:
+        from src.dalton.services.archive_lifecycle import reconcile_archiving_computer_impl
 
         return await reconcile_archiving_computer_impl(self, computer_id)
     # --- DALTON-HOOK(cos-settings-tools): end ---

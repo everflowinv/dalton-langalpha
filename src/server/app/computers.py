@@ -103,6 +103,7 @@ from src.server.services.computer_start_failure import (
     start_failure_from_row,
 )
 from src.server.services.computer_errors import (
+    ArchiveProviderError,  # DALTON-HOOK(cos-settings-tools)
     ComputerArchivingError,  # DALTON-HOOK(cos-settings-tools)
     ComputerBusyError,
     ComputerRemovalRefused,
@@ -240,7 +241,15 @@ async def _computer_action_errors(action: str, computer_id: str, *, spec: bool =
     except ComputerArchivingError as e:
         raise HTTPException(
             status_code=409,
-            detail=spec_refusal("computer_archiving", str(e)),
+            detail={"code": "computer_archiving", "message": str(e)},
+        ) from None
+    except ArchiveProviderError as e:
+        raise HTTPException(
+            status_code=e.http_status,
+            detail={
+                "code": e.category,
+                "message": e.user_message or "Sandbox provider reconciliation failed.",
+            },
         ) from None
     # --- DALTON-HOOK(cos-settings-tools): end ---
     except ComputerNameTaken as e:
