@@ -8,7 +8,7 @@ Global lock order across transactions (strictly ascending, zero exceptions, §2.
 - Level 0a: `dalton_user_roles` (sorted `user_id` `FOR UPDATE`) -> `dalton_credential_holder` (`FOR SHARE`)
 - Level 0b: `dalton_channel_gateway_lease` (`FOR UPDATE` for acquire/heartbeat/release; `FOR SHARE` for all gateway writes + `recover`) -> per-message / per-delivery advisory lock (`dalton_inbound:<platform>:<message_id>`, `dalton_delivery:<delivery_key>`); per updated §2.1 (8), `record_channel_inbound_progress` (`update_inbound_progress`) acquires the single-message `dalton_inbound` / `dalton_thread_platform` advisory lock(s) before calling `verify_gateway_epoch_in_tx` (lease `FOR SHARE`).
 - Level 1: Personal settings advisory + row locks (`dalton_user_settings:<user_id>`, `dalton_channel_user_settings` `FOR UPDATE`; sorted by `user_id` when locking multiple users)
-- Level 2: Group chat advisory locks (`_acquire_group_chat_lock`; sorted by `platform`, `chat_address`)
+- Level 2: Group chat advisory locks (`_acquire_group_chat_lock`; sorted by `platform`, `chat_address`) -> bot topic advisory lock (`_acquire_bot_topic_lock`, Level 2b; always acquired BEFORE Level 6 `dalton_channel_session_generations` in I-1, I-6, and I-7)
 - Level 3: Weixin accounts & occupation locks:
   - 3a: `dalton_channel_weixin_accounts` (sorted `account_id`: `FOR UPDATE` on mutations, `FOR NO KEY UPDATE` on active fast paths)
   - 3b: `dalton_weixin_bot:<bot_id>` -> sorted `dalton_weixin_ilink_user:<wx_uid>` advisory locks
@@ -560,6 +560,17 @@ def _parse_topic_root_from_scope_key(scope_key: str | None) -> str | None:
     return root_id or None
 
 
+def _parse_thread_id_from_scope_key(scope_key: str | None) -> str | None:
+    cleaned = str(scope_key or "").strip()
+    if not cleaned:
+        return None
+    m = _THREAD_SCOPE_ID_RE.search(cleaned)
+    if not m:
+        return None
+    thread_id = m.group(1).strip()
+    return thread_id or None
+
+
 async def _acquire_bot_topic_lock(cur: Any, platform: str, chat_address: str) -> None:
     await cur.execute(
         "SELECT pg_advisory_xact_lock(hashtext(%s))",
@@ -793,6 +804,7 @@ async def lookup_bot_topic(
 
     empty_resp: dict[str, Any] = {
         "found": False,
+        "status": None,
         "canonical_scope_key": None,
         "external_topic_id": None,
         "root_message_id": None,
@@ -881,6 +893,7 @@ async def lookup_bot_topic(
         return empty_resp
     return {
         "found": True,
+        "status": "confirmed",
         "canonical_scope_key": row.get("canonical_scope_key"),
         "external_topic_id": row.get("external_topic_id"),
         "root_message_id": row.get("root_message_id"),
@@ -9171,6 +9184,41 @@ async def authorize_and_claim_delivery(
                             "thread_scope_key": ex_scope_key,
                             "is_current": ex_is_current,
                         }
+                    if ex_status in ("in_flight", "unknown") and conversation_to_replay:
+                        ex_user = str(existing.get("user_id") or "").strip()
+                        ex_plat = str(existing.get("platform") or "").strip().lower()
+                        ex_target = str(existing.get("target_address") or "").strip()
+                        got_user = str(cleaned_uid or "").strip()
+                        got_plat = str(cleaned_platform or "").strip().lower()
+                        got_target = str(cleaned_target or "").strip()
+                        if (
+                            ex_user != got_user
+                            or ex_plat != got_plat
+                            or ex_target != got_target
+                        ):
+                            return {
+                                "claim_status": "denied",
+                                "status": "failed",
+                                "code": "not_allowed",
+                                "message": "Delivery identity or destination does not match the existing record.",
+                            }
+                        return {
+                            "claim_status": "in_flight_or_unknown",
+                            "status": "unknown",
+                            "existing_status": ex_status,
+                            "error_code": existing.get("error_code"),
+                            "sent_chunks": int(existing.get("sent_chunks") or 0),
+                            "code": "in_flight",
+                            "message": "An earlier attempt of this same call is still delivering it.",
+                            "platform": existing["platform"],
+                            "target_address": existing["target_address"],
+                            "confirmed_thread_address": stored_confirmed_thread,
+                            "discord_body_phase": stored_body_phase,
+                            "delivery_attempt": _delivery_attempt(existing),
+                            "thread_scope_key": ex_scope_key,
+                            "files_status": existing.get("files_status") or [],
+                            "is_current": ex_is_current,
+                        }
                     if scope_mismatch or gen_mismatch or (
                         origin_differs and not replay_recovery
                     ):
@@ -9209,6 +9257,9 @@ async def authorize_and_claim_delivery(
                         return {
                             "claim_status": "in_flight_or_unknown",
                             "status": "unknown",
+                            "existing_status": ex_status,
+                            "error_code": existing.get("error_code"),
+                            "sent_chunks": int(existing.get("sent_chunks") or 0),
                             "code": "in_flight",
                             "message": "An earlier attempt of this same call is still delivering it.",
                             "platform": existing["platform"],
@@ -9217,11 +9268,20 @@ async def authorize_and_claim_delivery(
                             "discord_body_phase": stored_body_phase,
                             "delivery_attempt": _delivery_attempt(existing),
                             "thread_scope_key": ex_scope_key,
+                            "files_status": existing.get("files_status") or [],
                             "is_current": ex_is_current,
                         }
 
-                # Guard final text fallback (`fallback:<run_id>`) when an `unknown` current-turn text delivery exists (§1.3.3)
-                if cleaned_kind == "fallback" or cleaned_key.startswith("fallback:"):
+                # Guard final text fallback (`fallback:<run_id>`) when an `unknown` current-turn text delivery exists (§1.3.3).
+                # Independent DM deliverable keys (`deliverables:` / `deliverables-links:`) deduplicate via `prior_run_files`
+                # and are NOT blocked by the text-fallback guard.
+                is_deliverables_key = cleaned_key.startswith(
+                    ("deliverables:", "deliverables-links:")
+                )
+                if (
+                    cleaned_key.startswith("fallback:")
+                    or (cleaned_kind == "fallback" and not is_deliverables_key)
+                ):
                     fallback_rid = cleaned_rid or (
                         cleaned_key.split(":", 1)[1].strip()
                         if cleaned_key.startswith("fallback:")
@@ -10607,10 +10667,20 @@ async def authorize_and_claim_delivery(
 
                 # 2c. Resolve verified root_message_id, confirmed topic, and pre-reserve :topic: (Lead Decisions #1 & #3)
                 resp_root_message_id: str | None = None
+                resp_inbound_message_id: str | None = None
                 resp_external_topic_id: str | None = None
                 resp_first_reply_message_id: str | None = None
                 resp_topic_initiator_puid: str | None = None
                 resp_topic_canonical_scope: str | None = None
+                if (
+                    verified_source_row is not None
+                    and str(verified_source_row.get("_source_table") or "")
+                    == "inbound_events"
+                    and verified_source_row.get("message_id")
+                ):
+                    resp_inbound_message_id = (
+                        str(verified_source_row["message_id"]).strip() or None
+                    )
                 if (
                     resolved_platform in ("feishu", "discord")
                     and resolved_target_address
@@ -10622,15 +10692,11 @@ async def authorize_and_claim_delivery(
                     scope_root_mid = _parse_topic_root_from_scope_key(
                         resolved_thread_scope_key
                     )
-                    if (
-                        verified_source_row is not None
-                        and str(verified_source_row.get("_source_table") or "")
-                        == "inbound_events"
-                        and verified_source_row.get("message_id")
-                    ):
-                        resp_root_message_id = (
-                            str(verified_source_row["message_id"]).strip() or None
-                        )
+                    scope_thread_tid = _parse_thread_id_from_scope_key(
+                        resolved_thread_scope_key
+                    )
+                    if resp_inbound_message_id:
+                        resp_root_message_id = resp_inbound_message_id
                     if resolved_thread_scope_key:
                         await cur.execute(
                             """
@@ -10649,6 +10715,27 @@ async def authorize_and_claim_delivery(
                             ),
                         )
                         existing_topic = await cur.fetchone()
+                        if existing_topic is None and scope_thread_tid:
+                            # Other member `@bot` inside a bot-owned topic uses `:thread:<ext_tid>` while
+                            # `dalton_channel_bot_topics` stores the initiator's `:topic:<root>` canonical scope.
+                            await cur.execute(
+                                """
+                                SELECT canonical_scope_key, external_topic_id, root_message_id,
+                                       first_reply_message_id, initiator_platform_user_id, status
+                                FROM dalton_channel_bot_topics
+                                WHERE platform = %s
+                                  AND chat_address = %s
+                                  AND external_topic_id = %s
+                                  AND status = 'confirmed'
+                                LIMIT 1
+                                """,
+                                (
+                                    resolved_platform,
+                                    topic_chat_addr,
+                                    scope_thread_tid,
+                                ),
+                            )
+                            existing_topic = await cur.fetchone()
                         if existing_topic and str(existing_topic.get("status") or "") == "confirmed":
                             resp_external_topic_id = existing_topic.get("external_topic_id")
                             resp_first_reply_message_id = existing_topic.get("first_reply_message_id")
@@ -10729,6 +10816,33 @@ async def authorize_and_claim_delivery(
                                         resp_first_reply_message_id = reserved_topic.get(
                                             "first_reply_message_id"
                                         )
+
+                    # Re-verify Discord parent channel binding & user channel settings before
+                    # authorizing current-conversation delivery to a registered thread/topic.
+                    if (
+                        resolved_platform == "discord"
+                        and is_current
+                        and (
+                            resp_external_topic_id is not None
+                            or _extract_discord_parent_address(resolved_target_address)
+                            != resolved_target_address
+                        )
+                    ):
+                        grp_ok, grp_err, _ = await _verify_group_target_deliverable(
+                            cur,
+                            user_id=resolved_user_id,
+                            platform=resolved_platform,
+                            chat_address=topic_chat_addr,
+                            conn=owned_conn,
+                        )
+                        if not grp_ok:
+                            return {
+                                "claim_status": "denied",
+                                "status": "failed",
+                                "code": "not_allowed",
+                                "message": grp_err
+                                or "Discord parent channel is not bound in channel settings.",
+                            }
 
                 # 2d. Aggregate prior files_status for same run_id (Lead Decision #7 / Codex r6 #6)
                 prior_run_files: list[dict[str, Any]] = []
@@ -10849,6 +10963,12 @@ async def authorize_and_claim_delivery(
                     and not str(resolved_user_id).startswith("unlinked:")
                     else None
                 )
+                resolved_source_ws_id = (
+                    str(verified_source_row.get("workspace_id")).strip()
+                    if isinstance(verified_source_row, dict)
+                    and verified_source_row.get("workspace_id")
+                    else None
+                )
                 resp_claim: dict[str, Any] = {
                     "claim_status": "claimed",
                     "recipient_id": resolved_recipient_id,
@@ -10859,6 +10979,7 @@ async def authorize_and_claim_delivery(
                     "discord_body_phase": _delivery_discord_body_phase(existing),
                     "delivery_attempt": next_attempt,
                     "thread_scope_key": resolved_thread_scope_key,
+                    "inbound_message_id": resp_inbound_message_id,
                     "root_message_id": resp_root_message_id,
                     "external_topic_id": resp_external_topic_id,
                     "first_reply_message_id": resp_first_reply_message_id,
@@ -10866,6 +10987,7 @@ async def authorize_and_claim_delivery(
                     "topic_canonical_scope_key": resp_topic_canonical_scope,
                     "prior_run_files": prior_run_files,
                     "is_current": is_current,
+                    "workspace_id": resolved_source_ws_id,
                     "home_workspace_id": home_ws_id,
                     "weixin_context_token": weixin_ctx_token,
                 }
@@ -10977,10 +11099,10 @@ async def _update_delivery_progress_once(
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
                     (f"dalton_delivery:{cleaned_key}",),
                 )
-                # 1. Pre-read immutable origin metadata to lock session generation row BEFORE delivery row
+                # 1. Pre-read immutable origin metadata to lock topic (Level 2b) BEFORE session generation row (Level 6) BEFORE delivery row (Level 7)
                 await cur.execute(
                     """
-                    SELECT user_id, platform, source_scope_key, source_generation, activity_origin
+                    SELECT user_id, platform, target_address, source_scope_key, source_generation, activity_origin
                     FROM dalton_channel_deliveries
                     WHERE delivery_key = %s
                     """,
@@ -11008,6 +11130,19 @@ async def _update_delivery_progress_once(
                 src_scope = str(pre_row.get("source_scope_key") or "").strip()
                 src_gen = pre_row.get("source_generation")
                 act_origin = str(pre_row.get("activity_origin") or "none").strip().lower()
+
+                # Acquire bot topic advisory lock (Level 2b) strictly BEFORE locking
+                # `dalton_channel_session_generations` (Level 6) so I-1 and I-7 share
+                # the exact same lock acquisition order (`bot_topic` -> `session_generations`).
+                if isinstance(bot_topic_registration, dict) and src_plat in (
+                    "feishu",
+                    "discord",
+                ):
+                    pre_topic_addr = _normalize_topic_chat_address(
+                        src_plat, str(pre_row.get("target_address") or "")
+                    )
+                    if pre_topic_addr:
+                        await _acquire_bot_topic_lock(cur, src_plat, pre_topic_addr)
 
                 if (
                     act_origin == "conversation"

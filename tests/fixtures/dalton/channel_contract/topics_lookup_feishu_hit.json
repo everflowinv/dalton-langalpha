@@ -1,0 +1,25 @@
+{
+  "request": {
+    "body": {
+      "chat_address": "feishu:oc_grp_1",
+      "external_topic_id": "omt_topic_1",
+      "match_mode": "inbound_followup",
+      "platform": "feishu"
+    },
+    "method": "POST",
+    "path": "/api/v1/dalton/channels/internal/topics/lookup"
+  },
+  "response": {
+    "body": {
+      "canonical_scope_key": "chat:oc_grp_1:topic:om_root_1",
+      "external_topic_id": "omt_topic_1",
+      "first_reply_message_id": "om_first_reply_1",
+      "found": true,
+      "initiator_dalton_user_id": "user-alice",
+      "initiator_platform_user_id": "ou_alice",
+      "root_message_id": "om_root_1",
+      "status": "confirmed"
+    },
+    "status": 200
+  }
+}

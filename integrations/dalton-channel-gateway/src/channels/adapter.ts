@@ -67,6 +67,10 @@ export interface SendTextChunkOptions {
   replyToMessageId?: string | null;
   /** Feishu: reply in topic (`reply_in_thread: true`) for bot-owned group topics. */
   replyInThread?: boolean;
+  /** Feishu: backup anchor message IDs inside the same topic if primary reply target was withdrawn. */
+  fallbackReplyToMessageIds?: string[];
+  /** Feishu: allow falling back to main-group direct message when reply target is withdrawn (default true; false for established topics). */
+  allowDirectFallback?: boolean;
   /** Existing platform topic/thread ID (`omt_xxx` on Feishu, thread channel ID on Discord). */
   externalTopicId?: string | null;
   /** Optional public web base URL & thread ID for fallback notices when original message was deleted. */

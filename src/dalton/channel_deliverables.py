@@ -526,28 +526,85 @@ async def collect_persistable_turn_deliverables(
     return items
 
 
-async def _default_get_live_sandbox(workspace_id: str) -> tuple[Any | None, str | None]:
-    """Return ``(sandbox, work_dir)`` if the workspace's sandbox is currently running, else ``(None, None)``."""
-    try:
-        from src.server.services.workspace_manager import WorkspaceManager
+async def _default_get_live_sandbox(
+    workspace_id: str,
+    *,
+    user_id: str | None = None,
+) -> tuple[Any | None, str | None]:
+    """Return ``(sandbox, work_dir)`` if the workspace's sandbox is currently running,
+    or ``(None, None)`` ONLY when the sandbox is confirmed stopped.
 
-        ws_mgr = WorkspaceManager.get_instance()
-        session = ws_mgr.get_cached_session(workspace_id)
-        if session is None:
-            return None, None
-        sandbox = getattr(session, "sandbox", None)
-        if sandbox is None:
-            return None, None
-        work_dir = getattr(sandbox, "working_directory", None)
-        if not work_dir:
-            cfg = getattr(sandbox, "config", None)
-            fs_cfg = getattr(cfg, "filesystem", None)
-            work_dir = getattr(fs_cfg, "working_directory", None)
-        if not work_dir:
-            return None, None
-        return sandbox, str(work_dir).rstrip("/")
-    except Exception:
+    Raises ``HTTPException(503)`` when the workspace is not confirmed stopped and
+    its live sandbox or workspace directory layout cannot be reached (preventing
+    stale offline backup reads while the sandbox is running).
+    """
+    from src.server.database.workspace import get_workspace as db_get_workspace
+    from src.server.models.workspace import served_from_mirror
+    from src.server.services.workspace_files import layout_for
+    from src.server.services.workspace_layout import WorkspaceLayoutUnavailable
+    from src.server.services.workspace_manager import WorkspaceManager
+
+    workspace = await db_get_workspace(workspace_id)
+    if not workspace:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "deliverable_not_found",
+                "message": "Workspace not found.",
+            },
+        )
+    if served_from_mirror(workspace.get("status")):
         return None, None
+
+    ws_mgr = WorkspaceManager.get_instance()
+    try:
+        session = await ws_mgr.get_session_if_running(
+            workspace_id,
+            user_id=user_id,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "[channel_deliverables] running sandbox unreachable for workspace %s: %s",
+            workspace_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "deliverable_sandbox_unavailable",
+                "message": "Workspace sandbox is not confirmed stopped and could not be reached.",
+            },
+        ) from exc
+
+    if session is None:
+        # `get_session_if_running` returns None only when Postgres computer status != 'running'
+        # or the provider runtime confirmed state != RUNNING.
+        return None, None
+
+    sandbox = getattr(session, "sandbox", None)
+    if sandbox is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "deliverable_sandbox_unavailable",
+                "message": "Workspace session has no attached sandbox.",
+            },
+        )
+
+    try:
+        work_dir = layout_for(workspace, manager=ws_mgr).workspace
+    except WorkspaceLayoutUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "deliverable_sandbox_unavailable",
+                "message": "Workspace directory layout is unavailable.",
+            },
+        ) from exc
+
+    return sandbox, str(work_dir).rstrip("/")
 
 
 async def _default_read_offline_backup(
@@ -655,12 +712,59 @@ async def download_verified_deliverable(
 
             # Verify gateway epoch + in_flight + attempt + DM + live binding + pinned recipient
             if platform == "weixin":
-                await wx_db.preflight_weixin_send(
+                preflight = await wx_db.preflight_weixin_send(
                     delivery_key=cleaned_key,
                     gateway_epoch=gateway_epoch,
                     delivery_attempt=delivery_attempt,
                     conn=owned_conn,
                 )
+                if (
+                    not isinstance(preflight, dict)
+                    or preflight.get("authorized") is not True
+                ):
+                    decision = (
+                        str(preflight.get("decision") or "deny").strip().lower()
+                        if isinstance(preflight, dict)
+                        else "deny"
+                    )
+                    deny_code = (
+                        str(
+                            preflight.get("deny_code")
+                            or "deliverable_recipient_denied"
+                        ).strip()
+                        if isinstance(preflight, dict)
+                        else "deliverable_recipient_denied"
+                    )
+                    retryable = (
+                        bool(preflight.get("retryable"))
+                        if isinstance(preflight, dict)
+                        else False
+                    )
+                    if decision == "defer" or retryable:
+                        raise HTTPException(
+                            status_code=503,
+                            detail={
+                                "code": deny_code,
+                                "decision": "defer",
+                                "retryable": True,
+                                "message": f"Weixin deliverable preflight deferred: {deny_code}",
+                            },
+                        )
+                    deny_status = (
+                        409
+                        if deny_code == "delivery_attempt_mismatch"
+                        else 404
+                        if deny_code == "delivery_not_found"
+                        else 403
+                    )
+                    raise HTTPException(
+                        status_code=deny_status,
+                        detail={
+                            "code": deny_code,
+                            "decision": "deny",
+                            "message": f"Weixin deliverable preflight denied: {deny_code}",
+                        },
+                    )
                 if not bool(d_row.get("is_current")) or not cg_db._is_dm_address(
                     platform, str(d_row.get("target_address") or "")
                 ):
@@ -672,13 +776,24 @@ async def download_verified_deliverable(
                         },
                     )
             else:
-                await cg_db.verify_dm_delivery_recipient(
+                verified = await cg_db.verify_dm_delivery_recipient(
                     delivery_key=cleaned_key,
                     delivery_attempt=delivery_attempt,
                     gateway_epoch=gateway_epoch,
                     require_gateway_epoch=True,
                     conn=owned_conn,
                 )
+                if (
+                    not isinstance(verified, dict)
+                    or verified.get("authorized") is not True
+                ):
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "code": "deliverable_recipient_denied",
+                            "message": "DM recipient verification was not authorized.",
+                        },
+                    )
 
             user_id = str(d_row.get("user_id") or "").strip()
             thread_id = str(d_row.get("thread_id") or "").strip()
@@ -772,9 +887,13 @@ async def download_verified_deliverable(
                     },
                 )
 
-            # Read file online if sandbox is running, otherwise offline backup from workspace_files
-            live_getter = get_live_sandbox_fn or _default_get_live_sandbox
-            sandbox, work_dir = await live_getter(cleaned_ws)
+            # Read file online if sandbox is running, otherwise offline backup ONLY when confirmed stopped
+            if get_live_sandbox_fn is not None:
+                sandbox, work_dir = await get_live_sandbox_fn(cleaned_ws)
+            else:
+                sandbox, work_dir = await _default_get_live_sandbox(
+                    cleaned_ws, user_id=user_id
+                )
 
             raw_bytes: bytes | None = None
             if sandbox is not None and work_dir:

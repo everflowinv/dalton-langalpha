@@ -494,12 +494,19 @@ export function buildWorkspaceFileDeepLinkLine(
   webBaseUrl: string | null | undefined,
   threadId?: string | null,
   workspaceId?: string | null,
+  currentWorkspaceId?: string | null,
 ): string {
   const cleanName = (filename || workspacePath.split("/").pop() || workspacePath).trim();
   const cleanPath = workspacePath.trim().replace(/^\/+/, "");
   const publicWebBaseUrl = normalizePublicWebBaseUrl(webBaseUrl);
   const normalizedThreadId = (threadId ?? "").trim() || null;
   const normalizedWorkspaceId = (workspaceId ?? "").trim() || null;
+  const normalizedCurrentWorkspaceId = (currentWorkspaceId ?? "").trim() || null;
+  const isCrossWorkspace = Boolean(
+    normalizedWorkspaceId &&
+      normalizedCurrentWorkspaceId &&
+      normalizedWorkspaceId !== normalizedCurrentWorkspaceId,
+  );
   const classification: Extract<
     DestinationClassification,
     { kind: "workspace_file" }
@@ -507,6 +514,9 @@ export function buildWorkspaceFileDeepLinkLine(
     kind: "workspace_file",
     deepLinkPath: cleanPath,
     displayPath: cleanPath,
+    ...(isCrossWorkspace && normalizedThreadId && normalizedWorkspaceId
+      ? { workspaceId: normalizedWorkspaceId }
+      : {}),
   };
   if (publicWebBaseUrl) {
     const url = buildDeepLinkUrl(

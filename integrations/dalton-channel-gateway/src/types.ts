@@ -373,9 +373,15 @@ export interface TurnDeliverableItem {
   workspace_id: string;
   path: string;
   filename?: string;
-  size_bytes: number;
+  size: number;
   sha256: string;
-  file_stamp?: string;
+  stamp?: {
+    size: number;
+    mtime: string;
+    ctime: string;
+    inode: string;
+  };
+  stamp_settled?: boolean;
   operation?: "write" | "edit" | string;
 }
 

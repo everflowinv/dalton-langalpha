@@ -617,8 +617,8 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       const res = await this.backendClient.lookupBotTopic({
         platform: "feishu",
         chat_address: event.chatAddress,
+        match_mode: "inbound_followup",
         external_topic_id: extTopicId,
-        purpose: "inbound_followup",
       });
       if (
         res.found &&
@@ -1045,13 +1045,17 @@ export class FeishuChannelAdapter implements ChannelAdapter {
           to: target,
           text: options.text,
           replyToMessageId: options.replyToMessageId,
+          fallbackReplyToMessageIds: options.fallbackReplyToMessageIds,
           replyInThread: options.replyInThread,
+          allowDirectFallback: options.allowDirectFallback,
         })
       : await sendMessageFeishu(client, {
           to: target,
           text: options.text,
           replyToMessageId: options.replyToMessageId,
+          fallbackReplyToMessageIds: options.fallbackReplyToMessageIds,
           replyInThread: options.replyInThread,
+          allowDirectFallback: options.allowDirectFallback,
         });
 
     let externalTopicId: string | null =

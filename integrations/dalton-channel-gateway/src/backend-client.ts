@@ -462,6 +462,15 @@ export interface I6AuthorizeAndClaimResponse {
     | "denied"
     | "claimed";
   status?: "sent" | "partial" | "failed" | "unknown";
+  existing_status?: "in_flight" | "unknown" | string;
+  error_code?: string | null;
+  sent_chunks?: number;
+  files_status?: Array<{
+    workspace_id?: string | null;
+    path: string;
+    status: string;
+    reason?: string | null;
+  }>;
   code?:
     | "not_linked"
     | "not_allowed"
@@ -498,6 +507,7 @@ export interface I6AuthorizeAndClaimResponse {
   delivery_attempt?: number;
   thread_scope_key?: string | null;
   is_current?: boolean;
+  workspace_id?: string | null;
   home_workspace_id?: string;
   weixin_account_id?: string | null;
   weixin_bot_id?: string | null;
@@ -507,6 +517,7 @@ export interface I6AuthorizeAndClaimResponse {
   source_scope_key?: string | null;
   source_generation?: number | null;
   activity_origin?: string | null;
+  inbound_message_id?: string | null;
   root_message_id?: string | null;
   external_topic_id?: string | null;
   first_reply_message_id?: string | null;
@@ -535,18 +546,16 @@ export interface BotTopicRegistrationPayload {
 export interface InternalTopicLookupRequest {
   platform: ChannelPlatform;
   chat_address: string;
+  match_mode: "inbound_followup" | "outbound_delivery";
   external_topic_id?: string | null;
   canonical_scope_key?: string | null;
   root_message_id?: string | null;
-  purpose?: "inbound_followup" | "outbound_route";
 }
 
 export interface InternalTopicLookupResponse {
   found: boolean;
-  status?: "pending" | "confirmed" | string;
-  platform?: string;
-  chat_address?: string;
-  canonical_scope_key?: string;
+  status?: "confirmed" | string | null;
+  canonical_scope_key?: string | null;
   external_topic_id?: string | null;
   root_message_id?: string | null;
   first_reply_message_id?: string | null;
@@ -555,12 +564,16 @@ export interface InternalTopicLookupResponse {
 }
 
 export interface VerifyDmRecipientResponse {
-  ok: boolean;
+  authorized: boolean;
+  platform?: string;
+  user_id?: string;
+  recipient_id?: string;
+  delivery_attempt?: number;
+  decision?: "deny" | "defer" | string;
+  retryable?: boolean;
+  deny_code?: string;
   code?: string;
   message?: string;
-  platform?: string;
-  recipient_id?: string;
-  user_id?: string;
 }
 
 export interface I7DeliveriesProgressRequest {
@@ -2861,6 +2874,7 @@ export class HttpBackendClient implements BackendClient {
             ? { delivery_attempt: deliveryAttempt }
             : {},
         timeoutMs: 10_000,
+        includeGatewayEpoch: true,
       },
     );
     if (status >= 400) {
@@ -2896,7 +2910,7 @@ export class HttpBackendClient implements BackendClient {
 
     const resp = await this.fetchImpl(url, {
       method: "GET",
-      headers: this.headers(),
+      headers: this.headers(undefined, undefined, true),
     });
     if (!resp.ok) {
       let errData: unknown = null;
@@ -2905,6 +2919,9 @@ export class HttpBackendClient implements BackendClient {
         errData = JSON.parse(errText);
       } catch {
         errData = errText;
+      }
+      if (resp.status === 409) {
+        this.checkStaleGatewayEpoch(resp.status, errData, url.pathname);
       }
       throw new BackendHttpError(
         `downloadVerifiedDeliverable failed (${resp.status}): ${errText}`,

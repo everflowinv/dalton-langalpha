@@ -373,6 +373,12 @@ export class ChannelGatewayOrchestrator {
   readonly activeWatches = new Map<string, ActiveWatchHandle>();
   private readonly activeBackgroundRunIds = new Map<string, Set<string>>();
   private readonly activeInboundTurns = new Set<Promise<void>>();
+  private readonly settledDeliverableKeys = new Set<string>();
+  private readonly inFlightDeliverableSettlements = new Map<
+    string,
+    Promise<boolean>
+  >();
+  private static readonly MAX_SETTLED_DELIVERABLE_KEYS = 2_000;
   private readonly logger = createSubsystemLogger("orchestrator");
   private readonly activeInboundUploadControllers = new Map<
     AbortController,
@@ -5224,7 +5230,14 @@ export class ChannelGatewayOrchestrator {
         if (replaySettled) {
           this.processingFeedback.settleMessage(event, "done");
           this.processingFeedback.settleRun(currentRunId, "done");
-          await this.evaluateWatchCloseConditions(userId, currentThreadId);
+          try {
+            await this.evaluateWatchCloseConditions(userId, currentThreadId);
+          } catch (err) {
+            if (isStaleGatewayEpochError(err)) {
+              throw err;
+            }
+            // Turn is already settled cleanly; ignore transient status/wakeup errors and let watch loop retry.
+          }
           return true;
         }
       }
@@ -5461,7 +5474,14 @@ export class ChannelGatewayOrchestrator {
           watchHandle.needsReconnectSync = true;
         }
       } else {
-        await this.evaluateWatchCloseConditions(userId, currentThreadId);
+        try {
+          await this.evaluateWatchCloseConditions(userId, currentThreadId);
+        } catch (err) {
+          if (isStaleGatewayEpochError(err)) {
+            throw err;
+          }
+          // Turn is already settled cleanly; ignore transient status/wakeup errors and let watch loop retry.
+        }
       }
     }
     // When `fallbackDeliveryFailed` or `interruptDeliveryFailed` occurs here,
@@ -10148,13 +10168,30 @@ export class ChannelGatewayOrchestrator {
         typeof rec.workspace_id === "string" ? rec.workspace_id.trim() : "";
       const path = typeof rec.path === "string" ? rec.path.trim() : "";
       const sha256 = typeof rec.sha256 === "string" ? rec.sha256.trim() : "";
-      const sizeBytes =
-        typeof rec.size_bytes === "number" && Number.isFinite(rec.size_bytes)
-          ? rec.size_bytes
+      const size =
+        typeof rec.size === "number" && Number.isFinite(rec.size)
+          ? rec.size
           : -1;
-      if (!wsId || !path || !sha256 || sizeBytes < 0) {
+      if (!wsId || !path || !sha256 || size < 0) {
         continue;
       }
+      const rawStamp =
+        rec.stamp && typeof rec.stamp === "object" && !Array.isArray(rec.stamp)
+          ? (rec.stamp as Record<string, unknown>)
+          : null;
+      const parsedStamp =
+        rawStamp &&
+        typeof rawStamp.size === "number" &&
+        typeof rawStamp.mtime === "string" &&
+        typeof rawStamp.ctime === "string" &&
+        typeof rawStamp.inode === "string"
+          ? {
+              size: rawStamp.size,
+              mtime: rawStamp.mtime,
+              ctime: rawStamp.ctime,
+              inode: rawStamp.inode,
+            }
+          : undefined;
       items.push({
         workspace_id: wsId,
         path,
@@ -10162,10 +10199,11 @@ export class ChannelGatewayOrchestrator {
           typeof rec.filename === "string" && rec.filename.trim()
             ? rec.filename.trim()
             : basename(path),
-        size_bytes: sizeBytes,
+        size,
         sha256,
-        ...(typeof rec.file_stamp === "string"
-          ? { file_stamp: rec.file_stamp }
+        ...(parsedStamp ? { stamp: parsedStamp } : {}),
+        ...(typeof rec.stamp_settled === "boolean"
+          ? { stamp_settled: rec.stamp_settled }
           : {}),
         ...(typeof rec.operation === "string"
           ? { operation: rec.operation }
@@ -10211,74 +10249,129 @@ export class ChannelGatewayOrchestrator {
       return true;
     }
 
-    const prose = this.stripCodeFromText(params.assistantText).toLowerCase();
-    const isMentioned = (item: TurnDeliverableItem): boolean => {
-      if (!prose) return false;
-      const pLower = item.path.toLowerCase();
-      const nameLower = (item.filename || basename(item.path)).toLowerCase();
-      return (
-        (pLower.length > 0 && prose.includes(pLower)) ||
-        (nameLower.length > 0 && prose.includes(nameLower))
-      );
-    };
-
-    const sorted = [
-      ...params.deliverables.filter((item) => isMentioned(item)),
-      ...params.deliverables.filter((item) => !isMentioned(item)),
-    ];
-
-    const maxAutoAttach = params.platform === "weixin" ? 3 : 5;
-    const filesToAttach: Array<{ path: string; workspace_id: string | null }> = [];
-    const linkOnlyLines: string[] = [];
-    let plannedBytes = 0;
-
-    for (const item of sorted) {
-      const lowerPath = item.path.toLowerCase();
-      const isHtml = lowerPath.endsWith(".html") || lowerPath.endsWith(".htm");
-      const tooLargeSingle = item.size_bytes > MAX_ATTACHMENT_BYTES;
-      const exceedsCap = filesToAttach.length >= maxAutoAttach;
-      const exceedsTotalBytes =
-        plannedBytes + item.size_bytes > MAX_TOTAL_ATTACHMENT_BYTES;
-
-      if (isHtml || tooLargeSingle || exceedsCap || exceedsTotalBytes) {
-        linkOnlyLines.push(
-          buildWorkspaceFileDeepLinkLine(
-            item.filename || basename(item.path) || item.path,
-            item.path,
-            this.webBaseUrl,
-            params.threadId,
-            item.workspace_id,
-          ),
-        );
-      } else {
-        filesToAttach.push({
-          path: item.path,
-          workspace_id: item.workspace_id,
-        });
-        plannedBytes += item.size_bytes;
-      }
+    const deliveryKey = `deliverables:${params.runId}`;
+    if (this.settledDeliverableKeys.has(deliveryKey)) {
+      return true;
+    }
+    const existingInFlight =
+      this.inFlightDeliverableSettlements.get(deliveryKey);
+    if (existingInFlight) {
+      return await existingInFlight;
     }
 
-    const res = await this.deliveryService.executeDelivery({
-      deliveryKey: `deliverables:${params.runId}`,
-      kind: "fallback",
-      userId: params.userId,
-      threadId: params.threadId,
-      workspaceId: sorted[0]?.workspace_id ?? null,
-      runId: params.runId,
-      platform: params.platform,
-      target: params.targetAddress,
-      inboundMessageId: params.inboundMessageId ?? null,
-      text: linkOnlyLines.join("\n"),
-      files: filesToAttach,
-      downloadMode: "deliverable",
-      linkFallbackOnDeliverableMismatch: true,
-      threadScopeKey: params.threadScopeKey ?? null,
-      sourceScopeKey: params.sourceScopeKey ?? params.threadScopeKey ?? null,
-      sourceGeneration: params.sourceGeneration ?? null,
-      activityOrigin: params.activityOrigin ?? null,
-    });
-    return res.status === "sent" || res.status === "partial";
+    const settlementPromise = (async (): Promise<boolean> => {
+      const prose = this.stripCodeFromText(params.assistantText).toLowerCase();
+      const isMentioned = (item: TurnDeliverableItem): boolean => {
+        if (!prose) return false;
+        const pLower = item.path.toLowerCase();
+        const nameLower = (item.filename || basename(item.path)).toLowerCase();
+        return (
+          (pLower.length > 0 && prose.includes(pLower)) ||
+          (nameLower.length > 0 && prose.includes(nameLower))
+        );
+      };
+
+      const seenDeliverableKeys = new Set<string>();
+      const uniqueDeliverables: TurnDeliverableItem[] = [];
+      for (const item of params.deliverables) {
+        const normPath = item.path.trim().replace(/^\/+/, "");
+        const dedupeKey = `${item.workspace_id.trim()}::${normPath}`;
+        if (!normPath || seenDeliverableKeys.has(dedupeKey)) {
+          continue;
+        }
+        seenDeliverableKeys.add(dedupeKey);
+        uniqueDeliverables.push(item);
+      }
+      if (uniqueDeliverables.length === 0) {
+        return true;
+      }
+
+      const sorted = [
+        ...uniqueDeliverables.filter((item) => isMentioned(item)),
+        ...uniqueDeliverables.filter((item) => !isMentioned(item)),
+      ];
+
+      const maxAutoAttach = params.platform === "weixin" ? 3 : 5;
+      const filesToAttach: Array<{ path: string; workspace_id: string | null }> =
+        [];
+      const linkOnlyLines: string[] = [];
+      let plannedBytes = 0;
+
+      for (const item of sorted) {
+        const lowerPath = item.path.toLowerCase();
+        const isHtml =
+          lowerPath.endsWith(".html") || lowerPath.endsWith(".htm");
+        const tooLargeSingle = item.size > MAX_ATTACHMENT_BYTES;
+        const exceedsCap = filesToAttach.length >= maxAutoAttach;
+        const exceedsTotalBytes =
+          plannedBytes + item.size > MAX_TOTAL_ATTACHMENT_BYTES;
+
+        if (isHtml || tooLargeSingle || exceedsCap || exceedsTotalBytes) {
+          linkOnlyLines.push(
+            buildWorkspaceFileDeepLinkLine(
+              item.filename || basename(item.path) || item.path,
+              item.path,
+              this.webBaseUrl,
+              params.threadId,
+              item.workspace_id,
+              item.workspace_id,
+            ),
+          );
+        } else {
+          filesToAttach.push({
+            path: item.path,
+            workspace_id: item.workspace_id,
+          });
+          plannedBytes += item.size;
+        }
+      }
+
+      const res = await this.deliveryService.executeDelivery({
+        deliveryKey,
+        kind: "fallback",
+        userId: params.userId,
+        threadId: params.threadId,
+        workspaceId: sorted[0]?.workspace_id ?? null,
+        runId: params.runId,
+        platform: params.platform,
+        target: params.targetAddress,
+        inboundMessageId: params.inboundMessageId ?? null,
+        text: linkOnlyLines.join("\n"),
+        files: filesToAttach,
+        downloadMode: "deliverable",
+        linkFallbackOnDeliverableMismatch: true,
+        threadScopeKey: params.threadScopeKey ?? null,
+        sourceScopeKey: params.sourceScopeKey ?? params.threadScopeKey ?? null,
+        sourceGeneration: params.sourceGeneration ?? null,
+        activityOrigin: params.activityOrigin ?? null,
+      });
+      const settled = res.status === "sent" || res.status === "partial";
+      if (settled) {
+        if (
+          this.settledDeliverableKeys.size >=
+          ChannelGatewayOrchestrator.MAX_SETTLED_DELIVERABLE_KEYS
+        ) {
+          const oldest = this.settledDeliverableKeys.values().next().value;
+          if (oldest !== undefined) {
+            this.settledDeliverableKeys.delete(oldest);
+          }
+        }
+        this.settledDeliverableKeys.add(deliveryKey);
+      }
+      return settled;
+    })();
+
+    this.inFlightDeliverableSettlements.set(deliveryKey, settlementPromise);
+    try {
+      return await settlementPromise;
+    } finally {
+      if (
+        this.inFlightDeliverableSettlements.get(deliveryKey) ===
+        settlementPromise
+      ) {
+        this.inFlightDeliverableSettlements.delete(deliveryKey);
+      }
+    }
   }
 
   private async settleTurnFallbackAndPartialNotice(params: {

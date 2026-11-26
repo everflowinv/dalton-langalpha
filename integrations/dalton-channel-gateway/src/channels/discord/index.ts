@@ -916,8 +916,8 @@ export class DiscordChannelAdapter implements ChannelAdapter {
             const lookup = await this.backendClient.lookupBotTopic({
               platform: "discord",
               chat_address: parentChatAddress,
+              match_mode: "inbound_followup",
               external_topic_id: channelId,
-              purpose: "inbound_followup",
             });
             if (
               lookup.found &&

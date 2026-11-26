@@ -109,10 +109,11 @@ function makeMockBackend(overrides: Partial<BackendClient> = {}): BackendClient 
       discord_body_phase: req.discord_body_phase ?? (req.confirmed_thread_address ? "before_body" : null),
     })),
     verifyDmDeliveryRecipient: vi.fn(async () => ({
-      ok: true,
+      authorized: true,
       platform: "feishu",
       recipient_id: "ou_alice",
       user_id: "user-alice",
+      delivery_attempt: 1,
     })),
     downloadVerifiedDeliverable: vi.fn(async () => ({
       content: Buffer.from("%PDF-1.4\nhello"),
@@ -501,11 +502,16 @@ describe("Channel Phase 2 Batch 1 — Group Deep Links & DM Deliverables", () =>
         verifyCalls += 1;
         // First check before upload passes; second check inside adapter after upload & before message send fails (unbound!)
         if (verifyCalls === 1) {
-          return { ok: true, platform: "feishu", recipient_id: "ou_alice" };
+          return {
+            authorized: true,
+            platform: "feishu",
+            recipient_id: "ou_alice",
+            delivery_attempt: 1,
+          };
         }
         return {
-          ok: false,
-          code: "dm_recipient_unbound",
+          authorized: false,
+          code: "deliverable_recipient_denied",
           message: "DM recipient was unbound before send",
         };
       }),
@@ -638,5 +644,189 @@ describe("Channel Phase 2 Batch 1 — Group Deep Links & DM Deliverables", () =>
     expect(downloadDeliv).not.toHaveBeenCalled();
     expect(feishu.sentFiles).toHaveLength(0);
     expect(feishu.sentTexts[0]!.text).toContain("results%2Freport.pdf");
+  });
+
+  it("keeps Feishu :thread: and confirmed :topic: replies inside thread, prefers current inbound anchor, uses registered anchors on replay/background, and refuses main-chat fallback once topic exists", async () => {
+    // 1) Other member `@bot` inside a bot topic (`:thread:` scope with authorized `external_topic_id`):
+    //    multi-chunk and `/agent/send` both set `replyInThread: true` and `allowDirectFallback: false`.
+    const feishuThread = makeStubAdapter("feishu", {
+      splitTextChunks: (text: string) => text.split("||"),
+    });
+    const svcThread = new DeliveryService({
+      backend: makeMockBackend({
+        authorizeAndClaimDelivery: vi.fn(async () => ({
+          claim_status: "claimed" as const,
+          platform: "feishu",
+          target_address: "feishu:oc_grp_1",
+          recipient_id: "oc_grp_1",
+          is_current: true,
+          delivery_attempt: 1,
+          thread_scope_key: "chat:oc_grp_1:thread:omt_topic_1",
+          inbound_message_id: "om_bob_msg_1",
+          root_message_id: "om_root_1",
+          external_topic_id: "omt_topic_1",
+          first_reply_message_id: "om_alice_reply_1",
+          topic_canonical_scope_key: "chat:oc_grp_1:topic:om_root_1",
+          topic_initiator_platform_user_id: "ou_alice",
+        })),
+      }),
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuThread]]),
+      webBaseUrl: WEB_BASE,
+    });
+    const resThread = await svcThread.executeDelivery({
+      deliveryKey: "run-bob:tc-1",
+      kind: "agent_send",
+      userId: "user-bob",
+      threadId: THREAD_ID,
+      runId: "run-bob",
+      platform: "feishu",
+      target: null,
+      text: "第一段||第二段",
+      activityOrigin: "conversation",
+    });
+    expect(resThread.status).toBe("sent");
+    expect(feishuThread.sentTexts).toHaveLength(2);
+    for (const sent of feishuThread.sentTexts) {
+      expect(sent.replyInThread).toBe(true);
+      expect(sent.allowDirectFallback).toBe(false);
+      // Live turn prefers current inbound message (`om_bob_msg_1`) over historical first reply
+      expect(sent.replyToMessageId).toBe("om_bob_msg_1");
+      expect(sent.fallbackReplyToMessageIds).toEqual(["om_alice_reply_1", "om_root_1"]);
+    }
+
+    // 2) Replay & background report-back in confirmed `:topic:` prefer registered `first_reply_message_id`
+    for (const origin of ["replay", "notification"] as const) {
+      const feishuBg = makeStubAdapter("feishu");
+      const svcBg = new DeliveryService({
+        backend: makeMockBackend({
+          authorizeAndClaimDelivery: vi.fn(async () => ({
+            claim_status: "claimed" as const,
+            platform: "feishu",
+            target_address: "feishu:oc_grp_1",
+            recipient_id: "oc_grp_1",
+            is_current: true,
+            delivery_attempt: 1,
+            thread_scope_key: "chat:oc_grp_1:topic:om_root_1",
+            inbound_message_id: origin === "replay" ? "om_followup_2" : null,
+            root_message_id: "om_root_1",
+            external_topic_id: "omt_topic_1",
+            first_reply_message_id: "om_first_reply_1",
+            topic_canonical_scope_key: "chat:oc_grp_1:topic:om_root_1",
+            topic_initiator_platform_user_id: "ou_alice",
+          })),
+        }),
+        adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuBg]]),
+        webBaseUrl: WEB_BASE,
+      });
+      const resBg = await svcBg.executeDelivery({
+        deliveryKey: `fallback:run-${origin}`,
+        kind: "fallback",
+        userId: "user-alice",
+        threadId: THREAD_ID,
+        runId: `run-${origin}`,
+        platform: "feishu",
+        target: "feishu:oc_grp_1",
+        text: "后台回报",
+        activityOrigin: origin,
+      });
+      expect(resBg.status).toBe("sent");
+      expect(feishuBg.sentTexts[0]!.replyInThread).toBe(true);
+      expect(feishuBg.sentTexts[0]!.allowDirectFallback).toBe(false);
+      expect(feishuBg.sentTexts[0]!.replyToMessageId).toBe("om_first_reply_1");
+    }
+
+    // 3) Established topic with withdrawn primary anchor tries fallback topic anchor first,
+    //    and if all anchors are withdrawn (`230011`), NEVER calls `im.message.create` (main group).
+    const createMock = vi.fn(async () => ({ code: 0, data: { message_id: "om_leaked_main" } }));
+    const replyMock = vi.fn(async (req: { path: { message_id: string } }) => {
+      if (req.path.message_id === "om_withdrawn_first") {
+        return { code: 230011, msg: "message withdrawn" };
+      }
+      if (req.path.message_id === "om_live_backup") {
+        return { code: 0, data: { message_id: "om_ok_in_topic", thread_id: "omt_topic_1" } };
+      }
+      return { code: 230011, msg: "message withdrawn" };
+    });
+    const fakeClient = {
+      im: { message: { create: createMock, reply: replyMock } },
+    } as unknown as Parameters<typeof sendReplyOrFallbackDirect>[0];
+
+    const recovered = await sendReplyOrFallbackDirect(fakeClient, {
+      replyToMessageId: "om_withdrawn_first",
+      fallbackReplyToMessageIds: ["om_live_backup"],
+      replyInThread: true,
+      allowDirectFallback: false,
+      content: JSON.stringify({ text: "hello" }),
+      msgType: "text",
+      target: "oc_grp_1",
+      receiveIdType: "chat_id",
+    });
+    expect(recovered.data?.message_id).toBe("om_ok_in_topic");
+    expect(createMock).not.toHaveBeenCalled();
+
+    await expect(
+      sendReplyOrFallbackDirect(fakeClient, {
+        replyToMessageId: "om_withdrawn_first",
+        fallbackReplyToMessageIds: ["om_also_withdrawn"],
+        replyInThread: true,
+        allowDirectFallback: false,
+        content: JSON.stringify({ text: "hello" }),
+        msgType: "text",
+        target: "oc_grp_1",
+        receiveIdType: "chat_id",
+      }),
+    ).rejects.toThrow(/withdrawn|unavailable/i);
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  it("generates target-workspace deep link for cross-workspace group attachments even when both workspaces have identically named files", async () => {
+    const feishu = makeStubAdapter("feishu");
+    const downloadMock = vi.fn();
+    const backend = makeMockBackend({
+      authorizeAndClaimDelivery: vi.fn(async () => ({
+        claim_status: "claimed" as const,
+        platform: "feishu",
+        target_address: "feishu:oc_grp_1",
+        recipient_id: "oc_grp_1",
+        is_current: true,
+        delivery_attempt: 1,
+        workspace_id: "ws-home",
+        home_workspace_id: "ws-home",
+      })),
+      downloadWorkspaceFile: downloadMock,
+    });
+    const svc = new DeliveryService({
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]),
+      webBaseUrl: WEB_BASE,
+    });
+
+    const res = await svc.executeDelivery({
+      deliveryKey: "run-cos-grp:tc-1",
+      kind: "agent_send",
+      userId: "user-alice",
+      threadId: "tid-home-1",
+      workspaceId: "ws-home",
+      runId: "run-cos-grp",
+      platform: "feishu",
+      target: "feishu:oc_grp_1",
+      text: "附上两份同名报告",
+      files: [
+        { path: "results/report.pdf", workspace_id: "ws-home" },
+        { path: "results/report.pdf", workspace_id: "ws-nvda" },
+      ],
+    });
+
+    expect(res.status).toBe("sent");
+    expect(downloadMock).not.toHaveBeenCalled();
+    expect(feishu.sentFiles).toHaveLength(0);
+    const sentText = feishu.sentTexts[0]!.text;
+    // Same-workspace file uses thread URL; cross-workspace file uses target workspace URL
+    expect(sentText).toContain(
+      `${WEB_BASE}/chat/t/tid-home-1?file=results%2Freport.pdf`,
+    );
+    expect(sentText).toContain(
+      `${WEB_BASE}/chat/ws-nvda?file=results%2Freport.pdf`,
+    );
   });
 });

@@ -1,0 +1,43 @@
+{
+  "replay_done": {
+    "latest_run_id": "run-contract-1",
+    "thread_id": "11111111-1111-4111-8111-111111111111",
+    "turn_deliverables_by_run": {
+      "run-contract-1": [
+        {
+          "path": "results/report.pdf",
+          "sha256": "ebae58c3a81727debd1890ab65bf967114be6765d474dc549bf09cda0e5ede6e",
+          "size": 37,
+          "stamp": {
+            "ctime": "1700000000.0",
+            "inode": "101",
+            "mtime": "1700000000.0",
+            "size": 37
+          },
+          "stamp_settled": true,
+          "workspace_id": "ws-contract-1"
+        }
+      ]
+    }
+  },
+  "run_end": {
+    "outcome": "completed",
+    "run_id": "run-contract-1",
+    "thread_id": "11111111-1111-4111-8111-111111111111",
+    "turn_deliverables": [
+      {
+        "path": "results/report.pdf",
+        "sha256": "ebae58c3a81727debd1890ab65bf967114be6765d474dc549bf09cda0e5ede6e",
+        "size": 37,
+        "stamp": {
+          "ctime": "1700000000.0",
+          "inode": "101",
+          "mtime": "1700000000.0",
+          "size": 37
+        },
+        "stamp_settled": true,
+        "workspace_id": "ws-contract-1"
+      }
+    ]
+  }
+}

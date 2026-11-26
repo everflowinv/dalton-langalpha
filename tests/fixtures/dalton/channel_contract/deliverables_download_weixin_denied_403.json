@@ -1,0 +1,17 @@
+{
+  "request": {
+    "headers": {
+      "X-Gateway-Epoch": "7"
+    },
+    "method": "GET",
+    "path": "/api/v1/dalton/channels/internal/deliverables/download?delivery_key=deliverables:run-wx-denied&delivery_attempt=1&workspace_id=ws-contract-1&path=results/report.pdf"
+  },
+  "response": {
+    "body": {
+      "code": "weixin_account_unbound",
+      "decision": "deny",
+      "message": "Weixin deliverable preflight denied: weixin_account_unbound"
+    },
+    "status": 403
+  }
+}

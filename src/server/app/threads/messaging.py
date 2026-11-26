@@ -1762,7 +1762,13 @@ async def replay_thread_messages(
 
                 if has_capability(CapabilityId.CHANNEL_GATEWAY):
                     deliverables_by_run: dict[str, list[dict[str, object]]] = {}
-                    for resp_row in getattr(rows, "responses", ()) or ():
+                    responses_map = getattr(rows, "responses_by_turn", None)
+                    resp_rows = (
+                        responses_map.values()
+                        if isinstance(responses_map, dict)
+                        else ()
+                    )
+                    for resp_row in resp_rows:
                         if not isinstance(resp_row, dict):
                             continue
                         if is_run_row_outbound_blocked(resp_row):

@@ -1030,3 +1030,845 @@ async def test_automation_notification_plan_returns_nullable_thread_and_workspac
     assert plan["authorized"] is True
     assert plan["thread_id"] == "tid-from-exec"
     assert plan["workspace_id"] == "ws-from-auto"
+
+
+# ---------------------------------------------------------------------------
+# 6. Review r6 Fixes: Workspace Root, Online/Offline Download, Weixin Preflight,
+#    I-1 vs I-7 Lock Order, Discord Parent Channel Binding, Link Hygiene
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_turn_deliverable_recorder_uses_workspace_dir_not_computer_root() -> None:
+    """Item 3: Write recorder uses actual workspace dir (`sandbox.workspace(project).workspace`),
+    stripping the workspace folder prefix and ignoring sibling workspaces."""
+    good_bytes = b"# Quarterly Analysis\n"
+    good_sha = hashlib.sha256(good_bytes).hexdigest()
+    ws_dir = "/home/workspace/Research"
+
+    async def _fake_versioned_read(
+        _sb: Any,
+        path: str,
+        *,
+        work_dir: str,
+        **_kwargs: Any,
+    ) -> ContainedFile | None:
+        assert work_dir == ws_dir
+        if path != f"{ws_dir}/results/report.md":
+            return None
+        return ContainedFile(
+            canonical=path,
+            size=len(good_bytes),
+            content=good_bytes,
+            stamp=FileStamp(size=len(good_bytes), mtime="1700000001.0", ctime="1700000001.0", inode="88"),
+            settled=True,
+        )
+
+    recorder = cd.TurnDeliverableRecorder(
+        thread_id="tid-ws-1",
+        run_id="run-ws-1",
+        workspace_id="ws-research",
+        sandbox=object(),
+        work_dir=ws_dir,
+        versioned_reader=_fake_versioned_read,
+    )
+
+    # Write inside this workspace folder -> stored relative to workspace root (`results/report.md`), NOT `Research/results/report.md`
+    await recorder.on_file_operation(
+        {
+            "operation": "write_file",
+            "file_path": "/home/workspace/Research/results/report.md",
+            "written_sha256": good_sha,
+            "written_size": len(good_bytes),
+        }
+    )
+    # Write inside a sibling workspace folder -> ignored
+    await recorder.on_file_operation(
+        {
+            "operation": "write_file",
+            "file_path": "/home/workspace/OtherWS/results/report.md",
+            "written_sha256": good_sha,
+            "written_size": len(good_bytes),
+        }
+    )
+
+    items = recorder.snapshot()
+    assert len(items) == 1
+    assert items[0]["path"] == "results/report.md"
+    assert items[0]["size"] == len(good_bytes)
+    assert items[0]["workspace_id"] == "ws-research"
+
+
+@pytest.mark.asyncio
+async def test_default_get_live_sandbox_uses_get_session_if_running_and_refuses_backup_when_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 3: Download resolves live sandbox via `get_session_if_running` + `layout_for` across workers,
+    reads backup ONLY when confirmed stopped, and raises 503 (never stale backup) if running sandbox is unreachable."""
+    from types import SimpleNamespace
+    from ptc_agent.core.paths import SandboxLayout
+    from src.server.database import workspace as ws_db
+    from src.server.services import workspace_files as ws_files
+    from src.server.services.workspace_manager import WorkspaceManager
+
+    ws_row_running = {
+        "workspace_id": "ws-research",
+        "user_id": "user-alice",
+        "status": "running",
+        "dir_name": "Research",
+        "computer_root_dir": "/home/workspace",
+    }
+    ws_row_stopped = {
+        **ws_row_running,
+        "status": "stopped",
+    }
+
+    fake_sandbox = SimpleNamespace(tag="worker-b-sandbox")
+    fake_session = SimpleNamespace(sandbox=fake_sandbox)
+    session_calls: list[tuple[str, str | None]] = []
+
+    class _FakeWsMgr:
+        def __init__(self, mode: str) -> None:
+            self.mode = mode
+
+        async def get_session_if_running(
+            self, workspace_id: str, user_id: str | None = None
+        ) -> Any:
+            session_calls.append((workspace_id, user_id))
+            if self.mode == "running":
+                return fake_session
+            if self.mode == "stopped":
+                return None
+            raise RuntimeError("SSH tunnel temporarily unreachable")
+
+    monkeypatch.setattr(
+        ws_files,
+        "layout_for",
+        create_autospec(
+            ws_files.layout_for,
+            return_value=SandboxLayout.for_root("/home/workspace").for_workspace("Research"),
+        ),
+    )
+
+    real_get_workspace = ws_db.get_workspace
+
+    # 1) Running on another worker -> attaches via get_session_if_running and resolves /home/workspace/Research
+    monkeypatch.setattr(
+        ws_db, "get_workspace", create_autospec(real_get_workspace, return_value=ws_row_running)
+    )
+    monkeypatch.setattr(
+        WorkspaceManager,
+        "get_instance",
+        classmethod(lambda _cls: _FakeWsMgr("running")),
+    )
+    sb, work_dir = await cd._default_get_live_sandbox("ws-research", user_id="user-alice")
+    assert sb is fake_sandbox
+    assert work_dir == "/home/workspace/Research"
+    assert session_calls == [("ws-research", "user-alice")]
+
+    # 2) Running but unreachable -> raises 503 (never falls back to offline backup!)
+    monkeypatch.setattr(
+        WorkspaceManager,
+        "get_instance",
+        classmethod(lambda _cls: _FakeWsMgr("unreachable")),
+    )
+    with pytest.raises(HTTPException) as exc_unreach:
+        await cd._default_get_live_sandbox("ws-research", user_id="user-alice")
+    assert exc_unreach.value.status_code == 503
+    assert exc_unreach.value.detail["code"] == "deliverable_sandbox_unavailable"
+
+    # 3) Confirmed stopped via workspace status -> returns (None, None) without dialing sandbox
+    session_calls.clear()
+    monkeypatch.setattr(
+        ws_db, "get_workspace", create_autospec(real_get_workspace, return_value=ws_row_stopped)
+    )
+    sb_stopped, dir_stopped = await cd._default_get_live_sandbox("ws-research", user_id="user-alice")
+    assert sb_stopped is None
+    assert dir_stopped is None
+    assert session_calls == []
+
+    # 4) Confirmed stopped via get_session_if_running returning None -> returns (None, None)
+    monkeypatch.setattr(
+        ws_db, "get_workspace", create_autospec(real_get_workspace, return_value=ws_row_running)
+    )
+    monkeypatch.setattr(
+        WorkspaceManager,
+        "get_instance",
+        classmethod(lambda _cls: _FakeWsMgr("stopped")),
+    )
+    sb_none, dir_none = await cd._default_get_live_sandbox("ws-research", user_id="user-alice")
+    assert sb_none is None
+    assert dir_none is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("preflight_resp", "expected_status", "expected_code"),
+    [
+        (
+            {
+                "authorized": False,
+                "decision": "deny",
+                "retryable": False,
+                "deny_code": "weixin_account_unbound",
+            },
+            403,
+            "weixin_account_unbound",
+        ),
+        (
+            {
+                "authorized": False,
+                "decision": "deny",
+                "retryable": False,
+                "deny_code": "delivery_attempt_mismatch",
+            },
+            409,
+            "delivery_attempt_mismatch",
+        ),
+        (
+            {
+                "authorized": False,
+                "decision": "defer",
+                "retryable": True,
+                "deny_code": "roster_lookup_error",
+            },
+            503,
+            "roster_lookup_error",
+        ),
+    ],
+)
+async def test_download_verified_deliverable_weixin_preflight_denied_or_deferred_does_zero_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    preflight_resp: dict[str, Any],
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    """Item 4: Weixin deliverable download requires `preflight_weixin_send` -> `authorized is True`,
+    returning 403/409/503 on deny/defer with ZERO sandbox reads and ZERO backup reads."""
+    monkeypatch.setattr(
+        cd,
+        "require_channel_platform_capability",
+        create_autospec(cd.require_channel_platform_capability, return_value=None),
+    )
+    monkeypatch.setattr(
+        wx_db,
+        "preflight_weixin_send",
+        create_autospec(wx_db.preflight_weixin_send, return_value=preflight_resp),
+    )
+
+    cur = _FakeTopicCursor()
+    cur.deliveries["deliverables:run-wx-1"] = {
+        "delivery_key": "deliverables:run-wx-1",
+        "kind": "fallback",
+        "platform": "weixin",
+        "user_id": "user-alice",
+        "thread_id": "tid-wx-1",
+        "run_id": "run-wx-1",
+        "is_current": True,
+        "target_address": "weixin:@me",
+        "status": "in_flight",
+        "delivery_attempt": 1,
+        "dm_recipient_platform_user_id": "wx_alice",
+    }
+    conn = _FakeConn(cur)
+
+    sandbox_reads = 0
+    backup_reads = 0
+
+    async def _fail_live_sb(_ws_id: str) -> tuple[Any, str | None]:
+        nonlocal sandbox_reads
+        sandbox_reads += 1
+        return object(), "/home/workspace/Research"
+
+    async def _fail_versioned_read(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal sandbox_reads
+        sandbox_reads += 1
+        raise AssertionError("Must not read live sandbox when preflight is denied")
+
+    async def _fail_backup_read(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal backup_reads
+        backup_reads += 1
+        raise AssertionError("Must not read offline backup when preflight is denied")
+
+    with pytest.raises(HTTPException) as exc:
+        await cd.download_verified_deliverable(
+            delivery_key="deliverables:run-wx-1",
+            delivery_attempt=1,
+            workspace_id="ws-1",
+            path="results/report.pdf",
+            gateway_epoch=7,
+            conn=conn,
+            get_live_sandbox_fn=_fail_live_sb,
+            versioned_reader_fn=_fail_versioned_read,
+            offline_backup_reader_fn=_fail_backup_read,
+        )
+    assert exc.value.status_code == expected_status
+    assert exc.value.detail["code"] == expected_code
+    assert sandbox_reads == 0
+    assert backup_reads == 0
+
+
+class _LockOrderTrackingCursor:
+    """In-memory cursor recording lock acquisition order for real I-1, I-6, and I-7 entrypoints."""
+
+    def __init__(self) -> None:
+        self.lock_events: list[str] = []
+        self.topics: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self.identities: dict[tuple[str, str], dict[str, Any]] = {}
+        self.inbound_events: dict[tuple[str, str], dict[str, Any]] = {}
+        self.session_rows: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self.deliveries: dict[str, dict[str, Any]] = {}
+        self.chat_bindings: dict[tuple[str, str], dict[str, Any]] = {}
+        self.user_settings: dict[str, dict[str, Any]] = {}
+        self._one: dict[str, Any] | None = None
+        self._all: list[dict[str, Any]] = []
+
+    async def execute(self, sql: str, params: tuple[Any, ...] | list[Any] = ()) -> None:
+        norm = " ".join(sql.split()).upper()
+        self._one = None
+        self._all = []
+
+        if "PG_ADVISORY_XACT_LOCK" in norm:
+            if params:
+                self.lock_events.append(f"advisory:{params[0]}")
+            return
+
+        if "SELECT NOW() AS DB_NOW" in norm:
+            self._one = {"db_now": datetime.now(timezone.utc)}
+            return
+
+        if "FROM DALTON_CHANNEL_SESSION_GENERATIONS" in norm and "FOR UPDATE" in norm:
+            self.lock_events.append("for_update:dalton_channel_session_generations")
+            plat, scope, uid = str(params[0]), str(params[1]), str(params[2])
+            row = self.session_rows.get((plat, scope, uid))
+            if row:
+                self._one = dict(row)
+            return
+
+        if "INSERT INTO DALTON_CHANNEL_SESSION_GENERATIONS" in norm:
+            plat, scope, uid = str(params[0]), str(params[1]), str(params[2])
+            self.session_rows.setdefault(
+                (plat, scope, uid),
+                {
+                    "platform": plat,
+                    "scope_key": scope,
+                    "dalton_user_id": uid,
+                    "generation": 1,
+                    "override_workspace_id": None,
+                    "pending_interrupt": None,
+                    "selection_initialized_at": datetime.now(timezone.utc),
+                    "last_conversation_activity_at": datetime.now(timezone.utc),
+                },
+            )
+            return
+
+        if "UPDATE DALTON_CHANNEL_SESSION_GENERATIONS" in norm:
+            return
+
+        if "INSERT INTO DALTON_CHANNEL_INBOUND_EVENTS" in norm:
+            plat, msg_id = str(params[0]), str(params[1])
+            key = (plat, msg_id)
+            if key not in self.inbound_events:
+                self.inbound_events[key] = {
+                    "platform": plat,
+                    "message_id": msg_id,
+                    "chat_type": params[2],
+                    "chat_address": params[3],
+                    "thread_scope_key": params[4],
+                    "request_key": params[5],
+                    "raw_payload": {},
+                    "status": "received",
+                    "dalton_user_id": None,
+                    "workspace_id": None,
+                    "external_thread_id": None,
+                    "session_generation": 1,
+                    "fallback_pending": False,
+                    "sent_to_current_count": 0,
+                    "uploaded_attachments": [],
+                }
+                self._one = dict(self.inbound_events[key])
+            return
+
+        if "UPDATE DALTON_CHANNEL_INBOUND_EVENTS" in norm:
+            if "WHERE PLATFORM = %S AND MESSAGE_ID = %S" in norm:
+                plat, msg_id = str(params[-2]), str(params[-1])
+                row = self.inbound_events.get((plat, msg_id))
+                if row:
+                    if "SET DALTON_USER_ID = %S, WORKSPACE_ID = %S" in norm:
+                        row["dalton_user_id"] = params[0]
+                        row["workspace_id"] = params[1]
+                        row["external_thread_id"] = params[2]
+                        row["session_generation"] = params[3]
+                        row["thread_scope_key"] = params[6]
+                    self._one = dict(row)
+            return
+
+        if "FROM DALTON_CHANNEL_IDENTITIES" in norm:
+            if "WHERE PLATFORM = %S AND PLATFORM_USER_ID = %S" in norm:
+                plat, puid = str(params[0]), str(params[1])
+                for (u, p), row in self.identities.items():
+                    if p == plat and row.get("platform_user_id") == puid:
+                        self._one = {"user_id": u, **row}
+                        return
+                return
+            uid, plat = str(params[0]), str(params[1])
+            row = self.identities.get((uid, plat))
+            if row:
+                self._one = dict(row)
+            return
+
+        if "FROM DALTON_CHANNEL_BOT_TOPICS" in norm:
+            where_part = norm.split("ORDER BY", 1)[0]
+            require_confirmed = "STATUS = 'CONFIRMED'" in where_part
+            if "(CANONICAL_SCOPE_KEY = %S OR ROOT_MESSAGE_ID = %S)" in norm:
+                plat, addr, scope, root_id = params[:4]
+                for r in self.topics.values():
+                    if (
+                        r["platform"] == plat
+                        and r["chat_address"] == addr
+                        and (r["canonical_scope_key"] == scope or r["root_message_id"] == root_id)
+                        and (not require_confirmed or r.get("status") == "confirmed")
+                    ):
+                        self._one = dict(r)
+                        return
+                return
+            if "EXTERNAL_TOPIC_ID = %S" in norm:
+                plat, addr, ext_id = params
+                for r in self.topics.values():
+                    if (
+                        r["platform"] == plat
+                        and r["chat_address"] == addr
+                        and r.get("external_topic_id") == ext_id
+                        and (not require_confirmed or r.get("status") == "confirmed")
+                    ):
+                        self._one = dict(r)
+                        return
+                return
+            if "ROOT_MESSAGE_ID = %S" in norm:
+                plat, addr, root_id = params
+                for r in self.topics.values():
+                    if (
+                        r["platform"] == plat
+                        and r["chat_address"] == addr
+                        and r.get("root_message_id") == root_id
+                        and (not require_confirmed or r.get("status") == "confirmed")
+                    ):
+                        self._one = dict(r)
+                        return
+                return
+            if "CANONICAL_SCOPE_KEY = %S" in norm:
+                plat, addr, scope = params
+                r = self.topics.get((plat, addr, scope))
+                if r and (not require_confirmed or r.get("status") == "confirmed"):
+                    self._one = dict(r)
+                return
+            return
+
+        if "UPDATE DALTON_CHANNEL_BOT_TOPICS" in norm:
+            if "SET EXTERNAL_TOPIC_ID = COALESCE" in norm:
+                ext_id, root_id, first_rep, plat, addr, scope = params
+                r = self.topics.get((plat, addr, scope))
+                if r:
+                    r["external_topic_id"] = r.get("external_topic_id") or ext_id
+                    r["root_message_id"] = r.get("root_message_id") or root_id
+                    r["first_reply_message_id"] = r.get("first_reply_message_id") or first_rep
+                    r["status"] = "confirmed"
+                    self._one = dict(r)
+            return
+
+        if "FROM DALTON_CHANNEL_DELIVERIES" in norm and "WHERE DELIVERY_KEY = %S" in norm:
+            if "FOR UPDATE" in norm:
+                self.lock_events.append("for_update:dalton_channel_deliveries")
+            row = self.deliveries.get(str(params[0]))
+            if row:
+                self._one = dict(row)
+            return
+
+        if "UPDATE DALTON_CHANNEL_DELIVERIES" in norm:
+            return
+
+        if "FROM DALTON_CHANNEL_CHAT_BINDINGS" in norm:
+            plat, addr = str(params[0]), str(params[1])
+            row = self.chat_bindings.get((plat, addr))
+            if row:
+                self._one = dict(row)
+            return
+
+        if "FROM DALTON_CHANNEL_USER_SETTINGS" in norm:
+            uid = str(params[0])
+            row = self.user_settings.get(uid)
+            if row:
+                self._one = dict(row)
+            return
+
+        if "FROM WORKSPACES" in norm:
+            self._one = {"workspace_id": str(params[0]), "user_id": "user-alice", "status": "running"}
+            return
+
+    async def fetchone(self) -> dict[str, Any] | None:
+        return self._one
+
+    async def fetchall(self) -> list[dict[str, Any]]:
+        return list(self._all)
+
+
+@pytest.mark.asyncio
+async def test_i1_and_i7_lock_order_and_real_i1_inbound_before_i7(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 7: Real I-1 (`register_and_resolve_inbound`) and real I-7 (`_update_delivery_progress_once`)
+    both acquire `dalton_bot_topic` advisory lock strictly BEFORE `dalton_channel_session_generations`
+    `FOR UPDATE`, and real I-1 handles both other-member @bot and initiator concurrent follow-up
+    before I-7 confirms."""
+    monkeypatch.setattr(
+        cg_db,
+        "require_channel_platform_capability",
+        create_autospec(cg_db.require_channel_platform_capability, return_value=None),
+    )
+    monkeypatch.setattr(
+        wx_db,
+        "verify_gateway_epoch_in_tx",
+        create_autospec(wx_db.verify_gateway_epoch_in_tx, return_value=None),
+    )
+    monkeypatch.setattr(
+        cg_db,
+        "get_user_tier",
+        create_autospec(cg_db.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        cg_db,
+        "get_home_workspace_id",
+        create_autospec(cg_db.get_home_workspace_id, return_value="ws-home"),
+    )
+
+    cur = _LockOrderTrackingCursor()
+    cur.identities[("user-alice", "feishu")] = {"platform_user_id": "ou_alice"}
+    cur.identities[("user-bob", "feishu")] = {"platform_user_id": "ou_bob"}
+    # Pre-reserved pending topic from I-6 (Alice is initiator)
+    cur.topics[("feishu", "feishu:oc_grp_1", "chat:oc_grp_1:topic:om_root_1")] = {
+        "platform": "feishu",
+        "chat_address": "feishu:oc_grp_1",
+        "canonical_scope_key": "chat:oc_grp_1:topic:om_root_1",
+        "external_topic_id": None,
+        "root_message_id": "om_root_1",
+        "first_reply_message_id": None,
+        "initiator_dalton_user_id": "user-alice",
+        "initiator_platform_user_id": "ou_alice",
+        "status": "pending",
+    }
+    cur.session_rows[("feishu", "chat:oc_grp_1:topic:om_root_1", "user-alice")] = {
+        "platform": "feishu",
+        "scope_key": "chat:oc_grp_1:topic:om_root_1",
+        "dalton_user_id": "user-alice",
+        "generation": 1,
+        "override_workspace_id": None,
+        "pending_interrupt": None,
+        "selection_initialized_at": datetime.now(timezone.utc),
+        "last_conversation_activity_at": datetime.now(timezone.utc),
+    }
+    cur.deliveries["fallback:run-topic-1"] = {
+        "delivery_key": "fallback:run-topic-1",
+        "kind": "fallback",
+        "user_id": "user-alice",
+        "platform": "feishu",
+        "target_address": "feishu:oc_grp_1",
+        "source_scope_key": "chat:oc_grp_1:topic:om_root_1",
+        "source_generation": 1,
+        "activity_origin": "conversation",
+        "status": "in_flight",
+        "sent_chunks": 0,
+        "total_chunks": 1,
+        "platform_message_ids": [],
+        "files_status": [],
+        "delivery_attempt": 1,
+        "is_current": True,
+        "has_non_empty_text": True,
+        "run_id": "run-topic-1",
+    }
+    conn = _FakeConn(cur)
+
+    # 1) Real I-1: Bob `@bot` arrives inside the topic BEFORE I-7 confirms
+    cur.lock_events.clear()
+    bob_res = await cg_db.register_and_resolve_inbound(
+        platform="feishu",
+        platform_user_id="ou_bob",
+        chat_type="group",
+        chat_address="feishu:oc_grp_1",
+        thread_scope_key="chat:oc_grp_1:thread:omt_topic_1",
+        message_id="om_bob_in_1",
+        request_key="rk-bob-1",
+        raw_payload={"platform_user_id": "ou_bob"},
+        external_topic_id="omt_topic_1",
+        root_message_id="om_root_1",
+        conn=conn,
+    )
+    assert bob_res["allowed"] is True
+    assert bob_res["resolved_scope_key"] == "chat:oc_grp_1:thread:omt_topic_1"
+    assert bob_res["topic_initiator_platform_user_id"] == "ou_alice"
+    i1_bob_topic_idx = cur.lock_events.index("advisory:dalton_bot_topic:feishu:feishu:oc_grp_1")
+    i1_bob_sess_idx = cur.lock_events.index("for_update:dalton_channel_session_generations")
+    assert i1_bob_topic_idx < i1_bob_sess_idx
+
+    # 2) Real I-1: Alice (initiator) immediately `@bot` follows up before I-7 confirms
+    cur.lock_events.clear()
+    alice_res = await cg_db.register_and_resolve_inbound(
+        platform="feishu",
+        platform_user_id="ou_alice",
+        chat_type="group",
+        chat_address="feishu:oc_grp_1",
+        thread_scope_key="chat:oc_grp_1:thread:omt_topic_1",
+        message_id="om_alice_in_2",
+        request_key="rk-alice-2",
+        raw_payload={"platform_user_id": "ou_alice"},
+        external_topic_id="omt_topic_1",
+        root_message_id="om_root_1",
+        conn=conn,
+    )
+    assert alice_res["allowed"] is True
+    assert alice_res["resolved_scope_key"] == "chat:oc_grp_1:topic:om_root_1"
+    i1_alice_topic_idx = cur.lock_events.index("advisory:dalton_bot_topic:feishu:feishu:oc_grp_1")
+    i1_alice_sess_idx = cur.lock_events.index("for_update:dalton_channel_session_generations")
+    assert i1_alice_topic_idx < i1_alice_sess_idx
+
+    # 3) Real I-7: confirms bot_topic_registration with identical lock order (`bot_topic` -> `session_generations`)
+    cur.lock_events.clear()
+    i7_res = await cg_db._update_delivery_progress_once(
+        delivery_key="fallback:run-topic-1",
+        sent_chunks=1,
+        total_chunks=1,
+        platform_message_ids=["om_reply_1"],
+        status="sent",
+        delivery_attempt=1,
+        bot_topic_registration={
+            "platform": "feishu",
+            "chat_address": "feishu:oc_grp_1",
+            "canonical_scope_key": "chat:oc_grp_1:topic:om_root_1",
+            "external_topic_id": "omt_topic_1",
+            "root_message_id": "om_root_1",
+            "first_reply_message_id": "om_reply_1",
+            "initiator_platform_user_id": "ou_alice",
+            "initiator_dalton_user_id": "user-alice",
+        },
+        conn=conn,
+    )
+    assert i7_res["ok"] is True
+    assert i7_res["bot_topic_registered"] is True
+    i7_topic_idx = cur.lock_events.index("advisory:dalton_bot_topic:feishu:feishu:oc_grp_1")
+    i7_sess_idx = cur.lock_events.index("for_update:dalton_channel_session_generations")
+    assert i7_topic_idx < i7_sess_idx
+
+
+@pytest.mark.asyncio
+async def test_discord_current_session_registered_thread_denies_after_parent_binding_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 8a: Current-session Discord delivery to a registered thread (both replay and background
+    report-back) calls `_verify_group_target_deliverable` on the parent channel and denies after
+    parent binding or user channel settings are removed."""
+    monkeypatch.setattr(
+        cg_db,
+        "require_channel_platform_capability",
+        create_autospec(cg_db.require_channel_platform_capability, return_value=None),
+    )
+    monkeypatch.setattr(
+        wx_db,
+        "verify_gateway_epoch_in_tx",
+        create_autospec(wx_db.verify_gateway_epoch_in_tx, return_value=None),
+    )
+    monkeypatch.setattr(
+        cg_db,
+        "get_user_tier",
+        create_autospec(cg_db.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        cg_db,
+        "get_home_workspace_id",
+        create_autospec(cg_db.get_home_workspace_id, return_value="ws-home"),
+    )
+    monkeypatch.setattr(
+        cg_db,
+        "_verify_workspace_write_permission",
+        create_autospec(
+            cg_db._verify_workspace_write_permission,
+            return_value=(True, None, {"workspace_id": "ws-home", "user_id": "user-alice"}),
+        ),
+    )
+
+    cur = _LockOrderTrackingCursor()
+    cur.identities[("user-alice", "discord")] = {
+        "platform_user_id": "100001",
+        "weixin_context_token": None,
+    }
+    cur.topics[("discord", "discord:111111/222222", "chat:111111/222222:topic:999000111")] = {
+        "platform": "discord",
+        "chat_address": "discord:111111/222222",
+        "canonical_scope_key": "chat:111111/222222:topic:999000111",
+        "external_topic_id": "999000111",
+        "root_message_id": "999000111",
+        "first_reply_message_id": "999000222",
+        "initiator_dalton_user_id": "user-alice",
+        "initiator_platform_user_id": "100001",
+        "status": "confirmed",
+    }
+    cur.chat_bindings[("discord", "discord:111111/222222")] = {
+        "chat_name": "research",
+        "workspace_id": None,
+    }
+    cur.user_settings["user-alice"] = {
+        "apps": {"discord": {"chats": {"discord:111111/222222": {"name": "research"}}}}
+    }
+    conn = _FakeConn(cur)
+
+    real_find_current_source = cg_db._find_current_conversation_source
+
+    for source_kind, source_table in [("replay", "inbound_events"), ("bg", "background_runs")]:
+        src_row = {
+            "_source_table": source_table,
+            "platform": "discord",
+            "dalton_user_id": "user-alice",
+            "target_address": "discord:111111/222222",
+            "thread_scope_key": "chat:111111/222222:topic:999000111",
+            "thread_id": "33333333-3333-4333-8333-333333333333",
+            "run_id": f"run-disc-{source_kind}",
+            "workspace_id": "ws-home",
+            "session_generation": 1,
+            "message_id": "999000111" if source_table == "inbound_events" else None,
+        }
+        monkeypatch.setattr(
+            cg_db,
+            "_find_current_conversation_source",
+            create_autospec(real_find_current_source, return_value=src_row),
+        )
+
+        # Bound parent channel -> allowed and returns external_topic_id
+        allowed = await cg_db.authorize_and_claim_delivery(
+            delivery_key=f"fallback:ok-{source_kind}",
+            kind="fallback",
+            user_id="user-alice",
+            thread_id="33333333-3333-4333-8333-333333333333",
+            run_id=f"run-disc-{source_kind}",
+            platform="discord",
+            target=None,
+            has_non_empty_text=True,
+            total_chunks=1,
+            source_scope_key="chat:111111/222222:topic:999000111",
+            source_generation=1,
+            activity_origin="replay" if source_kind == "replay" else "notification",
+            conn=conn,
+        )
+        assert allowed["claim_status"] == "claimed"
+        assert allowed["external_topic_id"] == "999000111"
+
+        # Remove parent channel binding -> denied with not_allowed
+        saved_binding = cur.chat_bindings.pop(("discord", "discord:111111/222222"))
+        denied_unbind = await cg_db.authorize_and_claim_delivery(
+            delivery_key=f"fallback:unbind-{source_kind}",
+            kind="fallback",
+            user_id="user-alice",
+            thread_id="33333333-3333-4333-8333-333333333333",
+            run_id=f"run-disc-{source_kind}",
+            platform="discord",
+            target=None,
+            has_non_empty_text=True,
+            total_chunks=1,
+            source_scope_key="chat:111111/222222:topic:999000111",
+            source_generation=1,
+            activity_origin="replay" if source_kind == "replay" else "notification",
+            conn=conn,
+        )
+        assert denied_unbind["claim_status"] == "denied"
+        assert denied_unbind["code"] == "not_allowed"
+        cur.chat_bindings[("discord", "discord:111111/222222")] = saved_binding
+
+        # Remove user channel setting -> denied with not_allowed
+        cur.user_settings["user-alice"] = {"apps": {"discord": {"chats": {}}}}
+        denied_setting = await cg_db.authorize_and_claim_delivery(
+            delivery_key=f"fallback:setting-{source_kind}",
+            kind="fallback",
+            user_id="user-alice",
+            thread_id="33333333-3333-4333-8333-333333333333",
+            run_id=f"run-disc-{source_kind}",
+            platform="discord",
+            target=None,
+            has_non_empty_text=True,
+            total_chunks=1,
+            source_scope_key="chat:111111/222222:topic:999000111",
+            source_generation=1,
+            activity_origin="replay" if source_kind == "replay" else "notification",
+            conn=conn,
+        )
+        assert denied_setting["claim_status"] == "denied"
+        assert denied_setting["code"] == "not_allowed"
+        cur.user_settings["user-alice"] = {
+            "apps": {"discord": {"chats": {"discord:111111/222222": {"name": "research"}}}}
+        }
+
+
+def test_rewrite_preserves_loopback_http_and_rejects_host_absolute_paths_in_reports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 8d: Non-workspace HTTP(S) links (including loopback URLs) are preserved, and
+    arbitrary host absolute paths like `/etc/ssl/openssl.cnf` are NOT rewritten into workspace
+    deep links before automation report validation so `_scan_string` still rejects them."""
+    text = (
+        "参考 [本地文档](http://127.0.0.1:8080/health) 与 "
+        "[开发页](http://localhost:3000/docs) 及 [研究报告](/home/workspace/results/report.md)。"
+    )
+    rewritten = notify_dispatch.rewrite_workspace_links_for_external(
+        text,
+        public_base="https://dalton.example.com",
+        thread_id="tid-link-1",
+    )
+    assert "[本地文档](http://127.0.0.1:8080/health)" in rewritten
+    assert "[开发页](http://localhost:3000/docs)" in rewritten
+    assert (
+        "[研究报告](https://dalton.example.com/chat/t/tid-link-1?file=%2Fhome%2Fworkspace%2Fresults%2Freport.md)"
+        in rewritten
+    )
+
+    # Host absolute path MUST NOT be classified as workspace file
+    assert (
+        notify_dispatch.classify_external_workspace_destination("/etc/ssl/openssl.cnf")[
+            "kind"
+        ]
+        == "keep"
+    )
+    assert (
+        notify_dispatch.classify_external_workspace_destination("file:///etc/ssl/openssl.cnf")[
+            "kind"
+        ]
+        == "keep"
+    )
+
+    # Automation report containing `/etc/ssl/openssl.cnf` MUST still be rejected by validation
+    monkeypatch.setattr(
+        "src.dalton.settings.get_dalton_public_app_url",
+        lambda: "https://dalton.example.com",
+    )
+    bad_card = {
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": "读取 [系统配置](/etc/ssl/openssl.cnf)",
+                }
+            ]
+        },
+    }
+    rw_cards, _, _ = auto_reports_db._rewrite_automation_report_inputs(
+        cards=[bad_card],
+        failure_text=None,
+        text=None,
+        thread_id="tid-rep-2",
+        workspace_id="ws-rep-2",
+    )
+    assert "/etc/ssl/openssl.cnf" in rw_cards[0]["body"]["elements"][0]["content"]
+    prepared, err = auto_reports_db.prepare_automation_report_content(
+        profile="market-digest-am",
+        cards=rw_cards,
+        failure_text=None,
+        text=None,
+    )
+    assert prepared is None
+    assert err == "invalid_card"

@@ -732,10 +732,6 @@ _WS_COMMON_HOST_TLDS = frozenset(
         "shop", "finance", "capital", "fund", "group", "ltd", "inc",
     }
 )
-_WS_BARE_LOCALHOST_PORT_RE = re.compile(
-    r"^(?:(?:[A-Za-z0-9-]+\.)*localhost\.?|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\]|0\.0\.0\.0):\d+(?:[/?#].*)?$",
-    re.IGNORECASE,
-)
 _WS_MD_DEF_LINE_RE = re.compile(
     r"^[ \t]{0,3}\[([^\]]+)\]:[ \t]*(?:<([^>\n]+)>|([^\s\n]+))(?:[ \t]+(?:\"[^\n]*\"|'[^\n]*'|\([^\n]*\)))?[ \t]*$",
     re.MULTILINE,
@@ -801,25 +797,18 @@ def _normalize_ws_path_segments(
     return f"{joined}/" if is_dir else joined
 
 
-def _is_local_preview_url(dest: str) -> bool:
-    if _WS_BARE_LOCALHOST_PORT_RE.match(dest):
-        return True
-    if not re.match(r"^https?://", dest, re.IGNORECASE):
-        return False
-    try:
-        parsed = urlparse(dest)
-    except ValueError:
-        return False
-    return bool(parsed.hostname and _is_local_hostname_external(parsed.hostname))
-
-
 def classify_external_workspace_destination(raw_dest: str) -> dict[str, Any]:
-    """Classify a link destination identically to gateway ``sandbox-links.ts``."""
+    """Classify a link destination for external workspace deep-link rewriting.
+
+    Preserves non-workspace HTTP(S) links (including loopback URLs) and leaves
+    arbitrary host absolute paths outside known sandbox roots untouched so
+    downstream report validation continues to reject local system paths.
+    """
     dest = raw_dest.strip()
     if not dest:
         return {"kind": "keep"}
-    if _is_local_preview_url(dest):
-        return {"kind": "local_preview"}
+    if re.match(r"^https?://", dest, re.IGNORECASE):
+        return {"kind": "keep"}
 
     ws_match = _WS_WSREF_RE.match(dest)
     if ws_match:
@@ -861,23 +850,11 @@ def classify_external_workspace_destination(raw_dest: str) -> dict[str, Any]:
             "display_path": rel_path,
         }
 
-    if candidate.startswith("/") and not candidate.startswith("//"):
-        decoded_abs = unquote(stripped)
-        if decoded_abs.endswith("/") or ":" in decoded_abs:
-            return {"kind": "keep"}
-        norm_abs = _normalize_ws_path_segments(decoded_abs)
-        if not norm_abs:
-            return {"kind": "keep"}
-        base_name = norm_abs.rsplit("/", 1)[-1]
-        if not _WS_FILE_EXT_BASENAME_RE.match(base_name):
-            return {"kind": "keep"}
-        rooted = f"/{norm_abs}"
-        return {
-            "kind": "workspace_file",
-            "deep_link_path": rooted,
-            "display_path": rooted,
-        }
-    if unwrapped_file:
+    # Only known sandbox roots (`/home/workspace/`, `/home/daytona/`), `__wsref__/`,
+    # and relative workspace paths are attributable to a workspace. Arbitrary host
+    # absolute paths (e.g. `/etc/ssl/openssl.cnf`, `/Users/...`) are kept intact so
+    # report validation rejects them.
+    if candidate.startswith("/") or unwrapped_file:
         return {"kind": "keep"}
 
     has_line = bool(_WS_LINE_SUFFIX_RE.search(candidate)) and not re.match(

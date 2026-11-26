@@ -1081,19 +1081,16 @@ async def astream_ptc_workflow(
         # DALTON-HOOK(channel-deliverables): record verified DM turn deliverables on Write/Edit for own workspace
         from src.dalton.channel_deliverables import create_turn_deliverable_recorder
 
-        _deliverable_work_dir = (
-            getattr(getattr(session, "sandbox", None), "working_directory", None)
-            or getattr(
-                getattr(getattr(session, "sandbox", None), "config", None),
-                "filesystem",
-                None,
-            )
-            and getattr(
-                getattr(session.sandbox.config, "filesystem", None),
-                "working_directory",
-                None,
-            )
-        )
+        _deliverable_work_dir: str | None = None
+        if session and session.sandbox:
+            if hasattr(session.sandbox, "workspace") and callable(
+                session.sandbox.workspace
+            ):
+                _deliverable_work_dir = session.sandbox.workspace(project).workspace
+            else:
+                _deliverable_work_dir = getattr(
+                    session.sandbox, "working_directory", None
+                )
         deliverable_recorder = create_turn_deliverable_recorder(
             thread_id=thread_id,
             run_id=run_id,
