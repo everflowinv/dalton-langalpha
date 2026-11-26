@@ -291,7 +291,14 @@ export async function postSSEStream(
     let duplicate: Record<string, unknown> | null = null;
     const onEvent = (event: Record<string, unknown>) => {
       if (event.event === 'metadata' || event.event === 'steering_accepted') release();
-      if (event.event !== 'turn_held') {
+      // DALTON-HOOK(antigravity-series): do not treat stream-level admission refusal frames as an admitted run in onRunIdResolved
+      const isAdmissionRefusalFrame = event.event === 'error' && (
+        event.code === 'duplicate_request'
+        || event.code === 'stale_fork'
+        || event.code === 'stale_retry'
+        || event.code === 'scope_changed'
+      );
+      if (event.event !== 'turn_held' && !isAdmissionRefusalFrame) {
         const runId = parseRunIdFromContentLocation(runLocation);
         if (runId && onRunIdResolved) onRunIdResolved(runId, parseThreadIdFromContentLocation(runLocation));
         runLocation = null;

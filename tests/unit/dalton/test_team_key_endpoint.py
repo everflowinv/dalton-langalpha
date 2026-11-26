@@ -1737,3 +1737,75 @@ async def test_r2_role_and_fallback_rejections_preserve_fallback_and_log_refusal
     assert "evil-fetch" in log_text
     assert "evil-fallback" in log_text
     assert net_events == []
+
+
+# ---------------------------------------------------------------------------
+# 12. AK4 — Shared BYOK native Muse role/fallback must not inherit OAuth ctx URL
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ak4_shared_byok_muse_role_does_not_inherit_oauth_context_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After resolving Muse OAuth in the same turn, a shared BYOK native Muse client keeps its own base_url."""
+    from datetime import datetime, timedelta, timezone
+
+    import src.dalton.llm.providers.muse.oauth as muse_oauth_mod
+
+    _configure_team_sharing(monkeypatch, sharing="team", host_mode="oss")
+    net_events = _install_network_tripwire(monkeypatch)
+    _patch_holder_prefs(monkeypatch, {})
+
+    oauth_ctx_url = "https://oauth-edge.meta.ai/v1"
+    oauth_token_row = {
+        "access_token": "muse-oauth-minted-token-1234",
+        "account_id": muse_oauth_mod.MUSE_API_KEY_ACCOUNT_ID,
+        "plan_type": "muse",
+        "expires_at": datetime.now(timezone.utc) + timedelta(days=30),
+    }
+
+    async def _fake_get_oauth_tokens(user_id: str, provider: str) -> dict[str, Any] | None:
+        if user_id == HOLDER_ID and provider == muse_oauth_mod.MUSE_PROVIDER:
+            return dict(oauth_token_row)
+        return None
+
+    async def _fake_get_muse_meta(user_id: str) -> dict[str, Any] | None:
+        return {"base_url": oauth_ctx_url}
+
+    monkeypatch.setattr(
+        muse_oauth_mod,
+        "get_oauth_tokens",
+        create_autospec(muse_oauth_mod.get_oauth_tokens, side_effect=_fake_get_oauth_tokens),
+    )
+    monkeypatch.setattr(
+        muse_oauth_mod,
+        "get_muse_cached_meta",
+        create_autospec(muse_oauth_mod.get_muse_cached_meta, side_effect=_fake_get_muse_meta),
+    )
+
+    # 1. Main model resolves Muse OAuth in this async task -> binds active Muse OAuth context.
+    oauth_client = await clients_mod.resolve_oauth_llm_client(
+        MEMBER_ID,
+        "muse-spark-1.3-oauth",
+    )
+    assert oauth_client is not None
+    assert str(oauth_client.openai_api_base).rstrip("/") == oauth_ctx_url.rstrip("/")
+
+    # 2. Same turn resolves a shared BYOK native Muse role/fallback model (holder holds `meta` BYOK key, no custom base_url).
+    byok_muse_entry = {
+        "name": "my-muse-role",
+        "model_id": "muse-spark-1.3",
+        "provider": "meta",
+    }
+    byok_client = await clients_mod.resolve_byok_llm_client(
+        MEMBER_ID,
+        "my-muse-role",
+        is_byok=True,
+        _pref_cache={"custom_models": [byok_muse_entry]},
+        _byok_cache=_byok_cache_for("meta", {"api_key": HOLDER_SECRET_KEY, "base_url": None}),
+    )
+    assert byok_client is not None
+    assert str(byok_client.openai_api_base).rstrip("/") == muse_oauth_mod.MUSE_DEFAULT_BASE_URL.rstrip("/")
+    assert getattr(byok_client, "muse_user_id", None) is None
+    assert net_events == []

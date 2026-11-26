@@ -15,6 +15,15 @@ vi.mock('react-i18next', () => {
 
 vi.mock('@/lib/supabase', () => ({ supabase: null }));
 
+// DALTON-HOOK(antigravity-series): enable Dalton build flag for activeTurnModel HITL admission tests
+const brandMock = vi.hoisted(() => ({ isDaltonBuild: false }));
+vi.mock('@/config/brand', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/config/brand')>()),
+  get isDaltonBuild() {
+    return brandMock.isDaltonBuild;
+  },
+}));
+
 vi.mock('../utils/threadStorage', () => ({
   getStoredThreadId: vi.fn().mockReturnValue(null),
   setStoredThreadId: vi.fn(),
@@ -67,6 +76,7 @@ function renderChat(initial: { onFileArtifact: (e: unknown) => void; readCompose
 describe('useChatMessages: HITL resume freshness', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    brandMock.isDaltonBuild = false;
     mockSendHitl.mockResolvedValue({ disconnected: false });
   });
 
@@ -115,5 +125,84 @@ describe('useChatMessages: HITL resume freshness', () => {
 
     await waitFor(() => expect(mockSendHitl).toHaveBeenCalledTimes(1));
     expect(mockSendHitl.mock.calls[0][3]).toMatchObject({ llmModel: 'model-a', reasoningEffort: 'low', fastMode: false });
+  });
+
+  // DALTON-HOOK(antigravity-series): R2 — a stale_fork refusal frame after onRunIdResolved must not leave activeTurnModel marked admitted
+  it('does not mark activeTurnModel admitted when a paused resume receives a stale_fork frame after onRunIdResolved', async () => {
+    brandMock.isDaltonBuild = true;
+    sendRaises(questionInterrupt);
+    const shown: ModelOptions = { model: 'gemini-4-neon-high-oauth', modelPickSeq: 7, reasoningEffort: null, fastMode: false };
+    const { result } = renderChat({ onFileArtifact: vi.fn(), readComposerOptions: () => shown });
+    await settleMountEffect();
+
+    await act(async () => {
+      await result.current.handleSendMessage('Screen chip names', null, null, shown);
+    });
+    await waitFor(() => expect(result.current.pendingInterrupt).not.toBeNull());
+
+    let resolveStream!: (v: { disconnected: boolean; aborted: boolean }) => void;
+    mockSendHitl.mockImplementation(async (...args: unknown[]) => {
+      const opts = args[3] as {
+        onEvent: (e: Record<string, unknown>) => void;
+        onRunIdResolved?: (id: string) => void;
+      };
+      opts.onRunIdResolved?.('run-stale');
+      opts.onEvent({
+        event: 'error',
+        thread_id: 'thread-1',
+        error: 'the branch moved',
+        type: 'workflow_error',
+        error_type: 'admission_conflict',
+        code: 'stale_fork',
+      });
+      return new Promise((res) => { resolveStream = res; });
+    });
+
+    act(() => {
+      result.current.handleAnswerQuestion('NVDA', 'int-ask', 'int-ask');
+    });
+
+    await waitFor(() => expect(mockSendHitl).toHaveBeenCalledTimes(1));
+    expect(result.current.activeTurnModel?.admitted).toBe(false);
+
+    await act(async () => {
+      resolveStream({ disconnected: false, aborted: false });
+    });
+  });
+
+  // DALTON-HOOK(antigravity-series): R5b — adopting a 409 duplicate_request on HITL resume must mark activeTurnModel admitted: true
+  it('marks activeTurnModel admitted when HITL resume adopts a 409 duplicate_request run', async () => {
+    brandMock.isDaltonBuild = true;
+    sendRaises(questionInterrupt);
+    const shown: ModelOptions = { model: 'gemini-4-neon-high-oauth', modelPickSeq: 9, reasoningEffort: null, fastMode: false };
+    const { result } = renderChat({ onFileArtifact: vi.fn(), readComposerOptions: () => shown });
+    await settleMountEffect();
+
+    await act(async () => {
+      await result.current.handleSendMessage('Screen chip names', null, null, shown);
+    });
+    await waitFor(() => expect(result.current.pendingInterrupt).not.toBeNull());
+
+    const dupErr = Object.assign(new Error('This request was already accepted'), {
+      status: 409,
+      errorInfo: {
+        code: 'duplicate_request',
+        run_id: 'run-dup-hitl',
+        thread_id: 'thread-1',
+        run_status: 'in_progress',
+      },
+    });
+    mockSendHitl.mockRejectedValueOnce(dupErr);
+
+    await act(async () => {
+      result.current.handleAnswerQuestion('NVDA', 'int-ask', 'int-ask');
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    await waitFor(() => expect(result.current.activeTurnModel).toEqual({
+      model: 'gemini-4-neon-high-oauth',
+      pickSeq: 9,
+      admitted: true,
+    }));
   });
 });

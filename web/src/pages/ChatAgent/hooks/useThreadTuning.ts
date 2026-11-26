@@ -189,9 +189,20 @@ function useThreadOverride<F extends TuningField>({
     // The row moving back carries the composer with it, so the hold goes and
     // the row shows through, unless the pick has moved on since. With no row
     // cached the composer falls back to Settings until the settle reads it.
+    // DALTON-HOOK(antigravity-series): also scrub a failed optimistic effort from an active clearLocal handle's restoreHeld so a subsequent Antigravity failure never writes the failed value back into held
     onFailed: ({ value }) => {
-      if (heldRef.current && heldRef.current.value === value) heldRef.current = null;
-      setHeld((current) => (current && current.value === value ? null : current));
+      const dropFailed = (current: Hold<Override<F>>): Hold<Override<F>> => {
+        if (!current) return current;
+        if (!current.clearToken) {
+          return current.value === value ? null : current;
+        }
+        if (current.restoreHeld && current.restoreHeld.value === value) {
+          return { ...current, restoreHeld: null };
+        }
+        return current;
+      };
+      heldRef.current = dropFailed(heldRef.current);
+      setHeld(dropFailed);
     },
   });
 

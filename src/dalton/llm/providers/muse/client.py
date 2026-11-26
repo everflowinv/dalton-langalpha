@@ -269,6 +269,7 @@ class ChatMuseOpenAI(ChatCodexOpenAI):
     muse_parent_thread_id: str | None = None
     muse_is_subagent: bool = False
     muse_user_id: str | None = None
+    muse_is_oauth: bool = True
 
     def model_copy(self, *, update: dict[str, Any] | None = None, deep: bool = False) -> Any:
         if isinstance(update, dict) and isinstance(update.get("model_kwargs"), dict):
@@ -318,6 +319,8 @@ class ChatMuseOpenAI(ChatCodexOpenAI):
         return str(raw)
 
     async def _handle_muse_401(self, exc: BaseException) -> None:
+        if not self.muse_is_oauth:
+            return
         if is_muse_auth_expired_error(exc):
             uid = self.muse_user_id or get_active_muse_context().get("user_id")
             api_key = self._extract_api_key_str()
@@ -372,7 +375,13 @@ def build_muse_client(
     """
     from src.llms.llm import STREAM_CHUNK_TIMEOUT_S, _merged_default_headers
 
-    active_ctx = get_active_muse_context()
+    resolved_api_key = llm._resolve_api_key()
+    is_muse_oauth = getattr(llm, "provider", None) == MUSE_PROVIDER
+    active_ctx = get_active_muse_context() if is_muse_oauth else {}
+    ctx_key_fp = active_ctx.get("api_key_fp") or ""
+    if ctx_key_fp and ctx_key_fp != _muse_key_fp(resolved_api_key):
+        active_ctx = {}
+
     resolved_base = llm._resolve_base_url("base_url")
     ctx_base_url = active_ctx.get("base_url")
     if ctx_base_url and resolved_base.get("base_url") in (None, "", MUSE_DEFAULT_BASE_URL):
@@ -382,13 +391,14 @@ def build_muse_client(
 
     params: dict[str, Any] = {
         "model": llm.model,
-        "api_key": llm._resolve_api_key(),
+        "api_key": resolved_api_key,
         "streaming": True,
         "stream_usage": True,
         "max_retries": 5,
         "timeout": 600.0,
         "stream_chunk_timeout": STREAM_CHUNK_TIMEOUT_S,
         "muse_user_id": active_ctx.get("user_id") or None,
+        "muse_is_oauth": is_muse_oauth and (not ctx_key_fp or ctx_key_fp == _muse_key_fp(resolved_api_key)),
     }
     params.update(resolved_base)
 

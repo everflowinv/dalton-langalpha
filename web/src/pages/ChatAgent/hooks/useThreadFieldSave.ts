@@ -93,6 +93,18 @@ export function useThreadFieldSave<F extends ThreadField>({
     ? `thread-field:model-effort:${threadId ?? ''}`
     : `thread-field:${field}:${threadId ?? ''}`;
 
+  // DALTON-HOOK(antigravity-series): check whether a queued llm_model mutation actually modifies reasoning_effort (e.g. Antigravity atomic clear) so a failed effort PATCH still rolls back immediately behind a plain model switch
+  const hasPendingModelEffortUpdate = useCallback((id: string) => (
+    isDaltonBuild
+    && field === 'reasoning_effort'
+    && queryClient.getMutationCache()
+      .findAll({ mutationKey: threadFieldMutationKey(id, 'llm_model'), status: 'pending' })
+      .some((m) => {
+        const vars = m.state.variables as ThreadFieldSave<unknown> | undefined;
+        return Boolean(vars?.extraUpdates && 'reasoning_effort' in vars.extraUpdates);
+      })
+  ), [field, queryClient]);
+
   const { mutateAsync } = useMutation({
     mutationKey: threadFieldMutationKey(threadId ?? '', field),
     scope: { id: scopeId },
@@ -193,13 +205,12 @@ export function useThreadFieldSave<F extends ThreadField>({
       // stands in only when the chain began in another mount.
       const confirmed = confirmedRef.current;
       const restored = confirmed.has(save.threadId) ? confirmed.get(save.threadId) : context?.previous;
-      // DALTON-HOOK(antigravity-series): respect serialized peer llm_model/reasoning_effort mutations and use latest confirmedEffort on rollback
+      // DALTON-HOOK(antigravity-series): respect serialized peer llm_model/reasoning_effort mutations and use latest confirmedEffort on rollback (only skip effort rollback when a queued model PATCH itself mutates reasoning_effort)
       const effortMap = isDaltonBuild && isModelOrEffortField ? getConfirmedEffortMap(queryClient) : null;
-      const modelOut = isDaltonBuild && field === 'reasoning_effort'
-        && queryClient.isMutating({ mutationKey: threadFieldMutationKey(save.threadId, 'llm_model') }) > 0;
+      const modelMutatesEffort = hasPendingModelEffortUpdate(save.threadId);
       const effortOut = isDaltonBuild && field === 'llm_model'
         && queryClient.isMutating({ mutationKey: threadFieldMutationKey(save.threadId, 'reasoning_effort') }) > 0;
-      if (restored && !modelOut) {
+      if (restored && !modelMutatesEffort) {
         const currentRow = queryClient.getQueryData<Thread>(queryKeys.threads.detail(save.threadId));
         const restoredValue = field === 'reasoning_effort' && effortMap?.has(save.threadId)
           ? (effortMap.get(save.threadId) as Thread[F])
@@ -230,6 +241,7 @@ export function useThreadFieldSave<F extends ThreadField>({
       confirmedRef.current.delete(id);
       const modelOut = isDaltonBuild && field === 'reasoning_effort'
         && queryClient.isMutating({ mutationKey: threadFieldMutationKey(id, 'llm_model') }) > 0;
+      const modelMutatesEffort = hasPendingModelEffortUpdate(id);
       const effortOut = isDaltonBuild && field === 'llm_model'
         && queryClient.isMutating({ mutationKey: threadFieldMutationKey(id, 'reasoning_effort') }) > 0;
       if (isDaltonBuild && isModelOrEffortField && !modelOut && !effortOut) {
@@ -241,8 +253,8 @@ export function useThreadFieldSave<F extends ThreadField>({
       // change made elsewhere or by a turn ending. Read before the write
       // below, which clears it.
       const marked = queryClient.getQueryState(key)?.isInvalidated ?? false;
-      // DALTON-HOOK(antigravity-series): preserve confirmed extraUpdates and prior confirmed extra fields (cleaning up earlier failed optimistic writes), without clobbering a queued peer mutation
-      if (!error && !modelOut) {
+      // DALTON-HOOK(antigravity-series): preserve confirmed extraUpdates and prior confirmed extra fields (cleaning up earlier failed optimistic writes), without clobbering a queued peer mutation that mutates reasoning_effort
+      if (!error && !modelMutatesEffort) {
         const extraKeys = new Set<string>([
           ...(extraUpdates ? Object.keys(extraUpdates) : []),
           ...(isDaltonBuild && settledConfirmed?.extra ? Object.keys(settledConfirmed.extra) : []),

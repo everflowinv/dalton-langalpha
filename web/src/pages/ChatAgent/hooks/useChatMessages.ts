@@ -3596,9 +3596,21 @@ export function useChatMessages(
     const processStreamFrame = createStreamEventProcessor(runtime, streamRouterDeps, assistantMessageId, refs, getTaskIdFromEvent, wasInterruptedRef);
     // Once the stream is open, a refusal arrives as a frame.
     let refusalFrame: SSEEvent | null = null;
+    // DALTON-HOOK(antigravity-series): helper callbacks to confirm or revert activeTurnModel admission across HITL resume outcomes (stale_fork refusal, disconnect, completion, 409 adoptDuplicateRun)
+    const confirmResumeTurnModel = () => {
+      if (!isDaltonBuild) return;
+      setActiveTurnModel((prev) => (prev && !prev.admitted ? { ...prev, admitted: true } : prev));
+    };
+    const unadmitResumeTurnModel = () => {
+      if (!isDaltonBuild) return;
+      setActiveTurnModel((prev) => (prev && prev.admitted ? { ...prev, admitted: false } : prev));
+    };
     const processEvent = (event: SSEEvent) => {
       // DALTON-HOOK(cos-settings-tools): capture scope_changed refusal frames as well as stale_fork
-      if (isStaleForkRefusal(event) || readScopeChangedMessage(event) !== null) refusalFrame = event;
+      if (isStaleForkRefusal(event) || readScopeChangedMessage(event) !== null) {
+        refusalFrame = event;
+        unadmitResumeTurnModel();
+      }
       processStreamFrame(event);
     };
 
@@ -3635,9 +3647,7 @@ export function useChatMessages(
           // rather than left to the `finally` because this is the first moment
           // "Resumed" is true, and the wait is visible on the card.
           admitted = true;
-          if (isDaltonBuild) {
-            setActiveTurnModel((prev) => (prev && !prev.admitted ? { ...prev, admitted: true } : prev));
-          }
+          if (!refusalFrame) confirmResumeTurnModel();
           settleResume(true);
         },
         signal: abortController.signal,
@@ -3677,6 +3687,7 @@ export function useChatMessages(
         wasDisconnected = true;
         // A dropped link, not a refusal: the run is live and reconnect owns it.
         admitted = true;
+        confirmResumeTurnModel();
         attemptReconnectAfterDisconnect(assistantMessageId);
         return;
       }
@@ -3690,6 +3701,7 @@ export function useChatMessages(
         markTranscriptPersisted();
       }
       admitted = true;
+      confirmResumeTurnModel();
     } catch (err: unknown) {
       if ((err as Error)?.name === 'AbortError' || wasStoppedRef.current) {
         return;
@@ -3700,6 +3712,7 @@ export function useChatMessages(
         wasDisconnected = true;
         // Accepted, just not by this attempt — the pause is genuinely answered.
         admitted = true;
+        confirmResumeTurnModel();
         return;
       }
       if (recoverStaleAnswer(err)) return;

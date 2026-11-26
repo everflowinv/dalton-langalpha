@@ -84,4 +84,30 @@ describe('postSSEStream: a duplicate refused in the stream', () => {
     await expect(postSSEStream('/api/v1/threads/thread-1/messages', {}, { onEvent })).resolves.toMatchObject({ aborted: false });
     expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({ event: 'error', error: 'boom' }));
   });
+
+  // DALTON-HOOK(antigravity-series): R2 — a stream-level stale_fork refusal frame must not trigger onRunIdResolved
+  it('does not invoke onRunIdResolved when the first SSE frame is a stale_fork refusal', async () => {
+    const staleFork = {
+      event: 'error',
+      data: {
+        thread_id: 'thread-1',
+        error: 'the branch moved',
+        type: 'workflow_error',
+        error_type: 'admission_conflict',
+        code: 'stale_fork',
+      },
+    };
+    const resp = sse([staleFork]);
+    (resp as unknown as { headers: { get: (k: string) => string | null } }).headers = {
+      get: (k: string) => (k.toLowerCase() === 'content-location' ? '/api/v1/threads/thread-1/stream?run_id=run-refused' : null),
+    };
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue(resp);
+    const { postSSEStream } = await import('../transport');
+    const onEvent = vi.fn();
+    const onRunIdResolved = vi.fn();
+
+    await expect(postSSEStream('/api/v1/threads/thread-1/messages', {}, { onEvent, onRunIdResolved })).resolves.toMatchObject({ aborted: false });
+    expect(onRunIdResolved).not.toHaveBeenCalled();
+    expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({ event: 'error', code: 'stale_fork' }));
+  });
 });

@@ -1837,5 +1837,42 @@ describe('MarketChatPanel', () => {
       expect(ci.props!.model).toBe('gpt-5');
       expect(ci.props!.tuning).toEqual(expect.objectContaining({ reasoningEffort: 'high' }));
     });
+
+    // DALTON-HOOK(antigravity-series): Q2a — widget prompt turns carry composer model options and modelPickSeq like normal sends
+    it('forwards composer model options and modelPickSeq when sending a widget prompt', async () => {
+      agSeriesMock.enabled = true;
+      agSeriesMock.isDaltonBuild = true;
+      agSeriesMock.useCustomPermissions = true;
+      agSeriesMock.featuresData = [{ key: 'shared_workspaces', enabled: false }];
+
+      api.getThread.mockResolvedValue({
+        thread_id: 'thread-xyz',
+        llm_model: 'gemini-4-neon-medium-oauth',
+        reasoning_effort: null,
+        fast_mode: null,
+      });
+      api.updateThread.mockResolvedValueOnce({
+        thread_id: 'thread-xyz',
+        llm_model: 'gemini-4-neon-high-oauth',
+        reasoning_effort: null,
+        fast_mode: null,
+      });
+
+      renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
+      await vi.waitFor(() => expect(ci.props!.model).toBe('gemini-4-neon-medium-oauth'));
+
+      await act(async () => {
+        await (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-high-oauth');
+      });
+
+      act(() => {
+        (ml.actions!.onWidgetSendPrompt as (text: string) => void)('from a widget');
+      });
+
+      expect(h.handleSendMessage).toHaveBeenCalledTimes(1);
+      const sendOpts = h.handleSendMessage.mock.calls[0][3] as Record<string, unknown>;
+      expect(sendOpts.model).toBe('gemini-4-neon-high-oauth');
+      expect(typeof sendOpts.modelPickSeq).toBe('number');
+    });
   });
 });

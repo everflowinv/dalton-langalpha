@@ -892,17 +892,22 @@ function ChatInput({
 
   // The menu names null for the level Settings gives, which returns the
   // thread to following Settings rather than pinning today's value.
+  // DALTON-HOOK(automation-effort): switching effort while a draft is already composed belongs to the draft, not a retry
+  const hasDraftContent = Boolean(
+    message.trim() || attachedFiles.length > 0 || chartImage || chips.length > 0 || widgetSnapshots.length > 0 || hasExternalContext,
+  );
   // DALTON-HOOK(antigravity-series): for Antigravity series, switching effort picks the series variant key
   const handleReasoningEffortChange = useCallback((effort: string | null) => {
+    const eligibleForRetry = !isLoading && retryTargetId !== null && !hasDraftContent;
     if (pillSeriesMatch) {
       if (!effort) return;
       const targetKey = pillSelectableSeries?.variants[effort] ?? pillSeriesMatch.series.variants[effort];
       if (!targetKey) return;
-      // DALTON-HOOK(automation-effort): bind Antigravity series-effort variant switch to the active retry target
+      // DALTON-HOOK(automation-effort): bind Antigravity series-effort variant switch to the active retry target only when no draft is being composed
       seriesEffortModelRef.current = {
         model: targetKey,
         targetId: retryTargetId ?? null,
-        activeForRetry: !isLoading && retryTargetId !== null,
+        activeForRetry: eligibleForRetry,
       };
       explicitRetryEffortRef.current = undefined;
       if (targetKey === pillModel) return;
@@ -913,8 +918,8 @@ function ChatInput({
       }
       return;
     }
-    // DALTON-HOOK(automation-effort): mark explicit effort pick only for the current active retry target
-    if (!isLoading && retryTargetId !== null) {
+    // DALTON-HOOK(automation-effort): mark explicit effort pick only for the current active retry target when no draft is being composed
+    if (eligibleForRetry) {
       explicitRetryEffortRef.current = {
         targetId: retryTargetId ?? null,
         effort: effort ?? settingsTuning.reasoning_effort ?? null,
@@ -928,7 +933,7 @@ function ChatInput({
   }, [
     pillSeriesMatch, pillSelectableSeries, pillModel, hostModel, setOwnModel, onPickModel,
     tuning.reasoningEffort, hostTuning, onPickReasoningEffort, settingsTuning.reasoning_effort,
-    isLoading, retryTargetId,
+    isLoading, retryTargetId, hasDraftContent,
   ]);
 
   // Speed has no Default of its own in the menu, so the side Settings is on
@@ -1092,9 +1097,11 @@ function ChatInput({
       // staged attachments / mentions / widget context behind for the next turn.
       // DALTON-HOOK(composer-drafts): clear stored composer draft on successful send
       clearCurrentDraft();
-      // DALTON-HOOK(automation-effort): standalone action commands also clear any pending retry effort pick
+      // DALTON-HOOK(automation-effort): standalone action commands invalidate retry eligibility without erasing the series-effort guard over sentModel
       explicitRetryEffortRef.current = undefined;
-      seriesEffortModelRef.current = undefined;
+      if (seriesEffortModelRef.current) {
+        seriesEffortModelRef.current = { ...seriesEffortModelRef.current, activeForRetry: false };
+      }
       resetSlash();
       // DALTON-HOOK(chat-large-upload): cancel any unsent server/staged uploads on standalone action commands
       discardFiles();

@@ -769,8 +769,18 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const stableThumbUp = useStableHandler(handleThumbUp);
   const stableThumbDown = useStableHandler(handleThumbDown);
   const stableThumbDownFollowUp = useStableHandler(handleThumbDownFollowUp);
+  // DALTON-HOOK(antigravity-series): forward composer model options and modelPickSeq on widget prompts in Dalton builds so saved picks are recognized as consumed
   const stableWidgetSendPrompt = useStableHandler((text: string) => {
-    handleSendMessage(text, null, null, {});
+    const composerOpts = chatInputRef.current?.getModelOptions?.();
+    const model = composerOpts?.model ?? (isDaltonBuild ? threadModel.sendModel : undefined);
+    const modelPickSeq = isDaltonBuild && model && model === threadModel.sendModel
+      ? threadModel.sendModelSeq
+      : undefined;
+    handleSendMessage(text, null, null, {
+      ...(composerOpts ?? {}),
+      ...(model !== undefined ? { model } : {}),
+      ...(modelPickSeq != null ? { modelPickSeq } : {}),
+    });
   });
 
   const { onPublishFile, dialog: publishDialog } = usePublishFile(activeWorkspaceId);

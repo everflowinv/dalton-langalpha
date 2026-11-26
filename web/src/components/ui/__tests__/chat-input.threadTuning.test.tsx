@@ -359,6 +359,7 @@ describe('ChatInput: the thread owns its effort and fast mode', () => {
     expect(inputRef.current?.getRetryModelOptions?.().reasoningEffort).toBeNull();
 
     // 4) Explicitly pick effort right for err-run-2 without composing -> submits once, then resets
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '' } });
     fireEvent.click(screen.getByText('pick-high'));
     expect(inputRef.current?.getRetryModelOptions?.().reasoningEffort).toBe('high');
     expect(inputRef.current?.getRetryModelOptions?.().reasoningEffort).toBeNull();
@@ -405,6 +406,7 @@ describe('ChatInput: the thread owns its effort and fast mode', () => {
     expect(inputRef.current?.getRetryModelOptions?.().model).toBeNull();
 
     // DALTON-HOOK(automation-effort): 4) explicit Antigravity effort pick for active retry submits variant once, then omits it
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '' } });
     fireEvent.click(screen.getByText('pick-high'));
     expect(inputRef.current?.getRetryModelOptions?.().model).toBe('gemini-4-neon-high-oauth');
     expect(inputRef.current?.getRetryModelOptions?.().model).toBeNull();
@@ -414,5 +416,101 @@ describe('ChatInput: the thread owns its effort and fast mode', () => {
     expect(onPickModel).toHaveBeenLastCalledWith('gemini-4-carbon-medium-oauth');
     rerender(renderWithHost('err-ag-2'));
     expect(inputRef.current?.getRetryModelOptions?.().model).toBe('gemini-4-carbon-medium-oauth');
+  });
+
+  // DALTON-HOOK(automation-effort): Q3a — typing a draft first then switching effort while a retryable failure exists must not count as a retry pick
+  it('ignores effort switch made after typing a draft while a retryable failed reply exists', () => {
+    const onSend = vi.fn();
+    const onPickReasoningEffort = vi.fn();
+    const inputRef = createRef<ChatInputHandle>();
+    const { unmount } = render(tree({
+      onSend,
+      inputRef,
+      tuning: { reasoningEffort: 'low', fastMode: false },
+      onPickReasoningEffort,
+      retryTargetId: 'err-run-draft-1',
+    }));
+
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'draft typed first' } });
+    fireEvent.click(screen.getByText('pick-high'));
+    expect(inputRef.current?.getRetryModelOptions?.().reasoningEffort).toBeNull();
+    unmount();
+
+    // Same for Antigravity series-effort switch after typing a draft
+    let hostModel = 'gemini-4-neon-medium-oauth';
+    let hostSendModel: string | null = null;
+    const onPickModel = vi.fn((next: string) => {
+      hostModel = next;
+      hostSendModel = next;
+    });
+    const agRef = createRef<ChatInputHandle>();
+    const agView = render(tree({
+      onSend,
+      inputRef: agRef,
+      model: hostModel,
+      sendModel: hostSendModel,
+      onPickModel,
+      tuning: { reasoningEffort: null, fastMode: false },
+      retryTargetId: 'err-ag-draft-1',
+    }));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'draft typed first' } });
+    fireEvent.click(screen.getByText('pick-high'));
+    agView.rerender(tree({
+      onSend,
+      inputRef: agRef,
+      model: hostModel,
+      sendModel: hostSendModel,
+      onPickModel,
+      tuning: { reasoningEffort: null, fastMode: false },
+      retryTargetId: 'err-ag-draft-1',
+    }));
+    expect(agRef.current?.getRetryModelOptions?.().model).toBeNull();
+  });
+
+  // DALTON-HOOK(automation-effort): Q3b — running /compact must keep suppressing an unsent Antigravity effort variant on retry
+  it('omits unsent Antigravity effort variant on retry even after running /compact', () => {
+    const onSend = vi.fn();
+    const onAction = vi.fn();
+    const inputRef = createRef<ChatInputHandle>();
+    let hostModel = 'gemini-4-neon-medium-oauth';
+    let hostSendModel: string | null = null;
+    const onPickModel = vi.fn((next: string) => {
+      hostModel = next;
+      hostSendModel = next;
+    });
+
+    const renderWithAction = (retryTargetId: string | null) => {
+      queryClient.setQueryData(queryKeys.user.preferences(), mocks.preferences);
+      return (
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <ChatInput
+              ref={inputRef}
+              onSend={onSend}
+              onAction={onAction}
+              model={hostModel}
+              sendModel={hostSendModel}
+              onPickModel={onPickModel}
+              tuning={{ reasoningEffort: null, fastMode: false }}
+              retryTargetId={retryTargetId}
+            />
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+    };
+
+    const { rerender } = render(renderWithAction('err-ag-compact'));
+    fireEvent.click(screen.getByText('pick-high'));
+    rerender(renderWithAction('err-ag-compact'));
+    expect(inputRef.current?.getModelOptions().model).toBe('gemini-4-neon-high-oauth');
+
+    // Run standalone /compact action command — does not clear host sentModel.
+    inputRef.current?.setValue('/compact', [{ type: 'action', name: 'compact', description: 'Compact' }]);
+    rerender(renderWithAction('err-ag-compact'));
+    expect(inputRef.current?.send()).toBe(true);
+    expect(onAction).toHaveBeenCalledWith(expect.objectContaining({ name: 'compact' }));
+
+    // Retry must NOT submit the earlier Antigravity effort variant as llm_model.
+    expect(inputRef.current?.getRetryModelOptions?.().model).toBeNull();
   });
 });
