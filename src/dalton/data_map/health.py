@@ -549,11 +549,15 @@ async def default_call_research_host_connector(
         list_body = list_resp.json()
         if isinstance(list_body, Mapping) and list_body.get("error"):
             raise RuntimeError(sanitize_health_text(list_body.get("error")))
-        listed_tools = (list_body.get("result") or {}).get("tools") if isinstance(list_body, Mapping) else None
-        if isinstance(listed_tools, list):
-            tool_names = {str(t.get("name") or "") for t in listed_tools if isinstance(t, Mapping)}
-            if tool_name not in tool_names:
-                raise RuntimeError(f"Tool '{tool_name}' not advertised by research-host connector {route_id}")
+        list_result = list_body.get("result") if isinstance(list_body, Mapping) else None
+        listed_tools = list_result.get("tools") if isinstance(list_result, Mapping) else None
+        if not isinstance(listed_tools, list):
+            raise RuntimeError(
+                f"Research-host connector {route_id} tools/list response missing 'tools' list"
+            )
+        tool_names = {str(t.get("name") or "") for t in listed_tools if isinstance(t, Mapping)}
+        if tool_name not in tool_names:
+            raise RuntimeError(f"Tool '{tool_name}' not advertised by research-host connector {route_id}")
         resp = await client.post(url, json=rpc_body, headers=headers)
     resp.raise_for_status()
     body = resp.json()

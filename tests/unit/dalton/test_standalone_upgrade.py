@@ -2314,6 +2314,12 @@ def _build_r11_backup_fixture(
     probe_attempts_file = state_dir / "probe_attempts.txt"
     drain_stdout_holder_flag = state_dir / "drain_stdout_holder.flag"
     drain_stdout_holder_pid_file = state_dir / "drain_stdout_holder.pid"
+    drain_detached_child_flag = state_dir / "drain_detached_child.flag"
+    drain_detached_child_pid_file = state_dir / "drain_detached_child.pid"
+    pause_fail_exit_code_file = state_dir / "pause_fail_exit_code.txt"
+    probe_hang_first_only_flag = state_dir / "probe_hang_first_only.flag"
+    probe_hang_entered_marker = state_dir / "probe_hang_entered.marker"
+    resume_bad_output_first_only_file = state_dir / "resume_bad_output_first_only.txt"
     spawn_sigterm_ignoring_child_flag = state_dir / "spawn_sigterm_child.flag"
     sigterm_ignoring_child_pid_file = state_dir / "sigterm_child.pid"
     sigterm_ignoring_child_ready_file = state_dir / "sigterm_child.ready"
@@ -2448,16 +2454,28 @@ if sub == "exec":
                 os.close(lock_fd)
 
         if "DALTON_RH_PROBE_OWNER" in joined:
+            p_cnt = 0
             lock_fd = os.open(state_path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             try:
-                p_cnt = 0
                 if os.path.exists({str(probe_attempts_file)!r}):
                     with open({str(probe_attempts_file)!r}, encoding="utf-8") as paf:
                         p_cnt = int((paf.read().strip() or "0"))
                 p_cnt += 1
                 with open({str(probe_attempts_file)!r}, "w", encoding="utf-8") as paf:
                     paf.write(str(p_cnt))
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            if p_cnt == 1 and os.path.exists({str(probe_hang_first_only_flag)!r}):
+                with open({str(probe_hang_entered_marker)!r}, "w", encoding="utf-8") as mf:
+                    mf.write(str(os.getpid()))
+                deadline = time.monotonic() + 30.0
+                while os.path.exists({str(probe_hang_first_only_flag)!r}) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            lock_fd = os.open(state_path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
                 delay_until = 0
                 if os.path.exists({str(probe_delay_until_file)!r}):
                     with open({str(probe_delay_until_file)!r}, encoding="utf-8") as pdf:
@@ -2497,6 +2515,9 @@ if sub == "exec":
             finally:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 os.close(lock_fd)
+            if os.path.exists({str(pause_fail_exit_code_file)!r}):
+                fail_rc = int((open({str(pause_fail_exit_code_file)!r}, encoding="utf-8").read().strip() or "52"))
+                sys.exit(fail_rc)
             if os.path.exists({str(hang_pause_after_apply_gate)!r}):
                 with open({str(pause_entered_marker)!r}, "w", encoding="utf-8") as mf:
                     mf.write(str(os.getpid()))
@@ -2514,6 +2535,12 @@ if sub == "exec":
             r_cnt += 1
             with open({str(resume_attempts_file)!r}, "w", encoding="utf-8") as raf:
                 raf.write(str(r_cnt))
+            if r_cnt == 1 and os.path.exists({str(resume_bad_output_first_only_file)!r}):
+                bad_out = open({str(resume_bad_output_first_only_file)!r}, encoding="utf-8").read().strip()
+                with open({str(events_log)!r}, "a", encoding="utf-8") as lf:
+                    lf.write(f"resume_bad_output:{{owner}}:{{bad_out}}\\n")
+                sys.stdout.write(bad_out + "\\n")
+                sys.exit(0)
             should_hang_resume = os.path.exists({str(hang_resume_gate)!r}) and (
                 (not os.path.exists({str(hang_resume_first_only_flag)!r})) or r_cnt == 1
             )
@@ -2549,6 +2576,28 @@ if sub == "exec":
                 os.close(lock_fd)
 
         # GET /admin/wiki/pause-writes drain poll with lease validation
+        if os.path.exists({str(drain_detached_child_flag)!r}):
+            # Group leader spawns a descendant in the SAME process group that CLOSES stdout (DEVNULL)
+            # and keeps running, then leader writes "0" and exits 0 immediately!
+            detached = subprocess.Popen(
+                [
+                    {py_exe!r},
+                    "-c",
+                    "import os, sys, time; "
+                    "open(sys.argv[1], 'w', encoding='utf-8').write(str(os.getpid())); "
+                    "time.sleep(30)",
+                    {str(drain_detached_child_pid_file)!r},
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            ready_deadline = time.monotonic() + 5.0
+            while not os.path.exists({str(drain_detached_child_pid_file)!r}) and time.monotonic() < ready_deadline:
+                time.sleep(0.01)
+            sys.stdout.write("0\\n")
+            sys.stdout.flush()
+            os._exit(0)
         if os.path.exists({str(drain_stdout_holder_flag)!r}):
             # Group leader spawns a descendant that inherits stdout and blocks, then leader exits 0 immediately!
             holder = subprocess.Popen(
@@ -2710,6 +2759,12 @@ sys.exit(0)
         "probe_attempts_file": probe_attempts_file,
         "drain_stdout_holder_flag": drain_stdout_holder_flag,
         "drain_stdout_holder_pid_file": drain_stdout_holder_pid_file,
+        "drain_detached_child_flag": drain_detached_child_flag,
+        "drain_detached_child_pid_file": drain_detached_child_pid_file,
+        "pause_fail_exit_code_file": pause_fail_exit_code_file,
+        "probe_hang_first_only_flag": probe_hang_first_only_flag,
+        "probe_hang_entered_marker": probe_hang_entered_marker,
+        "resume_bad_output_first_only_file": resume_bad_output_first_only_file,
         "spawn_sigterm_ignoring_child_flag": spawn_sigterm_ignoring_child_flag,
         "sigterm_ignoring_child_pid_file": sigterm_ignoring_child_pid_file,
         "sigterm_ignoring_child_ready_file": sigterm_ignoring_child_ready_file,
@@ -3724,5 +3779,280 @@ def test_r13_pause_recovery_retries_until_confirmed_and_resume_retries_in_exit_t
     finally:
         if fx_r["hang_resume_gate"].exists():
             fx_r["hang_resume_gate"].unlink()
+
+
+def _extract_run_with_timeout_pg_fn(backup_script: Path) -> str:
+    """Extract the `run_with_timeout_pg() { ... }` function definition from backup.sh."""
+    lines = backup_script.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("run_with_timeout_pg()"))
+    end = next(i for i in range(start + 1, len(lines)) if lines[i] == "}")
+    return "\n".join(lines[start : end + 1]) + "\n"
+
+
+def test_backup_timeout_pg_waits_for_pgrp_child_after_stdout_close_and_bounds_continuous_stdout(
+    tmp_path: Path,
+) -> None:
+    """Backup edge case 1:
+    1. When group leader writes stdout and exits 0 while a same-pgrp child closed stdout and keeps running,
+       run_with_timeout_pg must NOT return success; it must time out (124) and kill the lingering child.
+    2. When a command streams stdout continuously without blocking, inner read loop still enforces the deadline.
+    """
+    import signal
+    import sys
+    import time
+
+    backup_script = _REPO_ROOT / "scripts" / "standalone" / "backup.sh"
+    fn_src = _extract_run_with_timeout_pg_fn(backup_script)
+
+    # 1a. Direct run_with_timeout_pg: child closes stdout (DEVNULL) and keeps running after leader exits 0
+    child_pid_file = tmp_path / "detached_child.pid"
+    leader_code = (
+        "import os, subprocess, sys, time; "
+        f"c = subprocess.Popen([{sys.executable!r}, '-c', "
+        "\"import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(30)\", "
+        f"{str(child_pid_file)!r}], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        "dl = time.monotonic() + 5.0\n"
+        f"while not os.path.exists({str(child_pid_file)!r}) and time.monotonic() < dl: time.sleep(0.01)\n"
+        "sys.stdout.write('OK\\n'); sys.stdout.flush(); os._exit(0)\n"
+    )
+    t0 = time.monotonic()
+    try:
+        res_det = subprocess.run(
+            ["bash", "-c", f"{fn_src}\nrun_with_timeout_pg 0.35 \"$@\"", "_", sys.executable, "-c", leader_code],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        elapsed_det = time.monotonic() - t0
+        assert res_det.returncode == 124, (
+            f"Expected timeout (124) while same-pgrp child is still running after stdout EOF, "
+            f"got rc={res_det.returncode}, stdout={res_det.stdout!r}, stderr={res_det.stderr!r}"
+        )
+        assert elapsed_det < 4.0, f"Detached child timeout took too long: {elapsed_det:.2f}s"
+        assert child_pid_file.is_file(), "Detached child never started"
+        detached_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
+        _assert_pid_dead(detached_pid, label="same-pgrp child that closed stdout")
+    finally:
+        if child_pid_file.exists():
+            try:
+                os.kill(int(child_pid_file.read_text(encoding="utf-8").strip()), signal.SIGKILL)
+            except OSError:
+                pass
+
+    # 1b. End-to-end backup.sh drain poll: same-pgrp child closed stdout & kept running after leader printed "0"
+    fx = _build_r11_backup_fixture(tmp_path / "b3_detached", project_name="dalton_b3_det")
+    fx["clock_file"].write_text("10000.0", encoding="utf-8")
+    fx["drain_detached_child_flag"].write_text("1", encoding="utf-8")
+    lock_det = tmp_path / "b3_detached" / "det.flock"
+    out_det = tmp_path / "b3_detached" / "out"
+    try:
+        res_bk = subprocess.run(
+            [
+                "bash",
+                str(fx["backup_script"]),
+                "--work-dir",
+                str(fx["work_dir"]),
+                "--output-dir",
+                str(out_det),
+            ],
+            env={
+                **fx["env"],
+                "DALTON_WIKI_BACKUP_LOCK_FILE": str(lock_det),
+                "DALTON_WIKI_PAUSE_TTL_S": "300",
+                "DALTON_WIKI_PAUSE_HEARTBEAT_S": "60",
+                "DALTON_WIKI_EXEC_TIMEOUT_S": "0.25",
+                "DALTON_WIKI_DRAIN_TIMEOUT_S": "0.45",
+                "DALTON_WIKI_DRAIN_POLL_S": "0.05",
+            },
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        assert res_bk.returncode != 0, "backup.sh must not treat timed-out drain poll with live child as drained"
+        assert fx["drain_detached_child_pid_file"].is_file()
+        bk_child_pid = int(fx["drain_detached_child_pid_file"].read_text(encoding="utf-8").strip())
+        _assert_pid_dead(bk_child_pid, label="backup drain detached child")
+        _assert_flock_reacquirable(lock_det, label="after backup drain detached child timeout")
+    finally:
+        if fx["drain_detached_child_pid_file"].exists():
+            try:
+                os.kill(int(fx["drain_detached_child_pid_file"].read_text(encoding="utf-8").strip()), signal.SIGKILL)
+            except OSError:
+                pass
+
+    # 1c. Continuous stdout flood never stalls inner read loop past the deadline
+    flood_pid_file = tmp_path / "flood.pid"
+    flood_code = (
+        "import os, sys\n"
+        f"open({str(flood_pid_file)!r}, 'w').write(str(os.getpid()))\n"
+        "buf = b'x' * 65536\n"
+        "while True:\n"
+        "    try:\n"
+        "        os.write(1, buf)\n"
+        "    except BrokenPipeError:\n"
+        "        break\n"
+    )
+    t1 = time.monotonic()
+    try:
+        res_flood = subprocess.run(
+            ["bash", "-c", f"{fn_src}\nrun_with_timeout_pg 0.30 \"$@\"", "_", sys.executable, "-c", flood_code],
+            capture_output=True,
+            text=False,
+            timeout=8,
+            check=False,
+        )
+        elapsed_flood = time.monotonic() - t1
+        assert res_flood.returncode == 124, f"Expected timeout (124) on continuous stdout flood, got {res_flood.returncode}"
+        assert elapsed_flood < 3.0, f"Continuous stdout flood bypassed deadline: {elapsed_flood:.2f}s"
+        assert flood_pid_file.is_file()
+        _assert_pid_dead(int(flood_pid_file.read_text(encoding="utf-8").strip()), label="continuous stdout flood process")
+    finally:
+        if flood_pid_file.exists():
+            try:
+                os.kill(int(flood_pid_file.read_text(encoding="utf-8").strip()), signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def test_backup_pause_recovery_non124_retry_headroom_and_resume_allowlist(
+    tmp_path: Path,
+) -> None:
+    """Backup edge case 2:
+    1. Non-124 ambiguous pause failure (e.g. curl disconnect exit 52) keeps polling until confirmed or deadline
+       instead of stopping on the first NONE.
+    2. Single GET probe step timeout leaves retry headroom inside DALTON_WIKI_PAUSE_RECOVERY_TIMEOUT_S even when
+       DALTON_WIKI_EXEC_TIMEOUT_S >= DALTON_WIKI_PAUSE_RECOVERY_TIMEOUT_S.
+    3. resume_wiki_writes only clears WIKI_WRITES_PAUSED when output is strictly 'OK' or 'EXPIRED'; unexpected
+       non-empty output keeps WIKI_WRITES_PAUSED=1 so EXIT trap retries resuming.
+    """
+    import json
+    import time
+
+    # 2a. Non-124 ambiguous pause error (exit 52): probe #1 returns NONE, probe #2 sees active lease -> resumed!
+    fx_n = _build_r11_backup_fixture(tmp_path / "b3_non124", project_name="dalton_b3_n124")
+    fx_n["clock_file"].write_text("11000.0", encoding="utf-8")
+    fx_n["pause_fail_exit_code_file"].write_text("52", encoding="utf-8")
+    fx_n["probe_delay_until_file"].write_text("1", encoding="utf-8")
+    lock_n = tmp_path / "b3_non124" / "n124.flock"
+    out_n = tmp_path / "b3_non124" / "out"
+
+    res_n = subprocess.run(
+        [
+            "bash",
+            str(fx_n["backup_script"]),
+            "--work-dir",
+            str(fx_n["work_dir"]),
+            "--output-dir",
+            str(out_n),
+        ],
+        env={
+            **fx_n["env"],
+            "DALTON_WIKI_BACKUP_LOCK_FILE": str(lock_n),
+            "DALTON_WIKI_PAUSE_TTL_S": "300",
+            "DALTON_WIKI_EXEC_TIMEOUT_S": "0.5",
+            "DALTON_WIKI_PAUSE_RECOVERY_TIMEOUT_S": "1.8",
+            "DALTON_WIKI_PAUSE_RECOVERY_POLL_S": "0.05",
+            "DALTON_WIKI_RESUME_TIMEOUT_S": "2.0",
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert res_n.returncode != 0
+    n_events = fx_n["events_log"].read_text(encoding="utf-8").splitlines()
+    n_probes = [ev for ev in n_events if ev.startswith("probe_pause:")]
+    assert len(n_probes) >= 2, f"Non-124 ambiguous pause stopped on first NONE instead of polling: {n_events}"
+    assert any(ev.startswith("resume:") for ev in n_events), f"Expected resume after probe #2 confirmed lease: {n_events}"
+    st_n = json.loads(fx_n["lease_state"].read_text(encoding="utf-8"))
+    assert st_n["paused"] is False, f"Wiki writes left paused after non-124 ambiguous pause error: {st_n}"
+    _assert_flock_reacquirable(lock_n, label="after non-124 pause recovery")
+
+    # 2b. Single GET probe #1 hangs while EXEC_TIMEOUT_S > RECOVERY_TIMEOUT_S -> must leave retry headroom for probe #2!
+    fx_h = _build_r11_backup_fixture(tmp_path / "b3_headroom", project_name="dalton_b3_hr")
+    fx_h["clock_file"].write_text("12000.0", encoding="utf-8")
+    fx_h["pause_fail_exit_code_file"].write_text("52", encoding="utf-8")
+    fx_h["probe_hang_first_only_flag"].write_text("1", encoding="utf-8")
+    lock_h = tmp_path / "b3_headroom" / "hr.flock"
+    out_h = tmp_path / "b3_headroom" / "out"
+
+    t0 = time.monotonic()
+    try:
+        res_h = subprocess.run(
+            [
+                "bash",
+                str(fx_h["backup_script"]),
+                "--work-dir",
+                str(fx_h["work_dir"]),
+                "--output-dir",
+                str(out_h),
+            ],
+            env={
+                **fx_h["env"],
+                "DALTON_WIKI_BACKUP_LOCK_FILE": str(lock_h),
+                "DALTON_WIKI_PAUSE_TTL_S": "300",
+                "DALTON_WIKI_EXEC_TIMEOUT_S": "5.0",
+                "DALTON_WIKI_PAUSE_RECOVERY_TIMEOUT_S": "1.2",
+                "DALTON_WIKI_PAUSE_RECOVERY_POLL_S": "0.05",
+                "DALTON_WIKI_RESUME_TIMEOUT_S": "2.0",
+            },
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        elapsed_h = time.monotonic() - t0
+        assert res_h.returncode != 0
+        assert elapsed_h < 6.0, f"Probe headroom test took too long: {elapsed_h:.2f}s"
+        assert fx_h["probe_hang_entered_marker"].is_file()
+        _assert_pid_dead(int(fx_h["probe_hang_entered_marker"].read_text(encoding="utf-8").strip()), label="hung probe #1")
+        h_events = fx_h["events_log"].read_text(encoding="utf-8").splitlines()
+        assert any(ev.startswith("resume:") for ev in h_events), (
+            f"Single hung GET consumed entire recovery budget without retry headroom: {h_events}"
+        )
+        st_h = json.loads(fx_h["lease_state"].read_text(encoding="utf-8"))
+        assert st_h["paused"] is False, f"Wiki writes left paused when probe #1 hung: {st_h}"
+        _assert_flock_reacquirable(lock_h, label="after probe headroom recovery")
+    finally:
+        if fx_h["probe_hang_first_only_flag"].exists():
+            fx_h["probe_hang_first_only_flag"].unlink()
+
+    # 2c. Resume response with unexpected non-allowlisted stdout ("UNEXPECTED_BANNER") does NOT clear WIKI_WRITES_PAUSED;
+    #     EXIT trap retries resume_wiki_writes (#2 returns OK and unpauses)!
+    fx_a = _build_r11_backup_fixture(tmp_path / "b3_allowlist", project_name="dalton_b3_al")
+    fx_a["clock_file"].write_text("13000.0", encoding="utf-8")
+    fx_a["resume_bad_output_first_only_file"].write_text("UNEXPECTED_BANNER", encoding="utf-8")
+    lock_a = tmp_path / "b3_allowlist" / "al.flock"
+    out_a = tmp_path / "b3_allowlist" / "out"
+
+    res_a = subprocess.run(
+        [
+            "bash",
+            str(fx_a["backup_script"]),
+            "--work-dir",
+            str(fx_a["work_dir"]),
+            "--output-dir",
+            str(out_a),
+        ],
+        env={
+            **fx_a["env"],
+            "DALTON_WIKI_BACKUP_LOCK_FILE": str(lock_a),
+            "DALTON_WIKI_PAUSE_TTL_S": "300",
+            "DALTON_WIKI_PAUSE_HEARTBEAT_S": "60",
+            "DALTON_WIKI_RESUME_TIMEOUT_S": "2.0",
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert res_a.returncode != 0, "backup.sh must fail when resume returns unexpected non-OK/EXPIRED output"
+    attempts_a = int(fx_a["resume_attempts_file"].read_text(encoding="utf-8").strip())
+    assert attempts_a == 2, f"Expected EXIT trap retry after unexpected resume output (2 attempts), got {attempts_a}"
+    st_a = json.loads(fx_a["lease_state"].read_text(encoding="utf-8"))
+    assert st_a["paused"] is False, f"EXIT trap retry did not unpause after unexpected resume output: {st_a}"
+    _assert_flock_reacquirable(lock_a, label="after resume allowlist retry")
 
 

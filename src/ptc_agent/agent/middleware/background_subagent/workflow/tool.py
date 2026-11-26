@@ -605,6 +605,16 @@ def create_run_workflow_tool(
                 )
             except CompanyRoutingRefused as error:
                 raise _Refused(str(error)) from error
+        # DALTON-HOOK(workflow-discovered-tools): in Core, pass workspace-discovered
+        # MCP servers from `.agents/tools/mcp_client_config.json` so `topic-research`
+        # gates internal-memory retrieval on discovered tools rather than deployment
+        # capability flags alone (no-op in Everflow).
+        if isinstance(params, dict):
+            from src.dalton.content_assembly import resolve_launch_discovered_mcp_servers
+
+            params = await resolve_launch_discovered_mcp_servers(
+                backend, meta.name, params
+            )
         # DALTON-HOOK(workflow-resume): refresh progress_path after params normalization.
         if isinstance(params, dict) and isinstance(params.get("progress_path"), str):
             progress_path = params["progress_path"] or None

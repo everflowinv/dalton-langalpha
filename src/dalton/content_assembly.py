@@ -23,6 +23,7 @@ validation so malformed or unclosed markers fail loudly with the file path:
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 import hashlib
 import json
@@ -478,16 +479,114 @@ def assemble_json_text(
     return text
 
 
+_DEDICATED_RESEARCH_SERVER_CAPS: dict[str, CapabilityId] = {
+    "dalton_company_wiki": CapabilityId.COMPANY_WIKI,
+    "dalton_sales_notes": CapabilityId.SALES_NOTES,
+    "dalton_tmtb": CapabilityId.TMTB,
+    "dalton_funda_ai": CapabilityId.FUNDA_AI,
+}
+
+_SERVER_REQUIRED_ANY_TOOLS: dict[str, frozenset[str]] = {
+    "dalton_company_wiki": frozenset({"search", "list", "read"}),
+    "dalton_sales_notes": frozenset({"search", "list", "read"}),
+    "dalton_tmtb": frozenset({"search", "list", "read"}),
+    "dalton_funda_ai": frozenset({"search", "list", "read"}),
+    "dalton_research_all": frozenset({"search", "list", "read", "sales_mail"}),
+    "dalton_guidepoint": frozenset({"search_library", "list_transcripts"}),
+    "researchdata": frozenset({"research"}),
+}
+
+
+def _discovered_server_usable(
+    discovered_servers: Mapping[str, Any] | Iterable[str],
+    server_name: str,
+) -> bool:
+    """Return True when `server_name` is present in `discovered_servers`, enabled, and exposes a usable tool."""
+    if isinstance(discovered_servers, Mapping):
+        if server_name not in discovered_servers:
+            return False
+        entry = discovered_servers.get(server_name)
+        if entry is False:
+            return False
+        if isinstance(entry, Mapping):
+            if entry.get("enabled") is False:
+                return False
+            tools_meta = entry.get("tools")
+            if tools_meta is not None:
+                wanted = _SERVER_REQUIRED_ANY_TOOLS.get(server_name, frozenset())
+                if isinstance(tools_meta, Mapping):
+                    names = {str(k) for k in tools_meta.keys()}
+                elif isinstance(tools_meta, list):
+                    names = {
+                        str(item if isinstance(item, str) else item.get("name") or "")
+                        for item in tools_meta
+                        if isinstance(item, (str, Mapping))
+                    }
+                else:
+                    return False
+                if not names:
+                    return False
+                if wanted and not (names & wanted):
+                    return False
+        return True
+    return server_name in set(discovered_servers)
+
+
+def filter_capabilities_by_discovered_servers(
+    active_caps: frozenset[CapabilityId],
+    discovered_servers: Mapping[str, Any] | Iterable[str],
+) -> tuple[frozenset[CapabilityId], bool, bool]:
+    """Narrow research/bridge capabilities to actually discovered usable MCP servers.
+
+    Returns ``(effective_caps, has_dedicated_research, has_legacy_bridge)``.
+    """
+    filtered = set(active_caps)
+    has_all_connector = _discovered_server_usable(discovered_servers, "dalton_research_all")
+    has_legacy_bridge = (
+        CapabilityId.RESEARCHDATA_BRIDGE in active_caps
+        and _discovered_server_usable(discovered_servers, "researchdata")
+    )
+    if not has_legacy_bridge:
+        filtered.discard(CapabilityId.RESEARCHDATA_BRIDGE)
+
+    has_dedicated_research = False
+    for srv_name, cap in _DEDICATED_RESEARCH_SERVER_CAPS.items():
+        if cap not in active_caps:
+            continue
+        if _discovered_server_usable(discovered_servers, srv_name) or has_all_connector:
+            has_dedicated_research = True
+        else:
+            filtered.discard(cap)
+
+    if CapabilityId.GUIDEPOINT in active_caps:
+        gp_usable = _discovered_server_usable(discovered_servers, "dalton_guidepoint") or has_legacy_bridge
+        if not gp_usable:
+            filtered.discard(CapabilityId.GUIDEPOINT)
+
+    return frozenset(filtered), has_dedicated_research, has_legacy_bridge
+
+
 def assemble_text(
     text: str,
     *,
     path: Path | str | None = None,
     capabilities: frozenset[CapabilityId] | None = None,
+    discovered_servers: Mapping[str, Any] | Iterable[str] | None = None,
 ) -> str:
-    """Assemble *text* according to file suffix and active capabilities."""
+    """Assemble *text* according to file suffix, active capabilities, and discovered MCP servers."""
+    base_caps = effective_capabilities() if capabilities is None else capabilities
+    has_dedicated_discovered: bool | None = None
+    if discovered_servers is not None:
+        effective_caps, has_dedicated_discovered, _ = filter_capabilities_by_discovered_servers(
+            base_caps,
+            discovered_servers,
+        )
+    else:
+        effective_caps = base_caps
+
     suffix = Path(path).suffix.lower() if path is not None else ".md"
     if suffix == ".js":
-        assembled = assemble_js_text(text, path=path, capabilities=capabilities)
+        assembled = assemble_js_text(text, path=path, capabilities=effective_caps)
         # When dedicated Batch 3 connectors are active alongside the legacy bridge
         # (post-cutover Everflow), direct `topic-research/workflow.js` to the mounted
         # dedicated research connectors rather than retired legacy bridge routes, while
@@ -497,37 +596,76 @@ def assemble_text(
             from src.dalton.capabilities import is_batch3_connectors_enabled
             from src.dalton.settings import get_dalton_research_host_base_url
 
-            active_caps = effective_capabilities() if capabilities is None else capabilities
-            if (
-                CapabilityId.RESEARCHDATA_BRIDGE in active_caps
+            use_dedicated_wording = (
+                CapabilityId.RESEARCHDATA_BRIDGE in effective_caps
                 and is_batch3_connectors_enabled()
                 and bool(get_dalton_research_host_base_url())
-                and has_any_research_connector_capability(active_caps)
-            ):
+                and has_any_research_connector_capability(effective_caps)
+                and (has_dedicated_discovered is None or has_dedicated_discovered)
+            )
+            if use_dedicated_wording:
                 assembled = assembled.replace(
                     "检索 researchdata 的 sales-notes、tmtb、funda-ai、company-wiki（只读）",
                     "检索已启用的内部研究知识库连接器（只读）",
                 )
         return assembled
     if suffix == ".json":
-        return assemble_json_text(text, path=path, capabilities=capabilities)
-    return assemble_markdown_text(text, path=path, capabilities=capabilities)
+        return assemble_json_text(text, path=path, capabilities=effective_caps)
+    return assemble_markdown_text(text, path=path, capabilities=effective_caps)
+
+
+async def resolve_launch_discovered_mcp_servers(
+    backend: Any,
+    workflow_name: str,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach workspace `.agents/tools/mcp_client_config.json` servers to `topic-research` params in Core."""
+    if workflow_name != "topic-research" or not isinstance(params, dict):
+        return params
+    if "discovered_mcp_servers" in params or "mcp_servers" in params:
+        return params
+    if CapabilityId.RESEARCHDATA_BRIDGE in effective_capabilities():
+        return params
+    aread = getattr(backend, "aread_text", None)
+    if not callable(aread):
+        return params
+    try:
+        raw = await aread(".agents/tools/mcp_client_config.json")
+    except Exception:
+        return params
+    if not isinstance(raw, str) or not raw.strip():
+        return params
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return params
+    servers = parsed.get("servers") if isinstance(parsed, dict) else None
+    if not isinstance(servers, dict):
+        return params
+    return {**params, "discovered_mcp_servers": servers}
 
 
 def read_assembled_text(
     path: Path,
     *,
     capabilities: frozenset[CapabilityId] | None = None,
+    discovered_servers: Mapping[str, Any] | Iterable[str] | None = None,
 ) -> str:
     """Read UTF-8 file *path* and assemble conditional capability fragments."""
     raw = path.read_text(encoding="utf-8")
-    return assemble_text(raw, path=path, capabilities=capabilities)
+    return assemble_text(
+        raw,
+        path=path,
+        capabilities=capabilities,
+        discovered_servers=discovered_servers,
+    )
 
 
 def assemble_file_bytes(
     path: Path,
     *,
     capabilities: frozenset[CapabilityId] | None = None,
+    discovered_servers: Mapping[str, Any] | Iterable[str] | None = None,
 ) -> bytes:
     """Return capability-assembled bytes for *path* (raw bytes for non-text files)."""
     if path.suffix.lower() not in _ASSEMBLED_TEXT_EXTENSIONS:
@@ -536,7 +674,12 @@ def assemble_file_bytes(
         raw = path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         return path.read_bytes()
-    assembled = assemble_text(raw, path=path, capabilities=capabilities)
+    assembled = assemble_text(
+        raw,
+        path=path,
+        capabilities=capabilities,
+        discovered_servers=discovered_servers,
+    )
     return assembled.encode("utf-8")
 
 

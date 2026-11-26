@@ -479,6 +479,15 @@ if not cmd:
 
 active_proc = None
 
+def pgrp_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
 def terminate_pg(proc) -> None:
     if proc is None:
         return
@@ -500,14 +509,7 @@ def terminate_pg(proc) -> None:
     grace_deadline = time.monotonic() + 0.4
     while time.monotonic() < grace_deadline:
         child_done = proc.poll() is not None
-        try:
-            os.killpg(pgid, 0)
-            pg_alive = True
-        except ProcessLookupError:
-            pg_alive = False
-        except PermissionError:
-            pg_alive = True
-        if child_done and not pg_alive:
+        if child_done and not pgrp_alive(pgid):
             break
         time.sleep(0.02)
     try:
@@ -525,11 +527,7 @@ def terminate_pg(proc) -> None:
         pass
     kill_deadline = time.monotonic() + 0.5
     while time.monotonic() < kill_deadline:
-        try:
-            os.killpg(pgid, 0)
-        except ProcessLookupError:
-            break
-        except PermissionError:
+        if not pgrp_alive(pgid):
             break
         time.sleep(0.02)
 
@@ -545,6 +543,7 @@ active_proc = subprocess.Popen(
     stdout=subprocess.PIPE,
     start_new_session=True,
 )
+pgid = active_proc.pid
 assert active_proc.stdout is not None
 stdout_fd = active_proc.stdout.fileno()
 os.set_blocking(stdout_fd, False)
@@ -566,6 +565,9 @@ while True:
             continue
         if r:
             while True:
+                if time.monotonic() >= deadline:
+                    terminate_pg(active_proc)
+                    sys.exit(124)
                 try:
                     data = os.read(stdout_fd, 65536)
                 except BlockingIOError:
@@ -579,12 +581,15 @@ while True:
                     stdout_eof = True
                     break
                 chunks.append(data)
+                if time.monotonic() >= deadline:
+                    terminate_pg(active_proc)
+                    sys.exit(124)
     else:
-        if active_proc.poll() is not None:
+        if active_proc.poll() is not None and not pgrp_alive(pgid):
             break
         time.sleep(min(0.02, rem))
 
-    if stdout_eof and active_proc.poll() is not None:
+    if stdout_eof and active_proc.poll() is not None and not pgrp_alive(pgid):
         break
 
 try:
@@ -1089,9 +1094,9 @@ resume_wiki_writes() {
         research-host sh -c "$resume_sh_script" _ "http://127.0.0.1:${WIKI_PAUSE_PORT}" 2>/dev/null)"
     local exec_rc=$?
     set -e
-    if [[ "$exec_rc" -ne 0 || "$resume_state" == "FAIL" || -z "$resume_state" ]]; then
+    if [[ "$exec_rc" -ne 0 || ( "$resume_state" != "OK" && "$resume_state" != "EXPIRED" ) ]]; then
       # Keep WIKI_WRITES_PAUSED=1 so the EXIT cleanup trap can retry resuming once more.
-      err "CRITICAL: Failed to resume Wiki writes on research-host (owner=${WIKI_PAUSE_OWNER}, lease_id=${WIKI_PAUSE_LEASE_ID}, exit=${exec_rc}, timeout=${WIKI_RESUME_TIMEOUT_S}s); Wiki writes may remain paused (503) until resumed or lease expires (ttl=${WIKI_PAUSE_TTL_S}s)."
+      err "CRITICAL: Failed to resume Wiki writes on research-host (owner=${WIKI_PAUSE_OWNER}, lease_id=${WIKI_PAUSE_LEASE_ID}, exit=${exec_rc}, state=${resume_state:-<empty>}, timeout=${WIKI_RESUME_TIMEOUT_S}s); Wiki writes may remain paused (503) until resumed or lease expires (ttl=${WIKI_PAUSE_TTL_S}s)."
       return 1
     fi
     WIKI_WRITES_PAUSED=0
@@ -1762,13 +1767,14 @@ finally:
       # paused by this owner (then resume) or until the deadline expires.
       local_probe_sh='body="$(curl -sf --connect-timeout "${DALTON_RH_CURL_TIMEOUT_S}" --max-time "${DALTON_RH_CURL_TIMEOUT_S}" -H "Authorization: Bearer ${DALTON_RH_ADMIN_TOKEN}" "$1/admin/wiki/pause-writes")" || exit 1; printf "%s" "$body" | python3 -c "import json,os,sys; d=json.loads(sys.stdin.read()); lid=d.get(\"lease_id\") if isinstance(d, dict) else None; ok=isinstance(d, dict) and d.get(\"paused\") is True and str(d.get(\"owner\") or \"\") == os.environ[\"DALTON_RH_PROBE_OWNER\"] and isinstance(lid, int) and lid > 0; print(lid if ok else \"NONE\")"'
       probe_deadline_s="$(exec 8>&- 9>&-; python3 -c 'import sys, time; print(f"{time.monotonic() + max(0.05, float(sys.argv[1])):.6f}")' "$WIKI_PAUSE_RECOVERY_TIMEOUT_S")"
+      probe_step_cap_s="$(exec 8>&- 9>&-; python3 -c 'import sys; exec_t=float(sys.argv[1]); total_t=max(0.05, float(sys.argv[2])); print(f"{max(0.05, min(exec_t, total_t / 3.0)):.6f}")' "$WIKI_EXEC_TIMEOUT_S" "$WIKI_PAUSE_RECOVERY_TIMEOUT_S")"
       recovered_lease_id=""
       while true; do
         rem_probe_s="$(exec 8>&- 9>&-; python3 -c 'import sys, time; print(f"{max(0.0, float(sys.argv[1]) - time.monotonic()):.6f}")' "$probe_deadline_s")"
         if [[ "$rem_probe_s" == "0.000000" ]]; then
           break
         fi
-        probe_step_s="$(exec 8>&- 9>&-; python3 -c 'import sys; print(f"{max(0.05, min(float(sys.argv[1]), float(sys.argv[2]))):.6f}")' "$WIKI_EXEC_TIMEOUT_S" "$rem_probe_s")"
+        probe_step_s="$(exec 8>&- 9>&-; python3 -c 'import sys; print(f"{max(0.05, min(float(sys.argv[1]), float(sys.argv[2]))):.6f}")' "$probe_step_cap_s" "$rem_probe_s")"
         set +e
         probe_out="$(exec 8>&- 9>&-; \
           DALTON_RH_ADMIN_TOKEN="$WIKI_PAUSE_ADMIN_TOKEN" \
@@ -1782,10 +1788,6 @@ finally:
         set -e
         if [[ "$probe_rc" -eq 0 && "$probe_out" =~ ^[0-9]+$ ]]; then
           recovered_lease_id="$probe_out"
-          break
-        fi
-        # For non-timeout pause errors where a healthy GET explicitly confirms our owner is not paused, stop early.
-        if [[ "$wiki_pause_rc" -ne 124 && "$probe_rc" -eq 0 && "$probe_out" == "NONE" ]]; then
           break
         fi
         rem_probe_s="$(exec 8>&- 9>&-; python3 -c 'import sys, time; print(f"{max(0.0, float(sys.argv[1]) - time.monotonic()):.6f}")' "$probe_deadline_s")"

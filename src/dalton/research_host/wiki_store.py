@@ -1175,6 +1175,49 @@ class OpenWikiStore:
             """
         )
 
+    def _prepare_image_asset(
+        self,
+        *,
+        image_bytes: bytes,
+        suffix: str,
+    ) -> tuple[str, int | None, int | None, str, str, Path]:
+        mime, width, height = _inspect_image_header(image_bytes, suffix)
+        sha = hashlib.sha256(image_bytes).hexdigest()
+        asset_rel = f"state/research-images/assets/{sha[:2]}/{sha}{suffix}"
+        asset_abs = (self.data_root / asset_rel).resolve()
+        assets_root = (self.images_dir / "assets").resolve()
+        if not asset_abs.is_relative_to(assets_root):
+            raise ValueError("Resolved image asset path escapes state/research-images/assets")
+        return mime, width, height, sha, asset_rel, asset_abs
+
+    @staticmethod
+    def _persist_image_asset_file(asset_abs: Path, image_bytes: bytes) -> bool:
+        """Write `image_bytes` to `asset_abs` if not already present. Returns True if newly created."""
+        asset_abs.parent.mkdir(parents=True, exist_ok=True)
+        if asset_abs.exists():
+            return False
+        tmp_asset = asset_abs.with_name(f".{asset_abs.name}.{os.getpid()}.tmp")
+        try:
+            with tmp_asset.open("wb") as fh:
+                fh.write(image_bytes)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_asset, asset_abs)
+            return True
+        except BaseException:
+            if tmp_asset.exists():
+                try:
+                    tmp_asset.unlink()
+                except OSError:
+                    pass
+            raise
+
+    def ensure_images_schema(self) -> None:
+        self.images_dir.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.images_db, timeout=20) as img_conn:
+            self._ensure_images_schema(img_conn)
+            img_conn.commit()
+
     def register_image_asset(
         self,
         *,
@@ -1186,41 +1229,37 @@ class OpenWikiStore:
         doc_date: str,
         metadata: dict[str, Any],
         created_at: str,
+        conn: sqlite3.Connection | None = None,
+        db_alias: str | None = None,
+        write_asset_file: bool = True,
     ) -> str:
-        """Persist an uploaded image under `state/research-images/assets/` and index it in `index.sqlite`."""
-        mime, width, height = _inspect_image_header(image_bytes, suffix)
-        sha = hashlib.sha256(image_bytes).hexdigest()
-        asset_rel = f"state/research-images/assets/{sha[:2]}/{sha}{suffix}"
-        asset_abs = (self.data_root / asset_rel).resolve()
-        assets_root = (self.images_dir / "assets").resolve()
-        if not asset_abs.is_relative_to(assets_root):
-            raise ValueError("Resolved image asset path escapes state/research-images/assets")
-        asset_abs.parent.mkdir(parents=True, exist_ok=True)
-        if not asset_abs.exists():
-            tmp_asset = asset_abs.with_name(f".{asset_abs.name}.{os.getpid()}.tmp")
-            with tmp_asset.open("wb") as fh:
-                fh.write(image_bytes)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp_asset, asset_abs)
+        """Persist an uploaded image under `state/research-images/assets/` and index it in `index.sqlite`.
 
-        self.images_dir.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.images_db, timeout=20) as img_conn:
-            self._ensure_images_schema(img_conn)
-            img_conn.execute(
-                "INSERT OR IGNORE INTO assets (sha, path, preview_path, width, height, mime, size_bytes, created_at) "
+        When `conn` is supplied (e.g., an active transaction with `images_db` attached as `db_alias`),
+        SQLite rows are inserted on `conn` without committing so image indexing commits or rolls back
+        atomically with the caller's document transaction.
+        """
+        mime, width, height, sha, asset_rel, asset_abs = self._prepare_image_asset(
+            image_bytes=image_bytes,
+            suffix=suffix,
+        )
+        prefix = f"{db_alias}." if db_alias else ""
+
+        def _insert_rows(target_conn: sqlite3.Connection) -> str:
+            target_conn.execute(
+                f"INSERT OR IGNORE INTO {prefix}assets (sha, path, preview_path, width, height, mime, size_bytes, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (sha, asset_rel, asset_rel, width, height, mime, len(image_bytes), created_at),
             )
-            existing_ref = img_conn.execute(
-                "SELECT id FROM refs WHERE asset_sha = ? AND source = ? AND doc_key = ?",
+            existing_ref = target_conn.execute(
+                f"SELECT id FROM {prefix}refs WHERE asset_sha = ? AND source = ? AND doc_key = ?",
                 (sha, source, doc_key),
             ).fetchone()
             if existing_ref is not None:
                 ref_id = int(existing_ref[0])
             else:
-                cur = img_conn.execute(
-                    "INSERT INTO refs (asset_sha, source, doc_key, title, date, metadata, created_at) "
+                cur = target_conn.execute(
+                    f"INSERT INTO {prefix}refs (asset_sha, source, doc_key, title, date, metadata, created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         sha,
@@ -1233,8 +1272,30 @@ class OpenWikiStore:
                     ),
                 )
                 ref_id = int(cur.lastrowid)
-            img_conn.commit()
-        return f"image:{ref_id}"
+            return f"image:{ref_id}"
+
+        if conn is not None:
+            if write_asset_file:
+                self._persist_image_asset_file(asset_abs, image_bytes)
+            return _insert_rows(conn)
+
+        asset_created = False
+        if write_asset_file:
+            asset_created = self._persist_image_asset_file(asset_abs, image_bytes)
+        self.images_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with sqlite3.connect(self.images_db, timeout=20) as img_conn:
+                self._ensure_images_schema(img_conn)
+                image_id = _insert_rows(img_conn)
+                img_conn.commit()
+            return image_id
+        except BaseException:
+            if asset_created and asset_abs.exists():
+                try:
+                    asset_abs.unlink()
+                except OSError:
+                    pass
+            raise
 
     def _append_audit(self, entry: dict[str, Any]) -> None:
         self.audit_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1514,10 +1575,22 @@ class OpenWikiStore:
         )
         if not chunks_list:
             chunks_list = [body_text]
+        is_image_ingest = binary_bytes is not None and orig_binary_suffix in _IMAGE_FILE_EXTENSIONS
+        image_asset_abs: Path | None = None
+        if is_image_ingest and binary_bytes is not None:
+            _, _, _, _, _, image_asset_abs = self._prepare_image_asset(
+                image_bytes=binary_bytes,
+                suffix=orig_binary_suffix,
+            )
+            self.ensure_images_schema()
+
         md_written = False
         orig_written = False
+        asset_written = False
         conn = sqlite3.connect(self.wiki_db, timeout=20, isolation_level=None)
         try:
+            if is_image_ingest:
+                conn.execute("ATTACH DATABASE ? AS img_db", (str(self.images_db),))
             conn.execute("BEGIN IMMEDIATE")
             if cli_mod is not None and hasattr(cli_mod, "insert_document_and_chunks"):
                 doc_num = cli_mod.insert_document_and_chunks(
@@ -1551,7 +1624,7 @@ class OpenWikiStore:
 
             doc_id = f"wiki:{doc_num}"
             image_doc_id: str | None = None
-            if binary_bytes is not None and orig_binary_suffix in _IMAGE_FILE_EXTENSIONS:
+            if is_image_ingest and binary_bytes is not None:
                 image_doc_id = self.register_image_asset(
                     image_bytes=binary_bytes,
                     suffix=orig_binary_suffix,
@@ -1568,6 +1641,9 @@ class OpenWikiStore:
                         "caption": body_text[:1000],
                     },
                     created_at=created_at,
+                    conn=conn,
+                    db_alias="img_db",
+                    write_asset_file=False,
                 )
 
             receipt = {
@@ -1592,6 +1668,9 @@ class OpenWikiStore:
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (receipt_key, doc_id, rel_path, payload_sha, json.dumps(receipt, ensure_ascii=False), created_at),
             )
+
+            if is_image_ingest and binary_bytes is not None and image_asset_abs is not None:
+                asset_written = self._persist_image_asset_file(image_asset_abs, binary_bytes)
 
             if binary_bytes is not None and orig_dest_path is not None:
                 orig_dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1641,6 +1720,11 @@ class OpenWikiStore:
             if orig_written and orig_dest_path is not None and orig_dest_path.exists():
                 try:
                     orig_dest_path.unlink()
+                except OSError:
+                    pass
+            if asset_written and image_asset_abs is not None and image_asset_abs.exists():
+                try:
+                    image_asset_abs.unlink()
                 except OSError:
                     pass
             raise

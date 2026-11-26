@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
@@ -137,6 +139,118 @@ class MarketDigestPartitionStore:
     def _library(self) -> research_library_mod.Library:
         return research_library_mod.Library(data_root=self.data_root, code_root=self.code_root)
 
+    def _load_embedding_config(self) -> dict[str, Any]:
+        candidates = (
+            self.data_root / "config" / "config.json",
+            self.data_root / "skills" / "market-digest" / "config.json",
+            self.code_root / "skills" / "market-digest" / "config.json",
+            self.code_root / "skills" / "market-digest" / "config.example.json",
+        )
+        for cfg_path in candidates:
+            if cfg_path.is_file():
+                try:
+                    loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict) and isinstance(loaded.get("embedding"), dict):
+                        return loaded
+                except Exception:
+                    continue
+        return {
+            "embedding": {
+                "model": os.environ.get("DALTON_EMBEDDING_MODEL", "gemini-embedding-2"),
+                "dimensions": 3072,
+            }
+        }
+
+    def _embed_texts(self, texts: list[str]) -> list[bytes | None]:
+        """Compute float32 embedding BLOBs for sales-note chunks; degrades cleanly to None if unavailable."""
+        if not texts:
+            return []
+        try:
+            import numpy as np
+
+            mod = self._library().module("sales-notes")
+            cfg = self._load_embedding_config()
+            with contextlib.redirect_stdout(io.StringIO()):
+                vectors = mod.embed_texts(texts, cfg)
+            if not isinstance(vectors, (list, tuple)) or len(vectors) != len(texts):
+                return [None] * len(texts)
+            blobs: list[bytes | None] = []
+            for vec in vectors:
+                arr = np.asarray(vec, dtype=np.float32)
+                norm = float(np.linalg.norm(arr))
+                if arr.ndim != 1 or arr.size == 0 or not np.isfinite(norm) or norm == 0.0:
+                    blobs.append(None)
+                else:
+                    blobs.append(arr.tobytes())
+            return blobs
+        except (Exception, SystemExit):
+            return [None] * len(texts)
+
+    def _embed_query(self, lib: research_library_mod.Library, source: str, query: str) -> Any:
+        mod = lib.module(source)
+        cfg = self._load_embedding_config()
+        with contextlib.redirect_stdout(io.StringIO()):
+            return mod.embed_query(query, cfg)
+
+    @staticmethod
+    def _merge_keyword_and_semantic(
+        semantic_results: list[dict[str, Any]],
+        keyword_results: list[dict[str, Any]],
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Fuse semantic and keyword document ranks via RRF (k=60) so neither arm buries the other."""
+        rrf_k = 60.0
+        fused: dict[str, dict[str, Any]] = {}
+        sem_ranked = [
+            it
+            for it in semantic_results
+            if isinstance(it, dict) and it.get("score") is not None
+        ]
+        kw_ranked = [
+            it
+            for it in keyword_results
+            if isinstance(it, dict) and int(it.get("keyword_hits") or 0) > 0
+        ]
+
+        def _doc_key(item: dict[str, Any]) -> str:
+            return str(item.get("document_id") or item.get("canonical_id") or id(item))
+
+        for arm, items in (("semantic", sem_ranked), ("keyword", kw_ranked)):
+            for rank, item in enumerate(items, start=1):
+                k = _doc_key(item)
+                entry = fused.get(k)
+                if entry is None:
+                    merged_item = dict(item)
+                    merged_item["matched"] = [arm]
+                    merged_item["rrf_score"] = 1.0 / (rrf_k + rank)
+                    fused[k] = merged_item
+                else:
+                    entry["rrf_score"] = float(entry.get("rrf_score") or 0.0) + 1.0 / (rrf_k + rank)
+                    matched = list(entry.get("matched") or [])
+                    if arm not in matched:
+                        matched.append(arm)
+                    entry["matched"] = matched
+                    if entry.get("score") is None and item.get("score") is not None:
+                        entry["score"] = item.get("score")
+                    entry["keyword_hits"] = max(
+                        int(entry.get("keyword_hits") or 0),
+                        int(item.get("keyword_hits") or 0),
+                    )
+                    if not entry.get("snippet") and item.get("snippet"):
+                        entry["snippet"] = item.get("snippet")
+
+        ranked = sorted(
+            fused.values(),
+            key=lambda x: (
+                float(x.get("rrf_score") or 0.0),
+                float(x["score"]) if x.get("score") is not None else -1.0,
+                int(x.get("keyword_hits") or 0),
+            ),
+            reverse=True,
+        )
+        return ranked[:limit]
+
     def read(self, source: str, document: str, params: dict[str, Any]) -> dict[str, Any]:
         if not self.mail_db.is_file():
             raise ValueError("Document not found")
@@ -179,17 +293,59 @@ class MarketDigestPartitionStore:
         if source == "tmtb" and str(p.get("layer") or "raw") != "raw":
             raise ValueError("tmtb only supports raw layer")
         mail_params = dict(p)
-        mail_params.setdefault("search_mode", "keyword")
-        res = self._library().mail(
-            source,
-            operation,
-            query,
-            document,
-            start,
-            end,
-            capped_limit,
-            mail_params,
-        )
+        requested_mode = str(mail_params.setdefault("search_mode", "hybrid" if operation == "search" else "keyword")).strip().lower()
+        lib = self._library()
+        if operation == "search" and requested_mode != "keyword":
+            lib.embed = lambda src, q: self._embed_query(lib, src, q)  # type: ignore[method-assign]
+            sem_res = lib.mail(
+                source,
+                operation,
+                query,
+                document,
+                start,
+                end,
+                capped_limit,
+                mail_params,
+            )
+            sem_warnings = list(sem_res.get("warnings") or [])
+            semantic_degraded = any("语义检索不可用" in str(w) for w in sem_warnings)
+            if semantic_degraded:
+                res = sem_res
+            else:
+                kw_params = {**mail_params, "search_mode": "keyword"}
+                kw_res = lib.mail(
+                    source,
+                    operation,
+                    query,
+                    document,
+                    start,
+                    end,
+                    capped_limit,
+                    kw_params,
+                )
+                merged_results = self._merge_keyword_and_semantic(
+                    list(sem_res.get("results") or []),
+                    list(kw_res.get("results") or []),
+                    limit=capped_limit,
+                )
+                merged_warnings = list(dict.fromkeys([*sem_warnings, *list(kw_res.get("warnings") or [])]))
+                res = {
+                    **sem_res,
+                    "results": merged_results,
+                    "warnings": merged_warnings,
+                    "status": "partial" if merged_warnings else ("ok" if merged_results else "empty"),
+                }
+        else:
+            res = lib.mail(
+                source,
+                operation,
+                query,
+                document,
+                start,
+                end,
+                capped_limit,
+                mail_params,
+            )
         results = list(res.get("results") or [])
         srv = "dalton_tmtb" if source == "tmtb" else "dalton_sales_notes"
         sources_list = [_make_source(srv, source, it) for it in results[:50]]
@@ -505,23 +661,41 @@ class MarketDigestPartitionStore:
         }
         note_prefix = f"[{institution}] {title}\n\n"
         chunks_list = self._chunk_sales_note(body_text, note_prefix, max_chunk_chars=1500)
+        chunk_embeddings = self._embed_texts(chunks_list)
+        has_embeddings = any(blob is not None for blob in chunk_embeddings)
+
+        is_image_ingest = binary_bytes is not None and orig_binary_suffix in _IMAGE_FILE_EXTENSIONS
+        wiki_img_store: OpenWikiStore | None = None
+        image_asset_abs: Path | None = None
+        if is_image_ingest and binary_bytes is not None:
+            wiki_img_store = OpenWikiStore(self.data_root)
+            _, _, _, _, _, image_asset_abs = wiki_img_store._prepare_image_asset(
+                image_bytes=binary_bytes,
+                suffix=orig_binary_suffix,
+            )
+            wiki_img_store.ensure_images_schema()
+
         file_written = False
         orig_written = False
+        asset_written = False
         conn = sqlite3.connect(self.mail_db, timeout=20, isolation_level=None)
         try:
+            if is_image_ingest and wiki_img_store is not None:
+                conn.execute("ATTACH DATABASE ? AS img_db", (str(wiki_img_store.images_db),))
             conn.execute("BEGIN IMMEDIATE")
             row_id: int | None = None
             for chunk_idx, chunk_body in enumerate(chunks_list):
+                emb_blob = chunk_embeddings[chunk_idx] if chunk_idx < len(chunk_embeddings) else None
                 cur = conn.execute(
-                    "INSERT INTO email_chunks (date, email_id, message_id, sender, subject, chunk_index, content, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (received_date, doc_key, doc_key, institution, title, chunk_idx, chunk_body, created_at),
+                    "INSERT INTO email_chunks (date, email_id, message_id, sender, subject, chunk_index, content, embedding, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (received_date, doc_key, doc_key, institution, title, chunk_idx, chunk_body, emb_blob, created_at),
                 )
                 if row_id is None:
                     row_id = cur.lastrowid
             image_doc_id: str | None = None
-            if binary_bytes is not None and orig_binary_suffix in _IMAGE_FILE_EXTENSIONS:
-                image_doc_id = OpenWikiStore(self.data_root).register_image_asset(
+            if is_image_ingest and binary_bytes is not None and wiki_img_store is not None:
+                image_doc_id = wiki_img_store.register_image_asset(
                     image_bytes=binary_bytes,
                     suffix=orig_binary_suffix,
                     source="sales-notes",
@@ -534,6 +708,9 @@ class MarketDigestPartitionStore:
                         "caption": body_text[:1000],
                     },
                     created_at=created_at,
+                    conn=conn,
+                    db_alias="img_db",
+                    write_asset_file=False,
                 )
             receipt = {
                 "ok": True,
@@ -545,6 +722,7 @@ class MarketDigestPartitionStore:
                 **({"original_filepath": orig_rel} if orig_rel else {}),
                 "sha256": sha_hex,
                 "chunk_count": len(chunks_list),
+                "embedding_indexed": has_embeddings,
                 **({"request_id": request_id} if request_id else {}),
             }
             receipt_key = request_id or f"doc:{doc_key}"
@@ -561,6 +739,8 @@ class MarketDigestPartitionStore:
                     created_at,
                 ),
             )
+            if is_image_ingest and binary_bytes is not None and wiki_img_store is not None and image_asset_abs is not None:
+                asset_written = wiki_img_store._persist_image_asset_file(image_asset_abs, binary_bytes)
             if binary_bytes is not None and orig_abs is not None:
                 orig_abs.parent.mkdir(parents=True, exist_ok=True)
                 b_fd = os.open(str(orig_abs), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
@@ -606,6 +786,11 @@ class MarketDigestPartitionStore:
             if orig_written and orig_abs is not None and orig_abs.exists():
                 try:
                     orig_abs.unlink()
+                except OSError:
+                    pass
+            if asset_written and image_asset_abs is not None and image_asset_abs.exists():
+                try:
+                    image_asset_abs.unlink()
                 except OSError:
                     pass
             raise

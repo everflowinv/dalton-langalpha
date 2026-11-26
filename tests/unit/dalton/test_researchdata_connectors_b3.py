@@ -3438,3 +3438,478 @@ async def test_r8_wiki_pause_lease_owner_ttl_dotenv_disabled_feishu_pkg_and_sec_
     assert inc["Missing Date"] is None
     assert inc["Missing NA"] is None
     assert inc["Total Revenue"] == 95000000000.0
+
+
+# ---------------------------------------------------------------------------
+# 11. Small Fix Pack 3: BZ1 (wiki image index tx), BZ2 (sales-notes vectors &
+#     hybrid merge), BZ3 (discovered-tool routing fallbacks & clear errors)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bz1_wiki_image_index_rolls_back_with_document_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BZ1: When wiki ingest fails after document insert (before commit), image index & new asset file roll back too."""
+    wiki = OpenWikiStore(tmp_path / "wiki_bz1")
+    wiki._cli_checked = True
+    wiki._cli_module = None
+    wiki.ensure_schema()
+
+    png_bytes = _make_minimal_png_bytes()
+
+    # Case 1: DB failure on ingest_receipts AFTER documents/chunks/image insert -> images_db & asset file must roll back
+    with sqlite3.connect(wiki.wiki_db) as conn:
+        conn.execute(
+            "CREATE TRIGGER fail_receipt_for_bz1 BEFORE INSERT ON ingest_receipts "
+            "WHEN NEW.request_id = 'bz1-fail-receipt' "
+            "BEGIN SELECT RAISE(ABORT, 'simulated receipt failure'); END;"
+        )
+        conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="simulated receipt failure"):
+        await wiki.ingest(
+            {
+                "request_id": "bz1-fail-receipt",
+                "target_type": "company",
+                "target": "NVDA",
+                "content_type": "研报笔记",
+                "date": "2026-11-26",
+                "file": {
+                    "filename": "architecture_diagram.png",
+                    "content_b64": base64.b64encode(png_bytes).decode("ascii"),
+                },
+            }
+        )
+
+    with sqlite3.connect(wiki.wiki_db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+    if wiki.images_db.is_file():
+        with sqlite3.connect(wiki.images_db) as img_conn:
+            assert img_conn.execute("SELECT COUNT(*) FROM refs").fetchone()[0] == 0
+            assert img_conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
+    assets_dir = wiki.images_dir / "assets"
+    if assets_dir.exists():
+        assert [p for p in assets_dir.rglob("*") if p.is_file()] == []
+
+    # Case 2: Disk write failure on original binary file (os.open) -> images_db & documents both roll back cleanly
+    orig_os_open = os.open
+
+    def _fail_original_open(path: Any, flags: int, *a: Any, **kw: Any) -> int:
+        if "originals" in str(path):
+            raise OSError("simulated disk full on original write")
+        return orig_os_open(path, flags, *a, **kw)
+
+    monkeypatch.setattr(os, "open", create_autospec(os.open, side_effect=_fail_original_open))
+    with pytest.raises(OSError, match="simulated disk full on original write"):
+        await wiki.ingest(
+            {
+                "request_id": "bz1-fail-orig",
+                "target_type": "company",
+                "target": "NVDA",
+                "content_type": "研报笔记",
+                "date": "2026-11-26",
+                "file": {
+                    "filename": "rack_layout.png",
+                    "content_b64": base64.b64encode(png_bytes).decode("ascii"),
+                },
+            }
+        )
+    monkeypatch.undo()
+
+    with sqlite3.connect(wiki.wiki_db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+    if wiki.images_db.is_file():
+        with sqlite3.connect(wiki.images_db) as img_conn:
+            assert img_conn.execute("SELECT COUNT(*) FROM refs").fetchone()[0] == 0
+            assert img_conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
+
+    # Case 3: Subsequent valid image ingest commits both wiki_db and images_db atomically and is searchable/readable
+    code_ok, res_ok = await wiki.ingest(
+        {
+            "request_id": "bz1-ok-1",
+            "target_type": "company",
+            "target": "NVDA",
+            "content_type": "研报笔记",
+            "date": "2026-11-26",
+            "file": {
+                "filename": "rack_layout.png",
+                "content_b64": base64.b64encode(png_bytes).decode("ascii"),
+            },
+        }
+    )
+    assert code_ok == 200 and res_ok["ok"] is True
+    assert str(res_ok.get("image_id") or "").startswith("image:")
+    img_hits = wiki.query("search", query="rack_layout", params={"media": "images"})
+    assert img_hits["ok"] is True and img_hits["result_count"] == 1
+    assert img_hits["results"][0]["document_id"] == res_ok["image_id"]
+
+
+@pytest.mark.asyncio
+async def test_bz2_sales_notes_ingest_writes_embeddings_and_search_merges_keyword_and_semantic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BZ2: Sales-notes ingest persists chunk embeddings and default search merges keyword + semantic hits."""
+    import numpy as np
+
+    _, lib_mod = _load_commercial_connectors()
+    store = lib_mod.MarketDigestPartitionStore(tmp_path / "sn_bz2")
+    store.ensure_schema()
+
+    # Deterministic 4-dim semantic space:
+    # - AI/accelerator topic: [1, 0, 0, 0]
+    # - Consumer retail topic: [0, 1, 0, 0]
+    def _vec_for(text: str) -> list[float]:
+        low = text.lower()
+        if any(tok in low for tok in ("cowos", "packaging", "accelerator", "gpu", "rubin")):
+            return [1.0, 0.0, 0.0, 0.0]
+        if any(tok in low for tok in ("retail", "store", "apparel")):
+            return [0.0, 1.0, 0.0, 0.0]
+        return [0.0, 0.0, 1.0, 0.0]
+
+    md_cli = store._library().module("sales-notes")
+    spy_embed_texts = create_autospec(
+        md_cli.embed_texts,
+        side_effect=lambda texts, config: [_vec_for(t) for t in texts],
+    )
+    spy_embed_query = create_autospec(
+        md_cli.embed_query,
+        side_effect=lambda text, config: _vec_for(text),
+    )
+    monkeypatch.setattr(md_cli, "embed_texts", spy_embed_texts)
+    monkeypatch.setattr(md_cli, "embed_query", spy_embed_query)
+    # Reuse the patched module inside store._library() calls
+    orig_lib = store._library
+
+    def _patched_lib() -> Any:
+        lib = orig_lib()
+        lib._modules["market-digest"] = md_cli
+        return lib
+
+    monkeypatch.setattr(store, "_library", _patched_lib)
+
+    # Seed one older unindexed note (NULL embedding, matches keyword 'accelerator' directly)
+    # and one embedded unrelated retail note (to prove keyword hits aren't buried by embedded noise)
+    retail_blob = np.asarray([0.0, 1.0, 0.0, 0.0], dtype=np.float32).tobytes()
+    with sqlite3.connect(store.mail_db) as conn:
+        conn.execute(
+            "INSERT INTO email_chunks (date, email_id, message_id, sender, subject, chunk_index, content, embedding, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "2026-11-20",
+                "em-kw",
+                "mail-kw-only",
+                "GS",
+                "Legacy Accelerator Note",
+                0,
+                "Legacy accelerator backlog note without vector",
+                None,
+                "2026-11-20T10:00:00Z",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO email_chunks (date, email_id, message_id, sender, subject, chunk_index, content, embedding, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "2026-11-21",
+                "em-ret",
+                "mail-retail",
+                "MS",
+                "Retail Foot Traffic",
+                0,
+                "Mall retail store apparel sales update",
+                retail_blob,
+                "2026-11-21T10:00:00Z",
+            ),
+        )
+        conn.commit()
+
+    # 1. Ingest a new sales note that uses "CoWoS packaging" (NO literal word "accelerator")
+    code, res = await store.ingest_sales_note(
+        {
+            "request_id": "bz2-note-1",
+            "institution": "Morgan Stanley",
+            "title": "Taiwan Foundry Check",
+            "date": "2026-11-25",
+            "content": "CoWoS packaging ramp continues strongly into 2027.",
+        }
+    )
+    assert code == 200 and res["ok"] is True
+    assert spy_embed_texts.call_count == 1
+
+    # Verify embedding BLOB was actually persisted in email_chunks
+    with sqlite3.connect(store.mail_db) as conn:
+        emb_row = conn.execute(
+            "SELECT embedding FROM email_chunks WHERE message_id = ?",
+            (res["doc_key"],),
+        ).fetchone()
+    assert emb_row is not None and emb_row[0] is not None
+    stored_vec = np.frombuffer(emb_row[0], dtype=np.float32)
+    assert stored_vec.shape == (4,)
+    assert np.allclose(stored_vec, [1.0, 0.0, 0.0, 0.0])
+
+    # 2. Semantic-only query ("GPU") has zero keyword match on the new note, yet default search MUST return it
+    sales_conn = lib_mod.SalesNotesConnector(store)
+    sem_only = await sales_conn.call_tool(
+        "search",
+        {"query": "GPU", "limit": 5},
+        active_caps=frozenset({CapabilityId.SALES_NOTES}),
+    )
+    assert sem_only["ok"] is True
+    assert any(r["original_document_id"] == res["doc_key"] for r in sem_only["results"])
+    assert sem_only["results"][0]["original_document_id"] == res["doc_key"]
+
+    # 3. Query matching keyword on unindexed note AND semantic on newly ingested note returns BOTH merged
+    merged = await sales_conn.call_tool(
+        "search",
+        {"query": "accelerator", "limit": 2},
+        active_caps=frozenset({CapabilityId.SALES_NOTES}),
+    )
+    assert merged["ok"] is True
+    merged_keys = {r["original_document_id"] for r in merged["results"]}
+    assert res["doc_key"] in merged_keys, f"Semantic hit missing from merged results: {merged['results']}"
+    assert "mail-kw-only" in merged_keys, f"Keyword hit buried in merged results: {merged['results']}"
+
+    # 4. Explicit search_mode="keyword" skips query embedding and returns only keyword matches
+    prev_q_calls = spy_embed_query.call_count
+    kw_only = await sales_conn.call_tool(
+        "search",
+        {"query": "GPU", "params": {"search_mode": "keyword"}},
+        active_caps=frozenset({CapabilityId.SALES_NOTES}),
+    )
+    assert kw_only["ok"] is True
+    assert kw_only["results"] == []
+    assert spy_embed_query.call_count == prev_q_calls
+
+
+@pytest.mark.asyncio
+async def test_bz3_discovered_tool_selection_unimportable_wrapper_health_missing_tools_and_workflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BZ3: Handle unimportable wrapper in connector_transport, missing `tools` in health check,
+    and discovered-tool awareness in content_assembly + topic-research/workflow.js."""
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
+        WorkflowHost,
+        WorkflowLimits,
+        compile_check,
+        run_workflow_script,
+    )
+    from src.dalton.data_map import health as dm_health
+
+    ct_mod = _load_module_from_path(
+        "_test_ct_bz3",
+        REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-conventions" / "scripts" / "connector_transport.py",
+    )
+
+    # 1. connector_transport.py: unimportable wrapper + no `tools` metadata MUST fail closed (not guess True!)
+    cfg_dedicated_only = tmp_path / "mcp_dedicated_only.json"
+    cfg_dedicated_only.write_text(
+        json.dumps({"servers": {"dalton_company_wiki": {"enabled": True}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("DALTON_RESEARCHDATA_URL", raising=False)
+    monkeypatch.setenv("PTC_WORKSPACE_CONFIG", str(cfg_dedicated_only))
+    monkeypatch.delitem(sys.modules, "tools.dalton_company_wiki", raising=False)
+    monkeypatch.setitem(sys.modules, "tools", type(sys)("tools"))
+
+    def _fake_mcp_call(server: str, tool: str, args: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        return (False, {"ok": True, "server": server, "tool": tool, "args": args})
+
+    fake_mcp_flagged = type(sys)("mcp_client")
+    fake_mcp_flagged.call_mcp_tool_with_error_flag = _fake_mcp_call  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp_client", fake_mcp_flagged)
+
+    assert ct_mod.server_supports_tool(
+        "dalton_company_wiki",
+        "search",
+        servers_cfg={"dalton_company_wiki": {"enabled": True}},
+    ) is False
+    tr_unverified = ct_mod.resolve_connector_transport("company-wiki", tool_name="search")
+    assert tr_unverified["mode"] is None
+    assert "dalton_company_wiki" in tr_unverified["error"]
+    assert "tools" in tr_unverified["error"]
+
+    # 1b. Mixed workspace where dedicated server passes config `tools`, mcp_client lacks flagged helper,
+    #     and `tools.dalton_company_wiki` fails to import -> MUST fall back to `researchdata`!
+    cfg_mixed_broken = tmp_path / "mcp_mixed_broken.json"
+    cfg_mixed_broken.write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "dalton_company_wiki": {
+                        "enabled": True,
+                        "tools": [{"name": "search", "inputSchema": {"properties": {"query": {}}}}],
+                    },
+                    "researchdata": {"enabled": True},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PTC_WORKSPACE_CONFIG", str(cfg_mixed_broken))
+    fake_mcp_unflagged = type(sys)("mcp_client")
+    monkeypatch.setitem(sys.modules, "mcp_client", fake_mcp_unflagged)
+    fake_tools_pkg = type(sys)("tools")
+    fake_rd = type(sys)("tools.researchdata")
+    fake_rd._call_mcp_tool = _fake_mcp_call  # type: ignore[attr-defined]
+    fake_tools_pkg.researchdata = fake_rd  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "tools", fake_tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.researchdata", fake_rd)
+    monkeypatch.delitem(sys.modules, "tools.dalton_company_wiki", raising=False)
+
+    tr_fb = ct_mod.resolve_connector_transport("company-wiki", tool_name="search")
+    assert tr_fb["mode"] == "legacy", f"Expected fallback to legacy researchdata when wrapper unimportable: {tr_fb}"
+    assert tr_fb["server"] == "researchdata"
+
+    # 2. data_map/health.py: tools/list response missing `tools` MUST fail closed and never invoke tools/call
+    _clean_profile_env(monkeypatch, profile="core")
+    monkeypatch.setenv("DALTON_RESEARCH_HOST_URL", "http://research-host:8951")
+    monkeypatch.setenv("DALTON_RESEARCH_HOST_TOKEN", "tok-bz3")
+    seen_rpc_methods: list[str] = []
+
+    def _missing_tools_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        seen_rpc_methods.append(str(body.get("method")))
+        if body.get("method") == "tools/list":
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 0, "result": {}})
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"ok": True}}})
+
+    orig_async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        create_autospec(
+            httpx.AsyncClient,
+            side_effect=lambda *a, **kw: orig_async_client(*a, **{**kw, "transport": httpx.MockTransport(_missing_tools_handler)}),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="tools"):
+        await dm_health.default_call_research_host_connector("company-wiki", "list", {"limit": 1})
+    assert seen_rpc_methods == ["tools/list"], f"tools/call must not run when tools/list omits `tools`: {seen_rpc_methods}"
+
+    # 3. content_assembly.py: discovered_servers overrides deployment-only assumptions
+    wf_path = REPO_ROOT / "workflows" / "topic-research" / "workflow.js"
+    # 3a. Core with COMPANY_WIKI deployment cap, but workspace discovered NO internal research server
+    wf_core_no_server = read_assembled_text(
+        wf_path,
+        capabilities=frozenset({CapabilityId.COMPANY_WIKI}),
+        discovered_servers={"dalton_sec": {"enabled": True}},
+    )
+    assert "internal-memory.md" not in wf_core_no_server
+    compile_check(wf_core_no_server)
+
+    # 3b. Core with COMPANY_WIKI deployment cap, server present in config but `tools: []` (no usable tool)
+    wf_core_empty_tools = read_assembled_text(
+        wf_path,
+        capabilities=frozenset({CapabilityId.COMPANY_WIKI}),
+        discovered_servers={"dalton_company_wiki": {"enabled": True, "tools": []}},
+    )
+    assert "internal-memory.md" not in wf_core_empty_tools
+    compile_check(wf_core_empty_tools)
+
+    # 3c. Post-cutover Everflow (RESEARCHDATA_BRIDGE + COMPANY_WIKI + DALTON_RESEARCH_HOST_URL),
+    #     but workspace only discovered `researchdata` (no dedicated connector) -> keeps researchdata fallback!
+    _clean_profile_env(monkeypatch, profile="everflow")
+    monkeypatch.setenv("DALTON_RESEARCH_HOST_URL", "http://host.docker.internal:8951")
+    wf_ef_fallback = read_assembled_text(
+        wf_path,
+        discovered_servers={"researchdata": {"enabled": True}},
+    )
+    assert "检索 researchdata 的 sales-notes、tmtb、funda-ai、company-wiki（只读）" in wf_ef_fallback
+    compile_check(wf_ef_fallback)
+
+    # 4. workflows/topic-research/workflow.js runtime: prebuilt Core workflow (assembled from deployment caps only)
+    #    checks args.discovered_mcp_servers at runtime so missing connectors don't hard-block at line 265!
+    wf_core_prebuilt = read_assembled_text(wf_path, capabilities=frozenset({CapabilityId.COMPANY_WIKI}))
+    compile_check(wf_core_prebuilt)
+
+    async def _run_topic(script_src: str, extra_args: dict[str, Any], *, fail_internal: bool = False) -> tuple[dict[str, Any], list[tuple[str, str]]]:
+        dispatches: list[tuple[str, str]] = []
+
+        async def _agent(prompt: str, opts: dict[str, Any] | None = None) -> Any:
+            label = str((opts or {}).get("label") or "")
+            dispatches.append((label, prompt))
+            if label == "规划":
+                return {
+                    "file": "./research/2026-11-26-topic-ai/plan.md",
+                    "clusters": [
+                        {"id": "a", "name": "簇 A", "queries": ["q1"]},
+                        {"id": "b", "name": "簇 B", "queries": ["q2"]},
+                        {"id": "c", "name": "簇 C", "queries": ["q3"]},
+                    ],
+                    "questions": ["Q1"],
+                    "summary": "plan ok",
+                }
+            if label == "支线核验":
+                paths = [
+                    ln[2:].split("（")[0].strip()
+                    for ln in prompt.splitlines()
+                    if ln.startswith("- ") and "|" not in ln
+                ]
+                return {"files": [f"{p}|ok" for p in paths]}
+            if label == "内部记忆" and fail_internal:
+                return None
+            if label == "产物核验":
+                paths = [
+                    ln[2:].strip()
+                    for ln in prompt.splitlines()
+                    if ln.startswith("- ") and "|" not in ln
+                ]
+                return {"files": [f"{p}|{'e' * 64}" for p in paths]}
+            if (opts or {}).get("agentType") == "dalton-reviewer":
+                return {
+                    "verdict": "pass",
+                    "summary": "ok",
+                    "must_fix": [],
+                    "items": [{"check": n, "result": "pass", "reason": "ok"} for n in range(1, 10)],
+                }
+            return {"files": ["./research/2026-11-26-topic-ai/out.md"], "summary": "done", "sha256": "a" * 64}
+
+        host = create_autospec(WorkflowHost, instance=True)
+        host.agent.side_effect = _agent
+        host.phase.side_effect = lambda _t: None
+        host.log.side_effect = lambda _m: None
+        params = {
+            "topic": "AI Capex",
+            "slug": "ai",
+            "workspace_dir": ".",
+            "as_of": "2026-11-26",
+            **extra_args,
+        }
+        outcome = await run_workflow_script(
+            script_src,
+            params,
+            host,
+            WorkflowLimits(memory_limit_mb=64, cpu_budget_s=10.0),
+        )
+        assert outcome.status == "completed", outcome.error
+        return outcome.result, dispatches
+
+    # 4a. No internal research server discovered at runtime -> skips 内部记忆 branch & does NOT block at line 265
+    res_skip, disp_skip = await _run_topic(
+        wf_core_prebuilt,
+        {"discovered_mcp_servers": {"dalton_sec": {"enabled": True}}},
+    )
+    assert res_skip["ok"] is True, res_skip
+    assert not any(lbl == "内部记忆" for lbl, _ in disp_skip)
+
+    # 4b. Direct connector missing, `dalton_research_all` discovered -> falls back to `dalton_research_all`
+    res_rd, disp_rd = await _run_topic(
+        wf_core_prebuilt,
+        {"discovered_mcp_servers": {"dalton_research_all": {"enabled": True, "tools": [{"name": "search"}]}}},
+    )
+    assert res_rd["ok"] is True, res_rd
+    internal_prompts = [p for lbl, p in disp_rd if lbl == "内部记忆"]
+    assert internal_prompts and "dalton_research_all" in internal_prompts[0]
+
+    # 4c. Dedicated server discovered with `search` tool, but subagent fails -> blocks cleanly at line 265
+    res_blk, _ = await _run_topic(
+        wf_core_prebuilt,
+        {"discovered_mcp_servers": {"dalton_company_wiki": {"enabled": True, "tools": [{"name": "search"}]}}},
+        fail_internal=True,
+    )
+    assert res_blk["ok"] is False
+    assert "内部记忆检索" in str(res_blk.get("blocked") or "")
