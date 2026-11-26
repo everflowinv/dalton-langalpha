@@ -376,7 +376,7 @@ async def _get_offline_sandbox_stats(
             workspace_id=workspace_id,
             state=workspace.get("status", "unknown"),
             provider=provider_kind,
-            archivable=archivable,
+            archivable=archivable,  # DALTON-HOOK(cos-settings-tools): surface provider archive capability on fallback stats
             created_at=str(workspace.get("created_at", "")),
             resources=SandboxResources(),
         )
@@ -409,7 +409,7 @@ async def _get_offline_sandbox_stats(
             sandbox_id=sandbox_id,
             state=workspace.get("status", "unknown"),
             provider=provider_kind,
-            archivable=archivable,
+            archivable=archivable,  # DALTON-HOOK(cos-settings-tools): surface provider archive capability on fallback stats
             created_at=str(workspace.get("created_at", "")),
             resources=SandboxResources(),
         )

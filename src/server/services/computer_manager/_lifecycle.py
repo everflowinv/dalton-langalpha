@@ -577,6 +577,13 @@ class SessionLifecycleMixin:
                     computer_id,
                 )
                 return
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        elif heartbeat is False:
+            from src.dalton.services.archive_lifecycle import archive_claim_in_grace_window
+
+            if archive_claim_in_grace_window(await get_computer(computer_id), heartbeat=False):
+                return
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         await self._reconcile_provider_stop(binding)
 
     async def reconcile_stopping_computer(
@@ -584,13 +591,10 @@ class SessionLifecycleMixin:
     ) -> Dict[str, Any] | None:
         """Repair an abandoned stop before an explicit start evaluates the row."""
         async with self._observed_lock(computer_id, "computer.stopping.reconcile"):
-            computer = await get_computer(computer_id)
-            if not computer or computer.get("status") != ComputerStatus.STOPPING:
-                return computer
-            await self._correct_stuck_stopping(
-                self._binding_from_computer("", computer)
-            )
-            return await get_computer(computer_id)
+            # DALTON-HOOK(cos-settings-tools): convert provider exceptions before leaving the span
+            from src.dalton.services.archive_lifecycle import reconcile_stopping_locked
+
+            return await reconcile_stopping_locked(self, computer_id)
 
     async def _owner_machine_state(
         self, binding: ComputerBinding
@@ -641,10 +645,7 @@ class SessionLifecycleMixin:
             await self._retire_session(
                 computer_id, session, reason="the stop could not reach its machine"
             )
-        # DALTON-HOOK(cos-settings-tools): owner machines never archive; clear any stale fence
-        await self._settle_machine_stop(
-            computer_id, ComputerStatus.STOPPED, clear_archiving=True
-        )
+        await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
 
     async def _reconcile_provider_stop(self, binding: ComputerBinding) -> bool:
         """Keep a failed stop retryable without guessing whether the provider stopped.
@@ -657,10 +658,7 @@ class SessionLifecycleMixin:
         if not sandbox_id:
             # Nothing to probe: the stop had no sandbox to take down, so the
             # row is settled to 'stopped' and a start rebuilds from scratch.
-            # DALTON-HOOK(cos-settings-tools): no sandbox means archiving ended; clear fence
-            await self._settle_machine_stop(
-                computer_id, ComputerStatus.STOPPED, clear_archiving=True
-            )
+            await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
             return False
         if not binding.provider.recreatable:
             actual_state = await self._owner_machine_state(binding)
@@ -672,15 +670,13 @@ class SessionLifecycleMixin:
                 async with self._detached_runtime(sandbox_id, binding=binding) as runtime:
                     actual_state = await runtime.get_state()
             except SandboxGoneError:
-                # DALTON-HOOK(cos-settings-tools): whitelisted structured log and terminal fence clear
+                # DALTON-HOOK(cos-settings-tools): whitelisted structured log on missing sandbox
                 logger.warning(
                     "stopping_reconcile_sandbox_gone computer_id=%s sandbox_id=%s",
                     computer_id,
                     sandbox_id,
                 )
-                await self._settle_machine_stop(
-                    computer_id, ComputerStatus.STOPPED, clear_archiving=True
-                )
+                await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
                 return False
 
         state = actual_state.value
@@ -696,19 +692,14 @@ class SessionLifecycleMixin:
         # in progress only ends down, and one has been seen to run for days.
         # --- DALTON-HOOK(cos-settings-tools): begin ---
         if state == "archiving":
-            # Provider is still archiving: settle status to 'stopped' per state
-            # machine while keeping config.archiving=true to block new/moved workspaces.
             await self._settle_machine_stop(
                 computer_id, ComputerStatus.STOPPED, clear_archiving=False
             )
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         elif state in ("stopped", "archived", "error"):
-            await self._settle_machine_stop(
-                computer_id, ComputerStatus.STOPPED, clear_archiving=True
-            )
+            await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
         elif state == "running":
-            await self._settle_machine_stop(
-                computer_id, ComputerStatus.RUNNING, clear_archiving=True
-            )
+            await self._settle_machine_stop(computer_id, ComputerStatus.RUNNING)
             # The idle sweep reads this stamp, and a just-corrected machine must
             # not look like it has been idle for the whole stuck window.
             await update_computer_activity(computer_id)
@@ -717,7 +708,6 @@ class SessionLifecycleMixin:
                 f"Workspace {binding.workspace_id} sandbox is in transient "
                 f"state {state!r}. Please wait and try again."
             )
-        # --- DALTON-HOOK(cos-settings-tools): end ---
         return False
 
     async def _await_in_flight_start(
@@ -2016,147 +2006,13 @@ class SessionLifecycleMixin:
         expected_workspace_id: str | None = None,
     ) -> Dict[str, Any]:
         """Archive moves the machine's disk to storage; transactional DB fences guard it."""
-        from opentelemetry import trace as otel_trace
-        from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
-        from src.server.services.computer_errors import (
-            ArchiveProviderError,
-            ArchiveScopeChangedError,
-            ArchiveUnsupportedError,
-            ComputerArchivingError,
-            ComputerBusyError,
-            ComputerNotStoppedError,
+        from src.dalton.services.archive_lifecycle import archive_machine_impl
+
+        return await archive_machine_impl(
+            self,
+            computer_id,
+            workspace_id=workspace_id,
+            expected_workspaces=expected_workspaces,
+            expected_workspace_id=expected_workspace_id,
         )
-
-        _PASSTHROUGH_ERRORS = (
-            ArchiveUnsupportedError,
-            ArchiveScopeChangedError,
-            ComputerArchivingError,
-            ComputerBusyError,
-            ComputerNotStoppedError,
-            ArchiveProviderError,
-        )
-
-        async with self._observed_lock(computer_id, "computer.archive"):
-            # Gate across the machine so archive cannot freeze a sibling's live run.
-            if await self._machine_has_active_tasks(
-                computer_id, workspace_id=workspace_id
-            ):
-                raise ComputerBusyError(
-                    "Cannot archive a computer that still has work running"
-                )
-
-            computer = await self._claim_machine_for_archive(
-                computer_id,
-                expected_workspaces=expected_workspaces,
-                expected_workspace_id=expected_workspace_id,
-            )
-            binding = self._binding_from_computer(workspace_id or "", computer)
-            sandbox_id = computer["provider_ref"]
-
-            archive_state = "archiving"
-            async with computer_stop_heartbeat(computer_id):
-                try:
-                    async with self._detached_runtime(sandbox_id, binding=binding) as runtime:
-                        if not runtime.archives:
-                            raise ArchiveUnsupportedError(
-                                "Provider does not support archiving"
-                            )
-                        await runtime.archive()
-                        try:
-                            post_state: RuntimeState | None = await runtime.refresh_state()
-                        except SandboxGoneError:
-                            # Sandbox disappeared after archive was issued -> terminal gone.
-                            post_state = None
-
-                    if post_state is None or post_state == RuntimeState.ARCHIVED:
-                        await self._settle_machine_stop(
-                            computer_id, ComputerStatus.STOPPED, clear_archiving=True
-                        )
-                        archive_state = "archived"
-                    elif post_state == RuntimeState.ARCHIVING:
-                        # Daytona archive runs asynchronously: settle status to 'stopped'
-                        # while keeping config.archiving=True until reconciliation confirms
-                        # a terminal provider state.
-                        await self._settle_machine_stop(
-                            computer_id, ComputerStatus.STOPPED, clear_archiving=False
-                        )
-                        archive_state = "archiving"
-                    else:
-                        raise ArchiveProviderError(
-                            "archive_unexpected_state",
-                            http_status=503,
-                            message="Archive did not reach archived state; please retry.",
-                        )
-                except Exception as exc:
-                    refused = connect_failure(exc)
-                    if isinstance(exc, ArchiveProviderError):
-                        category = exc.category
-                    elif isinstance(exc, ArchiveUnsupportedError):
-                        category = "archive_unsupported"
-                    elif isinstance(exc, SSHConnectError) or refused is not None:
-                        category = "ssh_connect_refused"
-                    elif isinstance(exc, SandboxGoneError):
-                        category = "sandbox_gone"
-                    elif isinstance(exc, SandboxTransientError):
-                        category = "sandbox_transient"
-                    else:
-                        category = "archive_failed"
-
-                    span = otel_trace.get_current_span()
-                    if span is not None and span.is_recording():
-                        span.set_attribute("error.category", category)
-
-                    logger.warning(
-                        "archive_machine_failed category=%s computer_id=%s workspace_id=%s exc_type=%s",
-                        category,
-                        computer_id,
-                        workspace_id or "",
-                        type(exc).__name__,
-                    )
-                    try:
-                        await self._reconcile_provider_stop(binding)
-                    except Exception as rec_exc:
-                        logger.warning(
-                            "archive_reconcile_failed computer_id=%s workspace_id=%s exc_type=%s",
-                            computer_id,
-                            workspace_id or "",
-                            type(rec_exc).__name__,
-                        )
-
-                    if isinstance(exc, _PASSTHROUGH_ERRORS):
-                        raise
-
-                    if category == "ssh_connect_refused":
-                        status_code = 422 if (refused is not None and refused.answered) else 503
-                        raise ArchiveProviderError(
-                            category,
-                            http_status=status_code,
-                            message="Computer connection was refused while archiving.",
-                        ) from None
-                    if category == "sandbox_gone":
-                        raise ArchiveProviderError(
-                            category,
-                            http_status=503,
-                            message="Sandbox is no longer available.",
-                        ) from None
-                    if category == "sandbox_transient":
-                        raise ArchiveProviderError(
-                            category,
-                            http_status=503,
-                            message="Sandbox is temporarily unavailable. Please retry.",
-                        ) from None
-                    raise ArchiveProviderError(
-                        category,
-                        http_status=503,
-                        message="Archive failed due to a sandbox provider error.",
-                    ) from None
-
-            logger.info(
-                "archive_machine_completed computer_id=%s archive_state=%s",
-                computer_id,
-                archive_state,
-            )
-            result = dict(await self._stop_result(computer_id, workspace_id))
-            result["archive_state"] = archive_state
-            return result
     # --- DALTON-HOOK(cos-settings-tools): end ---

@@ -1000,8 +1000,10 @@ async def archive_workspace_preview(
         archivable=provider_supports_archive(computer.get("kind")),
         expected_workspaces=workspaces,
     )
+# --- DALTON-HOOK(cos-settings-tools): end ---
 
 
+# --- DALTON-HOOK(cos-settings-tools): begin ---
 @router.post("/{workspace_id}/archive", response_model=WorkspaceActionResponse)
 async def archive_workspace(
     workspace_id: str,
@@ -1015,93 +1017,9 @@ async def archive_workspace(
     The workspace must be in 'stopped' state. Archived sandboxes take longer
     to start (~60-300s) but use no compute resources.
     """
-    from src.dalton.services.archive_http import archive_http_errors
-    from src.server.database.computer import (
-        get_computer_for_workspace,
-        get_live_workspaces_for_archive_snapshot,
-    )
-    from src.server.dependencies.principal import forbidden
-    from src.server.services.computer_errors import ArchiveScopeChangedError
+    from src.dalton.services.archive_http import execute_workspace_archive_route
 
-    computer_id_for_log = (
-        body.expected_computer_id if body is not None else None
-    )
-    async with archive_http_errors(
-        target_kind="workspace",
-        workspace_id=workspace_id,
-        computer_id=computer_id_for_log,
-    ):
-        workspace = await db_get_workspace(workspace_id)
-        await workspace_access(workspace, principal.user_id, manage=True)
-
-        expected_computer_id = (
-            body.expected_computer_id if body is not None else None
-        )
-        expected_workspaces = (
-            [w.model_dump() for w in body.expected_workspaces]
-            if body is not None and body.expected_workspaces is not None
-            else None
-        )
-
-        if principal.computer_id is not None:
-            # Read-only computer resolution: never adopt an unbound workspace
-            # onto another computer, and always run self-archive + cli_approval.
-            computer = await get_computer_for_workspace(workspace_id)
-            if computer is None:
-                raise ArchiveScopeChangedError("情况已变化，请重新发起")
-            computer_id = str(computer["computer_id"])
-            if (
-                expected_computer_id is not None
-                and str(expected_computer_id) != computer_id
-            ):
-                raise ArchiveScopeChangedError("情况已变化，请重新发起")
-            if computer_id == str(principal.computer_id):
-                raise forbidden(
-                    "A computer cannot stop, archive or remove itself"
-                )
-            if expected_workspaces is None:
-                expected_workspaces = await get_live_workspaces_for_archive_snapshot(
-                    computer_id
-                )
-            await cli_approval.computer_archive(
-                request,
-                principal,
-                computer,
-                workspace_id=workspace_id,
-                body=body,
-                expected_workspaces=expected_workspaces,
-            )
-            expected_computer_id = computer_id
-
-        manager = WorkspaceManager.get_instance()
-        with computer_cause("archive"):
-            if expected_computer_id is not None or expected_workspaces is not None:
-                archived = await manager.archive_workspace(
-                    workspace_id,
-                    expected_computer_id=expected_computer_id,
-                    expected_workspaces=expected_workspaces,
-                )
-            else:
-                archived = await manager.archive_workspace(workspace_id)
-
-        in_progress = (
-            isinstance(archived, dict)
-            and archived.get("archive_state") == "archiving"
-        )
-        logger.info(
-            "archive_workspace_completed workspace_id=%s archive_state=%s",
-            workspace_id,
-            "archiving" if in_progress else "archived",
-        )
-        return WorkspaceActionResponse(
-            workspace_id=workspace_id,
-            status="stopped",
-            message=(
-                "Workspace archiving in progress"
-                if in_progress
-                else "Workspace archived successfully"
-            ),
-        )
+    return await execute_workspace_archive_route(workspace_id, request, body, principal)
 # --- DALTON-HOOK(cos-settings-tools): end ---
 
 

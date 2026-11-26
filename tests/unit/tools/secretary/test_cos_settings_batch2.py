@@ -3851,8 +3851,8 @@ async def test_daytona_archive_claim_blocks_workspace_create_across_precheck_man
     insert_sql = [s for s in executed_sql if "INSERT INTO workspaces" in s]
     assert insert_sql and FENCE_TAKES_WORKSPACES in insert_sql[0]
 
-    # 5. _settle_machine_stop preserves config.archiving unless terminal state
-    #    is confirmed (clear_archiving=True).
+    # 5. _settle_machine_stop clears config.archiving by default on terminal
+    #    settlement and preserves it only when clear_archiving=False (still archiving).
     settle_status_mock = create_autospec(
         update_computer_status,
         return_value=stopped_daytona,
@@ -3860,14 +3860,14 @@ async def test_daytona_archive_claim_blocks_workspace_create_across_precheck_man
     monkeypatch.setattr(_machines, "update_computer_status", settle_status_mock)
     cm._revoke_computer_tokens = create_autospec(cm._revoke_computer_tokens, return_value=None)
     cm._revoke_livefs = create_autospec(cm._revoke_livefs, return_value=None)
-    await cm._settle_machine_stop(CLOUD_1, "stopped")
+    await cm._settle_machine_stop(CLOUD_1, "stopped", clear_archiving=False)
     settle_status_mock.assert_awaited_once_with(
         CLOUD_1,
         "stopped",
         expected="stopping",
     )
     settle_status_mock.reset_mock()
-    await cm._settle_machine_stop(CLOUD_1, "stopped", clear_archiving=True)
+    await cm._settle_machine_stop(CLOUD_1, "stopped")
     settle_status_mock.assert_awaited_once_with(
         CLOUD_1,
         "stopped",

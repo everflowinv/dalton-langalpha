@@ -27,6 +27,7 @@ from src.server.database.computer import (
     # DALTON-HOOK(cos-settings-tools): transactional archive claim & terminal-only fence clearing
     claim_computer_for_archive,
     clear_computer_archiving,
+    retain_computer_archive_claim,
     computer_advisory_key,
     computer_capacity_lock,
     create_computer,
@@ -34,7 +35,6 @@ from src.server.database.computer import (
     get_computer_by_provider_ref,
     get_computer_for_workspace,
     get_computers_for_user,
-    get_live_workspaces_for_archive_snapshot,
     get_primary_computer,
     try_bind_computer_provider_ref,
     try_claim_computer_for_start,
@@ -72,7 +72,6 @@ from src.server.services.account import refuse_machine_use
 from src.server.services.computer_usage.events import note_start_path
 from src.server.services.computer_errors import (
     ApprovalScopeChangedError,  # DALTON-HOOK(cos-settings-tools)
-    ComputerArchivingError,  # DALTON-HOOK(cos-settings-tools)
     NeedsComputer,
     ProviderNotOffered,
     UnknownResourceTier,
@@ -89,9 +88,6 @@ from src.server.services.computer_manager._types import (
     _MACHINE_DECISION_LOCK_TIMEOUT_MS,
     ComputerBinding,
     WorkspaceNotOnComputer,
-)
-from src.server.services.path_lock_coordination import (
-    computer_stop_heartbeat_present,  # DALTON-HOOK(cos-settings-tools)
 )
 from src.server.database.shared_workspaces import is_holder
 
@@ -723,13 +719,19 @@ class MachineLifecycleMixin:
 
     # --- DALTON-HOOK(cos-settings-tools): begin ---
     async def _settle_machine_stop(
-        self, computer_id: str, status: str, *, clear_archiving: bool = False
+        self,
+        computer_id: str,
+        status: str,
+        *,
+        clear_archiving: bool = True,
+        expected_archiving_owner: str | None = None,
     ) -> None:
         """CAS from 'stopping' so a teardown's tail cannot stomp a peer's transition.
 
-        ``clear_archiving`` is True only once the provider confirms archiving
-        finished or failed; while the provider still reports ``archiving``, the
-        row settles to ``stopped`` with ``config.archiving`` left in place.
+        ``clear_archiving`` defaults to True so ordinary stops and terminal
+        reconciliations keep the upstream 2-argument call contract and clear
+        any residual ``config.archiving`` fence. Pass ``clear_archiving=False``
+        only while the provider still reports ``archiving``.
         """
         if status == ComputerStatus.STOPPED:
             # While the row still reads 'stopping', so no start can have minted
@@ -739,6 +741,8 @@ class MachineLifecycleMixin:
         kwargs: Dict[str, Any] = {"expected": "stopping"}
         if clear_archiving:
             kwargs["drop_config_key"] = "archiving"
+        if expected_archiving_owner is not None:
+            kwargs["expected_archiving_owner"] = expected_archiving_owner
         settled = await update_computer_status(
             computer_id,
             status,
@@ -748,8 +752,14 @@ class MachineLifecycleMixin:
             if clear_archiving and status == ComputerStatus.STOPPED:
                 # Startup recovery or a peer may already have settled status to
                 # 'stopped' while preserving config.archiving; a confirmed
-                # terminal provider state still clears the fence.
-                await clear_computer_archiving(computer_id)
+                # terminal provider state still clears the fence under the same owner CAS.
+                if expected_archiving_owner is not None:
+                    await clear_computer_archiving(
+                        computer_id,
+                        expected_archiving_owner=expected_archiving_owner,
+                    )
+                else:
+                    await clear_computer_archiving(computer_id)
             logger.info(
                 f"Computer {computer_id} was moved out of 'stopping' by another "
                 f"worker; leaving it rather than writing {status!r}"
@@ -768,6 +778,14 @@ class MachineLifecycleMixin:
         )
 
     # --- DALTON-HOOK(cos-settings-tools): begin ---
+    async def _retain_machine_archive_claim(
+        self, computer_id: str, *, archiving_owner: str
+    ) -> bool:
+        """Re-verify the durable archive owner claim before contacting the provider."""
+        return await retain_computer_archive_claim(
+            computer_id, archiving_owner=archiving_owner
+        )
+
     async def _claim_machine_for_archive(
         self,
         computer_id: str,
@@ -785,126 +803,36 @@ class MachineLifecycleMixin:
     async def _reconcile_stopped_archiving_locked(
         self, computer: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Probe provider for a stopped computer carrying ``config.archiving=true``.
+        from src.dalton.services.archive_lifecycle import (
+            reconcile_stopped_archiving_locked_impl,
+        )
 
-        Caller must hold ``self._observed_lock(computer_id, ...)``. Clears
-        ``config.archiving`` only when no active archive worker holds the stop
-        heartbeat and the provider confirms a terminal state (not ``archiving``).
-        """
-        computer_id = str(computer["computer_id"])
-        if not (computer.get("config") or {}).get("archiving"):
-            return computer
-        if await computer_stop_heartbeat_present(computer_id) is True:
-            return computer
-        sandbox_id = computer.get("provider_ref")
-        if not sandbox_id:
-            await clear_computer_archiving(computer_id)
-            return await get_computer(computer_id) or computer
-        binding = self._binding_from_computer("", computer)
-        if not binding.provider.recreatable:
-            await clear_computer_archiving(computer_id)
-            return await get_computer(computer_id) or computer
-        try:
-            async with self._detached_runtime(sandbox_id, binding=binding) as runtime:
-                actual_state = await runtime.get_state()
-        except SandboxGoneError:
-            await clear_computer_archiving(computer_id)
-            return await get_computer(computer_id) or computer
-        except Exception as exc:
-            logger.warning(
-                "archive_fence_reconcile_probe_failed computer_id=%s exc_type=%s",
-                computer_id,
-                type(exc).__name__,
-            )
-            return computer
-
-        state = actual_state.value
-        if state == "archiving":
-            return computer
-        if state in ("archived", "stopped", "error"):
-            await clear_computer_archiving(computer_id)
-            return await get_computer(computer_id) or computer
-        if state == "running":
-            await update_computer_status(
-                computer_id,
-                ComputerStatus.RUNNING,
-                expected=ComputerStatus.STOPPED,
-                drop_config_key="archiving",
-            )
-            await update_computer_activity(computer_id)
-            return await get_computer(computer_id) or computer
-        return computer
+        return await reconcile_stopped_archiving_locked_impl(self, computer)
 
     async def _ensure_not_archiving_locked(
         self, computer: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Shared archive-fence reconciliation for computer start and workspace start/session acquire.
+        from src.dalton.services.archive_lifecycle import (
+            ensure_not_archiving_locked_impl,
+        )
 
-        Caller holds ``self._observed_lock(computer_id, ...)``. Reconciles a
-        ``stopping`` or ``stopped`` computer carrying ``config.archiving=true``
-        and raises ``ComputerArchivingError`` if the fence still stands.
-        """
-        computer_id = str(computer["computer_id"])
-        if not (computer.get("config") or {}).get("archiving"):
-            return computer
-        status = computer.get("status")
-        if status == ComputerStatus.STOPPING:
-            await self._correct_stuck_stopping(
-                self._binding_from_computer("", computer)
-            )
-            computer = await get_computer(computer_id) or computer
-            status = computer.get("status")
-        if (
-            status == ComputerStatus.STOPPED
-            and (computer.get("config") or {}).get("archiving")
-        ):
-            computer = await self._reconcile_stopped_archiving_locked(computer)
-        if (computer.get("config") or {}).get("archiving"):
-            raise ComputerArchivingError(
-                "This computer is currently being archived. Wait for archiving to finish before starting it."
-            )
-        return computer
+        return await ensure_not_archiving_locked_impl(self, computer)
 
-    async def ensure_computer_not_archiving(
-        self, computer_id: str
-    ) -> bool:
-        """Reconcile any ``config.archiving`` fence on ``computer_id`` and refuse start while active.
+    async def ensure_computer_not_archiving(self, computer_id: str) -> bool:
+        from src.dalton.services.archive_lifecycle import (
+            ensure_computer_not_archiving_impl,
+        )
 
-        Returns True iff an archiving fence was present and reconciled clear,
-        False when no archiving fence was set on the computer.
-        """
-        computer = await get_computer(computer_id)
-        if computer is None or not (computer.get("config") or {}).get("archiving"):
-            return False
-        async with self._observed_lock(computer_id, "computer.archiving.reconcile"):
-            fresh = await get_computer(computer_id)
-            if fresh is None or not (fresh.get("config") or {}).get("archiving"):
-                return False
-            await self._ensure_not_archiving_locked(fresh)
-            return True
+        return await ensure_computer_not_archiving_impl(self, computer_id)
 
     async def reconcile_archiving_computer(
         self, computer_id: str
     ) -> Dict[str, Any] | None:
-        """Probe provider and clear ``config.archiving`` once archiving reached a terminal state."""
-        async with self._observed_lock(computer_id, "computer.archiving.reconcile"):
-            computer = await get_computer(computer_id)
-            if computer is None:
-                return None
-            if not (computer.get("config") or {}).get("archiving"):
-                return computer
-            status = computer.get("status")
-            if status == ComputerStatus.STOPPING:
-                await self._correct_stuck_stopping(
-                    self._binding_from_computer("", computer)
-                )
-                return await get_computer(computer_id)
-            if status == ComputerStatus.STOPPED:
-                return await self._reconcile_stopped_archiving_locked(computer)
-            if status == ComputerStatus.RUNNING:
-                await clear_computer_archiving(computer_id)
-                return await get_computer(computer_id)
-            return computer
+        from src.dalton.services.archive_lifecycle import (
+            reconcile_archiving_computer_impl,
+        )
+
+        return await reconcile_archiving_computer_impl(self, computer_id)
     # --- DALTON-HOOK(cos-settings-tools): end ---
 
     # Bare computers have no folder, file mirror or project MCP set. Use machine
@@ -1533,13 +1461,9 @@ class MachineLifecycleMixin:
         # DALTON-HOOK(cos-settings-tools): optional confirmation snapshot for whole-computer archive
         expected_workspaces: Any = None,
     ) -> Optional[Dict[str, Any]]:
-        # --- DALTON-HOOK(cos-settings-tools): begin ---
-        snapshot = (
-            expected_workspaces
-            if expected_workspaces is not None
-            else await get_live_workspaces_for_archive_snapshot(computer_id)
+        # DALTON-HOOK(cos-settings-tools): thin delegate to Dalton archive service
+        from src.dalton.services.archive_lifecycle import archive_computer_impl
+
+        return await archive_computer_impl(
+            self, computer_id, expected_workspaces=expected_workspaces
         )
-        return await self._archive_machine(
-            computer_id, expected_workspaces=snapshot
-        )
-        # --- DALTON-HOOK(cos-settings-tools): end ---

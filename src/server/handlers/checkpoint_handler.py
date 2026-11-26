@@ -366,6 +366,7 @@ def _snapshot_matches_action(
             and bool(snapshot.get("duplicate_check_unavailable"))
             == bool(action_req.get("duplicate_check_unavailable"))
         )
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
     if action_type == "archive_workspace":
         from src.server.database.computer import normalize_archive_workspace_snapshot
 
@@ -383,6 +384,7 @@ def _snapshot_matches_action(
             and normalize_archive_workspace_snapshot(snap_ws)
             == normalize_archive_workspace_snapshot(req_ws)
         )
+    # --- DALTON-HOOK(cos-settings-tools): end ---
     return False
 
 

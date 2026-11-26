@@ -630,22 +630,29 @@ async def computer_has_blocking_archive_move(
 async def clear_computer_archiving(
     computer_id: str,
     *,
+    expected_archiving_owner: Optional[str] = None,
     conn=None,
 ) -> bool:
     """Clear the ``config.archiving`` fence once the provider confirms a terminal state."""
     cid = normalize_uuid(computer_id)
     if cid is None:
         return False
+    owner_guard = (
+        "\n                  AND COALESCE(config, '{}'::jsonb)->>'archiving_owner' = %(expected_owner)s"
+        if expected_archiving_owner is not None
+        else ""
+    )
     async with _computer_cursor(conn) as cur:
         await cur.execute(
             f"""
             WITH comp AS (
                 UPDATE computers
-                SET config = COALESCE(config, '{{}}'::jsonb) - 'archiving',
+                SET config = COALESCE(config, '{{}}'::jsonb)
+                    - ARRAY['archiving', 'archiving_owner', 'archiving_claimed_at']::text[],
                     updated_at = NOW()
-                WHERE computer_id = %s
+                WHERE computer_id = %(computer_id)s
                   AND {FENCE_NOT_DELETED}
-                  AND COALESCE(config, '{{}}'::jsonb) @> '{{"archiving": true}}'::jsonb
+                  AND COALESCE(config, '{{}}'::jsonb) @> '{{"archiving": true}}'::jsonb{owner_guard}
                 RETURNING computer_id, status
             ),
             ws AS (
@@ -658,7 +665,40 @@ async def clear_computer_archiving(
             )
             SELECT computer_id FROM comp
             """,
-            (cid,),
+            {
+                "computer_id": cid,
+                "expected_owner": expected_archiving_owner,
+            },
+        )
+        return await cur.fetchone() is not None
+
+
+async def retain_computer_archive_claim(
+    computer_id: str,
+    *,
+    archiving_owner: str,
+    conn=None,
+) -> bool:
+    """Re-verify and touch ``updated_at`` for the active archive claim before contacting the provider."""
+    cid = normalize_uuid(computer_id)
+    if cid is None:
+        return False
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            UPDATE computers
+            SET updated_at = NOW()
+            WHERE computer_id = %(computer_id)s
+              AND {FENCE_NOT_DELETED}
+              AND status = 'stopping'
+              AND COALESCE(config, '{{}}'::jsonb) @> '{{"archiving": true}}'::jsonb
+              AND COALESCE(config, '{{}}'::jsonb)->>'archiving_owner' = %(archiving_owner)s
+            RETURNING computer_id
+            """,
+            {
+                "computer_id": cid,
+                "archiving_owner": archiving_owner,
+            },
         )
         return await cur.fetchone() is not None
 
@@ -667,13 +707,14 @@ async def reset_abandoned_archiving_computer(
     computer_id: str,
     *,
     expected_updated_at: Optional[datetime] = None,
+    expected_archiving_owner: Optional[str] = None,
     conn=None,
 ) -> Optional[Dict[str, Any]]:
     """Reset one abandoned ``stopping`` archiving computer back to ``stopped`` without shadow-writing workspaces.
 
     Matches only a row still in ``stopping`` with ``config.archiving = true`` (and
-    the exact ``expected_updated_at`` when given) so startup recovery never stomps
-    a newer claim or overwrites live workspaces on that computer.
+    the exact ``expected_updated_at`` / ``expected_archiving_owner`` when given) so
+    startup recovery never stomps a newer claim or overwrites live workspaces on that computer.
     """
     cid = normalize_uuid(computer_id)
     if cid is None:
@@ -681,6 +722,11 @@ async def reset_abandoned_archiving_computer(
     updated_guard = (
         "\n              AND updated_at = %(expected_updated_at)s"
         if expected_updated_at is not None
+        else ""
+    )
+    owner_guard = (
+        "\n              AND COALESCE(config, '{}'::jsonb)->>'archiving_owner' = %(expected_archiving_owner)s"
+        if expected_archiving_owner is not None
         else ""
     )
     async with _computer_cursor(conn) as cur:
@@ -692,12 +738,13 @@ async def reset_abandoned_archiving_computer(
                 updated_at = NOW()
             WHERE computer_id = %(computer_id)s
               AND status = 'stopping'
-              AND COALESCE(config, '{{}}'::jsonb) @> '{{"archiving": true}}'::jsonb{updated_guard}
+              AND COALESCE(config, '{{}}'::jsonb) @> '{{"archiving": true}}'::jsonb{updated_guard}{owner_guard}
             RETURNING {_COMPUTER_COLS}
             """,
             {
                 "computer_id": cid,
                 "expected_updated_at": expected_updated_at,
+                "expected_archiving_owner": expected_archiving_owner,
             },
         )
         row = await cur.fetchone()
@@ -857,12 +904,19 @@ async def claim_computer_for_archive(
                     "Cannot archive a computer while a workspace move is in progress"
                 )
 
-        # 4. Stamp stopping + config.archiving=True atomically in the same transaction.
+        # 4. Stamp stopping + config.archiving=True + owner/timestamp atomically in the same transaction.
+        from datetime import timezone
+        import uuid as _uuid
+
         claimed = await update_computer_status(
             cid,
             "stopping",
             expected="stopped",
-            merge_config={"archiving": True},
+            merge_config={
+                "archiving": True,
+                "archiving_owner": _uuid.uuid4().hex,
+                "archiving_claimed_at": datetime.now(timezone.utc).isoformat(),
+            },
             conn=conn,
         )
         if claimed is None:
@@ -1371,6 +1425,8 @@ async def update_computer_status(
     drop_config_key: str | None = None,
     unless_config_key: str | None = None,
     merge_config: dict[str, Any] | None = None,
+    # DALTON-HOOK(cos-settings-tools): optional CAS guard matching config.archiving_owner
+    expected_archiving_owner: Optional[str] = None,
     conn=None,
 ) -> Optional[Dict[str, Any]]:
     """Only try_bind_computer_provider_ref may change the durable machine binding.
@@ -1405,13 +1461,25 @@ async def update_computer_status(
             "\n                  AND c.provider_ref IS NOT DISTINCT FROM"
             " %(expected_ref)s"
         )
+    # DALTON-HOOK(cos-settings-tools): optional CAS guard on archiving_owner
+    if expected_archiving_owner is not None:
+        expected_clause += (
+            "\n                  AND COALESCE(c.config, '{}'::jsonb)->>'archiving_owner'"
+            " = %(expected_archiving_owner)s"
+        )
     stopped_clause = ", stopped_at = NOW()" if status == "stopped" else ""
     primary_clause = ", is_primary = FALSE" if status == "deleted" else ""
     config_value = "COALESCE(config, '{}'::jsonb)"
     if drop_config_key:
+        # DALTON-HOOK(cos-settings-tools): dropping archiving also clears its owner and claimed_at metadata
+        drop_expr = (
+            f"{config_value} - ARRAY['archiving', 'archiving_owner', 'archiving_claimed_at']::text[]"
+            if drop_config_key == "archiving"
+            else f"{config_value} - %(drop_key)s::text"
+        )
         config_value = (
             f"CASE WHEN {config_value} ? %(unless_key)s"
-            f" THEN config ELSE {config_value} - %(drop_key)s::text END"
+            f" THEN config ELSE {drop_expr} END"
         )
     if merge_config:
         config_value = f"({config_value}) || %(merge)s::jsonb"
@@ -1434,6 +1502,7 @@ async def update_computer_status(
         "updated_before": updated_before,
         "expected_always_on": expected_always_on,
         "expected_ref": expected_provider_ref,
+        "expected_archiving_owner": expected_archiving_owner,  # DALTON-HOOK(cos-settings-tools)
         "drop_key": drop_config_key,
         "unless_key": unless_config_key,
         "merge": Json(merge_config or {}),

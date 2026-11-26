@@ -368,7 +368,10 @@ async def test_claim_computer_for_archive_verifies_locks_snapshot_and_stale_move
     assert claimed["config"]["archiving"] is True
     assert update_mock.await_args.args == (COMP_A, "stopping")
     assert update_mock.await_args.kwargs["expected"] == "stopped"
-    assert update_mock.await_args.kwargs["merge_config"] == {"archiving": True}
+    merged_cfg = update_mock.await_args.kwargs["merge_config"]
+    assert merged_cfg["archiving"] is True
+    assert isinstance(merged_cfg.get("archiving_owner"), str) and merged_cfg["archiving_owner"]
+    assert isinstance(merged_cfg.get("archiving_claimed_at"), str) and merged_cfg["archiving_claimed_at"]
     assert update_mock.await_args.kwargs["conn"] is not None
 
 
@@ -409,9 +412,12 @@ async def test_reconcile_provider_stop_clears_archiving_only_on_terminal_state(
         provider=SimpleNamespace(recreatable=True),
     )
     await cm._reconcile_provider_stop(binding)
-    settle_mock.assert_awaited_once_with(
-        COMP_A, expected_status, clear_archiving=expected_clear
-    )
+    if expected_clear:
+        settle_mock.assert_awaited_once_with(COMP_A, expected_status)
+    else:
+        settle_mock.assert_awaited_once_with(
+            COMP_A, expected_status, clear_archiving=False
+        )
 
 
 @pytest.mark.asyncio
@@ -436,8 +442,14 @@ async def test_reconcile_archiving_computer_preserves_while_archiving_and_clears
 
     archiving_stopped = _computer_row(status="stopped", config={"archiving": True})
     cleared_stopped = _computer_row(status="stopped", config={})
+    from src.dalton.services import archive_lifecycle
     clear_mock = create_autospec(computer_db.clear_computer_archiving, return_value=True)
     monkeypatch.setattr(_machines, "clear_computer_archiving", clear_mock)
+    monkeypatch.setattr(
+        archive_lifecycle,
+        "computer_stop_heartbeat_present",
+        create_autospec(archive_lifecycle.computer_stop_heartbeat_present, return_value=False),
+    )
 
     # Provider still archiving -> keep fence
     monkeypatch.setattr(
@@ -480,6 +492,7 @@ async def test_reconcile_archiving_computer_preserves_while_archiving_and_clears
 
 @pytest.mark.asyncio
 async def test_startup_recovery_skips_when_stop_heartbeat_present(monkeypatch):
+    from src.dalton.services import archive_lifecycle
     from src.server.services import workspace_manager as wm_mod
 
     wm = object.__new__(WorkspaceManager)
@@ -492,32 +505,21 @@ async def test_startup_recovery_skips_when_stop_heartbeat_present(monkeypatch):
         computer_db.reset_abandoned_archiving_computer, return_value=stuck_row
     )
     shadow_mock = create_autospec(computer_db.update_computer_status)
-    monkeypatch.setattr(wm_mod, "get_archiving_computers_by_status", list_mock)
-    monkeypatch.setattr(wm_mod, "reset_abandoned_archiving_computer", reset_mock)
+    monkeypatch.setattr(archive_lifecycle, "get_archiving_computers_by_status", list_mock)
+    monkeypatch.setattr(archive_lifecycle, "reset_abandoned_archiving_computer", reset_mock)
     monkeypatch.setattr(wm_mod, "update_computer_status", shadow_mock)
 
     # 1. Live heartbeat -> skip writeback completely.
-    from src.server.services import path_lock_coordination
-
-    monkeypatch.setattr(
-        wm_mod,
-        "computer_stop_heartbeat_present",
-        create_autospec(
-            path_lock_coordination.computer_stop_heartbeat_present, return_value=True
-        ),
+    hb_mock = create_autospec(
+        archive_lifecycle.computer_stop_heartbeat_present, return_value=True
     )
+    monkeypatch.setattr(archive_lifecycle, "computer_stop_heartbeat_present", hb_mock)
     assert await wm.recover_archiving_computers_on_startup() == 0
     reset_mock.assert_not_awaited()
     shadow_mock.assert_not_awaited()
 
     # 2. Heartbeat unreadable (None) and durable claim still within 180s -> skip.
-    monkeypatch.setattr(
-        wm_mod,
-        "computer_stop_heartbeat_present",
-        create_autospec(
-            path_lock_coordination.computer_stop_heartbeat_present, return_value=None
-        ),
-    )
+    hb_mock.return_value = None
     assert await wm.recover_archiving_computers_on_startup() == 0
     reset_mock.assert_not_awaited()
     shadow_mock.assert_not_awaited()
@@ -527,10 +529,20 @@ async def test_startup_recovery_skips_when_stop_heartbeat_present(monkeypatch):
 async def test_startup_recovery_resets_only_abandoned_archiving_computer_without_shadow_write(
     monkeypatch,
 ):
+    from src.dalton.services import archive_lifecycle
     from src.server.services import workspace_manager as wm_mod
 
     wm = object.__new__(WorkspaceManager)
-    stuck_row = _computer_row(status="stopping", config={"archiving": True})
+    old_ts = datetime.now(timezone.utc) - timedelta(seconds=60)
+    stuck_row = _computer_row(
+        status="stopping",
+        config={
+            "archiving": True,
+            "archiving_owner": "owner-expired-1",
+            "archiving_claimed_at": old_ts.isoformat(),
+        },
+    )
+    stuck_row["updated_at"] = old_ts
     reset_row = _computer_row(status="stopped", config={"archiving": True})
 
     list_mock = create_autospec(
@@ -541,19 +553,21 @@ async def test_startup_recovery_resets_only_abandoned_archiving_computer_without
     )
     shadow_mock = create_autospec(computer_db.update_computer_status)
     hb_mock = create_autospec(
-        wm_mod.computer_stop_heartbeat_present, return_value=False
+        archive_lifecycle.computer_stop_heartbeat_present, return_value=False
     )
-    monkeypatch.setattr(wm_mod, "get_archiving_computers_by_status", list_mock)
-    monkeypatch.setattr(wm_mod, "reset_abandoned_archiving_computer", reset_mock)
+    monkeypatch.setattr(archive_lifecycle, "get_archiving_computers_by_status", list_mock)
+    monkeypatch.setattr(archive_lifecycle, "reset_abandoned_archiving_computer", reset_mock)
     monkeypatch.setattr(wm_mod, "update_computer_status", shadow_mock)
-    monkeypatch.setattr(wm_mod, "computer_stop_heartbeat_present", hb_mock)
+    monkeypatch.setattr(archive_lifecycle, "computer_stop_heartbeat_present", hb_mock)
 
     count = await wm.recover_archiving_computers_on_startup()
     assert count == 1
     list_mock.assert_awaited_once_with("stopping", limit=1000)
     hb_mock.assert_awaited_once_with(COMP_A)
     reset_mock.assert_awaited_once_with(
-        COMP_A, expected_updated_at=stuck_row["updated_at"]
+        COMP_A,
+        expected_updated_at=stuck_row["updated_at"],
+        expected_archiving_owner="owner-expired-1",
     )
     # Must NOT shadow-write live workspaces via update_computer_status.
     shadow_mock.assert_not_awaited()
@@ -1024,10 +1038,11 @@ async def test_workspace_start_and_session_acquire_share_archive_reconciliation_
         "get_computer",
         create_autospec(computer_db.get_computer, return_value=archiving_comp),
     )
+    from src.dalton.services import archive_lifecycle
     monkeypatch.setattr(
-        _machines,
+        archive_lifecycle,
         "computer_stop_heartbeat_present",
-        create_autospec(_machines.computer_stop_heartbeat_present, return_value=False),
+        create_autospec(archive_lifecycle.computer_stop_heartbeat_present, return_value=False),
     )
 
     rt_archiving = create_autospec(SandboxRuntime, instance=True)
@@ -1087,41 +1102,33 @@ async def test_workspace_start_and_session_acquire_share_archive_reconciliation_
 
 @pytest.mark.asyncio
 async def test_stage_workspace_move_locks_workspaces_by_workspace_id(monkeypatch):
+    import psycopg
+
     executed: list[str] = []
+    cur = create_autospec(psycopg.AsyncCursor, instance=True)
+    cur.__aenter__.return_value = cur
+    cur.__aexit__.return_value = False
 
-    class _Cur:
-        def __init__(self):
-            self._step = 0
+    async def _exec(sql, params=None):
+        executed.append(sql)
 
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-        async def execute(self, sql, params=None):
-            executed.append(sql)
-            self._step += 1
-
-        async def fetchone(self):
-            if self._step == 1:
-                return {"source_computer_id": COMP_A, "from_backup": False}
-            return {"move_id": "m-1", "phase": "staged"}
+    cur.execute.side_effect = _exec
+    cur.fetchone.side_effect = [
+        {"source_computer_id": COMP_A, "from_backup": False},
+        {"move_id": "m-1", "phase": "staged"},
+    ]
 
     @asynccontextmanager
     async def _tx():
         yield
 
-    class _Conn:
-        def transaction(self):
-            return _tx()
-
-        def cursor(self, row_factory=None):
-            return _Cur()
+    conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    conn.transaction.side_effect = _tx
+    conn.cursor.return_value = cur
 
     @asynccontextmanager
     async def _get_conn():
-        yield _Conn()
+        yield conn
 
     monkeypatch.setattr(move_db, "get_db_connection", _get_conn)
     monkeypatch.setattr(
@@ -1247,11 +1254,6 @@ async def test_reap_stuck_stopping_logs_only_whitelisted_fields(monkeypatch, cap
         "get_computers_by_status",
         create_autospec(wm_mod.get_computers_by_status, return_value=[old_stopping]),
     )
-    monkeypatch.setattr(
-        wm_mod,
-        "get_archiving_computers_by_status",
-        create_autospec(wm_mod.get_archiving_computers_by_status, return_value=[]),
-    )
     wm.reconcile_stopping_computer = create_autospec(
         wm.reconcile_stopping_computer,
         side_effect=RuntimeError(FAKE_SECRET_BODY),
@@ -1274,17 +1276,16 @@ async def test_daytona_get_maps_404_to_sandbox_gone_and_reconcile_clears_fence(
     monkeypatch,
 ):
     from daytona import DaytonaNotFoundError
+    from daytona._async.daytona import AsyncDaytona
     from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
     from src.server.services.computer_manager import _machines
 
     provider = DaytonaProvider.__new__(DaytonaProvider)
     provider._working_dir = "/home/workspace"
 
-    class _Client404:
-        async def get(self, sandbox_id: str):
-            raise DaytonaNotFoundError("sandbox not found", status_code=404)
-
-    provider._client = _Client404()
+    client_404 = create_autospec(AsyncDaytona, instance=True)
+    client_404.get.side_effect = DaytonaNotFoundError("sandbox not found", status_code=404)
+    provider._client = client_404
     with pytest.raises(SandboxGoneError) as gone_exc:
         await provider.get("sbx-missing-1")
     assert gone_exc.value.sandbox_id == "sbx-missing-1"
@@ -1311,10 +1312,11 @@ async def test_daytona_get_maps_404_to_sandbox_gone_and_reconcile_clears_fence(
         "get_computer",
         create_autospec(computer_db.get_computer, return_value=cleared_row),
     )
+    from src.dalton.services import archive_lifecycle
     monkeypatch.setattr(
-        _machines,
+        archive_lifecycle,
         "computer_stop_heartbeat_present",
-        create_autospec(_machines.computer_stop_heartbeat_present, return_value=False),
+        create_autospec(archive_lifecycle.computer_stop_heartbeat_present, return_value=False),
     )
 
     res = await cm._reconcile_stopped_archiving_locked(
@@ -1329,6 +1331,7 @@ async def test_daytona_get_preserves_transient_error_for_retry_and_keeps_fence(
     monkeypatch,
 ):
     from daytona import DaytonaError
+    from daytona._async.daytona import AsyncDaytona
     from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
     from src.server.services.computer_manager import _machines
 
@@ -1336,12 +1339,9 @@ async def test_daytona_get_preserves_transient_error_for_retry_and_keeps_fence(
     provider._working_dir = "/home/workspace"
 
     transient_err = DaytonaError("service unavailable", status_code=503)
-
-    class _Client503:
-        async def get(self, sandbox_id: str):
-            raise transient_err
-
-    provider._client = _Client503()
+    client_503 = create_autospec(AsyncDaytona, instance=True)
+    client_503.get.side_effect = transient_err
+    provider._client = client_503
     with pytest.raises(DaytonaError) as exc_info:
         await provider.get("sbx-transient-1")
     assert not isinstance(exc_info.value, SandboxGoneError)
@@ -1361,12 +1361,13 @@ async def test_daytona_get_preserves_transient_error_for_retry_and_keeps_fence(
         yield await provider.get(sandbox_id)
 
     cm._detached_runtime = _detached_via_provider
+    from src.dalton.services import archive_lifecycle
     clear_mock = create_autospec(computer_db.clear_computer_archiving, return_value=True)
     monkeypatch.setattr(_machines, "clear_computer_archiving", clear_mock)
     monkeypatch.setattr(
-        _machines,
+        archive_lifecycle,
         "computer_stop_heartbeat_present",
-        create_autospec(_machines.computer_stop_heartbeat_present, return_value=False),
+        create_autospec(archive_lifecycle.computer_stop_heartbeat_present, return_value=False),
     )
 
     archiving_row = _computer_row(status="stopped", config={"archiving": True})
@@ -1379,8 +1380,7 @@ async def test_daytona_get_preserves_transient_error_for_retry_and_keeps_fence(
 async def test_direct_archive_without_snapshot_collects_readonly_snapshot_and_never_adopts_unbound(
     monkeypatch,
 ):
-    from src.server.services import workspace_manager as wm_mod
-    from src.server.services.computer_manager import _machines
+    from src.dalton.services import archive_lifecycle
 
     snapshot = [
         {"workspace_id": WS_1, "name": "NVDA", "dir_name": "NVDA", "status": "stopped", "is_stand_in": False},
@@ -1392,18 +1392,17 @@ async def test_direct_archive_without_snapshot_collects_readonly_snapshot_and_ne
     wm._archive_machine = create_autospec(
         wm._archive_machine, return_value={"workspace_id": WS_1, "archive_state": "archived"}
     )
-    monkeypatch.setattr(
-        wm_mod,
-        "get_computer_for_workspace",
-        create_autospec(
-            wm_mod.get_computer_for_workspace,
-            return_value=_computer_row(cid=COMP_A),
-        ),
+    get_comp_mock = create_autospec(
+        archive_lifecycle.get_computer_for_workspace,
+        return_value=_computer_row(cid=COMP_A),
     )
+    monkeypatch.setattr(archive_lifecycle, "get_computer_for_workspace", get_comp_mock)
     snap_mock = create_autospec(
-        wm_mod.get_live_workspaces_for_archive_snapshot, return_value=snapshot
+        archive_lifecycle.get_live_workspaces_for_archive_snapshot, return_value=snapshot
     )
-    monkeypatch.setattr(wm_mod, "get_live_workspaces_for_archive_snapshot", snap_mock)
+    monkeypatch.setattr(
+        archive_lifecycle, "get_live_workspaces_for_archive_snapshot", snap_mock
+    )
 
     await wm.archive_workspace(WS_1)
     snap_mock.assert_awaited_once_with(COMP_A)
@@ -1417,11 +1416,7 @@ async def test_direct_archive_without_snapshot_collects_readonly_snapshot_and_ne
 
     # 2. Unbound workspace (get_computer_for_workspace -> None) is rejected without adoption.
     wm._archive_machine.reset_mock()
-    monkeypatch.setattr(
-        wm_mod,
-        "get_computer_for_workspace",
-        create_autospec(computer_db.get_computer_for_workspace, return_value=None),
-    )
+    get_comp_mock.return_value = None
     with pytest.raises(ArchiveScopeChangedError):
         await wm.archive_workspace(WS_1)
     wm.resolve_binding.assert_not_awaited()
@@ -1432,14 +1427,9 @@ async def test_direct_archive_without_snapshot_collects_readonly_snapshot_and_ne
     cm._archive_machine = create_autospec(
         cm._archive_machine, return_value=_computer_row(cid=COMP_A)
     )
-    comp_snap_mock = create_autospec(
-        _machines.get_live_workspaces_for_archive_snapshot, return_value=snapshot
-    )
-    monkeypatch.setattr(
-        _machines, "get_live_workspaces_for_archive_snapshot", comp_snap_mock
-    )
+    snap_mock.reset_mock()
     await cm.archive_computer(COMP_A)
-    comp_snap_mock.assert_awaited_once_with(COMP_A)
+    snap_mock.assert_awaited_once_with(COMP_A)
     cm._archive_machine.assert_awaited_once_with(
         COMP_A, expected_workspaces=snapshot
     )
@@ -1449,15 +1439,16 @@ async def test_direct_archive_without_snapshot_collects_readonly_snapshot_and_ne
 async def test_reconcile_stopped_archiving_keeps_fence_when_heartbeat_present(
     monkeypatch,
 ):
+    from src.dalton.services import archive_lifecycle
     from src.server.services.computer_manager import _machines
 
     cm = object.__new__(ComputerManager)
     clear_mock = create_autospec(computer_db.clear_computer_archiving, return_value=True)
     monkeypatch.setattr(_machines, "clear_computer_archiving", clear_mock)
     monkeypatch.setattr(
-        _machines,
+        archive_lifecycle,
         "computer_stop_heartbeat_present",
-        create_autospec(_machines.computer_stop_heartbeat_present, return_value=True),
+        create_autospec(archive_lifecycle.computer_stop_heartbeat_present, return_value=True),
     )
     archiving_row = _computer_row(status="stopped", config={"archiving": True})
     res = await cm._reconcile_stopped_archiving_locked(archiving_row)
@@ -1542,3 +1533,459 @@ async def test_cli_approval_computer_archive_binds_snapshot_into_digest_and_unbo
     assert resp.status_code == 409
     assert resp.json()["detail"]["code"] == "scope_changed"
     ws_mgr.archive_workspace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_does_not_take_over_fresh_claim_before_heartbeat_created(
+    monkeypatch,
+):
+    """After claim commit and before Redis heartbeat is created, startup recovery must NOT take over."""
+    from src.dalton.services import archive_lifecycle
+    from src.server.services.computer_manager import _lifecycle
+
+    wm = object.__new__(WorkspaceManager)
+    now = datetime.now(timezone.utc)
+    fresh_claim = _computer_row(
+        status="stopping",
+        config={
+            "archiving": True,
+            "archiving_owner": "owner-fresh-1",
+            "archiving_claimed_at": now.isoformat(),
+        },
+    )
+    fresh_claim["updated_at"] = now
+
+    list_mock = create_autospec(
+        computer_db.get_archiving_computers_by_status, return_value=[fresh_claim]
+    )
+    reset_mock = create_autospec(
+        computer_db.reset_abandoned_archiving_computer, return_value=fresh_claim
+    )
+    hb_mock = create_autospec(
+        archive_lifecycle.computer_stop_heartbeat_present, return_value=False
+    )
+    monkeypatch.setattr(archive_lifecycle, "get_archiving_computers_by_status", list_mock)
+    monkeypatch.setattr(archive_lifecycle, "reset_abandoned_archiving_computer", reset_mock)
+    monkeypatch.setattr(archive_lifecycle, "computer_stop_heartbeat_present", hb_mock)
+
+    # 1. Startup recovery sees heartbeat=False, but claim is within STOP_HEARTBEAT_TTL_S -> skip!
+    assert await wm.recover_archiving_computers_on_startup() == 0
+    reset_mock.assert_not_awaited()
+
+    # 2. _correct_stuck_stopping also respects the same claim grace window.
+    cm = object.__new__(ComputerManager)
+    cm._reconcile_provider_stop = create_autospec(cm._reconcile_provider_stop)
+    monkeypatch.setattr(_lifecycle, "computer_stop_heartbeat_present", hb_mock)
+    monkeypatch.setattr(
+        _lifecycle,
+        "get_computer",
+        create_autospec(computer_db.get_computer, return_value=fresh_claim),
+    )
+    binding = SimpleNamespace(
+        computer_id=COMP_A,
+        workspace_id=WS_1,
+        provider_ref="sbx-daytona-1",
+        provider=SimpleNamespace(recreatable=True),
+    )
+    await cm._correct_stuck_stopping(binding)
+    cm._reconcile_provider_stop.assert_not_awaited()
+
+    # 3. _archive_machine re-verifies claim ownership before calling provider; lost claim aborts.
+    cm._machines = {}
+
+    @asynccontextmanager
+    async def _noop_lock(*_a, **_kw):
+        yield
+
+    @asynccontextmanager
+    async def _noop_hb(*_a, **_kw):
+        yield
+
+    cm._observed_lock = _noop_lock
+    cm._machine_has_active_tasks = create_autospec(
+        cm._machine_has_active_tasks, return_value=False
+    )
+    cm._claim_machine_for_archive = create_autospec(
+        cm._claim_machine_for_archive, return_value=fresh_claim
+    )
+    cm._retain_machine_archive_claim = create_autospec(
+        cm._retain_machine_archive_claim, return_value=False
+    )
+    cm._binding_from_computer = lambda ws_id, row: binding
+    rt = create_autospec(SandboxRuntime, instance=True)
+    rt.archives = True
+
+    @asynccontextmanager
+    async def _detached(*_a, **_kw):
+        yield rt
+
+    cm._detached_runtime = _detached
+    monkeypatch.setattr(_lifecycle, "computer_stop_heartbeat", _noop_hb)
+
+    with pytest.raises(ComputerBusyError, match="archive claim was lost"):
+        await cm._archive_machine(COMP_A, workspace_id=WS_1)
+    cm._retain_machine_archive_claim.assert_awaited_once_with(
+        COMP_A, archiving_owner="owner-fresh-1"
+    )
+    rt.archive.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_stopping_computer_sanitizes_raw_exception_before_real_tracer_span(
+    monkeypatch, caplog
+):
+    """Real reconcile_stopping_computer + real OTel TracerProvider + real Daytona SDK get() leak zero raw text."""
+    import daytona._utils.otel_decorator as daytona_otel
+    from daytona._async.daytona import AsyncDaytona
+    from daytona_api_client_async.api.sandbox_api import SandboxApi
+    from daytona_api_client_async.exceptions import ApiException
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
+    from src.observability import tracing as tracing_mod
+    from src.server.services import workspace_manager as wm_mod
+    from src.server.services.computer_manager import _lifecycle
+
+    exporter = InMemorySpanExporter()
+    provider_tp = TracerProvider()
+    provider_tp.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(tracing_mod, "tracer", provider_tp.get_tracer("test-reconcile"))
+    monkeypatch.setattr(
+        daytona_otel, "_tracer", provider_tp.get_tracer("daytona-sdk-python")
+    )
+
+    # Real locked AsyncDaytona.get() raising a 503 ApiException carrying secrets.
+    sdk_client = AsyncDaytona.__new__(AsyncDaytona)
+    sdk_api = create_autospec(SandboxApi, instance=True)
+    sdk_api.get_sandbox.side_effect = ApiException(status=503, body=FAKE_SECRET_BODY)
+    sdk_client._sandbox_api = sdk_api
+
+    daytona_provider = DaytonaProvider.__new__(DaytonaProvider)
+    daytona_provider._working_dir = "/home/workspace"
+    daytona_provider._client = sdk_client
+
+    wm = object.__new__(WorkspaceManager)
+    wm._machines = {}
+
+    @asynccontextmanager
+    async def _noop_lock_inner(*_a, **_kw):
+        yield
+
+    wm._acquire_machine_lock = _noop_lock_inner
+    wm._observed_lock = ComputerManager._observed_lock.__get__(wm, ComputerManager)
+    wm._binding_from_computer = lambda ws_id, row: SimpleNamespace(
+        computer_id=str(row["computer_id"]),
+        workspace_id=ws_id,
+        provider_ref=row.get("provider_ref"),
+        provider=SimpleNamespace(recreatable=True),
+    )
+
+    @asynccontextmanager
+    async def _detached_real_daytona(sandbox_id, binding=None):
+        yield await daytona_provider.get(sandbox_id)
+
+    wm._detached_runtime = _detached_real_daytona
+
+    old_ts = datetime.now(timezone.utc) - timedelta(seconds=600)
+    old_stopping = _computer_row(
+        status="stopping",
+        config={
+            "archiving": True,
+            "archiving_owner": "owner-old-1",
+            "archiving_claimed_at": old_ts.isoformat(),
+        },
+    )
+    old_stopping["updated_at"] = old_ts
+
+    monkeypatch.setattr(
+        wm_mod,
+        "get_computers_by_status",
+        create_autospec(wm_mod.get_computers_by_status, return_value=[old_stopping]),
+    )
+    monkeypatch.setattr(
+        _lifecycle,
+        "get_computer",
+        create_autospec(computer_db.get_computer, return_value=old_stopping),
+    )
+    monkeypatch.setattr(
+        _lifecycle,
+        "computer_stop_heartbeat_present",
+        create_autospec(_lifecycle.computer_stop_heartbeat_present, return_value=False),
+    )
+
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
+    settled = await wm.reap_stuck_stopping_computers()
+    assert settled == 0
+    sdk_api.get_sandbox.assert_awaited_once()
+
+    spans = exporter.get_finished_spans()
+    assert any(sp.name == "computer.stopping.reconcile" for sp in spans)
+    for sp in spans:
+        blob = (
+            repr(dict(sp.attributes))
+            + "\n"
+            + repr(sp.status.description)
+            + "\n"
+            + "\n".join(repr(dict(ev.attributes or {})) for ev in sp.events)
+        )
+        for secret in ("DO_NOT_LOG", "sk-proj_", "s3cr3tP4ss", "AIzaSyA", "eyJhbGci"):
+            assert secret not in blob, f"Leaked {secret!r} in span {sp.name}: {blob}"
+    reconcile_span = [sp for sp in spans if sp.name == "computer.stopping.reconcile"][0]
+    assert reconcile_span.attributes.get("error.category") == "sandbox_transient"
+
+    log_blob = "\n".join(rec.getMessage() for rec in caplog.records)
+    for secret in ("DO_NOT_LOG", "sk-proj_", "s3cr3tP4ss", "AIzaSyA", "eyJhbGci"):
+        assert secret not in log_blob
+
+
+@pytest.mark.asyncio
+async def test_archive_machine_real_daytona_sdk_sanitizes_all_exported_spans(
+    monkeypatch, caplog
+):
+    """Real locked Daytona SDK AsyncSandbox.archive() failing with secrets leaks nothing into ANY span."""
+    import daytona._utils.otel_decorator as daytona_otel
+    from daytona.internal.event_subscription_manager import AsyncEventSubscriptionManager
+    from daytona._async.sandbox import AsyncSandbox
+    from daytona_api_client_async.api.sandbox_api import SandboxApi
+    from daytona_api_client_async.exceptions import ApiException
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    from ptc_agent.core.sandbox.providers.daytona_runtime import DaytonaRuntime
+    from src.observability import tracing as tracing_mod
+    from src.server.services.computer_manager import _lifecycle
+
+    exporter = InMemorySpanExporter()
+    provider_tp = TracerProvider()
+    provider_tp.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(tracing_mod, "tracer", provider_tp.get_tracer("test-archive-sdk"))
+    monkeypatch.setattr(
+        daytona_otel, "_tracer", provider_tp.get_tracer("daytona-sdk-python")
+    )
+
+    sdk_sandbox = AsyncSandbox.model_construct(id="sbx-daytona-1")
+    sdk_api = create_autospec(SandboxApi, instance=True)
+    sdk_api.archive_sandbox.side_effect = ApiException(status=503, body=FAKE_SECRET_BODY)
+    sub_mgr = create_autospec(AsyncEventSubscriptionManager, instance=True)
+    sub_mgr.subscribe.return_value = "sub-1"
+    object.__setattr__(sdk_sandbox, "_sandbox_api", sdk_api)
+    object.__setattr__(sdk_sandbox, "_subscription_manager", sub_mgr)
+    object.__setattr__(sdk_sandbox, "_sub_id", None)
+    real_runtime = DaytonaRuntime(sdk_sandbox)
+
+    cm = object.__new__(ComputerManager)
+    cm._machines = {}
+
+    @asynccontextmanager
+    async def _noop_lock_inner(*_a, **_kw):
+        yield
+
+    @asynccontextmanager
+    async def _noop_hb(*_a, **_kw):
+        yield
+
+    cm._acquire_machine_lock = _noop_lock_inner
+    cm._observed_lock = ComputerManager._observed_lock.__get__(cm, ComputerManager)
+    cm._machine_has_active_tasks = create_autospec(
+        cm._machine_has_active_tasks, return_value=False
+    )
+    claimed = _computer_row(
+        status="stopping",
+        config={
+            "archiving": True,
+            "archiving_owner": "owner-sdk-1",
+            "archiving_claimed_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    cm._claim_machine_for_archive = create_autospec(
+        cm._claim_machine_for_archive, return_value=claimed
+    )
+    cm._retain_machine_archive_claim = create_autospec(
+        cm._retain_machine_archive_claim, return_value=True
+    )
+    cm._reconcile_provider_stop = create_autospec(
+        cm._reconcile_provider_stop, side_effect=RuntimeError(FAKE_SECRET_BODY)
+    )
+    cm._binding_from_computer = lambda ws_id, row: SimpleNamespace(
+        computer_id=str(row["computer_id"]),
+        workspace_id=ws_id,
+        provider_ref=row.get("provider_ref"),
+        provider=SimpleNamespace(recreatable=True),
+    )
+
+    @asynccontextmanager
+    async def _detached_real(*_a, **_kw):
+        yield real_runtime
+
+    cm._detached_runtime = _detached_real
+    monkeypatch.setattr(_lifecycle, "computer_stop_heartbeat", _noop_hb)
+
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
+    with pytest.raises(ArchiveProviderError) as exc_info:
+        await cm._archive_machine(COMP_A, workspace_id=WS_1)
+
+    assert exc_info.value.category == "sandbox_transient"
+    assert exc_info.value.__cause__ is None
+    sdk_api.archive_sandbox.assert_awaited_once()
+
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert spans[0].name == "computer.archive"
+    assert spans[0].attributes.get("error.category") == "sandbox_transient"
+    for sp in spans:
+        blob = (
+            repr(dict(sp.attributes))
+            + "\n"
+            + repr(sp.status.description)
+            + "\n"
+            + "\n".join(repr(dict(ev.attributes or {})) for ev in sp.events)
+        )
+        for secret in ("DO_NOT_LOG", "sk-proj_", "s3cr3tP4ss", "AIzaSyA", "eyJhbGci"):
+            assert secret not in blob, f"Leaked {secret!r} in span {sp.name}: {blob}"
+
+
+@pytest.mark.asyncio
+async def test_archive_machine_daytona_sdk_post_submit_refresh_404_succeeds_and_clears_fence(
+    monkeypatch,
+):
+    """Locked Daytona SDK archive() submits POST then calls refresh_data(); 404 on refresh_data settles archived."""
+    import daytona._utils.otel_decorator as daytona_otel
+    from daytona.internal.event_subscription_manager import AsyncEventSubscriptionManager
+    from daytona._async.sandbox import AsyncSandbox
+    from daytona_api_client_async.api.sandbox_api import SandboxApi
+    from daytona_api_client_async.exceptions import NotFoundException
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    from ptc_agent.core.sandbox.providers.daytona_runtime import DaytonaRuntime
+    from src.observability import tracing as tracing_mod
+    from src.server.services.computer_manager import _lifecycle
+
+    exporter = InMemorySpanExporter()
+    provider_tp = TracerProvider()
+    provider_tp.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(tracing_mod, "tracer", provider_tp.get_tracer("test-archive-404"))
+    monkeypatch.setattr(
+        daytona_otel, "_tracer", provider_tp.get_tracer("daytona-sdk-python")
+    )
+
+    # 1. Post-submit refresh 404: archive_sandbox succeeds, get_sandbox (in refresh_data) returns 404.
+    sdk_sandbox = AsyncSandbox.model_construct(id="sbx-daytona-1")
+    sdk_api = create_autospec(SandboxApi, instance=True)
+    sdk_api.archive_sandbox.return_value = None
+    sdk_api.get_sandbox.side_effect = NotFoundException(
+        status=404, body=FAKE_SECRET_BODY
+    )
+    sub_mgr = create_autospec(AsyncEventSubscriptionManager, instance=True)
+    sub_mgr.subscribe.return_value = "sub-1"
+    object.__setattr__(sdk_sandbox, "_sandbox_api", sdk_api)
+    object.__setattr__(sdk_sandbox, "_subscription_manager", sub_mgr)
+    object.__setattr__(sdk_sandbox, "_sub_id", None)
+    real_runtime = DaytonaRuntime(sdk_sandbox)
+
+    cm = object.__new__(ComputerManager)
+    cm._machines = {}
+
+    @asynccontextmanager
+    async def _noop_lock_inner(*_a, **_kw):
+        yield
+
+    @asynccontextmanager
+    async def _noop_hb(*_a, **_kw):
+        yield
+
+    cm._acquire_machine_lock = _noop_lock_inner
+    cm._observed_lock = ComputerManager._observed_lock.__get__(cm, ComputerManager)
+    cm._machine_has_active_tasks = create_autospec(
+        cm._machine_has_active_tasks, return_value=False
+    )
+    claimed = _computer_row(
+        status="stopping",
+        config={
+            "archiving": True,
+            "archiving_owner": "owner-404-1",
+            "archiving_claimed_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    cm._claim_machine_for_archive = create_autospec(
+        cm._claim_machine_for_archive, return_value=claimed
+    )
+    cm._retain_machine_archive_claim = create_autospec(
+        cm._retain_machine_archive_claim, return_value=True
+    )
+    settle_mock = create_autospec(cm._settle_machine_stop)
+    cm._settle_machine_stop = settle_mock
+    cm._stop_result = create_autospec(
+        cm._stop_result, return_value=_computer_row(status="stopped")
+    )
+    cm._binding_from_computer = lambda ws_id, row: SimpleNamespace(
+        computer_id=str(row["computer_id"]),
+        workspace_id=ws_id,
+        provider_ref=row.get("provider_ref"),
+        provider=SimpleNamespace(recreatable=True),
+    )
+
+    @asynccontextmanager
+    async def _detached_real(*_a, **_kw):
+        yield real_runtime
+
+    cm._detached_runtime = _detached_real
+    monkeypatch.setattr(_lifecycle, "computer_stop_heartbeat", _noop_hb)
+
+    result = await cm._archive_machine(COMP_A, workspace_id=WS_1)
+    assert result["archive_state"] == "archived"
+    sdk_api.archive_sandbox.assert_awaited_once()
+    sdk_api.get_sandbox.assert_awaited_once()
+    settle_mock.assert_awaited_once_with(
+        COMP_A,
+        "stopped",
+        clear_archiving=True,
+        expected_archiving_owner="owner-404-1",
+    )
+    for sp in exporter.get_finished_spans():
+        blob = (
+            repr(dict(sp.attributes))
+            + "\n"
+            + repr(sp.status.description)
+            + "\n"
+            + "\n".join(repr(dict(ev.attributes or {})) for ev in sp.events)
+        )
+        for secret in ("DO_NOT_LOG", "sk-proj_", "s3cr3tP4ss", "AIzaSyA", "eyJhbGci"):
+            assert secret not in blob
+
+    # 2. Pre-submit 404: archive_sandbox itself returns 404 -> still fails as sandbox_gone (not false success).
+    sdk_api2 = create_autospec(SandboxApi, instance=True)
+    sdk_api2.archive_sandbox.side_effect = NotFoundException(
+        status=404, body=FAKE_SECRET_BODY
+    )
+    sdk_sandbox2 = AsyncSandbox.model_construct(id="sbx-daytona-1")
+    object.__setattr__(sdk_sandbox2, "_sandbox_api", sdk_api2)
+    object.__setattr__(sdk_sandbox2, "_subscription_manager", sub_mgr)
+    object.__setattr__(sdk_sandbox2, "_sub_id", None)
+    real_runtime2 = DaytonaRuntime(sdk_sandbox2)
+    settle_mock.reset_mock()
+    cm._reconcile_provider_stop = create_autospec(cm._reconcile_provider_stop)
+
+    @asynccontextmanager
+    async def _detached_pre404(*_a, **_kw):
+        yield real_runtime2
+
+    cm._detached_runtime = _detached_pre404
+    with pytest.raises(ArchiveProviderError) as pre_exc:
+        await cm._archive_machine(COMP_A, workspace_id=WS_1)
+    assert pre_exc.value.category == "sandbox_gone"
+    sdk_api2.archive_sandbox.assert_awaited_once()
+    sdk_api2.get_sandbox.assert_not_awaited()
+    cm._reconcile_provider_stop.assert_awaited_once()

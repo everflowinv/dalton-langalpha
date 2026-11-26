@@ -236,6 +236,15 @@ class ArchiveProviderError(RuntimeError):
         self.http_status = http_status
         self.user_message = message
         super().__init__(category)
+
+
+class ArchivePostSubmitGoneError(RuntimeError):
+    """Raised when an archive request was accepted by the provider and the immediate post-submit refresh returned 404."""
+
+    def __init__(self, sandbox_id: str, detail: str = "") -> None:
+        self.sandbox_id = sandbox_id
+        self.detail = detail
+        super().__init__(f"Sandbox {sandbox_id} gone after archive submission")
 # --- DALTON-HOOK(cos-settings-tools): end ---
 
 

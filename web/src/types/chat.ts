@@ -224,7 +224,7 @@ export type ContentSegment =
   | DeleteWorkspaceSegment
   | StopWorkspaceSegment
   | DeleteThreadSegment
-  | ArchiveWorkspaceSegment
+  | ArchiveWorkspaceSegment // DALTON-HOOK(cos-settings-tools)
   | CreditPauseSegment
   | ToolApprovalSegment;
 

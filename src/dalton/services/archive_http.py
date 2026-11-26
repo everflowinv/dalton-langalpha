@@ -220,3 +220,184 @@ async def archive_http_errors(
             else "Failed to archive workspace"
         )
         raise HTTPException(status_code=500, detail=detail) from None
+
+
+async def execute_workspace_archive_route(
+    workspace_id: str,
+    request: object,
+    body: object | None,
+    principal: object,
+):
+    """Dalton-owned implementation for ``POST /api/v1/workspaces/{workspace_id}/archive``.
+
+    Looks up collaborators on ``src.server.app.workspaces`` so upstream route tests
+    patching that module keep working identically while keeping the upstream route
+    file a 1-5 line thin delegate.
+    """
+    from src.server.app import workspaces as ws_app
+    from src.server.database.computer import (
+        get_computer_for_workspace,
+        get_live_workspaces_for_archive_snapshot,
+    )
+    from src.server.dependencies.principal import forbidden
+    from src.server.models.workspace import WorkspaceActionResponse
+
+    computer_id_for_log = (
+        getattr(body, "expected_computer_id", None) if body is not None else None
+    )
+    async with archive_http_errors(
+        target_kind="workspace",
+        workspace_id=workspace_id,
+        computer_id=computer_id_for_log,
+    ):
+        workspace = await ws_app.db_get_workspace(workspace_id)
+        await ws_app.workspace_access(workspace, principal.user_id, manage=True)
+
+        expected_computer_id = (
+            getattr(body, "expected_computer_id", None) if body is not None else None
+        )
+        body_workspaces = (
+            getattr(body, "expected_workspaces", None) if body is not None else None
+        )
+        expected_workspaces = (
+            [w.model_dump() for w in body_workspaces]
+            if body_workspaces is not None
+            else None
+        )
+
+        if getattr(principal, "computer_id", None) is not None:
+            # Read-only computer resolution: never adopt an unbound workspace
+            # onto another computer, and always run self-archive + cli_approval.
+            computer = await get_computer_for_workspace(workspace_id)
+            if computer is None:
+                raise ArchiveScopeChangedError("情况已变化，请重新发起")
+            computer_id = str(computer["computer_id"])
+            if (
+                expected_computer_id is not None
+                and str(expected_computer_id) != computer_id
+            ):
+                raise ArchiveScopeChangedError("情况已变化，请重新发起")
+            if computer_id == str(principal.computer_id):
+                raise forbidden(
+                    "A computer cannot stop, archive or remove itself"
+                )
+            if expected_workspaces is None:
+                expected_workspaces = await get_live_workspaces_for_archive_snapshot(
+                    computer_id
+                )
+            await ws_app.cli_approval.computer_archive(
+                request,
+                principal,
+                computer,
+                workspace_id=workspace_id,
+                body=body,
+                expected_workspaces=expected_workspaces,
+            )
+            expected_computer_id = computer_id
+
+        manager = ws_app.WorkspaceManager.get_instance()
+        with ws_app.computer_cause("archive"):
+            if expected_computer_id is not None or expected_workspaces is not None:
+                archived = await manager.archive_workspace(
+                    workspace_id,
+                    expected_computer_id=expected_computer_id,
+                    expected_workspaces=expected_workspaces,
+                )
+            else:
+                archived = await manager.archive_workspace(workspace_id)
+
+        in_progress = (
+            isinstance(archived, dict)
+            and archived.get("archive_state") == "archiving"
+        )
+        logger.info(
+            "archive_workspace_completed workspace_id=%s archive_state=%s",
+            workspace_id,
+            "archiving" if in_progress else "archived",
+        )
+        return WorkspaceActionResponse(
+            workspace_id=workspace_id,
+            status="stopped",
+            message=(
+                "Workspace archiving in progress"
+                if in_progress
+                else "Workspace archived successfully"
+            ),
+        )
+
+
+async def execute_computer_archive_route(
+    computer_id: str,
+    request: object,
+    body: object | None,
+    principal: object,
+):
+    """Dalton-owned implementation for ``POST /api/v1/computers/{computer_id}/archive``."""
+    from src.server.app import computers as comp_app
+    from src.server.database.computer import get_live_workspaces_for_archive_snapshot
+    from src.server.dependencies.principal import forbidden
+    from src.server.models.computer import ComputerActionResponse
+
+    async with archive_http_errors(
+        target_kind="computer",
+        computer_id=computer_id,
+    ):
+        computer = await comp_app._reached_computer(
+            computer_id, principal.user_id, manage=True
+        )
+        expected_cid = (
+            getattr(body, "expected_computer_id", None) if body is not None else None
+        )
+        if expected_cid is not None and str(expected_cid) != str(computer_id):
+            raise ArchiveScopeChangedError("情况已变化，请重新发起")
+        body_workspaces = (
+            getattr(body, "expected_workspaces", None) if body is not None else None
+        )
+        expected_workspaces = (
+            [w.model_dump() for w in body_workspaces]
+            if body_workspaces is not None
+            else None
+        )
+        if getattr(principal, "computer_id", None) is not None:
+            if str(computer_id) == str(principal.computer_id):
+                raise forbidden(
+                    "A computer cannot stop, archive or remove itself"
+                )
+            if expected_workspaces is None:
+                expected_workspaces = await get_live_workspaces_for_archive_snapshot(
+                    computer_id
+                )
+            await comp_app.cli_approval.computer_archive(
+                request,
+                principal,
+                computer,
+                body=body,
+                expected_workspaces=expected_workspaces,
+            )
+        manager = comp_app._computer_manager()
+        with comp_app.computer_cause("archive"):
+            if expected_workspaces is not None:
+                updated = await manager.archive_computer(
+                    computer_id,
+                    expected_workspaces=expected_workspaces,
+                )
+            else:
+                updated = await manager.archive_computer(computer_id)
+        in_progress = (
+            isinstance(updated, dict)
+            and updated.get("archive_state") == "archiving"
+        )
+        logger.info(
+            "archive_computer_completed computer_id=%s archive_state=%s",
+            computer_id,
+            "archiving" if in_progress else "archived",
+        )
+        return ComputerActionResponse(
+            computer_id=computer_id,
+            status=(updated or {}).get("status") or "stopped",
+            message=(
+                "Computer archiving in progress"
+                if in_progress
+                else "Computer archived successfully"
+            ),
+        )

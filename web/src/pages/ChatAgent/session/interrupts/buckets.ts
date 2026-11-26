@@ -277,6 +277,7 @@ function workspaceProposalResultFields(
   return outcome;
 }
 
+// --- DALTON-HOOK(cos-settings-tools): begin ---
 function archiveProposalResultFields(
   result: ToolResultLike & { status?: unknown },
 ): ProposalOutcomeFields & { computer_name?: string; archived_workspace_count?: number } {
@@ -302,6 +303,7 @@ function archiveProposalResultFields(
   }
   return outcome;
 }
+// --- DALTON-HOOK(cos-settings-tools): end ---
 
 /** Derive settled card fields (approved / rejected / failed) from a tool result.
  *  Shared by both live stream settlement and history replay so both views agree.
@@ -320,6 +322,7 @@ function proposalResultFields(
   if (type === 'create_workspace') {
     return workspaceProposalResultFields(result);
   }
+  // DALTON-HOOK(cos-settings-tools): settle archive_workspace proposal card
   if (type === 'archive_workspace') {
     return archiveProposalResultFields(result);
   }

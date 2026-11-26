@@ -6,6 +6,7 @@ import { api } from '@/api/client';
 import { useBackdropDismiss, useDialogA11y } from '@/hooks/useDialogA11y';
 import { useWorkspace } from '@/hooks/useWorkspace';
 import { queryKeys } from '@/lib/queryKeys';
+// --- DALTON-HOOK(cos-settings-tools): begin ---
 import {
   apiErrorObject, apiErrorStatus, archiveWorkspaceWithSnapshot, formatApiErrorDetail,
   getSandboxStats, getWorkspaceArchivePreview, refreshWorkspace,
@@ -15,6 +16,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Loader } from '@/components/ui/loader';
 import { ModalShell } from '@/components/ui/ModalShell';
+// --- DALTON-HOOK(cos-settings-tools): end ---
 import { patchComputerStatusInCaches, useComputers } from '../hooks/useComputers';
 import { isComputerPreparing } from '../utils/computerStatus';
 import { denialMessage } from '../utils/denialMessage';

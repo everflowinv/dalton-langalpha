@@ -375,7 +375,7 @@ class DaytonaProvider(SandboxProvider):
             sdk_sandbox = await self._client.get(sandbox_id)
         except Exception as exc:
             if self.classify_error(exc) is SandboxFailureKind.SANDBOX_GONE:
-                raise SandboxGoneError(sandbox_id, "Daytona sandbox not found") from exc
+                raise SandboxGoneError(sandbox_id, "Daytona sandbox not found") from None
             raise
         # --- DALTON-HOOK(cos-settings-tools): end ---
         return DaytonaRuntime(

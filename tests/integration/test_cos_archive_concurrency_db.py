@@ -14,11 +14,11 @@ from unittest.mock import create_autospec
 
 import pytest
 
+from src.dalton.services import archive_lifecycle
 from src.server.database import computer as computer_db
 from src.server.database import workspace as workspace_db
 from src.server.database import workspace_move as move_db
 from src.server.database.workspace_move import MoveRefused
-from src.server.services import workspace_manager as wm_mod
 from src.server.services.computer_errors import (
     ArchiveScopeChangedError,
     ComputerBusyError,
@@ -151,23 +151,43 @@ async def test_dual_conn_archiving_fence_blocks_create_start_and_move_and_surviv
 
         # Startup recovery with live heartbeat skips writeback.
         wm = object.__new__(WorkspaceManager)
-        monkeypatch.setattr(
-            wm_mod,
-            "computer_stop_heartbeat_present",
-            create_autospec(wm_mod.computer_stop_heartbeat_present, return_value=True),
+        hb_mock = create_autospec(
+            archive_lifecycle.computer_stop_heartbeat_present, return_value=True
         )
+        monkeypatch.setattr(archive_lifecycle, "computer_stop_heartbeat_present", hb_mock)
         assert await wm.recover_archiving_computers_on_startup() == 0
         row_still_stopping = await computer_db.get_computer(comp_a)
         assert row_still_stopping is not None
         assert row_still_stopping["status"] == "stopping"
+        assert (row_still_stopping.get("config") or {}).get("archiving_owner")
+        assert (row_still_stopping.get("config") or {}).get("archiving_claimed_at")
 
-        # Startup recovery with expired heartbeat resets ONLY computer row to 'stopped',
-        # preserving config.archiving=true and NOT shadow-writing live workspaces.
-        monkeypatch.setattr(
-            wm_mod,
-            "computer_stop_heartbeat_present",
-            create_autospec(wm_mod.computer_stop_heartbeat_present, return_value=False),
-        )
+        # Claim committed, heartbeat not created yet (returns False) within TTL ->
+        # startup recovery MUST NOT take over.
+        hb_mock.return_value = False
+        assert await wm.recover_archiving_computers_on_startup() == 0
+        row_in_grace = await computer_db.get_computer(comp_a)
+        assert row_in_grace is not None
+        assert row_in_grace["status"] == "stopping"
+
+        # Age the claim past STOP_HEARTBEAT_TTL_S -> startup recovery resets ONLY
+        # the computer row to 'stopped', preserving config.archiving=true and NOT
+        # shadow-writing live workspaces.
+        async with patched_get_db_connection() as conn, conn.transaction():
+            await conn.execute(
+                """
+                UPDATE computers
+                SET config = jsonb_set(
+                        config,
+                        '{archiving_claimed_at}',
+                        to_jsonb(to_char((NOW() - interval '60 seconds') AT TIME ZONE 'UTC',
+                                         'YYYY-MM-DD"T"HH24:MI:SS"+00:00"'))
+                    ),
+                    updated_at = NOW() - interval '60 seconds'
+                WHERE computer_id = %s
+                """,
+                (comp_a,),
+            )
         recovered = await wm.recover_archiving_computers_on_startup()
         assert recovered >= 1
         row_after_restart = await computer_db.get_computer(comp_a)
@@ -282,23 +302,31 @@ async def test_dual_conn_staging_and_archive_interleave_without_deadlock(
         snapshot = await computer_db.get_live_workspaces_for_archive_snapshot(comp_a)
         assert [w["workspace_id"] for w in snapshot] == [low_id, high_id]
 
-        # Hold a brief row lock on high_id on a separate connection so both
-        # stage_workspace_move and claim_computer_for_archive overlap in flight
-        # while traversing workspaces in ORDER BY workspace_id order.
+        # Hold a row lock on high_id on a separate connection so both
+        # stage_workspace_move and claim_computer_for_archive enter lock wait
+        # simultaneously while traversing workspaces in ORDER BY workspace_id order.
         gate_locked = asyncio.Event()
         release_gate = asyncio.Event()
+        holder_pid_box: list[int] = []
 
         async def _hold_high_row():
             async with patched_get_db_connection() as conn, conn.transaction():
-                await conn.execute(
-                    "SELECT 1 FROM workspaces WHERE workspace_id = %s FOR UPDATE",
-                    (high_id,),
-                )
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT pg_backend_pid()")
+                    pid_row = await cur.fetchone()
+                    if pid_row:
+                        holder_pid_box.append(int(pid_row[0]))
+                    await cur.execute(
+                        "SELECT 1 FROM workspaces WHERE workspace_id = %s FOR UPDATE",
+                        (high_id,),
+                    )
                 gate_locked.set()
                 await release_gate.wait()
 
         holder = asyncio.create_task(_hold_high_row())
-        await gate_locked.wait()
+        await asyncio.wait_for(gate_locked.wait(), timeout=5.0)
+        assert holder_pid_box, "holder backend pid should be recorded"
+        holder_pid = holder_pid_box[0]
 
         stage_task = asyncio.create_task(
             move_db.stage_workspace_move(
@@ -310,12 +338,42 @@ async def test_dual_conn_staging_and_archive_interleave_without_deadlock(
                 comp_a, expected_workspaces=snapshot, expected_workspace_id=low_id
             )
         )
-        await asyncio.sleep(0.15)
-        release_gate.set()
+        # Wait deterministically until BOTH business transactions are actually
+        # blocked in PostgreSQL lock waits (bounded timeout, no blind sleep).
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5.0
+        waiting_count = 0
+        try:
+            async with patched_get_db_connection() as obs_conn:
+                while loop.time() < deadline:
+                    async with obs_conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM pg_stat_activity
+                            WHERE datname = current_database()
+                              AND state = 'active'
+                              AND wait_event_type = 'Lock'
+                              AND pid NOT IN (pg_backend_pid(), %s)
+                            """,
+                            (holder_pid,),
+                        )
+                        row = await cur.fetchone()
+                        waiting_count = int(row[0]) if row else 0
+                    if waiting_count >= 2:
+                        break
+                    await asyncio.sleep(0.02)
+            assert waiting_count >= 2, (
+                f"Expected both stage and archive transactions to enter PG lock wait, "
+                f"observed waiting_count={waiting_count}"
+            )
+        finally:
+            release_gate.set()
 
-        await holder
-        stage_res, archive_res = await asyncio.gather(
-            stage_task, archive_task, return_exceptions=True
+        await asyncio.wait_for(holder, timeout=5.0)
+        stage_res, archive_res = await asyncio.wait_for(
+            asyncio.gather(stage_task, archive_task, return_exceptions=True),
+            timeout=5.0,
         )
         assert not isinstance(stage_res, Exception), f"stage failed: {stage_res!r}"
         assert stage_res is not None

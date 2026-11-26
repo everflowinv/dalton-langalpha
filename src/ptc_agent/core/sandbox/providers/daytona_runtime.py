@@ -172,8 +172,8 @@ class DaytonaRuntime(SandboxRuntime):
         # --- DALTON-HOOK(cos-settings-tools): begin ---
         try:
             await self._sandbox.refresh_data()
-        except DaytonaNotFoundError as exc:
-            raise SandboxGoneError(self.id, "Daytona sandbox not found") from exc
+        except DaytonaNotFoundError:
+            raise SandboxGoneError(self.id, "Daytona sandbox not found") from None
         # --- DALTON-HOOK(cos-settings-tools): end ---
         return await self.get_state()
 
@@ -351,7 +351,10 @@ class DaytonaRuntime(SandboxRuntime):
     archives = True
 
     async def archive(self) -> None:
-        await self._sandbox.archive()
+        # DALTON-HOOK(cos-settings-tools): suppress raw SDK spans and normalize post-submit refresh 404
+        from src.dalton.services.archive_lifecycle import archive_daytona_sandbox
+
+        await archive_daytona_sandbox(self._sandbox, self.id)
 
     autostops = True
 

@@ -23,14 +23,10 @@ from src.server.database.computer import (
     DEFAULT_ROOT_DIR,
     REMOVAL_INTENT,
     end_removal_intent,
-    # DALTON-HOOK(cos-settings-tools): startup/sweep reconciliation & archive snapshot helpers
-    get_archiving_computers_by_status,
     get_computer,
     get_computer_for_workspace,
     get_computers_by_status,
-    get_live_workspaces_for_archive_snapshot,
     list_removals_after_home_moves,
-    reset_abandoned_archiving_computer,
     take_removal_intent,
     update_computer_status,
 )
@@ -67,11 +63,9 @@ from src.server.models.computer import ComputerRemoveResponse, ComputerStatus
 from src.server.services.computer_usage.events import note_start_failure
 from src.server.services.path_lock_coordination import (
     STOP_HEARTBEAT_UNAVAILABLE_RECOVERY_S,
-    computer_stop_heartbeat_present,  # DALTON-HOOK(cos-settings-tools)
 )
 from src.server.services.computer_errors import (
     ApprovalScopeChangedError,  # DALTON-HOOK(cos-settings-tools)
-    ArchiveScopeChangedError,  # DALTON-HOOK(cos-settings-tools)
     ComputerArchivingError,  # DALTON-HOOK(cos-settings-tools)
     ComputerNotFoundError,
     ComputerPreparingError,
@@ -613,30 +607,14 @@ class WorkspaceManager(ComputerManager):
         expected_computer_id: str | None = None,
         expected_workspaces: Any = None,
     ) -> Dict[str, Any]:
-        """Archive a stopped machine (moves its sandbox to object storage).
+        """Archive a stopped machine (moves its sandbox to object storage)."""
+        from src.dalton.services.archive_lifecycle import archive_workspace_impl
 
-        Always resolves the computer read-only (never adopts an unbound
-        workspace onto another computer) and ensures a whole-computer snapshot
-        is verified inside the archive claim transaction.
-        """
-        computer = await get_computer_for_workspace(workspace_id)
-        if computer is None:
-            raise ArchiveScopeChangedError("情况已变化，请重新发起")
-        computer_id = str(computer["computer_id"])
-        if expected_computer_id is not None and computer_id != str(
-            expected_computer_id
-        ):
-            raise ArchiveScopeChangedError("情况已变化，请重新发起")
-        snapshot = (
-            expected_workspaces
-            if expected_workspaces is not None
-            else await get_live_workspaces_for_archive_snapshot(computer_id)
-        )
-        return await self._archive_machine(
-            computer_id,
-            workspace_id=workspace_id,
-            expected_workspaces=snapshot,
-            expected_workspace_id=workspace_id,
+        return await archive_workspace_impl(
+            self,
+            workspace_id,
+            expected_computer_id=expected_computer_id,
+            expected_workspaces=expected_workspaces,
         )
     # --- DALTON-HOOK(cos-settings-tools): end ---
 
@@ -1474,84 +1452,24 @@ class WorkspaceManager(ComputerManager):
             if after is not None and after.get("status") != ComputerStatus.STOPPING:
                 logger.info(f"Settled computer {computer_id}, stuck in 'stopping', as {after.get('status')!r}")
                 settled += 1
-        # --- DALTON-HOOK(cos-settings-tools): begin ---
-        # Also probe stopped computers carrying a residual config.archiving
-        # fence inside the existing sweep (no new background loop) so the fence
-        # clears once the provider reaches a terminal state.
-        for computer in await get_archiving_computers_by_status("stopped", limit=1000):
-            computer_id = str(computer["computer_id"])
-            try:
-                async with asyncio.timeout(STUCK_STOP_RECONCILE_TIMEOUT_S):
-                    after = await self.reconcile_archiving_computer(computer_id)
-            except Exception as e:
-                logger.warning(
-                    "archive_fence_sweep_failed computer_id=%s exc_type=%s",
-                    computer_id,
-                    type(e).__name__,
-                )
-                continue
-            if after is not None and not (after.get("config") or {}).get("archiving"):
-                logger.info(
-                    "archive_fence_cleared_by_sweep computer_id=%s status=%s",
-                    computer_id,
-                    after.get("status"),
-                )
-                settled += 1
-        # --- DALTON-HOOK(cos-settings-tools): end ---
         return settled
 
     # --- DALTON-HOOK(cos-settings-tools): begin ---
-    async def recover_archiving_computers_on_startup(self) -> int:
-        """Reset abandoned ``stopping`` archiving computers back to ``stopped`` on startup.
+    async def reap_stopped_archiving_computers(self) -> int:
+        """Probe stopped computers carrying a residual ``config.archiving`` fence."""
+        from src.dalton.services.archive_lifecycle import (
+            reap_stopped_archiving_computers_impl,
+        )
 
-        Invoked once from the existing server startup hook so a crashed worker
-        never leaves a computer permanently wedged in ``stopping`` / archiving.
-        Checks ``computer_stop_heartbeat_present`` using the same ownership rule
-        as ``_correct_stuck_stopping`` so another active worker's in-flight
-        archive is never touched, and updates only the computer row (no shadow
-        write to live workspaces) while keeping ``config.archiving=true``.
-        """
-        recovered = 0
-        for computer in await get_archiving_computers_by_status("stopping", limit=1000):
-            computer_id = str(computer["computer_id"])
-            try:
-                heartbeat = await computer_stop_heartbeat_present(computer_id)
-                if heartbeat is True:
-                    logger.info(
-                        "startup_skip_archiving_computer_owned computer_id=%s",
-                        computer_id,
-                    )
-                    continue
-                if heartbeat is None:
-                    updated_at = computer.get("updated_at")
-                    if isinstance(updated_at, datetime) and updated_at.tzinfo is None:
-                        updated_at = updated_at.replace(tzinfo=timezone.utc)
-                    if not isinstance(updated_at, datetime) or (
-                        datetime.now(timezone.utc) - updated_at
-                        < timedelta(seconds=STOP_HEARTBEAT_UNAVAILABLE_RECOVERY_S)
-                    ):
-                        logger.info(
-                            "startup_skip_archiving_computer_heartbeat_unavailable computer_id=%s",
-                            computer_id,
-                        )
-                        continue
-                updated = await reset_abandoned_archiving_computer(
-                    computer_id,
-                    expected_updated_at=computer.get("updated_at"),
-                )
-                if updated is not None:
-                    recovered += 1
-                    logger.info(
-                        "startup_reset_archiving_computer computer_id=%s",
-                        computer_id,
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "startup_reset_archiving_computer_failed computer_id=%s exc_type=%s",
-                    computer_id,
-                    type(exc).__name__,
-                )
-        return recovered
+        return await reap_stopped_archiving_computers_impl(self)
+
+    async def recover_archiving_computers_on_startup(self) -> int:
+        """Reset abandoned ``stopping`` archiving computers back to ``stopped`` on startup."""
+        from src.dalton.services.archive_lifecycle import (
+            recover_archiving_computers_on_startup_impl,
+        )
+
+        return await recover_archiving_computers_on_startup_impl()
     # --- DALTON-HOOK(cos-settings-tools): end ---
 
     async def start_cleanup_task(self) -> None:
@@ -1602,6 +1520,8 @@ class WorkspaceManager(ComputerManager):
                     await asyncio.sleep(self.cleanup_interval)
                     if not self._shutdown:
                         await self.reap_stuck_stopping_computers()
+                        # DALTON-HOOK(cos-settings-tools): probe stopped computers with residual archiving fence
+                        await self.reap_stopped_archiving_computers()
                 except asyncio.CancelledError:
                     break
                 except Exception as e:

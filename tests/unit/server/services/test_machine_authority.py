@@ -506,9 +506,14 @@ class TestStopOwnershipFence(_Base):
         if settles:
             await manager._reconcile_provider_stop(_binding("ws-1"))
             # DALTON-HOOK(cos-settings-tools): keep config.archiving fence while provider state is 'archiving'
-            manager._settle_machine_stop.assert_awaited_once_with(
-                COMPUTER_ID, "stopped", clear_archiving=(state != "archiving")
-            )
+            if state == "archiving":
+                manager._settle_machine_stop.assert_awaited_once_with(
+                    COMPUTER_ID, "stopped", clear_archiving=False
+                )
+            else:
+                manager._settle_machine_stop.assert_awaited_once_with(
+                    COMPUTER_ID, "stopped"
+                )
         else:
             with pytest.raises(RuntimeError, match="transient state"):
                 await manager._reconcile_provider_stop(_binding("ws-1"))
@@ -893,6 +898,7 @@ class TestArchiveClaim(_Base):
                     await manager._archive_machine(COMPUTER_ID)
                 runtime.archive.assert_not_awaited()
 
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
     @pytest.mark.asyncio
     async def test_failed_archive_keeps_recovery_claim_when_provider_unreachable(self):
         from unittest.mock import create_autospec
@@ -925,3 +931,4 @@ class TestArchiveClaim(_Base):
             await manager._archive_machine(COMPUTER_ID)
         manager._reconcile_provider_stop.assert_awaited_once()
         manager._settle_machine_stop.assert_not_awaited()
+    # --- DALTON-HOOK(cos-settings-tools): end ---
