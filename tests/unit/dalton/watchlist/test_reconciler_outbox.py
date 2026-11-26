@@ -2235,3 +2235,680 @@ async def test_r6_home_yaml_sync_reuses_lock_conn_with_pool_size_one_and_discard
     assert ok2 is True
     assert len(created_conns) == 2
     assert created_conns[1].closed is True
+
+
+@pytest.mark.asyncio
+async def test_r7_home_yaml_publish_pool_size_one_without_injected_backend_and_reconcile_passes_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r7 Item 1: With a strict 1-slot DB pool and NO injected backend, Home YAML publish resolves
+    Home workspace (get_or_create_home_workspace) and sandbox session (workspace_is_moving) BEFORE
+    acquiring the YAML advisory lock, and reconcile_job passes the pre-resolved backend."""
+    from types import SimpleNamespace
+    from src.dalton.coverage import service as cov_svc
+    from src.server.database import workspace as ws_db_mod
+    from src.server.services import workspace_manager as wm_mod
+
+    uid = "u-pool1-r7"
+    home_ws_id = str(uuid.uuid4())
+    pool_in_use = 0
+    max_concurrent = 0
+    advisory_lock_held = False
+    events: list[str] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self._last_sql = ""
+
+        async def __aenter__(self) -> "_FakeCursor":
+            return self
+
+        async def __aexit__(self, *exc: Any) -> None:
+            return None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            nonlocal advisory_lock_held
+            _ = params
+            self._last_sql = sql
+            if "pg_advisory_lock" in sql:
+                advisory_lock_held = True
+                events.append("lock_acquired")
+            elif "pg_advisory_unlock" in sql:
+                advisory_lock_held = False
+                events.append("lock_released")
+
+        async def fetchone(self) -> Any:
+            if "pg_advisory_unlock" in self._last_sql:
+                return (True,)
+            return None
+
+    class _FakeConn:
+        def cursor(self, **_kw: Any) -> _FakeCursor:
+            return _FakeCursor()
+
+    @asynccontextmanager
+    async def _one_slot_db_conn(existing_conn: Any = None):
+        nonlocal pool_in_use, max_concurrent
+        if existing_conn is not None:
+            yield existing_conn
+            return
+        if pool_in_use >= 1:
+            raise RuntimeError("PoolTimeout: pool max_size=1 exhausted by nested checkout!")
+        pool_in_use += 1
+        max_concurrent = max(max_concurrent, pool_in_use)
+        try:
+            yield _FakeConn()
+        finally:
+            pool_in_use -= 1
+
+    async def _fake_get_or_create_home(user_id: str, conn: Any = None) -> dict[str, Any]:
+        assert advisory_lock_held is False, "get_or_create_home_workspace must run BEFORE YAML lock"
+        async with _one_slot_db_conn(conn):
+            events.append("get_or_create_home")
+        return {"workspace_id": home_ws_id, "user_id": user_id, "dir_name": "Home"}
+
+    async def _fake_ws_is_moving(workspace_id: str, *, conn: Any = None) -> bool:
+        _ = workspace_id
+        assert advisory_lock_held is False, "workspace_is_moving must run BEFORE YAML lock"
+        async with _one_slot_db_conn(conn):
+            events.append("workspace_is_moving")
+        return False
+
+    async def _fake_get_workspace(workspace_id: str, *, conn: Any = None) -> dict[str, Any]:
+        async with _one_slot_db_conn(conn):
+            events.append("get_workspace")
+        return {"workspace_id": workspace_id, "user_id": uid, "dir_name": "Home"}
+
+    written_files: list[tuple[str, str]] = []
+
+    class _FakeSandbox:
+        working_dir = "/workspace"
+        _work_dir = "/workspace"
+        config = SimpleNamespace(
+            filesystem=SimpleNamespace(
+                working_directory="/workspace",
+                allowed_directories=["/workspace"],
+            )
+        )
+
+        async def awrite_file_text(self, path: str, content: str) -> bool:
+            written_files.append((path, content))
+            events.append("write_yaml")
+            return True
+
+    class _FakeWorkspaceManager:
+        async def get_session_for_workspace(self, workspace_id: str, *, user_id: str | None = None) -> Any:
+            _ = user_id
+            assert await ws_db_mod.workspace_is_moving(workspace_id) is False
+            return SimpleNamespace(sandbox=_FakeSandbox())
+
+    async def _fake_get_state(user_id: str, *, conn: Any = None) -> dict[str, int]:
+        _ = user_id
+        async with _one_slot_db_conn(conn):
+            pass
+        return {"roster_revision": 2, "last_yaml_synced_revision": 1}
+
+    async def _fake_render(user_id: str, *, conn: Any = None) -> str:
+        _ = user_id
+        async with _one_slot_db_conn(conn):
+            pass
+        return "companies:\n  - ticker: NVDA\n"
+
+    async def _fake_record(user_id: str, revision: int, *, conn: Any = None) -> bool:
+        _ = (user_id, revision)
+        async with _one_slot_db_conn(conn):
+            pass
+        return True
+
+    monkeypatch.setattr(coverage_db, "get_db_connection", _one_slot_db_conn)
+    monkeypatch.setattr(
+        ws_db_mod,
+        "get_or_create_home_workspace",
+        create_autospec(ws_db_mod.get_or_create_home_workspace, side_effect=_fake_get_or_create_home),
+    )
+    monkeypatch.setattr(
+        ws_db_mod,
+        "workspace_is_moving",
+        create_autospec(ws_db_mod.workspace_is_moving, side_effect=_fake_ws_is_moving),
+    )
+    monkeypatch.setattr(
+        ws_db_mod,
+        "get_workspace",
+        create_autospec(ws_db_mod.get_workspace, side_effect=_fake_get_workspace),
+    )
+    monkeypatch.setattr(
+        wm_mod.WorkspaceManager,
+        "get_instance",
+        classmethod(lambda cls: _FakeWorkspaceManager()),
+    )
+    monkeypatch.setattr(
+        policies_mod,
+        "get_user_roster_state",
+        create_autospec(policies_mod.get_user_roster_state, side_effect=_fake_get_state),
+    )
+    monkeypatch.setattr(
+        cov_svc,
+        "render_coverage_yaml",
+        create_autospec(cov_svc.render_coverage_yaml, side_effect=_fake_render),
+    )
+    monkeypatch.setattr(
+        policies_mod,
+        "record_yaml_synced_revision",
+        create_autospec(policies_mod.record_yaml_synced_revision, side_effect=_fake_record),
+    )
+
+    # Part A: direct sync_user_coverage_to_home(uid) WITHOUT injecting backend succeeds with 1-slot pool
+    ok = await cov_svc.sync_user_coverage_to_home(uid)
+    assert ok is True
+    assert max_concurrent == 1
+    assert len(written_files) == 1
+    assert "NVDA" in written_files[0][1]
+    assert events.index("get_or_create_home") < events.index("lock_acquired")
+    assert events.index("workspace_is_moving") < events.index("lock_acquired")
+
+    # Part B: reconcile_job pre-resolves backend and passes it into sync_user_coverage_to_home
+    received_backends: list[Any] = []
+    orig_sync = cov_svc.sync_user_coverage_to_home
+
+    async def _wrapped_sync(user_id: str, **kwargs: Any) -> bool:
+        received_backends.append(kwargs.get("backend"))
+        return await orig_sync(user_id, **kwargs)
+
+    monkeypatch.setattr(cov_svc, "sync_user_coverage_to_home", _wrapped_sync)
+    monkeypatch.setattr(reconciler_mod, "sync_user_coverage_to_home", _wrapped_sync)
+    monkeypatch.setattr(
+        reconciler_mod,
+        "renew_reconcile_job_lease",
+        create_autospec(policies_mod.renew_reconcile_job_lease, return_value=True),
+    )
+    monkeypatch.setattr(
+        reconciler_mod,
+        "update_reconcile_job_progress",
+        create_autospec(
+            policies_mod.update_reconcile_job_progress,
+            return_value={"status": "completed", "yaml_synced": True},
+        ),
+    )
+
+    jid = str(uuid.uuid4())
+    preclaimed = {
+        "job_id": jid,
+        "user_id": uid,
+        "trigger_action": "update_tags",
+        "target_policy_versions": {},
+        "pending_tickers": [],
+        "completed_tickers": [],
+        "failed_items": [],
+        "override_user_pause": False,
+        "job_context": {},
+        "claim_token": "tok-r7-pool1",
+        "roster_revision": 2,
+        "yaml_synced": False,
+        "status": "running",
+    }
+    res = await reconciler_mod.TierPolicyReconciler().reconcile_job(
+        uid, jid, sync_home=True, _preclaimed_job=preclaimed
+    )
+    assert res["status"] == "completed"
+    assert res["yaml_synced"] is True
+    assert len(received_backends) == 1
+    assert received_backends[0] is not None
+    assert max_concurrent == 1
+
+
+@pytest.mark.asyncio
+async def test_r7_recheck_task_shared_classification_and_stays_paused_after_removal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r7 Item 2: Reconciler and resume share the exact same earnings task classification
+    (including the ``recheck`` suffix) and rules; after removing a ticker, clicking Resume
+    keeps the ``recheck`` task paused with ``next_run_at=None``."""
+    from src.dalton import settings as dalton_settings_mod
+    from src.dalton.services import company_automations as comp_auto_mod
+    from src.dalton.watchlist import pause_guards as pg_mod
+    from src.server.database import automation as auto_db_mod
+    from src.server.services.automations import lifecycle as lifecycle_mod
+
+    # Shared classification covers tm3 / t0 / tp1 / recheck (with or without .json)
+    assert pg_mod.parse_earnings_task_name("dalton-nvda-earn-fy26q4-recheck") == ("nvda", "recheck")
+    assert pg_mod.parse_earnings_task_name("dalton-nvda-earn-fy26q4-recheck.json") == ("nvda", "recheck")
+    assert pg_mod.parse_earnings_task_name("dalton-0700-hk-earn-fy26q4-t0") == ("0700-hk", "t0")
+    assert pg_mod.is_earnings_task_allowed_for_stages("recheck", ("t0",)) is True
+    assert pg_mod.is_earnings_task_allowed_for_stages("recheck", ()) is False
+
+    # Step 1: Reconciler pauses unstarted recheck task when NVDA is removed
+    orig_get_auto = auto_db_mod.get_automation
+    orig_update_auto = auto_db_mod.update_automation
+    infra = _FakeWatchlistInfra()
+    infra.install(monkeypatch)
+    uid = "u-recheck-r7"
+    ws_id = "ws-nvda-recheck"
+    future_ts = datetime.now(UTC) + timedelta(days=4)
+    infra.workspace_owners[ws_id] = uid
+    infra.workspace_rows[ws_id] = {"workspace_id": ws_id, "name": "NVDA", "status": "active"}
+    recheck_auto = infra.add_automation(
+        user_id=uid,
+        workspace_id=ws_id,
+        name="dalton-nvda-earn-fy26q4-recheck",
+        trigger_type="once",
+        status="active",
+        next_run_at=future_ts,
+        metadata={
+            "ticker": "NVDA",
+            "dalton_managed": True,
+            "once_schedule_at": future_ts.isoformat(),
+        },
+    )
+
+    res_remove = await reconciler_mod.TierPolicyReconciler().reconcile_company(
+        uid, "NVDA", removed_workspace_id=ws_id
+    )
+    assert res_remove["ok"] is True
+    stored_recheck = infra.automations[recheck_auto["automation_id"]]
+    assert stored_recheck["status"] == "paused"
+    assert stored_recheck["next_run_at"] is None
+    assert stored_recheck["metadata"]["paused_by_policy"] is True
+
+    # Step 2: Clicking Resume (generic lifecycle.resume_automation) refuses and keeps recheck paused
+    updates_written: list[dict[str, Any]] = []
+
+    async def _fake_update_automation(
+        aid: str,
+        user_id: str,
+        *,
+        conn: Any = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        _ = (aid, user_id, conn)
+        effective = dict(kwargs)
+        hist_ctx = comp_auto_mod.get_current_history_context()
+        if hist_ctx is not None and hist_ctx.locked_row_reconciler is not None:
+            await hist_ctx.locked_row_reconciler(dict(stored_recheck), effective, None)
+        stored_recheck.update(effective)
+        updates_written.append(effective)
+        return dict(stored_recheck)
+
+    monkeypatch.setattr(dalton_settings_mod, "is_coverage_units_enabled", lambda: False)
+    monkeypatch.setattr(
+        auto_db_mod,
+        "get_automation",
+        create_autospec(orig_get_auto, side_effect=lambda *a, **kw: dict(stored_recheck)),
+    )
+    monkeypatch.setattr(
+        auto_db_mod,
+        "update_automation",
+        create_autospec(orig_update_auto, side_effect=_fake_update_automation),
+    )
+
+    with pytest.raises(lifecycle_mod.AutomationRefusal) as exc_info:
+        await lifecycle_mod.resume_automation(recheck_auto["automation_id"], uid)
+    assert getattr(exc_info.value, "schedule_error_code", None) == "earnings_stage_disabled"
+    assert updates_written == []
+    assert stored_recheck["status"] == "paused"
+    assert stored_recheck["next_run_at"] is None
+
+    # Step 3: Radar tier also refuses recheck; Watch tier (t0 allowed) permits recheck
+    infra.coverage[(uid, "NVDA")] = {"user_id": uid, "ticker": "NVDA", "tier": "radar", "is_private": False}
+    err_radar = await pg_mod.validate_earnings_stage_allowed_for_user(
+        uid, "dalton-nvda-earn-fy26q4-recheck", ticker="NVDA"
+    )
+    assert err_radar is not None and err_radar["error"] == "earnings_stage_disabled"
+
+    infra.coverage[(uid, "NVDA")] = {"user_id": uid, "ticker": "NVDA", "tier": "watch", "is_private": False}
+    ok_watch = await pg_mod.validate_earnings_stage_allowed_for_user(
+        uid, "dalton-nvda-earn-fy26q4-recheck", ticker="NVDA"
+    )
+    assert ok_watch is None
+
+
+@pytest.mark.asyncio
+async def test_r7_is_unstarted_earn_once_fallback_query_uses_savepoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r7 Item 3: Both the primary execution query and the fallback list_executions query
+    run inside savepoints (conn.transaction()) so SQL errors in the fallback never abort
+    the outer pause transaction."""
+    savepoints_entered = 0
+    savepoints_rolled_back = 0
+
+    class _TxConn:
+        def cursor(self):
+            raise RuntimeError("primary sql boom")
+
+        @asynccontextmanager
+        async def transaction(self):
+            nonlocal savepoints_entered, savepoints_rolled_back
+            savepoints_entered += 1
+            try:
+                yield self
+            except Exception:
+                savepoints_rolled_back += 1
+                raise
+
+    orig_list_exec = reconciler_mod.exec_db.list_executions
+    monkeypatch.setattr(
+        reconciler_mod.exec_db,
+        "list_executions",
+        create_autospec(orig_list_exec, side_effect=RuntimeError("fallback sql boom")),
+    )
+
+    row = {
+        "automation_id": str(uuid.uuid4()),
+        "user_id": "u-sp-r7",
+        "name": "dalton-nvda-earn-fy26q4-t0",
+        "trigger_type": "once",
+        "status": "active",
+        "last_run_at": datetime.now(UTC),
+        "run_count": 0,
+    }
+    conn = _TxConn()
+    should_pause = await reconciler_mod.is_unstarted_earn_once(row, user_id="u-sp-r7", conn=conn)
+    assert should_pause is True
+    assert savepoints_entered == 2
+    assert savepoints_rolled_back == 2
+
+
+@pytest.mark.asyncio
+async def test_r7_knowledge_doc_query_failure_and_unresolved_custom_ws_stay_bound_and_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r7 Item 4: Exercise the REAL _verify_workspace_bound_to_ticker -> _resolve_workspace_ticker ->
+    resolve_workspace_coverage_identity -> _load_doc_content path (no whole-resolver stub):
+    - knowledge doc DB failure stays bound and pauses
+    - get_workspace DB failure inside _resolve_workspace_ticker stays bound and pauses
+    - custom-named workspace with no docs (unresolved) stays bound and pauses
+    - ONLY when a DIFFERENT ticker is positively resolved does it skip as workspace_ticker_changed."""
+    from src.dalton import settings as dalton_settings_mod
+    from src.dalton.database import knowledge as db_knowledge
+    from src.server.database import workspace as ws_db_mod
+
+    orig_latest_valid = db_knowledge.latest_valid_version
+    orig_get_ws = ws_db_mod.get_workspace
+
+    infra = _FakeWatchlistInfra()
+    infra.install(monkeypatch)
+    monkeypatch.setattr(dalton_settings_mod, "is_coverage_units_enabled", lambda: False)
+
+    uid = "u-doc-err-r7"
+    ws_id = "ws-custom-ai-r7"
+    infra.workspace_owners[ws_id] = uid
+    infra.workspace_rows[ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": uid,
+        "name": "Custom AI Research Workspace",
+        "status": "running",
+    }
+
+    # Case A: db_knowledge.latest_valid_version raises DB error (real swallowing point in identity.py)
+    auto_a = infra.add_automation(
+        user_id=uid, workspace_id=ws_id, name="dalton-nvda-watch", status="active"
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_valid_version",
+        create_autospec(orig_latest_valid, side_effect=RuntimeError("knowledge DB error")),
+    )
+    res_a = await reconciler_mod.TierPolicyReconciler().reconcile_company(
+        uid, "NVDA", removed_workspace_id=ws_id
+    )
+    assert res_a.get("skipped") is not True
+    assert infra.automations[auto_a["automation_id"]]["status"] == "paused"
+
+    # Case B: get_workspace fails on the 2nd call (inside tracking._resolve_workspace_ticker)
+    infra.automations[auto_a["automation_id"]]["status"] = "active"
+    ws_call_count = 0
+
+    async def _flaky_get_ws(wid: str, *, conn: Any = None) -> dict[str, Any] | None:
+        nonlocal ws_call_count
+        _ = conn
+        ws_call_count += 1
+        if ws_call_count == 1:
+            return dict(infra.workspace_rows[wid])
+        raise RuntimeError("workspaces query timeout")
+
+    monkeypatch.setattr(
+        ws_db_mod,
+        "get_workspace",
+        create_autospec(orig_get_ws, side_effect=_flaky_get_ws),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_valid_version",
+        create_autospec(orig_latest_valid, return_value=None),
+    )
+    res_b = await reconciler_mod.TierPolicyReconciler().reconcile_company(
+        uid, "NVDA", removed_workspace_id=ws_id
+    )
+    assert res_b.get("skipped") is not True
+    assert infra.automations[auto_a["automation_id"]]["status"] == "paused"
+
+    # Case C: Custom-named workspace with no knowledge docs (unresolved ticker) -> stays bound and pauses
+    infra.automations[auto_a["automation_id"]]["status"] = "active"
+    monkeypatch.setattr(
+        ws_db_mod,
+        "get_workspace",
+        create_autospec(
+            orig_get_ws,
+            side_effect=lambda wid, *, conn=None: dict(infra.workspace_rows[wid]),
+        ),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_valid_version",
+        create_autospec(orig_latest_valid, return_value=None),
+    )
+    res_c = await reconciler_mod.TierPolicyReconciler().reconcile_company(
+        uid, "NVDA", removed_workspace_id=ws_id
+    )
+    assert res_c.get("skipped") is not True
+    assert infra.automations[auto_a["automation_id"]]["status"] == "paused"
+
+    # Case D: Custom-named workspace whose company doc positively resolves to DIFFERENT ticker (AMD) -> skips
+    infra.automations[auto_a["automation_id"]]["status"] = "active"
+
+    async def _amd_doc(wid: str, doc_key: str, *, conn: Any = None) -> dict[str, Any] | None:
+        _ = (wid, conn)
+        if doc_key == "company":
+            return {"content": {"ticker": "AMD"}}
+        return None
+
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_valid_version",
+        create_autospec(orig_latest_valid, side_effect=_amd_doc),
+    )
+    res_d = await reconciler_mod.TierPolicyReconciler().reconcile_company(
+        uid, "NVDA", removed_workspace_id=ws_id
+    )
+    assert res_d.get("skipped") is True
+    assert res_d.get("reason") == "workspace_ticker_changed"
+    assert infra.automations[auto_a["automation_id"]]["status"] == "active"
+
+
+def test_r7_calendar_state_matches_tasks_by_live_workspace_id_on_unbind_and_rebind(
+    tmp_path: Any,
+) -> None:
+    """r7 Item 5: calendar_state check / diff / mark match tasks strictly by live workspace_id:
+    - Live workspace.status=none does NOT resurrect stale ledger workspace_id or stages.
+    - Rebinding workspace_id (ws-old -> ws-new) with unchanged earnings date is NOT treated as
+      already created in check/diff, and mark does not carry over old workspace's task filenames."""
+    import importlib.util
+    import io
+    import json
+    from contextlib import redirect_stdout
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    script_path = (
+        Path(__file__).resolve().parents[4]
+        / "plugins/dalton/skills/dalton-earnings-calendar/scripts/calendar_state.py"
+    )
+    spec = importlib.util.spec_from_file_location("calendar_state_r7_test", script_path)
+    assert spec and spec.loader
+    cs_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cs_mod)
+
+    cov_yaml = tmp_path / "coverage.yaml"
+    cov_yaml.write_text(
+        "companies:\n"
+        "  - ticker: UNBOUND\n"
+        "    name: Unbound Corp\n"
+        "    tier: core\n"
+        "    workspace:\n"
+        "      name: UNBOUND\n"
+        "      status: none\n"
+        "  - ticker: REBOUND\n"
+        "    name: Rebound Corp\n"
+        "    tier: core\n"
+        "    workspace:\n"
+        "      workspace_id: ws-new\n"
+        "      status: active\n",
+        encoding="utf-8",
+    )
+    ledger_path = tmp_path / "ledger.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "updated": "2026-10-01",
+                "entries": {
+                    "UNBOUND": {
+                        "name": "Unbound Corp",
+                        "tier": "Core",
+                        "workspace_id": "ws-old-unbound",
+                        "status": "confirmed",
+                        "date_status": "confirmed",
+                        "date": "2026-11-05",
+                        "quarter": "FY26Q3",
+                        "automations": {
+                            "tm3": "dalton-unbound-earn-fy26q3-tm3.json",
+                            "t0": "dalton-unbound-earn-fy26q3-t0.json",
+                            "tp1": "dalton-unbound-earn-fy26q3-tp1.json",
+                        },
+                    },
+                    "REBOUND": {
+                        "name": "Rebound Corp",
+                        "tier": "Core",
+                        "workspace_id": "ws-old",
+                        "status": "confirmed",
+                        "date_status": "confirmed",
+                        "date": "2026-11-12",
+                        "quarter": "FY26Q3",
+                        "automations": {
+                            "tm3": "custom-old-ws-tm3.json",
+                            "t0": "custom-old-ws-t0.json",
+                            "tp1": "custom-old-ws-tp1.json",
+                        },
+                    },
+                },
+                "reported": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # 1. Unbound workspace (status: none) -> check must NOT resurrect ws-old-unbound or 3 stages
+    buf_chk_u = io.StringIO()
+    with redirect_stdout(buf_chk_u):
+        cs_mod.cmd_check(
+            SimpleNamespace(state=str(ledger_path), coverage=str(cov_yaml), ticker="UNBOUND", date="2026-11-05")
+        )
+    chk_u = json.loads(buf_chk_u.getvalue())
+    assert chk_u["workspace_id"] is None
+    assert chk_u["allowed_stages"] == []
+
+    # 2. Rebound workspace (ws-old -> ws-new, same date) -> check must NOT treat old tasks as created
+    buf_chk_r = io.StringIO()
+    with redirect_stdout(buf_chk_r):
+        cs_mod.cmd_check(
+            SimpleNamespace(state=str(ledger_path), coverage=str(cov_yaml), ticker="REBOUND", date="2026-11-12")
+        )
+    chk_r = json.loads(buf_chk_r.getvalue())
+    assert chk_r["workspace_id"] == "ws-new"
+    assert chk_r["allowed_stages"] == ["tm3", "t0", "tp1"]
+    assert chk_r["recorded"] is False
+    assert chk_r["action"] == "create_and_mark"
+
+    # 3. diff must report REBOUND missing all 3 stages for ws-new (old ws-old tasks don't count)
+    scan_path = tmp_path / "scan.jsonl"
+    scan_path.write_text(
+        json.dumps({"ticker": "UNBOUND", "status": "confirmed", "confidence": "high", "earnings_date": "2026-11-05"})
+        + "\n"
+        + json.dumps({"ticker": "REBOUND", "status": "confirmed", "confidence": "high", "earnings_date": "2026-11-12"})
+        + "\n",
+        encoding="utf-8",
+    )
+    buf_diff = io.StringIO()
+    with redirect_stdout(buf_diff):
+        rc_diff = cs_mod.cmd_diff(
+            SimpleNamespace(state=str(ledger_path), coverage=str(cov_yaml), scan=str(scan_path), automations_dir=None)
+        )
+    diff_out = json.loads(buf_diff.getvalue())
+    assert rc_diff == 2
+    assert diff_out["reconciled"] is False
+    assert [m["ticker"] for m in diff_out["missing"]] == ["REBOUND"]
+    assert diff_out["missing"][0]["missing_automations"] == ["tm3", "t0", "tp1"]
+
+    # 4. mark clears unbound entry to workspace_id=None / automations={} and rebuilds rebound entry without old filenames
+    def _mark(ticker: str, dt: str) -> dict[str, Any]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cs_mod.cmd_mark(
+                SimpleNamespace(
+                    state=str(ledger_path),
+                    coverage=str(cov_yaml),
+                    ticker=ticker,
+                    name=None,
+                    tier=None,
+                    workspace_id=None,
+                    fiscal_note=None,
+                    status="confirmed",
+                    date=dt,
+                    quarter="FY26Q3",
+                    timing="AMC",
+                    release_time_et=None,
+                    call_time_et=None,
+                    confidence="high",
+                    source_url="https://ir.example.com",
+                    source_type="company_ir",
+                    reason=None,
+                    automations_json=None,
+                    tm3=None,
+                    t0=None,
+                    tp1=None,
+                    tentative_date=None,
+                    tentative_sources=None,
+                    recheck_automation=None,
+                )
+            )
+        return json.loads(buf.getvalue())
+
+    res_u = _mark("UNBOUND", "2026-11-05")
+    assert res_u["entry"]["workspace_id"] is None
+    assert res_u["entry"]["automations"] == {}
+
+    res_r = _mark("REBOUND", "2026-11-12")
+    assert res_r["entry"]["workspace_id"] == "ws-new"
+    assert res_r["entry"]["automations"] == {
+        "tm3": "dalton-rebound-earn-fy26q3-tm3.json",
+        "t0": "dalton-rebound-earn-fy26q3-t0.json",
+        "tp1": "dalton-rebound-earn-fy26q3-tp1.json",
+    }
+
+    # 5. Once marked under ws-new, check returns skip and diff reconciles cleanly
+    buf_chk_after = io.StringIO()
+    with redirect_stdout(buf_chk_after):
+        cs_mod.cmd_check(
+            SimpleNamespace(state=str(ledger_path), coverage=str(cov_yaml), ticker="REBOUND", date="2026-11-12")
+        )
+    chk_after = json.loads(buf_chk_after.getvalue())
+    assert chk_after["recorded"] is True
+    assert chk_after["action"] == "skip"
+
+    buf_diff_after = io.StringIO()
+    with redirect_stdout(buf_diff_after):
+        rc_after = cs_mod.cmd_diff(
+            SimpleNamespace(state=str(ledger_path), coverage=str(cov_yaml), scan=str(scan_path), automations_dir=None)
+        )
+    diff_after = json.loads(buf_diff_after.getvalue())
+    assert rc_after == 0
+    assert diff_after["reconciled"] is True

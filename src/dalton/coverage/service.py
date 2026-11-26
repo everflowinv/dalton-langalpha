@@ -1176,6 +1176,22 @@ async def sync_user_coverage_to_home(
     )
 
     is_personal_yaml = rel_path == "dalton/coverage.yaml"
+    eff_backend = backend
+    if eff_backend is None:
+        # Resolve Home workspace & sandbox backend BEFORE acquiring the YAML advisory lock
+        # so get_or_create_home_workspace / workspace_is_moving / get_session_for_workspace
+        # never check out a second DB connection while the lock connection is held (safe for pool max_size=1).
+        try:
+            eff_backend = await _resolve_home_sandbox_backend(uid)
+        except Exception as exc:
+            logger.info(
+                "[DALTON_COVERAGE] skipped or failed writing Home/%s for user=%s: %s",
+                rel_path,
+                uid,
+                exc,
+            )
+            return False
+
     async with _cross_worker_home_yaml_lock(uid) as lock_conn:
         sql_conn = (
             lock_conn
@@ -1213,8 +1229,6 @@ async def sync_user_coverage_to_home(
                         last_synced_rev,
                     )
                     return False
-
-            eff_backend = backend or await _resolve_home_sandbox_backend(uid, conn=sql_conn)
 
             # Re-verify lease immediately before executing the actual sandbox write
             if lease_check is not None:

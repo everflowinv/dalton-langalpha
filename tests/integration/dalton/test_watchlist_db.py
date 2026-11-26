@@ -1007,3 +1007,176 @@ async def test_r6_home_yaml_sync_succeeds_with_pool_max_size_one_real_pg() -> No
 
             state_after = await policies_mod.get_user_roster_state(uid)
             assert state_after["last_yaml_synced_revision"] == 1
+
+
+@pytest.mark.asyncio
+async def test_r7_home_yaml_publish_pool_max_size_one_without_injected_backend_real_pg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r7 Item 1 (Real PG): With ``max_size=1`` and NO injected ``backend``,
+    ``sync_user_coverage_to_home`` resolves Home workspace (``get_or_create_home_workspace``)
+    and ``workspace_is_moving`` BEFORE taking the YAML advisory lock, so it succeeds without
+    PoolTimeout."""
+    from types import SimpleNamespace
+    from src.dalton.coverage import service as cov_svc
+    from src.dalton.watchlist import policies as policies_mod
+    from src.server.database import workspace as ws_db_mod
+    from src.server.services import workspace_manager as wm_mod
+
+    with _isolated_pg_database(PG_DSN) as iso_dsn:
+        env = _alembic_env_for_dsn(iso_dsn)
+        _run_alembic(["upgrade", "head"], env=env, dalton=False)
+        _run_alembic(["upgrade", "head"], env=env, dalton=True)
+
+        uid = f"u-pool1-r7-{uuid.uuid4().hex[:8]}"
+        written: list[tuple[str, str]] = []
+
+        class _FakeSandbox:
+            working_dir = "/workspace"
+            _work_dir = "/workspace"
+            config = SimpleNamespace(
+                filesystem=SimpleNamespace(
+                    working_directory="/workspace",
+                    allowed_directories=["/workspace"],
+                )
+            )
+
+            async def awrite_file_text(self, path: str, content: str) -> bool:
+                written.append((path, content))
+                return True
+
+        class _RealMovingCheckManager:
+            async def get_session_for_workspace(
+                self, workspace_id: str, *, user_id: str | None = None
+            ) -> Any:
+                _ = user_id
+                # Exercises the real DB query in workspace_is_moving against the max_size=1 pool
+                assert await ws_db_mod.workspace_is_moving(workspace_id) is False
+                return SimpleNamespace(sandbox=_FakeSandbox())
+
+        monkeypatch.setattr(
+            wm_mod.WorkspaceManager,
+            "get_instance",
+            classmethod(lambda cls: _RealMovingCheckManager()),
+        )
+
+        async with _isolated_pool(iso_dsn, max_size=1) as pool:
+            async with pool.connection() as conn:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "INSERT INTO users (user_id, email, name) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                            (uid, f"{uid}@example.com", "Pool1 User"),
+                        )
+                        await cur.execute(
+                            "INSERT INTO dalton_coverage (user_id, ticker, name, tier, market, extra, source) "
+                            "VALUES (%s, 'NVDA', 'NVIDIA', 'core', 'US', '{}'::jsonb, 'ui')",
+                            (uid,),
+                        )
+                    rev = await policies_mod.bump_user_roster_revision(uid, conn=conn)
+                    assert rev == 1
+
+            ok = await cov_svc.sync_user_coverage_to_home(uid, roster_revision=1)
+            assert ok is True
+            assert len(written) == 1
+            assert written[0][0].endswith("dalton/coverage.yaml")
+            assert "NVDA" in written[0][1]
+
+            state_after = await policies_mod.get_user_roster_state(uid)
+            assert state_after["last_yaml_synced_revision"] == 1
+
+
+@pytest.mark.asyncio
+async def test_r7_reconciler_fallback_query_savepoint_commits_pause_real_pg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r7 Item 3 (Real PG): When both the primary execution query and the fallback
+    ``list_executions(..., conn=sql_conn)`` raise real PostgreSQL SQL errors on the held
+    transaction connection, savepoints isolate both failures so the outer pause transaction
+    still commits cleanly."""
+    from src.dalton.watchlist import reconciler as reconciler_mod
+    from src.server.database import automation_executions as exec_db_mod
+
+    with _isolated_pg_database(PG_DSN) as iso_dsn:
+        env = _alembic_env_for_dsn(iso_dsn)
+        _run_alembic(["upgrade", "head"], env=env, dalton=False)
+        _run_alembic(["upgrade", "head"], env=env, dalton=True)
+
+        uid = f"u-sp-r7-{uuid.uuid4().hex[:8]}"
+        ws_id = str(uuid.uuid4())
+        auto_id = str(uuid.uuid4())
+
+        async with _isolated_pool(iso_dsn, max_size=2) as pool:
+            async with pool.connection() as conn:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "INSERT INTO users (user_id, email, name) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                            (uid, f"{uid}@example.com", "Savepoint User"),
+                        )
+                        await cur.execute(
+                            "INSERT INTO workspaces (workspace_id, user_id, name, status) "
+                            "VALUES (%s::uuid, %s, 'NVDA', 'running')",
+                            (ws_id, uid),
+                        )
+                        await cur.execute(
+                            """
+                            INSERT INTO automations (
+                                automation_id, user_id, name, trigger_type,
+                                timezone, instruction, next_run_at, last_run_at, run_count,
+                                workspace_id, status, metadata
+                            )
+                            VALUES (
+                                %s::uuid, %s, 'dalton-nvda-earn-fy26q4-t0', 'once',
+                                'America/New_York', 'Earnings flash',
+                                NOW() + INTERVAL '2 days', NOW(), 0,
+                                %s::uuid, 'active', '{"ticker": "NVDA", "dalton_managed": true}'::jsonb
+                            )
+                            """,
+                            (auto_id, uid, ws_id),
+                        )
+
+            # Rename automation_executions so BOTH the primary SQL query AND the real fallback
+            # exec_db.list_executions(..., conn=sql_conn) hit real PostgreSQL UndefinedTable errors
+            # on the held transaction connection.
+            orig_list_exec = exec_db_mod.list_executions
+            fallback_spy = create_autospec(orig_list_exec, side_effect=orig_list_exec)
+
+            async with pool.connection() as admin_conn:
+                async with admin_conn.transaction():
+                    async with admin_conn.cursor() as cur:
+                        await cur.execute("ALTER TABLE automation_executions RENAME TO automation_executions_bak")
+
+            monkeypatch.setattr(
+                reconciler_mod.exec_db,
+                "list_executions",
+                fallback_spy,
+            )
+            monkeypatch.setattr(
+                reconciler_mod.exec_db,
+                "skip_unstarted_executions_for_automations",
+                create_autospec(
+                    exec_db_mod.skip_unstarted_executions_for_automations,
+                    return_value=0,
+                ),
+            )
+
+            res = await reconciler_mod.TierPolicyReconciler().reconcile_company(
+                uid, "NVDA", removed_workspace_id=ws_id
+            )
+            assert res["ok"] is True
+            assert res.get("skipped") is not True
+            assert fallback_spy.await_count == 1
+            assert fallback_spy.await_args.kwargs.get("conn") is not None
+
+            # Verify from a fresh connection that the pause ACTUALLY COMMITTED to Postgres
+            async with pool.connection() as verify_conn:
+                async with verify_conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT status, next_run_at FROM automations WHERE automation_id = %s::uuid",
+                        (auto_id,),
+                    )
+                    row = await cur.fetchone()
+                    assert row is not None
+                    assert row[0] == "paused"
+                    assert row[1] is None

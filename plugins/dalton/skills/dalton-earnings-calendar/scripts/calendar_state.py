@@ -408,6 +408,35 @@ def _resolve_live_stage_scope(
     return live_tier, stages
 
 
+def _normalize_workspace_id(ws_id: Any) -> str | None:
+    clean = str(ws_id or "").strip()
+    return clean or None
+
+
+def _entry_automations_for_workspace(
+    entry: dict[str, Any] | None,
+    workspace_id: str | None,
+) -> dict[str, str]:
+    """Return ledger automations ONLY when ``entry`` matches the live ``workspace_id``.
+
+    Automations recorded under an older/different workspace never count as created for a new workspace.
+    """
+    if not isinstance(entry, dict):
+        return {}
+    live_ws = _normalize_workspace_id(workspace_id)
+    entry_ws = _normalize_workspace_id(entry.get("workspace_id"))
+    if not live_ws or entry_ws != live_ws:
+        return {}
+    raw_autos = entry.get("automations")
+    if not isinstance(raw_autos, dict):
+        return {}
+    return {
+        str(k).strip().lower(): str(v)
+        for k, v in raw_autos.items()
+        if str(k).strip() and v
+    }
+
+
 def _resolve_live_workspace_id(
     ticker: str,
     *,
@@ -415,17 +444,25 @@ def _resolve_live_workspace_id(
     entry: dict[str, Any] | None = None,
     explicit_workspace_id: str | None = None,
 ) -> str | None:
-    """Resolve the active workspace_id for ``check`` / ``mark`` / ``diff``: explicit > live coverage > ledger."""
+    """Resolve the active workspace_id for ``check`` / ``mark`` / ``diff`` strictly from explicit arg or live coverage.
+
+    Never resurrects a stale ``entry.workspace_id`` from the ledger when live coverage has unbound
+    the workspace (``status: none|planned|deleted|unbound`` or missing ``workspace_id``) or removed the ticker.
+    """
+    _ = entry
     if explicit_workspace_id is not None:
-        return explicit_workspace_id or None
+        return _normalize_workspace_id(explicit_workspace_id)
     sym = str(ticker or "").strip().upper()
-    cov = coverage.get(sym, {})
-    cov_ws_id = (
-        (cov.get("workspace") or {}).get("workspace_id")
-        if isinstance(cov.get("workspace"), dict)
-        else None
-    )
-    return cov_ws_id or ((entry or {}).get("workspace_id") or None)
+    cov = coverage.get(sym)
+    if not isinstance(cov, dict):
+        return None
+    ws_obj = cov.get("workspace")
+    if not isinstance(ws_obj, dict):
+        return None
+    ws_status = str(ws_obj.get("status") or "").strip().lower()
+    if ws_status in ("none", "planned", "deleted", "unbound"):
+        return None
+    return _normalize_workspace_id(ws_obj.get("workspace_id"))
 
 
 def _resolve_live_workspace_and_stages(
@@ -469,7 +506,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         tier_policies=tier_policies,
         entry=entry,
     )
-    existing_autos = (entry or {}).get("automations") if isinstance((entry or {}).get("automations"), dict) else {}
+    existing_autos = _entry_automations_for_workspace(entry, effective_ws_id)
     has_autos = (not expected_stages) or all(stage in existing_autos for stage in expected_stages)
     recorded = bool(same_date and has_autos)
     date_changed = bool(is_confirmed and old_date and old_date != args.date)
@@ -560,19 +597,22 @@ def cmd_mark(args: argparse.Namespace) -> int:
                     automations[sk] = v
                 else:
                     filtered_out_stages.append(sk)
-        elif existing.get("automations") and existing.get("quarter") == args.quarter:
-            # r6: derive default filenames strictly from live allowed_stages (empty -> {})
+        elif (
+            existing.get("quarter") == args.quarter
+            and (reusable_autos := _entry_automations_for_workspace(existing, workspace_id))
+        ):
+            # r6/r7: reuse ledger automations ONLY when workspace_id matches live workspace_id
             expected_defaults = default_automations_for_stages(
                 ticker,
                 args.quarter,
                 allowed_stages,
             )
             automations = {
-                stage: existing["automations"].get(stage) or default_fname
+                stage: reusable_autos.get(stage) or default_fname
                 for stage, default_fname in expected_defaults.items()
             }
         else:
-            # r6: derive default filenames strictly from live allowed_stages (empty -> {})
+            # r6/r7: derive default filenames strictly from live allowed_stages (empty -> {})
             automations = default_automations_for_stages(
                 ticker,
                 args.quarter,
@@ -732,14 +772,28 @@ def cmd_roll(args: argparse.Namespace) -> int:
     return 0
 
 
-def _verify_automation_file(auto_path: Path, expected_date: str, expected_tz: str = "America/New_York") -> dict:
-    """Read back an automation JSON file and verify active status & timezone-converted date."""
+def _verify_automation_file(
+    auto_path: Path,
+    expected_date: str,
+    expected_tz: str = "America/New_York",
+    expected_workspace_id: str | None = None,
+) -> dict:
+    """Read back an automation JSON file and verify active status, workspace_id & timezone-converted date."""
     if not auto_path.exists():
         return {"ok": False, "reason": "file_missing", "path": str(auto_path)}
     try:
         data = json.loads(auto_path.read_text(encoding="utf-8"))
     except Exception as exc:
         return {"ok": False, "reason": f"json_parse_error: {exc}", "path": str(auto_path)}
+
+    file_ws = _normalize_workspace_id(data.get("workspace_id"))
+    exp_ws = _normalize_workspace_id(expected_workspace_id)
+    if exp_ws and file_ws and file_ws != exp_ws:
+        return {
+            "ok": False,
+            "reason": f"workspace_id_mismatch: expected {exp_ws}, got {file_ws}",
+            "path": str(auto_path),
+        }
 
     status = data.get("status")
     state_block = data.get("state") or {}
@@ -878,7 +932,8 @@ def cmd_diff(args: argparse.Namespace) -> int:
             )
             continue
 
-        # Check automations presence using live coverage workspace + allowed stages (including newly bound workspaces)
+        # Check automations presence using live coverage workspace + allowed stages
+        # (automations recorded under an older/different workspace never satisfy the live workspace)
         effective_ws_id, _live_tier_diff, expected_keys = _resolve_live_workspace_and_stages(
             t,
             coverage=coverage,
@@ -886,7 +941,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
             entry=ent,
         )
         if effective_ws_id:
-            autos = ent.get("automations") or {}
+            autos = _entry_automations_for_workspace(ent, effective_ws_id)
             missing_keys = [k for k in expected_keys if not autos.get(k)]
             if missing_keys:
                 missing.append(
@@ -902,7 +957,11 @@ def cmd_diff(args: argparse.Namespace) -> int:
                     auto_file = Path(args.automations_dir) / autos[k]
                     # Only t0 is guaranteed to have the same market date as scan_date
                     exp_d = scan_date if k == "t0" else ""
-                    v_res = _verify_automation_file(auto_file, expected_date=exp_d)
+                    v_res = _verify_automation_file(
+                        auto_file,
+                        expected_date=exp_d,
+                        expected_workspace_id=effective_ws_id,
+                    )
                     if not v_res["ok"]:
                         automation_issues.append({"ticker": t, "window": k, **v_res})
 

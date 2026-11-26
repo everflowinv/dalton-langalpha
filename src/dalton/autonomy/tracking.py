@@ -283,6 +283,7 @@ async def _resolve_workspace_ticker(
     *,
     registered_units: Mapping[str, Mapping[str, Any]] | None = None,
     conn: Any = None,
+    raise_on_db_error: bool = False,
 ) -> str:
     """Resolve the uppercase company ticker for a workspace, or raise.
 
@@ -302,6 +303,8 @@ async def _resolve_workspace_ticker(
             else await ws_db.get_workspace(str(workspace_id))
         )
     except Exception as exc:
+        if raise_on_db_error:
+            raise
         logger.debug("[DALTON_TRACKING] get_workspace(%s) failed: %s", workspace_id, exc)
 
     from src.dalton.coverage.identity import resolve_workspace_coverage_identity
@@ -311,6 +314,7 @@ async def _resolve_workspace_ticker(
         registered_units=registered_units,
         automations=existing_rows,
         conn=conn,
+        raise_on_doc_error=raise_on_db_error,
     )
     if identity.is_home:
         raise ValueError("Home workspace does not support company auto-tracking")

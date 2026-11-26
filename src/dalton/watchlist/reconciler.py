@@ -19,13 +19,15 @@ from src.dalton.autonomy.tracking import (
     resolve_workspace_id_by_ticker,
     resolve_workspace_tracking_owner,
 )
-from src.dalton.coverage.models import VALID_EARNINGS_STAGES, _ensure_json_obj
+from src.dalton.coverage.models import _ensure_json_obj
 from src.dalton.coverage.service import sync_user_coverage_to_home
 from src.dalton.database import coverage as coverage_db
 from src.dalton.services.company_automations import automation_history_context
 from src.dalton.watchlist.pause_guards import (
     build_locked_resume_reconciler,
     can_override_user_pause_locked,
+    is_earnings_task_allowed_for_stages,
+    parse_earnings_task_name,
 )
 from src.dalton.watchlist.policies import (
     TierPolicy,
@@ -101,14 +103,14 @@ def _find_standard_task_row(
 
 
 def _earn_stage_from_name(name: str, ticker: str) -> str | None:
-    """Extract earnings stage (``tm3`` | ``t0`` | ``tp1``) from ``dalton-<slug>-earn-*-<stage>``."""
-    clean = str(name or "").strip().lower()
-    if not any(clean.startswith(f"dalton-{slug}-earn-") for slug in _ticker_slugs(ticker)):
+    """Extract earnings task kind (``tm3`` | ``t0`` | ``tp1`` | ``recheck``) via shared classifier."""
+    parsed = parse_earnings_task_name(name)
+    if parsed is None:
         return None
-    for stage in VALID_EARNINGS_STAGES:
-        if clean.endswith(f"-{stage}") or clean.endswith(f"-{stage}.json"):
-            return stage
-    return None
+    slug, kind = parsed
+    if slug not in _ticker_slugs(ticker):
+        return None
+    return kind
 
 
 async def is_unstarted_earn_once(
@@ -117,14 +119,15 @@ async def is_unstarted_earn_once(
     user_id: str | None = None,
     conn: Any = None,
 ) -> bool:
-    """Return True iff ``row`` is an unstarted one-shot earnings task.
+    """Return True iff ``row`` is an unstarted one-shot earnings task (``tm3``/``t0``/``tp1``/``recheck``).
 
     Includes tasks already claimed by the scheduler (``last_run_at`` stamped on claim)
     whose execution rows are still ``pending`` / ``waiting`` and have never started running.
+    Wraps both primary and fallback queries in savepoints when running inside a transaction.
     Fails safe (returns True -> pause) if execution status lookup fails.
     """
     name = str(row.get("name") or "").strip().lower()
-    if "-earn-" not in name:
+    if parse_earnings_task_name(name) is None:
         return False
     if str(row.get("trigger_type") or "").strip().lower() != "once":
         return False
@@ -190,9 +193,16 @@ async def is_unstarted_earn_once(
             return True
         try:
             if sql_conn is not None:
-                exec_res = await exec_db.list_executions(
-                    uid, automation_id=auto_id, limit=10, conn=sql_conn
-                )
+                tx_fn = getattr(sql_conn, "transaction", None)
+                if callable(tx_fn):
+                    async with tx_fn():
+                        exec_res = await exec_db.list_executions(
+                            uid, automation_id=auto_id, limit=10, conn=sql_conn
+                        )
+                else:
+                    exec_res = await exec_db.list_executions(
+                        uid, automation_id=auto_id, limit=10, conn=sql_conn
+                    )
             else:
                 exec_res = await exec_db.list_executions(
                     uid, automation_id=auto_id, limit=10
@@ -215,7 +225,7 @@ async def is_unstarted_earn_once(
 def _is_future_earn_once(row: Mapping[str, Any]) -> bool:
     """Synchronous fast-path check for unstarted one-shot earnings tasks."""
     name = str(row.get("name") or "").strip().lower()
-    if "-earn-" not in name:
+    if parse_earnings_task_name(name) is None:
         return False
     if str(row.get("trigger_type") or "").strip().lower() != "once":
         return False
@@ -439,19 +449,25 @@ async def _verify_workspace_bound_to_ticker(
 
     # 3. Positive fallback: read the CURRENT active company identity/document inside ws_clean itself
     # (never search historical knowledge versions across workspaces).
-    # Pass current conn so no second pool connection is checked out; on query failure,
-    # fail-safe by treating the workspace as still bound so removed-ticker tasks are paused.
+    # Pass current conn & raise_on_db_error=True so doc/workspace DB failures propagate out of the
+    # savepoint rather than collapsing into ValueError; only return False when a DIFFERENT ticker
+    # is positively resolved. DB failures or unresolved custom workspaces fail-safe as still bound.
     try:
         from src.dalton.autonomy.tracking import _resolve_workspace_ticker
 
         tx_fn = getattr(conn, "transaction", None) if conn is not None else None
         if callable(tx_fn):
             async with tx_fn():
-                cur_ws_ticker = await _resolve_workspace_ticker(ws_clean, conn=conn)
+                cur_ws_ticker = await _resolve_workspace_ticker(
+                    ws_clean, conn=conn, raise_on_db_error=True
+                )
         else:
-            cur_ws_ticker = await _resolve_workspace_ticker(ws_clean, conn=conn)
+            cur_ws_ticker = await _resolve_workspace_ticker(
+                ws_clean, conn=conn, raise_on_db_error=True
+            )
     except ValueError:
-        return False
+        # Unable to positively identify a different ticker -> fail-safe as still bound
+        return True
     except Exception as exc:
         logger.warning(
             "[WATCHLIST_RECONCILE] workspace identity lookup failed for ws=%s ticker=%s (%s); treating as still bound",
@@ -466,7 +482,9 @@ async def _verify_workspace_bound_to_ticker(
             return True
         if str(cur_ws_ticker).strip().upper() == sym:
             return True
-    return False
+        # Positively resolved a DIFFERENT ticker -> workspace was rebound
+        return False
+    return True
 
 
 def _apply_price_threshold_to_row(
@@ -665,8 +683,8 @@ class TierPolicyReconciler:
                         if not auto_id or r_status == "disabled":
                             continue
                         is_std = r_name in all_std_names
-                        is_future_earn = (live_row is None) and (
-                            await is_unstarted_earn_once(r, user_id=uid, conn=conn)
+                        is_future_earn = await is_unstarted_earn_once(
+                            r, user_id=uid, conn=conn
                         )
                         if not (is_std or is_future_earn):
                             continue
@@ -999,7 +1017,7 @@ class TierPolicyReconciler:
                         {"name": s_name, "op": "resume" if resuming else "update"}
                     )
 
-                # Item 9 / r5: pause unstarted earnings tasks (including scheduler-claimed pending/waiting rows)
+                # Item 9 / r5 / r7: pause unstarted earnings tasks (tm3/t0/tp1/recheck) using shared rules
                 allowed_earn_stages = set(effective_policy.earnings_stages)
                 for r in company_rows:
                     if not (await is_unstarted_earn_once(r, user_id=uid, conn=conn)):
@@ -1008,10 +1026,8 @@ class TierPolicyReconciler:
                     r_name = str(r.get("name") or "").strip().lower()
                     if not auto_id:
                         continue
-                    stage = _earn_stage_from_name(r_name, sym)
-                    if not allowed_earn_stages or (
-                        stage is not None and stage not in allowed_earn_stages
-                    ):
+                    earn_kind = _earn_stage_from_name(r_name, sym)
+                    if not is_earnings_task_allowed_for_stages(earn_kind, allowed_earn_stages):
                         r_status_earn = str(r.get("status") or "active").strip().lower()
                         new_meta = (
                             dict(r.get("metadata") or {})
@@ -1310,6 +1326,7 @@ class TierPolicyReconciler:
                 return held
 
             sync_kwargs: dict[str, Any] = {}
+            backend_resolve_failed = False
             try:
                 _sync_params = _inspect.signature(sync_user_coverage_to_home).parameters
                 _has_var_kw = any(
@@ -1319,9 +1336,30 @@ class TierPolicyReconciler:
                     sync_kwargs["roster_revision"] = job_roster_revision
                 if claim_token is not None and ("lease_check" in _sync_params or _has_var_kw):
                     sync_kwargs["lease_check"] = _verify_yaml_lease
+                if "backend" in _sync_params or _has_var_kw:
+                    from src.dalton.coverage import service as coverage_svc
+
+                    # Pre-resolve Home sandbox backend BEFORE entering sync_user_coverage_to_home's
+                    # YAML advisory lock so pool max_size=1 never deadlocks on a second checkout.
+                    if sync_user_coverage_to_home is coverage_svc.sync_user_coverage_to_home:
+                        try:
+                            sync_kwargs["backend"] = await coverage_svc._resolve_home_sandbox_backend(
+                                uid
+                            )
+                        except Exception as exc:
+                            logger.info(
+                                "[WATCHLIST_RECONCILE] skipped or failed resolving Home backend for user=%s: %s",
+                                uid,
+                                exc,
+                            )
+                            backend_resolve_failed = True
             except (TypeError, ValueError):
                 sync_kwargs["roster_revision"] = job_roster_revision
-            synced = bool(await sync_user_coverage_to_home(uid, **sync_kwargs))
+            synced = (
+                False
+                if backend_resolve_failed
+                else bool(await sync_user_coverage_to_home(uid, **sync_kwargs))
+            )
             if yaml_lease_lost:
                 return {
                     "ok": False,

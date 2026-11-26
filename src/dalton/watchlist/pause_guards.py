@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from typing import Any
 
 from src.dalton.coverage.models import VALID_EARNINGS_STAGES
 
-_EARN_STAGE_RE = re.compile(
-    r"^dalton-(?P<slug>[a-z0-9][a-z0-9._-]{0,19})-earn-.+-(?P<stage>tm3|t0|tp1)(?:\.json)?$",
+EARNINGS_RECHECK_KIND = "recheck"
+
+_EARN_TASK_RE = re.compile(
+    r"^dalton-(?P<slug>[a-z0-9][a-z0-9._-]{0,19})-earn-.+-(?P<kind>tm3|t0|tp1|recheck)(?:\.json)?$",
     re.IGNORECASE,
 )
 
@@ -196,16 +198,49 @@ def extract_automation_ticker(row: Mapping[str, Any] | None) -> str | None:
     return None
 
 
-def parse_earnings_stage_task_name(name: str | None) -> tuple[str, str] | None:
-    """Return ``(ticker_slug, stage)`` for ``dalton-<slug>-earn-*-<tm3|t0|tp1>``, else ``None``."""
+def parse_earnings_task_name(name: str | None) -> tuple[str, str] | None:
+    """Return ``(ticker_slug, kind)`` for ``dalton-<slug>-earn-*-<tm3|t0|tp1|recheck>``, else ``None``."""
     clean = str(name or "").strip().lower()
-    m = _EARN_STAGE_RE.match(clean)
+    m = _EARN_TASK_RE.match(clean)
     if not m:
         return None
-    stage = m.group("stage").lower()
-    if stage not in VALID_EARNINGS_STAGES:
+    kind = m.group("kind").lower()
+    if kind != EARNINGS_RECHECK_KIND and kind not in VALID_EARNINGS_STAGES:
         return None
-    return m.group("slug").lower(), stage
+    return m.group("slug").lower(), kind
+
+
+def parse_earnings_stage_task_name(name: str | None) -> tuple[str, str] | None:
+    """Return ``(ticker_slug, stage)`` for ``dalton-<slug>-earn-*-<tm3|t0|tp1>``, else ``None``."""
+    parsed = parse_earnings_task_name(name)
+    if parsed is None:
+        return None
+    slug, kind = parsed
+    if kind not in VALID_EARNINGS_STAGES:
+        return None
+    return slug, kind
+
+
+def is_earnings_task_allowed_for_stages(
+    kind: str | None,
+    allowed_stages: Collection[str],
+) -> bool:
+    """Shared rule for reconciler and resume: whether an earnings task kind is allowed.
+
+    - Empty ``allowed_stages`` (e.g. radar or all stages disabled) disallows ALL earnings tasks,
+      including ``recheck``.
+    - ``recheck`` is allowed iff at least one earnings stage is enabled.
+    - Stage tasks (``tm3`` / ``t0`` / ``tp1``) are allowed iff ``kind in allowed_stages``.
+    """
+    allowed = {str(s or "").strip().lower() for s in allowed_stages if str(s or "").strip()}
+    if not allowed:
+        return False
+    norm_kind = str(kind or "").strip().lower()
+    if norm_kind == EARNINGS_RECHECK_KIND:
+        return True
+    if norm_kind in VALID_EARNINGS_STAGES:
+        return norm_kind in allowed
+    return False
 
 
 async def validate_earnings_stage_allowed_for_user(
@@ -215,15 +250,15 @@ async def validate_earnings_stage_allowed_for_user(
     ticker: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any] | None:
-    """Validate an earnings-stage task against the user's live watchlist tier & policy.
+    """Validate an earnings task (``tm3``/``t0``/``tp1``/``recheck``) against the user's live watchlist tier & policy.
 
     Returns an error dict ``{"ok": False, "error": "earnings_stage_disabled", "message": ...}``
-    when the stage is disabled by the user's live coverage policy, or ``None`` when allowed.
+    when disallowed by the user's live coverage policy, or ``None`` when allowed.
     """
-    parsed = parse_earnings_stage_task_name(task_name)
+    parsed = parse_earnings_task_name(task_name)
     if parsed is None:
         return None
-    slug, stage = parsed
+    slug, kind = parsed
     uid = str(user_id or "").strip()
     if not uid:
         return None
@@ -258,14 +293,14 @@ async def validate_earnings_stage_allowed_for_user(
         return {
             "ok": False,
             "error": "earnings_stage_check_unavailable",
-            "message": f"无法核验 {candidates[0]} 的实时观察名单分档，拒绝排程财报 {stage} 阶段任务（{type(exc).__name__}）。",
+            "message": f"无法核验 {candidates[0]} 的实时观察名单分档，拒绝排程财报 {kind} 任务（{type(exc).__name__}）。",
         }
 
     if cov_row is None:
         return {
             "ok": False,
             "error": "earnings_stage_disabled",
-            "message": f"{candidates[0]} 当前不在个人观察名单中，不启用财报 {stage} 阶段自动任务。",
+            "message": f"{candidates[0]} 当前不在个人观察名单中，不启用财报 {kind} 自动任务。",
         }
 
     sym = str(cov_row.get("ticker") or candidates[0]).strip().upper()
@@ -273,7 +308,7 @@ async def validate_earnings_stage_allowed_for_user(
         return {
             "ok": False,
             "error": "earnings_stage_disabled",
-            "message": f"{sym} 为未上市公司，不启用财报 {stage} 阶段自动任务。",
+            "message": f"{sym} 为未上市公司，不启用财报 {kind} 自动任务。",
         }
 
     live_tier = str(cov_row.get("tier") or "").strip().lower()
@@ -283,15 +318,15 @@ async def validate_earnings_stage_allowed_for_user(
         return {
             "ok": False,
             "error": "earnings_stage_check_unavailable",
-            "message": f"无法读取 {sym} 的生效分档策略，拒绝排程财报 {stage} 阶段任务（{type(exc).__name__}）。",
+            "message": f"无法读取 {sym} 的生效分档策略，拒绝排程财报 {kind} 任务（{type(exc).__name__}）。",
         }
     eff_policy = resolve_effective_company_policy(base_policy, cov_row.get("task_overrides"))
-    if stage not in set(eff_policy.earnings_stages):
+    if not is_earnings_task_allowed_for_stages(kind, eff_policy.earnings_stages):
         return {
             "ok": False,
             "error": "earnings_stage_disabled",
             "message": (
-                f"{sym} 当前分档（{live_tier or 'unknown'}）未启用财报 {stage} 阶段自动任务"
+                f"{sym} 当前分档（{live_tier or 'unknown'}）未启用财报 {kind} 自动任务"
                 f"（允许阶段：{list(eff_policy.earnings_stages)}）。"
             ),
         }
@@ -306,18 +341,18 @@ async def assert_locked_earnings_resume_allowed(
     conn: Any = None,
     ticker: str | None = None,
 ) -> None:
-    """Shared row-locked earnings-stage guard for generic resume and Dalton schedule resume.
+    """Shared row-locked earnings-task guard for generic resume and Dalton schedule resume.
 
-    Checks the locked row's actual task name and ticker against the user's live watchlist
-    tier & allowed earnings stages on ``conn``. When disallowed (removed ticker, downgraded
-    tier, private company, or lookup unavailable), forces ``effective_kwargs`` to remain
-    paused with ``next_run_at = None`` and raises ``AutomationRefusal`` so the row is never
-    rescheduled.
+    Checks the locked row's actual task name (including ``tm3``/``t0``/``tp1`` and ``recheck``)
+    and ticker against the user's live watchlist tier & allowed earnings stages on ``conn``.
+    When disallowed (removed ticker, downgraded tier, private company, or lookup unavailable),
+    forces ``effective_kwargs`` to remain paused with ``next_run_at = None`` and raises
+    ``AutomationRefusal`` so the row is never rescheduled.
     """
     if not isinstance(locked_row, Mapping):
         return
     task_name = str(locked_row.get("name") or "").strip()
-    if parse_earnings_stage_task_name(task_name) is None:
+    if parse_earnings_task_name(task_name) is None:
         return
     actual_ticker = extract_automation_ticker(locked_row) or (
         str(ticker).strip().upper() if ticker and str(ticker).strip() else None
@@ -343,13 +378,16 @@ async def assert_locked_earnings_resume_allowed(
 
 
 __all__ = [
+    "EARNINGS_RECHECK_KIND",
     "apply_manual_pause_metadata",
     "assert_locked_earnings_resume_allowed",
     "build_locked_resume_reconciler",
     "can_override_user_pause_locked",
     "extract_automation_ticker",
     "is_dalton_managed_automation",
+    "is_earnings_task_allowed_for_stages",
     "parse_earnings_stage_task_name",
+    "parse_earnings_task_name",
     "resolve_paused_once_schedule_at",
     "validate_earnings_stage_allowed_for_user",
 ]
