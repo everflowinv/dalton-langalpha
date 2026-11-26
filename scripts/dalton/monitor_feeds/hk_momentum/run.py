@@ -124,8 +124,15 @@ def _commit_failure_artifacts(
     prev_index_meta: dict[str, Any],
     is_month_end: bool,
     headline_reason: str | None = None,
+    diagnostic_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Commit degraded SourceStatuses without touching frozen history or advancing last_success_at."""
+    """Commit degraded SourceStatuses without touching frozen history or advancing last_success_at.
+
+    When ``diagnostic_meta`` is supplied (e.g. from this run's ``compute_all`` on a month-end
+    completeness failure), this run's diagnostic fields (``index_dates``,
+    ``missing_held_by_index``) are recorded for observability while ``prev_index_meta``'s
+    published ``last_date`` / ``launch_date`` and published series/frozen files are preserved.
+    """
     status_doc = status_store.update_sources(
         results,
         required=required_names,
@@ -152,6 +159,11 @@ def _commit_failure_artifacts(
             "source_statuses": status_doc["sources"],
         }
     )
+    if isinstance(diagnostic_meta, dict):
+        if isinstance(diagnostic_meta.get("index_dates"), dict):
+            fail_meta["index_dates"] = dict(diagnostic_meta["index_dates"])
+        if isinstance(diagnostic_meta.get("missing_held_by_index"), dict):
+            fail_meta["missing_held_by_index"] = dict(diagnostic_meta["missing_held_by_index"])
     atomic_write_json(st_dir / "index_meta.json", fail_meta)
 
     prev_live = load_json_safe(st_dir / "live.json", {}) or {}
@@ -433,6 +445,7 @@ def run_daily_job(
             prev_index_meta=prev_index_meta,
             is_month_end=True,
             headline_reason=detail,
+            diagnostic_meta=meta,
         )
 
     snap: dict[str, Any] | None = None

@@ -22,13 +22,19 @@ _DALTON_TABLES = [
 ]
 
 
-_DSN_ENV_VARS = ("TEST_DB_DSN", "DALTON_TEST_DB_DSN", "TEST_DATABASE_URL")
+_DSN_ENV_VARS = (
+    "TEST_DB_DSN",
+    "DALTON_TEST_DB_DSN",
+    "TEST_DATABASE_URL",
+    "DALTON_DATA_JOBS_TEST_DSN",
+)
 
 
 def _ensure_safe_test_db_name() -> str:
     """Abort the entire pytest session before any DB connection or SQL if no explicit
-    test DB config (DSN or TEST_DB_HOST/TEST_DB_PORT/TEST_DB_NAME) is set or if DB name
-    does not end with ``_test``."""
+    test DB config (DSN or TEST_DB_HOST/TEST_DB_PORT/TEST_DB_NAME) is set or if any
+    configured test DB name does not end with ``_test``."""
+    found_db_name: str | None = None
     for var in _DSN_ENV_VARS:
         dsn = (os.getenv(var) or "").strip()
         if dsn:
@@ -38,7 +44,10 @@ def _ensure_safe_test_db_name() -> str:
                     f"Refusing to run Dalton integration session against non-test database {db_name!r} from {var} (must end with '_test')",
                     returncode=2,
                 )
-            return db_name
+            if found_db_name is None:
+                found_db_name = db_name
+    if found_db_name is not None:
+        return found_db_name
 
     host = (os.getenv("TEST_DB_HOST") or "").strip()
     port = (os.getenv("TEST_DB_PORT") or "").strip()

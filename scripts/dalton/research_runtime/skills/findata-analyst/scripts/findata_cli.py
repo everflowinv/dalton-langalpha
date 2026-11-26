@@ -81,6 +81,54 @@ _NON_SEC_MARKET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
+_DUAL_LISTED_SEC_ISSUER_MAP: dict[str, str] = {
+    "9988.HK": "BABA",
+    "09988": "BABA",
+    "HK:9988": "BABA",
+    "HK:09988": "BABA",
+    "9618.HK": "JD",
+    "09618": "JD",
+    "HK:9618": "JD",
+    "9888.HK": "BIDU",
+    "09888": "BIDU",
+    "HK:9888": "BIDU",
+    "9999.HK": "NTES",
+    "09999": "NTES",
+    "9626.HK": "BILI",
+    "09626": "BILI",
+    "2015.HK": "LI",
+    "02015": "LI",
+    "9866.HK": "NIO",
+    "09866": "NIO",
+    "9868.HK": "XPEV",
+    "09868": "XPEV",
+    "9961.HK": "TCOM",
+    "09961": "TCOM",
+    "9987.HK": "YUMC",
+    "09987": "YUMC",
+    "2057.HK": "ZTO",
+    "02057": "ZTO",
+    "0005.HK": "HSBC",
+    "00005": "HSBC",
+    "2330.TW": "TSM",
+}
+
+
+def _resolve_sec_issuer_ticker(ticker: str | None) -> str | None:
+    raw = str(ticker or "").strip().upper()
+    if not raw:
+        return None
+    if raw in _DUAL_LISTED_SEC_ISSUER_MAP:
+        return _DUAL_LISTED_SEC_ISSUER_MAP[raw]
+    m_hk = re.fullmatch(r"(?:HK:)?0*(\d{1,5})(?:\.HK)?", raw)
+    if m_hk and (raw.endswith(".HK") or raw.startswith("HK:") or (raw.isdigit() and len(raw) == 5 and raw.startswith("0"))):
+        num = int(m_hk.group(1))
+        for cand in (f"{num:04d}.HK", f"{num}.HK", f"{num:05d}"):
+            if cand in _DUAL_LISTED_SEC_ISSUER_MAP:
+                return _DUAL_LISTED_SEC_ISSUER_MAP[cand]
+    return None
+
+
 def _detect_non_sec_ticker(ticker: str | None) -> str | None:
     """Return a market label when ``ticker`` clearly belongs to a non-SEC market (no SEC CIK)."""
     raw = str(ticker or "").strip()
@@ -716,20 +764,23 @@ def cmd_ratios(args):
 
 
 def cmd_list_filings(args):
-    non_sec_market = _detect_non_sec_ticker(args.ticker)
-    if non_sec_market is not None:
-        return {
-            "ok": False,
-            "status": "not_sec_filer",
-            "error_code": "not_sec_filer",
-            "sec_filer": False,
-            "ticker": args.ticker,
-            "count": 0,
-            "rows": [],
-            "error": f"该证券不在 SEC 申报：{args.ticker} 属于{non_sec_market}，无 SEC 身份（CIK），未请求 SEC。",
-            "hint": "港股与 A 股请改用 cn-hk 路由；韩股等其他非美股请查当地交易所公告或内部研究库。",
-        }
-    c = _retry(lambda: Company(args.ticker))
+    mapped_sec = _resolve_sec_issuer_ticker(args.ticker)
+    effective_ticker = mapped_sec or args.ticker
+    if mapped_sec is None:
+        non_sec_market = _detect_non_sec_ticker(args.ticker)
+        if non_sec_market is not None:
+            return {
+                "ok": False,
+                "status": "not_sec_filer",
+                "error_code": "not_sec_filer",
+                "sec_filer": False,
+                "ticker": args.ticker,
+                "count": 0,
+                "rows": [],
+                "error": f"该证券不在 SEC 申报：{args.ticker} 属于{non_sec_market}，无 SEC 身份（CIK），未请求 SEC。",
+                "hint": "港股与 A 股请改用 cn-hk 路由；韩股等其他非美股请查当地交易所公告或内部研究库。",
+            }
+    c = _retry(lambda: Company(effective_ticker))
     filings = _get_filings(c, args, args.form)
     if len(filings) == 0:
         return {"ok": False, "error": f"No filings found for {args.ticker}."}

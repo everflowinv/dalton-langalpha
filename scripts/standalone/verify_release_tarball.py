@@ -32,6 +32,23 @@ FORBIDDEN_PAX_KEYS: frozenset[str] = frozenset(
     }
 )
 
+# Everflow/proprietary subpaths that must never ship inside a Standalone Core archive.
+FORBIDDEN_RELEASE_SUBPATHS: tuple[tuple[str, ...], ...] = (
+    ("plugins", "dalton_data"),
+    ("plugins", "dalton", "skills", "dalton-richard-coverage-weekly"),
+    ("scripts", "dalton", "researchdata_bridge.py"),
+    ("scripts", "dalton", "research_runtime"),
+    ("scripts", "dalton", "ops"),
+    ("web", ".env.dalton"),
+)
+
+
+def _matches_forbidden_subpath(rel_parts: tuple[str, ...]) -> tuple[str, ...] | None:
+    for forbidden in FORBIDDEN_RELEASE_SUBPATHS:
+        if len(rel_parts) >= len(forbidden) and rel_parts[: len(forbidden)] == forbidden:
+            return forbidden
+    return None
+
 
 def _is_forbidden_pax_key(key: str) -> bool:
     return key in FORBIDDEN_PAX_KEYS or any(
@@ -75,6 +92,18 @@ def inspect_tarball(
                 if part == ".DS_Store":
                     violations.append(f"forbidden .DS_Store member: {member.name}")
                     break
+
+            rel_parts = (
+                parts[1:]
+                if expected_top_dir is not None and parts and parts[0] == expected_top_dir
+                else parts
+            )
+            matched_forbidden = _matches_forbidden_subpath(rel_parts)
+            if matched_forbidden is not None:
+                violations.append(
+                    f"forbidden Everflow/proprietary member in core archive: {member.name} "
+                    f"(matched {'/'.join(matched_forbidden)})"
+                )
 
             pax_headers = member.pax_headers or {}
             for key in sorted(pax_headers):

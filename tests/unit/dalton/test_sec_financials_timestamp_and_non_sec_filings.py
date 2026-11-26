@@ -242,6 +242,23 @@ def test_bridge_separates_internal_serialization_error_from_argument_error() -> 
     assert ser_payload["hint"] != arg_payload["hint"]
     assert "序列化" in ser_payload["error"] or "序列化" in ser_payload["hint"]
 
+    # Even if an upstream caller pre-labeled error_category="参数错误", serialization signal overrides to "内部错误".
+    prelabeled_ser: dict[str, Any] = {
+        "ok": False,
+        "status": "error",
+        "error_category": "参数错误",
+        "error": "keys must be str, int, float, bool or None, not Timestamp",
+    }
+    rb._apply_error_and_empty_contract(
+        "finance",
+        "sec",
+        "financials",
+        prelabeled_ser,
+        {"route": "sec", "operation": "financials", "ticker": "SPOT"},
+    )
+    assert prelabeled_ser["error_category"] == "内部错误"
+    assert prelabeled_ser["error_code"] == "internal_serialization_error"
+
 
 def test_findata_cli_error_json_separates_serialization_error_from_argument_error() -> None:
     cli = _load_findata_cli()
@@ -252,7 +269,7 @@ def test_findata_cli_error_json_separates_serialization_error_from_argument_erro
     assert ser_err["hint"] != arg_err["hint"]
 
 
-@pytest.mark.parametrize("ticker", ["0700.HK", "00700", "9988.HK", "005930.KS", "035420.KQ"])
+@pytest.mark.parametrize("ticker", ["0700.HK", "00700", "005930.KS", "035420.KQ"])
 def test_bridge_sec_list_filings_rejects_non_sec_hk_kr_without_calling_sec(
     ticker: str,
 ) -> None:
@@ -327,3 +344,94 @@ def test_dalton_sec_mcp_list_filings_rejects_non_sec_hk_kr_without_requesting_se
     assert res.get("error_code") == "not_sec_filer"
     assert res.get("sec_filer") is False
     assert "不在 SEC 申报" in str(res.get("detail") or "")
+
+
+def test_dalton_sec_mcp_list_filings_resolves_dual_listed_9988_hk_via_baba_cik(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dual-listed 9988.HK maps to BABA (CIK 0001577552) and MUST NOT be rejected as non-SEC."""
+    sec_mod = _load_dalton_sec()
+    fake_sub = {
+        "name": "Alibaba Group Holding Limited",
+        "filings": {
+            "recent": {
+                "accessionNumber": ["0001577552-26-000010"],
+                "form": ["20-F"],
+                "filingDate": ["2026-06-20"],
+                "reportDate": ["2026-03-31"],
+                "primaryDocument": ["baba-20260331.htm"],
+            }
+        },
+    }
+    fetch_spy = create_autospec(sec_mod.fetch_submissions, return_value=fake_sub)
+    monkeypatch.setattr(sec_mod, "fetch_submissions", fetch_spy)
+
+    res = sec_mod.list_filings(ticker="9988.HK", limit=5)
+    fetch_spy.assert_called_once_with("0001577552")
+    assert res.get("ok") is True or isinstance(res.get("data"), list)
+    rows = res.get("data") or []
+    assert len(rows) == 1
+    assert rows[0]["cik"] == "0001577552"
+    assert rows[0]["form"] == "20-F"
+
+
+def test_bridge_sec_list_filings_maps_dual_listed_9988_hk_to_baba_before_short_circuit() -> None:
+    """Bridge finance(route='sec', operation='list-filings', ticker='9988.HK') resolves 9988.HK -> BABA
+    and forwards to SEC stdio instead of rejecting as not_sec_filer."""
+    rb = _load_bridge()
+    cfg = rb.BridgeConfig()
+    bridge = rb.ResearchDataBridge(cfg)
+    captured: list[dict[str, Any]] = []
+
+    async def _fake_stdio(
+        requests: list[dict[str, Any]],
+        timeout_s: float,
+    ) -> list[dict[str, Any]]:
+        captured.extend(requests)
+        req_id = requests[0].get("id") if requests else 2
+        return [
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {
+                                    "ok": True,
+                                    "ticker": "BABA",
+                                    "rows": [{"form": "20-F", "filing_date": "2026-06-20"}],
+                                }
+                            ),
+                        }
+                    ],
+                    "isError": False,
+                },
+            }
+        ]
+
+    stdio_spy = create_autospec(bridge._run_stdio_rpc, side_effect=_fake_stdio)
+    bridge._run_stdio_rpc = stdio_spy
+
+    rpc_resp = asyncio.run(
+        bridge.handle_tools_call(
+            req_id=2,
+            params={
+                "name": "finance",
+                "arguments": {
+                    "route": "sec",
+                    "operation": "list-filings",
+                    "ticker": "9988.HK",
+                    "limit": 5,
+                },
+            },
+        )
+    )
+    assert stdio_spy.call_count == 1
+    forwarded_args = ((captured[0].get("params") or {}).get("arguments")) or {}
+    assert forwarded_args.get("ticker") == "BABA"
+    text = rpc_resp["result"]["content"][0]["text"]
+    payload = json.loads(text)
+    assert payload.get("error_code") != "not_sec_filer"
+    assert payload.get("sec_filer") is not False

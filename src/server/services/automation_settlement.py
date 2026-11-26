@@ -362,7 +362,8 @@ async def _after_settling(
                 held_pending = True
                 _nudge_drainer()
             else:
-                await _finish_here(
+                # DALTON-HOOK(dalton-notify): capture _finish_here delivery result for failure notification receipt
+                webhook_delivery_result = await _finish_here(
                     automation,
                     execution_id,
                     thread_id,
@@ -577,15 +578,15 @@ async def _finish_here(
     finish = await ask()
     # DALTON-HOOK(execution-delivery-status): persist whether finish will be retried
     will_retry = finish.retry and bool(automation_delivery.FINISH_RETRY_DELAYS)
-    await _record_delivery(
-        execution_id, _stamp_delivery_retry(finish.result, retrying=will_retry)
-    )
+    stamped_result = _stamp_delivery_retry(finish.result, retrying=will_retry)
+    await _record_delivery(execution_id, stamped_result)
     if finish.retry:
         # Off the settle's path, which the executor waits on.
         _hold(asyncio.create_task(
             _finish_again(ask, execution_id, answered=finish.answered),
             name=f"settle_finish_{execution_id}",
         ))
+    return stamped_result
 
 
 class _FinishPending(Exception):

@@ -9,6 +9,7 @@ import type { PageLinkSpec } from '@/utils/rateLimitError';
 import {
   type DeliveryNames,
   deliveryTargetName,
+  failureNoticeLabelKey,
   formatDeliveryFailureReason,
   matchAttemptForTarget,
   stripSyncedDeliveryExcerptSuffix,
@@ -95,7 +96,8 @@ export function RunReport({
               total: delivery.total_targets,
             })
         : null;
-  const deliveryRetrying = delivery?.status === 'retrying';
+  const failureNoticeKey = failureNoticeLabelKey(delivery);
+  const deliveryRetrying = delivery?.status === 'retrying' && !failureNoticeKey;
   // DALTON-HOOK(execution-delivery-status): also show delivered targets in detail report when only notify-table summary records exist
   const showDeliveryTargetDetails =
     deliveryTargets.length > 0 &&
@@ -114,8 +116,13 @@ export function RunReport({
       </div>
       {displayExcerpt && <p className={classes.excerpt}>{displayExcerpt}</p>}
       {view.ui.danger && run.error_message && <p className="automation-mono automation-run-error">{run.error_message}</p>}
-      {/* DALTON-HOOK(execution-delivery-status): render delivery failure summary, per-target states/reasons, or retrying note */}
+      {/* DALTON-HOOK(execution-delivery-status): render delivery failure summary, failure notice receipt, per-target states/reasons, or retrying note */}
       {deliveryErrorLine && <p className="automation-mono automation-run-error">{deliveryErrorLine}</p>}
+      {failureNoticeKey && (
+        <p className="automation-run-note" data-testid="run-report-failure-notice">
+          {t(failureNoticeKey)}
+        </p>
+      )}
       {deliveryRetrying && <p className="automation-run-note">{t('automation:deliveryRetryingNote')}</p>}
       {showDeliveryTargetDetails && (
         <ul className="automation-run-delivery-targets" aria-label={t('automation:delivery')}>

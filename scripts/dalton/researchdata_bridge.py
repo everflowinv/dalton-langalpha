@@ -3307,6 +3307,78 @@ _NON_SEC_MARKET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
+_DUAL_LISTED_SEC_ISSUER_MAP: dict[str, str] = {
+    "9988.HK": "BABA",
+    "09988": "BABA",
+    "HK:9988": "BABA",
+    "HK:09988": "BABA",
+    "9618.HK": "JD",
+    "09618": "JD",
+    "HK:9618": "JD",
+    "HK:09618": "JD",
+    "9888.HK": "BIDU",
+    "09888": "BIDU",
+    "HK:9888": "BIDU",
+    "HK:09888": "BIDU",
+    "9999.HK": "NTES",
+    "09999": "NTES",
+    "HK:9999": "NTES",
+    "9626.HK": "BILI",
+    "09626": "BILI",
+    "HK:9626": "BILI",
+    "2015.HK": "LI",
+    "02015": "LI",
+    "HK:2015": "LI",
+    "9866.HK": "NIO",
+    "09866": "NIO",
+    "HK:9866": "NIO",
+    "9868.HK": "XPEV",
+    "09868": "XPEV",
+    "HK:9868": "XPEV",
+    "9961.HK": "TCOM",
+    "09961": "TCOM",
+    "HK:9961": "TCOM",
+    "9987.HK": "YUMC",
+    "09987": "YUMC",
+    "2057.HK": "ZTO",
+    "02057": "ZTO",
+    "0005.HK": "HSBC",
+    "00005": "HSBC",
+    "2330.TW": "TSM",
+}
+
+
+def _resolve_sec_issuer_ticker(ticker: str | None) -> str | None:
+    """Resolve dual-listed non-US ticker (e.g. ``9988.HK``) to its SEC filer ticker/CIK via known issuer maps."""
+    raw = str(ticker or "").strip().upper()
+    if not raw:
+        return None
+    if raw in _DUAL_LISTED_SEC_ISSUER_MAP:
+        return _DUAL_LISTED_SEC_ISSUER_MAP[raw]
+    m_hk = re.fullmatch(r"(?:HK:)?0*(\d{1,5})(?:\.HK)?", raw)
+    if m_hk and (raw.endswith(".HK") or raw.startswith("HK:") or (raw.isdigit() and len(raw) == 5 and raw.startswith("0"))):
+        num = int(m_hk.group(1))
+        for cand in (f"{num:04d}.HK", f"{num}.HK", f"{num:05d}"):
+            if cand in _DUAL_LISTED_SEC_ISSUER_MAP:
+                return _DUAL_LISTED_SEC_ISSUER_MAP[cand]
+    # Also consult the repo's alphaengine_search_cache canonical ticker alias map when available.
+    try:
+        import alphaengine_search_cache as _ae_cache  # type: ignore[import-not-found]
+
+        alias_map = getattr(_ae_cache, "_TICKER_ALIASES", None) or getattr(
+            _ae_cache, "TICKER_ALIASES", None
+        )
+        if isinstance(alias_map, dict):
+            for sec_sym, aliases in alias_map.items():
+                if _detect_non_sec_ticker(str(sec_sym)) is not None:
+                    continue
+                if any(str(a).strip().upper() == raw for a in (aliases or ())):
+                    return str(sec_sym).strip().upper()
+    except Exception:
+        pass
+    return None
+
+
 def _detect_non_sec_ticker(ticker: str | None) -> str | None:
     """Return market label when ``ticker`` clearly belongs to a non-SEC market (no SEC CIK)."""
     raw = str(ticker or "").strip()
@@ -5580,12 +5652,12 @@ def _classify_error_category_and_hint(
         _collect_multi_source_health(payload) if route == "all" else ([], [])
     )
 
-    if existing_cat in ("参数错误", "上游不可用", "权限或额度", "没有匹配", "内部错误"):
-        category = existing_cat
-    elif internal_serialization_signal:
+    if internal_serialization_signal:
         payload["error_code"] = payload.get("error_code") or "internal_serialization_error"
         payload["status"] = "internal_error"
         category = "内部错误"
+    elif existing_cat in ("参数错误", "上游不可用", "权限或额度", "没有匹配", "内部错误"):
+        category = existing_cat
     elif route == "all" and failed_legs:
         leg_cats = {
             name: _classify_error_category_and_hint(
@@ -14001,31 +14073,36 @@ class ResearchDataBridge:
             and operation in ("list-filings", "")
         ):
             sec_ticker = str(call_args.get("ticker") or "").strip()
-            non_sec_market = _detect_non_sec_ticker(sec_ticker)
-            if non_sec_market is not None:
-                alt_hint = (
-                    '港股与 A 股请改用 finance(route="cn-hk", operation="filings", ...) 查询公告。'
-                    if non_sec_market in ("港股", "A股")
-                    else "韩股及其他非美股请查当地交易所公告或内部研究库，无需请求 SEC。"
-                )
-                non_sec_payload: dict[str, Any] = {
-                    "_declared_sources": [],
-                    "_sources": [],
-                    "ok": False,
-                    "status": "not_sec_filer",
-                    "error_code": "not_sec_filer",
-                    "error_category": "没有匹配",
-                    "sec_filer": False,
-                    "ticker": sec_ticker,
-                    "filings": [],
-                    "rows": [],
-                    "error": f"该证券不在 SEC 申报：{sec_ticker} 属于{non_sec_market}，无 SEC 身份（CIK），未请求 SEC。",
-                    "hint": alt_hint,
-                    "normalized_params": norm_params_view,
-                }
-                return self._make_tool_result_response(
-                    req_id, non_sec_payload, is_error=True
-                )
+            mapped_sec = _resolve_sec_issuer_ticker(sec_ticker)
+            if mapped_sec is not None:
+                call_args["ticker"] = mapped_sec
+                norm_params_view["ticker"] = mapped_sec
+            else:
+                non_sec_market = _detect_non_sec_ticker(sec_ticker)
+                if non_sec_market is not None:
+                    alt_hint = (
+                        '港股与 A 股请改用 finance(route="cn-hk", operation="filings", ...) 查询公告。'
+                        if non_sec_market in ("港股", "A股")
+                        else "韩股及其他非美股请查当地交易所公告或内部研究库，无需请求 SEC。"
+                    )
+                    non_sec_payload: dict[str, Any] = {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "not_sec_filer",
+                        "error_code": "not_sec_filer",
+                        "error_category": "没有匹配",
+                        "sec_filer": False,
+                        "ticker": sec_ticker,
+                        "filings": [],
+                        "rows": [],
+                        "error": f"该证券不在 SEC 申报：{sec_ticker} 属于{non_sec_market}，无 SEC 身份（CIK），未请求 SEC。",
+                        "hint": alt_hint,
+                        "normalized_params": norm_params_view,
+                    }
+                    return self._make_tool_result_response(
+                        req_id, non_sec_payload, is_error=True
+                    )
 
         do_fanout = self._should_fanout_alphaengine(tool_name, arguments)
         ae_args: dict[str, Any] | None = None

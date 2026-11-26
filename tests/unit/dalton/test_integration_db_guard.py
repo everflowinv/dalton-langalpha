@@ -122,3 +122,36 @@ def test_dalton_db_integration_modules_refuse_without_explicit_env(
     msg = str(exc_info.value)
     assert "TEST_DB_HOST" in msg or "DSN" in msg
     assert "Refusing" in msg or "拒绝" in msg
+
+
+def test_dalton_integration_conftest_accepts_standalone_data_jobs_test_dsn_and_rejects_non_test(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Using DALTON_DATA_JOBS_TEST_DSN alone (pointing at a *_test DB) must pass the directory guard,
+    while a non-_test DB name must still be rejected."""
+    _clear_db_env(monkeypatch)
+    monkeypatch.delenv("DALTON_DATA_JOBS_TEST_DSN", raising=False)
+    mod = _load_mod("dalton_int_conftest_dj_dsn", "tests/integration/dalton/conftest.py")
+
+    monkeypatch.setenv(
+        "DALTON_DATA_JOBS_TEST_DSN",
+        "postgresql://postgres:postgres@127.0.0.1:55432/data_jobs_test",
+    )
+    assert mod._ensure_safe_test_db_name() == "data_jobs_test"
+
+    monkeypatch.setenv(
+        "DALTON_DATA_JOBS_TEST_DSN",
+        "postgresql://postgres:postgres@127.0.0.1:55432/langalpha_prod",
+    )
+    with pytest.raises(pytest.exit.Exception) as exc_info:
+        mod._ensure_safe_test_db_name()
+    assert "must end with '_test'" in str(exc_info.value)
+
+
+def test_ci_backend_integration_workflow_sets_explicit_test_db_env_vars() -> None:
+    """GitHub Actions backend-integration workflow must pass explicit TEST_DB_HOST/PORT/NAME
+    so the integration DB guard does not fail collection in CI."""
+    wf_text = (REPO_ROOT / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
+    assert "TEST_DB_HOST:" in wf_text
+    assert "TEST_DB_PORT:" in wf_text
+    assert "TEST_DB_NAME:" in wf_text

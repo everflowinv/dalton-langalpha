@@ -115,3 +115,91 @@ def test_richard_coverage_weekly_screen_movers_does_not_mark_anthropic_private()
     assert "Anthropic" not in rcw.PRIVATE_ROWS
     assert "Anthropic" in rcw.TICKERS
     assert rcw.TICKERS["Anthropic"][0] == "ANT"
+
+
+def test_extractor_normalizes_anthropic_company_name_in_tickers_to_only_ant() -> None:
+    """When the LLM puts 'Anthropic' directly into tickers, normalization + validation + backfill
+    must collapse it to 'ANT' and never keep 'ANTHROPIC' alongside 'ANT'."""
+    alias_map = extractor.SUPPLEMENTAL_TICKER_ALIASES
+    norm_tickers, _entities = extractor.normalize_tickers_and_entities(
+        ["Anthropic"],
+        [],
+        alias_map=alias_map,
+    )
+    assert norm_tickers == ["ANT"]
+
+    norm_dedup, _ = extractor.normalize_tickers_and_entities(
+        ["Anthropic", "ANT"],
+        [],
+        alias_map=alias_map,
+    )
+    assert norm_dedup == ["ANT"]
+
+    quote = "Anthropic 发布了新一代企业级 Claude 模型，推动年化经常性收入高速增长。"
+    kept, dropped = extractor.validate_tickers_against_quote(
+        ["Anthropic"],
+        quote,
+        claim="Anthropic 新产品带动收入增长。",
+        alias_map=alias_map,
+    )
+    assert dropped == 0
+    assert kept == ["ANT"]
+
+    final_tickers, added = extractor.backfill_tickers_from_quote(
+        kept,
+        quote,
+        claim="Anthropic 新产品带动收入增长。",
+        alias_map=alias_map,
+    )
+    assert added == 0
+    assert final_tickers == ["ANT"]
+
+
+def test_ai_app_weekly_monitor_universe_moves_anthropic_from_private_watchlist_to_listed_ant() -> None:
+    """dalton-ai-app-weekly-monitor universe.json must not exclude Anthropic as unlisted in private_watchlist."""
+    import json
+
+    uni_path = (
+        REPO_ROOT
+        / "plugins"
+        / "dalton"
+        / "skills"
+        / "dalton-ai-app-weekly-monitor"
+        / "references"
+        / "universe.json"
+    )
+    data = json.loads(uni_path.read_text(encoding="utf-8"))
+    private_companies = data.get("private_watchlist", {}).get("companies", [])
+    assert "Anthropic" not in private_companies
+    listed_tickers = {entry.get("ticker") for entry in data.get("universe", []) if isinstance(entry, dict)}
+    assert "ANT" in listed_tickers
+
+
+def test_core_release_packaging_excludes_richard_exclusive_weekly_skill(tmp_path: Path) -> None:
+    """Separation principle: package_release.sh denylist excludes dalton-richard-coverage-weekly
+    and verify_release_tarball.inspect_tarball rejects any core tarball containing it."""
+    import io
+    import tarfile
+
+    pkg_sh = (REPO_ROOT / "scripts" / "standalone" / "package_release.sh").read_text(encoding="utf-8")
+    assert '"plugins/dalton/skills/dalton-richard-coverage-weekly"' in pkg_sh
+
+    verify_mod = _load_module(
+        "verify_release_tarball_sep_check",
+        "scripts/standalone/verify_release_tarball.py",
+    )
+    tar_path = tmp_path / "bad_core.tar.gz"
+    top = "dalton-core-test"
+    with tarfile.open(tar_path, "w:gz") as tf:
+        d_info = tarfile.TarInfo(name=top)
+        d_info.type = tarfile.DIRTYPE
+        tf.addfile(d_info)
+        f_data = b"# exclusive\n"
+        f_info = tarfile.TarInfo(
+            name=f"{top}/plugins/dalton/skills/dalton-richard-coverage-weekly/scripts/screen_movers.py"
+        )
+        f_info.size = len(f_data)
+        tf.addfile(f_info, io.BytesIO(f_data))
+
+    violations = verify_mod.inspect_tarball(tar_path, expected_top_dir=top)
+    assert any("dalton-richard-coverage-weekly" in v for v in violations)

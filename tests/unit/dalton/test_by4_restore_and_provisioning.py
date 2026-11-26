@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import create_autospec
 
 import pytest
@@ -198,3 +199,88 @@ async def test_provisioning_backup_without_worker_session_skips_all_projects_and
     assert mirrored == 0
     assert any("no attached session on this worker" in r.message for r in caplog.records)
     assert any("mirrored 0 of 4 project(s)" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_sessionless_idle_stop_defers_and_requests_cross_worker_mirror_then_proceeds_after_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BY4 r2: when an idle stop lands on a worker without a cached session and files_backup is on,
+    _finish_claimed_stop requests commands.mirror.mirror_computer and defers stop (settling back to RUNNING)
+    within the grace window; once the grace window expires (no worker held a session), it proceeds with teardown."""
+    from src.server.models.computer import ComputerStatus
+    from src.server.services.commands import mirror as commands_mirror
+    from src.server.services.computer_manager._lifecycle import SessionLifecycleMixin
+
+    mirror_spy = create_autospec(commands_mirror.mirror_computer, return_value=None)
+    monkeypatch.setattr(commands_mirror, "mirror_computer", mirror_spy)
+    monkeypatch.setattr(commands_mirror, "_redis", create_autospec(commands_mirror._redis, return_value=None))
+
+    settled_states: list[tuple[str, Any]] = []
+    teardown_calls: list[str] = []
+
+    class _StopHarness(SessionLifecycleMixin):
+        _IDLE_STOP_DEFER_GRACE_S = 60.0
+
+        def _cached_session(self, computer_id: str):
+            return None
+
+        def _machine_if_known(self, computer_id: str):
+            return None
+
+        def _session_sandbox_id(self, session: Any):
+            return None
+
+        async def _backup_machine_files_to_db(self, *args: Any, **kwargs: Any) -> int:
+            return 0
+
+        async def refresh_computer_disk(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        async def _machine_has_active_tasks(self, *args: Any, **kwargs: Any) -> bool:
+            return False
+
+        async def _retain_machine_stop_claim(self, *args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def _detached_sandbox_teardown(self, sandbox_id: str, **kwargs: Any) -> None:
+            teardown_calls.append(sandbox_id)
+
+        async def _settle_machine_stop(self, computer_id: str, status: Any) -> None:
+            settled_states.append((computer_id, status))
+
+        async def _stop_result(self, computer_id: str, workspace_id: str | None) -> dict[str, Any]:
+            return {"computer_id": computer_id, "status": "running" if not teardown_calls else "stopped"}
+
+    harness = _StopHarness()
+    binding = SimpleNamespace(
+        computer_id="comp-idle-1",
+        files_backup=True,
+        provider=SimpleNamespace(recreatable=True),
+    )
+
+    # First idle stop on session-less worker -> requests cross-worker mirror and defers teardown!
+    res1 = await harness._finish_claimed_stop(
+        binding,
+        workspace_id="ws-1",
+        durable_sandbox_id="sb-1",
+        back_up=True,
+        reason="idle",
+    )
+    assert res1["status"] == "running"
+    mirror_spy.assert_awaited_once_with("comp-idle-1")
+    assert teardown_calls == []
+    assert settled_states == [("comp-idle-1", ComputerStatus.RUNNING)]
+
+    # Expire the deferral grace window (e.g. after backend restart when no worker holds a session)
+    harness._idle_stop_defer_since["comp-idle-1"] -= 120.0
+    res2 = await harness._finish_claimed_stop(
+        binding,
+        workspace_id="ws-1",
+        durable_sandbox_id="sb-1",
+        back_up=True,
+        reason="idle",
+    )
+    assert res2["status"] == "stopped"
+    assert teardown_calls == ["sb-1"]
+    assert settled_states[-1] == ("comp-idle-1", ComputerStatus.STOPPED)

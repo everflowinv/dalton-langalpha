@@ -368,6 +368,35 @@ def _is_trading_channel_discussed_in_claim(
     return any(not _TRADING_CHANNEL_VERB_RE.search(s) for s in matched_sents)
 
 
+def _resolve_alias_to_canonical_ticker(
+    raw_token: str,
+    alias_map: dict[str, tuple[str, ...]] | None,
+) -> str | None:
+    """Resolve a company name / alias (e.g. ``Anthropic`` -> ``ANT``, ``SpaceX`` -> ``SPCX``)
+    back to its unique canonical ticker before ticker validation and deduplication."""
+    s = str(raw_token or "").strip()
+    if not s or not alias_map:
+        return None
+    upper_s = s.upper()
+    canon_s = canonicalize_ticker_key(upper_s)
+    if upper_s in alias_map or canon_s in alias_map:
+        return upper_s if upper_s in alias_map else canon_s
+    folded = s.casefold()
+    matched_keys: list[str] = []
+    for ticker_key, aliases in alias_map.items():
+        if str(ticker_key).strip().casefold() == folded:
+            return str(ticker_key).strip().upper()
+        for alias in aliases or ():
+            if str(alias or "").strip().casefold() == folded:
+                tk_upper = str(ticker_key).strip().upper()
+                if tk_upper not in matched_keys:
+                    matched_keys.append(tk_upper)
+                break
+    if len(matched_keys) == 1:
+        return matched_keys[0]
+    return None
+
+
 def normalize_tickers_and_entities(
     raw_tickers: list[Any] | None,
     raw_entities: list[Any] | None,
@@ -401,8 +430,9 @@ def normalize_tickers_and_entities(
             if entity_label not in entities and entity_label.upper() not in {x.upper() for x in entities}:
                 entities.append(entity_label)
         else:
-            if upper_t not in tickers:
-                tickers.append(upper_t)
+            resolved = _resolve_alias_to_canonical_ticker(ts, eff_alias_map) or upper_t
+            if resolved not in tickers:
+                tickers.append(resolved)
 
     return tickers, entities
 
@@ -2723,9 +2753,10 @@ def _validate_tickers_against_quote_detailed(
     dropped_channel = 0
     seen_priv: set[str] = set()
     for raw_t in tickers or []:
-        t = str(raw_t or "").strip().upper()
-        if not t:
+        raw_str = str(raw_t or "").strip()
+        if not raw_str:
             continue
+        t = _resolve_alias_to_canonical_ticker(raw_str, eff_alias_map) or raw_str.upper()
         canon_t = canonicalize_ticker_key(t)
 
         if _is_private_company_ticker(t, user_id=user_id, alias_map=eff_alias_map):

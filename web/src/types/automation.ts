@@ -73,6 +73,19 @@ export interface DeliveryAttempt {
 
 // DALTON-HOOK(execution-delivery-status): structured delivery summary attached by backend
 export type ExecutionDeliveryStatus = 'delivered' | 'failed' | 'partial_failed' | 'retrying' | 'skipped';
+export type FailureNoticeStatus = 'unconfigured' | 'suppressed' | 'pending' | 'delivered';
+
+export interface FailureNoticeReceipt {
+  status: FailureNoticeStatus;
+  label_zh?: string | null;
+  label_en?: string | null;
+  reason?: string | null;
+  failure_reason?: string | null;
+  outcome?: string | null;
+  error?: string | null;
+  targets?: string[];
+  recorded_at?: string | null;
+}
 
 export interface ExecutionDeliveryTarget {
   target?: string | null;
@@ -96,6 +109,11 @@ export interface ExecutionDeliverySummary {
   failure_reason?: string | null;
   failure_reasons?: string[];
   targets?: ExecutionDeliveryTarget[];
+  // DALTON-HOOK(execution-delivery-status): dedicated failure notification receipt state
+  failure_notice_status?: FailureNoticeStatus | null;
+  failure_notice_label_zh?: string | null;
+  failure_notice_label_en?: string | null;
+  failure_notification_receipt?: FailureNoticeReceipt | null;
 }
 
 /** A chat an app offers as a delivery target. `kind` is e.g. `dm` or `channel`. */

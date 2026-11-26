@@ -194,3 +194,120 @@ def test_hk_momentum_run_result_includes_index_dates_and_failure_summary(
     assert "00626" in summary
     assert "smallcap=2026-04-16" in summary
     assert "nonggt=2026-04-17" in summary
+
+
+def test_hk_momentum_month_end_compute_failure_carries_current_run_diagnostics_and_preserves_previous_published_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a month-end rebalance day when compute_all fails completeness, run_daily_job must:
+    1. Propagate THIS run's per-index dates and missing_held_by_index into failure_summary & index_meta.json
+       (not the stale prev_index_meta dates).
+    2. Preserve the previous published frozen_history.json, series.csv, and prev last_date."""
+    from datetime import date
+    import scripts.dalton.monitor_feeds.hk_momentum.run as hk_run
+
+    st_dir = tmp_path / "state"
+    out_dir = tmp_path / "out"
+    st_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Seed previous published artifacts (March 31)
+    frozen_seed = {"2026-03": {"smallcap": ["00001"], "nonggt": ["00002"]}}
+    (st_dir / "frozen_history.json").write_text(json.dumps(frozen_seed), encoding="utf-8")
+    (st_dir / "series.csv").write_text("date,smallcap,nonggt,hsi\n2026-03-31,1000,1000,1000\n", encoding="utf-8")
+    (st_dir / "index_meta.json").write_text(
+        json.dumps(
+            {
+                "last_date": "2026-03-31",
+                "launch_date": "2026-01-01",
+                "index_dates": {
+                    "smallcap": "2026-03-31",
+                    "nonggt": "2026-03-31",
+                    "hsi": "2026-03-31",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # This run (2026-04-30, month-end rebalance day): smallcap lagged at 2026-04-29 missing 00626,
+    # while nonggt & hsi reached 2026-04-30.
+    fake_computed = {
+        "series": {
+            "dates": ["2026-03-31", "2026-04-30"],
+            "smallcap": [1000.0, 1010.0],
+            "nonggt": [1000.0, 1020.0],
+            "hsi": [1000.0, 1005.0],
+        },
+        "constituents": {"smallcap": [], "nonggt": []},
+        "meta": {
+            "last_date": "2026-04-29",
+            "launch_date": "2026-01-01",
+            "stale": True,
+            "stale_reason": "smallcap 持有成分缺少必要价格 1 只 (如 00626)",
+            "index_dates": {
+                "smallcap": "2026-04-29",
+                "nonggt": "2026-04-30",
+                "hsi": "2026-04-30",
+            },
+            "missing_held_by_index": {"smallcap": ["00626"], "nonggt": []},
+            "completeness_ok": False,
+            "ok": False,
+            "source_statuses": {
+                "hsi_history": {"source": "hsi_history", "ok": True, "stale": False, "reason": None, "label": "恒生指数历史"},
+                "index_compute": {
+                    "source": "index_compute",
+                    "ok": False,
+                    "stale": True,
+                    "reason": "smallcap 持有成分缺少必要价格 1 只 (如 00626)",
+                    "label": "动量日度计算",
+                },
+            },
+        },
+        "can_freeze": False,
+    }
+
+    monkeypatch.setattr(hk_run, "is_trading_day", create_autospec(hk_run.is_trading_day, return_value=True))
+    monkeypatch.setattr(hk_run, "last_trading_day_of_month", create_autospec(hk_run.last_trading_day_of_month, return_value=date(2026, 4, 30)))
+    monkeypatch.setattr(hk_run, "compute_all", create_autospec(hk_run.compute_all, return_value=fake_computed))
+    monkeypatch.setattr(
+        hk_run,
+        "write_hkmom_panel",
+        create_autospec(
+            hk_run.write_hkmom_panel,
+            side_effect=lambda *, output_dir, **kw: (
+                (Path(output_dir) / "index.html").write_text("<html>prev</html>", encoding="utf-8")
+                and (Path(output_dir) / "index.html")
+            ),
+        ),
+    )
+
+    res = hk_run.run_daily_job(
+        state_dir=st_dir,
+        output_dir=out_dir,
+        skip_fetch=True,
+        as_of_date=date(2026, 4, 30),
+    )
+
+    assert res["ok"] is False
+    assert res["month_end_failed"] is True
+    # Previous published files & last_date preserved!
+    assert res["last_date"] == "2026-03-31"
+    assert json.loads((st_dir / "frozen_history.json").read_text(encoding="utf-8")) == frozen_seed
+    assert "2026-04-30" not in (st_dir / "series.csv").read_text(encoding="utf-8")
+    # THIS run's diagnostic dates & missing constituents propagated!
+    assert res["index_dates"] == {
+        "smallcap": "2026-04-29",
+        "nonggt": "2026-04-30",
+        "hsi": "2026-04-30",
+    }
+    assert res["missing_held_by_index"] == {"smallcap": ["00626"], "nonggt": []}
+    summary = str(res.get("failure_summary") or "")
+    assert "00626" in summary
+    assert "smallcap=2026-04-29" in summary
+    assert "nonggt=2026-04-30" in summary
+    saved_meta = json.loads((st_dir / "index_meta.json").read_text(encoding="utf-8"))
+    assert saved_meta["last_date"] == "2026-03-31"
+    assert saved_meta["index_dates"]["smallcap"] == "2026-04-29"
+    assert saved_meta["index_dates"]["nonggt"] == "2026-04-30"

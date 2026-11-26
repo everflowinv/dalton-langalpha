@@ -54,7 +54,73 @@ BUILTIN_TICKER_CIKS: dict[str, tuple[str, str]] = {
     "PDD": ("0001737806", "PDD Holdings Inc."),
     "JD": ("0001549802", "JD.com, Inc."),
     "BIDU": ("0001329099", "Baidu, Inc."),
+    "NTES": ("0001110646", "NetEase, Inc."),
+    "BILI": ("0001723690", "Bilibili Inc."),
+    "LI": ("0001791706", "Li Auto Inc."),
+    "NIO": ("0001736541", "NIO Inc."),
+    "XPEV": ("0001810997", "XPeng Inc."),
+    "TCOM": ("0001269238", "Trip.com Group Limited"),
+    "YUMC": ("0001673358", "Yum China Holdings, Inc."),
+    "ZTO": ("0001677250", "ZTO Express (Cayman) Inc."),
+    "HSBC": ("0001089113", "HSBC HOLDINGS PLC"),
 }
+
+# Dual-listed / cross-market issuer aliases whose SEC EDGAR filings live under their US ADR / CIK.
+DUAL_LISTED_SEC_ALIASES: dict[str, str] = {
+    "9988.HK": "BABA",
+    "09988": "BABA",
+    "HK:9988": "BABA",
+    "HK:09988": "BABA",
+    "9618.HK": "JD",
+    "09618": "JD",
+    "HK:9618": "JD",
+    "HK:09618": "JD",
+    "9888.HK": "BIDU",
+    "09888": "BIDU",
+    "HK:9888": "BIDU",
+    "HK:09888": "BIDU",
+    "9999.HK": "NTES",
+    "09999": "NTES",
+    "HK:9999": "NTES",
+    "9626.HK": "BILI",
+    "09626": "BILI",
+    "HK:9626": "BILI",
+    "2015.HK": "LI",
+    "02015": "LI",
+    "HK:2015": "LI",
+    "9866.HK": "NIO",
+    "09866": "NIO",
+    "HK:9866": "NIO",
+    "9868.HK": "XPEV",
+    "09868": "XPEV",
+    "HK:9868": "XPEV",
+    "9961.HK": "TCOM",
+    "09961": "TCOM",
+    "HK:9961": "TCOM",
+    "9987.HK": "YUMC",
+    "09987": "YUMC",
+    "2057.HK": "ZTO",
+    "02057": "ZTO",
+    "0005.HK": "HSBC",
+    "00005": "HSBC",
+    "2330.TW": "TSM",
+}
+
+
+def _resolve_sec_issuer_alias(ticker: str | None) -> str | None:
+    """Resolve a known dual-listed/cross-market ticker (e.g. ``9988.HK``) to its SEC ticker."""
+    raw = str(ticker or "").strip().upper()
+    if not raw:
+        return None
+    if raw in DUAL_LISTED_SEC_ALIASES:
+        return DUAL_LISTED_SEC_ALIASES[raw]
+    m_hk = re.fullmatch(r"(?:HK:)?0*(\d{1,5})(?:\.HK)?", raw)
+    if m_hk and (raw.endswith(".HK") or raw.startswith("HK:") or (raw.isdigit() and len(raw) == 5 and raw.startswith("0"))):
+        num = int(m_hk.group(1))
+        for cand in (f"{num:04d}.HK", f"{num}.HK", f"{num:05d}"):
+            if cand in DUAL_LISTED_SEC_ALIASES:
+                return DUAL_LISTED_SEC_ALIASES[cand]
+    return None
 
 # Canonical concept alias groups (ordered by modern US-GAAP prevalence)
 CONCEPT_ALIASES: dict[str, list[str]] = {
@@ -174,6 +240,9 @@ def _http_get_json(url: str, cache_key: str, ttl_seconds: int = 86400) -> dict[s
 def resolve_cik(ticker_or_cik: str) -> tuple[str, str]:
     """Return `(cik10, company_name)` for a ticker or numeric CIK."""
     cleaned = ticker_or_cik.strip().upper()
+    alias_sec = _resolve_sec_issuer_alias(cleaned)
+    if alias_sec is not None:
+        cleaned = alias_sec
     if cleaned.isdigit() or (cleaned.startswith("CIK") and cleaned[3:].isdigit()):
         digits = cleaned[3:] if cleaned.startswith("CIK") else cleaned
         return digits.zfill(10), cleaned
@@ -1072,17 +1141,21 @@ def list_filings(
     Returns:
         dict: Filing list with form, filing_date, report_date, accession_no, and url.
     """
-    non_sec_market = _detect_non_sec_ticker(ticker)
-    if non_sec_market is not None:
-        return make_error(
-            "not_found",
-            f"该证券不在 SEC 申报：{ticker} 属于{non_sec_market}，无 SEC 身份（CIK），未请求 SEC。",
-            symbol=ticker.upper(),
-            error_code="not_sec_filer",
-            sec_filer=False,
-        )
+    # Resolve known dual-listed / ADR issuer mapping to SEC ticker/CIK BEFORE short-circuiting.
+    mapped_sec_ticker = _resolve_sec_issuer_alias(ticker)
+    effective_ticker = mapped_sec_ticker or ticker
+    if mapped_sec_ticker is None:
+        non_sec_market = _detect_non_sec_ticker(ticker)
+        if non_sec_market is not None:
+            return make_error(
+                "not_found",
+                f"该证券不在 SEC 申报：{ticker} 属于{non_sec_market}，无 SEC 身份（CIK），未请求 SEC。",
+                symbol=ticker.upper(),
+                error_code="not_sec_filer",
+                sec_filer=False,
+            )
     try:
-        cik10, company_name = resolve_cik(ticker)
+        cik10, company_name = resolve_cik(effective_ticker)
         sub = fetch_submissions(cik10)
         recent = ((sub.get("filings") or {}).get("recent")) or {}
         form_Set = {f.strip().upper() for f in forms.split(",") if f.strip()}

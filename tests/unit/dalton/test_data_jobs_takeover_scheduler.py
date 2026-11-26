@@ -12,7 +12,7 @@ import psycopg
 import pytest
 
 from src.dalton.data_jobs.container_runner import DataTaskDockerClient, build_path_map
-from src.dalton.data_jobs.scheduler import recover_on_takeover
+from src.dalton.data_jobs.scheduler import claim_next_queued_run, recover_on_takeover
 import src.dalton.monitors.service as monitor_service
 
 
@@ -371,4 +371,290 @@ async def test_takeover_abort_does_not_rerun_when_db_already_has_slot_retry(
     assert not any("INSERT INTO dalton_data_task_runs" in sql for sql, _ in state["executed"])
     publish_spy.assert_awaited_once()
     assert "补跑上限" in str(publish_spy.await_args.kwargs["failure_reason"])
+
+
+@pytest.mark.asyncio
+async def test_takeover_abort_and_rerun_enqueue_share_single_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Aborting the run and enqueueing the takeover rerun MUST happen in the exact same DB transaction."""
+    path_map = build_path_map(host_var_dir=tmp_path / "h", backend_var_dir=tmp_path / "b")
+    now = datetime(2026, 4, 21, 9, 10, 0, tzinfo=timezone.utc)
+    slot_utc = datetime(2026, 4, 21, 9, 0, 0, tzinfo=timezone.utc)
+    deadline_utc = slot_utc + timedelta(minutes=30)
+
+    publish_spy = create_autospec(monitor_service.maybe_publish_data_job_monitor)
+    monkeypatch.setattr(monitor_service, "maybe_publish_data_job_monitor", publish_spy)
+
+    docker_client = create_autospec(DataTaskDockerClient, instance=True)
+    docker_client.list_data_task_containers.return_value = []
+
+    lock_conn, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(10)])
+    conn, state = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "slot_id": 1,
+                    "generation": 20,
+                    "slot_state": "running",
+                    "active_run_id": "run-atomic-1",
+                    "active_job_key": "pm-market-state",
+                }
+            },
+            {
+                "fetchone": {
+                    "run_id": "run-atomic-1",
+                    "job_key": "pm-market-state",
+                    "status": "running",
+                    "container_id": None,
+                    "runner": "container",
+                    "trigger_source": "cron",
+                    "scheduled_slot_utc": slot_utc,
+                    "deadline_utc": deadline_utc,
+                    "triggered_by_user_id": None,
+                    "enabled": True,
+                    "paused_by_user": False,
+                    "deleted_at": None,
+                }
+            },
+            {"rowcount": 1},  # UPDATE runs -> aborted
+            {"rowcount": 1},  # UPDATE defs -> consecutive_failures + 1
+            {"fetchone": None},  # SELECT prior retry
+            {"rowcount": 1, "fetchone": {"run_id": "run-atomic-retry"}},  # INSERT retry
+            {"rowcount": 1},  # UPDATE slot -> idle
+        ]
+    )
+
+    outcome = await recover_on_takeover(
+        conn,
+        lock_conn=lock_conn,
+        docker_client=docker_client,
+        path_map=path_map,
+        now_utc=now,
+    )
+    assert outcome == "aborted"
+    # Exactly 2 transactions total: (1) abort + consecutive_failures + rerun INSERT, (2) slot -> idle.
+    assert state["tx_commits"] == 2
+
+
+@pytest.mark.asyncio
+async def test_takeover_abort_distinguishes_blocked_by_other_queued_run_on_insert_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When INSERT ON CONFLICT DO NOTHING returns empty because another queued run (e.g. manual)
+    occupies the per-job queued slot, monitor failure_reason must explicitly report the blocking run."""
+    path_map = build_path_map(host_var_dir=tmp_path / "h", backend_var_dir=tmp_path / "b")
+    now = datetime(2026, 4, 21, 9, 10, 0, tzinfo=timezone.utc)
+    slot_utc = datetime(2026, 4, 21, 9, 0, 0, tzinfo=timezone.utc)
+    deadline_utc = slot_utc + timedelta(minutes=30)
+
+    publish_spy = create_autospec(monitor_service.maybe_publish_data_job_monitor)
+    monkeypatch.setattr(monitor_service, "maybe_publish_data_job_monitor", publish_spy)
+
+    docker_client = create_autospec(DataTaskDockerClient, instance=True)
+    docker_client.list_data_task_containers.return_value = []
+
+    lock_conn, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(10)])
+    conn, _state = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "slot_id": 1,
+                    "generation": 21,
+                    "slot_state": "running",
+                    "active_run_id": "run-blocked-1",
+                    "active_job_key": "pm-market-state",
+                }
+            },
+            {
+                "fetchone": {
+                    "run_id": "run-blocked-1",
+                    "job_key": "pm-market-state",
+                    "status": "running",
+                    "container_id": None,
+                    "runner": "container",
+                    "trigger_source": "cron",
+                    "scheduled_slot_utc": slot_utc,
+                    "deadline_utc": deadline_utc,
+                    "triggered_by_user_id": None,
+                    "enabled": True,
+                    "paused_by_user": False,
+                    "deleted_at": None,
+                }
+            },
+            {"rowcount": 1},  # UPDATE runs -> aborted
+            {"rowcount": 1},  # UPDATE defs -> consecutive_failures + 1
+            {"fetchone": None},  # SELECT prior takeover retry -> none
+            {"rowcount": 0, "fetchone": None},  # INSERT ON CONFLICT DO NOTHING -> conflict!
+            {
+                "fetchone": {
+                    "run_id": "run-manual-queued-99",
+                    "trigger_source": "manual",
+                    "triggered_by_user_id": "user-ops",
+                    "scheduled_slot_utc": slot_utc,
+                }
+            },  # SELECT blocking queued row
+            {"rowcount": 1},  # UPDATE slot -> idle
+        ]
+    )
+
+    outcome = await recover_on_takeover(
+        conn,
+        lock_conn=lock_conn,
+        docker_client=docker_client,
+        path_map=path_map,
+        now_utc=now,
+    )
+    assert outcome == "aborted"
+    publish_spy.assert_awaited_once()
+    reason = str(publish_spy.await_args.kwargs["failure_reason"])
+    assert "run-manual-queued-99" in reason
+    assert "占槽" in reason
+
+
+@pytest.mark.asyncio
+async def test_takeover_replays_monitor_registration_when_already_aborted_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the process restarted after committing aborted+rerun but before monitor registration
+    and slot idle reset, the next takeover sees status='aborted' (cleaned_terminal), does NOT
+    modify runs/defs, and replays maybe_publish_data_job_monitor."""
+    path_map = build_path_map(host_var_dir=tmp_path / "h", backend_var_dir=tmp_path / "b")
+    now = datetime(2026, 4, 21, 9, 12, 0, tzinfo=timezone.utc)
+    slot_utc = datetime(2026, 4, 21, 9, 0, 0, tzinfo=timezone.utc)
+    deadline_utc = slot_utc + timedelta(minutes=30)
+
+    publish_spy = create_autospec(monitor_service.maybe_publish_data_job_monitor)
+    monkeypatch.setattr(monitor_service, "maybe_publish_data_job_monitor", publish_spy)
+
+    docker_client = create_autospec(DataTaskDockerClient, instance=True)
+    docker_client.list_data_task_containers.return_value = []
+
+    lock_conn, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(10)])
+    conn, state = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "slot_id": 1,
+                    "generation": 22,
+                    "slot_state": "running",
+                    "active_run_id": "run-crashed-mid-takeover",
+                    "active_job_key": "pm-market-state",
+                }
+            },
+            {
+                "fetchone": {
+                    "run_id": "run-crashed-mid-takeover",
+                    "job_key": "pm-market-state",
+                    "status": "aborted",
+                    "container_id": None,
+                    "runner": "container",
+                    "trigger_source": "cron",
+                    "scheduled_slot_utc": slot_utc,
+                    "deadline_utc": deadline_utc,
+                    "triggered_by_user_id": None,
+                    "enabled": True,
+                    "paused_by_user": False,
+                    "deleted_at": None,
+                    "failure_reason": "scheduler_takeover_aborted",
+                }
+            },
+            # Read-only lookup finds the retry already inserted in the prior atomic tx
+            {"fetchone": {"run_id": "run-retry-already-queued"}},
+            # UPDATE slot -> idle
+            {"rowcount": 1},
+        ]
+    )
+
+    outcome = await recover_on_takeover(
+        conn,
+        lock_conn=lock_conn,
+        docker_client=docker_client,
+        path_map=path_map,
+        now_utc=now,
+    )
+    assert outcome == "cleaned_terminal"
+    assert not any("UPDATE dalton_data_task_runs" in sql for sql, _ in state["executed"])
+    assert not any("UPDATE dalton_data_task_defs" in sql for sql, _ in state["executed"])
+    publish_spy.assert_awaited_once()
+    kwargs = publish_spy.await_args.kwargs
+    assert kwargs["run_id"] == "run-crashed-mid-takeover"
+    assert kwargs["terminal_status"] == "aborted"
+    assert "run-retry-already-queued" in str(kwargs["failure_reason"])
+
+
+@pytest.mark.asyncio
+async def test_claim_next_queued_run_rejects_expired_takeover_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even if a takeover retry was queued before expiry, claim_next_queued_run must refuse
+    to start it once deadline_utc has passed, cancelling it and updating the bound monitor."""
+    slot_utc = datetime(2026, 4, 21, 9, 0, 0, tzinfo=timezone.utc)
+    deadline_utc = slot_utc + timedelta(minutes=30)
+    now_past_deadline = deadline_utc + timedelta(seconds=10)
+
+    publish_spy = create_autospec(monitor_service.maybe_publish_data_job_monitor)
+    monkeypatch.setattr(monitor_service, "maybe_publish_data_job_monitor", publish_spy)
+
+    conn, state = _make_autospec_db(
+        [
+            # 1. SELECT slot -> idle
+            {
+                "fetchone": {
+                    "slot_id": 1,
+                    "generation": 25,
+                    "slot_state": "idle",
+                    "active_run_id": None,
+                    "active_job_key": None,
+                }
+            },
+            # 2. expire_low_memory_runs SELECT
+            {"fetchall": []},
+            # 3. SELECT queued candidates -> expired takeover retry
+            {
+                "fetchall": [
+                    {
+                        "run_id": "run-expired-retry-1",
+                        "job_key": "pm-market-state",
+                        "trigger_source": "manual",
+                        "triggered_by_user_id": "system:takeover_retry",
+                        "scheduled_slot_utc": slot_utc,
+                        "deadline_utc": deadline_utc,
+                        "low_mem_since_utc": None,
+                        "enabled": True,
+                        "paused_by_user": False,
+                        "runner": "container",
+                        "command_argv": ["python3", "run.py"],
+                        "workdir": "/tmp",
+                        "timeout_seconds": 1800,
+                        "no_output_timeout_seconds": 600,
+                        "required_secrets": [],
+                        "cos_mode": None,
+                        "notify_enabled": True,
+                        "timezone": "Asia/Shanghai",
+                        "deleted_at": None,
+                    }
+                ]
+            },
+            # 4. UPDATE dalton_data_task_runs SET status = 'cancelled', failure_reason = 'takeover_retry_expired'
+            {"rowcount": 1},
+        ]
+    )
+
+    claimed = await claim_next_queued_run(
+        conn,
+        now_utc=now_past_deadline,
+        available_memory_mb=4096,
+    )
+    assert claimed is None
+    cancel_sqls = [sql for sql, _ in state["executed"] if "takeover_retry_expired" in sql]
+    assert len(cancel_sqls) == 1
+    # Slot must NOT have been claimed
+    assert not any("slot_state     = 'running'" in sql for sql, _ in state["executed"])
+    publish_spy.assert_awaited_once()
+    assert publish_spy.await_args.kwargs["run_id"] == "run-expired-retry-1"
+    assert "takeover_retry_expired" in str(publish_spy.await_args.kwargs["failure_reason"])
 

@@ -274,25 +274,6 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
         </h1>
         <TagBadge soft>{t(`monitors:visibility.${monitor.visibility}`)}</TagBadge>
 
-        {monitor.last_publish_error && monitor.last_publish_failed_at && (
-          <span
-            data-testid="monitor-publish-error"
-            className="inline-flex items-center gap-1 text-xs min-w-0 max-w-md"
-            style={{ color: 'var(--color-warning)' }}
-            title={monitor.last_publish_error}
-          >
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-            <span className="truncate">
-              {t('monitors:lastPublishFailed', {
-                time: formatTimestamp(monitor.last_publish_failed_at, locale),
-              })}
-              {monitor.last_publish_error.trim() && (
-                <> — {monitor.last_publish_error}</>
-              )}
-            </span>
-          </span>
-        )}
-
         <div className="monitors-topbar-actions">
           {!publicMode && detail.versions.length > 0 && (
             <Select
@@ -359,6 +340,29 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
           )}
         </div>
       </header>
+
+      {monitor.last_publish_error && monitor.last_publish_failed_at && (
+        <div
+          data-testid="monitor-publish-error"
+          role="status"
+          className="flex items-start gap-2 border-b px-4 py-1.5 text-xs whitespace-normal break-words"
+          style={{
+            borderColor: 'var(--color-border-muted)',
+            backgroundColor: 'var(--color-bg-subtle, transparent)',
+            color: 'var(--color-warning)',
+          }}
+        >
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span className="min-w-0 flex-1 whitespace-normal break-words leading-relaxed">
+            {t('monitors:lastPublishFailed', {
+              time: formatTimestamp(monitor.last_publish_failed_at, locale),
+            })}
+            {monitor.last_publish_error.trim() && (
+              <> — {monitor.last_publish_error}</>
+            )}
+          </span>
+        </div>
+      )}
 
       {/* DALTON-HOOK(monitors): expose docState on monitor host and wire BridgedFrame expectedDocKey & onDocStateChange */}
       <div className="monitors-frame-host" data-doc-state={docState.kind}>

@@ -787,6 +787,21 @@ FailureReason = Literal["usage_limit", "claude_plan", "plan_limit", "provider_au
 
 # DALTON-HOOK(execution-delivery-status): structured per-execution delivery summary models
 ExecutionDeliveryStatus = Literal["delivered", "failed", "partial_failed", "retrying", "skipped"]
+FailureNoticeStatus = Literal["unconfigured", "suppressed", "pending", "delivered"]
+
+
+class FailureNoticeReceipt(BaseModel):
+    """Structured failure notification receipt for failed/timeout executions."""
+
+    status: FailureNoticeStatus
+    label_zh: Optional[str] = None
+    label_en: Optional[str] = None
+    reason: Optional[str] = None
+    failure_reason: Optional[str] = None
+    outcome: Optional[str] = None
+    error: Optional[str] = None
+    targets: List[str] = Field(default_factory=list)
+    recorded_at: Optional[str] = None
 
 
 class ExecutionDeliveryTarget(BaseModel):
@@ -817,6 +832,11 @@ class ExecutionDeliverySummary(BaseModel):
     failure_reason: Optional[str] = None
     failure_reasons: List[str] = Field(default_factory=list)
     targets: List[ExecutionDeliveryTarget] = Field(default_factory=list)
+    # DALTON-HOOK(execution-delivery-status): dedicated failure notification receipt state (never mixed into ExecutionDeliveryStatus)
+    failure_notice_status: Optional[FailureNoticeStatus] = None
+    failure_notice_label_zh: Optional[str] = None
+    failure_notice_label_en: Optional[str] = None
+    failure_notification_receipt: Optional[FailureNoticeReceipt] = None
 
 
 class AutomationExecutionResponse(BaseModel):

@@ -464,5 +464,9 @@ describe('Monitors page (Checklist 8)', () => {
     expect(errBanner).toHaveTextContent(/smallcap=2026-04-16/);
     expect(errBanner).toHaveTextContent(/nonggt=2026-04-17/);
     expect(errBanner).not.toHaveTextContent(/exit_code_1/);
+    // Must wrap cleanly instead of truncating trailing per-index dates.
+    expect(errBanner.className).toContain('whitespace-normal');
+    expect(errBanner.className).toContain('break-words');
+    expect(errBanner.querySelector('.truncate')).toBeNull();
   });
 });

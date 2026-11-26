@@ -336,69 +336,97 @@ class FeedDaemon:
             or needs_hk_daily_sync
             or daily_state_changed
         )
+        def _parse_ts(raw: Any) -> datetime | None:
+            if not raw:
+                return None
+            s = str(raw).strip()
+            if not s:
+                return None
+            try:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=cur_local.tzinfo)
+            return dt
+
+        def _retry_pending(
+            pending: dict[str, Any],
+            *,
+            action_on_ok: str = "retried_push",
+            extra_result: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            p_slug = str(pending.get("slug") or slug)
+            p_key = str(pending.get("data_key") or data_key)
+            p_payload = pending["payload"]
+            p_as_of = pending.get("as_of") or p_payload.get("as_of_iso") or cur_iso
+            try:
+                self._push(
+                    p_slug,
+                    p_key,
+                    p_payload,
+                    as_of=p_as_of,
+                    backend_url=self.backend_url,
+                )
+            except Exception as retry_exc:
+                logger.warning("Pending push retry failed for %s/%s: %s", p_slug, p_key, retry_exc)
+                with self._state_lock:
+                    updated_pending = dict(pending)
+                    updated_pending["failed_at"] = cur_iso
+                    updated_pending["attempts"] = int(updated_pending.get("attempts") or 1) + 1
+                    self.state[market]["pending_push"] = updated_pending
+                self._save_state()
+                res: dict[str, Any] = {
+                    "market": market,
+                    "action": "retry_push_failed",
+                    "stale": bool(p_payload.get("stale")),
+                    "error": str(retry_exc),
+                }
+                if extra_result:
+                    res.update(extra_result)
+                return res
+            p_stale = bool(p_payload.get("stale"))
+            p_trade_date = str(pending.get("trade_date") or trade_date)
+            p_daily_sig = str(pending.get("current_daily_sig") or "")
+            with self._state_lock:
+                self.state[market].pop("pending_push", None)
+                if market == "hk" and p_daily_sig:
+                    self.state[market]["last_hk_daily_sig"] = p_daily_sig
+                if pending.get("is_closed_td") and not pending.get("in_window") and not p_stale:
+                    if pending.get("needs_post_close"):
+                        self.state[market]["post_close_written_date"] = p_trade_date
+                    sc = p_payload.get("smallcap") or {}
+                    ng = p_payload.get("nonggt") or {}
+                    pushed_daily_date = (
+                        p_payload.get("daily_close_date")
+                        or p_payload.get("trade_date")
+                        or p_trade_date
+                    )
+                    if (
+                        market == "hk"
+                        and isinstance(sc, dict)
+                        and isinstance(ng, dict)
+                        and sc.get("source") == "daily_close"
+                        and ng.get("source") == "daily_close"
+                        and pushed_daily_date == p_trade_date
+                        and not self._hk_daily_is_stale_or_failed()
+                    ):
+                        self.state[market]["post_close_daily_synced_date"] = p_trade_date
+            self._save_state()
+            ok_res: dict[str, Any] = {
+                "market": market,
+                "action": action_on_ok,
+                "stale": p_stale,
+                "as_of": p_payload.get("as_of"),
+            }
+            if extra_result:
+                ok_res.update(extra_result)
+            return ok_res
+
         pending_push = fstate_snap.get("pending_push")
         if not should_collect:
             if isinstance(pending_push, dict) and isinstance(pending_push.get("payload"), dict):
-                p_slug = str(pending_push.get("slug") or slug)
-                p_key = str(pending_push.get("data_key") or data_key)
-                p_payload = pending_push["payload"]
-                p_as_of = pending_push.get("as_of") or p_payload.get("as_of_iso") or cur_iso
-                try:
-                    self._push(
-                        p_slug,
-                        p_key,
-                        p_payload,
-                        as_of=p_as_of,
-                        backend_url=self.backend_url,
-                    )
-                except Exception as exc:
-                    logger.warning("Pending push retry failed for %s/%s: %s", p_slug, p_key, exc)
-                    with self._state_lock:
-                        updated_pending = dict(pending_push)
-                        updated_pending["failed_at"] = cur_iso
-                        updated_pending["attempts"] = int(updated_pending.get("attempts") or 1) + 1
-                        self.state[market]["pending_push"] = updated_pending
-                    self._save_state()
-                    return {
-                        "market": market,
-                        "action": "retry_push_failed",
-                        "stale": bool(p_payload.get("stale")),
-                        "error": str(exc),
-                    }
-                p_stale = bool(p_payload.get("stale"))
-                p_trade_date = str(pending_push.get("trade_date") or trade_date)
-                p_daily_sig = str(pending_push.get("current_daily_sig") or "")
-                with self._state_lock:
-                    self.state[market].pop("pending_push", None)
-                    if market == "hk" and p_daily_sig:
-                        self.state[market]["last_hk_daily_sig"] = p_daily_sig
-                    if pending_push.get("is_closed_td") and not pending_push.get("in_window") and not p_stale:
-                        if pending_push.get("needs_post_close"):
-                            self.state[market]["post_close_written_date"] = p_trade_date
-                        sc = p_payload.get("smallcap") or {}
-                        ng = p_payload.get("nonggt") or {}
-                        pushed_daily_date = (
-                            p_payload.get("daily_close_date")
-                            or p_payload.get("trade_date")
-                            or p_trade_date
-                        )
-                        if (
-                            market == "hk"
-                            and isinstance(sc, dict)
-                            and isinstance(ng, dict)
-                            and sc.get("source") == "daily_close"
-                            and ng.get("source") == "daily_close"
-                            and pushed_daily_date == p_trade_date
-                            and not self._hk_daily_is_stale_or_failed()
-                        ):
-                            self.state[market]["post_close_daily_synced_date"] = p_trade_date
-                self._save_state()
-                return {
-                    "market": market,
-                    "action": "retried_push",
-                    "stale": p_stale,
-                    "as_of": p_payload.get("as_of"),
-                }
+                return _retry_pending(pending_push)
             return {"market": market, "action": "skip", "status": sess["status"]}
 
         daemon_store = SourceStatusStore(self.daemon_state_dir, filename=f"{market}_daemon_status.json")
@@ -423,6 +451,20 @@ class FeedDaemon:
             status_doc = daemon_store.update_sources(
                 [daemon_err_st], required=[f"{market}_collector"], now_str=f"{cur_str} 北京时间"
             )
+            cur_pending = fstate_cur.get("pending_push")
+            if isinstance(cur_pending, dict) and isinstance(cur_pending.get("payload"), dict):
+                # Never overwrite a newer unpushed pending snapshot with an older last_good_payload
+                # stamped with a synthetic cur_iso. Retry the pending snapshot directly instead.
+                p_payload = cur_pending["payload"]
+                p_ts = _parse_ts(cur_pending.get("as_of") or p_payload.get("as_of_iso") or p_payload.get("as_of"))
+                lg_payload = fstate_cur.get("last_good_payload") or {}
+                lg_ts = _parse_ts(lg_payload.get("as_of_iso") or lg_payload.get("as_of")) if isinstance(lg_payload, dict) else None
+                if lg_ts is None or p_ts is None or p_ts >= lg_ts:
+                    return _retry_pending(
+                        cur_pending,
+                        action_on_ok="retried_push",
+                        extra_result={"collect_error": str(exc)},
+                    )
             payload = dict(fstate_cur.get("last_good_payload") or {})
             merged_sources = dict(payload.get("sources") or {})
             merged_sources.update(status_doc["sources"])

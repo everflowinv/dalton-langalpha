@@ -12,7 +12,7 @@ import { useOpenThread } from '../hooks/useOpenThread';
 import { useRecentRuns } from '../hooks/useRecentRuns';
 import type { TemplateId } from '../utils/templates';
 // DALTON-HOOK(execution-delivery-status): align feed per-target labels with delivery_summary
-import { deliveryAttemptLabel, deliveryTargetName, matchAttemptForTarget } from '../utils/delivery';
+import { deliveryAttemptLabel, deliveryTargetName, failureNoticeLabelKey, matchAttemptForTarget } from '../utils/delivery';
 import { groupRunsByDay, nearDayKeys, runTime } from '../utils/feed';
 import { automationActions, describeRun, isRunFailed } from '../utils/status'; // DALTON-HOOK(execution-delivery-status)
 import { formatClock, formatDayHeading, formatDuration } from '../utils/time';
@@ -215,6 +215,10 @@ function RunEntry({
       } else {
         meta.push(t('automation:deliveryFailedVia', { method: displayName }));
       }
+    }
+    const noticeKey = failureNoticeLabelKey(explicitSummary);
+    if (summaryTargets.length === 0 && noticeKey) {
+      meta.push(t(noticeKey));
     }
   } else {
     // Where each delivery landed and how, by the name the run recorded.

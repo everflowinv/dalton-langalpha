@@ -5155,13 +5155,22 @@ Palantir、Cloudflare 这类公司的问题不是没被收进池子，是**卡�
       "name": "Instacart",
       "name_en": "Maplebear",
       "watch": "AI 广告投放、Carrot Ads 外部客户、GTV 与广告 take rate"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "ANT",
+      "name": "Anthropic",
+      "name_en": "Anthropic",
+      "watch": "Claude 企业订阅与 API ARR、Claude Code 付费席位、云渠道分成"
     }
   ],
   "private_watchlist": {
     "note": "未上市，不可交易。作用是领先指标：新变现方式与新产品形态通常先在这里出现，再传导到上市公司。只做定性追踪，不进增速筛选表。",
     "companies": [
       "OpenAI",
-      "Anthropic",
       "xAI",
       "Mistral",
       "月之暗面 Moonshot",
