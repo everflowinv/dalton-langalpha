@@ -1078,6 +1078,29 @@ async def astream_ptc_workflow(
 
         from src.dalton.services.team_model_catalog.snapshot import bind_catalog_snapshot
 
+        # DALTON-HOOK(channel-deliverables): record verified DM turn deliverables on Write/Edit for own workspace
+        from src.dalton.channel_deliverables import create_turn_deliverable_recorder
+
+        _deliverable_work_dir: str | None = None
+        if session and session.sandbox:
+            if hasattr(session.sandbox, "workspace") and callable(
+                session.sandbox.workspace
+            ):
+                _deliverable_work_dir = session.sandbox.workspace(project).workspace
+            else:
+                _deliverable_work_dir = getattr(
+                    session.sandbox, "working_directory", None
+                )
+        deliverable_recorder = create_turn_deliverable_recorder(
+            thread_id=thread_id,
+            run_id=run_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            workspace_owner_id=workspace_owner_id,
+            shared=bool(identity.shared),
+            sandbox=session.sandbox if session else None,
+            work_dir=_deliverable_work_dir,
+        )
         _graph_snap = getattr(run_handle, "catalog_snapshot", None)
         # DALTON-HOOK(colleague-dispatch): strip Task/schedule_wakeup on post-revocation tail turn
         with bind_catalog_snapshot(_graph_snap) if _graph_snap is not None else nullcontext():
@@ -1089,7 +1112,11 @@ async def astream_ptc_workflow(
                 # need TaskOutput to fetch the result); their re-announce
                 # recursion is handled by the outbox's ledger arbitration.
                 disable_subagents=bool(request.disable_subagents),
-                operation_callback=None,
+                operation_callback=(
+                    deliverable_recorder.on_file_operation
+                    if deliverable_recorder is not None
+                    else None
+                ),
                 # I2: the run's fenced session-bound saver when the WriterGuard
                 # is active; the global pooled saver otherwise.
                 checkpointer=run_handle.checkpointer,
@@ -1500,6 +1527,8 @@ async def astream_ptc_workflow(
                 "token_callback": token_callback,
                 "run_handle": run_handle,
                 "artifact_hook": capture_artifacts,
+                # DALTON-HOOK(channel-deliverables): pass per-run deliverable recorder to finalization
+                "deliverable_recorder": deliverable_recorder,
             },
             completion_callback=on_background_workflow_complete,
             graph=ptc_graph,

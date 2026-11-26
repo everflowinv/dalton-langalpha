@@ -308,16 +308,13 @@ describe("rewriteSandboxLinks", () => {
     ].join("\n");
 
     const expected = [
-      "见 [完整报告][r1] 与 [趋势图][r2]。",
+      `见 [完整报告](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Freport.md) 与 [趋势图](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fcharts%2Ftrend.png)。`,
       `带标题：[双引号](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Freport.md)、[括号标题](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Freport.md)。`,
       `转义括号：[备忘](${WEB_BASE}/chat/t/${THREAD_ID}?file=results%2Fmemo%281%29.md)`,
       "外链包图：[图表](https://example.com/view)",
-      "",
-      `[r1]: ${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Freport.md "Q3"`,
-      `[r2]: ${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fcharts%2Ftrend.png`,
     ].join("\n");
 
-    expect(rewriteSandboxLinks(input, WEB_BASE, THREAD_ID)).toBe(expected);
+    expect(rewriteSandboxLinks(input, WEB_BASE, THREAD_ID).trim()).toBe(expected);
 
     // Without threadId, reference links degrade to plain-text hints and remove dead definition lines.
     const degradedRef = rewriteSandboxLinks(
@@ -362,12 +359,12 @@ describe("rewriteSandboxLinks", () => {
     expect(performance.now() - started).toBeLessThan(2_000);
   });
 
-  it("documents Markdown link syntax, code/backtick passthrough, and send_message attachment in buildSurfaceRules", () => {
+  it("documents Markdown link syntax, DM deliverable auto-attach, and send_message in buildSurfaceRules", () => {
     const rules = buildSurfaceRules("feishu");
     expect(rules).toContain("[Report](results/report.md)");
-    expect(rules).toContain("reachable web URL");
-    expect(rules).toContain("code blocks or backticks");
-    expect(rules).toContain("send_message(files=[...])");
+    expect(rules).toContain("Write or Edit");
+    expect(rules).toContain("sign-in required");
+    expect(rules).toContain("send_message(text=..., files=[...])");
     expect(rules).not.toContain("Do NOT paste local sandbox paths");
   });
 });

@@ -11,7 +11,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -33,6 +33,7 @@ from src.dalton.database.channel_gateway import (
     execute_session_command,
     finish_automation_run,
     get_channel_internal_state,
+    lookup_bot_topic,
     reconcile_steer,
     recover_channel_state,
     register_and_resolve_inbound,
@@ -40,6 +41,7 @@ from src.dalton.database.channel_gateway import (
     update_delivery_progress,
     update_inbound_progress,
     update_user_channel_settings,
+    verify_dm_delivery_recipient,
 )
 from src.dalton.database import weixin_multi_account as wx_db
 from src.dalton.database.weixin_multi_account import StaleGatewayEpochError
@@ -228,6 +230,19 @@ class PreflightSendRequest(BaseModel):
     chunk_index: int | None = None
 
 
+class VerifyDmRecipientRequest(BaseModel):
+    delivery_attempt: int | None = None
+
+
+class TopicsLookupRequest(BaseModel):
+    platform: str
+    chat_address: str
+    match_mode: str
+    external_topic_id: str | None = None
+    canonical_scope_key: str | None = None
+    root_message_id: str | None = None
+
+
 class InboundRegisterResolveRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -239,6 +254,8 @@ class InboundRegisterResolveRequest(BaseModel):
     message_id: str
     request_key: str | None = None
     raw_payload: dict[str, Any] = Field(default_factory=dict)
+    external_topic_id: str | None = None
+    root_message_id: str | None = None
     weixin_account_id: str | None = None
     weixin_context_token: str | None = None
     weixin_bot_id: str | None = None
@@ -358,6 +375,7 @@ class DeliveryProgressRequest(BaseModel):
     confirmed_thread_address: str | None = None
     discord_body_phase: str | None = None
     delivery_attempt: int | None = None
+    bot_topic_registration: dict[str, Any] | None = None
 
 
 class InboundProgressRequest(BaseModel):
@@ -767,6 +785,87 @@ async def internal_deliveries_preflight_send_endpoint(
         return _handle_structured_http_error(exc)
 
 
+@channels_router.post(
+    "/internal/deliveries/{delivery_key}/verify-dm-recipient",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_deliveries_verify_dm_recipient_endpoint(
+    delivery_key: str,
+    body: VerifyDmRecipientRequest,
+    request: Request,
+) -> Any:
+    """Re-verify DM delivery's pinned platform recipient and current active binding before sending a file."""
+    try:
+        raw_epoch = request.headers.get("X-Gateway-Epoch")
+        return await verify_dm_delivery_recipient(
+            delivery_key=delivery_key,
+            delivery_attempt=body.delivery_attempt,
+            gateway_epoch=raw_epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/topics/lookup",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_topics_lookup_endpoint(
+    body: TopicsLookupRequest,
+) -> Any:
+    """Read-only lookup of a registered bot topic for inbound follow-up or outbound routing."""
+    try:
+        return await lookup_bot_topic(
+            platform=body.platform,
+            chat_address=body.chat_address,
+            match_mode=body.match_mode,
+            external_topic_id=body.external_topic_id,
+            canonical_scope_key=body.canonical_scope_key,
+            root_message_id=body.root_message_id,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.get(
+    "/internal/deliverables/download",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_deliverables_download_endpoint(
+    request: Request,
+    delivery_key: str = Query(..., min_length=1),
+    delivery_attempt: int = Query(..., ge=1),
+    workspace_id: str = Query(..., min_length=1),
+    path: str = Query(..., min_length=1),
+) -> Any:
+    """Download a verified DM turn deliverable after recipient, binding, and FileStamp/SHA-256 checks."""
+    from urllib.parse import quote as _url_quote
+
+    from src.dalton.channel_deliverables import download_verified_deliverable
+
+    try:
+        raw_epoch = request.headers.get("X-Gateway-Epoch")
+        content_bytes, mime_type, filename = await download_verified_deliverable(
+            delivery_key=delivery_key,
+            delivery_attempt=delivery_attempt,
+            workspace_id=workspace_id,
+            path=path,
+            gateway_epoch=raw_epoch,
+        )
+        encoded_name = _url_quote(filename, safe="")
+        return Response(
+            content=content_bytes,
+            media_type=mime_type,
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}",
+                "Cache-Control": "no-store",
+            },
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
 # ---------------------------------------------------------------------------
 # Shared Internal Persistence Endpoints (I-1 ~ I-8)
 # ---------------------------------------------------------------------------
@@ -799,6 +898,8 @@ async def internal_inbound_register_and_resolve_endpoint(
             message_id=body.message_id,
             request_key=body.request_key,
             raw_payload=body.raw_payload,
+            external_topic_id=body.external_topic_id,
+            root_message_id=body.root_message_id,
             weixin_account_id=body.weixin_account_id,
             weixin_context_token=body.weixin_context_token,
             weixin_bot_id=body.weixin_bot_id,
@@ -1047,6 +1148,7 @@ async def internal_deliveries_progress_endpoint(
             confirmed_thread_address=body.confirmed_thread_address,
             discord_body_phase=body.discord_body_phase,
             delivery_attempt=body.delivery_attempt,
+            bot_topic_registration=body.bot_topic_registration,
             gateway_epoch=epoch,
             require_gateway_epoch=True,
         )

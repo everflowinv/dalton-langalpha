@@ -15,6 +15,7 @@
  */
 
 import type * as Lark from "@larksuiteoapi/node-sdk";
+import type { BackendClient } from "../../backend-client.js";
 import {
   createMemoryDedupe,
   type MemoryDedupeGuard,
@@ -113,6 +114,8 @@ export interface MonitorFeishuWebSocketOptions {
   creds: FeishuCredentials;
   botOpenId?: string;
   resolveBotOpenId?: () => Promise<string | undefined>;
+  /** Fast filter / topic-followup resolution before heavy message fetch or I-1. */
+  resolveGroupFollowupTopic?: (event: InboundChannelEvent) => Promise<boolean>;
   client?: Lark.Client;
   onEvent: (event: InboundChannelEvent) => Promise<void>;
   dedupe?: MemoryDedupeGuard;
@@ -272,6 +275,14 @@ export async function monitorWebSocket(
         throw new Error(
           "Feishu bot identity is not resolved; a group message with structured mentions cannot be classified yet",
         );
+      }
+      if (parsed.chatType === "group" && !parsed.isGroupTrigger) {
+        const followupAllowed = options.resolveGroupFollowupTopic
+          ? await options.resolveGroupFollowupTopic(parsed)
+          : false;
+        if (!followupAllowed) {
+          return;
+        }
       }
       if (
         messageType === "merge_forward" &&
@@ -464,6 +475,18 @@ export class FeishuChannelAdapter implements ChannelAdapter {
     [];
   private monitorHandle: MonitorFeishuWebSocketHandle | null = null;
   private connected = false;
+  private backendClient?: BackendClient;
+  private readonly positiveTopicCache = new Map<
+    string,
+    {
+      canonicalScopeKey: string;
+      initiatorPlatformUserId: string;
+      rootMessageId?: string | null;
+    }
+  >();
+  private readonly negativeTopicCache = new Map<string, number>();
+  private static readonly MAX_TOPIC_CACHE_ENTRIES = 2_000;
+  private static readonly NEGATIVE_TOPIC_TTL_MS = 5 * 60 * 1000;
 
   constructor(options: FeishuChannelAdapterOptions = {}) {
     this.appId = options.appId?.trim() ?? "";
@@ -512,6 +535,213 @@ export class FeishuChannelAdapter implements ChannelAdapter {
 
   getBotOpenId(): string | undefined {
     return this.botOpenId;
+  }
+
+  setBackendClient(client: BackendClient): void {
+    this.backendClient = client;
+  }
+
+  recordBotTopic(info: {
+    chatAddress: string;
+    externalTopicId: string;
+    canonicalScopeKey: string;
+    initiatorPlatformUserId: string;
+    rootMessageId?: string | null;
+  }): void {
+    const key = `${info.chatAddress.trim()}::${info.externalTopicId.trim()}`;
+    if (!info.chatAddress.trim() || !info.externalTopicId.trim()) {
+      return;
+    }
+    this.negativeTopicCache.delete(key);
+    this.positiveTopicCache.delete(key);
+    if (
+      this.positiveTopicCache.size >=
+      FeishuChannelAdapter.MAX_TOPIC_CACHE_ENTRIES
+    ) {
+      const oldest = this.positiveTopicCache.keys().next().value;
+      if (oldest !== undefined) {
+        this.positiveTopicCache.delete(oldest);
+      }
+    }
+    this.positiveTopicCache.set(key, {
+      canonicalScopeKey: info.canonicalScopeKey.trim(),
+      initiatorPlatformUserId: info.initiatorPlatformUserId.trim(),
+      ...(info.rootMessageId?.trim()
+        ? { rootMessageId: info.rootMessageId.trim() }
+        : {}),
+    });
+  }
+
+  private setNegativeTopicCache(key: string): void {
+    this.negativeTopicCache.delete(key);
+    if (
+      this.negativeTopicCache.size >=
+      FeishuChannelAdapter.MAX_TOPIC_CACHE_ENTRIES
+    ) {
+      const oldest = this.negativeTopicCache.keys().next().value;
+      if (oldest !== undefined) {
+        this.negativeTopicCache.delete(oldest);
+      }
+    }
+    this.negativeTopicCache.set(
+      key,
+      Date.now() + FeishuChannelAdapter.NEGATIVE_TOPIC_TTL_MS,
+    );
+  }
+
+  private async resolveGroupFollowupTopic(
+    event: InboundChannelEvent,
+  ): Promise<boolean> {
+    if (event.chatType !== "group" || event.isGroupTrigger) {
+      return true;
+    }
+    const extTopicId = event.externalTopicId?.trim();
+    if (!extTopicId) {
+      // Main-chat unmentioned message (including quoted reply with only root_id) -> drop in memory.
+      return false;
+    }
+    const key = `${event.chatAddress}::${extTopicId}`;
+    const pos = this.positiveTopicCache.get(key);
+    if (pos) {
+      if (pos.initiatorPlatformUserId === event.platformUserId) {
+        event.threadScopeKey = pos.canonicalScopeKey;
+        if (!event.rootMessageId && pos.rootMessageId) {
+          event.rootMessageId = pos.rootMessageId;
+        }
+        event.isGroupTrigger = true;
+        return true;
+      }
+      return false;
+    }
+    const negExp = this.negativeTopicCache.get(key);
+    if (negExp !== undefined) {
+      if (negExp > Date.now()) {
+        return false;
+      }
+      this.negativeTopicCache.delete(key);
+    }
+    if (!this.backendClient?.lookupBotTopic) {
+      return false;
+    }
+    try {
+      const res = await this.backendClient.lookupBotTopic({
+        platform: "feishu",
+        chat_address: event.chatAddress,
+        match_mode: "inbound_followup",
+        external_topic_id: extTopicId,
+        ...(event.rootMessageId ? { root_message_id: event.rootMessageId } : {}),
+      });
+      if (
+        res.found &&
+        res.status === "confirmed" &&
+        res.canonical_scope_key &&
+        res.initiator_platform_user_id
+      ) {
+        this.recordBotTopic({
+          chatAddress: event.chatAddress,
+          externalTopicId: extTopicId,
+          canonicalScopeKey: res.canonical_scope_key,
+          initiatorPlatformUserId: res.initiator_platform_user_id,
+          rootMessageId: res.root_message_id ?? null,
+        });
+        if (res.initiator_platform_user_id === event.platformUserId) {
+          event.threadScopeKey = res.canonical_scope_key;
+          if (!event.rootMessageId && res.root_message_id) {
+            event.rootMessageId = res.root_message_id;
+          }
+          event.isGroupTrigger = true;
+          return true;
+        }
+        return false;
+      }
+      let hadUnresolvedPending = false;
+      if (
+        !res.found &&
+        Array.isArray(res.pending_candidates) &&
+        res.pending_candidates.length > 0
+      ) {
+        let client: Lark.Client | null = null;
+        if (this.isConfigured()) {
+          try {
+            client = this.getClient();
+          } catch {
+            client = null;
+          }
+        }
+        for (const cand of res.pending_candidates) {
+          const replyId = cand.first_reply_message_id?.trim();
+          const scopeKey = cand.canonical_scope_key?.trim();
+          const initiatorId = cand.initiator_platform_user_id?.trim();
+          if (!replyId || !scopeKey || !initiatorId) {
+            continue;
+          }
+          let fetchedThreadId: string | null = null;
+          if (client) {
+            try {
+              const fetched = await getMessageFeishu(client, {
+                messageId: replyId,
+              });
+              fetchedThreadId = fetched?.threadId?.trim() || null;
+            } catch (fetchErr) {
+              this.logger.warn(
+                "Feishu getMessageFeishu failed while confirming pending topic reply",
+                {
+                  chatAddress: event.chatAddress,
+                  externalTopicId: extTopicId,
+                  firstReplyMessageId: replyId,
+                  error: fetchErr,
+                },
+              );
+            }
+          }
+          let matched = false;
+          if (fetchedThreadId) {
+            if (fetchedThreadId !== extTopicId) {
+              continue;
+            }
+            matched = true;
+          } else if (
+            event.rootMessageId &&
+            cand.root_message_id &&
+            event.rootMessageId === cand.root_message_id
+          ) {
+            matched = true;
+          } else {
+            hadUnresolvedPending = true;
+            continue;
+          }
+          if (matched) {
+            this.recordBotTopic({
+              chatAddress: event.chatAddress,
+              externalTopicId: extTopicId,
+              canonicalScopeKey: scopeKey,
+              initiatorPlatformUserId: initiatorId,
+              rootMessageId: cand.root_message_id ?? event.rootMessageId ?? null,
+            });
+            if (initiatorId === event.platformUserId) {
+              event.threadScopeKey = scopeKey;
+              if (!event.rootMessageId && cand.root_message_id) {
+                event.rootMessageId = cand.root_message_id;
+              }
+              event.isGroupTrigger = true;
+              return true;
+            }
+            return false;
+          }
+        }
+      }
+      if (!res.found && !hadUnresolvedPending) {
+        this.setNegativeTopicCache(key);
+      }
+      return false;
+    } catch (err) {
+      this.logger.warn("Feishu bot topic lookup failed; dropping unmentioned topic message", {
+        chatAddress: event.chatAddress,
+        externalTopicId: extTopicId,
+        error: err,
+      });
+      return false;
+    }
   }
 
   private getClient(): Lark.Client {
@@ -595,6 +825,7 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       creds,
       botOpenId: this.botOpenId,
       resolveBotOpenId: () => this.ensureBotOpenId(),
+      resolveGroupFollowupTopic: (event) => this.resolveGroupFollowupTopic(event),
       client: this.clientInstance ?? (this.isConfigured() ? this.getClient() : undefined),
       dedupe: this.dedupe,
       queue: this.queue,
@@ -664,6 +895,12 @@ export class FeishuChannelAdapter implements ChannelAdapter {
         throw new Error(
           "Feishu bot identity is not resolved; a group message with structured mentions cannot be classified yet",
         );
+      }
+      if (parsed.chatType === "group" && !parsed.isGroupTrigger) {
+        const followupAllowed = await this.resolveGroupFollowupTopic(parsed);
+        if (!followupAllowed) {
+          return;
+        }
       }
       if (
         messageType === "merge_forward" &&
@@ -893,26 +1130,56 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       );
     }
 
-    if (shouldUseFeishuCard(options.text)) {
-      const res = await sendStructuredCardFeishu(client, {
-        to: target,
-        text: options.text,
-        replyToMessageId: options.replyToMessageId,
-      });
-      return {
-        messageId: res.messageId,
-        resolvedAddress: options.targetAddress,
-      };
-    }
+    const res = shouldUseFeishuCard(options.text)
+      ? await sendStructuredCardFeishu(client, {
+          to: target,
+          text: options.text,
+          replyToMessageId: options.replyToMessageId,
+          fallbackReplyToMessageIds: options.fallbackReplyToMessageIds,
+          replyInThread: options.replyInThread,
+          allowDirectFallback: options.allowDirectFallback,
+        })
+      : await sendMessageFeishu(client, {
+          to: target,
+          text: options.text,
+          replyToMessageId: options.replyToMessageId,
+          fallbackReplyToMessageIds: options.fallbackReplyToMessageIds,
+          replyInThread: options.replyInThread,
+          allowDirectFallback: options.allowDirectFallback,
+        });
 
-    const res = await sendMessageFeishu(client, {
-      to: target,
-      text: options.text,
-      replyToMessageId: options.replyToMessageId,
-    });
+    let externalTopicId: string | null =
+      res.threadId ?? options.externalTopicId ?? null;
+    if (
+      options.replyInThread &&
+      res.repliedInThread &&
+      !externalTopicId &&
+      res.messageId
+    ) {
+      try {
+        const fetched = await getMessageFeishu(client, {
+          messageId: res.messageId,
+        });
+        if (fetched?.threadId) {
+          externalTopicId = fetched.threadId;
+        }
+      } catch (err) {
+        this.logger.warn("Feishu getMessageFeishu failed while resolving topic id", {
+          messageId: res.messageId,
+          error: err,
+        });
+      }
+    }
     return {
       messageId: res.messageId,
       resolvedAddress: options.targetAddress,
+      ...(externalTopicId ? { externalTopicId } : {}),
+      ...(typeof res.repliedInThread === "boolean"
+        ? { repliedInThread: res.repliedInThread }
+        : {}),
+      ...(typeof res.usedDirectFallback === "boolean"
+        ? { usedDirectFallback: res.usedDirectFallback }
+        : {}),
     };
   }
 
@@ -989,6 +1256,7 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       buffer: options.content,
       fileName: options.filename,
       mimeType: options.mimeType,
+      verifyRecipientBeforeSend: options.verifyRecipientBeforeSend,
     });
 
     return {

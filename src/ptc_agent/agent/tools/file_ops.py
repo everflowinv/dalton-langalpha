@@ -430,13 +430,22 @@ def create_filesystem_tools(
 
             if operation_callback:
                 try:
-                    operation_callback({
+                    # DALTON-HOOK(channel-deliverables): pass exact written byte hash/size and await async callbacks
+                    import hashlib as _hashlib
+                    import inspect as _inspect
+
+                    _written_bytes = content.encode("utf-8")
+                    _cb_res = operation_callback({
                         "operation": "write_file",
                         "file_path": normalized_path,
                         "line_count": content.count("\n") + 1,
                         "timestamp": datetime.now(UTC).isoformat(),
                         "content": content,
+                        "written_sha256": _hashlib.sha256(_written_bytes).hexdigest(),
+                        "written_size": len(_written_bytes),
                     })
+                    if _inspect.isawaitable(_cb_res):
+                        await _cb_res
                 except Exception as cb_err:
                     logger.warning("Operation callback failed", error=str(cb_err))
 
@@ -507,8 +516,11 @@ def create_filesystem_tools(
 
             if operation_callback:
                 try:
+                    # DALTON-HOOK(channel-deliverables): forward exact written byte hash/size from aedit_text and await async callbacks
+                    import inspect as _inspect
+
                     content = await backend.aread_text(normalized_path)
-                    operation_callback({
+                    _cb_payload: dict[str, Any] = {
                         "operation": "edit_file",
                         "file_path": normalized_path,
                         "occurrences": result.get("occurrences", 1),
@@ -517,7 +529,14 @@ def create_filesystem_tools(
                         "old_string": old_string,
                         "new_string": new_string,
                         "content": content,
-                    })
+                    }
+                    if result.get("written_sha256") is not None:
+                        _cb_payload["written_sha256"] = result.get("written_sha256")
+                    if result.get("written_size") is not None:
+                        _cb_payload["written_size"] = result.get("written_size")
+                    _cb_res = operation_callback(_cb_payload)
+                    if _inspect.isawaitable(_cb_res):
+                        await _cb_res
                 except Exception as cb_err:
                     logger.warning("Operation callback failed", error=str(cb_err))
 

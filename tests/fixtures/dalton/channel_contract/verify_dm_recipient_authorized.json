@@ -1,0 +1,22 @@
+{
+  "request": {
+    "body": {
+      "delivery_attempt": 1
+    },
+    "headers": {
+      "X-Gateway-Epoch": "7"
+    },
+    "method": "POST",
+    "path": "/api/v1/dalton/channels/internal/deliveries/deliverables%3Arun-contract-1/verify-dm-recipient"
+  },
+  "response": {
+    "body": {
+      "authorized": true,
+      "delivery_attempt": 1,
+      "platform": "feishu",
+      "recipient_id": "ou_alice",
+      "user_id": "user-alice"
+    },
+    "status": 200
+  }
+}

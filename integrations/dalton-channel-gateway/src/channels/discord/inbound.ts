@@ -138,11 +138,20 @@ export function buildDiscordThreadScopeKey(params: {
   channelId: string;
   parentId?: string;
   isThread?: boolean;
+  messageId?: string | null;
+  isGroupTrigger?: boolean;
 }): string {
   if (params.chatType === "dm") return `dm:${params.platformUserId}`;
   const parent = params.isThread && params.parentId ? params.parentId : params.channelId;
   const base = params.guildId ? `${params.guildId}/${parent}` : parent;
-  return params.isThread ? `chat:${base}:thread:${params.channelId}` : `chat:${base}`;
+  if (params.isThread) {
+    return `chat:${base}:thread:${params.channelId}`;
+  }
+  const cleanMsg = params.messageId?.trim();
+  if (params.isGroupTrigger && cleanMsg) {
+    return `chat:${base}:topic:${cleanMsg}`;
+  }
+  return `chat:${base}`;
 }
 
 export function buildDiscordChatAddress(params: {
@@ -207,9 +216,17 @@ export function parseDiscordInboundMessage(
     chatId: chatType === "dm" ? channelId : guildId ? `${guildId}/${chatIdForScope}` : chatIdForScope,
     ...(ctx?.name ? { chatName: ctx.name } : {}),
     threadScopeKey: buildDiscordThreadScopeKey({
-      chatType, platformUserId: author.id, guildId, channelId, parentId, isThread,
+      chatType,
+      platformUserId: author.id,
+      guildId,
+      channelId,
+      parentId,
+      isThread,
+      messageId,
+      isGroupTrigger: chatType === "group" ? mentioned : false,
     }),
     messageId,
+    ...(isThread ? { externalTopicId: channelId } : {}),
     text,
     isGroupTrigger: chatType === "group" ? mentioned : undefined,
     ...(attachments.length > 0 ? { attachments } : {}),

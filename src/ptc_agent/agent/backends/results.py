@@ -19,6 +19,9 @@ class EditTextResult(TypedDict, total=False):
     message: str
     occurrences: int
     size: int
+    # DALTON-HOOK(channel-deliverables): exact written UTF-8 byte digest & byte length from aedit_file_text
+    written_sha256: str
+    written_size: int
 
 
 class WriteTextResult(TypedDict, total=False):

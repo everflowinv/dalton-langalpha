@@ -1,0 +1,25 @@
+{
+  "request": {
+    "body": {
+      "chat_address": "feishu:oc_grp_1",
+      "external_topic_id": "omt_unknown",
+      "match_mode": "inbound_followup",
+      "platform": "feishu"
+    },
+    "method": "POST",
+    "path": "/api/v1/dalton/channels/internal/topics/lookup"
+  },
+  "response": {
+    "body": {
+      "canonical_scope_key": null,
+      "external_topic_id": null,
+      "first_reply_message_id": null,
+      "found": false,
+      "initiator_dalton_user_id": null,
+      "initiator_platform_user_id": null,
+      "root_message_id": null,
+      "status": null
+    },
+    "status": 200
+  }
+}

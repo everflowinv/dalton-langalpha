@@ -1,0 +1,17 @@
+{
+  "request": {
+    "body": {
+      "delivery_attempt": 1
+    },
+    "headers": {},
+    "method": "POST",
+    "path": "/api/v1/dalton/channels/internal/deliveries/deliverables%3Arun-contract-1/verify-dm-recipient"
+  },
+  "response": {
+    "body": {
+      "code": "stale_gateway_epoch",
+      "message": "Missing X-Gateway-Epoch header"
+    },
+    "status": 409
+  }
+}

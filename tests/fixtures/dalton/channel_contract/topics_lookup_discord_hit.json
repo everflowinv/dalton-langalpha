@@ -1,0 +1,25 @@
+{
+  "request": {
+    "body": {
+      "chat_address": "discord:111111/222222",
+      "external_topic_id": "999000111",
+      "match_mode": "inbound_followup",
+      "platform": "discord"
+    },
+    "method": "POST",
+    "path": "/api/v1/dalton/channels/internal/topics/lookup"
+  },
+  "response": {
+    "body": {
+      "canonical_scope_key": "chat:111111/222222:topic:999000111",
+      "external_topic_id": "999000111",
+      "first_reply_message_id": "999000222",
+      "found": true,
+      "initiator_dalton_user_id": "user-alice",
+      "initiator_platform_user_id": "100001",
+      "root_message_id": "999000111",
+      "status": "confirmed"
+    },
+    "status": 200
+  }
+}

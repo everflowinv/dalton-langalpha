@@ -10656,5 +10656,347 @@ async def test_r17_mixed_stale_watch_gen_session_gen1_preserves_gen2_watch_inter
                 await cur.execute("DELETE FROM dalton_channel_gateway_lease WHERE singleton_id = 1")
 
 
+@pytest.mark.asyncio
+async def test_bot_topic_concurrent_i1_and_i7_two_connections_feishu_and_discord(
+    db_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R8 #10 & #1: Two separate Postgres connections verify Feishu and Discord when another
+    member `@bot`s inside a newly created topic BEFORE the initiator's I-7 confirms:
+    1. Pre-confirmation I-1 keeps the other member on `:thread:<ext_tid>` without stealing initiator
+       ownership, and pre-confirmation I-6 returns the verified inbound `external_topic_id`.
+    2. Interleaved concurrent I-1 and I-7 transactions on two real Postgres connections acquire
+       `dalton_bot_topic` before `dalton_channel_session_generations` with zero deadlocks,
+       preserve initiator attribution, and confirm the topic cleanly.
+    """
+    prefix = db_env["prefix"]
+    user_a = db_env["user_a"]
+    user_b = db_env["user_b"]
+    pool: AsyncConnectionPool = db_env["pool"]
+    monkeypatch.setenv("DALTON_PM_USER_IDS", f"{user_a},{user_b}")
+    monkeypatch.setenv(
+        "DALTON_ALLOWED_EMAILS", f"{user_a}@example.com,{user_b}@example.com"
+    )
+    monkeypatch.setattr(
+        cg_db,
+        "require_channel_platform_capability",
+        create_autospec(cg_db.require_channel_platform_capability, return_value=None),
+    )
+
+    lease = await wx_db.acquire_gateway_lease(instance_id=f"{prefix}_topic_race_gw")
+    epoch = int(lease["epoch"])
+
+    created_deliveries: list[str] = []
+    created_topics: list[tuple[str, str]] = []
+    created_bindings: list[tuple[str, str]] = []
+    created_inbound: list[tuple[str, str]] = []
+    created_scopes: list[tuple[str, str, str]] = []
+
+    try:
+        for platform in ("feishu", "discord"):
+            if platform == "feishu":
+                chat_addr = f"feishu:oc_{prefix}_grp"
+                chat_part = f"oc_{prefix}_grp"
+                root_mid = f"om_{prefix}_root"
+                ext_tid = f"omt_{prefix}_topic"
+                bob_mid = f"om_{prefix}_bob_at"
+                alice_follow_mid = f"om_{prefix}_alice_follow"
+                alice_puid = f"ou_{prefix}_alice"
+                bob_puid = f"ou_{prefix}_bob"
+            else:
+                guild_id = f"91{uuid4().int % 10**14:014d}"
+                ch_id = f"92{uuid4().int % 10**14:014d}"
+                chat_addr = f"discord:{guild_id}/{ch_id}"
+                chat_part = f"{guild_id}/{ch_id}"
+                root_mid = f"93{uuid4().int % 10**14:014d}"
+                ext_tid = root_mid
+                bob_mid = f"94{uuid4().int % 10**14:014d}"
+                alice_follow_mid = f"95{uuid4().int % 10**14:014d}"
+                alice_puid = f"96{uuid4().int % 10**14:014d}"
+                bob_puid = f"97{uuid4().int % 10**14:014d}"
+
+            canonical_topic_scope = f"chat:{chat_part}:topic:{root_mid}"
+            thread_scope = f"chat:{chat_part}:thread:{ext_tid}"
+            alice_tid = str(uuid4())
+            bob_tid = str(uuid4())
+            alice_run_id = f"run_{prefix}_{platform}_alice"
+            bob_run_id = f"run_{prefix}_{platform}_bob"
+            alice_dkey = f"fallback:{alice_run_id}"
+            bob_dkey = f"fallback:{bob_run_id}"
+
+            db_env["cleanup_thread_ids"].extend([alice_tid, bob_tid])
+            created_deliveries.extend([alice_dkey, bob_dkey])
+            created_topics.append((platform, chat_addr))
+            created_bindings.append((platform, chat_addr))
+            created_inbound.extend(
+                [
+                    (platform, root_mid),
+                    (platform, bob_mid),
+                    (platform, alice_follow_mid),
+                ]
+            )
+            created_scopes.extend(
+                [
+                    (platform, canonical_topic_scope, user_a),
+                    (platform, thread_scope, user_b),
+                ]
+            )
+
+            # Seed identities, parent group binding, and user channel settings
+            async with pool.connection() as conn:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            INSERT INTO dalton_channel_identities (
+                                user_id, platform, platform_user_id, platform_username,
+                                created_at, updated_at
+                            )
+                            VALUES (%s, %s, %s, 'alice', NOW(), NOW()),
+                                   (%s, %s, %s, 'bob', NOW(), NOW())
+                            ON CONFLICT (user_id, platform) DO UPDATE SET
+                                platform_user_id = EXCLUDED.platform_user_id,
+                                updated_at = NOW()
+                            """,
+                            (user_a, platform, alice_puid, user_b, platform, bob_puid),
+                        )
+                        await cur.execute(
+                            """
+                            INSERT INTO dalton_channel_chat_bindings (
+                                platform, chat_address, chat_name, workspace_id,
+                                bound_by_user_id, updated_at
+                            )
+                            VALUES (%s, %s, 'research', NULL, %s, NOW())
+                            ON CONFLICT (platform, chat_address) DO NOTHING
+                            """,
+                            (platform, chat_addr, user_a),
+                        )
+                        for uid in (user_a, user_b):
+                            apps_json = {
+                                platform: {
+                                    "chats": {chat_addr: {"name": "research"}}
+                                }
+                            }
+                            await cur.execute(
+                                """
+                                INSERT INTO dalton_channel_user_settings (
+                                    user_id, version, apps, updated_at
+                                )
+                                VALUES (%s, 'v1', %s::jsonb, NOW())
+                                ON CONFLICT (user_id) DO UPDATE SET
+                                    apps = dalton_channel_user_settings.apps || EXCLUDED.apps,
+                                    updated_at = NOW()
+                                """,
+                                (uid, json.dumps(apps_json)),
+                            )
+
+            # 1) Alice starts a top-level @bot topic -> I-1 + I-6 pre-reserves pending topic
+            alice_in = await cg_db.register_and_resolve_inbound(
+                platform=platform,
+                platform_user_id=alice_puid,
+                chat_type="group",
+                chat_address=chat_addr,
+                thread_scope_key=canonical_topic_scope,
+                message_id=root_mid,
+                raw_payload={"platform_user_id": alice_puid},
+                gateway_epoch=epoch,
+                require_gateway_epoch=True,
+            )
+            assert alice_in["allowed"] is True
+            async with pool.connection() as conn:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_inbound_events
+                            SET thread_id = %s::uuid, run_id = %s, updated_at = NOW()
+                            WHERE platform = %s AND message_id = %s
+                            """,
+                            (alice_tid, alice_run_id, platform, root_mid),
+                        )
+
+            alice_claim = await cg_db.authorize_and_claim_delivery(
+                delivery_key=alice_dkey,
+                kind="fallback",
+                user_id=user_a,
+                thread_id=alice_tid,
+                run_id=alice_run_id,
+                platform=platform,
+                target=None,
+                has_non_empty_text=True,
+                total_chunks=1,
+                source_scope_key=canonical_topic_scope,
+                source_generation=int(alice_in["generation"]),
+                activity_origin="conversation",
+                gateway_epoch=epoch,
+                require_gateway_epoch=True,
+            )
+            assert alice_claim["claim_status"] == "claimed"
+            assert alice_claim["topic_initiator_platform_user_id"] == alice_puid
+
+            # 2) BEFORE Alice's I-7 confirms, Bob `@bot`s inside the topic on a separate connection
+            async with pool.connection() as conn_bob:
+                bob_in = await cg_db.register_and_resolve_inbound(
+                    platform=platform,
+                    platform_user_id=bob_puid,
+                    chat_type="group",
+                    chat_address=chat_addr,
+                    thread_scope_key=thread_scope,
+                    message_id=bob_mid,
+                    raw_payload={"platform_user_id": bob_puid},
+                    external_topic_id=ext_tid,
+                    root_message_id=root_mid,
+                    gateway_epoch=epoch,
+                    require_gateway_epoch=True,
+                    conn=conn_bob,
+                )
+            assert bob_in["allowed"] is True
+            assert bob_in["resolved_scope_key"] == thread_scope
+            assert bob_in["topic_initiator_platform_user_id"] == alice_puid
+
+            async with pool.connection() as conn:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_inbound_events
+                            SET thread_id = %s::uuid, run_id = %s, updated_at = NOW()
+                            WHERE platform = %s AND message_id = %s
+                            """,
+                            (bob_tid, bob_run_id, platform, bob_mid),
+                        )
+
+            # 3) Bob finishes his turn BEFORE Alice's I-7 confirms -> I-6 MUST return `external_topic_id`
+            async with pool.connection() as conn_bob_out:
+                bob_claim = await cg_db.authorize_and_claim_delivery(
+                    delivery_key=bob_dkey,
+                    kind="fallback",
+                    user_id=user_b,
+                    thread_id=bob_tid,
+                    run_id=bob_run_id,
+                    platform=platform,
+                    target=None,
+                    has_non_empty_text=True,
+                    total_chunks=1,
+                    source_scope_key=thread_scope,
+                    source_generation=int(bob_in["generation"]),
+                    activity_origin="conversation",
+                    gateway_epoch=epoch,
+                    require_gateway_epoch=True,
+                    conn=conn_bob_out,
+                )
+            assert bob_claim["claim_status"] == "claimed"
+            assert bob_claim["external_topic_id"] == ext_tid
+            assert bob_claim["inbound_message_id"] == bob_mid
+
+            # 4) Interleave real I-7 (conn 1) and real initiator I-1 follow-up (conn 2) concurrently
+            #    across two real Postgres connections to prove deadlock-free lock ordering.
+            async def _run_i7_confirm() -> dict[str, Any]:
+                async with pool.connection() as conn1:
+                    return await cg_db.update_delivery_progress(
+                        delivery_key=alice_dkey,
+                        sent_chunks=1,
+                        total_chunks=1,
+                        platform_message_ids=[f"reply_{prefix}_{platform}"],
+                        status="sent",
+                        delivery_attempt=1,
+                        bot_topic_registration={
+                            "platform": platform,
+                            "chat_address": chat_addr,
+                            "canonical_scope_key": canonical_topic_scope,
+                            "external_topic_id": ext_tid,
+                            "root_message_id": root_mid,
+                            "first_reply_message_id": f"reply_{prefix}_{platform}",
+                            "initiator_platform_user_id": alice_puid,
+                            "initiator_dalton_user_id": user_a,
+                        },
+                        gateway_epoch=epoch,
+                        require_gateway_epoch=True,
+                        conn=conn1,
+                    )
+
+            async def _run_i1_alice_followup() -> dict[str, Any]:
+                async with pool.connection() as conn2:
+                    return await cg_db.register_and_resolve_inbound(
+                        platform=platform,
+                        platform_user_id=alice_puid,
+                        chat_type="group",
+                        chat_address=chat_addr,
+                        thread_scope_key=thread_scope,
+                        message_id=alice_follow_mid,
+                        raw_payload={"platform_user_id": alice_puid},
+                        external_topic_id=ext_tid,
+                        root_message_id=root_mid,
+                        gateway_epoch=epoch,
+                        require_gateway_epoch=True,
+                        conn=conn2,
+                    )
+
+            i7_out, alice_follow_out = await asyncio.gather(
+                _run_i7_confirm(),
+                _run_i1_alice_followup(),
+            )
+            assert i7_out["ok"] is True
+            assert i7_out["bot_topic_registered"] is True
+            assert i7_out["external_topic_id"] == ext_tid
+            assert alice_follow_out["allowed"] is True
+            assert alice_follow_out["resolved_scope_key"] == canonical_topic_scope
+            assert alice_follow_out["topic_initiator_platform_user_id"] == alice_puid
+
+            # Verify final persisted row in `dalton_channel_bot_topics`
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        SELECT canonical_scope_key, external_topic_id,
+                               initiator_dalton_user_id, initiator_platform_user_id, status
+                        FROM dalton_channel_bot_topics
+                        WHERE platform = %s AND chat_address = %s
+                        """,
+                        (platform, chat_addr),
+                    )
+                    rows = await cur.fetchall()
+                    assert len(rows) == 1
+                    assert rows[0]["status"] == "confirmed"
+                    assert rows[0]["canonical_scope_key"] == canonical_topic_scope
+                    assert rows[0]["external_topic_id"] == ext_tid
+                    assert rows[0]["initiator_dalton_user_id"] == user_a
+                    assert rows[0]["initiator_platform_user_id"] == alice_puid
+    finally:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                if created_deliveries:
+                    await cur.execute(
+                        "DELETE FROM dalton_channel_deliveries WHERE delivery_key = ANY(%s)",
+                        (created_deliveries,),
+                    )
+                for plat, addr in created_topics:
+                    await cur.execute(
+                        "DELETE FROM dalton_channel_bot_topics WHERE platform = %s AND chat_address = %s",
+                        (plat, addr),
+                    )
+                for plat, addr in created_bindings:
+                    await cur.execute(
+                        "DELETE FROM dalton_channel_chat_bindings WHERE platform = %s AND chat_address = %s",
+                        (plat, addr),
+                    )
+                for plat, mid in created_inbound:
+                    await cur.execute(
+                        "DELETE FROM dalton_channel_inbound_events WHERE platform = %s AND message_id = %s",
+                        (plat, mid),
+                    )
+                for plat, sc, uid in created_scopes:
+                    await cur.execute(
+                        "DELETE FROM dalton_channel_session_generations WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s",
+                        (plat, sc, uid),
+                    )
+                await cur.execute(
+                    "DELETE FROM dalton_channel_user_settings WHERE user_id = ANY(%s)",
+                    ([user_a, user_b],),
+                )
+                await cur.execute(
+                    "DELETE FROM dalton_channel_gateway_lease WHERE singleton_id = 1"
+                )
+
+
 if __name__ == "__main__" and "--serve-http-harness" in sys.argv:
     asyncio.run(_serve_cli_harness_main())

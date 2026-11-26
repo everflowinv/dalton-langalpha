@@ -545,10 +545,21 @@ export async function createThreadDiscord(
       if (created && messageCreateConfirms(created, query)) return created;
     } catch (err) {
       if (isDefiniteThreadPostFailure(err)) {
-        throw classifyDiscordDeliveryError(err, {
+        const classified = classifyDiscordDeliveryError(err, {
           stage: "send",
           message: "Discord thread creation failed",
         });
+        if (err instanceof DiscordError && typeof err.discordCode === "number") {
+          throw new ChannelDeliveryError(classified.message, {
+            outcome: classified.outcome,
+            code: classified.code,
+            retryAfterMs: classified.retryAfterMs,
+            retryable: classified.retryable,
+            denyCode: classified.denyCode,
+            errorDetail: `discord_code:${err.discordCode}`,
+          });
+        }
+        throw classified;
       }
       // A timeout or 5xx can happen after Discord has created the thread.
       // One lookup may reuse it. Anything short of a positive match stays unknown.

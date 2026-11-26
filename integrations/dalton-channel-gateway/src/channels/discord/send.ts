@@ -81,6 +81,11 @@ export interface SendMessageDiscordParams {
   replyToMessageId?: string | null;
   newThread?: boolean;
   threadScopeKey?: string | null;
+  /** Existing bot-owned Discord thread channel id (from `dalton_channel_bot_topics`). */
+  externalTopicId?: string | null;
+  /** Optional public web URL & thread id for fallback notice when starter message was deleted (10008). */
+  webBaseUrl?: string | null;
+  threadId?: string | null;
   /** Stable delivery id. Standalone thread recovery reuses it across retries. */
   deliveryKey?: string | null;
   /** Current bot user. A standalone thread is adopted only when this user owns it. */
@@ -98,6 +103,8 @@ export interface SendMessageDiscordResult {
   channelId: string;
   resolvedAddress: string;
   nonce: string;
+  externalTopicId?: string | null;
+  terminalFallbackNotice?: boolean;
 }
 
 /**
@@ -160,9 +167,13 @@ export async function sendMessageDiscord(
     });
   }
   const scopeThreadId = threadIdFromScopeKey(params.threadScopeKey);
+  const explicitTopicId = params.externalTopicId?.trim() || null;
   const confirmedAddress = params.confirmedThreadAddress?.trim() || "";
   let channelId: string;
   let resolvedAddress = params.targetAddress;
+  let resolvedExternalTopicId: string | null = explicitTopicId;
+  let fallbackToParentReply = false;
+  let fallbackDeletedMessageNotice = false;
 
   if (confirmedAddress) {
     const routed = await routeConfirmedDiscordThread(rest, {
@@ -171,6 +182,7 @@ export async function sendMessageDiscord(
     });
     channelId = routed.channelId;
     resolvedAddress = routed.resolvedAddress;
+    resolvedExternalTopicId = routed.channelId;
   } else if (parsed.kind === "dm") {
     const recipient = params.recipientPlatformUserId?.trim();
     if (!recipient) {
@@ -181,6 +193,15 @@ export async function sendMessageDiscord(
     channelId = params.resolveDmChannelId
       ? await params.resolveDmChannelId(recipient)
       : await createDmChannelId(rest, recipient);
+  } else if (explicitTopicId) {
+    channelId = explicitTopicId;
+    const channel = await getDiscordChannel(rest, channelId);
+    await ensureThreadUnarchived(rest, channel);
+    resolvedAddress = formatDiscordThreadAddress({
+      guildId: channel.guild_id ?? parsed.guildId,
+      parentChannelId: channel.parent_id ?? parsed.channelId,
+      threadId: explicitTopicId,
+    });
   } else if (scopeThreadId) {
     channelId = scopeThreadId;
     const channel = await getDiscordChannel(rest, channelId);
@@ -196,45 +217,84 @@ export async function sendMessageDiscord(
   if (
     params.newThread &&
     !confirmedAddress &&
+    !explicitTopicId &&
     parsed.kind !== "dm" &&
     !scopeThreadId &&
     parsed.kind !== "thread"
   ) {
     const messageId = params.replyToMessageId?.trim() || null;
     const name = sanitizeDiscordThreadName(params.text, messageId ?? undefined);
-    const thread = await createThreadDiscord(rest, {
-      channelId,
-      messageId,
-      name,
-      deliveryKey: params.deliveryKey,
-      botUserId: params.botUserId,
-    });
-    channelId = thread.id;
-    resolvedAddress = formatDiscordThreadAddress({
-      guildId: thread.guild_id ?? parsed.guildId,
-      parentChannelId: thread.parent_id ?? parsed.channelId,
-      threadId: thread.id,
-    });
-    if (params.onConfirmedThread) {
-      try {
-        await params.onConfirmedThread({ address: resolvedAddress });
-      } catch (err) {
-        if (err instanceof ChannelDeliveryError) throw err;
-        throw new ChannelDeliveryError("Discord confirmed thread was not stored", {
-          outcome: "unknown",
-          code: "unavailable",
-        });
+    let createdThread: Awaited<ReturnType<typeof createThreadDiscord>> | null = null;
+    try {
+      createdThread = await createThreadDiscord(rest, {
+        channelId,
+        messageId,
+        name,
+        deliveryKey: params.deliveryKey,
+        botUserId: params.botUserId,
+      });
+    } catch (err) {
+      const detail = err instanceof ChannelDeliveryError ? err.errorDetail : undefined;
+      const codeMatch = detail ? /^discord_code:(\d+)$/.exec(detail) : null;
+      const discordCode = codeMatch ? Number.parseInt(codeMatch[1]!, 10) : null;
+      if (discordCode === 50013 || discordCode === 160006 || discordCode === 160007) {
+        // Missing permissions or thread-type/existing-thread conflict: fall back to parent channel reply.
+        fallbackToParentReply = true;
+      } else if (discordCode === 10008) {
+        // Starter message deleted before thread creation: post short notice in parent channel without message_reference.
+        fallbackDeletedMessageNotice = true;
+      } else {
+        throw err;
+      }
+    }
+    if (createdThread) {
+      channelId = createdThread.id;
+      resolvedExternalTopicId = createdThread.id;
+      resolvedAddress = formatDiscordThreadAddress({
+        guildId: createdThread.guild_id ?? parsed.guildId,
+        parentChannelId: createdThread.parent_id ?? parsed.channelId,
+        threadId: createdThread.id,
+      });
+      if (params.onConfirmedThread) {
+        try {
+          await params.onConfirmedThread({ address: resolvedAddress });
+        } catch (err) {
+          if (err instanceof ChannelDeliveryError) throw err;
+          throw new ChannelDeliveryError("Discord confirmed thread was not stored", {
+            outcome: "unknown",
+            code: "unavailable",
+          });
+        }
       }
     }
   }
 
   const nonce = createDiscordMessageNonce();
+  let outboundContent = params.text;
+  if (fallbackDeletedMessageNotice) {
+    const cleanWebBase = params.webBaseUrl?.trim().replace(/\/+$/, "") || "";
+    const cleanTid = params.threadId?.trim() || "";
+    const webUrl =
+      cleanWebBase &&
+      cleanTid &&
+      /^https?:\/\//i.test(cleanWebBase) &&
+      !/^https?:\/\/(?:localhost|127\.\d+\.\d+\.\d+|\[::1\]|0\.0\.0\.0)(?:[:/]|$)/i.test(cleanWebBase)
+        ? `${cleanWebBase}/chat/t/${encodeURIComponent(cleanTid)}`
+        : "";
+    outboundContent = webUrl
+      ? `原消息已删除，无法创建子区；回复已生成，请前往网页查看：${webUrl}`
+      : "原消息已删除，无法创建子区；回复已生成，请前往网页工作区查看。";
+  }
   const body: Record<string, unknown> = {
-    content: params.text,
+    content: outboundContent,
     nonce,
     allowed_mentions: { parse: [] },
   };
-  if (params.replyToMessageId && !params.newThread && !confirmedAddress) {
+  if (
+    params.replyToMessageId &&
+    !fallbackDeletedMessageNotice &&
+    ((!params.newThread && !confirmedAddress && !explicitTopicId) || fallbackToParentReply)
+  ) {
     body.message_reference = { message_id: params.replyToMessageId };
   }
   let response: unknown;
@@ -252,7 +312,14 @@ export async function sendMessageDiscord(
       outcome: "unknown", code: "unavailable",
     });
   }
-  return { messageId, channelId, resolvedAddress, nonce };
+  return {
+    messageId,
+    channelId,
+    resolvedAddress,
+    nonce,
+    ...(resolvedExternalTopicId ? { externalTopicId: resolvedExternalTopicId } : {}),
+    ...(fallbackDeletedMessageNotice ? { terminalFallbackNotice: true } : {}),
+  };
 }
 
 export async function createDmChannelId(rest: RequestClient, recipientUserId: string): Promise<string> {
@@ -286,6 +353,7 @@ export async function sendFileDiscord(
     text?: string;
     threadScopeKey?: string | null;
     resolveDmChannelId?: (recipientUserId: string) => Promise<string>;
+    verifyRecipientBeforeSend?: () => Promise<void>;
   },
 ): Promise<{ messageId: string; channelId: string }> {
   const parsed = parseDiscordTarget(params.targetAddress);
@@ -316,6 +384,9 @@ export async function sendFileDiscord(
     channelId = parsed.channelId;
   }
   const file: DiscordFilePart = { name: params.filename, data: params.content, contentType: params.mimeType };
+  if (params.verifyRecipientBeforeSend) {
+    await params.verifyRecipientBeforeSend();
+  }
   let response: unknown;
   try {
     response = await rest.post(`/channels/${encodeURIComponent(channelId)}/messages`, {

@@ -1066,6 +1066,8 @@ class LocalRunExecutor:
         *,
         error_frame: Optional[Dict[str, Any]] = None,
         stopped_by: Optional[str] = None,
+        # DALTON-HOOK(channel-deliverables): pass persisted DM turn deliverables on run_end
+        turn_deliverables: Optional[list[dict[str, Any]]] = None,
     ) -> None:
         """Write the closing frames to the per-run Stream (I6), exactly once.
 
@@ -1107,6 +1109,7 @@ class LocalRunExecutor:
             images=images,
             closing_frames=closing_frames,
             stopped_by=stopped_by,
+            turn_deliverables=turn_deliverables,  # DALTON-HOOK(channel-deliverables)
             redis_event_ttl=self.redis_event_ttl,
             max_stored_messages=self.max_stored_messages,
         )
@@ -1492,6 +1495,8 @@ class LocalRunExecutor:
             await self.append_run_end_event(
                 thread_id, run_id, status,
                 stopped_by=SUSPENSION_STOPPER if verdict.stopped_by_suspension else None,
+                # DALTON-HOOK(channel-deliverables): forward persisted DM turn deliverables on run_end
+                turn_deliverables=metadata.get("persisted_turn_deliverables"),
             )
 
             if status == "completed" and completion_callback:

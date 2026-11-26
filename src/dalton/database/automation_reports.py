@@ -567,6 +567,160 @@ def automation_report_content_sha256(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _rewrite_report_card_node(
+    node: Any,
+    *,
+    public_base: str | None,
+    thread_id: str | None,
+    workspace_id: str | None,
+    url_key: bool = False,
+) -> Any:
+    from src.dalton.notify.dispatch import (
+        build_workspace_file_deep_link,
+        classify_external_workspace_destination,
+        rewrite_workspace_links_for_external,
+    )
+
+    if isinstance(node, str):
+        if url_key:
+            cls = classify_external_workspace_destination(node)
+            if cls["kind"] == "workspace_file":
+                url = build_workspace_file_deep_link(
+                    cls,
+                    public_base=public_base,
+                    thread_id=thread_id,
+                    workspace_id=workspace_id,
+                )
+                return url if url else None
+            if cls["kind"] == "local_preview":
+                return None
+            return node
+        return rewrite_workspace_links_for_external(
+            node,
+            public_base=public_base,
+            thread_id=thread_id,
+            workspace_id=workspace_id,
+        )
+    if isinstance(node, list):
+        rebuilt: list[Any] = []
+        for item in node:
+            res = _rewrite_report_card_node(
+                item,
+                public_base=public_base,
+                thread_id=thread_id,
+                workspace_id=workspace_id,
+                url_key=False,
+            )
+            if res is not None:
+                rebuilt.append(res)
+        return rebuilt
+    if isinstance(node, Mapping):
+        # Handle open_url behavior / button elements gracefully when no public URL exists
+        if node.get("type") == "open_url":
+            rewritten_behavior: dict[str, Any] = {}
+            dropped_url = False
+            for k, v in node.items():
+                is_url = isinstance(k, str) and k.casefold() in _URL_KEYS
+                rv = _rewrite_report_card_node(
+                    v,
+                    public_base=public_base,
+                    thread_id=thread_id,
+                    workspace_id=workspace_id,
+                    url_key=is_url,
+                )
+                if is_url and rv is None:
+                    dropped_url = True
+                    continue
+                rewritten_behavior[k] = rv
+            if dropped_url and not any(
+                isinstance(k, str) and k.casefold() in _URL_KEYS
+                for k in rewritten_behavior
+            ):
+                return None
+            return rewritten_behavior
+
+        rewritten_map: dict[str, Any] = {}
+        for k, v in node.items():
+            is_url = isinstance(k, str) and k.casefold() in _URL_KEYS
+            rv = _rewrite_report_card_node(
+                v,
+                public_base=public_base,
+                thread_id=thread_id,
+                workspace_id=workspace_id,
+                url_key=is_url,
+            )
+            if is_url and rv is None:
+                continue
+            rewritten_map[k] = rv
+        # If a button lost all open_url behaviors because public_base is local/absent, degrade to plain markdown text
+        if (
+            rewritten_map.get("tag") == "button"
+            and isinstance(node.get("behaviors"), list)
+            and node.get("behaviors")
+            and not rewritten_map.get("behaviors")
+        ):
+            text_obj = rewritten_map.get("text")
+            btn_label = (
+                str(text_obj.get("content") or "").strip()
+                if isinstance(text_obj, Mapping)
+                else ""
+            )
+            return {
+                "tag": "markdown",
+                "content": f"{btn_label or '报告文件'}（请在网页工作区查看）",
+            }
+        return rewritten_map
+    return node
+
+
+def _rewrite_automation_report_inputs(
+    *,
+    cards: Any,
+    failure_text: Any,
+    text: Any,
+    thread_id: str | None,
+    workspace_id: str | None,
+) -> tuple[Any, Any, Any]:
+    """Rewrite workspace file links in report inputs before card/text validation."""
+    from src.dalton.notify.dispatch import (
+        normalize_public_web_base_url,
+        rewrite_workspace_links_for_external,
+    )
+    from src.dalton.settings import get_dalton_public_app_url
+
+    public_base = normalize_public_web_base_url(get_dalton_public_app_url())
+    new_text = (
+        rewrite_workspace_links_for_external(
+            text,
+            public_base=public_base,
+            thread_id=thread_id,
+            workspace_id=workspace_id,
+        )
+        if isinstance(text, str)
+        else text
+    )
+    new_failure = (
+        rewrite_workspace_links_for_external(
+            failure_text,
+            public_base=public_base,
+            thread_id=thread_id,
+            workspace_id=workspace_id,
+        )
+        if isinstance(failure_text, str)
+        else failure_text
+    )
+    if isinstance(cards, list):
+        new_cards = _rewrite_report_card_node(
+            deepcopy(cards),
+            public_base=public_base,
+            thread_id=thread_id,
+            workspace_id=workspace_id,
+        )
+    else:
+        new_cards = cards
+    return new_cards, new_failure, new_text
+
+
 def prepare_automation_report_content(
     *,
     profile: str,
@@ -834,11 +988,30 @@ async def submit_automation_report(
                             "delivery_confirmed": False,
                             "created": False,
                         }
+                    rewritten_cards, rewritten_failure_text, rewritten_text = (
+                        _rewrite_automation_report_inputs(
+                            cards=cards,
+                            failure_text=failure_text,
+                            text=text,
+                            thread_id=str(
+                                row.get("conversation_thread_id")
+                                or identity.get("thread_id")
+                                or ""
+                            ).strip()
+                            or None,
+                            workspace_id=str(
+                                row.get("workspace_id")
+                                or identity.get("workspace_id")
+                                or ""
+                            ).strip()
+                            or None,
+                        )
+                    )
                     prepared, content_err = prepare_automation_report_content(
                         profile=str(parsed["profile"]),
-                        cards=cards,
-                        failure_text=failure_text,
-                        text=text,
+                        cards=rewritten_cards,
+                        failure_text=rewritten_failure_text,
+                        text=rewritten_text,
                     )
                     if content_err or prepared is None:
                         return _error(
@@ -3163,6 +3336,31 @@ async def authorize_saved_report_target(
                 code="target_revoked",
                 message="The saved personal target is no longer bound to the owner.",
             )
+    resolved_workspace_id = (
+        str(automation_row.get("workspace_id") or "").strip() or None
+    )
+    resolved_thread_id = (
+        str(
+            payload.get("conversation_thread_id")
+            or payload.get("thread_id")
+            or ""
+        ).strip()
+        or None
+    )
+    if not resolved_thread_id and _UUID_RE.fullmatch(row_execution):
+        await cur.execute(
+            """
+            SELECT conversation_thread_id::text AS conversation_thread_id
+            FROM automation_executions
+            WHERE automation_execution_id = %s::uuid
+            """,
+            (row_execution,),
+        )
+        t_row = await cur.fetchone()
+        if isinstance(t_row, Mapping):
+            resolved_thread_id = (
+                str(t_row.get("conversation_thread_id") or "").strip() or None
+            )
     return {
         "scope": "report",
         "allowed": True,
@@ -3177,4 +3375,6 @@ async def authorize_saved_report_target(
         "recipient_id": recipient_id,
         "items": items,
         "payload": payload,
+        "workspace_id": resolved_workspace_id,
+        "thread_id": resolved_thread_id,
     }

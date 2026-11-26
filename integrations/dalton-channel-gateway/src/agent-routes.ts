@@ -83,6 +83,7 @@ export class AgentRoutesHandler {
       kind: "agent_send",
       userId,
       threadId: body.thread_id,
+      workspaceId: body.workspace_id ?? null,
       runId: body.run_id,
       automationExecutionId: body.automation_execution_id ?? null,
       platform: effectivePlatform,

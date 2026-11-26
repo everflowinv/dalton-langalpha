@@ -1,0 +1,102 @@
+{
+  "links_recovery_claim": {
+    "request": {
+      "body": {
+        "activity_origin": "replay",
+        "delivery_key": "deliverables-links:run-crash-1",
+        "has_non_empty_text": false,
+        "kind": "fallback",
+        "platform": "feishu",
+        "run_id": "run-crash-1",
+        "source_generation": 1,
+        "source_scope_key": "dm:ou_alice",
+        "target": "feishu:@me",
+        "thread_id": "11111111-1111-4111-8111-111111111111",
+        "total_chunks": 0,
+        "user_id": "user-alice"
+      },
+      "method": "POST",
+      "path": "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim"
+    },
+    "response": {
+      "body": {
+        "claim_status": "claimed",
+        "confirmed_thread_address": null,
+        "delivery_attempt": 1,
+        "discord_body_phase": null,
+        "dm_recipient_platform_user_id": "ou_alice",
+        "external_topic_id": null,
+        "first_reply_message_id": null,
+        "home_workspace_id": "ws-home-alice",
+        "inbound_message_id": "om_crash_in_1",
+        "is_current": true,
+        "platform": "feishu",
+        "prior_run_files": [
+          {
+            "delivery_key": "deliverables:run-crash-1",
+            "delivery_status": "unknown",
+            "path": "results/report.pdf",
+            "status": "unknown",
+            "workspace_id": "ws-contract-1"
+          }
+        ],
+        "recipient_id": "ou_alice",
+        "root_message_id": null,
+        "target_address": "feishu:@me",
+        "thread_scope_key": "dm:ou_alice",
+        "topic_canonical_scope_key": null,
+        "topic_initiator_platform_user_id": null,
+        "weixin_context_token": null,
+        "workspace_id": "ws-contract-1"
+      },
+      "status": 200
+    }
+  },
+  "unknown_claim": {
+    "request": {
+      "body": {
+        "activity_origin": "replay",
+        "delivery_key": "deliverables:run-crash-1",
+        "has_non_empty_text": false,
+        "kind": "fallback",
+        "platform": "feishu",
+        "run_id": "run-crash-1",
+        "source_generation": 1,
+        "source_scope_key": "dm:ou_alice",
+        "target": "feishu:@me",
+        "thread_id": "11111111-1111-4111-8111-111111111111",
+        "total_chunks": 0,
+        "user_id": "user-alice"
+      },
+      "method": "POST",
+      "path": "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim"
+    },
+    "response": {
+      "body": {
+        "claim_status": "in_flight_or_unknown",
+        "code": "in_flight",
+        "confirmed_thread_address": null,
+        "delivery_attempt": 1,
+        "discord_body_phase": null,
+        "error_code": "gateway_restarted",
+        "existing_status": "unknown",
+        "files_status": [
+          {
+            "path": "results/report.pdf",
+            "reason": null,
+            "status": "pending",
+            "workspace_id": "ws-contract-1"
+          }
+        ],
+        "is_current": true,
+        "message": "An earlier attempt of this same call is still delivering it.",
+        "platform": "feishu",
+        "sent_chunks": 0,
+        "status": "unknown",
+        "target_address": "feishu:@me",
+        "thread_scope_key": "dm:ou_alice"
+      },
+      "status": 200
+    }
+  }
+}

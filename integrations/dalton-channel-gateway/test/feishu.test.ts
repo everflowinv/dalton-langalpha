@@ -2187,7 +2187,7 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
       received.push(ev);
     });
 
-    await adapter.receiveRawEvent({
+    const broadcastRaw = {
       sender: { sender_id: { open_id: "ou_bob_2" }, sender_type: "user" },
       message: {
         message_id: "om_identity_broadcast",
@@ -2199,7 +2199,20 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
           { key: "@_all", id: { open_id: "all" }, name: "所有人" },
         ],
       },
-    });
+    };
+    const plainCommandRaw = {
+      sender: { sender_id: { open_id: "ou_bob_2" }, sender_type: "user" },
+      message: {
+        message_id: "om_identity_plain_command",
+        chat_id: "oc_grp_identity_open",
+        chat_type: "group",
+        message_type: "text",
+        content: JSON.stringify({ text: "/stop" }),
+        mentions: [],
+      },
+    };
+
+    await adapter.receiveRawEvent(broadcastRaw);
     await adapter.receiveRawEvent({
       sender: { sender_id: { open_id: "ou_bob_2" }, sender_type: "user" },
       message: {
@@ -2217,29 +2230,24 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
         ],
       },
     });
-    await adapter.receiveRawEvent({
-      sender: { sender_id: { open_id: "ou_bob_2" }, sender_type: "user" },
-      message: {
-        message_id: "om_identity_plain_command",
-        chat_id: "oc_grp_identity_open",
-        chat_type: "group",
-        message_type: "text",
-        content: JSON.stringify({ text: "/stop" }),
-        mentions: [],
-      },
+    await adapter.receiveRawEvent(plainCommandRaw);
+
+    // Unmentioned non-topic group events resolve without blocking and are filtered in memory
+    // before onInboundEvent, while DMs still pass through cleanly.
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({
+      messageId: "om_identity_dm",
+      chatType: "dm",
     });
 
-    expect(received).toHaveLength(3);
-    expect(received[0]).toMatchObject({
+    const parsedBroadcast = parseFeishuInboundEvent(broadcastRaw, {});
+    const parsedPlainCommand = parseFeishuInboundEvent(plainCommandRaw, {});
+    expect(parsedBroadcast).toMatchObject({
       messageId: "om_identity_broadcast",
       chatType: "group",
       isGroupTrigger: false,
     });
-    expect(received[1]).toMatchObject({
-      messageId: "om_identity_dm",
-      chatType: "dm",
-    });
-    expect(received[2]).toMatchObject({
+    expect(parsedPlainCommand).toMatchObject({
       messageId: "om_identity_plain_command",
       chatType: "group",
       isGroupTrigger: false,
@@ -2248,8 +2256,8 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
 
     const h = createTestHarness();
     try {
-      await h.app.orchestrator.handleInboundEvent(received[0]!);
-      await h.app.orchestrator.handleInboundEvent(received[2]!);
+      await h.app.orchestrator.handleInboundEvent(parsedBroadcast!);
+      await h.app.orchestrator.handleInboundEvent(parsedPlainCommand!);
       expect(h.backend.registerAndResolveInbound).not.toHaveBeenCalled();
       expect(h.backend.sessionCommand).not.toHaveBeenCalled();
       expect(h.feishuAdapter.sentTexts).toHaveLength(0);

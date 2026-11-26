@@ -1,0 +1,19 @@
+{
+  "request": {
+    "body": {
+      "delivery_attempt": 1
+    },
+    "headers": {
+      "X-Gateway-Epoch": "7"
+    },
+    "method": "POST",
+    "path": "/api/v1/dalton/channels/internal/deliveries/deliverables%3Arun-contract-1/verify-dm-recipient"
+  },
+  "response": {
+    "body": {
+      "code": "deliverable_recipient_denied",
+      "message": "Platform binding changed or was unbound after turn start."
+    },
+    "status": 403
+  }
+}
