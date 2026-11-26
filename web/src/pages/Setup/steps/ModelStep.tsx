@@ -10,9 +10,10 @@ import { Group } from '@/components/modelAccess/parts';
 import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(dalton-setup): Dalton build & unified team-model availability check
 // DALTON-HOOK(standalone-core): delegate profile & control config to Dalton helper
+// DALTON-HOOK(team-model-catalog): resolve curated providers from server `dalton_curated_providers`
 import { isDaltonBuild } from '@/config/brand';
 import { getDaltonModelStepConfig } from '@/config/daltonSetup';
-import { DALTON_CURATED_PROVIDERS, effectiveModelsAnswer } from '../answers/setupSteps';
+import { effectiveModelsAnswer, resolveDaltonCuratedProviders } from '../answers/setupSteps';
 import { useDaltonTeamModels } from '../answers/useTeamModels';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
 import { useAccount, useRule } from '@/hooks/useAccount';
@@ -68,7 +69,16 @@ export default function ModelStep() {
   }
   if (isDaltonBuild && effectiveModels === 'claude_code') return <Navigate to="/setup/use" replace />;
   if (effectiveModels === 'langalpha_models') return <Navigate to="/setup/default" replace />;
-  if (effectiveModels !== 'claude_code') return <SubscriptionStep flow={flow} teamModelsAvailable={team.available} daltonProfile={team.daltonProfile} />;
+  if (effectiveModels !== 'claude_code') {
+    return (
+      <SubscriptionStep
+        flow={flow}
+        teamModelsAvailable={team.available}
+        daltonProfile={team.daltonProfile}
+        daltonCuratedProviders={team.daltonCuratedProviders}
+      />
+    );
+  }
   switch (step.kind) {
     case 'loading':
       return <StepLoading />;
@@ -256,7 +266,18 @@ function ClaudeCodeTokenStep({ flow, askConsent }: { flow: Flow; askConsent: boo
 
 // DALTON-HOOK(dalton-setup): pass teamModelsAvailable to AnswersStrip
 // DALTON-HOOK(standalone-core): pass daltonProfile to Dalton helper for Core/Everflow control config
-function SubscriptionStep({ flow, teamModelsAvailable, daltonProfile }: { flow: Flow; teamModelsAvailable: boolean; daltonProfile?: string | null }) {
+// DALTON-HOOK(team-model-catalog): pass version-aligned `daltonCuratedProviders` into getDaltonModelStepConfig
+function SubscriptionStep({
+  flow,
+  teamModelsAvailable,
+  daltonProfile,
+  daltonCuratedProviders,
+}: {
+  flow: Flow;
+  teamModelsAvailable: boolean;
+  daltonProfile?: string | null;
+  daltonCuratedProviders?: readonly string[];
+}) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
@@ -279,7 +300,7 @@ function SubscriptionStep({ flow, teamModelsAvailable, daltonProfile }: { flow: 
     daltonProfile,
     ownKeys,
     configured,
-    curatedProviders: DALTON_CURATED_PROVIDERS,
+    curatedProviders: resolveDaltonCuratedProviders(daltonCuratedProviders),
   });
 
   // Back from a connect page with what it connected: that becomes the

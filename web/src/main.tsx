@@ -6,6 +6,7 @@ import { ThemeProvider } from './contexts/ThemeContext'
 import { AuthProvider } from './contexts/AuthContext'
 import App from './App'
 import { BRAND_NAME } from './config/brand' // DALTON-HOOK(brand-name)
+import { attachCatalogRevisionQueryClient } from './lib/dalton/catalogRevision' // DALTON-HOOK(team-model-catalog)
 import { initI18n } from './i18n'
 import './index.css'
 // Side-effect import: the modality listeners have to be running before the
@@ -29,6 +30,8 @@ const queryClient = new QueryClient({
     },
   },
 })
+// DALTON-HOOK(team-model-catalog): wire global QueryClient for X-Dalton-Catalog-Revision header invalidation
+attachCatalogRevisionQueryClient(queryClient)
 
 document.title = BRAND_NAME // DALTON-HOOK(brand-name)
 tolerateTranslatedDom()

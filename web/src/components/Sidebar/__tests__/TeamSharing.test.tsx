@@ -1238,7 +1238,7 @@ describe('Dalton Team Sharing', () => {
     }
   });
 
-  // DALTON-HOOK(external-member-perms): cached team lists grant write access only to a confirmed internal member.
+  // DALTON-HOOK(colleague-access): cached team lists grant write access only to a confirmed internal member.
   it('keeps a cached rw colleague workspace read-only for an external caller', () => {
     const queryClient = createTestQueryClient();
     queryClient.setQueryData(queryKeys.dalton.credentialsStatus(LOCAL_USER_ID), {

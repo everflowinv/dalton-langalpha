@@ -529,6 +529,21 @@ export const queryKeys = {
     workspaceSettings: (workspaceId: string) => [...queryKeys.dalton.all, 'workspace-settings', workspaceId],
     userSettings: () => [...queryKeys.dalton.all, 'user-settings'],
     channelBindings: () => [...queryKeys.dalton.all, 'channels', 'bindings'],
+    // DALTON-HOOK(team-model-catalog): team model catalog overview, revisions, and revision detail query keys
+    teamModelCatalog: () => [...queryKeys.dalton.all, 'team-model-catalog'],
+    teamModelRevisions: (limit = 50, offset = 0) => [
+      ...queryKeys.dalton.all,
+      'team-model-catalog',
+      'revisions',
+      limit,
+      offset,
+    ],
+    teamModelRevisionDetail: (revision: number) => [
+      ...queryKeys.dalton.all,
+      'team-model-catalog',
+      'revision',
+      revision,
+    ],
   },
   // DALTON-HOOK(monitors): query keys for Dalton Monitors list, detail, artifact lookup, and company members
   daltonMonitors: {

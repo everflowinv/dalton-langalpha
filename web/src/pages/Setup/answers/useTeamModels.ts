@@ -89,6 +89,10 @@ export interface DaltonTeamModelsState {
   rejectedProviders: ReadonlySet<string>;
   /** Active deployment profile reported by `/api/v1/models` (`everflow` | `core`). */
   daltonProfile?: DaltonDeploymentProfile;
+  /** Version-aligned curated setup candidates reported by `/api/v1/models`. */
+  daltonSetupCandidates?: readonly string[];
+  /** Version-aligned curated setup providers reported by `/api/v1/models`. */
+  daltonCuratedProviders?: readonly string[];
   retry: () => void;
   all: UseAllModelsResult;
 }
@@ -178,6 +182,10 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
   }, [queryClient, userId, useSharedQuery, listedProviders, policy]);
 
   const daltonProfile = all.rawApiResponse?.dalton_profile ?? sharedAvailability.daltonProfile;
+  const daltonSetupCandidates =
+    all.rawApiResponse?.dalton_setup_candidates ?? sharedAvailability.daltonSetupCandidates;
+  const daltonCuratedProviders =
+    all.rawApiResponse?.dalton_curated_providers ?? sharedAvailability.daltonCuratedProviders;
   // DALTON-HOOK(standalone-core): wait for /api/v1/models catalog read before deciding Dalton profile
   const catalogPending = isDaltonBuild && all.isLoading;
   const catalogUnread = isDaltonBuild && !all.isLoading && all.unread;
@@ -193,6 +201,8 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
       callerTierPending,
       rejectedProviders: sharedAvailability.rejectedProviders,
       daltonProfile,
+      daltonSetupCandidates,
+      daltonCuratedProviders,
       retry,
       all,
     };
@@ -212,6 +222,7 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
       true,
       localRejectedProviders,
       daltonProfile,
+      daltonSetupCandidates,
     );
   const empty = localShared && !callerTierPending && !all.isLoading && !listsLoading && !all.unread && !available;
 
@@ -225,6 +236,8 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
     callerTierPending,
     rejectedProviders: localRejectedProviders,
     daltonProfile,
+    daltonSetupCandidates,
+    daltonCuratedProviders,
     retry,
     all,
   };

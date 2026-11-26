@@ -2,6 +2,7 @@ import { useTranslation } from 'react-i18next';
 import { SettingsCardBody, SettingsGroup } from '@/pages/Settings/components/SettingsLayout';
 import { ModelAccessSection } from '../ModelAccessSection';
 import { ProviderStatusCard } from './ProviderStatusCard';
+import { TeamModelCatalogCard } from './TeamModelCatalogCard';
 
 /** Team Management -> Models & Providers panel (admin-only). */
 export function DaltonTeamModelsPanel() {
@@ -17,6 +18,7 @@ export function DaltonTeamModelsPanel() {
           <ModelAccessSection scope="team" />
         </SettingsCardBody>
       </SettingsGroup>
+      <TeamModelCatalogCard />
       <ProviderStatusCard />
     </div>
   );

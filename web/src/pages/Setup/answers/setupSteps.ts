@@ -21,6 +21,16 @@ export const DALTON_CURATED_PROVIDERS: ReadonlySet<string> = new Set([
   'codex-oauth',
 ]);
 
+// DALTON-HOOK(team-model-catalog): prefer version-aligned server `dalton_curated_providers` (including empty []) over static fallback
+export function resolveDaltonCuratedProviders(
+  serverProviders?: readonly string[] | null,
+): ReadonlySet<string> {
+  if (Array.isArray(serverProviders)) {
+    return new Set(serverProviders);
+  }
+  return DALTON_CURATED_PROVIDERS;
+}
+
 export type ModelsAnswer = OnboardingModels;
 export type RunsOnAnswer = OnboardingRunsOn;
 /** The account's steps, which its onboarding record keeps, and `server`, the

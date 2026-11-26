@@ -15,6 +15,8 @@ import { authSessionCheck } from '../lib/authResets';
 import { authGeneration, bearerTokenOf, getAccessToken, refreshAccessToken } from '../lib/authToken';
 import { trackRequest } from '../lib/reloadHolds';
 import { noteIfSuspended } from '../lib/accountSuspension';
+// DALTON-HOOK(team-model-catalog): invalidate model caches on newer X-Dalton-Catalog-Revision headers or stale-model 400s
+import { observeCatalogModelError, observeCatalogRevisionHeader } from '../lib/dalton/catalogRevision';
 
 const baseURL: string = import.meta.env.VITE_API_BASE_URL ?? '';
 
@@ -259,10 +261,13 @@ async function send(
   const { rawHeaders, ...rest } = sent;
   const response: ApiResponse = { ...rest, headers: Object.fromEntries(rawHeaders) };
   const { status } = response;
+  // DALTON-HOOK(team-model-catalog): track X-Dalton-Catalog-Revision on every response for immediate cross-session refresh
+  observeCatalogRevisionHeader(response.headers, { url });
   if (status >= 200 && status < 300) return response;
   // Every route refuses a suspended account the same way: the shell turns
   // the whole app into that one state rather than each caller failing alone.
   if (status === 403) noteIfSuspended((response.data as { detail?: unknown } | null)?.detail);
+  if (status === 400) observeCatalogModelError(status, (response.data as { detail?: unknown } | null)?.detail);
   throw new ApiError(
     `Request failed with status code ${status}`,
     status >= 400 && status < 500 ? 'ERR_BAD_REQUEST' : 'ERR_BAD_RESPONSE',

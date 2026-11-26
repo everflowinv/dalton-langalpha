@@ -124,8 +124,10 @@ export default function DefaultStep() {
     // DALTON-HOOK(dalton-setup): pass dalton build flag and team state into DefaultForm
     // DALTON-HOOK(antigravity-series): pass seriesCatalog & selectableSeries into defaultChoices
     // DALTON-HOOK(standalone-core): pass runtime dalton_profile so Core unlocks BYOK/custom models
+    // DALTON-HOOK(team-model-catalog): pass version-aligned `dalton_setup_candidates` into defaultChoices
     dalton: isDaltonBuild,
     daltonProfile: all.rawApiResponse?.dalton_profile,
+    daltonSetupCandidates: all.rawApiResponse?.dalton_setup_candidates,
     seriesCatalog: all.seriesCatalog,
     selectableSeries: all.selectableSeries,
   });
@@ -302,9 +304,11 @@ function DefaultForm({
   const name = (m: string) =>
     formatAntigravityVariantLabel(m, seriesOpts) ?? getModelDisplayName(m, metadata);
   // DALTON-HOOK(standalone-core): pass runtime dalton_profile & effectiveMetadata so Core unlocks BYOK/custom models
+  // DALTON-HOOK(team-model-catalog): align Customize curated list with server `dalton_setup_candidates`
   const curatedCustomizeModels = filterDaltonCuratedModels(visibleSlotModels, isDaltonBuild, {
     profile: rawApiResponse?.dalton_profile,
     metadata: effectiveMetadata,
+    serverCandidates: rawApiResponse?.dalton_setup_candidates,
   });
   const deploymentBackground = systemBackground ? t('settings:autoModel', { model: name(systemBackground) }) : undefined;
   // DALTON-HOOK(standalone-core): Core Recommended card & Customize placeholder show "Follows primary model" when recommended.background is null

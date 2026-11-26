@@ -24,12 +24,13 @@ import { useOnboardingProgress } from '@/hooks/useOnboardingProgress';
 import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(dalton-setup): check live Dalton team-model availability off the entry bundle and normalize legacy answers
 // DALTON-HOOK(standalone-core): unlock BYOK/custom providers in Core profile via isDaltonSetupProviderAllowed
+// DALTON-HOOK(team-model-catalog): resolve curated providers from version-aligned server `dalton_curated_providers`
 import { isDaltonBuild } from '@/config/brand';
 import type { SetupStatus } from '@/api/setup';
 import { useSetupStatus } from '@/hooks/useServerSetup';
 import { isDaltonSetupProviderAllowed } from '@/config/daltonSetup';
 import { useDaltonTeamModelsAvailable } from './useTeamModelsAvailable';
-import { DALTON_CURATED_PROVIDERS, effectiveModelsAnswer, nextSetupPath, nextSetupStep, readAnswers, setupRail, type ServerStepState, type SetupFacts } from './setupSteps';
+import { effectiveModelsAnswer, nextSetupPath, nextSetupStep, readAnswers, resolveDaltonCuratedProviders, setupRail, type ServerStepState, type SetupFacts } from './setupSteps';
 
 /**
  * The server's own step, from its setup status: owed while it says the step is,
@@ -112,10 +113,12 @@ export function useSetupFacts({ refetchInterval = false }: { refetchInterval?: n
   // A connection that runs a turn, as the model filters count one: a
   // subscription signed in, a key only while BYOK is on where it can be off,
   // either only while the account's rules allow it.
-  // DALTON-HOOK(dalton-setup): in Dalton, only subscriptions that can supply the 5 curated candidates satisfy the model step
+  // DALTON-HOOK(dalton-setup): in Dalton, only subscriptions that can supply curated candidates satisfy the model step
   // DALTON-HOOK(standalone-core): Core profile accepts any connected BYOK/custom provider
+  // DALTON-HOOK(team-model-catalog): use version-aligned server `dalton_curated_providers` when present
+  const curatedProviders = resolveDaltonCuratedProviders(team.daltonCuratedProviders);
   const providerConnected = providers.some((p) => p.masked_key !== SERVER_KEY
-    && (!isDaltonBuild || isDaltonSetupProviderAllowed(p.provider, DALTON_CURATED_PROVIDERS, team.daltonProfile))
+    && (!isDaltonBuild || isDaltonSetupProviderAllowed(p.provider, curatedProviders, team.daltonProfile))
     && (p.access_type === 'oauth'
       ? allows(policy, RULE.ownSubscriptions) && p.state === 'connected'
       : allows(policy, RULE.ownApiKeys) && (!isPlatformMode || byokEnabled)));

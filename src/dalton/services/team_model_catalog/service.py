@@ -61,6 +61,7 @@ from src.dalton.services.team_model_catalog.transport import (
     preflight_catalog_variant_url,
 )
 from src.dalton.services.team_model_catalog.validation import (
+    _SUPPORTED_VARIANT_SDKS,
     CatalogModelUpsertInput,
     CatalogRollbackInput,
     CatalogTestCallInput,
@@ -96,6 +97,79 @@ _USER_PREF_SLOT_KEYS = (
     "fetch_model",
     "summarization_model",
 )
+
+# Defensive read-only parameter sanitizer for GET /api/v1/dalton/team-models:
+# strips any credential, secret, auth, or header keys recursively while
+# preserving legitimate model parameters such as max_tokens / reasoning / thinking.
+_PUBLIC_PARAM_FORBIDDEN_KEYS = frozenset(
+    {
+        "apikey",
+        "api_key",
+        "headers",
+        "default_headers",
+        "additional_headers",
+        "extra_headers",
+        "auth",
+        "authorization",
+        "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "auth_token",
+        "secret",
+        "client_secret",
+        "api_secret",
+        "secret_key",
+        "private_key",
+        "env_key",
+        "password",
+        "passwd",
+        "credentials",
+        "credential",
+        "bearer",
+        "x-api-key",
+        "x_api_key",
+    }
+)
+_PUBLIC_PARAM_FORBIDDEN_SUFFIXES = (
+    "_key",
+    "_secret",
+    "_password",
+    "_passwd",
+    "_credential",
+    "_credentials",
+    "_auth",
+    "_headers",
+    "_header",
+)
+
+
+def _is_forbidden_public_param_key(key: str) -> bool:
+    low = key.strip().lower()
+    if low in _PUBLIC_PARAM_FORBIDDEN_KEYS:
+        return True
+    return any(low.endswith(suffix) for suffix in _PUBLIC_PARAM_FORBIDDEN_SUFFIXES)
+
+
+def _sanitize_public_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        cleaned: dict[str, Any] = {}
+        for k, v in value.items():
+            k_str = str(k)
+            if _is_forbidden_public_param_key(k_str):
+                continue
+            cleaned[k_str] = _sanitize_public_value(v)
+        return cleaned
+    if isinstance(value, list):
+        return [_sanitize_public_value(item) for item in value]
+    return copy.deepcopy(value)
+
+
+def _sanitize_public_parameters(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, Mapping):
+        return None
+    cleaned = _sanitize_public_value(raw)
+    return cleaned if isinstance(cleaned, dict) and cleaned else None
 
 
 def _utcnow_iso() -> str:
@@ -468,6 +542,17 @@ async def get_team_catalog_overview() -> dict[str, Any]:
         if isinstance(compiled.payload, Mapping)
         else {}
     )
+    compiled_bounds = (
+        compiled.task_costs.bounds
+        if compiled.task_costs is not None and isinstance(compiled.task_costs.bounds, Mapping)
+        else {}
+    )
+    raw_db_tc = compiled.payload.get("task_costs") if isinstance(compiled.payload, Mapping) else None
+    raw_db_bounds = (
+        raw_db_tc.get("bounds")
+        if isinstance(raw_db_tc, Mapping) and isinstance(raw_db_tc.get("bounds"), Mapping)
+        else {}
+    )
 
     items: list[dict[str, Any]] = []
     for key, entry in (mc.llm_config or {}).items():
@@ -477,9 +562,31 @@ async def get_team_catalog_overview() -> dict[str, Any]:
         prov_info = mc.get_provider_info(prov)
         model_id = str(entry.get("model_id") or key)
         meta_entry = compiled.dalton_meta.get(key) or {}
-        cash_card = mc.get_model_info(prov, model_id)
+        cash_card = mc.get_model_info(prov, model_id) or _find_provider_pricing_card(
+            mc, prov, model_id
+        )
+        raw_aliases = (cash_card or {}).get("alias") if isinstance(cash_card, Mapping) else None
+        aliases = (
+            [str(a).strip() for a in raw_aliases if isinstance(a, str) and str(a).strip()]
+            if isinstance(raw_aliases, list)
+            else []
+        )
+        bound_out: dict[str, Any] | None = None
+        if key in compiled_bounds:
+            b_model, b_times = compiled_bounds[key]
+            bound_out = {"model": str(b_model), "times": float(b_times)}
+        elif key in raw_db_bounds and isinstance(raw_db_bounds[key], Mapping):
+            raw_b = raw_db_bounds[key]
+            if (
+                isinstance(raw_b.get("model"), str)
+                and raw_b["model"].strip()
+                and isinstance(raw_b.get("times"), (int, float))
+                and not isinstance(raw_b.get("times"), bool)
+            ):
+                bound_out = {"model": raw_b["model"].strip(), "times": float(raw_b["times"])}
         is_variant = bool(prov_info.get("catalog_defined"))
         source = "team_added" if key in db_models else ("team_overridden" if key in db_overrides else "factory")
+        prompt_guidance = entry.get("prompt_guidance")
         items.append(
             {
                 "model_key": key,
@@ -499,6 +606,10 @@ async def get_team_catalog_overview() -> dict[str, Any]:
                 "compaction_profile": entry.get("compaction_profile"),
                 "input_modalities": entry.get("input_modalities") or ["text"],
                 "reasoning": entry.get("reasoning"),
+                "parameters": _sanitize_public_parameters(entry.get("parameters")),
+                "prompt_guidance": prompt_guidance if isinstance(prompt_guidance, str) else None,
+                "task_costs_bound": bound_out,
+                "alias": aliases or None,
                 "pricing": (cash_card or {}).get("pricing") if isinstance(cash_card, Mapping) else None,
                 "pricing_meta": (cash_card or {}).get("pricing_meta") if isinstance(cash_card, Mapping) else None,
                 "dalton_meta": meta_entry,
@@ -554,6 +665,18 @@ async def get_team_catalog_overview() -> dict[str, Any]:
             }
         )
 
+    from src.dalton.llm.overlay import _is_oauth_model_key
+
+    prov_cfg = (mc.manifest or {}).get("provider_config") or {}
+    parent_provider_groups = sorted(
+        str(g).strip()
+        for g in prov_cfg
+        if isinstance(g, str)
+        and str(g).strip()
+        and (compiled.oauth_sync_enabled or not _is_oauth_model_key(str(g).strip().lower()))
+    )
+    supported_variant_sdks = sorted(_SUPPORTED_VARIANT_SDKS)
+
     return {
         "revision": compiled.revision,
         "payload_sha256": compiled.payload_sha256,
@@ -562,6 +685,8 @@ async def get_team_catalog_overview() -> dict[str, Any]:
         "models": items,
         "retired": retired_items,
         "provider_variants": variants_out,
+        "parent_provider_groups": parent_provider_groups,
+        "supported_variant_sdks": supported_variant_sdks,
         "curated_setup": compiled.curated_setup,
         **derive_curated_setup_for_catalog(compiled),
     }
