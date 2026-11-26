@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import errno
 import hashlib
 import importlib.util
 import io
@@ -19,6 +20,7 @@ import re
 import sqlite3
 import struct
 import tempfile
+import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import date, datetime, timezone
@@ -1192,25 +1194,82 @@ class OpenWikiStore:
 
     @staticmethod
     def _persist_image_asset_file(asset_abs: Path, image_bytes: bytes) -> bool:
-        """Write `image_bytes` to `asset_abs` if not already present. Returns True if newly created."""
+        """Atomically and exclusively create `asset_abs` if absent.
+
+        Returns True iff this call exclusively created `asset_abs`; returns False
+        when another writer already created the content-addressed path.
+        """
         asset_abs.parent.mkdir(parents=True, exist_ok=True)
         if asset_abs.exists():
             return False
-        tmp_asset = asset_abs.with_name(f".{asset_abs.name}.{os.getpid()}.tmp")
+        tmp_asset = asset_abs.with_name(f".{asset_abs.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         try:
             with tmp_asset.open("wb") as fh:
                 fh.write(image_bytes)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp_asset, asset_abs)
-            return True
-        except BaseException:
+            try:
+                os.link(tmp_asset, asset_abs)
+                return True
+            except FileExistsError:
+                return False
+            except OSError as exc:
+                if exc.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV, errno.ENOSYS):
+                    raise
+                try:
+                    fd = os.open(str(asset_abs), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                except FileExistsError:
+                    return False
+                try:
+                    with os.fdopen(fd, "wb") as dfh:
+                        dfh.write(image_bytes)
+                        dfh.flush()
+                        os.fsync(dfh.fileno())
+                    return True
+                except BaseException:
+                    try:
+                        asset_abs.unlink()
+                    except OSError:
+                        pass
+                    raise
+        finally:
             if tmp_asset.exists():
                 try:
                     tmp_asset.unlink()
                 except OSError:
                     pass
-            raise
+
+    def _cleanup_unreferenced_image_asset(self, asset_abs: Path, sha: str) -> bool:
+        """Under an IMMEDIATE write lock on `images_db`, delete `asset_abs` only if zero `refs` reference `sha`."""
+        if not asset_abs.exists() or not self.images_db.is_file():
+            return False
+        img_conn = sqlite3.connect(self.images_db, timeout=20, isolation_level=None)
+        try:
+            img_conn.execute("BEGIN IMMEDIATE")
+            row = img_conn.execute(
+                "SELECT COUNT(*) FROM refs WHERE asset_sha = ?",
+                (sha,),
+            ).fetchone()
+            ref_count = int(row[0]) if row else 0
+            if ref_count == 0:
+                try:
+                    asset_abs.unlink()
+                except FileNotFoundError:
+                    pass
+                img_conn.execute("DELETE FROM assets WHERE sha = ?", (sha,))
+                img_conn.execute("COMMIT")
+                return True
+            img_conn.execute("COMMIT")
+            return False
+        except BaseException:
+            try:
+                if img_conn.in_transaction:
+                    img_conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            return False
+        finally:
+            img_conn.close()
 
     def ensure_images_schema(self) -> None:
         self.images_dir.mkdir(parents=True, exist_ok=True)
@@ -1280,22 +1339,26 @@ class OpenWikiStore:
             return _insert_rows(conn)
 
         asset_created = False
-        if write_asset_file:
-            asset_created = self._persist_image_asset_file(asset_abs, image_bytes)
-        self.images_dir.mkdir(parents=True, exist_ok=True)
+        self.ensure_images_schema()
+        img_conn = sqlite3.connect(self.images_db, timeout=20, isolation_level=None)
         try:
-            with sqlite3.connect(self.images_db, timeout=20) as img_conn:
-                self._ensure_images_schema(img_conn)
-                image_id = _insert_rows(img_conn)
-                img_conn.commit()
+            img_conn.execute("BEGIN IMMEDIATE")
+            image_id = _insert_rows(img_conn)
+            if write_asset_file:
+                asset_created = self._persist_image_asset_file(asset_abs, image_bytes)
+            img_conn.execute("COMMIT")
             return image_id
         except BaseException:
-            if asset_created and asset_abs.exists():
-                try:
-                    asset_abs.unlink()
-                except OSError:
-                    pass
+            try:
+                if img_conn.in_transaction:
+                    img_conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            if asset_created:
+                self._cleanup_unreferenced_image_asset(asset_abs, sha)
             raise
+        finally:
+            img_conn.close()
 
     def _append_audit(self, entry: dict[str, Any]) -> None:
         self.audit_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1577,8 +1640,9 @@ class OpenWikiStore:
             chunks_list = [body_text]
         is_image_ingest = binary_bytes is not None and orig_binary_suffix in _IMAGE_FILE_EXTENSIONS
         image_asset_abs: Path | None = None
+        image_asset_sha: str | None = None
         if is_image_ingest and binary_bytes is not None:
-            _, _, _, _, _, image_asset_abs = self._prepare_image_asset(
+            _, _, _, image_asset_sha, _, image_asset_abs = self._prepare_image_asset(
                 image_bytes=binary_bytes,
                 suffix=orig_binary_suffix,
             )
@@ -1722,11 +1786,8 @@ class OpenWikiStore:
                     orig_dest_path.unlink()
                 except OSError:
                     pass
-            if asset_written and image_asset_abs is not None and image_asset_abs.exists():
-                try:
-                    image_asset_abs.unlink()
-                except OSError:
-                    pass
+            if asset_written and image_asset_abs is not None and image_asset_sha is not None:
+                self._cleanup_unreferenced_image_asset(image_asset_abs, image_asset_sha)
             raise
         finally:
             conn.close()

@@ -243,6 +243,8 @@ def create_run_workflow_tool(
     store: Any | None = None,
     user_id: str | None = None,
     prebuilt_workflows: PrebuiltWorkflowRegistry | None = None,
+    # DALTON-HOOK(workflow-discovered-tools): workspace MCP registry for server-side discovery.
+    mcp_registry: Any | None = None,
 ) -> BaseTool:
     mw = dispatcher.middleware
     registry = dispatcher.registry
@@ -605,15 +607,18 @@ def create_run_workflow_tool(
                 )
             except CompanyRoutingRefused as error:
                 raise _Refused(str(error)) from error
-        # DALTON-HOOK(workflow-discovered-tools): in Core, pass workspace-discovered
-        # MCP servers from `.agents/tools/mcp_client_config.json` so `topic-research`
-        # gates internal-memory retrieval on discovered tools rather than deployment
-        # capability flags alone (no-op in Everflow).
+        # DALTON-HOOK(workflow-discovered-tools): when legacy researchdata_bridge
+        # is disabled, build minimal discovered tools from server-side MCP registry
+        # (overwriting caller params) and record the internal-memory decision in
+        # args.json so workflow.js and dalton_check_done stay consistent.
         if isinstance(params, dict):
             from src.dalton.content_assembly import resolve_launch_discovered_mcp_servers
 
             params = await resolve_launch_discovered_mcp_servers(
-                backend, meta.name, params
+                backend,
+                meta.name,
+                params,
+                mcp_registry=mcp_registry,
             )
         # DALTON-HOOK(workflow-resume): refresh progress_path after params normalization.
         if isinstance(params, dict) and isinstance(params.get("progress_path"), str):

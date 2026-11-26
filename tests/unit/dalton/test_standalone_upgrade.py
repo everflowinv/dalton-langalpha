@@ -4056,3 +4056,148 @@ def test_backup_pause_recovery_non124_retry_headroom_and_resume_allowlist(
     _assert_flock_reacquirable(lock_a, label="after resume allowlist retry")
 
 
+def test_backup_sigterm_during_pending_pause_probes_and_resumes_writes(
+    tmp_path: Path,
+) -> None:
+    """R2 item 8a: If SIGTERM arrives after research-host paused writes but before backup.sh receives
+    the POST lease response, EXIT cleanup probes by owner within deadline and resumes Wiki writes."""
+    import json
+    import signal
+    import time
+
+    fx = _build_r11_backup_fixture(tmp_path / "r2_term_pause", project_name="dalton_r2_tp")
+    fx["clock_file"].write_text("14000.0", encoding="utf-8")
+    fx["hang_pause_after_apply_gate"].write_text("1", encoding="utf-8")
+    lock_f = tmp_path / "r2_term_pause" / "tp.flock"
+    out_dir = tmp_path / "r2_term_pause" / "out"
+
+    proc = subprocess.Popen(
+        [
+            "bash",
+            str(fx["backup_script"]),
+            "--work-dir",
+            str(fx["work_dir"]),
+            "--output-dir",
+            str(out_dir),
+        ],
+        env={
+            **fx["env"],
+            "DALTON_WIKI_BACKUP_LOCK_FILE": str(lock_f),
+            "DALTON_WIKI_PAUSE_TTL_S": "300",
+            "DALTON_WIKI_EXEC_TIMEOUT_S": "15.0",
+            "DALTON_WIKI_PAUSE_RECOVERY_TIMEOUT_S": "2.0",
+            "DALTON_WIKI_PAUSE_RECOVERY_POLL_S": "0.05",
+            "DALTON_WIKI_RESUME_TIMEOUT_S": "2.0",
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        # Wait until fake research-host has actually applied paused=True (POST is still hanging)
+        wait_deadline = time.monotonic() + 10.0
+        while not fx["pause_entered_marker"].is_file() and time.monotonic() < wait_deadline:
+            assert proc.poll() is None, f"backup.sh exited prematurely: {proc.communicate()}"
+            time.sleep(0.05)
+        assert fx["pause_entered_marker"].is_file(), "Pause POST never entered fake research-host"
+        st_mid = json.loads(fx["lease_state"].read_text(encoding="utf-8"))
+        assert st_mid["paused"] is True, f"Expected server paused before SIGTERM: {st_mid}"
+
+        t_term = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        stdout, stderr = proc.communicate(timeout=10.0)
+        elapsed_after_term = time.monotonic() - t_term
+        assert proc.returncode != 0, f"Expected non-zero exit on SIGTERM, stdout={stdout} stderr={stderr}"
+        assert elapsed_after_term < 8.0, f"SIGTERM cleanup took too long ({elapsed_after_term:.2f}s)"
+
+        events = fx["events_log"].read_text(encoding="utf-8").splitlines()
+        assert any(ev.startswith("probe_pause:") for ev in events), f"Expected owner probe on EXIT cleanup: {events}"
+        assert any(ev.startswith("resume:") for ev in events), f"Expected resume after owner probe: {events}"
+        st_after = json.loads(fx["lease_state"].read_text(encoding="utf-8"))
+        assert st_after["paused"] is False, f"Wiki writes left paused after SIGTERM during pending POST: {st_after}"
+        _assert_flock_reacquirable(lock_f, label="after SIGTERM during pending pause POST")
+    finally:
+        if fx["hang_pause_after_apply_gate"].exists():
+            fx["hang_pause_after_apply_gate"].unlink()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_backup_publish_lock_pid_write_failure_and_empty_pid_recovery(
+    tmp_path: Path,
+) -> None:
+    """R2 item 8b:
+    1. When writing `${LOCK_DIR}/pid` fails (e.g. ENOSPC leaving an empty/unwritten file),
+       `acquire_publish_lock` immediately revokes the lock directory and exits non-zero.
+    2. When an orphan `${LOCK_DIR}` exists with a 0-byte empty `pid` file, a subsequent
+       `backup.sh` run treats the empty PID file as missing, removes the stale lock after
+       the grace period, and completes the backup cleanly.
+    """
+    # 1. Simulate PID write failure (e.g. ENOSPC leaving an empty pid file and returning non-zero)
+    lock_test_dir = tmp_path / "pid_fail_out"
+    lock_test_dir.mkdir(parents=True)
+    backup_src = (_REPO_ROOT / "scripts" / "standalone" / "backup.sh").read_text(encoding="utf-8")
+    # Extract pid_is_alive, acquire_publish_lock, release_publish_lock directly from backup.sh
+    fn_start = backup_src.index("pid_is_alive() {")
+    fn_end = backup_src.index("cleanup() {")
+    lock_funcs = backup_src[fn_start:fn_end]
+    harness = f"""
+set -euo pipefail
+err() {{ echo "ERR: $*" >&2; }}
+warn() {{ echo "WARN: $*" >&2; }}
+LOCK_DIR={str(lock_test_dir / '.dalton-backup.lock')!r}
+LOCK_HELD=0
+{lock_funcs}
+printf() {{ : > "${{LOCK_DIR}}/pid"; return 1; }}
+acquire_publish_lock
+"""
+    res_fail = subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert res_fail.returncode != 0, "acquire_publish_lock must fail when PID write fails"
+    assert not (lock_test_dir / ".dalton-backup.lock").exists(), (
+        "Lock directory must be revoked when writing PID file fails"
+    )
+
+    # 2. End-to-end backup.sh recovers from an orphan lock containing an empty 0-byte PID file
+    fx = _build_r11_backup_fixture(tmp_path / "r2_empty_pid", project_name="dalton_r2_ep")
+    fx["clock_file"].write_text("15000.0", encoding="utf-8")
+    lock_f = tmp_path / "r2_empty_pid" / "ep.flock"
+    out_dir = tmp_path / "r2_empty_pid" / "out"
+    stale_lock = out_dir / ".dalton-backup.lock"
+    stale_lock.mkdir(parents=True, exist_ok=True)
+    (stale_lock / "pid").write_text("", encoding="utf-8")  # 0-byte empty PID file
+
+    res_ok = subprocess.run(
+        [
+            "bash",
+            str(fx["backup_script"]),
+            "--work-dir",
+            str(fx["work_dir"]),
+            "--output-dir",
+            str(out_dir),
+        ],
+        env={
+            **fx["env"],
+            "DALTON_WIKI_BACKUP_LOCK_FILE": str(lock_f),
+            "DALTON_WIKI_PAUSE_TTL_S": "300",
+            "DALTON_WIKI_PAUSE_HEARTBEAT_S": "60",
+            "DALTON_PUBLISH_LOCK_MISSING_PID_GRACE_S": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert res_ok.returncode == 0, f"backup.sh failed to recover from empty PID file: {res_ok.stderr}"
+    assert "empty/invalid PID file" in res_ok.stderr
+    assert not stale_lock.exists(), "Publish lock should be released after successful backup"
+    backups = [p for p in out_dir.iterdir() if p.is_dir() and p.name.startswith("dalton-backup-")]
+    assert len(backups) == 1, f"Expected 1 published backup after empty-PID lock recovery, got {backups}"
+
+

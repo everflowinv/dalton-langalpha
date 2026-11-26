@@ -168,34 +168,39 @@ const primary = await agent(
 
 phase('分簇取证')
 const clusters = (plan.clusters || []).slice(0, 6)
-/* DALTON_CAP:!researchdata_bridge,company_wiki|!researchdata_bridge,sales_notes|!researchdata_bridge,tmtb|!researchdata_bridge,funda_ai */const _INTERNAL_DIRECT_SERVERS = ['dalton_company_wiki', 'dalton_sales_notes', 'dalton_tmtb', 'dalton_funda_ai']
+/* DALTON_CAP:!researchdata_bridge,company_wiki|!researchdata_bridge,sales_notes|!researchdata_bridge,tmtb|!researchdata_bridge,funda_ai */const _hasLegacyBridgeTask = /* DALTON_CAP:researchdata_bridge */true || /* /DALTON_CAP */false
+const _INTERNAL_DIRECT_SERVERS = [/* DALTON_CAP:company_wiki */'dalton_company_wiki',/* /DALTON_CAP *//* DALTON_CAP:sales_notes */'dalton_sales_notes',/* /DALTON_CAP *//* DALTON_CAP:tmtb */'dalton_tmtb',/* /DALTON_CAP *//* DALTON_CAP:funda_ai */'dalton_funda_ai',/* /DALTON_CAP */]
 const _INTERNAL_FED_SERVERS = ['dalton_research_all']
 const _discoveredServers =
-  args.discovered_mcp_servers !== undefined
+  args.discovered_mcp_servers && typeof args.discovered_mcp_servers === 'object' && !Array.isArray(args.discovered_mcp_servers)
     ? args.discovered_mcp_servers
-    : args.mcp_servers !== undefined
-      ? args.mcp_servers
-      : null
+    : null
 const _hasUsableInternalServer = (cfg, names) => {
-  if (cfg === null || cfg === undefined) return true
-  if (Array.isArray(cfg)) return names.some((n) => cfg.includes(n))
-  if (typeof cfg !== 'object') return false
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return false
   return names.some((n) => {
     const entry = cfg[n]
-    if (!entry || entry === false) return false
-    if (typeof entry === 'object' && entry.enabled === false) return false
-    if (typeof entry === 'object' && Array.isArray(entry.tools)) {
-      return entry.tools.some((t) => {
-        const tn = typeof t === 'string' ? t : t && t.name
-        return tn === 'search' || tn === 'list' || tn === 'read' || tn === 'sales_mail'
-      })
-    }
-    return true
+    if (!entry || typeof entry !== 'object') return false
+    if (entry.enabled === false) return false
+    if (!Array.isArray(entry.tools) || entry.tools.length === 0) return false
+    return entry.tools.some((t) => {
+      const tn = typeof t === 'string' ? t : t && t.name
+      return tn === 'search' || tn === 'list' || tn === 'read'/* DALTON_CAP:sales_notes */ || tn === 'sales_mail'/* /DALTON_CAP */
+    })
   })
 }
+const _serverInternalDecision =
+  args.internal_memory_decision && typeof args.internal_memory_decision === 'object'
+    ? args.internal_memory_decision
+    : null
 const _directInternalOk = _hasUsableInternalServer(_discoveredServers, _INTERNAL_DIRECT_SERVERS)
-const _fedInternalFallback = !_directInternalOk && _hasUsableInternalServer(_discoveredServers, _INTERNAL_FED_SERVERS)
-const _runInternalBranch = _directInternalOk || _fedInternalFallback
+const _fedInternalFallback =
+  _serverInternalDecision && typeof _serverInternalDecision.run === 'boolean'
+    ? _serverInternalDecision.run && _serverInternalDecision.mode === 'federated'
+    : !_directInternalOk && _hasUsableInternalServer(_discoveredServers, _INTERNAL_FED_SERVERS)
+const _runInternalBranch =
+  _serverInternalDecision && typeof _serverInternalDecision.run === 'boolean'
+    ? _serverInternalDecision.run
+    : _directInternalOk || _fedInternalFallback
 /* /DALTON_CAP */const evTasks = [
   ...clusters.map((c, idx) => () => {
     const cid = c.id || `c${idx + 1}`
@@ -211,7 +216,7 @@ const _runInternalBranch = _directInternalOk || _fedInternalFallback
       `${base} 阶段 2 内部记忆检索：检索 researchdata 的 sales-notes、tmtb、funda-ai、company-wiki（只读），英文与中文结合，写 ${R}/internal-memory.md。`,
       { agentType: 'dalton-evidence', label: '内部记忆', phase: '分簇取证', schema: OUT }
     ),
-/* /DALTON_CAP *//* DALTON_CAP:!researchdata_bridge,company_wiki|!researchdata_bridge,sales_notes|!researchdata_bridge,tmtb|!researchdata_bridge,funda_ai */  ...(_runInternalBranch
+/* /DALTON_CAP *//* DALTON_CAP:!researchdata_bridge,company_wiki|!researchdata_bridge,sales_notes|!researchdata_bridge,tmtb|!researchdata_bridge,funda_ai */  ...(!_hasLegacyBridgeTask && _runInternalBranch
     ? [
         () =>
           agent(
@@ -242,9 +247,9 @@ const clusterNames = clusters.map((c, idx) => c.name || `簇 ${idx + 1}`)
 /* /DALTON_CAP */const primaryFile = `${R}/primary.md`
 const clusterOnDisk = clusters.map((_, i) => branchArtifacts(evResults[i]).length > 0)
 /* DALTON_CAP:researchdata_bridge|company_wiki|sales_notes|tmtb|funda_ai */let internalOnDisk = branchArtifacts(evResults[clusters.length]).length > 0
-/* /DALTON_CAP *//* DALTON_CAP:!researchdata_bridge,company_wiki|!researchdata_bridge,sales_notes|!researchdata_bridge,tmtb|!researchdata_bridge,funda_ai */internalOnDisk = _runInternalBranch ? branchArtifacts(evResults[clusters.length]).length > 0 : false
+/* /DALTON_CAP *//* DALTON_CAP:!researchdata_bridge,company_wiki|!researchdata_bridge,sales_notes|!researchdata_bridge,tmtb|!researchdata_bridge,funda_ai */if (!_hasLegacyBridgeTask) internalOnDisk = _runInternalBranch ? branchArtifacts(evResults[clusters.length]).length > 0 : false
 /* /DALTON_CAP *//* DALTON_CAP:guidepoint */let guidepointOnDisk = branchArtifacts(evResults[clusters.length + 1]).length > 0
-/* /DALTON_CAP *//* DALTON_CAP:!researchdata_bridge,guidepoint,company_wiki|!researchdata_bridge,guidepoint,sales_notes|!researchdata_bridge,guidepoint,tmtb|!researchdata_bridge,guidepoint,funda_ai */guidepointOnDisk = branchArtifacts(evResults[clusters.length + (_runInternalBranch ? 1 : 0)]).length > 0
+/* /DALTON_CAP *//* DALTON_CAP:!researchdata_bridge,guidepoint,company_wiki|!researchdata_bridge,guidepoint,sales_notes|!researchdata_bridge,guidepoint,tmtb|!researchdata_bridge,guidepoint,funda_ai */if (!_hasLegacyBridgeTask) guidepointOnDisk = branchArtifacts(evResults[clusters.length + (_runInternalBranch ? 1 : 0)]).length > 0
 /* /DALTON_CAP *//* DALTON_CAP:!researchdata_bridge,!company_wiki,!sales_notes,!tmtb,!funda_ai,guidepoint */guidepointOnDisk = branchArtifacts(evResults[clusters.length]).length > 0
 /* /DALTON_CAP */let primaryOnDisk = branchArtifacts(primary).length > 0
 // 缺失簇在核验前先按子任务回报算一遍（核验失败的出口要用），核验后再按在盘
@@ -298,7 +303,7 @@ const topicMissing = []
 if (!primaryOnDisk) topicMissing.push('一手材料')
 if (presentClusters < 3)
   topicMissing.push(`cluster-*.md 完整产物不足 3 个（现 ${presentClusters} 个）`)
-/* DALTON_CAP:researchdata_bridge|company_wiki|sales_notes|tmtb|funda_ai */if (/* DALTON_CAP:!researchdata_bridge */_runInternalBranch && /* /DALTON_CAP */!internalOnDisk) topicMissing.push('内部记忆检索')
+/* DALTON_CAP:researchdata_bridge|company_wiki|sales_notes|tmtb|funda_ai */if (/* DALTON_CAP:!researchdata_bridge */(_hasLegacyBridgeTask || _runInternalBranch) && /* /DALTON_CAP */!internalOnDisk) topicMissing.push('内部记忆检索')
 /* /DALTON_CAP *//* DALTON_CAP:guidepoint */if (!guidepointOnDisk) topicMissing.push('专家纪要检索')
 /* /DALTON_CAP */if (topicMissing.length) {
   return {

@@ -1154,20 +1154,17 @@ async def _latest_run_dir(
     return best_dir
 
 
-async def _run_args_as_of(
+async def _load_run_args(
     backend: Any, workflow: str, run_id: str | None, thread_id: str | None
-) -> str | None:
-    """The effective ``as_of`` recorded in this run's ``args.json``.
-
-    Resolution mirrors the run checks: the named run when ``run_id`` was
-    passed, else the thread's latest run of the same workflow. The date is
-    read, never recomputed — the launch path's trading-day default is what
-    the run's artifacts are keyed on. An unreadable record inherits nothing;
-    the missing-parameter check then names the gap honestly.
-    """
+) -> dict[str, Any] | None:
+    """Read the server-written ``args.json`` snapshot for this run, or None when unavailable."""
     dirs: list[str]
     if run_id:
-        dirs = [f"{_thread_prefix(thread_id)}{run_id}"]
+        if thread_id:
+            dirs = [f"{_thread_prefix(thread_id)}{run_id}"]
+        else:
+            matches = await _glob(backend, f".agents/threads/*/workflows/{run_id}/args.json")
+            dirs = [m.rsplit("/args.json", 1)[0] for m in (matches or [])]
     else:
         if not thread_id:
             return None
@@ -1184,12 +1181,75 @@ async def _run_args_as_of(
             doc = json.loads(text)
         except ValueError:
             continue
-        if not isinstance(doc, dict):
-            continue
-        as_of = doc.get("as_of")
-        if isinstance(as_of, str) and as_of.strip() and as_of.strip() != "latest":
-            return as_of.strip()
+        if isinstance(doc, dict):
+            return doc
     return None
+
+
+async def _run_args_as_of(
+    backend: Any, workflow: str, run_id: str | None, thread_id: str | None
+) -> str | None:
+    """The effective ``as_of`` recorded in this run's ``args.json``.
+
+    Resolution mirrors the run checks: the named run when ``run_id`` was
+    passed, else the thread's latest run of the same workflow. The date is
+    read, never recomputed — the launch path's trading-day default is what
+    the run's artifacts are keyed on. An unreadable record inherits nothing;
+    the missing-parameter check then names the gap honestly.
+    """
+    doc = await _load_run_args(backend, workflow, run_id, thread_id)
+    if not isinstance(doc, dict):
+        return None
+    as_of = doc.get("as_of")
+    if isinstance(as_of, str) and as_of.strip() and as_of.strip() != "latest":
+        return as_of.strip()
+    return None
+
+
+def _apply_run_internal_memory_decision(
+    contract: dict[str, Any],
+    run_args: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Align `topic-research` contract with the server-recorded launch decision in `args.json`."""
+    if contract.get("name") != "topic-research" or not isinstance(run_args, dict):
+        return contract
+    skip_internal = False
+    decision = run_args.get("internal_memory_decision")
+    if isinstance(decision, dict) and isinstance(decision.get("run"), bool):
+        skip_internal = not decision["run"]
+    else:
+        from src.dalton.capabilities import CapabilityId, effective_capabilities
+        from src.dalton.content_assembly import decide_topic_research_internal_memory
+
+        active_caps = effective_capabilities()
+        discovered = run_args.get("discovered_mcp_servers")
+        if (
+            CapabilityId.RESEARCHDATA_BRIDGE not in active_caps
+            and isinstance(discovered, dict)
+        ):
+            inferred = decide_topic_research_internal_memory(discovered, active_caps)
+            skip_internal = not inferred["run"]
+    if not skip_internal:
+        return contract
+
+    pruned = dict(contract)
+    new_stages = []
+    for stage in contract.get("stages") or []:
+        if isinstance(stage, dict) and isinstance(stage.get("artifacts"), list):
+            stage_copy = dict(stage)
+            stage_copy["artifacts"] = [
+                art
+                for art in stage["artifacts"]
+                if not (
+                    isinstance(art, dict)
+                    and str(art.get("path") or "").endswith("/internal-memory.md")
+                )
+            ]
+            new_stages.append(stage_copy)
+        else:
+            new_stages.append(stage)
+    pruned["stages"] = new_stages
+    return pruned
 
 
 async def _review_records_from_journals(
@@ -3790,6 +3850,15 @@ async def run_check_done(
 
     try:
         contract = load_contract(workflow)
+        run_args = (
+            await _load_run_args(backend, workflow, run_id, thread_id)
+            if backend is not None
+            else None
+        )
+        # Honor the same server-recorded internal-memory decision written to
+        # `args.json` at workflow launch, so skipping internal-memory retrieval
+        # when no workspace connector was discovered does not fail check_done.
+        contract = _apply_run_internal_memory_decision(contract, run_args)
         # The launch path resolves ``as_of`` to a concrete trading day before
         # the script runs; the closing check inherits that effective date from
         # the run's own ``args.json`` so the caller's original params (which
@@ -3802,7 +3871,14 @@ async def run_check_done(
                 and current.strip()
                 and current.strip() != "latest"
             ):
-                inherited = await _run_args_as_of(backend, workflow, run_id, thread_id)
+                inherited = (
+                    run_args.get("as_of").strip()
+                    if isinstance(run_args, dict)
+                    and isinstance(run_args.get("as_of"), str)
+                    and run_args.get("as_of").strip()
+                    and run_args.get("as_of").strip() != "latest"
+                    else None
+                )
                 if inherited:
                     params = {**params, "as_of": inherited}
         gap_params = missing_params(contract, params)

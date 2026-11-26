@@ -3715,11 +3715,27 @@ async def test_bz3_discovered_tool_selection_unimportable_wrapper_health_missing
     monkeypatch.delitem(sys.modules, "tools.dalton_company_wiki", raising=False)
     monkeypatch.setitem(sys.modules, "tools", type(sys)("tools"))
 
-    def _fake_mcp_call(server: str, tool: str, args: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
-        return (False, {"ok": True, "server": server, "tool": tool, "args": args})
+    from ptc_agent.core.sandbox import mcp_client_runtime
+
+    fake_mcp_call = create_autospec(
+        mcp_client_runtime.call_mcp_tool_with_error_flag,
+        side_effect=lambda server_name, tool_name, arguments: (
+            False,
+            {"ok": True, "server": server_name, "tool": tool_name, "args": arguments},
+        ),
+    )
+    fake_legacy_call = create_autospec(
+        mcp_client_runtime._call_mcp_tool,
+        side_effect=lambda server_name, tool_name, arguments: {
+            "ok": True,
+            "server": server_name,
+            "tool": tool_name,
+            "args": arguments,
+        },
+    )
 
     fake_mcp_flagged = type(sys)("mcp_client")
-    fake_mcp_flagged.call_mcp_tool_with_error_flag = _fake_mcp_call  # type: ignore[attr-defined]
+    fake_mcp_flagged.call_mcp_tool_with_error_flag = fake_mcp_call  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "mcp_client", fake_mcp_flagged)
 
     assert ct_mod.server_supports_tool(
@@ -3754,7 +3770,7 @@ async def test_bz3_discovered_tool_selection_unimportable_wrapper_health_missing
     monkeypatch.setitem(sys.modules, "mcp_client", fake_mcp_unflagged)
     fake_tools_pkg = type(sys)("tools")
     fake_rd = type(sys)("tools.researchdata")
-    fake_rd._call_mcp_tool = _fake_mcp_call  # type: ignore[attr-defined]
+    fake_rd._call_mcp_tool = fake_legacy_call  # type: ignore[attr-defined]
     fake_tools_pkg.researchdata = fake_rd  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "tools", fake_tools_pkg)
     monkeypatch.setitem(sys.modules, "tools.researchdata", fake_rd)
@@ -3811,15 +3827,24 @@ async def test_bz3_discovered_tool_selection_unimportable_wrapper_health_missing
     compile_check(wf_core_empty_tools)
 
     # 3c. Post-cutover Everflow (RESEARCHDATA_BRIDGE + COMPANY_WIKI + DALTON_RESEARCH_HOST_URL),
-    #     but workspace only discovered `researchdata` (no dedicated connector) -> keeps researchdata fallback!
+    #     workspace only discovered `researchdata` with `research` tool (no dedicated connector) -> keeps researchdata fallback!
     _clean_profile_env(monkeypatch, profile="everflow")
     monkeypatch.setenv("DALTON_RESEARCH_HOST_URL", "http://host.docker.internal:8951")
     wf_ef_fallback = read_assembled_text(
         wf_path,
-        discovered_servers={"researchdata": {"enabled": True}},
+        discovered_servers={"researchdata": {"enabled": True, "tools": ["research"]}},
     )
     assert "检索 researchdata 的 sales-notes、tmtb、funda-ai、company-wiki（只读）" in wf_ef_fallback
     compile_check(wf_ef_fallback)
+
+    # 3d. Name + enabled WITHOUT `tools` is NOT usable (in content_assembly and in workflow.js)
+    wf_core_name_only = read_assembled_text(
+        wf_path,
+        capabilities=frozenset({CapabilityId.COMPANY_WIKI}),
+        discovered_servers={"dalton_company_wiki": {"enabled": True}},
+    )
+    assert "internal-memory.md" not in wf_core_name_only
+    compile_check(wf_core_name_only)
 
     # 4. workflows/topic-research/workflow.js runtime: prebuilt Core workflow (assembled from deployment caps only)
     #    checks args.discovered_mcp_servers at runtime so missing connectors don't hard-block at line 265!
@@ -3913,3 +3938,396 @@ async def test_bz3_discovered_tool_selection_unimportable_wrapper_health_missing
     )
     assert res_blk["ok"] is False
     assert "内部记忆检索" in str(res_blk.get("blocked") or "")
+
+    # 4d. Direct server has only {enabled: true} (no tools), federated `dalton_research_all` has `search`
+    #     -> direct server MUST NOT suppress federated fallback!
+    res_name_only_fb, disp_name_only_fb = await _run_topic(
+        wf_core_prebuilt,
+        {
+            "discovered_mcp_servers": {
+                "dalton_company_wiki": {"enabled": True},
+                "dalton_research_all": {"enabled": True, "tools": ["search"]},
+            }
+        },
+    )
+    assert res_name_only_fb["ok"] is True, res_name_only_fb
+    fb_prompts = [p for lbl, p in disp_name_only_fb if lbl == "内部记忆"]
+    assert fb_prompts and "dalton_research_all" in fb_prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_r2_workflow_server_discovery_overwrites_caller_and_aligns_check_done(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2 items 2, 3 & 5:
+    - Core default capabilities (`COMPANY_WIKI`) assemble `topic-research/workflow.js` without proprietary names.
+    - `resolve_launch_discovered_mcp_servers` builds minimal tools strictly from server `mcp_registry`,
+      overwrites caller `discovered_mcp_servers`/`mcp_servers`/`internal_memory_decision`, rejects
+      tool-less servers, and explicitly falls back on discovery error.
+    - `dalton_check_done` honors the same server-recorded decision from `args.json` (and ignores caller spoofing).
+    """
+    from ptc_agent.core.mcp_registry import MCPRegistry, MCPToolInfo
+    from src.dalton.capabilities import effective_capabilities
+    from src.dalton.content_assembly import (
+        read_assembled_text,
+        resolve_launch_discovered_mcp_servers,
+    )
+    from src.dalton.tools.check_done_tools import run_check_done
+
+    _clean_profile_env(monkeypatch, profile="core")
+    core_caps = effective_capabilities()
+    assert core_caps == frozenset({CapabilityId.COMPANY_WIKI})
+
+    # Item 5: Core default assembled workflow.js has zero proprietary connector names
+    wf_js = read_assembled_text(
+        REPO_ROOT / "workflows" / "topic-research" / "workflow.js",
+        capabilities=core_caps,
+    )
+    assert "dalton_company_wiki" in wf_js
+    for banned in ("dalton_tmtb", "tmtb", "dalton_sales_notes", "dalton_funda_ai", "sales_mail"):
+        assert banned not in wf_js.lower(), f"Core default workflow.js leaked {banned!r}"
+
+    # Item 2a: Server discovery overwrites caller-supplied discovered_mcp_servers / mcp_servers / decision
+    reg_empty = create_autospec(MCPRegistry, instance=True)
+    reg_empty.config = None
+    reg_empty.get_all_tools.return_value = {
+        "dalton_company_wiki": [],  # enabled name with zero tools -> NOT usable
+        "dalton_sec": [MCPToolInfo(name="search_filings", description="sec", input_schema={}, server_name="dalton_sec")],
+    }
+    spoofed_params = {
+        "topic": "AI Capex",
+        "slug": "ai",
+        "workspace_dir": ".",
+        "as_of": "2026-11-26",
+        "discovered_mcp_servers": {"dalton_company_wiki": {"enabled": True, "tools": ["search"]}},
+        "mcp_servers": {"dalton_company_wiki": {"enabled": True, "tools": ["search"]}},
+        "internal_memory_decision": {"run": True, "mode": "direct"},
+    }
+    resolved_skip = await resolve_launch_discovered_mcp_servers(
+        None, "topic-research", spoofed_params, mcp_registry=reg_empty
+    )
+    assert "mcp_servers" not in resolved_skip
+    assert "dalton_company_wiki" not in resolved_skip["discovered_mcp_servers"]
+    assert resolved_skip["discovered_mcp_servers"] == {"dalton_sec": {"enabled": True, "tools": ["search_filings"]}}
+    assert resolved_skip["internal_memory_decision"] == {
+        "run": False,
+        "mode": "skip",
+        "discovery_status": "ok",
+    }
+
+    # Item 2b: Discovery exception -> explicit fallback (empty servers, skip internal memory, status="error")
+    reg_err = create_autospec(MCPRegistry, instance=True)
+    reg_err.config = None
+    reg_err.get_all_tools.side_effect = RuntimeError("registry broken")
+    resolved_err = await resolve_launch_discovered_mcp_servers(
+        None, "topic-research", spoofed_params, mcp_registry=reg_err
+    )
+    assert resolved_err["discovered_mcp_servers"] == {}
+    assert resolved_err["internal_memory_decision"] == {
+        "run": False,
+        "mode": "skip",
+        "discovery_status": "error",
+    }
+
+    # Item 2c: Direct connector empty, federated connector usable -> explicit federated fallback
+    reg_fed = create_autospec(MCPRegistry, instance=True)
+    reg_fed.config = None
+    reg_fed.get_all_tools.return_value = {
+        "dalton_company_wiki": [],
+        "dalton_research_all": [MCPToolInfo(name="search", description="s", input_schema={}, server_name="dalton_research_all")],
+    }
+    resolved_fed = await resolve_launch_discovered_mcp_servers(
+        None, "topic-research", {"topic": "AI", "slug": "ai", "workspace_dir": "."}, mcp_registry=reg_fed
+    )
+    assert resolved_fed["internal_memory_decision"] == {
+        "run": True,
+        "mode": "federated",
+        "discovery_status": "ok",
+    }
+
+    # Item 3: dalton_check_done uses the SAME server-recorded decision from args.json
+    # Build a minimal backend exposing files for topic-research WITHOUT internal-memory.md
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+
+    files_map: dict[str, str] = {
+        ".agents/threads/th123456/workflows/wf-skip/args.json": json.dumps(resolved_skip, ensure_ascii=False),
+        ".agents/threads/th123456/workflows/wf-run/args.json": json.dumps(resolved_fed, ensure_ascii=False),
+        "research/2026-11-26-topic-ai/plan.md": "p" * 120,
+        "research/2026-11-26-topic-ai/primary.md": "p" * 120,
+        "research/2026-11-26-topic-ai/cluster-a.md": "c" * 120,
+        "research/2026-11-26-topic-ai/cluster-b.md": "c" * 120,
+        "research/2026-11-26-topic-ai/cluster-c.md": "c" * 120,
+        "research/2026-11-26-topic-ai/cross-check.md": ("x" * 120) + "\n盲区检查完成\n",
+        "research/2026-11-26-topic-ai/number-audit.md": "n" * 80,
+        "research/2026-11-26-topic-ai/knowledge-revision.json": json.dumps({"ok": True, "pad": "x" * 50}),
+        "drafts/2026-11-26-topic-ai.md": "d" * 600,
+    }
+    backend = create_autospec(SandboxBackend, instance=True)
+    backend.workspace_dir = None
+
+    async def _fake_aread(path: str) -> str | None:
+        norm = path[2:] if path.startswith("./") else path.lstrip("/")
+        return files_map.get(norm)
+
+    async def _fake_aglob(pattern: str, _root: str = ".") -> list[str]:
+        import fnmatch
+
+        return sorted(k for k in files_map if fnmatch.fnmatch(k, pattern))
+
+    backend.aread_text.side_effect = _fake_aread
+    backend.aglob_paths.side_effect = _fake_aglob
+    backend.aexecute = None
+
+    check_skip = await run_check_done(
+        workflow="topic-research",
+        params={"topic": "AI Capex", "slug": "ai", "workspace_dir": ".", "as_of": "2026-11-26"},
+        backend=backend,
+        workspace_id=None,
+        run_id="wf-skip",
+        thread_id="th123456-full",
+    )
+    assert not any("internal-memory.md" in m for m in check_skip["missing"]), check_skip["missing"]
+
+    # Negative: when args.json recorded run=True, caller CANNOT spoof params to skip internal-memory.md
+    check_run = await run_check_done(
+        workflow="topic-research",
+        params={
+            "topic": "AI Capex",
+            "slug": "ai",
+            "workspace_dir": ".",
+            "as_of": "2026-11-26",
+            "internal_memory_decision": {"run": False, "mode": "skip"},
+        },
+        backend=backend,
+        workspace_id=None,
+        run_id="wf-run",
+        thread_id="th123456-full",
+    )
+    assert any("internal-memory.md" in m for m in check_run["missing"]), check_run["missing"]
+
+
+@pytest.mark.asyncio
+async def test_r2_sales_notes_streamed_search_tmtb_keyword_default_and_embedding_retry_backfill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2 items 4 & 7:
+    - TMTB keeps default `keyword` search (never invokes query embedding unless explicitly requested).
+    - Sales-notes hybrid search avoids `SELECT *` and never loads full-table embedding BLOBs on keyword pass;
+      semantic pass only selects `(id, doc_key, embedding)` filtered to `embedding IS NOT NULL`.
+    - Embedding calls never use global `contextlib.redirect_stdout`.
+    - Transient embedding failure during ingest marks `embedding_pending=True`; retrying with same `request_id`
+      after recovery backfills `email_chunks.embedding` so semantic search immediately finds the note.
+    """
+    import numpy as np
+
+    _, lib_mod = _load_commercial_connectors()
+    store = lib_mod.MarketDigestPartitionStore(tmp_path / "sn_r2")
+    store.ensure_schema()
+
+    def _vec(text: str) -> list[float]:
+        low = text.lower()
+        if any(k in low for k in ("cowos", "gpu", "accelerator")):
+            return [1.0, 0.0, 0.0, 0.0]
+        return [0.0, 1.0, 0.0, 0.0]
+
+    md_cli = store._library().module("sales-notes")
+    fail_once = {"fail": True}
+
+    def _flaky_embed_texts(texts: list[str], config: dict[str, Any]) -> list[list[float]]:
+        if fail_once["fail"]:
+            fail_once["fail"] = False
+            raise RuntimeError("transient 503 embedding outage")
+        return [_vec(t) for t in texts]
+
+    spy_texts = create_autospec(md_cli.embed_texts, side_effect=_flaky_embed_texts)
+    spy_query = create_autospec(md_cli.embed_query, side_effect=lambda q, c: _vec(q))
+    monkeypatch.setattr(md_cli, "embed_texts", spy_texts)
+    monkeypatch.setattr(md_cli, "embed_query", spy_query)
+    orig_lib = store._library
+
+    def _patched_lib() -> Any:
+        lib = orig_lib()
+        lib._modules["market-digest"] = md_cli
+        return lib
+
+    monkeypatch.setattr(store, "_library", _patched_lib)
+
+    # Seed one TMTB row + one unindexed sales-note row
+    with sqlite3.connect(store.mail_db) as conn:
+        conn.execute(
+            "INSERT INTO email_chunks (date, email_id, message_id, sender, subject, chunk_index, content, embedding, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("2026-11-20", "ae-1", "alphaengine:doc1", "TMTB", "Cloud Capex", 0, "Hyperscaler capex rising", None, "2026-11-20T00:00:00Z"),
+        )
+        conn.commit()
+
+    # 1. TMTB search defaults to keyword -> zero embed_query calls!
+    tmtb_conn = lib_mod.TmtbConnector(store)
+    tm_res = await tmtb_conn.call_tool(
+        "search",
+        {"query": "Hyperscaler", "limit": 5},
+        active_caps=frozenset({CapabilityId.TMTB}),
+    )
+    assert tm_res["ok"] is True and len(tm_res["results"]) == 1
+    assert spy_query.call_count == 0, "TMTB default search must stay keyword and not invoke embed_query"
+
+    # 2. Item 7: Attempt 1 embedding fails -> records embedding_pending=True, NOT permanently lost!
+    note_payload = {
+        "request_id": "r2-emb-retry-1",
+        "institution": "Goldman Sachs",
+        "title": "Foundry Supply Check",
+        "date": "2026-11-25",
+        "content": "CoWoS wafer capacity expanding sharply.",
+    }
+    code1, res1 = await store.ingest_sales_note(note_payload)
+    assert code1 == 200 and res1["ok"] is True
+    assert res1["embedding_indexed"] is False
+    assert res1["embedding_pending"] is True
+
+    # Retry with same request_id once embedding recovers -> backfills vectors!
+    code2, res2 = await store.ingest_sales_note(note_payload)
+    assert code2 == 200 and res2["ok"] is True
+    assert res2["idempotent_replay"] is True
+    assert res2["embedding_indexed"] is True
+    assert res2["embedding_pending"] is False
+    assert res2.get("embedding_backfilled") is True
+
+    # Verify DB now holds the embedding and semantic-only query ("GPU") finds the note!
+    with sqlite3.connect(store.mail_db) as conn:
+        emb = conn.execute("SELECT embedding FROM email_chunks WHERE message_id = ?", (res2["doc_key"],)).fetchone()[0]
+    assert emb is not None and np.allclose(np.frombuffer(emb, dtype=np.float32), [1.0, 0.0, 0.0, 0.0])
+
+    # 3. Item 4: Trace SQL executed during sales-notes hybrid search -> zero `SELECT *`,
+    #    semantic query selects only minimal columns with `embedding IS NOT NULL`!
+    traced_sql: list[str] = []
+    orig_readonly = lib_mod.research_library_mod.readonly
+
+    import contextlib as _cl
+
+    @_cl.contextmanager
+    def _tracing_readonly(path: Path) -> Any:
+        with orig_readonly(path) as c:
+            c.set_trace_callback(traced_sql.append)
+            yield c
+
+    monkeypatch.setattr(lib_mod.research_library_mod, "readonly", _tracing_readonly)
+    sales_conn = lib_mod.SalesNotesConnector(store)
+    sem_hit = await sales_conn.call_tool(
+        "search",
+        {"query": "GPU", "limit": 5},
+        active_caps=frozenset({CapabilityId.SALES_NOTES}),
+    )
+    assert sem_hit["ok"] is True
+    assert any(r["original_document_id"] == res2["doc_key"] for r in sem_hit["results"])
+    assert traced_sql, "Expected SQL trace statements"
+    assert not any("SELECT *" in q.upper() for q in traced_sql), f"Must never run SELECT *: {traced_sql}"
+    emb_queries = [q for q in traced_sql if "embedding" in q.lower() and "count(" not in q.lower()]
+    assert emb_queries, f"Expected semantic embedding query in {traced_sql}"
+    for q in emb_queries:
+        assert "embedding is not null" in q.lower(), f"Semantic query must filter non-NULL embeddings: {q}"
+        assert "content" not in q.lower(), f"Semantic vector scan must not fetch content column: {q}"
+
+
+@pytest.mark.asyncio
+async def test_r2_shared_image_asset_rollback_preserves_concurrently_referenced_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2 item 6: Exclusive image asset creation + images_db write-lock cleanup on rollback.
+
+    When Wiki creates a shared image file and rolls back while Sales Notes concurrently commits
+    a `refs` row pointing to that same image SHA, Wiki's rollback MUST NOT delete the file.
+    When zero `refs` remain, rollback cleans up the newly created file.
+    """
+    from src.dalton.research_host.wiki_store import OpenWikiStore
+
+    _, lib_mod = _load_commercial_connectors()
+    data_root = tmp_path / "shared_img_r2"
+    wiki = OpenWikiStore(data_root)
+    sn_store = lib_mod.MarketDigestPartitionStore(data_root)
+    wiki.ensure_schema()
+    sn_store.ensure_schema()
+
+    png_bytes = _make_minimal_png_bytes()
+    _, _, _, sha, _, asset_abs = wiki._prepare_image_asset(image_bytes=png_bytes, suffix=".png")
+
+    # 1. Exclusive creation: first writer returns True, second returns False
+    assert wiki._persist_image_asset_file(asset_abs, png_bytes) is True
+    assert wiki._persist_image_asset_file(asset_abs, png_bytes) is False
+    asset_abs.unlink()
+
+    # 2. Simulate Wiki rollback after Sales Notes concurrently commits a reference to the same SHA:
+    #    Inject failure when Wiki writes the final markdown file (after asset_abs was created),
+    #    and hook `_cleanup_unreferenced_image_asset` to first let Sales Notes commit a ref for `sha`!
+    orig_cleanup = wiki._cleanup_unreferenced_image_asset
+    cleanup_results: list[bool] = []
+
+    def _race_cleanup(path_arg: Path, sha_arg: str) -> bool:
+        # Simulate Sales Notes committing its reference between Wiki's ROLLBACK and Wiki's cleanup
+        wiki.register_image_asset(
+            image_bytes=png_bytes,
+            suffix=".png",
+            source="sales-notes",
+            doc_key="sn-concurrent-1",
+            title="Concurrent Sales Note Chart",
+            doc_date="2026-11-25",
+            metadata={"caption": "concurrent"},
+            created_at="2026-11-25T10:00:00Z",
+            write_asset_file=False,
+        )
+        deleted = orig_cleanup(path_arg, sha_arg)
+        cleanup_results.append(deleted)
+        return deleted
+
+    monkeypatch.setattr(wiki, "_cleanup_unreferenced_image_asset", _race_cleanup)
+
+    real_os_open = os.open
+
+    def _fail_md_open(path: Any, flags: int, mode: int = 0o777) -> int:
+        if str(path).endswith(".md"):
+            raise OSError("simulated markdown disk failure")
+        return real_os_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", _fail_md_open)
+    with pytest.raises(OSError, match="simulated markdown disk failure"):
+        await wiki.ingest(
+            {
+                "request_id": "wiki-race-1",
+                "target_type": "company",
+                "target": "NVDA",
+                "content_type": "memo",
+                "date": "2026-11-25",
+                "file": {
+                    "filename": "shared_chart.png",
+                    "content_b64": base64.b64encode(png_bytes).decode("ascii"),
+                },
+            }
+        )
+    monkeypatch.setattr(os, "open", real_os_open)
+
+    assert cleanup_results == [False], "Rollback must NOT unlink asset still referenced by Sales Notes"
+    assert asset_abs.is_file(), "Shared image file referenced by Sales Notes was erroneously deleted!"
+
+    # 3. Contrast: unreferenced image asset IS cleaned up on rollback
+    png_orphan = _make_minimal_png_bytes() + b"\x00orphan"
+    _, _, _, _, _, orphan_abs = wiki._prepare_image_asset(image_bytes=png_orphan, suffix=".png")
+    monkeypatch.setattr(wiki, "_cleanup_unreferenced_image_asset", orig_cleanup)
+    monkeypatch.setattr(os, "open", _fail_md_open)
+    with pytest.raises(OSError, match="simulated markdown disk failure"):
+        await wiki.ingest(
+            {
+                "request_id": "wiki-orphan-1",
+                "target_type": "company",
+                "target": "NVDA",
+                "content_type": "memo",
+                "date": "2026-11-25",
+                "file": {
+                    "filename": "orphan_chart.png",
+                    "content_b64": base64.b64encode(png_orphan).decode("ascii"),
+                },
+            }
+        )
+    monkeypatch.setattr(os, "open", real_os_open)
+    assert not orphan_abs.exists(), "Unreferenced newly created image asset should be removed on rollback"

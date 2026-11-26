@@ -410,6 +410,9 @@ WIKI_LOCK_CTL_FIFO=""
 WIKI_LOCK_STATUS_FILE=""
 WIKI_LOCK_ERR_FILE=""
 WIKI_WRITES_PAUSED=0
+WIKI_PAUSE_PENDING=0
+WIKI_PAUSE_CMD_PID=""
+WIKI_PAUSE_LEASE_TMP=""
 WIKI_PAUSE_PORT="8951"
 WIKI_PAUSE_ADMIN_TOKEN=""
 WIKI_PAUSE_OWNER="${BACKUP_NAME}-pid$$"
@@ -469,7 +472,8 @@ WIKI_HEARTBEAT_FAILED_FILE=""
 run_with_timeout_pg() {
   local timeout_s="$1"
   shift
-  python3 - "$timeout_s" "$@" <<'PY'
+  local py_src=""
+  IFS= read -r -d '' py_src <<'PY' || true
 import errno, os, select, signal, subprocess, sys, time
 
 timeout_s = max(0.05, float(sys.argv[1]))
@@ -602,6 +606,10 @@ if chunks:
     sys.stdout.buffer.flush()
 sys.exit(rc)
 PY
+  if [[ "${RUN_WITH_TIMEOUT_PG_EXEC:-0}" -eq 1 ]]; then
+    exec python3 -c "$py_src" "$timeout_s" "$@"
+  fi
+  python3 -c "$py_src" "$timeout_s" "$@"
 }
 
 _kill_lock_helper_and_reap() {
@@ -1108,6 +1116,61 @@ resume_wiki_writes() {
   return 0
 }
 
+probe_and_resume_pending_wiki_pause() {
+  if [[ "$WIKI_PAUSE_PENDING" -ne 1 || "$WIKI_WRITES_PAUSED" -eq 1 || -z "$WIKI_PAUSE_ADMIN_TOKEN" ]]; then
+    return 0
+  fi
+  if [[ -n "$WIKI_PAUSE_CMD_PID" ]]; then
+    kill -TERM "$WIKI_PAUSE_CMD_PID" 2>/dev/null || true
+    wait "$WIKI_PAUSE_CMD_PID" 2>/dev/null || true
+    WIKI_PAUSE_CMD_PID=""
+  fi
+  if [[ -n "$WIKI_PAUSE_LEASE_TMP" ]]; then
+    rm -f "$WIKI_PAUSE_LEASE_TMP" 2>/dev/null || true
+    WIKI_PAUSE_LEASE_TMP=""
+  fi
+  local local_probe_sh='body="$(curl -sf --connect-timeout "${DALTON_RH_CURL_TIMEOUT_S}" --max-time "${DALTON_RH_CURL_TIMEOUT_S}" -H "Authorization: Bearer ${DALTON_RH_ADMIN_TOKEN}" "$1/admin/wiki/pause-writes")" || exit 1; printf "%s" "$body" | python3 -c "import json,os,sys; d=json.loads(sys.stdin.read()); lid=d.get(\"lease_id\") if isinstance(d, dict) else None; ok=isinstance(d, dict) and d.get(\"paused\") is True and str(d.get(\"owner\") or \"\") == os.environ[\"DALTON_RH_PROBE_OWNER\"] and isinstance(lid, int) and lid > 0; print(lid if ok else \"NONE\")"'
+  local probe_deadline_s probe_step_cap_s recovered_lease_id="" rem_probe_s probe_step_s probe_out probe_rc probe_sleep_s
+  probe_deadline_s="$(exec 8>&- 9>&-; python3 -c 'import sys, time; print(f"{time.monotonic() + max(0.05, float(sys.argv[1])):.6f}")' "$WIKI_PAUSE_RECOVERY_TIMEOUT_S")"
+  probe_step_cap_s="$(exec 8>&- 9>&-; python3 -c 'import sys; exec_t=float(sys.argv[1]); total_t=max(0.05, float(sys.argv[2])); print(f"{max(0.05, min(exec_t, total_t / 3.0)):.6f}")' "$WIKI_EXEC_TIMEOUT_S" "$WIKI_PAUSE_RECOVERY_TIMEOUT_S")"
+  while true; do
+    rem_probe_s="$(exec 8>&- 9>&-; python3 -c 'import sys, time; print(f"{max(0.0, float(sys.argv[1]) - time.monotonic()):.6f}")' "$probe_deadline_s")"
+    if [[ "$rem_probe_s" == "0.000000" ]]; then
+      break
+    fi
+    probe_step_s="$(exec 8>&- 9>&-; python3 -c 'import sys; print(f"{max(0.05, min(float(sys.argv[1]), float(sys.argv[2]))):.6f}")' "$probe_step_cap_s" "$rem_probe_s")"
+    set +e
+    probe_out="$(exec 8>&- 9>&-; \
+      DALTON_RH_ADMIN_TOKEN="$WIKI_PAUSE_ADMIN_TOKEN" \
+      DALTON_RH_PROBE_OWNER="$WIKI_PAUSE_OWNER" \
+      DALTON_RH_CURL_TIMEOUT_S="$probe_step_s" \
+      run_with_timeout_pg "$probe_step_s" \
+        env "${ENV_UNSET_ARGS[@]}" docker compose -p "$PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" --project-directory "$WORK_DIR" \
+        exec -T -e DALTON_RH_ADMIN_TOKEN -e DALTON_RH_PROBE_OWNER -e DALTON_RH_CURL_TIMEOUT_S \
+        research-host sh -c "$local_probe_sh" _ "http://127.0.0.1:${WIKI_PAUSE_PORT}" 2>/dev/null)"
+    probe_rc=$?
+    set -e
+    if [[ "$probe_rc" -eq 0 && "$probe_out" =~ ^[0-9]+$ ]]; then
+      recovered_lease_id="$probe_out"
+      break
+    fi
+    rem_probe_s="$(exec 8>&- 9>&-; python3 -c 'import sys, time; print(f"{max(0.0, float(sys.argv[1]) - time.monotonic()):.6f}")' "$probe_deadline_s")"
+    if [[ "$rem_probe_s" == "0.000000" ]]; then
+      break
+    fi
+    probe_sleep_s="$(exec 8>&- 9>&-; python3 -c 'import sys; print(f"{min(float(sys.argv[1]), float(sys.argv[2])):.6f}")' "$WIKI_PAUSE_RECOVERY_POLL_S" "$rem_probe_s")"
+    sleep "$probe_sleep_s" 8>&- 9>&-
+  done
+  WIKI_PAUSE_PENDING=0
+  if [[ "$recovered_lease_id" =~ ^[0-9]+$ ]]; then
+    warn "Pause request outcome was ambiguous, but research-host confirmed owner=${WIKI_PAUSE_OWNER} holds active lease ${recovered_lease_id}; resuming Wiki writes before exiting..."
+    WIKI_PAUSE_LEASE_ID="$recovered_lease_id"
+    WIKI_WRITES_PAUSED=1
+    resume_wiki_writes || return 1
+  fi
+  return 0
+}
+
 pid_is_alive() {
   local pid="$1"
   [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 1
@@ -1123,6 +1186,10 @@ pid_is_alive() {
 acquire_publish_lock() {
   local waited=0
   local missing_pid_waited=0
+  local missing_pid_grace="${DALTON_PUBLISH_LOCK_MISSING_PID_GRACE_S:-5}"
+  if [[ ! "$missing_pid_grace" =~ ^[1-9][0-9]*$ ]]; then
+    missing_pid_grace=5
+  fi
   while ! mkdir "$LOCK_DIR" 2>/dev/null; do
     local pid_file="${LOCK_DIR}/pid"
     if [[ -f "$pid_file" ]]; then
@@ -1136,10 +1203,19 @@ acquire_publish_lock() {
           continue
         fi
         missing_pid_waited=0
+      else
+        missing_pid_waited=$(( missing_pid_waited + 1 ))
+        if (( missing_pid_waited >= missing_pid_grace )); then
+          warn "Removing stale backup lock ${LOCK_DIR} (empty/invalid PID file)."
+          rm -f "$pid_file" 2>/dev/null || true
+          rmdir "$LOCK_DIR" 2>/dev/null || true
+          missing_pid_waited=0
+          continue
+        fi
       fi
     else
       missing_pid_waited=$(( missing_pid_waited + 1 ))
-      if (( missing_pid_waited >= 5 )); then
+      if (( missing_pid_waited >= missing_pid_grace )); then
         warn "Removing stale backup lock ${LOCK_DIR} (missing PID file)."
         rmdir "$LOCK_DIR" 2>/dev/null || true
         missing_pid_waited=0
@@ -1153,8 +1229,14 @@ acquire_publish_lock() {
     sleep 1
     waited=$(( waited + 1 ))
   done
-  printf '%s\n' "$$" > "${LOCK_DIR}/pid"
   LOCK_HELD=1
+  if ! printf '%s\n' "$$" > "${LOCK_DIR}/pid" 2>/dev/null || [[ "$(tr -d '[:space:]' < "${LOCK_DIR}/pid" 2>/dev/null || true)" != "$$" ]]; then
+    err "Failed to write PID file for backup publish lock: ${LOCK_DIR}/pid"
+    rm -f "${LOCK_DIR}/pid" 2>/dev/null || true
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    LOCK_HELD=0
+    exit 1
+  fi
 }
 
 release_publish_lock() {
@@ -1172,13 +1254,21 @@ release_publish_lock() {
 }
 
 cleanup() {
+  trap '' INT TERM
+  probe_and_resume_pending_wiki_pause || true
   resume_wiki_writes || true
   release_wiki_backup_lock
   release_publish_lock
+  if [[ -n "$WIKI_PAUSE_LEASE_TMP" ]]; then
+    rm -f "$WIKI_PAUSE_LEASE_TMP" 2>/dev/null || true
+    WIKI_PAUSE_LEASE_TMP=""
+  fi
   if [[ -d "$STAGE_DIR" ]]; then
     rm -rf "$STAGE_DIR"
   fi
 }
+trap 'exit 130' INT
+trap 'exit 143' TERM
 trap cleanup EXIT
 
 info "Starting zero-downtime backup into ${FINAL_DIR}..."
@@ -1749,8 +1839,12 @@ finally:
     fi
     info "Pausing Wiki writes on research-host (owner=${WIKI_PAUSE_OWNER}, ttl=${WIKI_PAUSE_TTL_S}s, heartbeat=${WIKI_PAUSE_HEARTBEAT_S}s) and waiting for in-flight writes to drain..."
     local_pause_sh='payload="$(python3 -c "import json,os; print(json.dumps({\"paused\": True, \"owner\": os.environ[\"DALTON_RH_PAUSE_OWNER\"], \"ttl_s\": float(os.environ[\"DALTON_RH_PAUSE_TTL_S\"])}))")" && body="$(curl -sf --connect-timeout "${DALTON_RH_CURL_TIMEOUT_S}" --max-time "${DALTON_RH_CURL_TIMEOUT_S}" -X POST -H "Content-Type: application/json" -H "Authorization: Bearer ${DALTON_RH_ADMIN_TOKEN}" -d "$payload" "$1/admin/wiki/pause-writes")" && printf "%s" "$body" | python3 -c "import json,os,sys; d=json.loads(sys.stdin.read()); lid=d.get(\"lease_id\") if isinstance(d, dict) else None; ok=isinstance(d, dict) and d.get(\"paused\") is True and d.get(\"owner\") == os.environ[\"DALTON_RH_PAUSE_OWNER\"] and isinstance(lid, int) and lid > 0; sys.exit(1) if not ok else print(lid)"'
+    WIKI_PAUSE_LEASE_TMP="$(mktemp "${TMPDIR:-/tmp}/dalton-wiki-pause-lease.XXXXXX")"
+    WIKI_PAUSE_PENDING=1
     set +e
-    WIKI_PAUSE_LEASE_ID="$(exec 8>&- 9>&-; \
+    (
+      exec 8>&- 9>&-
+      RUN_WITH_TIMEOUT_PG_EXEC=1 \
       DALTON_RH_ADMIN_TOKEN="$WIKI_PAUSE_ADMIN_TOKEN" \
       DALTON_RH_PAUSE_OWNER="$WIKI_PAUSE_OWNER" \
       DALTON_RH_PAUSE_TTL_S="$WIKI_PAUSE_TTL_S" \
@@ -1758,56 +1852,26 @@ finally:
       run_with_timeout_pg "$WIKI_EXEC_TIMEOUT_S" \
         env "${ENV_UNSET_ARGS[@]}" docker compose -p "$PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" --project-directory "$WORK_DIR" \
         exec -T -e DALTON_RH_ADMIN_TOKEN -e DALTON_RH_PAUSE_OWNER -e DALTON_RH_PAUSE_TTL_S -e DALTON_RH_CURL_TIMEOUT_S \
-        research-host sh -c "$local_pause_sh" _ "http://127.0.0.1:${WIKI_PAUSE_PORT}")"
+        research-host sh -c "$local_pause_sh" _ "http://127.0.0.1:${WIKI_PAUSE_PORT}"
+    ) > "$WIKI_PAUSE_LEASE_TMP" 2>/dev/null &
+    WIKI_PAUSE_CMD_PID=$!
+    wait "$WIKI_PAUSE_CMD_PID"
     wiki_pause_rc=$?
+    WIKI_PAUSE_CMD_PID=""
+    WIKI_PAUSE_LEASE_ID="$(tr -d '[:space:]' < "$WIKI_PAUSE_LEASE_TMP" 2>/dev/null || true)"
+    rm -f "$WIKI_PAUSE_LEASE_TMP" 2>/dev/null || true
+    WIKI_PAUSE_LEASE_TMP=""
     set -e
     if [[ "$wiki_pause_rc" -ne 0 || ! "$WIKI_PAUSE_LEASE_ID" =~ ^[0-9]+$ ]]; then
       # Pause POST may have succeeded (or still be landing) on research-host after a timeout
-      # or dropped response; repeatedly probe status within a bounded deadline until confirmed
-      # paused by this owner (then resume) or until the deadline expires.
-      local_probe_sh='body="$(curl -sf --connect-timeout "${DALTON_RH_CURL_TIMEOUT_S}" --max-time "${DALTON_RH_CURL_TIMEOUT_S}" -H "Authorization: Bearer ${DALTON_RH_ADMIN_TOKEN}" "$1/admin/wiki/pause-writes")" || exit 1; printf "%s" "$body" | python3 -c "import json,os,sys; d=json.loads(sys.stdin.read()); lid=d.get(\"lease_id\") if isinstance(d, dict) else None; ok=isinstance(d, dict) and d.get(\"paused\") is True and str(d.get(\"owner\") or \"\") == os.environ[\"DALTON_RH_PROBE_OWNER\"] and isinstance(lid, int) and lid > 0; print(lid if ok else \"NONE\")"'
-      probe_deadline_s="$(exec 8>&- 9>&-; python3 -c 'import sys, time; print(f"{time.monotonic() + max(0.05, float(sys.argv[1])):.6f}")' "$WIKI_PAUSE_RECOVERY_TIMEOUT_S")"
-      probe_step_cap_s="$(exec 8>&- 9>&-; python3 -c 'import sys; exec_t=float(sys.argv[1]); total_t=max(0.05, float(sys.argv[2])); print(f"{max(0.05, min(exec_t, total_t / 3.0)):.6f}")' "$WIKI_EXEC_TIMEOUT_S" "$WIKI_PAUSE_RECOVERY_TIMEOUT_S")"
-      recovered_lease_id=""
-      while true; do
-        rem_probe_s="$(exec 8>&- 9>&-; python3 -c 'import sys, time; print(f"{max(0.0, float(sys.argv[1]) - time.monotonic()):.6f}")' "$probe_deadline_s")"
-        if [[ "$rem_probe_s" == "0.000000" ]]; then
-          break
-        fi
-        probe_step_s="$(exec 8>&- 9>&-; python3 -c 'import sys; print(f"{max(0.05, min(float(sys.argv[1]), float(sys.argv[2]))):.6f}")' "$probe_step_cap_s" "$rem_probe_s")"
-        set +e
-        probe_out="$(exec 8>&- 9>&-; \
-          DALTON_RH_ADMIN_TOKEN="$WIKI_PAUSE_ADMIN_TOKEN" \
-          DALTON_RH_PROBE_OWNER="$WIKI_PAUSE_OWNER" \
-          DALTON_RH_CURL_TIMEOUT_S="$probe_step_s" \
-          run_with_timeout_pg "$probe_step_s" \
-            env "${ENV_UNSET_ARGS[@]}" docker compose -p "$PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" --project-directory "$WORK_DIR" \
-            exec -T -e DALTON_RH_ADMIN_TOKEN -e DALTON_RH_PROBE_OWNER -e DALTON_RH_CURL_TIMEOUT_S \
-            research-host sh -c "$local_probe_sh" _ "http://127.0.0.1:${WIKI_PAUSE_PORT}" 2>/dev/null)"
-        probe_rc=$?
-        set -e
-        if [[ "$probe_rc" -eq 0 && "$probe_out" =~ ^[0-9]+$ ]]; then
-          recovered_lease_id="$probe_out"
-          break
-        fi
-        rem_probe_s="$(exec 8>&- 9>&-; python3 -c 'import sys, time; print(f"{max(0.0, float(sys.argv[1]) - time.monotonic()):.6f}")' "$probe_deadline_s")"
-        if [[ "$rem_probe_s" == "0.000000" ]]; then
-          break
-        fi
-        probe_sleep_s="$(exec 8>&- 9>&-; python3 -c 'import sys; print(f"{min(float(sys.argv[1]), float(sys.argv[2])):.6f}")' "$WIKI_PAUSE_RECOVERY_POLL_S" "$rem_probe_s")"
-        sleep "$probe_sleep_s" 8>&- 9>&-
-      done
-      if [[ "$recovered_lease_id" =~ ^[0-9]+$ ]]; then
-        warn "Pause request outcome was ambiguous (exit=${wiki_pause_rc}), but research-host confirmed owner=${WIKI_PAUSE_OWNER} holds active lease ${recovered_lease_id}; resuming Wiki writes before exiting..."
-        WIKI_PAUSE_LEASE_ID="$recovered_lease_id"
-        WIKI_WRITES_PAUSED=1
-        resume_wiki_writes || true
-      fi
+      # or dropped response; probe status by owner within a bounded deadline and resume if held.
+      probe_and_resume_pending_wiki_pause || true
       err "Failed to pause Wiki writes via research-host /admin/wiki/pause-writes (owner=${WIKI_PAUSE_OWNER}, exit=${wiki_pause_rc})."
       release_wiki_backup_lock
       exit 1
     fi
     WIKI_WRITES_PAUSED=1
+    WIKI_PAUSE_PENDING=0
     start_wiki_pause_heartbeat
     wiki_drained=0
     wiki_in_flight="-1"

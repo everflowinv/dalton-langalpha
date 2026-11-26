@@ -27,6 +27,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 import hashlib
 import json
+import logging
 from pathlib import Path
 import re
 from typing import Any
@@ -38,6 +39,8 @@ from src.dalton.capabilities import (
     is_bridge_route_enabled,
     is_research_source_enabled,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ContentAssemblyError(ValueError):
@@ -501,35 +504,36 @@ def _discovered_server_usable(
     discovered_servers: Mapping[str, Any] | Iterable[str],
     server_name: str,
 ) -> bool:
-    """Return True when `server_name` is present in `discovered_servers`, enabled, and exposes a usable tool."""
-    if isinstance(discovered_servers, Mapping):
-        if server_name not in discovered_servers:
-            return False
-        entry = discovered_servers.get(server_name)
-        if entry is False:
-            return False
-        if isinstance(entry, Mapping):
-            if entry.get("enabled") is False:
-                return False
-            tools_meta = entry.get("tools")
-            if tools_meta is not None:
-                wanted = _SERVER_REQUIRED_ANY_TOOLS.get(server_name, frozenset())
-                if isinstance(tools_meta, Mapping):
-                    names = {str(k) for k in tools_meta.keys()}
-                elif isinstance(tools_meta, list):
-                    names = {
-                        str(item if isinstance(item, str) else item.get("name") or "")
-                        for item in tools_meta
-                        if isinstance(item, (str, Mapping))
-                    }
-                else:
-                    return False
-                if not names:
-                    return False
-                if wanted and not (names & wanted):
-                    return False
-        return True
-    return server_name in set(discovered_servers)
+    """Return True only when `server_name` is present, enabled, and exposes at least one usable tool."""
+    if not isinstance(discovered_servers, Mapping):
+        return False
+    if server_name not in discovered_servers:
+        return False
+    entry = discovered_servers.get(server_name)
+    if not isinstance(entry, Mapping):
+        return False
+    if entry.get("enabled") is False:
+        return False
+    tools_meta = entry.get("tools")
+    if tools_meta is None:
+        return False
+    wanted = _SERVER_REQUIRED_ANY_TOOLS.get(server_name, frozenset())
+    if isinstance(tools_meta, Mapping):
+        names = {str(k) for k in tools_meta.keys() if k}
+    elif isinstance(tools_meta, (list, tuple, set, frozenset)):
+        names = {
+            str(item if isinstance(item, str) else item.get("name") or "")
+            for item in tools_meta
+            if isinstance(item, (str, Mapping))
+        }
+        names.discard("")
+    else:
+        return False
+    if not names:
+        return False
+    if wanted and not (names & wanted):
+        return False
+    return True
 
 
 def filter_capabilities_by_discovered_servers(
@@ -614,35 +618,140 @@ def assemble_text(
     return assemble_markdown_text(text, path=path, capabilities=effective_caps)
 
 
+def build_minimal_discovered_mcp_servers(
+    mcp_registry: Any | None,
+) -> tuple[dict[str, dict[str, Any]], str]:
+    """Build minimal ``{server: {"enabled": True, "tools": [...]}}`` from server-side ``mcp_registry``.
+
+    Returns ``(minimal_servers, discovery_status)`` where ``discovery_status`` is
+    ``"ok"``, ``"unavailable"``, or ``"error"``. Servers without discovered tools
+    are excluded so name-and-enabled-only configs never count as usable.
+    """
+    if mcp_registry is None:
+        return {}, "unavailable"
+    get_all_tools = getattr(mcp_registry, "get_all_tools", None)
+    if not callable(get_all_tools):
+        return {}, "unavailable"
+    try:
+        tools_by_server = get_all_tools()
+    except Exception as exc:
+        logger.warning(
+            "Server-side MCP tool discovery failed for workflow launch; falling back to empty tool set: %s",
+            exc,
+        )
+        return {}, "error"
+    if not isinstance(tools_by_server, Mapping):
+        return {}, "error"
+
+    disabled_servers: set[str] = set()
+    cfg = getattr(mcp_registry, "config", None)
+    mcp_cfg = getattr(cfg, "mcp", None) if cfg is not None else None
+    cfg_servers = getattr(mcp_cfg, "servers", None) if mcp_cfg is not None else None
+    if isinstance(cfg_servers, Iterable) and not isinstance(cfg_servers, (str, bytes)):
+        for srv in cfg_servers:
+            srv_name = getattr(srv, "name", None)
+            if isinstance(srv_name, str) and getattr(srv, "enabled", True) is False:
+                disabled_servers.add(srv_name)
+
+    minimal: dict[str, dict[str, Any]] = {}
+    for srv_name, tools_list in tools_by_server.items():
+        name_str = str(srv_name)
+        if name_str in disabled_servers:
+            continue
+        tool_names: list[str] = []
+        if isinstance(tools_list, Iterable) and not isinstance(tools_list, (str, bytes)):
+            for item in tools_list:
+                if isinstance(item, str):
+                    tname = item.strip()
+                elif isinstance(item, Mapping):
+                    tname = str(item.get("name") or "").strip()
+                else:
+                    tname = str(getattr(item, "name", "") or "").strip()
+                if tname:
+                    tool_names.append(tname)
+        unique_tools = sorted(set(tool_names))
+        if unique_tools:
+            minimal[name_str] = {"enabled": True, "tools": unique_tools}
+    return minimal, "ok"
+
+
+def decide_topic_research_internal_memory(
+    discovered_servers: Mapping[str, Any],
+    active_caps: frozenset[CapabilityId],
+    *,
+    discovery_status: str = "ok",
+) -> dict[str, Any]:
+    """Decide whether `topic-research` runs internal-memory retrieval from server-discovered tools."""
+    active_direct_servers = [
+        srv for srv, cap in _DEDICATED_RESEARCH_SERVER_CAPS.items() if cap in active_caps
+    ]
+    direct_ok = any(
+        _discovered_server_usable(discovered_servers, srv) for srv in active_direct_servers
+    )
+    fed_ok = (
+        bool(active_direct_servers)
+        and not direct_ok
+        and _discovered_server_usable(discovered_servers, "dalton_research_all")
+    )
+    if direct_ok:
+        mode = "direct"
+        run_internal = True
+    elif fed_ok:
+        mode = "federated"
+        run_internal = True
+    else:
+        mode = "skip"
+        run_internal = False
+    return {
+        "run": run_internal,
+        "mode": mode,
+        "discovery_status": discovery_status,
+    }
+
+
 async def resolve_launch_discovered_mcp_servers(
     backend: Any,
     workflow_name: str,
     params: dict[str, Any],
+    *,
+    mcp_registry: Any | None = None,
 ) -> dict[str, Any]:
-    """Attach workspace `.agents/tools/mcp_client_config.json` servers to `topic-research` params in Core."""
+    """Attach server-discovered MCP tools and internal-memory decision for `topic-research`.
+
+    Runs when legacy `researchdata_bridge` capability is disabled. Always overwrites
+    any caller-supplied `discovered_mcp_servers`, `mcp_servers`, or
+    `internal_memory_decision` so callers cannot bypass server discovery.
+    """
+    _ = backend
     if workflow_name != "topic-research" or not isinstance(params, dict):
         return params
-    if "discovered_mcp_servers" in params or "mcp_servers" in params:
+    active_caps = effective_capabilities()
+    if CapabilityId.RESEARCHDATA_BRIDGE in active_caps:
         return params
-    if CapabilityId.RESEARCHDATA_BRIDGE in effective_capabilities():
-        return params
-    aread = getattr(backend, "aread_text", None)
-    if not callable(aread):
-        return params
-    try:
-        raw = await aread(".agents/tools/mcp_client_config.json")
-    except Exception:
-        return params
-    if not isinstance(raw, str) or not raw.strip():
-        return params
-    try:
-        parsed = json.loads(raw)
-    except ValueError:
-        return params
-    servers = parsed.get("servers") if isinstance(parsed, dict) else None
-    if not isinstance(servers, dict):
-        return params
-    return {**params, "discovered_mcp_servers": servers}
+
+    cleaned = {
+        k: v
+        for k, v in params.items()
+        if k not in ("discovered_mcp_servers", "mcp_servers", "internal_memory_decision")
+    }
+    minimal_servers, discovery_status = build_minimal_discovered_mcp_servers(mcp_registry)
+    decision = decide_topic_research_internal_memory(
+        minimal_servers,
+        active_caps,
+        discovery_status=discovery_status,
+    )
+    if discovery_status != "ok" and any(
+        cap in active_caps for cap in _DEDICATED_RESEARCH_SERVER_CAPS.values()
+    ):
+        logger.warning(
+            "topic-research MCP tool discovery %s; falling back to skipping internal-memory retrieval",
+            discovery_status,
+        )
+    return {
+        **cleaned,
+        "discovered_mcp_servers": minimal_servers,
+        "internal_memory_decision": decision,
+    }
 
 
 def read_assembled_text(

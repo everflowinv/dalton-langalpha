@@ -352,10 +352,15 @@ def check_skills_and_workflows() -> dict[str, Any]:
     from ptc_agent.agent.middleware.background_subagent.workflow.engine import compile_check
     from ptc_agent.agent.middleware.skills import dalton_registry
     from ptc_agent.agent.middleware.skills import registry as skill_registry
+    from src.dalton.capabilities import effective_capabilities
     from src.dalton.content_assembly import read_assembled_text
     from src.dalton.publish.review import load_agent_body
     from src.dalton.settings import REPO_ROOT as app_root
 
+    default_core_caps = effective_capabilities()
+    core_default_proprietary_terms = tuple(
+        t for t in PROPRIETARY_BLACKLIST if t not in ("公司 wiki", "内部研究库", "基金 wiki")
+    )
     enabled_skills = sorted(
         name
         for name in dalton_registry.DALTON_SKILL_DEFINITIONS
@@ -375,6 +380,10 @@ def check_skills_and_workflows() -> dict[str, Any]:
             assembled = read_assembled_text(fp, capabilities=frozenset())
             assert "DALTON_CAP" not in assembled, f"Unresolved DALTON_CAP marker in {fp}"
             _assert_no_proprietary_terms(assembled, label=f"Core skill file {fp.relative_to(app_root)}")
+            assembled_default = read_assembled_text(fp, capabilities=default_core_caps)
+            assert "DALTON_CAP" not in assembled_default, f"Unresolved DALTON_CAP marker in {fp}"
+            hits_default = [t for t in core_default_proprietary_terms if t in assembled_default.lower()]
+            assert not hits_default, f"Core default skill file {fp.relative_to(app_root)} leaked {hits_default}"
             skill_files_checked += 1
 
     langalpha_doc_dir = app_root / "plugins" / "langalpha_service" / "skills" / "langalpha-doc"
@@ -407,11 +416,17 @@ def check_skills_and_workflows() -> dict[str, Any]:
             assembled = read_assembled_text(fp, capabilities=frozenset())
             assert "DALTON_CAP" not in assembled, f"Unresolved DALTON_CAP marker in {fp}"
             _assert_no_proprietary_terms(assembled, label=f"Core workflow file {fp.relative_to(app_root)}")
+            assembled_default = read_assembled_text(fp, capabilities=default_core_caps)
+            assert "DALTON_CAP" not in assembled_default, f"Unresolved DALTON_CAP marker in {fp}"
+            hits_default = [t for t in core_default_proprietary_terms if t in assembled_default.lower()]
+            assert not hits_default, f"Core default workflow file {fp.relative_to(app_root)} leaked {hits_default}"
             if fp.suffix.lower() == ".js":
                 compile_check(assembled)
+                compile_check(assembled_default)
                 js_compiled += 1
             elif fp.suffix.lower() == ".json":
                 json.loads(assembled)
+                json.loads(assembled_default)
 
     assert js_compiled > 0, "Expected at least one workflow .js file to pass compile_check()"
     return {
