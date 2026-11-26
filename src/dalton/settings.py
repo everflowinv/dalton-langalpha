@@ -467,6 +467,8 @@ class DaltonConfig(BaseModel):
     network: DaltonNetworkConfig = Field(default_factory=DaltonNetworkConfig)
     weixin: DaltonWeixinConfig = Field(default_factory=DaltonWeixinConfig)
     stop_backup_attach_timeout_s: float = Field(default=60.0, gt=0)
+    stop_backup_total_timeout_s: float = Field(default=120.0, gt=0)
+    stop_backup_close_timeout_s: float = Field(default=10.0, gt=0)
 
 
 def _parse_env_pm_user_ids() -> list[str] | None:
@@ -1944,6 +1946,24 @@ def get_stop_backup_attach_timeout_s() -> float:
     return _positive_float_env(
         "DALTON_STOP_BACKUP_ATTACH_TIMEOUT_S",
         cfg.stop_backup_attach_timeout_s,
+    )
+
+
+def get_stop_backup_total_timeout_s() -> float:
+    """Shared wall-clock deadline in seconds for one whole stop-time backup round."""
+    cfg = get_dalton_config()
+    return _positive_float_env(
+        "DALTON_STOP_BACKUP_TOTAL_TIMEOUT_S",
+        cfg.stop_backup_total_timeout_s,
+    )
+
+
+def get_stop_backup_close_timeout_s() -> float:
+    """Independent short timeout in seconds for closing temporary stop-backup clients."""
+    cfg = get_dalton_config()
+    return _positive_float_env(
+        "DALTON_STOP_BACKUP_CLOSE_TIMEOUT_S",
+        cfg.stop_backup_close_timeout_s,
     )
 
 

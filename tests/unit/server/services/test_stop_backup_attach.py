@@ -1,10 +1,11 @@
 """Reproduction & regression tests for BY4:
 
-1. Stop-time backup on a session-less worker temporarily attaches a running-only
-   sandbox session (with configurable timeout, default 60s), releases it after
-   backup, falls back cleanly on timeout/failure, records skipped workspace
-   count in stop result and logs, and keeps ``backup_project_files`` non-strict
-   contract unchanged.
+1. Stop-time backup on a session-less worker temporarily attaches a running-only,
+   no-reconnect sandbox session under a shared wall-clock deadline with an
+   independent short close budget, releases it on normal exit / timeout /
+   cancellation, keeps enumeration failures as unknown (never 0), surfaces
+   skipped workspace counts in stop results and logs, and preserves the upstream
+   ``backup_project_files`` non-strict contract.
 2. Concurrent orphan cleanup (``_restamp_dirs`` or a concurrent sweeping
    ``pull_direct``) racing with ``_restore_relay`` upload/placement, and ambient
    ``ProjectContext`` folding during relay staging.
@@ -14,10 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock, create_autospec, patch
+from unittest.mock import create_autospec, patch
 
 import pytest
 
@@ -36,11 +39,15 @@ from ptc_agent.core.project_context import ProjectContext, project_bound
 from ptc_agent.core.sandbox import wsfiles_transfer_runtime as rt
 from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 from ptc_agent.core.sandbox.runtime import (
+    ExecResult,
     RuntimeState,
     SandboxProvider,
     SandboxRuntime,
 )
-from src.dalton.services.stop_backup import attach_stop_backup_session
+from src.dalton.services.stop_backup import (
+    attach_stop_backup_session,
+    run_stop_backup,
+)
 from src.server.services.computer_manager import ComputerBinding, ComputerManager
 from src.server.services.persistence import restore, transfer
 from src.server.services.persistence.sync_result import SyncResult
@@ -50,7 +57,6 @@ COMPUTER_ID = "22222222-2222-4222-8222-222222222222"
 SANDBOX_ID = "sandbox-by4-test"
 
 _LIFECYCLE = "src.server.services.computer_manager._lifecycle"
-_MACHINES = "src.server.services.computer_manager._machines"
 _MACHINE_BACKUP = "src.server.services.computer_manager._machine_backup"
 _PROVISIONING = "src.server.services.computer_manager._provisioning"
 
@@ -98,17 +104,17 @@ def _make_provider_and_runtime(
     runtime = create_autospec(SandboxRuntime, instance=True)
     runtime.id = SANDBOX_ID
     runtime.working_dir = work_dir
-    runtime.get_state = AsyncMock(return_value=state)
-    runtime.fetch_working_dir = AsyncMock(return_value=work_dir)
-    runtime.start = AsyncMock()
-    runtime.stop = AsyncMock()
+    runtime.get_state.return_value = state
+    runtime.fetch_working_dir.return_value = work_dir
+    runtime.start.return_value = None
+    runtime.stop.return_value = None
 
     provider = create_autospec(SandboxProvider, instance=True)
     if get_side_effect is not None:
-        provider.get = AsyncMock(side_effect=get_side_effect)
+        provider.get.side_effect = get_side_effect
     else:
-        provider.get = AsyncMock(return_value=runtime)
-    provider.close = AsyncMock()
+        provider.get.return_value = runtime
+    provider.close.return_value = None
     provider.is_host_unavailable.return_value = False
     provider.is_transient_error.return_value = False
     return provider, runtime
@@ -120,23 +126,42 @@ def _setup_manager_for_stop(
 ) -> WorkspaceManager:
     ComputerManager.reset_instance()
     manager = WorkspaceManager(_make_agent_config())
-    manager._provider_for = lambda _binding: provider
-    manager._machine_has_active_tasks = AsyncMock(return_value=False)
-    manager._retain_machine_stop_claim = AsyncMock(return_value=True)
-    manager._settle_machine_stop = AsyncMock()
-    manager._detached_sandbox_teardown = AsyncMock()
-    manager.refresh_computer_disk = AsyncMock(return_value=(None, None))
-    manager._stop_result = AsyncMock(
-        return_value={"computer_id": COMPUTER_ID, "status": "stopped"}
+    manager._provider_for = create_autospec(
+        manager._provider_for, return_value=provider
+    )
+    manager._machine_has_active_tasks = create_autospec(
+        manager._machine_has_active_tasks, return_value=False
+    )
+    manager._retain_machine_stop_claim = create_autospec(
+        manager._retain_machine_stop_claim, return_value=True
+    )
+    manager._settle_machine_stop = create_autospec(
+        manager._settle_machine_stop, return_value=None
+    )
+    manager._detached_sandbox_teardown = create_autospec(
+        manager._detached_sandbox_teardown, return_value=None
+    )
+    manager.refresh_computer_disk = create_autospec(
+        manager.refresh_computer_disk, return_value=(None, None)
+    )
+    manager._stop_result = create_autospec(
+        manager._stop_result,
+        return_value={"computer_id": COMPUTER_ID, "status": "stopped"},
     )
 
     @asynccontextmanager
-    async def _held_folder(_ws_id: str):
-        yield f"dir-{_ws_id}"
+    async def _held_folder(workspace_id: str):
+        yield f"dir-{workspace_id}"
 
-    manager._held_workspace_folder = _held_folder
-    manager.resolve_binding = AsyncMock(
-        side_effect=lambda ws_id, **_: _make_binding(ws_id)
+    manager._held_workspace_folder = create_autospec(
+        manager._held_workspace_folder, side_effect=_held_folder
+    )
+
+    async def _resolve_binding(workspace_id: str, *, workspace=None) -> ComputerBinding:
+        return _make_binding(workspace_id)
+
+    manager.resolve_binding = create_autospec(
+        manager.resolve_binding, side_effect=_resolve_binding
     )
     return manager
 
@@ -172,13 +197,15 @@ class TestStopBackupTemporaryAttach:
             caplog.at_level(logging.INFO),
             patch(
                 f"{_MACHINE_BACKUP}.get_live_workspace_ids_for_computer",
-                AsyncMock(return_value=ws_ids),
+                autospec=True,
+                return_value=ws_ids,
             ),
             patch(
                 f"{_PROVISIONING}.FilePersistenceService.sync_to_db",
-                AsyncMock(side_effect=fake_sync_to_db),
+                autospec=True,
+                side_effect=fake_sync_to_db,
             ),
-            patch(f"{_LIFECYCLE}.note_stop_phases"),
+            patch(f"{_LIFECYCLE}.note_stop_phases", autospec=True),
         ):
             result = await manager._finish_claimed_stop(
                 _make_binding(ws_ids[0]),
@@ -215,9 +242,10 @@ class TestStopBackupTemporaryAttach:
             caplog.at_level(logging.INFO),
             patch(
                 f"{_MACHINE_BACKUP}.get_live_workspace_ids_for_computer",
-                AsyncMock(return_value=ws_ids),
+                autospec=True,
+                return_value=ws_ids,
             ),
-            patch(f"{_LIFECYCLE}.note_stop_phases"),
+            patch(f"{_LIFECYCLE}.note_stop_phases", autospec=True),
         ):
             result = await manager._finish_claimed_stop(
                 _make_binding(ws_ids[0]),
@@ -249,9 +277,10 @@ class TestStopBackupTemporaryAttach:
             caplog.at_level(logging.INFO),
             patch(
                 f"{_MACHINE_BACKUP}.get_live_workspace_ids_for_computer",
-                AsyncMock(return_value=ws_ids),
+                autospec=True,
+                return_value=ws_ids,
             ),
-            patch(f"{_LIFECYCLE}.note_stop_phases"),
+            patch(f"{_LIFECYCLE}.note_stop_phases", autospec=True),
         ):
             result = await manager._finish_claimed_stop(
                 _make_binding(ws_ids[0]),
@@ -276,9 +305,10 @@ class TestStopBackupTemporaryAttach:
             caplog.at_level(logging.INFO),
             patch(
                 f"{_MACHINE_BACKUP}.get_live_workspace_ids_for_computer",
-                AsyncMock(return_value=ws_ids),
+                autospec=True,
+                return_value=ws_ids,
             ),
-            patch(f"{_LIFECYCLE}.note_stop_phases"),
+            patch(f"{_LIFECYCLE}.note_stop_phases", autospec=True),
         ):
             result = await manager._finish_claimed_stop(
                 _make_binding(ws_ids[0]),
@@ -303,9 +333,9 @@ class TestStopBackupTemporaryAttach:
         runtime = create_autospec(SandboxRuntime, instance=True)
         runtime.id = SANDBOX_ID
         runtime.working_dir = "/home/workspace"
-        runtime.get_state = AsyncMock(return_value=RuntimeState.STOPPED)
-        runtime.fetch_working_dir = AsyncMock(return_value="/home/workspace")
-        runtime.start = AsyncMock()
+        runtime.get_state.return_value = RuntimeState.STOPPED
+        runtime.fetch_working_dir.return_value = "/home/workspace"
+        runtime.start.return_value = None
 
         async def slow_non_running_get(_sandbox_id: str):
             await asyncio.sleep(0.05)
@@ -324,9 +354,10 @@ class TestStopBackupTemporaryAttach:
             caplog.at_level(logging.INFO),
             patch(
                 f"{_MACHINE_BACKUP}.get_live_workspace_ids_for_computer",
-                AsyncMock(side_effect=slow_workspace_lookup),
+                autospec=True,
+                side_effect=slow_workspace_lookup,
             ),
-            patch(f"{_LIFECYCLE}.note_stop_phases"),
+            patch(f"{_LIFECYCLE}.note_stop_phases", autospec=True),
         ):
             result = await manager._finish_claimed_stop(
                 _make_binding(ws_ids[0]),
@@ -368,22 +399,297 @@ class TestStopBackupTemporaryAttach:
             branch_provider.close.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_owner_machine_non_transient_probe_error_rethrows_without_unbound_local(
+    async def test_sessionless_stop_multi_workspace_slow_backup_respects_shared_deadline(
+        self, monkeypatch, caplog
+    ):
+        """A multi-workspace slow backup stops remaining workspaces when the
+        shared stop-backup deadline expires, reports completed/unfinished
+        counts, closes the temporary provider within its independent close
+        budget, and continues stopping the computer."""
+        ws_ids = [f"ws-{i}" for i in range(4)]
+        provider, _runtime = _make_provider_and_runtime(state=RuntimeState.RUNNING)
+        manager = _setup_manager_for_stop(ws_ids, provider)
+        monkeypatch.setenv("DALTON_STOP_BACKUP_TOTAL_TIMEOUT_S", "0.15")
+        monkeypatch.setenv("DALTON_STOP_BACKUP_CLOSE_TIMEOUT_S", "0.1")
+
+        started_workspaces: list[str] = []
+
+        async def slow_sync_to_db(workspace_id, sandbox, *, layout, routine=False):
+            started_workspaces.append(workspace_id)
+            if workspace_id == "ws-0":
+                await asyncio.sleep(0.01)
+                return SyncResult(synced=1)
+            # Simulate a slow sync lock wait / scan on ws-1.
+            await asyncio.sleep(5.0)
+            return SyncResult(synced=1)
+
+        t0 = time.monotonic()
+        with (
+            caplog.at_level(logging.INFO),
+            patch(
+                f"{_MACHINE_BACKUP}.get_live_workspace_ids_for_computer",
+                autospec=True,
+                return_value=ws_ids,
+            ),
+            patch(
+                f"{_PROVISIONING}.FilePersistenceService.sync_to_db",
+                autospec=True,
+                side_effect=slow_sync_to_db,
+            ),
+            patch(f"{_LIFECYCLE}.note_stop_phases", autospec=True),
+        ):
+            result = await manager._finish_claimed_stop(
+                _make_binding(ws_ids[0]),
+                workspace_id=ws_ids[0],
+                durable_sandbox_id=SANDBOX_ID,
+            )
+        elapsed = time.monotonic() - t0
+
+        assert elapsed < 1.5
+        assert started_workspaces == ["ws-0", "ws-1"]
+        assert result["status"] == "stopped"
+        assert result["backup_skipped_workspaces"] == 3
+        provider.close.assert_awaited_once()
+        manager._detached_sandbox_teardown.assert_awaited_once()
+        manager._settle_machine_stop.assert_awaited_once()
+        assert any(
+            "timed out" in rec.getMessage()
+            and "1 of 4" in rec.getMessage()
+            and "3 unfinished" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_backup_provider_close_respects_independent_close_budget(
+        self, monkeypatch, caplog
+    ):
+        """A hanging provider.close() is bounded by its independent short close
+        budget on both non-running probe and normal/timeout teardown paths."""
+        ws_ids = ["ws-0"]
+        provider, _runtime = _make_provider_and_runtime(state=RuntimeState.STOPPED)
+
+        async def hanging_close():
+            await asyncio.sleep(5.0)
+
+        provider.close.side_effect = hanging_close
+        manager = _setup_manager_for_stop(ws_ids, provider)
+        monkeypatch.setenv("DALTON_STOP_BACKUP_CLOSE_TIMEOUT_S", "0.05")
+
+        t0 = time.monotonic()
+        with (
+            caplog.at_level(logging.WARNING),
+            patch(
+                f"{_MACHINE_BACKUP}.get_live_workspace_ids_for_computer",
+                autospec=True,
+                return_value=ws_ids,
+            ),
+            patch(f"{_LIFECYCLE}.note_stop_phases", autospec=True),
+        ):
+            result = await manager._finish_claimed_stop(
+                _make_binding(ws_ids[0]),
+                workspace_id=ws_ids[0],
+                durable_sandbox_id=SANDBOX_ID,
+            )
+        elapsed = time.monotonic() - t0
+
+        assert elapsed < 1.0
+        assert result["status"] == "stopped"
+        assert result["backup_skipped_workspaces"] == 1
+        provider.close.assert_awaited_once()
+        assert any("Timed out closing temporary stop-backup provider" in rec.getMessage() for rec in caplog.records)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stage", ["get", "get_state"])
+    async def test_attach_stop_backup_cancelled_during_probe_closes_provider_and_propagates(
+        self, stage
+    ):
+        """External cancellation during provider.get() or runtime.get_state()
+        must close the created provider client and propagate CancelledError."""
+        probe_entered = asyncio.Event()
+        provider, runtime = _make_provider_and_runtime(state=RuntimeState.RUNNING)
+
+        if stage == "get":
+            async def blocking_get(_sandbox_id: str):
+                probe_entered.set()
+                await asyncio.sleep(5.0)
+
+            provider.get.side_effect = blocking_get
+        else:
+            async def blocking_get_state():
+                probe_entered.set()
+                await asyncio.sleep(5.0)
+
+            runtime.get_state.side_effect = blocking_get_state
+
+        manager = _setup_manager_for_stop(["ws-1"], provider)
+
+        async def _enter_attach():
+            async with attach_stop_backup_session(
+                manager,
+                _make_binding("ws-1"),
+                SANDBOX_ID,
+                timeout_s=5.0,
+                close_timeout_s=1.0,
+            ):
+                pytest.fail("must not yield when cancelled during probe")
+
+        task = asyncio.create_task(_enter_attach())
+        await asyncio.wait_for(probe_entered.wait(), timeout=2.0)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        provider.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_temporary_stop_backup_io_transient_error_skips_without_reconnect_or_mcp_start(
         self, caplog
+    ):
+        """Backup I/O on a temporary stop-backup session retries safely on the
+        existing runtime connection only; on persistent connection failure it
+        never triggers generic reconnect (prepare_reconnect / _reset_provider /
+        MCP startup), keeps the old mirror, skips that workspace, and stops."""
+        ws_ids = ["ws-0", "ws-1"]
+        provider, runtime = _make_provider_and_runtime(state=RuntimeState.RUNNING)
+        provider.is_transient_error.return_value = True
+
+        exec_calls = 0
+        current_ws = ""
+
+        async def fake_exec(command: str, timeout: int = 60, *, env=None) -> ExecResult:
+            nonlocal exec_calls
+            exec_calls += 1
+            if current_ws == "ws-0":
+                raise ConnectionResetError("transient docker stream reset")
+            payload = json.dumps({"entries": []})
+            return ExecResult(
+                stdout=f"{rt.RESULT_MARKER}{payload}\n",
+                stderr="",
+                exit_code=0,
+            )
+
+        runtime.exec.side_effect = fake_exec
+        manager = _setup_manager_for_stop(ws_ids, provider)
+        observed_sandboxes: list[PTCSandbox] = []
+
+        async def sync_via_transfer_op(workspace_id, sandbox, *, layout, routine=False):
+            nonlocal current_ws
+            current_ws = workspace_id
+            observed_sandboxes.append(sandbox)
+            await transfer.run_transfer_op(
+                sandbox,
+                "scan",
+                {"root": layout.workspace, "workspace": workspace_id},
+                timeout_s=5,
+            )
+            return SyncResult(synced=1)
+
+        with (
+            caplog.at_level(logging.INFO),
+            patch("ptc_agent.core.sandbox.retry.asyncio.sleep", autospec=True, return_value=None),
+            patch.object(PTCSandbox, "reconnect", autospec=True) as mock_reconnect,
+            patch.object(
+                PTCSandbox, "_ensure_sandbox_connected", autospec=True
+            ) as mock_ensure_connected,
+            patch.object(
+                PTCSandbox, "_start_internal_mcp_servers", autospec=True
+            ) as mock_start_mcp,
+            patch.object(
+                PTCSandbox, "_reset_provider", autospec=True
+            ) as mock_reset_provider,
+            patch(
+                f"{_MACHINE_BACKUP}.get_live_workspace_ids_for_computer",
+                autospec=True,
+                return_value=ws_ids,
+            ),
+            patch(
+                f"{_PROVISIONING}.FilePersistenceService.sync_to_db",
+                autospec=True,
+                side_effect=sync_via_transfer_op,
+            ),
+            patch(f"{_LIFECYCLE}.note_stop_phases", autospec=True),
+        ):
+            result = await manager._finish_claimed_stop(
+                _make_binding(ws_ids[0]),
+                workspace_id=ws_ids[0],
+                durable_sandbox_id=SANDBOX_ID,
+            )
+
+        # Safe retries ran on the existing runtime (5 attempts for ws-0 + 1 for ws-1).
+        assert exec_calls == 6
+        assert len(observed_sandboxes) == 2
+        assert observed_sandboxes[0]._reconnect_task is None
+        provider.prepare_reconnect.assert_not_awaited()
+        mock_reconnect.assert_not_awaited()
+        mock_ensure_connected.assert_not_awaited()
+        mock_start_mcp.assert_not_awaited()
+        mock_reset_provider.assert_not_awaited()
+        assert result["status"] == "stopped"
+        assert result["backup_skipped_workspaces"] == 1
+        provider.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_computer_stop_workspace_enumeration_failure_reports_unknown_not_zero(
+        self, caplog
+    ):
+        """When listing workspaces on a computer fails during a computer-level
+        stop (workspace_id=None), skipped count stays unknown (None / omitted)
+        rather than being reported as 0, and enumeration failure is logged."""
+        provider, _runtime = _make_provider_and_runtime(state=RuntimeState.RUNNING)
+        manager = _setup_manager_for_stop([], provider)
+        binding = _make_binding(workspace_id="")
+
+        with (
+            caplog.at_level(logging.WARNING),
+            patch(
+                f"{_MACHINE_BACKUP}.get_live_workspace_ids_for_computer",
+                autospec=True,
+                side_effect=RuntimeError("db connection lost"),
+            ),
+            patch(f"{_LIFECYCLE}.note_stop_phases", autospec=True),
+        ):
+            outcome = await run_stop_backup(
+                manager,
+                binding,
+                workspace_id=None,
+                durable_sandbox_id=SANDBOX_ID,
+            )
+            result = await manager._finish_claimed_stop(
+                binding,
+                workspace_id=None,
+                durable_sandbox_id=SANDBOX_ID,
+            )
+
+        assert outcome.enumeration_failed is True
+        assert outcome.total is None
+        assert outcome.skipped is None
+        assert result["status"] == "stopped"
+        assert "backup_skipped_workspaces" not in result
+        assert any(
+            "workspace enumeration failed" in rec.getMessage()
+            and "skipped count unknown" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ssh", "local"])
+    async def test_owner_machine_non_transient_probe_error_rethrows_without_unbound_local(
+        self, kind, caplog
     ):
         """On SSH/local computers (recreatable=False), a non-transient error
         during the pre-backup _owner_machine_state probe must propagate the
         original stop error cleanly without hitting UnboundLocalError."""
         provider, _ = _make_provider_and_runtime(
-            get_side_effect=RuntimeError("ssh control plane failure")
+            get_side_effect=RuntimeError("owner machine control plane failure")
         )
         manager = _setup_manager_for_stop(["ws-1"], provider)
-        binding = _make_binding("ws-1", kind="ssh")
+        binding = _make_binding("ws-1", kind=kind)
         assert binding.provider.recreatable is False
 
         with (
             caplog.at_level(logging.WARNING),
-            pytest.raises(RuntimeError, match="ssh control plane failure"),
+            pytest.raises(RuntimeError, match="owner machine control plane failure"),
         ):
             await manager._finish_claimed_stop(
                 binding,
@@ -397,25 +703,25 @@ class TestStopBackupTemporaryAttach:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ssh", "local"])
     async def test_owner_machine_probe_error_reconciled_without_unbound_local(
-        self, caplog
+        self, kind, caplog
     ):
         """If the pre-backup probe on an SSH/local computer raises a
         non-transient error and _reconcile_provider_stop subsequently settles
-        the stop, reading backup_skipped_workspaces must not raise
-        UnboundLocalError."""
+        the stop, reading backup outcome must not raise UnboundLocalError."""
         calls = 0
 
         async def fail_then_timeout(_sandbox_id: str):
             nonlocal calls
             calls += 1
             if calls == 1:
-                raise RuntimeError("ssh control plane failure")
+                raise RuntimeError("owner machine control plane failure")
             raise TimeoutError("machine went unreachable")
 
         provider, _ = _make_provider_and_runtime(get_side_effect=fail_then_timeout)
         manager = _setup_manager_for_stop(["ws-1"], provider)
-        binding = _make_binding("ws-1", kind="ssh")
+        binding = _make_binding("ws-1", kind=kind)
         assert binding.provider.recreatable is False
 
         with caplog.at_level(logging.WARNING):
@@ -484,9 +790,11 @@ class TestRelayStagingConcurrentCleanup:
             await asyncio.wait_for(release_upload.wait(), timeout=2.0)
             return True
 
-        sandbox.aupload_file_bytes = AsyncMock(side_effect=fake_upload)
+        sandbox.aupload_file_bytes.side_effect = fake_upload
 
-        async def fake_run_transfer_op(_sb, op: str, spec: dict, *, timeout_s: int, reports=()):
+        async def fake_run_transfer_op(
+            _sb, op: str, spec: dict, *, timeout_s: int, reports: tuple[str, ...] = ()
+        ):
             assert op == "pull"
             return rt.pull(spec)
 
@@ -500,7 +808,12 @@ class TestRelayStagingConcurrentCleanup:
         }
         result = {"restored": 0, "errors": 0}
 
-        with patch.object(transfer, "run_transfer_op", AsyncMock(side_effect=fake_run_transfer_op)):
+        with patch.object(
+            transfer,
+            "run_transfer_op",
+            autospec=True,
+            side_effect=fake_run_transfer_op,
+        ):
             restore_task = asyncio.create_task(
                 restore._restore_relay(
                     "user-1",
@@ -552,10 +865,10 @@ class TestRelayStagingConcurrentCleanup:
         provider, runtime = _make_provider_and_runtime(work_dir=root)
         written: dict[str, bytes] = {}
 
-        async def _upload_file(content: bytes, path: str) -> None:
-            written[path] = content
+        async def _upload_file(content: bytes, dest_path: str) -> None:
+            written[dest_path] = content
 
-        runtime.upload_file = AsyncMock(side_effect=_upload_file)
+        runtime.upload_file.side_effect = _upload_file
 
         core = CoreConfig(
             sandbox=SandboxConfig(provider="docker", docker=DockerConfig()),

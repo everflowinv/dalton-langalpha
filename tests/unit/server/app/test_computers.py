@@ -2010,6 +2010,44 @@ async def test_stop(client, computer, sample_computer_dict, mock_computer_manage
     assert read.await_count == 1
 
 
+# DALTON-HOOK(stop-backup-attach): verify stop route surfaces backup_skipped_workspaces
+@pytest.mark.asyncio
+@pytest.mark.parametrize("skipped", [2, 0, None])
+async def test_stop_returns_backup_skipped_workspaces(
+    client, computer, sample_computer_dict, skipped
+):
+    """Stop route forwards backup_skipped_workspaces from stop_computer."""
+    from unittest.mock import create_autospec
+
+    from src.server.services.workspace_manager import WorkspaceManager
+
+    manager = create_autospec(WorkspaceManager, instance=True)
+    stopped = sample_computer_dict(computer_id=COMPUTER_ID, status="stopped")
+    if skipped is not None:
+        stopped = {**stopped, "backup_skipped_workspaces": skipped}
+    manager.stop_computer.return_value = stopped
+
+    with (
+        patch(
+            "src.server.app.computers.get_computer",
+            autospec=True,
+            return_value=computer,
+        ),
+        patch(
+            "src.server.app.computers._computer_manager",
+            autospec=True,
+            return_value=manager,
+        ),
+    ):
+        resp = await client.post(f"/api/v1/computers/{COMPUTER_ID}/stop")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "stopped"
+    assert body["backup_skipped_workspaces"] == skipped
+    manager.stop_computer.assert_awaited_once_with(COMPUTER_ID)
+
+
 @pytest.mark.asyncio
 async def test_archive(client, sample_computer_dict, mock_computer_manager):
     stopped = sample_computer_dict(computer_id=COMPUTER_ID, status="stopped")

@@ -75,6 +75,10 @@ class MachineBackupMixin:
             )
             siblings = []
             failures.append(f"sibling list unavailable: {type(e).__name__}: {e}")
+            # DALTON-HOOK(stop-backup-attach): record enumeration failure so stop backup reports unknown skipped count
+            from src.dalton.services.stop_backup import record_enumeration_failure
+
+            record_enumeration_failure(e)
         ordered += [ws for ws in siblings if ws != workspace_id]
         return await self._mirror_projects(
             computer_id,
@@ -111,6 +115,10 @@ class MachineBackupMixin:
         mirrored = 0
         unsaved: list[UnsavedFile] = []
         unnamed_failure = bool(failures)
+        # DALTON-HOOK(stop-backup-attach): publish incremental progress so stop-backup timeout sees partial counts
+        from src.dalton.services.stop_backup import record_mirror_outcome
+
+        record_mirror_outcome(total=len(ordered), mirrored=0)
         for ws_id in ordered:
             try:
                 if await self.backup_project_files(
@@ -123,6 +131,8 @@ class MachineBackupMixin:
                     routine=routine,
                 ):
                     mirrored += 1
+                    # DALTON-HOOK(stop-backup-attach): update mirrored count after each workspace completes
+                    record_mirror_outcome(total=len(ordered), mirrored=mirrored)
             except Exception as e:
                 logger.error(
                     f"File backup failed for {ws_id} on computer {computer_id}: "
@@ -146,10 +156,6 @@ class MachineBackupMixin:
                 f"File backup mirrored {mirrored} of {len(ordered)} project(s) "
                 f"on computer {computer_id}; the rest keep their last mirror"
             )
-        # DALTON-HOOK(stop-backup-attach): report mirrored/skipped counts to active stop-backup scope
-        from src.dalton.services.stop_backup import record_mirror_outcome
-
-        record_mirror_outcome(total=len(ordered), mirrored=mirrored)
         return mirrored
 
     async def backup_changed_projects(

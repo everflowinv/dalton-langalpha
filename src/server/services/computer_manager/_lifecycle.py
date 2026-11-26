@@ -1847,7 +1847,7 @@ class SessionLifecycleMixin:
         computer_id = binding.computer_id
         try:
             # DALTON-HOOK(stop-backup-attach): initialize before owner-machine probe so except-path reconcile never hits UnboundLocalError
-            backup_skipped_workspaces: int | None = None
+            backup_outcome = None
             # Before the backup, which would wait out its timeout on every
             # folder of a machine that is not there.
             if (
@@ -1861,35 +1861,13 @@ class SessionLifecycleMixin:
             # A machine its owner chose not to back up keeps its last backup.
             backup_ms = None
             if binding.files_backup and back_up:
-                backup_started = time.monotonic()
-                # DALTON-HOOK(stop-backup-attach): temporarily attach a running-only session when this worker holds none
+                # DALTON-HOOK(stop-backup-attach): delegate stop backup (temporary attach, deadline, timing, logging) to Dalton service
                 from src.dalton.services.stop_backup import run_stop_backup
 
-                outcome = await run_stop_backup(
-                    self,
-                    binding,
-                    workspace_id=workspace_id,
-                    durable_sandbox_id=durable_sandbox_id,
+                backup_outcome = await run_stop_backup(
+                    self, binding, workspace_id=workspace_id, durable_sandbox_id=durable_sandbox_id
                 )
-                folder_count = outcome.mirrored
-                backup_skipped_workspaces = outcome.skipped
-                backup_ms = round((time.monotonic() - backup_started) * 1000)
-                if backup_skipped_workspaces > 0:
-                    logger.warning(
-                        "Computer %s stop backup mirrored %d folder(s), skipped %d workspace(s) in %dms",
-                        computer_id,
-                        int(folder_count or 0),
-                        backup_skipped_workspaces,
-                        backup_ms,
-                    )
-                else:
-                    logger.info(
-                        "Computer %s stop backup mirrored %d folder(s), skipped %d workspace(s) in %dms",
-                        computer_id,
-                        int(folder_count or 0),
-                        backup_skipped_workspaces,
-                        backup_ms,
-                    )
+                backup_ms = backup_outcome.duration_ms
 
             # The last chance to read the disk before it is unreachable, so the
             # stopped machine still shows how full it is.
@@ -1960,9 +1938,9 @@ class SessionLifecycleMixin:
             logger.info(f"Computer {computer_id} stopped successfully")
             stop_result = await self._stop_result(computer_id, workspace_id)
             # DALTON-HOOK(stop-backup-attach): include skipped workspace count in stop result
-            if backup_skipped_workspaces is not None and isinstance(stop_result, dict):
-                return {**stop_result, "backup_skipped_workspaces": backup_skipped_workspaces}
-            return stop_result
+            from src.dalton.services.stop_backup import with_stop_backup_result
+
+            return with_stop_backup_result(stop_result, backup_outcome)
 
         except Exception as e:
             logger.error(f"Error stopping computer {computer_id}: {e}")
@@ -1970,9 +1948,9 @@ class SessionLifecycleMixin:
                 if await self._reconcile_provider_stop(binding):
                     stop_result = await self._stop_result(computer_id, workspace_id)
                     # DALTON-HOOK(stop-backup-attach): include skipped workspace count in reconciled stop result
-                    if backup_skipped_workspaces is not None and isinstance(stop_result, dict):
-                        return {**stop_result, "backup_skipped_workspaces": backup_skipped_workspaces}
-                    return stop_result
+                    from src.dalton.services.stop_backup import with_stop_backup_result
+
+                    return with_stop_backup_result(stop_result, backup_outcome)
             except Exception:
                 # Leave the durable stopping claim for the existing recovery
                 # path once this owner releases its heartbeat.
