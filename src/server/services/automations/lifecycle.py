@@ -1854,6 +1854,12 @@ async def resume_automation(
             except HTTPException as exc:
                 raise TargetRefused(exc, field="workspace_id") from None
         apply_locked_resume_schedule(locked_row, effective_kwargs)
+        # DALTON-HOOK(watchlist): enforce live watchlist earnings-stage policy under row lock on resume
+        from src.dalton.watchlist.pause_guards import assert_locked_earnings_resume_allowed
+
+        await assert_locked_earnings_resume_allowed(
+            user_id, locked_row, effective_kwargs, conn=locked_conn
+        )
 
     outer_ctx = get_current_history_context()
     eff_actor_for_ctx = (

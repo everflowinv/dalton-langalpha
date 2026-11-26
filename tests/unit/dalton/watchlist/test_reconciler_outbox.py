@@ -325,8 +325,11 @@ class _FakeWatchlistInfra:
             backend: Any = None,
             rel_path: str = "dalton/coverage.yaml",
             roster_revision: int | None = None,
+            lease_check: Any = None,
         ) -> bool:
             _ = (uid, yaml_text, backend, rel_path, roster_revision)
+            if lease_check is not None and not await lease_check(None):
+                return False
             infra.home_sync_calls += 1
             return infra.home_sync_result
 
@@ -1546,6 +1549,7 @@ async def test_r5_earnings_guard_refuses_removed_ticker_and_catches_claimed_pend
     # 3. Scheduler-claimed pending once (last_run_at set, pending execution) is caught by is_unstarted_earn_once
     claimed_once_row = {
         "automation_id": "a-claimed-once",
+        "user_id": "u1",
         "name": "dalton-nvda-earn-2026q4-t0",
         "trigger_type": "once",
         "status": "active",
@@ -1557,7 +1561,7 @@ async def test_r5_earnings_guard_refuses_removed_ticker_and_catches_claimed_pend
         "list_executions",
         create_autospec(
             orig_list_exec,
-            return_value=[{"status": "pending"}],
+            return_value=([{"status": "pending"}], False),
         ),
     )
     assert await reconciler_mod.is_unstarted_earn_once(claimed_once_row) is True
@@ -1567,7 +1571,7 @@ async def test_r5_earnings_guard_refuses_removed_ticker_and_catches_claimed_pend
         "list_executions",
         create_autospec(
             orig_list_exec,
-            return_value=[{"status": "completed"}],
+            return_value=([{"status": "completed"}], False),
         ),
     )
     assert await reconciler_mod.is_unstarted_earn_once(claimed_once_row) is False
@@ -1659,3 +1663,575 @@ async def test_r5_earnings_guard_refuses_removed_ticker_and_catches_claimed_pend
     chk_res = json.loads(buf_chk.getvalue())
     assert chk_res["tier"] is None
     assert chk_res["allowed_stages"] == []
+
+
+@pytest.mark.asyncio
+async def test_r6_generic_resume_refuses_removed_or_downgraded_earnings_task_and_keeps_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r6 Item 1: Generic lifecycle.resume_automation shares the locked earnings-stage guard
+    with Dalton scheduling: resuming an earnings task after ticker removal or tier downgrade
+    is refused and never reschedules next_run_at."""
+    from src.dalton import settings as dalton_settings_mod
+    from src.dalton.services import company_automations as comp_auto_mod
+    from src.server.database import automation as auto_db_mod
+    from src.server.services.automations import lifecycle as lifecycle_mod
+
+    future_ts = datetime.now(UTC) + timedelta(days=3)
+    uid = "u-resume-r6"
+    auto_id = str(uuid.uuid4())
+    stored_row: dict[str, Any] = {
+        "automation_id": auto_id,
+        "user_id": uid,
+        "name": "dalton-nvda-earn-fy26q4-tm3",
+        "trigger_type": "once",
+        "status": "paused",
+        "next_run_at": None,
+        "workspace_id": "ws-nvda",
+        "timezone": "America/New_York",
+        "config_version": 2,
+        "metadata": {
+            "ticker": "NVDA",
+            "dalton_managed": True,
+            "paused_by_policy": True,
+            "once_schedule_at": future_ts.isoformat(),
+        },
+    }
+
+    updates_written: list[dict[str, Any]] = []
+
+    async def _fake_update_automation(
+        aid: str,
+        user_id: str,
+        *,
+        conn: Any = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        _ = (aid, user_id, conn)
+        effective = dict(kwargs)
+        hist_ctx = comp_auto_mod.get_current_history_context()
+        if hist_ctx is not None and hist_ctx.locked_row_reconciler is not None:
+            await hist_ctx.locked_row_reconciler(dict(stored_row), effective, None)
+        stored_row.update(effective)
+        updates_written.append(effective)
+        return dict(stored_row)
+
+    monkeypatch.setattr(dalton_settings_mod, "is_coverage_units_enabled", lambda: False)
+    monkeypatch.setattr(
+        auto_db_mod,
+        "get_automation",
+        create_autospec(auto_db_mod.get_automation, side_effect=lambda *a, **kw: dict(stored_row)),
+    )
+    monkeypatch.setattr(
+        auto_db_mod,
+        "update_automation",
+        create_autospec(auto_db_mod.update_automation, side_effect=_fake_update_automation),
+    )
+
+    orig_get_cov = coverage_db.get_coverage_row
+
+    # Case A: Ticker removed from watchlist -> generic resume MUST refuse and keep paused + next_run_at=None
+    monkeypatch.setattr(
+        coverage_db,
+        "get_coverage_row",
+        create_autospec(orig_get_cov, return_value=None),
+    )
+    with pytest.raises(lifecycle_mod.AutomationRefusal) as exc_info:
+        await lifecycle_mod.resume_automation(auto_id, uid)
+    assert getattr(exc_info.value, "schedule_error_code", None) == "earnings_stage_disabled"
+    assert updates_written == []
+    assert stored_row["status"] == "paused"
+    assert stored_row["next_run_at"] is None
+
+    # Case B: Ticker downgraded to watch (only t0 allowed) -> tm3 refused, t0 allowed
+    monkeypatch.setattr(
+        coverage_db,
+        "get_coverage_row",
+        create_autospec(
+            orig_get_cov,
+            return_value={"user_id": uid, "ticker": "NVDA", "tier": "watch", "is_private": False},
+        ),
+    )
+    monkeypatch.setattr(
+        policies_mod,
+        "get_user_tier_policy",
+        create_autospec(
+            policies_mod.get_user_tier_policy,
+            return_value=policies_mod.DEFAULT_TIER_POLICIES["watch"],
+        ),
+    )
+    with pytest.raises(lifecycle_mod.AutomationRefusal):
+        await lifecycle_mod.resume_automation(auto_id, uid)
+    assert updates_written == []
+    assert stored_row["status"] == "paused"
+    assert stored_row["next_run_at"] is None
+
+    # Allowed stage (t0 on watch tier) resumes and restores next_run_at
+    stored_row["name"] = "dalton-nvda-earn-fy26q4-t0"
+    resumed = await lifecycle_mod.resume_automation(auto_id, uid)
+    assert resumed is not None
+    assert resumed["status"] == "active"
+    assert resumed["next_run_at"] == future_ts
+
+
+def test_r6_calendar_state_mark_default_branch_and_diff_live_workspace(
+    tmp_path: Any,
+) -> None:
+    """r6 Item 2: calendar_state mark default branch derives automations solely from live allowed_stages
+    (empty -> {}), and diff includes workspaces newly bound in live coverage.yaml."""
+    import importlib.util
+    import io
+    import json
+    from contextlib import redirect_stdout
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    script_path = (
+        Path(__file__).resolve().parents[4]
+        / "plugins/dalton/skills/dalton-earnings-calendar/scripts/calendar_state.py"
+    )
+    spec = importlib.util.spec_from_file_location("calendar_state_r6_test", script_path)
+    assert spec and spec.loader
+    cs_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cs_mod)
+
+    cov_yaml = tmp_path / "coverage.yaml"
+    cov_yaml.write_text(
+        "companies:\n"
+        "  - ticker: SHARED\n"
+        "    name: Shared Ticker Only\n"
+        "    workspace:\n"
+        "      workspace_id: ws-shared\n"
+        "  - ticker: OPENAI\n"
+        "    name: OpenAI\n"
+        "    tier: core\n"
+        "    is_private: true\n"
+        "    workspace:\n"
+        "      workspace_id: ws-openai\n"
+        "  - ticker: NEWWS\n"
+        "    name: Newly Bound Co\n"
+        "    tier: core\n"
+        "    workspace:\n"
+        "      workspace_id: ws-newly-bound\n",
+        encoding="utf-8",
+    )
+    ledger_path = tmp_path / "ledger.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "updated": "2026-10-01",
+                "entries": {
+                    "GONE": {
+                        "ticker": "GONE",
+                        "tier": "Core",
+                        "workspace_id": "ws-gone",
+                        "status": "confirmed",
+                        "date_status": "confirmed",
+                        "date": "2026-11-05",
+                        "quarter": "FY26Q3",
+                        "automations": {"tm3": "old-tm3.json", "t0": "old-t0.json", "tp1": "old-tp1.json"},
+                    },
+                    "NEWWS": {
+                        "ticker": "NEWWS",
+                        "tier": "Core",
+                        "workspace_id": None,
+                        "status": "confirmed",
+                        "date_status": "confirmed",
+                        "date": "2026-11-10",
+                        "quarter": "FY26Q3",
+                        "automations": {},
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _mark_default(ticker: str, tier_arg: str | None = "core", ws_arg: str | None = None) -> dict[str, Any]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cs_mod.cmd_mark(
+                SimpleNamespace(
+                    state=str(ledger_path),
+                    coverage=str(cov_yaml),
+                    ticker=ticker,
+                    name=None,
+                    tier=tier_arg,
+                    workspace_id=ws_arg,
+                    fiscal_note=None,
+                    status="confirmed",
+                    date="2026-11-05",
+                    date_status="confirmed",
+                    quarter="FY26Q3",
+                    timing="AMC",
+                    release_time_et=None,
+                    call_time_et=None,
+                    confidence="high",
+                    source_url="https://ir.example.com",
+                    source_type="company_ir",
+                    reason=None,
+                    automations_json=None,
+                    tm3=None,
+                    t0=None,
+                    tp1=None,
+                    tentative_date=None,
+                    tentative_sources=None,
+                    recheck_automation=None,
+                )
+            )
+        return json.loads(buf.getvalue())
+
+    # Removed ticker, shared Home ticker-only, and private company ALL write empty automations in default branch
+    for sym in ("GONE", "SHARED", "OPENAI"):
+        res = _mark_default(sym, tier_arg="core")
+        assert res["entry"]["automations"] == {}, f"{sym} should write empty automations"
+
+    # diff catches NEWWS whose ledger workspace_id is None but live coverage.yaml newly bound ws-newly-bound
+    scan_path = tmp_path / "scan.jsonl"
+    scan_path.write_text(
+        json.dumps({"ticker": "NEWWS", "status": "confirmed", "confidence": "high", "earnings_date": "2026-11-10"})
+        + "\n",
+        encoding="utf-8",
+    )
+    buf_diff = io.StringIO()
+    with redirect_stdout(buf_diff):
+        rc = cs_mod.cmd_diff(
+            SimpleNamespace(
+                state=str(ledger_path),
+                coverage=str(cov_yaml),
+                scan=str(scan_path),
+                automations_dir=None,
+            )
+        )
+    diff_out = json.loads(buf_diff.getvalue())
+    assert rc == 2
+    assert diff_out["reconciled"] is False
+    assert any(
+        m["ticker"] == "NEWWS"
+        and m["reason"] == "missing_automation_entries_in_ledger"
+        and m["missing_automations"] == ["tm3", "t0", "tp1"]
+        for m in diff_out["missing"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_r6_list_executions_signature_bind_and_fail_safe_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r6 Item 3: list_executions call site matches real signature (verified via inspect.signature().bind),
+    unpacks the (rows, has_more) tuple, passes held conn, and fails safe (returns True -> pause) on error."""
+    import inspect
+
+    orig_list_exec = reconciler_mod.exec_db.list_executions
+    sig = inspect.signature(orig_list_exec)
+    bound_with_conn = sig.bind("u-sig", automation_id="auto-123", limit=10, conn=object())
+    assert bound_with_conn.arguments["user_id"] == "u-sig"
+    assert bound_with_conn.arguments["automation_id"] == "auto-123"
+    assert bound_with_conn.arguments["limit"] == 10
+
+    bound_no_conn = sig.bind("u-sig", automation_id="auto-123", limit=10)
+    assert bound_no_conn.arguments["user_id"] == "u-sig"
+
+    row = {
+        "automation_id": "auto-123",
+        "user_id": "u-sig",
+        "name": "dalton-nvda-earn-fy26q4-t0",
+        "trigger_type": "once",
+        "status": "active",
+        "last_run_at": datetime.now(UTC),
+        "run_count": 0,
+    }
+
+    # Cursor failure falls back to list_executions(user_id, automation_id=..., limit=10, conn=held_conn)
+    class _BrokenCursorConn:
+        def cursor(self):
+            raise RuntimeError("cursor boom")
+
+    held_conn = _BrokenCursorConn()
+    spy_ok = create_autospec(orig_list_exec, return_value=([{"status": "waiting"}], True))
+    monkeypatch.setattr(reconciler_mod.exec_db, "list_executions", spy_ok)
+    assert await reconciler_mod.is_unstarted_earn_once(row, user_id="u-sig", conn=held_conn) is True
+    spy_ok.assert_awaited_once_with("u-sig", automation_id="auto-123", limit=10, conn=held_conn)
+
+    # Query failure in list_executions fails safe -> returns True (should pause)
+    spy_err = create_autospec(orig_list_exec, side_effect=RuntimeError("db down"))
+    monkeypatch.setattr(reconciler_mod.exec_db, "list_executions", spy_err)
+    assert await reconciler_mod.is_unstarted_earn_once(row, user_id="u-sig", conn=held_conn) is True
+
+
+@pytest.mark.asyncio
+async def test_r6_removed_workspace_fallback_passes_conn_and_fails_safe_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r6 Item 4: _resolve_workspace_ticker receives current conn; query errors during removed-row
+    workspace identity fallback treat the workspace as still bound and pause tasks instead of skipping."""
+    from src.dalton.autonomy import tracking as tracking_mod
+
+    infra = _FakeWatchlistInfra()
+    infra.install(monkeypatch)
+    uid = "u-fb-r6"
+    ws_id = "ws-custom-name"
+    sentinel_conn = object()
+
+    @asynccontextmanager
+    async def _lock_with_sentinel(user_id: str, *, conn: Any = None, prelock_ws: str | None = None):
+        _ = (user_id, conn, prelock_ws)
+        yield sentinel_conn
+
+    monkeypatch.setattr(reconciler_mod, "_user_automations_lock_for_write", _lock_with_sentinel)
+    infra.workspace_owners[ws_id] = uid
+    infra.workspace_rows[ws_id] = {
+        "workspace_id": ws_id,
+        "name": "Custom AI Research Workspace",
+        "status": "active",
+    }
+    auto = infra.add_automation(
+        user_id=uid,
+        workspace_id=ws_id,
+        name="dalton-nvda-watch",
+        status="active",
+    )
+
+    # Fallback lookup raises a DB error -> MUST pass conn and fail safe (still bound -> PAUSE, not skip)
+    resolve_err_spy = create_autospec(
+        tracking_mod._resolve_workspace_ticker,
+        side_effect=RuntimeError("knowledge table unavailable"),
+    )
+    monkeypatch.setattr(tracking_mod, "_resolve_workspace_ticker", resolve_err_spy)
+
+    rec = reconciler_mod.TierPolicyReconciler()
+    res = await rec.reconcile_company(uid, "NVDA", removed_workspace_id=ws_id)
+    assert res.get("skipped") is not True
+    assert infra.automations[auto["automation_id"]]["status"] == "paused"
+    assert resolve_err_spy.await_count == 1
+    assert resolve_err_spy.await_args.kwargs.get("conn") is sentinel_conn
+
+
+@pytest.mark.asyncio
+async def test_r6_reconciler_fences_lease_inside_automation_and_yaml_locks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r6 Item 5: When lease expires AFTER pre-lock renew (while waiting on automation lock or YAML lock),
+    in-lock lease verification aborts with reason='lease_lost' and performs zero DB/YAML writes."""
+    from src.dalton.coverage import service as cov_svc
+
+    infra = _FakeWatchlistInfra()
+    infra.install(monkeypatch)
+    uid = "u-fence-r6"
+    ws_id = "ws-nvda-fence"
+    infra.workspaces[(uid, "NVDA")] = ws_id
+    infra.workspace_owners[ws_id] = uid
+    infra.coverage[(uid, "NVDA")] = {"user_id": uid, "ticker": "NVDA", "tier": "radar", "is_private": False}
+    auto = infra.add_automation(
+        user_id=uid,
+        workspace_id=ws_id,
+        name="dalton-nvda-watch",
+        status="active",
+    )
+
+    jid = str(uuid.uuid4())
+    preclaimed = {
+        "job_id": jid,
+        "user_id": uid,
+        "trigger_action": "set_tier",
+        "target_policy_versions": {"radar": 1},
+        "pending_tickers": ["NVDA"],
+        "completed_tickers": [],
+        "failed_items": [],
+        "override_user_pause": False,
+        "job_context": {},
+        "claim_token": "tok-old",
+        "roster_revision": 1,
+        "yaml_synced": False,
+        "status": "running",
+    }
+
+    # 1st call (pre-lock renew) returns True; 2nd call (inside automation lock) returns False!
+    renew_calls = 0
+
+    async def _renew_lose_in_lock(
+        user_id: str,
+        job_id: str,
+        *,
+        claim_token: str,
+        lease_seconds: int = 300,
+        conn: Any = None,
+    ) -> bool:
+        nonlocal renew_calls
+        _ = (user_id, job_id, claim_token, lease_seconds, conn)
+        renew_calls += 1
+        return renew_calls == 1
+
+    monkeypatch.setattr(
+        reconciler_mod,
+        "renew_reconcile_job_lease",
+        create_autospec(policies_mod.renew_reconcile_job_lease, side_effect=_renew_lose_in_lock),
+    )
+
+    rec = reconciler_mod.TierPolicyReconciler()
+    res = await rec.reconcile_job(uid, jid, sync_home=False, _preclaimed_job=preclaimed)
+    assert res["reason"] == "lease_lost"
+    assert renew_calls == 2
+    assert infra.automations[auto["automation_id"]]["status"] == "active"
+
+    # Part 2: YAML sync lease check fails right before actual write -> zero backend writes
+    writes: list[str] = []
+
+    class _SpyBackend:
+        async def awrite_text(self, rel_path: str, content: str) -> bool:
+            _ = rel_path
+            writes.append(content)
+            return True
+
+    yaml_checks = 0
+
+    async def _lose_before_write(lock_conn: Any = None) -> bool:
+        nonlocal yaml_checks
+        _ = lock_conn
+        yaml_checks += 1
+        return yaml_checks == 1  # passes after YAML lock, fails right before actual write
+
+    monkeypatch.setattr(
+        policies_mod,
+        "get_user_roster_state",
+        create_autospec(
+            policies_mod.get_user_roster_state,
+            return_value={"roster_revision": 2, "last_yaml_synced_revision": 1},
+        ),
+    )
+    ok_yaml = await cov_svc.sync_user_coverage_to_home(
+        uid,
+        yaml_text="companies: []\n",
+        backend=_SpyBackend(),
+        roster_revision=2,
+        lease_check=_lose_before_write,
+    )
+    assert ok_yaml is False
+    assert yaml_checks == 2
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_r6_home_yaml_sync_reuses_lock_conn_with_pool_size_one_and_discards_on_unlock_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r6 Item 6: sync_user_coverage_to_home succeeds with a strict 1-slot pool (reuses the lock
+    connection for roster read, render, and revision record) and closes/discards the connection
+    when pg_advisory_unlock fails."""
+    from src.dalton.coverage import service as cov_svc
+
+    uid = "u-pool1-r6"
+    pool_in_use = 0
+    unlock_should_fail = False
+    created_conns: list[Any] = []
+
+    class _FakeCursor:
+        def __init__(self, conn: Any) -> None:
+            self._conn = conn
+            self._last_sql = ""
+
+        async def __aenter__(self) -> "_FakeCursor":
+            return self
+
+        async def __aexit__(self, *exc: Any) -> None:
+            return None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            _ = params
+            self._last_sql = sql
+            if "pg_advisory_unlock" in sql and unlock_should_fail:
+                raise RuntimeError("unlock network error")
+
+        async def fetchone(self) -> Any:
+            if "pg_advisory_unlock" in self._last_sql:
+                return (True,)
+            return None
+
+    class _FakeConn:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def cursor(self, **_kw: Any) -> _FakeCursor:
+            return _FakeCursor(self)
+
+        async def close(self) -> None:
+            self.closed = True
+
+    @asynccontextmanager
+    async def _one_slot_db_conn(existing_conn: Any = None):
+        nonlocal pool_in_use
+        if existing_conn is not None:
+            yield existing_conn
+            return
+        if pool_in_use >= 1:
+            raise RuntimeError("PoolTimeout: pool max_size=1 exhausted by nested checkout!")
+        pool_in_use += 1
+        conn = _FakeConn()
+        created_conns.append(conn)
+        try:
+            yield conn
+        finally:
+            pool_in_use -= 1
+
+    seen_conns: list[Any] = []
+
+    async def _fake_get_state(user_id: str, *, conn: Any = None) -> dict[str, int]:
+        _ = user_id
+        async with _one_slot_db_conn(conn) as c:
+            seen_conns.append(c)
+        return {"roster_revision": 3, "last_yaml_synced_revision": 2}
+
+    async def _fake_render(user_id: str, *, conn: Any = None) -> str:
+        _ = user_id
+        async with _one_slot_db_conn(conn) as c:
+            seen_conns.append(c)
+        return "companies: [{ticker: NVDA}]\n"
+
+    async def _fake_record(user_id: str, revision: int, *, conn: Any = None) -> bool:
+        _ = (user_id, revision)
+        async with _one_slot_db_conn(conn) as c:
+            seen_conns.append(c)
+        return True
+
+    class _CaptureBackend:
+        def __init__(self) -> None:
+            self.writes: list[str] = []
+
+        async def awrite_text(self, rel_path: str, content: str) -> bool:
+            _ = rel_path
+            self.writes.append(content)
+            return True
+
+    monkeypatch.setattr(coverage_db, "get_db_connection", _one_slot_db_conn)
+    monkeypatch.setattr(
+        policies_mod,
+        "get_user_roster_state",
+        create_autospec(policies_mod.get_user_roster_state, side_effect=_fake_get_state),
+    )
+    monkeypatch.setattr(
+        cov_svc,
+        "render_coverage_yaml",
+        create_autospec(cov_svc.render_coverage_yaml, side_effect=_fake_render),
+    )
+    monkeypatch.setattr(
+        policies_mod,
+        "record_yaml_synced_revision",
+        create_autospec(policies_mod.record_yaml_synced_revision, side_effect=_fake_record),
+    )
+
+    backend = _CaptureBackend()
+    ok = await cov_svc.sync_user_coverage_to_home(uid, backend=backend)
+    assert ok is True
+    assert len(backend.writes) == 1
+    assert len(created_conns) == 1
+    assert created_conns[0].closed is False
+    # Every DB call inside the lock reused the exact same lock connection
+    assert len(seen_conns) == 4
+    assert all(c is created_conns[0] for c in seen_conns)
+
+    # When pg_advisory_unlock fails, the connection MUST be closed/discarded (not returned locked to pool)
+    unlock_should_fail = True
+    ok2 = await cov_svc.sync_user_coverage_to_home(uid, backend=backend)
+    assert ok2 is True
+    assert len(created_conns) == 2
+    assert created_conns[1].closed is True

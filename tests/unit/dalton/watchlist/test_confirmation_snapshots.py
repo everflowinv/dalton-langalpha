@@ -1267,3 +1267,129 @@ async def test_r5_shared_thread_strips_context_and_withholds_tool_fail_closed(
         ),
     )
     assert await privacy_mod.is_thread_shared("thread-err-1") is True
+
+
+@pytest.mark.asyncio
+async def test_r6_resolve_group_snapshot_binds_full_membership_delta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r6 Item 7: resolve_group snapshot binds membership adds, stale marks, and unstale marks
+    (not just net-new tickers), rejecting drift even when net-new count is 0 in both runs."""
+    state = _wire_in_memory_watchlist(monkeypatch)
+    gid = str(uuid.uuid4())
+    state["groups"][gid] = {
+        "group_id": gid,
+        "user_id": USER_ALICE,
+        "label": "AI Leaders",
+        "criteria": {"sector": "AI"},
+        "default_tier": "watch",
+    }
+    # All 3 tickers ALREADY exist in Alice's roster -> net-new is ALWAYS []!
+    # AAPL: currently in group G (active)
+    # MSFT: NOT in group G yet (candidate for membership add)
+    # TSLA: currently in group G AND marked stale (candidate for unstale)
+    state["rows"][(USER_ALICE, "AAPL")] = {
+        "user_id": USER_ALICE,
+        "ticker": "AAPL",
+        "name": "Apple",
+        "tier": "core",
+        "group_id": gid,
+        "extra": {"group_ids": [gid], "group_stale_ids": []},
+    }
+    state["rows"][(USER_ALICE, "MSFT")] = {
+        "user_id": USER_ALICE,
+        "ticker": "MSFT",
+        "name": "Microsoft",
+        "tier": "watch",
+        "group_id": None,
+        "extra": {"group_ids": [], "group_stale_ids": []},
+    }
+    state["rows"][(USER_ALICE, "TSLA")] = {
+        "user_id": USER_ALICE,
+        "ticker": "TSLA",
+        "name": "Tesla",
+        "tier": "watch",
+        "group_id": gid,
+        "extra": {"group_ids": [gid], "group_stale_ids": [gid]},
+    }
+
+    screener_result: list[str] = ["AAPL"]
+
+    async def _dynamic_preview_group(label: str, criteria: Any) -> dict[str, Any]:
+        _ = (label, criteria)
+        return {
+            "companies": [{"ticker": t, "name": f"{t} Inc", "market": "US"} for t in screener_result],
+            "not_found": [],
+        }
+
+    monkeypatch.setattr(
+        service_mod,
+        "preview_coverage_group",
+        create_autospec(cov_svc.preview_coverage_group, side_effect=_dynamic_preview_group),
+    )
+
+    svc = service_mod.WatchlistMutationService()
+
+    # Preview with screener = ["AAPL"]: new=[], membership=[], stale=["TSLA"], unstale=[]
+    prev = await svc.preview_mutation(USER_ALICE, action="resolve_group", group_id=gid)
+    assert prev["target_tickers"] == []
+    assert prev["resolve_membership_delta"] == {
+        "new_tickers": [],
+        "membership_tickers": [],
+        "stale_tickers": ["TSLA"],
+        "unstale_tickers": [],
+    }
+    snap_id = prev["snapshot_id"]
+    assert snap_id is not None
+
+    # Case 1: Screener drifts to ["AAPL", "MSFT"] -> new STILL [], but membership_tickers changed!
+    screener_result[:] = ["AAPL", "MSFT"]
+    with pytest.raises(service_mod.WatchlistScopeChangedError):
+        await svc.execute_mutation(
+            USER_ALICE,
+            action="resolve_group",
+            group_id=gid,
+            snapshot_id=snap_id,
+            allow_internal=False,
+        )
+
+    # Case 2: Screener drifts to ["AAPL", "TSLA"] -> new STILL [], but stale/unstale changed!
+    screener_result[:] = ["AAPL", "TSLA"]
+    with pytest.raises(service_mod.WatchlistScopeChangedError):
+        await svc.execute_mutation(
+            USER_ALICE,
+            action="resolve_group",
+            group_id=gid,
+            snapshot_id=snap_id,
+            allow_internal=False,
+        )
+
+    # Case 3: Screener drifts to [] -> new STILL [], but AAPL would also be marked stale!
+    screener_result[:] = []
+    with pytest.raises(service_mod.WatchlistScopeChangedError):
+        await svc.execute_mutation(
+            USER_ALICE,
+            action="resolve_group",
+            group_id=gid,
+            snapshot_id=snap_id,
+            allow_internal=False,
+        )
+
+    # Case 4: Matching full delta (["MSFT", "TSLA"] previewed and executed) succeeds!
+    screener_result[:] = ["MSFT", "TSLA"]
+    prev2 = await svc.preview_mutation(USER_ALICE, action="resolve_group", group_id=gid)
+    assert prev2["resolve_membership_delta"] == {
+        "new_tickers": [],
+        "membership_tickers": ["MSFT"],
+        "stale_tickers": ["AAPL"],
+        "unstale_tickers": ["TSLA"],
+    }
+    exec_res = await svc.execute_mutation(
+        USER_ALICE,
+        action="resolve_group",
+        group_id=gid,
+        snapshot_id=prev2["snapshot_id"],
+        allow_internal=False,
+    )
+    assert exec_res["ok"] is True
+    assert exec_res["stale_tickers"] == ["AAPL"]

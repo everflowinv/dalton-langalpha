@@ -111,6 +111,32 @@ def _alembic_env_for_dsn(dsn: str) -> dict[str, str]:
     return env
 
 
+@asynccontextmanager
+async def _isolated_pool(iso_dsn: str, *, max_size: int = 4):
+    """Open an AsyncConnectionPool for ``iso_dsn`` and wire it into ``pool.get_or_create_pool``."""
+    from psycopg_pool import AsyncConnectionPool
+    import src.server.database.pool as pool_mod
+
+    pool = AsyncConnectionPool(
+        conninfo=iso_dsn,
+        min_size=1,
+        max_size=max_size,
+        configure=pool_mod._configure_postgres_connection,
+        open=False,
+    )
+    await pool.open()
+    orig_get_pool = pool_mod.get_or_create_pool
+    orig_cache = pool_mod._conversation_db_pool_cache
+    pool_mod.get_or_create_pool = create_autospec(orig_get_pool, return_value=pool)
+    pool_mod._conversation_db_pool_cache = {iso_dsn: pool}
+    try:
+        yield pool
+    finally:
+        pool_mod.get_or_create_pool = orig_get_pool
+        pool_mod._conversation_db_pool_cache = orig_cache
+        await pool.close()
+
+
 def test_d056_single_head_and_fresh_upgrade_schema() -> None:
     """Verify Dalton migration chain has a single head `d056` and all watchlist tables/constraints exist."""
     with _isolated_pg_database(PG_DSN) as iso_dsn:
@@ -431,32 +457,22 @@ def test_d056_upgrade_backfill_and_downgrade_with_radar_samples() -> None:
                 )
             conn.commit()
 
-        # Execute the migration_restore_radar outbox job against the real DB and verify task is paused
-        import asyncio
-        from psycopg_pool import AsyncConnectionPool
+        # Execute the migration_restore_radar outbox job against the real isolated DB and verify task is paused
         import src.dalton.watchlist.reconciler as reconciler_mod
-        import src.server.database.pool as pool_mod
 
         async def _consume_restore_job() -> None:
-            pool = AsyncConnectionPool(conninfo=iso_dsn, min_size=1, max_size=2, open=False)
-            await pool.open()
-            prev_pool = pool_mod._pool
-            pool_mod._pool = pool
             orig_sync = reconciler_mod.sync_user_coverage_to_home
-
-            async def _noop_sync(*_a: Any, **_kw: Any) -> bool:
-                return True
-
-            reconciler_mod.sync_user_coverage_to_home = _noop_sync  # type: ignore[assignment]
+            reconciler_mod.sync_user_coverage_to_home = create_autospec(
+                orig_sync, return_value=True
+            )
             try:
-                res = await reconciler_mod.TierPolicyReconciler().reconcile_job(
-                    test_uid, mig_job_id, sync_home=True
-                )
-                assert res["status"] == "completed"
+                async with _isolated_pool(iso_dsn, max_size=2):
+                    res = await reconciler_mod.TierPolicyReconciler().reconcile_job(
+                        test_uid, mig_job_id, sync_home=True
+                    )
+                    assert res["status"] == "completed"
             finally:
                 reconciler_mod.sync_user_coverage_to_home = orig_sync
-                pool_mod._pool = prev_pool
-                await pool.close()
 
         asyncio.run(_consume_restore_job())
 
@@ -636,30 +652,19 @@ async def test_r4_coverage_units_enabled_real_pg_tx(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """r4 Codex Low #19 / Grok r3: real PostgreSQL transaction with coverage_units enabled."""
-    from psycopg_pool import AsyncConnectionPool
-
     import src.dalton.database.coverage_units as cu_db_mod
     import src.dalton.settings as dalton_settings_mod
     import src.dalton.watchlist.reconciler as reconciler_mod
-    import src.server.database.pool as pool_mod
 
     with _isolated_pg_database(PG_DSN) as iso_dsn:
         env = _alembic_env_for_dsn(iso_dsn)
         _run_alembic(["upgrade", "head"], env=env, dalton=False)
         _run_alembic(["upgrade", "head"], env=env, dalton=True)
-        pool = AsyncConnectionPool(
-            conninfo=iso_dsn,
-            min_size=1,
-            max_size=2,
-            open=False,
-        )
-        await pool.open()
-        monkeypatch.setattr(pool_mod, "_pool", pool)
         monkeypatch.setattr(dalton_settings_mod, "is_coverage_units_enabled", lambda: True)
 
         uid = f"wl-cu-user-{uuid.uuid4().hex[:8]}"
         ws_id = str(uuid.uuid4())
-        try:
+        async with _isolated_pool(iso_dsn, max_size=2) as pool:
             async with pool.connection() as conn:
                 async with conn.transaction():
                     async with conn.cursor() as cur:
@@ -692,8 +697,6 @@ async def test_r4_coverage_units_enabled_real_pg_tx(
                         uid, "NVDA", conn=conn
                     )
                     assert resolved == ws_id
-        finally:
-            await pool.close()
 
 
 @pytest.mark.asyncio
@@ -778,3 +781,229 @@ async def test_r5_expired_lease_takeover_blocks_old_worker_side_effects_real_pg(
         )
         assert res_b["status"] == "completed"
         assert side_effects == ["NVDA"]
+
+
+async def _wait_for_advisory_lock_waiter(iso_dsn: str, *, timeout: float = 5.0) -> None:
+    """Poll ``pg_locks`` until another backend is waiting on an advisory lock."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        async with await psycopg.AsyncConnection.connect(iso_dsn, autocommit=True) as obs:
+            async with obs.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT count(*)
+                    FROM pg_locks
+                    WHERE locktype = 'advisory' AND NOT granted
+                    """
+                )
+                row = await cur.fetchone()
+                if row and int(row[0]) > 0:
+                    return
+        await asyncio.sleep(0.02)
+    raise AssertionError("Timed out waiting for worker to block on PostgreSQL advisory lock")
+
+
+@pytest.mark.asyncio
+async def test_r6_lease_lost_while_blocked_on_locks_skips_db_and_yaml_writes_real_pg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r6 Item 5 (Real PG): Worker A renews lease, then blocks on automation lock / YAML lock;
+    during the wait its lease expires and Worker B takes over. Once unblocked, Worker A MUST NOT
+    write automations or Home YAML."""
+    from src.dalton.coverage import service as cov_svc
+    from src.dalton.watchlist import policies as policies_mod
+    from src.dalton.watchlist import reconciler as reconciler_mod
+    from src.server.database import automation as auto_db
+
+    with _isolated_pg_database(PG_DSN) as iso_dsn:
+        env = _alembic_env_for_dsn(iso_dsn)
+        _run_alembic(["upgrade", "head"], env=env, dalton=False)
+        _run_alembic(["upgrade", "head"], env=env, dalton=True)
+
+        uid = f"u-stall-{uuid.uuid4().hex[:8]}"
+        ws_id = str(uuid.uuid4())
+        auto_id = str(uuid.uuid4())
+
+        async with _isolated_pool(iso_dsn, max_size=4) as pool:
+            async with pool.connection() as conn:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "INSERT INTO users (user_id, email, name) VALUES (%s, %s, %s)",
+                            (uid, f"{uid}@example.com", "Stall User"),
+                        )
+                        await cur.execute(
+                            "INSERT INTO workspaces (workspace_id, user_id, name, status) VALUES (%s::uuid, %s, 'NVDA', 'running')",
+                            (ws_id, uid),
+                        )
+                        await cur.execute(
+                            "INSERT INTO dalton_coverage (user_id, ticker, name, tier, market, extra, source) "
+                            "VALUES (%s, 'NVDA', 'NVIDIA', 'radar', 'US', '{}'::jsonb, 'ui')",
+                            (uid,),
+                        )
+                        await cur.execute(
+                            """
+                            INSERT INTO automations (
+                                automation_id, user_id, name, trigger_type, cron_expression,
+                                timezone, instruction, next_run_at, workspace_id, status, metadata
+                            )
+                            VALUES (
+                                %s::uuid, %s, 'dalton-nvda-watch', 'cron', '0 9 * * 1-5',
+                                'America/New_York', 'Watch NVDA', NOW() + INTERVAL '1 day',
+                                %s::uuid, 'active', '{"ticker": "NVDA", "dalton_managed": true}'::jsonb
+                            )
+                            """,
+                            (auto_id, uid, ws_id),
+                        )
+
+            # Part A: Stalled on automation advisory lock while lease expires and Worker B takes over
+            job_a = await policies_mod.insert_reconcile_job(
+                uid,
+                trigger_action="set_tier",
+                target_policy_versions={"radar": 1},
+                pending_tickers=["NVDA"],
+                roster_revision=1,
+            )
+            jid_a = str(job_a["job_id"])
+            claimed_a = await policies_mod.claim_reconcile_job(uid, jid_a, lease_seconds=60)
+            assert claimed_a is not None
+
+            rec = reconciler_mod.TierPolicyReconciler()
+            async with await psycopg.AsyncConnection.connect(iso_dsn, autocommit=False) as blocker:
+                await auto_db.lock_user_automations(uid, conn=blocker)
+
+                worker_a_task = asyncio.create_task(
+                    rec.reconcile_job(uid, jid_a, sync_home=False, _preclaimed_job=claimed_a)
+                )
+                await _wait_for_advisory_lock_waiter(iso_dsn)
+
+                # Lease expires while Worker A is waiting on the automation lock; Worker B takes over
+                async with await psycopg.AsyncConnection.connect(iso_dsn, autocommit=True) as admin:
+                    async with admin.cursor() as cur:
+                        await cur.execute(
+                            "UPDATE dalton_watchlist_reconcile_jobs "
+                            "SET claim_expires_at = NOW() - INTERVAL '5 seconds' "
+                            "WHERE job_id = %s::uuid",
+                            (jid_a,),
+                        )
+                claimed_b = await policies_mod.claim_reconcile_job(uid, jid_a, lease_seconds=60)
+                assert claimed_b is not None
+                assert claimed_b["claim_token"] != claimed_a["claim_token"]
+
+                # Release the automation lock -> Worker A wakes up, re-checks lease inside tx, MUST NOT write
+                await blocker.rollback()
+
+            res_a = await asyncio.wait_for(worker_a_task, timeout=10.0)
+            assert res_a["reason"] == "lease_lost"
+            assert res_a["claimed"] is False
+
+            async with pool.connection() as check_conn:
+                async with check_conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT status, next_run_at FROM automations WHERE automation_id = %s::uuid",
+                        (auto_id,),
+                    )
+                    st_row, next_row = await cur.fetchone()
+                    assert st_row == "active"
+                    assert next_row is not None
+
+            # Part B: Stalled on Home YAML advisory lock while lease expires and Worker B takes over
+            job_y = await policies_mod.insert_reconcile_job(
+                uid,
+                trigger_action="update_tags",
+                target_policy_versions={"radar": 1},
+                pending_tickers=[],
+                roster_revision=2,
+            )
+            jid_y = str(job_y["job_id"])
+            claimed_ya = await policies_mod.claim_reconcile_job(uid, jid_y, lease_seconds=60)
+            assert claimed_ya is not None
+
+            yaml_writes: list[str] = []
+
+            class _SpyBackend:
+                async def awrite_text(self, rel_path: str, content: str) -> bool:
+                    _ = rel_path
+                    yaml_writes.append(content)
+                    return True
+
+            monkeypatch.setattr(
+                cov_svc,
+                "_resolve_home_sandbox_backend",
+                create_autospec(cov_svc._resolve_home_sandbox_backend, return_value=_SpyBackend()),
+            )
+
+            lock_key = f"dalton_home_yaml_sync:{uid}"
+            async with await psycopg.AsyncConnection.connect(iso_dsn, autocommit=True) as y_blocker:
+                async with y_blocker.cursor() as cur:
+                    await cur.execute("SELECT pg_advisory_lock(hashtext(%s))", (lock_key,))
+                try:
+                    worker_ya_task = asyncio.create_task(
+                        rec.reconcile_job(uid, jid_y, sync_home=True, _preclaimed_job=claimed_ya)
+                    )
+                    await _wait_for_advisory_lock_waiter(iso_dsn)
+
+                    async with await psycopg.AsyncConnection.connect(iso_dsn, autocommit=True) as admin:
+                        async with admin.cursor() as cur:
+                            await cur.execute(
+                                "UPDATE dalton_watchlist_reconcile_jobs "
+                                "SET claim_expires_at = NOW() - INTERVAL '5 seconds' "
+                                "WHERE job_id = %s::uuid",
+                                (jid_y,),
+                            )
+                    claimed_yb = await policies_mod.claim_reconcile_job(uid, jid_y, lease_seconds=60)
+                    assert claimed_yb is not None
+                    assert claimed_yb["claim_token"] != claimed_ya["claim_token"]
+                finally:
+                    async with y_blocker.cursor() as cur:
+                        await cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (lock_key,))
+
+            res_ya = await asyncio.wait_for(worker_ya_task, timeout=10.0)
+            assert res_ya["reason"] == "lease_lost"
+            assert yaml_writes == []
+
+
+@pytest.mark.asyncio
+async def test_r6_home_yaml_sync_succeeds_with_pool_max_size_one_real_pg() -> None:
+    """r6 Item 6 (Real PG): ``sync_user_coverage_to_home`` reuses its lock connection and
+    succeeds cleanly even when the database connection pool has ``max_size=1``."""
+    from src.dalton.coverage import service as cov_svc
+    from src.dalton.watchlist import policies as policies_mod
+
+    with _isolated_pg_database(PG_DSN) as iso_dsn:
+        env = _alembic_env_for_dsn(iso_dsn)
+        _run_alembic(["upgrade", "head"], env=env, dalton=False)
+        _run_alembic(["upgrade", "head"], env=env, dalton=True)
+
+        uid = f"u-pool1-{uuid.uuid4().hex[:8]}"
+        written: list[tuple[str, str]] = []
+
+        class _CaptureBackend:
+            async def awrite_text(self, rel_path: str, content: str) -> bool:
+                written.append((rel_path, content))
+                return True
+
+        async with _isolated_pool(iso_dsn, max_size=1) as pool:
+            async with pool.connection() as conn:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "INSERT INTO dalton_coverage (user_id, ticker, name, tier, market, extra, source) "
+                            "VALUES (%s, 'NVDA', 'NVIDIA', 'core', 'US', '{}'::jsonb, 'ui')",
+                            (uid,),
+                        )
+                    rev = await policies_mod.bump_user_roster_revision(uid, conn=conn)
+                    assert rev == 1
+
+            ok = await cov_svc.sync_user_coverage_to_home(
+                uid,
+                backend=_CaptureBackend(),
+                roster_revision=1,
+            )
+            assert ok is True
+            assert len(written) == 1
+            assert written[0][0] == "dalton/coverage.yaml"
+            assert "NVDA" in written[0][1]
+
+            state_after = await policies_mod.get_user_roster_state(uid)
+            assert state_after["last_yaml_synced_revision"] == 1

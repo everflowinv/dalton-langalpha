@@ -184,6 +184,18 @@ def build_locked_resume_reconciler(
     return _reconcile_locked
 
 
+def extract_automation_ticker(row: Mapping[str, Any] | None) -> str | None:
+    """Return the uppercase ticker stored in ``row['metadata']['ticker']``, if present."""
+    if not isinstance(row, Mapping):
+        return None
+    meta = row.get("metadata")
+    if isinstance(meta, Mapping):
+        raw = str(meta.get("ticker") or "").strip().upper()
+        if raw:
+            return raw
+    return None
+
+
 def parse_earnings_stage_task_name(name: str | None) -> tuple[str, str] | None:
     """Return ``(ticker_slug, stage)`` for ``dalton-<slug>-earn-*-<tm3|t0|tp1>``, else ``None``."""
     clean = str(name or "").strip().lower()
@@ -286,10 +298,56 @@ async def validate_earnings_stage_allowed_for_user(
     return None
 
 
+async def assert_locked_earnings_resume_allowed(
+    user_id: str,
+    locked_row: Mapping[str, Any] | None,
+    effective_kwargs: dict[str, Any],
+    *,
+    conn: Any = None,
+    ticker: str | None = None,
+) -> None:
+    """Shared row-locked earnings-stage guard for generic resume and Dalton schedule resume.
+
+    Checks the locked row's actual task name and ticker against the user's live watchlist
+    tier & allowed earnings stages on ``conn``. When disallowed (removed ticker, downgraded
+    tier, private company, or lookup unavailable), forces ``effective_kwargs`` to remain
+    paused with ``next_run_at = None`` and raises ``AutomationRefusal`` so the row is never
+    rescheduled.
+    """
+    if not isinstance(locked_row, Mapping):
+        return
+    task_name = str(locked_row.get("name") or "").strip()
+    if parse_earnings_stage_task_name(task_name) is None:
+        return
+    actual_ticker = extract_automation_ticker(locked_row) or (
+        str(ticker).strip().upper() if ticker and str(ticker).strip() else None
+    )
+    err = await validate_earnings_stage_allowed_for_user(
+        user_id,
+        task_name,
+        ticker=actual_ticker,
+        conn=conn,
+    )
+    if err is None:
+        return
+    effective_kwargs["status"] = "paused"
+    effective_kwargs["next_run_at"] = None
+    from src.server.services.automations.lifecycle import AutomationRefusal
+
+    exc = AutomationRefusal(
+        str(err.get("message") or err.get("error") or "earnings_stage_disabled"),
+        field="status",
+    )
+    setattr(exc, "schedule_error_code", str(err.get("error") or "earnings_stage_disabled"))
+    raise exc
+
+
 __all__ = [
     "apply_manual_pause_metadata",
+    "assert_locked_earnings_resume_allowed",
     "build_locked_resume_reconciler",
     "can_override_user_pause_locked",
+    "extract_automation_ticker",
     "is_dalton_managed_automation",
     "parse_earnings_stage_task_name",
     "resolve_paused_once_schedule_at",

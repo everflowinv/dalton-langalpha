@@ -259,6 +259,18 @@ def resolve_earnings_stages(
     return list(CHAIN_BY_TIER.get(tier_key, []))
 
 
+def default_automations_for_stages(
+    ticker: str,
+    quarter: str,
+    stages: list[str],
+) -> dict[str, str]:
+    if not stages:
+        return {}
+    t_slug = slug_ticker(ticker)
+    q_slug = quarter.strip().lower().replace(" ", "")
+    return {k: f"dalton-{t_slug}-earn-{q_slug}-{k}.json" for k in stages}
+
+
 def default_automations_for(
     ticker: str,
     quarter: str,
@@ -270,14 +282,12 @@ def default_automations_for(
 ) -> dict[str, str]:
     if not workspace_id:
         return {}
-    t_slug = slug_ticker(ticker)
-    q_slug = quarter.strip().lower().replace(" ", "")
     keys = resolve_earnings_stages(
         tier,
         tier_policies=tier_policies,
         task_overrides=task_overrides,
     )
-    return {k: f"dalton-{t_slug}-earn-{q_slug}-{k}.json" for k in keys}
+    return default_automations_for_stages(ticker, quarter, keys)
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -398,6 +408,50 @@ def _resolve_live_stage_scope(
     return live_tier, stages
 
 
+def _resolve_live_workspace_id(
+    ticker: str,
+    *,
+    coverage: dict[str, dict[str, Any]],
+    entry: dict[str, Any] | None = None,
+    explicit_workspace_id: str | None = None,
+) -> str | None:
+    """Resolve the active workspace_id for ``check`` / ``mark`` / ``diff``: explicit > live coverage > ledger."""
+    if explicit_workspace_id is not None:
+        return explicit_workspace_id or None
+    sym = str(ticker or "").strip().upper()
+    cov = coverage.get(sym, {})
+    cov_ws_id = (
+        (cov.get("workspace") or {}).get("workspace_id")
+        if isinstance(cov.get("workspace"), dict)
+        else None
+    )
+    return cov_ws_id or ((entry or {}).get("workspace_id") or None)
+
+
+def _resolve_live_workspace_and_stages(
+    ticker: str,
+    *,
+    coverage: dict[str, dict[str, Any]],
+    tier_policies: dict[str, dict[str, Any]] | None,
+    entry: dict[str, Any] | None = None,
+    explicit_workspace_id: str | None = None,
+) -> tuple[str | None, str | None, list[str]]:
+    """Shared live-workspace + live-stage resolver for ``check``, ``mark``, and ``diff``."""
+    ws_id = _resolve_live_workspace_id(
+        ticker,
+        coverage=coverage,
+        entry=entry,
+        explicit_workspace_id=explicit_workspace_id,
+    )
+    live_tier, allowed_stages = _resolve_live_stage_scope(
+        ticker,
+        coverage=coverage,
+        tier_policies=tier_policies,
+        workspace_id=ws_id,
+    )
+    return ws_id, live_tier, allowed_stages
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     state_path = Path(args.state) if args.state else _default_state_path()
     cov_path = Path(getattr(args, "coverage", None)) if getattr(args, "coverage", None) else _default_coverage_path()
@@ -405,18 +459,15 @@ def cmd_check(args: argparse.Namespace) -> int:
     ledger = load_ledger(state_path, create=False)
     ticker = args.ticker.upper()
     entry = ledger.get("entries", {}).get(ticker)
-    cov = coverage.get(ticker, {})
 
     is_confirmed = bool(entry and entry.get("status") == "confirmed" and entry.get("date_status") == "confirmed")
     old_date = entry.get("date") if entry else None
     same_date = bool(is_confirmed and old_date == args.date)
-    cov_ws_id = (cov.get("workspace") or {}).get("workspace_id") if isinstance(cov.get("workspace"), dict) else None
-    effective_ws_id = (entry or {}).get("workspace_id") or cov_ws_id
-    tier_val, expected_stages = _resolve_live_stage_scope(
+    effective_ws_id, tier_val, expected_stages = _resolve_live_workspace_and_stages(
         ticker,
         coverage=coverage,
         tier_policies=tier_policies,
-        workspace_id=effective_ws_id,
+        entry=entry,
     )
     existing_autos = (entry or {}).get("automations") if isinstance((entry or {}).get("automations"), dict) else {}
     has_autos = (not expected_stages) or all(stage in existing_autos for stage in expected_stages)
@@ -428,6 +479,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         "ok": True,
         "ticker": ticker,
         "tier": tier_val,
+        "workspace_id": effective_ws_id,
         "allowed_stages": expected_stages,
         "query_date": args.date,
         "recorded": recorded,
@@ -452,18 +504,13 @@ def cmd_mark(args: argparse.Namespace) -> int:
     now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
     name = args.name or existing.get("name") or cov.get("name") or ticker
-    cov_ws_id = (cov.get("workspace") or {}).get("workspace_id") if isinstance(cov.get("workspace"), dict) else None
-    workspace_id = (
-        args.workspace_id
-        if args.workspace_id is not None
-        else (existing.get("workspace_id") or cov_ws_id)
-    )
-    # r5: allowed stages ALWAYS follow live coverage tier/policy (never overridden by stale ledger or --tier)
-    live_tier, allowed_stages = _resolve_live_stage_scope(
+    # r5/r6: workspace and allowed stages ALWAYS follow the shared live-coverage resolver
+    workspace_id, live_tier, allowed_stages = _resolve_live_workspace_and_stages(
         ticker,
         coverage=coverage,
         tier_policies=tier_policies,
-        workspace_id=workspace_id,
+        entry=existing,
+        explicit_workspace_id=args.workspace_id,
     )
     tier = (live_tier or args.tier or existing.get("tier") or "radar").capitalize()
     fiscal_note = args.fiscal_note or existing.get("fiscal_note") or cov.get("note") or "FY=CY"
@@ -514,27 +561,22 @@ def cmd_mark(args: argparse.Namespace) -> int:
                 else:
                     filtered_out_stages.append(sk)
         elif existing.get("automations") and existing.get("quarter") == args.quarter:
-            # Item 9: recompute/filter against live effective stages so tier changes update tasks immediately
-            expected_defaults = default_automations_for(
+            # r6: derive default filenames strictly from live allowed_stages (empty -> {})
+            expected_defaults = default_automations_for_stages(
                 ticker,
                 args.quarter,
-                tier=tier,
-                workspace_id=workspace_id,
-                tier_policies=tier_policies,
-                task_overrides=cov.get("task_overrides") if isinstance(cov, dict) else None,
+                allowed_stages,
             )
             automations = {
                 stage: existing["automations"].get(stage) or default_fname
                 for stage, default_fname in expected_defaults.items()
             }
         else:
-            automations = default_automations_for(
+            # r6: derive default filenames strictly from live allowed_stages (empty -> {})
+            automations = default_automations_for_stages(
                 ticker,
                 args.quarter,
-                tier=tier,
-                workspace_id=workspace_id,
-                tier_policies=tier_policies,
-                task_overrides=cov.get("task_overrides") if isinstance(cov, dict) else None,
+                allowed_stages,
             )
 
         new_entry = {
@@ -836,15 +878,14 @@ def cmd_diff(args: argparse.Namespace) -> int:
             )
             continue
 
-        # Check automations presence when workspace_id is active/present
-        if ent.get("workspace_id"):
-            # r5: diff uses the exact same live-coverage stage resolver as check and mark
-            _live_tier_diff, expected_keys = _resolve_live_stage_scope(
-                t,
-                coverage=coverage,
-                tier_policies=tier_policies,
-                workspace_id=ent.get("workspace_id"),
-            )
+        # Check automations presence using live coverage workspace + allowed stages (including newly bound workspaces)
+        effective_ws_id, _live_tier_diff, expected_keys = _resolve_live_workspace_and_stages(
+            t,
+            coverage=coverage,
+            tier_policies=tier_policies,
+            entry=ent,
+        )
+        if effective_ws_id:
             autos = ent.get("automations") or {}
             missing_keys = [k for k in expected_keys if not autos.get(k)]
             if missing_keys:

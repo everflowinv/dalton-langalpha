@@ -1041,7 +1041,7 @@ async def render_company_coverage_yaml(*, conn: Any = None) -> str:
     return dump_coverage_yaml(scope_doc)
 
 
-async def _resolve_home_sandbox_backend(user_id: str) -> Any:
+async def _resolve_home_sandbox_backend(user_id: str, *, conn: Any = None) -> Any:
     """Resolve a `SandboxBackend` for `user_id`'s Home workspace if reachable."""
     from ptc_agent.agent.backends.sandbox import SandboxBackend
     from ptc_agent.core.paths import SandboxLayout
@@ -1056,7 +1056,7 @@ async def _resolve_home_sandbox_backend(user_id: str) -> Any:
     )
     if not hasattr(session, "sandbox") or session.sandbox is None:
         raise RuntimeError(f"Sandbox session unavailable for Home workspace {home_ws_id}")
-    row = await get_workspace(str(home_ws_id)) or {}
+    row = await get_workspace(str(home_ws_id), conn=conn) or {}
     dir_name = row.get("dir_name")
     layout = SandboxLayout(session.sandbox.working_dir).for_workspace(dir_name)
     return SandboxBackend(session.sandbox, layout.workspace)
@@ -1077,8 +1077,14 @@ def _get_home_yaml_sync_lock(user_id: str) -> asyncio.Lock:
 async def _cross_worker_home_yaml_lock(user_id: str):
     """Serialize Home YAML check->write->record across workers via PG session advisory lock.
 
+    Yields the lock-holding connection so callers reuse it for all DB operations inside the
+    critical section without checking out a second connection from the same pool.
+    If ``pg_advisory_unlock`` fails or returns False, closes/discards the connection rather
+    than returning a session that still holds the advisory lock to the pool.
     Falls back to in-process asyncio lock cleanly when DB pool is closed (unit tests).
     """
+    import inspect as _inspect
+
     uid = str(user_id or "").strip()
     async with _get_home_yaml_sync_lock(uid):
         lock_key = f"dalton_home_yaml_sync:{uid}"
@@ -1086,7 +1092,7 @@ async def _cross_worker_home_yaml_lock(user_id: str):
             async with coverage_db.get_db_connection() as lock_conn:
                 can_lock = callable(getattr(lock_conn, "cursor", None))
                 if not can_lock:
-                    yield
+                    yield None
                     return
                 try:
                     async with lock_conn.cursor() as cur:
@@ -1096,28 +1102,50 @@ async def _cross_worker_home_yaml_lock(user_id: str):
                         )
                 except Exception as exc:
                     if _is_pool_not_open_error(exc) or not isinstance(exc, Exception):
-                        yield
+                        yield None
                         return
                     # Non-PG mock connection in unit tests: fall back to in-process lock
                     if isinstance(exc, (TypeError, AttributeError)):
-                        yield
+                        yield None
                         return
                     raise
                 try:
-                    yield
+                    yield lock_conn
                 finally:
+                    unlocked = False
                     try:
                         async with lock_conn.cursor() as cur:
                             await cur.execute(
                                 "SELECT pg_advisory_unlock(hashtext(%s))",
                                 (lock_key,),
                             )
-                    except Exception:
-                        pass
+                            fetchone_fn = getattr(cur, "fetchone", None)
+                            if callable(fetchone_fn):
+                                row = await fetchone_fn()
+                                unlocked = bool(row and row[0]) if row is not None else True
+                            else:
+                                unlocked = True
+                    except Exception as unlock_exc:
+                        logger.warning(
+                            "[DALTON_COVERAGE] pg_advisory_unlock failed for user=%s (%s); discarding connection",
+                            uid,
+                            type(unlock_exc).__name__,
+                        )
+                        unlocked = False
+                    if not unlocked:
+                        # Discard the connection so the pool never reuses a session still holding the advisory lock
+                        close_fn = getattr(lock_conn, "close", None)
+                        if callable(close_fn):
+                            try:
+                                close_res = close_fn()
+                                if _inspect.isawaitable(close_res):
+                                    await close_res
+                            except Exception:
+                                pass
                 return
         except Exception as exc:
             if _is_pool_not_open_error(exc) or isinstance(exc, (TypeError, AttributeError)):
-                yield
+                yield None
                 return
             raise
 
@@ -1129,9 +1157,13 @@ async def sync_user_coverage_to_home(
     backend: Any = None,
     rel_path: str = "dalton/coverage.yaml",
     roster_revision: int | None = None,
+    lease_check: Any = None,
 ) -> bool:
     """Cross-worker serialized, revision-guarded write of rendered `coverage.yaml` into `user_id`'s Home sandbox.
 
+    Reuses the advisory-lock connection for all DB reads/writes inside the lock (safe with pool max_size=1).
+    When ``lease_check`` is provided, verifies lease ownership after acquiring the YAML lock and again
+    immediately before the actual write so an expired worker never overwrites Home YAML.
     Refuses to overwrite Home YAML when ``roster_revision < last_yaml_synced_revision`` (including revision 0).
     Logs and returns False on failure without raising.
     """
@@ -1144,19 +1176,33 @@ async def sync_user_coverage_to_home(
     )
 
     is_personal_yaml = rel_path == "dalton/coverage.yaml"
-    async with _cross_worker_home_yaml_lock(uid):
+    async with _cross_worker_home_yaml_lock(uid) as lock_conn:
+        sql_conn = (
+            lock_conn
+            if (lock_conn is not None and callable(getattr(lock_conn, "cursor", None)))
+            else None
+        )
         try:
+            if lease_check is not None:
+                if not await lease_check(sql_conn):
+                    logger.info(
+                        "[DALTON_COVERAGE] aborting Home/%s publish for user=%s: lease lost after YAML lock",
+                        rel_path,
+                        uid,
+                    )
+                    return False
+
             eff_revision = roster_revision
             if yaml_text is None:
                 if is_personal_yaml and eff_revision is None:
-                    state_before = await get_user_roster_state(uid)
+                    state_before = await get_user_roster_state(uid, conn=sql_conn)
                     eff_revision = int(state_before.get("roster_revision") or 0)
-                rendered = await render_coverage_yaml(uid)
+                rendered = await render_coverage_yaml(uid, conn=sql_conn)
             else:
                 rendered = yaml_text
 
             if is_personal_yaml and eff_revision is not None:
-                cur_state = await get_user_roster_state(uid)
+                cur_state = await get_user_roster_state(uid, conn=sql_conn)
                 last_synced_rev = int(cur_state.get("last_yaml_synced_revision") or 0)
                 if int(eff_revision) < last_synced_rev:
                     logger.info(
@@ -1168,7 +1214,18 @@ async def sync_user_coverage_to_home(
                     )
                     return False
 
-            eff_backend = backend or await _resolve_home_sandbox_backend(uid)
+            eff_backend = backend or await _resolve_home_sandbox_backend(uid, conn=sql_conn)
+
+            # Re-verify lease immediately before executing the actual sandbox write
+            if lease_check is not None:
+                if not await lease_check(sql_conn):
+                    logger.info(
+                        "[DALTON_COVERAGE] aborting Home/%s publish for user=%s: lease lost before write",
+                        rel_path,
+                        uid,
+                    )
+                    return False
+
             if hasattr(eff_backend, "awrite_text"):
                 wrote = await eff_backend.awrite_text(rel_path, rendered)
                 if wrote is False:
@@ -1181,7 +1238,7 @@ async def sync_user_coverage_to_home(
                 raise RuntimeError("Unsupported sandbox backend interface")
 
             if is_personal_yaml and eff_revision is not None:
-                await record_yaml_synced_revision(uid, int(eff_revision))
+                await record_yaml_synced_revision(uid, int(eff_revision), conn=sql_conn)
             return True
         except Exception as exc:
             logger.info(

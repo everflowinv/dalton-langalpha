@@ -1708,16 +1708,23 @@ async def schedule_dalton_automation_helper(
                     }
 
         if resolved_action in ("upsert", "resume") and not is_home_target:
-            from src.dalton.watchlist.pause_guards import validate_earnings_stage_allowed_for_user
+            from src.dalton.watchlist.pause_guards import (
+                extract_automation_ticker,
+                validate_earnings_stage_allowed_for_user,
+            )
 
             earn_target_name = str(
                 (existing.get("name") if isinstance(existing, Mapping) and existing.get("name") else None)
                 or resolved_name
             )
+            earn_target_ticker = (
+                extract_automation_ticker(existing)
+                or (str(resolved_ticker) if resolved_ticker else None)
+            )
             earn_guard_err = await validate_earnings_stage_allowed_for_user(
                 task_owner,
                 earn_target_name,
-                ticker=str(resolved_ticker) if resolved_ticker else None,
+                ticker=earn_target_ticker,
                 conn=active_conn,
             )
             if earn_guard_err is not None:
@@ -1847,6 +1854,18 @@ async def schedule_dalton_automation_helper(
                     apply_locked_pause_schedule(locked_view, effective_kwargs)
                 else:
                     apply_locked_resume_schedule(locked_view, effective_kwargs)
+                    if not locked_is_home:
+                        from src.dalton.watchlist.pause_guards import (
+                            assert_locked_earnings_resume_allowed,
+                        )
+
+                        await assert_locked_earnings_resume_allowed(
+                            task_owner,
+                            locked_view,
+                            effective_kwargs,
+                            conn=_locked_conn,
+                            ticker=str(resolved_ticker) if resolved_ticker else None,
+                        )
                     locked_meta = locked_view.get("metadata")
                     if isinstance(locked_meta, Mapping) and (
                         "handoff_paused_reason" in locked_meta

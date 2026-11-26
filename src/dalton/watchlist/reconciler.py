@@ -114,12 +114,14 @@ def _earn_stage_from_name(name: str, ticker: str) -> str | None:
 async def is_unstarted_earn_once(
     row: Mapping[str, Any],
     *,
+    user_id: str | None = None,
     conn: Any = None,
 ) -> bool:
     """Return True iff ``row`` is an unstarted one-shot earnings task.
 
     Includes tasks already claimed by the scheduler (``last_run_at`` stamped on claim)
     whose execution rows are still ``pending`` / ``waiting`` and have never started running.
+    Fails safe (returns True -> pause) if execution status lookup fails.
     """
     name = str(row.get("name") or "").strip().lower()
     if "-earn-" not in name:
@@ -140,35 +142,69 @@ async def is_unstarted_earn_once(
     auto_id = str(row.get("automation_id") or "").strip()
     if not auto_id:
         return False
+    uid = str(user_id or row.get("user_id") or "").strip()
     statuses: list[str] = []
-    if conn is not None and callable(getattr(conn, "cursor", None)):
+    queried_ok = False
+    sql_conn = conn if (conn is not None and callable(getattr(conn, "cursor", None))) else None
+    if sql_conn is not None:
         try:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    SELECT status
-                    FROM automation_executions
-                    WHERE automation_id = %s::uuid
-                    ORDER BY created_at DESC
-                    LIMIT 10
-                    """,
-                    (auto_id,),
-                )
-                exec_rows = await cur.fetchall()
+            tx_fn = getattr(sql_conn, "transaction", None)
+            if callable(tx_fn):
+                async with tx_fn():
+                    async with sql_conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            SELECT status
+                            FROM automation_executions
+                            WHERE automation_id = %s::uuid
+                            ORDER BY created_at DESC
+                            LIMIT 10
+                            """,
+                            (auto_id,),
+                        )
+                        exec_rows = await cur.fetchall()
+            else:
+                async with sql_conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        SELECT status
+                        FROM automation_executions
+                        WHERE automation_id = %s::uuid
+                        ORDER BY created_at DESC
+                        LIMIT 10
+                        """,
+                        (auto_id,),
+                    )
+                    exec_rows = await cur.fetchall()
+            queried_ok = True
             for er in exec_rows or []:
                 st = er["status"] if isinstance(er, Mapping) else er[0]
                 if st is not None:
                     statuses.append(str(st).strip().lower())
         except Exception:
+            queried_ok = False
             statuses = []
-    if not statuses:
+    if not queried_ok:
+        if not uid:
+            # Fail-safe: unable to query executions without user_id -> pause
+            return True
         try:
-            exec_list = await exec_db.list_executions(auto_id, limit=10)
+            if sql_conn is not None:
+                exec_res = await exec_db.list_executions(
+                    uid, automation_id=auto_id, limit=10, conn=sql_conn
+                )
+            else:
+                exec_res = await exec_db.list_executions(
+                    uid, automation_id=auto_id, limit=10
+                )
+            exec_list = exec_res[0] if isinstance(exec_res, tuple) else exec_res
+            queried_ok = True
             for er in exec_list or []:
                 if isinstance(er, Mapping) and er.get("status") is not None:
                     statuses.append(str(er["status"]).strip().lower())
         except Exception:
-            return False
+            # Fail-safe: query failure -> treat as should-pause
+            return True
     if not statuses:
         return False
     has_unstarted = any(s in ("pending", "waiting") for s in statuses)
@@ -403,18 +439,33 @@ async def _verify_workspace_bound_to_ticker(
 
     # 3. Positive fallback: read the CURRENT active company identity/document inside ws_clean itself
     # (never search historical knowledge versions across workspaces).
+    # Pass current conn so no second pool connection is checked out; on query failure,
+    # fail-safe by treating the workspace as still bound so removed-ticker tasks are paused.
     try:
         from src.dalton.autonomy.tracking import _resolve_workspace_ticker
 
-        cur_ws_ticker = await _resolve_workspace_ticker(ws_clean)
-        if cur_ws_ticker:
-            cur_canon = canonical_workspace_ticker_key(str(cur_ws_ticker))
-            if cur_canon and sym_canon and cur_canon == sym_canon:
-                return True
-            if str(cur_ws_ticker).strip().upper() == sym:
-                return True
-    except Exception:
-        pass
+        tx_fn = getattr(conn, "transaction", None) if conn is not None else None
+        if callable(tx_fn):
+            async with tx_fn():
+                cur_ws_ticker = await _resolve_workspace_ticker(ws_clean, conn=conn)
+        else:
+            cur_ws_ticker = await _resolve_workspace_ticker(ws_clean, conn=conn)
+    except ValueError:
+        return False
+    except Exception as exc:
+        logger.warning(
+            "[WATCHLIST_RECONCILE] workspace identity lookup failed for ws=%s ticker=%s (%s); treating as still bound",
+            ws_clean,
+            sym,
+            type(exc).__name__,
+        )
+        return True
+    if cur_ws_ticker:
+        cur_canon = canonical_workspace_ticker_key(str(cur_ws_ticker))
+        if cur_canon and sym_canon and cur_canon == sym_canon:
+            return True
+        if str(cur_ws_ticker).strip().upper() == sym:
+            return True
     return False
 
 
@@ -485,6 +536,8 @@ class TierPolicyReconciler:
         override_user_pause: bool = False,
         override_pause_versions: Mapping[str, int] | None = None,
         target_policy_versions: Mapping[str, int] | None = None,
+        job_id: str | None = None,
+        claim_token: str | None = None,
     ) -> dict[str, Any]:
         """Reconcile all managed automations for one company under its own ``user_automations_lock``."""
         uid = str(user_id or "").strip()
@@ -519,6 +572,22 @@ class TierPolicyReconciler:
         async with _user_automations_lock_for_write(uid, prelock_ws=ws_id) as conn:
             conn_kw = {"conn": conn} if conn is not None else {}
 
+            # r6: fence DB side effects with lease verification INSIDE the automation lock & same transaction
+            if job_id and claim_token:
+                lease_still_held = await renew_reconcile_job_lease(
+                    uid, job_id, claim_token=claim_token, conn=conn
+                )
+                if not lease_still_held:
+                    return {
+                        "ticker": sym,
+                        "workspace_id": ws_id,
+                        "ok": False,
+                        "lease_lost": True,
+                        "reason": "lease_lost",
+                        "actions": [],
+                        "skipped_executions": 0,
+                    }
+
             # Re-verify workspace tracking ownership inside the lock
             owner_uid = await resolve_workspace_tracking_owner(ws_id, conn=conn)
             if owner_uid != uid:
@@ -533,10 +602,27 @@ class TierPolicyReconciler:
             # Re-read live coverage row and latest tier policies inside the lock
             live_row = await coverage_db.get_coverage_row(uid, sym, conn=conn)
             if live_row is None:
-                # Item 6: verify workspace is still bound to this ticker before pausing on remove
-                still_bound = await _verify_workspace_bound_to_ticker(
-                    uid, ws_id, sym, conn=conn
-                )
+                # Item 6 / r6: verify workspace is still bound to this ticker before pausing on remove;
+                # query errors fail safe (still_bound=True) so removed-ticker tasks are paused, never skipped.
+                try:
+                    tx_fn = getattr(conn, "transaction", None) if conn is not None else None
+                    if callable(tx_fn):
+                        async with tx_fn():
+                            still_bound = await _verify_workspace_bound_to_ticker(
+                                uid, ws_id, sym, conn=conn
+                            )
+                    else:
+                        still_bound = await _verify_workspace_bound_to_ticker(
+                            uid, ws_id, sym, conn=conn
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "[WATCHLIST_RECONCILE] _verify_workspace_bound_to_ticker failed for ws=%s ticker=%s (%s); treating as still bound",
+                        ws_id,
+                        sym,
+                        type(exc).__name__,
+                    )
+                    still_bound = True
                 if not still_bound:
                     return {
                         "ticker": sym,
@@ -580,7 +666,7 @@ class TierPolicyReconciler:
                             continue
                         is_std = r_name in all_std_names
                         is_future_earn = (live_row is None) and (
-                            await is_unstarted_earn_once(r, conn=conn)
+                            await is_unstarted_earn_once(r, user_id=uid, conn=conn)
                         )
                         if not (is_std or is_future_earn):
                             continue
@@ -916,7 +1002,7 @@ class TierPolicyReconciler:
                 # Item 9 / r5: pause unstarted earnings tasks (including scheduler-claimed pending/waiting rows)
                 allowed_earn_stages = set(effective_policy.earnings_stages)
                 for r in company_rows:
-                    if not (await is_unstarted_earn_once(r, conn=conn)):
+                    if not (await is_unstarted_earn_once(r, user_id=uid, conn=conn)):
                         continue
                     auto_id = str(r.get("automation_id") or "").strip()
                     r_name = str(r.get("name") or "").strip().lower()
@@ -1094,7 +1180,25 @@ class TierPolicyReconciler:
                     override_user_pause=override_user_pause,
                     override_pause_versions=override_pause_versions,
                     target_policy_versions=target_versions,
+                    job_id=jid if claim_token is not None else None,
+                    claim_token=claim_token,
                 )
+                if isinstance(res, Mapping) and (
+                    res.get("lease_lost") or res.get("reason") == "lease_lost"
+                ):
+                    return {
+                        "ok": False,
+                        "claimed": False,
+                        "job_id": jid,
+                        "status": "running",
+                        "reason": "lease_lost",
+                        "yaml_synced": bool(job.get("yaml_synced", False)),
+                        "completed_tickers": completed,
+                        "pending_tickers": remaining_pending,
+                        "failed_items": new_failed,
+                        "company_results": company_results,
+                        "job": None,
+                    }
                 company_results.append(res)
                 completed.append(sym)
                 completed_set.add(sym)
@@ -1164,7 +1268,7 @@ class TierPolicyReconciler:
                         "job": None,
                     }
 
-        # Stage 3: Home YAML sync (verify active lease BEFORE writing Home YAML; include revision 0)
+        # Stage 3: Home YAML sync (verify active lease BEFORE, inside YAML lock, and right before actual write)
         yaml_synced = bool(job.get("yaml_synced", False))
         if sync_home and not yaml_synced:
             if claim_token is not None:
@@ -1187,16 +1291,51 @@ class TierPolicyReconciler:
                     }
             import inspect as _inspect
 
+            yaml_lease_lost = False
+
+            async def _verify_yaml_lease(lock_conn: Any = None) -> bool:
+                nonlocal yaml_lease_lost
+                if claim_token is None:
+                    return True
+                sql_c = (
+                    lock_conn
+                    if (lock_conn is not None and callable(getattr(lock_conn, "cursor", None)))
+                    else None
+                )
+                held = await renew_reconcile_job_lease(
+                    uid, jid, claim_token=claim_token, conn=sql_c
+                )
+                if not held:
+                    yaml_lease_lost = True
+                return held
+
             sync_kwargs: dict[str, Any] = {}
             try:
                 _sync_params = _inspect.signature(sync_user_coverage_to_home).parameters
-                if "roster_revision" in _sync_params or any(
+                _has_var_kw = any(
                     p.kind == _inspect.Parameter.VAR_KEYWORD for p in _sync_params.values()
-                ):
+                )
+                if "roster_revision" in _sync_params or _has_var_kw:
                     sync_kwargs["roster_revision"] = job_roster_revision
+                if claim_token is not None and ("lease_check" in _sync_params or _has_var_kw):
+                    sync_kwargs["lease_check"] = _verify_yaml_lease
             except (TypeError, ValueError):
                 sync_kwargs["roster_revision"] = job_roster_revision
             synced = bool(await sync_user_coverage_to_home(uid, **sync_kwargs))
+            if yaml_lease_lost:
+                return {
+                    "ok": False,
+                    "claimed": False,
+                    "job_id": jid,
+                    "status": "running",
+                    "reason": "lease_lost",
+                    "yaml_synced": False,
+                    "completed_tickers": completed,
+                    "pending_tickers": remaining_pending,
+                    "failed_items": new_failed,
+                    "company_results": company_results,
+                    "job": None,
+                }
             if synced:
                 yaml_synced = True
 

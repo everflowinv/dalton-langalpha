@@ -313,6 +313,57 @@ async def _resolve_ws_map_and_owners(
     return ws_map, ws_owners
 
 
+def _compute_resolve_group_membership_delta(
+    group_id: str,
+    matched_set: set[str],
+    existing_rows: Sequence[Mapping[str, Any]],
+    existing_by_ticker: Mapping[str, Mapping[str, Any]],
+) -> dict[str, list[str]]:
+    """Compute the full deterministic membership delta for ``resolve_group`` (preview & locked execute)."""
+    gid = str(group_id or "").strip()
+    new_tickers = sorted(t for t in matched_set if t not in existing_by_ticker)
+    membership_tickers = sorted(
+        t
+        for t in matched_set
+        if t not in existing_by_ticker
+        or gid not in extract_row_group_ids(existing_by_ticker[t])
+    )
+    stale_tickers = sorted(
+        str(r["ticker"]).upper()
+        for r in existing_rows
+        if r.get("ticker")
+        and gid in extract_row_group_ids(r)
+        and str(r["ticker"]).upper() not in matched_set
+    )
+    unstale_tickers = sorted(
+        str(r["ticker"]).upper()
+        for r in existing_rows
+        if r.get("ticker")
+        and gid in extract_row_group_ids(r)
+        and str(r["ticker"]).upper() in matched_set
+        and gid in extract_row_stale_group_ids(r)
+    )
+    return {
+        "new_tickers": new_tickers,
+        "membership_tickers": membership_tickers,
+        "stale_tickers": stale_tickers,
+        "unstale_tickers": unstale_tickers,
+    }
+
+
+def _normalize_resolve_membership_delta(raw: Mapping[str, Any]) -> dict[str, list[str]]:
+    """Normalize a snapshot's ``resolve_membership_delta`` mapping for exact comparison."""
+    out: dict[str, list[str]] = {}
+    for key in ("new_tickers", "membership_tickers", "stale_tickers", "unstale_tickers"):
+        vals = raw.get(key)
+        if not isinstance(vals, Sequence) or isinstance(vals, (str, bytes)):
+            raise WatchlistScopeChangedError()
+        out[key] = sorted(
+            str(t).strip().upper() for t in vals if str(t).strip()
+        )
+    return out
+
+
 class WatchlistMutationService:
     """Unified preview & transactional mutation service shared by Web REST, legacy `/coverage`, and CoS."""
 
@@ -385,6 +436,7 @@ class WatchlistMutationService:
         resolved_group_label: str | None = None
         resolved_criteria: dict[str, Any] = dict(criteria or {})
 
+        resolve_membership_delta: dict[str, list[str]] | None = None
         if act == "add":
             raw_tickers = normalize_tickers_input(tickers)
             if not raw_tickers:
@@ -502,7 +554,10 @@ class WatchlistMutationService:
             matched_all = [
                 str(c["ticker"]).upper() for c in resolved_companies if c.get("ticker")
             ]
-            norm_tickers = [t for t in matched_all if t not in existing_by_ticker]
+            resolve_membership_delta = _compute_resolve_group_membership_delta(
+                resolved_group_id, set(matched_all), existing_rows, existing_by_ticker
+            )
+            norm_tickers = list(resolve_membership_delta["new_tickers"])
             raw_tickers = list(norm_tickers)
             prevalidated = {
                 str(c["ticker"]).upper(): dict(c)
@@ -720,6 +775,7 @@ class WatchlistMutationService:
                 "expected_pause_versions": dict(expected_pause_versions),
                 "roster_revision": roster_revision,
                 "prevalidated": prevalidated if act in ("add", "add_group") else None,
+                "resolve_membership_delta": resolve_membership_delta if act == "resolve_group" else None,
             }
             snapshot_id = await insert_confirm_snapshot(uid, server_snapshot_payload)
 
@@ -748,6 +804,7 @@ class WatchlistMutationService:
             "criteria": resolved_criteria if act == "add_group" else None,
             "auto_refresh": bool(auto_refresh) if act == "add_group" else None,
             "prevalidated": prevalidated if act in ("add", "add_group") else None,
+            "resolve_membership_delta": resolve_membership_delta if act == "resolve_group" else None,
             "card_title": card_title,
             "card_description": card_description,
             "preserve_workspace_notice": (
@@ -877,7 +934,13 @@ class WatchlistMutationService:
                     }
                     has_any_rows = bool(matched_by_ticker or existing_rows)
 
-                    new_tickers = [t for t in matched_by_ticker if t not in existing_by_ticker]
+                    live_delta = _compute_resolve_group_membership_delta(
+                        gid, matched_set, existing_rows, existing_by_ticker
+                    )
+                    new_tickers = list(live_delta["new_tickers"])
+                    tickers_needing_membership = list(live_delta["membership_tickers"])
+                    stale_candidates = list(live_delta["stale_tickers"])
+                    unstale_candidates = list(live_delta["unstale_tickers"])
                     if not allow_internal:
                         snap_row_res = await get_confirm_snapshot(
                             uid,
@@ -904,32 +967,19 @@ class WatchlistMutationService:
                             for t in (snap_res.get("target_tickers") or [])
                             if str(t).strip()
                         )
-                        if sorted(new_tickers) != snap_new_tickers:
+                        if new_tickers != snap_new_tickers:
+                            raise WatchlistScopeChangedError()
+                        snap_delta_raw = snap_res.get("resolve_membership_delta")
+                        if not isinstance(snap_delta_raw, Mapping):
+                            raise WatchlistScopeChangedError()
+                        snap_delta = _normalize_resolve_membership_delta(snap_delta_raw)
+                        if snap_delta != live_delta:
                             raise WatchlistScopeChangedError()
                         consumed_res = await consume_confirm_snapshot(
                             uid, clean_snapshot_id or "", conn=db_conn
                         )
                         if consumed_res is None:
                             raise WatchlistScopeChangedError("确认快照已被使用或已过期，请重新预览确认。")
-                    tickers_needing_membership = [
-                        t
-                        for t in matched_by_ticker
-                        if t not in existing_by_ticker
-                        or gid not in extract_row_group_ids(existing_by_ticker[t])
-                    ]
-                    stale_candidates = [
-                        str(r["ticker"]).upper()
-                        for r in existing_rows
-                        if gid in extract_row_group_ids(r)
-                        and str(r["ticker"]).upper() not in matched_set
-                    ]
-                    unstale_candidates = [
-                        str(r["ticker"]).upper()
-                        for r in existing_rows
-                        if gid in extract_row_group_ids(r)
-                        and str(r["ticker"]).upper() in matched_set
-                        and gid in extract_row_stale_group_ids(r)
-                    ]
 
                     units_unavailable = False
                     if tickers_needing_membership:

@@ -282,6 +282,7 @@ async def _resolve_workspace_ticker(
     existing_rows: list[dict[str, Any]] | None = None,
     *,
     registered_units: Mapping[str, Mapping[str, Any]] | None = None,
+    conn: Any = None,
 ) -> str:
     """Resolve the uppercase company ticker for a workspace, or raise.
 
@@ -295,7 +296,11 @@ async def _resolve_workspace_ticker(
     """
     ws: dict[str, Any] | None = None
     try:
-        ws = await ws_db.get_workspace(str(workspace_id))
+        ws = (
+            await ws_db.get_workspace(str(workspace_id), conn=conn)
+            if conn is not None
+            else await ws_db.get_workspace(str(workspace_id))
+        )
     except Exception as exc:
         logger.debug("[DALTON_TRACKING] get_workspace(%s) failed: %s", workspace_id, exc)
 
@@ -305,6 +310,7 @@ async def _resolve_workspace_ticker(
         ws if ws is not None else {"workspace_id": str(workspace_id)},
         registered_units=registered_units,
         automations=existing_rows,
+        conn=conn,
     )
     if identity.is_home:
         raise ValueError("Home workspace does not support company auto-tracking")
