@@ -25,7 +25,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ptc_agent.core.paths import DEFAULT_LAYOUT, resolve_agent_path
+from ptc_agent.core.path_fold import resolve_agent_path
+from ptc_agent.core.paths import DEFAULT_LAYOUT
 from src.dalton.auth import verify_workspace_access
 from src.dalton.llm.assist import assist_json
 from src.dalton.llm.model_prefs import (

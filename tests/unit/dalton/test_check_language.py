@@ -20,7 +20,8 @@ from src.dalton.llm.assist import AssistResult, assist_json
 from src.dalton.publish import language as language_mod
 from src.dalton.publish.language import run_check_language
 from ptc_agent.agent.backends.sandbox import SandboxBackend
-from ptc_agent.core.paths import DEFAULT_LAYOUT, resolve_agent_path
+from ptc_agent.core.path_fold import resolve_agent_path
+from ptc_agent.core.paths import DEFAULT_LAYOUT
 
 WORKSPACE_DIR = DEFAULT_LAYOUT.root
 DRAFT = "drafts/2026-10-23-call-META.md"

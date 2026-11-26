@@ -35,6 +35,8 @@ features:
     enabled: false
   browser:
     enabled: false
+  drive:
+    enabled: false
   teams:
     enabled: false
   shared_workspaces:

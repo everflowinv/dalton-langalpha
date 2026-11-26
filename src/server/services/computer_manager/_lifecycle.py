@@ -271,6 +271,27 @@ class SessionLifecycleMixin:
                             ws_version=workspace_view.mcp_config_version,
                         )
                         self._freeze_tool_view(computer_id, workspace_id, session)
+                        # DALTON-HOOK(colleague-access): ensure owner's Drive mount is torn down before a colleague's turn on a warm computer
+                        if (
+                            user_id
+                            and workspace_user_id
+                            and str(user_id) != str(workspace_user_id)
+                            and session.sandbox is not None
+                        ):
+                            from src.config.features import is_feature_enabled_system
+
+                            if is_feature_enabled_system("drive"):
+                                from src.server.services.livefs import (
+                                    drive_mount as livefs_drive_mount,
+                                )
+
+                                await livefs_drive_mount.converge(
+                                    session.sandbox,
+                                    computer_id=computer_id,
+                                    user_id=workspace_user_id,
+                                    provider=self._livefs_provider(session.sandbox),
+                                    caller_user_id=user_id,
+                                )
                         safe_add(session_path_counter, 1, {"path": "warm_cooldown"})
                         return session
 

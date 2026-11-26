@@ -12,8 +12,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { AuthContext, _localDevValue } from '@/contexts/AuthContext';
 import { clearAuthToken } from '@/lib/authToken';
 import { LocalAuthProvider } from '@/lib/dalton/LocalAuthProvider';
+import { computeAgentArtifactRouting } from '@/pages/ChatAgent/utils/agentArtifactRouting';
 import {
-  computeAgentArtifactRouting,
   normalizeAgentPath,
   type ComputerFolders,
 } from '@/pages/ChatAgent/utils/agentPaths';
@@ -245,22 +245,31 @@ describe('gateway ?file= encoding and rooted-path parity with agentPaths', () =>
   };
 
   it('routes rooted sandbox, sibling, custom-root, and former-root ?file= values to the exact workspace file', () => {
+    const fileDest = (raw: string, folders: ComputerFolders | null) => {
+      const dest = computeAgentArtifactRouting(raw, undefined, folders);
+      expect(dest.kind).toBe('panel');
+      if (dest.kind !== 'panel' || dest.target.kind !== 'file' || !('path' in dest.target)) {
+        throw new Error(`expected panel file destination, got ${JSON.stringify(dest)}`);
+      }
+      return { workspaceId: dest.workspaceId, path: dest.target.path };
+    };
+
     // 1. Current workspace folder folded off when rooted `/home/workspace/Research/...` is preserved
     const ownFile = new URLSearchParams('?file=%2Fhome%2Fworkspace%2FResearch%2Fresults%2Freport.md').get('file')!;
-    const ownRouting = computeAgentArtifactRouting(ownFile, undefined, researchFolders);
-    expect(ownRouting.setWorkspaceId).toBeNull();
-    expect(normalizeAgentPath(ownRouting.targetFile!)).toBe('results/report.md');
+    const ownRouting = fileDest(ownFile, researchFolders);
+    expect(ownRouting.workspaceId).toBeNull();
+    expect(normalizeAgentPath(ownRouting.path)).toBe('results/report.md');
 
     // 2. Sibling workspace folder routed to sibling workspace id instead of nested subdirectory
     const siblingFile = new URLSearchParams('?file=%2Fhome%2Fworkspace%2FNVDA%2Fresults%2Freport.md').get('file')!;
-    const siblingRouting = computeAgentArtifactRouting(siblingFile, undefined, researchFolders);
-    expect(siblingRouting.setWorkspaceId).toBe('20cc68e8-d057-41f4-9bb1-57aa8d310704');
-    expect(normalizeAgentPath(siblingRouting.targetFile!)).toBe('results/report.md');
+    const siblingRouting = fileDest(siblingFile, researchFolders);
+    expect(siblingRouting.workspaceId).toBe('20cc68e8-d057-41f4-9bb1-57aa8d310704');
+    expect(normalizeAgentPath(siblingRouting.path)).toBe('results/report.md');
 
     // 3. Rootless / flat sandbox workspace still opens `results/report.md`
     const flatFile = new URLSearchParams('?file=%2Fhome%2Fworkspace%2Fresults%2Freport.md').get('file')!;
-    const flatRouting = computeAgentArtifactRouting(flatFile, undefined, null);
-    expect(normalizeAgentPath(flatRouting.targetFile!)).toBe('results/report.md');
+    const flatRouting = fileDest(flatFile, null);
+    expect(normalizeAgentPath(flatRouting.path)).toBe('results/report.md');
 
     // 4. Custom computer root and former (moved-off) root resolve via ComputerFolders
     const customFolders: ComputerFolders = {
@@ -271,10 +280,10 @@ describe('gateway ?file= encoding and rooted-path parity with agentPaths', () =>
       siblings: [],
     };
     const customFile = new URLSearchParams('?file=%2Fhome%2Fsomeone%2Flangalpha%2FResearch%2Fresults%2Freport.md').get('file')!;
-    expect(computeAgentArtifactRouting(customFile, undefined, customFolders).targetFile).toBe('results/report.md');
+    expect(fileDest(customFile, customFolders).path).toBe('results/report.md');
 
     const movedFile = new URLSearchParams('?file=%2Fsrv%2Fold%2FResearch%2Fresults%2Freport.md').get('file')!;
-    expect(computeAgentArtifactRouting(movedFile, undefined, customFolders).targetFile).toBe('results/report.md');
+    expect(fileDest(movedFile, customFolders).path).toBe('results/report.md');
 
     // 5. `+`, Chinese, spaces, and parentheses round-trip identically via URLSearchParams
     expect(new URLSearchParams('?file=results%2Fa%2Bb.md').get('file')).toBe('results/a+b.md');

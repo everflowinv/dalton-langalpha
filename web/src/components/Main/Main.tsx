@@ -1,4 +1,4 @@
-import { Suspense, useEffect } from 'react';
+import { Suspense, useEffect, type ReactNode } from 'react';
 import { Routes, Route, Navigate, useLocation } from 'react-router';
 import type { QueryClient } from '@tanstack/react-query';
 import PageLoading from '@/components/PageLoading/PageLoading';
@@ -45,6 +45,9 @@ const routeChunks = {
   // takes the dashboard chunk, the same one the catch-all redirect lands on.
   orders: dashboardChunk,
   library: withCopy(() => import('../../pages/Library/Library'), ['mcp']),
+  drive: withCopy(() => import('../../pages/Drive/Drive'), [
+    'drive', 'filePanel', 'mcp', 'pageViewer', 'toolArtifact',
+  ]),
   plugins: pluginsChunk,
   // DALTON-HOOK(i18n): Settings reaches McpPrimitives ('mcp') in Dalton chunk graph
   settings: withCopy(() => import('../../pages/Settings/Settings'), [
@@ -63,15 +66,18 @@ const Automations = lazyWithMotion(routeChunks.automations);
 const Monitors = lazyWithMotion(routeChunks.monitors); // DALTON-HOOK(monitors)
 // DALTON-HOOK(hide-trading): do not mount Orders page
 const Library = lazyWithMotion(routeChunks.library);
+const Drive = lazyWithMotion(routeChunks.drive);
 
-/** /library exists only where the organization library is on for the account;
- *  anywhere else it is an unknown address and goes where every unknown one
- *  goes. */
-function LibraryRoute() {
+/**
+ * A page that exists only where its feature is on for the user: the
+ * organization library, the Drive. Anywhere else its address is unknown and
+ * goes where every unknown one goes.
+ */
+function FeatureRoute({ feature, children }: { feature: string; children: ReactNode }) {
   const { data, isPending } = useFeatures();
   if (isPending) return <PageLoading variant="pane" />;
-  return isFeatureEnabled(data, 'org_library')
-    ? <Library />
+  return isFeatureEnabled(data, feature)
+    ? children
     : <Navigate to={import.meta.env.VITE_DALTON_MODE ? '/chat' : '/dashboard'} replace />; // DALTON-HOOK(dalton-nav)
 }
 const Plugins = lazyWithMotion(routeChunks.plugins);
@@ -90,6 +96,7 @@ const routePreloads = {
   // DALTON-HOOK(hide-trading): the Orders page is not mounted; /orders warms the dashboard.
   orders: Dashboard.preload,
   library: Library.preload,
+  drive: Drive.preload,
   plugins: Plugins.preload,
   settings: Settings.preload,
   connectors: Plugins.preload,
@@ -180,7 +187,8 @@ function Main() {
           <Route path="/monitors" element={<Monitors />} />
           <Route path="/monitors/:slug" element={<Monitors />} />
           <Route path="/orders" element={<Navigate to={import.meta.env.VITE_DALTON_MODE ? '/chat' : '/dashboard'} replace />} /> {/* DALTON-HOOK(hide-trading) */}
-          <Route path="/library" element={<LibraryRoute />} />
+          <Route path="/library" element={<FeatureRoute feature="org_library"><Library /></FeatureRoute>} />
+          <Route path="/drive" element={<FeatureRoute feature="drive"><Drive /></FeatureRoute>} />
           <Route path="/plugins" element={<Plugins />} />
           <Route path="/connectors" element={<LegacyConnectorsRedirect />} />
           <Route path="/settings" element={<Settings />} />

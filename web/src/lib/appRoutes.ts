@@ -8,6 +8,7 @@ export const APP_SECTIONS = [
   'monitors', // DALTON-HOOK(monitors)
   'orders',
   'library',
+  'drive',
   'plugins',
   'settings',
   'connectors',

@@ -134,6 +134,15 @@ docker compose -f docker-compose.yml -f docker-compose.dalton.yml exec -T \
   3. 按第 1.1 节运行 `bash scripts/dalton/docker_build_backend.sh` 重建并重启后端；
   4. 按上游默认（`INSTALL_AGENT_BROWSER=1`）重建 `langalpha-sandbox:latest`（如 `docker build -f Dockerfile.sandbox -t langalpha-sandbox:latest .` 或显式加 `--build-arg INSTALL_AGENT_BROWSER=1`），并重建替换现有沙箱容器。
 
+### 2.3 Drive 功能（默认关闭）与对象存储生命周期规则
+
+- **默认关闭配置**：合并上游 `#872`（Drive）后，Everflow 生产（`config.dalton.yaml`）与独立核心安装（`config.core.yaml`）均默认设置 `features.drive.enabled: false`。关闭状态下，设置页实验开关、侧栏 `/drive` 入口、前端 `/drive` 路由、计算机 `.agents/drive` 挂载与智能体文件工具中的 Drive 路由均处于隐藏或关闭状态，后端 `/api/v1/drive/*` 与 `/api/v1/livefs/drive/*` 路由统一返回 `404`。
+- **开启前的安全前提**：Dalton 的同事访问会在计算机主人的环境上运行同事回合。当前已在 Drive 挂载生命周期、Drive 挂载接口、命令门卫及 `backends/drive.py` 中加入 `DALTON-HOOK(colleague-access)` 防护，确保调用者为非计算机主人时不会挂载或暴露主人的 `.agents/drive`。计划开启 Drive 前，仍需结合同事访问与外部成员权限边界完成专项安全复查。
+- **对象存储生命周期规则与启动告警说明**：后端启动时会调用 `has_multipart_cleanup_rule(min_days=7, prefix="uploads/")` 检查主存储桶（`STORAGE_BUCKET_NAME`）是否配置了「中止未完成分片上传且 `DaysAfterInitiation >= 7`」的生命周期规则。
+  - 当存储桶缺少该规则或天数为 6 天及以下时，后端会输出一条 `WARNING` 日志提醒运维配置，该检查仅作告警提示，正常放行 Everflow 启动。
+  - 即使 Drive 保持关闭，工作区大文件与附件的分片上传同样使用 `uploads/` 前缀；建议在 S3 / R2 / MinIO 的对应存储桶上配置 `AbortIncompleteMultipartUpload`（`DaysAfterInitiation >= 7`，作用于整桶或覆盖 `uploads/` 前缀），及时清理进程异常中断遗留的分片碎片并消除启动告警。
+  - 独立核心安装自带的 `scripts/standalone/minio_init.py` 已在初始化存储桶时自动幂等写入 `7` 天 `AbortIncompleteMultipartUpload` 生命周期规则（同时保留桶上已有其他规则）。
+
 ## 3. 宿主机 `launchd` 服务运维
 
 ### 3.1 服务安装与常用管理命令
