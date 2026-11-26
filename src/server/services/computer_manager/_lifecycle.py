@@ -1846,6 +1846,8 @@ class SessionLifecycleMixin:
     ) -> Dict[str, Any]:
         computer_id = binding.computer_id
         try:
+            # DALTON-HOOK(stop-backup-attach): initialize before owner-machine probe so except-path reconcile never hits UnboundLocalError
+            backup_skipped_workspaces: int | None = None
             # Before the backup, which would wait out its timeout on every
             # folder of a machine that is not there.
             if (
@@ -1858,7 +1860,6 @@ class SessionLifecycleMixin:
 
             # A machine its owner chose not to back up keeps its last backup.
             backup_ms = None
-            backup_skipped_workspaces: int | None = None
             if binding.files_backup and back_up:
                 backup_started = time.monotonic()
                 # DALTON-HOOK(stop-backup-attach): temporarily attach a running-only session when this worker holds none

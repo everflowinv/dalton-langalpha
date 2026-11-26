@@ -1667,7 +1667,7 @@ def _unlink_orphan_if_unlocked(path: str) -> None:
             os.close(fd)
 
 
-# DALTON-HOOK(relay-staging-race): lock claimed staged files under sweep lock so concurrent sweeps skip active restores
+# --- DALTON-HOOK(by4-relay-guard): begin ---
 def _claim_staged_files(
     root: str, pack_base: str, items: list[dict[str, Any]]
 ) -> list[str]:
@@ -1694,6 +1694,13 @@ def _claim_staged_files(
     return locked
 
 
+def _release_claimed_staged_files(locked: list[str]) -> None:
+    """Release any claimed staged-file flock not already released by placement/unlink."""
+    for claimed_path in locked:
+        _release_temp_ownership(claimed_path)
+# --- DALTON-HOOK(by4-relay-guard): end ---
+
+
 # DALTON-HOOK(chat-large-upload): allow incremental pulls to skip root-wide orphan sweeps
 def _sweep_orphan_staging(
     root: str,
@@ -1711,7 +1718,7 @@ def _sweep_orphan_staging(
     restores skip any transient file still locked by an active transfer.
     """
     resolved_pack_base = pack_base if pack_base is not None else os.path.join(root, _PACK_DIR)
-    # DALTON-HOOK(relay-staging-race): always acquire flock ownership on claimed staged files under the sweep lock
+    # DALTON-HOOK(by4-relay-guard): always acquire flock ownership on claimed staged files under the sweep lock
     if not sweep_orphans:
         with _hold_sweep_lock(root, exclusive=False):
             return _claim_staged_files(root, resolved_pack_base, items)
@@ -1994,70 +2001,72 @@ def pull(spec: dict[str, Any]) -> dict[str, Any]:
     results: dict[str, dict[str, Any]] = {}
     # DALTON-HOOK(chat-large-upload): honor per-pull sweep_orphans flag
     sweep_orphans = bool(spec.get("sweep_orphans", True))
-    # DALTON-HOOK(relay-staging-race): hold flock ownership on claimed staged files until placement completes
+    # DALTON-HOOK(by4-relay-guard): hold flock ownership on claimed staged files until placement completes
     locked_claimed = _sweep_orphan_staging(
         root, items, sweep_orphans=sweep_orphans, pack_base=pack_base
     )
     _inside.cache_clear()
-    try:
-        files: list[dict[str, Any]] = []
-        packs: list[dict[str, Any]] = []
-        symlinks: list[dict[str, Any]] = []
-        dirs: list[tuple[dict[str, Any], str]] = []
-        # Every directory this op creates, parents included. Anything else standing
-        # where a ``keep_existing`` dir goes was put there after the backup, so it
-        # keeps its own mode and mtime.
-        made: set[str] = set()
 
-        # Step 1: parents first, then dir items, so a file lands in a directory
-        # that already exists. Dir modes wait for step 4: a read-only directory
-        # restored read-only first would reject its own children.
-        for item in items:
-            if item.get("kind") == "pack":
-                packs.append(item)
-                continue
-            path = item.get("path", "")
-            final = _resolve_under_root(root, path)
-            if final is None:
-                results[path] = _result("failed", error="path escapes root")
-                continue
-            kind = item.get("kind", "file")
-            if not _inside(root, final if kind == "dir" else os.path.dirname(final)):
-                results[path] = _result("failed", error="path leaves root through a link")
-                continue
-            try:
-                if kind == "dir" and item.get("made"):
-                    # One the turn has removed since an earlier op made it stays
-                    # removed.
-                    if os.path.isdir(final) and not os.path.islink(final):
-                        _reopen_dir(final)
-                        dirs.append((item, final))
-                    else:
-                        results[path] = _result("ok")
-                    continue
-                _make_dirs(os.path.dirname(final), made)
-                if kind == "dir":
-                    try:
-                        _make_dirs(final, made)
-                    except FileExistsError:
-                        if not item.get("keep_existing"):
-                            raise
-                    if item.get("keep_existing") and final not in made:
-                        results[path] = _result("ok")
-                        continue
+    files: list[dict[str, Any]] = []
+    packs: list[dict[str, Any]] = []
+    symlinks: list[dict[str, Any]] = []
+    dirs: list[tuple[dict[str, Any], str]] = []
+    # Every directory this op creates, parents included. Anything else standing
+    # where a ``keep_existing`` dir goes was put there after the backup, so it
+    # keeps its own mode and mtime.
+    made: set[str] = set()
+
+    # Step 1: parents first, then dir items, so a file lands in a directory
+    # that already exists. Dir modes wait for step 4: a read-only directory
+    # restored read-only first would reject its own children.
+    for item in items:
+        if item.get("kind") == "pack":
+            packs.append(item)
+            continue
+        path = item.get("path", "")
+        final = _resolve_under_root(root, path)
+        if final is None:
+            results[path] = _result("failed", error="path escapes root")
+            continue
+        kind = item.get("kind", "file")
+        if not _inside(root, final if kind == "dir" else os.path.dirname(final)):
+            results[path] = _result("failed", error="path leaves root through a link")
+            continue
+        try:
+            if kind == "dir" and item.get("made"):
+                # One the turn has removed since an earlier op made it stays
+                # removed.
+                if os.path.isdir(final) and not os.path.islink(final):
                     _reopen_dir(final)
                     dirs.append((item, final))
-                elif kind == "symlink":
-                    symlinks.append(item)
-                elif kind == "file":
-                    files.append(item)
                 else:
-                    results[path] = _result("failed", error=f"unknown kind {kind!r}")
-            except OSError as exc:
-                results[path] = _result("failed", error=str(exc))
+                    results[path] = _result("ok")
+                continue
+            _make_dirs(os.path.dirname(final), made)
+            if kind == "dir":
+                try:
+                    _make_dirs(final, made)
+                except FileExistsError:
+                    if not item.get("keep_existing"):
+                        raise
+                if item.get("keep_existing") and final not in made:
+                    results[path] = _result("ok")
+                    continue
+                _reopen_dir(final)
+                dirs.append((item, final))
+            elif kind == "symlink":
+                symlinks.append(item)
+            elif kind == "file":
+                files.append(item)
+            else:
+                results[path] = _result("failed", error=f"unknown kind {kind!r}")
+        except OSError as exc:
+            results[path] = _result("failed", error=str(exc))
 
-        # Step 2: packs and files, in parallel. Packs are submitted first: each
-        # is one download that fans out into many members, so it is the tail.
+    # Step 2: packs and files, in parallel. Packs are submitted first: each
+    # is one download that fans out into many members, so it is the tail.
+    # DALTON-HOOK(by4-relay-guard): release claimed staged-file flocks after file/pack placement
+    try:
         if files or packs:
             with ThreadPoolExecutor(max_workers=concurrency) as pool:
                 pack_futures = [
@@ -2068,45 +2077,43 @@ def pull(spec: dict[str, Any]) -> dict[str, Any]:
                     results[item["path"]] = res
                 for fut in pack_futures:
                     results.update(fut.result())
-
-        # Step 3: symlinks after files, so a link never shadows a file being written.
-        for item in symlinks:
-            results[item["path"]] = _pull_symlink(root, item)
-
-        # Step 4: dir modes and mtimes last, deepest first; writing children
-        # above would disturb the mtimes, and a parent's mode may forbid writes.
-        for item, final in sorted(dirs, key=lambda d: d[1], reverse=True):
-            done = _result("ok")
-            if item.get("keep_existing"):
-                # Only the restore's own get this far.
-                done["made"] = True
-            if defer_dir_modes:
-                results[item["path"]] = done
-                continue
-            mode = item.get("mode")
-            if mode is not None and item.get("keep_existing"):
-                # Restored beside a running turn and ahead of later batches, both
-                # of which write beneath it, so it never closes to its owner.
-                mode = int(mode) | 0o300
-            mtime_ns = item.get("mtime_ns")
-            try:
-                if mode is not None:
-                    os.chmod(final, int(mode))
-                # DALTON-HOOK(wsfiles-mtime): stamp current time instead of epoch 0 on directories
-                if mtime_ns is not None:
-                    if int(mtime_ns) // 1000 == 0:
-                        os.utime(final)
-                    else:
-                        os.utime(final, ns=(int(mtime_ns), int(mtime_ns)))
-                results[item["path"]] = done
-            except OSError as exc:
-                results[item["path"]] = _result("failed", error=str(exc))
-
-        return {"results": results, "handshakes": dict(_HANDSHAKES)}
     finally:
-        # DALTON-HOOK(relay-staging-race): release any claimed staged-file flock not already released by placement/unlink
-        for claimed_path in locked_claimed:
-            _release_temp_ownership(claimed_path)
+        _release_claimed_staged_files(locked_claimed)
+
+    # Step 3: symlinks after files, so a link never shadows a file being written.
+    for item in symlinks:
+        results[item["path"]] = _pull_symlink(root, item)
+
+    # Step 4: dir modes and mtimes last, deepest first; writing children
+    # above would disturb the mtimes, and a parent's mode may forbid writes.
+    for item, final in sorted(dirs, key=lambda d: d[1], reverse=True):
+        done = _result("ok")
+        if item.get("keep_existing"):
+            # Only the restore's own get this far.
+            done["made"] = True
+        if defer_dir_modes:
+            results[item["path"]] = done
+            continue
+        mode = item.get("mode")
+        if mode is not None and item.get("keep_existing"):
+            # Restored beside a running turn and ahead of later batches, both
+            # of which write beneath it, so it never closes to its owner.
+            mode = int(mode) | 0o300
+        mtime_ns = item.get("mtime_ns")
+        try:
+            if mode is not None:
+                os.chmod(final, int(mode))
+            # DALTON-HOOK(wsfiles-mtime): stamp current time instead of epoch 0 on directories
+            if mtime_ns is not None:
+                if int(mtime_ns) // 1000 == 0:
+                    os.utime(final)
+                else:
+                    os.utime(final, ns=(int(mtime_ns), int(mtime_ns)))
+            results[item["path"]] = done
+        except OSError as exc:
+            results[item["path"]] = _result("failed", error=str(exc))
+
+    return {"results": results, "handshakes": dict(_HANDSHAKES)}
 
 
 # ---------------------------------------------------------------------------

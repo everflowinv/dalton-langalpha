@@ -40,6 +40,7 @@ from ptc_agent.core.sandbox.runtime import (
     SandboxProvider,
     SandboxRuntime,
 )
+from src.dalton.services.stop_backup import attach_stop_backup_session
 from src.server.services.computer_manager import ComputerBinding, ComputerManager
 from src.server.services.persistence import restore, transfer
 from src.server.services.persistence.sync_result import SyncResult
@@ -75,11 +76,13 @@ def _make_agent_config(working_dir: str = "/home/workspace") -> AgentConfig:
     return cfg
 
 
-def _make_binding(workspace_id: str = "ws-1") -> ComputerBinding:
+def _make_binding(
+    workspace_id: str = "ws-1", *, kind: str = "docker"
+) -> ComputerBinding:
     return ComputerBinding(
         workspace_id=workspace_id,
         computer_id=COMPUTER_ID,
-        kind="docker",
+        kind=kind,
         root_dir="/home/workspace",
         provider_ref=SANDBOX_ID,
         files_backup=True,
@@ -106,6 +109,7 @@ def _make_provider_and_runtime(
     else:
         provider.get = AsyncMock(return_value=runtime)
     provider.close = AsyncMock()
+    provider.is_host_unavailable.return_value = False
     provider.is_transient_error.return_value = False
     return provider, runtime
 
@@ -285,6 +289,148 @@ class TestStopBackupTemporaryAttach:
         runtime.start.assert_not_awaited()
         provider.close.assert_awaited_once()
         assert result["backup_skipped_workspaces"] == 2
+
+    @pytest.mark.asyncio
+    async def test_sessionless_stop_non_running_near_timeout_does_not_double_yield(
+        self, monkeypatch, caplog
+    ):
+        """When provider.get() returns a non-RUNNING runtime just before the
+        attach timeout expires and the caller's subsequent backup await runs
+        past that timeout window (or raises TimeoutError), stop continues with
+        backup_skipped_workspaces and never raises RuntimeError from a second
+        context-manager yield."""
+        ws_ids = ["ws-a", "ws-b", "ws-c"]
+        runtime = create_autospec(SandboxRuntime, instance=True)
+        runtime.id = SANDBOX_ID
+        runtime.working_dir = "/home/workspace"
+        runtime.get_state = AsyncMock(return_value=RuntimeState.STOPPED)
+        runtime.fetch_working_dir = AsyncMock(return_value="/home/workspace")
+        runtime.start = AsyncMock()
+
+        async def slow_non_running_get(_sandbox_id: str):
+            await asyncio.sleep(0.05)
+            return runtime
+
+        provider, _ = _make_provider_and_runtime(get_side_effect=slow_non_running_get)
+        manager = _setup_manager_for_stop(ws_ids, provider)
+        monkeypatch.setenv("DALTON_STOP_BACKUP_ATTACH_TIMEOUT_S", "0.12")
+
+        async def slow_workspace_lookup(_computer_id: str):
+            # Exceeds the 0.12s attach timeout budget (0.05s + 0.15s > 0.12s).
+            await asyncio.sleep(0.15)
+            return ws_ids
+
+        with (
+            caplog.at_level(logging.INFO),
+            patch(
+                f"{_MACHINE_BACKUP}.get_live_workspace_ids_for_computer",
+                AsyncMock(side_effect=slow_workspace_lookup),
+            ),
+            patch(f"{_LIFECYCLE}.note_stop_phases"),
+        ):
+            result = await manager._finish_claimed_stop(
+                _make_binding(ws_ids[0]),
+                workspace_id=ws_ids[0],
+                durable_sandbox_id=SANDBOX_ID,
+            )
+
+        assert result["status"] == "stopped"
+        assert result["backup_skipped_workspaces"] == 3
+        provider.close.assert_awaited_once()
+        runtime.start.assert_not_awaited()
+        manager._detached_sandbox_teardown.assert_awaited_once()
+        manager._settle_machine_stop.assert_awaited_once()
+        assert not any("timed out" in rec.getMessage() for rec in caplog.records)
+
+        # Also verify caller TimeoutError inside the context manager propagates
+        # directly (never caught/re-yielded as RuntimeError) across all three
+        # fallback branches: non-running, attach timeout, and connect error.
+        async def slow_branch_get(_sid: str):
+            await asyncio.sleep(5.0)
+
+        for branch_provider in (
+            _make_provider_and_runtime(state=RuntimeState.STOPPED)[0],
+            _make_provider_and_runtime(get_side_effect=slow_branch_get)[0],
+            _make_provider_and_runtime(
+                get_side_effect=ConnectionError("daemon down")
+            )[0],
+        ):
+            branch_mgr = _setup_manager_for_stop(ws_ids, branch_provider)
+            with pytest.raises(TimeoutError, match="caller backup timeout"):
+                async with attach_stop_backup_session(
+                    branch_mgr,
+                    _make_binding(ws_ids[0]),
+                    SANDBOX_ID,
+                    timeout_s=0.05,
+                ) as temp_session:
+                    assert temp_session is None
+                    raise TimeoutError("caller backup timeout")
+            branch_provider.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_owner_machine_non_transient_probe_error_rethrows_without_unbound_local(
+        self, caplog
+    ):
+        """On SSH/local computers (recreatable=False), a non-transient error
+        during the pre-backup _owner_machine_state probe must propagate the
+        original stop error cleanly without hitting UnboundLocalError."""
+        provider, _ = _make_provider_and_runtime(
+            get_side_effect=RuntimeError("ssh control plane failure")
+        )
+        manager = _setup_manager_for_stop(["ws-1"], provider)
+        binding = _make_binding("ws-1", kind="ssh")
+        assert binding.provider.recreatable is False
+
+        with (
+            caplog.at_level(logging.WARNING),
+            pytest.raises(RuntimeError, match="ssh control plane failure"),
+        ):
+            await manager._finish_claimed_stop(
+                binding,
+                workspace_id="ws-1",
+                durable_sandbox_id=SANDBOX_ID,
+            )
+
+        assert not any(
+            "UnboundLocalError" in (rec.exc_text or rec.getMessage())
+            for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_owner_machine_probe_error_reconciled_without_unbound_local(
+        self, caplog
+    ):
+        """If the pre-backup probe on an SSH/local computer raises a
+        non-transient error and _reconcile_provider_stop subsequently settles
+        the stop, reading backup_skipped_workspaces must not raise
+        UnboundLocalError."""
+        calls = 0
+
+        async def fail_then_timeout(_sandbox_id: str):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("ssh control plane failure")
+            raise TimeoutError("machine went unreachable")
+
+        provider, _ = _make_provider_and_runtime(get_side_effect=fail_then_timeout)
+        manager = _setup_manager_for_stop(["ws-1"], provider)
+        binding = _make_binding("ws-1", kind="ssh")
+        assert binding.provider.recreatable is False
+
+        with caplog.at_level(logging.WARNING):
+            result = await manager._finish_claimed_stop(
+                binding,
+                workspace_id="ws-1",
+                durable_sandbox_id=SANDBOX_ID,
+            )
+
+        assert result == {"computer_id": COMPUTER_ID, "status": "stopped"}
+        assert "backup_skipped_workspaces" not in result
+        assert not any(
+            "Could not reconcile failed stop" in rec.getMessage()
+            for rec in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_backup_project_files_non_strict_contract_unchanged(self):

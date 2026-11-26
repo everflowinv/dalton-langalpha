@@ -524,9 +524,11 @@ ALLOWED_HOOKS=(
   # _machine_backup.py, ptc_sandbox.py).
   "stop-backup-attach"
   # BY4: protect .wsfiles-relay-* staging files against concurrent orphan sweeps and
-  # ambient ProjectContext path folding (relay_staging_guard.py, restore.py, transfer.py,
-  # wsfiles_transfer_runtime.py).
+  # ambient ProjectContext path folding (relay_staging_guard.py, restore.py, transfer.py).
   "relay-staging-race"
+  # BY4: sandbox-side runtime staged-file flock claim/release in wsfiles_transfer_runtime.py
+  # (standalone script copied into sandboxes; cannot import src.dalton).
+  "by4-relay-guard"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

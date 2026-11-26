@@ -118,49 +118,52 @@ async def attach_stop_backup_session(
         async with asyncio.timeout(effective_timeout):
             runtime = await provider.get(durable_sandbox_id)
             state = await runtime.get_state()
-            if not _is_running_state(state):
-                logger.info(
-                    "Computer %s sandbox %s is %s (not running); skipping temporary stop-backup attach",
-                    computer_id,
-                    durable_sandbox_id,
-                    getattr(state, "value", state),
+            is_running = _is_running_state(state)
+            if is_running:
+                work_dir = (
+                    await runtime.fetch_working_dir()
+                    or binding.root_dir
+                    or core_config.filesystem.working_directory
                 )
-                await _safe_close_provider(provider)
-                provider = None
-                yield None
-                return
-            work_dir = (
-                await runtime.fetch_working_dir()
-                or binding.root_dir
-                or core_config.filesystem.working_directory
+            else:
+                work_dir = None
+
+        if not is_running:
+            logger.info(
+                "Computer %s sandbox %s is %s (not running); skipping temporary stop-backup attach",
+                computer_id,
+                durable_sandbox_id,
+                getattr(state, "value", state),
             )
+            await _safe_close_provider(provider)
+            provider = None
+        else:
+            sandbox = PTCSandbox(
+                core_config,
+                None,
+                resource_tier=binding.resource_tier,
+                host_unavailable_policy=None,
+                provider=provider,
+            )
+            # Ownership of provider now transfers to sandbox.close().
+            provider = None
+            sandbox.runtime = runtime
+            sandbox.sandbox_id = durable_sandbox_id
+            sandbox._work_dir = work_dir
 
-        sandbox = PTCSandbox(
-            core_config,
-            None,
-            resource_tier=binding.resource_tier,
-            host_unavailable_policy=None,
-            provider=provider,
-        )
-        # Ownership of provider now transfers to sandbox.close().
-        provider = None
-        sandbox.runtime = runtime
-        sandbox.sandbox_id = durable_sandbox_id
-        sandbox._work_dir = work_dir
-
-        session = Session(
-            binding.workspace_id or computer_id,
-            core_config,
-            computer_id=computer_id,
-            resource_tier=binding.resource_tier,
-        )
-        session.sandbox = sandbox
-        session._initialized = True
-        logger.info(
-            "Temporarily attached stop-backup session for computer %s (sandbox=%s)",
-            computer_id,
-            durable_sandbox_id,
-        )
+            session = Session(
+                binding.workspace_id or computer_id,
+                core_config,
+                computer_id=computer_id,
+                resource_tier=binding.resource_tier,
+            )
+            session.sandbox = sandbox
+            session._initialized = True
+            logger.info(
+                "Temporarily attached stop-backup session for computer %s (sandbox=%s)",
+                computer_id,
+                durable_sandbox_id,
+            )
     except TimeoutError:
         logger.warning(
             "Computer %s temporary stop-backup attach timed out after %.1fs; "
@@ -168,10 +171,10 @@ async def attach_stop_backup_session(
             computer_id,
             effective_timeout,
         )
+        await _safe_close_sandbox(sandbox)
+        sandbox = None
         await _safe_close_provider(provider)
         provider = None
-        yield None
-        return
     except Exception as exc:  # noqa: BLE001 - best-effort attach must never block stop
         logger.warning(
             "Computer %s temporary stop-backup attach failed (%s: %s); "
@@ -180,8 +183,12 @@ async def attach_stop_backup_session(
             type(exc).__name__,
             exc,
         )
+        await _safe_close_sandbox(sandbox)
+        sandbox = None
         await _safe_close_provider(provider)
         provider = None
+
+    if session is None:
         yield None
         return
 
@@ -189,9 +196,8 @@ async def attach_stop_backup_session(
         with attach_only():
             yield session
     finally:
-        if session is not None:
-            session.sandbox = None
-            session._initialized = False
+        session.sandbox = None
+        session._initialized = False
         await _safe_close_sandbox(sandbox)
         await _safe_close_provider(provider)
 
