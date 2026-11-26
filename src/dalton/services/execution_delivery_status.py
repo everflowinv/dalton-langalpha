@@ -84,8 +84,6 @@ _ERROR_REASON_ZH: dict[str, str] = {
     "partial": "投递状态未确认",
     "gateway_restarted": "投递状态未确认",
     "feishu_cards_not_supported": "卡片包含不支持的图片或格式",
-    "feishu_card_required": "飞书通道要求卡片消息",
-    "unsupported_notify_channel": "不支持的通知通道",
     "images_not_supported": "卡片包含不支持的图片或格式",
     "image_placeholder_not_supported": "卡片包含不支持的图片或格式",
     "missing_card": "投递内容为空",
@@ -115,8 +113,6 @@ _ERROR_REASON_EN: dict[str, str] = {
     "partial": "Delivery could not be confirmed",
     "gateway_restarted": "Delivery could not be confirmed",
     "feishu_cards_not_supported": "Card contains unsupported images or format",
-    "feishu_card_required": "Feishu channel requires a card payload",
-    "unsupported_notify_channel": "Unsupported notification channel",
     "images_not_supported": "Card contains unsupported images or format",
     "image_placeholder_not_supported": "Card contains unsupported images or format",
     "missing_card": "Delivery content is empty",
@@ -401,7 +397,6 @@ def summarize_execution_delivery(
     delivery_result: Sequence[Mapping[str, Any]] | None = None,
     completed_at: Any = None,
     notify_status: Any = None,
-    execution_status: str | None = None,
     max_attempts: int = DEFAULT_MAX_DELIVERY_ATTEMPTS,
     retry_lookback_hours: int = DEFAULT_RETRY_LOOKBACK_HOURS,
     now: datetime | None = None,
@@ -418,9 +413,7 @@ def summarize_execution_delivery(
     )
     targets: list[dict[str, Any]] = []
     has_notify_rows = False
-    skipped_notify_reasons: list[str] = []
     awaiting_receipt = False
-    failure_receipt_summary: dict[str, Any] | None = None
     seen_notify_keys: dict[tuple[str, str], dict[str, Any]] = {}
     seen_normalized_targets: dict[tuple[str, str, str], dict[str, Any]] = {}
 
@@ -431,8 +424,6 @@ def summarize_execution_delivery(
         if st in ("sent", "pending", "failed", "skipped"):
             has_notify_rows = True
         if st == "skipped":
-            skip_code = str(raw.get("error_code") or raw.get("reason") or "skipped").strip().lower()
-            skipped_notify_reasons.append(skip_code or "skipped")
             continue
         channel = str(raw.get("channel") or "").strip().lower() or None
         target = str(raw.get("target") or "").strip() or None
@@ -544,42 +535,8 @@ def summarize_execution_delivery(
         if norm_key is not None:
             seen_normalized_targets[norm_key] = target_entry
 
-    _RECEIPT_LABELS_ZH = {
-        "unconfigured": "未配置",
-        "suppressed": "已抑制",
-        "pending": "待发",
-        "delivered": "已送达",
-    }
-    _RECEIPT_LABELS_EN = {
-        "unconfigured": "Not configured",
-        "suppressed": "Suppressed",
-        "pending": "Pending",
-        "delivered": "Delivered",
-    }
-
     for raw in delivery_result or ():
         if not isinstance(raw, Mapping):
-            continue
-        if (
-            raw.get("kind") == "failure_receipt"
-            or str(raw.get("receipt_status") or "").strip().lower() in _RECEIPT_LABELS_ZH
-        ):
-            r_status = str(
-                raw.get("receipt_status") or raw.get("status") or "unconfigured"
-            ).strip().lower()
-            if r_status not in _RECEIPT_LABELS_ZH:
-                r_status = "unconfigured"
-            failure_receipt_summary = {
-                "status": r_status,
-                "label_zh": str(raw.get("receipt_label") or _RECEIPT_LABELS_ZH[r_status]),
-                "label_en": str(raw.get("receipt_label_en") or _RECEIPT_LABELS_EN[r_status]),
-                "reason": raw.get("reason"),
-                "failure_reason": raw.get("failure_reason"),
-                "outcome": raw.get("outcome"),
-                "error": raw.get("error"),
-                "targets": list(raw.get("targets") or []),
-                "recorded_at": raw.get("recorded_at"),
-            }
             continue
         method = str(raw.get("method") or "").strip()
         address = str(raw.get("address") or "").strip() or None
@@ -649,61 +606,6 @@ def summarize_execution_delivery(
         )
 
     if not targets:
-        if failure_receipt_summary is not None:
-            r_st = failure_receipt_summary["status"]
-            r_targets = failure_receipt_summary.get("targets") or []
-            reconciled_empty = dict(failure_receipt_summary)
-            if r_st == "pending" and has_notify_rows and skipped_notify_reasons:
-                _unconf_skips = frozenset(
-                    {
-                        "target_removed",
-                        "no_targets",
-                        "no_target",
-                        "capability_disabled",
-                        "bridge_url_unconfigured",
-                        "gateway_unconfigured",
-                    }
-                )
-                r_st = (
-                    "unconfigured"
-                    if all(code in _unconf_skips for code in skipped_notify_reasons)
-                    else "suppressed"
-                )
-                reconciled_empty = {
-                    **reconciled_empty,
-                    "status": r_st,
-                    "label_zh": _RECEIPT_LABELS_ZH[r_st],
-                    "label_en": _RECEIPT_LABELS_EN[r_st],
-                    "reason": skipped_notify_reasons[0],
-                }
-            if r_st == "delivered":
-                mapped_delivery_status: Literal[
-                    "delivered", "failed", "partial_failed", "retrying", "skipped"
-                ] = "delivered"
-            elif r_st == "pending":
-                mapped_delivery_status = "retrying"
-            else:
-                mapped_delivery_status = "skipped"
-            return {
-                "status": mapped_delivery_status,
-                "total_targets": len(r_targets),
-                "sent_count": len(r_targets) if r_st == "delivered" else 0,
-                "failed_count": 0,
-                "retrying_count": len(r_targets) if r_st == "pending" else 0,
-                "awaiting_receipt": r_st == "pending",
-                "failure_code": reconciled_empty.get("failure_reason"),
-                "failure_reason": reconciled_empty.get("reason"),
-                "failure_reasons": (
-                    [str(reconciled_empty["reason"])]
-                    if reconciled_empty.get("reason")
-                    else []
-                ),
-                "failure_notice_status": r_st,
-                "failure_notice_label_zh": reconciled_empty["label_zh"],
-                "failure_notice_label_en": reconciled_empty["label_en"],
-                "failure_notification_receipt": reconciled_empty,
-                "targets": [],
-            }
         if has_notify_rows:
             return {
                 "status": "skipped",
@@ -743,53 +645,6 @@ def summarize_execution_delivery(
         if reason and reason not in failure_reasons:
             failure_reasons.append(reason)
 
-    extra_receipt_fields: dict[str, Any] = {}
-    if failure_receipt_summary is not None:
-        eff_r_st: str | None = failure_receipt_summary["status"]
-        if status == "delivered":
-            eff_r_st = "delivered"
-        elif status == "retrying" and eff_r_st not in ("unconfigured", "suppressed"):
-            eff_r_st = "pending"
-        elif status in ("failed", "partial_failed") and eff_r_st == "pending":
-            # Terminal failure after outbox or channel retries exhausted: clear stale 'pending' receipt.
-            eff_r_st = None
-        if eff_r_st is not None:
-            reconciled_receipt = {
-                **failure_receipt_summary,
-                "status": eff_r_st,
-                "label_zh": _RECEIPT_LABELS_ZH[eff_r_st],
-                "label_en": _RECEIPT_LABELS_EN[eff_r_st],
-            }
-            extra_receipt_fields = {
-                "failure_notice_status": eff_r_st,
-                "failure_notice_label_zh": reconciled_receipt["label_zh"],
-                "failure_notice_label_en": reconciled_receipt["label_en"],
-                "failure_notification_receipt": reconciled_receipt,
-            }
-    elif str(execution_status or "").strip().lower() in ("failed", "timeout"):
-        derived_notice: str | None = None
-        if status == "delivered":
-            derived_notice = "delivered"
-        elif status == "retrying":
-            derived_notice = "pending"
-        if derived_notice is not None:
-            extra_receipt_fields = {
-                "failure_notice_status": derived_notice,
-                "failure_notice_label_zh": _RECEIPT_LABELS_ZH[derived_notice],
-                "failure_notice_label_en": _RECEIPT_LABELS_EN[derived_notice],
-                "failure_notification_receipt": {
-                    "status": derived_notice,
-                    "label_zh": _RECEIPT_LABELS_ZH[derived_notice],
-                    "label_en": _RECEIPT_LABELS_EN[derived_notice],
-                    "reason": "delivery_settled" if derived_notice == "delivered" else "delivery_retrying",
-                    "failure_reason": None,
-                    "outcome": str(execution_status or "").strip().lower(),
-                    "error": None,
-                    "targets": [str(t.get("target")) for t in targets if t.get("target")],
-                    "recorded_at": None,
-                },
-            }
-
     return {
         "status": status,
         "total_targets": total_targets,
@@ -805,7 +660,6 @@ def summarize_execution_delivery(
         ),
         "failure_reasons": failure_reasons if status in ("failed", "partial_failed") else [],
         "targets": targets,
-        **extra_receipt_fields,
     }
 
 
@@ -1070,15 +924,7 @@ def _set_delivery_summary(item: Any, summary: dict[str, Any] | None) -> None:
         else:
             from src.server.models.automation import ExecutionDeliverySummary
 
-            try:
-                item.delivery_summary = ExecutionDeliverySummary.model_validate(summary)
-            except Exception as exc:  # noqa: BLE001 - malformed summary must never 500 the list/detail endpoint
-                logger.warning(
-                    "[EXEC_DELIVERY_STATUS] Dropping invalid delivery_summary for execution=%s: %s",
-                    _get_field(item, "automation_execution_id") or _get_field(item, "run_id"),
-                    type(exc).__name__,
-                )
-                item.delivery_summary = None
+            item.delivery_summary = ExecutionDeliverySummary.model_validate(summary)
 
 
 async def enrich_executions_with_delivery_summary(
@@ -1122,7 +968,6 @@ async def enrich_executions_with_delivery_summary(
             delivery_result=_get_field(item, "delivery_result"),
             completed_at=_get_field(item, "completed_at"),
             notify_status=_get_field(item, "notify_status"),
-            execution_status=_get_field(item, "status"),
             max_attempts=max_attempts,
             retry_lookback_hours=retry_lookback_hours,
             now=now,
@@ -1169,7 +1014,6 @@ def resolve_execution_delivery_summary(
         delivery_result=_get_field(exec_row, "delivery_result"),
         completed_at=_get_field(exec_row, "completed_at"),
         notify_status=_get_field(exec_row, "notify_status"),
-        execution_status=_get_field(exec_row, "status"),
         now=now,
     )
 

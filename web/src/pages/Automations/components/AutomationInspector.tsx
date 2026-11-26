@@ -29,8 +29,6 @@ import {
   deliveryNames,
   deliveryOutcome, // DALTON-HOOK(execution-delivery-status)
   deliveryTargetName,
-  failureNoticeLabelKey, // DALTON-HOOK(execution-delivery-status)
-  failureNoticeStatusOf,
   formatDeliveryFailureReason,
   matchAttemptForTarget,
 } from '../utils/delivery';
@@ -519,8 +517,6 @@ function RunHistory({
               ...targetErrors,
               ...(summaryFallbackError ? [summaryFallbackError] : []),
             ];
-            const failureNoticeStatus = failureNoticeStatusOf(explicitSummary ?? deliverySummary);
-            const failureNoticeKey = failureNoticeLabelKey(explicitSummary ?? deliverySummary);
             const deliverySummaryLabelKey =
               deliverySummary?.status === 'failed'
                 ? 'automation:deliveryStatusFailed'
@@ -554,10 +550,9 @@ function RunHistory({
                   </td>
                   <td className="automation-mono">{showDuration ? formatDuration(e.started_at, e.completed_at, t) : ''}</td>
                   <td className="automation-history-delivery">
-                    {/* DALTON-HOOK(execution-delivery-status): render per-target delivery_summary status and failure notice receipt state */}
-                    {useSummaryTargets ? (
-                      <>
-                        {summaryTargets.map((tgt, i) => {
+                    {/* DALTON-HOOK(execution-delivery-status): render per-target delivery_summary status when available */}
+                    {useSummaryTargets
+                      ? summaryTargets.map((tgt, i) => {
                           const matched = matchAttemptForTarget(tgt, attempts);
                           const displayName = deliveryTargetName(tgt, t, names, matched);
                           const labelText =
@@ -581,71 +576,44 @@ function RunHistory({
                               {labelText}
                             </span>
                           );
-                        })}
-                        {failureNoticeKey && (
-                          <span className="automation-history-attempt" data-testid="failure-notice-status">
-                            {failureNoticeStatus === 'pending' && (
-                              <Clock className="h-3 w-3 shrink-0" style={{ color: 'var(--color-accent-primary)' }} aria-label={t(failureNoticeKey)} />
+                        })
+                      : explicitSummary != null
+                        ? deliverySummaryLabelKey && (
+                            <span className="automation-history-attempt">
+                              {(explicitSummary.status === 'failed' || explicitSummary.status === 'partial_failed') && (
+                                <AlertCircle className="h-3 w-3 shrink-0" style={{ color: 'var(--color-icon-danger)' }} aria-label={t('automation:deliveryStatusFailed')} />
+                              )}
+                              {explicitSummary.status === 'retrying' && (
+                                <Clock className="h-3 w-3 shrink-0" style={{ color: 'var(--color-accent-primary)' }} aria-label={t('automation:deliveryStatusRetrying')} />
+                              )}
+                              {t(deliverySummaryLabelKey)}
+                            </span>
+                          )
+                        : attempts.length > 0
+                          ? attempts.map((d, i) => {
+                              // DALTON-HOOK(execution-delivery-status): distinguish retrying from failed on raw delivery_result attempts with settle-window fallback
+                              const outcome = deliveryOutcome(d, e.completed_at);
+                              return (
+                                <span key={`${d.method}|${d.address ?? ''}|${i}`} className="automation-history-attempt">
+                                  {outcome === 'failed' && (
+                                    <AlertCircle className="h-3 w-3 shrink-0" style={{ color: 'var(--color-icon-danger)' }} aria-label={t('automation:runFailed')} />
+                                  )}
+                                  {outcome === 'retrying' && (
+                                    <Clock className="h-3 w-3 shrink-0" style={{ color: 'var(--color-accent-primary)' }} aria-label={t('automation:deliveryStatusRetrying')} />
+                                  )}
+                                  {/* Where it landed and how; an older run says only which app. */}
+                                  {isLegacyAttempt(d) ? deliveryMethodName(d.method, t) : deliveryAttemptLabel(d, t, names, e.completed_at)}
+                                </span>
+                              );
+                            })
+                          : deliverySummaryLabelKey && (
+                              <span className="automation-history-attempt">
+                                {(deliverySummary?.status === 'failed' || deliverySummary?.status === 'partial_failed') && (
+                                  <AlertCircle className="h-3 w-3 shrink-0" style={{ color: 'var(--color-icon-danger)' }} aria-label={t('automation:deliveryStatusFailed')} />
+                                )}
+                                {t(deliverySummaryLabelKey)}
+                              </span>
                             )}
-                            {t(failureNoticeKey)}
-                          </span>
-                        )}
-                      </>
-                    ) : explicitSummary != null ? (
-                      failureNoticeKey ? (
-                        <span className="automation-history-attempt" data-testid="failure-notice-status">
-                          {failureNoticeStatus === 'pending' && (
-                            <Clock className="h-3 w-3 shrink-0" style={{ color: 'var(--color-accent-primary)' }} aria-label={t(failureNoticeKey)} />
-                          )}
-                          {t(failureNoticeKey)}
-                        </span>
-                      ) : (
-                        deliverySummaryLabelKey && (
-                          <span className="automation-history-attempt">
-                            {(explicitSummary.status === 'failed' || explicitSummary.status === 'partial_failed') && (
-                              <AlertCircle className="h-3 w-3 shrink-0" style={{ color: 'var(--color-icon-danger)' }} aria-label={t('automation:deliveryStatusFailed')} />
-                            )}
-                            {explicitSummary.status === 'retrying' && (
-                              <Clock className="h-3 w-3 shrink-0" style={{ color: 'var(--color-accent-primary)' }} aria-label={t('automation:deliveryStatusRetrying')} />
-                            )}
-                            {t(deliverySummaryLabelKey)}
-                          </span>
-                        )
-                      )
-                    ) : failureNoticeKey && attempts.length === 0 ? (
-                      <span className="automation-history-attempt" data-testid="failure-notice-status">
-                        {failureNoticeStatus === 'pending' && (
-                          <Clock className="h-3 w-3 shrink-0" style={{ color: 'var(--color-accent-primary)' }} aria-label={t(failureNoticeKey)} />
-                        )}
-                        {t(failureNoticeKey)}
-                      </span>
-                    ) : attempts.length > 0 ? (
-                      attempts.map((d, i) => {
-                        // DALTON-HOOK(execution-delivery-status): distinguish retrying from failed on raw delivery_result attempts with settle-window fallback
-                        const outcome = deliveryOutcome(d, e.completed_at);
-                        return (
-                          <span key={`${d.method}|${d.address ?? ''}|${i}`} className="automation-history-attempt">
-                            {outcome === 'failed' && (
-                              <AlertCircle className="h-3 w-3 shrink-0" style={{ color: 'var(--color-icon-danger)' }} aria-label={t('automation:runFailed')} />
-                            )}
-                            {outcome === 'retrying' && (
-                              <Clock className="h-3 w-3 shrink-0" style={{ color: 'var(--color-accent-primary)' }} aria-label={t('automation:deliveryStatusRetrying')} />
-                            )}
-                            {/* Where it landed and how; an older run says only which app. */}
-                            {isLegacyAttempt(d) ? deliveryMethodName(d.method, t) : deliveryAttemptLabel(d, t, names, e.completed_at)}
-                          </span>
-                        );
-                      })
-                    ) : (
-                      deliverySummaryLabelKey && (
-                        <span className="automation-history-attempt">
-                          {(deliverySummary?.status === 'failed' || deliverySummary?.status === 'partial_failed') && (
-                            <AlertCircle className="h-3 w-3 shrink-0" style={{ color: 'var(--color-icon-danger)' }} aria-label={t('automation:deliveryStatusFailed')} />
-                          )}
-                          {t(deliverySummaryLabelKey)}
-                        </span>
-                      )
-                    )}
                   </td>
                   <td className="text-right">
                     {e.conversation_thread_id && (

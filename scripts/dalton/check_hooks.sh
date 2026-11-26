@@ -523,6 +523,9 @@ ALLOWED_HOOKS=(
   # folding cannot redirect .wsfiles-relay-* into another workspace, and disable orphan sweep
   # in unlocked _restamp_dirs (src/server/services/persistence/restore.py).
   "by4-relay-staging-guard"
+  # Sync plugin-local sec_issuer_map.json beside dalton_sec_mcp_server.py in core sandboxes
+  # (manifest hashing, upload batch, and prune allowlist in src/ptc_agent/core/sandbox/assets.py).
+  "sec-issuer-map"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

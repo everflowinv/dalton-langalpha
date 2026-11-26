@@ -237,3 +237,58 @@ def test_integration_db_guards_reject_libpq_dbname_override_and_service_bypass(
     with pytest.raises(RuntimeError) as wx_exc:
         wx_mod.resolve_validated_test_dsn(sneaky_dsn)
     assert "Refusing" in str(wx_exc.value)
+
+
+@pytest.mark.parametrize(
+    ("dsn", "expected_dbname"),
+    [
+        ("postgresql://postgres:p%3Fa%23s@127.0.0.1:5432/prod%3Ffoo_test", "prod?foo_test"),
+        ("postgresql://postgres:pass@127.0.0.1:5432/prod%23foo_test", "prod#foo_test"),
+        ("postgresql://postgres:pass@127.0.0.1:5432/prod%2Ffoo_test", "prod/foo_test"),
+        ("postgresql://postgres:pass@127.0.0.1:5432/prod%25foo_test?sslmode=disable", "prod%foo_test"),
+        (
+            "host=127.0.0.1 port=55432 user=postgres password=secret dbname=isolated_test sslmode=require",
+            "isolated_test",
+        ),
+    ],
+)
+def test_d048_alembic_subprocess_url_matches_guard_parsed_params(
+    dsn: str,
+    expected_dbname: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r6 A-fix: d048 Alembic subprocess must pass the guard's parsed libpq params via
+    percent-encoded sqlalchemy.url so an encoded `?` (or `#`/`%`/`/`) in dbname cannot
+    split the URL and redirect SQLAlchemy to a non-test database."""
+    from alembic.config import Config
+    from psycopg.conninfo import conninfo_to_dict
+    from sqlalchemy import engine_from_config, pool
+
+    monkeypatch.setenv("DB_NAME", "langalpha_prod")
+    monkeypatch.setenv("DB_HOST", "prod.internal")
+    monkeypatch.setenv("PGDATABASE", "langalpha_prod")
+    monkeypatch.setenv("PGSERVICE", "prod")
+
+    d048_mod = _load_mod(
+        "dalton_d048_url_roundtrip",
+        "tests/integration/dalton/test_d048_invite_admin_tier_migration_db.py",
+    )
+    env = d048_mod._alembic_env_for_dsn(dsn)
+    assert "DB_NAME" not in env
+    assert "DB_HOST" not in env
+    assert "PGDATABASE" not in env
+    assert "PGSERVICE" not in env
+
+    sa_url = env["DALTON_ALEMBIC_SQLALCHEMY_URL"]
+    expected_params = {k: str(v) for k, v in conninfo_to_dict(dsn).items() if v is not None}
+    assert expected_params["dbname"] == expected_dbname
+
+    for ini_rel in ("alembic.ini", "src/dalton/alembic.ini"):
+        cfg = Config(str(REPO_ROOT / ini_rel))
+        cfg.set_main_option("sqlalchemy.url", sa_url.replace("%", "%%"))
+        section = cfg.get_section(cfg.config_ini_section, {})
+        eng = engine_from_config(section, prefix="sqlalchemy.", poolclass=pool.NullPool)
+        _, connect_params = eng.dialect.create_connect_args(eng.url)
+        actual_params = {k: v for k, v in connect_params.items() if k != "context"}
+        assert actual_params == expected_params, (ini_rel, actual_params, expected_params)
+        assert actual_params["dbname"] == expected_dbname

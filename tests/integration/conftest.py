@@ -437,6 +437,7 @@ def _build_db_uri() -> str:
     # Deliberately not DB_SSLMODE — reading it would let a production-shaped .env
     # dictate test TLS policy, which is what TEST_DB_* exists to prevent.
     sslmode = os.getenv("TEST_DB_SSLMODE", "prefer")
+    # DALTON-HOOK(budget): validate constructed test URI via conninfo_to_dict() before returning.
     uri = f"postgresql://{user}:{password}@{host}:{port}/{name}?sslmode={sslmode}"
     return _validate_test_db_dsn(uri, source="TEST_DB_NAME")
 

@@ -59,6 +59,11 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 
+# DALTON-HOOK(sec-issuer-map): sidecar data files shipped beside specific built-in MCP server entrypoints
+_MCP_SERVER_SIDECAR_FILES: dict[str, tuple[str, ...]] = {
+    "dalton_sec_mcp_server.py": ("sec_issuer_map.json",),
+}
+
 _ASSET_SYNC_CONTEXT: ContextVar[
     tuple[Any, tuple[Any, ...] | None, Mapping[str, str] | None] | None
 ] = ContextVar("asset_sync_context", default=None)
@@ -450,7 +455,13 @@ async def _compute_sandbox_manifest(
             continue
         resolved = _resolve_local_path(server.args[2], config_dir)
         if resolved:
-            mcp_files[Path(resolved).name] = _sha256_file(Path(resolved))
+            entry_path = Path(resolved)
+            mcp_files[entry_path.name] = _sha256_file(entry_path)
+            # DALTON-HOOK(sec-issuer-map): hash sidecar data files shipped beside builtin MCP servers
+            for sidecar_name in _MCP_SERVER_SIDECAR_FILES.get(entry_path.name, ()):
+                sidecar_path = entry_path.with_name(sidecar_name)
+                if sidecar_path.is_file():
+                    mcp_files[sidecar_name] = _sha256_file(sidecar_path)
     if mcp_files:
         for shared_name in _MCP_SHARED_RUNTIME_FILES:
             shared = _resolve_local_path(f"mcp_servers/{shared_name}", config_dir)
@@ -741,6 +752,26 @@ async def _upload_mcp_server_files_impl(sandbox: "PTCSandbox") -> set[str]:
                     claimed[filename] = resolved
                     expected_files.add(filename)
                     files_to_upload.append((server.name, resolved, sandbox_path))
+                    # DALTON-HOOK(sec-issuer-map): ship sidecar data files (e.g. sec_issuer_map.json) beside builtin MCP servers
+                    for sidecar_name in _MCP_SERVER_SIDECAR_FILES.get(filename, ()):
+                        sidecar_path = Path(resolved).with_name(sidecar_name)
+                        if sidecar_path.is_file():
+                            sidecar_resolved = str(sidecar_path)
+                            if (
+                                (sidecar_clash := claimed.get(sidecar_name))
+                                and sidecar_clash != sidecar_resolved
+                            ):
+                                logger.error(
+                                    "MCP server sidecar files collide in the sandbox: "
+                                    f"{sidecar_clash} and {sidecar_resolved} both stage as {sidecar_name}",
+                                    server=server.name,
+                                )
+                                continue
+                            claimed[sidecar_name] = sidecar_resolved
+                            expected_files.add(sidecar_name)
+                            files_to_upload.append(
+                                (server.name, sidecar_resolved, f"{mcp_servers_dir}/{sidecar_name}")
+                            )
                 else:
                     searched = [server.args[2]]
                     if config_dir:

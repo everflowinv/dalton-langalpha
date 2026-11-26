@@ -10,7 +10,6 @@ import type {
   ExecutionDeliveryStatus,
   ExecutionDeliverySummary,
   ExecutionDeliveryTarget,
-  FailureNoticeStatus,
 } from '@/types/automation';
 import { mutationErrorMessage } from './errors';
 
@@ -392,31 +391,6 @@ export function deliveryTargetName(
   return fallbackKey ? deliveryMethodName(fallbackKey, t) : t('automation:delivery');
 }
 
-// DALTON-HOOK(execution-delivery-status): i18n label key for dedicated failure notification receipt state
-const FAILURE_NOTICE_LABEL_KEYS: Record<FailureNoticeStatus, string> = {
-  unconfigured: 'automation:failureNoticeUnconfigured',
-  suppressed: 'automation:failureNoticeSuppressed',
-  pending: 'automation:failureNoticePending',
-  delivered: 'automation:failureNoticeDelivered',
-};
-
-export function failureNoticeStatusOf(
-  summary: ExecutionDeliverySummary | null | undefined,
-): FailureNoticeStatus | null {
-  const raw = summary?.failure_notice_status ?? summary?.failure_notification_receipt?.status ?? null;
-  if (raw === 'unconfigured' || raw === 'suppressed' || raw === 'pending' || raw === 'delivered') {
-    return raw;
-  }
-  return null;
-}
-
-export function failureNoticeLabelKey(
-  summary: ExecutionDeliverySummary | null | undefined,
-): string | null {
-  const status = failureNoticeStatusOf(summary);
-  return status ? FAILURE_NOTICE_LABEL_KEYS[status] : null;
-}
-
 export function resolveExecutionDelivery(
   run: Pick<AutomationExecution, 'delivery_summary' | 'delivery_result' | 'completed_at'>,
   now = Date.now(),
@@ -438,17 +412,8 @@ export function resolveExecutionDelivery(
   let retryingCount = 0;
   let firstCode: string | null = null;
   const failureReasons: string[] = [];
-  let failureNoticeStatus: FailureNoticeStatus | null = null;
 
   for (const attempt of attempts) {
-    const rawRec = attempt as DeliveryAttempt & { kind?: string; receipt_status?: string };
-    if (rawRec.kind === 'failure_receipt' || rawRec.receipt_status) {
-      const st = String(rawRec.receipt_status ?? '').trim().toLowerCase();
-      if (st === 'unconfigured' || st === 'suppressed' || st === 'pending' || st === 'delivered') {
-        failureNoticeStatus = st;
-      }
-      continue;
-    }
     if (attempt.success) {
       sentCount += 1;
       targets.push({
@@ -484,41 +449,11 @@ export function resolveExecutionDelivery(
     });
   }
 
-  if (targets.length === 0) {
-    if (!failureNoticeStatus) return null;
-    const mapped: ExecutionDeliveryStatus =
-      failureNoticeStatus === 'delivered'
-        ? 'delivered'
-        : failureNoticeStatus === 'pending'
-          ? 'retrying'
-          : 'skipped';
-    return {
-      status: mapped,
-      total_targets: 0,
-      sent_count: 0,
-      failed_count: 0,
-      retrying_count: 0,
-      failure_notice_status: failureNoticeStatus,
-      targets: [],
-    };
-  }
-
   let status: ExecutionDeliveryStatus;
   if (retryingCount > 0) status = 'retrying';
   else if (failedCount === 0) status = 'delivered';
   else if (sentCount > 0) status = 'partial_failed';
   else status = 'failed';
-
-  let effectiveFailureNotice: FailureNoticeStatus | null = failureNoticeStatus;
-  if (failureNoticeStatus) {
-    if (status === 'delivered') {
-      effectiveFailureNotice = 'delivered';
-    } else if (status === 'retrying' && failureNoticeStatus !== 'unconfigured' && failureNoticeStatus !== 'suppressed') {
-      effectiveFailureNotice = 'pending';
-    } else if ((status === 'failed' || status === 'partial_failed') && failureNoticeStatus === 'pending') {
-      effectiveFailureNotice = null;
-    }
-  }
 
   return {
     status,
@@ -532,7 +467,6 @@ export function resolveExecutionDelivery(
         ? failureReasons[0]
         : null,
     failure_reasons: status === 'failed' || status === 'partial_failed' ? failureReasons : [],
-    ...(effectiveFailureNotice ? { failure_notice_status: effectiveFailureNotice } : {}),
     targets,
   };
 }

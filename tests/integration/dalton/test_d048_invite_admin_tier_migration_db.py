@@ -26,11 +26,54 @@ pytestmark = [
 ]
 
 
+_ALEMBIC_SUBPROCESS_SCRIPT = """
+import os
+import sys
+from alembic import command
+from alembic.config import Config
+
+ini_path, action, revision = sys.argv[1], sys.argv[2], sys.argv[3]
+sa_url = os.environ["DALTON_ALEMBIC_SQLALCHEMY_URL"]
+cfg = Config(ini_path)
+cfg.set_main_option("sqlalchemy.url", sa_url.replace("%", "%%"))
+if action == "upgrade":
+    command.upgrade(cfg, revision)
+elif action == "downgrade":
+    command.downgrade(cfg, revision)
+else:
+    raise SystemExit(f"Unsupported alembic action: {action}")
+""".strip()
+
+_AMBIENT_DB_ENV_KEYS = (
+    "DATABASE_URL",
+    "DB_HOST",
+    "DB_PORT",
+    "DB_NAME",
+    "DB_USER",
+    "DB_PASSWORD",
+    "DB_SSLMODE",
+    "PGDATABASE",
+    "PGSERVICE",
+)
+
+
 def _run_alembic(args: list[str], *, env: dict[str, str], dalton: bool = True) -> None:
-    cmd = [sys.executable, "-m", "alembic"]
-    if dalton:
-        cmd.extend(["-c", "src/dalton/alembic.ini"])
-    cmd.extend(args)
+    from sqlalchemy.engine import make_url
+
+    assert len(args) == 2 and args[0] in ("upgrade", "downgrade"), (
+        f"Expected ['upgrade'|'downgrade', revision], got {args!r}"
+    )
+    sa_url = (env.get("DALTON_ALEMBIC_SQLALCHEMY_URL") or "").strip()
+    assert sa_url, "DALTON_ALEMBIC_SQLALCHEMY_URL must be populated by _alembic_env_for_dsn()"
+    parsed = make_url(sa_url)
+    effective_db = str(parsed.query.get("dbname") or "")
+    assert not parsed.database and effective_db.endswith("_test"), (
+        f"Refusing to run Alembic against non-test URL target: database={parsed.database!r}, "
+        f"dbname={effective_db!r}"
+    )
+
+    ini_path = "src/dalton/alembic.ini" if dalton else "alembic.ini"
+    cmd = [sys.executable, "-c", _ALEMBIC_SUBPROCESS_SCRIPT, ini_path, args[0], args[1]]
     proc = subprocess.run(
         cmd,
         cwd=str(REPO_ROOT),
@@ -40,7 +83,7 @@ def _run_alembic(args: list[str], *, env: dict[str, str], dalton: bool = True) -
         check=False,
     )
     assert proc.returncode == 0, (
-        f"Alembic command failed: {' '.join(cmd)}\n"
+        f"Alembic command failed: alembic -c {ini_path} {' '.join(args)}\n"
         f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     )
 
@@ -48,22 +91,41 @@ def _run_alembic(args: list[str], *, env: dict[str, str], dalton: bool = True) -
 from tests.integration.dalton._db_guard import extract_effective_test_db_name
 
 
-def _alembic_env_for_dsn(dsn: str) -> dict[str, str]:
+def _build_alembic_sqlalchemy_url(dsn: str) -> str:
+    """Build a SQLAlchemy+psycopg URL directly from the guard's parsed libpq parameters.
+
+    Passing all validated libpq parameters (including ``dbname``) as percent-encoded
+    query parameters ensures SQLAlchemy's ``make_url()`` and psycopg's dialect decode
+    the exact same ``dbname`` checked by ``extract_effective_test_db_name()`` even
+    when the database name contains URL-special characters such as ``?``, ``#``, ``%``,
+    or ``/``.
+    """
+    from urllib.parse import urlencode
+
     from psycopg.conninfo import conninfo_to_dict
+    from sqlalchemy.engine import make_url
 
     db_name = extract_effective_test_db_name(dsn, source="DALTON_TEST_PG_DSN")
-    params = conninfo_to_dict(dsn)
+    params = {k: str(v) for k, v in conninfo_to_dict(dsn).items() if v is not None}
+    params["dbname"] = db_name
+    sa_url = "postgresql+psycopg:///?" + urlencode(params)
+    parsed = make_url(sa_url)
+    if parsed.database or parsed.query.get("dbname") != db_name:
+        raise ValueError(
+            f"Refusing to run integration tests: SQLAlchemy URL target mismatch "
+            f"(expected dbname={db_name!r}, got database={parsed.database!r}, "
+            f"query_dbname={parsed.query.get('dbname')!r})"
+        )
+    return sa_url
+
+
+def _alembic_env_for_dsn(dsn: str) -> dict[str, str]:
+    sa_url = _build_alembic_sqlalchemy_url(dsn)
     env = os.environ.copy()
+    for key in _AMBIENT_DB_ENV_KEYS:
+        env.pop(key, None)
+    env["DALTON_ALEMBIC_SQLALCHEMY_URL"] = sa_url
     env["DATABASE_URL"] = dsn
-    if params.get("host"):
-        env["DB_HOST"] = str(params["host"])
-    if params.get("port"):
-        env["DB_PORT"] = str(params["port"])
-    if params.get("user"):
-        env["DB_USER"] = str(params["user"])
-    if params.get("password") is not None:
-        env["DB_PASSWORD"] = str(params["password"])
-    env["DB_NAME"] = db_name
     return env
 
 

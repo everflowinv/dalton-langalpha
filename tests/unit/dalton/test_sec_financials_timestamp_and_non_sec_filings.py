@@ -535,3 +535,73 @@ def test_sec_shared_issuer_map_resolves_toyota_7203_t_and_distinguishes_unmapped
     assert unmapped_cli["ok"] is False
     assert unmapped_cli["error_code"] == "sec_issuer_mapping_not_found"
     assert unmapped_cli["sec_filer"] is None
+
+
+@pytest.mark.asyncio
+async def test_sandbox_assets_syncs_and_hashes_sec_issuer_map_json(tmp_path: Path) -> None:
+    """r6 B-1: core sandbox asset sync hashes, uploads, and keeps sec_issuer_map.json beside dalton_sec_mcp_server.py."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    from ptc_agent.core.sandbox import assets
+
+    sec_server = SimpleNamespace(
+        name="dalton_sec",
+        enabled=True,
+        transport="stdio",
+        command="uv",
+        args=["run", "python", "plugins/dalton_sec/dalton_sec_mcp_server.py"],
+    )
+
+    uploaded_batches: list[list[tuple[str, str]]] = []
+
+    async def _fake_runtime_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
+        if fn is runtime.upload_files:
+            uploaded_batches.append(list(args[0]))
+        return None
+
+    class _DummyProvider:
+        mounts_livefs = False
+
+    runtime = SimpleNamespace(exec=AsyncMock(), upload_files=AsyncMock())
+    sandbox = SimpleNamespace(
+        _work_dir="/work",
+        config=SimpleNamespace(config_file_dir=REPO_ROOT),
+        provider=_DummyProvider(),
+        runtime=runtime,
+        _builtin_servers=lambda: [sec_server],
+        _runtime_call=_fake_runtime_call,
+        _compute_tool_schema_hash=MagicMock(return_value="schema-hash"),
+        _compute_user_mcp_config_hash=MagicMock(return_value=""),
+    )
+
+    # 1. Manifest includes sec_issuer_map.json alongside dalton_sec_mcp_server.py
+    manifest = await assets._compute_sandbox_manifest(sandbox)
+    mcp_files = manifest["modules"]["mcp_servers"]["files"]
+    assert "dalton_sec_mcp_server.py" in mcp_files
+    assert "sec_issuer_map.json" in mcp_files
+
+    # 2. Upload batch ships sec_issuer_map.json to /work/mcp_servers/sec_issuer_map.json and shields it from prune
+    expected = await assets._upload_mcp_server_files_impl(sandbox)
+    assert "dalton_sec_mcp_server.py" in expected
+    assert "sec_issuer_map.json" in expected
+    assert uploaded_batches, "expected upload_files batch to be invoked"
+    uploaded_map = {remote: local for local, remote in uploaded_batches[0]}
+    assert "/work/mcp_servers/dalton_sec_mcp_server.py" in uploaded_map
+    assert "/work/mcp_servers/sec_issuer_map.json" in uploaded_map
+    assert Path(uploaded_map["/work/mcp_servers/sec_issuer_map.json"]).is_file()
+
+    # 3. Loading dalton_sec_mcp_server.py from the synced flat directory (without src/) resolves 9988.HK -> BABA and 7203.T -> TM
+    sandbox_mcp_dir = tmp_path / "mcp_servers"
+    sandbox_mcp_dir.mkdir()
+    for remote, local in uploaded_map.items():
+        (sandbox_mcp_dir / Path(remote).name).write_bytes(Path(local).read_bytes())
+
+    spec = importlib.util.spec_from_file_location(
+        "dalton_sec_sandbox_copy", sandbox_mcp_dir / "dalton_sec_mcp_server.py"
+    )
+    assert spec is not None and spec.loader is not None
+    sandbox_sec_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sandbox_sec_mod)
+    assert sandbox_sec_mod.DUAL_LISTED_SEC_ALIASES.get("9988.HK") == "BABA"
+    assert sandbox_sec_mod.DUAL_LISTED_SEC_ALIASES.get("7203.T") == "TM"
