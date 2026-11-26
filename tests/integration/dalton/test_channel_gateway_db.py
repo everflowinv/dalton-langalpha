@@ -10749,7 +10749,7 @@ async def test_bot_topic_concurrent_i1_and_i7_two_connections_feishu_and_discord
                             """
                             INSERT INTO dalton_channel_identities (
                                 user_id, platform, platform_user_id, platform_username,
-                                linked_at, updated_at
+                                created_at, updated_at
                             )
                             VALUES (%s, %s, %s, 'alice', NOW(), NOW()),
                                    (%s, %s, %s, 'bob', NOW(), NOW())
@@ -10763,32 +10763,30 @@ async def test_bot_topic_concurrent_i1_and_i7_two_connections_feishu_and_discord
                             """
                             INSERT INTO dalton_channel_chat_bindings (
                                 platform, chat_address, chat_name, workspace_id,
-                                bound_by, created_at, updated_at
+                                bound_by_user_id, updated_at
                             )
-                            VALUES (%s, %s, 'research', NULL, %s, NOW(), NOW())
+                            VALUES (%s, %s, 'research', NULL, %s, NOW())
                             ON CONFLICT (platform, chat_address) DO NOTHING
                             """,
                             (platform, chat_addr, user_a),
                         )
                         for uid in (user_a, user_b):
-                            settings_json = {
-                                "apps": {
-                                    platform: {
-                                        "chats": {chat_addr: {"name": "research"}}
-                                    }
+                            apps_json = {
+                                platform: {
+                                    "chats": {chat_addr: {"name": "research"}}
                                 }
                             }
                             await cur.execute(
                                 """
                                 INSERT INTO dalton_channel_user_settings (
-                                    user_id, settings_json, updated_at
+                                    user_id, version, apps, updated_at
                                 )
-                                VALUES (%s, %s::jsonb, NOW())
+                                VALUES (%s, 'v1', %s::jsonb, NOW())
                                 ON CONFLICT (user_id) DO UPDATE SET
-                                    settings_json = dalton_channel_user_settings.settings_json || EXCLUDED.settings_json,
+                                    apps = dalton_channel_user_settings.apps || EXCLUDED.apps,
                                     updated_at = NOW()
                                 """,
-                                (uid, json.dumps(settings_json)),
+                                (uid, json.dumps(apps_json)),
                             )
 
             # 1) Alice starts a top-level @bot topic -> I-1 + I-6 pre-reserves pending topic

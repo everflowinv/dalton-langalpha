@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { AgentRoutesHandler } from "../src/agent-routes.js";
 import { BackendHttpError, type BackendClient, type I6AuthorizeAndClaimRequest, type I6AuthorizeAndClaimResponse, type I7DeliveriesProgressRequest } from "../src/backend-client.js";
-import type { ChannelAdapter, SendFileOptions, SendFileResult, SendTextChunkOptions, SendTextChunkResult } from "../src/channels/adapter.js";
+import { ChannelDeliveryError, type ChannelAdapter, type SendFileOptions, type SendFileResult, type SendTextChunkOptions, type SendTextChunkResult } from "../src/channels/adapter.js";
 import { DiscordChannelAdapter } from "../src/channels/discord/index.js";
 import { DiscordError } from "../src/channels/discord/rest.js";
 import { sendMessageDiscord, threadIdFromScopeKey } from "../src/channels/discord/send.js";
@@ -1197,5 +1197,321 @@ describe("Channel Phase 2 Batch 1 — Group Deep Links & DM Deliverables", () =>
     expect(feishu.sentTexts[0]!.text).toContain(
       `${WEB_BASE}/chat/t/${THREAD_ID}?file=results%2Freport.pdf`,
     );
+  });
+
+  it("persists first_reply_message_id on Feishu single-chunk topic reply without thread_id and confirms initiator mention-free follow-up", async () => {
+    const createMock = vi.fn(async () => ({ code: 0, data: { message_id: "om_leaked_main" } }));
+    const replyMock = vi.fn(async () => ({
+      code: 0,
+      data: { message_id: "om_single_reply_1" },
+    }));
+    let allowDelayedThreadId = false;
+    const getMock = vi.fn(async (req: { path: { message_id: string } }) => ({
+      code: 0,
+      data: {
+        items: [
+          {
+            message_id: req.path.message_id,
+            chat_id: "oc_grp_1",
+            msg_type: "post",
+            body: { content: "{}" },
+            ...(allowDelayedThreadId && req.path.message_id === "om_single_reply_1"
+              ? { thread_id: "omt_delayed_single_1" }
+              : {}),
+          },
+        ],
+      },
+    }));
+
+    const clientFactory = () =>
+      ({
+        im: { message: { create: createMock, reply: replyMock, get: getMock } },
+      }) as unknown as ReturnType<
+        NonNullable<NonNullable<ConstructorParameters<typeof FeishuChannelAdapter>[0]>["clientFactory"]>
+      >;
+
+    const feishuOut = new FeishuChannelAdapter({
+      appId: "cli_test",
+      appSecret: "sec_test",
+      botOpenId: "ou_bot",
+      clientFactory,
+    });
+    vi.spyOn(feishuOut, "isConnected").mockReturnValue(true);
+
+    const progressCalls: I7DeliveriesProgressRequest[] = [];
+    const svc = new DeliveryService({
+      backend: makeMockBackend({
+        authorizeAndClaimDelivery: vi.fn(async () => ({
+          claim_status: "claimed" as const,
+          platform: "feishu",
+          target_address: "feishu:oc_grp_1",
+          recipient_id: "oc_grp_1",
+          is_current: true,
+          delivery_attempt: 1,
+          thread_scope_key: "chat:oc_grp_1:topic:om_root_single",
+          root_message_id: "om_root_single",
+          external_topic_id: null,
+          topic_canonical_scope_key: "chat:oc_grp_1:topic:om_root_single",
+          topic_initiator_platform_user_id: "ou_alice",
+        })),
+        updateDeliveryProgress: vi.fn(async (req: I7DeliveriesProgressRequest) => {
+          progressCalls.push(req);
+          return { ok: true, delivery_key: req.delivery_key, status: req.status ?? "in_flight", sent_to_current_count: 1 };
+        }),
+      }),
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuOut]]),
+      webBaseUrl: WEB_BASE,
+    });
+
+    const outRes = await svc.executeDelivery({
+      deliveryKey: "fallback:run-fs-single-chunk",
+      kind: "fallback",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-fs-single-chunk",
+      platform: "feishu",
+      target: "feishu:oc_grp_1",
+      text: "单片回复内容",
+    });
+
+    expect(outRes.status).toBe("sent");
+    expect(createMock).not.toHaveBeenCalled();
+    expect(replyMock).toHaveBeenCalledTimes(1);
+    const pendingReg = progressCalls.find((p) => p.bot_topic_registration)?.bot_topic_registration;
+    expect(pendingReg).toBeDefined();
+    expect(pendingReg?.external_topic_id).toBeNull();
+    expect(pendingReg?.first_reply_message_id).toBe("om_single_reply_1");
+    expect(pendingReg?.canonical_scope_key).toBe("chat:oc_grp_1:topic:om_root_single");
+
+    // Simulate next mention-free inbound message from initiator Alice on a fresh adapter (post-restart):
+    // backend has the pending topic row with persisted `first_reply_message_id`, and Feishu `im.message.get`
+    // now returns `thread_id: "omt_delayed_single_1"`.
+    allowDelayedThreadId = true;
+    const received: InboundChannelEvent[] = [];
+    const lookupMock = vi.fn(async () => ({
+      found: false,
+      status: null,
+      canonical_scope_key: null,
+      external_topic_id: null,
+      root_message_id: null,
+      first_reply_message_id: null,
+      initiator_platform_user_id: null,
+      initiator_dalton_user_id: null,
+      pending_candidates: [
+        {
+          canonical_scope_key: "chat:oc_grp_1:topic:om_root_single",
+          root_message_id: "om_root_single",
+          first_reply_message_id: "om_single_reply_1",
+          initiator_platform_user_id: "ou_alice",
+          initiator_dalton_user_id: "user-alice",
+        },
+      ],
+    }));
+
+    const feishuIn = new FeishuChannelAdapter({
+      appId: "cli_test",
+      appSecret: "sec_test",
+      botOpenId: "ou_bot",
+      clientFactory,
+    });
+    feishuIn.setBackendClient(makeMockBackend({ lookupBotTopic: lookupMock }));
+    feishuIn.onInboundEvent(async (ev) => {
+      received.push(ev);
+    });
+
+    await feishuIn.receiveRawEvent({
+      sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+      message: {
+        message_id: "om_followup_single_alice",
+        thread_id: "omt_delayed_single_1",
+        chat_id: "oc_grp_1",
+        chat_type: "group",
+        message_type: "text",
+        content: JSON.stringify({ text: "继续追问单片话题" }),
+      },
+    });
+
+    expect(lookupMock).toHaveBeenCalledTimes(1);
+    expect(received).toHaveLength(1);
+    expect(received[0]!.threadScopeKey).toBe("chat:oc_grp_1:topic:om_root_single");
+    expect(received[0]!.rootMessageId).toBe("om_root_single");
+    expect(received[0]!.isGroupTrigger).toBe(true);
+
+    // Non-initiator mention-free message inside the same topic is still dropped
+    await feishuIn.receiveRawEvent({
+      sender: { sender_id: { open_id: "ou_bob" }, sender_type: "user" },
+      message: {
+        message_id: "om_followup_single_bob",
+        thread_id: "omt_delayed_single_1",
+        chat_id: "oc_grp_1",
+        chat_type: "group",
+        message_type: "text",
+        content: JSON.stringify({ text: "非发起人发言" }),
+      },
+    });
+    expect(received).toHaveLength(1);
+  });
+
+  it("tracks multi-chunk overflow login links per (workspace_id, path) and resumes only unsent links after restart", async () => {
+    const runId = "run-overflow-multichunk";
+    const overflowFiles = [
+      { path: "results/overflow_1.pdf", workspace_id: "ws-a", filename: "overflow_1.pdf", reason: "deliverable_overflow_link" },
+      { path: "results/overflow_2.pdf", workspace_id: "ws-a", filename: "overflow_2.pdf", reason: "deliverable_overflow_link" },
+      { path: "results/overflow_3.pdf", workspace_id: "ws-b", filename: "overflow_3.pdf", reason: "deliverable_overflow_link" },
+      { path: "results/overflow_4.pdf", workspace_id: "ws-b", filename: "overflow_4.pdf", reason: "deliverable_overflow_link" },
+    ];
+    const binaryFiles = [
+      { path: "results/bin_1.pdf", workspace_id: "ws-a" },
+    ];
+
+    // Pack at most 2 lines per chunk so 4 overflow links span 2 chunks ([overflow_1, overflow_2] and [overflow_3, overflow_4]).
+    let crashAfterChunk0 = true;
+    const sentChunkTexts: string[] = [];
+    const feishu = makeStubAdapter("feishu", {
+      splitTextChunks: (text: string) => {
+        const lines = text.split("\n").filter((l) => l.length > 0);
+        const chunks: string[] = [];
+        for (let idx = 0; idx < lines.length; idx += 2) {
+          chunks.push(lines.slice(idx, idx + 2).join("\n"));
+        }
+        return chunks.length > 0 ? chunks : [text];
+      },
+      sendTextChunk: vi.fn(async (opts: SendTextChunkOptions): Promise<SendTextChunkResult> => {
+        if (crashAfterChunk0 && opts.chunkIndex === 1) {
+          throw new ChannelDeliveryError("Simulated gateway exit after chunk 0", {
+            outcome: "unknown",
+            code: "unavailable",
+          });
+        }
+        sentChunkTexts.push(opts.text);
+        return { messageId: `om_ov_${sentChunkTexts.length}`, resolvedAddress: opts.targetAddress };
+      }),
+    });
+
+    const deliveriesState = new Map<
+      string,
+      {
+        status: string;
+        sent_chunks: number;
+        files_status: Array<{ path: string; workspace_id?: string | null; status: string; reason: string | null }>;
+      }
+    >();
+
+    const backend = makeMockBackend({
+      authorizeAndClaimDelivery: vi.fn(async (req) => {
+        const existing = deliveriesState.get(req.delivery_key);
+        if (existing && existing.status === "unknown") {
+          return {
+            claim_status: "in_flight_or_unknown" as const,
+            existing_status: "unknown",
+            sent_chunks: existing.sent_chunks,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            is_current: true,
+            delivery_attempt: 1,
+            files_status: existing.files_status,
+          };
+        }
+        const priorRunFiles = Array.from(deliveriesState.entries())
+          .filter(([k]) => k !== req.delivery_key)
+          .flatMap(([k, row]) =>
+            row.files_status.map((f) => ({
+              delivery_key: k,
+              delivery_status: row.status,
+              workspace_id: f.workspace_id ?? null,
+              path: f.path,
+              status: f.status,
+            })),
+          );
+        deliveriesState.set(req.delivery_key, {
+          status: "in_flight",
+          sent_chunks: 0,
+          files_status: [],
+        });
+        return {
+          claim_status: "claimed" as const,
+          platform: "feishu",
+          target_address: "feishu:@me",
+          recipient_id: "ou_alice",
+          dm_recipient_platform_user_id: "ou_alice",
+          is_current: true,
+          delivery_attempt: 1,
+          workspace_id: "ws-a",
+          home_workspace_id: "ws-home",
+          prior_run_files: priorRunFiles,
+        };
+      }),
+      updateDeliveryProgress: vi.fn(async (req: I7DeliveriesProgressRequest) => {
+        const row = deliveriesState.get(req.delivery_key);
+        if (row) {
+          if (typeof req.sent_chunks === "number") row.sent_chunks = req.sent_chunks;
+          if (Array.isArray(req.files_status)) row.files_status = [...req.files_status];
+          if (typeof req.status === "string") row.status = req.status;
+        }
+        return { ok: true, delivery_key: req.delivery_key, status: req.status ?? "in_flight", sent_to_current_count: 1 };
+      }),
+    });
+
+    const svc = new DeliveryService({
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]),
+      webBaseUrl: WEB_BASE,
+    });
+
+    // Attempt 1: chunk 0 confirms overflow_1 & overflow_2, then gateway exits before chunk 1
+    await svc.executeDelivery({
+      deliveryKey: `deliverables:${runId}`,
+      kind: "fallback",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      workspaceId: "ws-a",
+      runId,
+      platform: "feishu",
+      target: "feishu:@me",
+      text: "",
+      files: binaryFiles,
+      linkOnlyFiles: overflowFiles,
+      downloadMode: "deliverable",
+      linkFallbackOnDeliverableMismatch: true,
+    });
+
+    // Simulate gateway restart sweeping the unsettled delivery to `unknown`
+    const crashedRow = deliveriesState.get(`deliverables:${runId}`)!;
+    crashedRow.status = "unknown";
+    expect(crashedRow.sent_chunks).toBe(1);
+    expect(
+      crashedRow.files_status.filter((f) => f.status === "linked").map((f) => `${f.workspace_id}::${f.path}`),
+    ).toEqual(["ws-a::results/overflow_1.pdf", "ws-a::results/overflow_2.pdf"]);
+
+    // Attempt 2 (post-restart recovery): must NOT resend overflow_1/overflow_2,
+    // and MUST send remaining overflow_3/overflow_4 plus bin_1 login link.
+    crashAfterChunk0 = false;
+    sentChunkTexts.length = 0;
+
+    const recovered = await svc.executeDelivery({
+      deliveryKey: `deliverables:${runId}`,
+      kind: "fallback",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      workspaceId: "ws-a",
+      runId,
+      platform: "feishu",
+      target: "feishu:@me",
+      text: "",
+      files: binaryFiles,
+      linkOnlyFiles: overflowFiles,
+      downloadMode: "deliverable",
+      linkFallbackOnDeliverableMismatch: true,
+      activityOrigin: "replay",
+    });
+
+    expect(recovered.status).toBe("sent");
+    expect(feishu.sentFiles).toHaveLength(0);
+    const recoveredCombined = sentChunkTexts.join("\n");
+    expect(recoveredCombined).not.toContain("overflow_1.pdf");
+    expect(recoveredCombined).not.toContain("overflow_2.pdf");
+    expect(recoveredCombined).toContain("overflow_3.pdf");
+    expect(recoveredCombined).toContain("overflow_4.pdf");
+    expect(recoveredCombined).toContain("bin_1.pdf");
   });
 });

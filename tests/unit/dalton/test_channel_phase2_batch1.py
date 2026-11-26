@@ -167,7 +167,7 @@ class _FakeTopicCursor:
                 return
 
             if "ROOT_MESSAGE_ID = %S" in norm:
-                plat, addr, root_id = params
+                plat, addr, root_id = params[:3]
                 for row in self.topics.values():
                     if (
                         row["platform"] == plat
@@ -2635,3 +2635,247 @@ async def test_deliverables_links_excluded_from_body_dedupe_and_sent_count(
     )
     assert i7_links["ok"] is True
     assert cur.inbound_events[("feishu", "om_dm_6files")]["sent_to_current_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_r10_fallback_replay_on_in_flight_or_unknown_stays_denied_while_deliverables_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PG regression #1: non-deliverable `fallback:*` rows in `in_flight` or `unknown`
+    MUST return `denied` (`not_allowed`) when claimed with `activity_origin='replay'`,
+    while `deliverables:*` in `unknown` still returns `in_flight_or_unknown` for link recovery.
+    """
+    monkeypatch.setattr(
+        cg_db,
+        "require_channel_platform_capability",
+        create_autospec(cg_db.require_channel_platform_capability, return_value=None),
+    )
+
+    cur = _LockOrderTrackingCursor()
+    conn = _FakeConn(cur)
+    for key, st in (
+        ("fallback:run-r10:flight", "in_flight"),
+        ("fallback:run-r10:unknown", "unknown"),
+        ("deliverables:run-r10", "unknown"),
+    ):
+        cur.deliveries[key] = {
+            "delivery_key": key,
+            "kind": "fallback",
+            "user_id": "user-alice",
+            "thread_id": "77777777-7777-4777-8777-777777777777",
+            "run_id": "run-r10",
+            "is_current": True,
+            "has_non_empty_text": not key.startswith("deliverables:"),
+            "platform": "feishu",
+            "target_address": "feishu:@me",
+            "status": st,
+            "sent_chunks": 0,
+            "total_chunks": 1,
+            "platform_message_ids": [],
+            "files_status": [],
+            "source_scope_key": "dm:ou_alice",
+            "source_generation": 2,
+            "activity_origin": "conversation",
+            "delivery_attempt": 1,
+            "error_code": "gateway_restarted" if st == "unknown" else None,
+        }
+
+    flight_replay = await cg_db.authorize_and_claim_delivery(
+        delivery_key="fallback:run-r10:flight",
+        kind="fallback",
+        user_id="user-alice",
+        thread_id="77777777-7777-4777-8777-777777777777",
+        run_id="run-r10",
+        platform="feishu",
+        target="feishu:@me",
+        has_non_empty_text=True,
+        total_chunks=1,
+        source_scope_key="dm:ou_alice",
+        source_generation=2,
+        activity_origin="replay",
+        conn=conn,
+    )
+    assert flight_replay["claim_status"] == "denied"
+    assert flight_replay["code"] == "not_allowed"
+
+    unknown_replay = await cg_db.authorize_and_claim_delivery(
+        delivery_key="fallback:run-r10:unknown",
+        kind="fallback",
+        user_id="user-alice",
+        thread_id="77777777-7777-4777-8777-777777777777",
+        run_id="run-r10",
+        platform="feishu",
+        target="feishu:@me",
+        has_non_empty_text=True,
+        total_chunks=1,
+        source_scope_key="dm:ou_alice",
+        source_generation=2,
+        activity_origin="replay",
+        conn=conn,
+    )
+    assert unknown_replay["claim_status"] == "denied"
+    assert unknown_replay["code"] == "not_allowed"
+
+    deliv_replay = await cg_db.authorize_and_claim_delivery(
+        delivery_key="deliverables:run-r10",
+        kind="fallback",
+        user_id="user-alice",
+        thread_id="77777777-7777-4777-8777-777777777777",
+        run_id="run-r10",
+        platform="feishu",
+        target="feishu:@me",
+        has_non_empty_text=False,
+        total_chunks=0,
+        source_scope_key="dm:ou_alice",
+        source_generation=2,
+        activity_origin="replay",
+        conn=conn,
+    )
+    assert deliv_replay["claim_status"] == "in_flight_or_unknown"
+    assert deliv_replay["existing_status"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_r10_feishu_single_chunk_pending_reply_persists_and_confirms_on_followup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex r3 High: persisting `first_reply_message_id` on a pending Feishu topic
+    allows `lookup_bot_topic` to return `pending_candidates` and I-1 to promote the topic
+    to `confirmed` once the initiator's mention-free follow-up arrives with `external_topic_id`.
+    """
+    monkeypatch.setattr(
+        cg_db,
+        "require_channel_platform_capability",
+        create_autospec(cg_db.require_channel_platform_capability, return_value=None),
+    )
+
+    topics: dict[tuple[str, str, str], dict[str, Any]] = {
+        ("feishu", "feishu:oc_grp_single", "chat:oc_grp_single:topic:om_root_s1"): {
+            "platform": "feishu",
+            "chat_address": "feishu:oc_grp_single",
+            "canonical_scope_key": "chat:oc_grp_single:topic:om_root_s1",
+            "external_topic_id": None,
+            "root_message_id": "om_root_s1",
+            "first_reply_message_id": None,
+            "initiator_dalton_user_id": "user-alice",
+            "initiator_platform_user_id": "ou_alice",
+            "status": "pending",
+        }
+    }
+
+    class _PendingTopicCur:
+        def __init__(self) -> None:
+            self._one: dict[str, Any] | None = None
+            self._all: list[dict[str, Any]] = []
+
+        async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+            norm = " ".join(sql.split()).upper()
+            self._one = None
+            self._all = []
+            if "PG_ADVISORY_XACT_LOCK" in norm:
+                return
+            if norm.startswith("SELECT") and "FROM DALTON_CHANNEL_BOT_TOPICS" in norm:
+                if "STATUS = 'PENDING'" in norm and "FIRST_REPLY_MESSAGE_ID IS NOT NULL" in norm:
+                    plat, addr = params[0], params[1]
+                    self._all = [
+                        dict(r)
+                        for r in topics.values()
+                        if r["platform"] == plat
+                        and r["chat_address"] == addr
+                        and r["status"] == "pending"
+                        and r.get("first_reply_message_id")
+                    ]
+                    return
+                if "STATUS = 'CONFIRMED'" in norm and "EXTERNAL_TOPIC_ID = %S" in norm:
+                    plat, addr, ext = params[0], params[1], params[2]
+                    for r in topics.values():
+                        if (
+                            r["platform"] == plat
+                            and r["chat_address"] == addr
+                            and r.get("external_topic_id") == ext
+                            and r["status"] == "confirmed"
+                        ):
+                            self._one = dict(r)
+                            return
+                    return
+                if "CANONICAL_SCOPE_KEY = %S OR ROOT_MESSAGE_ID = %S" in norm:
+                    plat, addr, scope, root_mid = params[0], params[1], params[2], params[3]
+                    for r in topics.values():
+                        if r["platform"] == plat and r["chat_address"] == addr and (
+                            r["canonical_scope_key"] == scope or r.get("root_message_id") == root_mid
+                        ):
+                            self._one = dict(r)
+                            return
+                    return
+            if norm.startswith("UPDATE DALTON_CHANNEL_BOT_TOPICS") and "FIRST_REPLY_MESSAGE_ID = COALESCE" in norm:
+                root_mid, first_rep, plat, addr, scope = params
+                row = topics[(plat, addr, scope)]
+                row["root_message_id"] = row["root_message_id"] or root_mid
+                row["first_reply_message_id"] = row["first_reply_message_id"] or first_rep
+                self._one = dict(row)
+                return
+
+        async def fetchone(self) -> dict[str, Any] | None:
+            return self._one
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(self._all)
+
+    class _PendingTopicConn:
+        def __init__(self, cur: _PendingTopicCur) -> None:
+            self._cur = cur
+
+        @asynccontextmanager
+        async def cursor(self, **_kwargs: Any):
+            yield self._cur
+
+    cur = _PendingTopicCur()
+    conn = _PendingTopicConn(cur)
+
+    recorded = await cg_db._record_pending_bot_topic_reply_in_tx(
+        cur,
+        platform="feishu",
+        chat_address="feishu:oc_grp_single",
+        canonical_scope_key="chat:oc_grp_single:topic:om_root_s1",
+        first_reply_message_id="om_single_reply_1",
+        initiator_dalton_user_id="user-alice",
+        initiator_platform_user_id="ou_alice",
+        root_message_id="om_root_s1",
+    )
+    assert recorded is not None
+    assert recorded["status"] == "pending"
+    assert recorded["first_reply_message_id"] == "om_single_reply_1"
+
+    lookup = await cg_db.lookup_bot_topic(
+        platform="feishu",
+        chat_address="feishu:oc_grp_single",
+        match_mode="inbound_followup",
+        external_topic_id="omt_delayed_s1",
+        conn=conn,
+    )
+    assert lookup["found"] is False
+    assert lookup["pending_candidates"] == [
+        {
+            "canonical_scope_key": "chat:oc_grp_single:topic:om_root_s1",
+            "root_message_id": "om_root_s1",
+            "first_reply_message_id": "om_single_reply_1",
+            "initiator_platform_user_id": "ou_alice",
+            "initiator_dalton_user_id": "user-alice",
+        }
+    ]
+
+
+def test_r10_automation_notifications_load_delivery_row_guards_uuid_casts_with_case() -> None:
+    """PG regression #2: `_load_delivery_row` MUST guard `::uuid` casts with short-circuiting
+    `CASE WHEN ... THEN ...::uuid ELSE NULL END` so Postgres never evaluates `::uuid` on
+    non-UUID test/synthetic `execution_id` or `automation_id` strings.
+    """
+    import inspect
+
+    from src.dalton.database import automation_notifications as auto_db
+
+    src = inspect.getsource(auto_db._load_delivery_row)
+    assert "CASE" in src and "THEN d.execution_id::uuid" in src
+    assert "THEN d.automation_id::uuid" in src
+    assert "AND ae.automation_execution_id = d.execution_id::uuid" not in src
+    assert "AND a.automation_id = d.automation_id::uuid" not in src

@@ -118,6 +118,13 @@ export async function abortableRetrySleep(
   });
 }
 
+export interface LinkOnlyFileRef {
+  path: string;
+  workspace_id?: string | null;
+  filename?: string | null;
+  reason?: string | null;
+}
+
 export interface ExecuteDeliveryOptions {
   deliveryKey: string;
   kind: "agent_send" | "fallback" | "interrupt" | "automation" | "notice";
@@ -132,6 +139,8 @@ export interface ExecuteDeliveryOptions {
   inboundMessageId?: string | null;
   text: string;
   files?: AgentSendFileRef[];
+  /** Files delivered as web login deep links (tracked per `(workspace_id, path)` in `files_status` per confirmed chunk). */
+  linkOnlyFiles?: LinkOnlyFileRef[];
   /** `"deliverable"` downloads via `/internal/deliverables/download` and applies DM deliverable dedupe/link fallback. */
   downloadMode?: "workspace" | "deliverable";
   /** When true (DM auto-attach deliverables), version mismatch / 404 / oversize falls back to a web login deep link. */
@@ -465,8 +474,9 @@ export class DeliveryService {
         )
       : rawText;
     const hasOutboundText = outboundText.trim().length > 0;
+    const linkOnlyFiles = options.linkOnlyFiles ?? [];
 
-    if (!hasOutboundText && files.length === 0) {
+    if (!hasOutboundText && files.length === 0 && linkOnlyFiles.length === 0) {
       return {
         status: "failed",
         code: null,
@@ -567,7 +577,12 @@ export class DeliveryService {
         return this.executeDelivery({
           ...options,
           deliveryKey: `deliverables-links:${options.runId}`,
-          text: (claim.sent_chunks ?? 0) > 0 ? "" : options.text,
+          text:
+            linkOnlyFiles.length > 0
+              ? options.text
+              : (claim.sent_chunks ?? 0) > 0
+                ? ""
+                : options.text,
           forceLinkOnly: true,
         });
       }
@@ -695,7 +710,93 @@ export class DeliveryService {
       null;
     const fileOutcomes: AgentSendFileOutcome[] = [];
     let filesToSend: AgentSendFileRef[] = [...files];
-    const extraLinkLines: string[] = [];
+    const pendingLinkEntries: Array<{
+      line: string;
+      outcome: AgentSendFileOutcome;
+    }> = [];
+
+    const normalizeDeliverablePath = (rawPath: string): string => {
+      const segments: string[] = [];
+      for (const seg of rawPath.trim().replace(/\\/g, "/").split("/")) {
+        if (!seg || seg === ".") continue;
+        segments.push(seg);
+      }
+      return segments.join("/");
+    };
+
+    const priorByWsAndPath = new Map<string, string>();
+    const legacyPriorByPath = new Map<string, string>();
+    if (isDmTarget && options.downloadMode === "deliverable") {
+      const statusPriority = (status: string): number => {
+        if (status === "sent" || status === "linked") return 3;
+        if (status === "unknown" || status === "pending") return 2;
+        return 1;
+      };
+      const recordPrior = (
+        map: Map<string, string>,
+        key: string,
+        status: string,
+      ): void => {
+        const prev = map.get(key);
+        if (!prev || statusPriority(status) >= statusPriority(prev)) {
+          map.set(key, status);
+        }
+      };
+      for (const prior of claim.prior_run_files ?? []) {
+        const normPath = normalizeDeliverablePath(prior.path);
+        const wsKey = (prior.workspace_id ?? "").trim();
+        const status = (prior.status ?? "").trim().toLowerCase();
+        if (!normPath || !status) continue;
+        if (wsKey) {
+          recordPrior(priorByWsAndPath, `${wsKey}::${normPath}`, status);
+        } else {
+          recordPrior(legacyPriorByPath, normPath, status);
+        }
+      }
+    }
+    const lookupPriorDeliverableStatus = (
+      rawPath: string,
+      wsId: string,
+    ): string | undefined => {
+      const normPath = normalizeDeliverablePath(rawPath);
+      if (!normPath) return undefined;
+      const canUseLegacyMatch =
+        !wsId || !currentSessionWsId || wsId === currentSessionWsId;
+      return (
+        (wsId ? priorByWsAndPath.get(`${wsId}::${normPath}`) : undefined) ??
+        (canUseLegacyMatch ? legacyPriorByPath.get(normPath) : undefined)
+      );
+    };
+
+    // Track overflow / HTML / oversized link-only deliverables per `(workspace_id, path)` so
+    // multi-chunk link messages persist confirmed links per chunk and restart recovery only
+    // sends remaining unconfirmed links.
+    for (const linkRef of linkOnlyFiles) {
+      const wsId =
+        (linkRef.workspace_id ?? "").trim() || currentSessionWsId || "";
+      if (isDmTarget && options.downloadMode === "deliverable") {
+        const priorStatus = lookupPriorDeliverableStatus(linkRef.path, wsId);
+        if (priorStatus === "sent" || priorStatus === "linked") {
+          continue;
+        }
+      }
+      pendingLinkEntries.push({
+        line: buildWorkspaceFileDeepLinkLine(
+          linkRef.filename || basename(linkRef.path) || linkRef.path,
+          linkRef.path,
+          this.webBaseUrl,
+          options.threadId,
+          wsId || null,
+          currentSessionWsId,
+        ),
+        outcome: {
+          path: linkRef.path,
+          workspace_id: wsId || null,
+          status: "linked",
+          reason: linkRef.reason ?? "deliverable_overflow_link",
+        },
+      });
+    }
 
     // Lead Decision #7: Group targets (including explicit `send_message(files=...)`) NEVER upload binary files;
     // after I-6 authorizes the delivery, convert every file into a sign-in-protected web deep link.
@@ -703,8 +804,8 @@ export class DeliveryService {
       for (const fileRef of filesToSend) {
         const wsId =
           fileRef.workspace_id || currentSessionWsId || null;
-        extraLinkLines.push(
-          buildWorkspaceFileDeepLinkLine(
+        pendingLinkEntries.push({
+          line: buildWorkspaceFileDeepLinkLine(
             basename(fileRef.path) || fileRef.path,
             fileRef.path,
             this.webBaseUrl,
@@ -712,12 +813,12 @@ export class DeliveryService {
             wsId,
             currentSessionWsId,
           ),
-        );
-        fileOutcomes.push({
-          path: fileRef.path,
-          workspace_id: wsId,
-          status: "linked",
-          reason: "group_target_deep_link",
+          outcome: {
+            path: fileRef.path,
+            workspace_id: wsId,
+            status: "linked",
+            reason: "group_target_deep_link",
+          },
         });
       }
       filesToSend = [];
@@ -732,8 +833,8 @@ export class DeliveryService {
         const lowerPath = fileRef.path.trim().toLowerCase();
         if (lowerPath.endsWith(".html") || lowerPath.endsWith(".htm")) {
           const wsId = fileRef.workspace_id || currentSessionWsId || null;
-          extraLinkLines.push(
-            buildWorkspaceFileDeepLinkLine(
+          pendingLinkEntries.push({
+            line: buildWorkspaceFileDeepLinkLine(
               basename(fileRef.path) || fileRef.path,
               fileRef.path,
               this.webBaseUrl,
@@ -741,12 +842,12 @@ export class DeliveryService {
               wsId,
               currentSessionWsId,
             ),
-          );
-          fileOutcomes.push({
-            path: fileRef.path,
-            workspace_id: wsId,
-            status: "linked",
-            reason: "html_file_deep_link",
+            outcome: {
+              path: fileRef.path,
+              workspace_id: wsId,
+              status: "linked",
+              reason: "html_file_deep_link",
+            },
           });
           continue;
         }
@@ -765,61 +866,18 @@ export class DeliveryService {
     //    lacks a pinned original DM recipient (`claim.dm_recipient_platform_user_id`), emit web login deep
     //    links only (never upload binaries).
     if (isDmTarget && options.downloadMode === "deliverable" && filesToSend.length > 0) {
-      const normalizeDeliverablePath = (rawPath: string): string => {
-        const segments: string[] = [];
-        for (const seg of rawPath.trim().replace(/\\/g, "/").split("/")) {
-          if (!seg || seg === ".") continue;
-          segments.push(seg);
-        }
-        return segments.join("/");
-      };
-      const statusPriority = (status: string): number => {
-        if (status === "sent" || status === "linked") return 3;
-        if (status === "unknown" || status === "pending") return 2;
-        return 1;
-      };
-      const recordPrior = (
-        map: Map<string, string>,
-        key: string,
-        status: string,
-      ): void => {
-        const prev = map.get(key);
-        if (!prev || statusPriority(status) >= statusPriority(prev)) {
-          map.set(key, status);
-        }
-      };
-
-      const priorByWsAndPath = new Map<string, string>();
-      const legacyPriorByPath = new Map<string, string>();
-      for (const prior of claim.prior_run_files ?? []) {
-        const normPath = normalizeDeliverablePath(prior.path);
-        const wsKey = (prior.workspace_id ?? "").trim();
-        const status = (prior.status ?? "").trim().toLowerCase();
-        if (!normPath || !status) continue;
-        if (wsKey) {
-          recordPrior(priorByWsAndPath, `${wsKey}::${normPath}`, status);
-        } else {
-          recordPrior(legacyPriorByPath, normPath, status);
-        }
-      }
-
       const pinnedDmRecipient = (claim.dm_recipient_platform_user_id ?? "").trim();
       const nextFilesToSend: AgentSendFileRef[] = [];
       for (const fileRef of filesToSend) {
         const wsId =
           (fileRef.workspace_id ?? "").trim() || currentSessionWsId || "";
-        const normPath = normalizeDeliverablePath(fileRef.path);
-        const canUseLegacyMatch =
-          !wsId || !currentSessionWsId || wsId === currentSessionWsId;
-        const priorStatus =
-          (wsId ? priorByWsAndPath.get(`${wsId}::${normPath}`) : undefined) ??
-          (canUseLegacyMatch ? legacyPriorByPath.get(normPath) : undefined);
+        const priorStatus = lookupPriorDeliverableStatus(fileRef.path, wsId);
         if (priorStatus === "sent" || priorStatus === "linked") {
           continue;
         }
         if (priorStatus === "pending" || priorStatus === "unknown") {
-          extraLinkLines.push(
-            buildWorkspaceFileDeepLinkLine(
+          pendingLinkEntries.push({
+            line: buildWorkspaceFileDeepLinkLine(
               basename(fileRef.path) || fileRef.path,
               fileRef.path,
               this.webBaseUrl,
@@ -827,18 +885,18 @@ export class DeliveryService {
               wsId || null,
               currentSessionWsId,
             ),
-          );
-          fileOutcomes.push({
-            path: fileRef.path,
-            workspace_id: wsId || null,
-            status: "linked",
-            reason: "prior_pending_or_unknown_link_only",
+            outcome: {
+              path: fileRef.path,
+              workspace_id: wsId || null,
+              status: "linked",
+              reason: "prior_pending_or_unknown_link_only",
+            },
           });
           continue;
         }
         if (options.forceLinkOnly) {
-          extraLinkLines.push(
-            buildWorkspaceFileDeepLinkLine(
+          pendingLinkEntries.push({
+            line: buildWorkspaceFileDeepLinkLine(
               basename(fileRef.path) || fileRef.path,
               fileRef.path,
               this.webBaseUrl,
@@ -846,18 +904,18 @@ export class DeliveryService {
               wsId || null,
               currentSessionWsId,
             ),
-          );
-          fileOutcomes.push({
-            path: fileRef.path,
-            workspace_id: wsId || null,
-            status: "linked",
-            reason: "prior_unknown_delivery_link_only",
+            outcome: {
+              path: fileRef.path,
+              workspace_id: wsId || null,
+              status: "linked",
+              reason: "prior_unknown_delivery_link_only",
+            },
           });
           continue;
         }
         if (!pinnedDmRecipient) {
-          extraLinkLines.push(
-            buildWorkspaceFileDeepLinkLine(
+          pendingLinkEntries.push({
+            line: buildWorkspaceFileDeepLinkLine(
               basename(fileRef.path) || fileRef.path,
               fileRef.path,
               this.webBaseUrl,
@@ -865,12 +923,12 @@ export class DeliveryService {
               wsId || null,
               currentSessionWsId,
             ),
-          );
-          fileOutcomes.push({
-            path: fileRef.path,
-            workspace_id: wsId || null,
-            status: "linked",
-            reason: "missing_dm_recipient_link_only",
+            outcome: {
+              path: fileRef.path,
+              workspace_id: wsId || null,
+              status: "linked",
+              reason: "missing_dm_recipient_link_only",
+            },
           });
           continue;
         }
@@ -879,13 +937,8 @@ export class DeliveryService {
       filesToSend = nextFilesToSend;
     }
 
-    const effectiveOutboundText =
-      extraLinkLines.length > 0
-        ? hasOutboundText
-          ? `${outboundText}\n\n${extraLinkLines.join("\n")}`
-          : extraLinkLines.join("\n")
-        : outboundText;
-    const hasEffectiveOutboundText = effectiveOutboundText.trim().length > 0;
+    const hasEffectiveOutboundText =
+      hasOutboundText || pendingLinkEntries.length > 0;
 
     // If all deliverable files were already satisfied by prior deliveries and there is no text to send,
     // settle cleanly as `sent` without dispatching anything duplicate.
@@ -917,9 +970,75 @@ export class DeliveryService {
       return noopResp;
     }
 
-    const chunks = hasEffectiveOutboundText
-      ? adapter.splitTextChunks(effectiveOutboundText)
-      : [];
+    const packLinkEntriesIntoChunks = (
+      entries: Array<{ line: string; outcome: AgentSendFileOutcome }>,
+    ): { packedChunks: string[]; outcomesByChunk: AgentSendFileOutcome[][] } => {
+      const packedChunks: string[] = [];
+      const outcomesByChunk: AgentSendFileOutcome[][] = [];
+      let curLines: string[] = [];
+      let curOutcomes: AgentSendFileOutcome[] = [];
+      for (const entry of entries) {
+        const candidateLines = [...curLines, entry.line];
+        const candidateText = candidateLines.join("\n");
+        const splitCandidate = adapter.splitTextChunks(candidateText);
+        if (splitCandidate.length === 1) {
+          curLines = candidateLines;
+          curOutcomes.push(entry.outcome);
+          continue;
+        }
+        if (curLines.length > 0) {
+          packedChunks.push(curLines.join("\n"));
+          outcomesByChunk.push(curOutcomes);
+          curLines = [];
+          curOutcomes = [];
+        }
+        const singleSplit = adapter.splitTextChunks(entry.line);
+        if (singleSplit.length <= 1) {
+          curLines = [entry.line];
+          curOutcomes = [entry.outcome];
+        } else {
+          for (let s = 0; s < singleSplit.length; s += 1) {
+            packedChunks.push(singleSplit[s]!);
+            outcomesByChunk.push(
+              s === singleSplit.length - 1 ? [entry.outcome] : [],
+            );
+          }
+        }
+      }
+      if (curLines.length > 0) {
+        packedChunks.push(curLines.join("\n"));
+        outcomesByChunk.push(curOutcomes);
+      }
+      return { packedChunks, outcomesByChunk };
+    };
+
+    let chunks: string[] = [];
+    let chunkLinkOutcomes: AgentSendFileOutcome[][] = [];
+    if (pendingLinkEntries.length === 0) {
+      chunks = hasOutboundText ? adapter.splitTextChunks(outboundText) : [];
+      chunkLinkOutcomes = chunks.map(() => []);
+    } else if (hasOutboundText) {
+      const combined = `${outboundText}\n\n${pendingLinkEntries.map((e) => e.line).join("\n")}`;
+      const combinedSplit = adapter.splitTextChunks(combined);
+      if (combinedSplit.length === 1) {
+        chunks = combinedSplit;
+        chunkLinkOutcomes = [pendingLinkEntries.map((e) => e.outcome)];
+      } else {
+        const textChunks = adapter.splitTextChunks(outboundText);
+        const { packedChunks, outcomesByChunk } =
+          packLinkEntriesIntoChunks(pendingLinkEntries);
+        chunks = [...textChunks, ...packedChunks];
+        chunkLinkOutcomes = [
+          ...textChunks.map(() => [] as AgentSendFileOutcome[]),
+          ...outcomesByChunk,
+        ];
+      }
+    } else {
+      const { packedChunks, outcomesByChunk } =
+        packLinkEntriesIntoChunks(pendingLinkEntries);
+      chunks = packedChunks;
+      chunkLinkOutcomes = outcomesByChunk;
+    }
     let totalChunks = chunks.length;
     if (totalChunks !== preliminaryChunks.length) {
       await recordProgress({
@@ -984,12 +1103,13 @@ export class DeliveryService {
     const topicInitiatorPlatformUserId =
       (claim.topic_initiator_platform_user_id ?? "").trim() || null;
     const buildTopicRegistration = (
-      extTopicId: string,
+      extTopicId: string | null,
       firstReplyId?: string | null,
     ): BotTopicRegistrationPayload | null => {
+      const resolvedFirstReply = firstReplyId ?? firstReplyMessageId ?? null;
       if (
         !isGroupTopicTarget ||
-        !extTopicId ||
+        (!extTopicId && !resolvedFirstReply) ||
         !topicCanonicalScopeKey ||
         !topicInitiatorPlatformUserId
       ) {
@@ -1001,7 +1121,7 @@ export class DeliveryService {
         canonical_scope_key: topicCanonicalScopeKey,
         external_topic_id: extTopicId,
         root_message_id: verifiedRootMessageId,
-        first_reply_message_id: firstReplyId ?? firstReplyMessageId ?? null,
+        first_reply_message_id: resolvedFirstReply,
         initiator_platform_user_id: topicInitiatorPlatformUserId,
         initiator_dalton_user_id: daltonUserId || null,
       };
@@ -1304,9 +1424,14 @@ export class DeliveryService {
             feishuTopicCreationFailed = true;
           } else if (res.repliedInThread === true) {
             // Chunk 0 succeeded inside the topic but topic ID is not yet available;
-            // keep subsequent chunks inside the topic using the confirmed reply anchor.
+            // keep subsequent chunks inside the topic using the confirmed reply anchor
+            // and persist `first_reply_message_id` on the pending topic row so single-chunk
+            // replies can still confirm the topic on the next inbound message.
             feishuTopicConfirmedInThread = true;
             feishuLastInThreadMessageId = res.messageId;
+            if (res.messageId) {
+              feishuTopicReg = buildTopicRegistration(null, res.messageId);
+            }
           } else {
             // Cannot confirm whether chunk 0 landed in the topic or main group;
             // stop sending and mark `unknown` instead of risking a main-group leak.
@@ -1329,12 +1454,19 @@ export class DeliveryService {
           terminalNoticeCompleted = true;
           totalChunks = sentChunks;
         }
+        const chunkConfirmedLinks = chunkLinkOutcomes[i] ?? [];
+        if (chunkConfirmedLinks.length > 0) {
+          fileOutcomes.push(...chunkConfirmedLinks);
+        }
         maybeNotifyFirstCurrentDelivery();
         await recordProgress({
           delivery_key: options.deliveryKey,
           sent_chunks: sentChunks,
           total_chunks: totalChunks,
           platform_message_ids: [...platformMessageIds],
+          ...(chunkConfirmedLinks.length > 0
+            ? { files_status: [...fileOutcomes] }
+            : {}),
           ...(feishuTopicReg ? { bot_topic_registration: feishuTopicReg } : {}),
         });
         if (terminalNoticeCompleted) {
@@ -1384,6 +1516,17 @@ export class DeliveryService {
             code: "unavailable",
             message: err instanceof Error ? err.message : String(err),
           };
+        }
+        for (let j = i; j < chunkLinkOutcomes.length; j += 1) {
+          const unsentStatus: AgentSendFileOutcome["status"] =
+            j === i && chunkFailure.outcome === "unknown" ? "unknown" : "failed";
+          for (const unsent of chunkLinkOutcomes[j] ?? []) {
+            fileOutcomes.push({
+              ...unsent,
+              status: unsentStatus,
+              reason: chunkFailure.message,
+            });
+          }
         }
         break;
       }

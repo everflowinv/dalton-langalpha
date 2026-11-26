@@ -774,6 +774,98 @@ async def _confirm_bot_topic_in_tx(
     return dict(await cur.fetchone())
 
 
+async def _record_pending_bot_topic_reply_in_tx(
+    cur: Any,
+    *,
+    platform: str,
+    chat_address: str,
+    canonical_scope_key: str,
+    first_reply_message_id: str,
+    initiator_dalton_user_id: str,
+    initiator_platform_user_id: str,
+    root_message_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Persist ``first_reply_message_id`` on a pending Feishu/Discord topic before ``external_topic_id`` is known."""
+    cleaned_plat = str(platform or "").strip().lower()
+    if cleaned_plat not in ("feishu", "discord"):
+        return None
+    topic_addr = _normalize_topic_chat_address(cleaned_plat, chat_address)
+    scope = str(canonical_scope_key or "").strip()
+    first_rep = str(first_reply_message_id or "").strip()
+    root_mid = str(root_message_id or "").strip() or None
+    init_uid = str(initiator_dalton_user_id or "").strip()
+    init_puid = str(initiator_platform_user_id or "").strip()
+    if not topic_addr or not scope or not first_rep:
+        return None
+
+    await _acquire_bot_topic_lock(cur, cleaned_plat, topic_addr)
+
+    if root_mid:
+        await cur.execute(
+            """
+            SELECT * FROM dalton_channel_bot_topics
+            WHERE platform = %s AND chat_address = %s
+              AND (canonical_scope_key = %s OR root_message_id = %s)
+            ORDER BY CASE WHEN canonical_scope_key = %s THEN 0 ELSE 1 END
+            LIMIT 1
+            """,
+            (cleaned_plat, topic_addr, scope, root_mid, scope),
+        )
+    else:
+        await cur.execute(
+            """
+            SELECT * FROM dalton_channel_bot_topics
+            WHERE platform = %s AND chat_address = %s AND canonical_scope_key = %s
+            LIMIT 1
+            """,
+            (cleaned_plat, topic_addr, scope),
+        )
+    existing = await cur.fetchone()
+    if existing:
+        await cur.execute(
+            """
+            UPDATE dalton_channel_bot_topics
+            SET root_message_id = COALESCE(root_message_id, %s),
+                first_reply_message_id = COALESCE(first_reply_message_id, %s),
+                last_active_at = NOW()
+            WHERE platform = %s AND chat_address = %s AND canonical_scope_key = %s
+            RETURNING *
+            """,
+            (
+                root_mid,
+                first_rep,
+                cleaned_plat,
+                topic_addr,
+                str(existing["canonical_scope_key"]),
+            ),
+        )
+        updated = await cur.fetchone()
+        return dict(updated) if updated else dict(existing)
+
+    if not init_uid or not init_puid:
+        return None
+
+    await cur.execute(
+        """
+        INSERT INTO dalton_channel_bot_topics (
+            platform, chat_address, canonical_scope_key,
+            external_topic_id, root_message_id, first_reply_message_id,
+            initiator_dalton_user_id, initiator_platform_user_id,
+            status, created_at, last_active_at
+        )
+        VALUES (%s, %s, %s, NULL, %s, %s, %s, %s, 'pending', NOW(), NOW())
+        ON CONFLICT (platform, chat_address, canonical_scope_key) DO UPDATE SET
+            root_message_id = COALESCE(dalton_channel_bot_topics.root_message_id, EXCLUDED.root_message_id),
+            first_reply_message_id = COALESCE(dalton_channel_bot_topics.first_reply_message_id, EXCLUDED.first_reply_message_id),
+            last_active_at = NOW()
+        RETURNING *
+        """,
+        (cleaned_plat, topic_addr, scope, root_mid, first_rep, init_uid, init_puid),
+    )
+    inserted = await cur.fetchone()
+    return dict(inserted) if inserted else None
+
+
 async def lookup_bot_topic(
     *,
     platform: str,
@@ -821,6 +913,7 @@ async def lookup_bot_topic(
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.cursor(row_factory=dict_row) as cur:
             row = None
+            pending_candidates: list[dict[str, Any]] = []
             if cleaned_mode == "inbound_followup":
                 await cur.execute(
                     """
@@ -837,6 +930,48 @@ async def lookup_bot_topic(
                     (cleaned_plat, topic_addr, ext_tid),
                 )
                 row = await cur.fetchone()
+                if row is None and cleaned_plat == "feishu":
+                    await cur.execute(
+                        """
+                        SELECT canonical_scope_key, root_message_id,
+                               first_reply_message_id, initiator_platform_user_id,
+                               initiator_dalton_user_id
+                        FROM dalton_channel_bot_topics
+                        WHERE platform = %s
+                          AND chat_address = %s
+                          AND status = 'pending'
+                          AND first_reply_message_id IS NOT NULL
+                        ORDER BY CASE WHEN %s::varchar IS NOT NULL AND root_message_id = %s THEN 0 ELSE 1 END,
+                                 last_active_at DESC
+                        LIMIT 5
+                        """,
+                        (cleaned_plat, topic_addr, root_mid, root_mid),
+                    )
+                    for pending_row in await cur.fetchall() or []:
+                        if (
+                            pending_row.get("canonical_scope_key")
+                            and pending_row.get("first_reply_message_id")
+                            and pending_row.get("initiator_platform_user_id")
+                        ):
+                            pending_candidates.append(
+                                {
+                                    "canonical_scope_key": pending_row.get(
+                                        "canonical_scope_key"
+                                    ),
+                                    "root_message_id": pending_row.get(
+                                        "root_message_id"
+                                    ),
+                                    "first_reply_message_id": pending_row.get(
+                                        "first_reply_message_id"
+                                    ),
+                                    "initiator_platform_user_id": pending_row.get(
+                                        "initiator_platform_user_id"
+                                    ),
+                                    "initiator_dalton_user_id": pending_row.get(
+                                        "initiator_dalton_user_id"
+                                    ),
+                                }
+                            )
             else:
                 if scope:
                     await cur.execute(
@@ -890,6 +1025,8 @@ async def lookup_bot_topic(
                     row = await cur.fetchone()
 
     if not row:
+        if pending_candidates:
+            return {**empty_resp, "pending_candidates": pending_candidates}
         return empty_resp
     return {
         "found": True,
@@ -3280,8 +3417,10 @@ async def _register_and_resolve_inbound_once(
                     )
                     matched_topic = await cur.fetchone()
                     if matched_topic is None:
-                        # Check pre-reserved pending (or confirmed) topic by root_message_id so
-                        # another member's I-1 arriving before I-7 never steals topic ownership.
+                        # Check pre-reserved pending (or confirmed) topic by root_message_id
+                        # or canonical `:topic:` scope so another member's I-1 arriving before
+                        # I-7 never steals topic ownership and a confirmed Feishu follow-up
+                        # promotes a pending topic whose `first_reply_message_id` was recorded.
                         eff_root_id = cleaned_root_msg_id or (
                             cleaned_ext_topic_id if cleaned_platform == "discord" else None
                         )
@@ -3298,6 +3437,18 @@ async def _register_and_resolve_inbound_once(
                                 (cleaned_platform, topic_chat_addr, eff_root_id),
                             )
                             matched_topic = await cur.fetchone()
+                        if matched_topic is None and ":topic:" in cleaned_scope:
+                            await cur.execute(
+                                """
+                                SELECT * FROM dalton_channel_bot_topics
+                                WHERE platform = %s
+                                  AND chat_address = %s
+                                  AND canonical_scope_key = %s
+                                LIMIT 1
+                                """,
+                                (cleaned_platform, topic_chat_addr, cleaned_scope),
+                            )
+                            matched_topic = await cur.fetchone()
 
                     if matched_topic is not None:
                         topic_initiator_puid = str(
@@ -3312,7 +3463,8 @@ async def _register_and_resolve_inbound_once(
                             cleaned_scope = (
                                 f"chat:{chat_part}:thread:{cleaned_ext_topic_id}"
                             )
-                        if str(matched_topic.get("status") or "") == "confirmed":
+                        matched_status = str(matched_topic.get("status") or "")
+                        if matched_status == "confirmed":
                             await cur.execute(
                                 """
                                 UPDATE dalton_channel_bot_topics
@@ -3327,6 +3479,29 @@ async def _register_and_resolve_inbound_once(
                                     str(matched_topic["canonical_scope_key"]),
                                 ),
                             )
+                        elif (
+                            matched_status == "pending"
+                            and matched_topic.get("first_reply_message_id")
+                            and cleaned_ext_topic_id
+                        ):
+                            await cur.execute(
+                                """
+                                UPDATE dalton_channel_bot_topics
+                                SET external_topic_id = COALESCE(external_topic_id, %s),
+                                    status = 'confirmed',
+                                    last_active_at = NOW()
+                                WHERE platform = %s
+                                  AND chat_address = %s
+                                  AND canonical_scope_key = %s
+                                """,
+                                (
+                                    cleaned_ext_topic_id,
+                                    cleaned_platform,
+                                    topic_chat_addr,
+                                    str(matched_topic["canonical_scope_key"]),
+                                ),
+                            )
+                            topic_newly_registered = True
                     else:
                         chat_part = extract_chat_id(
                             cleaned_platform, chat_address=topic_chat_addr
@@ -9188,7 +9363,11 @@ async def authorize_and_claim_delivery(
                             "thread_scope_key": ex_scope_key,
                             "is_current": ex_is_current,
                         }
-                    if ex_status in ("in_flight", "unknown") and conversation_to_replay:
+                    if (
+                        cleaned_key.startswith(("deliverables:", "deliverables-links:"))
+                        and ex_status in ("in_flight", "unknown")
+                        and conversation_to_replay
+                    ):
                         ex_user = str(existing.get("user_id") or "").strip()
                         ex_plat = str(existing.get("platform") or "").strip().lower()
                         ex_target = str(existing.get("target_address") or "").strip()
@@ -10818,12 +10997,13 @@ async def authorize_and_claim_delivery(
                                     resp_topic_canonical_scope = reserved_topic.get(
                                         "canonical_scope_key"
                                     )
+                                    if reserved_topic.get("first_reply_message_id"):
+                                        resp_first_reply_message_id = reserved_topic.get(
+                                            "first_reply_message_id"
+                                        )
                                     if str(reserved_topic.get("status") or "") == "confirmed":
                                         resp_external_topic_id = reserved_topic.get(
                                             "external_topic_id"
-                                        )
-                                        resp_first_reply_message_id = reserved_topic.get(
-                                            "first_reply_message_id"
                                         )
 
                     # When the topic is not yet confirmed (e.g. another member `@bot` inside a
@@ -11409,6 +11589,17 @@ async def _update_delivery_progress_once(
                             first_reply_message_id=reg_first_reply,
                         )
                         registered_topic_id = confirmed_topic.get("external_topic_id")
+                    elif reg_first_reply and reg_scope:
+                        await _record_pending_bot_topic_reply_in_tx(
+                            cur,
+                            platform=locked_plat,
+                            chat_address=str(row.get("target_address") or ""),
+                            canonical_scope_key=reg_scope,
+                            first_reply_message_id=reg_first_reply,
+                            initiator_dalton_user_id=locked_uid,
+                            initiator_platform_user_id=reg_init_puid,
+                            root_message_id=reg_root_mid,
+                        )
 
                 await cur.execute(
                     """

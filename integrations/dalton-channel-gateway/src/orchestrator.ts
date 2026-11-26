@@ -92,7 +92,6 @@ import {
   type TurnDeliverableItem,
   type UploadedAttachmentRecord,
 } from "./types.js";
-import { buildWorkspaceFileDeepLinkLine } from "./shared/sandbox-links.js";
 import { SafeFetchError } from "./shared/safe-fetch.js";
 import {
   makeCreditSupplementSteerKey,
@@ -10294,7 +10293,12 @@ export class ChannelGatewayOrchestrator {
       const maxAutoAttach = params.platform === "weixin" ? 3 : 5;
       const filesToAttach: Array<{ path: string; workspace_id: string | null }> =
         [];
-      const linkOnlyLines: string[] = [];
+      const linkOnlyFiles: Array<{
+        path: string;
+        workspace_id: string | null;
+        filename: string;
+        reason: string;
+      }> = [];
       let plannedBytes = 0;
 
       for (const item of sorted) {
@@ -10307,16 +10311,18 @@ export class ChannelGatewayOrchestrator {
           plannedBytes + item.size > MAX_TOTAL_ATTACHMENT_BYTES;
 
         if (isHtml || tooLargeSingle || exceedsCap || exceedsTotalBytes) {
-          linkOnlyLines.push(
-            buildWorkspaceFileDeepLinkLine(
-              item.filename || basename(item.path) || item.path,
-              item.path,
-              this.webBaseUrl,
-              params.threadId,
-              item.workspace_id,
-              item.workspace_id,
-            ),
-          );
+          linkOnlyFiles.push({
+            path: item.path,
+            workspace_id: item.workspace_id,
+            filename: item.filename || basename(item.path) || item.path,
+            reason: isHtml
+              ? "html_file_deep_link"
+              : tooLargeSingle
+                ? "deliverable_size_exceeded_link"
+                : exceedsTotalBytes
+                  ? "deliverable_total_size_exceeded_link"
+                  : "deliverable_overflow_link",
+          });
         } else {
           filesToAttach.push({
             path: item.path,
@@ -10336,8 +10342,9 @@ export class ChannelGatewayOrchestrator {
         platform: params.platform,
         target: params.targetAddress,
         inboundMessageId: params.inboundMessageId ?? null,
-        text: linkOnlyLines.join("\n"),
+        text: "",
         files: filesToAttach,
+        linkOnlyFiles,
         downloadMode: "deliverable",
         linkFallbackOnDeliverableMismatch: true,
         threadScopeKey: params.threadScopeKey ?? null,

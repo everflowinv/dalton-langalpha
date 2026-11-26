@@ -536,10 +536,18 @@ export interface BotTopicRegistrationPayload {
   platform: ChannelPlatform;
   chat_address: string;
   canonical_scope_key: string;
-  external_topic_id: string;
+  external_topic_id?: string | null;
   root_message_id?: string | null;
   first_reply_message_id?: string | null;
   initiator_platform_user_id?: string | null;
+  initiator_dalton_user_id?: string | null;
+}
+
+export interface PendingBotTopicCandidate {
+  canonical_scope_key: string;
+  root_message_id?: string | null;
+  first_reply_message_id: string;
+  initiator_platform_user_id: string;
   initiator_dalton_user_id?: string | null;
 }
 
@@ -561,6 +569,7 @@ export interface InternalTopicLookupResponse {
   first_reply_message_id?: string | null;
   initiator_platform_user_id?: string | null;
   initiator_dalton_user_id?: string | null;
+  pending_candidates?: PendingBotTopicCandidate[];
 }
 
 export interface VerifyDmRecipientResponse {

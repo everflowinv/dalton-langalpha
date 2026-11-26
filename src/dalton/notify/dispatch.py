@@ -952,8 +952,24 @@ def _format_ws_file_replacement(
     return f"{label}{hint}" if label else hint
 
 
-def _split_code_protected_spans(text: str) -> list[tuple[bool, str]]:
-    """Split text into ``(is_code, chunk)`` segments skipping fenced and inline code."""
+def _find_closing_backtick_run(text: str, start: int, run: int, limit: int) -> int:
+    """Find the start index of an exact ``run``-length closing backtick sequence."""
+    i = start
+    while i < limit:
+        if text[i] != "`":
+            i += 1
+            continue
+        j = i
+        while j < limit and text[j] == "`":
+            j += 1
+        if j - i == run:
+            return i
+        i = j
+    return -1
+
+
+def _split_fenced_code_spans(text: str) -> list[tuple[bool, str]]:
+    """Split text into ``(is_fenced_code, chunk)`` segments skipping fenced code blocks."""
     lines = text.splitlines(keepends=True)
     segments: list[tuple[bool, str]] = []
     buf: list[str] = []
@@ -962,40 +978,9 @@ def _split_code_protected_spans(text: str) -> list[tuple[bool, str]]:
     fence_len = 0
 
     def _flush_plain() -> None:
-        if not buf:
-            return
-        plain = "".join(buf)
-        buf.clear()
-        i = 0
-        n = len(plain)
-        cur_start = 0
-        while i < n:
-            if plain[i] == "`":
-                j = i
-                while j < n and plain[j] == "`":
-                    j += 1
-                run = j - i
-                # Leave `[` + inlineCode + `](` unprotected so links with code labels rewrite
-                is_link_label = (
-                    i > 0 and plain[i - 1] == "["
-                )
-                close = plain.find("`" * run, j)
-                if close != -1 and not (
-                    is_link_label
-                    and close + run + 1 < n
-                    and plain[close + run : close + run + 2] == "]("
-                ):
-                    if i > cur_start:
-                        segments.append((False, plain[cur_start:i]))
-                    segments.append((True, plain[i : close + run]))
-                    i = close + run
-                    cur_start = i
-                    continue
-                i = j
-            else:
-                i += 1
-        if cur_start < n:
-            segments.append((False, plain[cur_start:]))
+        if buf:
+            segments.append((False, "".join(buf)))
+            buf.clear()
 
     for line in lines:
         if not in_fence:
@@ -1011,15 +996,263 @@ def _split_code_protected_spans(text: str) -> list[tuple[bool, str]]:
         else:
             segments.append((True, line))
             stripped = line.lstrip(" \t").rstrip("\r\n ")
-            if (
-                len(stripped) >= fence_len
-                and set(stripped) == {fence_char}
-            ):
+            if len(stripped) >= fence_len and set(stripped) == {fence_char}:
                 in_fence = False
                 fence_char = ""
                 fence_len = 0
     _flush_plain()
     return segments
+
+
+def _find_md_bracket_close(text: str, bracket_open: int, limit: int) -> int:
+    """Find matching ``]`` for ``[`` at ``bracket_open``, honoring escapes, inline code, and nested brackets."""
+    i = bracket_open + 1
+    depth = 0
+    while i < limit:
+        ch = text[i]
+        if ch == "\\" and i + 1 < limit:
+            i += 2
+            continue
+        if ch == "`":
+            j = i
+            while j < limit and text[j] == "`":
+                j += 1
+            run = j - i
+            close = _find_closing_backtick_run(text, j, run, limit)
+            i = close + run if close != -1 else j
+            continue
+        if ch == "\n":
+            nxt = i + 1
+            while nxt < limit and text[nxt] in (" ", "\t"):
+                nxt += 1
+            if nxt < limit and text[nxt] in ("\r", "\n"):
+                return -1
+            i += 1
+            continue
+        if ch == "[":
+            depth += 1
+            i += 1
+            continue
+        if ch == "]":
+            if depth == 0:
+                return i
+            depth -= 1
+            i += 1
+            continue
+        i += 1
+    return -1
+
+
+def _skip_optional_title_and_close_paren(text: str, pos: int, limit: int) -> int:
+    """Skip optional whitespace + CommonMark title + whitespace and return index of ``)`` or ``-1``."""
+    p = pos
+    while p < limit and text[p] in (" ", "\t"):
+        p += 1
+    if p < limit and text[p] == ")":
+        return p
+    if p < limit and text[p] == "\r":
+        p += 1
+    if p < limit and text[p] == "\n":
+        p += 1
+        while p < limit and text[p] in (" ", "\t"):
+            p += 1
+        if p < limit and text[p] == ")":
+            return p
+    if p == pos or p >= limit:
+        return -1
+    if text[p] in ('"', "'", "("):
+        title_end = _parse_md_title_at(text, p, limit)
+        if title_end == -1:
+            return -1
+        q = title_end
+        while q < limit and text[q] in (" ", "\t"):
+            q += 1
+        if q < limit and text[q] == "\r":
+            q += 1
+        if q < limit and text[q] == "\n":
+            q += 1
+            while q < limit and text[q] in (" ", "\t"):
+                q += 1
+        return q if q < limit and text[q] == ")" else -1
+    return -1
+
+
+def _parse_md_inline_link_at(text: str, start: int) -> tuple[int, str, str] | None:
+    """Parse ``[label](dest)`` or ``![label](dest)`` starting at ``start``.
+
+    Supports inline code in labels, angle-bracketed destinations containing spaces
+    (``<...>``), balanced parentheses, optional quoted titles, and single-line
+    agent-emitted bare spaced destinations.
+    """
+    n = len(text)
+    is_image = text[start] == "!"
+    bracket_open = start + 1 if is_image else start
+    if bracket_open >= n or text[bracket_open] != "[":
+        return None
+    label_limit = min(n, bracket_open + 1 + 1024)
+    bracket_close = _find_md_bracket_close(text, bracket_open, label_limit)
+    if bracket_close == -1 or bracket_close + 1 >= n or text[bracket_close + 1] != "(":
+        return None
+
+    label = text[bracket_open + 1 : bracket_close]
+    pos = bracket_close + 2
+    while pos < n and text[pos] in (" ", "\t"):
+        pos += 1
+    if pos < n and text[pos] == "\r":
+        pos += 1
+    if pos < n and text[pos] == "\n":
+        pos += 1
+        while pos < n and text[pos] in (" ", "\t"):
+            pos += 1
+    if pos >= n:
+        return None
+
+    dest_limit = min(n, pos + 4096)
+    if text[pos] == "<":
+        j = pos + 1
+        gt = -1
+        while j < dest_limit and text[j] not in ("\r", "\n"):
+            if text[j] == "\\" and j + 1 < dest_limit and text[j + 1] not in ("\r", "\n"):
+                j += 2
+                continue
+            if text[j] == "<":
+                return None
+            if text[j] == ">":
+                gt = j
+                break
+            j += 1
+        if gt == -1:
+            return None
+        close_paren = _skip_optional_title_and_close_paren(text, gt + 1, dest_limit)
+        if close_paren == -1:
+            return None
+        return close_paren + 1, label, text[pos + 1 : gt].strip()
+
+    # Standard CommonMark bare destination (non-whitespace, balanced parens)
+    j = pos
+    paren_depth = 0
+    valid_bare = True
+    while j < dest_limit:
+        ch = text[j]
+        if ch in (" ", "\t", "\r", "\n"):
+            break
+        if ord(ch) < 0x20 or ord(ch) == 0x7F:
+            valid_bare = False
+            break
+        if ch == "\\" and j + 1 < dest_limit and text[j + 1] not in ("\r", "\n"):
+            j += 2
+            continue
+        if ch == "(":
+            paren_depth += 1
+            if paren_depth > 32:
+                valid_bare = False
+                break
+        elif ch == ")":
+            if paren_depth == 0:
+                return j + 1, label, text[pos:j].strip()
+            paren_depth -= 1
+        j += 1
+
+    if valid_bare and paren_depth == 0 and j > pos:
+        close_paren = _skip_optional_title_and_close_paren(text, j, dest_limit)
+        if close_paren != -1:
+            return close_paren + 1, label, text[pos:j].strip()
+
+    # Single-line fallback for bare destinations with unescaped spaces (matches gateway)
+    line_nl = text.find("\n", pos)
+    line_end = dest_limit if line_nl == -1 else min(dest_limit, line_nl)
+    j = pos
+    paren_depth = 0
+    close_paren = -1
+    while j < line_end:
+        ch = text[j]
+        if ch == "\\" and j + 1 < line_end:
+            j += 2
+            continue
+        if ch in ('"', "'") and j > pos and text[j - 1] in (" ", "\t"):
+            q = j + 1
+            closed = False
+            while q < line_end:
+                if text[q] == "\\" and q + 1 < line_end:
+                    q += 2
+                    continue
+                if text[q] == ch:
+                    q += 1
+                    closed = True
+                    break
+                q += 1
+            j = q if closed else j + 1
+            continue
+        if ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            if paren_depth == 0:
+                close_paren = j
+                break
+            paren_depth -= 1
+        j += 1
+    if close_paren == -1:
+        return None
+    raw_inner = text[pos:close_paren].strip()
+    dest = re.sub(
+        r'[ \t]+(?:"[^"\n]{0,512}"|\'[^\'\n]{0,512}\')$', "", raw_inner
+    ).strip()
+    if not dest:
+        return None
+    return close_paren + 1, label, dest
+
+
+def _parse_md_ref_link_at(
+    text: str,
+    start: int,
+    definitions: Mapping[str, dict[str, Any]],
+) -> tuple[int, str, str] | None:
+    """Parse ``[label][ref]``, ``[label][]``, or ``[label]`` (and image variants) when defined."""
+    n = len(text)
+    is_image = text[start] == "!"
+    bracket_open = start + 1 if is_image else start
+    if bracket_open >= n or text[bracket_open] != "[":
+        return None
+    label_limit = min(n, bracket_open + 1 + 1024)
+    bracket_close = _find_md_bracket_close(text, bracket_open, label_limit)
+    if bracket_close == -1:
+        return None
+    after = bracket_close + 1
+    if after < n and text[after] in ("(", ":"):
+        return None
+    label = text[bracket_open + 1 : bracket_close]
+
+    if after < n and text[after] == "[":
+        ref_limit = min(n, after + 1 + 999)
+        j = after + 1
+        ref_close = -1
+        while j < ref_limit:
+            ch = text[j]
+            if ch == "\\" and j + 1 < ref_limit:
+                j += 2
+                continue
+            if ch == "[":
+                break
+            if ch == "]":
+                ref_close = j
+                break
+            if ch == "\n":
+                nxt = j + 1
+                while nxt < ref_limit and text[nxt] in (" ", "\t"):
+                    nxt += 1
+                if nxt < ref_limit and text[nxt] in ("\r", "\n"):
+                    break
+            j += 1
+        if ref_close != -1:
+            ref_raw = text[after + 1 : ref_close]
+            key = _normalize_md_ref_key(label if ref_raw == "" else ref_raw)
+            if key and key in definitions:
+                return ref_close + 1, label, key
+
+    shortcut_key = _normalize_md_ref_key(label)
+    if shortcut_key and shortcut_key in definitions:
+        return after, label, shortcut_key
+    return None
 
 
 def _normalize_md_ref_key(raw_label: str) -> str:
@@ -1260,101 +1493,37 @@ def _find_md_definitions(segment: str) -> list[dict[str, Any]]:
     return defs
 
 
-def _rewrite_plain_prose_segment(
-    segment: str,
+def _rewrite_bare_sandbox_paths_in_prose(
+    prose: str,
     *,
-    definitions: Mapping[str, dict[str, Any]],
-    used_ref_ids: set[str],
     public_base: str | None,
     thread_id: str | None,
     workspace_id: str | None,
     fallback_mode: str = "hint",
     rewritten_links: set[str] | None = None,
 ) -> str:
-    # 1. Inline links and images: ![label](dest) or [label](dest)
-    def _replace_inline(match: re.Match[str]) -> str:
-        label = match.group(2)
-        raw_dest = match.group(3).strip()
-        # Strip optional quoted title
-        dest = re.sub(r'[ \t]+(?:"[^"\n]{0,512}"|\'[^\'\n]{0,512}\')$', "", raw_dest).strip()
-        if dest.startswith("<") and dest.endswith(">"):
-            dest = dest[1:-1].strip()
-        cls = classify_external_workspace_destination(dest)
-        if cls["kind"] == "keep":
-            return match.group(0)
-        if cls["kind"] == "local_preview":
-            return label
-        return _format_ws_file_replacement(
-            label,
-            cls,
-            public_base=public_base,
-            thread_id=thread_id,
-            workspace_id=workspace_id,
-            fallback_mode=fallback_mode,
-            rewritten_links=rewritten_links,
-        )
-
-    out = _MD_LINK_RE.sub(_replace_inline, segment)
-
-    # 2. Reference links: ![label][id], [label][id], [id][], [id] (only when defined in definitions)
-    if definitions:
-        ref_re = re.compile(r"(!?)\[([^\[\]\n]+)\](?:\[([^\[\]\n]*)\])?")
-
-        def _replace_ref(match: re.Match[str]) -> str:
-            # Skip if immediately followed by `(` (inline link already handled) or `:` (definition)
-            end = match.end()
-            if end < len(out) and out[end] in ("(", ":"):
-                return match.group(0)
-            label = match.group(2)
-            ref_id_raw = match.group(3)
-            if ref_id_raw is None or ref_id_raw == "":
-                key = _normalize_md_ref_key(label)
-            else:
-                key = _normalize_md_ref_key(ref_id_raw)
-            info = definitions.get(key)
-            if not info:
-                return match.group(0)
-            cls = info["classification"]
-            if cls["kind"] == "keep":
-                return match.group(0)
-            used_ref_ids.add(key)
-            if cls["kind"] == "local_preview":
-                return label
-            return _format_ws_file_replacement(
-                label,
-                cls,
-                public_base=public_base,
-                thread_id=thread_id,
-                workspace_id=workspace_id,
-                fallback_mode=fallback_mode,
-                rewritten_links=rewritten_links,
-            )
-
-        out = ref_re.sub(_replace_ref, out)
-
-    # 3. Bare absolute sandbox paths in prose (outside markdown links)
-    link_spans = [(m.start(), m.end()) for m in _MD_LINK_RE.finditer(out)]
+    """Rewrite bare absolute sandbox paths in plain prose (guaranteed outside code & links)."""
+    if not prose:
+        return prose
     pieces: list[str] = []
     cursor = 0
-    for m in _WS_BARE_SANDBOX_PREFIX_RE.finditer(out):
+    for m in _WS_BARE_SANDBOX_PREFIX_RE.finditer(prose):
         start = m.start()
         if start < cursor:
             continue
-        if any(ls <= start < le for ls, le in link_spans):
-            continue
-        if start > 0 and _WS_BARE_PRECEDING_BLOCK_RE.match(out[start - 1]):
+        if start > 0 and _WS_BARE_PRECEDING_BLOCK_RE.match(prose[start - 1]):
             continue
         end = m.end()
-        while end < len(out) and not re.match(
-            r"[\s<>\"'`()\[\]{}，。；：、！？（）【】《》「」『』“”‘’]", out[end]
+        while end < len(prose) and not re.match(
+            r"[\s<>\"'`()\[\]{}，。；：、！？（）【】《》「」『』“”‘’]", prose[end]
         ):
             end += 1
-        candidate = out[start:end].rstrip(".,;:!?")
+        candidate = prose[start:end].rstrip(".,;:!?")
         cand_end = start + len(candidate)
         cls = classify_external_workspace_destination(candidate)
         if cls["kind"] != "workspace_file":
             continue
-        pieces.append(out[cursor:start])
+        pieces.append(prose[cursor:start])
         pieces.append(
             _format_ws_file_replacement(
                 cls["display_path"],
@@ -1368,9 +1537,119 @@ def _rewrite_plain_prose_segment(
         )
         cursor = cand_end
     if cursor == 0:
-        return out
-    pieces.append(out[cursor:])
+        return prose
+    pieces.append(prose[cursor:])
     return "".join(pieces)
+
+
+def _rewrite_plain_prose_segment(
+    segment: str,
+    *,
+    definitions: Mapping[str, dict[str, Any]],
+    used_ref_ids: set[str],
+    public_base: str | None,
+    thread_id: str | None,
+    workspace_id: str | None,
+    fallback_mode: str = "hint",
+    rewritten_links: set[str] | None = None,
+) -> str:
+    """Recognize inline code, full inline links, and reference links before scanning bare paths."""
+    if not segment:
+        return segment
+    out_parts: list[str] = []
+    n = len(segment)
+    i = 0
+    prose_start = 0
+
+    def _flush_prose(until: int) -> None:
+        if until > prose_start:
+            out_parts.append(
+                _rewrite_bare_sandbox_paths_in_prose(
+                    segment[prose_start:until],
+                    public_base=public_base,
+                    thread_id=thread_id,
+                    workspace_id=workspace_id,
+                    fallback_mode=fallback_mode,
+                    rewritten_links=rewritten_links,
+                )
+            )
+
+    while i < n:
+        ch = segment[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "`":
+            j = i
+            while j < n and segment[j] == "`":
+                j += 1
+            run = j - i
+            close = _find_closing_backtick_run(segment, j, run, n)
+            if close != -1:
+                _flush_prose(i)
+                out_parts.append(segment[i : close + run])
+                i = close + run
+                prose_start = i
+                continue
+            i = j
+            continue
+        if ch == "[" or (ch == "!" and i + 1 < n and segment[i + 1] == "["):
+            inline_parsed = _parse_md_inline_link_at(segment, i)
+            if inline_parsed is not None:
+                link_end, label, dest = inline_parsed
+                _flush_prose(i)
+                cls = classify_external_workspace_destination(dest)
+                if cls["kind"] == "keep":
+                    out_parts.append(segment[i:link_end])
+                elif cls["kind"] == "local_preview":
+                    out_parts.append(label)
+                else:
+                    out_parts.append(
+                        _format_ws_file_replacement(
+                            label,
+                            cls,
+                            public_base=public_base,
+                            thread_id=thread_id,
+                            workspace_id=workspace_id,
+                            fallback_mode=fallback_mode,
+                            rewritten_links=rewritten_links,
+                        )
+                    )
+                i = link_end
+                prose_start = i
+                continue
+            if definitions:
+                ref_parsed = _parse_md_ref_link_at(segment, i, definitions)
+                if ref_parsed is not None:
+                    ref_end, label, key = ref_parsed
+                    _flush_prose(i)
+                    info = definitions[key]
+                    cls = info["classification"]
+                    if cls["kind"] == "keep":
+                        out_parts.append(segment[i:ref_end])
+                    else:
+                        used_ref_ids.add(key)
+                        if cls["kind"] == "local_preview":
+                            out_parts.append(label)
+                        else:
+                            out_parts.append(
+                                _format_ws_file_replacement(
+                                    label,
+                                    cls,
+                                    public_base=public_base,
+                                    thread_id=thread_id,
+                                    workspace_id=workspace_id,
+                                    fallback_mode=fallback_mode,
+                                    rewritten_links=rewritten_links,
+                                )
+                            )
+                    i = ref_end
+                    prose_start = i
+                    continue
+        i += 1
+
+    _flush_prose(n)
+    return "".join(out_parts)
 
 
 def _rewrite_workspace_links_for_external_with_links(
@@ -1392,7 +1671,7 @@ def _rewrite_workspace_links_for_external_with_links(
     else:
         resolved_base = normalize_public_web_base_url(public_base)
 
-    segments = _split_code_protected_spans(text)
+    segments = _split_fenced_code_spans(text)
     definitions: dict[str, dict[str, Any]] = {}
     # Pass 1: split prose segments around full Markdown reference definitions so
     # bare-path rewriting NEVER mutates definition lines before expansion/removal.

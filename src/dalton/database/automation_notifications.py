@@ -210,11 +210,17 @@ async def _load_delivery_row(cur: Any, delivery_id: str) -> dict[str, Any] | Non
                a.workspace_id::text AS workspace_id
         FROM dalton_notify_deliveries d
         LEFT JOIN automation_executions ae
-          ON d.execution_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-         AND ae.automation_execution_id = d.execution_id::uuid
+          ON ae.automation_execution_id = CASE
+              WHEN d.execution_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+              THEN d.execution_id::uuid
+              ELSE NULL
+          END
         LEFT JOIN automations a
-          ON d.automation_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-         AND a.automation_id = d.automation_id::uuid
+          ON a.automation_id = CASE
+              WHEN d.automation_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+              THEN d.automation_id::uuid
+              ELSE NULL
+          END
         WHERE d.delivery_id = %s::uuid
         """,
         (delivery_id,),

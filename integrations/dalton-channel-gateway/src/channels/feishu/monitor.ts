@@ -478,7 +478,11 @@ export class FeishuChannelAdapter implements ChannelAdapter {
   private backendClient?: BackendClient;
   private readonly positiveTopicCache = new Map<
     string,
-    { canonicalScopeKey: string; initiatorPlatformUserId: string }
+    {
+      canonicalScopeKey: string;
+      initiatorPlatformUserId: string;
+      rootMessageId?: string | null;
+    }
   >();
   private readonly negativeTopicCache = new Map<string, number>();
   private static readonly MAX_TOPIC_CACHE_ENTRIES = 2_000;
@@ -562,6 +566,9 @@ export class FeishuChannelAdapter implements ChannelAdapter {
     this.positiveTopicCache.set(key, {
       canonicalScopeKey: info.canonicalScopeKey.trim(),
       initiatorPlatformUserId: info.initiatorPlatformUserId.trim(),
+      ...(info.rootMessageId?.trim()
+        ? { rootMessageId: info.rootMessageId.trim() }
+        : {}),
     });
   }
 
@@ -598,6 +605,9 @@ export class FeishuChannelAdapter implements ChannelAdapter {
     if (pos) {
       if (pos.initiatorPlatformUserId === event.platformUserId) {
         event.threadScopeKey = pos.canonicalScopeKey;
+        if (!event.rootMessageId && pos.rootMessageId) {
+          event.rootMessageId = pos.rootMessageId;
+        }
         event.isGroupTrigger = true;
         return true;
       }
@@ -619,6 +629,7 @@ export class FeishuChannelAdapter implements ChannelAdapter {
         chat_address: event.chatAddress,
         match_mode: "inbound_followup",
         external_topic_id: extTopicId,
+        ...(event.rootMessageId ? { root_message_id: event.rootMessageId } : {}),
       });
       if (
         res.found &&
@@ -635,12 +646,91 @@ export class FeishuChannelAdapter implements ChannelAdapter {
         });
         if (res.initiator_platform_user_id === event.platformUserId) {
           event.threadScopeKey = res.canonical_scope_key;
+          if (!event.rootMessageId && res.root_message_id) {
+            event.rootMessageId = res.root_message_id;
+          }
           event.isGroupTrigger = true;
           return true;
         }
         return false;
       }
-      if (!res.found) {
+      let hadUnresolvedPending = false;
+      if (
+        !res.found &&
+        Array.isArray(res.pending_candidates) &&
+        res.pending_candidates.length > 0
+      ) {
+        let client: Lark.Client | null = null;
+        if (this.isConfigured()) {
+          try {
+            client = this.getClient();
+          } catch {
+            client = null;
+          }
+        }
+        for (const cand of res.pending_candidates) {
+          const replyId = cand.first_reply_message_id?.trim();
+          const scopeKey = cand.canonical_scope_key?.trim();
+          const initiatorId = cand.initiator_platform_user_id?.trim();
+          if (!replyId || !scopeKey || !initiatorId) {
+            continue;
+          }
+          let fetchedThreadId: string | null = null;
+          if (client) {
+            try {
+              const fetched = await getMessageFeishu(client, {
+                messageId: replyId,
+              });
+              fetchedThreadId = fetched?.threadId?.trim() || null;
+            } catch (fetchErr) {
+              this.logger.warn(
+                "Feishu getMessageFeishu failed while confirming pending topic reply",
+                {
+                  chatAddress: event.chatAddress,
+                  externalTopicId: extTopicId,
+                  firstReplyMessageId: replyId,
+                  error: fetchErr,
+                },
+              );
+            }
+          }
+          let matched = false;
+          if (fetchedThreadId) {
+            if (fetchedThreadId !== extTopicId) {
+              continue;
+            }
+            matched = true;
+          } else if (
+            event.rootMessageId &&
+            cand.root_message_id &&
+            event.rootMessageId === cand.root_message_id
+          ) {
+            matched = true;
+          } else {
+            hadUnresolvedPending = true;
+            continue;
+          }
+          if (matched) {
+            this.recordBotTopic({
+              chatAddress: event.chatAddress,
+              externalTopicId: extTopicId,
+              canonicalScopeKey: scopeKey,
+              initiatorPlatformUserId: initiatorId,
+              rootMessageId: cand.root_message_id ?? event.rootMessageId ?? null,
+            });
+            if (initiatorId === event.platformUserId) {
+              event.threadScopeKey = scopeKey;
+              if (!event.rootMessageId && cand.root_message_id) {
+                event.rootMessageId = cand.root_message_id;
+              }
+              event.isGroupTrigger = true;
+              return true;
+            }
+            return false;
+          }
+        }
+      }
+      if (!res.found && !hadUnresolvedPending) {
         this.setNegativeTopicCache(key);
       }
       return false;

@@ -1010,6 +1010,7 @@ describe("Shared Backend <-> Gateway Contract Tests (real FastAPI fixtures)", ()
           workspace_id: "ws-contract-1",
           home_workspace_id: "ws-home-alice",
           prior_run_files: [
+            { workspace_id: "ws-contract-1", path: "results/file_6.pdf", status: "linked" },
             { workspace_id: "ws-contract-1", path: "results/file_1.pdf", status: "unknown" },
           ],
         });
