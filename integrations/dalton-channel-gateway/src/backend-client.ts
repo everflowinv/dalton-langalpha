@@ -128,6 +128,8 @@ export interface I1RegisterAndResolveRequest {
   message_id: string;
   request_key: string;
   raw_payload?: Record<string, unknown>;
+  external_topic_id?: string | null;
+  root_message_id?: string | null;
   weixin_account_id?: string | null;
   weixin_context_token?: string | null;
   weixin_bot_id?: string | null;
@@ -198,6 +200,10 @@ export interface I1RegisterAndResolveResponse {
   one_time_weixin_reply?: OneTimeWeixinReplyEnvelope | null;
   weixin_account_id?: string | null;
   weixin_context_token_version?: number | null;
+  resolved_scope_key?: string | null;
+  external_topic_id?: string | null;
+  topic_initiator_platform_user_id?: string | null;
+  topic_newly_registered?: boolean;
 }
 
 export interface I2BindCodeConsumeRequest {
@@ -501,6 +507,60 @@ export interface I6AuthorizeAndClaimResponse {
   source_scope_key?: string | null;
   source_generation?: number | null;
   activity_origin?: string | null;
+  root_message_id?: string | null;
+  external_topic_id?: string | null;
+  first_reply_message_id?: string | null;
+  topic_initiator_platform_user_id?: string | null;
+  topic_canonical_scope_key?: string | null;
+  dm_recipient_platform_user_id?: string | null;
+  prior_run_files?: Array<{
+    workspace_id?: string | null;
+    path: string;
+    status: string;
+    reason?: string | null;
+  }>;
+}
+
+export interface BotTopicRegistrationPayload {
+  platform: ChannelPlatform;
+  chat_address: string;
+  canonical_scope_key: string;
+  external_topic_id: string;
+  root_message_id?: string | null;
+  first_reply_message_id?: string | null;
+  initiator_platform_user_id?: string | null;
+  initiator_dalton_user_id?: string | null;
+}
+
+export interface InternalTopicLookupRequest {
+  platform: ChannelPlatform;
+  chat_address: string;
+  external_topic_id?: string | null;
+  canonical_scope_key?: string | null;
+  root_message_id?: string | null;
+  purpose?: "inbound_followup" | "outbound_route";
+}
+
+export interface InternalTopicLookupResponse {
+  found: boolean;
+  status?: "pending" | "confirmed" | string;
+  platform?: string;
+  chat_address?: string;
+  canonical_scope_key?: string;
+  external_topic_id?: string | null;
+  root_message_id?: string | null;
+  first_reply_message_id?: string | null;
+  initiator_platform_user_id?: string | null;
+  initiator_dalton_user_id?: string | null;
+}
+
+export interface VerifyDmRecipientResponse {
+  ok: boolean;
+  code?: string;
+  message?: string;
+  platform?: string;
+  recipient_id?: string;
+  user_id?: string;
 }
 
 export interface I7DeliveriesProgressRequest {
@@ -510,7 +570,8 @@ export interface I7DeliveriesProgressRequest {
   platform_message_ids?: string[];
   files_status?: Array<{
     path: string;
-    status: "sent" | "linked" | "failed" | "unknown";
+    workspace_id?: string | null;
+    status: "sent" | "linked" | "failed" | "unknown" | "pending";
     reason: string | null;
   }>;
   first_response_json?: Record<string, unknown>;
@@ -532,6 +593,8 @@ export interface I7DeliveriesProgressRequest {
    * An older generation does not change the delivery.
    */
   delivery_attempt?: number;
+  /** Optional bot-owned group topic confirmation persisted atomically with delivery progress. */
+  bot_topic_registration?: BotTopicRegistrationPayload | null;
 }
 
 export interface I7DeliveriesProgressResponse {
@@ -544,10 +607,13 @@ export interface I7DeliveriesProgressResponse {
   platform_message_ids?: string[];
   files_status?: Array<{
     path: string;
-    status: "sent" | "linked" | "failed" | "unknown";
+    workspace_id?: string | null;
+    status: "sent" | "linked" | "failed" | "unknown" | "pending";
     reason: string | null;
   }>;
   sent_to_current_count: number;
+  bot_topic_registered?: boolean;
+  external_topic_id?: string | null;
   /** Echo of the stored Discord thread address, or null when none is stored. */
   confirmed_thread_address?: string | null;
   /** Echo of the stored Discord body phase, or null when none is stored. */
@@ -1448,6 +1514,27 @@ export interface BackendClient {
     workspaceId: string,
     workspacePath: string,
   ): Promise<{ content: Buffer; mimeType: string }>;
+
+  lookupBotTopic?(
+    req: InternalTopicLookupRequest,
+  ): Promise<InternalTopicLookupResponse>;
+
+  verifyDmDeliveryRecipient?(
+    deliveryKey: string,
+    deliveryAttempt?: number,
+  ): Promise<VerifyDmRecipientResponse>;
+
+  downloadVerifiedDeliverable?(params: {
+    deliveryKey: string;
+    deliveryAttempt?: number;
+    workspaceId: string;
+    path: string;
+  }): Promise<{
+    content: Buffer;
+    mimeType: string;
+    filename: string;
+    sha256: string | null;
+  }>;
 
   authorizeDataTaskNotificationPlan?(
     req: DataTaskNotificationRequest,
@@ -2738,6 +2825,120 @@ export class HttpBackendClient implements BackendClient {
       content,
       mimeType,
     };
+  }
+
+  async lookupBotTopic(
+    req: InternalTopicLookupRequest,
+  ): Promise<InternalTopicLookupResponse> {
+    const { status, data } = await this.jsonRequest<InternalTopicLookupResponse>(
+      "POST",
+      "/api/v1/dalton/channels/internal/topics/lookup",
+      {
+        body: req,
+        timeoutMs: 10_000,
+      },
+    );
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `lookupBotTopic failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
+  async verifyDmDeliveryRecipient(
+    deliveryKey: string,
+    deliveryAttempt?: number,
+  ): Promise<VerifyDmRecipientResponse> {
+    const { status, data } = await this.jsonRequest<VerifyDmRecipientResponse>(
+      "POST",
+      `/api/v1/dalton/channels/internal/deliveries/${encodeURIComponent(deliveryKey)}/verify-dm-recipient`,
+      {
+        body:
+          deliveryAttempt !== undefined
+            ? { delivery_attempt: deliveryAttempt }
+            : {},
+        timeoutMs: 10_000,
+      },
+    );
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `verifyDmDeliveryRecipient failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
+  async downloadVerifiedDeliverable(params: {
+    deliveryKey: string;
+    deliveryAttempt?: number;
+    workspaceId: string;
+    path: string;
+  }): Promise<{
+    content: Buffer;
+    mimeType: string;
+    filename: string;
+    sha256: string | null;
+  }> {
+    const url = new URL(
+      `${this.baseUrl}/api/v1/dalton/channels/internal/deliverables/download`,
+    );
+    url.searchParams.set("delivery_key", params.deliveryKey);
+    if (params.deliveryAttempt !== undefined) {
+      url.searchParams.set("delivery_attempt", String(params.deliveryAttempt));
+    }
+    url.searchParams.set("workspace_id", params.workspaceId);
+    url.searchParams.set("path", params.path);
+
+    const resp = await this.fetchImpl(url, {
+      method: "GET",
+      headers: this.headers(),
+    });
+    if (!resp.ok) {
+      let errData: unknown = null;
+      const errText = await resp.text();
+      try {
+        errData = JSON.parse(errText);
+      } catch {
+        errData = errText;
+      }
+      throw new BackendHttpError(
+        `downloadVerifiedDeliverable failed (${resp.status}): ${errText}`,
+        resp.status,
+        errData,
+      );
+    }
+    const contentLengthHeader = resp.headers.get("content-length");
+    if (contentLengthHeader) {
+      const parsedLen = Number.parseInt(contentLengthHeader, 10);
+      if (Number.isFinite(parsedLen) && parsedLen > MAX_ATTACHMENT_BYTES) {
+        await resp.body?.cancel().catch(() => undefined);
+        throw new SafeFetchError(
+          "size_exceeded",
+          `Deliverable exceeds 20 MB limit (${parsedLen} bytes)`,
+        );
+      }
+    }
+    const content = resp.body
+      ? await readStreamWithLimit(resp.body, { maxBytes: MAX_ATTACHMENT_BYTES })
+      : Buffer.from(await resp.arrayBuffer());
+    if (content.byteLength > MAX_ATTACHMENT_BYTES) {
+      throw new SafeFetchError(
+        "size_exceeded",
+        `Deliverable exceeds 20 MB limit (${content.byteLength} bytes)`,
+      );
+    }
+    const mimeType =
+      resp.headers.get("content-type")?.split(";")[0]?.trim() ||
+      "application/octet-stream";
+    const filename =
+      params.path.split("/").pop()?.trim() || "deliverable";
+    const sha256 = resp.headers.get("x-deliverable-sha256") ?? null;
+    return { content, mimeType, filename, sha256 };
   }
 
   async authorizeDataTaskNotificationPlan(

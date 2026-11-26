@@ -89,8 +89,10 @@ import {
   type PendingInterruptState,
   PUBLIC_LIVE_STATUSES,
   PUBLIC_REPLAY_NEEDED_STATUSES,
+  type TurnDeliverableItem,
   type UploadedAttachmentRecord,
 } from "./types.js";
+import { buildWorkspaceFileDeepLinkLine } from "./shared/sandbox-links.js";
 import { SafeFetchError } from "./shared/safe-fetch.js";
 import {
   makeCreditSupplementSteerKey,
@@ -616,6 +618,8 @@ export class ChannelGatewayOrchestrator {
       message_id: event.messageId,
       request_key: requestKey,
       raw_payload: this.buildInboundRawPayload(event),
+      external_topic_id: event.externalTopicId ?? null,
+      root_message_id: event.rootMessageId ?? null,
       weixin_account_id: event.weixinAccountId ?? null,
       weixin_context_token: event.weixinContextToken ?? null,
       weixin_bot_id: event.weixinBotId ?? null,
@@ -628,6 +632,27 @@ export class ChannelGatewayOrchestrator {
         ? { unsupported_item_types: event.unsupportedItemTypes }
         : {}),
     });
+
+    if (
+      typeof resolved.resolved_scope_key === "string" &&
+      resolved.resolved_scope_key.trim().length > 0
+    ) {
+      event.threadScopeKey = resolved.resolved_scope_key.trim();
+    }
+    if (
+      resolved.topic_newly_registered &&
+      resolved.external_topic_id &&
+      resolved.resolved_scope_key &&
+      resolved.topic_initiator_platform_user_id
+    ) {
+      this.adapters.get(event.platform)?.recordBotTopic?.({
+        chatAddress: event.chatAddress,
+        externalTopicId: resolved.external_topic_id,
+        canonicalScopeKey: resolved.resolved_scope_key,
+        initiatorPlatformUserId: resolved.topic_initiator_platform_user_id,
+        rootMessageId: event.rootMessageId ?? null,
+      });
+    }
 
     // D16 one-time reply (e.g. conflict auto-unbind) — send directly with inbound context_token without preflight.
     // R8 #1: Do not blindly cancel attachments here; `dispatchOneTimeWeixinReply` triggers snapshot sync.
@@ -4619,6 +4644,7 @@ export class ChannelGatewayOrchestrator {
     let interruptDeliveryFailed = false;
     let sawTurnAccepted = false;
     let runEndOutcome: string | null = null;
+    let runEndDeliverables: TurnDeliverableItem[] = [];
     let progressRecorded = false;
     let interruptCleared = false;
     let runStartedCallbackInvoked = false;
@@ -4861,6 +4887,9 @@ export class ChannelGatewayOrchestrator {
             : typeof payload.status === "string"
               ? payload.status
               : "completed";
+        runEndDeliverables = this.parseTurnDeliverables(
+          payload.turn_deliverables,
+        );
         continue;
       }
 
@@ -5338,6 +5367,36 @@ export class ChannelGatewayOrchestrator {
       return settled;
     }
 
+    // Lead Decision #7: DM deliverable auto-attach settles independently of whether
+    // text was already sent via `/agent/send` or `fallback:${runId}`, deduplicated
+    // against `files_status` across the run.
+    if (
+      !sawInterrupt &&
+      !fallbackDeliveryFailed &&
+      !prog.has_in_flight_or_unknown_current_text &&
+      currentRunId &&
+      runEndDeliverables.length > 0 &&
+      event.chatAddress.endsWith(":@me")
+    ) {
+      const delivOk = await this.settleDmTurnDeliverables({
+        userId,
+        threadId: currentThreadId,
+        runId: currentRunId,
+        platform: event.platform,
+        targetAddress: event.chatAddress,
+        inboundMessageId: event.messageId,
+        threadScopeKey: event.threadScopeKey,
+        sourceScopeKey: event.threadScopeKey,
+        sourceGeneration: resolved.generation,
+        activityOrigin: params.isAttachedStream ? "replay" : "conversation",
+        assistantText: trimmedAssistant,
+        deliverables: runEndDeliverables,
+      });
+      if (!delivOk) {
+        fallbackDeliveryFailed = true;
+      }
+    }
+
     // Preserve `fallback_pending: true` if an `/agent/send` to current conversation is still `in_flight` or `unknown`,
     // or if `executeDelivery` returned an explicit failure status!
     const keepFallbackPending =
@@ -5718,6 +5777,7 @@ export class ChannelGatewayOrchestrator {
     let foundTargetTurn = false;
     let resolvedRunId = runId;
     let anyPageSucceeded = false;
+    const replayDeliverablesByRun = new Map<string, TurnDeliverableItem[]>();
     let tipInterruptDelivered = false;
     let tipInterruptDeliveryFailed = false;
     let terminalEmptyOutcome:
@@ -6167,6 +6227,21 @@ export class ChannelGatewayOrchestrator {
             if (sse.event === "replay_done" || sse.event === "history_page") {
               if (sse.event === "replay_done") {
                 sawReplayDone = true;
+                const rawByRun = data.turn_deliverables_by_run;
+                if (
+                  rawByRun &&
+                  typeof rawByRun === "object" &&
+                  !Array.isArray(rawByRun)
+                ) {
+                  for (const [rid, rawItems] of Object.entries(
+                    rawByRun as Record<string, unknown>,
+                  )) {
+                    const parsedItems = this.parseTurnDeliverables(rawItems);
+                    if (parsedItems.length > 0) {
+                      replayDeliverablesByRun.set(rid, parsedItems);
+                    }
+                  }
+                }
               }
               const oldestOrFirst =
                 typeof data.oldest_turn_index === "number"
@@ -6882,6 +6957,36 @@ export class ChannelGatewayOrchestrator {
       });
       if (!settledOk) {
         fallbackTextDeliveryFailed = true;
+      }
+    }
+
+    if (
+      !fallbackTextDeliveryFailed &&
+      !tipInterruptDeliveryFailed &&
+      !prog.has_in_flight_or_unknown_current_text &&
+      resolvedRunId &&
+      targetAddress.endsWith(":@me")
+    ) {
+      const replayDeliverables = replayDeliverablesByRun.get(resolvedRunId) ?? [];
+      if (replayDeliverables.length > 0) {
+        const delivOk = await this.settleDmTurnDeliverables({
+          userId,
+          threadId,
+          runId: resolvedRunId,
+          platform,
+          targetAddress,
+          inboundMessageId: inboundMessageId ?? null,
+          threadScopeKey: scopeKey ?? null,
+          sourceScopeKey: scopeKey ?? null,
+          sourceGeneration: generation ?? null,
+          activityOrigin:
+            activityOrigin ?? (isBackgroundRun ? "notification" : "replay"),
+          assistantText: trimmed,
+          deliverables: replayDeliverables,
+        });
+        if (!delivOk) {
+          fallbackTextDeliveryFailed = true;
+        }
       }
     }
 
@@ -8164,6 +8269,7 @@ export class ChannelGatewayOrchestrator {
     let sawInterrupt = false;
     let interruptDelivered = true;
     let runEndOutcome: string | null = null;
+    let runEndDeliverables: TurnDeliverableItem[] = [];
     let settledOk = false;
 
     try {
@@ -8204,6 +8310,9 @@ export class ChannelGatewayOrchestrator {
                 : typeof payload.status === "string"
                   ? payload.status
                   : "completed";
+            runEndDeliverables = this.parseTurnDeliverables(
+              payload.turn_deliverables,
+            );
             continue;
           }
 
@@ -8383,6 +8492,30 @@ export class ChannelGatewayOrchestrator {
                 generation: handle.generation,
                 isBackgroundRun: true,
               });
+            }
+          }
+          if (
+            !keepFallbackPending &&
+            !sawStreamErrorOrGap &&
+            !prog.has_in_flight_or_unknown_current_text &&
+            runEndDeliverables.length > 0 &&
+            handle.targetAddress.endsWith(":@me")
+          ) {
+            const delivOk = await this.settleDmTurnDeliverables({
+              userId: handle.userId,
+              threadId: handle.threadId,
+              runId,
+              platform: handle.platform,
+              targetAddress: handle.targetAddress,
+              threadScopeKey: handle.scopeKey,
+              sourceScopeKey: handle.scopeKey,
+              sourceGeneration: handle.generation,
+              activityOrigin: "notification",
+              assistantText: trimmed,
+              deliverables: runEndDeliverables,
+            });
+            if (!delivOk) {
+              keepFallbackPending = true;
             }
           } else if (
             (trimmed.length === 0 || sawStreamErrorOrGap) &&
@@ -9999,6 +10132,153 @@ export class ChannelGatewayOrchestrator {
       handle.abortController.abort();
     }
     this.activeWatches.clear();
+  }
+
+  private parseTurnDeliverables(raw: unknown): TurnDeliverableItem[] {
+    if (!Array.isArray(raw)) {
+      return [];
+    }
+    const items: TurnDeliverableItem[] = [];
+    for (const entry of raw) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        continue;
+      }
+      const rec = entry as Record<string, unknown>;
+      const wsId =
+        typeof rec.workspace_id === "string" ? rec.workspace_id.trim() : "";
+      const path = typeof rec.path === "string" ? rec.path.trim() : "";
+      const sha256 = typeof rec.sha256 === "string" ? rec.sha256.trim() : "";
+      const sizeBytes =
+        typeof rec.size_bytes === "number" && Number.isFinite(rec.size_bytes)
+          ? rec.size_bytes
+          : -1;
+      if (!wsId || !path || !sha256 || sizeBytes < 0) {
+        continue;
+      }
+      items.push({
+        workspace_id: wsId,
+        path,
+        filename:
+          typeof rec.filename === "string" && rec.filename.trim()
+            ? rec.filename.trim()
+            : basename(path),
+        size_bytes: sizeBytes,
+        sha256,
+        ...(typeof rec.file_stamp === "string"
+          ? { file_stamp: rec.file_stamp }
+          : {}),
+        ...(typeof rec.operation === "string"
+          ? { operation: rec.operation }
+          : {}),
+      });
+    }
+    return items;
+  }
+
+  private stripCodeFromText(text: string): string {
+    if (!text) return "";
+    // Remove fenced code blocks first, then inline code spans.
+    return text
+      .replace(/```[\s\S]*?```/g, " ")
+      .replace(/~~~[\s\S]*?~~~/g, " ")
+      .replace(/`[^`\n]+`/g, " ");
+  }
+
+  /**
+   * Independent DM deliverable settlement (`deliverables:${runId}`).
+   * Enforces platform auto-attach caps (Feishu/Discord: 5, Weixin: 3), HTML/size
+   * link-only rules, and delegates version-verified download, recipient checks,
+   * and `prior_run_files` deduplication to `DeliveryService`.
+   */
+  private async settleDmTurnDeliverables(params: {
+    userId: string;
+    threadId: string | null;
+    runId: string;
+    platform: ChannelPlatform;
+    targetAddress: string;
+    inboundMessageId?: string | null;
+    threadScopeKey?: string | null;
+    sourceScopeKey?: string | null;
+    sourceGeneration?: number | null;
+    activityOrigin?: DeliveryActivityOrigin | null;
+    assistantText: string;
+    deliverables: TurnDeliverableItem[];
+  }): Promise<boolean> {
+    if (
+      !params.targetAddress.endsWith(":@me") ||
+      params.deliverables.length === 0
+    ) {
+      return true;
+    }
+
+    const prose = this.stripCodeFromText(params.assistantText).toLowerCase();
+    const isMentioned = (item: TurnDeliverableItem): boolean => {
+      if (!prose) return false;
+      const pLower = item.path.toLowerCase();
+      const nameLower = (item.filename || basename(item.path)).toLowerCase();
+      return (
+        (pLower.length > 0 && prose.includes(pLower)) ||
+        (nameLower.length > 0 && prose.includes(nameLower))
+      );
+    };
+
+    const sorted = [
+      ...params.deliverables.filter((item) => isMentioned(item)),
+      ...params.deliverables.filter((item) => !isMentioned(item)),
+    ];
+
+    const maxAutoAttach = params.platform === "weixin" ? 3 : 5;
+    const filesToAttach: Array<{ path: string; workspace_id: string | null }> = [];
+    const linkOnlyLines: string[] = [];
+    let plannedBytes = 0;
+
+    for (const item of sorted) {
+      const lowerPath = item.path.toLowerCase();
+      const isHtml = lowerPath.endsWith(".html") || lowerPath.endsWith(".htm");
+      const tooLargeSingle = item.size_bytes > MAX_ATTACHMENT_BYTES;
+      const exceedsCap = filesToAttach.length >= maxAutoAttach;
+      const exceedsTotalBytes =
+        plannedBytes + item.size_bytes > MAX_TOTAL_ATTACHMENT_BYTES;
+
+      if (isHtml || tooLargeSingle || exceedsCap || exceedsTotalBytes) {
+        linkOnlyLines.push(
+          buildWorkspaceFileDeepLinkLine(
+            item.filename || basename(item.path) || item.path,
+            item.path,
+            this.webBaseUrl,
+            params.threadId,
+            item.workspace_id,
+          ),
+        );
+      } else {
+        filesToAttach.push({
+          path: item.path,
+          workspace_id: item.workspace_id,
+        });
+        plannedBytes += item.size_bytes;
+      }
+    }
+
+    const res = await this.deliveryService.executeDelivery({
+      deliveryKey: `deliverables:${params.runId}`,
+      kind: "fallback",
+      userId: params.userId,
+      threadId: params.threadId,
+      workspaceId: sorted[0]?.workspace_id ?? null,
+      runId: params.runId,
+      platform: params.platform,
+      target: params.targetAddress,
+      inboundMessageId: params.inboundMessageId ?? null,
+      text: linkOnlyLines.join("\n"),
+      files: filesToAttach,
+      downloadMode: "deliverable",
+      linkFallbackOnDeliverableMismatch: true,
+      threadScopeKey: params.threadScopeKey ?? null,
+      sourceScopeKey: params.sourceScopeKey ?? params.threadScopeKey ?? null,
+      sourceGeneration: params.sourceGeneration ?? null,
+      activityOrigin: params.activityOrigin ?? null,
+    });
+    return res.status === "sent" || res.status === "partial";
   }
 
   private async settleTurnFallbackAndPartialNotice(params: {

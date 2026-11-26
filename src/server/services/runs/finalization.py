@@ -226,6 +226,21 @@ async def assemble_finalize_artifacts(
         and token_callback.llm_calls_started() == 0
     )
 
+    # DALTON-HOOK(channel-deliverables): persist verified own-workspace Write/Edit deliverables
+    # into conversation_responses.metadata and pass to run_end when not outbound-blocked.
+    deliverable_recorder = metadata.get("deliverable_recorder")
+    if deliverable_recorder is not None:
+        from src.dalton.channel_deliverables import collect_persistable_turn_deliverables
+
+        recorded_deliverables = await collect_persistable_turn_deliverables(
+            deliverable_recorder,
+            run_id=key[1],
+            user_id=metadata.get("user_id"),
+        )
+        if recorded_deliverables:
+            persist_metadata["turn_deliverables"] = recorded_deliverables
+            metadata["persisted_turn_deliverables"] = recorded_deliverables
+
     return RunOutcome(
         status=status,
         interrupt_reason=interrupt_reason,

@@ -472,10 +472,11 @@ export function classifyFeishuDeliveryError(
 export interface FeishuMessageSendResult {
   messageId: string;
   chatId: string;
+  threadId?: string;
 }
 
 export function toFeishuMessageSendResult(
-  response: { data?: { message_id?: string } } | undefined,
+  response: { data?: { message_id?: string; thread_id?: string } } | undefined,
   chatId: string,
 ): FeishuMessageSendResult {
   const messageId = response?.data?.message_id?.trim();
@@ -488,9 +489,11 @@ export function toFeishuMessageSendResult(
       },
     );
   }
+  const threadId = response?.data?.thread_id?.trim() || undefined;
   return {
     messageId,
     chatId,
+    ...(threadId ? { threadId } : {}),
   };
 }
 
@@ -570,7 +573,7 @@ export async function sendReplyOrFallbackDirect(
   }
 
   let replyResponse: {
-    data?: { message_id?: string };
+    data?: { message_id?: string; thread_id?: string };
     code?: number;
     msg?: string;
   };
@@ -582,19 +585,16 @@ export async function sendReplyOrFallbackDirect(
         msg_type: params.msgType,
         ...(params.replyInThread ? { reply_in_thread: true } : {}),
       },
-    })) as { data?: { message_id?: string }; code?: number; msg?: string };
+    })) as { data?: { message_id?: string; thread_id?: string }; code?: number; msg?: string };
   } catch (err) {
-    if (!params.replyInThread && shouldFallbackFromReplyTarget(err)) {
+    if (shouldFallbackFromReplyTarget(err)) {
       return sendDirect();
     }
     throw classifyFeishuDeliveryError(err, "Feishu reply failed");
   }
 
   if (replyResponse.code !== undefined && replyResponse.code !== 0) {
-    if (
-      !params.replyInThread &&
-      WITHDRAWN_REPLY_ERROR_CODES.has(replyResponse.code)
-    ) {
+    if (WITHDRAWN_REPLY_ERROR_CODES.has(replyResponse.code)) {
       return sendDirect();
     }
     throw classifyFeishuDeliveryError(

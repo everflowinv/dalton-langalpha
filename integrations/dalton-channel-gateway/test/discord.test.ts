@@ -1688,7 +1688,9 @@ describe("Discord inbound parsing", () => {
     expect(event).not.toBeNull();
     expect(event!.chatType).toBe("group");
     expect(event!.chatAddress).toBe(`discord:${GUILD_ID}/${CHANNEL_ID}`);
-    expect(event!.threadScopeKey).toBe(`chat:${GUILD_ID}/${CHANNEL_ID}`);
+    expect(event!.threadScopeKey).toBe(
+      `chat:${GUILD_ID}/${CHANNEL_ID}:topic:${event!.messageId}`,
+    );
     expect(event!.text).toBe("hello team");
     expect(event!.isGroupTrigger).toBe(true);
     expect(event!.platformUserId).toBe(USER_ID);
@@ -4978,22 +4980,25 @@ describe("Discord outbound", () => {
         current: true,
         duplicate: false,
         message: `Delivered to discord:${GUILD_ID}/${CHANNEL_ID}.`,
-        files: [{ path: "reports/q4-margins.png", status: "sent", reason: null }],
+        files: [
+          {
+            path: "reports/q4-margins.png",
+            status: "linked",
+            reason: "group_target_deep_link",
+          },
+        ],
       });
 
       // The API address is the parent channel. thread_scope_key still selects the
-      // thread for both the text POST and the multipart file POST.
-      expect(sentMessages).toHaveLength(2);
+      // thread, and group files are converted into sign-in web deep links instead of multipart uploads.
+      expect(sentMessages).toHaveLength(1);
       expect(sentMessages[0]!.route).toBe(`/channels/${THREAD_ID}/messages`);
       expect(sentMessages[0]!.isMultipart).toBe(false);
       expect(sentMessages[0]!.bodyText).toContain("Q4 gross margin expanded 180 bps.");
-      expect(sentMessages[1]!.route).toBe(`/channels/${THREAD_ID}/messages`);
-      expect(sentMessages[1]!.isMultipart).toBe(true);
-      expect(sentMessages[1]!.bodyText).toContain("q4-margins.png");
+      expect(sentMessages[0]!.bodyText).toContain("q4-margins.png");
       expect(sentMessages.some((m) => m.route === `/channels/${CHANNEL_ID}/messages`)).toBe(false);
       const currentRoutes = describeRest(calls);
       expect(messagePostRoutes(currentRoutes)).toEqual([
-        `/channels/${THREAD_ID}/messages`,
         `/channels/${THREAD_ID}/messages`,
       ]);
       expect(currentRoutes.some((call) => isParentChannelRoute(call.route))).toBe(false);
@@ -5011,7 +5016,7 @@ describe("Discord outbound", () => {
           ),
         ).toBe(true);
       });
-      expect(sentMessages).toHaveLength(2);
+      expect(sentMessages).toHaveLength(1);
       expect(sentMessages.some((m) => m.route === `/channels/${CHANNEL_ID}/messages`)).toBe(false);
       const restCountBeforeExplicit = calls.length;
 
@@ -5030,8 +5035,8 @@ describe("Discord outbound", () => {
         address: `discord:${GUILD_ID}/${OTHER_CHANNEL_ID}`,
         current: false,
       });
-      expect(sentMessages).toHaveLength(3);
-      expect(sentMessages[2]!.route).toBe(`/channels/${OTHER_CHANNEL_ID}/messages`);
+      expect(sentMessages).toHaveLength(2);
+      expect(sentMessages[1]!.route).toBe(`/channels/${OTHER_CHANNEL_ID}/messages`);
       const explicitRoutes = describeRest(calls.slice(restCountBeforeExplicit));
       expect(messagePostRoutes(explicitRoutes)).toEqual([
         `/channels/${OTHER_CHANNEL_ID}/messages`,
@@ -5050,7 +5055,7 @@ describe("Discord outbound", () => {
         text: "Retryable thread reply",
       });
       expect(failedAttemptRes.body).toMatchObject({ status: "failed" });
-      expect(sentMessages).toHaveLength(3);
+      expect(sentMessages).toHaveLength(2);
 
       const retriedAttemptRes = await postAgentSend({
         thread_id: TURN_THREAD_ID,
@@ -5065,8 +5070,8 @@ describe("Discord outbound", () => {
         current: true,
         message: `Delivered to discord:${GUILD_ID}/${CHANNEL_ID}.`,
       });
-      expect(sentMessages).toHaveLength(4);
-      expect(sentMessages[3]!.route).toBe(`/channels/${THREAD_ID}/messages`);
+      expect(sentMessages).toHaveLength(3);
+      expect(sentMessages[2]!.route).toBe(`/channels/${THREAD_ID}/messages`);
       const retryRoutes = describeRest(calls.slice(restCountBeforeRetry));
       expect(messagePostRoutes(retryRoutes)).toEqual([
         `/channels/${THREAD_ID}/messages`,
@@ -5193,12 +5198,11 @@ describe("Discord outbound", () => {
       });
 
       await app.orchestrator.runStartupRecovery();
-      expect(sentMessages).toHaveLength(5);
-      expect(sentMessages[4]!.route).toBe(`/channels/${THREAD_ID}/messages`);
-      expect(sentMessages[4]!.bodyText).toContain(recoveredText);
+      expect(sentMessages).toHaveLength(4);
+      expect(sentMessages[3]!.route).toBe(`/channels/${THREAD_ID}/messages`);
+      expect(sentMessages[3]!.bodyText).toContain(recoveredText);
       expect(sentMessages.some((m) => m.route === `/channels/${CHANNEL_ID}/messages`)).toBe(false);
       expect(messagePostRoutes(describeRest(calls))).toEqual([
-        `/channels/${THREAD_ID}/messages`,
         `/channels/${THREAD_ID}/messages`,
         `/channels/${OTHER_CHANNEL_ID}/messages`,
         `/channels/${THREAD_ID}/messages`,

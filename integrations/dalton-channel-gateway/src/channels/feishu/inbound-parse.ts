@@ -758,6 +758,9 @@ export function parseFeishuInboundEvent(
 
   const attachments = extractInboundAttachments(rawContent, messageType);
 
+  const externalTopicId = message.thread_id?.trim() || undefined;
+  const rootMessageId = message.root_id?.trim() || undefined;
+
   return {
     platform: "feishu",
     platformUserId: senderOpenId,
@@ -770,9 +773,13 @@ export function parseFeishuInboundEvent(
       chatType,
       chatId,
       senderOpenId,
-      threadId: message.thread_id,
+      threadId: externalTopicId,
+      messageId,
+      isGroupTrigger: chatType === "group" ? mentionsBot : false,
     }),
     messageId,
+    ...(externalTopicId ? { externalTopicId } : {}),
+    ...(rootMessageId ? { rootMessageId } : {}),
     text,
     commandText,
     isGroupTrigger: chatType === "group" ? mentionsBot : undefined,

@@ -204,10 +204,18 @@ async def _parent_is_deleted(automation_id: str) -> bool:
 async def _load_delivery_row(cur: Any, delivery_id: str) -> dict[str, Any] | None:
     await cur.execute(
         """
-        SELECT delivery_id, execution_id, automation_id, user_id, channel, target,
-               status, attempt_count, error_code, payload_json
-        FROM dalton_notify_deliveries
-        WHERE delivery_id = %s::uuid
+        SELECT d.delivery_id, d.execution_id, d.automation_id, d.user_id, d.channel, d.target,
+               d.status, d.attempt_count, d.error_code, d.payload_json,
+               ae.conversation_thread_id::text AS conversation_thread_id,
+               a.workspace_id::text AS workspace_id
+        FROM dalton_notify_deliveries d
+        LEFT JOIN automation_executions ae
+          ON d.execution_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+         AND ae.automation_execution_id = d.execution_id::uuid
+        LEFT JOIN automations a
+          ON d.automation_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+         AND a.automation_id = d.automation_id::uuid
+        WHERE d.delivery_id = %s::uuid
         """,
         (delivery_id,),
     )
@@ -548,11 +556,26 @@ async def decide_automation_notification_plan(
         "recipient_id": parsed["recipient_id"],
         "items": [item],
     }
-    thread_id = str(
-        payload.get("thread_id") or payload.get("conversation_thread_id") or ""
-    ).strip()
-    if thread_id:
-        plan["thread_id"] = thread_id
+    thread_id = (
+        str(
+            payload.get("thread_id")
+            or payload.get("conversation_thread_id")
+            or row.get("conversation_thread_id")
+            or row.get("thread_id")
+            or ""
+        ).strip()
+        or None
+    )
+    workspace_id = (
+        str(
+            payload.get("workspace_id")
+            or row.get("workspace_id")
+            or ""
+        ).strip()
+        or None
+    )
+    plan["thread_id"] = thread_id
+    plan["workspace_id"] = workspace_id
     return plan
 
 

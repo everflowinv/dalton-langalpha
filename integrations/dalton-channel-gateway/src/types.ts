@@ -109,10 +109,11 @@ export function buildSurfaceRules(platform: ChannelPlatform): string {
   return [
     `<surface_rules platform="${platform}">`,
     `The user is chatting with you from ${platform}.`,
-    `- Keep replies concise and mobile-friendly.`,
-    `- To send files (charts, PDFs, spreadsheets, reports) or extra messages into this conversation, call \`send_message(text=..., files=[...])\` with \`target\` omitted.`,
-    `- When referencing a workspace file in text, write a Markdown link with a workspace-relative path such as [Report](results/report.md). The channel rewrites it into a web link that requires sign-in when a reachable web URL is configured; paths inside code blocks or backticks are sent as-is. When the user needs the file directly in this chat, attach it via \`send_message(files=[...])\`.`,
-    `- Avoid wide Markdown tables (> 4 columns); use bullet lists or attach a file.`,
+    `- Keep replies concise and easy to read on mobile.`,
+    `- Write deliverables into the workspace using Write or Edit and reference them with workspace-relative Markdown links such as [Report](results/report.md).`,
+    `- In direct messages, new or updated deliverables from this turn (reports, PDFs, spreadsheets, charts) are attached automatically after your reply; HTML pages and larger files are linked to the web workspace (sign-in required). In group chats, files are always linked to the web workspace instead of uploaded as attachments.`,
+    `- Call \`send_message(text=..., files=[...])\` only when you need to send an extra message or push a file during the turn (for example, an existing file you did not write in this turn, or a message to another chat).`,
+    `- Avoid wide Markdown tables (> 4 columns); use bullet lists or write a file instead.`,
     `</surface_rules>`,
   ].join("\n");
 }
@@ -215,6 +216,10 @@ export interface InboundChannelEvent {
   threadScopeKey: string;
   /** Unique platform message ID (`message_id` / `msg.id`). */
   messageId: string;
+  /** Platform topic/thread ID (`omt_xxx` for Feishu, thread channel ID for Discord) when inbound arrived inside a topic/thread. */
+  externalTopicId?: string;
+  /** Platform root message ID (`root_id` on Feishu, starter message ID on Discord) when inbound arrived inside a topic/thread. */
+  rootMessageId?: string;
   /** User text content (trimmed or raw). */
   text: string;
   /** Unescaped raw text used for slash-command recognition and arguments when `text` is Markdown-rendered. */
@@ -364,9 +369,20 @@ export interface AgentSendRequest {
   automation_execution_id?: string | null;
 }
 
+export interface TurnDeliverableItem {
+  workspace_id: string;
+  path: string;
+  filename?: string;
+  size_bytes: number;
+  sha256: string;
+  file_stamp?: string;
+  operation?: "write" | "edit" | string;
+}
+
 export interface AgentSendFileOutcome {
   path: string;
-  status: "sent" | "linked" | "failed" | "unknown";
+  workspace_id?: string | null;
+  status: "sent" | "linked" | "failed" | "unknown" | "pending";
   reason: string | null;
 }
 

@@ -11,6 +11,7 @@ import logging
 import re
 import time
 from typing import Any
+from urllib.parse import quote, unquote, urlparse
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -702,6 +703,593 @@ def truncate_preserving_markdown_links(text: str, max_chars: int) -> str:
     return prefix + "…"
 
 
+_WS_SANDBOX_ROOT_PREFIXES: tuple[str, ...] = (
+    "home/workspace/",
+    "home/daytona/",
+)
+_WS_SANDBOX_ROOT_RE = re.compile(r"^/?(home/workspace|home/daytona)(?:/|$)")
+_WS_FILE_TRIPLE_SLASH_RE = re.compile(r"^file://(?=/)", re.IGNORECASE)
+_WS_BARE_SANDBOX_PREFIX_RE = re.compile(
+    r"(?:file://)?/(?:home/workspace|home/daytona)/+"
+    r"(?=[^\s<>\"'`()\[\]{}，。；：、！？（）【】《》「」『』“”‘’/])",
+    re.IGNORECASE,
+)
+_WS_BARE_PRECEDING_BLOCK_RE = re.compile(r"[A-Za-z0-9._~:/%-]")
+_WS_WSREF_RE = re.compile(r"^/?__wsref__/([A-Za-z0-9][A-Za-z0-9_-]{0,127})/(.+)$")
+_WS_LINE_SUFFIX_RE = re.compile(
+    r"(\.(?=[A-Za-z0-9]{0,7}[A-Za-z])[A-Za-z0-9]{1,8}):\d+(?:-\d+|:\d+)?$"
+)
+_WS_FILE_EXT_BASENAME_RE = re.compile(
+    r"^[^/]*[^/.]\.(?=[A-Za-z0-9]{0,7}[A-Za-z])[A-Za-z0-9]{1,8}$"
+)
+_WS_COMMON_HOST_TLDS = frozenset(
+    {
+        "com", "org", "net", "edu", "gov", "mil", "int", "io", "co", "ai",
+        "app", "dev", "cn", "hk", "tw", "sg", "jp", "kr", "uk", "de", "fr",
+        "au", "ca", "us", "eu", "br", "nl", "se", "ch", "it", "es", "ru",
+        "xyz", "info", "biz", "me", "cc", "gg", "site", "online", "tech",
+        "cloud", "pro", "top", "club", "news", "media", "live", "store",
+        "shop", "finance", "capital", "fund", "group", "ltd", "inc",
+    }
+)
+_WS_BARE_LOCALHOST_PORT_RE = re.compile(
+    r"^(?:(?:[A-Za-z0-9-]+\.)*localhost\.?|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\]|0\.0\.0\.0):\d+(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
+_WS_MD_DEF_LINE_RE = re.compile(
+    r"^[ \t]{0,3}\[([^\]]+)\]:[ \t]*(?:<([^>\n]+)>|([^\s\n]+))(?:[ \t]+(?:\"[^\n]*\"|'[^\n]*'|\([^\n]*\)))?[ \t]*$",
+    re.MULTILINE,
+)
+_WS_FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+
+
+def _is_local_hostname_external(raw_hostname: str) -> bool:
+    host = raw_hostname.strip().lower().strip("[]").rstrip(".")
+    if not host:
+        return True
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or host.endswith(".localhost"):
+        return True
+    if re.fullmatch(r"127\.\d{1,3}\.\d{1,3}\.\d{1,3}", host):
+        return True
+    return False
+
+
+def normalize_public_web_base_url(raw_url: str | None) -> str | None:
+    """Return stripped http(s) non-local public base URL, or None when unusable."""
+    cleaned = str(raw_url or "").strip().rstrip("/")
+    if not cleaned:
+        return None
+    try:
+        parsed = urlparse(cleaned)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        return None
+    if _is_local_hostname_external(parsed.hostname):
+        return None
+    return cleaned
+
+
+def _encode_file_query_param(file_path: str) -> str:
+    return quote(file_path, safe="-_.~")
+
+
+def _normalize_ws_path_segments(
+    raw: str, *, allow_single_leading_climb: bool = False
+) -> str | None:
+    is_dir = raw.endswith("/")
+    segments: list[str] = []
+    leading_climbs = 0
+    for seg in raw.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if segments and segments[-1] != "..":
+                segments.pop()
+                continue
+            if allow_single_leading_climb and leading_climbs == 0:
+                leading_climbs += 1
+                segments.append("..")
+                continue
+            return None
+        segments.append(seg)
+    if not segments:
+        return None
+    if leading_climbs > 0 and len(segments) < 2:
+        return None
+    joined = "/".join(segments)
+    return f"{joined}/" if is_dir else joined
+
+
+def _is_local_preview_url(dest: str) -> bool:
+    if _WS_BARE_LOCALHOST_PORT_RE.match(dest):
+        return True
+    if not re.match(r"^https?://", dest, re.IGNORECASE):
+        return False
+    try:
+        parsed = urlparse(dest)
+    except ValueError:
+        return False
+    return bool(parsed.hostname and _is_local_hostname_external(parsed.hostname))
+
+
+def classify_external_workspace_destination(raw_dest: str) -> dict[str, Any]:
+    """Classify a link destination identically to gateway ``sandbox-links.ts``."""
+    dest = raw_dest.strip()
+    if not dest:
+        return {"kind": "keep"}
+    if _is_local_preview_url(dest):
+        return {"kind": "local_preview"}
+
+    ws_match = _WS_WSREF_RE.match(dest)
+    if ws_match:
+        ws_id = ws_match.group(1)
+        inner = re.sub(r"[?#].*$", "", ws_match.group(2))
+        inner = _WS_LINE_SUFFIX_RE.sub(r"\1", inner)
+        inner = _WS_FILE_TRIPLE_SLASH_RE.sub("", inner).lstrip("/")
+        root_m = _WS_SANDBOX_ROOT_RE.match(inner)
+        without_root = inner[root_m.end() :] if root_m else inner
+        rel_path = _normalize_ws_path_segments(unquote(without_root))
+        if not rel_path:
+            return {"kind": "keep"}
+        return {
+            "kind": "workspace_file",
+            "deep_link_path": rel_path,
+            "display_path": rel_path,
+            "workspace_id": ws_id,
+        }
+
+    candidate = dest
+    unwrapped_file = False
+    if re.match(r"^file:", candidate, re.IGNORECASE):
+        if not _WS_FILE_TRIPLE_SLASH_RE.match(candidate):
+            return {"kind": "keep"}
+        candidate = _WS_FILE_TRIPLE_SLASH_RE.sub("", candidate)
+        unwrapped_file = True
+
+    stripped = _WS_LINE_SUFFIX_RE.sub(r"\1", re.sub(r"[?#].*$", "", candidate))
+    root_m = _WS_SANDBOX_ROOT_RE.match(stripped)
+    if root_m:
+        root_name = root_m.group(1)
+        rest = stripped[root_m.end() :]
+        rel_path = _normalize_ws_path_segments(unquote(rest))
+        if not rel_path:
+            return {"kind": "keep"}
+        return {
+            "kind": "workspace_file",
+            "deep_link_path": f"/{root_name}/{rel_path}",
+            "display_path": rel_path,
+        }
+
+    if candidate.startswith("/") and not candidate.startswith("//"):
+        decoded_abs = unquote(stripped)
+        if decoded_abs.endswith("/") or ":" in decoded_abs:
+            return {"kind": "keep"}
+        norm_abs = _normalize_ws_path_segments(decoded_abs)
+        if not norm_abs:
+            return {"kind": "keep"}
+        base_name = norm_abs.rsplit("/", 1)[-1]
+        if not _WS_FILE_EXT_BASENAME_RE.match(base_name):
+            return {"kind": "keep"}
+        rooted = f"/{norm_abs}"
+        return {
+            "kind": "workspace_file",
+            "deep_link_path": rooted,
+            "display_path": rooted,
+        }
+    if unwrapped_file:
+        return {"kind": "keep"}
+
+    has_line = bool(_WS_LINE_SUFFIX_RE.search(candidate)) and not re.match(
+        r"^[a-z][a-z0-9+.-]*://", candidate, re.IGNORECASE
+    )
+    if not has_line and re.match(r"^[a-z][a-z0-9+.-]*:", candidate, re.IGNORECASE):
+        return {"kind": "keep"}
+    if (
+        candidate.startswith(("//", "#", "?"))
+        or re.match(r"^www\.", candidate, re.IGNORECASE)
+        or "@" in candidate
+    ):
+        return {"kind": "keep"}
+
+    decoded_rel = unquote(stripped)
+    if decoded_rel.endswith("/") or ":" in decoded_rel:
+        return {"kind": "keep"}
+    explicit_dot = decoded_rel.startswith(("./", "../"))
+    rel_path = _normalize_ws_path_segments(decoded_rel, allow_single_leading_climb=True)
+    if not rel_path:
+        return {"kind": "keep"}
+    base_name = rel_path.rsplit("/", 1)[-1]
+    if not _WS_FILE_EXT_BASENAME_RE.match(base_name):
+        return {"kind": "keep"}
+    if not explicit_dot and "/" not in rel_path:
+        dot = rel_path.rfind(".")
+        if dot > 0 and rel_path[dot + 1 :].lower() in _WS_COMMON_HOST_TLDS:
+            return {"kind": "keep"}
+    return {
+        "kind": "workspace_file",
+        "deep_link_path": rel_path,
+        "display_path": rel_path,
+    }
+
+
+def build_workspace_file_deep_link(
+    classification: Mapping[str, Any],
+    *,
+    public_base: str | None,
+    thread_id: str | None = None,
+    workspace_id: str | None = None,
+) -> str | None:
+    """Build sign-in-protected deep link URL for a classified workspace file."""
+    base = normalize_public_web_base_url(public_base)
+    if not base:
+        return None
+    deep_path = str(classification.get("deep_link_path") or "").strip()
+    if not deep_path:
+        return None
+    target_ws = str(classification.get("workspace_id") or "").strip()
+    cleaned_tid = str(thread_id or "").strip()
+    if target_ws:
+        if not cleaned_tid:
+            return None
+        return f"{base}/chat/{quote(target_ws, safe='')}?file={_encode_file_query_param(deep_path)}"
+    if cleaned_tid:
+        return f"{base}/chat/t/{quote(cleaned_tid, safe='')}?file={_encode_file_query_param(deep_path)}"
+    cleaned_ws = str(workspace_id or "").strip()
+    if cleaned_ws:
+        return f"{base}/chat/{quote(cleaned_ws, safe='')}?file={_encode_file_query_param(deep_path)}"
+    return None
+
+
+def _format_ws_file_replacement(
+    label: str,
+    classification: Mapping[str, Any],
+    *,
+    public_base: str | None,
+    thread_id: str | None,
+    workspace_id: str | None,
+    fallback_mode: str = "hint",
+    rewritten_links: set[str] | None = None,
+) -> str:
+    url = build_workspace_file_deep_link(
+        classification,
+        public_base=public_base,
+        thread_id=thread_id,
+        workspace_id=workspace_id,
+    )
+    display_path = str(classification.get("display_path") or "")
+    if url:
+        md_link = f"[{label or display_path}]({url})"
+        if rewritten_links is not None:
+            rewritten_links.add(md_link)
+        return md_link
+    if fallback_mode == "label":
+        return label or display_path
+    hint = f"（在网页工作区查看：{display_path}）"
+    return f"{label}{hint}" if label else hint
+
+
+def _split_code_protected_spans(text: str) -> list[tuple[bool, str]]:
+    """Split text into ``(is_code, chunk)`` segments skipping fenced and inline code."""
+    lines = text.splitlines(keepends=True)
+    segments: list[tuple[bool, str]] = []
+    buf: list[str] = []
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+
+    def _flush_plain() -> None:
+        if not buf:
+            return
+        plain = "".join(buf)
+        buf.clear()
+        i = 0
+        n = len(plain)
+        cur_start = 0
+        while i < n:
+            if plain[i] == "`":
+                j = i
+                while j < n and plain[j] == "`":
+                    j += 1
+                run = j - i
+                # Leave `[` + inlineCode + `](` unprotected so links with code labels rewrite
+                is_link_label = (
+                    i > 0 and plain[i - 1] == "["
+                )
+                close = plain.find("`" * run, j)
+                if close != -1 and not (
+                    is_link_label
+                    and close + run + 1 < n
+                    and plain[close + run : close + run + 2] == "]("
+                ):
+                    if i > cur_start:
+                        segments.append((False, plain[cur_start:i]))
+                    segments.append((True, plain[i : close + run]))
+                    i = close + run
+                    cur_start = i
+                    continue
+                i = j
+            else:
+                i += 1
+        if cur_start < n:
+            segments.append((False, plain[cur_start:]))
+
+    for line in lines:
+        if not in_fence:
+            m = _WS_FENCE_OPEN_RE.match(line)
+            if m:
+                _flush_plain()
+                in_fence = True
+                fence_char = m.group(1)[0]
+                fence_len = len(m.group(1))
+                segments.append((True, line))
+                continue
+            buf.append(line)
+        else:
+            segments.append((True, line))
+            stripped = line.lstrip(" \t").rstrip("\r\n ")
+            if (
+                len(stripped) >= fence_len
+                and set(stripped) == {fence_char}
+            ):
+                in_fence = False
+                fence_char = ""
+                fence_len = 0
+    _flush_plain()
+    return segments
+
+
+def _rewrite_plain_prose_segment(
+    segment: str,
+    *,
+    definitions: Mapping[str, dict[str, Any]],
+    used_ref_ids: set[str],
+    public_base: str | None,
+    thread_id: str | None,
+    workspace_id: str | None,
+    fallback_mode: str = "hint",
+    rewritten_links: set[str] | None = None,
+) -> str:
+    # 1. Inline links and images: ![label](dest) or [label](dest)
+    def _replace_inline(match: re.Match[str]) -> str:
+        label = match.group(2)
+        raw_dest = match.group(3).strip()
+        # Strip optional quoted title
+        dest = re.sub(r'[ \t]+(?:"[^"\n]{0,512}"|\'[^\'\n]{0,512}\')$', "", raw_dest).strip()
+        if dest.startswith("<") and dest.endswith(">"):
+            dest = dest[1:-1].strip()
+        cls = classify_external_workspace_destination(dest)
+        if cls["kind"] == "keep":
+            return match.group(0)
+        if cls["kind"] == "local_preview":
+            return label
+        return _format_ws_file_replacement(
+            label,
+            cls,
+            public_base=public_base,
+            thread_id=thread_id,
+            workspace_id=workspace_id,
+            fallback_mode=fallback_mode,
+            rewritten_links=rewritten_links,
+        )
+
+    out = _MD_LINK_RE.sub(_replace_inline, segment)
+
+    # 2. Reference links: ![label][id], [label][id], [id][], [id] (only when defined in definitions)
+    if definitions:
+        ref_re = re.compile(r"(!?)\[([^\[\]\n]+)\](?:\[([^\[\]\n]*)\])?")
+
+        def _replace_ref(match: re.Match[str]) -> str:
+            # Skip if immediately followed by `(` (inline link already handled) or `:` (definition)
+            end = match.end()
+            if end < len(out) and out[end] in ("(", ":"):
+                return match.group(0)
+            label = match.group(2)
+            ref_id_raw = match.group(3)
+            if ref_id_raw is None or ref_id_raw == "":
+                key = label.strip().lower()
+            else:
+                key = ref_id_raw.strip().lower()
+            info = definitions.get(key)
+            if not info:
+                return match.group(0)
+            cls = info["classification"]
+            if cls["kind"] == "keep":
+                return match.group(0)
+            used_ref_ids.add(key)
+            if cls["kind"] == "local_preview":
+                return label
+            return _format_ws_file_replacement(
+                label,
+                cls,
+                public_base=public_base,
+                thread_id=thread_id,
+                workspace_id=workspace_id,
+                fallback_mode=fallback_mode,
+                rewritten_links=rewritten_links,
+            )
+
+        out = ref_re.sub(_replace_ref, out)
+
+    # 3. Bare absolute sandbox paths in prose (outside markdown links)
+    link_spans = [(m.start(), m.end()) for m in _MD_LINK_RE.finditer(out)]
+    pieces: list[str] = []
+    cursor = 0
+    for m in _WS_BARE_SANDBOX_PREFIX_RE.finditer(out):
+        start = m.start()
+        if start < cursor:
+            continue
+        if any(ls <= start < le for ls, le in link_spans):
+            continue
+        if start > 0 and _WS_BARE_PRECEDING_BLOCK_RE.match(out[start - 1]):
+            continue
+        end = m.end()
+        while end < len(out) and not re.match(
+            r"[\s<>\"'`()\[\]{}，。；：、！？（）【】《》「」『』“”‘’]", out[end]
+        ):
+            end += 1
+        candidate = out[start:end].rstrip(".,;:!?")
+        cand_end = start + len(candidate)
+        cls = classify_external_workspace_destination(candidate)
+        if cls["kind"] != "workspace_file":
+            continue
+        pieces.append(out[cursor:start])
+        pieces.append(
+            _format_ws_file_replacement(
+                cls["display_path"],
+                cls,
+                public_base=public_base,
+                thread_id=thread_id,
+                workspace_id=workspace_id,
+                fallback_mode=fallback_mode,
+                rewritten_links=rewritten_links,
+            )
+        )
+        cursor = cand_end
+    if cursor == 0:
+        return out
+    pieces.append(out[cursor:])
+    return "".join(pieces)
+
+
+def _rewrite_workspace_links_for_external_with_links(
+    text: str,
+    *,
+    public_base: str | None = None,
+    thread_id: str | None = None,
+    workspace_id: str | None = None,
+    fallback_mode: str = "hint",
+) -> tuple[str, set[str]]:
+    """Rewrite sandbox/workspace links and return ``(rewritten_text, generated_deep_links)``."""
+    rewritten_links: set[str] = set()
+    if not text:
+        return text, rewritten_links
+    if public_base is None:
+        from src.dalton.settings import get_dalton_public_app_url
+
+        resolved_base = normalize_public_web_base_url(get_dalton_public_app_url())
+    else:
+        resolved_base = normalize_public_web_base_url(public_base)
+
+    segments = _split_code_protected_spans(text)
+    definitions: dict[str, dict[str, Any]] = {}
+    for is_code, seg in segments:
+        if is_code:
+            continue
+        for m in _WS_MD_DEF_LINE_RE.finditer(seg):
+            key = m.group(1).strip().lower()
+            url = (m.group(2) or m.group(3) or "").strip()
+            if key and key not in definitions:
+                definitions[key] = {
+                    "label": m.group(1).strip(),
+                    "url": url,
+                    "classification": classify_external_workspace_destination(url),
+                }
+
+    used_ref_ids: set[str] = set()
+    rewritten_segments: list[tuple[bool, str]] = []
+    for is_code, seg in segments:
+        if is_code:
+            rewritten_segments.append((True, seg))
+            continue
+        rewritten_segments.append(
+            (
+                False,
+                _rewrite_plain_prose_segment(
+                    seg,
+                    definitions=definitions,
+                    used_ref_ids=used_ref_ids,
+                    public_base=resolved_base,
+                    thread_id=thread_id,
+                    workspace_id=workspace_id,
+                    fallback_mode=fallback_mode,
+                    rewritten_links=rewritten_links,
+                ),
+            )
+        )
+
+    if not definitions:
+        return "".join(seg for _, seg in rewritten_segments), rewritten_links
+
+    final_parts: list[str] = []
+    for is_code, seg in rewritten_segments:
+        if is_code:
+            final_parts.append(seg)
+            continue
+        out_lines: list[str] = []
+        for line in seg.splitlines(keepends=True):
+            m = _WS_MD_DEF_LINE_RE.match(line.rstrip("\r\n"))
+            if m:
+                key = m.group(1).strip().lower()
+                info = definitions.get(key)
+                if info and info["classification"]["kind"] != "keep":
+                    if key in used_ref_ids:
+                        continue
+                    cls = info["classification"]
+                    if cls["kind"] == "local_preview":
+                        out_lines.append(
+                            re.sub(r"^https?://", "", info["url"], flags=re.IGNORECASE)
+                            + ("\n" if line.endswith("\n") else "")
+                        )
+                        continue
+                    rep = _format_ws_file_replacement(
+                        info["label"],
+                        cls,
+                        public_base=resolved_base,
+                        thread_id=thread_id,
+                        workspace_id=workspace_id,
+                        fallback_mode=fallback_mode,
+                        rewritten_links=rewritten_links,
+                    )
+                    out_lines.append(rep + ("\n" if line.endswith("\n") else ""))
+                    continue
+            out_lines.append(line)
+        final_parts.append("".join(out_lines))
+    return "".join(final_parts), rewritten_links
+
+
+def rewrite_workspace_links_for_external(
+    text: str,
+    *,
+    public_base: str | None = None,
+    thread_id: str | None = None,
+    workspace_id: str | None = None,
+    fallback_mode: str = "hint",
+) -> str:
+    """Rewrite sandbox/workspace links into web deep links (or plain hints) for external channels."""
+    rewritten, _ = _rewrite_workspace_links_for_external_with_links(
+        text,
+        public_base=public_base,
+        thread_id=thread_id,
+        workspace_id=workspace_id,
+        fallback_mode=fallback_mode,
+    )
+    return rewritten
+
+
+def _visible_markdown_len(
+    text: str,
+    *,
+    rewritten_links: set[str] | frozenset[str] | None = None,
+) -> int:
+    """Count characters for summary/card budgets.
+
+    When ``rewritten_links`` is provided, only workspace deep links generated by
+    ``rewrite_workspace_links_for_external`` are measured by visible label length,
+    preserving raw length measurement for ordinary ``http(s)`` links and plain text.
+    """
+    if rewritten_links is None:
+        return len(_MD_LINK_RE.sub(lambda m: m.group(2), text))
+    if not rewritten_links:
+        return len(text)
+    return len(
+        _MD_LINK_RE.sub(
+            lambda m: m.group(2) if m.group(0) in rewritten_links else m.group(0),
+            text,
+        )
+    )
+
+
 def _strip_non_http_markdown_links(text: str) -> str:
     """Keep http(s) links, expand ``/monitors/...`` links to the configured public URL (or title + path), and strip other relative/local links."""
     from src.dalton.settings import get_dalton_public_app_url
@@ -789,16 +1377,24 @@ def _has_odd_bold_outside_links(text: str) -> bool:
     return without_links.count("**") % 2 == 1
 
 
-def _truncate_line_at_punct(line: str, max_chars: int) -> str:
+def _truncate_line_at_punct(
+    line: str,
+    max_chars: int,
+    *,
+    rewritten_links: set[str] | frozenset[str] = frozenset(),
+) -> str:
     if max_chars <= 1:
         return ""
     spans = _link_spans_in_line(line)
-    limit = min(len(line), max_chars - 1)
-    for idx in range(limit - 1, -1, -1):
+    for idx in range(len(line) - 1, -1, -1):
         if _is_sentence_end_punct(line, idx, spans):
             prefix = line[: idx + 1]
             suffix = "**…" if _has_odd_bold_outside_links(prefix) else "…"
-            if len(prefix) + len(suffix) <= max_chars:
+            if (
+                _visible_markdown_len(prefix, rewritten_links=rewritten_links)
+                + len(suffix)
+                <= max_chars
+            ):
                 return f"{prefix}{suffix}"
     return ""
 
@@ -846,6 +1442,7 @@ def _truncate_section_body(
     raw_body: str | Sequence[str],
     *,
     max_chars: int = MAX_CARD_SECTION_CHARS,
+    rewritten_links: set[str] | frozenset[str] = frozenset(),
 ) -> str:
     """Truncate a section body block-by-block up to ``max_chars``."""
     if max_chars <= 0:
@@ -876,7 +1473,11 @@ def _truncate_section_body(
             lead_line = items[0]
             list_items = blocks[idx + 1][1]
             first_item = list_items[0]
-            pair_len = len(lead_line) + 1 + len(first_item)
+            pair_len = (
+                _visible_markdown_len(lead_line, rewritten_links=rewritten_links)
+                + 1
+                + _visible_markdown_len(first_item, rewritten_links=rewritten_links)
+            )
             if used + sep + pair_len > max_chars:
                 break
             kept_blocks.append([lead_line])
@@ -884,9 +1485,10 @@ def _truncate_section_body(
             used += sep + pair_len
             stopped = False
             for item in list_items[1:]:
-                if used + 1 + len(item) <= max_chars:
+                item_len = _visible_markdown_len(item, rewritten_links=rewritten_links)
+                if used + 1 + item_len <= max_chars:
                     kept_blocks.append([item])
-                    used += 1 + len(item)
+                    used += 1 + item_len
                 else:
                     stopped = True
                     break
@@ -897,9 +1499,12 @@ def _truncate_section_body(
 
         if kind == "table":
             block_text = "\n".join(items)
-            if used + sep + len(block_text) <= max_chars:
+            block_len = _visible_markdown_len(
+                block_text, rewritten_links=rewritten_links
+            )
+            if used + sep + block_len <= max_chars:
                 kept_blocks.append([block_text])
-                used += sep + len(block_text)
+                used += sep + block_len
                 idx += 1
                 continue
             break
@@ -908,9 +1513,10 @@ def _truncate_section_body(
             stopped = False
             for item in items:
                 item_sep = 1 if kept_blocks else 0
-                if used + item_sep + len(item) <= max_chars:
+                item_len = _visible_markdown_len(item, rewritten_links=rewritten_links)
+                if used + item_sep + item_len <= max_chars:
                     kept_blocks.append([item])
-                    used += item_sep + len(item)
+                    used += item_sep + item_len
                 else:
                     stopped = True
                     break
@@ -920,13 +1526,18 @@ def _truncate_section_body(
             continue
 
         block_text = "\n".join(items)
-        if used + sep + len(block_text) <= max_chars:
+        block_len = _visible_markdown_len(block_text, rewritten_links=rewritten_links)
+        if used + sep + block_len <= max_chars:
             kept_blocks.append(list(items))
-            used += sep + len(block_text)
+            used += sep + block_len
             idx += 1
             continue
         if not kept_blocks:
-            truncated = _truncate_line_at_punct(block_text, max_chars)
+            truncated = _truncate_line_at_punct(
+                block_text,
+                max_chars,
+                rewritten_links=rewritten_links,
+            )
             if truncated:
                 kept_blocks.append([truncated])
         break
@@ -948,13 +1559,23 @@ def extract_summary_lines(
     min_lines: int = 3,
     max_lines: int = 6,
     max_chars: int = MAX_CARD_SECTION_CHARS,
+    thread_id: str | None = None,
+    workspace_id: str | None = None,
+    public_base: str | None = None,
 ) -> list[str]:
     """Extract 3-6 summary lines from the start of ``text``."""
     _ = min_lines
     if not text or not str(text).strip() or max_chars <= 0:
         return []
 
-    cleaned = _strip_non_http_markdown_links(str(text).strip())
+    rewritten, rewritten_links = _rewrite_workspace_links_for_external_with_links(
+        str(text).strip(),
+        public_base=public_base,
+        thread_id=thread_id,
+        workspace_id=workspace_id,
+        fallback_mode="label",
+    )
+    cleaned = _strip_non_http_markdown_links(rewritten)
     candidates: list[str] = []
     for line in cleaned.splitlines():
         spans = _link_spans_in_line(line)
@@ -978,10 +1599,11 @@ def extract_summary_lines(
     for item in candidates:
         if len(selected) >= max_lines:
             break
-        if total_chars + len(item) > max_chars:
+        visible_len = _visible_markdown_len(item, rewritten_links=rewritten_links)
+        if total_chars + visible_len > max_chars:
             break
         selected.append(item)
-        total_chars += len(item)
+        total_chars += visible_len
     return selected
 
 
@@ -1006,6 +1628,7 @@ def format_notify_message(
     verdict_word: str | None = None,
     final_text: str | None = None,
     thread_id: str | None = None,
+    workspace_id: str | None = None,
     frontend_base_url: str | None = None,
     max_summary_chars: int = MAX_CARD_SECTION_CHARS,
     title_override: str | None = None,
@@ -1022,19 +1645,22 @@ def format_notify_message(
     if cleaned_word:
         lines.append(f"结论：{cleaned_word}")
 
-    summary_lines = extract_summary_lines(
-        final_text,
-        min_lines=3,
-        max_lines=6,
-        max_chars=max_summary_chars,
-    )
-    lines.extend(summary_lines)
-
     resolved_base = (
         get_dalton_frontend_url()
         if frontend_base_url is None
         else str(frontend_base_url).strip().rstrip("/")
     )
+    summary_lines = extract_summary_lines(
+        final_text,
+        min_lines=3,
+        max_lines=6,
+        max_chars=max_summary_chars,
+        thread_id=thread_id,
+        workspace_id=workspace_id,
+        public_base=frontend_base_url,
+    )
+    lines.extend(summary_lines)
+
     cleaned_tid = (thread_id or "").strip()
     if resolved_base and cleaned_tid:
         lines.append(f"{resolved_base}/chat/t/{cleaned_tid}")
@@ -1075,6 +1701,9 @@ def extract_card_sections(
     max_summary_chars: int = MAX_CARD_SECTION_CHARS,
     max_total_chars: int = MAX_CARD_TOTAL_BODY_CHARS,
     is_excerpt: bool = False,
+    thread_id: str | None = None,
+    workspace_id: str | None = None,
+    public_base: str | None = None,
 ) -> list[tuple[str, str]]:
     """Extract structured ``(section_title, section_body)`` pairs for Feishu Card 2.0 body."""
     _ = classification
@@ -1086,7 +1715,14 @@ def extract_card_sections(
     ):
         return []
 
-    cleaned_text = _strip_non_http_markdown_links(str(final_text).strip())
+    rewritten_text, rewritten_links = _rewrite_workspace_links_for_external_with_links(
+        str(final_text).strip(),
+        public_base=public_base,
+        thread_id=thread_id,
+        workspace_id=workspace_id,
+        fallback_mode="label",
+    )
+    cleaned_text = _strip_non_http_markdown_links(rewritten_text)
     raw_lines = cleaned_text.splitlines()
     while raw_lines and not raw_lines[-1].strip():
         raw_lines.pop()
@@ -1133,10 +1769,16 @@ def extract_card_sections(
         if remaining <= 0:
             break
         sec_cap = min(max_summary_chars, remaining)
-        truncated = _truncate_section_body(sec_lines, max_chars=sec_cap)
+        truncated = _truncate_section_body(
+            sec_lines,
+            max_chars=sec_cap,
+            rewritten_links=rewritten_links,
+        )
         if truncated:
             result.append((key, truncated))
-            total_used += len(truncated)
+            total_used += _visible_markdown_len(
+                truncated, rewritten_links=rewritten_links
+            )
     return result
 
 
@@ -1146,6 +1788,7 @@ def build_feishu_notify_card(
     verdict_word: str | None = None,
     final_text: str | None = None,
     thread_id: str | None = None,
+    workspace_id: str | None = None,
     frontend_base_url: str | None = None,
     timestamp_str: str | None = None,
     max_summary_chars: int = MAX_CARD_SECTION_CHARS,
@@ -1194,6 +1837,9 @@ def build_feishu_notify_card(
         max_summary_chars=max_summary_chars,
         max_total_chars=max_total_chars,
         is_excerpt=is_excerpt,
+        thread_id=thread_id,
+        workspace_id=workspace_id,
+        public_base=frontend_base_url,
     )
     elements: list[dict[str, Any]] = []
     for sec_title, sec_body in sections:
@@ -5409,6 +6055,7 @@ async def on_automation_settled(
             verdict_word=verdict_word or None,
             final_text=final_text,
             thread_id=thread_id,
+            workspace_id=ws_id_notify or None,
             frontend_base_url=resolved_frontend_url,
             title_override=payoff_title_override,
         )
@@ -5417,6 +6064,7 @@ async def on_automation_settled(
             verdict_word=verdict_word or None,
             final_text=final_text,
             thread_id=thread_id,
+            workspace_id=ws_id_notify or None,
             frontend_base_url=resolved_frontend_url,
             title_override=payoff_title_override,
         )
@@ -5434,6 +6082,8 @@ async def on_automation_settled(
         }
         if thread_id and str(thread_id).strip():
             base_payload_record["thread_id"] = str(thread_id).strip()
+        if ws_id_notify:
+            base_payload_record["workspace_id"] = ws_id_notify
         eff_unit_id = clean_stamped_unit_id or active_unit_id
         if eff_unit_id:
             base_payload_record["coverage_unit_id"] = eff_unit_id

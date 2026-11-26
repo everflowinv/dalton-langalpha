@@ -65,6 +65,13 @@ export interface SendTextChunkOptions {
   chunkIndex: number;
   totalChunks: number;
   replyToMessageId?: string | null;
+  /** Feishu: reply in topic (`reply_in_thread: true`) for bot-owned group topics. */
+  replyInThread?: boolean;
+  /** Existing platform topic/thread ID (`omt_xxx` on Feishu, thread channel ID on Discord). */
+  externalTopicId?: string | null;
+  /** Optional public web base URL & thread ID for fallback notices when original message was deleted. */
+  webBaseUrl?: string | null;
+  threadId?: string | null;
   newThread?: boolean;
   threadScopeKey?: string | null;
   /**
@@ -96,6 +103,8 @@ export interface SendTextChunkOptions {
 export interface SendTextChunkResult {
   messageId: string;
   resolvedAddress?: string;
+  /** Platform topic/thread ID discovered or created when sending this chunk (e.g. Feishu `omt_xxx`, Discord thread channel ID). */
+  externalTopicId?: string | null;
 }
 
 export interface SendFileOptions {
@@ -108,6 +117,12 @@ export interface SendFileOptions {
   threadScopeKey?: string | null;
   deliveryKey?: string | null;
   deliveryAttempt?: number;
+  /**
+   * Called immediately before dispatching the platform file message (for Feishu:
+   * after media upload and before `im.message.create`/`reply`) to re-verify that
+   * the pinned DM recipient binding is still active.
+   */
+  verifyRecipientBeforeSend?: () => Promise<void>;
   weixinContextToken?: string | null;
   inboundMessageId?: string | null;
   /** Authoritative Weixin preflight credentials before CDN upload. */
@@ -393,6 +408,17 @@ export interface ChannelAdapter {
   /** Optional Weixin iLink multi-account & QR login methods (§3.1 ~ §3.5). */
   setBackendClient?(client: BackendClient): void;
   setLeaseManager?(lease: GatewayLeaseManager): void;
+  /**
+   * Record a newly confirmed bot-owned group topic in the adapter's in-memory
+   * topic cache (and clear any negative cache entry for the same topic).
+   */
+  recordBotTopic?(info: {
+    chatAddress: string;
+    externalTopicId: string;
+    canonicalScopeKey: string;
+    initiatorPlatformUserId: string;
+    rootMessageId?: string | null;
+  }): void;
   /**
    * Loads and applies the initial managed account snapshot BEFORE the gateway lifts
    * startup write gating and before long-polling starts (R4 #5).

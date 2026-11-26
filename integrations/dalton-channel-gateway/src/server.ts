@@ -216,9 +216,8 @@ export function createGatewayApp(options: {
     );
   }
 
-  const wxInitial = adapters.get("weixin");
-  if (wxInitial?.setBackendClient) {
-    wxInitial.setBackendClient(backend);
+  for (const adapter of adapters.values()) {
+    adapter.setBackendClient?.(backend);
   }
 
   const onWeixinAccountRotated = (info: {
@@ -347,7 +346,7 @@ export function createGatewayApp(options: {
     backend.setOnStaleGatewayEpoch?.((err) => {
       leaseManager.notifyLeaseLost("backend_409_stale_epoch", err);
     });
-    wxInitial?.setLeaseManager?.(leaseManager);
+    adapters.get("weixin")?.setLeaseManager?.(leaseManager);
   }
 
   const server = createServer(async (req, res) => {

@@ -457,6 +457,10 @@ ALLOWED_HOOKS=(
   # Preserve server-written dalton_historical_duplicate_of marker in
   # SERVER_OWNED_CONFIG_KEYS across whole-config replacements (workspace.py).
   "historical-duplicate-marker"
+  # Channel phase 2 batch 1: record actual written bytes SHA-256 and verified
+  # FileStamp for DM turn deliverables across Write/Edit, run finalization,
+  # run_end SSE frame, and /messages/replay.
+  "channel-deliverables"
   # Collapse Antigravity model variants into series + reasoning-effort pickers
   # across UI selectors while preserving suffixed model IDs on the wire.
   "antigravity-series"

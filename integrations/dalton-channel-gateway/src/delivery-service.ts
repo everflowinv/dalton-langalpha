@@ -3,6 +3,7 @@ import { basename } from "node:path";
 import {
   type BackendClient,
   BackendHttpError,
+  type BotTopicRegistrationPayload,
   type DeliveryActivityOrigin,
   type I6AuthorizeAndClaimRequest,
   type I6AuthorizeAndClaimResponse,
@@ -18,7 +19,10 @@ import {
   extractSafeLogErrorFields,
   sanitizeLogErrorCode,
 } from "./shared/logger.js";
-import { rewriteSandboxLinks } from "./shared/sandbox-links.js";
+import {
+  buildWorkspaceFileDeepLinkLine,
+  rewriteSandboxLinks,
+} from "./shared/sandbox-links.js";
 import {
   type AgentSendFileOutcome,
   type AgentSendFileRef,
@@ -118,6 +122,7 @@ export interface ExecuteDeliveryOptions {
   kind: "agent_send" | "fallback" | "interrupt" | "automation" | "notice";
   userId?: string | null;
   threadId?: string | null;
+  workspaceId?: string | null;
   runId?: string | null;
   executionId?: string | null;
   automationExecutionId?: string | null;
@@ -126,6 +131,10 @@ export interface ExecuteDeliveryOptions {
   inboundMessageId?: string | null;
   text: string;
   files?: AgentSendFileRef[];
+  /** `"deliverable"` downloads via `/internal/deliverables/download` and applies DM deliverable dedupe/link fallback. */
+  downloadMode?: "workspace" | "deliverable";
+  /** When true (DM auto-attach deliverables), version mismatch / 404 / oversize falls back to a web login deep link. */
+  linkFallbackOnDeliverableMismatch?: boolean;
   replyToMessageId?: string | null;
   newThread?: boolean;
   threadScopeKey?: string | null;
@@ -445,7 +454,12 @@ export class DeliveryService {
     }
 
     const outboundText = hasNonEmptyText
-      ? rewriteSandboxLinks(rawText, this.webBaseUrl, options.threadId)
+      ? rewriteSandboxLinks(
+          rawText,
+          this.webBaseUrl,
+          options.threadId,
+          options.workspaceId ?? null,
+        )
       : rawText;
     const hasOutboundText = outboundText.trim().length > 0;
 
@@ -646,7 +660,147 @@ export class DeliveryService {
       return failResp;
     }
 
-    const chunks = hasOutboundText ? adapter.splitTextChunks(outboundText) : [];
+    const isDmTarget = targetAddress.endsWith(":@me");
+    const fileOutcomes: AgentSendFileOutcome[] = [];
+    let filesToSend: AgentSendFileRef[] = [...files];
+    const extraLinkLines: string[] = [];
+
+    // Lead Decision #7: Group targets (including explicit `send_message(files=...)`) NEVER upload binary files;
+    // after I-6 authorizes the delivery, convert every file into a sign-in-protected web deep link.
+    if (!isDmTarget && filesToSend.length > 0) {
+      for (const fileRef of filesToSend) {
+        const wsId =
+          fileRef.workspace_id || claim.home_workspace_id || options.workspaceId || null;
+        extraLinkLines.push(
+          buildWorkspaceFileDeepLinkLine(
+            basename(fileRef.path) || fileRef.path,
+            fileRef.path,
+            this.webBaseUrl,
+            options.threadId,
+            wsId,
+          ),
+        );
+        fileOutcomes.push({
+          path: fileRef.path,
+          workspace_id: wsId,
+          status: "linked",
+          reason: "group_target_deep_link",
+        });
+      }
+      filesToSend = [];
+    }
+
+    // Lead Decisions #6 & #7 (DM auto-attach deliverables):
+    // 1. Deduplicate against `claim.prior_run_files` across the run's `is_current=TRUE` deliveries:
+    //    - `sent` / `linked` -> skip (already delivered)
+    //    - `pending` / `unknown` -> never re-send binary; emit web login deep link only
+    // 2. If DM deliverable delivery lacks a pinned original DM recipient (`claim.dm_recipient_platform_user_id`),
+    //    e.g. a background run with no originating DM inbound row -> emit web login deep links only (no binary upload).
+    if (isDmTarget && options.downloadMode === "deliverable" && filesToSend.length > 0) {
+      const priorByKey = new Map<string, string>();
+      for (const prior of claim.prior_run_files ?? []) {
+        const normPath = prior.path.trim().replace(/^\/+/, "");
+        const wsKey = (prior.workspace_id ?? "").trim();
+        const status = (prior.status ?? "").trim().toLowerCase();
+        if (!normPath || !status) continue;
+        priorByKey.set(`${wsKey}::${normPath}`, status);
+        priorByKey.set(`::${normPath}`, status);
+      }
+
+      const pinnedDmRecipient = (claim.dm_recipient_platform_user_id ?? "").trim();
+      const nextFilesToSend: AgentSendFileRef[] = [];
+      for (const fileRef of filesToSend) {
+        const wsId =
+          fileRef.workspace_id || claim.home_workspace_id || options.workspaceId || "";
+        const normPath = fileRef.path.trim().replace(/^\/+/, "");
+        const priorStatus =
+          priorByKey.get(`${wsId}::${normPath}`) ??
+          priorByKey.get(`::${normPath}`);
+        if (priorStatus === "sent" || priorStatus === "linked") {
+          continue;
+        }
+        if (priorStatus === "pending" || priorStatus === "unknown") {
+          extraLinkLines.push(
+            buildWorkspaceFileDeepLinkLine(
+              basename(fileRef.path) || fileRef.path,
+              fileRef.path,
+              this.webBaseUrl,
+              options.threadId,
+              wsId || null,
+            ),
+          );
+          fileOutcomes.push({
+            path: fileRef.path,
+            workspace_id: wsId || null,
+            status: "linked",
+            reason: "prior_pending_or_unknown_link_only",
+          });
+          continue;
+        }
+        if (!pinnedDmRecipient) {
+          extraLinkLines.push(
+            buildWorkspaceFileDeepLinkLine(
+              basename(fileRef.path) || fileRef.path,
+              fileRef.path,
+              this.webBaseUrl,
+              options.threadId,
+              wsId || null,
+            ),
+          );
+          fileOutcomes.push({
+            path: fileRef.path,
+            workspace_id: wsId || null,
+            status: "linked",
+            reason: "missing_dm_recipient_link_only",
+          });
+          continue;
+        }
+        nextFilesToSend.push(fileRef);
+      }
+      filesToSend = nextFilesToSend;
+    }
+
+    const effectiveOutboundText =
+      extraLinkLines.length > 0
+        ? hasOutboundText
+          ? `${outboundText}\n\n${extraLinkLines.join("\n")}`
+          : extraLinkLines.join("\n")
+        : outboundText;
+    const hasEffectiveOutboundText = effectiveOutboundText.trim().length > 0;
+
+    // If all deliverable files were already satisfied by prior deliveries and there is no text to send,
+    // settle cleanly as `sent` without dispatching anything duplicate.
+    if (!hasEffectiveOutboundText && filesToSend.length === 0) {
+      const noopResp: AgentSendResponse = {
+        status: "sent",
+        code: null,
+        address: targetAddress,
+        current: isCurrent,
+        duplicate: false,
+        message: `No additional content or files needed for ${targetAddress}.`,
+        files: fileOutcomes.map(({ path, status, reason }) => ({
+          path,
+          status,
+          reason,
+        })),
+      };
+      await recordProgress({
+        delivery_key: options.deliveryKey,
+        sent_chunks: 0,
+        total_chunks: 0,
+        platform_message_ids: [],
+        files_status: fileOutcomes,
+        first_response_json: noopResp as unknown as Record<string, unknown>,
+        status: "sent",
+        error_code: null,
+        error_message: null,
+      });
+      return noopResp;
+    }
+
+    const chunks = hasEffectiveOutboundText
+      ? adapter.splitTextChunks(effectiveOutboundText)
+      : [];
     const totalChunks = chunks.length;
     if (totalChunks !== preliminaryChunks.length) {
       await recordProgress({
@@ -656,12 +810,18 @@ export class DeliveryService {
     }
 
     // `claim.recipient_id` already carries the platform recipient ID from `I-6`.
+    // For DM deliveries, prefer `claim.dm_recipient_platform_user_id` when present (Lead Decision #6).
     // Only fall back to `I-4` lookup (with Dalton `user_id`) if `claim.recipient_id` was omitted on a DM.
     let recipientPlatformUserId: string | null =
-      claim.recipient_id && claim.recipient_id.trim().length > 0
+      (isDmTarget &&
+        claim.dm_recipient_platform_user_id &&
+        claim.dm_recipient_platform_user_id.trim().length > 0
+        ? claim.dm_recipient_platform_user_id.trim()
+        : null) ??
+      (claim.recipient_id && claim.recipient_id.trim().length > 0
         ? claim.recipient_id.trim()
-        : null;
-    if (!recipientPlatformUserId && targetAddress.endsWith(":@me") && daltonUserId) {
+        : null);
+    if (!recipientPlatformUserId && isDmTarget && daltonUserId) {
       try {
         const state = await this.backend.getChannelState({
           user_id: daltonUserId,
@@ -673,6 +833,62 @@ export class DeliveryService {
         // Proceed with targetAddress if lookup fails
       }
     }
+
+    // Lead Decisions #1 & #3: Bot-owned group topic creation & routing.
+    const isTopicScope = Boolean(
+      effectiveThreadScopeKey && effectiveThreadScopeKey.includes(":topic:"),
+    );
+    const isGroupTopicTarget =
+      !isDmTarget &&
+      isCurrent &&
+      isTopicScope &&
+      (platformStr === "feishu" || platformStr === "discord");
+    let currentExternalTopicId = (claim.external_topic_id ?? "").trim() || null;
+    const verifiedRootMessageId =
+      (claim.root_message_id ?? "").trim() ||
+      (options.replyToMessageId ?? "").trim() ||
+      null;
+    let firstReplyMessageId = (claim.first_reply_message_id ?? "").trim() || null;
+    const topicCanonicalScopeKey =
+      (claim.topic_canonical_scope_key ?? effectiveThreadScopeKey ?? "").trim() ||
+      null;
+    const topicInitiatorPlatformUserId =
+      (claim.topic_initiator_platform_user_id ?? "").trim() || null;
+    const buildTopicRegistration = (
+      extTopicId: string,
+      firstReplyId?: string | null,
+    ): BotTopicRegistrationPayload | null => {
+      if (!isGroupTopicTarget || !extTopicId || !topicCanonicalScopeKey) {
+        return null;
+      }
+      return {
+        platform: platformStr,
+        chat_address: targetAddress,
+        canonical_scope_key: topicCanonicalScopeKey,
+        external_topic_id: extTopicId,
+        root_message_id: verifiedRootMessageId,
+        first_reply_message_id: firstReplyId ?? firstReplyMessageId ?? null,
+        initiator_platform_user_id: topicInitiatorPlatformUserId,
+        initiator_dalton_user_id: daltonUserId || null,
+      };
+    };
+    const recordAdapterTopicCache = (extTopicId: string): void => {
+      if (
+        !isGroupTopicTarget ||
+        !extTopicId ||
+        !topicCanonicalScopeKey ||
+        !topicInitiatorPlatformUserId
+      ) {
+        return;
+      }
+      adapter.recordBotTopic?.({
+        chatAddress: targetAddress,
+        externalTopicId: extTopicId,
+        canonicalScopeKey: topicCanonicalScopeKey,
+        initiatorPlatformUserId: topicInitiatorPlatformUserId,
+        rootMessageId: verifiedRootMessageId,
+      });
+    };
 
     const platformMessageIds: string[] = [];
     let sentChunks = 0;
@@ -765,26 +981,54 @@ export class DeliveryService {
               effectiveRecipientId = weixinPreflight.recipient_id;
             }
 
+            const shouldCreateGroupTopic =
+              isGroupTopicTarget && !currentExternalTopicId;
             const creatingDiscordThread =
               i === 0 &&
               platformStr === "discord" &&
-              options.newThread === true &&
-              !reuseConfirmedThread;
+              (options.newThread === true || shouldCreateGroupTopic) &&
+              !reuseConfirmedThread &&
+              !currentExternalTopicId;
             if (i === 0 && reuseConfirmedThread) {
               await this.authorizeDiscordBodyDispatch(
                 options.deliveryKey,
                 deliveryAttempt,
               );
             }
+            const feishuReplyInThread =
+              platformStr === "feishu" && isGroupTopicTarget;
+            const chunkReplyToMessageId =
+              platformStr === "feishu" && isGroupTopicTarget
+                ? currentExternalTopicId
+                  ? (firstReplyMessageId ?? verifiedRootMessageId)
+                  : i === 0
+                    ? verifiedRootMessageId
+                    : (firstReplyMessageId ?? verifiedRootMessageId)
+                : i === 0
+                  ? (shouldCreateGroupTopic
+                      ? verifiedRootMessageId
+                      : options.replyToMessageId)
+                  : null;
             return adapter.sendTextChunk({
               targetAddress: finalAddress,
               recipientPlatformUserId: effectiveRecipientId,
               text: chunkText,
               chunkIndex: i,
               totalChunks,
-              replyToMessageId: i === 0 ? options.replyToMessageId : null,
+              replyToMessageId: chunkReplyToMessageId,
+              replyInThread: feishuReplyInThread,
+              externalTopicId:
+                platformStr === "discord" && isGroupTopicTarget
+                  ? currentExternalTopicId
+                  : null,
+              webBaseUrl: this.webBaseUrl,
+              threadId: options.threadId ?? null,
               newThread:
-                i === 0 ? Boolean(options.newThread) && !reuseConfirmedThread : false,
+                i === 0
+                  ? (Boolean(options.newThread) || shouldCreateGroupTopic) &&
+                    !reuseConfirmedThread &&
+                    !currentExternalTopicId
+                  : false,
               threadScopeKey: effectiveThreadScopeKey,
               deliveryKey: options.deliveryKey,
               deliveryAttempt: effectiveWeixinAttempt,
@@ -798,11 +1042,23 @@ export class DeliveryService {
                 i === 0 && reuseConfirmedThread ? confirmedThreadAddress : null,
               onConfirmedThread: creatingDiscordThread
                 ? async (confirmed) => {
+                    const threadMatch = /:thread:([^:]+)$/.exec(
+                      confirmed.address,
+                    );
+                    const confirmedTopicId = threadMatch?.[1]?.trim() || null;
+                    const topicReg = confirmedTopicId
+                      ? buildTopicRegistration(confirmedTopicId, null)
+                      : null;
                     await this.storeConfirmedDiscordThread(
                       options.deliveryKey,
                       confirmed.address,
                       deliveryAttempt,
+                      topicReg,
                     );
+                    if (confirmedTopicId) {
+                      currentExternalTopicId = confirmedTopicId;
+                      recordAdapterTopicCache(confirmedTopicId);
+                    }
                     finalAddress = confirmed.address;
                     await this.authorizeDiscordBodyDispatch(
                       options.deliveryKey,
@@ -815,8 +1071,25 @@ export class DeliveryService {
         );
         sentChunks += 1;
         platformMessageIds.push(res.messageId);
+        if (i === 0 && !firstReplyMessageId) {
+          firstReplyMessageId = res.messageId;
+        }
         if (res.resolvedAddress) {
           finalAddress = res.resolvedAddress;
+        }
+        let feishuTopicReg: BotTopicRegistrationPayload | null = null;
+        if (
+          platformStr === "feishu" &&
+          isGroupTopicTarget &&
+          !currentExternalTopicId &&
+          res.externalTopicId
+        ) {
+          currentExternalTopicId = res.externalTopicId;
+          feishuTopicReg = buildTopicRegistration(
+            res.externalTopicId,
+            firstReplyMessageId ?? res.messageId,
+          );
+          recordAdapterTopicCache(res.externalTopicId);
         }
         maybeNotifyFirstCurrentDelivery();
         await recordProgress({
@@ -824,6 +1097,7 @@ export class DeliveryService {
           sent_chunks: sentChunks,
           total_chunks: totalChunks,
           platform_message_ids: [...platformMessageIds],
+          ...(feishuTopicReg ? { bot_topic_registration: feishuTopicReg } : {}),
         });
       } catch (err) {
         if (isStaleGatewayEpochError(err) || this.leaseLost) {
@@ -856,23 +1130,122 @@ export class DeliveryService {
     }
 
     // Process files if text chunks did not fail before any progress
-    const fileOutcomes: AgentSendFileOutcome[] = [];
     let totalDownloadedBytes = 0;
-    let anyFileSucceeded = false;
+    let anyFileSucceeded = fileOutcomes.some((f) => f.status === "linked" || f.status === "sent");
     let anyFileFailed = false;
     let fileUnknownError: string | null = null;
     let fileFailureCode: AgentSendResponse["code"] = null;
     let fileFailureDenyCode: string | undefined;
     let fileFailureErrorDetail: string | undefined;
 
+    const verifyDmRecipientNow = async (): Promise<void> => {
+      if (
+        !isDmTarget ||
+        (platformStr !== "feishu" && platformStr !== "discord") ||
+        typeof this.backend.verifyDmDeliveryRecipient !== "function"
+      ) {
+        return;
+      }
+      const verified = await this.backend.verifyDmDeliveryRecipient(
+        options.deliveryKey,
+        deliveryAttempt,
+      );
+      if (!verified.ok) {
+        throw new ChannelDeliveryError(
+          verified.message ?? "DM recipient binding changed or was revoked.",
+          {
+            outcome: "failed",
+            code: "not_allowed",
+            denyCode: verified.code ?? "dm_recipient_revoked",
+          },
+        );
+      }
+    };
+
+    const sendDeliverableLinkFallback = async (
+      fileRef: AgentSendFileRef,
+      wsId: string,
+      reason: string,
+      fallbackChunkIdx: number,
+    ): Promise<boolean> => {
+      const linkLine = buildWorkspaceFileDeepLinkLine(
+        basename(fileRef.path) || fileRef.path,
+        fileRef.path,
+        this.webBaseUrl,
+        options.threadId,
+        wsId || null,
+      );
+      try {
+        await verifyDmRecipientNow();
+        const linkRes = await runWithWeixinSignal(
+          claim.weixin_account_id ?? null,
+          async ({ signal, attachAccount }) => {
+            let weixinPreflight: WeixinPreflightAuthorizedData | null = null;
+            let weixinContextToken: string | null =
+              claim.weixin_context_token ?? null;
+            let effectiveRecipientId = recipientPlatformUserId;
+            if (platformStr === "weixin") {
+              weixinPreflight = await this.runWeixinPreflight(
+                options.deliveryKey,
+                effectiveWeixinAttempt,
+                fallbackChunkIdx,
+                weixinPreflightBudget!,
+                signal,
+                claim.weixin_account_id ?? null,
+              );
+              attachAccount(weixinPreflight.account_id);
+              weixinContextToken = weixinPreflight.weixin_context_token;
+              effectiveRecipientId = weixinPreflight.recipient_id;
+            }
+            return adapter.sendTextChunk({
+              targetAddress: finalAddress,
+              recipientPlatformUserId: effectiveRecipientId,
+              text: linkLine,
+              chunkIndex: fallbackChunkIdx,
+              totalChunks: Math.max(totalChunks, 1),
+              threadScopeKey: effectiveThreadScopeKey,
+              deliveryKey: options.deliveryKey,
+              deliveryAttempt: effectiveWeixinAttempt,
+              weixinPreflight,
+              weixinAccountId:
+                weixinPreflight?.account_id ?? claim.weixin_account_id ?? null,
+              weixinContextToken,
+              inboundMessageId: options.inboundMessageId ?? null,
+              signal,
+            });
+          },
+        );
+        platformMessageIds.push(linkRes.messageId);
+        anyFileSucceeded = true;
+        fileOutcomes.push({
+          path: fileRef.path,
+          workspace_id: wsId || null,
+          status: "linked",
+          reason,
+        });
+        await recordProgress({
+          delivery_key: options.deliveryKey,
+          sent_chunks: sentChunks,
+          total_chunks: totalChunks,
+          platform_message_ids: [...platformMessageIds],
+          files_status: [...fileOutcomes],
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
     if (!chunkFailure) {
-      for (let fileIdx = 0; fileIdx < files.length; fileIdx += 1) {
-        const fileRef = files[fileIdx]!;
-        const wsId = fileRef.workspace_id || claim.home_workspace_id || "";
+      for (let fileIdx = 0; fileIdx < filesToSend.length; fileIdx += 1) {
+        const fileRef = filesToSend[fileIdx]!;
+        const wsId =
+          fileRef.workspace_id || claim.home_workspace_id || options.workspaceId || "";
         if (!wsId) {
           anyFileFailed = true;
           fileOutcomes.push({
             path: fileRef.path,
+            workspace_id: null,
             status: "failed",
             reason: "Missing workspace_id for file attachment",
           });
@@ -880,16 +1253,54 @@ export class DeliveryService {
         }
         let downloaded: { content: Buffer; mimeType: string };
         try {
-          // Always pass Dalton user UUID (`daltonUserId`) as `X-User-Id` (`PROTOCOL.md` §8)
-          downloaded = await this.backend.downloadWorkspaceFile(
-            daltonUserId,
-            wsId,
-            fileRef.path,
-          );
+          if (
+            options.downloadMode === "deliverable" &&
+            typeof this.backend.downloadVerifiedDeliverable === "function"
+          ) {
+            const verifiedDl = await this.backend.downloadVerifiedDeliverable({
+              deliveryKey: options.deliveryKey,
+              deliveryAttempt,
+              workspaceId: wsId,
+              path: fileRef.path,
+            });
+            downloaded = {
+              content: verifiedDl.content,
+              mimeType: verifiedDl.mimeType,
+            };
+          } else {
+            // Always pass Dalton user UUID (`daltonUserId`) as `X-User-Id` (`PROTOCOL.md` §8)
+            downloaded = await this.backend.downloadWorkspaceFile(
+              daltonUserId,
+              wsId,
+              fileRef.path,
+            );
+          }
         } catch (err) {
+          const isVersionOrMissing =
+            err instanceof BackendHttpError &&
+            (err.status === 409 || err.status === 404);
+          const isSizeExceeded =
+            err instanceof Error && err.name === "SafeFetchError";
+          if (
+            options.linkFallbackOnDeliverableMismatch &&
+            (isVersionOrMissing || isSizeExceeded)
+          ) {
+            const linked = await sendDeliverableLinkFallback(
+              fileRef,
+              wsId,
+              isSizeExceeded
+                ? "deliverable_size_exceeded_link_fallback"
+                : "deliverable_version_mismatch_link_fallback",
+              chunks.length + fileIdx,
+            );
+            if (linked) {
+              continue;
+            }
+          }
           anyFileFailed = true;
           fileOutcomes.push({
             path: fileRef.path,
+            workspace_id: wsId,
             status: "failed",
             reason: err instanceof Error ? err.message : "Failed to download file from workspace",
           });
@@ -898,18 +1309,38 @@ export class DeliveryService {
 
         const byteLen = downloaded.content.byteLength;
         if (byteLen > MAX_ATTACHMENT_BYTES) {
+          if (options.linkFallbackOnDeliverableMismatch) {
+            const linked = await sendDeliverableLinkFallback(
+              fileRef,
+              wsId,
+              "deliverable_size_exceeded_link_fallback",
+              chunks.length + fileIdx,
+            );
+            if (linked) continue;
+          }
           anyFileFailed = true;
           fileOutcomes.push({
             path: fileRef.path,
+            workspace_id: wsId,
             status: "failed",
             reason: "File exceeds 20 MB limit",
           });
           continue;
         }
         if (totalDownloadedBytes + byteLen > MAX_TOTAL_ATTACHMENT_BYTES) {
+          if (options.linkFallbackOnDeliverableMismatch) {
+            const linked = await sendDeliverableLinkFallback(
+              fileRef,
+              wsId,
+              "deliverable_total_size_exceeded_link_fallback",
+              chunks.length + fileIdx,
+            );
+            if (linked) continue;
+          }
           anyFileFailed = true;
           fileOutcomes.push({
             path: fileRef.path,
+            workspace_id: wsId,
             status: "failed",
             reason: "Total attachments exceed 50 MB limit",
           });
@@ -918,6 +1349,29 @@ export class DeliveryService {
         totalDownloadedBytes += byteLen;
 
         try {
+          // Lead Decision #6: Re-verify pinned DM recipient before uploading/sending file.
+          await verifyDmRecipientNow();
+
+          // Lead Decision #7 / Codex r6 #6: Persist `pending` entry BEFORE platform send
+          // so a crash after platform receipt leaves `pending` (link-only on recovery, never duplicate upload).
+          if (isDmTarget) {
+            await recordProgress({
+              delivery_key: options.deliveryKey,
+              sent_chunks: sentChunks,
+              total_chunks: totalChunks,
+              platform_message_ids: [...platformMessageIds],
+              files_status: [
+                ...fileOutcomes,
+                {
+                  path: fileRef.path,
+                  workspace_id: wsId,
+                  status: "pending",
+                  reason: null,
+                },
+              ],
+            });
+          }
+
           const fileChunkIndex = chunks.length + fileIdx;
           const sendRes = await runWithWeixinSignal(
             claim.weixin_account_id ?? null,
@@ -961,6 +1415,11 @@ export class DeliveryService {
                 threadScopeKey: effectiveThreadScopeKey,
                 deliveryKey: options.deliveryKey,
                 deliveryAttempt: effectiveWeixinAttempt,
+                verifyRecipientBeforeSend:
+                  isDmTarget &&
+                  (platformStr === "feishu" || platformStr === "discord")
+                    ? () => verifyDmRecipientNow()
+                    : undefined,
                 weixinPreflight,
                 weixinAccountId:
                   weixinPreflight?.account_id ?? claim.weixin_account_id ?? null,
@@ -995,6 +1454,7 @@ export class DeliveryService {
           }
           fileOutcomes.push({
             path: fileRef.path,
+            workspace_id: wsId,
             status: sendRes.status,
             reason: sendRes.reason ?? null,
           });
@@ -1039,16 +1499,18 @@ export class DeliveryService {
           }
           fileOutcomes.push({
             path: fileRef.path,
+            workspace_id: wsId,
             status: fileEntryStatus,
             reason: err instanceof Error ? err.message : String(err),
           });
         }
       }
-    } else if (files.length > 0) {
-      for (const fileRef of files) {
+    } else if (filesToSend.length > 0) {
+      for (const fileRef of filesToSend) {
         anyFileFailed = true;
         fileOutcomes.push({
           path: fileRef.path,
+          workspace_id: fileRef.workspace_id || null,
           status: "failed",
           reason: "Skipped because earlier message chunk failed",
         });
@@ -1117,7 +1579,11 @@ export class DeliveryService {
       current: isCurrent,
       duplicate: false,
       message: finalMessage,
-      files: fileOutcomes,
+      files: fileOutcomes.map(({ path, status, reason }) => ({
+        path,
+        status,
+        reason,
+      })),
     };
 
     const recordedErrorCode =
@@ -1447,6 +1913,7 @@ export class DeliveryService {
     deliveryKey: string,
     address: string,
     deliveryAttempt?: number,
+    botTopicRegistration?: BotTopicRegistrationPayload | null,
   ): Promise<void> {
     let stored = false;
     try {
@@ -1456,6 +1923,9 @@ export class DeliveryService {
           confirmed_thread_address: address,
           ...(typeof deliveryAttempt === "number"
             ? { delivery_attempt: deliveryAttempt }
+            : {}),
+          ...(botTopicRegistration
+            ? { bot_topic_registration: botTopicRegistration }
             : {}),
         },
         { platform: "discord" },

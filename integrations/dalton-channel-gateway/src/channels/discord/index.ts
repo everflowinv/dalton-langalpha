@@ -4,6 +4,7 @@
  * (see `THIRD_PARTY_NOTICES.md` for per-file source ranges).
  */
 
+import type { BackendClient } from "../../backend-client.js";
 import { createMemoryDedupe, type MemoryDedupeGuard } from "../../shared/dedupe.js";
 import { createSequentialQueue, type SequentialQueue } from "../../shared/keyed-queue.js";
 import { createSubsystemLogger, type SubsystemLogger } from "../../shared/logger.js";
@@ -193,6 +194,14 @@ export class DiscordChannelAdapter implements ChannelAdapter {
   private lifecycleEpoch = 0;
   private startPromise: Promise<void> | null = null;
   private lifecycleAbortController = new AbortController();
+  private backendClient?: BackendClient;
+  private readonly positiveTopicCache = new Map<
+    string,
+    { chatAddress: string; canonicalScopeKey: string; initiatorPlatformUserId: string }
+  >();
+  private readonly negativeTopicCache = new Map<string, number>();
+  private static readonly MAX_TOPIC_CACHE_ENTRIES = 2_000;
+  private static readonly NEGATIVE_TOPIC_TTL_MS = 5 * 60 * 1000;
 
   constructor(private readonly options: DiscordChannelAdapterOptions = {}) {
     this.botToken = options.botToken?.trim() ?? "";
@@ -229,6 +238,45 @@ export class DiscordChannelAdapter implements ChannelAdapter {
   getApplicationId(): string | undefined { return this.verifiedApplicationId; }
   getConfiguredApplicationId(): string | undefined { return this.applicationId; }
   getVerifiedApplicationId(): string | undefined { return this.verifiedApplicationId; }
+
+  setBackendClient(client: BackendClient): void {
+    this.backendClient = client;
+  }
+
+  recordBotTopic(info: {
+    chatAddress: string;
+    externalTopicId: string;
+    canonicalScopeKey: string;
+    initiatorPlatformUserId: string;
+    rootMessageId?: string | null;
+  }): void {
+    const topicId = info.externalTopicId.trim();
+    const chatAddress = info.chatAddress.trim();
+    if (!topicId || !chatAddress) return;
+    this.negativeTopicCache.delete(topicId);
+    this.positiveTopicCache.delete(topicId);
+    if (this.positiveTopicCache.size >= DiscordChannelAdapter.MAX_TOPIC_CACHE_ENTRIES) {
+      const oldest = this.positiveTopicCache.keys().next().value;
+      if (oldest !== undefined) this.positiveTopicCache.delete(oldest);
+    }
+    this.positiveTopicCache.set(topicId, {
+      chatAddress,
+      canonicalScopeKey: info.canonicalScopeKey.trim(),
+      initiatorPlatformUserId: info.initiatorPlatformUserId.trim(),
+    });
+  }
+
+  private setNegativeTopicCache(topicId: string): void {
+    this.negativeTopicCache.delete(topicId);
+    if (this.negativeTopicCache.size >= DiscordChannelAdapter.MAX_TOPIC_CACHE_ENTRIES) {
+      const oldest = this.negativeTopicCache.keys().next().value;
+      if (oldest !== undefined) this.negativeTopicCache.delete(oldest);
+    }
+    this.negativeTopicCache.set(
+      topicId,
+      this.nowFn() + DiscordChannelAdapter.NEGATIVE_TOPIC_TTL_MS,
+    );
+  }
 
   private getRest(): RequestClient {
     if (this.restInstance) return this.restInstance;
@@ -827,12 +875,84 @@ export class DiscordChannelAdapter implements ChannelAdapter {
         }
       }
 
-      if (guildId && !isBotMentioned(message, this.botUserId)) {
-        return;
-      }
-
+      const mentioned = Boolean(guildId && isBotMentioned(message, this.botUserId));
+      let followupCanonicalScopeKey: string | null = null;
       let ctx = this.channelCache.get(channelId);
       const hintThread = Boolean(message.thread?.id && message.thread.id === channelId);
+
+      if (guildId && !mentioned) {
+        // Fast path: check positive topic cache by thread channel id first.
+        const pos = this.positiveTopicCache.get(channelId);
+        if (pos) {
+          if (pos.initiatorPlatformUserId !== authorId) {
+            return;
+          }
+          followupCanonicalScopeKey = pos.canonicalScopeKey;
+        } else {
+          const isKnownThread = Boolean(
+            (ctx && isDiscordThreadChannelType(ctx.type)) || hintThread,
+          );
+          if (!isKnownThread) {
+            // Unmentioned message in a regular guild channel (or unknown non-thread): drop in memory.
+            return;
+          }
+          const negExp = this.negativeTopicCache.get(channelId);
+          if (negExp !== undefined) {
+            if (negExp > this.nowFn()) {
+              return;
+            }
+            this.negativeTopicCache.delete(channelId);
+          }
+          const parentIdForLookup =
+            ctx?.parentId ??
+            (typeof message.thread?.parent_id === "string"
+              ? message.thread.parent_id.trim()
+              : undefined);
+          if (!parentIdForLookup || !this.backendClient?.lookupBotTopic) {
+            return;
+          }
+          const parentChatAddress = `discord:${guildId}/${parentIdForLookup}`;
+          try {
+            const lookup = await this.backendClient.lookupBotTopic({
+              platform: "discord",
+              chat_address: parentChatAddress,
+              external_topic_id: channelId,
+              purpose: "inbound_followup",
+            });
+            if (
+              lookup.found &&
+              lookup.status === "confirmed" &&
+              lookup.canonical_scope_key &&
+              lookup.initiator_platform_user_id
+            ) {
+              this.recordBotTopic({
+                chatAddress: parentChatAddress,
+                externalTopicId: channelId,
+                canonicalScopeKey: lookup.canonical_scope_key,
+                initiatorPlatformUserId: lookup.initiator_platform_user_id,
+                rootMessageId: lookup.root_message_id ?? null,
+              });
+              if (lookup.initiator_platform_user_id !== authorId) {
+                return;
+              }
+              followupCanonicalScopeKey = lookup.canonical_scope_key;
+            } else {
+              if (!lookup.found) {
+                this.setNegativeTopicCache(channelId);
+              }
+              return;
+            }
+          } catch (err) {
+            this.logger.warn("Discord bot topic lookup failed; dropping unmentioned thread message", {
+              channelId,
+              parentChatAddress,
+              error: err,
+            });
+            return;
+          }
+        }
+      }
+
       const needsChannelLookup =
         Boolean(guildId) &&
         (!ctx || ((isDiscordThreadChannelType(ctx.type) || hintThread) && !ctx.parentId));
@@ -886,6 +1006,11 @@ export class DiscordChannelAdapter implements ChannelAdapter {
         channelContext: ctx,
       });
       if (!parsed) return;
+      if (followupCanonicalScopeKey) {
+        parsed.threadScopeKey = followupCanonicalScopeKey;
+        parsed.isGroupTrigger = true;
+        parsed.externalTopicId = channelId;
+      }
       if (parsed.chatType === "group" && !parsed.isGroupTrigger) return;
 
       try {
@@ -1139,13 +1264,20 @@ export class DiscordChannelAdapter implements ChannelAdapter {
       replyToMessageId: options.replyToMessageId,
       newThread: options.newThread,
       threadScopeKey: options.threadScopeKey,
+      externalTopicId: options.externalTopicId,
+      webBaseUrl: options.webBaseUrl,
+      threadId: options.threadId,
       deliveryKey: options.deliveryKey,
       botUserId: this.botUserId,
       confirmedThreadAddress: options.confirmedThreadAddress,
       onConfirmedThread: options.onConfirmedThread,
       resolveDmChannelId: (id) => this.resolveDmChannelId(id),
     });
-    return { messageId: res.messageId, resolvedAddress: res.resolvedAddress };
+    return {
+      messageId: res.messageId,
+      resolvedAddress: res.resolvedAddress,
+      ...(res.externalTopicId ? { externalTopicId: res.externalTopicId } : {}),
+    };
   }
 
   async sendFile(options: SendFileOptions): Promise<SendFileResult> {
@@ -1157,6 +1289,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
       mimeType: options.mimeType,
       threadScopeKey: options.threadScopeKey,
       resolveDmChannelId: (id) => this.resolveDmChannelId(id),
+      verifyRecipientBeforeSend: options.verifyRecipientBeforeSend,
     });
     return { messageId: res.messageId, status: "sent", reason: null };
   }
