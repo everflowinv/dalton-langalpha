@@ -168,8 +168,8 @@ export function docStatesEqual(a: HtmlFrameDocState, b: HtmlFrameDocState): bool
 /** What the document's bridge reports, as the viewer reads it. */
 export type PageToViewer =
   /** The bridge is listening; `path` is the workspace file the document is, which a link can change. */
-  // DALTON-HOOK(mobile-web): classify page:ready location as path / root / invalid / unrecognized
-  | { type: 'page:ready'; path: string | null; pathState: PageReadyPathState }
+  // DALTON-HOOK(mobile-web): classify page:ready location as path / root / invalid / unrecognized with docId and optional rootProof
+  | { type: 'page:ready'; path: string | null; pathState: PageReadyPathState; docId?: string; rootProof?: string }
   /** The colour the document paints behind itself, null for none. */
   | { type: 'page:ground'; color: string | null }
   | { type: 'page:scroll'; x: number; y: number; moving: boolean }
@@ -213,7 +213,7 @@ export type PageToViewer =
    */
   | { type: 'page:frame-loads'; doc: string }
   /** DALTON-HOOK(mobile-web): liveness echo confirming the loaded document is still bridged. */
-  | { type: 'page:pong'; seq: number }
+  | { type: 'page:pong'; seq: number; docId?: string }
   /** DALTON-HOOK(monitors): cross-monitor /monitors/* link clicked inside a sandboxed monitor frame. */
   | { type: 'page:navigate-monitor'; path: string };
 
@@ -438,6 +438,8 @@ function click<K extends 'page:pick' | 'page:area'>(type: K, anchor: typeof pick
 
 // DALTON-HOOK(mobile-web): validate raw page:ready own properties before Zod strips optional keys
 const pageReadyVersion = z.optional(z.number());
+const DOC_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const ROOT_PROOF_RE = /^[A-Za-z0-9_-]{16,128}$/;
 
 function parsePageReady(raw: Record<string, unknown>): Extract<PageToViewer, { type: 'page:ready' }> | null {
   if (raw.type !== 'page:ready') return null;
@@ -447,33 +449,60 @@ function parsePageReady(raw: Record<string, unknown>): Extract<PageToViewer, { t
   const hasPath = hasOwn('path');
   const hasRoot = hasOwn('root');
   const hasInvalidPath = hasOwn('invalidPath');
+  const hasDocId = hasOwn('docId');
+  const hasRootProof = hasOwn('rootProof');
 
-  // Step 1: reject non-boolean root/invalidPath, explicit invalidPath: true, or multiple location own properties
+  let parsedDocId: string | undefined;
+  if (hasDocId) {
+    if (typeof raw.docId !== 'string' || !DOC_ID_RE.test(raw.docId)) {
+      return { type: 'page:ready', path: null, pathState: 'invalid' };
+    }
+    parsedDocId = raw.docId;
+  }
+
+  let parsedRootProof: string | undefined;
+  if (hasRootProof) {
+    if (typeof raw.rootProof !== 'string' || !ROOT_PROOF_RE.test(raw.rootProof)) {
+      return { type: 'page:ready', path: null, pathState: 'invalid' };
+    }
+    parsedRootProof = raw.rootProof;
+  }
+
+  const docMeta = parsedDocId !== undefined ? { docId: parsedDocId } : {};
+
+  // Step 1: reject non-boolean root/invalidPath, explicit invalidPath: true, rootProof without root: true, or multiple location own properties
   const locationKeyCount = Number(hasPath) + Number(hasRoot) + Number(hasInvalidPath);
   if (
     (hasRoot && typeof raw.root !== 'boolean') ||
     (hasInvalidPath && typeof raw.invalidPath !== 'boolean') ||
     raw.invalidPath === true ||
-    locationKeyCount > 1
+    locationKeyCount > 1 ||
+    (hasRootProof && !(hasRoot && raw.root === true))
   ) {
-    return { type: 'page:ready', path: null, pathState: 'invalid' };
+    return { type: 'page:ready', path: null, pathState: 'invalid', ...docMeta };
   }
 
   // Step 2: only `path` own property present -> strict docPath validation (no lenient wrapper)
   if (hasPath) {
     const parsed = docPath.safeParse(raw.path);
     return parsed.success
-      ? { type: 'page:ready', path: parsed.data, pathState: 'path' }
-      : { type: 'page:ready', path: null, pathState: 'invalid' };
+      ? { type: 'page:ready', path: parsed.data, pathState: 'path', ...docMeta }
+      : { type: 'page:ready', path: null, pathState: 'invalid', ...docMeta };
   }
 
   // Step 3: only `root: true` own property present -> confirmed pathless version root
   if (hasRoot && raw.root === true) {
-    return { type: 'page:ready', path: null, pathState: 'root' };
+    return {
+      type: 'page:ready',
+      path: null,
+      pathState: 'root',
+      ...docMeta,
+      ...(parsedRootProof !== undefined ? { rootProof: parsedRootProof } : {}),
+    };
   }
 
   // Step 4: missing path and root !== true / invalidPath !== true -> unrecognized
-  return { type: 'page:ready', path: null, pathState: 'unrecognized' };
+  return { type: 'page:ready', path: null, pathState: 'unrecognized', ...docMeta };
 }
 
 /** One per type: a nested union where a type's message can also say `clear`. */
@@ -562,8 +591,15 @@ const pageToViewer = z.discriminatedUnion('type', [
   ),
   z.object({ type: z.literal('page:key'), key: z.enum(['Escape', 'c']) }),
   z.object({ type: z.literal('page:pointer-in') }),
-  // DALTON-HOOK(mobile-web): liveness echo confirming the loaded document is still bridged
-  z.object({ type: z.literal('page:pong'), seq: z.int().check(z.gte(1)) }),
+  // DALTON-HOOK(mobile-web): liveness echo confirming the loaded document is still bridged (carries matching docId)
+  z.pipe(
+    z.object({
+      type: z.literal('page:pong'),
+      seq: z.int().check(z.gte(1)),
+      docId: z.optional(z.string().check(z.regex(DOC_ID_RE))),
+    }),
+    z.transform((m) => (m.docId !== undefined ? { type: m.type, seq: m.seq, docId: m.docId } : { type: m.type, seq: m.seq })),
+  ),
   // DALTON-HOOK(monitors): cross-monitor navigation requested from sandboxed monitor frame
   z.object({
     type: z.literal('page:navigate-monitor'),
@@ -574,10 +610,10 @@ const pageToViewer = z.discriminatedUnion('type', [
 
 // DALTON-HOOK(mobile-web): tri-state wire union for page:ready (validated on raw own properties in parsePageReady)
 export type PageReadyWire =
-  | { type: 'page:ready'; v?: number; path: string }
-  | { type: 'page:ready'; v?: number; root: true }
-  | { type: 'page:ready'; v?: number; invalidPath: true }
-  | { type: 'page:ready'; v?: number };
+  | { type: 'page:ready'; v?: number; docId?: string; path: string }
+  | { type: 'page:ready'; v?: number; docId?: string; root: true; rootProof?: string }
+  | { type: 'page:ready'; v?: number; docId?: string; invalidPath: true }
+  | { type: 'page:ready'; v?: number; docId?: string };
 
 /**
  * What the bridge sends, as it sends it. Every message also carries `v`, the

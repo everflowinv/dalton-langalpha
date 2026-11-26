@@ -15,6 +15,21 @@
 
 var VERSION = 1;
 var viewer = window.parent;
+// DALTON-HOOK(mobile-web): per-document identifier echoed on both page:ready and page:pong,
+// plus optional server-signed root proof read and stripped before page scripts run.
+var DOC_ID = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+  ? crypto.randomUUID()
+  : ('d_' + Math.random().toString(36).slice(2) + '_' + Date.now().toString(36));
+/** @type {string | null} */
+var rootProof = null;
+(function () {
+  if (!document.querySelector) return;
+  var meta = document.querySelector('meta[name="dalton-root-proof"]');
+  if (!meta) return;
+  var value = meta.getAttribute('content');
+  if (typeof value === 'string' && /^[A-Za-z0-9_-]{16,128}$/.test(value)) rootProof = value;
+  if (meta.parentNode) meta.parentNode.removeChild(meta);
+})();
 
 // The viewer's origin, learned from its first message. A page cannot know
 // it in advance: the app can be served from any origin.
@@ -27,14 +42,16 @@ function hello() {
   // answers with its first message, whose origin every later message is
   // addressed to. The path tells the viewer whose comments these are after
   // a link in the document took the frame to another file.
-  // DALTON-HOOK(mobile-web): report tri-state docLocation (path / root / invalidPath) on page:ready.
+  // DALTON-HOOK(mobile-web): report tri-state docLocation (path / root / invalidPath), docId, and optional rootProof on page:ready.
   var loc = docLocation();
   /** @type {PageToViewerWire} */
   var message = loc.kind === 'path'
-    ? { type: 'page:ready', v: VERSION, path: loc.path }
+    ? { type: 'page:ready', v: VERSION, docId: DOC_ID, path: loc.path }
     : loc.kind === 'root'
-      ? { type: 'page:ready', v: VERSION, root: true }
-      : { type: 'page:ready', v: VERSION, invalidPath: true };
+      ? (rootProof
+          ? { type: 'page:ready', v: VERSION, docId: DOC_ID, root: true, rootProof: rootProof }
+          : { type: 'page:ready', v: VERSION, docId: DOC_ID, root: true })
+      : { type: 'page:ready', v: VERSION, docId: DOC_ID, invalidPath: true };
   viewer.postMessage(message, '*');
 }
 
@@ -440,7 +457,7 @@ listen('page:monitor-grant', function (data) {
 // DALTON-HOOK(mobile-web): confirm the same bridged document owns the frame after load completes.
 listen('page:ping', function (data) {
   if (!data || typeof data.seq !== 'number' || !isFinite(data.seq)) return;
-  send({ type: 'page:pong', seq: data.seq });
+  send({ type: 'page:pong', seq: data.seq, docId: DOC_ID });
 });
 
 // A window the document has no tie to is not heard, by this bridge or the

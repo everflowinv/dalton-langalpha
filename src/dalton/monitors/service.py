@@ -34,10 +34,13 @@ from src.dalton.monitors.data_job_registry import (
     get_registered_monitor_bindings,
 )
 from src.dalton.monitors.grants import (
+    ROOT_NONCE_RE,
     MonitorGrantError,
+    compute_public_root_proof,
     data_prefix,
     frame_prefix,
     mint_monitor_grant,
+    mint_public_root_challenge,
     verify_monitor_grant,
 )
 from src.dalton.monitors.models import (
@@ -327,6 +330,9 @@ async def get_public_monitor_detail(slug: str) -> dict[str, Any]:
         serialized.pop(internal_key, None)
     serialized["owner_email"] = None
     serialized["member_user_ids"] = []
+    root_nonce, root_proof = await mint_public_root_challenge(
+        monitor.slug, monitor.published_seq or 1
+    )
     return {
         "monitor": serialized,
         "versions": [],
@@ -334,6 +340,8 @@ async def get_public_monitor_detail(slug: str) -> dict[str, Any]:
         "frame_base": f"/api/v1/dalton/monitors/public/{monitor.slug}/",
         "data_base": f"/api/v1/dalton/monitors/public/{monitor.slug}/data",
         "expires_in": 0,
+        "root_nonce": root_nonce,
+        "root_proof": root_proof,
     }
 
 
@@ -1381,6 +1389,7 @@ async def _serve_monitor_version_file(
     *,
     if_none_match: str | None = None,
     head: bool = False,
+    root_proof: str | None = None,
 ) -> ServedArtifactFile:
     if not await monitor_db.is_monitor_version_published(monitor.monitor_id, seq):
         raise HTTPException(status_code=404, detail="File not found")
@@ -1392,7 +1401,12 @@ async def _serve_monitor_version_file(
     content_type = _content_type(stored.content_type)
     bridged = _is_html(content_type) and _charset_is_utf8(content_type)
     bridge = bridge_for("view")
-    etag = f"{stored.sha256}-{bridge.digest}" if bridged else stored.sha256
+    proof_tag = (
+        f"-{hashlib.sha256(root_proof.encode('ascii')).hexdigest()[:12]}"
+        if bridged and root_proof
+        else ""
+    )
+    etag = f"{stored.sha256}-{bridge.digest}{proof_tag}" if bridged else stored.sha256
     headers = _headers(
         content_type,
         etag,
@@ -1416,7 +1430,7 @@ async def _serve_monitor_version_file(
             raise ArtifactFileUnavailable(str(exc)) from exc
 
     if bridged:
-        body = await asyncio.to_thread(with_bridge, body, bridge)
+        body = await asyncio.to_thread(with_bridge, body, bridge, root_proof=root_proof)
     headers.append(("content-length", str(len(body))))
     return ServedArtifactFile(body=body, headers=headers)
 
@@ -1451,6 +1465,7 @@ async def serve_public_monitor_file(
     *,
     if_none_match: str | None = None,
     head: bool = False,
+    root_nonce: str | None = None,
 ) -> ServedArtifactFile:
     """Anonymously serve the current published version file when ``visibility == 'public'``."""
     monitor = await monitor_db.get_monitor_by_slug(slug)
@@ -1466,6 +1481,10 @@ async def serve_public_monitor_file(
         or not _valid_path(target_path)
     ):
         raise HTTPException(status_code=404, detail="File not found")
+    # Only the pathless version root entry (path == "") may receive a server-signed root proof.
+    root_proof: str | None = None
+    if not path and root_nonce and ROOT_NONCE_RE.fullmatch(root_nonce):
+        root_proof = await compute_public_root_proof(monitor.slug, int(seq), root_nonce)
     try:
         return await _serve_monitor_version_file(
             monitor,
@@ -1473,6 +1492,7 @@ async def serve_public_monitor_file(
             target_path,
             if_none_match=if_none_match,
             head=head,
+            root_proof=root_proof,
         )
     except HTTPException as exc:
         entry_dir = posixpath.dirname(monitor.entry_path or "")

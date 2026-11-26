@@ -1994,7 +1994,7 @@ describe('the page bridge classifies docLocation into path, root, or invalidPath
       ['https://page-x.example.com/v/3/reports/q1..q2%20summary.html', 'reports/q1..q2 summary.html'],
     ];
     for (const [url, expectedPath] of cases) {
-      expect(readyFor(url)).toEqual({ type: 'page:ready', v: 1, path: expectedPath });
+      expect(readyFor(url)).toEqual({ type: 'page:ready', v: 1, docId: expect.any(String), path: expectedPath });
     }
   });
 
@@ -2010,10 +2010,60 @@ describe('the page bridge classifies docLocation into path, root, or invalidPath
     ];
     for (const url of roots) {
       const msg = readyFor(url);
-      expect(msg).toEqual({ type: 'page:ready', v: 1, root: true });
+      expect(msg).toEqual({ type: 'page:ready', v: 1, docId: expect.any(String), root: true });
       expect(Object.prototype.hasOwnProperty.call(msg, 'path')).toBe(false);
       expect(Object.prototype.hasOwnProperty.call(msg, 'invalidPath')).toBe(false);
     }
+  });
+
+  it('reads and strips dalton-root-proof meta into rootProof on pathless version roots only', () => {
+    const proof = 'signed_root_proof_token_123456';
+    const rootSent: Record<string, unknown>[] = [];
+    const rootViewer = { postMessage: (message: unknown) => rootSent.push(JSON.parse(JSON.stringify(message))) };
+    const { window: rootWin } = new JSDOM(
+      `<!doctype html><html><head><meta name="dalton-root-proof" content="${proof}"><script>${BRIDGE}</script></head><body></body></html>`,
+      {
+        url: 'https://api.example.com/api/v1/dalton/monitors/public/public-market-pulse/v/4/?root_nonce=nonce-12345678901234',
+        runScripts: 'dangerously',
+        pretendToBeVisual: true,
+        beforeParse(win) {
+          Object.defineProperty(win, 'parent', { value: rootViewer, configurable: true });
+        },
+      },
+    );
+    open.push(rootWin);
+    expect(rootSent.find((m) => m.type === 'page:ready')).toEqual({
+      type: 'page:ready',
+      v: 1,
+      docId: expect.any(String),
+      root: true,
+      rootProof: proof,
+    });
+    expect(rootWin.document.querySelector('meta[name="dalton-root-proof"]')).toBeNull();
+
+    // A non-root path page must never attach rootProof to page:ready.
+    const pathSent: Record<string, unknown>[] = [];
+    const pathViewer = { postMessage: (message: unknown) => pathSent.push(JSON.parse(JSON.stringify(message))) };
+    const { window: pathWin } = new JSDOM(
+      `<!doctype html><html><head><meta name="dalton-root-proof" content="${proof}"><script>${BRIDGE}</script></head><body></body></html>`,
+      {
+        url: 'https://api.example.com/api/v1/dalton/monitors/public/public-market-pulse/v/4/other.html',
+        runScripts: 'dangerously',
+        pretendToBeVisual: true,
+        beforeParse(win) {
+          Object.defineProperty(win, 'parent', { value: pathViewer, configurable: true });
+        },
+      },
+    );
+    open.push(pathWin);
+    const pathReady = pathSent.find((m) => m.type === 'page:ready');
+    expect(pathReady).toEqual({
+      type: 'page:ready',
+      v: 1,
+      docId: expect.any(String),
+      path: 'other.html',
+    });
+    expect(Object.prototype.hasOwnProperty.call(pathReady, 'rootProof')).toBe(false);
   });
 
   it('sends invalidPath: true for traversal, backslashes, control chars, bad encoding, overlong paths, and unrecognized prefixes', () => {
@@ -2039,16 +2089,18 @@ describe('the page bridge classifies docLocation into path, root, or invalidPath
     ];
     for (const url of invalidUrls) {
       const msg = readyFor(url);
-      expect(msg).toEqual({ type: 'page:ready', v: 1, invalidPath: true });
+      expect(msg).toEqual({ type: 'page:ready', v: 1, docId: expect.any(String), invalidPath: true });
       expect(Object.prototype.hasOwnProperty.call(msg, 'path')).toBe(false);
       expect(Object.prototype.hasOwnProperty.call(msg, 'root')).toBe(false);
     }
   });
 
-  it('echoes page:ping with page:pong carrying the matching sequence number', () => {
+  it('echoes page:ping with page:pong carrying the matching sequence number and docId from page:ready', () => {
     const page = served('https://api.example.com/api/v1/public/shared/tok-1/files/serve/reports/a.html?inject=view');
+    const ready = page.sent.find((m) => m.type === 'page:ready') as { docId?: string };
+    expect(typeof ready.docId).toBe('string');
     page.from(page.viewer, { type: 'page:ping', seq: 7 });
-    expect(page.of('page:pong')).toEqual([{ type: 'page:pong', v: 1, seq: 7 }]);
+    expect(page.of('page:pong')).toEqual([{ type: 'page:pong', v: 1, seq: 7, docId: ready.docId }]);
 
     page.from(page.viewer, { type: 'page:ping', seq: 'not-a-number' });
     page.from(page.viewer, { type: 'page:ping', seq: Number.NaN });

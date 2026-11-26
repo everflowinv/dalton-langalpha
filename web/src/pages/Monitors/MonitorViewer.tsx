@@ -70,6 +70,8 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     dataBase: string;
     expiresIn: number;
     receivedAt: number;
+    rootNonce?: string;
+    rootProof?: string;
   } | null>(null);
   const [copied, setCopied] = useState(false);
 
@@ -86,6 +88,8 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
       dataBase: detail.data_base,
       expiresIn: detail.expires_in,
       receivedAt: Date.now(),
+      rootNonce: detail.root_nonce,
+      rootProof: detail.root_proof,
     });
   }, [detail]);
 
@@ -128,10 +132,15 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     const prefix = versionPrefix(activeGrant.frameBase, effectiveSeq);
     if (!effectiveEntryPath) {
       if (!publicMode) return null;
+      const rootUrl = `${prefix.replace(/\/+$/, '')}/`;
+      const src = activeGrant.rootNonce
+        ? `${rootUrl}?root_nonce=${encodeURIComponent(activeGrant.rootNonce)}`
+        : rootUrl;
       return {
         key: `${monitor.monitor_id}:v${effectiveSeq}`,
-        src: `${prefix.replace(/\/+$/, '')}/`,
+        src,
         sandbox: SERVED_HTML_SANDBOX,
+        rootProof: activeGrant.rootProof ?? null,
       };
     }
     return {

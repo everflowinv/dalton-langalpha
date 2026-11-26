@@ -90,6 +90,26 @@ describe('parsePageMessage', () => {
 
     // Invalid version field drops the message whole.
     expect(parsePageMessage({ type: 'page:ready', v: '1', path: 'a.html' })).toBeNull();
+
+    // Valid docId and rootProof on page:ready.
+    expect(read('page:ready', { docId: 'doc-1', path: 'reports/a.html' })).toEqual({
+      type: 'page:ready',
+      path: 'reports/a.html',
+      pathState: 'path',
+      docId: 'doc-1',
+    });
+    expect(read('page:ready', { docId: 'doc-root', root: true, rootProof: 'proof_token_1234567890' })).toEqual({
+      type: 'page:ready',
+      path: null,
+      pathState: 'root',
+      docId: 'doc-root',
+      rootProof: 'proof_token_1234567890',
+    });
+    // Invalid docId or rootProof without root: true -> invalid.
+    expect(read('page:ready', { docId: '', path: 'a.html' })).toEqual({ type: 'page:ready', path: null, pathState: 'invalid' });
+    expect(read('page:ready', { docId: 'bad space', path: 'a.html' })).toEqual({ type: 'page:ready', path: null, pathState: 'invalid' });
+    expect(read('page:ready', { path: 'a.html', rootProof: 'proof_token_1234567890' })).toEqual({ type: 'page:ready', path: null, pathState: 'invalid' });
+    expect(read('page:ready', { root: true, rootProof: 'short' })).toEqual({ type: 'page:ready', path: null, pathState: 'invalid' });
   });
 
   // DALTON-HOOK(mobile-web): docPath rejects backslashes and traversal in page:loads too
@@ -341,11 +361,14 @@ describe('page:key', () => {
 
 // DALTON-HOOK(mobile-web): verify page:pong liveness response parsing
 describe('page:pong', () => {
-  it('accepts positive integer sequence numbers and rejects invalid values', () => {
+  it('accepts positive integer sequence numbers with optional docId and rejects invalid values', () => {
     expect(read('page:pong', { seq: 1 })).toEqual({ type: 'page:pong', seq: 1 });
-    expect(read('page:pong', { seq: 42 })).toEqual({ type: 'page:pong', seq: 42 });
+    expect(read('page:pong', { seq: 42, docId: 'doc-42' })).toEqual({ type: 'page:pong', seq: 42, docId: 'doc-42' });
     for (const seq of [0, -1, 1.5, '3', null, undefined]) {
       expect(read('page:pong', { seq })).toBeNull();
+    }
+    for (const docId of ['', 'bad space', 123, null]) {
+      expect(read('page:pong', { seq: 1, docId })).toBeNull();
     }
   });
 });

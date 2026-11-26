@@ -12,6 +12,8 @@ export interface FramedDoc {
   /** The origin its messages arrive from (`messageOrigin`). */
   origin: string;
   sandbox: string;
+  // DALTON-HOOK(mobile-web): optional server-signed root proof pinned per host-initiated root navigation
+  rootProof?: string | null;
 }
 
 /** What is known of the document loading, each a fact that stays once true. */

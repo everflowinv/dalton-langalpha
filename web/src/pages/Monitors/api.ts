@@ -62,6 +62,8 @@ export interface MonitorDetail {
   frame_base: string;
   data_base: string;
   expires_in: number;
+  root_nonce?: string;
+  root_proof?: string;
   cut?: boolean;
   auto_publish_paused?: boolean;
   auto_publish_pause_token?: string | null;

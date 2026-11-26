@@ -5,24 +5,26 @@
  *      location.href navigation without ?inject=view falling into unbridged (hiding all
  *      file actions and "Open in new tab"), verified on desktop (1280px) and mobile (390px)
  *      using the real page bridge scripts.
- *   2. Logged-in external member preview (/chat/t/:threadId) executing the same A -> B -> C
- *      -> open C in own tab -> scripted location.href unbridged flow on desktop & mobile.
+ *   2. Logged-in external member preview (/chat/t/:threadId) on a Dalton build
+ *      (VITE_DALTON_UI=true, automatically spawned on a worker-local Vite dev server
+ *      when not already active): waits for GET /api/v1/dalton/credentials/status to return
+ *      caller_tier: 'external', verifies external-member UI restrictions (ShareButton hidden,
+ *      read-only ?inject=view preview without comment controls), and runs A -> B -> C ->
+ *      open C in own tab -> scripted location.href unbridged on desktop & mobile.
  *   3. Pathless public monitor (/m/:slug -> /api/v1/dalton/monitors/public/:slug/v/:seq/)
- *      entering bridged_root and keeping primary topbar actions on desktop & mobile.
+ *      with server-signed root proof entering bridged_root and keeping primary topbar actions
+ *      on desktop & mobile, plus opaque-sandbox redirect failing closed to unbridged.
  *   4. Misconfigured Dalton frontend (VITE_DALTON_AUTH intentionally unset) connected to a
  *      REAL core/local backend: waits for an unmocked HTTP 401 from
  *      GET /api/v1/dalton/credentials/status, then verifies Publish, Share, Audience
- *      modification, and Copy link controls all fail closed.
+ *      modification (fieldset + radio with organization audience enabled), and Copy link
+ *      controls all fail closed while keeping Unshare / Stop sharing available.
  *
  * Run outside sandbox via Playwright:
  *
- *   # Suites 1-3 (Playwright built-in dev server + mock SSE server):
+ *   # Suites 1-3 (Playwright built-in dev server + worker-local Dalton server for Suite 2 + mock SSE server):
  *   cd web && env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
  *     npx playwright test e2e/external-member-perms-b3.spec.js
- *
- *   # Suite 2 with Dalton identity active (optional, activates real useCallerIdentity external tier):
- *   cd web && env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
- *     VITE_DALTON_UI=true npx playwright test e2e/external-member-perms-b3.spec.js
  *
  *   # Suite 4 (real core/local backend 401 verification):
  *   # Prerequisites:
@@ -38,7 +40,10 @@
  *     E2E_DALTON_REAL_FRONTEND_URL=http://127.0.0.1:5178 \
  *     npx playwright test e2e/external-member-perms-b3.spec.js
  */
+import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import http from 'node:http';
+import net from 'node:net';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test as baseTest } from '@playwright/test';
@@ -46,6 +51,7 @@ import { test, expect, mockAPI, configureSSE, resetMockServer } from './fixtures
 import { sampleWorkspace, sampleThread, sseEvents, defaultResponses } from './helpers/mockResponses.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const WEB_DIR = resolve(HERE, '..');
 const BRIDGE_DIR = resolve(HERE, '../../src/server/preview_proxy/bridge');
 const VIEW_BRIDGE_PARTS = ['opaque', 'core', 'links', 'loads', 'requests'];
 const VIEW_BRIDGE_SCRIPT = [
@@ -57,12 +63,100 @@ const VIEW_BRIDGE_SCRIPT = [
 const SHARE_TOKEN = 'b3-share-tok';
 const THREAD_ID = 'b0000003-0000-4000-8000-000000000003';
 const WS_ID = 'a0000003-0000-4000-8000-000000000003';
+const APP_API_PORT = Number(process.env.E2E_MOCK_PORT) || 4100;
 const REAL_DALTON_FRONTEND_URL = (process.env.E2E_DALTON_REAL_FRONTEND_URL || '').replace(/\/+$/, '');
 
-function wrapHtml(title, body, injectBridge) {
+function wrapHtml(title, body, injectBridge, headExtra = '') {
   const script = injectBridge ? `<script>${VIEW_BRIDGE_SCRIPT}</script>` : '';
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>${script}</head><body>${body}</body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>${headExtra}${script}</head><body>${body}</body></html>`;
 }
+
+async function findFreePort() {
+  return new Promise((resolvePort, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.on('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      const port = typeof addr === 'object' && addr ? addr.port : 0;
+      server.close((err) => (err ? reject(err) : resolvePort(port)));
+    });
+  });
+}
+
+async function waitForHttpReady(url, child, stderrChunks, timeoutMs = 45000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) {
+      throw new Error(`Dalton Vite dev server exited early (${child.exitCode}): ${stderrChunks.join('')}`);
+    }
+    const ok = await new Promise((resolveOk) => {
+      const req = http.get(url, (res) => {
+        res.resume();
+        resolveOk(res.statusCode !== undefined && res.statusCode < 500);
+      });
+      req.on('error', () => resolveOk(false));
+      req.setTimeout(1000, () => {
+        req.destroy();
+        resolveOk(false);
+      });
+    });
+    if (ok) return;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error(`Timed out waiting for Dalton Vite dev server at ${url}: ${stderrChunks.join('')}`);
+}
+
+const daltonTest = test.extend({
+  daltonOrigin: [
+    // eslint-disable-next-line no-empty-pattern
+    async ({}, provide) => {
+      if (/^(true|1|yes|on)$/i.test((process.env.VITE_DALTON_UI || '').trim())) {
+        await provide('');
+        return;
+      }
+      const port = await findFreePort();
+      const origin = `http://127.0.0.1:${port}`;
+      const stderrChunks = [];
+      const env = { ...process.env };
+      for (const key of ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY']) {
+        delete env[key];
+      }
+      env.VITE_HOST_MODE = 'oss';
+      env.VITE_DALTON_UI = 'true';
+      env.VITE_SUPABASE_URL = '';
+      env.VITE_SUPABASE_PUBLISHABLE_KEY = '';
+      env.VITE_API_BASE_URL = `http://127.0.0.1:${APP_API_PORT}`;
+
+      const viteBin = resolve(WEB_DIR, 'node_modules/vite/bin/vite.js');
+      const child = spawn(process.execPath, [viteBin, '--port', String(port), '--strictPort'], {
+        cwd: WEB_DIR,
+        env,
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      child.stderr?.on('data', (chunk) => stderrChunks.push(String(chunk)));
+      try {
+        await waitForHttpReady(origin, child, stderrChunks);
+        await provide(origin);
+      } finally {
+        if (child.exitCode === null) {
+          child.kill('SIGTERM');
+          await new Promise((r) => {
+            const timer = setTimeout(() => {
+              if (child.exitCode === null) child.kill('SIGKILL');
+              r();
+            }, 3000);
+            child.once('exit', () => {
+              clearTimeout(timer);
+              r();
+            });
+          });
+        }
+      }
+    },
+    { scope: 'worker' },
+  ],
+});
 
 function serveReportHtml(url, hasBridge) {
   if (url.pathname.endsWith('/reports/a.html')) {
@@ -82,7 +176,7 @@ function serveReportHtml(url, hasBridge) {
   return wrapHtml('Raw Unbridged', '<h1>Unbridged Page</h1>', hasBridge);
 }
 
-function makeArtifactRecord(filePath, { shared = false } = {}) {
+function makeArtifactRecord(filePath, { shared = false, audiences = ['public', 'organization'] } = {}) {
   const name = filePath.split('/').pop() || filePath;
   const suffix = name.replace(/[^a-z0-9]/gi, '').slice(0, 6) || 'doc';
   return {
@@ -93,6 +187,8 @@ function makeArtifactRecord(filePath, { shared = false } = {}) {
     path: filePath,
     name,
     shared,
+    audience: 'public',
+    audiences,
     shared_at: shared ? '2026-11-25T00:00:00Z' : null,
     shared_seq: shared ? 1 : null,
     keep_updated: false,
@@ -308,9 +404,11 @@ async function setupExternalMemberReportRoutes(page) {
     delay: 10,
   });
 
+  const servedInjectModes = [];
   await page.route('**/api/v1/wsfiles/g/ext-grant/**', async (route) => {
     const url = new URL(route.request().url());
     const inject = url.searchParams.get('inject');
+    servedInjectModes.push({ path: url.pathname, inject });
     const hasBridge = inject === 'view' || inject === 'comments';
     await route.fulfill({
       status: 200,
@@ -318,6 +416,7 @@ async function setupExternalMemberReportRoutes(page) {
       body: serveReportHtml(url, hasBridge),
     });
   });
+  return { servedInjectModes };
 }
 
 async function verifyRelativeLinksNewTabAndUnbridged(page, mode, { expectPublish = false } = {}) {
@@ -405,16 +504,18 @@ async function verifyRelativeLinksNewTabAndUnbridged(page, mode, { expectPublish
   }
 }
 
-test.beforeEach(async () => {
-  await resetMockServer();
-});
-
-for (const mode of [
+const VIEWPORT_MODES = [
   { name: 'desktop (1280px)', viewport: { width: 1280, height: 800 }, isMobile: false },
   { name: 'mobile (390px)', viewport: { width: 390, height: 844 }, isMobile: true },
-]) {
+];
+
+for (const mode of VIEWPORT_MODES) {
   test.describe(`Preview bridge doc state machine on ${mode.name}`, () => {
     test.use({ viewport: mode.viewport, isMobile: mode.isMobile, hasTouch: mode.isMobile });
+
+    test.beforeEach(async () => {
+      await resetMockServer();
+    });
 
     test('shared chat: expands reports/, navigates A -> B -> C, opens C in own tab, and hides all actions on scripted unbridged nav', async ({ page }) => {
       await setupSharedReportRoutes(page);
@@ -423,15 +524,10 @@ for (const mode of [
       await verifyRelativeLinksNewTabAndUnbridged(page, mode, { expectPublish: false });
     });
 
-    test('logged-in external member preview: expands reports/, navigates A -> B -> C, opens C in own tab, and hides all actions on scripted unbridged nav', async ({ page }) => {
-      await setupExternalMemberReportRoutes(page);
-      await page.goto(`/chat/t/${THREAD_ID}`);
-      await openReportAFromTree(page);
-      await verifyRelativeLinksNewTabAndUnbridged(page, mode, { expectPublish: true });
-    });
-
-    test('pathless public monitor enters bridged_root and keeps primary topbar actions', async ({ page }) => {
+    test('pathless public monitor with server root proof enters bridged_root and keeps primary topbar actions', async ({ page }) => {
       const slug = 'public-root-pulse';
+      const rootNonce = 'e2e-public-root-nonce-123456';
+      const rootProof = 'e2e_public_root_proof_abcdef123456';
       await mockAPI(page, {
         [`GET /dalton/monitors/public/${slug}`]: {
           monitor: {
@@ -459,14 +555,22 @@ for (const mode of [
           frame_base: `/api/v1/dalton/monitors/public/${slug}/`,
           data_base: `/api/v1/dalton/monitors/public/${slug}/data`,
           expires_in: 0,
+          root_nonce: rootNonce,
+          root_proof: rootProof,
         },
       });
 
       await page.route(`**/api/v1/dalton/monitors/public/${slug}/v/4/**`, async (route) => {
+        const url = new URL(route.request().url());
+        const isConfirmedRoot =
+          /\/v\/4\/?$/.test(url.pathname) && url.searchParams.get('root_nonce') === rootNonce;
+        const proofMeta = isConfirmedRoot
+          ? `<meta name="dalton-root-proof" content="${rootProof}">`
+          : '';
         await route.fulfill({
           status: 200,
           contentType: 'text/html; charset=utf-8',
-          body: wrapHtml('Public Root Pulse', '<h1>Public Monitor Root</h1>', true),
+          body: wrapHtml('Public Root Pulse', '<h1>Public Monitor Root</h1>', true, proofMeta),
         });
       });
 
@@ -476,6 +580,104 @@ for (const mode of [
       await expect(page.locator('.monitors-frame-host')).toHaveAttribute('data-doc-state', 'bridged_root', { timeout: 5000 });
       await expect(page.getByRole('button', { name: /Copy link|复制链接/i })).toBeVisible();
       await expect(page.getByRole('link', { name: /Open in new window|新窗口打开/i })).toBeVisible();
+    });
+
+    test('pathless public monitor redirect in opaque sandbox does not enter bridged_root and hides Open in new window', async ({ page }) => {
+      const slug = 'public-root-redirect';
+      const rootNonce = 'e2e-redir-root-nonce-123456';
+      const rootProof = 'e2e_redir_root_proof_abcdef123456';
+      await mockAPI(page, {
+        [`GET /dalton/monitors/public/${slug}`]: {
+          monitor: {
+            monitor_id: 'mon-redir-1',
+            slug,
+            title: 'Public Root Redirect',
+            category: 'us',
+            sort_order: 0,
+            visibility: 'public',
+            member_user_ids: [],
+            published_seq: 4,
+            keep_updated: true,
+            source_kind: 'workspace',
+            source_ref: 'ws-1:index.html',
+            acl_revision: 1,
+            last_publish_error: null,
+            last_publish_failed_at: null,
+            data_as_of: null,
+            created_at: '2026-11-20T00:00:00Z',
+            updated_at: '2026-11-20T00:00:00Z',
+            can_manage: false,
+          },
+          versions: [],
+          monitor_grant: '',
+          frame_base: `/api/v1/dalton/monitors/public/${slug}/`,
+          data_base: `/api/v1/dalton/monitors/public/${slug}/data`,
+          expires_in: 0,
+          root_nonce: rootNonce,
+          root_proof: rootProof,
+        },
+      });
+
+      await page.route(`**/api/v1/dalton/monitors/public/${slug}/v/4/**`, async (route) => {
+        const url = new URL(route.request().url());
+        if (/\/v\/4\/?$/.test(url.pathname)) {
+          await route.fulfill({
+            status: 302,
+            headers: { location: `/api/v1/dalton/monitors/public/${slug}/v/4/redirected.html` },
+          });
+          return;
+        }
+        // Redirect target attempts to spoof root: true without the server-signed rootProof.
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html; charset=utf-8',
+          body: '<!doctype html><html><head><meta charset="utf-8"><script>'
+            + 'window.parent.postMessage({ type: "page:ready", v: 1, docId: "spoof-redir", root: true }, "*");'
+            + '</script></head><body><h1>Redirected Target</h1></body></html>',
+        });
+      });
+
+      await page.goto(`/m/${slug}`);
+      const frame = page.frameLocator('iframe.bridged-frame-doc').first();
+      await expect(frame.locator('h1')).toHaveText('Redirected Target', { timeout: 10000 });
+      await expect(page.locator('.monitors-frame-host')).toHaveAttribute('data-doc-state', 'unbridged', { timeout: 5000 });
+      await expect(page.getByRole('link', { name: /Open in new window|新窗口打开/i })).toHaveCount(0);
+    });
+  });
+
+  daltonTest.describe(`Logged-in external member preview (Dalton build) on ${mode.name}`, () => {
+    daltonTest.use({ viewport: mode.viewport, isMobile: mode.isMobile, hasTouch: mode.isMobile });
+    daltonTest.setTimeout(60_000);
+
+    daltonTest.beforeEach(async () => {
+      await resetMockServer();
+    });
+
+    daltonTest('confirms external caller_tier via /credentials/status, hides ShareButton & comment controls, navigates A -> B -> C -> own tab -> unbridged', async ({ page, daltonOrigin }) => {
+      const { servedInjectModes } = await setupExternalMemberReportRoutes(page);
+
+      const credsResPromise = page.waitForResponse(
+        (res) => res.url().includes('/api/v1/dalton/credentials/status') && res.request().method() === 'GET',
+        { timeout: 15000 },
+      );
+
+      await page.goto(`${daltonOrigin}/chat/t/${THREAD_ID}`);
+
+      const credsRes = await credsResPromise;
+      expect(credsRes.status()).toBe(200);
+      const credsBody = await credsRes.json();
+      expect(credsBody.caller_tier).toBe('external');
+
+      // External-member-specific UI restriction: ShareButton is hidden when no active share exists.
+      await expect(page.getByRole('button', { name: /Share conversation|分享对话/i })).toHaveCount(0);
+
+      await openReportAFromTree(page);
+      await verifyRelativeLinksNewTabAndUnbridged(page, mode, { expectPublish: true });
+
+      // External member HTML preview uses read-only ?inject=view (never owner ?inject=comments) and exposes no Comment toggle.
+      expect(servedInjectModes.some((entry) => entry.path.endsWith('/reports/a.html') && entry.inject === 'view')).toBe(true);
+      expect(servedInjectModes.some((entry) => entry.inject === 'comments')).toBe(false);
+      await expect(page.getByRole('button', { name: /^Comment$|^评论$/i })).toHaveCount(0);
     });
   });
 }
@@ -493,6 +695,10 @@ for (const mode of [
  * link controls all fail closed.
  */
 baseTest.describe('Real core/local backend 401 fail-closed (misconfigured VITE_DALTON_AUTH)', () => {
+  baseTest.skip(
+    !REAL_DALTON_FRONTEND_URL,
+    'Set E2E_DALTON_REAL_FRONTEND_URL to a Dalton frontend (VITE_DALTON_UI=true, VITE_DALTON_PROFILE=core, VITE_HOST_MODE=oss, VITE_DALTON_AUTH unset) connected to a real core/local backend.',
+  );
   baseTest.use({ viewport: { width: 1280, height: 800 } });
 
   async function installNonIdentityShellFixtures(page, { sharedThread, sharedFile }) {
@@ -551,13 +757,15 @@ baseTest.describe('Real core/local backend 401 fail-closed (misconfigured VITE_D
                   is_shared: true,
                   share_token: 'existing-share-tok',
                   share_url: '/s/existing-share-tok',
-                  permissions: { allow_files: true, allow_download: false },
+                  permissions: { allow_files: true, allow_download: false, audience: 'public' },
+                  audiences: ['public', 'organization'],
                 }
               : {
                   is_shared: false,
                   share_token: null,
                   share_url: null,
-                  permissions: { allow_files: false, allow_download: false },
+                  permissions: { allow_files: false, allow_download: false, audience: 'public' },
+                  audiences: ['public', 'organization'],
                 },
           ),
         });
@@ -609,11 +817,6 @@ baseTest.describe('Real core/local backend 401 fail-closed (misconfigured VITE_D
   }
 
   baseTest('unshared thread & file: real 401 disables Share (Confirming account permissions…) and blocks Publish', async ({ page }) => {
-    baseTest.skip(
-      !REAL_DALTON_FRONTEND_URL,
-      'Set E2E_DALTON_REAL_FRONTEND_URL to a Dalton frontend (VITE_DALTON_UI=true, VITE_DALTON_PROFILE=core, VITE_HOST_MODE=oss, VITE_DALTON_AUTH unset) connected to a real core/local backend.',
-    );
-
     await installNonIdentityShellFixtures(page, { sharedThread: false, sharedFile: false });
 
     const credsResPromise = page.waitForResponse(
@@ -641,11 +844,6 @@ baseTest.describe('Real core/local backend 401 fail-closed (misconfigured VITE_D
   });
 
   baseTest('active share & shared file: real 401 blocks Publish, Audience modification, and Copy link while keeping Stop sharing available', async ({ page }) => {
-    baseTest.skip(
-      !REAL_DALTON_FRONTEND_URL,
-      'Set E2E_DALTON_REAL_FRONTEND_URL to a Dalton frontend (VITE_DALTON_UI=true, VITE_DALTON_PROFILE=core, VITE_HOST_MODE=oss, VITE_DALTON_AUTH unset) connected to a real core/local backend.',
-    );
-
     await installNonIdentityShellFixtures(page, { sharedThread: true, sharedFile: true });
 
     const credsResPromise = page.waitForResponse(
@@ -664,10 +862,11 @@ baseTest.describe('Real core/local backend 401 fail-closed (misconfigured VITE_D
     await expect(shareBtn).toBeEnabled();
     await shareBtn.click();
 
-    // ThreadSharePanel shows fail-closed identity error and hides Copy link & Audience picker.
+    // ThreadSharePanel shows fail-closed identity error and hides Copy link & AudiencePicker (fieldset + radio).
     await expect(page.getByRole('alert')).toBeVisible({ timeout: 10000 });
     await expect(page.getByRole('button', { name: /Copy link|复制链接/i })).toHaveCount(0);
-    await expect(page.getByRole('radiogroup')).toHaveCount(0);
+    await expect(page.getByRole('group', { name: /Who can open it|谁可以打开/i })).toHaveCount(0);
+    await expect(page.getByRole('radio')).toHaveCount(0);
     await expect(page.getByRole('switch', { name: /Share conversation|分享对话/i })).toBeEnabled();
     await page.keyboard.press('Escape');
 
@@ -685,7 +884,8 @@ baseTest.describe('Real core/local backend 401 fail-closed (misconfigured VITE_D
     await expect(dialog).toBeVisible({ timeout: 10000 });
     await expect(dialog.getByRole('button', { name: /^Publish$|^Update$|^发布$|^更新$/i })).toHaveCount(0);
     await expect(dialog.getByRole('button', { name: /^Copy$|^Copy link$|^复制$|^复制链接$/i })).toHaveCount(0);
-    await expect(dialog.getByRole('radiogroup')).toHaveCount(0);
-    await expect(dialog.getByRole('button', { name: /Stop sharing|停止分享/i })).toBeVisible();
+    await expect(dialog.getByRole('group', { name: /Who can open it|谁可以打开/i })).toHaveCount(0);
+    await expect(dialog.getByRole('radio')).toHaveCount(0);
+    await expect(dialog.getByRole('button', { name: /Unshare|Stop sharing|停止分享/i })).toBeVisible();
   });
 });

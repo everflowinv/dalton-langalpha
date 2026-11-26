@@ -42,6 +42,7 @@ function matchesHostVersionRoot(
   frame: FramedDoc | null,
   expectedDocKey: string | null,
   el: HTMLIFrameElement | null,
+  messageRootProof?: string | null,
 ): boolean {
   if (!frame || expectedDocKey) return false;
   let expectedUrl: URL;
@@ -51,23 +52,42 @@ function matchesHostVersionRoot(
     return false;
   }
   if (!VERSION_ROOT_PATH.test(expectedUrl.pathname)) return false;
-  // When directly framed and same-origin readable (never for opaque sandboxes or FrameHost),
-  // confirm the frame actually landed on the version root URL rather than redirecting away.
-  if (framedDirectly(frame.src) && el) {
-    try {
-      const href = el.contentWindow?.location?.href;
-      if (href && href !== 'about:blank') {
-        const actualUrl = new URL(href);
-        const norm = (p: string) => p.replace(/\/+$/, '');
-        if (actualUrl.origin !== expectedUrl.origin || norm(actualUrl.pathname) !== norm(expectedUrl.pathname)) {
-          return false;
-        }
-      }
-    } catch {
-      // Opaque sandbox origin: cannot read location; rely on host-initiated navigation state.
+
+  const norm = (p: string) => p.replace(/\/+$/, '');
+
+  // DALTON-HOOK(mobile-web): for opaque-origin sandboxes where contentWindow.location is unreadable,
+  // verify the server-signed one-time root proof embedded only on the pathless version root response.
+  if (frame.rootProof) {
+    if (!messageRootProof || messageRootProof !== frame.rootProof) {
+      return false;
     }
+    if (framedDirectly(frame.src) && el) {
+      try {
+        const href = el.contentWindow?.location?.href;
+        if (href && href !== 'about:blank') {
+          const actualUrl = new URL(href);
+          if (actualUrl.origin !== expectedUrl.origin || norm(actualUrl.pathname) !== norm(expectedUrl.pathname)) {
+            return false;
+          }
+        }
+      } catch {
+        // Opaque origin: verified via server-signed rootProof above.
+      }
+    }
+    return true;
   }
-  return true;
+
+  // Without a server-signed root proof, the host must be able to read the frame's actual same-origin
+  // location and confirm it matches the version root URL; never default to true when unreadable.
+  if (!framedDirectly(frame.src) || !el) return false;
+  try {
+    const href = el.contentWindow?.location?.href;
+    if (!href || href === 'about:blank') return false;
+    const actualUrl = new URL(href);
+    return actualUrl.origin === expectedUrl.origin && norm(actualUrl.pathname) === norm(expectedUrl.pathname);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -114,6 +134,8 @@ export interface FrameSource {
   src: string;
   /** Which origin the document posts from follows from it: opaque without `allow-same-origin`. */
   sandbox: string;
+  // DALTON-HOOK(mobile-web): optional server-signed one-time root proof for opaque-sandbox version root entries
+  rootProof?: string | null;
 }
 
 /** The document the frame holds. */
@@ -200,7 +222,14 @@ export function BridgedFrame({
   if (source && swap.current?.doc.key !== source.key) {
     const action: FrameSwapAction = {
       type: 'frame',
-      doc: { key: source.key, src: source.src, origin: messageOrigin(source.src, source.sandbox), sandbox: source.sandbox },
+      doc: {
+        key: source.key,
+        src: source.src,
+        origin: messageOrigin(source.src, source.sandbox),
+        sandbox: source.sandbox,
+        // DALTON-HOOK(mobile-web): pin server-signed root proof onto the framed document
+        rootProof: source.rootProof ?? null,
+      },
     };
     swap = frameSwap(swap, action);
     dispatch(action);
@@ -253,10 +282,10 @@ export function BridgedFrame({
   // A load waiting for its hello, or a hello that came before its load. The
   // flags answer at once, since a hello can follow its load before React
   // renders again; `loads` restarts the wait for each load.
-  // DALTON-HOOK(mobile-web): correlate pre-load page:ready with load via page:ping/page:pong,
-  // and restrict `root: true` to a host-initiated navigation matching a pathless version root URL.
-  const greetedDocRef = useRef<{ key: string; raw: RawFrameDoc } | null>(null);
-  const verifyingRef = useRef<{ seq: number; key: string; raw: RawFrameDoc } | null>(null);
+  // DALTON-HOOK(mobile-web): correlate page:ready with the latest load via docId + page:ping/page:pong,
+  // and restrict `root: true` to a host-verified version root navigation.
+  const greetedDocRef = useRef<{ key: string; docId: string | null; raw: RawFrameDoc } | null>(null);
+  const verifyingRef = useRef<{ seq: number; key: string; docId: string | null; raw: RawFrameDoc } | null>(null);
   const waiting = useRef(false);
   const navSeqRef = useRef(0);
   const currentKeyRef = useRef<string | null>(current);
@@ -324,7 +353,7 @@ export function BridgedFrame({
     const seq = navSeqRef.current;
     waiting.current = true;
     if (greeted) {
-      verifyingRef.current = { seq, key, raw: greeted.raw };
+      verifyingRef.current = { seq, key, docId: greeted.docId, raw: greeted.raw };
       setDocTracking({
         key,
         raw: greeted.raw.kind === 'unbridged' ? { kind: 'unbridged' } : { kind: 'pending' },
@@ -390,11 +419,15 @@ export function BridgedFrame({
         setGround(message.color);
         return;
       case 'page:pong': {
-        // DALTON-HOOK(mobile-web): confirm the document that finished load is the same bridged document
+        // DALTON-HOOK(mobile-web): confirm the document that finished load matches both seq and docId
         const verifying = verifyingRef.current;
         if (!verifying || message.seq !== verifying.seq || navSeqRef.current !== verifying.seq || current !== verifying.key) {
           return;
         }
+        const docMatches = verifying.docId !== null
+          ? message.docId === verifying.docId
+          : message.docId === undefined;
+        if (!docMatches) return;
         verifyingRef.current = null;
         waiting.current = false;
         setDocTracking({ key: verifying.key, raw: verifying.raw });
@@ -425,18 +458,17 @@ export function BridgedFrame({
       }
       case 'page:ready': {
         carried.current = null;
-        // DALTON-HOOK(mobile-web): invalidate active grace timer, gate `root: true` on host-initiated
-        // version root navigation, and pair pre-load hello with load verification.
+        // DALTON-HOOK(mobile-web): invalidate active grace timer, gate `root: true` on host-verified
+        // version root navigation, and retain docId so a subsequent load confirms this exact document.
         navSeqRef.current += 1;
         verifyingRef.current = null;
-        const wasWaiting = waiting.current;
-        if (wasWaiting) waiting.current = false;
+        waiting.current = false;
 
         const allowRoot =
           current !== null &&
           rootNavAllowedRef.current.key === current &&
           rootNavAllowedRef.current.allowed &&
-          matchesHostVersionRoot(frame, expectedDocKey, frameRef.current);
+          matchesHostVersionRoot(frame, expectedDocKey, frameRef.current, message.rootProof);
         if (current !== null) {
           rootNavAllowedRef.current = { key: current, allowed: false };
         }
@@ -455,7 +487,9 @@ export function BridgedFrame({
           nextRaw = { kind: 'unbridged' };
         }
         setDocTracking({ key: current, raw: nextRaw });
-        greetedDocRef.current = !wasWaiting && current !== null ? { key: current, raw: nextRaw } : null;
+        greetedDocRef.current = current !== null
+          ? { key: current, docId: message.docId ?? null, raw: nextRaw }
+          : null;
 
         // The first hello of a new frame, not a link inside it to another file.
         const pending = carry.current;
