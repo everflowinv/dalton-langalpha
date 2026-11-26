@@ -69,6 +69,7 @@ def _build_confirm_card_payload(
     """Build the HITL interrupt payload echoed to the web card and verified by checkpoint_handler."""
     return {
         "tool_call_id": tool_call_id,
+        "snapshot_id": snapshot.get("snapshot_id"),
         "owner_user_id": str(snapshot.get("owner_user_id") or user_id),
         "raw_action": str(snapshot.get("raw_action") or raw_action),
         "name": str(snapshot.get("card_title") or "确认修改个人观察名单"),
@@ -294,23 +295,26 @@ def build_coverage_tools(*, role: str = "chief_of_staff") -> list[BaseTool]:
                     )
                 if not approved:
                     return decline_command(
-                        "用户取消了个人观察名单变更。",
+                        "User declined personal watchlist update.",
                         tool_call_id,
                     )
 
             res = await service.execute_mutation(
                 user_id,
                 action=act,
-                tickers=tickers,
-                tier=tier,
+                snapshot_id=snap.get("snapshot_id") if snap.get("requires_confirmation") else None,
+                tickers=tickers if not snap.get("requires_confirmation") else None,
+                tier=tier if not snap.get("requires_confirmation") else None,
                 source="chat",
-                label=label,
-                criteria=criteria,
-                default_tier=default_tier,
-                group_id=snap.get("group_id") or group_id,
-                override_user_pause=bool(snap.get("override_user_pause", override_user_pause)),
-                expected_snapshot=snap,
-                require_snapshot=bool(snap.get("requires_confirmation")),
+                label=label if not snap.get("requires_confirmation") else None,
+                criteria=criteria if not snap.get("requires_confirmation") else None,
+                default_tier=default_tier if not snap.get("requires_confirmation") else None,
+                group_id=(snap.get("group_id") or group_id) if not snap.get("requires_confirmation") else None,
+                override_user_pause=(
+                    bool(snap.get("override_user_pause", override_user_pause))
+                    if not snap.get("requires_confirmation")
+                    else None
+                ),
             )
             return success_command(
                 _json_safe(

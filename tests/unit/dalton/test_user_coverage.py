@@ -39,10 +39,14 @@ import src.dalton.database.coverage as coverage_db
 import src.dalton.database.watch as watch_db
 from src.dalton.watchlist import policies as _wl_policies_orig_mod
 from src.dalton.watchlist import reconciler as _wl_reconciler_orig_mod
+from src.dalton.watchlist import service as _wl_service_orig_mod
 
 _ORIG_INSERT_RECONCILE_JOB = _wl_policies_orig_mod.insert_reconcile_job
 _ORIG_RECONCILE_JOB = _wl_reconciler_orig_mod.TierPolicyReconciler.reconcile_job
 _ORIG_USER_WORKSPACE_TICKERS = coverage_svc._user_workspace_tickers
+_ORIG_LIST_ALL_USER_AUTOMATIONS = _wl_service_orig_mod.list_all_user_automations
+_ORIG_RESOLVE_COMPANY_WS_ID = _wl_reconciler_orig_mod.resolve_company_workspace_id
+_ORIG_RESOLVE_WS_TRACKING_OWNER = _wl_service_orig_mod.resolve_workspace_tracking_owner
 from src.dalton.tools import build_dalton_tools
 from src.dalton.tools.coverage_tools import build_coverage_tools
 from src.server.utils.api import get_current_user_id
@@ -52,6 +56,64 @@ COVERAGE_YAML_PATH = REPO_ROOT / "config" / "dalton" / "coverage.yaml"
 
 USER_ALICE = "user-alice-111"
 USER_BOB = "user-bob-222"
+
+
+async def _confirmed_add_group(
+    user_id: str,
+    *,
+    label: str,
+    criteria: dict[str, Any],
+    default_tier: str = "watch",
+    auto_refresh: bool = True,
+) -> dict[str, Any]:
+    from src.dalton.watchlist.service import WatchlistMutationService
+
+    preview = await WatchlistMutationService().preview_mutation(
+        user_id,
+        action="add_group",
+        label=label,
+        criteria=criteria,
+        default_tier=default_tier,
+        auto_refresh=auto_refresh,
+    )
+    return await coverage_svc.add_coverage_group(
+        user_id,
+        label=label,
+        criteria=criteria,
+        default_tier=default_tier,
+        auto_refresh=auto_refresh,
+        snapshot_id=preview["snapshot_id"],
+    )
+
+
+async def _confirmed_remove_group(user_id: str, group_id: str) -> dict[str, Any]:
+    from src.dalton.watchlist.service import WatchlistMutationService
+
+    preview = await WatchlistMutationService().preview_mutation(
+        user_id,
+        action="remove_group",
+        group_id=group_id,
+    )
+    return await coverage_svc.remove_coverage_group(
+        user_id,
+        group_id=group_id,
+        snapshot_id=preview["snapshot_id"],
+    )
+
+
+async def _confirmed_remove_tickers(user_id: str, tickers: list[str]) -> dict[str, Any]:
+    from src.dalton.watchlist.service import WatchlistMutationService
+
+    preview = await WatchlistMutationService().preview_mutation(
+        user_id,
+        action="remove",
+        tickers=tickers,
+    )
+    return await coverage_svc.remove_user_coverage_tickers(
+        user_id,
+        tickers,
+        snapshot_id=preview["snapshot_id"],
+    )
 
 
 class _InMemoryCoverageStore:
@@ -485,6 +547,58 @@ def _wire_coverage_store(monkeypatch: pytest.MonkeyPatch, store: _InMemoryCovera
     import src.dalton.watchlist.service as wl_service_mod
 
     store_jobs: dict[str, dict[str, Any]] = {}
+    store_snapshots: dict[str, dict[str, Any]] = {}
+    store_revisions: dict[str, dict[str, int]] = {}
+
+    async def _store_get_rev(uid: str, *, conn: Any = None) -> dict[str, int]:
+        _ = conn
+        return dict(store_revisions.get(uid, {"roster_revision": 0, "last_yaml_synced_revision": 0}))
+
+    async def _store_bump_rev(uid: str, *, conn: Any = None) -> int:
+        _ = conn
+        cur = store_revisions.setdefault(uid, {"roster_revision": 0, "last_yaml_synced_revision": 0})
+        cur["roster_revision"] += 1
+        return cur["roster_revision"]
+
+    async def _store_rec_yaml_rev(uid: str, revision: int, *, conn: Any = None) -> int:
+        _ = conn
+        cur = store_revisions.setdefault(uid, {"roster_revision": 0, "last_yaml_synced_revision": 0})
+        cur["last_yaml_synced_revision"] = max(cur["last_yaml_synced_revision"], int(revision))
+        return cur["last_yaml_synced_revision"]
+
+    async def _store_insert_snap(uid: str, payload: Any, *, ttl_seconds: int = 900, conn: Any = None) -> str:
+        _ = (ttl_seconds, conn)
+        import uuid as _uuid
+
+        sid = str(_uuid.uuid4())
+        store_snapshots[sid] = {
+            "snapshot_id": sid,
+            "user_id": uid,
+            "payload": dict(payload),
+            "consumed_at": None,
+        }
+        return sid
+
+    async def _store_get_snap(
+        uid: str,
+        snapshot_id: str,
+        *,
+        for_update: bool = False,
+        conn: Any = None,
+    ) -> dict[str, Any] | None:
+        _ = (for_update, conn)
+        row = store_snapshots.get(str(snapshot_id or "").strip())
+        if row is None or row["user_id"] != uid or row["consumed_at"] is not None:
+            return None
+        return dict(row)
+
+    async def _store_consume_snap(uid: str, snapshot_id: str, *, conn: Any = None) -> dict[str, Any] | None:
+        _ = conn
+        row = store_snapshots.get(str(snapshot_id or "").strip())
+        if row is None or row["user_id"] != uid or row["consumed_at"] is not None:
+            return None
+        row["consumed_at"] = datetime.now(timezone.utc)
+        return dict(row)
 
     async def _store_insert_job(
         uid: str,
@@ -494,6 +608,7 @@ def _wire_coverage_store(monkeypatch: pytest.MonkeyPatch, store: _InMemoryCovera
         pending_tickers: Any,
         override_user_pause: bool = False,
         job_context: Any = None,
+        roster_revision: int = 0,
         job_id: str | None = None,
         conn: Any = None,
     ) -> dict[str, Any]:
@@ -508,6 +623,7 @@ def _wire_coverage_store(monkeypatch: pytest.MonkeyPatch, store: _InMemoryCovera
             "completed_tickers": [],
             "failed_items": [],
             "job_context": dict(job_context or {}),
+            "roster_revision": int(roster_revision or 0),
             "yaml_synced": False,
             "status": "pending",
         }
@@ -551,6 +667,36 @@ def _wire_coverage_store(monkeypatch: pytest.MonkeyPatch, store: _InMemoryCovera
     monkeypatch.setattr(wl_service_mod, "get_user_tier_policies", policies_mock)
     monkeypatch.setattr(wl_policies_mod, "insert_reconcile_job", insert_job_mock)
     monkeypatch.setattr(wl_service_mod, "insert_reconcile_job", insert_job_mock)
+    for fn_name, impl in (
+        ("get_user_roster_state", _store_get_rev),
+        ("bump_user_roster_revision", _store_bump_rev),
+        ("record_yaml_synced_revision", _store_rec_yaml_rev),
+        ("insert_confirm_snapshot", _store_insert_snap),
+        ("get_confirm_snapshot", _store_get_snap),
+        ("consume_confirm_snapshot", _store_consume_snap),
+    ):
+        orig_fn = getattr(wl_policies_mod, fn_name)
+        mock_fn = create_autospec(orig_fn, side_effect=impl)
+        monkeypatch.setattr(wl_policies_mod, fn_name, mock_fn)
+        if hasattr(wl_service_mod, fn_name):
+            monkeypatch.setattr(wl_service_mod, fn_name, mock_fn)
+        if hasattr(coverage_svc, fn_name):
+            monkeypatch.setattr(coverage_svc, fn_name, mock_fn)
+    monkeypatch.setattr(
+        wl_service_mod,
+        "list_all_user_automations",
+        create_autospec(_ORIG_LIST_ALL_USER_AUTOMATIONS, return_value=[]),
+    )
+    monkeypatch.setattr(
+        wl_service_mod,
+        "resolve_company_workspace_id",
+        create_autospec(_ORIG_RESOLVE_COMPANY_WS_ID, return_value=None),
+    )
+    monkeypatch.setattr(
+        wl_service_mod,
+        "resolve_workspace_tracking_owner",
+        create_autospec(_ORIG_RESOLVE_WS_TRACKING_OWNER, return_value=None),
+    )
     monkeypatch.setattr(
         wl_reconciler_mod.TierPolicyReconciler,
         "reconcile_job",
@@ -837,6 +983,7 @@ async def test_cos_coverage_tool_binding_actions_and_quarterly_preflight(
         pending_tickers: Any,
         override_user_pause: bool = False,
         job_context: Any = None,
+        roster_revision: int = 0,
         job_id: str | None = None,
         conn: Any = None,
     ) -> dict[str, Any]:
@@ -850,6 +997,7 @@ async def test_cos_coverage_tool_binding_actions_and_quarterly_preflight(
             "pending_tickers": list(pending_tickers),
             "completed_tickers": [],
             "failed_items": [],
+            "roster_revision": int(roster_revision or 0),
             "yaml_synced": False,
             "status": "pending",
         }
@@ -898,7 +1046,7 @@ async def test_cos_coverage_tool_binding_actions_and_quarterly_preflight(
         wl_service_mod,
         "resolve_company_workspace_id",
         create_autospec(
-            wl_reconciler_mod.resolve_company_workspace_id,
+            _ORIG_RESOLVE_COMPANY_WS_ID,
             side_effect=lambda uid, sym, *, cov_row=None, conn=None: (
                 "ws-nvda-123" if str(sym).upper() == "NVDA" else None
             ),
@@ -908,14 +1056,14 @@ async def test_cos_coverage_tool_binding_actions_and_quarterly_preflight(
         wl_service_mod,
         "resolve_workspace_tracking_owner",
         create_autospec(
-            wl_service_mod.resolve_workspace_tracking_owner,
+            _ORIG_RESOLVE_WS_TRACKING_OWNER,
             return_value=USER_ALICE,
         ),
     )
     monkeypatch.setattr(
         wl_service_mod,
         "list_all_user_automations",
-        create_autospec(wl_service_mod.list_all_user_automations, return_value=[]),
+        create_autospec(_ORIG_LIST_ALL_USER_AUTOMATIONS, return_value=[]),
     )
     monkeypatch.setattr(
         wl_policies_mod,
@@ -1368,7 +1516,7 @@ async def test_extractor_per_owner_aliases_for_stripping_and_proper_nouns(
         "sync_user_coverage_to_home",
         create_autospec(coverage_svc.sync_user_coverage_to_home, return_value=True),
     )
-    await coverage_svc.remove_user_coverage_tickers(USER_ALICE, ["ZETA"])
+    await _confirmed_remove_tickers(USER_ALICE, ["ZETA"])
     assert "泽塔99科技" not in extractor_mod._chinese_company_aliases_for_stripping(USER_ALICE)
     assert not any("泽塔99科技" in grp for grp in extractor_mod._build_entity_alias_groups(USER_ALICE))
 
@@ -1411,8 +1559,9 @@ async def test_multi_group_membership_include_validation_and_preflight_autonomy_
         yaml_text: str | None = None,
         backend: Any = None,
         rel_path: str = "dalton/coverage.yaml",
+        roster_revision: int | None = None,
     ) -> bool:
-        _ = (yaml_text, backend, rel_path)
+        _ = (yaml_text, backend, rel_path, roster_revision)
         home_sync_calls.append(user_id)
         return True
 
@@ -1465,7 +1614,7 @@ async def test_multi_group_membership_include_validation_and_preflight_autonomy_
     )
 
     # Group 1 includes NVDA, AVGO (from screener) + TSM (valid include) + BOGUS99 (invalid include -> rejected/not_found)
-    g1 = await coverage_svc.add_coverage_group(
+    g1 = await _confirmed_add_group(
         USER_ALICE,
         label="Group One",
         criteria={"country": "US", "industry": "Semiconductors", "include": ["TSM", "BOGUS99"]},
@@ -1480,7 +1629,7 @@ async def test_multi_group_membership_include_validation_and_preflight_autonomy_
     yf_screener_mock.return_value = [
         {"symbol": "NVDA", "companyName": "NVIDIA", "exchangeShortName": "NMS"},
     ]
-    g2 = await coverage_svc.add_coverage_group(
+    g2 = await _confirmed_add_group(
         USER_ALICE,
         label="Group Two",
         criteria={"country": "US", "industry": "Semiconductors"},
@@ -1495,7 +1644,7 @@ async def test_multi_group_membership_include_validation_and_preflight_autonomy_
     assert set(nvda_row["extra"].get("group_ids", [])) == {g1_id, g2_id}
 
     # Deleting Group 1 removes AVGO and TSM (exclusive to Group 1), but keeps NVDA (still in Group 2)
-    rm1 = await coverage_svc.remove_coverage_group(USER_ALICE, group_id=g1_id)
+    rm1 = await _confirmed_remove_group(USER_ALICE, group_id=g1_id)
     assert rm1["ok"] is True
     assert set(rm1["removed_tickers"]) == {"AVGO", "TSM"}
     nvda_after = await store.get_coverage_row(USER_ALICE, "NVDA")
@@ -1585,7 +1734,7 @@ async def test_two_users_mutual_isolation_service_and_router(
 
     # --- Service-layer mutual isolation ---
     await coverage_svc.add_user_coverage_tickers(USER_ALICE, ["AAPL"], tier="core")
-    alice_grp = await coverage_svc.add_coverage_group(
+    alice_grp = await _confirmed_add_group(
         USER_ALICE,
         label="Alice Semis",
         criteria={"country": "US", "industry": "Semiconductors"},
@@ -1605,13 +1754,17 @@ async def test_two_users_mutual_isolation_service_and_router(
     assert bob_tier_attempt["missing_tickers"] == ["AAPL"]
     assert (await coverage_pkg.get_user_tier(USER_ALICE, "AAPL")) == "core"
 
-    bob_rm_attempt = await coverage_svc.remove_user_coverage_tickers(USER_BOB, ["AAPL"])
+    bob_rm_attempt = await _confirmed_remove_tickers(USER_BOB, ["AAPL"])
     assert bob_rm_attempt["removed"] == []
     assert (await coverage_pkg.get_user_tier(USER_ALICE, "AAPL")) == "core"
 
-    bob_grp_rm_attempt = await coverage_svc.remove_coverage_group(USER_BOB, group_id=alice_group_id)
-    assert bob_grp_rm_attempt["deleted"] is False
-    assert bob_grp_rm_attempt["removed_tickers"] == []
+    from src.dalton.watchlist.service import WatchlistMutationService
+
+    bob_grp_pv = await WatchlistMutationService().preview_mutation(
+        USER_BOB, action="remove_group", group_id=alice_group_id
+    )
+    assert bob_grp_pv["ok"] is False
+    assert bob_grp_pv.get("error") == "group_not_found"
     assert len(await coverage_db.list_coverage_groups(USER_ALICE)) == 1
 
     # --- Router-layer mutual isolation ---
@@ -1626,10 +1779,38 @@ async def test_two_users_mutual_isolation_service_and_router(
     assert r_bob_cov.status_code == 200
     assert [c["ticker"] for c in r_bob_cov.json()["companies"]] == ["MSFT"]
 
-    # Bob attempting POST /dalton/coverage with action=set_tier and action=remove on Alice's AAPL mutates 0 rows and returns not_found
+    # r4 Decision 1: legacy POST /coverage (set_tier/remove) and DELETE /coverage/groups/{id}
+    # require server-issued snapshot_id; missing snapshot_id returns 409 scope_changed.
+    assert (
+        client.post(
+            "/api/v1/dalton/coverage",
+            json={"action": "set_tier", "tickers": ["AAPL"], "tier": "watch"},
+        ).status_code
+        == 409
+    )
+    assert (
+        client.post(
+            "/api/v1/dalton/coverage",
+            json={"action": "remove", "tickers": ["AAPL"]},
+        ).status_code
+        == 409
+    )
+    assert client.delete(f"/api/v1/dalton/coverage/groups/{alice_group_id}").status_code == 409
+
+    # Bob attempting POST /dalton/coverage with valid server-issued snapshot_id on Alice's AAPL mutates 0 rows
+    p_bob_set_tier_alice = client.post(
+        "/api/v1/dalton/watchlist/preview",
+        json={"action": "set_tier", "tickers": ["AAPL"], "tier": "watch"},
+    )
+    assert p_bob_set_tier_alice.status_code == 200
     r_bob_set_tier_alice = client.post(
         "/api/v1/dalton/coverage",
-        json={"action": "set_tier", "tickers": ["AAPL"], "tier": "watch"},
+        json={
+            "action": "set_tier",
+            "tickers": ["AAPL"],
+            "tier": "watch",
+            "snapshot_id": p_bob_set_tier_alice.json()["snapshot_id"],
+        },
     )
     assert r_bob_set_tier_alice.status_code == 200
     assert r_bob_set_tier_alice.json()["updated"] == []
@@ -1637,9 +1818,19 @@ async def test_two_users_mutual_isolation_service_and_router(
 
     # Item 5: legacy REST POST /coverage converges onto WatchlistMutationService
     # (same-tx Outbox + TierPolicyReconciler), updating only Bob's own MSFT row.
+    p_bob_core = client.post(
+        "/api/v1/dalton/watchlist/preview",
+        json={"action": "set_tier", "tickers": ["MSFT", "AAPL"], "tier": "core"},
+    )
+    assert p_bob_core.status_code == 200
     r_bob_core = client.post(
         "/api/v1/dalton/coverage",
-        json={"action": "set_tier", "tickers": ["MSFT", "AAPL"], "tier": "core"},
+        json={
+            "action": "set_tier",
+            "tickers": ["MSFT", "AAPL"],
+            "tier": "core",
+            "snapshot_id": p_bob_core.json()["snapshot_id"],
+        },
     )
     assert r_bob_core.status_code == 200
     assert r_bob_core.json()["updated"] == ["MSFT"]
@@ -1647,16 +1838,30 @@ async def test_two_users_mutual_isolation_service_and_router(
     assert r_bob_core.json()["job_id"]
     assert r_bob_core.json()["reconcile_status"] == "completed"
 
+    p_bob_rm_alice = client.post(
+        "/api/v1/dalton/watchlist/preview",
+        json={"action": "remove", "tickers": ["AAPL"]},
+    )
+    assert p_bob_rm_alice.status_code == 200
     r_bob_rm_alice = client.post(
         "/api/v1/dalton/coverage",
-        json={"action": "remove", "tickers": ["AAPL"]},
+        json={
+            "action": "remove",
+            "tickers": ["AAPL"],
+            "snapshot_id": p_bob_rm_alice.json()["snapshot_id"],
+        },
     )
     assert r_bob_rm_alice.status_code == 200
     assert r_bob_rm_alice.json()["removed"] == []
     assert r_bob_rm_alice.json()["not_found"] == ["AAPL"]
 
-    r_bob_del_grp = client.delete(f"/api/v1/dalton/coverage/groups/{alice_group_id}")
-    assert r_bob_del_grp.status_code == 404
+    p_bob_del_grp = client.post(
+        "/api/v1/dalton/watchlist/preview",
+        json={"action": "remove_group", "group_id": alice_group_id},
+    )
+    assert p_bob_del_grp.status_code == 200
+    assert p_bob_del_grp.json()["ok"] is False
+    assert p_bob_del_grp.json().get("error") == "group_not_found"
 
     # Switch to Alice and verify her AAPL (core) and group are untouched
     current_user["id"] = USER_ALICE
@@ -1702,7 +1907,7 @@ async def test_resolve_and_delete_group_race_interleaving(
     )
     monkeypatch.setattr(coverage_svc, "_fetch_yf_screener_rows", screener_mock)
 
-    grp = await coverage_svc.add_coverage_group(
+    grp = await _confirmed_add_group(
         USER_ALICE,
         label="Semis Group",
         criteria={"country": "US", "industry": "Semiconductors"},
@@ -1717,7 +1922,7 @@ async def test_resolve_and_delete_group_race_interleaving(
 
     async def _interleaved_preview(label: str, criteria: Any) -> dict[str, Any]:
         res = await orig_preview(label, criteria)
-        await coverage_svc.remove_coverage_group(USER_ALICE, gid)
+        await _confirmed_remove_group(USER_ALICE, gid)
         return res
 
     monkeypatch.setattr(
@@ -1735,13 +1940,13 @@ async def test_resolve_and_delete_group_race_interleaving(
 
     # Restore preview_coverage_group and verify deleting a group only picks new primary group_id from still-existing groups
     monkeypatch.setattr(coverage_svc, "preview_coverage_group", orig_preview)
-    g_active_1 = await coverage_svc.add_coverage_group(
+    g_active_1 = await _confirmed_add_group(
         USER_ALICE,
         label="Active 1",
         criteria={"country": "US", "industry": "Semiconductors"},
         default_tier="watch",
     )
-    g_active_2 = await coverage_svc.add_coverage_group(
+    g_active_2 = await _confirmed_add_group(
         USER_ALICE,
         label="Active 2",
         criteria={"country": "US", "industry": "Semiconductors"},
@@ -1754,7 +1959,7 @@ async def test_resolve_and_delete_group_race_interleaving(
     nvda_row = store.rows[(USER_ALICE, "NVDA")]
     nvda_row["extra"]["group_ids"] = [g1_id, "grp-ghost-deleted", g2_id]
 
-    await coverage_svc.remove_coverage_group(USER_ALICE, g1_id)
+    await _confirmed_remove_group(USER_ALICE, g1_id)
     nvda_after = await store.get_coverage_row(USER_ALICE, "NVDA")
     assert nvda_after is not None
     assert nvda_after["group_id"] == g2_id
@@ -1942,13 +2147,13 @@ async def test_group_stale_per_group_and_legacy_bool_compat(
     monkeypatch.setattr(coverage_svc, "_fetch_yf_screener_rows", screener_mock)
 
     # Create Group A and Group B; both initially match NVDA and AVGO
-    grp_a = await coverage_svc.add_coverage_group(
+    grp_a = await _confirmed_add_group(
         USER_ALICE,
         label="AI Semis A",
         criteria={"country": "US", "industry": "Semiconductors"},
         default_tier="watch",
     )
-    grp_b = await coverage_svc.add_coverage_group(
+    grp_b = await _confirmed_add_group(
         USER_ALICE,
         label="Networking B",
         criteria={"country": "US", "industry": "Communication Equipment"},
@@ -1990,7 +2195,7 @@ async def test_group_stale_per_group_and_legacy_bool_compat(
     assert "group_stale" not in avgo_after_b["extra"]
 
     # 3) Adding a new Group C that also matches AVGO (upserting & rebuilding extra) preserves Group A's stale ID
-    grp_c = await coverage_svc.add_coverage_group(
+    grp_c = await _confirmed_add_group(
         USER_ALICE,
         label="Custom Silicon C",
         criteria={"country": "US", "industry": "Semiconductors"},
@@ -2165,7 +2370,7 @@ async def test_screener_malformed_response_raises_and_valid_empty_marks_stale(
     )
     monkeypatch.setattr(yf_screener_mod, "screen", yf_screen_mock)
 
-    grp_res = await coverage_svc.add_coverage_group(
+    grp_res = await _confirmed_add_group(
         USER_ALICE,
         label="US Semis",
         criteria={"country": "US", "industry": "Semiconductors"},
@@ -2266,7 +2471,7 @@ async def test_quarterly_refresh_failure_reports_summary_and_keeps_last_resolved
     )
     monkeypatch.setattr(coverage_svc, "_fetch_yf_screener_rows", screener_mock)
 
-    grp_res = await coverage_svc.add_coverage_group(
+    grp_res = await _confirmed_add_group(
         USER_ALICE,
         label="美股半导体大票",
         criteria={"country": "US", "industry": "Semiconductors"},
@@ -2866,7 +3071,23 @@ async def test_add_tickers_redacts_unreadable_ws_and_preserves_manual_vs_synced_
     )
 
     # Item 3 + Item 4 (system-written link survives re-add and still clears on archive/transfer)
+    from src.dalton.watchlist.service import WatchlistMutationService
+
     await coverage_svc.sync_lead_analyst_personal_coverage(nvda_unit_alice)
+    monkeypatch.setattr(
+        coverage_svc,
+        "validate_and_enrich_tickers",
+        create_autospec(
+            coverage_svc.validate_and_enrich_tickers,
+            side_effect=lambda ts: (
+                [{"ticker": str(t).upper(), "name": str(t).upper(), "market": "US"} for t in ts],
+                [],
+            ),
+        ),
+    )
+    pv_readd_alice = await WatchlistMutationService().preview_mutation(
+        USER_ALICE, action="add", tickers=["NVDA"], tier="watch"
+    )
     readded_alice = await coverage_svc.add_user_coverage_tickers(
         USER_ALICE,
         ["NVDA"],
@@ -2874,6 +3095,7 @@ async def test_add_tickers_redacts_unreadable_ws_and_preserves_manual_vs_synced_
         prevalidated={"NVDA": {"ticker": "NVDA", "name": "NVIDIA", "market": "US"}},
         ensure_automation=False,
         sync_home=False,
+        snapshot_id=pv_readd_alice["snapshot_id"],
     )
     assert readded_alice["added"][0]["workspace"]["status"] == "none"
     assert "workspace_id" not in readded_alice["added"][0]["workspace"]
@@ -2909,6 +3131,9 @@ async def test_add_tickers_redacts_unreadable_ws_and_preserves_manual_vs_synced_
     assert bob_synced["extra"]["_synced_ws_written"] is False
     assert bob_synced["extra"]["_synced_unit_id"] == aapl_unit_bob["unit_id"]
 
+    pv_readd_bob = await WatchlistMutationService().preview_mutation(
+        USER_BOB, action="add", tickers=["AAPL"], tier="core"
+    )
     await coverage_svc.add_user_coverage_tickers(
         USER_BOB,
         ["AAPL"],
@@ -2916,6 +3141,7 @@ async def test_add_tickers_redacts_unreadable_ws_and_preserves_manual_vs_synced_
         prevalidated={"AAPL": {"ticker": "AAPL", "name": "Apple", "market": "US"}},
         ensure_automation=False,
         sync_home=False,
+        snapshot_id=pv_readd_bob["snapshot_id"],
     )
     bob_readded = (await store.list_coverage_rows(USER_BOB))[0]
     assert bob_readded["extra"]["_manual_workspace_id"] == canon_ws
@@ -3284,7 +3510,7 @@ async def test_group_write_isolates_registry_failure_in_savepoint_and_commits(
         create_autospec(cu_db_mod.list_active_company_units_with_ticker, side_effect=_failing_registry),
     )
 
-    added = await coverage_svc.add_coverage_group(
+    added = await _confirmed_add_group(
         USER_ALICE,
         label="Semis",
         criteria={"country": "US", "industry": "Semiconductors"},

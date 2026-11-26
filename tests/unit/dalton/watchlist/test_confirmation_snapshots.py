@@ -58,6 +58,8 @@ def _wire_in_memory_watchlist(
         },
         "groups": {},
         "jobs": {},
+        "snapshots": {},
+        "user_state": {},
         "writes": 0,
         "reconciled_jobs": [],
         "workspaces": dict(workspaces or {}),
@@ -144,6 +146,7 @@ def _wire_in_memory_watchlist(
         pending_tickers: Any,
         override_user_pause: bool = False,
         job_context: Any = None,
+        roster_revision: int = 0,
         job_id: str | None = None,
         conn: Any = None,
     ):
@@ -159,11 +162,105 @@ def _wire_in_memory_watchlist(
             "failed_items": [],
             "override_user_pause": override_user_pause,
             "job_context": dict(job_context or {}),
+            "roster_revision": int(roster_revision or 0),
             "yaml_synced": False,
             "status": "pending",
         }
         state["jobs"][jid] = job
         return dict(job)
+
+    async def _insert_snapshot(
+        uid: str,
+        payload: Any,
+        *,
+        ttl_seconds: int = 900,
+        snapshot_id: str | None = None,
+        conn: Any = None,
+    ) -> str:
+        _ = (ttl_seconds, conn)
+        sid = snapshot_id or str(uuid.uuid4())
+        state["snapshots"][sid] = {
+            "snapshot_id": sid,
+            "user_id": uid,
+            "payload": dict(payload),
+            "consumed_at": None,
+            "is_expired": False,
+        }
+        return sid
+
+    async def _get_snapshot(
+        uid: str,
+        snapshot_id: str,
+        *,
+        for_update: bool = False,
+        conn: Any = None,
+    ) -> dict[str, Any] | None:
+        _ = (for_update, conn)
+        row = state["snapshots"].get(str(snapshot_id or "").strip())
+        if row is None or row["user_id"] != uid:
+            return None
+        return {**row, "payload": dict(row["payload"])}
+
+    async def _consume_snapshot(
+        uid: str,
+        snapshot_id: str,
+        *,
+        conn: Any = None,
+    ) -> bool:
+        _ = conn
+        row = state["snapshots"].get(str(snapshot_id or "").strip())
+        if row is None or row["user_id"] != uid or row["consumed_at"] is not None or row["is_expired"]:
+            return False
+        row["consumed_at"] = "now"
+        return True
+
+    async def _get_roster_state(uid: str, *, conn: Any = None) -> dict[str, int]:
+        _ = conn
+        st = state["user_state"].get(uid) or {"roster_revision": 0, "last_yaml_synced_revision": 0}
+        return dict(st)
+
+    async def _bump_roster_rev(uid: str, *, conn: Any = None) -> int:
+        _ = conn
+        st = state["user_state"].setdefault(uid, {"roster_revision": 0, "last_yaml_synced_revision": 0})
+        st["roster_revision"] += 1
+        return int(st["roster_revision"])
+
+    async def _insert_group(
+        uid: str,
+        *,
+        label: str,
+        criteria: Any,
+        default_tier: str = "watch",
+        auto_refresh: bool = True,
+        last_resolved_at: Any = None,
+        conn: Any = None,
+    ) -> dict[str, Any]:
+        _ = conn
+        state["writes"] += 1
+        gid = str(uuid.uuid4())
+        grp = {
+            "group_id": gid,
+            "user_id": uid,
+            "label": label,
+            "criteria": dict(criteria or {}),
+            "default_tier": default_tier,
+            "auto_refresh": bool(auto_refresh),
+            "last_resolved_at": last_resolved_at,
+        }
+        state["groups"][gid] = grp
+        return dict(grp)
+
+    async def _update_group_resolved(uid: str, gid: str, *, last_resolved_at: Any = None, conn: Any = None):
+        _ = conn
+        g = state["groups"].get(gid)
+        if g and g["user_id"] == uid:
+            g["last_resolved_at"] = last_resolved_at
+            return dict(g)
+        return None
+
+    async def _mark_group_stale(uid: str, tickers: Any, *, group_id: str, stale: bool = True, conn: Any = None):
+        _ = (uid, group_id, stale, conn)
+        return list(tickers)
 
     async def _update_tags(uid: str, tickers: list[str], tags: list[str], *, conn: Any = None):
         _ = conn
@@ -327,6 +424,46 @@ def _wire_in_memory_watchlist(
         service_mod,
         "insert_reconcile_job",
         create_autospec(policies_mod.insert_reconcile_job, side_effect=_insert_job),
+    )
+    monkeypatch.setattr(
+        service_mod,
+        "insert_confirm_snapshot",
+        create_autospec(policies_mod.insert_confirm_snapshot, side_effect=_insert_snapshot),
+    )
+    monkeypatch.setattr(
+        service_mod,
+        "get_confirm_snapshot",
+        create_autospec(policies_mod.get_confirm_snapshot, side_effect=_get_snapshot),
+    )
+    monkeypatch.setattr(
+        service_mod,
+        "consume_confirm_snapshot",
+        create_autospec(policies_mod.consume_confirm_snapshot, side_effect=_consume_snapshot),
+    )
+    monkeypatch.setattr(
+        service_mod,
+        "get_user_roster_state",
+        create_autospec(policies_mod.get_user_roster_state, side_effect=_get_roster_state),
+    )
+    monkeypatch.setattr(
+        service_mod,
+        "bump_user_roster_revision",
+        create_autospec(policies_mod.bump_user_roster_revision, side_effect=_bump_roster_rev),
+    )
+    monkeypatch.setattr(
+        coverage_db,
+        "insert_coverage_group",
+        create_autospec(coverage_db.insert_coverage_group, side_effect=_insert_group),
+    )
+    monkeypatch.setattr(
+        coverage_db,
+        "update_coverage_group_resolved",
+        create_autospec(coverage_db.update_coverage_group_resolved, side_effect=_update_group_resolved),
+    )
+    monkeypatch.setattr(
+        coverage_db,
+        "mark_coverage_rows_group_stale",
+        create_autospec(coverage_db.mark_coverage_rows_group_stale, side_effect=_mark_group_stale),
     )
     monkeypatch.setattr(
         service_mod,
@@ -628,7 +765,7 @@ def test_web_rest_watchlist_preview_mutate_conflict_and_company_isolation(
     app.include_router(dalton_router)
     client = TestClient(app, raise_server_exceptions=False)
 
-    # Preview via shared WatchlistMutationService
+    # Preview via shared WatchlistMutationService -> issues server snapshot_id
     r_prev = client.post(
         "/api/v1/dalton/watchlist/preview",
         json={"action": "set_tier", "tickers": ["NVDA"], "tier": "radar"},
@@ -637,8 +774,9 @@ def test_web_rest_watchlist_preview_mutate_conflict_and_company_isolation(
     prev = r_prev.json()
     assert prev["action"] == "watchlist_set_tier"
     assert prev["requires_confirmation"] is True
+    assert prev["snapshot_id"]
 
-    # Missing snapshot on confirmable set_tier -> 409 scope_changed & zero writes (Item 2)
+    # Missing snapshot_id on confirmable set_tier -> 409 scope_changed & zero writes
     r_missing = client.post(
         "/api/v1/dalton/watchlist/mutate",
         json={"action": "set_tier", "tickers": ["NVDA"], "tier": "radar"},
@@ -647,63 +785,52 @@ def test_web_rest_watchlist_preview_mutate_conflict_and_company_isolation(
     assert r_missing.json()["detail"]["code"] == "scope_changed"
     assert state["writes"] == 0
 
-    # Tampered expected_target_tier -> 409 scope_changed & zero writes (Item 2)
+    # Tampered tier vs server-issued snapshot_id -> 409 scope_changed & zero writes
     r_tamper = client.post(
         "/api/v1/dalton/watchlist/mutate",
         json={
             "action": "set_tier",
+            "snapshot_id": prev["snapshot_id"],
             "tickers": ["NVDA"],
-            "tier": "radar",
-            "expected_action": "set_tier",
-            "expected_target_tier": "watch",
-            "expected_override_user_pause": False,
-            "expected_roster_hash": prev["expected_roster_hash"],
-            "expected_policy_versions": prev["expected_policy_versions"],
-            "expected_target_tickers": ["NVDA"],
+            "tier": "watch",
         },
     )
     assert r_tamper.status_code == 409
     assert r_tamper.json()["detail"]["code"] == "scope_changed"
     assert state["writes"] == 0
 
-    # Mutate with stale expected_roster_hash -> 409 scope_changed & zero writes
+    # Unknown / bogus snapshot_id -> 409 scope_changed & zero writes
     r_conflict = client.post(
         "/api/v1/dalton/watchlist/mutate",
         json={
             "action": "set_tier",
-            "tickers": ["NVDA"],
-            "tier": "radar",
-            "expected_action": "set_tier",
-            "expected_target_tier": "radar",
-            "expected_override_user_pause": False,
-            "expected_roster_hash": "stale-hash",
-            "expected_policy_versions": prev["expected_policy_versions"],
-            "expected_target_tickers": ["NVDA"],
+            "snapshot_id": str(uuid.uuid4()),
         },
     )
     assert r_conflict.status_code == 409
     assert r_conflict.json()["detail"]["code"] == "scope_changed"
     assert state["writes"] == 0
 
-    # Mutate with matching full snapshot -> 200 & reconciled
+    # Mutate with valid server-issued snapshot_id -> 200 & reconciled
     r_ok = client.post(
         "/api/v1/dalton/watchlist/mutate",
         json={
             "action": "set_tier",
-            "tickers": ["NVDA"],
-            "tier": "radar",
-            "expected_action": prev["raw_action"],
-            "expected_target_tier": prev["target_tier"],
-            "expected_override_user_pause": prev["override_user_pause"],
-            "expected_roster_hash": prev["expected_roster_hash"],
-            "expected_policy_versions": prev["expected_policy_versions"],
-            "expected_target_tickers": prev["target_tickers"],
+            "snapshot_id": prev["snapshot_id"],
         },
     )
     assert r_ok.status_code == 200
     assert r_ok.json()["updated"] == ["NVDA"]
     assert state["rows"][(USER_ALICE, "NVDA")]["tier"] == "radar"
     assert len(state["reconciled_jobs"]) == 1
+
+    # Snapshot is single-use: replaying consumed snapshot_id -> 409 scope_changed
+    r_replay = client.post(
+        "/api/v1/dalton/watchlist/mutate",
+        json={"action": "set_tier", "snapshot_id": prev["snapshot_id"]},
+    )
+    assert r_replay.status_code == 409
+    assert r_replay.json()["detail"]["code"] == "scope_changed"
 
     # Company system user is strictly rejected on personal watchlist endpoints (401 Unauthorized)
     current_user["id"] = COMPANY_SYSTEM_USER_ID
@@ -793,7 +920,7 @@ async def test_r3_real_langgraph_interrupt_pause_approve_and_reject_without_mock
     )
     assert "__interrupt__" not in resumed_rej
     rej_content = str(resumed_rej["messages"][-1].content)
-    assert "取消" in rej_content
+    assert rej_content.startswith("User declined")
     assert state["writes"] == writes_before
     assert state["rows"][(USER_ALICE, "NVDA")]["tier"] == "core"
 
@@ -872,9 +999,8 @@ async def test_r3_exempt_boundaries_group_label_uuid_drift_and_update_tags_outbo
         await svc.execute_mutation(
             USER_ALICE,
             action="remove_group",
+            snapshot_id=prev_grp["snapshot_id"],
             label="AI Leaders",
-            expected_snapshot=prev_grp,
-            require_snapshot=True,
         )
     assert state["writes"] == 0
 
@@ -884,9 +1010,8 @@ async def test_r3_exempt_boundaries_group_label_uuid_drift_and_update_tags_outbo
     res_grp = await svc.execute_mutation(
         USER_ALICE,
         action="remove_group",
+        snapshot_id=prev_grp2["snapshot_id"],
         label="AI Leaders",
-        expected_snapshot=prev_grp2,
-        require_snapshot=True,
     )
     assert res_grp["ok"] is True
     assert res_grp["group_id"] == gid
@@ -937,3 +1062,118 @@ async def test_r3_exempt_boundaries_group_label_uuid_drift_and_update_tags_outbo
     assert marked == 1
     assert state["jobs"][j1]["yaml_synced"] is True
     assert state["jobs"][j2]["yaml_synced"] is False
+
+
+@pytest.mark.asyncio
+async def test_r4_server_issued_snapshots_web_exempt_add_group_binding_legacy_and_resolve_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 Decision 1: Web exempt single-stock add returns 200; empty group A snapshot cannot delete group B;
+    add_group binds criteria/auto_refresh; legacy /coverage & /coverage/groups routes enforce snapshot_id;
+    resolve_coverage_group runs unified internal action='resolve_group'."""
+    gid_a = str(uuid.uuid4())
+    gid_b = str(uuid.uuid4())
+    initial = [
+        cov_models.company_to_row(
+            cov_models.make_new_company_dict("NVDA", name="NVIDIA", tier="core"),
+            user_id=USER_ALICE,
+            source="chat",
+        ),
+    ]
+    state = _wire_in_memory_watchlist(
+        monkeypatch, initial_rows=initial, workspaces={"NVDA": "ws-nvda"}
+    )
+    state["groups"][gid_a] = {"group_id": gid_a, "user_id": USER_ALICE, "label": "Empty A", "criteria": {}, "default_tier": "watch", "auto_refresh": True}
+    state["groups"][gid_b] = {"group_id": gid_b, "user_id": USER_ALICE, "label": "Empty B", "criteria": {}, "default_tier": "watch", "auto_refresh": True}
+
+    app = FastAPI()
+    app.dependency_overrides[get_current_user_id] = lambda: USER_ALICE
+    app.include_router(dalton_router)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    # 1. Regression: Web single-stock exempt add (NO snapshot_id) -> 200 OK via real WatchlistMutationService
+    r_prev_1 = client.post(
+        "/api/v1/dalton/watchlist/preview",
+        json={"action": "add", "tickers": ["NET"], "tier": "watch"},
+    )
+    assert r_prev_1.status_code == 200
+    assert r_prev_1.json()["requires_confirmation"] is False
+    assert r_prev_1.json()["snapshot_id"] is None
+
+    r_add_1 = client.post(
+        "/api/v1/dalton/watchlist/mutate",
+        json={"action": "add", "tickers": ["NET"], "tier": "watch"},
+    )
+    assert r_add_1.status_code == 200
+    assert r_add_1.json()["added_tickers"] == ["NET"]
+    assert (USER_ALICE, "NET") in state["rows"]
+
+    # 2. Empty group A snapshot CANNOT be used to delete empty group B -> 409 scope_changed
+    r_prev_ga = client.post(
+        "/api/v1/dalton/watchlist/preview",
+        json={"action": "remove_group", "group_id": gid_a},
+    )
+    assert r_prev_ga.status_code == 200
+    snap_ga = r_prev_ga.json()["snapshot_id"]
+    assert snap_ga
+
+    r_cross_grp = client.post(
+        "/api/v1/dalton/watchlist/mutate",
+        json={"action": "remove_group", "group_id": gid_b, "snapshot_id": snap_ga},
+    )
+    assert r_cross_grp.status_code == 409
+    assert gid_b in state["groups"]
+
+    # 3. add_group binds criteria & auto_refresh -> tampering either rejects with 409
+    async def _fake_prev_grp(label: str, criteria: Any):
+        return {
+            "ok": True,
+            "label": label,
+            "criteria": dict(criteria or {}),
+            "companies": [{"ticker": "CRWD", "name": "CrowdStrike", "market": "US"}],
+            "not_found": [],
+        }
+
+    monkeypatch.setattr(
+        service_mod,
+        "preview_coverage_group",
+        create_autospec(cov_svc.preview_coverage_group, side_effect=_fake_prev_grp),
+    )
+    r_prev_ag = client.post(
+        "/api/v1/dalton/watchlist/preview",
+        json={"action": "add_group", "label": "Security", "criteria": {"sector": "Tech"}, "default_tier": "radar", "auto_refresh": True},
+    )
+    assert r_prev_ag.status_code == 200
+    snap_ag = r_prev_ag.json()["snapshot_id"]
+    r_tamper_crit = client.post(
+        "/api/v1/dalton/watchlist/mutate",
+        json={"action": "add_group", "label": "Security", "criteria": {"sector": "Energy"}, "auto_refresh": True, "snapshot_id": snap_ag},
+    )
+    assert r_tamper_crit.status_code == 409
+    r_tamper_auto = client.post(
+        "/api/v1/dalton/watchlist/mutate",
+        json={"action": "add_group", "label": "Security", "criteria": {"sector": "Tech"}, "auto_refresh": False, "snapshot_id": snap_ag},
+    )
+    assert r_tamper_auto.status_code == 409
+
+    # 4. Legacy POST /coverage and DELETE /coverage/groups/{id} enforce snapshot_id
+    r_legacy_no_snap = client.post(
+        "/api/v1/dalton/coverage",
+        json={"action": "set_tier", "tickers": ["NVDA"], "tier": "watch"},
+    )
+    assert r_legacy_no_snap.status_code == 409
+
+    r_legacy_del_no_snap = client.delete(f"/api/v1/dalton/coverage/groups/{gid_a}")
+    assert r_legacy_del_no_snap.status_code == 409
+
+    r_legacy_del_ok = client.delete(f"/api/v1/dalton/coverage/groups/{gid_a}?snapshot_id={snap_ga}")
+    assert r_legacy_del_ok.status_code == 200
+    assert gid_a not in state["groups"]
+
+    # 5. Internal quarterly refresh runs through WatchlistMutationService(action='resolve_group')
+    res_resolve = await cov_svc.resolve_coverage_group(USER_ALICE, gid_b, sync_home=True)
+    assert res_resolve["ok"] is True
+    assert "CRWD" in res_resolve["added_tickers"]
+    assert res_resolve["job_id"] in state["jobs"]
+    assert state["jobs"][res_resolve["job_id"]]["trigger_action"] == "resolve_group"
+    assert state["jobs"][res_resolve["job_id"]]["roster_revision"] >= 1

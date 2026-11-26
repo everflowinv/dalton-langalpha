@@ -219,4 +219,50 @@ describe('Dashboard PortfolioWatchlistWidget coverage tab & 50-quote cap', () =>
     expect(subscribed.length).toBe(50);
     expect(subscribed).not.toContain('SYM000'); // private company excluded from live quotes
   });
+
+  it('r4: filters by tier BEFORE slicing the 50-symbol quote cap so radar stocks beyond 50 core rows still render & subscribe quotes', () => {
+    const core60 = Array.from({ length: 60 }, (_, i) => ({
+      ticker: `CORE${String(i).padStart(2, '0')}`,
+      name: `Core ${i}`,
+      tier: 'core' as const,
+      is_private: false,
+      is_pinned: false,
+    }));
+    const radar5 = Array.from({ length: 5 }, (_, i) => ({
+      ticker: `RADAR${i}`,
+      name: `Radar ${i}`,
+      tier: 'radar' as const,
+      is_private: false,
+      is_pinned: false,
+    }));
+    mocks.dashboardCtx = {
+      ...mocks.dashboardCtx,
+      coverage: {
+        rows: core60.slice(0, 50).map((c) => makeCoverageRow(c.ticker, 'core')),
+        allCompanies: [...core60, ...radar5],
+        quotesBySymbol: {},
+        totalCount: 65,
+        quotedLimit: MAX_DASHBOARD_COVERAGE_QUOTES,
+        counts: { core: 60, watch: 0, radar: 5, total: 65, groups: 0 },
+        loading: false,
+        loaded: true,
+        refetch: vi.fn(),
+      },
+    };
+
+    renderWidget({ valuesHidden: false });
+    // Switch tier chip to Radar
+    const radarBtn = screen.getByRole('button', { name: /雷达|Radar/i });
+    fireEvent.click(radarBtn);
+
+    // All 5 radar rows MUST be rendered (even though 60 core rows precede them!)
+    expect(screen.getByTestId('coverage-row-RADAR0')).toBeTruthy();
+    expect(screen.getByTestId('coverage-row-RADAR4')).toBeTruthy();
+    // Live quotes subscribed for the filtered radar symbols!
+    expect(mocks.useQuotesCalls.some((syms) => syms.includes('RADAR0'))).toBe(true);
+    // Export reflects filtered radar totalCount (5), not full 65
+    const exp = mocks.exported['pw-1'].full() as { data: { totalCount: number; rows: unknown[] } };
+    expect(exp.data.totalCount).toBe(5);
+    expect(exp.data.rows.length).toBe(5);
+  });
 });

@@ -745,18 +745,27 @@ async def _sync_home_coverage_for_preflight(
         except Exception as e:
             logger.warning("[DALTON_PREFLIGHT] refresh_due_coverage_groups_for_preflight failed: %s", e)
 
-    # Item 13: capture the exact set of unsynced job IDs BEFORE rendering coverage.yaml
-    # so any new mutation committed during/after render is NOT prematurely marked yaml_synced=TRUE.
+    # Item 13 / r4 Decision 6: capture roster_revision and ONLY completed unsynced jobs BEFORE render
     covered_job_ids: list[str] | None = None
+    rendered_revision: int | None = None
     if not company_execution:
         try:
-            from src.dalton.watchlist.policies import list_unfinished_reconcile_jobs
+            from src.dalton.watchlist.policies import (
+                get_user_roster_state,
+                list_unfinished_reconcile_jobs,
+            )
 
+            roster_state = await get_user_roster_state(user_id)
+            rendered_revision = int(roster_state.get("roster_revision") or 0)
             unsynced_before = await list_unfinished_reconcile_jobs(user_id)
             covered_job_ids = [
                 str(j["job_id"])
                 for j in unsynced_before
-                if j.get("job_id") and not j.get("yaml_synced")
+                if j.get("job_id")
+                and not j.get("yaml_synced")
+                and not (j.get("pending_tickers") or [])
+                and not (j.get("failed_items") or [])
+                and int(j.get("roster_revision") or 0) <= rendered_revision
             ]
         except Exception as e:
             logger.debug("[DALTON_PREFLIGHT] list_unfinished_reconcile_jobs skipped: %s", e)
@@ -764,9 +773,12 @@ async def _sync_home_coverage_for_preflight(
     async def _render_and_sync() -> bool:
         if company_execution:
             yaml_text = await render_company_coverage_yaml()
-        else:
-            yaml_text = await render_coverage_yaml(user_id)
-        return bool(await sync_user_coverage_to_home(user_id, yaml_text=yaml_text))
+            return bool(await sync_user_coverage_to_home(user_id, yaml_text=yaml_text))
+        yaml_text = await render_coverage_yaml(user_id)
+        sync_kwargs: dict[str, Any] = {"yaml_text": yaml_text}
+        if rendered_revision is not None and rendered_revision > 0:
+            sync_kwargs["roster_revision"] = rendered_revision
+        return bool(await sync_user_coverage_to_home(user_id, **sync_kwargs))
 
     try:
         synced = await asyncio.wait_for(_render_and_sync(), timeout=eff_sync_timeout)
@@ -775,7 +787,9 @@ async def _sync_home_coverage_for_preflight(
                 from src.dalton.watchlist.reconciler import TierPolicyReconciler
 
                 await TierPolicyReconciler().mark_yaml_synced_for_user(
-                    user_id, covered_job_ids=covered_job_ids
+                    user_id,
+                    covered_job_ids=covered_job_ids,
+                    max_revision=rendered_revision,
                 )
             except Exception as e:
                 logger.debug("[DALTON_PREFLIGHT] mark_yaml_synced_for_user skipped: %s", e)

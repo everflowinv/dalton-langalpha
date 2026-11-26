@@ -20,6 +20,15 @@ export function isWatchlistInterruptType(actionType: string | undefined): action
   return Boolean(actionType && WATCHLIST_INTERRUPT_TYPES.has(actionType));
 }
 
+export function isWatchlistDeclineContent(content: unknown): boolean {
+  if (typeof content !== 'string') return false;
+  const trimmed = content.trim();
+  return (
+    trimmed.startsWith('User declined') ||
+    trimmed.startsWith('用户取消了个人观察名单变更')
+  );
+}
+
 export function buildWatchlistProposalState(
   actionType: WatchlistProposalActionType,
   proposalData: Record<string, unknown>,
@@ -139,4 +148,66 @@ export function applyWatchlistProposalToMessage(
     },
     ...(extraFlags || {}),
   };
+}
+
+export function rearmHistoryWatchlistInterrupt(params: {
+  actionType: string | undefined;
+  interruptId: string;
+  proposalData: { tool_call_id?: string } | undefined;
+  assistantMessageId: string;
+  setPending: (proposalId: string) => void;
+  pendingHistoryInterrupts: Array<{
+    type: string;
+    assistantMessageId: string;
+    proposalId?: string;
+    interruptId?: string;
+    toolCallId?: string;
+  }>;
+}): boolean {
+  const { actionType, interruptId, proposalData, assistantMessageId, setPending, pendingHistoryInterrupts } = params;
+  if (!isWatchlistInterruptType(actionType) || !proposalData?.tool_call_id) return false;
+  setPending(interruptId);
+  if (!pendingHistoryInterrupts.some((p) => p.interruptId === interruptId)) {
+    pendingHistoryInterrupts.push({
+      type: actionType,
+      assistantMessageId,
+      proposalId: interruptId,
+      interruptId,
+      toolCallId: proposalData.tool_call_id,
+    });
+  }
+  return true;
+}
+
+export function projectHistoryWatchlistInterrupt(params: {
+  actionType: WatchlistProposalActionType;
+  interruptId: string | undefined;
+  proposalData: Record<string, unknown>;
+  assistantMessageId: string;
+  order: number;
+  applyToMessage: (
+    proposalId: string,
+    state: WatchlistProposalState,
+  ) => void;
+  pendingHistoryInterrupts: Array<{
+    type: string;
+    assistantMessageId: string;
+    proposalId?: string;
+    interruptId?: string;
+    toolCallId?: string;
+  }>;
+}): void {
+  const { actionType, interruptId, proposalData, assistantMessageId, applyToMessage, pendingHistoryInterrupts } = params;
+  const proposalId = interruptId || `watchlist-${actionType}-history-${Date.now()}`;
+  const { state, toolCallId, hasToolCallId } = buildWatchlistProposalState(actionType, proposalData, interruptId);
+  applyToMessage(proposalId, state);
+  if (hasToolCallId) {
+    pendingHistoryInterrupts.push({
+      type: actionType,
+      assistantMessageId,
+      proposalId,
+      interruptId,
+      toolCallId,
+    });
+  }
 }

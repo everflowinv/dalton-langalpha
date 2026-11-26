@@ -21,6 +21,7 @@ import type { HistoryInterruptInfo, SetMessages } from '../types';
 import {
   WATCHLIST_INTERRUPT_TYPES,
   extractWatchlistOutcomeExtras,
+  isWatchlistDeclineContent,
   settleWatchlistProposalsBucket,
 } from '@/lib/dalton/watchlistInterrupts'; // DALTON-HOOK(watchlist)
 
@@ -211,7 +212,8 @@ function proposalOutcomeFields(
   result: ToolResultLike & { status?: unknown },
 ): ProposalOutcomeFields {
   const { content, status: toolStatus } = result;
-  if (typeof content === 'string' && content.startsWith('User declined')) {
+  // DALTON-HOOK(watchlist): also recognize legacy Chinese watchlist cancel text as rejected
+  if (typeof content === 'string' && (content.startsWith('User declined') || isWatchlistDeclineContent(content))) {
     return { status: 'rejected', failure_code: undefined, failure_error: undefined };
   }
   const isToolError = toolStatus === 'error';

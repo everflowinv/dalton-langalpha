@@ -4,7 +4,12 @@ import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-rou
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type React from 'react';
 import { queryKeys } from '@/lib/queryKeys';
-import { BATCH1_WATCHLIST_COLUMNS } from '@/lib/dalton/watchlist';
+import {
+  BATCH1_WATCHLIST_COLUMNS,
+  buildPersonalWatchlistContextText,
+  flattenWatchlistCompanies,
+} from '@/lib/dalton/watchlist';
+import { WatchlistAddModal } from '../components/watchlist/WatchlistAddModal';
 
 const mocks = vi.hoisted(() => ({
   toast: vi.fn(),
@@ -113,6 +118,8 @@ const mocks = vi.hoisted(() => ({
   capturedChatProps: [] as Array<{ watchlistContext?: string | null; scope: string; symbol: string }>,
   activeWorkspaceObj: { workspace_id: 'home-ws', name: 'Home', is_home: true, is_shared: false } as Record<string, unknown>,
   isColleague: false,
+  previewMutateMock: vi.fn(),
+  mutateWatchlistMock: vi.fn(),
 }));
 
 vi.mock('@/config/brand', () => ({
@@ -145,6 +152,8 @@ vi.mock('@/lib/dalton/watchlist', async (importActual) => {
     ...actual,
     fetchPersonalWatchlist: vi.fn(async () => mocks.watchlistSummary),
     fetchPersonalWatchlistMetrics: vi.fn(async () => mocks.watchlistMetrics),
+    previewWatchlistMutation: (...args: unknown[]) => mocks.previewMutateMock(...args),
+    mutateWatchlist: (...args: unknown[]) => mocks.mutateWatchlistMock(...args),
     usePersonalWatchlist: () => ({
       data: mocks.watchlistSummary,
       isLoading: false,
@@ -171,9 +180,22 @@ vi.mock('../../ChatAgent/components/dalton/TeamSharing', () => ({
 
 vi.mock('../components/StockHeader', () => ({ default: () => <div data-testid="stock-header" /> }));
 vi.mock('../components/MarketChart', () => ({
-  default: ({ symbol, interval, toolbarLead }: { symbol: string; interval: string; toolbarLead?: React.ReactNode }) => (
+  default: ({
+    symbol,
+    interval,
+    onIntervalChange,
+    toolbarLead,
+  }: {
+    symbol: string;
+    interval: string;
+    onIntervalChange?: (iv: string) => void;
+    toolbarLead?: React.ReactNode;
+  }) => (
     <div data-testid="market-chart" data-symbol={symbol} data-interval={interval}>
       {toolbarLead}
+      <button type="button" data-testid="switch-tf-4h" onClick={() => onIntervalChange?.('4hour')}>
+        4h
+      </button>
     </div>
   ),
 }));
@@ -346,5 +368,118 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
     expect(await screen.findByTestId('watchlist-row-NVDA')).toBeTruthy();
     const chatPanel = screen.getByTestId('market-chat-panel');
     expect(chatPanel.getAttribute('data-has-watchlist-ctx')).toBe('false');
+  });
+
+  it('r4: normalizes nested workspace.workspace_id, persists search/sort/tf URL, and restores list via Back button', async () => {
+    // 1. Nested workspace.workspace_id normalized into top-level workspace_id
+    const flat = flattenWatchlistCompanies({
+      ...mocks.watchlistSummary,
+      watch: [
+        {
+          ticker: 'TSM',
+          name: 'TSMC',
+          tier: 'watch',
+          workspace: { workspace_id: 'ws-nested-tsm', status: 'active' },
+        },
+      ],
+    });
+    expect(flat.find((c) => c.ticker === 'TSM')?.workspace_id).toBe('ws-nested-tsm');
+
+    // 2. Full-roster summary included in watchlist context beyond 120 rows
+    const ctxText = buildPersonalWatchlistContextText(
+      flat,
+      mocks.watchlistMetrics.items,
+      'all',
+      {
+        total_count: 150,
+        listed_count: 149,
+        private_count: 1,
+        tier_counts: { core: 50, watch: 50, radar: 50 },
+        lowest_rsi_14d: [{ ticker: 'SNOW', rsi_14d: 21.3 }],
+        highest_rsi_14d: [{ ticker: 'NVDA', rsi_14d: 78.1 }],
+        top_gainers_1d: [],
+        top_losers_1d: [],
+        upcoming_earnings: [{ ticker: 'SNOW', date: '2026-12-03' }],
+      },
+    );
+    expect(ctxText).toContain('SNOW(21.3)');
+    expect(ctxText).toContain('SNOW(2026-12-03)');
+
+    // 3. Search filter & tf URL persist across list <-> chart navigation
+    renderAt(['/market']);
+    const searchInput = await screen.findByRole('searchbox');
+    fireEvent.change(searchInput, { target: { value: 'NVDA' } });
+    expect(screen.getByTestId('watchlist-row-NVDA')).toBeTruthy();
+    expect(screen.queryByTestId('watchlist-row-NET')).toBeNull();
+
+    // Jump to chart, switch timeframe -> `?tf=4hour` written to URL
+    fireEvent.click(screen.getByTestId('watchlist-row-NVDA'));
+    await waitFor(() => expect(screen.getByTestId('market-chart')).toBeTruthy());
+    fireEvent.click(screen.getByTestId('switch-tf-4h'));
+    await waitFor(() => {
+      expect(screen.getByTestId('loc-display').textContent).toContain('tf=4hour');
+    });
+
+    // Click BackToWatchlistButton -> returns to /market with search query restored!
+    fireEvent.click(screen.getByTestId('back-to-watchlist-btn'));
+    await waitFor(() => expect(screen.getByTestId('watchlist-workspace')).toBeTruthy());
+    expect((screen.getByRole('searchbox') as HTMLInputElement).value).toBe('NVDA');
+  });
+
+  it('r4: WatchlistAddModal submits raw request without snapshot_id on exempt add, and snapshot_id on confirmable add', async () => {
+    mocks.previewMutateMock.mockReset();
+    mocks.mutateWatchlistMock.mockReset();
+
+    // Exempt 1-ticker add: no snapshot_id sent!
+    mocks.previewMutateMock.mockResolvedValueOnce({
+      ok: true,
+      action: null,
+      raw_action: 'add',
+      snapshot_id: null,
+      requires_confirmation: false,
+      target_tickers: ['PLTR'],
+      target_tier: 'watch',
+      affected_tickers: [{ ticker: 'PLTR', new_tier: 'watch' }],
+      affected_workspaces: [],
+      task_summary: {},
+    });
+    mocks.mutateWatchlistMock.mockResolvedValueOnce({ ok: true, added_tickers: ['PLTR'] });
+
+    const onSuccess = vi.fn();
+    const onClose = vi.fn();
+    const { rerender } = render(<WatchlistAddModal open={true} onClose={onClose} onSuccess={onSuccess} />);
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'PLTR' } });
+    fireEvent.submit(screen.getByRole('textbox').closest('form')!);
+    await waitFor(() => expect(mocks.mutateWatchlistMock).toHaveBeenCalledTimes(1));
+    expect(mocks.mutateWatchlistMock).toHaveBeenCalledWith({
+      action: 'add',
+      tickers: ['PLTR'],
+      tier: 'watch',
+    });
+
+    // Confirmable add (>5 tickers): submits ONLY action + server snapshot_id
+    mocks.previewMutateMock.mockResolvedValueOnce({
+      ok: true,
+      action: 'watchlist_batch_add',
+      raw_action: 'add',
+      snapshot_id: 'snap-uuid-123',
+      requires_confirmation: true,
+      target_tickers: ['A1', 'A2', 'A3', 'A4', 'A5', 'A6'],
+      target_tier: 'watch',
+      affected_tickers: [{ ticker: 'A1', new_tier: 'watch' }],
+      affected_workspaces: [],
+      task_summary: {},
+    });
+    mocks.mutateWatchlistMock.mockResolvedValueOnce({ ok: true, added_tickers: ['A1'] });
+    rerender(<WatchlistAddModal open={true} onClose={onClose} onSuccess={onSuccess} />);
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'A1,A2,A3,A4,A5,A6' } });
+    fireEvent.submit(screen.getByRole('textbox').closest('form')!);
+    const confirmBtn = await screen.findByRole('button', { name: /确认执行|Confirm/i });
+    fireEvent.click(confirmBtn);
+    await waitFor(() => expect(mocks.mutateWatchlistMock).toHaveBeenCalledTimes(2));
+    expect(mocks.mutateWatchlistMock).toHaveBeenLastCalledWith({
+      action: 'add',
+      snapshot_id: 'snap-uuid-123',
+    });
   });
 });

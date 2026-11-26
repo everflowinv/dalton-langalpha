@@ -125,10 +125,12 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
    ```bash
    python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json check --ticker META --date 2026-10-28
    ```
+   - 先读取返回结果中的 `allowed_stages`（实时分档与策略允许创建的财报阶段列表），后续仅对 `allowed_stages` 内的阶段创建或更新自动任务。
    - `recorded: true` 且日期未变 → 跳过建任务，仅确认议程已同步。
    - `date_changed: true`（已确认日期发生变更）：
-     - 若三条 `once` 自动任务尚未执行，调用 `dalton_schedule_automation(action="upsert", name=..., trigger_type="once", next_run_at=..., workspace_id=..., ticker=...)` **原地修改**它们的 `next_run_at`（保持连续生效），并在台账 `history` 记一条改期原因；
-     - 若某条 `once` 已经执行完毕（`file.py` 禁止修改已完成的 `once` 任务），只为尚未执行的剩余窗口调用 `dalton_schedule_automation` 补建新任务（不要直接写自动化文件）。
+     - 先按本次 `check` 返回的 `allowed_stages` 核对当前允许阶段；
+     - 对仍在 `allowed_stages` 内且尚未执行的 `once` 自动任务，调用 `dalton_schedule_automation(action="upsert", name=..., trigger_type="once", next_run_at=..., workspace_id=..., ticker=...)` **原地更新** `next_run_at`，并在台账 `history` 记录改期原因；
+     - 若某条 `once` 已经执行完毕，只为 `allowed_stages` 内尚未执行的剩余窗口调用 `dalton_schedule_automation` 补建新任务（不要直接写自动化文件）。
 2. **计算触发时间（官方 `confirmed` 且 `workspace.status=active`）**：
    - **前瞻（`tm3`）**：用 `trading_days.py` 计算发布日前 3 个交易日，设为当天市场时区 `08:00`（带 UTC 偏移）：
      ```bash
@@ -143,9 +145,10 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
      ```bash
      python3 .agents/skills/dalton-earnings-calendar/scripts/trading_days.py --date 2026-10-28 --plus 1 --exchange XNYS --at 20:00 --timezone America/New_York --json
      ```
-   - **按 Tier 建链**：
-     - `Core`（`workspace.status=active`）：建 `["tm3", "t0", "tp1"]` 三条；若无工作区，不建任务，记入“缺工作区”。
-     - `Watch`（`workspace.status=active`）：默认只建 `["t0"]` 快讯一条（`chain_by_tier: {"core": ["tm3","t0","tp1"], "watch": ["t0"]}`）。
+   - **按实时分档与策略建链（以 `check` 返回的 `allowed_stages` 为准）**：
+     - `Core`（核心，有活跃工作区）：默认建 `["tm3", "t0", "tp1"]` 三条；若无工作区，仅记录日历不建任务。
+     - `Watch`（跟踪，有活跃工作区）：默认仅建 `["t0"]` 快讯一条。
+     - `Radar`（雷达）：默认仅记录个人财报日历，不创建自动任务。
 3. **调用 `dalton_schedule_automation` 写入自动任务**：
    调用 `dalton_schedule_automation(action="upsert", name="dalton-<t>-earn-<period>-<tm3|t0|tp1>", trigger_type="once", next_run_at=..., instruction=..., description=..., timezone_name=..., workspace_id=..., ticker=...)` 创建或更新自动任务（模板见下节；`<t>` 为小写 ticker、`.` 换 `-`，`<period>` 为小写财季如 `fy26q3`）。
 4. **候选日期（`pending` + `tentative_date`）处理**：

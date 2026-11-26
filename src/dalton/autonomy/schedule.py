@@ -1707,6 +1707,22 @@ async def schedule_dalton_automation_helper(
                         "message": "只有 PM 用户可以修改或启停 Home 全局任务。",
                     }
 
+        if resolved_action in ("upsert", "resume") and not is_home_target:
+            from src.dalton.watchlist.pause_guards import validate_earnings_stage_allowed_for_user
+
+            earn_target_name = str(
+                (existing.get("name") if isinstance(existing, Mapping) and existing.get("name") else None)
+                or resolved_name
+            )
+            earn_guard_err = await validate_earnings_stage_allowed_for_user(
+                task_owner,
+                earn_target_name,
+                ticker=str(resolved_ticker) if resolved_ticker else None,
+                conn=active_conn,
+            )
+            if earn_guard_err is not None:
+                return earn_guard_err
+
         if resolved_action in ("pause", "resume"):
             if not existing:
                 return {"ok": False, "error": f"未找到任务 `{resolved_name}`"}

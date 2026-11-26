@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react';
 import type { AssistantMessage, ChatMessage, WatchlistProposalState } from '@/types/chat';
 import {
   CARD_BUCKET_FOR_TYPE,
@@ -12,7 +12,9 @@ import {
 import { projectLiveInterrupt } from '../fromLiveEvent';
 import { projectHistoryInterrupt } from '../fromHistoryEvent';
 import { claimedCardFields, createApprovalEvidence } from '../claims';
+import { useInterruptAnswers } from '../useInterruptAnswers';
 import { buildRenderBlocks } from '../../../components/messageList/buildRenderBlocks';
+import * as watchlistLib from '@/lib/dalton/watchlist';
 import WatchlistConfirmCard from '../../../components/WatchlistConfirmCard';
 import type { HistoryInterruptInfo, SSEEvent, StreamProcessorRefs } from '../../types';
 
@@ -228,5 +230,95 @@ describe('WatchlistConfirmCard & interrupt bucket 4-state lifecycle', () => {
       />,
     );
     expect(screen.getByTestId('proposal-settled').textContent).toMatch(/情况已变化|state changed/);
+  });
+
+  it('r4: settles both English and legacy Chinese decline as rejected, routes mixed HITL via answerBoard, and checks retry errors', async () => {
+    // 1. Legacy Chinese cancel message AND new English decline both settle as rejected (never failed!)
+    let messages: ChatMessage[] = [makeAssistantMessage()];
+    const rt = {
+      setMessages: (updater: (prev: ChatMessage[]) => ChatMessage[]) => {
+        messages = updater(messages);
+      },
+      renderedInterruptIdsRef: { current: new Set<string>() },
+      currentRunIdRef: { current: 'run-1' },
+      pause: { arm: vi.fn() },
+    } as never;
+    projectLiveInterrupt(rt, makeWatchlistInterruptEvent(), 'msg-1', { contentOrderCounterRef: { current: 0 } } as StreamProcessorRefs);
+
+    const legacyDeclined = settleLiveProposalFromResult(messages, 'tc-wl-1', {
+      content: '用户取消了个人观察名单变更。',
+    });
+    expect((legacyDeclined[0] as AssistantMessage).watchlistProposals?.['intr-wl-1']?.status).toBe('rejected');
+
+    const englishDeclined = settleLiveProposalFromResult(messages, 'tc-wl-1', {
+      content: 'User declined personal watchlist update.',
+    });
+    expect((englishDeclined[0] as AssistantMessage).watchlistProposals?.['intr-wl-1']?.status).toBe('rejected');
+
+    // 2. Mixed HITL: pendingInterrupt holds ask_user_question, but clicking watchlist card still answers via answerBoard by interruptId
+    const boardAnswer = vi.fn(() => ({ 'intr-wl-1': { decisions: [{ type: 'approve' }] } }));
+    const resumeMock = vi.fn();
+    const { result } = renderHook(() =>
+      useInterruptAnswers({
+        pendingInterrupt: {
+          type: 'ask_user_question',
+          interruptId: 'intr-q-9',
+          assistantMessageId: 'msg-1',
+          proposalId: 'intr-q-9',
+        } as never,
+        setMessages: (updater) => {
+          messages = typeof updater === 'function' ? updater(messages) : updater;
+        },
+        resumeWithHitlResponse: resumeMock,
+        answerBoard: { answer: boardAnswer } as never,
+        pendingPTCBackfillRef: { current: new Map() },
+        armReportBackWatch: vi.fn(),
+        threadIdRef: { current: 't-1' },
+      }),
+    );
+
+    result.current.handleApproveWatchlistAction({ interruptId: 'intr-wl-1' });
+    expect(boardAnswer).toHaveBeenCalledWith('intr-wl-1', { decisions: [{ type: 'approve' }] });
+    expect(resumeMock).toHaveBeenCalledWith({ 'intr-wl-1': { decisions: [{ type: 'approve' }] } });
+
+    // 3. WatchlistConfirmCard retry keeps Retry button visible on partial/error and clears only on completed
+    const spyReconcile = vi.spyOn(watchlistLib, 'reconcileWatchlist');
+    spyReconcile.mockResolvedValueOnce({ ok: false, status: 'partial' });
+    render(
+      <WatchlistConfirmCard
+        proposalData={{
+          status: 'approved',
+          actionType: 'watchlist_set_tier',
+          reconcile_status: 'partial',
+          job_id: 'job-partial',
+          affected_tickers: [{ ticker: 'NVDA', old_tier: 'core', new_tier: 'radar' }],
+          affected_workspaces: [
+            { ticker: 'NVDA', workspace_id: 'ws-nvda', task_changes: [{ name: 'dalton-nvda-watch', change: 'pause' }] },
+          ],
+        }}
+      />,
+    );
+    // Expand settled card to inspect localized task verbs and Retry button
+    fireEvent.click(
+      screen.getByRole('button', { name: /Watchlist updated|已更新观察名单/i }),
+    );
+    // Task change verb is localized (not raw '(pause)')
+    expect(screen.queryByText(/\(pause\)/)).toBeNull();
+    expect(screen.getByText(/\(暂停\)|\(Pause\)/)).toBeTruthy();
+    const retryBtn = screen.getByRole('button', { name: /一键补齐同步|Retry sync/i });
+    fireEvent.click(retryBtn);
+    await waitFor(() => {
+      expect(screen.getByText(/仍有部分任务未完成同步|still pending sync/i)).toBeTruthy();
+    });
+    // Retry button stays visible when still partial
+    expect(screen.getByRole('button', { name: /一键补齐同步|Retry sync/i })).toBeTruthy();
+
+    // Second click succeeds -> Retry button disappears & settled label updates
+    spyReconcile.mockResolvedValueOnce({ ok: true, status: 'completed' });
+    fireEvent.click(screen.getByRole('button', { name: /一键补齐同步|Retry sync/i }));
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: /一键补齐同步|Retry sync/i })).toBeNull();
+    });
+    spyReconcile.mockRestore();
   });
 });

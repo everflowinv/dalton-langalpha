@@ -13,6 +13,8 @@ from src.dalton.autonomy.schedule import build_company_watch_specs, list_all_use
 from src.dalton.autonomy.tracking import resolve_workspace_tracking_owner
 from src.dalton.coverage.models import (
     VALID_TIERS,
+    extract_row_group_ids,
+    extract_row_stale_group_ids,
     normalize_source,
     normalize_tags,
     normalize_tier,
@@ -29,8 +31,13 @@ from src.dalton.coverage.service import (
 from src.dalton.database import coverage as coverage_db
 from src.dalton.watchlist.policies import (
     TierPolicy,
+    bump_user_roster_revision,
+    consume_confirm_snapshot,
+    get_confirm_snapshot,
     get_default_tier_policy,
+    get_user_roster_state,
     get_user_tier_policies,
+    insert_confirm_snapshot,
     insert_reconcile_job,
     resolve_effective_company_policy,
 )
@@ -322,6 +329,7 @@ class WatchlistMutationService:
         label: str | None = None,
         criteria: Mapping[str, Any] | None = None,
         default_tier: str | None = None,
+        auto_refresh: bool = True,
         group_id: str | None = None,
         tags: Sequence[str] | None = None,
         override_user_pause: bool = False,
@@ -364,6 +372,8 @@ class WatchlistMutationService:
             str(r["ticker"]).strip().upper(): r for r in existing_rows if r.get("ticker")
         }
         policies = await get_user_tier_policies(uid)
+        user_roster_state = await get_user_roster_state(uid)
+        roster_revision = int(user_roster_state.get("roster_revision") or 0)
 
         # Resolve target tickers & tier according to action
         raw_tickers: list[str] = []
@@ -613,9 +623,8 @@ class WatchlistMutationService:
             confirm_action_type = "watchlist_batch_add"
             requires_confirmation = True
         elif act == "set_tier":
-            if norm_tickers or override_user_pause:
-                confirm_action_type = "watchlist_set_tier"
-                requires_confirmation = True
+            confirm_action_type = "watchlist_set_tier"
+            requires_confirmation = True
         elif act in ("remove", "remove_group"):
             confirm_action_type = "watchlist_remove"
             requires_confirmation = True
@@ -658,11 +667,36 @@ class WatchlistMutationService:
             card_title = ""
             card_description = ""
 
+        snapshot_id: str | None = None
+        if requires_confirmation:
+            server_snapshot_payload: dict[str, Any] = {
+                "owner_user_id": uid,
+                "raw_action": act,
+                "action": confirm_action_type,
+                "requested_count": requested_count,
+                "target_tickers": list(norm_tickers),
+                "not_found": list(not_found),
+                "target_tier": target_tier,
+                "group_id": resolved_group_id,
+                "group_label": resolved_group_label,
+                "criteria": resolved_criteria if act == "add_group" else None,
+                "auto_refresh": bool(auto_refresh) if act == "add_group" else None,
+                "override_user_pause": bool(override_user_pause),
+                "expected_roster_hash": expected_roster_hash,
+                "expected_policy_versions": dict(expected_policy_versions),
+                "expected_pause_versions": dict(expected_pause_versions),
+                "roster_revision": roster_revision,
+                "prevalidated": prevalidated if act in ("add", "add_group") else None,
+            }
+            snapshot_id = await insert_confirm_snapshot(uid, server_snapshot_payload)
+
         return {
             "ok": True,
             "action": confirm_action_type,
             "raw_action": act,
             "tool_call_id": tool_call_id,
+            "snapshot_id": snapshot_id,
+            "roster_revision": roster_revision,
             "requires_confirmation": requires_confirmation,
             "owner_user_id": uid,
             "requested_count": requested_count,
@@ -679,6 +713,7 @@ class WatchlistMutationService:
             "group_id": resolved_group_id,
             "group_label": resolved_group_label,
             "criteria": resolved_criteria if act == "add_group" else None,
+            "auto_refresh": bool(auto_refresh) if act == "add_group" else None,
             "prevalidated": prevalidated if act in ("add", "add_group") else None,
             "card_title": card_title,
             "card_description": card_description,
@@ -694,28 +729,29 @@ class WatchlistMutationService:
         user_id: str,
         *,
         action: str,
+        snapshot_id: str | None = None,
         tickers: Sequence[str] | str | None = None,
         tier: str | None = None,
         source: str = "chat",
         label: str | None = None,
         criteria: Mapping[str, Any] | None = None,
         default_tier: str | None = None,
-        auto_refresh: bool = True,
+        auto_refresh: bool | None = None,
         group_id: str | None = None,
         tags: Sequence[str] | None = None,
-        override_user_pause: bool = False,
-        expected_snapshot: Mapping[str, Any] | None = None,
+        override_user_pause: bool | None = None,
         prevalidated: Mapping[str, Mapping[str, Any]] | None = None,
-        require_snapshot: bool = False,
+        now: datetime | None = None,
         sync_home: bool = True,
         reconcile_now: bool = True,
     ) -> dict[str, Any]:
-        """Execute Stage 1 (locked check + DB write + Outbox insert) and Stage 2/3 reconciliation."""
+        """Execute Stage 1 (locked server-snapshot check + DB write + Outbox insert) and Stage 2/3 reconciliation."""
         uid = str(user_id or "").strip()
         if not uid:
             raise ValueError("user_id is required")
         act = str(action or "").strip().lower()
         norm_source = normalize_source(source, default="chat")
+        clean_snapshot_id = str(snapshot_id or "").strip() or None
 
         if act == "update_tags":
             norm_tickers = normalize_tickers_input(tickers)
@@ -729,6 +765,7 @@ class WatchlistMutationService:
                     updated_rows = await coverage_db.update_coverage_tags(
                         uid, norm_tickers, norm_tags, conn=db_conn
                     )
+                    new_rev_tags = await bump_user_roster_revision(uid, conn=db_conn)
                     live_policies = await get_user_tier_policies(uid, conn=db_conn)
                     outbox_job_tags = await insert_reconcile_job(
                         uid,
@@ -738,6 +775,7 @@ class WatchlistMutationService:
                         },
                         pending_tickers=[],
                         override_user_pause=False,
+                        roster_revision=new_rev_tags,
                         conn=db_conn,
                     )
 
@@ -758,152 +796,216 @@ class WatchlistMutationService:
                 "home_synced": bool(reconcile_res_tags.get("yaml_synced", False)),
             }
 
-        # Pre-transaction external lookups (never hold DB advisory lock across yfinance calls)
-        snap_tickers = (
-            [
-                str(t).strip().upper()
-                for t in (expected_snapshot.get("target_tickers") or [])
-                if str(t).strip()
-            ]
-            if isinstance(expected_snapshot, Mapping)
-            and expected_snapshot.get("target_tickers") is not None
-            else None
-        )
-        snap_prevalidated = (
-            expected_snapshot.get("prevalidated")
-            if isinstance(expected_snapshot, Mapping)
-            and isinstance(expected_snapshot.get("prevalidated"), Mapping)
-            else None
-        )
-        eff_prevalidated: Mapping[str, Mapping[str, Any]] | None = prevalidated or snap_prevalidated
+        if act == "resolve_group":
+            gid = str(group_id or "").strip()
+            if not gid:
+                raise ValueError("user_id and group_id are required")
+            group_row = await coverage_db.get_coverage_group(uid, gid)
+            if group_row is None:
+                raise ValueError(f"Coverage group {gid!r} not found")
+            grp_label = str(group_row.get("label") or "")
+            grp_criteria = group_row.get("criteria") or {}
+            grp_default_tier = normalize_tier(group_row.get("default_tier"), default="watch")
 
-        resolved_valid_items: list[dict[str, Any]] = []
-        snap_not_found: list[str] = [
-            str(t).strip().upper()
-            for t in ((expected_snapshot or {}).get("not_found") or [])
-            if str(t).strip()
-        ]
-        not_found: list[str] = []
-        norm_tickers: list[str] = []
-        norm_tier: str | None = None
+            preview = await preview_coverage_group(grp_label, grp_criteria)
+            resolved_companies = preview.get("companies") or []
+            rejected_tickers = list(preview.get("not_found") or [])
+            matched_by_ticker = {
+                str(c["ticker"]).upper(): dict(c)
+                for c in resolved_companies
+                if c.get("ticker")
+            }
+            matched_set = set(matched_by_ticker.keys())
+            resolved_ts = now or datetime.now(timezone.utc)
+            owned_ws_resolve = await _user_workspace_tickers(uid)
+
+            resolve_stage1: dict[str, Any] = {}
+            outbox_job_resolve: dict[str, Any] | None = None
+            has_any_rows = False
+
+            async with coverage_db.get_db_connection() as db_conn:
+                async with db_conn.transaction():
+                    await coverage_db.acquire_coverage_advisory_lock(db_conn, uid)
+                    current_group = await coverage_db.get_coverage_group(uid, gid, conn=db_conn)
+                    if current_group is None:
+                        return {"status": "group_deleted", "ok": False, "group_id": gid}
+                    eff_default_tier = normalize_tier(
+                        current_group.get("default_tier") or grp_default_tier,
+                        default="watch",
+                    )
+                    existing_rows = await coverage_db.list_coverage_rows(uid, conn=db_conn)
+                    existing_by_ticker = {
+                        str(r["ticker"]).upper(): r for r in existing_rows if r.get("ticker")
+                    }
+                    has_any_rows = bool(matched_by_ticker or existing_rows)
+
+                    new_tickers = [t for t in matched_by_ticker if t not in existing_by_ticker]
+                    tickers_needing_membership = [
+                        t
+                        for t in matched_by_ticker
+                        if t not in existing_by_ticker
+                        or gid not in extract_row_group_ids(existing_by_ticker[t])
+                    ]
+                    stale_candidates = [
+                        str(r["ticker"]).upper()
+                        for r in existing_rows
+                        if gid in extract_row_group_ids(r)
+                        and str(r["ticker"]).upper() not in matched_set
+                    ]
+                    unstale_candidates = [
+                        str(r["ticker"]).upper()
+                        for r in existing_rows
+                        if gid in extract_row_group_ids(r)
+                        and str(r["ticker"]).upper() in matched_set
+                        and gid in extract_row_stale_group_ids(r)
+                    ]
+
+                    units_unavailable = False
+                    if tickers_needing_membership:
+                        existing_groups = await coverage_db.list_coverage_groups(uid, conn=db_conn)
+                        valid_group_ids = {
+                            str(g["group_id"]).strip()
+                            for g in existing_groups
+                            if g.get("group_id")
+                        } | {gid}
+                        rows_to_upsert = _build_upsert_rows_from_existing(
+                            uid=uid,
+                            valid_items=[matched_by_ticker[t] for t in tickers_needing_membership],
+                            existing_rows=existing_by_ticker,
+                            ws_by_ticker=owned_ws_resolve,
+                            norm_tier=eff_default_tier,
+                            norm_source="group",
+                            group_id=gid,
+                            valid_group_ids=valid_group_ids,
+                        )
+                        _, upserted = await coverage_db.upsert_coverage_rows(
+                            uid, rows_to_upsert, conn=db_conn
+                        )
+                        added_companies = [row_to_company(r) for r in upserted]
+                        from src.dalton.coverage.service import _overlay_canonical_unit_workspaces
+
+                        units_unavailable = await _overlay_canonical_unit_workspaces(
+                            uid, added_companies, raw_rows=upserted, conn=db_conn
+                        )
+
+                    marked_stale: list[str] = []
+                    if stale_candidates:
+                        marked_stale = await coverage_db.mark_coverage_rows_group_stale(
+                            uid, stale_candidates, group_id=gid, stale=True, conn=db_conn
+                        )
+                    if unstale_candidates:
+                        await coverage_db.mark_coverage_rows_group_stale(
+                            uid, unstale_candidates, group_id=gid, stale=False, conn=db_conn
+                        )
+
+                    updated_group = await coverage_db.update_coverage_group_resolved(
+                        uid, gid, last_resolved_at=resolved_ts, conn=db_conn
+                    )
+                    new_rev_resolve = await bump_user_roster_revision(uid, conn=db_conn)
+                    live_policies = await get_user_tier_policies(uid, conn=db_conn)
+                    outbox_job_resolve = await insert_reconcile_job(
+                        uid,
+                        trigger_action="resolve_group",
+                        target_policy_versions={
+                            t: p.policy_version for t, p in live_policies.items()
+                        },
+                        pending_tickers=list(new_tickers),
+                        override_user_pause=False,
+                        roster_revision=new_rev_resolve,
+                        conn=db_conn,
+                    )
+                    resolve_stage1 = {
+                        "ok": True,
+                        "group": updated_group or group_row,
+                        "matched_tickers": list(matched_by_ticker.keys()),
+                        "added_tickers": new_tickers,
+                        "stale_tickers": marked_stale,
+                        "not_found": rejected_tickers,
+                        "rejected": rejected_tickers,
+                    }
+                    if units_unavailable:
+                        resolve_stage1["units_unavailable"] = True
+
+            invalidate_user_aliases_cache(uid)
+            if has_any_rows:
+                try:
+                    await ensure_user_earnings_calendar_automation(uid)
+                except Exception as exc:
+                    logger.debug("[WATCHLIST_MUTATION] ensure earnings calendar skipped: %s", exc)
+
+            reconcile_res_resolve: dict[str, Any] = {}
+            if reconcile_now and outbox_job_resolve is not None:
+                reconcile_res_resolve = await self._reconciler.reconcile_job(
+                    uid, str(outbox_job_resolve["job_id"]), sync_home=sync_home
+                )
+            return {
+                **resolve_stage1,
+                "job_id": str(outbox_job_resolve["job_id"]) if outbox_job_resolve else None,
+                "reconcile_status": (
+                    reconcile_res_resolve.get("status") if reconcile_res_resolve else "pending"
+                ),
+                "home_synced": (
+                    bool(reconcile_res_resolve.get("yaml_synced", False)) if sync_home else False
+                ),
+            }
+
+        if act not in ("add", "add_group", "set_tier", "remove", "remove_group"):
+            raise ValueError(f"Unsupported watchlist mutation action: {action!r}")
+
         caller_raw_tickers = normalize_tickers_input(tickers)
-        clean_label = str(label or (expected_snapshot or {}).get("group_label") or "").strip()
-        eff_criteria = dict(
-            criteria
-            if criteria is not None
-            else ((expected_snapshot or {}).get("criteria") or {})
-        )
-        snap_group_id = (
-            str(expected_snapshot.get("group_id") or "").strip() or None
-            if isinstance(expected_snapshot, Mapping)
+        caller_tier_norm = (
+            normalize_tier(default_tier if act == "add_group" and default_tier else tier, default="watch")
+            if (tier is not None or (act == "add_group" and default_tier is not None))
             else None
         )
-        raw_group_id = str(group_id or "").strip() or None
-        # When previewed by label, execution MUST use the preview-resolved UUID (Item 3)
-        eff_group_id = snap_group_id or raw_group_id
+        caller_group_id = str(group_id or "").strip() or None
+        caller_label = str(label or "").strip() or None
 
-        if act == "add":
-            norm_tier = normalize_tier(
-                tier or (expected_snapshot or {}).get("target_tier"), default="watch"
-            )
-            raw_tickers = (
-                list(caller_raw_tickers)
-                if caller_raw_tickers
-                else (list(snap_tickers) if snap_tickers is not None else [])
-            )
-            if not raw_tickers:
+        # Pre-transaction validation ONLY for exempt `add` (no snapshot_id).
+        # Confirmable actions MUST carry a server-issued `snapshot_id` whose full parameters
+        # and prevalidated tickers are loaded from DB under the advisory lock.
+        exempt_valid_items: list[dict[str, Any]] = []
+        exempt_not_found: list[str] = []
+        exempt_norm_tickers: list[str] = []
+        exempt_tier: str = "watch"
+
+        if clean_snapshot_id is None:
+            if act != "add" or bool(override_user_pause):
+                raise WatchlistScopeChangedError("此操作会改变观察名单或已有任务，请先预览并确认后再执行。")
+            if not caller_raw_tickers:
                 raise ValueError("执行 add 时必须提供 tickers。")
-            if eff_prevalidated is not None:
-                for sym in raw_tickers:
-                    if sym in eff_prevalidated:
-                        info = dict(eff_prevalidated[sym])
+            if len(caller_raw_tickers) > EXEMPT_ADD_MAX_TICKERS:
+                raise WatchlistScopeChangedError("单次新增超过 5 只标的，请先预览并确认后再执行。")
+            exempt_tier = normalize_tier(tier, default="watch")
+            if prevalidated is not None:
+                exempt_valid_items = []
+                exempt_not_found = []
+                for sym in caller_raw_tickers:
+                    if sym in prevalidated:
+                        info = dict(prevalidated[sym])
                         info["ticker"] = sym
-                        resolved_valid_items.append(info)
-                        norm_tickers.append(sym)
+                        exempt_valid_items.append(info)
                     else:
-                        not_found.append(sym)
-                for sym in snap_not_found:
-                    if sym not in not_found and sym not in norm_tickers:
-                        not_found.append(sym)
+                        exempt_not_found.append(sym)
             else:
-                resolved_valid_items, not_found = await validate_and_enrich_tickers(raw_tickers)
-                norm_tickers = [str(item["ticker"]).upper() for item in resolved_valid_items]
-            if not norm_tickers:
+                exempt_valid_items, exempt_not_found = await validate_and_enrich_tickers(
+                    caller_raw_tickers
+                )
+            exempt_norm_tickers = [str(item["ticker"]).upper() for item in exempt_valid_items]
+            if not exempt_norm_tickers:
                 return {
-                    "ok": len(not_found) == 0,
+                    "ok": len(exempt_not_found) == 0,
                     "added": [],
                     "added_tickers": [],
-                    "not_found": not_found,
-                    "tier": norm_tier,
+                    "not_found": exempt_not_found,
+                    "tier": exempt_tier,
                     "automation_created": False,
                     "home_synced": False,
                 }
 
-        elif act == "add_group":
-            if not clean_label:
-                raise ValueError("执行 add_group 时必须提供 label。")
-            norm_tier = normalize_tier(
-                default_tier or tier or (expected_snapshot or {}).get("target_tier"),
-                default="watch",
-            )
-            if eff_prevalidated is not None:
-                norm_tickers = list(eff_prevalidated.keys())
-                resolved_valid_items = [
-                    {**dict(v), "ticker": k} for k, v in eff_prevalidated.items()
-                ]
-                not_found = list((expected_snapshot or {}).get("not_found") or [])
-            else:
-                grp_prev = await preview_coverage_group(clean_label, eff_criteria)
-                resolved_valid_items = [
-                    dict(c) for c in (grp_prev.get("companies") or []) if c.get("ticker")
-                ]
-                norm_tickers = [str(c["ticker"]).upper() for c in resolved_valid_items]
-                not_found = list(grp_prev.get("not_found") or [])
-
-        elif act == "set_tier":
-            norm_tier = normalize_tier(
-                tier or (expected_snapshot or {}).get("target_tier"), default="watch"
-            )
-            norm_tickers = (
-                list(caller_raw_tickers)
-                if caller_raw_tickers
-                else (list(snap_tickers) if snap_tickers is not None else [])
-            )
-            if not norm_tickers:
-                raise ValueError("执行 set_tier 时必须提供 tickers。")
-
-        elif act == "remove":
-            norm_tickers = (
-                list(caller_raw_tickers)
-                if caller_raw_tickers
-                else (list(snap_tickers) if snap_tickers is not None else [])
-            )
-            if not norm_tickers:
-                raise ValueError("执行 remove 时必须提供 tickers。")
-
-        elif act == "remove_group":
-            if not eff_group_id and clean_label:
-                groups = await coverage_db.list_coverage_groups(uid)
-                matched = next(
-                    (
-                        g
-                        for g in groups
-                        if str(g.get("label") or "").strip().lower() == clean_label.lower()
-                    ),
-                    None,
-                )
-                eff_group_id = str(matched["group_id"]) if matched else clean_label
-            if not eff_group_id:
-                raise ValueError("执行 remove_group 时必须提供 group_id。")
-            norm_tickers = list(snap_tickers or [])
-
-        else:
-            raise ValueError(f"Unsupported watchlist mutation action: {action!r}")
-
         owned_ws = await _user_workspace_tickers(uid)
-        requested_count_for_exempt = len(caller_raw_tickers) if caller_raw_tickers else len(norm_tickers)
 
-        # Stage 1: short atomic transaction (advisory lock -> verify snapshot -> DB write -> outbox insert)
+        # Stage 1: short atomic transaction (advisory lock -> verify/consume server snapshot -> DB write -> outbox insert)
         stage1_result: dict[str, Any] = {}
         outbox_job: dict[str, Any] | None = None
 
@@ -914,8 +1016,9 @@ class WatchlistMutationService:
                 str(r["ticker"]).strip().upper(): r for r in live_rows if r.get("ticker")
             }
             live_policies = await get_user_tier_policies(uid, conn=conn)
+            live_roster_state = await get_user_roster_state(uid, conn=conn)
+            live_roster_rev = int(live_roster_state.get("roster_revision") or 0)
 
-            # Determine whether this mutation requires a confirmation snapshot (Items 2 & 4)
             live_autos: list[dict[str, Any]] | None = None
 
             async def _get_live_autos() -> list[dict[str, Any]]:
@@ -927,205 +1030,222 @@ class WatchlistMutationService:
                         live_autos = []
                 return live_autos
 
-            is_confirmable = act in ("remove", "set_tier", "remove_group", "add_group") or bool(
-                override_user_pause
-            )
-            if not is_confirmable and act == "add":
-                req_syms = caller_raw_tickers or norm_tickers
-                if requested_count_for_exempt > EXEMPT_ADD_MAX_TICKERS or any(
-                    sym in live_by_ticker for sym in req_syms
-                ):
-                    is_confirmable = True
-                else:
-                    # Also require confirmation if adding any ticker would resume a paused task
-                    live_ws_check, _ = await _resolve_ws_map_and_owners(
-                        uid, norm_tickers, live_by_ticker, owned_ws=owned_ws, conn=conn
-                    )
-                    if any(live_ws_check.values()):
-                        autos_now = await _get_live_autos()
-                        eff_pol = resolve_effective_company_policy(
-                            live_policies.get(
-                                norm_tier or "watch",
-                                get_default_tier_policy(norm_tier or "watch"),
-                            ),
-                            None,
-                        )
-                        for sym, ws_id in live_ws_check.items():
-                            if not ws_id:
-                                continue
-                            c_rows = _company_rows_for_workspace(
-                                autos_now, workspace_id=ws_id, ticker=sym
-                            )
-                            _, c_counts = _estimate_workspace_task_changes(
-                                ticker=sym,
-                                workspace_id=ws_id,
-                                old_tier=None,
-                                new_tier=norm_tier,
-                                new_policy=eff_pol,
-                                company_rows=c_rows,
-                                override_user_pause=False,
-                            )
-                            if c_counts["resume_count"] > 0:
-                                is_confirmable = True
-                                break
-
-            has_snapshot = isinstance(expected_snapshot, Mapping) and bool(expected_snapshot)
-            if require_snapshot and is_confirmable and not has_snapshot:
-                raise WatchlistScopeChangedError("此操作会改变观察名单或已有任务，请先预览并确认后再执行。")
-
             job_context: dict[str, Any] = {}
+            eff_norm_tickers: list[str] = []
+            eff_not_found: list[str] = []
+            eff_tier: str | None = None
+            eff_group_id: str | None = None
+            eff_group_label: str = ""
+            eff_criteria: dict[str, Any] = {}
+            eff_auto_refresh: bool = True
+            eff_override_pause: bool = False
+            eff_valid_items: list[dict[str, Any]] = []
 
-            # Snapshot verification BEFORE any write (§5.3 Stage 1, Items 2, 3, 8)
-            if has_snapshot:
-                assert isinstance(expected_snapshot, Mapping)
-                snap_owner = expected_snapshot.get("owner_user_id")
-                if snap_owner is not None and str(snap_owner).strip() != uid:
-                    raise WatchlistScopeChangedError()
-
-                # Bind action
-                snap_action = str(
-                    expected_snapshot.get("raw_action")
-                    or expected_snapshot.get("expected_action")
-                    or ""
-                ).strip().lower()
-                if snap_action:
-                    if snap_action != act:
-                        raise WatchlistScopeChangedError()
-                elif require_snapshot and is_confirmable:
-                    raise WatchlistScopeChangedError()
-
-                # Bind target_tier
-                if "target_tier" in expected_snapshot or "expected_target_tier" in expected_snapshot:
-                    raw_exp_tier = (
-                        expected_snapshot.get("target_tier")
-                        if "target_tier" in expected_snapshot
-                        else expected_snapshot.get("expected_target_tier")
-                    )
-                    exp_tier = (
-                        str(raw_exp_tier).strip().lower()
-                        if raw_exp_tier is not None and str(raw_exp_tier).strip()
-                        else None
-                    )
-                    if exp_tier != norm_tier:
-                        raise WatchlistScopeChangedError()
-
-                # Bind override_user_pause
+            if clean_snapshot_id is not None:
+                snap_row = await get_confirm_snapshot(
+                    uid, clean_snapshot_id, for_update=True, conn=conn
+                )
                 if (
-                    "override_user_pause" in expected_snapshot
-                    or "expected_override_user_pause" in expected_snapshot
+                    snap_row is None
+                    or snap_row.get("consumed_at") is not None
+                    or snap_row.get("is_expired")
                 ):
-                    raw_exp_override = (
-                        expected_snapshot.get("override_user_pause")
-                        if "override_user_pause" in expected_snapshot
-                        else expected_snapshot.get("expected_override_user_pause")
-                    )
-                    if bool(raw_exp_override) != bool(override_user_pause):
+                    raise WatchlistScopeChangedError()
+                snap = snap_row.get("payload")
+                if not isinstance(snap, Mapping):
+                    raise WatchlistScopeChangedError()
+                if str(snap.get("owner_user_id") or "").strip() != uid:
+                    raise WatchlistScopeChangedError()
+                if str(snap.get("raw_action") or "").strip().lower() != act:
+                    raise WatchlistScopeChangedError()
+
+                # Reject any caller-provided parameter that conflicts with the server-issued snapshot
+                snap_tickers = [
+                    str(t).strip().upper()
+                    for t in (snap.get("target_tickers") or [])
+                    if str(t).strip()
+                ]
+                snap_not_found = [
+                    str(t).strip().upper()
+                    for t in (snap.get("not_found") or [])
+                    if str(t).strip()
+                ]
+                snap_tier_raw = snap.get("target_tier")
+                snap_tier = (
+                    str(snap_tier_raw).strip().lower()
+                    if snap_tier_raw is not None and str(snap_tier_raw).strip()
+                    else None
+                )
+                snap_gid = str(snap.get("group_id") or "").strip() or None
+                snap_glabel = str(snap.get("group_label") or "").strip()
+                snap_criteria = dict(snap.get("criteria") or {}) if snap.get("criteria") is not None else {}
+                snap_auto_refresh = bool(
+                    snap.get("auto_refresh", True) if snap.get("auto_refresh") is not None else True
+                )
+                snap_override = bool(snap.get("override_user_pause", False))
+
+                if caller_tier_norm is not None and caller_tier_norm != snap_tier:
+                    raise WatchlistScopeChangedError()
+                if override_user_pause is not None and bool(override_user_pause) != snap_override:
+                    raise WatchlistScopeChangedError()
+                if act in ("add", "set_tier", "remove") and caller_raw_tickers:
+                    allowed_req = set(snap_tickers) | set(snap_not_found)
+                    if not set(caller_raw_tickers).issubset(allowed_req):
                         raise WatchlistScopeChangedError()
-
-                # Bind target_tickers against request tickers (accounting for snap_not_found on set_tier/remove)
-                if snap_tickers is not None and act in ("add", "set_tier", "remove", "add_group"):
-                    if act in ("set_tier", "remove"):
-                        allowed_req = set(snap_tickers) | set(snap_not_found)
-                        live_matched = sorted({t for t in norm_tickers if t in live_by_ticker})
-                        if (
-                            not set(norm_tickers).issubset(allowed_req)
-                            or live_matched != sorted(set(snap_tickers))
-                        ):
-                            raise WatchlistScopeChangedError()
-                    elif sorted(set(norm_tickers)) != sorted(set(snap_tickers)):
+                    if act == "add" and sorted(set(caller_raw_tickers) - set(snap_not_found)) != sorted(
+                        set(snap_tickers)
+                    ):
                         raise WatchlistScopeChangedError()
-                elif require_snapshot and is_confirmable and act != "remove_group":
-                    raise WatchlistScopeChangedError()
-
-                # Check policy_versions for all expected tiers
-                exp_versions = expected_snapshot.get("expected_policy_versions")
-                if isinstance(exp_versions, Mapping):
-                    for t_name, exp_ver in exp_versions.items():
-                        live_ver = live_policies.get(
-                            str(t_name).lower(), get_default_tier_policy(str(t_name).lower())
-                        ).policy_version
-                        if int(live_ver) != int(exp_ver):
-                            raise WatchlistScopeChangedError()
-                elif require_snapshot and is_confirmable:
-                    raise WatchlistScopeChangedError()
-
-                # Check target tickers' current roster & workspace ownership fingerprint
-                exp_hash = expected_snapshot.get("expected_roster_hash")
-                if isinstance(exp_hash, str) and exp_hash:
-                    check_tickers = list(snap_tickers if snap_tickers is not None else norm_tickers)
-                    live_ws_map, live_ws_owners = await _resolve_ws_map_and_owners(
-                        uid, check_tickers, live_by_ticker, owned_ws=owned_ws, conn=conn
-                    )
-                    live_hash_with_owner = compute_roster_hash(
-                        check_tickers,
-                        live_by_ticker,
-                        live_ws_map,
-                        ws_owners=live_ws_owners,
-                    )
-                    if live_hash_with_owner != exp_hash:
-                        # Backward compatibility for callers/tests computing hash without ws_owners
-                        live_hash_legacy = compute_roster_hash(
-                            check_tickers, live_by_ticker, live_ws_map
-                        )
-                        if live_hash_legacy != exp_hash:
-                            raise WatchlistScopeChangedError()
-                elif require_snapshot and is_confirmable:
-                    raise WatchlistScopeChangedError()
-
-                # For remove_group, verify group exists & exclusive deletion set matches snapshot (Item 3)
+                    if act in ("set_tier", "remove") and sorted(
+                        t for t in caller_raw_tickers if t in live_by_ticker
+                    ) != sorted(set(snap_tickers)):
+                        raise WatchlistScopeChangedError()
+                if act == "add_group":
+                    if caller_label is not None and caller_label != snap_glabel:
+                        raise WatchlistScopeChangedError()
+                    if criteria is not None and dict(criteria) != snap_criteria:
+                        raise WatchlistScopeChangedError()
+                    if auto_refresh is not None and bool(auto_refresh) != snap_auto_refresh:
+                        raise WatchlistScopeChangedError()
                 if act == "remove_group":
-                    if not eff_group_id:
+                    if not snap_gid:
                         raise WatchlistScopeChangedError()
+                    if caller_group_id and caller_group_id != snap_gid:
+                        if caller_group_id.lower() != snap_glabel.lower():
+                            raise WatchlistScopeChangedError()
+                    if caller_label and caller_label.lower() != snap_glabel.lower():
+                        raise WatchlistScopeChangedError()
+
+                # Check roster revision, policy versions, roster+owner hash, group deletion set, pause versions
+                if int(snap.get("roster_revision", 0)) != live_roster_rev:
+                    raise WatchlistScopeChangedError()
+
+                exp_versions = snap.get("expected_policy_versions")
+                if not isinstance(exp_versions, Mapping):
+                    raise WatchlistScopeChangedError()
+                for t_name, exp_ver in exp_versions.items():
+                    live_ver = live_policies.get(
+                        str(t_name).lower(), get_default_tier_policy(str(t_name).lower())
+                    ).policy_version
+                    if int(live_ver) != int(exp_ver):
+                        raise WatchlistScopeChangedError()
+
+                exp_hash = snap.get("expected_roster_hash")
+                if not isinstance(exp_hash, str) or not exp_hash:
+                    raise WatchlistScopeChangedError()
+                live_ws_map, live_ws_owners = await _resolve_ws_map_and_owners(
+                    uid, snap_tickers, live_by_ticker, owned_ws=owned_ws, conn=conn
+                )
+                live_hash_with_owner = compute_roster_hash(
+                    snap_tickers,
+                    live_by_ticker,
+                    live_ws_map,
+                    ws_owners=live_ws_owners,
+                )
+                if live_hash_with_owner != exp_hash:
+                    raise WatchlistScopeChangedError()
+
+                if act == "remove_group":
+                    assert snap_gid is not None
                     live_groups = await coverage_db.list_coverage_groups(uid, conn=conn)
                     matched_live_grp = next(
                         (
                             g
                             for g in live_groups
-                            if str(g.get("group_id") or "").strip() == eff_group_id
+                            if str(g.get("group_id") or "").strip() == snap_gid
                         ),
                         None,
                     )
                     if matched_live_grp is None:
                         raise WatchlistScopeChangedError()
-                    # If caller also supplied raw_group_id, it must match either the UUID or label of matched_live_grp
-                    if raw_group_id and raw_group_id != eff_group_id:
-                        grp_lbl = str(matched_live_grp.get("label") or "").strip().lower()
-                        if raw_group_id.lower() != grp_lbl:
-                            raise WatchlistScopeChangedError()
                     live_del_tickers = coverage_db.compute_exclusive_group_deletion_tickers(
-                        eff_group_id, live_groups, live_rows
+                        snap_gid, live_groups, live_rows
                     )
-                    if snap_tickers is not None and sorted(live_del_tickers) != sorted(snap_tickers):
+                    if sorted(live_del_tickers) != sorted(snap_tickers):
                         raise WatchlistScopeChangedError()
 
-            # Bind override_user_pause to exact config_version at confirmation time (Item 8)
-            if override_user_pause:
-                autos_now = await _get_live_autos()
-                check_syms = list(snap_tickers if snap_tickers is not None else norm_tickers)
-                live_ws_map_pv, _ = await _resolve_ws_map_and_owners(
-                    uid, check_syms, live_by_ticker, owned_ws=owned_ws, conn=conn
-                )
-                live_pause_versions: dict[str, int] = {}
-                for sym in check_syms:
-                    ws_id = live_ws_map_pv.get(sym)
-                    if not ws_id:
-                        continue
-                    c_rows = _company_rows_for_workspace(
-                        autos_now, workspace_id=ws_id, ticker=sym
-                    )
-                    live_pause_versions.update(
-                        _collect_user_pause_versions(c_rows, ticker=sym)
-                    )
-                if has_snapshot:
-                    assert isinstance(expected_snapshot, Mapping)
-                    raw_exp_pv = expected_snapshot.get("expected_pause_versions")
-                    if isinstance(raw_exp_pv, Mapping):
-                        norm_exp_pv = {str(k): int(v) for k, v in raw_exp_pv.items()}
-                        if norm_exp_pv != live_pause_versions:
-                            raise WatchlistScopeChangedError()
-                    elif require_snapshot:
+                if snap_override:
+                    autos_now = await _get_live_autos()
+                    live_pause_versions: dict[str, int] = {}
+                    for sym in snap_tickers:
+                        ws_id = live_ws_map.get(sym)
+                        if not ws_id:
+                            continue
+                        c_rows = _company_rows_for_workspace(
+                            autos_now, workspace_id=ws_id, ticker=sym
+                        )
+                        live_pause_versions.update(
+                            _collect_user_pause_versions(c_rows, ticker=sym)
+                        )
+                    raw_exp_pv = snap.get("expected_pause_versions")
+                    if not isinstance(raw_exp_pv, Mapping):
                         raise WatchlistScopeChangedError()
-                job_context["override_pause_versions"] = live_pause_versions
+                    norm_exp_pv = {str(k): int(v) for k, v in raw_exp_pv.items()}
+                    if norm_exp_pv != live_pause_versions:
+                        raise WatchlistScopeChangedError()
+                    job_context["override_pause_versions"] = live_pause_versions
+
+                consumed = await consume_confirm_snapshot(uid, clean_snapshot_id, conn=conn)
+                if not consumed:
+                    raise WatchlistScopeChangedError()
+
+                eff_norm_tickers = list(snap_tickers)
+                eff_not_found = list(snap_not_found)
+                eff_tier = snap_tier
+                eff_group_id = snap_gid
+                eff_group_label = snap_glabel
+                eff_criteria = snap_criteria
+                eff_auto_refresh = snap_auto_refresh
+                eff_override_pause = snap_override
+                snap_preval = snap.get("prevalidated")
+                if isinstance(snap_preval, Mapping):
+                    for sym in eff_norm_tickers:
+                        info = dict(snap_preval.get(sym) or {"ticker": sym, "name": sym})
+                        info["ticker"] = sym
+                        eff_valid_items.append(info)
+                elif act in ("add", "add_group"):
+                    eff_valid_items = [{"ticker": sym, "name": sym} for sym in eff_norm_tickers]
+
+            else:
+                # Server-verified exempt `add`: <= 5 requested, ALL net-new, no pause override, no paused task resumed
+                assert act == "add"
+                if any(sym in live_by_ticker for sym in caller_raw_tickers):
+                    raise WatchlistScopeChangedError("标的已在观察名单中，请先预览并确认后再修改。")
+                live_ws_check, _ = await _resolve_ws_map_and_owners(
+                    uid, exempt_norm_tickers, live_by_ticker, owned_ws=owned_ws, conn=conn
+                )
+                if any(live_ws_check.values()):
+                    autos_now = await _get_live_autos()
+                    eff_pol = resolve_effective_company_policy(
+                        live_policies.get(
+                            exempt_tier,
+                            get_default_tier_policy(exempt_tier),
+                        ),
+                        None,
+                    )
+                    for sym, ws_id in live_ws_check.items():
+                        if not ws_id:
+                            continue
+                        c_rows = _company_rows_for_workspace(
+                            autos_now, workspace_id=ws_id, ticker=sym
+                        )
+                        _, c_counts = _estimate_workspace_task_changes(
+                            ticker=sym,
+                            workspace_id=ws_id,
+                            old_tier=None,
+                            new_tier=exempt_tier,
+                            new_policy=eff_pol,
+                            company_rows=c_rows,
+                            override_user_pause=False,
+                        )
+                        if c_counts["resume_count"] > 0:
+                            raise WatchlistScopeChangedError("此操作会恢复已暂停的任务，请先预览并确认后再执行。")
+
+                eff_norm_tickers = list(exempt_norm_tickers)
+                eff_not_found = list(exempt_not_found)
+                eff_tier = exempt_tier
+                eff_valid_items = list(exempt_valid_items)
+                eff_override_pause = False
 
             target_versions = {
                 t: p.policy_version for t, p in live_policies.items()
@@ -1134,7 +1254,7 @@ class WatchlistMutationService:
             res_payload: dict[str, Any] = {}
 
             if act == "add":
-                assert norm_tier is not None
+                assert eff_tier is not None
                 existing_groups = await coverage_db.list_coverage_groups(uid, conn=conn)
                 valid_group_ids = {
                     str(g["group_id"]).strip()
@@ -1143,10 +1263,10 @@ class WatchlistMutationService:
                 }
                 rows_to_upsert = _build_upsert_rows_from_existing(
                     uid=uid,
-                    valid_items=resolved_valid_items,
+                    valid_items=eff_valid_items,
                     existing_rows=live_by_ticker,
                     ws_by_ticker=owned_ws,
-                    norm_tier=norm_tier,
+                    norm_tier=eff_tier,
                     norm_source=norm_source,
                     group_id=None,
                     valid_group_ids=valid_group_ids,
@@ -1161,19 +1281,19 @@ class WatchlistMutationService:
                     "ok": True,
                     "added": added_companies,
                     "added_tickers": added_tickers,
-                    "not_found": not_found,
-                    "tier": norm_tier,
+                    "not_found": eff_not_found,
+                    "tier": eff_tier,
                 }
 
             elif act == "add_group":
-                assert norm_tier is not None
+                assert eff_tier is not None
                 now_utc = datetime.now(timezone.utc)
                 group_row = await coverage_db.insert_coverage_group(
                     uid,
-                    label=clean_label,
+                    label=eff_group_label,
                     criteria=eff_criteria,
-                    default_tier=norm_tier,
-                    auto_refresh=bool(auto_refresh),
+                    default_tier=eff_tier,
+                    auto_refresh=bool(eff_auto_refresh),
                     last_resolved_at=now_utc,
                     conn=conn,
                 )
@@ -1186,10 +1306,10 @@ class WatchlistMutationService:
                 } | {new_gid}
                 rows_to_upsert = _build_upsert_rows_from_existing(
                     uid=uid,
-                    valid_items=resolved_valid_items,
+                    valid_items=eff_valid_items,
                     existing_rows=live_by_ticker,
                     ws_by_ticker=owned_ws,
-                    norm_tier=norm_tier,
+                    norm_tier=eff_tier,
                     norm_source="group",
                     group_id=new_gid,
                     valid_group_ids=valid_group_ids,
@@ -1204,33 +1324,32 @@ class WatchlistMutationService:
                 units_unavailable = await _overlay_canonical_unit_workspaces(
                     uid, added_companies, raw_rows=upserted, conn=conn
                 )
-                # Only newly added tickers (existing ones keep their manual tier)
                 pending_reconcile_tickers = [
                     t for t in added_tickers if t not in live_by_ticker
                 ]
                 res_payload = {
                     "ok": True,
                     "group": group_row,
-                    "resolved_count": len(resolved_valid_items),
+                    "resolved_count": len(eff_valid_items),
                     "added_tickers": added_tickers,
-                    "not_found": not_found,
-                    "rejected": not_found,
+                    "not_found": eff_not_found,
+                    "rejected": eff_not_found,
                 }
                 if units_unavailable:
                     res_payload["units_unavailable"] = True
 
             elif act == "set_tier":
-                assert norm_tier is not None
+                assert eff_tier is not None
                 updated_rows = await coverage_db.update_coverage_tier(
-                    uid, norm_tickers, norm_tier, conn=conn
+                    uid, eff_norm_tickers, eff_tier, conn=conn
                 )
                 updated_tickers = [str(r["ticker"]) for r in updated_rows]
                 updated_set = set(updated_tickers)
                 missing_tickers = list(
                     dict.fromkeys(
                         [
-                            *[t for t in snap_not_found if t not in updated_set],
-                            *[t for t in norm_tickers if t not in updated_set],
+                            *[t for t in eff_not_found if t not in updated_set],
+                            *[t for t in eff_norm_tickers if t not in updated_set],
                         ]
                     )
                 )
@@ -1241,13 +1360,12 @@ class WatchlistMutationService:
                     "updated_tickers": updated_tickers,
                     "missing_tickers": missing_tickers,
                     "not_found": missing_tickers,
-                    "tier": norm_tier,
+                    "tier": eff_tier,
                 }
 
             elif act == "remove":
-                # Capture original workspace_id BEFORE deleting rows (Item 6)
                 removed_ws_map: dict[str, str] = {}
-                for sym in norm_tickers:
+                for sym in eff_norm_tickers:
                     if sym not in live_by_ticker:
                         continue
                     ws_id = await resolve_company_workspace_id(
@@ -1259,7 +1377,7 @@ class WatchlistMutationService:
                         removed_ws_map[sym] = ws_id
 
                 removed = await coverage_db.delete_coverage_tickers(
-                    uid, norm_tickers, conn=conn
+                    uid, eff_norm_tickers, conn=conn
                 )
                 removed_set = set(removed)
                 if removed_ws_map:
@@ -1269,8 +1387,8 @@ class WatchlistMutationService:
                 missing_tickers = list(
                     dict.fromkeys(
                         [
-                            *[t for t in snap_not_found if t not in removed_set],
-                            *[t for t in norm_tickers if t not in removed_set],
+                            *[t for t in eff_not_found if t not in removed_set],
+                            *[t for t in eff_norm_tickers if t not in removed_set],
                         ]
                     )
                 )
@@ -1322,14 +1440,16 @@ class WatchlistMutationService:
                     **del_res,
                 }
 
-            # Insert outbox record in the EXACT SAME transaction as the watchlist mutation (§5.3 Stage 1)
+            # Bump monotonic roster revision & insert outbox record in the SAME transaction
+            new_rev = await bump_user_roster_revision(uid, conn=conn)
             job_row = await insert_reconcile_job(
                 uid,
                 trigger_action=act,
                 target_policy_versions=target_versions,
                 pending_tickers=pending_reconcile_tickers,
-                override_user_pause=override_user_pause,
+                override_user_pause=eff_override_pause,
                 job_context=job_context,
+                roster_revision=new_rev,
                 conn=conn,
             )
             return res_payload, job_row

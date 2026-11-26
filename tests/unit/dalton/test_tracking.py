@@ -228,6 +228,13 @@ def _install_fake_automation_store(
     )
     monkeypatch.setattr(exec_db, "skip_unstarted_executions_for_automations", mock_skip_execs)
     monkeypatch.setattr(exec_db, "get_db_now", mock_get_db_now)
+    from src.dalton.database import coverage as cov_db
+
+    monkeypatch.setattr(
+        cov_db,
+        "get_coverage_row",
+        create_autospec(cov_db.get_coverage_row, return_value=None),
+    )
 
     return {
         "store": store,
@@ -345,10 +352,22 @@ async def test_coverage_completion_does_not_reopen_after_user_pause_while_conver
     assert tool_cov_finish["paused_by_user"] is True
     assert all(r["status"] == "paused" for r in store)
 
-    # 2. Conversational enable (`source="user"`, the default) forces re-enable and clears `paused_by_user`
-    tool_user_enable = json.loads(
+    # 2. Conversational enable without version authorization refuses to override manual pause (r4 Decision 3);
+    #    with explicit `override_pause_versions` matching each row's `config_version`, it re-enables and clears `paused_by_user`.
+    tool_user_no_ver = json.loads(
         await analyst_tools["dalton_coverage_tracking"].ainvoke(
             {"action": "enable"},
+            config={"configurable": {"user_id": "user-1", "workspace_id": "ws-nvda"}},
+        )
+    )
+    assert tool_user_no_ver["status"] == "disabled"
+    assert tool_user_no_ver["paused_by_user"] is True
+    assert all(r["status"] == "paused" for r in store)
+
+    override_vers = {str(r["automation_id"]): int(r.get("config_version") or 1) for r in store}
+    tool_user_enable = json.loads(
+        await analyst_tools["dalton_coverage_tracking"].ainvoke(
+            {"action": "enable", "override_pause_versions": override_vers},
             config={"configurable": {"user_id": "user-1", "workspace_id": "ws-nvda"}},
         )
     )
@@ -1265,7 +1284,14 @@ async def test_round9_enable_tracking_earnings_resume_refuses_expired_once_and_r
         initial_rows=initial_rows,
     )
 
-    res = await enable_tracking("user-1", "ws-nvda", force=True)
+    res = await enable_tracking(
+        "user-1",
+        "ws-nvda",
+        force=True,
+        override_pause_versions={
+            str(r["automation_id"]): int(r.get("config_version") or 1) for r in initial_rows
+        },
+    )
     assert res["status"] == "enabled"
     assert res["paused_by_user"] is False
     refusals = res.get("resume_refusals") or []
@@ -1467,7 +1493,14 @@ async def test_round10_enable_tracking_resumes_brk_b_dotted_earnings_and_renamed
         create_autospec(_REAL_GET_ACTIVE_UNIT, return_value=brk_unit),
     )
 
-    res = await enable_tracking("user-1", ws_brk, force=True)
+    res = await enable_tracking(
+        "user-1",
+        ws_brk,
+        force=True,
+        override_pause_versions={
+            str(r["automation_id"]): int(r.get("config_version") or 1) for r in initial_rows
+        },
+    )
     assert res["status"] == "enabled"
     assert not res.get("resume_refusals")
     by_id = {r["automation_id"]: r for r in ctx["store"]}

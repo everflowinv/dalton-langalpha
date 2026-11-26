@@ -62,7 +62,7 @@ def upgrade() -> None:
         """
     )
 
-    # Backfill unlisted companies (e.g. OPENAI), legacy extra.tags, and restore radar rows saved by downgrade()
+    # Backfill unlisted companies (e.g. OPENAI), legacy extra.tags, and restore radar rule groups saved by downgrade()
     op.execute(
         """
         UPDATE dalton_coverage
@@ -74,12 +74,11 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        UPDATE dalton_coverage
-        SET tier = 'radar',
-            extra = COALESCE(extra, '{}'::jsonb) - 'downgraded_from_tier' - 'downgraded_silent',
+        UPDATE dalton_coverage_groups
+        SET default_tier = 'radar',
+            criteria = COALESCE(criteria, '{}'::jsonb) - '_downgraded_default_tier',
             updated_at = NOW()
-        WHERE COALESCE(extra->>'downgraded_from_tier', '') = 'radar'
-           OR COALESCE(extra->>'downgraded_silent', '') = 'true'
+        WHERE COALESCE(criteria->>'_downgraded_default_tier', '') = 'radar'
         """
     )
     op.execute(
@@ -125,7 +124,39 @@ def upgrade() -> None:
         """
     )
 
-    # 4. Transactional outbox for watchlist automation reconciliation
+    # 4. Per-user roster revision & Home YAML publish state
+    op.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dalton_watchlist_user_state (
+            user_id TEXT PRIMARY KEY,
+            roster_revision BIGINT NOT NULL DEFAULT 0,
+            last_yaml_synced_revision BIGINT NOT NULL DEFAULT 0,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+
+    # 5. Server-issued confirmation snapshots (bound & single-use)
+    op.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dalton_watchlist_confirm_snapshots (
+            snapshot_id UUID PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            payload JSONB NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL,
+            consumed_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+    op.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_dalton_watchlist_confirm_snapshots_user_exp
+            ON dalton_watchlist_confirm_snapshots (user_id, expires_at)
+        """
+    )
+
+    # 6. Transactional outbox for watchlist automation reconciliation (with claim lease & roster revision)
     op.execute(
         """
         CREATE TABLE IF NOT EXISTS dalton_watchlist_reconcile_jobs (
@@ -138,6 +169,9 @@ def upgrade() -> None:
             failed_items JSONB NOT NULL DEFAULT '[]'::jsonb,
             override_user_pause BOOLEAN NOT NULL DEFAULT FALSE,
             job_context JSONB NOT NULL DEFAULT '{}'::jsonb,
+            claim_token TEXT,
+            claim_expires_at TIMESTAMPTZ,
+            roster_revision BIGINT NOT NULL DEFAULT 0,
             yaml_synced BOOLEAN NOT NULL DEFAULT FALSE,
             status VARCHAR(24) NOT NULL DEFAULT 'pending'
                 CHECK (status IN ('pending', 'running', 'completed', 'partial')),
@@ -151,6 +185,60 @@ def upgrade() -> None:
         CREATE INDEX IF NOT EXISTS idx_dalton_watchlist_reconcile_pending
             ON dalton_watchlist_reconcile_jobs (user_id, created_at ASC)
             WHERE status IN ('pending', 'running', 'partial') OR yaml_synced = FALSE
+        """
+    )
+
+    # Restore radar rows saved by downgrade() and enqueue reconcile jobs so tasks re-pause cleanly
+    op.execute(
+        """
+        WITH restored AS (
+            UPDATE dalton_coverage
+            SET tier = 'radar',
+                extra = COALESCE(extra, '{}'::jsonb) - 'downgraded_from_tier' - 'downgraded_silent',
+                updated_at = NOW()
+            WHERE COALESCE(extra->>'downgraded_from_tier', '') = 'radar'
+               OR COALESCE(extra->>'downgraded_silent', '') = 'true'
+            RETURNING user_id, ticker
+        ),
+        per_user AS (
+            SELECT user_id, jsonb_agg(ticker ORDER BY ticker) AS tickers
+            FROM restored
+            GROUP BY user_id
+        ),
+        bumped AS (
+            INSERT INTO dalton_watchlist_user_state (
+                user_id, roster_revision, last_yaml_synced_revision, updated_at
+            )
+            SELECT user_id, 1, 0, NOW()
+            FROM per_user
+            ON CONFLICT (user_id) DO UPDATE
+            SET roster_revision = dalton_watchlist_user_state.roster_revision + 1,
+                updated_at = NOW()
+            RETURNING user_id, roster_revision
+        )
+        INSERT INTO dalton_watchlist_reconcile_jobs (
+            job_id, user_id, trigger_action, target_policy_versions,
+            pending_tickers, completed_tickers, failed_items,
+            override_user_pause, job_context, roster_revision, yaml_synced, status,
+            created_at, updated_at
+        )
+        SELECT
+            gen_random_uuid(),
+            p.user_id,
+            'migration_restore_radar',
+            '{"core": 1, "watch": 1, "radar": 1}'::jsonb,
+            p.tickers,
+            '[]'::jsonb,
+            '[]'::jsonb,
+            FALSE,
+            '{}'::jsonb,
+            b.roster_revision,
+            FALSE,
+            'pending',
+            NOW(),
+            NOW()
+        FROM per_user p
+        JOIN bumped b ON b.user_id = p.user_id
         """
     )
 
@@ -225,7 +313,10 @@ def downgrade() -> None:
     op.execute(
         """
         UPDATE dalton_coverage_groups
-        SET default_tier = 'watch'
+        SET criteria = COALESCE(criteria, '{}'::jsonb)
+                       || jsonb_build_object('_downgraded_default_tier', 'radar'),
+            default_tier = 'watch',
+            updated_at = NOW()
         WHERE default_tier = 'radar'
         """
     )
@@ -237,6 +328,9 @@ def downgrade() -> None:
     op.execute("DROP TABLE IF EXISTS dalton_watchlist_views")
     op.execute("DROP INDEX IF EXISTS idx_dalton_watchlist_reconcile_pending")
     op.execute("DROP TABLE IF EXISTS dalton_watchlist_reconcile_jobs")
+    op.execute("DROP INDEX IF EXISTS idx_dalton_watchlist_confirm_snapshots_user_exp")
+    op.execute("DROP TABLE IF EXISTS dalton_watchlist_confirm_snapshots")
+    op.execute("DROP TABLE IF EXISTS dalton_watchlist_user_state")
     op.execute("DROP TABLE IF EXISTS dalton_watchlist_tier_policies")
 
     # Drop new indexes and columns from dalton_coverage

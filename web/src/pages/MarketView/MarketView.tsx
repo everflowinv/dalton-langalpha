@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useEffectEvent, useCallback, useMemo } from 'react';
-import { useNavigate, useSearchParams } from 'react-router';
+import { useLocation, useNavigate, useSearchParams } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Info } from 'lucide-react';
@@ -8,10 +8,14 @@ import { useToast } from '@/components/ui/use-toast';
 import { WatchlistWorkspace } from './components/watchlist/WatchlistWorkspace';
 import {
   BackToWatchlistButton,
+  buildConsumedRouteReplaceState,
+  navigateBackToDaltonWatchlist,
   navigateDaltonChartJump,
+  readDaltonOpeningMarketRoute,
   shouldConsumeMarketRouteParam,
   shouldShowDaltonWatchlist,
   syncDaltonMarketSymbolParam,
+  syncDaltonMarketTimeframeParam,
 } from './components/watchlist/marketViewWatchlistHook';
 import './MarketView.css';
 import StockHeader from './components/StockHeader';
@@ -104,6 +108,7 @@ function pickQuickQueryIndices(): number[] {
 function MarketViewInner() {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const { toast } = useToast();
   const queryClient = useQueryClient();
@@ -113,7 +118,8 @@ function MarketViewInner() {
   // mount as a scope change the user made, and drops the forwarded `?thread`
   // for a fresh chat. Seeded here, the effect below re-applies the same values
   // and React bails, so the link's conversation survives the landing.
-  const [openingRoute] = useState(() => readMarketViewRoute(searchParams));
+  // DALTON-HOOK(watchlist): restore consumed ws/returnTo from history entry state
+  const [openingRoute] = useState(() => readDaltonOpeningMarketRoute(searchParams, location.state));
   // DALTON-HOOK(watchlist): `/market` without `?symbol=` opens the full personal watchlist in Dalton builds
   const showWatchlistView = shouldShowDaltonWatchlist(searchParams);
   // Every way in (link, saved pref, search, sidebar, chip) lands on the display
@@ -310,8 +316,8 @@ function MarketViewInner() {
     setChatExpanded(true);
   } : null);
 
-  // Chat return path — captured from URL when navigating from chat DetailPanel
-  const [chatReturnPath, setChatReturnPath] = useState<string | null>(null);
+  // Chat return path — captured from URL (or history entry state in Dalton) when navigating from chat DetailPanel
+  const [chatReturnPath, setChatReturnPath] = useState<string | null>(() => openingRoute.returnTo);
 
   // Handle URL parameters (symbol + returnTo from chat context, and ws when
   // opening a chart layer card from ChatAgent). Preserve
@@ -348,18 +354,19 @@ function MarketViewInner() {
       setChatReturnPath(route.returnTo);
     }
     // `thread` stays for MarketChatPanel, which consumes it itself.
-    // DALTON-HOOK(watchlist): keep `symbol` and `tf` in URL for Dalton back/forward between /market and /market?symbol=
+    // DALTON-HOOK(watchlist): keep `symbol` and `tf` in URL & persist consumed `ws`/`returnTo` in history state
     const consumed = MARKET_VIEW_ROUTE_PARAMS.filter(
       (key) => shouldConsumeMarketRouteParam(key) && searchParams.has(key),
     );
     if (consumed.length > 0) {
+      const nextState = buildConsumedRouteReplaceState(location.state, route);
       setSearchParams((prev) => {
         const next = new URLSearchParams(prev);
         for (const key of consumed) next.delete(key);
         return next;
-      }, { replace: true });
+      }, { replace: true, ...(nextState ? { state: nextState } : {}) });
     }
-  }, [searchParams, selectedStock, setSearchParams, selectWorkspace]);
+  }, [searchParams, selectedStock, setSearchParams, selectWorkspace, location.state]);
 
   const handleStockSearch = useCallback((symbol: string, searchResult?: StockSearchHit | null) => {
     const nextSym = displaySpelling(symbol);
@@ -588,9 +595,12 @@ function MarketViewInner() {
     syncDaltonMarketSymbolParam(setSearchParams, nextSym);
   }, [setSearchParams]);
 
-  // DALTON-HOOK(watchlist): button returning from K-line view to `/market` personal watchlist
+  // DALTON-HOOK(watchlist): button returning from K-line view to `/market` personal watchlist (uses history.back when arrived from list)
   const backToWatchlistButton = (
-    <BackToWatchlistButton onBack={() => navigate('/market')} label={t('marketView:watchlist.backToWatchlist')} />
+    <BackToWatchlistButton
+      onBack={() => navigateBackToDaltonWatchlist(navigate, location.state)}
+      label={t('marketView:watchlist.backToWatchlist')}
+    />
   );
 
   // The chart toolbar's own end: the watchlist and holdings, then the company overview.
@@ -615,7 +625,9 @@ function MarketViewInner() {
 
   const handleIntervalChange = useCallback((interval: string) => {
     setSelectedInterval(interval);
-  }, []);
+    // DALTON-HOOK(watchlist): reflect timeframe changes in URL `?tf=`
+    syncDaltonMarketTimeframeParam(setSearchParams, interval);
+  }, [setSearchParams]);
 
   const handleStockMeta = useCallback((meta: Record<string, unknown> | null) => {
     setChartMeta(meta);

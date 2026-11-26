@@ -99,6 +99,58 @@ export function coverageQuoteRow(
   };
 }
 
+export function buildCoverageRowsForCompanies(
+  companies: readonly PersonalWatchlistCompany[],
+  quotes: Record<string, Parameters<typeof snapshotToStockPrice>[1]>,
+): CoverageWatchlistRow[] {
+  if (!companies.length) return [];
+  const listedQuoted: string[] = [];
+  for (const c of companies) {
+    if (c.is_private) continue;
+    if (listedQuoted.length >= MAX_DASHBOARD_COVERAGE_QUOTES) break;
+    listedQuoted.push(c.ticker.toUpperCase());
+  }
+  const bySym: Record<string, StockPrice> = Object.fromEntries(
+    listedQuoted.map((s) => [s, snapshotToStockPrice(s, quotes[s])]),
+  );
+  return companies.slice(0, MAX_DASHBOARD_COVERAGE_QUOTES).map((c) => {
+    const sym = c.ticker.toUpperCase();
+    const isPrivate = Boolean(c.is_private);
+    const p = isPrivate ? ({} as Partial<StockPrice>) : (bySym[sym] || ({} as Partial<StockPrice>));
+    const quoteAvailable = !isPrivate && p.quoteAvailable !== false && p.price != null;
+    const currency = p.currency ?? null;
+    const assetClass = quotes[sym]?.asset_class ?? null;
+    return {
+      symbol: sym,
+      name: c.name || sym,
+      tier: c.tier,
+      is_private: isPrivate,
+      is_pinned: Boolean(c.is_pinned),
+      workspace_id: c.workspace_id ?? null,
+      price: quoteAvailable ? p.price ?? 0 : 0,
+      change: quoteAvailable ? p.change ?? 0 : 0,
+      changePercent: quoteAvailable ? p.changePercent ?? 0 : 0,
+      isPositive: quoteAvailable ? (p.change ?? 0) >= 0 : true,
+      quoteAvailable,
+      previousClose: p.previousClose ?? null,
+      regularClose: p.regularClose ?? null,
+      regularTradingChange: p.regularTradingChange ?? null,
+      regularTradingChangePercent: p.regularTradingChangePercent ?? null,
+      earlyTradingChange: p.earlyTradingChange ?? null,
+      earlyTradingChangePercent: p.earlyTradingChangePercent ?? null,
+      lateTradingChange: p.lateTradingChange ?? null,
+      lateTradingChangePercent: p.lateTradingChangePercent ?? null,
+      lastMinuteClose: p.lastMinuteClose ?? null,
+      lastTradePrice: p.lastTradePrice ?? null,
+      liveTickAt: p.liveTickAt ?? null,
+      currency,
+      assetClass,
+      places: p.places ?? quotePlaces(sym, { currency, assetClass }),
+      session: p.session,
+    };
+  });
+}
+
 export function useCoverageWatchlistData() {
   const {
     data: summary,
@@ -129,48 +181,10 @@ export function useCoverageWatchlistData() {
     enabled: isDaltonBuild && quotedSymbols.length > 0,
   });
 
-  const rows = useMemo<CoverageWatchlistRow[]>(() => {
-    if (!companies.length) return [];
-    const bySym: Record<string, StockPrice> = Object.fromEntries(
-      quotedSymbols.map((s) => [s, snapshotToStockPrice(s, quotes[s])]),
-    );
-    return companies.slice(0, MAX_DASHBOARD_COVERAGE_QUOTES).map((c) => {
-      const sym = c.ticker.toUpperCase();
-      const isPrivate = Boolean(c.is_private);
-      const p = isPrivate ? ({} as Partial<StockPrice>) : (bySym[sym] || ({} as Partial<StockPrice>));
-      const quoteAvailable = !isPrivate && p.quoteAvailable !== false && p.price != null;
-      const currency = p.currency ?? null;
-      const assetClass = quotes[sym]?.asset_class ?? null;
-      return {
-        symbol: sym,
-        name: c.name || sym,
-        tier: c.tier,
-        is_private: isPrivate,
-        is_pinned: Boolean(c.is_pinned),
-        workspace_id: c.workspace_id ?? null,
-        price: quoteAvailable ? p.price ?? 0 : 0,
-        change: quoteAvailable ? p.change ?? 0 : 0,
-        changePercent: quoteAvailable ? p.changePercent ?? 0 : 0,
-        isPositive: quoteAvailable ? (p.change ?? 0) >= 0 : true,
-        quoteAvailable,
-        previousClose: p.previousClose ?? null,
-        regularClose: p.regularClose ?? null,
-        regularTradingChange: p.regularTradingChange ?? null,
-        regularTradingChangePercent: p.regularTradingChangePercent ?? null,
-        earlyTradingChange: p.earlyTradingChange ?? null,
-        earlyTradingChangePercent: p.earlyTradingChangePercent ?? null,
-        lateTradingChange: p.lateTradingChange ?? null,
-        lateTradingChangePercent: p.lateTradingChangePercent ?? null,
-        lastMinuteClose: p.lastMinuteClose ?? null,
-        lastTradePrice: p.lastTradePrice ?? null,
-        liveTickAt: p.liveTickAt ?? null,
-        currency,
-        assetClass,
-        places: p.places ?? quotePlaces(sym, { currency, assetClass }),
-        session: p.session,
-      };
-    });
-  }, [companies, quotedSymbols, quotes]);
+  const rows = useMemo<CoverageWatchlistRow[]>(
+    () => buildCoverageRowsForCompanies(companies, quotes),
+    [companies, quotes],
+  );
 
   const counts = summary?.counts ?? {
     core: companies.filter((c) => c.tier === 'core').length,
@@ -182,6 +196,8 @@ export function useCoverageWatchlistData() {
 
   return {
     rows,
+    allCompanies: companies,
+    quotesBySymbol: quotes,
     totalCount: counts.total,
     quotedLimit: MAX_DASHBOARD_COVERAGE_QUOTES,
     counts,

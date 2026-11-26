@@ -1151,14 +1151,10 @@ class PriceMonitorService:
                             ignore_subscribe_messages=True, timeout=_TARGET_SIGNAL_POLL
                         )
                         if msg and msg.get("type") == "message":
-                            # DALTON-HOOK(watchlist): route automation reload signal to _load_automations
-                            raw_data = msg.get("data")
-                            if isinstance(raw_data, bytes):
-                                raw_data = raw_data.decode("utf-8", errors="ignore")
-                            if str(raw_data or "").strip() == "__automations__":
-                                self.request_automations_reload()
-                            else:
-                                self.request_targets_reload(raw_data)
+                            # DALTON-HOOK(watchlist): route automation reload vs target reload signal
+                            from src.dalton.watchlist.privacy import dispatch_price_monitor_signal
+
+                            dispatch_price_monitor_signal(self, msg.get("data"))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

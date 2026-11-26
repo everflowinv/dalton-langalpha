@@ -1562,6 +1562,7 @@ async def enable_tracking(
     *,
     force: bool = False,
     respect_user_pause: bool = True,
+    override_pause_versions: Mapping[str, int] | None = None,
     viewer_user_id: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
@@ -1654,8 +1655,8 @@ async def enable_tracking(
                 unit_id=unit_id_for_specs,
             )
 
-            # Item 10: when tier is radar or produces no standard specs, NEVER resume any task
-            # (even if force=True); pause any active managed tasks by policy and skip queued runs.
+            # Item 10 / r4 Decision 3: when tier is radar or produces no standard specs, NEVER resume any task
+            # (even if force=True); pause active standard tasks AND unstarted earnings once tasks by policy.
             if not specs:
                 paused_ids_empty: list[str] = []
                 t_lower_empty = str(ticker).strip().lower()
@@ -1668,14 +1669,22 @@ async def enable_tracking(
                     r_name = str(r.get("name") or "").strip().lower()
                     auto_id = str(r.get("automation_id") or "").strip()
                     r_status = str(r.get("status") or "active").strip().lower()
-                    if not auto_id or r_status == "disabled":
+                    if not auto_id or r_status in ("disabled", "completed", "deleted"):
                         continue
                     is_std_row = any(
                         r_name == f"{p}{sfx}"
                         for p in std_prefixes_empty
                         for sfx in std_suffixes_empty
                     )
-                    if not is_std_row or r_status != "active":
+                    is_unstarted_earn_once = (
+                        any(r_name.startswith(f"{p}earn-") for p in std_prefixes_empty)
+                        and str(r.get("trigger_type") or "").strip().lower() == "once"
+                        and r.get("last_run_at") is None
+                        and not (isinstance(r.get("run_count"), int) and r["run_count"] > 0)
+                    )
+                    if not (is_std_row or is_unstarted_earn_once):
+                        continue
+                    if r_status != "active":
                         continue
                     new_meta = (
                         dict(r.get("metadata") or {})
@@ -1735,8 +1744,25 @@ async def enable_tracking(
                     "skip_reason": "empty_tier_policy",
                 }
 
-            # Item 10: respect_user_pause guards manual pauses unless explicitly forced (CoS always passes force=False)
-            if not force and respect_user_pause and raw_current.get("paused_by_user"):
+            from src.dalton.watchlist.pause_guards import (
+                build_locked_resume_reconciler,
+                can_override_user_pause_locked,
+            )
+
+            # r4 Decision 3: overriding paused_by_user requires explicit config_version authorization
+            # (override_pause_versions); missing version authorization defaults to refusing override.
+            has_unauthorized_user_pause = any(
+                isinstance(r, Mapping)
+                and isinstance(r.get("metadata"), Mapping)
+                and bool(r["metadata"].get("paused_by_user"))
+                and not can_override_user_pause_locked(
+                    r,
+                    override_user_pause=bool(force),
+                    override_pause_versions=override_pause_versions,
+                )
+                for r in company_rows
+            )
+            if respect_user_pause and raw_current.get("paused_by_user") and has_unauthorized_user_pause:
                 visible_rows = (
                     await _filter_rows_by_viewer_web_read(
                         company_rows,
@@ -1783,6 +1809,12 @@ async def enable_tracking(
                 for r in company_rows
             )
 
+            locked_std_reconciler = build_locked_resume_reconciler(
+                override_user_pause=bool(force),
+                override_pause_versions=override_pause_versions,
+                skip_policy_pause=False,
+            )
+
             for spec in specs:
                 s_name = str(spec.get("name") or "")
                 existing_c = by_name_company.get(s_name)
@@ -1800,11 +1832,17 @@ async def enable_tracking(
                         continue
                     if bool(str(ex_meta.get("handoff_paused_reason") or "").strip()):
                         continue
-                    if not force and respect_user_pause and bool(ex_meta.get("paused_by_user")):
-                        continue
+                    if respect_user_pause and bool(ex_meta.get("paused_by_user")):
+                        if not can_override_user_pause_locked(
+                            existing_c,
+                            override_user_pause=bool(force),
+                            override_pause_versions=override_pause_versions,
+                        ):
+                            continue
                 spec_copy = dict(spec)
                 spec_meta = dict(spec_copy.get("metadata") or {})
                 spec_meta["paused_by_user"] = None
+                spec_meta["paused_by_policy"] = None
                 spec_meta["tier"] = resolved_tier
                 if str(spec_copy.get("name") or "") == delta_name:
                     spec_copy["cron_expression"] = delta_cron
@@ -1819,6 +1857,7 @@ async def enable_tracking(
                     actor_user_id=effective_actor,
                     action="resume" if was_paused else "update",
                     skip_if_unchanged=True,
+                    locked_row_reconciler=locked_std_reconciler,
                 ):
                     await schedule_dalton_automation_helper(
                         s_name,
@@ -1831,8 +1870,13 @@ async def enable_tracking(
                         conn=conn,
                     )
 
-            # Also resume paused non-standard unit-managed tasks (e.g. `dalton-brk.b-earn-*`
-            # or renamed `unit_id` tasks) via the shared schedule helper / lifecycle rules.
+            # Also resume paused non-standard unit-managed tasks via the shared schedule helper,
+            # ALWAYS skipping policy-paused rows (`paused_by_policy`) and verifying user pause under lock.
+            locked_nonstd_reconciler = build_locked_resume_reconciler(
+                override_user_pause=bool(force),
+                override_pause_versions=override_pause_versions,
+                skip_policy_pause=True,
+            )
             resume_refusals: list[dict[str, str]] = []
             for r in company_rows:
                 r_name = str(r.get("name") or "").strip()
@@ -1843,24 +1887,37 @@ async def enable_tracking(
                 r_meta = r.get("metadata") if isinstance(r.get("metadata"), Mapping) else {}
                 if bool(str(r_meta.get("handoff_paused_reason") or "").strip()):
                     continue
-                if not force and respect_user_pause and bool(r_meta.get("paused_by_user")):
+                if bool(r_meta.get("paused_by_policy")):
                     continue
+                if respect_user_pause and bool(r_meta.get("paused_by_user")):
+                    if not can_override_user_pause_locked(
+                        r,
+                        override_user_pause=bool(force),
+                        override_pause_versions=override_pause_versions,
+                    ):
+                        continue
                 if str(r.get("status") or "").lower() == "paused" and r.get("automation_id"):
                     resume_spec: dict[str, Any] = {
                         "action": "resume",
                         "automation_id": str(r["automation_id"]),
                     }
-                    resume_res = await schedule_dalton_automation_helper(
-                        r_name,
-                        resume_spec,
-                        user_id=uid,
-                        workspace_id=ws_id,
-                        ticker=ticker,
-                        role="chief_of_staff",
-                        action="resume",
+                    with automation_history_context(
                         actor_user_id=effective_actor,
-                        conn=conn,
-                    )
+                        action="resume",
+                        skip_if_unchanged=True,
+                        locked_row_reconciler=locked_nonstd_reconciler,
+                    ):
+                        resume_res = await schedule_dalton_automation_helper(
+                            r_name,
+                            resume_spec,
+                            user_id=uid,
+                            workspace_id=ws_id,
+                            ticker=ticker,
+                            role="chief_of_staff",
+                            action="resume",
+                            actor_user_id=effective_actor,
+                            conn=conn,
+                        )
                     if not resume_res.get("ok"):
                         resume_refusals.append(
                             {

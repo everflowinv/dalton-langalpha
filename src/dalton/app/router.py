@@ -88,6 +88,7 @@ class DaltonAutomationWriteRequest(BaseModel):
 class WorkspaceTrackingUpdateRequest(BaseModel):
     enabled: bool
     tier: str | None = None
+    override_pause_versions: dict[str, int] | None = None
 
 
 class WorkspaceSharingUpdateRequest(BaseModel):
@@ -116,8 +117,10 @@ class SystemJobToggleRequest(BaseModel):
 
 class CoverageMutateRequest(BaseModel):
     action: str
-    tickers: list[str] | str
-    tier: str = "watch"
+    tickers: list[str] | str | None = None
+    tier: str | None = None
+    snapshot_id: str | None = None
+    override_user_pause: bool | None = None
 
 
 class CoverageGroupPreviewRequest(BaseModel):
@@ -130,6 +133,7 @@ class CoverageGroupCreateRequest(BaseModel):
     criteria: dict[str, Any] = Field(default_factory=dict)
     default_tier: str = "watch"
     auto_refresh: bool = True
+    snapshot_id: str | None = None
 
 
 class EarningsCalendarMirrorRequest(BaseModel):
@@ -2333,7 +2337,9 @@ async def update_workspace_tracking_endpoint(
                     owner_id,
                     workspace_id,
                     tier=body.tier,
-                    force=True,
+                    force=bool(body.override_pause_versions),
+                    respect_user_pause=True,
+                    override_pause_versions=body.override_pause_versions,
                 )
             else:
                 res = await disable_tracking(owner_id, workspace_id)
@@ -2692,12 +2698,15 @@ async def mutate_user_coverage_endpoint(
 ) -> dict[str, Any]:
     _require_dalton_enabled()
     from src.dalton.coverage import CoverageDataSourceError
-    from src.dalton.watchlist.service import WatchlistMutationService
+    from src.dalton.watchlist.service import (
+        WatchlistMutationService,
+        WatchlistScopeChangedError,
+    )
 
     uid = str(user_id).strip()
     act = str(body.action or "").strip().lower()
-    tickers = _parse_tickers_payload(body.tickers)
-    if not tickers:
+    tickers = _parse_tickers_payload(body.tickers) if body.tickers is not None else []
+    if not tickers and not body.snapshot_id:
         raise HTTPException(status_code=400, detail="tickers is required")
 
     svc = WatchlistMutationService()
@@ -2706,27 +2715,37 @@ async def mutate_user_coverage_endpoint(
             return await svc.execute_mutation(
                 uid,
                 action="add",
-                tickers=tickers,
-                tier=body.tier or "watch",
+                snapshot_id=body.snapshot_id,
+                tickers=tickers or None,
+                tier=body.tier if body.tier is not None else (None if body.snapshot_id else "watch"),
+                override_user_pause=body.override_user_pause,
                 source="ui",
             )
         if act == "remove":
             return await svc.execute_mutation(
                 uid,
                 action="remove",
-                tickers=tickers,
+                snapshot_id=body.snapshot_id,
+                tickers=tickers or None,
                 source="ui",
             )
         if act == "set_tier":
             res = await svc.execute_mutation(
                 uid,
                 action="set_tier",
-                tickers=tickers,
-                tier=body.tier or "watch",
+                snapshot_id=body.snapshot_id,
+                tickers=tickers or None,
+                tier=body.tier if body.tier is not None else (None if body.snapshot_id else "watch"),
+                override_user_pause=body.override_user_pause,
                 source="ui",
             )
             res.setdefault("delta_schedule", [])
             return res
+    except WatchlistScopeChangedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
     except CoverageDataSourceError as exc:
         raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
     except ValueError as exc:
@@ -2786,6 +2805,7 @@ async def create_user_coverage_group_endpoint(
 ) -> dict[str, Any]:
     _require_dalton_enabled()
     from src.dalton.coverage import CoverageDataSourceError, add_coverage_group
+    from src.dalton.watchlist.service import WatchlistScopeChangedError
 
     try:
         return await add_coverage_group(
@@ -2794,7 +2814,13 @@ async def create_user_coverage_group_endpoint(
             criteria=body.criteria,
             default_tier=body.default_tier,
             auto_refresh=body.auto_refresh,
+            snapshot_id=body.snapshot_id,
         )
+    except WatchlistScopeChangedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
     except CoverageDataSourceError as exc:
         raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
     except ValueError as exc:
@@ -2806,11 +2832,23 @@ async def create_user_coverage_group_endpoint(
 async def delete_user_coverage_group_endpoint(
     group_id: str,
     user_id: CurrentUserId,
+    snapshot_id: str | None = Query(default=None),
 ) -> dict[str, Any]:
     _require_dalton_enabled()
     from src.dalton.coverage import remove_coverage_group
+    from src.dalton.watchlist.service import WatchlistScopeChangedError
 
-    res = await remove_coverage_group(str(user_id).strip(), group_id)
+    try:
+        res = await remove_coverage_group(
+            str(user_id).strip(),
+            group_id,
+            snapshot_id=snapshot_id,
+        )
+    except WatchlistScopeChangedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
     if not res.get("ok") or res.get("deleted") is False:
         raise HTTPException(status_code=404, detail=str(res.get("error") or "Group not found"))
     return res

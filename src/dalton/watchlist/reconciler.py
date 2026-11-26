@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
 from typing import Any
 
 from src.dalton.autonomy.schedule import (
@@ -24,6 +23,10 @@ from src.dalton.coverage.models import VALID_EARNINGS_STAGES, _ensure_json_obj
 from src.dalton.coverage.service import sync_user_coverage_to_home
 from src.dalton.database import coverage as coverage_db
 from src.dalton.services.company_automations import automation_history_context
+from src.dalton.watchlist.pause_guards import (
+    build_locked_resume_reconciler,
+    can_override_user_pause_locked,
+)
 from src.dalton.watchlist.policies import (
     TierPolicy,
     claim_reconcile_job,
@@ -108,6 +111,7 @@ def _earn_stage_from_name(name: str, ticker: str) -> str | None:
 
 
 def _is_future_earn_once(row: Mapping[str, Any]) -> bool:
+    """Return True iff ``row`` is an unstarted one-shot earnings task (even if overdue/delayed)."""
     name = str(row.get("name") or "").strip().lower()
     if "-earn-" not in name:
         return False
@@ -116,19 +120,12 @@ def _is_future_earn_once(row: Mapping[str, Any]) -> bool:
     status = str(row.get("status") or "").strip().lower()
     if status in ("completed", "disabled", "deleted"):
         return False
-    when = row.get("next_run_at")
-    if when is None:
-        return True
-    if isinstance(when, str):
-        try:
-            when = datetime.fromisoformat(when.strip().replace("Z", "+00:00"))
-        except ValueError:
-            return False
-    if isinstance(when, datetime):
-        if when.tzinfo is None:
-            when = when.replace(tzinfo=UTC)
-        return when > datetime.now(UTC)
-    return False
+    if row.get("last_run_at") is not None:
+        return False
+    run_count = row.get("run_count")
+    if isinstance(run_count, int) and run_count > 0:
+        return False
+    return True
 
 
 def _has_handoff_pause(row: Mapping[str, Any]) -> bool:
@@ -167,15 +164,11 @@ def _can_override_user_pause(
     override_pause_versions: Mapping[str, int] | None,
 ) -> bool:
     """Return True iff ``override_user_pause`` is authorized for ``existing``'s current ``config_version``."""
-    if not override_user_pause:
-        return False
-    if override_pause_versions is None:
-        return True
-    auto_id = str(existing.get("automation_id") or "").strip()
-    if not auto_id or auto_id not in override_pause_versions:
-        return False
-    live_ver = int(existing.get("config_version") or 1)
-    return live_ver == int(override_pause_versions[auto_id])
+    return can_override_user_pause_locked(
+        existing,
+        override_user_pause=override_user_pause,
+        override_pause_versions=override_pause_versions,
+    )
 
 
 def _company_rows_for_workspace(
@@ -269,42 +262,13 @@ async def _verify_workspace_bound_to_ticker(
     *,
     conn: Any = None,
 ) -> bool:
-    """Verify inside the write lock that ``workspace_id`` is still bound to ``ticker`` (not rebound)."""
+    """Positively verify inside the write lock that ``workspace_id`` belongs to ``ticker`` (not rebound)."""
     sym = str(ticker or "").strip().upper()
     ws_clean = str(workspace_id or "").strip()
     if not sym or not ws_clean:
         return False
 
-    from src.dalton.capabilities import CapabilityId, has_capability
-    from src.dalton.settings import is_coverage_units_enabled
-
-    if has_capability(CapabilityId.COLLEAGUE_SHARING) and is_coverage_units_enabled():
-        from src.dalton.coverage.identity import normalize_ticker_key
-        from src.dalton.database import coverage_units as cu_db
-
-        unit = await cu_db.get_active_unit_by_workspace(ws_clean, conn=conn)
-        if unit is not None:
-            u_ticker = str(unit.get("ticker") or "").strip().upper()
-            u_key = str(unit.get("ticker_key") or "").strip().upper()
-            t_key = (normalize_ticker_key(sym) or sym).upper()
-            if u_ticker or u_key:
-                return u_ticker == sym or (bool(u_key) and u_key == t_key)
-
-    try:
-        ws_row = await ws_db.get_workspace(ws_clean, conn=conn)
-    except RuntimeError as exc:
-        if "database pool is not open" not in str(exc):
-            raise
-        ws_row = None
-
-    if ws_row is not None:
-        if str(ws_row.get("status") or "").strip().lower() == "deleted":
-            return False
-        ws_name = str(ws_row.get("name") or "").strip().upper()
-        if ws_name and _PURE_TICKER_RE.fullmatch(ws_name) and ws_name != sym:
-            return False
-
-    # Ensure no other live coverage row for user_id has rebound this workspace_id
+    # 0. Reject immediately if ANY other live coverage row for user_id has rebound this workspace_id
     try:
         live_rows = await coverage_db.list_coverage_rows(user_id, conn=conn)
     except RuntimeError as exc:
@@ -329,7 +293,56 @@ async def _verify_workspace_bound_to_ticker(
         )
         if bound_ws == ws_clean:
             return False
-    return True
+
+    from src.dalton.capabilities import CapabilityId, has_capability
+    from src.dalton.coverage.identity import canonical_workspace_ticker_key, normalize_ticker_key
+    from src.dalton.settings import is_coverage_units_enabled
+
+    t_key = (normalize_ticker_key(sym) or sym).upper()
+
+    # 1. Active coverage unit check (authoritative when present)
+    if has_capability(CapabilityId.COLLEAGUE_SHARING) and is_coverage_units_enabled():
+        from src.dalton.database import coverage_units as cu_db
+
+        unit = await cu_db.get_active_unit_by_workspace(ws_clean, conn=conn)
+        if unit is not None:
+            u_ticker = str(unit.get("ticker") or "").strip().upper()
+            u_key = str(unit.get("ticker_key") or "").strip().upper()
+            if u_ticker or u_key:
+                return u_ticker == sym or (bool(u_key) and u_key == t_key)
+
+    # 2. Workspace row existence, non-deleted, and positive company identity match
+    try:
+        ws_row = await ws_db.get_workspace(ws_clean, conn=conn)
+    except RuntimeError as exc:
+        if "database pool is not open" not in str(exc):
+            raise
+        ws_row = None
+
+    if ws_row is None:
+        return False
+    if str(ws_row.get("status") or "").strip().lower() == "deleted":
+        return False
+
+    ws_name = str(ws_row.get("name") or "").strip()
+    ws_name_upper = ws_name.upper()
+    if ws_name_upper == sym:
+        return True
+    ws_canon = canonical_workspace_ticker_key(ws_name)
+    sym_canon = canonical_workspace_ticker_key(sym)
+    if ws_canon and sym_canon and ws_canon == sym_canon:
+        return True
+    if ws_name_upper and _PURE_TICKER_RE.fullmatch(ws_name_upper) and ws_name_upper != sym:
+        return False
+
+    # 3. Positive fallback: workspace resolves as ticker's company workspace (e.g. via knowledge doc)
+    try:
+        matched_ws = await resolve_workspace_id_by_ticker(sym, user_id)
+        if matched_ws and str(matched_ws).strip() == ws_clean:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _apply_price_threshold_to_row(
@@ -407,11 +420,15 @@ class TierPolicyReconciler:
             return {"ticker": sym, "ok": True, "skipped": True, "reason": "empty_args"}
 
         pre_row = await coverage_db.get_coverage_row(uid, sym)
-        ws_id = (
-            workspace_id
-            or await resolve_company_workspace_id(uid, sym, cov_row=pre_row)
-            or removed_workspace_id
-        )
+        if pre_row is None:
+            # Decision 5: remove compensation strictly uses the workspace_id captured in the Outbox.
+            ws_id = workspace_id or removed_workspace_id
+        else:
+            ws_id = (
+                workspace_id
+                or await resolve_company_workspace_id(uid, sym, cov_row=pre_row)
+                or removed_workspace_id
+            )
         if not ws_id:
             return {
                 "ticker": sym,
@@ -497,7 +514,9 @@ class TierPolicyReconciler:
                             if isinstance(r.get("metadata"), Mapping)
                             else {}
                         )
-                        new_meta["paused_by_policy"] = True
+                        # Preserve manual/external pause: only mark paused_by_policy if row was active or already policy-paused
+                        if r_status == "active" or _has_policy_pause(r):
+                            new_meta["paused_by_policy"] = True
                         await auto_db.update_automation(
                             auto_id,
                             uid,
@@ -586,7 +605,9 @@ class TierPolicyReconciler:
                             if isinstance(existing.get("metadata"), Mapping)
                             else {}
                         )
-                        new_meta["paused_by_policy"] = True
+                        # Preserve manual/external pause: do NOT stamp paused_by_policy onto an already manually paused row
+                        if existing_status == "active" or _has_policy_pause(existing):
+                            new_meta["paused_by_policy"] = True
                         new_meta["tier"] = live_tier
                         with automation_history_context(
                             actor_user_id=uid,
@@ -799,6 +820,10 @@ class TierPolicyReconciler:
                         actor_user_id=uid,
                         action="resume" if resuming else "update",
                         skip_if_unchanged=True,
+                        locked_row_reconciler=build_locked_resume_reconciler(
+                            override_user_pause=override_user_pause,
+                            override_pause_versions=override_pause_versions,
+                        ),
                     ):
                         await auto_db.update_automation(
                             auto_id,
@@ -826,13 +851,15 @@ class TierPolicyReconciler:
                     if not allowed_earn_stages or (
                         stage is not None and stage not in allowed_earn_stages
                     ):
+                        r_status_earn = str(r.get("status") or "active").strip().lower()
                         new_meta = (
                             dict(r.get("metadata") or {})
                             if isinstance(r.get("metadata"), Mapping)
                             else {}
                         )
-                        # Preserve all three manual pause markers untouched; add paused_by_policy
-                        new_meta["paused_by_policy"] = True
+                        # Preserve manual/external pause: only mark paused_by_policy if active or already policy-paused
+                        if r_status_earn == "active" or _has_policy_pause(r):
+                            new_meta["paused_by_policy"] = True
                         new_meta["tier"] = live_tier
                         with automation_history_context(
                             actor_user_id=uid,
@@ -920,6 +947,12 @@ class TierPolicyReconciler:
                     "job": existing,
                 }
 
+        claim_token = (
+            str(job.get("claim_token")).strip()
+            if job.get("claim_token") is not None and str(job.get("claim_token")).strip()
+            else None
+        )
+        job_roster_revision = int(job.get("roster_revision") or 0)
         target_versions = dict(job.get("target_policy_versions") or {})
         override_user_pause = bool(job.get("override_user_pause", False))
         job_ctx = dict(job.get("job_context") or {}) if isinstance(job.get("job_context"), Mapping) else {}
@@ -972,13 +1005,29 @@ class TierPolicyReconciler:
                 completed.append(sym)
                 completed_set.add(sym)
                 remaining_pending = [x for x in remaining_pending if x != sym]
-                await update_reconcile_job_progress(
+                prog = await update_reconcile_job_progress(
                     uid,
                     jid,
                     pending_tickers=remaining_pending,
                     completed_tickers=completed,
                     failed_items=new_failed,
+                    claim_token=claim_token,
+                    release_claim=False,
                 )
+                if claim_token is not None and prog is None:
+                    return {
+                        "ok": False,
+                        "claimed": False,
+                        "job_id": jid,
+                        "status": "running",
+                        "reason": "lease_lost",
+                        "yaml_synced": bool(job.get("yaml_synced", False)),
+                        "completed_tickers": completed,
+                        "pending_tickers": remaining_pending,
+                        "failed_items": new_failed,
+                        "company_results": company_results,
+                        "job": None,
+                    }
             except Exception as exc:
                 logger.warning(
                     "[WATCHLIST_RECONCILE] per-company reconcile failed | user=%s job=%s ticker=%s exc_type=%s",
@@ -995,19 +1044,39 @@ class TierPolicyReconciler:
                     }
                 )
                 remaining_pending = [x for x in remaining_pending if x != sym]
-                await update_reconcile_job_progress(
+                # Decision 2: record `partial` WITHOUT releasing claim_token so lease stays exclusive
+                prog = await update_reconcile_job_progress(
                     uid,
                     jid,
                     pending_tickers=remaining_pending,
                     completed_tickers=completed,
                     failed_items=new_failed,
                     status="partial",
+                    claim_token=claim_token,
+                    release_claim=False,
                 )
+                if claim_token is not None and prog is None:
+                    return {
+                        "ok": False,
+                        "claimed": False,
+                        "job_id": jid,
+                        "status": "partial",
+                        "reason": "lease_lost",
+                        "yaml_synced": bool(job.get("yaml_synced", False)),
+                        "completed_tickers": completed,
+                        "pending_tickers": remaining_pending,
+                        "failed_items": new_failed,
+                        "company_results": company_results,
+                        "job": None,
+                    }
 
-        # Stage 3: Home YAML sync
+        # Stage 3: Home YAML sync (only when job has no remaining work, or sync with revision guard)
         yaml_synced = bool(job.get("yaml_synced", False))
         if sync_home and not yaml_synced:
-            synced = bool(await sync_user_coverage_to_home(uid))
+            sync_kwargs: dict[str, Any] = {}
+            if job_roster_revision > 0:
+                sync_kwargs["roster_revision"] = job_roster_revision
+            synced = bool(await sync_user_coverage_to_home(uid, **sync_kwargs))
             if synced:
                 yaml_synced = True
 
@@ -1024,7 +1093,23 @@ class TierPolicyReconciler:
             failed_items=new_failed,
             yaml_synced=yaml_synced,
             status=final_status,
+            claim_token=claim_token,
+            release_claim=True,
         )
+        if claim_token is not None and updated_job is None:
+            return {
+                "ok": False,
+                "claimed": False,
+                "job_id": jid,
+                "status": final_status,
+                "reason": "lease_lost",
+                "yaml_synced": yaml_synced,
+                "completed_tickers": completed,
+                "pending_tickers": remaining_pending,
+                "failed_items": new_failed,
+                "company_results": company_results,
+                "job": None,
+            }
         return {
             "ok": final_status == "completed",
             "claimed": True,
@@ -1068,8 +1153,9 @@ class TierPolicyReconciler:
         user_id: str,
         *,
         covered_job_ids: Sequence[str] | None = None,
+        max_revision: int | None = None,
     ) -> int:
-        """Mark covered unsynced outbox jobs as ``yaml_synced=TRUE`` after an external Home sync succeeded."""
+        """Mark covered completed unsynced outbox jobs as ``yaml_synced=TRUE`` after Home sync."""
         uid = str(user_id or "").strip()
         if not uid:
             return 0
@@ -1088,47 +1174,74 @@ class TierPolicyReconciler:
                 continue
             if job.get("yaml_synced"):
                 continue
+            if max_revision is not None and int(job.get("roster_revision") or 0) > int(max_revision):
+                continue
             pending = list(job.get("pending_tickers") or [])
             failed = list(job.get("failed_items") or [])
-            next_status = "completed" if (not pending and not failed) else str(job.get("status") or "partial")
+            # Decision 6: NEVER mark a job with remaining pending_tickers or failed_items as yaml_synced=TRUE
+            if pending or failed:
+                continue
             await update_reconcile_job_progress(
                 uid,
                 jid,
                 yaml_synced=True,
-                status=next_status,
+                status="completed",
             )
             updated += 1
         return updated
 
 
-async def run_startup_reconcile_scan(*, limit: int = 100) -> dict[str, Any]:
-    """One-shot startup scan that claims and drains unfinished watchlist outbox jobs (Item 11)."""
+async def run_startup_reconcile_scan(
+    *,
+    limit: int = 100,
+    batch_size: int | None = None,
+) -> dict[str, Any]:
+    """Drain all claimable unfinished watchlist outbox jobs in batches without re-claiming failures."""
     reconciler = TierPolicyReconciler()
-    try:
-        claimed_jobs = await claim_unfinished_reconcile_jobs_for_startup(limit=limit)
-    except Exception as exc:
-        logger.debug("[WATCHLIST_RECONCILE] startup scan skipped: %s", exc)
-        return {"ok": False, "processed_jobs": 0, "error": type(exc).__name__}
-
+    eff_batch = max(1, int(batch_size if batch_size is not None else limit))
+    seen_job_ids: set[str] = set()
     results: list[dict[str, Any]] = []
-    for job in claimed_jobs:
-        uid = str(job.get("user_id") or "").strip()
-        jid = str(job.get("job_id") or "").strip()
-        if not uid or not jid:
-            continue
+
+    while True:
         try:
-            res = await reconciler.reconcile_job(
-                uid, jid, sync_home=True, _preclaimed_job=job
+            claimed_jobs = await claim_unfinished_reconcile_jobs_for_startup(
+                limit=eff_batch,
+                exclude_job_ids=sorted(seen_job_ids) if seen_job_ids else None,
             )
-            results.append(res)
         except Exception as exc:
-            logger.warning(
-                "[WATCHLIST_RECONCILE] startup reconcile job failed | user=%s job=%s exc=%s",
-                uid,
-                jid,
-                type(exc).__name__,
-            )
-            results.append({"ok": False, "job_id": jid, "error": type(exc).__name__})
+            logger.debug("[WATCHLIST_RECONCILE] startup scan stopped: %s", exc)
+            if not results:
+                return {"ok": False, "processed_jobs": 0, "error": type(exc).__name__}
+            break
+
+        if not claimed_jobs:
+            break
+
+        progress_this_batch = False
+        for job in claimed_jobs:
+            uid = str(job.get("user_id") or "").strip()
+            jid = str(job.get("job_id") or "").strip()
+            if not uid or not jid or jid in seen_job_ids:
+                continue
+            seen_job_ids.add(jid)
+            progress_this_batch = True
+            try:
+                res = await reconciler.reconcile_job(
+                    uid, jid, sync_home=True, _preclaimed_job=job
+                )
+                results.append(res)
+            except Exception as exc:
+                logger.warning(
+                    "[WATCHLIST_RECONCILE] startup reconcile job failed | user=%s job=%s exc=%s",
+                    uid,
+                    jid,
+                    type(exc).__name__,
+                )
+                results.append({"ok": False, "job_id": jid, "error": type(exc).__name__})
+
+        if not progress_this_batch:
+            break
+
     return {
         "ok": all(r.get("ok") for r in results),
         "processed_jobs": len(results),

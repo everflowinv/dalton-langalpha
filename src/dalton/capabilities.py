@@ -876,6 +876,7 @@ BACKGROUND_LOOP_REGISTRY: Mapping[str, CapabilityId | None] = MappingProxyType(
         "dalton-data-task-scheduler": CapabilityId.DATA_JOBS,
         "dalton-chat-upload-cleanup": CORE_CAPABILITY,
         "dalton-team-model-catalog-follow": CORE_CAPABILITY,
+        "dalton-startup-watchlist-reconcile": CORE_CAPABILITY,
         # Filtered by filter_reconnectable_builtin_mcp (skips disabled servers like researchdata)
         "mcp-builtin-reconnect": CORE_CAPABILITY,
         # Upstream core platform background tasks & services

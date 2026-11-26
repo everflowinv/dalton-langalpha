@@ -284,16 +284,12 @@ async def astream_ptc_workflow(
         or user_id
     )
     is_colleague_turn = (not identity.shared) and (workspace_owner_id != str(user_id))
-    # DALTON-HOOK(watchlist): strip client personal watchlist context on shared or foreign turns
-    if request.additional_context:
-        from src.dalton.watchlist.privacy import strip_watchlist_context_if_shared
+    # DALTON-HOOK(watchlist): strip personal watchlist context on shared workspaces/threads or foreign turns
+    from src.dalton.watchlist.privacy import sanitize_turn_watchlist_context
 
-        request.additional_context = strip_watchlist_context_if_shared(
-            request.additional_context,
-            is_shared=bool(identity.shared),
-            user_id=user_id,
-            workspace_owner_id=workspace_owner_id,
-        )
+    await sanitize_turn_watchlist_context(
+        request, thread_id=thread_id, is_shared=bool(identity.shared), user_id=user_id, workspace_owner_id=workspace_owner_id
+    )
     tail_turn_no_new_work = bool((run_metadata or {}).get("tail_turn_no_new_work"))
     origin_channel = str((run_metadata or {}).get("origin_channel") or "web")
     start_time = time.time()
@@ -1301,12 +1297,16 @@ async def astream_ptc_workflow(
             if isinstance(input_state, dict) and input_state.get("messages")
             else None
         )
+        # DALTON-HOOK(watchlist): inject allowed personal watchlist context inline reminder
+        from src.dalton.watchlist.privacy import build_watchlist_context_reminder
+
         inject_inline_reminders(
             inline_target,
             [
                 build_directive_reminder(directives),
                 build_widget_context_reminder(widget_ctxs),
                 build_chart_selection_reminder(chart_selections),
+                build_watchlist_context_reminder(request.additional_context),
             ],
         )
 

@@ -563,9 +563,11 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       const slashCommands = commands as SlashCommandLike[];
       const send = buildMarketSendContexts(symbol, interval, message, collectViews());
       const contexts: Record<string, unknown>[] = symbol ? [send.skill] : [];
-      // DALTON-HOOK(watchlist): auto-attach personal watchlist snapshot ONLY in private sessions (never shared workspaces/threads)
-      if (watchlistContext && !teamReadOnly.isColleague && (scope === 'all' || !(activeWorkspace as { is_shared?: boolean } | null)?.is_shared)) {
-        contexts.push({ type: 'text', content: watchlistContext });
+      // DALTON-HOOK(watchlist): auto-attach personal watchlist_context ONLY in private unshared sessions
+      const cachedThreads = queryClient.getQueryData<{ threads?: Array<{ thread_id: string; is_shared?: boolean }> }>(queryKeys.threads.byWorkspace(activeWorkspaceId));
+      const activeThreadShared = Boolean(threadId && threadId !== '__default__' && cachedThreads?.threads?.find((th) => th.thread_id === threadId)?.is_shared);
+      if (watchlistContext && !teamReadOnly.isColleague && !activeThreadShared && (scope === 'all' || !(activeWorkspace as { is_shared?: boolean } | null)?.is_shared)) {
+        contexts.push({ type: 'watchlist_context', content: watchlistContext });
       }
 
       // Skill contexts from typed slash commands (mirrors ChatView). Skip a

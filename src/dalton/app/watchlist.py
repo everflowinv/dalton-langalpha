@@ -45,6 +45,7 @@ class WatchlistPreviewRequest(BaseModel):
     label: str | None = None
     criteria: dict[str, Any] | None = None
     default_tier: str | None = None
+    auto_refresh: bool = True
     group_id: str | None = None
     tags: list[str] | None = None
     override_user_pause: bool = False
@@ -52,23 +53,16 @@ class WatchlistPreviewRequest(BaseModel):
 
 class WatchlistMutateRequest(BaseModel):
     action: str
+    snapshot_id: str | None = None
     tickers: list[str] | str | None = None
     tier: str | None = None
     label: str | None = None
     criteria: dict[str, Any] | None = None
     default_tier: str | None = None
-    auto_refresh: bool = True
+    auto_refresh: bool | None = None
     group_id: str | None = None
     tags: list[str] | None = None
-    override_user_pause: bool = False
-    expected_action: str | None = None
-    expected_roster_hash: str | None = None
-    expected_policy_versions: dict[str, int] | None = None
-    expected_target_tickers: list[str] | None = None
-    expected_target_tier: str | None = None
-    expected_group_id: str | None = None
-    expected_override_user_pause: bool | None = None
-    expected_pause_versions: dict[str, int] | None = None
+    override_user_pause: bool | None = None
 
 
 class WatchlistReconcileRequest(BaseModel):
@@ -144,6 +138,7 @@ async def preview_watchlist_mutation_endpoint(
             label=body.label,
             criteria=body.criteria,
             default_tier=body.default_tier,
+            auto_refresh=body.auto_refresh,
             group_id=body.group_id,
             tags=body.tags,
             override_user_pause=body.override_user_pause,
@@ -164,29 +159,11 @@ async def mutate_watchlist_endpoint(
     uid = str(user_id).strip()
     reject_company_system_auth(uid)
 
-    expected_snapshot: dict[str, Any] | None = None
-    if (
-        body.expected_roster_hash is not None
-        or body.expected_policy_versions is not None
-        or body.expected_target_tickers is not None
-        or body.expected_action is not None
-    ):
-        expected_snapshot = {
-            "owner_user_id": uid,
-            "raw_action": body.expected_action,
-            "expected_roster_hash": body.expected_roster_hash,
-            "expected_policy_versions": body.expected_policy_versions,
-            "target_tickers": body.expected_target_tickers,
-            "target_tier": body.expected_target_tier,
-            "group_id": body.expected_group_id,
-            "override_user_pause": body.expected_override_user_pause,
-            "expected_pause_versions": body.expected_pause_versions,
-        }
-
     try:
         return await WatchlistMutationService().execute_mutation(
             uid,
             action=body.action,
+            snapshot_id=body.snapshot_id,
             tickers=body.tickers,
             tier=body.tier,
             source="ui",
@@ -197,8 +174,6 @@ async def mutate_watchlist_endpoint(
             group_id=body.group_id,
             tags=body.tags,
             override_user_pause=body.override_user_pause,
-            expected_snapshot=expected_snapshot,
-            require_snapshot=True,
         )
     except WatchlistScopeChangedError as exc:
         raise HTTPException(

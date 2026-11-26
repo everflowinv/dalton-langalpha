@@ -31,10 +31,21 @@ import { buildMarketViewUrl } from '../../utils/marketRoute';
 import MarketChatPanel from '../MarketChatPanel';
 import { WatchlistColumnPicker } from './WatchlistColumnPicker';
 import { WatchlistAddModal } from './WatchlistAddModal';
-import { WatchlistFullTable } from './WatchlistFullTable';
+import { WatchlistFullTable, type WatchlistSortField } from './WatchlistFullTable';
 
 const STORAGE_COLS_KEY = 'dalton:watchlist:visibleColumns:v1';
 const SESSION_FILTER_KEY = 'dalton:watchlist:tierFilter:v1';
+const SESSION_VIEW_STATE_KEY = 'dalton:watchlist:viewState:v1';
+
+interface PersistedWatchlistViewState {
+  tierFilter: WatchlistTier | 'all';
+  searchQuery: string;
+  groupedByTier: boolean;
+  holdingsOnly: boolean;
+  sortField: WatchlistSortField | null;
+  sortDir: 'asc' | 'desc';
+  scrollTop: number;
+}
 
 interface WatchlistWorkspaceProps {
   scope: ComposerScope;
@@ -70,14 +81,39 @@ function loadSavedColumns(): WatchlistColumnKey[] {
   }
 }
 
-function loadSessionTierFilter(): WatchlistTier | 'all' {
+function loadSessionViewState(): PersistedWatchlistViewState {
+  const defaults: PersistedWatchlistViewState = {
+    tierFilter: 'all',
+    searchQuery: '',
+    groupedByTier: false,
+    holdingsOnly: false,
+    sortField: null,
+    sortDir: 'desc',
+    scrollTop: 0,
+  };
   try {
-    const raw = sessionStorage.getItem(SESSION_FILTER_KEY);
-    if (raw === 'core' || raw === 'watch' || raw === 'radar' || raw === 'all') return raw;
+    const rawState = sessionStorage.getItem(SESSION_VIEW_STATE_KEY);
+    if (rawState) {
+      const parsed = JSON.parse(rawState) as Partial<PersistedWatchlistViewState>;
+      const tf = parsed.tierFilter;
+      return {
+        tierFilter: tf === 'core' || tf === 'watch' || tf === 'radar' || tf === 'all' ? tf : 'all',
+        searchQuery: typeof parsed.searchQuery === 'string' ? parsed.searchQuery : '',
+        groupedByTier: Boolean(parsed.groupedByTier),
+        holdingsOnly: Boolean(parsed.holdingsOnly),
+        sortField: typeof parsed.sortField === 'string' ? (parsed.sortField as WatchlistSortField) : null,
+        sortDir: parsed.sortDir === 'asc' ? 'asc' : 'desc',
+        scrollTop: typeof parsed.scrollTop === 'number' && parsed.scrollTop >= 0 ? parsed.scrollTop : 0,
+      };
+    }
+    const legacy = sessionStorage.getItem(SESSION_FILTER_KEY);
+    if (legacy === 'core' || legacy === 'watch' || legacy === 'radar' || legacy === 'all') {
+      return { ...defaults, tierFilter: legacy };
+    }
   } catch {
     // ignore storage errors
   }
-  return 'all';
+  return defaults;
 }
 
 const TIER_LABEL_KEY: Record<WatchlistTier, string> = {
@@ -104,10 +140,14 @@ export function WatchlistWorkspace({
   const { toast } = useToast();
   const isMobile = useIsMobile();
 
-  const [tierFilter, setTierFilter] = useState<WatchlistTier | 'all'>(loadSessionTierFilter);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [groupedByTier, setGroupedByTier] = useState(false);
-  const [holdingsOnly, setHoldingsOnly] = useState(false);
+  const [initialViewState] = useState<PersistedWatchlistViewState>(loadSessionViewState);
+  const [tierFilter, setTierFilter] = useState<WatchlistTier | 'all'>(initialViewState.tierFilter);
+  const [searchQuery, setSearchQuery] = useState(initialViewState.searchQuery);
+  const [groupedByTier, setGroupedByTier] = useState(initialViewState.groupedByTier);
+  const [holdingsOnly, setHoldingsOnly] = useState(initialViewState.holdingsOnly);
+  const [sortField, setSortField] = useState<WatchlistSortField | null>(initialViewState.sortField);
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>(initialViewState.sortDir);
+  const [scrollTop, setScrollTop] = useState<number>(initialViewState.scrollTop);
   const [visibleColumns, setVisibleColumns] = useState<WatchlistColumnKey[]>(loadSavedColumns);
   const [addModalOpen, setAddModalOpen] = useState(false);
   const [chatOpen, setChatOpen] = useState(!isMobile);
@@ -119,10 +159,20 @@ export function WatchlistWorkspace({
   useEffect(() => {
     try {
       sessionStorage.setItem(SESSION_FILTER_KEY, tierFilter);
+      const nextState: PersistedWatchlistViewState = {
+        tierFilter,
+        searchQuery,
+        groupedByTier,
+        holdingsOnly,
+        sortField,
+        sortDir,
+        scrollTop,
+      };
+      sessionStorage.setItem(SESSION_VIEW_STATE_KEY, JSON.stringify(nextState));
     } catch {
       // ignore storage errors
     }
-  }, [tierFilter]);
+  }, [tierFilter, searchQuery, groupedByTier, holdingsOnly, sortField, sortDir, scrollTop]);
 
   const handleColumnsChange = useCallback((next: WatchlistColumnKey[]) => {
     setVisibleColumns(next);
@@ -186,12 +236,17 @@ export function WatchlistWorkspace({
 
   const watchlistContextText = useMemo(() => {
     if (!isPrivateChatSession || !filteredCompanies.length) return null;
-    return buildPersonalWatchlistContextText(filteredCompanies, metricsMap, tierFilter);
-  }, [isPrivateChatSession, filteredCompanies, metricsMap, tierFilter]);
+    return buildPersonalWatchlistContextText(
+      filteredCompanies,
+      metricsMap,
+      tierFilter,
+      metricsData?.summary ?? null,
+    );
+  }, [isPrivateChatSession, filteredCompanies, metricsMap, tierFilter, metricsData?.summary]);
 
   const handleSelectSymbol = useCallback(
     (symbol: string) => {
-      navigate(buildMarketViewUrl({ symbol }));
+      navigate(buildMarketViewUrl({ symbol }), { state: { fromWatchlist: true } });
     },
     [navigate],
   );
@@ -256,16 +311,7 @@ export function WatchlistWorkspace({
     try {
       await mutateWatchlist({
         action: pendingConfirm.kind,
-        tickers: [pendingConfirm.company.ticker],
-        ...(pendingConfirm.nextTier ? { tier: pendingConfirm.nextTier } : {}),
-        expected_action: pendingConfirm.preview.raw_action ?? pendingConfirm.kind,
-        expected_target_tier: pendingConfirm.preview.target_tier ?? null,
-        expected_group_id: pendingConfirm.preview.group_id ?? null,
-        expected_override_user_pause: Boolean(pendingConfirm.preview.override_user_pause),
-        expected_pause_versions: pendingConfirm.preview.expected_pause_versions,
-        expected_roster_hash: pendingConfirm.preview.expected_roster_hash,
-        expected_policy_versions: pendingConfirm.preview.expected_policy_versions,
-        expected_target_tickers: pendingConfirm.preview.target_tickers,
+        snapshot_id: pendingConfirm.preview.snapshot_id ?? undefined,
       });
       await queryClient.invalidateQueries({ queryKey: queryKeys.dalton.watchlist() });
       setPendingConfirm(null);
@@ -504,6 +550,14 @@ export function WatchlistWorkspace({
             visibleColumns={visibleColumns}
             groupedByTier={groupedByTier}
             holdingSymbols={holdingSymbols}
+            sortField={sortField}
+            sortDir={sortDir}
+            onSortChange={(nextField, nextDir) => {
+              setSortField(nextField);
+              setSortDir(nextDir);
+            }}
+            initialScrollTop={initialViewState.scrollTop}
+            onScrollTopChange={setScrollTop}
             onSelectSymbol={handleSelectSymbol}
             onRequestTierChange={handleRequestTierChange}
             onRequestRemove={handleRequestRemove}

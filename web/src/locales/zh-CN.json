@@ -1944,7 +1944,18 @@
       "submitting": "执行中…",
       "decline": "取消",
       "retryReconcile": "一键补齐同步",
-      "retrying": "补齐中…"
+      "retrying": "补齐中…",
+      "retryPartialError": "仍有部分任务未完成同步，请稍后重试",
+      "retryFailedError": "补齐同步失败，请稍后重试",
+      "changeLabels": {
+        "create": "新建",
+        "update": "改频",
+        "resume": "恢复",
+        "pause": "暂停",
+        "preserveUserPause": "保留手动暂停",
+        "preserveTracker": "由多空跟踪接管",
+        "preserveHandoff": "保留交接暂停"
+      }
     },
     "userQuestion": {
       "answered": "已回答：{{answer}}",

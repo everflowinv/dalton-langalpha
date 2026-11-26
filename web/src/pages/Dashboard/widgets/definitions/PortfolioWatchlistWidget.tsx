@@ -26,6 +26,7 @@ import {
   getPortfolioWatchlistTabs,
   normalizeCoverageContext,
   resolveInitialPortfolioWatchlistTab,
+  useFilteredCoverageWatchlistRows,
   type PortfolioWatchlistTabKey,
 } from '../../components/dalton/CoverageWatchlistTab'; // DALTON-HOOK(watchlist)
 import { WidgetCardMeta } from '../framework/widgetCardSlots';
@@ -85,10 +86,8 @@ function PortfolioWatchlistWidget({
     if (coverage.loaded && coverage.totalCount > 0 && activeTab !== 'coverage') setActiveTab('coverage');
   }, [savedDefaultTab, coverage.loaded, coverage.totalCount, activeTab]);
 
-  const filteredCoverageRows = useMemo(
-    () => (coverageTier === 'all' ? coverage.rows : coverage.rows.filter((r) => r.tier === coverageTier)),
-    [coverage.rows, coverageTier],
-  );
+  // DALTON-HOOK(watchlist): filter coverage rows by tier BEFORE slicing the 50-symbol quote cap
+  const { rows: filteredCoverageRows, filteredTotalCount, quotesBridge } = useFilteredCoverageWatchlistRows(coverage, coverageTier);
 
   // Snapshot exporter — full payload reflects whichever tab the user is viewing
   // (the agent should see what the user sees). Per-row attach delegates to the
@@ -98,12 +97,8 @@ function PortfolioWatchlistWidget({
       // DALTON-HOOK(watchlist): export personal watchlist tab snapshot
       if (activeTab === 'coverage') {
         return buildCoverageFullContextExport({
-          instanceId: instance.id,
-          coverage,
-          filteredRows: filteredCoverageRows,
-          coverageTier,
-          marketStatus: dashboard.marketStatus,
-          headerLabel: t('dashboard:widgets.portfolioWatchlist.headerCoverage'),
+          instanceId: instance.id, coverage, filteredRows: filteredCoverageRows, filteredTotalCount,
+          coverageTier, marketStatus: dashboard.marketStatus, headerLabel: t('dashboard:widgets.portfolioWatchlist.headerCoverage'),
         });
       }
       if (activeTab === 'watchlist') {
@@ -151,11 +146,8 @@ function PortfolioWatchlistWidget({
       // DALTON-HOOK(watchlist): export single personal watchlist row
       if (activeTab === 'coverage') {
         return buildCoverageRowContextExport({
-          instanceId: instance.id,
-          rowId,
-          coverage,
-          marketStatus: dashboard.marketStatus,
-          headerLabel: t('dashboard:widgets.portfolioWatchlist.headerCoverage'),
+          instanceId: instance.id, rowId, coverage, filteredRows: filteredCoverageRows,
+          marketStatus: dashboard.marketStatus, headerLabel: t('dashboard:widgets.portfolioWatchlist.headerCoverage'),
         });
       }
       if (activeTab === 'watchlist') {
@@ -287,11 +279,13 @@ function PortfolioWatchlistWidget({
           swapKey={`${activeTab}:${showSkeleton ? 'loading' : 'ready'}`}
         >
           {/* DALTON-HOOK(watchlist): render personal watchlist tab panel via Dalton component */}
+          {quotesBridge}
           {activeTab === 'coverage' ? (
             <CoverageWatchlistTabPanel
               instanceId={instance.id}
               coverage={coverage}
               filteredRows={filteredCoverageRows}
+              filteredTotalCount={filteredTotalCount}
               coverageTier={coverageTier}
               onSelectTier={setCoverageTier}
               showSkeleton={showCoverageSkeleton}

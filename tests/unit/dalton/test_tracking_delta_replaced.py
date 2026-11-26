@@ -197,7 +197,12 @@ async def test_blank_marker_still_reenables_the_delta(
         ticker=TICKER,
         initial_rows=[delta],
     )
-    result = await enable_tracking(USER, WORKSPACE, force=True)
+    result = await enable_tracking(
+        USER,
+        WORKSPACE,
+        force=True,
+        override_pause_versions={"auto-delta": int(delta.get("config_version") or 1)},
+    )
     assert result["status"] == "enabled"
     assert "delta_replaced_by_tracker" not in result
     stored = _by_name(ctx["store"])["dalton-nvda-delta"]

@@ -366,6 +366,7 @@ async def build_watchlist_confirmation_snapshot(
             label=args.get("label"),
             criteria=args.get("criteria") if isinstance(args.get("criteria"), dict) else None,
             default_tier=args.get("default_tier"),
+            auto_refresh=bool(args.get("auto_refresh", True)),
             group_id=args.get("group_id"),
             tags=args.get("tags") if isinstance(args.get("tags"), list) else None,
             override_user_pause=bool(args.get("override_user_pause", False)),

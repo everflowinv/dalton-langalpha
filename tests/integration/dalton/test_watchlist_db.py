@@ -134,6 +134,8 @@ def test_d056_single_head_and_fresh_upgrade_schema() -> None:
                       AND table_name IN (
                           'dalton_watchlist_tier_policies',
                           'dalton_watchlist_reconcile_jobs',
+                          'dalton_watchlist_confirm_snapshots',
+                          'dalton_watchlist_user_state',
                           'dalton_watchlist_views',
                           'dalton_watchlist_custom_columns'
                       )
@@ -143,6 +145,8 @@ def test_d056_single_head_and_fresh_upgrade_schema() -> None:
                 assert tables == {
                     "dalton_watchlist_tier_policies",
                     "dalton_watchlist_reconcile_jobs",
+                    "dalton_watchlist_confirm_snapshots",
+                    "dalton_watchlist_user_state",
                     "dalton_watchlist_views",
                     "dalton_watchlist_custom_columns",
                 }
@@ -165,10 +169,15 @@ def test_d056_single_head_and_fresh_upgrade_schema() -> None:
                     FROM information_schema.columns
                     WHERE table_schema = 'public'
                       AND table_name = 'dalton_watchlist_reconcile_jobs'
-                      AND column_name = 'job_context'
+                      AND column_name IN ('job_context', 'claim_token', 'claim_expires_at', 'roster_revision')
                     """
                 )
-                assert cur.fetchone() == ("job_context",)
+                assert {r[0] for r in cur.fetchall()} == {
+                    "job_context",
+                    "claim_token",
+                    "claim_expires_at",
+                    "roster_revision",
+                }
 
                 # Verify invalid tier is rejected by CHECK constraint
                 bad_uid = f"d056-bad-tier-{uuid.uuid4().hex[:8]}"
@@ -318,10 +327,12 @@ def test_d056_upgrade_backfill_and_downgrade_with_radar_samples() -> None:
                 assert net_extra.get("downgraded_silent") is True
 
                 cur.execute(
-                    "SELECT default_tier FROM dalton_coverage_groups WHERE group_id = %s::uuid",
+                    "SELECT default_tier, criteria FROM dalton_coverage_groups WHERE group_id = %s::uuid",
                     (radar_group_id,),
                 )
-                assert cur.fetchone() == ("watch",)
+                dg_tier, dg_crit = cur.fetchone()
+                assert dg_tier == "watch"
+                assert (dg_crit or {}).get("_downgraded_default_tier") == "radar"
 
                 cur.execute(
                     "SELECT ticker, tier FROM dalton_coverage WHERE user_id = %s ORDER BY ticker",
@@ -360,6 +371,30 @@ def test_d056_upgrade_backfill_and_downgrade_with_radar_samples() -> None:
                     (test_uid,),
                 )
                 assert cur.fetchone() == (True,)
+
+                # r4 Decision 7: radar rule group default_tier restored & _downgraded_default_tier cleaned
+                cur.execute(
+                    "SELECT default_tier, criteria FROM dalton_coverage_groups WHERE group_id = %s::uuid",
+                    (radar_group_id,),
+                )
+                rg_tier, rg_crit = cur.fetchone()
+                assert rg_tier == "radar"
+                assert "_downgraded_default_tier" not in (rg_crit or {})
+
+                # r4 Decision 7: re-upgrade enqueues a pending migration_restore_radar reconcile job for NET
+                cur.execute(
+                    """
+                    SELECT trigger_action, pending_tickers, status
+                    FROM dalton_watchlist_reconcile_jobs
+                    WHERE user_id = %s AND trigger_action = 'migration_restore_radar'
+                    """,
+                    (test_uid,),
+                )
+                mig_job = cur.fetchone()
+                assert mig_job is not None
+                assert mig_job[0] == "migration_restore_radar"
+                assert mig_job[1] == ["NET"]
+                assert mig_job[2] == "pending"
 
 
 @pytest.mark.asyncio
@@ -435,3 +470,153 @@ async def test_concurrent_reconcile_job_exclusive_claim_real_pg(
         assert claimed_results[0]["status"] == "completed"
         assert skipped_results[0]["reason"] == "already_claimed"
         assert reconcile_calls == ["NVDA"]
+
+
+@pytest.mark.asyncio
+async def test_r4_startup_vs_worker_lease_and_first_failure_interleaving_real_pg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 Decision 2 (Real PG): startup scan never steals an active lease; first-ticker failure
+    writes status='partial' while retaining claim_token so competing workers cannot interleave."""
+    from src.dalton.watchlist import policies as policies_mod
+    from src.dalton.watchlist import reconciler as reconciler_mod
+
+    with _isolated_pg_database(PG_DSN) as iso_dsn:
+        env = _alembic_env_for_dsn(iso_dsn)
+        _run_alembic(["upgrade", "head"], env=env, dalton=False)
+        _run_alembic(["upgrade", "head"], env=env, dalton=True)
+
+        @asynccontextmanager
+        async def _connect_iso(existing_conn: Any = None):
+            if existing_conn is not None:
+                yield existing_conn
+                return
+            async with await psycopg.AsyncConnection.connect(iso_dsn) as aconn:
+                yield aconn
+
+        monkeypatch.setattr(policies_mod, "get_db_connection", _connect_iso)
+
+        uid = f"u-lease-{uuid.uuid4().hex[:8]}"
+        job = await policies_mod.insert_reconcile_job(
+            uid,
+            trigger_action="set_tier",
+            target_policy_versions={"core": 1},
+            pending_tickers=["FAIL1", "OK2"],
+            roster_revision=1,
+        )
+        jid = str(job["job_id"])
+
+        first_failed_evt = asyncio.Event()
+        allow_second_evt = asyncio.Event()
+        calls: list[str] = []
+
+        async def _interleaved_reconcile(self: Any, user_id: str, ticker: str, **kwargs: Any) -> dict[str, Any]:
+            _ = (self, user_id, kwargs)
+            calls.append(ticker)
+            if ticker == "FAIL1":
+                raise RuntimeError("transient first-ticker failure")
+            first_failed_evt.set()
+            await allow_second_evt.wait()
+            return {"ticker": ticker, "ok": True, "actions": []}
+
+        monkeypatch.setattr(
+            reconciler_mod.TierPolicyReconciler,
+            "reconcile_company",
+            create_autospec(
+                reconciler_mod.TierPolicyReconciler.reconcile_company,
+                side_effect=_interleaved_reconcile,
+            ),
+        )
+        monkeypatch.setattr(
+            reconciler_mod,
+            "sync_user_coverage_to_home",
+            create_autospec(reconciler_mod.sync_user_coverage_to_home, return_value=True),
+        )
+
+        rec = reconciler_mod.TierPolicyReconciler()
+        worker_task = asyncio.create_task(rec.reconcile_job(uid, jid, sync_home=True))
+        await asyncio.wait_for(first_failed_evt.wait(), timeout=5.0)
+
+        # At this exact point, FAIL1 failed -> row has status='partial' BUT claim_token is STILL active!
+        # Neither startup scan nor another worker may claim it!
+        startup_claimed = await policies_mod.claim_unfinished_reconcile_jobs_for_startup(limit=10)
+        assert startup_claimed == []
+        competing = await policies_mod.claim_reconcile_job(uid, jid)
+        assert competing is None
+
+        allow_second_evt.set()
+        worker_res = await worker_task
+        assert worker_res["status"] == "partial"
+        assert worker_res["completed_tickers"] == ["OK2"]
+        assert calls == ["FAIL1", "OK2"]
+
+        # Once worker finished, claim_token is released so a retry CAN claim it
+        after = await policies_mod.get_reconcile_job(uid, jid)
+        assert after is not None and after["claim_token"] is None
+        reclaimed = await policies_mod.claim_reconcile_job(uid, jid)
+        assert reclaimed is not None and reclaimed["claim_token"] is not None
+
+
+@pytest.mark.asyncio
+async def test_r4_coverage_units_enabled_real_pg_tx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 Codex Low #19 / Grok r3: real PostgreSQL transaction with coverage_units enabled."""
+    from psycopg_pool import AsyncConnectionPool
+
+    import src.dalton.database.coverage_units as cu_db_mod
+    import src.dalton.settings as dalton_settings_mod
+    import src.dalton.watchlist.reconciler as reconciler_mod
+    import src.server.database.pool as pool_mod
+
+    with _isolated_pg_database(PG_DSN) as iso_dsn:
+        env = _alembic_env_for_dsn(iso_dsn)
+        _run_alembic(["upgrade", "head"], env=env, dalton=False)
+        _run_alembic(["upgrade", "head"], env=env, dalton=True)
+        pool = AsyncConnectionPool(
+            conninfo=iso_dsn,
+            min_size=1,
+            max_size=2,
+            open=False,
+        )
+        await pool.open()
+        monkeypatch.setattr(pool_mod, "_pool", pool)
+        monkeypatch.setattr(dalton_settings_mod, "is_coverage_units_enabled", lambda: True)
+
+        uid = f"wl-cu-user-{uuid.uuid4().hex[:8]}"
+        ws_id = str(uuid.uuid4())
+        try:
+            async with pool.connection() as conn:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            INSERT INTO users (user_id, email, name)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT (user_id) DO NOTHING
+                            """,
+                            (uid, f"{uid}@example.com", "CU Test User"),
+                        )
+                        await cur.execute(
+                            """
+                            INSERT INTO workspaces (workspace_id, user_id, name, status)
+                            VALUES (%s::uuid, %s, %s, 'running')
+                            """,
+                            (ws_id, uid, "Custom NVIDIA Research"),
+                        )
+                    await cu_db_mod.insert_coverage_unit(
+                        kind="company",
+                        owner_user_id=uid,
+                        slug="nvda",
+                        display_name="NVIDIA",
+                        ticker="NVDA",
+                        lead_analyst_user_id=uid,
+                        workspace_id=ws_id,
+                        conn=conn,
+                    )
+                    resolved = await reconciler_mod.resolve_company_workspace_id(
+                        uid, "NVDA", conn=conn
+                    )
+                    assert resolved == ws_id
+        finally:
+            await pool.close()

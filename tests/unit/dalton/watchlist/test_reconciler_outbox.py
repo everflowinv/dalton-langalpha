@@ -110,6 +110,7 @@ class _FakeWatchlistInfra:
             pending_tickers: Any,
             override_user_pause: bool = False,
             job_context: Any = None,
+            roster_revision: int = 0,
             job_id: str | None = None,
             conn: Any = None,
         ) -> dict[str, Any]:
@@ -125,6 +126,9 @@ class _FakeWatchlistInfra:
                 "failed_items": [],
                 "override_user_pause": bool(override_user_pause),
                 "job_context": dict(job_context or {}),
+                "claim_token": None,
+                "claim_expires_at": None,
+                "roster_revision": int(roster_revision or 0),
                 "yaml_synced": False,
                 "status": "pending",
             }
@@ -136,18 +140,20 @@ class _FakeWatchlistInfra:
             jid: str,
             *,
             stale_seconds: int = 300,
+            lease_seconds: int | None = None,
             force_claim: bool = False,
             conn: Any = None,
         ) -> dict[str, Any] | None:
-            _ = (stale_seconds, conn)
+            _ = (stale_seconds, lease_seconds, conn)
             job = infra.jobs.get(jid)
             if not job or job["user_id"] != uid:
                 return None
-            if job["status"] == "running" and not force_claim:
+            if (job["status"] == "running" or job.get("claim_token")) and not force_claim:
                 return None
             if job["status"] == "completed" and job.get("yaml_synced"):
                 return None
             job["status"] = "running"
+            job["claim_token"] = str(uuid.uuid4())
             return dict(job)
 
         async def _get_job(uid: str, jid: str, *, conn: Any = None) -> dict[str, Any] | None:
@@ -175,11 +181,16 @@ class _FakeWatchlistInfra:
             failed_items: Any = None,
             yaml_synced: bool | None = None,
             status: str | None = None,
+            claim_token: str | None = None,
+            release_claim: bool = False,
+            lease_seconds: int = 300,
             conn: Any = None,
         ) -> dict[str, Any] | None:
-            _ = conn
+            _ = (lease_seconds, conn)
             job = infra.jobs.get(jid)
             if not job or job["user_id"] != uid:
+                return None
+            if claim_token is not None and job.get("claim_token") != claim_token:
                 return None
             if pending_tickers is not None:
                 job["pending_tickers"] = list(pending_tickers)
@@ -191,6 +202,8 @@ class _FakeWatchlistInfra:
                 job["yaml_synced"] = bool(yaml_synced)
             if status is not None:
                 job["status"] = status
+            if release_claim:
+                job["claim_token"] = None
             return dict(job)
 
         @asynccontextmanager
@@ -284,8 +297,15 @@ class _FakeWatchlistInfra:
             )
             return len(list(automation_ids))
 
-        async def _sync_home(uid: str, *, yaml_text: str | None = None, backend: Any = None, rel_path: str = "dalton/coverage.yaml") -> bool:
-            _ = (uid, yaml_text, backend, rel_path)
+        async def _sync_home(
+            uid: str,
+            *,
+            yaml_text: str | None = None,
+            backend: Any = None,
+            rel_path: str = "dalton/coverage.yaml",
+            roster_revision: int | None = None,
+        ) -> bool:
+            _ = (uid, yaml_text, backend, rel_path, roster_revision)
             infra.home_sync_calls += 1
             return infra.home_sync_result
 
@@ -484,9 +504,18 @@ async def test_reconciler_pause_matrix_four_states_and_same_conn_skip(
     assert md_now["trigger_config"]["conditions"][0]["value"] == 4.0
     assert infra.price_nudges >= 1
 
-    # Explicit override_user_pause=True resumes paused_by_user (price stays next_run_at=None),
-    # while STILL keeping replaced_by_tracker and handoff_paused_reason paused!
+    # Missing override_pause_versions MUST default to refusing override (r4 Decision 3)
     await rec.reconcile_company(uid, "NVDA", override_user_pause=True)
+    assert infra.automations[mu_row["automation_id"]]["status"] == "paused"
+
+    # Explicit version-authorized override_user_pause=True resumes paused_by_user (price stays next_run_at=None),
+    # while STILL keeping replaced_by_tracker and handoff_paused_reason paused!
+    await rec.reconcile_company(
+        uid,
+        "NVDA",
+        override_user_pause=True,
+        override_pause_versions={mu_row["automation_id"]: 1},
+    )
     assert infra.automations[mu_row["automation_id"]]["status"] == "active"
     assert infra.automations[mu_row["automation_id"]]["next_run_at"] is None
     assert "paused_by_user" not in infra.automations[mu_row["automation_id"]]["metadata"]
@@ -635,6 +664,7 @@ async def test_reconciler_remove_pauses_standard_and_future_earnings_on_same_con
     ws_id = "ws-meta"
     infra.workspaces[(uid, "META")] = ws_id
     infra.workspace_owners[ws_id] = uid
+    infra.workspace_rows[ws_id] = {"workspace_id": ws_id, "name": "META", "status": "active"}
     # META is absent from infra.coverage -> removed!
     w_row = infra.add_automation(user_id=uid, workspace_id=ws_id, name="dalton-meta-watch", status="active")
     future_earn = infra.add_automation(
@@ -647,7 +677,9 @@ async def test_reconciler_remove_pauses_standard_and_future_earnings_on_same_con
         next_run_at=datetime.now(UTC) + timedelta(days=5),
     )
 
-    await reconciler_mod.TierPolicyReconciler().reconcile_company(uid, "META")
+    await reconciler_mod.TierPolicyReconciler().reconcile_company(
+        uid, "META", removed_workspace_id=ws_id
+    )
     assert infra.automations[w_row["automation_id"]]["status"] == "paused"
     assert infra.automations[future_earn["automation_id"]]["status"] == "paused"
     assert len(infra.skip_calls) == 1
@@ -874,3 +906,438 @@ async def test_r3_coverage_units_enabled_uses_real_query_with_conn_and_propagate
     )
     with pytest.raises(RuntimeError, match="pg connection reset"):
         await reconciler_mod.resolve_company_workspace_id("alice", "NVDA", conn=sentinel_conn)
+
+
+@pytest.mark.asyncio
+async def test_r4_outbox_claim_token_lease_loss_first_failure_and_batched_startup_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 Decision 2: first-ticker failure keeps claim_token until job end; lost lease stops writes;
+    startup scan drains >batch_size jobs without re-claiming failed rows in the same pass."""
+    infra = _FakeWatchlistInfra()
+    infra.install(monkeypatch)
+    uid = "u1"
+    for sym in ("NVDA", "TSM"):
+        ws_id = f"ws-{sym.lower()}"
+        infra.workspaces[(uid, sym)] = ws_id
+        infra.workspace_owners[ws_id] = uid
+        infra.coverage[(uid, sym)] = {"user_id": uid, "ticker": sym, "tier": "core", "is_private": False}
+
+    # First ticker NVDA fails, second ticker TSM succeeds -> claim_token must stay held during NVDA failure!
+    infra.fail_tickers.add("NVDA")
+    observed_updates: list[dict[str, Any]] = []
+    orig_upd = reconciler_mod.update_reconcile_job_progress
+
+    async def _spy_upd(*args: Any, **kwargs: Any):
+        observed_updates.append(dict(kwargs))
+        return await orig_upd(*args, **kwargs)
+
+    monkeypatch.setattr(
+        reconciler_mod,
+        "update_reconcile_job_progress",
+        create_autospec(policies_mod.update_reconcile_job_progress, side_effect=_spy_upd),
+    )
+
+    jid = str(uuid.uuid4())
+    infra.jobs[jid] = {
+        "job_id": jid,
+        "user_id": uid,
+        "trigger_action": "set_tier",
+        "target_policy_versions": {"core": 1},
+        "pending_tickers": ["NVDA", "TSM"],
+        "completed_tickers": [],
+        "failed_items": [],
+        "override_user_pause": False,
+        "job_context": {},
+        "claim_token": None,
+        "roster_revision": 1,
+        "yaml_synced": False,
+        "status": "pending",
+    }
+
+    res = await reconciler_mod.TierPolicyReconciler().reconcile_job(uid, jid)
+    assert res["status"] == "partial"
+    # Update 0 (NVDA failure): status='partial', release_claim=False (claim_token preserved!)
+    assert observed_updates[0]["status"] == "partial"
+    assert observed_updates[0]["release_claim"] is False
+    assert observed_updates[0]["claim_token"] is not None
+    # Final update: release_claim=True
+    assert observed_updates[-1]["release_claim"] is True
+    assert infra.jobs[jid]["claim_token"] is None
+
+    # Lease loss mid-job: if claim_token is stolen before progress update, worker stops with lease_lost
+    jid2 = str(uuid.uuid4())
+    infra.jobs[jid2] = {
+        "job_id": jid2,
+        "user_id": uid,
+        "trigger_action": "set_tier",
+        "target_policy_versions": {"core": 1},
+        "pending_tickers": ["TSM"],
+        "completed_tickers": [],
+        "failed_items": [],
+        "override_user_pause": False,
+        "job_context": {},
+        "claim_token": "other-worker-token",
+        "roster_revision": 1,
+        "yaml_synced": False,
+        "status": "running",
+    }
+    res_lost = await reconciler_mod.TierPolicyReconciler().reconcile_job(
+        uid,
+        jid2,
+        _preclaimed_job={**infra.jobs[jid2], "claim_token": "stale-worker-token"},
+    )
+    assert res_lost["ok"] is False
+    assert res_lost["reason"] == "lease_lost"
+
+    # Batched startup scan: 5 jobs with batch_size=2 drains all 5, and a failed job is NEVER re-claimed in same pass
+    infra.jobs.clear()
+    infra.fail_tickers = {"NVDA"}
+    batch_jids: list[str] = []
+    for i in range(5):
+        bj = str(uuid.uuid4())
+        batch_jids.append(bj)
+        infra.jobs[bj] = {
+            "job_id": bj,
+            "user_id": uid,
+            "trigger_action": "set_tier",
+            "target_policy_versions": {"core": 1},
+            "pending_tickers": ["NVDA" if i == 0 else "TSM"],
+            "completed_tickers": [],
+            "failed_items": [],
+            "override_user_pause": False,
+            "job_context": {},
+            "claim_token": None,
+            "roster_revision": i + 1,
+            "yaml_synced": False,
+            "status": "pending",
+        }
+
+    claim_calls: list[set[str]] = []
+
+    async def _startup_claim(*, limit: int = 100, exclude_job_ids: Any = None, lease_seconds: int = 300, conn: Any = None):
+        _ = (lease_seconds, conn)
+        excl = set(exclude_job_ids or ())
+        claim_calls.append(excl)
+        picked = []
+        for j in infra.jobs.values():
+            if j["job_id"] in excl:
+                continue
+            if j["status"] in ("pending", "partial") and j.get("claim_token") is None:
+                j["status"] = "running"
+                j["claim_token"] = str(uuid.uuid4())
+                picked.append(dict(j))
+                if len(picked) >= limit:
+                    break
+        return picked
+
+    monkeypatch.setattr(
+        reconciler_mod,
+        "claim_unfinished_reconcile_jobs_for_startup",
+        create_autospec(policies_mod.claim_unfinished_reconcile_jobs_for_startup, side_effect=_startup_claim),
+    )
+
+    scan = await reconciler_mod.run_startup_reconcile_scan(batch_size=2)
+    assert scan["processed_jobs"] == 5
+    # Batch 0 (2), Batch 1 (2), Batch 2 (1), Batch 3 (0 -> stop); failed job batch_jids[0] was never re-claimed!
+    assert len(claim_calls) == 4
+    assert batch_jids[0] in claim_calls[1]
+
+
+@pytest.mark.asyncio
+async def test_r4_manual_pause_persistence_remove_identity_and_preflight_yaml_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 Decisions 3, 5, 6: single-task pause sets paused_by_user; demote->promote preserves manual pause;
+    remove compensation ignores ticker fallback when pre_row is None; preflight YAML guard blocks stale overwrite
+    and never marks incomplete jobs yaml_synced."""
+    from src.dalton.coverage import service as cov_svc
+    from src.server.services.automations import lifecycle as lifecycle_mod
+
+    # 1. Single-task manual pause stamps paused_by_user=True for Dalton tasks only
+    dalton_row = {
+        "automation_id": "a1",
+        "name": "dalton-nvda-watch",
+        "status": "active",
+        "trigger_type": "cron",
+        "metadata": {"tier": "core"},
+    }
+    pw = lifecycle_mod.pause_update_fields(dalton_row)
+    assert pw["metadata"]["paused_by_user"] is True
+    locked_kw: dict[str, Any] = {"status": "paused"}
+    lifecycle_mod.apply_locked_pause_schedule(dalton_row, locked_kw)
+    assert locked_kw["metadata"]["paused_by_user"] is True
+
+    non_dalton_row = {
+        "automation_id": "a2",
+        "name": "user-custom-alert",
+        "status": "active",
+        "trigger_type": "cron",
+        "metadata": {},
+    }
+    pw_non = lifecycle_mod.pause_update_fields(non_dalton_row)
+    assert "metadata" not in pw_non
+
+    # 2. Demote manually paused task to radar, then promote back to core -> MUST stay paused!
+    infra = _FakeWatchlistInfra()
+    infra.install(monkeypatch)
+    uid = "u1"
+    ws_id = "ws-nvda"
+    infra.workspaces[(uid, "NVDA")] = ws_id
+    infra.workspace_owners[ws_id] = uid
+    infra.coverage[(uid, "NVDA")] = {"user_id": uid, "ticker": "NVDA", "tier": "radar", "is_private": False}
+    manual_paused = infra.add_automation(
+        user_id=uid,
+        workspace_id=ws_id,
+        name="dalton-nvda-watch",
+        status="paused",
+        metadata={"paused_by_user": True, "tier": "core"},
+    )
+    overdue_unstarted_earn = infra.add_automation(
+        user_id=uid,
+        workspace_id=ws_id,
+        name="dalton-nvda-earn-fy26q4-t0",
+        trigger_type="once",
+        cron_expression=None,
+        status="active",
+        next_run_at=datetime.now(UTC) - timedelta(minutes=10),  # overdue but never ran (last_run_at=None)
+    )
+    rec = reconciler_mod.TierPolicyReconciler()
+    await rec.reconcile_company(uid, "NVDA")
+    # Manual pause MUST NOT have been stamped paused_by_policy=True; overdue unstarted earn WAS paused!
+    assert "paused_by_policy" not in infra.automations[manual_paused["automation_id"]]["metadata"]
+    assert infra.automations[overdue_unstarted_earn["automation_id"]]["status"] == "paused"
+
+    infra.coverage[(uid, "NVDA")]["tier"] = "core"
+    await rec.reconcile_company(uid, "NVDA")
+    assert infra.automations[manual_paused["automation_id"]]["status"] == "paused"
+
+    # 3. Remove compensation when pre_row is None NEVER falls back to ticker lookup
+    infra.workspaces[(uid, "META")] = "ws-newly-bound-meta"
+    infra.workspace_owners["ws-newly-bound-meta"] = uid
+    infra.workspace_rows["ws-newly-bound-meta"] = {"workspace_id": "ws-newly-bound-meta", "name": "META", "status": "active"}
+    meta_auto = infra.add_automation(user_id=uid, workspace_id="ws-newly-bound-meta", name="dalton-meta-watch", status="active")
+    res_no_rem = await rec.reconcile_company(uid, "META", removed_workspace_id=None)
+    assert res_no_rem["reason"] == "no_workspace"
+    assert infra.automations[meta_auto["automation_id"]]["status"] == "active"
+
+    # 4. Preflight YAML revision guard blocks stale overwrite & never marks incomplete jobs yaml_synced
+    sync_state = {"roster_revision": 2, "last_yaml_synced_revision": 2}
+    writes_yaml: list[str] = []
+
+    class _FakeBackend:
+        async def awrite_text(self, rel_path: str, content: str) -> bool:
+            _ = rel_path
+            writes_yaml.append(content)
+            return True
+
+    monkeypatch.setattr(
+        policies_mod,
+        "get_user_roster_state",
+        create_autospec(policies_mod.get_user_roster_state, side_effect=lambda u, *, conn=None: dict(sync_state)),
+    )
+    monkeypatch.setattr(
+        policies_mod,
+        "record_yaml_synced_revision",
+        create_autospec(policies_mod.record_yaml_synced_revision, return_value=True),
+    )
+    ok_stale = await cov_svc.sync_user_coverage_to_home(
+        uid, yaml_text="old-v1", backend=_FakeBackend(), roster_revision=1
+    )
+    assert ok_stale is False
+    assert writes_yaml == []
+
+    # mark_yaml_synced_for_user NEVER marks a job with pending_tickers as yaml_synced=True
+    j_inc = str(uuid.uuid4())
+    j_done = str(uuid.uuid4())
+    infra.jobs[j_inc] = {
+        "job_id": j_inc,
+        "user_id": uid,
+        "trigger_action": "set_tier",
+        "target_policy_versions": {"core": 1},
+        "pending_tickers": ["NVDA"],
+        "completed_tickers": [],
+        "failed_items": [],
+        "override_user_pause": False,
+        "job_context": {},
+        "roster_revision": 1,
+        "yaml_synced": False,
+        "status": "pending",
+    }
+    infra.jobs[j_done] = {
+        "job_id": j_done,
+        "user_id": uid,
+        "trigger_action": "set_tier",
+        "target_policy_versions": {"core": 1},
+        "pending_tickers": [],
+        "completed_tickers": ["NVDA"],
+        "failed_items": [],
+        "override_user_pause": False,
+        "job_context": {},
+        "roster_revision": 2,
+        "yaml_synced": False,
+        "status": "partial",
+    }
+    marked = await rec.mark_yaml_synced_for_user(uid, covered_job_ids=[j_inc, j_done], max_revision=2)
+    assert marked == 1
+    assert infra.jobs[j_inc]["yaml_synced"] is False
+    assert infra.jobs[j_done]["yaml_synced"] is True
+    assert infra.jobs[j_done]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_r4_earnings_stage_guard_and_calendar_state_live_tier_consistency(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """r4 Decision 4: validate_earnings_stage_allowed_for_user blocks radar/disabled stages;
+    calendar_state check/mark/diff enforce live tier & allowed_stages."""
+    import importlib.util
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from src.dalton.watchlist import pause_guards as pg_mod
+
+    cov_map = {
+        ("u1", "NET"): {"user_id": "u1", "ticker": "NET", "tier": "radar", "is_private": False},
+        ("u1", "MSFT"): {"user_id": "u1", "ticker": "MSFT", "tier": "watch", "is_private": False},
+        ("u1", "NVDA"): {"user_id": "u1", "ticker": "NVDA", "tier": "core", "is_private": False},
+    }
+    monkeypatch.setattr(
+        coverage_db,
+        "get_coverage_row",
+        create_autospec(
+            coverage_db.get_coverage_row,
+            side_effect=lambda u, t, *, conn=None: cov_map.get((u, t.upper())),
+        ),
+    )
+    monkeypatch.setattr(
+        policies_mod,
+        "get_user_tier_policy",
+        create_autospec(
+            policies_mod.get_user_tier_policy,
+            side_effect=lambda u, tier, *, conn=None: policies_mod.get_default_tier_policy(tier),
+        ),
+    )
+
+    err_radar = await pg_mod.validate_earnings_stage_allowed_for_user("u1", "dalton-net-earn-fy26q4-t0", ticker="NET")
+    assert err_radar is not None and err_radar["error"] == "earnings_stage_disabled"
+
+    err_watch_tm3 = await pg_mod.validate_earnings_stage_allowed_for_user("u1", "dalton-msft-earn-fy26q4-tm3", ticker="MSFT")
+    assert err_watch_tm3 is not None and err_watch_tm3["error"] == "earnings_stage_disabled"
+
+    ok_watch_t0 = await pg_mod.validate_earnings_stage_allowed_for_user("u1", "dalton-msft-earn-fy26q4-t0", ticker="MSFT")
+    assert ok_watch_t0 is None
+
+    ok_core_tm3 = await pg_mod.validate_earnings_stage_allowed_for_user("u1", "dalton-nvda-earn-fy26q4-tm3", ticker="NVDA")
+    assert ok_core_tm3 is None
+
+    # calendar_state.py check, mark (filtering explicit disabled stages), and diff (live tier over stale ledger)
+    script_path = Path(__file__).resolve().parents[4] / "plugins/dalton/skills/dalton-earnings-calendar/scripts/calendar_state.py"
+    spec = importlib.util.spec_from_file_location("calendar_state_r4", script_path)
+    assert spec and spec.loader
+    cs_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cs_mod)
+
+    cov_yaml = tmp_path / "coverage.yaml"
+    cov_yaml.write_text(
+        "companies:\n"
+        "  - ticker: MSFT\n"
+        "    name: Microsoft\n"
+        "    tier: watch\n"
+        "    workspace:\n"
+        "      workspace_id: ws-msft\n"
+        "      status: active\n"
+        "  - ticker: NET\n"
+        "    name: Cloudflare\n"
+        "    tier: radar\n"
+        "    workspace:\n"
+        "      workspace_id: ws-net\n"
+        "      status: active\n",
+        encoding="utf-8",
+    )
+    ledger_path = tmp_path / "state.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "updated": "2026-10-01",
+                "entries": {
+                    "NET": {
+                        "name": "Cloudflare",
+                        "tier": "Core",  # stale ledger tier!
+                        "workspace_id": "ws-net",
+                        "status": "confirmed",
+                        "date_status": "confirmed",
+                        "quarter": "FY26Q3",
+                        "date": "2026-11-05",
+                        "automations": {},
+                    }
+                },
+                "reported": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # cmd_check returns allowed_stages matching live tier
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        cs_mod.cmd_check(
+            SimpleNamespace(state=str(ledger_path), coverage=str(cov_yaml), ticker="MSFT", date="2026-10-28")
+        )
+    chk = json.loads(buf.getvalue())
+    assert chk["allowed_stages"] == ["t0"]
+
+    # cmd_mark with explicit --tm3 and --t0 on Watch filters out tm3!
+    buf2 = io.StringIO()
+    with redirect_stdout(buf2):
+        cs_mod.cmd_mark(
+            SimpleNamespace(
+                state=str(ledger_path),
+                coverage=str(cov_yaml),
+                ticker="MSFT",
+                name=None,
+                tier=None,
+                workspace_id=None,
+                fiscal_note=None,
+                status="confirmed",
+                quarter="FY26Q1",
+                date="2026-10-28",
+                timing="AMC",
+                release_time_et="16:05",
+                call_time_et="17:30",
+                confidence="high",
+                source_url="https://ir.microsoft.com",
+                source_type="company_ir",
+                reason=None,
+                automations_json=None,
+                tm3="dalton-msft-earn-fy26q1-tm3.json",
+                t0="dalton-msft-earn-fy26q1-t0.json",
+                tp1="dalton-msft-earn-fy26q1-tp1.json",
+                tentative_date=None,
+                tentative_sources=None,
+                recheck_automation=None,
+            )
+        )
+    marked_out = json.loads(buf2.getvalue())
+    assert list(marked_out["entry"]["automations"].keys()) == ["t0"]
+    assert set(marked_out["filtered_out_stages"]) == {"tm3", "tp1"}
+
+    # cmd_diff uses live coverage tier (radar -> []) rather than stale ledger tier (Core -> tm3/t0/tp1)
+    scan_file = tmp_path / "scan.jsonl"
+    scan_file.write_text(
+        json.dumps({"ticker": "NET", "status": "confirmed", "confidence": "high", "earnings_date": "2026-11-05"}) + "\n",
+        encoding="utf-8",
+    )
+    buf3 = io.StringIO()
+    with redirect_stdout(buf3):
+        cs_mod.cmd_diff(
+            SimpleNamespace(state=str(ledger_path), coverage=str(cov_yaml), scan=str(scan_file), automations_dir=None)
+        )
+    diff_out = json.loads(buf3.getvalue())
+    assert diff_out["reconciled"] is True
+    assert diff_out["missing"] == []

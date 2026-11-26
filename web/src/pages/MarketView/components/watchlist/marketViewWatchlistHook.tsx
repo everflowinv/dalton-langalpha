@@ -7,7 +7,13 @@ import React from 'react';
 import type { NavigateFunction, SetURLSearchParams } from 'react-router';
 import { ArrowLeft } from 'lucide-react';
 import { isDaltonBuild } from '@/config/brand';
-import { buildMarketViewUrl, readMarketViewRoute } from '../../utils/marketRoute';
+import { buildMarketViewUrl, readMarketViewRoute, type MarketViewRouteParams } from '../../utils/marketRoute';
+
+interface DaltonMarketLocationState {
+  fromWatchlist?: boolean;
+  daltonRouteWs?: string | null;
+  daltonRouteReturnTo?: string | null;
+}
 
 export function shouldShowDaltonWatchlist(searchParams: URLSearchParams): boolean {
   return isDaltonBuild && !readMarketViewRoute(searchParams).symbol;
@@ -19,6 +25,34 @@ export function shouldConsumeMarketRouteParam(key: string): boolean {
   return true;
 }
 
+export function readDaltonOpeningMarketRoute(
+  searchParams: URLSearchParams,
+  locationState: unknown,
+): MarketViewRouteParams {
+  const base = readMarketViewRoute(searchParams);
+  if (!isDaltonBuild || !locationState || typeof locationState !== 'object') return base;
+  const st = locationState as DaltonMarketLocationState;
+  return {
+    ...base,
+    workspaceId: base.workspaceId ?? (typeof st.daltonRouteWs === 'string' ? st.daltonRouteWs : null),
+    returnTo: base.returnTo ?? (typeof st.daltonRouteReturnTo === 'string' ? st.daltonRouteReturnTo : null),
+  };
+}
+
+export function buildConsumedRouteReplaceState(
+  locationState: unknown,
+  route: MarketViewRouteParams,
+): Record<string, unknown> | undefined {
+  if (!isDaltonBuild) return undefined;
+  const prev =
+    locationState && typeof locationState === 'object'
+      ? { ...(locationState as Record<string, unknown>) }
+      : {};
+  if (route.workspaceId) prev.daltonRouteWs = route.workspaceId;
+  if (route.returnTo) prev.daltonRouteReturnTo = route.returnTo;
+  return Object.keys(prev).length > 0 ? prev : undefined;
+}
+
 export function syncDaltonMarketSymbolParam(
   setSearchParams: SetURLSearchParams,
   symbol: string,
@@ -28,6 +62,23 @@ export function syncDaltonMarketSymbolParam(
     (prev) => {
       const next = new URLSearchParams(prev);
       next.set('symbol', symbol);
+      return next;
+    },
+    { replace: true },
+  );
+}
+
+export function syncDaltonMarketTimeframeParam(
+  setSearchParams: SetURLSearchParams,
+  timeframe: string,
+): void {
+  if (!isDaltonBuild || !timeframe) return;
+  setSearchParams(
+    (prev) => {
+      if (!prev.has('symbol')) return prev;
+      const next = new URLSearchParams(prev);
+      if (next.get('tf') === timeframe) return prev;
+      next.set('tf', timeframe);
       return next;
     },
     { replace: true },
@@ -46,8 +97,27 @@ export function navigateDaltonChartJump(
       symbol,
       ...(timeframe ? { timeframe } : {}),
     }),
-    { replace: !fromWatchlistView },
+    {
+      replace: !fromWatchlistView,
+      ...(fromWatchlistView ? { state: { fromWatchlist: true } } : {}),
+    },
   );
+}
+
+export function navigateBackToDaltonWatchlist(
+  navigate: NavigateFunction,
+  locationState: unknown,
+): void {
+  const fromWatchlist = Boolean(
+    locationState &&
+      typeof locationState === 'object' &&
+      (locationState as DaltonMarketLocationState).fromWatchlist,
+  );
+  if (fromWatchlist && typeof window !== 'undefined' && window.history.length > 1) {
+    navigate(-1);
+    return;
+  }
+  navigate('/market');
 }
 
 export function BackToWatchlistButton({

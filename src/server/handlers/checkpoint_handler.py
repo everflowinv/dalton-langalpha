@@ -388,6 +388,7 @@ def _snapshot_matches_action(
     }:
         return (
             snapshot.get("tool_call_id") == action_req.get("tool_call_id")
+            and snapshot.get("snapshot_id") == action_req.get("snapshot_id")
             and snapshot.get("owner_user_id") == action_req.get("owner_user_id")
             and snapshot.get("expected_roster_hash")
             == action_req.get("expected_roster_hash")

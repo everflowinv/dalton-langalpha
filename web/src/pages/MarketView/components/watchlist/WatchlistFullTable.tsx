@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, FolderOpen, Star, Trash2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useLocale } from '@/hooks/useLocale';
@@ -21,6 +21,11 @@ interface WatchlistFullTableProps {
   visibleColumns: readonly WatchlistColumnKey[];
   groupedByTier: boolean;
   holdingSymbols: ReadonlySet<string>;
+  sortField?: WatchlistSortField | null;
+  sortDir?: 'asc' | 'desc';
+  onSortChange?: (field: WatchlistSortField | null, dir: 'asc' | 'desc') => void;
+  initialScrollTop?: number;
+  onScrollTopChange?: (scrollTop: number) => void;
   onSelectSymbol: (symbol: string) => void;
   onRequestTierChange: (company: PersonalWatchlistCompany, nextTier: WatchlistTier) => void;
   onRequestRemove: (company: PersonalWatchlistCompany) => void;
@@ -68,6 +73,11 @@ export function WatchlistFullTable({
   visibleColumns,
   groupedByTier,
   holdingSymbols,
+  sortField: controlledSortField,
+  sortDir: controlledSortDir,
+  onSortChange,
+  initialScrollTop = 0,
+  onScrollTopChange,
   onSelectSymbol,
   onRequestTierChange,
   onRequestRemove,
@@ -75,15 +85,34 @@ export function WatchlistFullTable({
 }: WatchlistFullTableProps): React.ReactElement {
   const { t } = useTranslation();
   const locale = useLocale();
-  const [sortField, setSortField] = useState<WatchlistSortField | null>(null);
-  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  const [internalSortField, setInternalSortField] = useState<WatchlistSortField | null>(null);
+  const [internalSortDir, setInternalSortDir] = useState<'asc' | 'desc'>('desc');
+  const sortField = controlledSortField !== undefined ? controlledSortField : internalSortField;
+  const sortDir = controlledSortDir !== undefined ? controlledSortDir : internalSortDir;
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const restoredScrollRef = useRef(false);
+
+  useEffect(() => {
+    if (restoredScrollRef.current) return;
+    if (initialScrollTop > 0 && scrollContainerRef.current) {
+      scrollContainerRef.current.scrollTop = initialScrollTop;
+      restoredScrollRef.current = true;
+    }
+  }, [initialScrollTop, companies.length]);
 
   const toggleSort = (field: WatchlistSortField) => {
+    let nextField: WatchlistSortField | null = field;
+    let nextDir: 'asc' | 'desc';
     if (sortField === field) {
-      setSortDir((d) => (d === 'desc' ? 'asc' : 'desc'));
+      nextDir = sortDir === 'desc' ? 'asc' : 'desc';
     } else {
-      setSortField(field);
-      setSortDir(field === 'ticker' || field === 'tier' || field === 'next_earnings' ? 'asc' : 'desc');
+      nextDir = field === 'ticker' || field === 'tier' || field === 'next_earnings' ? 'asc' : 'desc';
+    }
+    if (onSortChange) {
+      onSortChange(nextField, nextDir);
+    } else {
+      setInternalSortField(nextField);
+      setInternalSortDir(nextDir);
     }
   };
 
@@ -308,7 +337,11 @@ export function WatchlistFullTable({
   };
 
   return (
-    <div className="flex-1 min-h-0 overflow-auto">
+    <div
+      ref={scrollContainerRef}
+      onScroll={(e) => onScrollTopChange?.(e.currentTarget.scrollTop)}
+      className="flex-1 min-h-0 overflow-auto"
+    >
       <table className="w-full border-collapse text-left">
         <thead
           className="sticky top-0 z-10 border-b"

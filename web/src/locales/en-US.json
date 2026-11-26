@@ -1961,7 +1961,18 @@
       "submitting": "Applying…",
       "decline": "Cancel",
       "retryReconcile": "Retry sync",
-      "retrying": "Syncing…"
+      "retrying": "Syncing…",
+      "retryPartialError": "Some tasks are still pending sync. Please retry.",
+      "retryFailedError": "Sync retry failed. Please try again.",
+      "changeLabels": {
+        "create": "Create",
+        "update": "Update",
+        "resume": "Resume",
+        "pause": "Pause",
+        "preserveUserPause": "keep manual pause",
+        "preserveTracker": "managed by tracker",
+        "preserveHandoff": "keep handoff pause"
+      }
     },
     "userQuestion": {
       "answered": "Answered: {{answer}}",

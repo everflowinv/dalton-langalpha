@@ -16,9 +16,9 @@ import {
 } from './buckets';
 import {
   applyWatchlistProposalToMessage,
-  buildWatchlistProposalState,
   isWatchlistInterruptType,
-  WATCHLIST_INTERRUPT_TYPES,
+  projectHistoryWatchlistInterrupt,
+  rearmHistoryWatchlistInterrupt,
 } from '@/lib/dalton/watchlistInterrupts'; // DALTON-HOOK(watchlist)
 import { claimedCardFields, evidenceLookup, type ApprovalEvidence } from './claims';
 import { buildCreditPauseState } from './creditPauseCard';
@@ -145,21 +145,13 @@ export function projectHistoryInterrupt(
         });
       }
     // --- DALTON-HOOK(cos-settings-tools): end ---
-    // --- DALTON-HOOK(watchlist): begin ---
-    } else if (actionType && WATCHLIST_INTERRUPT_TYPES.has(actionType) && actionRequests[0]?.tool_call_id) {
-      const proposalId = event.interrupt_id;
-      const proposalData = actionRequests[0];
-      rt.setMessages((prev) => setCardStatus(prev, 'watchlistProposals', proposalId, 'pending'));
-      if (!ctx.pendingHistoryInterrupts.some((p) => p.interruptId === proposalId)) {
-        ctx.pendingHistoryInterrupts.push({
-          type: actionType,
-          assistantMessageId: interruptAssistantId || '',
-          proposalId,
-          interruptId: proposalId,
-          toolCallId: proposalData.tool_call_id,
-        });
-      }
-    // --- DALTON-HOOK(watchlist): end ---
+    // DALTON-HOOK(watchlist): re-arm stranded watchlist confirmation card via Dalton helper
+    } else if (rearmHistoryWatchlistInterrupt({
+      actionType, interruptId: event.interrupt_id, proposalData: actionRequests[0], assistantMessageId: interruptAssistantId || '',
+      setPending: (pid) => rt.setMessages((prev) => setCardStatus(prev, 'watchlistProposals', pid, 'pending')),
+      pendingHistoryInterrupts: ctx.pendingHistoryInterrupts,
+    })) {
+      // handled by Dalton helper
     }
     return;
   }
@@ -367,16 +359,13 @@ export function projectHistoryInterrupt(
       });
     // DALTON-HOOK(watchlist): project history personal watchlist confirmation interrupt via Dalton helper
     } else if (isWatchlistInterruptType(actionType)) {
-      const proposalId = event.interrupt_id || `watchlist-${actionType}-history-${Date.now()}`;
       const order = eventOrder(event, () => ++pairState.contentOrderCounter);
-      const { state, toolCallId, hasToolCallId } = buildWatchlistProposalState(actionType, actionRequests[0] as Record<string, unknown>, event.interrupt_id);
-      rt.setMessages((prev) =>
-        updateMessage(prev, interruptAssistantId, (m) =>
-          m.role === 'assistant'
-            ? applyWatchlistProposalToMessage(m as AssistantMessage, actionType, proposalId, order, state, (segs, s) => [...(segs || []), s])
-            : m),
-      );
-      if (hasToolCallId) ctx.pendingHistoryInterrupts.push({ type: actionType, assistantMessageId: interruptAssistantId, proposalId, interruptId: event.interrupt_id, toolCallId });
+      projectHistoryWatchlistInterrupt({
+        actionType, interruptId: event.interrupt_id, proposalData: actionRequests[0] as Record<string, unknown>,
+        assistantMessageId: interruptAssistantId, order, pendingHistoryInterrupts: ctx.pendingHistoryInterrupts,
+        applyToMessage: (pid, st) => rt.setMessages((prev) => updateMessage(prev, interruptAssistantId, (m) =>
+          m.role === 'assistant' ? applyWatchlistProposalToMessage(m as AssistantMessage, actionType, pid, order, st, (segs, s) => [...(segs || []), s]) : m)),
+      });
     } else if (actionType === 'credit_pause') {
       // --- Credit pause interrupt (history) ---
       const proposalId = event.interrupt_id!;

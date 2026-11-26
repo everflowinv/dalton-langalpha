@@ -417,6 +417,12 @@ def _normalize_reconcile_job_row(row: Mapping[str, Any] | None) -> dict[str, Any
     out["failed_items"] = list(_ensure_json(out.get("failed_items"), []) or [])
     out["override_user_pause"] = bool(out.get("override_user_pause", False))
     out["job_context"] = dict(_ensure_json(out.get("job_context"), {}) or {})
+    out["claim_token"] = (
+        str(out["claim_token"]).strip()
+        if out.get("claim_token") is not None and str(out["claim_token"]).strip()
+        else None
+    )
+    out["roster_revision"] = int(out.get("roster_revision") or 0)
     out["yaml_synced"] = bool(out.get("yaml_synced", False))
     return out
 
@@ -424,9 +430,270 @@ def _normalize_reconcile_job_row(row: Mapping[str, Any] | None) -> dict[str, Any
 _RECONCILE_JOB_SELECT_COLS = """
     job_id::text AS job_id, user_id, trigger_action,
     target_policy_versions, pending_tickers, completed_tickers,
-    failed_items, override_user_pause, job_context, yaml_synced, status,
-    created_at, updated_at
+    failed_items, override_user_pause, job_context,
+    claim_token, claim_expires_at, roster_revision,
+    yaml_synced, status, created_at, updated_at
 """
+
+CONFIRM_SNAPSHOT_TTL_SECONDS = 900
+DEFAULT_OUTBOX_LEASE_SECONDS = 300
+
+
+def _is_pool_unavailable_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "pool is not open",
+            "not initialized",
+            "connection pool",
+            "no running event loop",
+            "does not exist",
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Server-issued confirmation snapshots & user roster revision helpers
+# ---------------------------------------------------------------------------
+
+
+async def insert_confirm_snapshot(
+    user_id: str,
+    payload: Mapping[str, Any],
+    *,
+    ttl_seconds: int = CONFIRM_SNAPSHOT_TTL_SECONDS,
+    snapshot_id: str | None = None,
+    conn: Any = None,
+) -> str:
+    """Persist a server-issued, single-use confirmation snapshot and return its UUID."""
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise ValueError("user_id is required")
+    sid = str(snapshot_id or uuid.uuid4())
+    payload_json = json.dumps(dict(payload or {}), ensure_ascii=False, default=str)
+    ttl = max(30, int(ttl_seconds))
+
+    async def _run(c: Any) -> str:
+        async with c.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                INSERT INTO dalton_watchlist_confirm_snapshots (
+                    snapshot_id, user_id, payload, expires_at, created_at
+                )
+                VALUES (
+                    %s::uuid, %s, %s::jsonb, NOW() + (%s * INTERVAL '1 second'), NOW()
+                )
+                RETURNING snapshot_id::text AS snapshot_id
+                """,
+                (sid, uid, payload_json, ttl),
+            )
+            row = await cur.fetchone()
+            return str((row or {}).get("snapshot_id") or sid)
+
+    if conn is not None:
+        return await _run(conn)
+    async with get_db_connection() as c, c.transaction():
+        return await _run(c)
+
+
+async def get_confirm_snapshot(
+    user_id: str,
+    snapshot_id: str,
+    *,
+    for_update: bool = False,
+    conn: Any = None,
+) -> dict[str, Any] | None:
+    """Fetch a server-issued confirmation snapshot belonging to ``user_id``."""
+    uid = str(user_id or "").strip()
+    sid = str(snapshot_id or "").strip()
+    if not uid or not sid:
+        return None
+    try:
+        uuid.UUID(sid)
+    except ValueError:
+        return None
+
+    lock_sql = " FOR UPDATE" if for_update else ""
+    async with get_db_connection(conn) as c:
+        async with c.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT
+                    snapshot_id::text AS snapshot_id,
+                    user_id,
+                    payload,
+                    expires_at,
+                    consumed_at,
+                    (expires_at <= NOW()) AS is_expired,
+                    created_at
+                FROM dalton_watchlist_confirm_snapshots
+                WHERE user_id = %s AND snapshot_id = %s::uuid
+                {lock_sql}
+                """,
+                (uid, sid),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            out = dict(row)
+            out["payload"] = dict(_ensure_json(out.get("payload"), {}) or {})
+            out["is_expired"] = bool(out.get("is_expired", False))
+            return out
+
+
+async def consume_confirm_snapshot(
+    user_id: str,
+    snapshot_id: str,
+    *,
+    conn: Any = None,
+) -> bool:
+    """Atomically mark a confirmation snapshot as consumed; returns False if already used or expired."""
+    uid = str(user_id or "").strip()
+    sid = str(snapshot_id or "").strip()
+    if not uid or not sid:
+        return False
+    try:
+        uuid.UUID(sid)
+    except ValueError:
+        return False
+
+    async def _run(c: Any) -> bool:
+        async with c.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_watchlist_confirm_snapshots
+                SET consumed_at = NOW()
+                WHERE user_id = %s
+                  AND snapshot_id = %s::uuid
+                  AND consumed_at IS NULL
+                  AND expires_at > NOW()
+                RETURNING snapshot_id::text AS snapshot_id
+                """,
+                (uid, sid),
+            )
+            return (await cur.fetchone()) is not None
+
+    if conn is not None:
+        return await _run(conn)
+    async with get_db_connection() as c, c.transaction():
+        return await _run(c)
+
+
+async def get_user_roster_state(
+    user_id: str,
+    *,
+    conn: Any = None,
+) -> dict[str, int]:
+    """Return ``{roster_revision, last_yaml_synced_revision}`` for ``user_id``."""
+    uid = str(user_id or "").strip()
+    default_state = {"roster_revision": 0, "last_yaml_synced_revision": 0}
+    if not uid:
+        return default_state
+    try:
+        async with get_db_connection(conn) as c:
+            async with c.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT roster_revision, last_yaml_synced_revision
+                    FROM dalton_watchlist_user_state
+                    WHERE user_id = %s
+                    """,
+                    (uid,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    return default_state
+                return {
+                    "roster_revision": int(row.get("roster_revision") or 0),
+                    "last_yaml_synced_revision": int(row.get("last_yaml_synced_revision") or 0),
+                }
+    except Exception as exc:
+        if _is_pool_unavailable_error(exc):
+            return default_state
+        raise
+
+
+async def bump_user_roster_revision(
+    user_id: str,
+    *,
+    conn: Any = None,
+) -> int:
+    """Monotonically increment ``roster_revision`` for ``user_id`` inside the caller's tx."""
+    uid = str(user_id or "").strip()
+    if not uid:
+        return 0
+
+    async def _run(c: Any) -> int:
+        async with c.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                INSERT INTO dalton_watchlist_user_state (
+                    user_id, roster_revision, last_yaml_synced_revision, updated_at
+                )
+                VALUES (%s, 1, 0, NOW())
+                ON CONFLICT (user_id) DO UPDATE
+                SET roster_revision = dalton_watchlist_user_state.roster_revision + 1,
+                    updated_at = NOW()
+                RETURNING roster_revision
+                """,
+                (uid,),
+            )
+            row = await cur.fetchone()
+            return int((row or {}).get("roster_revision") or 1)
+
+    if conn is not None:
+        return await _run(conn)
+    async with get_db_connection() as c, c.transaction():
+        return await _run(c)
+
+
+async def record_yaml_synced_revision(
+    user_id: str,
+    revision: int,
+    *,
+    conn: Any = None,
+) -> bool:
+    """Advance ``last_yaml_synced_revision`` iff ``revision >= last_yaml_synced_revision``."""
+    uid = str(user_id or "").strip()
+    rev = max(0, int(revision))
+    if not uid:
+        return False
+
+    async def _run(c: Any) -> bool:
+        async with c.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                INSERT INTO dalton_watchlist_user_state (
+                    user_id, roster_revision, last_yaml_synced_revision, updated_at
+                )
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (user_id) DO NOTHING
+                """,
+                (uid, rev, rev),
+            )
+            await cur.execute(
+                """
+                UPDATE dalton_watchlist_user_state
+                SET last_yaml_synced_revision = %s,
+                    updated_at = NOW()
+                WHERE user_id = %s
+                  AND last_yaml_synced_revision <= %s
+                RETURNING last_yaml_synced_revision
+                """,
+                (rev, uid, rev),
+            )
+            return (await cur.fetchone()) is not None
+
+    try:
+        if conn is not None:
+            return await _run(conn)
+        async with get_db_connection() as c, c.transaction():
+            return await _run(c)
+    except Exception as exc:
+        if _is_pool_unavailable_error(exc):
+            return True
+        raise
 
 
 async def insert_reconcile_job(
@@ -437,6 +704,7 @@ async def insert_reconcile_job(
     pending_tickers: Sequence[str],
     override_user_pause: bool = False,
     job_context: Mapping[str, Any] | None = None,
+    roster_revision: int = 0,
     job_id: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
@@ -466,14 +734,14 @@ async def insert_reconcile_job(
                 INSERT INTO dalton_watchlist_reconcile_jobs (
                     job_id, user_id, trigger_action, target_policy_versions,
                     pending_tickers, completed_tickers, failed_items,
-                    override_user_pause, job_context, yaml_synced, status,
-                    created_at, updated_at
+                    override_user_pause, job_context, roster_revision,
+                    yaml_synced, status, created_at, updated_at
                 )
                 VALUES (
                     %s::uuid, %s, %s, %s::jsonb,
                     %s::jsonb, '[]'::jsonb, '[]'::jsonb,
-                    %s, %s::jsonb, FALSE, 'pending',
-                    NOW(), NOW()
+                    %s, %s::jsonb, %s,
+                    FALSE, 'pending', NOW(), NOW()
                 )
                 RETURNING {_RECONCILE_JOB_SELECT_COLS}
                 """,
@@ -485,6 +753,7 @@ async def insert_reconcile_job(
                     pending_json,
                     bool(override_user_pause),
                     context_json,
+                    int(roster_revision or 0),
                 ),
             )
             row = await cur.fetchone()
@@ -526,15 +795,18 @@ async def claim_reconcile_job(
     user_id: str,
     job_id: str,
     *,
-    stale_seconds: int = 300,
+    stale_seconds: int = DEFAULT_OUTBOX_LEASE_SECONDS,
+    lease_seconds: int | None = None,
     force_claim: bool = False,
     conn: Any = None,
 ) -> dict[str, Any] | None:
-    """Atomically claim one outbox job for exclusive execution via conditional UPDATE."""
+    """Atomically claim one outbox job with an exclusive lease token."""
     uid = str(user_id or "").strip()
     jid = str(job_id or "").strip()
     if not uid or not jid:
         return None
+    eff_lease = max(1, int(lease_seconds if lease_seconds is not None else stale_seconds))
+    token = str(uuid.uuid4())
 
     async def _run(c: Any) -> dict[str, Any] | None:
         async with c.cursor(row_factory=dict_row) as cur:
@@ -542,29 +814,48 @@ async def claim_reconcile_job(
                 await cur.execute(
                     f"""
                     UPDATE dalton_watchlist_reconcile_jobs
-                    SET status = 'running', updated_at = NOW()
+                    SET status = 'running',
+                        claim_token = %s,
+                        claim_expires_at = NOW() + (%s * INTERVAL '1 second'),
+                        updated_at = NOW()
                     WHERE user_id = %s
                       AND job_id = %s::uuid
                       AND (status IN ('pending', 'running', 'partial') OR yaml_synced = FALSE)
                     RETURNING {_RECONCILE_JOB_SELECT_COLS}
                     """,
-                    (uid, jid),
+                    (token, eff_lease, uid, jid),
                 )
             else:
                 await cur.execute(
                     f"""
                     UPDATE dalton_watchlist_reconcile_jobs
-                    SET status = 'running', updated_at = NOW()
+                    SET status = 'running',
+                        claim_token = %s,
+                        claim_expires_at = NOW() + (%s * INTERVAL '1 second'),
+                        updated_at = NOW()
                     WHERE user_id = %s
                       AND job_id = %s::uuid
                       AND (
-                          status IN ('pending', 'partial')
-                          OR (status = 'running' AND updated_at < NOW() - (%s * INTERVAL '1 second'))
-                          OR (status = 'completed' AND yaml_synced = FALSE)
+                          (
+                              status IN ('pending', 'partial')
+                              AND (claim_token IS NULL OR claim_expires_at IS NULL OR claim_expires_at <= NOW())
+                          )
+                          OR (
+                              status = 'running'
+                              AND (
+                                  (claim_expires_at IS NOT NULL AND claim_expires_at <= NOW())
+                                  OR (claim_expires_at IS NULL AND updated_at < NOW() - (%s * INTERVAL '1 second'))
+                              )
+                          )
+                          OR (
+                              status = 'completed'
+                              AND yaml_synced = FALSE
+                              AND (claim_token IS NULL OR claim_expires_at IS NULL OR claim_expires_at <= NOW())
+                          )
                       )
                     RETURNING {_RECONCILE_JOB_SELECT_COLS}
                     """,
-                    (uid, jid, max(1, int(stale_seconds))),
+                    (token, eff_lease, uid, jid, eff_lease),
                 )
             return _normalize_reconcile_job_row(await cur.fetchone())
 
@@ -577,32 +868,73 @@ async def claim_reconcile_job(
 async def claim_unfinished_reconcile_jobs_for_startup(
     *,
     limit: int = 100,
+    exclude_job_ids: Sequence[str] | None = None,
+    lease_seconds: int = DEFAULT_OUTBOX_LEASE_SECONDS,
     conn: Any = None,
 ) -> list[dict[str, Any]]:
-    """Atomically claim unfinished outbox jobs across all users on server startup using FOR UPDATE SKIP LOCKED."""
+    """Atomically claim claimable outbox jobs across all users without stealing active leases."""
+    eff_lease = max(1, int(lease_seconds))
+    excl: list[str] = []
+    for raw_id in exclude_job_ids or ():
+        s = str(raw_id or "").strip()
+        if not s:
+            continue
+        try:
+            uuid.UUID(s)
+            excl.append(s)
+        except ValueError:
+            continue
+
     async def _run(c: Any) -> list[dict[str, Any]]:
         async with c.cursor(row_factory=dict_row) as cur:
+            excl_clause = "AND NOT (job_id = ANY(%s::uuid[]))" if excl else ""
+            params: list[Any] = [eff_lease]
+            if excl:
+                params.append(excl)
+            params.extend([max(1, int(limit)), eff_lease])
             await cur.execute(
                 f"""
                 WITH picked AS (
                     SELECT job_id
                     FROM dalton_watchlist_reconcile_jobs
-                    WHERE status IN ('pending', 'running', 'partial') OR yaml_synced = FALSE
+                    WHERE (
+                        (
+                            status IN ('pending', 'partial')
+                            AND (claim_token IS NULL OR claim_expires_at IS NULL OR claim_expires_at <= NOW())
+                        )
+                        OR (
+                            status = 'running'
+                            AND (
+                                (claim_expires_at IS NOT NULL AND claim_expires_at <= NOW())
+                                OR (claim_expires_at IS NULL AND updated_at < NOW() - (%s * INTERVAL '1 second'))
+                            )
+                        )
+                        OR (
+                            status = 'completed'
+                            AND yaml_synced = FALSE
+                            AND (claim_token IS NULL OR claim_expires_at IS NULL OR claim_expires_at <= NOW())
+                        )
+                    )
+                    {excl_clause}
                     ORDER BY created_at ASC
                     LIMIT %s
                     FOR UPDATE SKIP LOCKED
                 )
                 UPDATE dalton_watchlist_reconcile_jobs j
-                SET status = 'running', updated_at = NOW()
+                SET status = 'running',
+                    claim_token = gen_random_uuid()::text,
+                    claim_expires_at = NOW() + (%s * INTERVAL '1 second'),
+                    updated_at = NOW()
                 FROM picked
                 WHERE j.job_id = picked.job_id
                 RETURNING
                     j.job_id::text AS job_id, j.user_id, j.trigger_action,
                     j.target_policy_versions, j.pending_tickers, j.completed_tickers,
                     j.failed_items, j.override_user_pause, j.job_context,
+                    j.claim_token, j.claim_expires_at, j.roster_revision,
                     j.yaml_synced, j.status, j.created_at, j.updated_at
                 """,
-                (max(1, int(limit)),),
+                tuple(params),
             )
             rows = await cur.fetchall()
             return [
@@ -655,9 +987,12 @@ async def update_reconcile_job_progress(
     failed_items: Sequence[Mapping[str, Any]] | None = None,
     yaml_synced: bool | None = None,
     status: str | None = None,
+    claim_token: str | None = None,
+    release_claim: bool = False,
+    lease_seconds: int = DEFAULT_OUTBOX_LEASE_SECONDS,
     conn: Any = None,
 ) -> dict[str, Any] | None:
-    """Update outbox job progress fields atomically."""
+    """Update outbox job progress fields atomically, enforcing ``claim_token`` when supplied."""
     uid = str(user_id or "").strip()
     jid = str(job_id or "").strip()
     if not uid or not jid:
@@ -682,7 +1017,18 @@ async def update_reconcile_job_progress(
             raise ValueError(f"Invalid reconcile job status {status!r}")
         sets.append("status = %s")
         params.append(status)
+    if release_claim:
+        sets.append("claim_token = NULL")
+        sets.append("claim_expires_at = NULL")
+    elif claim_token is not None:
+        sets.append("claim_expires_at = NOW() + (%s * INTERVAL '1 second')")
+        params.append(max(1, int(lease_seconds)))
+
+    where_clauses = ["user_id = %s", "job_id = %s::uuid"]
     params.extend([uid, jid])
+    if claim_token is not None:
+        where_clauses.append("claim_token = %s")
+        params.append(str(claim_token))
 
     async def _run(c: Any) -> dict[str, Any] | None:
         async with c.cursor(row_factory=dict_row) as cur:
@@ -690,7 +1036,7 @@ async def update_reconcile_job_progress(
                 f"""
                 UPDATE dalton_watchlist_reconcile_jobs
                 SET {", ".join(sets)}
-                WHERE user_id = %s AND job_id = %s::uuid
+                WHERE {" AND ".join(where_clauses)}
                 RETURNING {_RECONCILE_JOB_SELECT_COLS}
                 """,
                 tuple(params),
@@ -704,7 +1050,9 @@ async def update_reconcile_job_progress(
 
 
 __all__ = [
+    "CONFIRM_SNAPSHOT_TTL_SECONDS",
     "CRON_VALIDATION_HORIZON_DAYS",
+    "DEFAULT_OUTBOX_LEASE_SECONDS",
     "DEFAULT_TIER_POLICIES",
     "DELTA_CRON_CORE_DEFAULT",
     "DELTA_CRON_RADAR_TEMPLATE",
@@ -718,17 +1066,23 @@ __all__ = [
     "WATCH_CRON_CORE_DEFAULT",
     "WATCH_CRON_RADAR_TEMPLATE",
     "WATCH_CRON_WATCH_DEFAULT",
+    "bump_user_roster_revision",
     "claim_reconcile_job",
     "claim_unfinished_reconcile_jobs_for_startup",
+    "consume_confirm_snapshot",
     "default_tier_policies_yaml_dict",
+    "get_confirm_snapshot",
     "get_default_tier_policy",
     "get_reconcile_job",
+    "get_user_roster_state",
     "get_user_tier_policies",
     "get_user_tier_policy",
+    "insert_confirm_snapshot",
     "insert_reconcile_job",
     "list_unfinished_reconcile_jobs",
     "normalize_tier",
     "policy_from_mapping",
+    "record_yaml_synced_revision",
     "resolve_effective_company_policy",
     "update_reconcile_job_progress",
     "validate_delta_cron",

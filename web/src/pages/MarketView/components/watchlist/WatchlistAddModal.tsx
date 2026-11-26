@@ -68,13 +68,11 @@ export function WatchlistAddModal({
         setPreview(prev);
         return;
       }
+      // Exempt add (<=5 net-new tickers, no pause override): submit raw request without snapshot_id
       await mutateWatchlist({
         action: 'add',
         tickers: prev.target_tickers.length > 0 ? prev.target_tickers : parsedTickers,
         tier,
-        expected_roster_hash: prev.expected_roster_hash,
-        expected_policy_versions: prev.expected_policy_versions,
-        expected_target_tickers: prev.target_tickers,
       });
       onSuccess();
       resetAndClose();
@@ -99,16 +97,7 @@ export function WatchlistAddModal({
     try {
       await mutateWatchlist({
         action: 'add',
-        tickers: preview.target_tickers,
-        tier: (preview.target_tier || tier) as WatchlistTier,
-        expected_action: preview.raw_action ?? 'add',
-        expected_target_tier: preview.target_tier ?? tier,
-        expected_group_id: preview.group_id ?? null,
-        expected_override_user_pause: Boolean(preview.override_user_pause),
-        expected_pause_versions: preview.expected_pause_versions,
-        expected_roster_hash: preview.expected_roster_hash,
-        expected_policy_versions: preview.expected_policy_versions,
-        expected_target_tickers: preview.target_tickers,
+        snapshot_id: preview.snapshot_id ?? undefined,
       });
       onSuccess();
       resetAndClose();
@@ -135,14 +124,14 @@ export function WatchlistAddModal({
       onClick={resetAndClose}
     >
       <div
-        className="w-full max-w-md rounded-xl border p-5 shadow-xl"
+        className="w-full max-w-md max-h-[90vh] flex flex-col overflow-hidden rounded-xl border p-5 shadow-xl"
         style={{
           backgroundColor: 'var(--color-bg-card)',
           borderColor: 'var(--color-border-muted)',
         }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center justify-between mb-4 shrink-0">
           <h2 className="text-base font-semibold" style={{ color: 'var(--color-text-primary)' }}>
             {t('marketView:watchlist.addModal.title')}
           </h2>
@@ -157,6 +146,7 @@ export function WatchlistAddModal({
           </button>
         </div>
 
+        <div className="overflow-y-auto flex-1 min-h-0">
         {!preview ? (
           <form onSubmit={handleSubmit} className="space-y-4">
             <div>
@@ -288,6 +278,7 @@ export function WatchlistAddModal({
             </div>
           </div>
         )}
+        </div>
       </div>
     </div>
   );

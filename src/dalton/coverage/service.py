@@ -1028,10 +1028,7 @@ async def render_company_coverage_yaml(*, conn: Any = None) -> str:
     """Render the shared Home company-execution coverage scope as YAML (tickers only; no personal tiers/tags/radar)."""
     doc = await get_company_coverage(conn=conn)
     scope_companies = [
-        {
-            "ticker": str(c.get("ticker") or "").strip().upper(),
-            "market": str(c.get("market") or "").strip().upper(),
-        }
+        {"ticker": str(c.get("ticker") or "").strip().upper()}
         for c in (doc.get("companies") or [])
         if c.get("ticker")
     ]
@@ -1065,42 +1062,86 @@ async def _resolve_home_sandbox_backend(user_id: str) -> Any:
     return SandboxBackend(session.sandbox, layout.workspace)
 
 
+_HOME_YAML_SYNC_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _get_home_yaml_sync_lock(user_id: str) -> asyncio.Lock:
+    lock = _HOME_YAML_SYNC_LOCKS.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _HOME_YAML_SYNC_LOCKS[user_id] = lock
+    return lock
+
+
 async def sync_user_coverage_to_home(
     user_id: str,
     *,
     yaml_text: str | None = None,
     backend: Any = None,
     rel_path: str = "dalton/coverage.yaml",
+    roster_revision: int | None = None,
 ) -> bool:
-    """Best-effort write of rendered `coverage.yaml` into `user_id`'s Home sandbox.
+    """Serialized, revision-guarded write of rendered `coverage.yaml` into `user_id`'s Home sandbox.
 
+    Refuses to overwrite Home YAML when ``roster_revision < last_yaml_synced_revision``.
     Logs and returns False on failure without raising.
     """
     uid = str(user_id or "").strip()
     if not uid:
         return False
-    try:
-        rendered = yaml_text if yaml_text is not None else await render_coverage_yaml(uid)
-        eff_backend = backend or await _resolve_home_sandbox_backend(uid)
-        if hasattr(eff_backend, "awrite_text"):
-            wrote = await eff_backend.awrite_text(rel_path, rendered)
-            if wrote is False:
-                raise RuntimeError(f"awrite_text returned False for {rel_path}")
-        elif hasattr(eff_backend, "awrite"):
-            await eff_backend.awrite(rel_path, rendered)
-        elif hasattr(eff_backend, "write"):
-            eff_backend.write(rel_path, rendered)
-        else:
-            raise RuntimeError("Unsupported sandbox backend interface")
-        return True
-    except Exception as exc:
-        logger.info(
-            "[DALTON_COVERAGE] skipped or failed writing Home/%s for user=%s: %s",
-            rel_path,
-            uid,
-            exc,
-        )
-        return False
+    from src.dalton.watchlist.policies import (
+        get_user_roster_state,
+        record_yaml_synced_revision,
+    )
+
+    is_personal_yaml = rel_path == "dalton/coverage.yaml"
+    async with _get_home_yaml_sync_lock(uid):
+        try:
+            eff_revision = roster_revision
+            if yaml_text is None:
+                if is_personal_yaml and eff_revision is None:
+                    state_before = await get_user_roster_state(uid)
+                    eff_revision = int(state_before.get("roster_revision") or 0)
+                rendered = await render_coverage_yaml(uid)
+            else:
+                rendered = yaml_text
+
+            if is_personal_yaml and eff_revision is not None:
+                cur_state = await get_user_roster_state(uid)
+                last_synced_rev = int(cur_state.get("last_yaml_synced_revision") or 0)
+                if int(eff_revision) < last_synced_rev:
+                    logger.info(
+                        "[DALTON_COVERAGE] skipping stale Home/%s publish for user=%s (rev=%s < synced=%s)",
+                        rel_path,
+                        uid,
+                        eff_revision,
+                        last_synced_rev,
+                    )
+                    return False
+
+            eff_backend = backend or await _resolve_home_sandbox_backend(uid)
+            if hasattr(eff_backend, "awrite_text"):
+                wrote = await eff_backend.awrite_text(rel_path, rendered)
+                if wrote is False:
+                    raise RuntimeError(f"awrite_text returned False for {rel_path}")
+            elif hasattr(eff_backend, "awrite"):
+                await eff_backend.awrite(rel_path, rendered)
+            elif hasattr(eff_backend, "write"):
+                eff_backend.write(rel_path, rendered)
+            else:
+                raise RuntimeError("Unsupported sandbox backend interface")
+
+            if is_personal_yaml and eff_revision is not None:
+                await record_yaml_synced_revision(uid, int(eff_revision))
+            return True
+        except Exception as exc:
+            logger.info(
+                "[DALTON_COVERAGE] skipped or failed writing Home/%s for user=%s: %s",
+                rel_path,
+                uid,
+                exc,
+            )
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -1787,6 +1828,7 @@ async def add_user_coverage_tickers(
     conn: Any = None,
     ensure_automation: bool = True,
     sync_home: bool = True,
+    snapshot_id: str | None = None,
 ) -> dict[str, Any]:
     """Validate and add tickers to `user_id`'s coverage roster.
 
@@ -1808,6 +1850,7 @@ async def add_user_coverage_tickers(
         res = await WatchlistMutationService().execute_mutation(
             uid,
             action="add",
+            snapshot_id=snapshot_id,
             tickers=list(tickers),
             tier=norm_tier,
             source=norm_source,
@@ -1916,6 +1959,8 @@ async def add_user_coverage_tickers(
 async def remove_user_coverage_tickers(
     user_id: str,
     tickers: Sequence[str],
+    *,
+    snapshot_id: str | None = None,
 ) -> dict[str, Any]:
     """Remove tickers from `user_id`'s coverage roster via WatchlistMutationService (same-tx Outbox + reconciler)."""
     uid = str(user_id or "").strip()
@@ -1940,6 +1985,7 @@ async def remove_user_coverage_tickers(
         uid,
         action="remove",
         tickers=cleaned,
+        snapshot_id=snapshot_id,
     )
 
 
@@ -2399,6 +2445,7 @@ async def add_coverage_group(
     criteria: Mapping[str, Any],
     default_tier: str = "watch",
     auto_refresh: bool = True,
+    snapshot_id: str | None = None,
 ) -> dict[str, Any]:
     """Create a coverage rule group via WatchlistMutationService (same-tx Outbox + reconciler)."""
     uid = str(user_id or "").strip()
@@ -2414,6 +2461,7 @@ async def add_coverage_group(
     return await WatchlistMutationService().execute_mutation(
         uid,
         action="add_group",
+        snapshot_id=snapshot_id,
         label=clean_label,
         criteria=criteria,
         default_tier=norm_tier,
@@ -2424,6 +2472,8 @@ async def add_coverage_group(
 async def remove_coverage_group(
     user_id: str,
     group_id: str,
+    *,
+    snapshot_id: str | None = None,
 ) -> dict[str, Any]:
     """Delete a coverage group via WatchlistMutationService (same-tx Outbox + reconciler)."""
     uid = str(user_id or "").strip()
@@ -2436,6 +2486,7 @@ async def remove_coverage_group(
     return await WatchlistMutationService().execute_mutation(
         uid,
         action="remove_group",
+        snapshot_id=snapshot_id,
         group_id=gid,
     )
 
@@ -2447,143 +2498,21 @@ async def resolve_coverage_group(
     now: datetime | None = None,
     sync_home: bool = True,
 ) -> dict[str, Any]:
-    """Re-resolve an existing coverage group for `user_id` under a single advisory lock.
-
-    - Newly matching tickers not yet in the user's coverage are added with `default_tier` and `source='group'`.
-    - Existing tickers that also match this group have `group_id` added to their `extra.group_ids` without overwriting manual tier/source.
-    - Tickers in this group that no longer match are NOT deleted; instead `group_id` is added to their `extra.group_stale_ids` (tracked per group).
-    - Tickers in this group that match again have `group_id` removed from their `extra.group_stale_ids`.
-    """
+    """Re-resolve an existing coverage group via the unified WatchlistMutationService internal action."""
     uid = str(user_id or "").strip()
     gid = str(group_id or "").strip()
     if not uid or not gid:
         raise ValueError("user_id and group_id are required")
 
-    group_row = await coverage_db.get_coverage_group(uid, gid)
-    if group_row is None:
-        raise ValueError(f"Coverage group {gid!r} not found")
+    from src.dalton.watchlist.service import WatchlistMutationService
 
-    label = str(group_row.get("label") or "")
-    criteria = group_row.get("criteria") or {}
-    default_tier = normalize_tier(group_row.get("default_tier"), default="watch")
-
-    preview = await preview_coverage_group(label, criteria)
-    resolved_companies = preview.get("companies") or []
-    rejected_tickers = list(preview.get("not_found") or [])
-    matched_by_ticker = {
-        str(c["ticker"]).upper(): c for c in resolved_companies if c.get("ticker")
-    }
-    matched_set = set(matched_by_ticker.keys())
-    resolved_ts = now or datetime.now(timezone.utc)
-
-    async with coverage_db.get_db_connection() as conn:
-        async with conn.transaction():
-            await coverage_db.acquire_coverage_advisory_lock(conn, uid)
-            current_group = await coverage_db.get_coverage_group(uid, gid, conn=conn)
-            if current_group is None:
-                return {"status": "group_deleted", "ok": False, "group_id": gid}
-            default_tier = normalize_tier(
-                current_group.get("default_tier") or default_tier,
-                default="watch",
-            )
-            existing_rows = await coverage_db.list_coverage_rows(uid, conn=conn)
-            existing_by_ticker = {str(r["ticker"]).upper(): r for r in existing_rows}
-
-            new_tickers = [t for t in matched_by_ticker if t not in existing_by_ticker]
-            tickers_needing_membership = [
-                t
-                for t in matched_by_ticker
-                if t not in existing_by_ticker
-                or gid not in extract_row_group_ids(existing_by_ticker[t])
-            ]
-            stale_candidates = [
-                str(r["ticker"]).upper()
-                for r in existing_rows
-                if gid in extract_row_group_ids(r)
-                and str(r["ticker"]).upper() not in matched_set
-            ]
-            unstale_candidates = [
-                str(r["ticker"]).upper()
-                for r in existing_rows
-                if gid in extract_row_group_ids(r)
-                and str(r["ticker"]).upper() in matched_set
-                and gid in extract_row_stale_group_ids(r)
-            ]
-
-            add_res: dict[str, Any] = {}
-            if tickers_needing_membership:
-                add_res = await add_user_coverage_tickers(
-                    uid,
-                    tickers_needing_membership,
-                    tier=default_tier,
-                    source="group",
-                    group_id=gid,
-                    prevalidated={t: matched_by_ticker[t] for t in tickers_needing_membership},
-                    conn=conn,
-                    ensure_automation=False,
-                    sync_home=False,
-                )
-
-            marked_stale: list[str] = []
-            if stale_candidates:
-                marked_stale = await coverage_db.mark_coverage_rows_group_stale(
-                    uid, stale_candidates, group_id=gid, stale=True, conn=conn
-                )
-
-            if unstale_candidates:
-                await coverage_db.mark_coverage_rows_group_stale(
-                    uid, unstale_candidates, group_id=gid, stale=False, conn=conn
-                )
-
-            updated_group = await coverage_db.update_coverage_group_resolved(
-                uid, gid, last_resolved_at=resolved_ts, conn=conn
-            )
-
-            # Item 5: insert Outbox reconcile job in the SAME transaction as group resolution
-            from src.dalton.watchlist.policies import (
-                get_user_tier_policies,
-                insert_reconcile_job,
-            )
-
-            live_policies = await get_user_tier_policies(uid, conn=conn)
-            outbox_job_resolve = await insert_reconcile_job(
-                uid,
-                trigger_action="resolve_group",
-                target_policy_versions={
-                    t: p.policy_version for t, p in live_policies.items()
-                },
-                pending_tickers=list(new_tickers),
-                override_user_pause=False,
-                conn=conn,
-            )
-
-    invalidate_user_aliases_cache(uid)
-
-    if matched_by_ticker or existing_rows:
-        await ensure_user_earnings_calendar_automation(uid)
-
-    from src.dalton.watchlist.reconciler import TierPolicyReconciler
-
-    reconcile_res = await TierPolicyReconciler().reconcile_job(
-        uid, str(outbox_job_resolve["job_id"]), sync_home=sync_home
+    return await WatchlistMutationService().execute_mutation(
+        uid,
+        action="resolve_group",
+        group_id=gid,
+        now=now,
+        sync_home=sync_home,
     )
-    home_synced = bool(reconcile_res.get("yaml_synced", False)) if sync_home else False
-
-    resolve_out: dict[str, Any] = {
-        "ok": True,
-        "group": updated_group or group_row,
-        "matched_tickers": list(matched_by_ticker.keys()),
-        "added_tickers": new_tickers,
-        "stale_tickers": marked_stale,
-        "not_found": rejected_tickers,
-        "rejected": rejected_tickers,
-        "job_id": str(outbox_job_resolve["job_id"]),
-        "reconcile_status": reconcile_res.get("status"),
-        "home_synced": home_synced,
-    }
-    if add_res.get("units_unavailable"):
-        resolve_out["units_unavailable"] = True
-    return resolve_out
 
 
 def _is_group_due_for_refresh(

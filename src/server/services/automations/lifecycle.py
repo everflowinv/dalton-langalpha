@@ -1203,6 +1203,10 @@ def pause_update_fields(current: Dict[str, Any]) -> Dict[str, Any]:
     update_kwargs: Dict[str, Any] = {"status": "paused"}
     if current["trigger_type"] != "once":
         update_kwargs["next_run_at"] = None
+    # DALTON-HOOK(watchlist): persist paused_by_user on manual pause of Dalton-managed automations
+    from src.dalton.watchlist.pause_guards import apply_manual_pause_metadata
+
+    apply_manual_pause_metadata(current, update_kwargs)
     return update_kwargs
 
 
@@ -1221,6 +1225,10 @@ def apply_locked_pause_schedule(
         effective_kwargs["next_run_at"] = None
     else:
         effective_kwargs.pop("next_run_at", None)
+    # DALTON-HOOK(watchlist): persist paused_by_user on locked manual pause of Dalton-managed automations
+    from src.dalton.watchlist.pause_guards import apply_manual_pause_metadata
+
+    apply_manual_pause_metadata(locked_row, effective_kwargs)
 
 
 def _replaced_by_tracker_refusal(row: Any) -> AutomationRefusal | None:

@@ -402,6 +402,8 @@ def cmd_check(args: argparse.Namespace) -> int:
     payload = {
         "ok": True,
         "ticker": ticker,
+        "tier": tier_val,
+        "allowed_stages": expected_stages,
         "query_date": args.date,
         "recorded": recorded,
         "date_changed": date_changed,
@@ -437,6 +439,7 @@ def cmd_mark(args: argparse.Namespace) -> int:
     history = list(existing.get("history") or [])
 
     status = args.status.lower()
+    filtered_out_stages: list[str] = []
     if status == "confirmed":
         if not args.date:
             raise ValueError("--date is required when --status=confirmed")
@@ -452,16 +455,42 @@ def cmd_mark(args: argparse.Namespace) -> int:
                     "reason": args.reason or "公司改期或更新披露日期",
                 }
             )
+        allowed_stages = (
+            resolve_earnings_stages(
+                tier,
+                tier_policies=tier_policies,
+                task_overrides=cov.get("task_overrides") if isinstance(cov, dict) else None,
+            )
+            if workspace_id
+            else []
+        )
+        allowed_stage_set = set(allowed_stages)
+
         if args.automations_json:
-            automations = json.loads(args.automations_json)
-        elif any([args.tm3, args.t0, args.tp1]):
+            raw_autos = json.loads(args.automations_json)
+            if not isinstance(raw_autos, dict):
+                raise ValueError("--automations-json must decode to a JSON object")
             automations = {}
+            for k, v in raw_autos.items():
+                sk = str(k).strip().lower()
+                if sk in allowed_stage_set:
+                    automations[sk] = v
+                else:
+                    filtered_out_stages.append(sk)
+        elif any([args.tm3, args.t0, args.tp1]):
+            raw_cli = {}
             if args.tm3:
-                automations["tm3"] = args.tm3
+                raw_cli["tm3"] = args.tm3
             if args.t0:
-                automations["t0"] = args.t0
+                raw_cli["t0"] = args.t0
             if args.tp1:
-                automations["tp1"] = args.tp1
+                raw_cli["tp1"] = args.tp1
+            automations = {}
+            for sk, v in raw_cli.items():
+                if sk in allowed_stage_set:
+                    automations[sk] = v
+                else:
+                    filtered_out_stages.append(sk)
         elif existing.get("automations") and existing.get("quarter") == args.quarter:
             # Item 9: recompute/filter against live effective stages so tier changes update tasks immediately
             expected_defaults = default_automations_for(
@@ -549,6 +578,7 @@ def cmd_mark(args: argparse.Namespace) -> int:
                 "status": new_entry["status"],
                 "date_status": new_entry["date_status"],
                 "date": new_entry.get("date") or new_entry.get("tentative_date"),
+                "filtered_out_stages": filtered_out_stages,
                 "state_path": str(state_path),
                 "entry": new_entry,
             },
@@ -787,7 +817,12 @@ def cmd_diff(args: argparse.Namespace) -> int:
         # Check automations presence when workspace_id is active/present
         if ent.get("workspace_id"):
             cov = coverage.get(t, {})
-            tier_key = str(ent.get("tier") or cov.get("tier") or "").lower()
+            # r4 Decision 4: use live coverage tier when company is in live coverage (never stale ledger tier)
+            tier_key = (
+                str(cov.get("tier") or "").lower()
+                if t in coverage
+                else str(ent.get("tier") or "").lower()
+            )
             expected_keys = resolve_earnings_stages(
                 tier_key,
                 tier_policies=tier_policies,

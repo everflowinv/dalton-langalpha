@@ -3,7 +3,7 @@
  * Keeps upstream `PortfolioWatchlistWidget.tsx` and `_holdingsPrimitives.tsx` to thin hooks.
  */
 
-import type { ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { ArrowRight } from 'lucide-react';
@@ -18,11 +18,13 @@ import {
   deriveQuoteDisplay,
   formatSignedPct2,
   roundQuote2,
+  useQuotes,
   type MarketStatusInput,
 } from '@/lib/quotes';
-import type { WatchlistTier } from '@/lib/dalton/watchlist';
+import type { PersonalWatchlistCompany, WatchlistTier } from '@/lib/dalton/watchlist';
 import { TermChange } from '@/pages/ChatAgent/components/charts/TermCard';
 import {
+  buildCoverageRowsForCompanies,
   coverageQuoteRow,
   MAX_DASHBOARD_COVERAGE_QUOTES,
   useCoverageWatchlistData,
@@ -46,6 +48,7 @@ type MarketStatusData = MarketStatusInput;
 export type PortfolioWatchlistTabKey = 'coverage' | 'watchlist' | 'portfolio';
 
 const EMPTY_COVERAGE_ROWS: CoverageWatchlistRow[] = [];
+const EMPTY_COMPANIES: PersonalWatchlistCompany[] = [];
 
 export function normalizeCoverageContext(
   rawCoverage: UseCoverageWatchlistDataResult | undefined,
@@ -53,6 +56,8 @@ export function normalizeCoverageContext(
   return (
     rawCoverage ?? ({
       rows: EMPTY_COVERAGE_ROWS,
+      allCompanies: EMPTY_COMPANIES,
+      quotesBySymbol: {},
       totalCount: 0,
       quotedLimit: MAX_DASHBOARD_COVERAGE_QUOTES,
       counts: { core: 0, watch: 0, radar: 0, total: 0, groups: 0 },
@@ -61,6 +66,91 @@ export function normalizeCoverageContext(
       refetch: async () => undefined,
     } as unknown as UseCoverageWatchlistDataResult)
   );
+}
+
+type QuotesMap = ReturnType<typeof useQuotes>['quotes'];
+const EMPTY_QUOTES: QuotesMap = {};
+
+function CoverageTierQuotesBridge({
+  symbols,
+  onQuotes,
+}: {
+  symbols: string[];
+  onQuotes: (quotes: QuotesMap) => void;
+}) {
+  const { quotes } = useQuotes(symbols, {
+    staleTime: 1000 * 30,
+    refetchInterval: 60000,
+    enabled: isDaltonBuild && symbols.length > 0,
+  });
+  useEffect(() => {
+    onQuotes(quotes);
+  }, [quotes, onQuotes]);
+  return null;
+}
+
+/**
+ * Filter personal watchlist companies by `coverageTier` BEFORE slicing the 50-symbol
+ * live quote cap, fetching any unquoted filtered listed symbols on demand.
+ */
+export function useFilteredCoverageWatchlistRows(
+  coverage: UseCoverageWatchlistDataResult,
+  coverageTier: WatchlistTier | 'all',
+): {
+  rows: CoverageWatchlistRow[];
+  filteredTotalCount: number;
+  quotesBridge: ReactNode;
+} {
+  const allCompanies = coverage.allCompanies ?? EMPTY_COMPANIES;
+  const filteredCompanies = useMemo(() => {
+    if (allCompanies.length === 0) return EMPTY_COMPANIES;
+    return coverageTier === 'all'
+      ? allCompanies
+      : allCompanies.filter((c) => c.tier === coverageTier);
+  }, [allCompanies, coverageTier]);
+
+  const extraSymbols = useMemo(() => {
+    if (coverageTier === 'all' || filteredCompanies.length === 0) return [];
+    const baseQuotes = coverage.quotesBySymbol ?? {};
+    const out: string[] = [];
+    let listedSeen = 0;
+    for (const c of filteredCompanies) {
+      if (c.is_private) continue;
+      if (listedSeen >= MAX_DASHBOARD_COVERAGE_QUOTES) break;
+      listedSeen += 1;
+      const sym = c.ticker.toUpperCase();
+      if (!(sym in baseQuotes)) out.push(sym);
+    }
+    return out;
+  }, [coverageTier, filteredCompanies, coverage.quotesBySymbol]);
+
+  const [tierQuotes, setTierQuotes] = useState<QuotesMap>(EMPTY_QUOTES);
+  const effectiveTierQuotes = extraSymbols.length > 0 ? tierQuotes : EMPTY_QUOTES;
+  const quotesBridge =
+    isDaltonBuild && extraSymbols.length > 0 ? (
+      <CoverageTierQuotesBridge symbols={extraSymbols} onQuotes={setTierQuotes} />
+    ) : null;
+
+  const rows = useMemo(() => {
+    // Fallback for test mocks that only populate `coverage.rows` without `allCompanies`
+    if (allCompanies.length === 0) {
+      return coverageTier === 'all'
+        ? coverage.rows
+        : coverage.rows.filter((r) => r.tier === coverageTier);
+    }
+    if (coverageTier === 'all') return coverage.rows;
+    const mergedQuotes = { ...(coverage.quotesBySymbol ?? {}), ...effectiveTierQuotes };
+    return buildCoverageRowsForCompanies(filteredCompanies, mergedQuotes);
+  }, [allCompanies.length, coverage.rows, coverage.quotesBySymbol, coverageTier, filteredCompanies, effectiveTierQuotes]);
+
+  const filteredTotalCount =
+    allCompanies.length > 0
+      ? filteredCompanies.length
+      : coverageTier === 'all'
+        ? coverage.totalCount
+        : coverage.counts[coverageTier] ?? rows.length;
+
+  return { rows, filteredTotalCount, quotesBridge };
 }
 
 export function resolveInitialPortfolioWatchlistTab(
@@ -93,6 +183,7 @@ export function buildCoverageFullContextExport({
   instanceId,
   coverage,
   filteredRows,
+  filteredTotalCount,
   coverageTier,
   marketStatus,
   headerLabel,
@@ -100,25 +191,27 @@ export function buildCoverageFullContextExport({
   instanceId: string;
   coverage: UseCoverageWatchlistDataResult;
   filteredRows: CoverageWatchlistRow[];
+  filteredTotalCount?: number;
   coverageTier: WatchlistTier | 'all';
   marketStatus: MarketStatusData | null;
   headerLabel: string;
 }) {
+  const effectiveTotal = filteredTotalCount ?? coverage.totalCount;
   const rows = filteredRows.map((r) => coverageQuoteRow(r, marketStatus));
   const body = serializeQuoteRowsToMarkdown(rows);
   const text = wrapWidgetContext(
     'personal.portfolioWatchlist',
-    { tab: 'coverage', tier: coverageTier, count: coverage.totalCount, shown: rows.length },
+    { tab: 'coverage', tier: coverageTier, count: effectiveTotal, shown: rows.length },
     body,
   );
   return {
     widget_type: 'personal.portfolioWatchlist',
     widget_id: instanceId,
-    label: `${headerLabel} · ${coverage.totalCount}`,
+    label: `${headerLabel} · ${effectiveTotal}`,
     description: rows.length ? `${rows.length} symbol${rows.length === 1 ? '' : 's'}` : 'empty',
     captured_at: new Date().toISOString(),
     text,
-    data: { tab: 'coverage', tier: coverageTier, totalCount: coverage.totalCount, rows },
+    data: { tab: 'coverage', tier: coverageTier, totalCount: effectiveTotal, rows },
   };
 }
 
@@ -126,16 +219,19 @@ export function buildCoverageRowContextExport({
   instanceId,
   rowId,
   coverage,
+  filteredRows,
   marketStatus,
   headerLabel,
 }: {
   instanceId: string;
   rowId: string;
   coverage: UseCoverageWatchlistDataResult;
+  filteredRows?: CoverageWatchlistRow[];
   marketStatus: MarketStatusData | null;
   headerLabel: string;
 }) {
-  const row = coverage.rows.find((r) => r.symbol === rowId);
+  const row = (filteredRows ?? coverage.rows).find((r) => r.symbol === rowId)
+    ?? coverage.rows.find((r) => r.symbol === rowId);
   if (!row) return null;
   const quote = coverageQuoteRow(row, marketStatus);
   const body = serializeQuoteRowToMarkdown(quote);
@@ -240,6 +336,7 @@ export function CoverageWatchlistTabPanel({
   instanceId,
   coverage,
   filteredRows,
+  filteredTotalCount,
   coverageTier,
   onSelectTier,
   showSkeleton,
@@ -249,6 +346,7 @@ export function CoverageWatchlistTabPanel({
   instanceId: string;
   coverage: UseCoverageWatchlistDataResult;
   filteredRows: CoverageWatchlistRow[];
+  filteredTotalCount?: number;
   coverageTier: WatchlistTier | 'all';
   onSelectTier: (tier: WatchlistTier | 'all') => void;
   showSkeleton: boolean;
@@ -257,6 +355,7 @@ export function CoverageWatchlistTabPanel({
 }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const effectiveTotal = filteredTotalCount ?? coverage.totalCount;
 
   return (
     <div>
@@ -305,11 +404,11 @@ export function CoverageWatchlistTabPanel({
         )}
       </WatchlistTable>
       <div className="flex items-center justify-between px-2 pt-2 text-xs">
-        {coverage.totalCount > coverage.quotedLimit ? (
+        {effectiveTotal > filteredRows.length ? (
           <span style={{ color: 'var(--color-text-tertiary)' }}>
             {t('dashboard:widgets.portfolioWatchlist.coverageTruncated', {
-              shown: coverage.quotedLimit,
-              total: coverage.totalCount,
+              shown: filteredRows.length,
+              total: effectiveTotal,
             })}
           </span>
         ) : (

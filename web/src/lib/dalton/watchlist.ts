@@ -16,6 +16,7 @@ export interface PersonalWatchlistCompany {
   industry?: string | null;
   peer_group?: string | null;
   workspace_id?: string | null;
+  workspace?: { workspace_id?: string | null; status?: string | null } | null;
   source?: string;
   group_id?: string | null;
   group_ids?: string[];
@@ -72,7 +73,7 @@ export interface PersonalWatchlistSummary {
 export interface WatchlistMetricRow {
   ticker: string;
   is_private: boolean;
-  status: 'ok' | 'unlisted' | 'unavailable';
+  status: 'ok' | 'warming' | 'unlisted' | 'unavailable';
   price: number | null;
   currency: string | null;
   chg_1d: number | null;
@@ -91,10 +92,23 @@ export interface WatchlistMetricRow {
   next_earnings: string | null;
 }
 
+export interface WatchlistMetricsSummary {
+  total_count: number;
+  listed_count: number;
+  private_count: number;
+  tier_counts: Record<WatchlistTier, number>;
+  lowest_rsi_14d: Array<{ ticker: string; rsi_14d: number }>;
+  highest_rsi_14d: Array<{ ticker: string; rsi_14d: number }>;
+  top_gainers_1d: Array<{ ticker: string; chg_1d: number }>;
+  top_losers_1d: Array<{ ticker: string; chg_1d: number }>;
+  upcoming_earnings: Array<{ ticker: string; date: string }>;
+}
+
 export interface WatchlistMetricsResponse {
   ok: boolean;
   items: Record<string, WatchlistMetricRow>;
   pending_symbols: string[];
+  summary?: WatchlistMetricsSummary;
   as_of: string;
 }
 
@@ -138,6 +152,8 @@ export interface WatchlistPreviewResponse {
   ok: boolean;
   action: string | null;
   raw_action: string;
+  snapshot_id?: string | null;
+  roster_revision?: number;
   requires_confirmation: boolean;
   owner_user_id?: string;
   target_tickers: string[];
@@ -147,6 +163,7 @@ export interface WatchlistPreviewResponse {
   expected_policy_versions?: Record<string, number>;
   expected_pause_versions?: Record<string, number>;
   override_user_pause?: boolean;
+  auto_refresh?: boolean | null;
   group_id?: string | null;
   affected_tickers: WatchlistAffectedTicker[];
   affected_workspaces: WatchlistAffectedWorkspace[];
@@ -159,22 +176,16 @@ export interface WatchlistPreviewResponse {
 
 export interface WatchlistMutateRequestBody {
   action: 'add' | 'remove' | 'set_tier' | 'add_group' | 'remove_group' | 'update_tags';
+  snapshot_id?: string | null;
   tickers?: string[] | string;
   tier?: WatchlistTier;
   label?: string;
   criteria?: Record<string, unknown>;
   default_tier?: WatchlistTier;
+  auto_refresh?: boolean;
   group_id?: string;
   tags?: string[];
   override_user_pause?: boolean;
-  expected_roster_hash?: string;
-  expected_policy_versions?: Record<string, number>;
-  expected_target_tickers?: string[];
-  expected_action?: string;
-  expected_target_tier?: string | null;
-  expected_group_id?: string | null;
-  expected_override_user_pause?: boolean;
-  expected_pause_versions?: Record<string, number>;
 }
 
 export interface WatchlistMutateResponse {
@@ -254,7 +265,7 @@ export async function fetchPersonalWatchlistMetrics(
 }
 
 export async function previewWatchlistMutation(
-  body: Omit<WatchlistMutateRequestBody, 'expected_roster_hash' | 'expected_policy_versions' | 'expected_target_tickers'>,
+  body: Omit<WatchlistMutateRequestBody, 'snapshot_id'>,
 ): Promise<WatchlistPreviewResponse> {
   const { data } = await api.post<WatchlistPreviewResponse>('/api/v1/dalton/watchlist/preview', body);
   return data;
@@ -279,11 +290,16 @@ export function flattenWatchlistCompanies(
   summary: PersonalWatchlistSummary | null | undefined,
 ): PersonalWatchlistCompany[] {
   if (!summary) return [];
-  const all: PersonalWatchlistCompany[] = [
+  const rawAll: PersonalWatchlistCompany[] = [
     ...(summary.core ?? []),
     ...(summary.watch ?? []),
     ...(summary.radar ?? []),
   ];
+  // Normalize nested `workspace.workspace_id` into top-level `workspace_id`
+  const all = rawAll.map((c) => ({
+    ...c,
+    workspace_id: c.workspace_id ?? c.workspace?.workspace_id ?? null,
+  }));
   const tierRank: Record<WatchlistTier, number> = { core: 0, watch: 1, radar: 2 };
   return all.sort((a, b) => {
     const pinDiff = Number(Boolean(b.is_pinned)) - Number(Boolean(a.is_pinned));
@@ -316,7 +332,7 @@ export function usePersonalWatchlistMetrics(
     queryFn: () => fetchPersonalWatchlistMetrics(symbols.length > 0 ? symbols : undefined),
     enabled: enabled && isDaltonBuild && symbols.length > 0,
     staleTime: 30_000,
-    refetchInterval: 60_000,
+    refetchInterval: (query) => ((query.state.data?.pending_symbols?.length ?? 0) > 0 ? 3_000 : 60_000),
     refetchIntervalInBackground: false,
     retry: 1,
   });
@@ -332,14 +348,38 @@ export function useMutatePersonalWatchlist() {
   });
 }
 
-/** Build a compact personal watchlist context block for private MarketView chat sessions only. */
+/** Build a compact personal watchlist context block (with full-roster summary) for private MarketView chat sessions only. */
 export function buildPersonalWatchlistContextText(
   companies: readonly PersonalWatchlistCompany[],
   metrics: Record<string, WatchlistMetricRow>,
   activeTierFilter: WatchlistTier | 'all',
+  summary?: WatchlistMetricsSummary | null,
 ): string {
   if (!companies.length) return '';
-  const header = `Personal watchlist snapshot (filter=${activeTierFilter}, count=${companies.length}):`;
+  const shownCount = Math.min(companies.length, 120);
+  const header = `Personal watchlist snapshot (filter=${activeTierFilter}, total=${companies.length}, shown=${shownCount}):`;
+  const summaryLines: string[] = [];
+  if (summary) {
+    const tc = summary.tier_counts;
+    summaryLines.push(
+      `Full-roster summary: total=${summary.total_count} (core=${tc.core}, watch=${tc.watch}, radar=${tc.radar}; listed=${summary.listed_count}, unlisted=${summary.private_count})`,
+    );
+    if (summary.lowest_rsi_14d.length > 0) {
+      summaryLines.push(
+        `Lowest 14D RSI across full roster: ${summary.lowest_rsi_14d.map((x) => `${x.ticker}(${x.rsi_14d.toFixed(1)})`).join(', ')}`,
+      );
+    }
+    if (summary.highest_rsi_14d.length > 0) {
+      summaryLines.push(
+        `Highest 14D RSI across full roster: ${summary.highest_rsi_14d.map((x) => `${x.ticker}(${x.rsi_14d.toFixed(1)})`).join(', ')}`,
+      );
+    }
+    if (summary.upcoming_earnings.length > 0) {
+      summaryLines.push(
+        `Upcoming earnings across full roster: ${summary.upcoming_earnings.map((x) => `${x.ticker}(${x.date})`).join(', ')}`,
+      );
+    }
+  }
   const tableHeader = '| Ticker | Name | Tier | Price | 1D% | 1W% | 1M% | 52W% | 14D RSI | 30D RSI | Next Earnings |';
   const sep = '|---|---|---|---|---|---|---|---|---|---|---|';
   const fmtPct = (v: number | null | undefined) => (v == null ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`);
@@ -350,5 +390,6 @@ export function buildPersonalWatchlistContextText(
     const posStr = m?.position_52w == null ? '—' : `${m.position_52w.toFixed(0)}%`;
     return `| ${c.ticker} | ${c.name || c.ticker} | ${c.tier} | ${priceStr} | ${fmtPct(m?.chg_1d)} | ${fmtPct(m?.chg_1w)} | ${fmtPct(m?.chg_1m)} | ${posStr} | ${fmtNum(m?.rsi_14d, 1)} | ${fmtNum(m?.rsi_30d, 1)} | ${m?.next_earnings ?? '—'} |`;
   });
-  return `<watchlist_context>\n${header}\n${tableHeader}\n${sep}\n${lines.join('\n')}\n</watchlist_context>`;
+  const parts = [header, ...summaryLines, tableHeader, sep, ...lines];
+  return `<watchlist_context>\n${parts.join('\n')}\n</watchlist_context>`;
 }

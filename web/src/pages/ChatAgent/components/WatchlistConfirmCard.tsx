@@ -35,6 +35,21 @@ function formatTaskNameLabel(name: string, t: (k: string) => string): string {
   return name;
 }
 
+const CHANGE_LABEL_KEY: Record<string, string> = {
+  create: 'chat.watchlistConfirm.changeLabels.create',
+  update: 'chat.watchlistConfirm.changeLabels.update',
+  resume: 'chat.watchlistConfirm.changeLabels.resume',
+  pause: 'chat.watchlistConfirm.changeLabels.pause',
+  preserve_user_pause: 'chat.watchlistConfirm.changeLabels.preserveUserPause',
+  preserve_replaced_by_tracker: 'chat.watchlistConfirm.changeLabels.preserveTracker',
+  preserve_handoff_pause: 'chat.watchlistConfirm.changeLabels.preserveHandoff',
+};
+
+function formatTaskChangeLabel(change: string, t: (k: string) => string): string {
+  const key = CHANGE_LABEL_KEY[String(change || '').toLowerCase()];
+  return key ? t(key) : change;
+}
+
 /**
  * WatchlistConfirmCard - Inline HITL confirmation card for personal watchlist mutations.
  *
@@ -52,6 +67,7 @@ export function WatchlistConfirmCard({
   const { t } = useTranslation();
   const [retrying, setRetrying] = useState(false);
   const [retryDone, setRetryDone] = useState(false);
+  const [retryError, setRetryError] = useState<string | null>(null);
 
   if (!proposalData) return null;
 
@@ -91,9 +107,20 @@ export function WatchlistConfirmCard({
     e.stopPropagation();
     if (retrying) return;
     setRetrying(true);
+    setRetryError(null);
     try {
-      await reconcileWatchlist(job_id || undefined);
-      setRetryDone(true);
+      const res = await reconcileWatchlist(job_id || undefined);
+      const stillPartial =
+        !res || res.ok === false || res.status === 'partial';
+      if (stillPartial) {
+        setRetryDone(false);
+        setRetryError(t('chat.watchlistConfirm.retryPartialError'));
+      } else {
+        setRetryDone(true);
+      }
+    } catch {
+      setRetryDone(false);
+      setRetryError(t('chat.watchlistConfirm.retryFailedError'));
     } finally {
       setRetrying(false);
     }
@@ -184,7 +211,7 @@ export function WatchlistConfirmCard({
                 </span>
                 {(ws.task_changes || []).slice(0, 4).map((tc, idx) => (
                   <span key={`${tc.name}-${idx}`}>
-                    {formatTaskNameLabel(tc.name, t)} ({tc.change})
+                    {formatTaskNameLabel(tc.name, t)} ({formatTaskChangeLabel(tc.change, t)})
                   </span>
                 ))}
               </div>
@@ -201,7 +228,7 @@ export function WatchlistConfirmCard({
       )}
 
       {isPartial && (
-        <div className="pt-1">
+        <div className="pt-1 space-y-1">
           <button
             type="button"
             disabled={retrying}
@@ -215,6 +242,11 @@ export function WatchlistConfirmCard({
             <RefreshCw className="h-3 w-3" />
             <span>{retrying ? t('chat.watchlistConfirm.retrying') : t('chat.watchlistConfirm.retryReconcile')}</span>
           </button>
+          {retryError && (
+            <div className="text-[11px]" style={{ color: 'var(--color-warning)' }}>
+              {retryError}
+            </div>
+          )}
         </div>
       )}
     </div>
