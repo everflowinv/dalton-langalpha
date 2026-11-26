@@ -733,7 +733,7 @@ async def test_another_worker_asks_the_finish_from_the_job_alone():
     (asked,) = ask.await_args_list
     assert asked.args[1] == f"/agent/automation-runs/{_EID}.2/finish"
     assert asked.kwargs["body"] == {
-        "status": "completed", "thread_id": _THREAD, "final_text": "The brief.", "run_id": _RUN,
+        "status": "completed", "thread_id": _THREAD, "final_text": "The brief.", "run_id": _RUN,  # DALTON-HOOK(channel-chart-snapshot)
     }
     fx.db.record_delivery.assert_awaited_once()
     assert fx.db.record_delivery.await_args.args[0] == _EID
@@ -1257,7 +1257,7 @@ async def test_a_finished_held_run_hands_its_answer_to_the_messaging_service():
     fx.finish.assert_awaited_once_with(
         _automation("cron"), _EID, "completed",
         targets=_TARGETS, final_text="**Markets** rose.\n\nDetails follow.",
-        thread_id=_THREAD, run_id=_RUN,
+        thread_id=_THREAD, run_id=_RUN,  # DALTON-HOOK(channel-chart-snapshot)
     )
     assert fx.db.settle_execution.await_args.kwargs["result_excerpt"] == (
         "Markets rose. Details follow."
@@ -1351,7 +1351,7 @@ async def test_a_held_run_that_did_not_complete_hands_over_no_answer(run, status
     fx.excerpt.assert_not_awaited()
     fx.finish.assert_awaited_once_with(
         _automation("cron"), _EID, status, targets=_TARGETS, final_text=None,
-        thread_id=_THREAD, run_id=_RUN,
+        thread_id=_THREAD, run_id=_RUN,  # DALTON-HOOK(channel-chart-snapshot)
     )
     fx.fire.assert_not_awaited()
 
@@ -1516,7 +1516,7 @@ async def test_sweep_ends_a_held_run_never_admitted_by_the_start_its_execution_k
 
     fx.finish.assert_awaited_once_with(
         _automation(), kept.id, "failed",
-        targets=_TARGETS, final_text=None, thread_id=_THREAD, run_id=None,
+        targets=_TARGETS, final_text=None, thread_id=_THREAD, run_id=None,  # DALTON-HOOK(channel-chart-snapshot)
     )
     fx.fire.assert_not_awaited()
     fx.db.record_delivery.assert_awaited_once_with(_EID, _LANDED)

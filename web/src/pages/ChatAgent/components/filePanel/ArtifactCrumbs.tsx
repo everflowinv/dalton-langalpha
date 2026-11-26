@@ -169,6 +169,7 @@ export function ArtifactCrumbs({ view, onReview, readAt, updateDisabled = false 
           <button
             type="button"
             className="file-panel-artifact-update"
+            // DALTON-HOOK(mobile-web): Update stays disabled while the framed doc identity is pending
             onClick={updateDisabled ? undefined : crumbs.onUpdate}
             disabled={crumbs.updatePending || updateDisabled}
           >

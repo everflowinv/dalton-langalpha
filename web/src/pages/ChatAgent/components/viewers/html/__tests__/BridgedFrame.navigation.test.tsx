@@ -52,7 +52,7 @@ const PREFIX = `${window.location.origin}/api/v1/wsfiles/g/v1.ws.1.sig/`;
 const NEXT = `${PREFIX}r/next.html`;
 
 function say(message: Parameters<PageBridgeListener>[0]) {
-  if (message.type === 'page:ready') page.lastDocId = message.docId;
+  if (message.type === 'page:ready') page.lastDocId = message.docId; // DALTON-HOOK(mobile-web)
   act(() => page.listener?.(message, null as never));
 }
 

@@ -34,6 +34,7 @@ export function useModels() {
     retry: false,
   });
 
+  // DALTON-HOOK(team-model-catalog): mirror the server team_catalog_enabled flag into the revision tracker
   useEffect(() => {
     if (data !== undefined) {
       setTeamCatalogEnabled(data.team_catalog_enabled === true);
