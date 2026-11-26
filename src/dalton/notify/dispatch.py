@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import inspect
 import logging
 import re
@@ -6893,3 +6893,318 @@ async def on_automation_settled(
             status_code,
         )
         return False
+
+
+FAILURE_RECEIPT_LABELS_ZH: dict[str, str] = {
+    "unconfigured": "未配置",
+    "suppressed": "已抑制",
+    "pending": "待发",
+    "delivered": "已送达",
+}
+
+
+def build_failure_notification_receipt(
+    *,
+    receipt_status: str,
+    outcome: str,
+    failure_reason: str | None = None,
+    reason: str | None = None,
+    error: str | None = None,
+    targets: list[str] | None = None,
+    channel: str | None = None,
+) -> dict[str, Any]:
+    """Build a canonical failure notification receipt entry for ``delivery_result``."""
+    norm_status = str(receipt_status or "unconfigured").strip().lower()
+    if norm_status not in FAILURE_RECEIPT_LABELS_ZH:
+        norm_status = "unconfigured"
+    label_zh = FAILURE_RECEIPT_LABELS_ZH[norm_status]
+    return {
+        "method": channel or "failure_notification",
+        "kind": "failure_receipt",
+        "receipt_status": norm_status,
+        "receipt_label": label_zh,
+        "status": norm_status,
+        "success": norm_status == "delivered",
+        "retrying": norm_status == "pending",
+        "outcome": str(outcome or "failed"),
+        "failure_reason": failure_reason,
+        "reason": reason,
+        "error": (str(error).strip()[:300] if error else None),
+        "targets": list(targets or []),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def on_automation_failed(
+    *,
+    automation: Mapping[str, Any],
+    execution_id: str,
+    outcome: str,
+    failure_reason: str | None = None,
+    error: str | None = None,
+    thread_id: str | None = None,
+    run_id: str | None = None,
+    workspace_id: str | None = None,
+    deleted: bool = False,
+    repeated_refusal: bool = False,
+    webhook_result: Sequence[Mapping[str, Any]] | None = None,
+    held_pending: bool = False,
+    coverage_unit_id: Any = None,
+    coverage_unit_version: Any = None,
+    resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] = resolve_dalton_notify_enabled,
+    resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] = resolve_dalton_notify_overrides,
+    resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] = resolve_dalton_notify_targets,
+    resolve_routes_fn: Callable[[str | None], Awaitable[dict[str, list[str]]]] = resolve_dalton_notify_routes,
+    resolve_unit_gate_fn: Callable[..., Awaitable[tuple[bool, str | None, str | None, bool]]] = _resolve_unit_managed_notify_gate,
+    is_admin_fn: Callable[[str | None], Awaitable[bool]] | None = None,
+    post_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_bridge_notify,
+    record_delivery_fn: Callable[[str, list[dict[str, Any]]], Awaitable[Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Record a failure notification receipt distinguishing unconfigured / suppressed / pending / delivered.
+
+    When upstream settlement did not already record a webhook/messaging delivery
+    result (e.g. quota-exhausted ``429`` runs with no upstream webhook URL), this
+    evaluates configured Dalton channel targets, attempts failure notice dispatch
+    when configured and allowed, and persists a structured receipt into
+    ``automation_executions.delivery_result`` so execution records show one of:
+    ``unconfigured`` (未配置) / ``suppressed`` (已抑制) / ``pending`` (待发) / ``delivered`` (已送达).
+    """
+    from src.dalton.capabilities import CapabilityId, has_capability, is_channel_target_enabled
+
+    if (
+        record_delivery_fn is None
+        and post_notify_fn is post_bridge_notify
+        and not has_capability(CapabilityId.CHANNEL_GATEWAY)
+    ):
+        return None
+
+    async def _persist(receipt_entry: dict[str, Any]) -> None:
+        if webhook_result is not None or held_pending:
+            return
+        writer = record_delivery_fn
+        if writer is None:
+            from src.server.database import automation_execution as exec_db
+
+            writer = exec_db.record_delivery
+        try:
+            await writer(execution_id, [receipt_entry])
+        except Exception as exc:
+            logger.debug(
+                "[DALTON_NOTIFY] Skipping failure receipt DB persist for execution_id=%s: %s",
+                execution_id,
+                type(exc).__name__,
+            )
+
+    try:
+        if webhook_result:
+            if any(isinstance(r, Mapping) and r.get("success") is True for r in webhook_result):
+                return build_failure_notification_receipt(
+                    receipt_status="delivered",
+                    outcome=outcome,
+                    failure_reason=failure_reason,
+                    reason="webhook_delivered",
+                    error=error,
+                )
+            if any(
+                isinstance(r, Mapping)
+                and (
+                    r.get("retrying") is True
+                    or str(r.get("status") or "").strip().lower() in ("pending", "retrying")
+                )
+                for r in webhook_result
+            ):
+                return build_failure_notification_receipt(
+                    receipt_status="pending",
+                    outcome=outcome,
+                    failure_reason=failure_reason,
+                    reason="webhook_pending",
+                    error=error,
+                )
+
+        if held_pending:
+            return build_failure_notification_receipt(
+                receipt_status="pending",
+                outcome=outcome,
+                failure_reason=failure_reason,
+                reason="outbox_queued",
+                error=error,
+            )
+
+        if deleted:
+            receipt = build_failure_notification_receipt(
+                receipt_status="suppressed",
+                outcome=outcome,
+                failure_reason=failure_reason,
+                reason="soft_deleted",
+                error=error,
+            )
+            await _persist(receipt)
+            return receipt
+
+        if repeated_refusal:
+            receipt = build_failure_notification_receipt(
+                receipt_status="suppressed",
+                outcome=outcome,
+                failure_reason=failure_reason,
+                reason="repeated_refusal",
+                error=error,
+            )
+            await _persist(receipt)
+            return receipt
+
+        if not isinstance(automation, Mapping) or is_excluded_automation_for_notify(automation):
+            receipt = build_failure_notification_receipt(
+                receipt_status="suppressed",
+                outcome=outcome,
+                failure_reason=failure_reason,
+                reason="excluded_automation",
+                error=error,
+            )
+            await _persist(receipt)
+            return receipt
+
+        user_id = str(automation.get("user_id") or "").strip()
+        ws_id_notify = str(workspace_id or automation.get("workspace_id") or "").strip()
+        clean_stamped_unit_id = str(coverage_unit_id or "").strip()
+        clean_stamped_unit_version = _normalize_coverage_unit_version(coverage_unit_version)
+
+        gate_ok, gate_reason, _active_unit_id, gate_include_chats = await resolve_unit_gate_fn(
+            user_id,
+            ws_id_notify,
+            automation,
+            stamped_unit_id=clean_stamped_unit_id,
+            stamped_unit_version=clean_stamped_unit_version,
+        )
+        if not gate_ok:
+            receipt = build_failure_notification_receipt(
+                receipt_status="suppressed",
+                outcome=outcome,
+                failure_reason=failure_reason,
+                reason=gate_reason or "unit_gate_disabled",
+                error=error,
+            )
+            await _persist(receipt)
+            return receipt
+
+        allowed, elig_reason, targets = await evaluate_user_notify_eligibility(
+            user_id,
+            automation,
+            include_chat_targets=gate_include_chats,
+            resolve_enabled_fn=resolve_enabled_fn,
+            resolve_overrides_fn=resolve_overrides_fn,
+            resolve_targets_fn=resolve_targets_fn,
+            resolve_routes_fn=resolve_routes_fn,
+            is_admin_fn=is_admin_fn,
+        )
+        enabled_targets = [t for t in (targets or []) if is_channel_target_enabled(t)]
+        if not enabled_targets:
+            if not allowed and elig_reason not in (
+                "target_removed",
+                "no_targets",
+                "no_target",
+                None,
+            ):
+                # Check if the user actually has any targets/routes configured at all;
+                # if neither targets nor routes exist, report unconfigured rather than suppressed.
+                raw_user_targets = await resolve_targets_fn(user_id)
+                raw_user_routes = await resolve_routes_fn(user_id)
+                has_any_configured = bool(
+                    [t for t in (raw_user_targets or []) if str(t).strip()]
+                    or (isinstance(raw_user_routes, Mapping) and any(raw_user_routes.values()))
+                )
+                if has_any_configured:
+                    receipt = build_failure_notification_receipt(
+                        receipt_status="suppressed",
+                        outcome=outcome,
+                        failure_reason=failure_reason,
+                        reason=str(elig_reason),
+                        error=error,
+                    )
+                else:
+                    receipt = build_failure_notification_receipt(
+                        receipt_status="unconfigured",
+                        outcome=outcome,
+                        failure_reason=failure_reason,
+                        reason="no_notify_targets",
+                        error=error,
+                    )
+            else:
+                receipt = build_failure_notification_receipt(
+                    receipt_status="unconfigured",
+                    outcome=outcome,
+                    failure_reason=failure_reason,
+                    reason="no_notify_targets",
+                    error=error,
+                )
+            await _persist(receipt)
+            return receipt
+
+        if not allowed:
+            receipt = build_failure_notification_receipt(
+                receipt_status="suppressed",
+                outcome=outcome,
+                failure_reason=failure_reason,
+                reason=str(elig_reason or "notify_disabled"),
+                error=error,
+                targets=enabled_targets,
+            )
+            await _persist(receipt)
+            return receipt
+
+        auto_name = str(automation.get("name") or automation.get("automation_id") or "定时任务").strip()
+        reason_text = failure_reason or outcome
+        err_snippet = f"\n详情：{str(error).strip()[:200]}" if error else ""
+        notice_text = f"自动化任务「{auto_name}」执行失败（原因：{reason_text}）。{err_snippet}"
+
+        any_sent = False
+        last_dispatch_err: str | None = None
+        try:
+            res = await post_notify_fn(
+                enabled_targets,
+                notice_text,
+                run_id=run_id,
+            )
+            if isinstance(res, Mapping) and res.get("ok") is True:
+                any_sent = True
+            elif isinstance(res, Mapping):
+                last_dispatch_err = str(
+                    res.get("error_code") or res.get("error") or "dispatch_pending"
+                )
+        except Exception as send_exc:
+            last_dispatch_err = type(send_exc).__name__
+
+        if any_sent:
+            receipt = build_failure_notification_receipt(
+                receipt_status="delivered",
+                outcome=outcome,
+                failure_reason=failure_reason,
+                reason="channel_delivered",
+                error=error,
+                targets=enabled_targets,
+                channel=enabled_targets[0].split(":", 1)[0].lower()
+                if ":" in enabled_targets[0]
+                else "failure_notification",
+            )
+        else:
+            receipt = build_failure_notification_receipt(
+                receipt_status="pending",
+                outcome=outcome,
+                failure_reason=failure_reason,
+                reason=last_dispatch_err or "channel_dispatch_pending",
+                error=error,
+                targets=enabled_targets,
+                channel=enabled_targets[0].split(":", 1)[0].lower()
+                if ":" in enabled_targets[0]
+                else "failure_notification",
+            )
+        await _persist(receipt)
+        return receipt
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.debug(
+            "[DALTON_NOTIFY] Failure notification receipt skipped for execution_id=%s: %s",
+            execution_id,
+            type(exc).__name__,
+        )
+        return None

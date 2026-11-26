@@ -378,15 +378,37 @@ _ALL_TABLES = [
 
 
 def _build_db_uri() -> str:
-    """Build PostgreSQL connection string from env vars (CI-compatible defaults).
+    """Build PostgreSQL connection string from explicit env vars.
 
-    Uses TEST_DB_* env vars so the app's .env (which sets DB_HOST to
-    host.docker.internal for Docker networking) does not bleed into tests
-    that run on the host machine.
+    Uses TEST_DB_* env vars (or explicit DSN) so the app's .env (which sets
+    DB_HOST to host.docker.internal for Docker networking) does not bleed into
+    tests and so integration tests never silently fall back to localhost:5432.
     """
-    host = os.getenv("TEST_DB_HOST", "localhost")
-    port = os.getenv("TEST_DB_PORT", "5432")
-    name = os.getenv("TEST_DB_NAME", "langalpha_test")
+    # DALTON-HOOK(budget): require explicit test DB DSN or TEST_DB_HOST/PORT/NAME; refuse localhost:5432 fallback.
+    for dsn_var in ("TEST_DB_DSN", "DALTON_TEST_DB_DSN", "TEST_DATABASE_URL"):
+        dsn_val = (os.getenv(dsn_var) or "").strip()
+        if dsn_val:
+            return dsn_val
+
+    host = (os.getenv("TEST_DB_HOST") or "").strip()
+    port = (os.getenv("TEST_DB_PORT") or "").strip()
+    name = (os.getenv("TEST_DB_NAME") or "").strip().lstrip("/")
+    missing = [
+        k
+        for k, v in (
+            ("TEST_DB_HOST", host),
+            ("TEST_DB_PORT", port),
+            ("TEST_DB_NAME", name),
+        )
+        if not v
+    ]
+    if missing:
+        raise RuntimeError(
+            "Refusing to run integration DB tests without explicit TEST_DB_HOST / "
+            "TEST_DB_PORT / TEST_DB_NAME (or TEST_DB_DSN / DALTON_TEST_DB_DSN / "
+            f"TEST_DATABASE_URL). Missing: {', '.join(missing)}. "
+            "Falling back to localhost:5432 is disabled to protect local/production PostgreSQL."
+        )
     user = os.getenv("TEST_DB_USER", "postgres")
     password = os.getenv("TEST_DB_PASSWORD", "postgres")
     # Deliberately not DB_SSLMODE — reading it would let a production-shaped .env

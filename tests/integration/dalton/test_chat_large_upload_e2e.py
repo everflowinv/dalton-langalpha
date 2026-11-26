@@ -189,9 +189,20 @@ def _resolve_isolated_test_dsn() -> str:
             except psycopg.OperationalError as exc:
                 _skip_or_fail_infra(f"Test database from {var} is unreachable: {exc}")
 
-    host = (os.environ.get("TEST_DB_HOST") or "localhost").strip()
-    port = (os.environ.get("TEST_DB_PORT") or "5432").strip()
-    name = (os.environ.get("TEST_DB_NAME") or "langalpha_test").strip().lstrip("/")
+    host = (os.environ.get("TEST_DB_HOST") or "").strip()
+    port = (os.environ.get("TEST_DB_PORT") or "").strip()
+    name = (os.environ.get("TEST_DB_NAME") or "").strip().lstrip("/")
+    missing = [
+        k
+        for k, v in (("TEST_DB_HOST", host), ("TEST_DB_PORT", port), ("TEST_DB_NAME", name))
+        if not v
+    ]
+    if missing:
+        pytest.fail(
+            "Refusing to run chat upload integration tests without explicit test DB configuration "
+            f"(missing {', '.join(missing)}; or set one of {', '.join(_DSN_ENV_VARS)}). "
+            "Falling back to localhost:5432 is disabled."
+        )
     user = os.environ.get("TEST_DB_USER") or "postgres"
     password = os.environ.get("TEST_DB_PASSWORD") or "postgres"
     sslmode = (os.environ.get("TEST_DB_SSLMODE") or "prefer").strip()

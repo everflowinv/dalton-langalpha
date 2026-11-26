@@ -434,4 +434,35 @@ describe('Monitors page (Checklist 8)', () => {
     expect(CORE_DEFAULT_CAPABILITY_SET.has('data_jobs')).toBe(false);
     expect(EVERFLOW_DEFAULT_CAPABILITY_SET.has('data_jobs')).toBe(true);
   });
+
+  it('viewer visibly displays publish failure details and per-index data dates instead of only exit_code_1', async () => {
+    const failureText =
+      'smallcap 持有成分缺少必要价格 1 只 (如 00626) | 数据日期: smallcap=2026-04-16, nonggt=2026-04-17, hsi=2026-04-17';
+    mockGetMonitorDetail.mockResolvedValue(
+      makeDetail({
+        monitor: makeSummary({
+          slug: 'hk-momentum',
+          title: 'HK Momentum',
+          category: 'hk',
+          source_kind: 'data_job',
+          last_publish_error: failureText,
+          last_publish_failed_at: '2026-04-17T10:15:00Z',
+        }),
+      }),
+    );
+
+    renderWithProviders(
+      <Routes>
+        <Route path="/monitors/:slug" element={<Monitors />} />
+      </Routes>,
+      { route: '/monitors/hk-momentum' },
+    );
+
+    await screen.findByTestId('bridged-frame');
+    const errBanner = screen.getByTestId('monitor-publish-error');
+    expect(errBanner).toHaveTextContent(/00626/);
+    expect(errBanner).toHaveTextContent(/smallcap=2026-04-16/);
+    expect(errBanner).toHaveTextContent(/nonggt=2026-04-17/);
+    expect(errBanner).not.toHaveTextContent(/exit_code_1/);
+  });
 });

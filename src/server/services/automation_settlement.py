@@ -348,13 +348,18 @@ async def _after_settling(
 
     parent_id = str(automation.get("automation_id") or "")
     deleted = bool(parent_id) and await automation_is_soft_deleted(parent_id)
+    # DALTON-HOOK(dalton-notify): track suppression and webhook delivery result for failure notification receipt
+    repeated_refusal = _repeats_a_refusal(policy.failure_reason, run_id, row)
+    webhook_delivery_result: Optional[list] = None
+    held_pending = False
     if (
         not deleted
         and policy.webhook
-        and not _repeats_a_refusal(policy.failure_reason, run_id, row)
+        and not repeated_refusal
     ):
         if delivery is not None and delivery.held and policy.finish is not None:
             if finish_left:
+                held_pending = True
                 _nudge_drainer()
             else:
                 await _finish_here(
@@ -376,6 +381,7 @@ async def _after_settling(
                 # has nowhere to post: each entry went undelivered, and why.
                 delivery_result = automation_delivery.unsent(delivery) or None
             if delivery_result is not None:
+                webhook_delivery_result = delivery_result
                 await _record_delivery(execution_id, delivery_result)
     # DALTON-HOOK(dalton-notify): push completed Dalton automation results to the analyst via the channel gateway
     if not deleted and outcome is Outcome.COMPLETED:
@@ -389,6 +395,26 @@ async def _after_settling(
             run_id=run_id,
             workspace_id=workspace_id,
             final_text=final_text or (row.get("result_excerpt") if isinstance(row, dict) else None),
+            coverage_unit_id=row.get("coverage_unit_id") if isinstance(row, dict) else None,
+            coverage_unit_version=row.get("coverage_unit_version") if isinstance(row, dict) else None,
+        )
+    # DALTON-HOOK(dalton-notify): save failure notification receipt (unconfigured/suppressed/pending/delivered) on failed/timeout runs
+    elif policy.status in ("failed", "timeout"):
+        from src.dalton.notify.dispatch import on_automation_failed
+
+        await on_automation_failed(
+            automation=automation,
+            execution_id=execution_id,
+            outcome=outcome.value,
+            failure_reason=policy.failure_reason,
+            error=error,
+            thread_id=thread_id,
+            run_id=run_id,
+            workspace_id=workspace_id,
+            deleted=deleted,
+            repeated_refusal=repeated_refusal,
+            webhook_result=webhook_delivery_result,
+            held_pending=held_pending,
             coverage_unit_id=row.get("coverage_unit_id") if isinstance(row, dict) else None,
             coverage_unit_version=row.get("coverage_unit_version") if isinstance(row, dict) else None,
         )

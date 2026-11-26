@@ -519,6 +519,10 @@ ALLOWED_HOOKS=(
   "channel-chart-snapshot"
   # Channel phase 2 batch 2: web deep-link query params (?chart=&layer= and ?widget=) in ChatView.
   "channel-deep-links"
+  # BY4 prod audit fix: clear ambient ProjectContext before relayed staging uploads so path
+  # folding cannot redirect .wsfiles-relay-* into another workspace, and disable orphan sweep
+  # in unlocked _restamp_dirs (src/server/services/persistence/restore.py).
+  "by4-relay-staging-guard"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -1026,6 +1026,31 @@ def get_company_facts(
         return make_error("sec_error", str(exc), symbol=ticker)
 
 
+_NON_SEC_MARKET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^(?:\d{1,5}\.HK|HK:\d{1,5}|0\d{3,4})$", re.IGNORECASE), "港股"),
+    (re.compile(r"^(?:\d{6}\.(?:KS|KQ)|(?:KR|KS|KQ):\d{6})$", re.IGNORECASE), "韩股"),
+    (re.compile(r"^(?:\d{6}\.(?:SH|SZ|SS|BJ)|(?:SH|SZ|BJ)\d{6})$", re.IGNORECASE), "A股"),
+    (
+        re.compile(
+            r"^[A-Z0-9._-]+\.(?:T|JP|TW|TWO|L|PA|DE|SW|AS|MI|TO|AX|SI|NS|BO)$",
+            re.IGNORECASE,
+        ),
+        "非美股交易所标的",
+    ),
+)
+
+
+def _detect_non_sec_ticker(ticker: str | None) -> str | None:
+    """Return a market label when ``ticker`` clearly belongs to a non-SEC market."""
+    raw = str(ticker or "").strip()
+    if not raw:
+        return None
+    for pat, label in _NON_SEC_MARKET_PATTERNS:
+        if pat.fullmatch(raw):
+            return label
+    return None
+
+
 @mcp.tool()
 def list_filings(
     ticker: str,
@@ -1047,6 +1072,15 @@ def list_filings(
     Returns:
         dict: Filing list with form, filing_date, report_date, accession_no, and url.
     """
+    non_sec_market = _detect_non_sec_ticker(ticker)
+    if non_sec_market is not None:
+        return make_error(
+            "not_found",
+            f"该证券不在 SEC 申报：{ticker} 属于{non_sec_market}，无 SEC 身份（CIK），未请求 SEC。",
+            symbol=ticker.upper(),
+            error_code="not_sec_filer",
+            sec_filer=False,
+        )
     try:
         cik10, company_name = resolve_cik(ticker)
         sub = fetch_submissions(cik10)

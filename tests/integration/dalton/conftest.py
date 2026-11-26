@@ -22,12 +22,46 @@ _DALTON_TABLES = [
 ]
 
 
+_DSN_ENV_VARS = ("TEST_DB_DSN", "DALTON_TEST_DB_DSN", "TEST_DATABASE_URL")
+
+
 def _ensure_safe_test_db_name() -> str:
-    """Abort the entire pytest session before any DB connection or SQL if `TEST_DB_NAME` does not end with `_test`."""
-    db_name = (os.getenv("TEST_DB_NAME", "langalpha_test") or "").strip().lstrip("/")
-    if not db_name.endswith("_test"):
+    """Abort the entire pytest session before any DB connection or SQL if no explicit
+    test DB config (DSN or TEST_DB_HOST/TEST_DB_PORT/TEST_DB_NAME) is set or if DB name
+    does not end with ``_test``."""
+    for var in _DSN_ENV_VARS:
+        dsn = (os.getenv(var) or "").strip()
+        if dsn:
+            db_name = urlsplit(dsn).path.lstrip("/")
+            if not db_name.endswith("_test"):
+                pytest.exit(
+                    f"Refusing to run Dalton integration session against non-test database {db_name!r} from {var} (must end with '_test')",
+                    returncode=2,
+                )
+            return db_name
+
+    host = (os.getenv("TEST_DB_HOST") or "").strip()
+    port = (os.getenv("TEST_DB_PORT") or "").strip()
+    db_name = (os.getenv("TEST_DB_NAME") or "").strip().lstrip("/")
+    if db_name and not db_name.endswith("_test"):
         pytest.exit(
             f"Refusing to run Dalton integration session against non-test database TEST_DB_NAME={db_name!r} (must end with '_test')",
+            returncode=2,
+        )
+    missing = [
+        k
+        for k, v in (
+            ("TEST_DB_HOST", host),
+            ("TEST_DB_PORT", port),
+            ("TEST_DB_NAME", db_name),
+        )
+        if not v
+    ]
+    if missing:
+        pytest.exit(
+            "Refusing to run Dalton integration session without explicit test DB configuration "
+            f"(missing {', '.join(missing)}; or set one of {', '.join(_DSN_ENV_VARS)}). "
+            "Falling back to localhost:5432 is disabled to protect local/production PostgreSQL.",
             returncode=2,
         )
     return db_name

@@ -9,7 +9,9 @@ import sys
 import time
 from importlib.metadata import version
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from math import isfinite
+from typing import Any
 from point_in_time import parse_as_of, dated_filings, facts_at_date, select_fact_rows
 from public_macro import register_commands
 
@@ -61,22 +63,132 @@ CACHE_MAX_AGE_S = 86400  # 24h
 EDGAR_VERSION = version("edgartools")
 
 
+class _SerializationError(RuntimeError):
+    """Raised when internal result data cannot be serialized to JSON."""
+
+
+_NON_SEC_MARKET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^(?:\d{1,5}\.HK|HK:\d{1,5}|0\d{3,4})$", re.IGNORECASE), "港股"),
+    (re.compile(r"^(?:\d{6}\.(?:KS|KQ)|(?:KR|KS|KQ):\d{6})$", re.IGNORECASE), "韩股"),
+    (re.compile(r"^(?:\d{6}\.(?:SH|SZ|SS|BJ)|(?:SH|SZ|BJ)\d{6})$", re.IGNORECASE), "A股"),
+    (
+        re.compile(
+            r"^[A-Z0-9._-]+\.(?:T|JP|TW|TWO|L|PA|DE|SW|AS|MI|TO|AX|SI|NS|BO)$",
+            re.IGNORECASE,
+        ),
+        "非美股交易所标的",
+    ),
+)
+
+
+def _detect_non_sec_ticker(ticker: str | None) -> str | None:
+    """Return a market label when ``ticker`` clearly belongs to a non-SEC market (no SEC CIK)."""
+    raw = str(ticker or "").strip()
+    if not raw:
+        return None
+    for pat, label in _NON_SEC_MARKET_PATTERNS:
+        if pat.fullmatch(raw):
+            return label
+    return None
+
+
+def _iso_date_key(key: Any) -> str:
+    """Convert Timestamp / datetime / date (or any non-JSON key) to an ISO date string."""
+    if isinstance(key, pd.Timestamp):
+        if pd.isna(key):
+            return "NaT"
+        if key.hour == 0 and key.minute == 0 and key.second == 0 and key.microsecond == 0:
+            return key.date().isoformat()
+        return key.isoformat()
+    if isinstance(key, datetime):
+        if key.hour == 0 and key.minute == 0 and key.second == 0 and key.microsecond == 0:
+            return key.date().isoformat()
+        return key.isoformat()
+    if isinstance(key, date):
+        return key.isoformat()
+    if isinstance(key, (str, int, float, bool)) or key is None:
+        return key  # type: ignore[return-value]
+    return str(key)
+
+
+def _sanitize_for_json(obj: Any) -> Any:
+    """Recursively convert date/Timestamp dict keys (and NaN/NaT values) before JSON serialization."""
+    if isinstance(obj, dict):
+        return {_iso_date_key(k): _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, pd.Timestamp):
+        if pd.isna(obj):
+            return None
+        if obj.hour == 0 and obj.minute == 0 and obj.second == 0 and obj.microsecond == 0:
+            return obj.date().isoformat()
+        return obj.isoformat()
+    if isinstance(obj, datetime):
+        if obj.hour == 0 and obj.minute == 0 and obj.second == 0 and obj.microsecond == 0:
+            return obj.date().isoformat()
+        return obj.isoformat()
+    if isinstance(obj, date):
+        return obj.isoformat()
+    if isinstance(obj, float) and not isfinite(obj):
+        return None
+    try:
+        if obj is pd.NA or obj is pd.NaT:
+            return None
+    except Exception:
+        pass
+    return obj
+
+
+def _dataframe_to_json_dict(df: pd.DataFrame) -> dict[str, Any]:
+    """Convert a financial statement DataFrame (columns/index may be Timestamp) to JSON-safe dict."""
+    safe_df = df.copy()
+    safe_df.columns = [_iso_date_key(c) for c in safe_df.columns]
+    safe_df.index = [_iso_date_key(i) for i in safe_df.index]
+    return _sanitize_for_json(safe_df.to_dict())
+
+
+def _dataframe_to_json_records(df: pd.DataFrame) -> list[dict[str, Any]]:
+    """Convert a financial statement DataFrame to JSON-safe list of records with ISO date column keys."""
+    safe_df = df.copy()
+    safe_df.columns = [_iso_date_key(c) for c in safe_df.columns]
+    return _sanitize_for_json(safe_df.to_dict(orient="records"))
+
+
+def _is_serialization_exception(err: BaseException) -> bool:
+    if isinstance(err, _SerializationError):
+        return True
+    msg = str(err).lower()
+    return (
+        "keys must be str, int, float, bool or none" in msg
+        or "is not json serializable" in msg
+        or "circular reference detected" in msg
+    )
+
+
 def _emit(payload, as_json=False, as_csv=False):
-    if as_json:
-        print(json.dumps(payload, ensure_ascii=False, default=str))
-    elif as_csv and isinstance(payload, dict) and "rows" in payload:
-        rows = payload["rows"]
-        if rows:
-            cols = list(rows[0].keys())
-            print(",".join(cols))
-            for r in rows:
-                vals = [str(r.get(c, "")).replace('"', '""') for c in cols]
-                print(",".join(f'"{v}"' if "," in v else v for v in vals))
-    else:
-        print(json.dumps(payload, ensure_ascii=False, default=str, indent=2))
+    safe_payload = _sanitize_for_json(payload)
+    try:
+        if as_json:
+            print(json.dumps(safe_payload, ensure_ascii=False, default=str))
+        elif as_csv and isinstance(safe_payload, dict) and "rows" in safe_payload:
+            rows = safe_payload["rows"]
+            if rows:
+                cols = [str(c) for c in rows[0].keys()]
+                print(",".join(cols))
+                for r in rows:
+                    vals = [str(r.get(c, "")).replace('"', '""') for c in cols]
+                    print(",".join(f'"{v}"' if "," in v else v for v in vals))
+        else:
+            print(json.dumps(safe_payload, ensure_ascii=False, default=str, indent=2))
+    except (TypeError, ValueError) as exc:
+        raise _SerializationError(f"财务数据内部 JSON 序列化失败: {exc}") from exc
 
 
 def _error_hint(err):
+    if _is_serialization_exception(err):
+        return "这是服务端内部数据序列化错误，不是调用参数错误；请稍后重试或改用备用数据源。"
     msg = str(err).lower()
     if "ssl" in msg or "tls" in msg or "unexpected_eof" in msg:
         return "Network/TLS error. Check proxy and access to https://data.sec.gov."
@@ -90,7 +202,22 @@ def _error_hint(err):
 
 
 def _error_json(err):
-    return {"ok": False, "error": str(err), "hint": _error_hint(err)}
+    if _is_serialization_exception(err):
+        return {
+            "ok": False,
+            "status": "internal_error",
+            "error_code": "internal_serialization_error",
+            "error_category": "内部错误",
+            "error": f"内部序列化失败: {err}",
+            "hint": _error_hint(err),
+        }
+    return {
+        "ok": False,
+        "status": "error",
+        "error_code": "cli_error",
+        "error": str(err),
+        "hint": _error_hint(err),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -231,11 +358,11 @@ def _yf_financials(ticker: str, form: str = "10-K") -> dict:
             cf = t.quarterly_cashflow
         
         if inc is not None and not inc.empty:
-            statements["income"] = inc.to_dict()
+            statements["income"] = _dataframe_to_json_dict(inc)
         if bal is not None and not bal.empty:
-            statements["balance"] = bal.to_dict()
+            statements["balance"] = _dataframe_to_json_dict(bal)
         if cf is not None and not cf.empty:
-            statements["cash"] = cf.to_dict()
+            statements["cash"] = _dataframe_to_json_dict(cf)
     except Exception as e:
         return {"ok": False, "error": f"yfinance fetch failed: {e}"}
     
@@ -330,7 +457,7 @@ def cmd_financials(args):
                     if callable(stmt):
                         stmt = stmt()
                     if stmt is not None and hasattr(stmt, "to_dataframe"):
-                        row["statements"][key] = stmt.to_dataframe().to_dict(orient="records")
+                        row["statements"][key] = _dataframe_to_json_records(stmt.to_dataframe())
                     else:
                         row["statements"][key] = None
             rows.append(row)
@@ -589,6 +716,19 @@ def cmd_ratios(args):
 
 
 def cmd_list_filings(args):
+    non_sec_market = _detect_non_sec_ticker(args.ticker)
+    if non_sec_market is not None:
+        return {
+            "ok": False,
+            "status": "not_sec_filer",
+            "error_code": "not_sec_filer",
+            "sec_filer": False,
+            "ticker": args.ticker,
+            "count": 0,
+            "rows": [],
+            "error": f"该证券不在 SEC 申报：{args.ticker} 属于{non_sec_market}，无 SEC 身份（CIK），未请求 SEC。",
+            "hint": "港股与 A 股请改用 cn-hk 路由；韩股等其他非美股请查当地交易所公告或内部研究库。",
+        }
     c = _retry(lambda: Company(args.ticker))
     filings = _get_filings(c, args, args.form)
     if len(filings) == 0:

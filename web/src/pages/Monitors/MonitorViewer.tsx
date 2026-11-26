@@ -276,14 +276,20 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
 
         {monitor.last_publish_error && monitor.last_publish_failed_at && (
           <span
-            className="inline-flex items-center gap-1 text-xs shrink-0"
+            data-testid="monitor-publish-error"
+            className="inline-flex items-center gap-1 text-xs min-w-0 max-w-md"
             style={{ color: 'var(--color-warning)' }}
             title={monitor.last_publish_error}
           >
             <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-            {t('monitors:lastPublishFailed', {
-              time: formatTimestamp(monitor.last_publish_failed_at, locale),
-            })}
+            <span className="truncate">
+              {t('monitors:lastPublishFailed', {
+                time: formatTimestamp(monitor.last_publish_failed_at, locale),
+              })}
+              {monitor.last_publish_error.trim() && (
+                <> — {monitor.last_publish_error}</>
+              )}
+            </span>
           </span>
         )}
 

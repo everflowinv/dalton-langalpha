@@ -414,6 +414,7 @@ def summarize_execution_delivery(
     targets: list[dict[str, Any]] = []
     has_notify_rows = False
     awaiting_receipt = False
+    failure_receipt_summary: dict[str, Any] | None = None
     seen_notify_keys: dict[tuple[str, str], dict[str, Any]] = {}
     seen_normalized_targets: dict[tuple[str, str, str], dict[str, Any]] = {}
 
@@ -535,8 +536,35 @@ def summarize_execution_delivery(
         if norm_key is not None:
             seen_normalized_targets[norm_key] = target_entry
 
+    _RECEIPT_LABELS = {
+        "unconfigured": "未配置",
+        "suppressed": "已抑制",
+        "pending": "待发",
+        "delivered": "已送达",
+    }
+
     for raw in delivery_result or ():
         if not isinstance(raw, Mapping):
+            continue
+        if (
+            raw.get("kind") == "failure_receipt"
+            or str(raw.get("receipt_status") or "").strip().lower() in _RECEIPT_LABELS
+        ):
+            r_status = str(
+                raw.get("receipt_status") or raw.get("status") or "unconfigured"
+            ).strip().lower()
+            if r_status not in _RECEIPT_LABELS:
+                r_status = "unconfigured"
+            failure_receipt_summary = {
+                "status": r_status,
+                "label_zh": str(raw.get("receipt_label") or _RECEIPT_LABELS[r_status]),
+                "reason": raw.get("reason"),
+                "failure_reason": raw.get("failure_reason"),
+                "outcome": raw.get("outcome"),
+                "error": raw.get("error"),
+                "targets": list(raw.get("targets") or []),
+                "recorded_at": raw.get("recorded_at"),
+            }
             continue
         method = str(raw.get("method") or "").strip()
         address = str(raw.get("address") or "").strip() or None
@@ -606,6 +634,26 @@ def summarize_execution_delivery(
         )
 
     if not targets:
+        if failure_receipt_summary is not None:
+            r_st = failure_receipt_summary["status"]
+            r_targets = failure_receipt_summary.get("targets") or []
+            return {
+                "status": r_st,
+                "total_targets": len(r_targets),
+                "sent_count": len(r_targets) if r_st == "delivered" else 0,
+                "failed_count": 0,
+                "retrying_count": len(r_targets) if r_st == "pending" else 0,
+                "awaiting_receipt": r_st == "pending",
+                "failure_code": failure_receipt_summary.get("failure_reason"),
+                "failure_reason": failure_receipt_summary.get("reason"),
+                "failure_reasons": (
+                    [str(failure_receipt_summary["reason"])]
+                    if failure_receipt_summary.get("reason")
+                    else []
+                ),
+                "failure_notification_receipt": failure_receipt_summary,
+                "targets": [],
+            }
         if has_notify_rows:
             return {
                 "status": "skipped",
@@ -660,6 +708,11 @@ def summarize_execution_delivery(
         ),
         "failure_reasons": failure_reasons if status in ("failed", "partial_failed") else [],
         "targets": targets,
+        **(
+            {"failure_notification_receipt": failure_receipt_summary}
+            if failure_receipt_summary is not None
+            else {}
+        ),
     }
 
 

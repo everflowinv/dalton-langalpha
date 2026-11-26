@@ -58,9 +58,20 @@ def _get_test_dsn() -> str:
                 )
             return val
 
-    host = os.getenv("TEST_DB_HOST", "localhost")
-    port = os.getenv("TEST_DB_PORT", "5432")
-    name = (os.getenv("TEST_DB_NAME", "langalpha_test") or "").strip().lstrip("/")
+    host = (os.getenv("TEST_DB_HOST") or "").strip()
+    port = (os.getenv("TEST_DB_PORT") or "").strip()
+    name = (os.getenv("TEST_DB_NAME") or "").strip().lstrip("/")
+    missing = [
+        k
+        for k, v in (("TEST_DB_HOST", host), ("TEST_DB_PORT", port), ("TEST_DB_NAME", name))
+        if not v
+    ]
+    if missing:
+        pytest.fail(
+            "Refusing to run integration tests without explicit test DB configuration "
+            f"(missing {', '.join(missing)}; or set one of {', '.join(_DSN_ENV_VARS)}). "
+            "Falling back to localhost:5432 is disabled."
+        )
     if not name.endswith("_test"):
         pytest.fail(
             f"Refusing to run integration tests against non-test DB {name!r}"

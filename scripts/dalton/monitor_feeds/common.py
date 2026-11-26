@@ -871,6 +871,18 @@ def build_grant_poller_js(
   var etag = null;
   var dataBase = null;
   var lastDataTsMs = NaN;
+  var lastReceivedTsMs = NaN;
+
+  function formatBjTime(ms) {{
+    if (!Number.isFinite(ms)) return '';
+    var bj = new Date(ms + 8 * 3600 * 1000);
+    var mo = String(bj.getUTCMonth() + 1).padStart(2, '0');
+    var da = String(bj.getUTCDate()).padStart(2, '0');
+    var hh = String(bj.getUTCHours()).padStart(2, '0');
+    var mm = String(bj.getUTCMinutes()).padStart(2, '0');
+    var ss = String(bj.getUTCSeconds()).padStart(2, '0');
+    return mo + '-' + da + ' ' + hh + ':' + mm + ':' + ss;
+  }}
 
   function inferDataBaseFromPath() {{
     var m = /^(.*?\\/api\\/v1\\/dalton\\/monitors\\/(?:g|public)\\/[^\\/]+)\\/v\\//.exec(location.pathname);
@@ -920,23 +932,38 @@ def build_grant_poller_js(
     return DEFAULT_WINS.some(function (w) {{ return cur.hm >= w[0] && cur.hm <= w[1]; }});
   }}
 
-  function checkDataFreshness(payload) {{
+  function checkDataFreshness(payload, meta) {{
     if (payload && (payload.as_of_iso || payload.as_of)) {{
       var parsed = parseBjTsMs(payload.as_of_iso || payload.as_of);
       if (Number.isFinite(parsed)) lastDataTsMs = parsed;
+    }}
+    if (meta) {{
+      var recRaw = meta.updated_at || meta.updatedAt || meta.as_of || meta.asOf;
+      if (recRaw) {{
+        var parsedRec = parseBjTsMs(recRaw);
+        if (Number.isFinite(parsedRec)) lastReceivedTsMs = parsedRec;
+      }} else if (Number.isFinite(meta.receivedAtMs)) {{
+        lastReceivedTsMs = meta.receivedAtMs;
+      }}
     }}
     var curPayload = payload || window.__DALTON_LAST_PAYLOAD__ || null;
     if (!Number.isFinite(lastDataTsMs) && curPayload && (curPayload.as_of_iso || curPayload.as_of)) {{
       lastDataTsMs = parseBjTsMs(curPayload.as_of_iso || curPayload.as_of);
     }}
-    if (!Number.isFinite(lastDataTsMs)) return false;
+    var refTsMs = Number.isFinite(lastReceivedTsMs) ? lastReceivedTsMs : lastDataTsMs;
+    window.__DALTON_LAST_RECEIVED_MS__ = refTsMs;
+    if (!Number.isFinite(refTsMs)) return false;
     if (!isNowInTradingSession(curPayload)) {{
       if (typeof window[{json.dumps(on_stale_fn)}] === 'function') window[{json.dumps(on_stale_fn)}](null);
       return false;
     }}
-    if (Date.now() - lastDataTsMs > STALE_AFTER_MS) {{
+    if (Date.now() - refTsMs > STALE_AFTER_MS) {{
       if (typeof window[{json.dumps(on_stale_fn)}] === 'function') {{
-        window[{json.dumps(on_stale_fn)}]('交易时段内数据时间超过 3 分钟未更新，采集可能已中断');
+        var tsLabel = formatBjTime(refTsMs);
+        var staleMsg = tsLabel
+          ? ('交易时段内超过 3 分钟未收到更新（最后收到更新：' + tsLabel + '），推送或采集可能已中断')
+          : '交易时段内超过 3 分钟未收到更新，推送或采集可能已中断';
+        window[{json.dumps(on_stale_fn)}](staleMsg);
       }}
       return true;
     }}
@@ -969,7 +996,10 @@ def build_grant_poller_js(
       etag = resp.headers.get('ETag') || etag;
       var body = await resp.json();
       if (body && body.data) window.__DALTON_LAST_PAYLOAD__ = body.data;
-      checkDataFreshness(body && body.data ? body.data : null);
+      checkDataFreshness(
+        body && body.data ? body.data : null,
+        body ? {{ updated_at: body.updated_at, as_of: body.as_of }} : null
+      );
       {on_data_fn}(body);
     }} catch (err) {{
       var msg = (err && err.name === 'AbortError')

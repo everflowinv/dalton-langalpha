@@ -1717,6 +1717,175 @@ async def _stop_and_confirm_container(
     return True
 
 
+TAKEOVER_RETRY_TRIGGERED_BY = "system:takeover_retry"
+
+
+def _coerce_utc_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    return None
+
+
+async def _handle_takeover_abort_postprocess(
+    conn: Any,
+    *,
+    lock_conn: Any,
+    job_key: str,
+    run_id: str,
+    run_trigger_raw: Any,
+    triggered_by_user_id: Any,
+    scheduled_slot_utc: datetime | None,
+    deadline_utc: datetime | None,
+    def_enabled: bool,
+    def_paused: bool,
+    def_deleted_at: Any,
+    now_utc: datetime,
+    paths: DataTaskPathMap,
+) -> None:
+    """After a takeover marks a run ``aborted``:
+
+    1. If the aborted cron run's slot is still within its validity window
+       (``now_utc < deadline_utc``) and no takeover retry has yet been scheduled
+       for ``(job_key, scheduled_slot_utc)``, enqueue one same-slot rerun
+       (at most once per slot).
+    2. Register the monitor publish failure via ``maybe_publish_data_job_monitor``
+       (same hook path as ``finalize_task_run``), preserving abort details
+       including whether a rerun was scheduled or the slot expired.
+    """
+    already_takeover_retry = (
+        str(triggered_by_user_id or "") == TAKEOVER_RETRY_TRIGGERED_BY
+    )
+    is_cron_run = str(run_trigger_raw or "cron") == "cron"
+    has_slot_window = scheduled_slot_utc is not None and deadline_utc is not None
+    slot_still_valid = bool(
+        has_slot_window and deadline_utc is not None and now_utc < deadline_utc
+    )
+
+    scheduled_rerun_id: str | None = None
+    retry_exhausted = already_takeover_retry
+
+    if (
+        slot_still_valid
+        and is_cron_run
+        and not already_takeover_retry
+        and def_enabled
+        and not def_paused
+        and def_deleted_at is None
+        and scheduled_slot_utc is not None
+        and deadline_utc is not None
+    ):
+        await check_scheduler_lock(lock_conn)
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT run_id
+                    FROM dalton_data_task_runs
+                    WHERE job_key = %(job_key)s
+                      AND scheduled_slot_utc = %(slot_utc)s
+                      AND triggered_by_user_id = %(triggered_by_user_id)s
+                    LIMIT 1
+                    """,
+                    {
+                        "job_key": job_key,
+                        "slot_utc": scheduled_slot_utc,
+                        "triggered_by_user_id": TAKEOVER_RETRY_TRIGGERED_BY,
+                    },
+                )
+                prior_retry = await cur.fetchone()
+                if prior_retry is not None:
+                    retry_exhausted = True
+                else:
+                    rerun_id = str(uuid4())
+                    await cur.execute(
+                        """
+                        INSERT INTO dalton_data_task_runs (
+                            run_id,
+                            job_key,
+                            trigger_source,
+                            triggered_by_user_id,
+                            scheduled_slot_utc,
+                            deadline_utc,
+                            status,
+                            created_at,
+                            updated_at
+                        ) VALUES (
+                            %(run_id)s::uuid,
+                            %(job_key)s,
+                            'manual',
+                            %(triggered_by_user_id)s,
+                            %(slot_utc)s,
+                            %(deadline_utc)s,
+                            'queued',
+                            NOW(),
+                            NOW()
+                        )
+                        ON CONFLICT DO NOTHING
+                        RETURNING run_id
+                        """,
+                        {
+                            "run_id": rerun_id,
+                            "job_key": job_key,
+                            "triggered_by_user_id": TAKEOVER_RETRY_TRIGGERED_BY,
+                            "slot_utc": scheduled_slot_utc,
+                            "deadline_utc": deadline_utc,
+                        },
+                    )
+                    inserted = await cur.fetchone()
+                    if inserted is not None:
+                        scheduled_rerun_id = str(_extract_field(inserted, "run_id", 0))
+
+    if scheduled_rerun_id and scheduled_slot_utc is not None:
+        abort_failure_detail = (
+            f"scheduler_takeover_aborted: 调度器接管终止"
+            f"（时段 {scheduled_slot_utc.isoformat()} 仍在有效期内，已安排补跑 {scheduled_rerun_id}）"
+        )
+    elif retry_exhausted and scheduled_slot_utc is not None:
+        abort_failure_detail = (
+            f"scheduler_takeover_aborted: 调度器接管终止"
+            f"（时段 {scheduled_slot_utc.isoformat()} 已达补跑上限，每时段最多 1 次）"
+        )
+    elif has_slot_window and not slot_still_valid and scheduled_slot_utc is not None and deadline_utc is not None:
+        abort_failure_detail = (
+            f"scheduler_takeover_aborted: 调度器接管终止"
+            f"（时段 {scheduled_slot_utc.isoformat()} 已过期，截止 {deadline_utc.isoformat()}，不再补跑）"
+        )
+    else:
+        abort_failure_detail = "scheduler_takeover_aborted"
+
+    # DALTON-HOOK(monitors): record takeover-abort publish failure for any monitor bound to this job_key.
+    try:
+        from src.dalton.monitors.service import maybe_publish_data_job_monitor
+
+        await maybe_publish_data_job_monitor(
+            job_key=job_key,
+            run_id=str(run_id),
+            terminal_status="aborted",
+            failure_reason=abort_failure_detail,
+            data_root=paths.backend_data_root,
+        )
+    except Exception as monitor_exc:
+        logger.warning(
+            "Failed to update monitor for takeover-aborted data task run %s (%s): %s",
+            run_id,
+            job_key,
+            monitor_exc,
+        )
+
+
 async def recover_on_takeover(
     conn: Any,
     *,
@@ -1724,6 +1893,7 @@ async def recover_on_takeover(
     docker_client: DataTaskDockerClient | None = None,
     host_client: DataTaskHostBridgeClient | None = None,
     path_map: DataTaskPathMap | None = None,
+    now_utc: datetime | None = None,
 ) -> str | None:
     """Reconcile active slot, leftover containers, and in-flight host tasks on scheduler startup/takeover (§3.4.2).
 
@@ -1742,6 +1912,11 @@ async def recover_on_takeover(
       containers, secrets directory, and reset `dalton_data_task_slot` to `'idle'`.
     """
     paths = path_map or build_path_map()
+    effective_now = (
+        now_utc.astimezone(timezone.utc)
+        if now_utc is not None
+        else datetime.now(timezone.utc)
+    )
     await check_scheduler_lock(lock_conn)
 
     all_confirmed_stopped = True
@@ -1789,7 +1964,9 @@ async def recover_on_takeover(
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
-                SELECT r.run_id, r.job_key, r.status, r.container_id, d.runner, r.trigger_source
+                SELECT r.run_id, r.job_key, r.status, r.container_id, d.runner, r.trigger_source,
+                       r.scheduled_slot_utc, r.deadline_utc, r.triggered_by_user_id,
+                       d.enabled, d.paused_by_user, d.deleted_at
                 FROM dalton_data_task_runs r
                 LEFT JOIN dalton_data_task_defs d
                   ON d.job_key = r.job_key
@@ -1805,14 +1982,42 @@ async def recover_on_takeover(
             run_cid = _extract_field(run_row, "container_id", 3)
             run_runner_raw: Any = None
             run_trigger_raw: Any = None
+            run_slot_raw: Any = None
+            run_deadline_raw: Any = None
+            run_triggered_by_raw: Any = None
+            def_enabled = True
+            def_paused = False
+            def_deleted_at: Any = None
             if isinstance(run_row, Mapping):
                 run_runner_raw = run_row.get("runner")
                 run_trigger_raw = run_row.get("trigger_source")
+                run_slot_raw = run_row.get("scheduled_slot_utc")
+                run_deadline_raw = run_row.get("deadline_utc")
+                run_triggered_by_raw = run_row.get("triggered_by_user_id")
+                if "enabled" in run_row and run_row.get("enabled") is not None:
+                    def_enabled = bool(run_row.get("enabled"))
+                if "paused_by_user" in run_row and run_row.get("paused_by_user") is not None:
+                    def_paused = bool(run_row.get("paused_by_user"))
+                def_deleted_at = run_row.get("deleted_at")
             elif isinstance(run_row, (tuple, list)):
                 if len(run_row) > 4:
                     run_runner_raw = run_row[4]
                 if len(run_row) > 5:
                     run_trigger_raw = run_row[5]
+                if len(run_row) > 6:
+                    run_slot_raw = run_row[6]
+                if len(run_row) > 7:
+                    run_deadline_raw = run_row[7]
+                if len(run_row) > 8:
+                    run_triggered_by_raw = run_row[8]
+                if len(run_row) > 9 and run_row[9] is not None:
+                    def_enabled = bool(run_row[9])
+                if len(run_row) > 10 and run_row[10] is not None:
+                    def_paused = bool(run_row[10])
+                if len(run_row) > 11:
+                    def_deleted_at = run_row[11]
+            scheduled_slot_utc = _coerce_utc_datetime(run_slot_raw)
+            deadline_utc = _coerce_utc_datetime(run_deadline_raw)
             is_host_run = (
                 str(run_runner_raw) == "host"
                 if run_runner_raw is not None
@@ -1880,6 +2085,23 @@ async def recover_on_takeover(
                         else:
                             recovery_outcome = "cleaned_terminal"
 
+                if recovery_outcome == "aborted":
+                    await _handle_takeover_abort_postprocess(
+                        conn,
+                        lock_conn=lock_conn,
+                        job_key=job_key,
+                        run_id=active_run_id,
+                        run_trigger_raw=run_trigger_raw,
+                        triggered_by_user_id=run_triggered_by_raw,
+                        scheduled_slot_utc=scheduled_slot_utc,
+                        deadline_utc=deadline_utc,
+                        def_enabled=def_enabled,
+                        def_paused=def_paused,
+                        def_deleted_at=def_deleted_at,
+                        now_utc=effective_now,
+                        paths=paths,
+                    )
+
                 if not all_confirmed_stopped:
                     await check_scheduler_lock(lock_conn)
                     async with conn.transaction():
@@ -1939,6 +2161,23 @@ async def recover_on_takeover(
                                 recovery_outcome = "aborted"
                             else:
                                 recovery_outcome = "cleaned_terminal"
+
+                    if recovery_outcome == "aborted":
+                        await _handle_takeover_abort_postprocess(
+                            conn,
+                            lock_conn=lock_conn,
+                            job_key=job_key,
+                            run_id=active_run_id,
+                            run_trigger_raw=run_trigger_raw,
+                            triggered_by_user_id=run_triggered_by_raw,
+                            scheduled_slot_utc=scheduled_slot_utc,
+                            deadline_utc=deadline_utc,
+                            def_enabled=def_enabled,
+                            def_paused=def_paused,
+                            def_deleted_at=def_deleted_at,
+                            now_utc=effective_now,
+                            paths=paths,
+                        )
                 else:
                     # Already terminal: do NOT alter dalton_data_task_runs or consecutive_failures!
                     recovery_outcome = "cleaned_terminal"

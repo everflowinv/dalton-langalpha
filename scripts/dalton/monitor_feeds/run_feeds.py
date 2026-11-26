@@ -283,12 +283,30 @@ class FeedDaemon:
                 )
             except Exception as exc:
                 logger.warning("Calendar error push failed for %s/%s: %s", slug, data_key, exc)
+                with self._state_lock:
+                    self.state[market]["pending_push"] = {
+                        "slug": slug,
+                        "data_key": data_key,
+                        "payload": payload,
+                        "as_of": cur_iso,
+                        "trade_date": trade_date,
+                        "in_window": False,
+                        "is_closed_td": False,
+                        "needs_post_close": False,
+                        "current_daily_sig": "",
+                        "failed_at": cur_iso,
+                        "attempts": 1,
+                    }
+                self._save_state()
                 return {
                     "market": market,
                     "action": "push_failed",
                     "stale": True,
                     "error": str(exc),
                 }
+            with self._state_lock:
+                self.state[market].pop("pending_push", None)
+            self._save_state()
             return {
                 "market": market,
                 "action": "calendar_error",
@@ -311,13 +329,76 @@ class FeedDaemon:
             and bool(current_daily_sig)
             and current_daily_sig != fstate_snap.get("last_hk_daily_sig")
         )
-        if (
-            not force
-            and not in_window
-            and not needs_post_close
-            and not needs_hk_daily_sync
-            and not daily_state_changed
-        ):
+        should_collect = bool(
+            force
+            or in_window
+            or needs_post_close
+            or needs_hk_daily_sync
+            or daily_state_changed
+        )
+        pending_push = fstate_snap.get("pending_push")
+        if not should_collect:
+            if isinstance(pending_push, dict) and isinstance(pending_push.get("payload"), dict):
+                p_slug = str(pending_push.get("slug") or slug)
+                p_key = str(pending_push.get("data_key") or data_key)
+                p_payload = pending_push["payload"]
+                p_as_of = pending_push.get("as_of") or p_payload.get("as_of_iso") or cur_iso
+                try:
+                    self._push(
+                        p_slug,
+                        p_key,
+                        p_payload,
+                        as_of=p_as_of,
+                        backend_url=self.backend_url,
+                    )
+                except Exception as exc:
+                    logger.warning("Pending push retry failed for %s/%s: %s", p_slug, p_key, exc)
+                    with self._state_lock:
+                        updated_pending = dict(pending_push)
+                        updated_pending["failed_at"] = cur_iso
+                        updated_pending["attempts"] = int(updated_pending.get("attempts") or 1) + 1
+                        self.state[market]["pending_push"] = updated_pending
+                    self._save_state()
+                    return {
+                        "market": market,
+                        "action": "retry_push_failed",
+                        "stale": bool(p_payload.get("stale")),
+                        "error": str(exc),
+                    }
+                p_stale = bool(p_payload.get("stale"))
+                p_trade_date = str(pending_push.get("trade_date") or trade_date)
+                p_daily_sig = str(pending_push.get("current_daily_sig") or "")
+                with self._state_lock:
+                    self.state[market].pop("pending_push", None)
+                    if market == "hk" and p_daily_sig:
+                        self.state[market]["last_hk_daily_sig"] = p_daily_sig
+                    if pending_push.get("is_closed_td") and not pending_push.get("in_window") and not p_stale:
+                        if pending_push.get("needs_post_close"):
+                            self.state[market]["post_close_written_date"] = p_trade_date
+                        sc = p_payload.get("smallcap") or {}
+                        ng = p_payload.get("nonggt") or {}
+                        pushed_daily_date = (
+                            p_payload.get("daily_close_date")
+                            or p_payload.get("trade_date")
+                            or p_trade_date
+                        )
+                        if (
+                            market == "hk"
+                            and isinstance(sc, dict)
+                            and isinstance(ng, dict)
+                            and sc.get("source") == "daily_close"
+                            and ng.get("source") == "daily_close"
+                            and pushed_daily_date == p_trade_date
+                            and not self._hk_daily_is_stale_or_failed()
+                        ):
+                            self.state[market]["post_close_daily_synced_date"] = p_trade_date
+                self._save_state()
+                return {
+                    "market": market,
+                    "action": "retried_push",
+                    "stale": p_stale,
+                    "as_of": p_payload.get("as_of"),
+                }
             return {"market": market, "action": "skip", "status": sess["status"]}
 
         daemon_store = SourceStatusStore(self.daemon_state_dir, filename=f"{market}_daemon_status.json")
@@ -385,16 +466,31 @@ class FeedDaemon:
                 elif not payload.get("last_success_at") and self.state[market].get("last_success_at"):
                     payload["last_success_at"] = self.state[market]["last_success_at"]
 
+        push_as_of = payload.get("as_of_iso") or cur_iso
         try:
             self._push(
                 slug,
                 data_key,
                 payload,
-                as_of=payload.get("as_of_iso") or cur_iso,
+                as_of=push_as_of,
                 backend_url=self.backend_url,
             )
         except Exception as exc:
             logger.warning("Push failed for %s/%s: %s", slug, data_key, exc)
+            with self._state_lock:
+                self.state[market]["pending_push"] = {
+                    "slug": slug,
+                    "data_key": data_key,
+                    "payload": payload,
+                    "as_of": push_as_of,
+                    "trade_date": trade_date,
+                    "in_window": in_window,
+                    "is_closed_td": is_closed_td,
+                    "needs_post_close": needs_post_close,
+                    "current_daily_sig": current_daily_sig,
+                    "failed_at": cur_iso,
+                    "attempts": 1,
+                }
             self._save_state()
             return {
                 "market": market,
@@ -405,6 +501,7 @@ class FeedDaemon:
 
         is_stale = bool(payload.get("stale"))
         with self._state_lock:
+            self.state[market].pop("pending_push", None)
             if market == "hk" and current_daily_sig:
                 self.state[market]["last_hk_daily_sig"] = current_daily_sig
             if is_closed_td and not in_window and not is_stale:
@@ -460,6 +557,8 @@ class FeedDaemon:
         trade_date = str(sess["trade_date"])
         with self._state_lock:
             fstate = dict(self.state[market])
+        if isinstance(fstate.get("pending_push"), dict):
+            return self._aligned_interval_wait(cur)
         if sess["is_trading_day"] and sess["status"] == "closed":
             if fstate.get("post_close_written_date") != trade_date:
                 return self._aligned_interval_wait(cur)
