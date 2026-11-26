@@ -735,47 +735,51 @@ async def _restore_relay(
         else:
             plain.append(r)
 
-    items: list[dict[str, Any]] = []
-    for row, staged in await asyncio.gather(*(_stage(r) for r in plain)):
-        if staged is None:
-            result["errors"] += 1
-            continue
-        name, digest, n = staged
-        if digest != row.get("content_hash"):
-            # The row's own digest no longer decides placement, so a row that
-            # cannot reproduce it would otherwise pass through unremarked.
-            logger.warning(
-                f"Row for {row['file_path']} in workspace {workspace_id} "
-                f"stores bytes that do not reproduce its own content_hash; "
-                f"restoring the bytes the row stores"
-            )
-        item = _pull_item(row, url=None)
-        item.update({"file": name, "sha256": digest, "size": n})
-        items.append(item)
-    if packs:
-        items += await _relayed_pack_items(
-            user_id, workspace_id, sandbox, packs, result, layout
-        )
-    if not items and not dirs:
-        return
+    # DALTON-HOOK(relay-staging-race): hold per-root relay transfer lock across staging uploads and placement
+    from src.dalton.services.relay_staging_guard import relay_transfer_lock
 
-    file_paths: set[str] = set()
-    for i in items:
-        if i.get("kind") == "pack":
-            file_paths.update(m["path"] for m in i["members"])
-        else:
-            file_paths.add(i["path"])
-    try:
-        outcomes = await pull_direct(
-            sandbox, items + list(dirs or []), layout=layout
-        )
-    except Exception as e:
-        logger.warning(
-            f"Could not place {len(file_paths)} relayed file(s) for workspace "
-            f"{workspace_id}: {e}"
-        )
-        result["errors"] += len(file_paths)
-        return
+    async with relay_transfer_lock(sandbox, layout.workspace):
+        items: list[dict[str, Any]] = []
+        for row, staged in await asyncio.gather(*(_stage(r) for r in plain)):
+            if staged is None:
+                result["errors"] += 1
+                continue
+            name, digest, n = staged
+            if digest != row.get("content_hash"):
+                # The row's own digest no longer decides placement, so a row that
+                # cannot reproduce it would otherwise pass through unremarked.
+                logger.warning(
+                    f"Row for {row['file_path']} in workspace {workspace_id} "
+                    f"stores bytes that do not reproduce its own content_hash; "
+                    f"restoring the bytes the row stores"
+                )
+            item = _pull_item(row, url=None)
+            item.update({"file": name, "sha256": digest, "size": n})
+            items.append(item)
+        if packs:
+            items += await _relayed_pack_items(
+                user_id, workspace_id, sandbox, packs, result, layout
+            )
+        if not items and not dirs:
+            return
+
+        file_paths: set[str] = set()
+        for i in items:
+            if i.get("kind") == "pack":
+                file_paths.update(m["path"] for m in i["members"])
+            else:
+                file_paths.add(i["path"])
+        try:
+            outcomes = await pull_direct(
+                sandbox, items + list(dirs or []), layout=layout
+            )
+        except Exception as e:
+            logger.warning(
+                f"Could not place {len(file_paths)} relayed file(s) for workspace "
+                f"{workspace_id}: {e}"
+            )
+            result["errors"] += len(file_paths)
+            return
     _tally_pull(
         workspace_id, {p: r for p, r in outcomes.items() if p in file_paths}, result, placed
     )
@@ -826,17 +830,12 @@ async def _stage_relayed_file(
     staged = _staging_name()
     # The staging name is excluded at the root of the walk, which is the
     # project folder, so that is also where it has to land.
-    # DALTON-HOOK(by4-relay-staging-guard): clear ambient ProjectContext before
-    # uploading so path folding cannot redirect the staging file into another workspace.
-    from ptc_agent.core.project_context import _current as _project_ctx_var
+    # DALTON-HOOK(relay-staging-race): clear ambient ProjectContext so layout.join(staged) does not fold into another workspace
+    from src.dalton.services.relay_staging_guard import without_ambient_project
 
-    _proj_token = _project_ctx_var.set(None) if _project_ctx_var.get() is not None else None
-    try:
+    with without_ambient_project():
         if not await sandbox.aupload_file_bytes(layout.join(staged), content):
             return None
-    finally:
-        if _proj_token is not None:
-            _project_ctx_var.reset(_proj_token)
     return staged, hashlib.sha256(content).hexdigest(), len(content)
 
 
@@ -856,21 +855,17 @@ async def _relayed_pack_items(
     chunk keeps the relay path at the direct path's fidelity, and memory
     at one chunk at a time.
     """
-    # DALTON-HOOK(by4-relay-staging-guard): clear ambient ProjectContext before pack staging upload
-    from ptc_agent.core.project_context import _current as _project_ctx_var
-
     items: list[dict[str, Any]] = []
     for pack_sha256, members in packs.items():
         rel = f".wsfiles-relay-{pack_sha256}"
         try:
             data = await fetch_blob(user_id, pack_sha256)
             size = len(data)
-            _proj_token = _project_ctx_var.set(None) if _project_ctx_var.get() is not None else None
-            try:
+            # DALTON-HOOK(relay-staging-race): clear ambient ProjectContext so pack staging path does not fold into another workspace
+            from src.dalton.services.relay_staging_guard import without_ambient_project
+
+            with without_ambient_project():
                 ok = await sandbox.aupload_file_bytes(layout.join(rel), data)
-            finally:
-                if _proj_token is not None:
-                    _project_ctx_var.reset(_proj_token)
             del data
         except Exception as e:
             ok = False
@@ -1124,8 +1119,10 @@ async def _restamp_dirs(
     in place and would not stamp them either.
     """
     try:
-        # DALTON-HOOK(by4-relay-staging-guard): unlocked dir-only restamp must not sweep concurrent relay staging files
-        outcomes = await pull_direct(sandbox, items, layout=layout, sweep_orphans=False)
+        # DALTON-HOOK(relay-staging-race): _restamp_dirs runs outside workspace_sync_lock and must not sweep active staging files
+        outcomes = await pull_direct(
+            sandbox, items, layout=layout, sweep_orphans=False
+        )
     except Exception as e:  # noqa: BLE001 - the files are in place either way
         logger.warning(
             f"Could not stamp {len(items)} deferred dir(s) for workspace "

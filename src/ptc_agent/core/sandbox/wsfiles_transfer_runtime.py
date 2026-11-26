@@ -1667,10 +1667,48 @@ def _unlink_orphan_if_unlocked(path: str) -> None:
             os.close(fd)
 
 
+# --- DALTON-HOOK(by4-relay-guard): begin ---
+def _claim_staged_files(
+    root: str, pack_base: str, items: list[dict[str, Any]]
+) -> list[str]:
+    """Acquire exclusive flock ownership on every existing staged file claimed by ``items``."""
+    locked: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        local = item.get("file")
+        if not local:
+            continue
+        staged = (
+            _resolve_item(root, pack_base, local)
+            if item.get("kind") == "pack"
+            else _resolve_under_root(root, local)
+        )
+        if staged is None or staged in seen:
+            continue
+        seen.add(staged)
+        try:
+            _acquire_temp_ownership(staged)
+        except OSError:
+            continue
+        locked.append(staged)
+    return locked
+
+
+def _release_claimed_staged_files(locked: list[str]) -> None:
+    """Release any claimed staged-file flock not already released by placement/unlink."""
+    for claimed_path in locked:
+        _release_temp_ownership(claimed_path)
+# --- DALTON-HOOK(by4-relay-guard): end ---
+
+
 # DALTON-HOOK(chat-large-upload): allow incremental pulls to skip root-wide orphan sweeps
 def _sweep_orphan_staging(
-    root: str, items: list[dict[str, Any]], *, sweep_orphans: bool = True
-) -> None:
+    root: str,
+    items: list[dict[str, Any]],
+    *,
+    sweep_orphans: bool = True,
+    pack_base: str | None = None,
+) -> list[str]:
     """Remove root-level transient entries no item of this op claims.
 
     A relay upload the file API cut short, or a download the runtime died
@@ -1679,10 +1717,14 @@ def _sweep_orphan_staging(
     pass ``sweep_orphans=False`` and clean only their own temp files; full
     restores skip any transient file still locked by an active transfer.
     """
+    resolved_pack_base = pack_base if pack_base is not None else os.path.join(root, _PACK_DIR)
+    # DALTON-HOOK(by4-relay-guard): always acquire flock ownership on claimed staged files under the sweep lock
     if not sweep_orphans:
-        return
+        with _hold_sweep_lock(root, exclusive=False):
+            return _claim_staged_files(root, resolved_pack_base, items)
     claimed = {os.path.basename(i["file"]) for i in items if i.get("file")}
     with _hold_sweep_lock(root, exclusive=True):
+        locked = _claim_staged_files(root, resolved_pack_base, items)
         for name in os.listdir(root):
             if (
                 not name.startswith(_TEMP_PREFIX)
@@ -1698,6 +1740,7 @@ def _sweep_orphan_staging(
                 _rmtree_quiet(path)
             else:
                 _unlink_orphan_if_unlocked(path)
+        return locked
 
 
 def _place_staged(root: str, final: str, item: dict[str, Any]) -> dict[str, Any]:
@@ -1958,7 +2001,10 @@ def pull(spec: dict[str, Any]) -> dict[str, Any]:
     results: dict[str, dict[str, Any]] = {}
     # DALTON-HOOK(chat-large-upload): honor per-pull sweep_orphans flag
     sweep_orphans = bool(spec.get("sweep_orphans", True))
-    _sweep_orphan_staging(root, items, sweep_orphans=sweep_orphans)
+    # DALTON-HOOK(by4-relay-guard): hold flock ownership on claimed staged files until placement completes
+    locked_claimed = _sweep_orphan_staging(
+        root, items, sweep_orphans=sweep_orphans, pack_base=pack_base
+    )
     _inside.cache_clear()
 
     files: list[dict[str, Any]] = []
@@ -2019,16 +2065,20 @@ def pull(spec: dict[str, Any]) -> dict[str, Any]:
 
     # Step 2: packs and files, in parallel. Packs are submitted first: each
     # is one download that fans out into many members, so it is the tail.
-    if files or packs:
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            pack_futures = [
-                pool.submit(_timed_pack, root, pack_base, p, timeout_s, budget)
-                for p in packs
-            ]
-            for item, res in zip(files, pool.map(lambda i: _timed(_pull_file, root, i, timeout_s, budget), files)):
-                results[item["path"]] = res
-            for fut in pack_futures:
-                results.update(fut.result())
+    # DALTON-HOOK(by4-relay-guard): release claimed staged-file flocks after file/pack placement
+    try:
+        if files or packs:
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                pack_futures = [
+                    pool.submit(_timed_pack, root, pack_base, p, timeout_s, budget)
+                    for p in packs
+                ]
+                for item, res in zip(files, pool.map(lambda i: _timed(_pull_file, root, i, timeout_s, budget), files)):
+                    results[item["path"]] = res
+                for fut in pack_futures:
+                    results.update(fut.result())
+    finally:
+        _release_claimed_staged_files(locked_claimed)
 
     # Step 3: symlinks after files, so a link never shadows a file being written.
     for item in symlinks:

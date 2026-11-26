@@ -1101,6 +1101,8 @@ async def stop_computer(computer_id: str, x_user_id: ComputerEndUserId):
             computer_id=computer_id,
             status=(updated or {}).get("status") or "stopped",
             message="Computer stopped successfully",
+            # DALTON-HOOK(stop-backup-attach): pass through stop-backup skipped workspace count
+            backup_skipped_workspaces=(updated or {}).get("backup_skipped_workspaces"),
         )
 
 

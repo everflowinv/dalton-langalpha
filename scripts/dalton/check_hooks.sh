@@ -548,6 +548,16 @@ ALLOWED_HOOKS=(
   # for the next list read. The host takes `statusFanout` for that
   # (ComputersDialogHost, Settings.tsx).
   "page-host-status-fanout"
+  # BY4: stop-path temporary running-only sandbox attach for session-less workers,
+  # plus skipped workspace count in stop result and logs (stop_backup.py, _lifecycle.py,
+  # _machine_backup.py, ptc_sandbox.py).
+  "stop-backup-attach"
+  # BY4: protect .wsfiles-relay-* staging files against concurrent orphan sweeps and
+  # ambient ProjectContext path folding (relay_staging_guard.py, restore.py, transfer.py).
+  "relay-staging-race"
+  # BY4: sandbox-side runtime staged-file flock claim/release in wsfiles_transfer_runtime.py
+  # (standalone script copied into sandboxes; cannot import src.dalton).
+  "by4-relay-guard"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -1846,6 +1846,8 @@ class SessionLifecycleMixin:
     ) -> Dict[str, Any]:
         computer_id = binding.computer_id
         try:
+            # DALTON-HOOK(stop-backup-attach): initialize before owner-machine probe so except-path reconcile never hits UnboundLocalError
+            backup_outcome = None
             # Before the backup, which would wait out its timeout on every
             # folder of a machine that is not there.
             if (
@@ -1859,20 +1861,13 @@ class SessionLifecycleMixin:
             # A machine its owner chose not to back up keeps its last backup.
             backup_ms = None
             if binding.files_backup and back_up:
-                backup_started = time.monotonic()
-                folder_count = await self._backup_machine_files_to_db(
-                    computer_id,
-                    workspace_id=workspace_id,
-                    expected_sandbox_id=durable_sandbox_id,
-                    routine=True,
+                # DALTON-HOOK(stop-backup-attach): delegate stop backup (temporary attach, deadline, timing, logging) to Dalton service
+                from src.dalton.services.stop_backup import run_stop_backup
+
+                backup_outcome = await run_stop_backup(
+                    self, binding, workspace_id=workspace_id, durable_sandbox_id=durable_sandbox_id
                 )
-                backup_ms = round((time.monotonic() - backup_started) * 1000)
-                logger.info(
-                    "Computer %s stop backup mirrored %d folder(s) in %dms",
-                    computer_id,
-                    int(folder_count or 0),
-                    backup_ms,
-                )
+                backup_ms = backup_outcome.duration_ms
 
             # The last chance to read the disk before it is unreachable, so the
             # stopped machine still shows how full it is.
@@ -1941,13 +1936,21 @@ class SessionLifecycleMixin:
 
             await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
             logger.info(f"Computer {computer_id} stopped successfully")
-            return await self._stop_result(computer_id, workspace_id)
+            stop_result = await self._stop_result(computer_id, workspace_id)
+            # DALTON-HOOK(stop-backup-attach): include skipped workspace count in stop result
+            from src.dalton.services.stop_backup import with_stop_backup_result
+
+            return with_stop_backup_result(stop_result, backup_outcome)
 
         except Exception as e:
             logger.error(f"Error stopping computer {computer_id}: {e}")
             try:
                 if await self._reconcile_provider_stop(binding):
-                    return await self._stop_result(computer_id, workspace_id)
+                    stop_result = await self._stop_result(computer_id, workspace_id)
+                    # DALTON-HOOK(stop-backup-attach): include skipped workspace count in reconciled stop result
+                    from src.dalton.services.stop_backup import with_stop_backup_result
+
+                    return with_stop_backup_result(stop_result, backup_outcome)
             except Exception:
                 # Leave the durable stopping claim for the existing recovery
                 # path once this owner releases its heartbeat.

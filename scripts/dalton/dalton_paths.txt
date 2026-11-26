@@ -645,3 +645,6 @@ web/src/pages/Automations/__tests__/Automations.reportDeliveryConfirm.test.tsx
 # and a machine that finishes preparing while Settings is open (DALTON-HOOK(page-host-status-fanout)).
 web/src/pages/ChatAgent/components/__tests__/CreateWorkspaceModal.focusReturn.test.tsx
 web/src/pages/Settings/__tests__/Settings.computerReady.test.tsx
+# BY4: stop-path temporary attach backup and concurrent relay staging race tests.
+tests/unit/server/services/test_stop_backup_attach.py
+tests/unit/ptc_agent/core/sandbox/test_wsfiles_relay_race.py

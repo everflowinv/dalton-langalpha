@@ -1175,6 +1175,11 @@ class ComputerActionResponse(BaseModel):
     computer_id: str = Field(description="Computer identifier")
     status: str = Field(description="New computer status")
     message: str = Field(description="Action result message")
+    # DALTON-HOOK(stop-backup-attach): surface skipped workspace count from stop-time backup
+    backup_skipped_workspaces: Optional[int] = Field(
+        default=None,
+        description="Number of workspaces skipped during stop-time file backup, if known",
+    )
 
 
 KeyRemovalOutcome = Literal["removed", "kept", "skipped", "unreached"]
