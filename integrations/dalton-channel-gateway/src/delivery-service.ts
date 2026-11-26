@@ -139,6 +139,79 @@ function buildDeliverableLinkItemKey(
   return `deliverables-links:${runId}:item:${digest}`;
 }
 
+function isDeliverableLinkItemKey(deliveryKey: string): boolean {
+  return (
+    deliveryKey.startsWith("deliverables-links:") &&
+    deliveryKey.includes(":item:")
+  );
+}
+
+interface PersistedDeliverableFileStatus {
+  path: string;
+  workspace_id?: string | null;
+  status:
+    | "sent"
+    | "linked"
+    | "failed"
+    | "unknown"
+    | "pending"
+    | "queued"
+    | "dispatching";
+  reason: string | null;
+  idempotency_key?: string | null;
+  platform_message_id?: string | null;
+  chunk_index?: number | null;
+}
+
+function toExternalFileOutcome(
+  entry: PersistedDeliverableFileStatus | AgentSendFileOutcome,
+): AgentSendFileOutcome {
+  const st = entry.status;
+  const externalStatus: AgentSendFileOutcome["status"] =
+    st === "queued"
+      ? "failed"
+      : st === "dispatching"
+        ? "unknown"
+        : st;
+  return {
+    path: entry.path,
+    ...(entry.workspace_id !== undefined ? { workspace_id: entry.workspace_id } : {}),
+    status: externalStatus,
+    reason: entry.reason ?? null,
+  };
+}
+
+function buildDeliverableChunkIdempotencyKey(
+  deliveryKey: string,
+  runId: string | null | undefined,
+  chunkIndex: number,
+  chunkOutcomes: readonly AgentSendFileOutcome[],
+): string {
+  if (chunkOutcomes.length === 1 && runId) {
+    const only = chunkOutcomes[0]!;
+    const norm = normalizeDeliverablePath(only.path);
+    if (norm) {
+      return buildDeliverableLinkItemKey(
+        runId,
+        (only.workspace_id ?? "").trim(),
+        norm,
+      );
+    }
+  }
+  const sig = chunkOutcomes
+    .map(
+      (o) =>
+        `${(o.workspace_id ?? "").trim()}::${normalizeDeliverablePath(o.path)}`,
+    )
+    .sort()
+    .join("|");
+  const digest = createHash("sha256")
+    .update(`${deliveryKey}\0${chunkIndex}\0${sig}`)
+    .digest("hex")
+    .slice(0, 16);
+  return `${deliveryKey}:chunk:${chunkIndex}:${digest}`;
+}
+
 export interface LinkOnlyFileRef {
   path: string;
   workspace_id?: string | null;
@@ -174,6 +247,8 @@ export interface ExecuteDeliveryOptions {
     path: string;
     status: string;
   }>;
+  /** Internal BT2 flag: allow backend I-6 to reclaim an `unknown` `:item:` row after platform receipt check proved it was not sent. */
+  reclaimVerifiedUnsent?: boolean;
   replyToMessageId?: string | null;
   newThread?: boolean;
   threadScopeKey?: string | null;
@@ -550,6 +625,7 @@ export class DeliveryService {
         source_scope_key: options.sourceScopeKey ?? options.threadScopeKey ?? null,
         source_generation: options.sourceGeneration ?? null,
         activity_origin: options.activityOrigin ?? null,
+        ...(options.reclaimVerifiedUnsent ? { reclaim_verified_unsent: true } : {}),
       });
     } catch (err) {
       if (isStaleGatewayEpochError(err)) {
@@ -624,51 +700,312 @@ export class DeliveryService {
       if (
         options.downloadMode === "deliverable" &&
         options.runId &&
-        options.deliveryKey === `deliverables-links:${options.runId}` &&
-        claim.existing_status === "unknown"
+        isDeliverableLinkItemKey(options.deliveryKey) &&
+        (claim.existing_status === "unknown" ||
+          claim.existing_status === "in_flight")
       ) {
-        // BT2: `deliverables-links:${runId}` itself crashed mid-flight and was swept to `unknown`.
-        // Recover remaining unconfirmed links idempotently per `(workspace_id, normalized_path)`:
-        // skip links already confirmed (`sent`/`linked`), and send each remaining link under its
-        // deterministic per-item key so already-sent links are never duplicated across restarts.
+        // BT2: Per-item key `deliverables-links:${runId}:item:<digest>` is `unknown`,
+        // `in_flight`, or `gateway_restarted`. Reconcile by `(workspace_id, path)`:
+        // 1) If already confirmed in DB (`sent`/`linked`/`platform_message_id` or `sent_chunks > 0`),
+        //    adopt the confirmed result and settle the item row to `sent` via I-7.
+        // 2) If provably never dispatched (0 chunks, 0 receipts, no dispatching/pending/unknown
+        //    entries), re-claim and send.
+        // 3) Otherwise reconcile via platform receipt / idempotency key: adopt if confirmed,
+        //    re-claim with `reclaimVerifiedUnsent: true` if proven not sent, or keep `unknown`.
         const fallbackWsId =
           (options.workspaceId ?? "").trim() ||
           (claim.workspace_id ?? "").trim() ||
           (claim.home_workspace_id ?? "").trim() ||
           "";
-        const confirmedByWsPath = new Set<string>();
-        const legacyConfirmedByPath = new Set<string>();
-        const alreadyConfirmedOutcomes: AgentSendFileOutcome[] = [];
-        const recordConfirmed = (
-          f: { workspace_id?: string | null; path: string; status: string },
+        const targetRef: LinkOnlyFileRef | null =
+          linkOnlyFiles[0] ??
+          (files[0]
+            ? {
+                path: files[0].path,
+                workspace_id: files[0].workspace_id ?? null,
+                filename: basename(files[0].path) || files[0].path,
+                reason: "prior_unknown_delivery_link_only",
+              }
+            : null);
+        if (targetRef) {
+          const itemWsId = (targetRef.workspace_id ?? "").trim() || fallbackWsId;
+          const itemNormPath = normalizeDeliverablePath(targetRef.path);
+          const itemPlatformStr = (
+            claim.platform ??
+            preliminaryPlat ??
+            options.platform ??
+            ""
+          )
+            .trim()
+            .toLowerCase();
+          const itemTargetAddr = claim.target_address ?? options.target ?? null;
+          const itemFilesStatus = claim.files_status ?? [];
+          const itemPlatformMsgIds = (claim.platform_message_ids ?? []).filter(
+            (m): m is string => typeof m === "string" && m.trim().length > 0,
+          );
+          const matchedEntry = itemFilesStatus.find((f) => {
+            const np = normalizeDeliverablePath(f.path);
+            if (!np || np !== itemNormPath) return false;
+            const fw = (f.workspace_id ?? "").trim();
+            if (fw && itemWsId) return fw === itemWsId;
+            return !fw || !itemWsId || fw === fallbackWsId;
+          });
+          const matchedStatus = (matchedEntry?.status ?? "").trim().toLowerCase();
+          const confirmedMsgId =
+            (matchedEntry?.platform_message_id ?? "").trim() ||
+            itemPlatformMsgIds[0] ||
+            null;
+          const isConfirmedInDb =
+            matchedStatus === "sent" ||
+            matchedStatus === "linked" ||
+            Boolean(confirmedMsgId) ||
+            (claim.sent_chunks ?? 0) > 0;
+
+          const settleItemAsConfirmed = async (
+            msgId: string | null,
+            reason: string,
+          ): Promise<AgentSendResponse> => {
+            const confirmedOutcome: PersistedDeliverableFileStatus = {
+              path: targetRef.path,
+              workspace_id: itemWsId || null,
+              status: "linked",
+              reason,
+              idempotency_key: matchedEntry?.idempotency_key ?? options.deliveryKey,
+              ...(msgId ? { platform_message_id: msgId } : {}),
+            };
+            const settledResp: AgentSendResponse = {
+              status: "sent",
+              code: null,
+              address: itemTargetAddr,
+              current: Boolean(claim.is_current),
+              duplicate: true,
+              message: `Deliverable link ${targetRef.path} was already confirmed.`,
+              files: [toExternalFileOutcome(confirmedOutcome)],
+            };
+            if (claim.existing_status === "unknown") {
+              if (this.leaseLost) {
+                throw new StaleGatewayEpochError(
+                  "Gateway lease lost before I-7 deliverable item settlement",
+                );
+              }
+              await this.backend.updateDeliveryProgress(
+                {
+                  delivery_key: options.deliveryKey,
+                  ...(typeof claim.delivery_attempt === "number"
+                    ? { delivery_attempt: claim.delivery_attempt }
+                    : {}),
+                  sent_chunks: Math.max(claim.sent_chunks ?? 0, 1),
+                  total_chunks: 1,
+                  platform_message_ids: msgId
+                    ? Array.from(new Set([...itemPlatformMsgIds, msgId]))
+                    : itemPlatformMsgIds,
+                  files_status: [confirmedOutcome],
+                  first_response_json:
+                    settledResp as unknown as Record<string, unknown>,
+                  status: "sent",
+                  error_code: null,
+                  error_message: null,
+                },
+                { platform: itemPlatformStr || null },
+              );
+            }
+            return settledResp;
+          };
+
+          if (isConfirmedInDb) {
+            return await settleItemAsConfirmed(
+              confirmedMsgId,
+              matchedEntry?.reason ?? targetRef.reason ?? "already_confirmed",
+            );
+          }
+
+          const hasUncertainItemState = itemFilesStatus.some((f) => {
+            const st = (f.status ?? "").trim().toLowerCase();
+            return (
+              st !== "queued" &&
+              st !== "not_sent" &&
+              st !== "failed"
+            );
+          });
+          const provablyUnsent =
+            claim.existing_status === "unknown" &&
+            (claim.sent_chunks ?? 0) === 0 &&
+            itemPlatformMsgIds.length === 0 &&
+            !hasUncertainItemState;
+
+          if (provablyUnsent && !options.reclaimVerifiedUnsent) {
+            return await this.executeDelivery({
+              ...options,
+              reclaimVerifiedUnsent: true,
+            });
+          }
+
+          const itemAdapter = isSupportedPlatform(itemPlatformStr)
+            ? this.adapters.get(itemPlatformStr)
+            : undefined;
+          if (
+            itemAdapter &&
+            typeof itemAdapter.reconcileDeliveryReceipt === "function" &&
+            itemTargetAddr
+          ) {
+            const expectedLinkLine = buildWorkspaceFileDeepLinkLine(
+              targetRef.filename || basename(targetRef.path) || targetRef.path,
+              targetRef.path,
+              this.webBaseUrl,
+              options.threadId,
+              itemWsId || null,
+              fallbackWsId || null,
+            );
+            const rec = await itemAdapter.reconcileDeliveryReceipt({
+              targetAddress: itemTargetAddr,
+              recipientPlatformUserId:
+                claim.dm_recipient_platform_user_id ?? claim.recipient_id ?? null,
+              deliveryKey: options.deliveryKey,
+              idempotencyKey: matchedEntry?.idempotency_key ?? options.deliveryKey,
+              deliveryAttempt: claim.delivery_attempt,
+              threadScopeKey:
+                claim.thread_scope_key ?? options.threadScopeKey ?? null,
+              workspaceId: itemWsId || null,
+              path: targetRef.path,
+              text: expectedLinkLine,
+              weixinAccountId: claim.weixin_account_id ?? null,
+            });
+            if (rec.status === "confirmed") {
+              return await settleItemAsConfirmed(
+                rec.messageId,
+                rec.reason ?? "platform_receipt_confirmed",
+              );
+            }
+            if (
+              rec.status === "not_sent" &&
+              claim.existing_status === "unknown" &&
+              !options.reclaimVerifiedUnsent
+            ) {
+              return await this.executeDelivery({
+                ...options,
+                reclaimVerifiedUnsent: true,
+              });
+            }
+          }
+        }
+      }
+      if (
+        options.downloadMode === "deliverable" &&
+        options.runId &&
+        options.deliveryKey === `deliverables-links:${options.runId}` &&
+        claim.existing_status === "unknown"
+      ) {
+        // BT2: `deliverables-links:${runId}` itself crashed mid-flight and was swept to `unknown`.
+        // Reconcile every `(workspace_id, normalized_path)`:
+        // - Adopt items already confirmed (`sent`/`linked`/`platform_message_id`).
+        // - For items that reached `dispatching`/`pending`/`unknown` on the parent row (or when
+        //   the parent row sent chunks with empty `files_status`), reconcile with the platform
+        //   receipt / idempotency key BEFORE ever sending under a new per-item key.
+        // - Send provably-unsent items under deterministic per-item keys.
+        // - Once all items are confirmed, settle parent `deliverables-links:${runId}` to `sent` via I-7.
+        const fallbackWsId =
+          (options.workspaceId ?? "").trim() ||
+          (claim.workspace_id ?? "").trim() ||
+          (claim.home_workspace_id ?? "").trim() ||
+          "";
+        const parentPlatformStr = (
+          claim.platform ??
+          preliminaryPlat ??
+          options.platform ??
+          ""
+        )
+          .trim()
+          .toLowerCase();
+        const resolvedAddr = claim.target_address ?? options.target ?? null;
+        const parentAdapter = isSupportedPlatform(parentPlatformStr)
+          ? this.adapters.get(parentPlatformStr)
+          : undefined;
+        const parentFilesStatus = claim.files_status ?? [];
+        const parentPlatformMsgIds = (claim.platform_message_ids ?? []).filter(
+          (m): m is string => typeof m === "string" && m.trim().length > 0,
+        );
+
+        type ParentItemEntry = {
+          workspace_id?: string | null;
+          path: string;
+          status: string;
+          reason?: string | null;
+          idempotency_key?: string | null;
+          platform_message_id?: string | null;
+        };
+        const parentEntryByWsPath = new Map<string, ParentItemEntry>();
+        const legacyParentEntryByPath = new Map<string, ParentItemEntry>();
+        const confirmedByWsPath = new Map<string, ParentItemEntry>();
+        const legacyConfirmedByPath = new Map<string, ParentItemEntry>();
+
+        const statusRank = (st: string): number => {
+          if (st === "sent" || st === "linked") return 4;
+          if (st === "dispatching" || st === "pending" || st === "unknown") return 3;
+          if (st === "queued" || st === "not_sent") return 2;
+          return 1;
+        };
+        const recordEntry = (
+          targetMap: Map<string, ParentItemEntry>,
+          key: string,
+          entry: ParentItemEntry,
         ): void => {
+          const prev = targetMap.get(key);
+          const nextSt = (entry.status ?? "").trim().toLowerCase();
+          const prevSt = (prev?.status ?? "").trim().toLowerCase();
+          if (!prev || statusRank(nextSt) >= statusRank(prevSt)) {
+            targetMap.set(key, entry);
+          }
+        };
+        const recordConfirmed = (f: ParentItemEntry): void => {
           const st = (f.status ?? "").trim().toLowerCase();
-          if (st !== "sent" && st !== "linked") return;
+          const hasMsgId = Boolean((f.platform_message_id ?? "").trim());
+          if (st !== "sent" && st !== "linked" && !hasMsgId) return;
           const normPath = normalizeDeliverablePath(f.path);
           if (!normPath) return;
           const wsKey = (f.workspace_id ?? "").trim();
           if (wsKey) {
-            confirmedByWsPath.add(`${wsKey}::${normPath}`);
+            recordEntry(confirmedByWsPath, `${wsKey}::${normPath}`, f);
           } else {
-            legacyConfirmedByPath.add(normPath);
+            recordEntry(legacyConfirmedByPath, normPath, f);
           }
         };
         for (const f of options.priorConfirmedDeliverables ?? []) {
           recordConfirmed(f);
         }
-        for (const f of claim.files_status ?? []) {
+        for (const f of parentFilesStatus) {
           recordConfirmed(f);
+          const normPath = normalizeDeliverablePath(f.path);
+          if (!normPath) continue;
+          const wsKey = (f.workspace_id ?? "").trim();
+          if (wsKey) {
+            recordEntry(parentEntryByWsPath, `${wsKey}::${normPath}`, f);
+          } else {
+            recordEntry(legacyParentEntryByPath, normPath, f);
+          }
         }
-        const isAlreadyConfirmed = (wsId: string, normPath: string): boolean => {
+        const lookupConfirmed = (
+          wsId: string,
+          normPath: string,
+        ): ParentItemEntry | undefined => {
           if (wsId && confirmedByWsPath.has(`${wsId}::${normPath}`)) {
-            return true;
+            return confirmedByWsPath.get(`${wsId}::${normPath}`);
           }
           const canUseLegacy = !wsId || !fallbackWsId || wsId === fallbackWsId;
-          return canUseLegacy && legacyConfirmedByPath.has(normPath);
+          return canUseLegacy ? legacyConfirmedByPath.get(normPath) : undefined;
+        };
+        const lookupParentEntry = (
+          wsId: string,
+          normPath: string,
+        ): ParentItemEntry | undefined => {
+          if (wsId && parentEntryByWsPath.has(`${wsId}::${normPath}`)) {
+            return parentEntryByWsPath.get(`${wsId}::${normPath}`);
+          }
+          const canUseLegacy = !wsId || !fallbackWsId || wsId === fallbackWsId;
+          return canUseLegacy ? legacyParentEntryByPath.get(normPath) : undefined;
         };
 
         const seenCandidates = new Set<string>();
-        const unconfirmedItems: Array<{
+        const allCandidates: Array<{
           wsId: string;
           normPath: string;
           ref: LinkOnlyFileRef;
@@ -680,16 +1017,7 @@ export class DeliveryService {
           const dedupeKey = `${wsId}::${normPath}`;
           if (seenCandidates.has(dedupeKey)) return;
           seenCandidates.add(dedupeKey);
-          if (isAlreadyConfirmed(wsId, normPath)) {
-            alreadyConfirmedOutcomes.push({
-              path: ref.path,
-              workspace_id: wsId || null,
-              status: "linked",
-              reason: ref.reason ?? "already_confirmed",
-            });
-            return;
-          }
-          unconfirmedItems.push({ wsId, normPath, ref });
+          allCandidates.push({ wsId, normPath, ref });
         };
         for (const linkRef of linkOnlyFiles) {
           pushCandidate(linkRef);
@@ -703,26 +1031,146 @@ export class DeliveryService {
           });
         }
 
-        const resolvedAddr = claim.target_address ?? options.target ?? null;
-        if (unconfirmedItems.length === 0) {
-          return {
-            status: "sent",
-            code: null,
-            address: resolvedAddr,
-            current: Boolean(claim.is_current),
-            duplicate: true,
-            message: "All deliverable links were already confirmed.",
-            files: alreadyConfirmedOutcomes,
-          };
-        }
-
-        const recoveredFiles: AgentSendFileOutcome[] = [...alreadyConfirmedOutcomes];
+        const recoveredFiles: PersistedDeliverableFileStatus[] = [];
+        const recoveredMsgIds = new Set<string>(parentPlatformMsgIds);
+        const unconfirmedItems: Array<{
+          wsId: string;
+          normPath: string;
+          ref: LinkOnlyFileRef;
+        }> = [];
         let anyUnknown = false;
         let anyFailed = false;
         let allDuplicate = true;
         let lastFailureCode: AgentSendResponse["code"] = null;
         let lastFailureMessage: string | null = null;
         let lastAddress: string | null = resolvedAddr;
+
+        const parentSentChunksWithoutFileRecords =
+          (claim.sent_chunks ?? 0) > 0 && parentFilesStatus.length === 0;
+        const reconcileCache = new Map<
+          string,
+          Awaited<
+            ReturnType<NonNullable<ChannelAdapter["reconcileDeliveryReceipt"]>>
+          >
+        >();
+
+        for (const item of allCandidates) {
+          const confirmed = lookupConfirmed(item.wsId, item.normPath);
+          if (confirmed) {
+            const msgId = (confirmed.platform_message_id ?? "").trim() || null;
+            if (msgId) recoveredMsgIds.add(msgId);
+            recoveredFiles.push({
+              path: item.ref.path,
+              workspace_id: item.wsId || null,
+              status: "linked",
+              reason:
+                confirmed.reason ?? item.ref.reason ?? "already_confirmed",
+              ...(confirmed.idempotency_key
+                ? { idempotency_key: confirmed.idempotency_key }
+                : {}),
+              ...(msgId ? { platform_message_id: msgId } : {}),
+            });
+            continue;
+          }
+
+          const parentEntry = lookupParentEntry(item.wsId, item.normPath);
+          const parentEntryStatus = (parentEntry?.status ?? "")
+            .trim()
+            .toLowerCase();
+          const isParentItemUncertain =
+            parentEntryStatus === "dispatching" ||
+            parentEntryStatus === "pending" ||
+            parentEntryStatus === "unknown" ||
+            parentSentChunksWithoutFileRecords;
+
+          if (isParentItemUncertain) {
+            const idemKey =
+              parentEntry?.idempotency_key ?? options.deliveryKey;
+            if (
+              parentAdapter &&
+              typeof parentAdapter.reconcileDeliveryReceipt === "function" &&
+              resolvedAddr
+            ) {
+              const cacheKey = `${idemKey}::${item.wsId}::${item.normPath}`;
+              let rec = reconcileCache.get(idemKey) ?? reconcileCache.get(cacheKey);
+              if (!rec) {
+                const expectedLinkLine = buildWorkspaceFileDeepLinkLine(
+                  item.ref.filename || basename(item.ref.path) || item.ref.path,
+                  item.ref.path,
+                  this.webBaseUrl,
+                  options.threadId,
+                  item.wsId || null,
+                  fallbackWsId || null,
+                );
+                rec = await parentAdapter.reconcileDeliveryReceipt({
+                  targetAddress: resolvedAddr,
+                  recipientPlatformUserId:
+                    claim.dm_recipient_platform_user_id ??
+                    claim.recipient_id ??
+                    null,
+                  deliveryKey: options.deliveryKey,
+                  idempotencyKey: idemKey,
+                  deliveryAttempt: claim.delivery_attempt,
+                  threadScopeKey:
+                    claim.thread_scope_key ?? options.threadScopeKey ?? null,
+                  workspaceId: item.wsId || null,
+                  path: item.ref.path,
+                  text: expectedLinkLine,
+                  weixinAccountId: claim.weixin_account_id ?? null,
+                });
+                reconcileCache.set(
+                  parentEntry?.idempotency_key ? idemKey : cacheKey,
+                  rec,
+                );
+              }
+              if (rec.status === "confirmed") {
+                if (rec.messageId) recoveredMsgIds.add(rec.messageId);
+                recoveredFiles.push({
+                  path: item.ref.path,
+                  workspace_id: item.wsId || null,
+                  status: "linked",
+                  reason: rec.reason ?? "platform_receipt_confirmed",
+                  idempotency_key: idemKey,
+                  platform_message_id: rec.messageId,
+                });
+                continue;
+              }
+              if (rec.status === "not_sent") {
+                unconfirmedItems.push(item);
+                continue;
+              }
+              anyUnknown = true;
+              lastFailureCode = "in_flight";
+              lastFailureMessage =
+                rec.reason ??
+                "Deliverable link receipt could not be verified with platform.";
+              recoveredFiles.push({
+                path: item.ref.path,
+                workspace_id: item.wsId || null,
+                status: "unknown",
+                reason: lastFailureMessage,
+                idempotency_key: idemKey,
+              });
+              continue;
+            }
+            // Cannot verify whether the platform received the in-flight/dispatching chunk:
+            // never duplicate-send under a new per-item key.
+            anyUnknown = true;
+            lastFailureCode = "in_flight";
+            lastFailureMessage =
+              "Deliverable link was dispatching before crash and cannot be verified without platform receipt.";
+            recoveredFiles.push({
+              path: item.ref.path,
+              workspace_id: item.wsId || null,
+              status: "unknown",
+              reason: lastFailureMessage,
+              idempotency_key: idemKey,
+            });
+            continue;
+          }
+
+          unconfirmedItems.push(item);
+        }
 
         for (const item of unconfirmedItems) {
           const itemKey = buildDeliverableLinkItemKey(
@@ -746,12 +1194,21 @@ export class DeliveryService {
             ],
             forceLinkOnly: true,
             priorConfirmedDeliverables: undefined,
+            reclaimVerifiedUnsent: false,
           });
           if (itemRes.address) {
             lastAddress = itemRes.address;
           }
           if (Array.isArray(itemRes.files)) {
-            recoveredFiles.push(...itemRes.files);
+            for (const f of itemRes.files) {
+              recoveredFiles.push({
+                path: f.path,
+                workspace_id: f.workspace_id ?? (item.wsId || null),
+                status: f.status,
+                reason: f.reason ?? null,
+                idempotency_key: itemKey,
+              });
+            }
           }
           if (!itemRes.duplicate) {
             allDuplicate = false;
@@ -767,6 +1224,7 @@ export class DeliveryService {
           }
         }
 
+        const externalRecoveredFiles = recoveredFiles.map(toExternalFileOutcome);
         if (anyUnknown) {
           return {
             status: "unknown",
@@ -777,7 +1235,7 @@ export class DeliveryService {
             message:
               lastFailureMessage ??
               "One or more deliverable links remain unknown after recovery.",
-            files: recoveredFiles,
+            files: externalRecoveredFiles,
           };
         }
         if (anyFailed) {
@@ -790,18 +1248,52 @@ export class DeliveryService {
             message:
               lastFailureMessage ??
               "One or more deliverable links failed during recovery.",
-            files: recoveredFiles,
+            files: externalRecoveredFiles,
           };
         }
-        return {
+
+        const finalParentResp: AgentSendResponse = {
           status: "sent",
           code: null,
           address: lastAddress,
           current: Boolean(claim.is_current),
           duplicate: allDuplicate,
-          message: `Delivered remaining deliverable links to ${lastAddress ?? "target"}.`,
-          files: recoveredFiles,
+          message:
+            unconfirmedItems.length === 0
+              ? "All deliverable links were already confirmed."
+              : `Delivered remaining deliverable links to ${lastAddress ?? "target"}.`,
+          files: externalRecoveredFiles,
         };
+        if (this.leaseLost) {
+          throw new StaleGatewayEpochError(
+            "Gateway lease lost before I-7 parent deliverable settlement",
+          );
+        }
+        await this.backend.updateDeliveryProgress(
+          {
+            delivery_key: options.deliveryKey,
+            ...(typeof claim.delivery_attempt === "number"
+              ? { delivery_attempt: claim.delivery_attempt }
+              : {}),
+            sent_chunks: Math.max(
+              claim.sent_chunks ?? 0,
+              recoveredFiles.length > 0 ? 1 : 0,
+            ),
+            total_chunks: Math.max(
+              claim.sent_chunks ?? 0,
+              recoveredFiles.length > 0 ? 1 : 0,
+            ),
+            platform_message_ids: [...recoveredMsgIds],
+            files_status: recoveredFiles,
+            first_response_json:
+              finalParentResp as unknown as Record<string, unknown>,
+            status: "sent",
+            error_code: null,
+            error_message: null,
+          },
+          { platform: parentPlatformStr || null },
+        );
+        return finalParentResp;
       }
       return {
         status: "unknown",
@@ -1413,9 +1905,65 @@ export class DeliveryService {
       return fn({ signal: undefined, attachAccount: () => undefined });
     };
 
+    const isDeliverableLinkTracking =
+      options.deliveryKey.startsWith("deliverables-links:") &&
+      pendingLinkEntries.length > 0;
+    const chunkIdempotencyKeys: Array<string | null> = chunks.map((_, idx) => {
+      const linkOuts = chunkLinkOutcomes[idx] ?? [];
+      if (!isDeliverableLinkTracking || linkOuts.length === 0) {
+        return null;
+      }
+      return buildDeliverableChunkIdempotencyKey(
+        options.deliveryKey,
+        options.runId,
+        idx,
+        linkOuts,
+      );
+    });
+    const trackedLinkStates: PersistedDeliverableFileStatus[] = [];
+    const trackedLinkIndicesByChunk: number[][] = chunks.map(() => []);
+    if (isDeliverableLinkTracking) {
+      for (let cIdx = 0; cIdx < chunkLinkOutcomes.length; cIdx += 1) {
+        const idemKey = chunkIdempotencyKeys[cIdx] ?? options.deliveryKey;
+        for (const o of chunkLinkOutcomes[cIdx] ?? []) {
+          const entryIdx = trackedLinkStates.length;
+          trackedLinkStates.push({
+            path: o.path,
+            workspace_id: o.workspace_id ?? null,
+            status: "queued",
+            reason: o.reason ?? null,
+            idempotency_key: idemKey,
+            chunk_index: cIdx,
+          });
+          trackedLinkIndicesByChunk[cIdx]!.push(entryIdx);
+        }
+      }
+    }
+    const snapshotPersistedFilesStatus = (): PersistedDeliverableFileStatus[] =>
+      isDeliverableLinkTracking
+        ? [...fileOutcomes, ...trackedLinkStates]
+        : [...fileOutcomes];
+
     for (let i = 0; i < chunks.length; i++) {
       const chunkText = chunks[i]!;
+      const chunkTrackedIndices = trackedLinkIndicesByChunk[i] ?? [];
+      const chunkIdemKey = chunkIdempotencyKeys[i] ?? null;
       try {
+        if (isDeliverableLinkTracking && chunkTrackedIndices.length > 0) {
+          for (const idx of chunkTrackedIndices) {
+            trackedLinkStates[idx] = {
+              ...trackedLinkStates[idx]!,
+              status: "dispatching",
+            };
+          }
+          await recordProgress({
+            delivery_key: options.deliveryKey,
+            sent_chunks: sentChunks,
+            total_chunks: totalChunks,
+            platform_message_ids: [...platformMessageIds],
+            files_status: snapshotPersistedFilesStatus(),
+          });
+        }
         const res = await runWithWeixinSignal(
           claim.weixin_account_id ?? null,
           async ({ signal, attachAccount }) => {
@@ -1553,6 +2101,7 @@ export class DeliveryService {
                   : false,
               threadScopeKey: effectiveThreadScopeKey,
               deliveryKey: options.deliveryKey,
+              ...(chunkIdemKey ? { idempotencyKey: chunkIdemKey } : {}),
               deliveryAttempt: effectiveWeixinAttempt,
               weixinPreflight,
               weixinAccountId:
@@ -1663,7 +2212,15 @@ export class DeliveryService {
           totalChunks = sentChunks;
         }
         const chunkConfirmedLinks = chunkLinkOutcomes[i] ?? [];
-        if (chunkConfirmedLinks.length > 0) {
+        if (isDeliverableLinkTracking && chunkTrackedIndices.length > 0) {
+          for (const idx of chunkTrackedIndices) {
+            trackedLinkStates[idx] = {
+              ...trackedLinkStates[idx]!,
+              status: "linked",
+              platform_message_id: res.messageId,
+            };
+          }
+        } else if (chunkConfirmedLinks.length > 0) {
           fileOutcomes.push(...chunkConfirmedLinks);
         }
         maybeNotifyFirstCurrentDelivery();
@@ -1672,8 +2229,8 @@ export class DeliveryService {
           sent_chunks: sentChunks,
           total_chunks: totalChunks,
           platform_message_ids: [...platformMessageIds],
-          ...(chunkConfirmedLinks.length > 0
-            ? { files_status: [...fileOutcomes] }
+          ...(chunkConfirmedLinks.length > 0 || isDeliverableLinkTracking
+            ? { files_status: snapshotPersistedFilesStatus() }
             : {}),
           ...(feishuTopicReg ? { bot_topic_registration: feishuTopicReg } : {}),
         });
@@ -1725,15 +2282,26 @@ export class DeliveryService {
             message: err instanceof Error ? err.message : String(err),
           };
         }
-        for (let j = i; j < chunkLinkOutcomes.length; j += 1) {
-          const unsentStatus: AgentSendFileOutcome["status"] =
-            j === i && chunkFailure.outcome === "unknown" ? "unknown" : "failed";
-          for (const unsent of chunkLinkOutcomes[j] ?? []) {
-            fileOutcomes.push({
-              ...unsent,
-              status: unsentStatus,
+        if (isDeliverableLinkTracking) {
+          for (const idx of chunkTrackedIndices) {
+            trackedLinkStates[idx] = {
+              ...trackedLinkStates[idx]!,
+              status: chunkFailure.outcome === "unknown" ? "unknown" : "failed",
               reason: chunkFailure.message,
-            });
+            };
+          }
+          // Later chunks (j > i) remain `queued` (provably unsent) in persisted `trackedLinkStates`.
+        } else {
+          for (let j = i; j < chunkLinkOutcomes.length; j += 1) {
+            const unsentStatus: AgentSendFileOutcome["status"] =
+              j === i && chunkFailure.outcome === "unknown" ? "unknown" : "failed";
+            for (const unsent of chunkLinkOutcomes[j] ?? []) {
+              fileOutcomes.push({
+                ...unsent,
+                status: unsentStatus,
+                reason: chunkFailure.message,
+              });
+            }
           }
         }
         break;
@@ -1742,7 +2310,9 @@ export class DeliveryService {
 
     // Process files if text chunks did not fail before any progress
     let totalDownloadedBytes = 0;
-    let anyFileSucceeded = fileOutcomes.some((f) => f.status === "linked" || f.status === "sent");
+    let anyFileSucceeded =
+      fileOutcomes.some((f) => f.status === "linked" || f.status === "sent") ||
+      trackedLinkStates.some((f) => f.status === "linked" || f.status === "sent");
     let anyFileFailed = false;
     let fileUnknownError: string | null = null;
     let fileFailureCode: AgentSendResponse["code"] = null;
@@ -2281,6 +2851,7 @@ export class DeliveryService {
       finalMessage = `Delivered to ${finalAddress}.`;
     }
 
+    const persistedFinalFiles = snapshotPersistedFilesStatus();
     const responseObj: AgentSendResponse = {
       status: finalStatus,
       code: finalCode,
@@ -2288,11 +2859,14 @@ export class DeliveryService {
       current: isCurrent,
       duplicate: false,
       message: finalMessage,
-      files: fileOutcomes.map(({ path, status, reason }) => ({
-        path,
-        status,
-        reason,
-      })),
+      files: persistedFinalFiles.map((f) => {
+        const ext = toExternalFileOutcome(f);
+        return {
+          path: ext.path,
+          status: ext.status,
+          reason: ext.reason,
+        };
+      }),
     };
 
     const recordedErrorCode =
@@ -2309,7 +2883,7 @@ export class DeliveryService {
       sent_chunks: sentChunks,
       total_chunks: totalChunks,
       platform_message_ids: platformMessageIds,
-      files_status: fileOutcomes,
+      files_status: persistedFinalFiles,
       first_response_json: responseObj as unknown as Record<string, unknown>,
       status: finalStatus,
       error_code: recordedErrorCode,

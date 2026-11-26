@@ -453,6 +453,7 @@ export interface I6AuthorizeAndClaimRequest {
   source_scope_key?: string | null;
   source_generation?: number | null;
   activity_origin?: DeliveryActivityOrigin | null;
+  reclaim_verified_unsent?: boolean;
 }
 
 export interface I6AuthorizeAndClaimResponse {
@@ -465,11 +466,15 @@ export interface I6AuthorizeAndClaimResponse {
   existing_status?: "in_flight" | "unknown" | string;
   error_code?: string | null;
   sent_chunks?: number;
+  platform_message_ids?: string[];
   files_status?: Array<{
     workspace_id?: string | null;
     path: string;
     status: string;
     reason?: string | null;
+    idempotency_key?: string | null;
+    platform_message_id?: string | null;
+    chunk_index?: number | null;
   }>;
   code?:
     | "not_linked"
@@ -634,8 +639,18 @@ export interface I7DeliveriesProgressRequest {
   files_status?: Array<{
     path: string;
     workspace_id?: string | null;
-    status: "sent" | "linked" | "failed" | "unknown" | "pending";
+    status:
+      | "sent"
+      | "linked"
+      | "failed"
+      | "unknown"
+      | "pending"
+      | "queued"
+      | "dispatching";
     reason: string | null;
+    idempotency_key?: string | null;
+    platform_message_id?: string | null;
+    chunk_index?: number | null;
   }>;
   first_response_json?: Record<string, unknown>;
   status?: "in_flight" | "sent" | "partial" | "failed" | "unknown";
@@ -671,8 +686,18 @@ export interface I7DeliveriesProgressResponse {
   files_status?: Array<{
     path: string;
     workspace_id?: string | null;
-    status: "sent" | "linked" | "failed" | "unknown" | "pending";
+    status:
+      | "sent"
+      | "linked"
+      | "failed"
+      | "unknown"
+      | "pending"
+      | "queued"
+      | "dispatching";
     reason: string | null;
+    idempotency_key?: string | null;
+    platform_message_id?: string | null;
+    chunk_index?: number | null;
   }>;
   sent_to_current_count: number;
   bot_topic_registered?: boolean;
@@ -1541,7 +1566,7 @@ export interface BackendClient {
     userId: string,
     threadId: string,
     runId: string,
-    opts?: { source?: "auto" | "checkpoint" },
+    opts?: { source?: "auto" | "checkpoint"; executionId?: string | null },
   ): Promise<SseOrErrorResponse>;
 
   watchThread(
@@ -2671,16 +2696,21 @@ export class HttpBackendClient implements BackendClient {
     userId: string,
     threadId: string,
     runId: string,
-    opts?: { source?: "auto" | "checkpoint" },
+    opts?: { source?: "auto" | "checkpoint"; executionId?: string | null },
   ): Promise<SseOrErrorResponse> {
+    const query: Record<string, string | null | undefined> = {
+      source: opts?.source ?? "auto",
+    };
+    const execId = opts?.executionId?.trim();
+    if (execId) {
+      query.execution_id = execId;
+    }
     return await this.sseRequest(
       "GET",
       `/api/v1/dalton/channels/internal/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/replay`,
       {
         userId,
-        query: {
-          source: opts?.source ?? "auto",
-        },
+        query,
       },
     );
   }

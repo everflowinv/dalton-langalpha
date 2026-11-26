@@ -1571,7 +1571,7 @@ describe("Channel Phase 2 Batch 1 — Group Deep Links & DM Deliverables", () =>
     expect(received).toHaveLength(0);
   });
 
-  it("BT2: recovers remaining unsent links per (workspace_id, path) when deliverables-links:${runId} becomes unknown after crash without duplicating confirmed links", async () => {
+  it("BT2: persists per-item link state from first send, recovers unknown/gateway_restarted subkeys by (workspace_id, path), reconciles uncertain receipts, and settles parent via I-7", async () => {
     const runId = "run-bt2-links-crash";
     const binaryFiles = [
       { path: "results/doc.pdf", workspace_id: "ws-a" },
@@ -1585,8 +1585,8 @@ describe("Channel Phase 2 Batch 1 — Group Deep Links & DM Deliverables", () =>
     // Pack 2 lines per chunk so 4 links span 2 chunks during deliverables-links:${runId}:
     // chunk 0: ws-a::results/link_2.pdf + ws-b::results/link_4.pdf (linkOnlyFiles first)
     // chunk 1: ws-a::results/doc.pdf + ws-b::results/doc.pdf (files next)
-    let crashLinksChunk1 = true;
-    let crashSecondItem = false;
+    let failChunk1Definite = true;
+    let simulateSubkeyCrashBeforeSend = false;
     const sentChunkTexts: string[] = [];
     const feishu = makeStubAdapter("feishu", {
       splitTextChunks: (text: string) => {
@@ -1598,15 +1598,15 @@ describe("Channel Phase 2 Batch 1 — Group Deep Links & DM Deliverables", () =>
         return chunks.length > 0 ? chunks : [text];
       },
       sendTextChunk: vi.fn(async (opts: SendTextChunkOptions): Promise<SendTextChunkResult> => {
-        if (crashLinksChunk1 && opts.chunkIndex === 1) {
-          throw new ChannelDeliveryError("Simulated gateway exit during deliverables-links chunk 1", {
-            outcome: "unknown",
+        if (failChunk1Definite && opts.chunkIndex === 1) {
+          throw new ChannelDeliveryError("Simulated definite rejection before platform receipt on chunk 1", {
+            outcome: "failed",
             code: "unavailable",
           });
         }
-        if (crashSecondItem && opts.text.includes("ws-b")) {
-          throw new ChannelDeliveryError("Simulated crash on second per-item recovery", {
-            outcome: "failed",
+        if (simulateSubkeyCrashBeforeSend && opts.text.includes("ws-b")) {
+          throw new ChannelDeliveryError("Simulated crash on ws-b item before platform receipt", {
+            outcome: "unknown",
             code: "unavailable",
           });
         }
@@ -1615,20 +1615,51 @@ describe("Channel Phase 2 Batch 1 — Group Deep Links & DM Deliverables", () =>
       }),
     });
 
-    const deliveriesState = new Map<
-      string,
-      {
+    type MockDeliveryRow = {
+      status: string;
+      error_code: string | null;
+      sent_chunks: number;
+      delivery_attempt: number;
+      platform_message_ids: string[];
+      files_status: Array<{
+        path: string;
+        workspace_id?: string | null;
         status: string;
-        sent_chunks: number;
-        files_status: Array<{ path: string; workspace_id?: string | null; status: string; reason: string | null }>;
-      }
-    >();
+        reason: string | null;
+        idempotency_key?: string | null;
+        platform_message_id?: string | null;
+      }>;
+      first_response_json?: Record<string, unknown> | null;
+    };
+    const deliveriesState = new Map<string, MockDeliveryRow>();
+    const progressHistory: Array<{ key: string; status?: string; files_status?: unknown }> = [];
     // Seed initial `deliverables:${runId}` as `unknown` (first crash before any files confirmed)
     deliveriesState.set(`deliverables:${runId}`, {
       status: "unknown",
+      error_code: "gateway_restarted",
       sent_chunks: 0,
+      delivery_attempt: 1,
+      platform_message_ids: [],
       files_status: [],
     });
+
+    const isProvablyUnsentItemRow = (row: MockDeliveryRow): boolean => {
+      if (row.sent_chunks > 0 || row.platform_message_ids.length > 0) return false;
+      return row.files_status.every((f) => {
+        const st = f.status.trim().toLowerCase();
+        return (
+          (st === "queued" || st === "not_sent" || st === "failed") &&
+          !f.platform_message_id
+        );
+      });
+    };
+    const hasNoConfirmedReceipt = (row: MockDeliveryRow): boolean => {
+      if (row.sent_chunks > 0 || row.platform_message_ids.length > 0) return false;
+      return row.files_status.every((f) => {
+        const st = f.status.trim().toLowerCase();
+        return st !== "sent" && st !== "linked" && !f.platform_message_id;
+      });
+    };
 
     const backend = makeMockBackend({
       authorizeAndClaimDelivery: vi.fn(async (req) => {
@@ -1641,8 +1672,8 @@ describe("Channel Phase 2 Batch 1 — Group Deep Links & DM Deliverables", () =>
             platform: "feishu",
             target_address: "feishu:@me",
             is_current: true,
-            delivery_attempt: 1,
-            first_response_json: {
+            delivery_attempt: existing.delivery_attempt,
+            first_response_json: existing.first_response_json ?? {
               status: completedStatus,
               code: null,
               address: "feishu:@me",
@@ -1653,15 +1684,31 @@ describe("Channel Phase 2 Batch 1 — Group Deep Links & DM Deliverables", () =>
             },
           };
         }
-        if (existing && (existing.status === "unknown" || existing.status === "in_flight")) {
+        const isItemKey =
+          req.delivery_key.startsWith("deliverables-links:") &&
+          req.delivery_key.includes(":item:");
+        const allowReclaim =
+          isItemKey &&
+          existing?.status === "unknown" &&
+          (isProvablyUnsentItemRow(existing) ||
+            (Boolean(req.reclaim_verified_unsent) && hasNoConfirmedReceipt(existing)));
+        if (
+          existing &&
+          (existing.status === "unknown" || existing.status === "in_flight") &&
+          !allowReclaim
+        ) {
           return {
             claim_status: "in_flight_or_unknown" as const,
             existing_status: existing.status,
+            error_code: existing.error_code,
             sent_chunks: existing.sent_chunks,
+            platform_message_ids: [...existing.platform_message_ids],
             platform: "feishu",
             target_address: "feishu:@me",
+            recipient_id: "ou_alice",
+            dm_recipient_platform_user_id: "ou_alice",
             is_current: true,
-            delivery_attempt: 1,
+            delivery_attempt: existing.delivery_attempt,
             files_status: existing.files_status,
           };
         }
@@ -1676,9 +1723,13 @@ describe("Channel Phase 2 Batch 1 — Group Deep Links & DM Deliverables", () =>
               status: f.status,
             })),
           );
+        const nextAttempt = existing ? existing.delivery_attempt + 1 : 1;
         deliveriesState.set(req.delivery_key, {
           status: "in_flight",
+          error_code: null,
           sent_chunks: 0,
+          delivery_attempt: nextAttempt,
+          platform_message_ids: [],
           files_status: [],
         });
         return {
@@ -1688,18 +1739,33 @@ describe("Channel Phase 2 Batch 1 — Group Deep Links & DM Deliverables", () =>
           recipient_id: "ou_alice",
           dm_recipient_platform_user_id: "ou_alice",
           is_current: true,
-          delivery_attempt: 1,
+          delivery_attempt: nextAttempt,
           workspace_id: "ws-a",
           home_workspace_id: "ws-home",
           prior_run_files: priorRunFiles,
         };
       }),
       updateDeliveryProgress: vi.fn(async (req: I7DeliveriesProgressRequest) => {
+        progressHistory.push({
+          key: req.delivery_key,
+          status: req.status,
+          files_status: req.files_status ? [...req.files_status] : undefined,
+        });
         const row = deliveriesState.get(req.delivery_key);
         if (row) {
+          if (typeof req.delivery_attempt === "number" && req.delivery_attempt !== row.delivery_attempt) {
+            throw new BackendHttpError("stale attempt", 409, null);
+          }
           if (typeof req.sent_chunks === "number") row.sent_chunks = req.sent_chunks;
+          if (Array.isArray(req.platform_message_ids)) {
+            row.platform_message_ids = [...req.platform_message_ids];
+          }
           if (Array.isArray(req.files_status)) row.files_status = [...req.files_status];
-          if (typeof req.status === "string") row.status = req.status;
+          if (req.first_response_json) row.first_response_json = req.first_response_json;
+          if (typeof req.status === "string") {
+            row.status = req.status;
+            if (req.status === "sent") row.error_code = null;
+          }
         }
         return { ok: true, delivery_key: req.delivery_key, status: req.status ?? "in_flight", sent_to_current_count: 1 };
       }),
@@ -1728,28 +1794,52 @@ describe("Channel Phase 2 Batch 1 — Group Deep Links & DM Deliverables", () =>
       activityOrigin: "replay" as const,
     };
 
-    // Attempt 1: `deliverables-links:${runId}` sends chunk 0 (link_2.pdf + link_4.pdf), then crashes on chunk 1
+    // Attempt 1: first send of `deliverables-links:${runId}` persists per-item states
+    // (`queued` -> `dispatching` -> `linked` on chunk 0, `failed` on chunk 1).
     await svc.executeDelivery(baseOpts);
     const linksRow = deliveriesState.get(`deliverables-links:${runId}`)!;
     linksRow.status = "unknown";
+    linksRow.error_code = "gateway_restarted";
+    // Verify WAL persisted pre-send `dispatching` + `queued` entries on first send
+    expect(
+      progressHistory.some(
+        (p) =>
+          p.key === `deliverables-links:${runId}` &&
+          Array.isArray(p.files_status) &&
+          p.files_status.some((f: { status?: string }) => f.status === "dispatching") &&
+          p.files_status.some((f: { status?: string }) => f.status === "queued"),
+      ),
+    ).toBe(true);
     expect(linksRow.sent_chunks).toBe(1);
     expect(
       linksRow.files_status.filter((f) => f.status === "linked").map((f) => `${f.workspace_id}::${f.path}`),
     ).toEqual(["ws-a::results/link_2.pdf", "ws-b::results/link_4.pdf"]);
 
-    // Attempt 2: restart recovery crashes on ws-b::results/doc.pdf AFTER ws-a::results/doc.pdf succeeds
-    crashLinksChunk1 = false;
-    crashSecondItem = true;
+    // Attempt 2: restart recovery succeeds for ws-a::results/doc.pdf, while ws-b::results/doc.pdf
+    // crashes after claim BEFORE sending and is swept to `unknown` + `gateway_restarted` (0 chunks, empty files_status).
+    failChunk1Definite = false;
+    simulateSubkeyCrashBeforeSend = true;
     sentChunkTexts.length = 0;
     const partialRes = await svc.executeDelivery(baseOpts);
-    expect(partialRes.status).toBe("failed");
+    expect(partialRes.status).toBe("unknown");
     expect(sentChunkTexts.join("\n")).not.toContain("link_2.pdf");
     expect(sentChunkTexts.join("\n")).not.toContain("link_4.pdf");
     expect(sentChunkTexts).toHaveLength(1);
     expect(sentChunkTexts[0]).toContain("doc.pdf");
+    // Simulate startup sweep on ws-b item key leaving it in `unknown` / `gateway_restarted` with 0 sent chunks and empty files_status (provably unsent)
+    const wsBItemEntry = Array.from(deliveriesState.entries()).find(
+      ([k, v]) => k.startsWith(`deliverables-links:${runId}:item:`) && v.status === "unknown",
+    );
+    expect(wsBItemEntry).toBeDefined();
+    wsBItemEntry![1].status = "unknown";
+    wsBItemEntry![1].error_code = "gateway_restarted";
+    wsBItemEntry![1].sent_chunks = 0;
+    wsBItemEntry![1].platform_message_ids = [];
+    wsBItemEntry![1].files_status = [];
 
-    // Attempt 3: next restart sends ONLY ws-b::results/doc.pdf (same path, different workspace!) and does not duplicate ws-a::results/doc.pdf
-    crashSecondItem = false;
+    // Attempt 3: next restart re-claims the provably-unsent `gateway_restarted` ws-b subkey,
+    // sends ONLY ws-b::results/doc.pdf, and settles parent `deliverables-links:${runId}` to `sent` via I-7!
+    simulateSubkeyCrashBeforeSend = false;
     sentChunkTexts.length = 0;
     const finalRes = await svc.executeDelivery(baseOpts);
     expect(finalRes.status).toBe("sent");
@@ -1757,11 +1847,359 @@ describe("Channel Phase 2 Batch 1 — Group Deep Links & DM Deliverables", () =>
     expect(sentChunkTexts[0]).toContain("ws-b");
     expect(sentChunkTexts[0]).toContain("doc.pdf");
     expect(feishu.sentFiles).toHaveLength(0);
+    // Parent key MUST now be settled to `sent` via I-7 so next restart never re-enters subkey recovery!
+    expect(deliveriesState.get(`deliverables-links:${runId}`)?.status).toBe("sent");
 
-    // Attempt 4: subsequent replay is completely idempotent (sends zero additional messages)
+    // Attempt 4: subsequent replay hits parent `already_completed` immediately (zero subkey claims, zero messages)
     sentChunkTexts.length = 0;
+    const claimCallsBefore = (backend.authorizeAndClaimDelivery as ReturnType<typeof vi.fn>).mock.calls.length;
     const idempotentRes = await svc.executeDelivery(baseOpts);
     expect(idempotentRes.status).toBe("sent");
+    expect(idempotentRes.duplicate).toBe(true);
     expect(sentChunkTexts).toHaveLength(0);
+    const newClaimKeys = (backend.authorizeAndClaimDelivery as ReturnType<typeof vi.fn>).mock.calls
+      .slice(claimCallsBefore)
+      .map((c) => (c[0] as { delivery_key: string }).delivery_key);
+    expect(newClaimKeys).toEqual([`deliverables:${runId}`, `deliverables-links:${runId}`]);
+  });
+
+  it("BT2: reconciles unknown/gateway_restarted/in_flight subkeys and parent dispatching crashes via platform receipts without duplicate sends", async () => {
+    const runId = "run-bt2-reconcile";
+    const files = [
+      { path: "results/a.pdf", workspace_id: "ws-a" },
+      { path: "results/b.pdf", workspace_id: "ws-a" },
+      { path: "results/c.pdf", workspace_id: "ws-b" },
+    ];
+
+    // Scenario A: Parent `deliverables-links:${runId}` crashed AFTER platform accepted chunk 0 (`a.pdf`, `b.pdf`)
+    // and BEFORE chunk 0 I-7 recorded `linked` -> DB has `status: "unknown"`, `files_status: [a: dispatching, b: dispatching, c: queued]`.
+    // Recovery MUST reconcile the `dispatching` chunk via `reconcileDeliveryReceipt` (platform confirms receipt -> adopt `linked`,
+    // ZERO duplicate send under new `:item:` keys!), and only send `c.pdf` (which was `queued`).
+    const sentTextsA: string[] = [];
+    const reconcileSpyA = vi.fn(async () => ({
+      status: "confirmed" as const,
+      messageId: "om_confirmed_chunk0",
+    }));
+    const feishuA = makeStubAdapter("feishu", {
+      sendTextChunk: vi.fn(async (opts: SendTextChunkOptions) => {
+        sentTextsA.push(opts.text);
+        return { messageId: `om_send_${sentTextsA.length}`, resolvedAddress: opts.targetAddress };
+      }),
+      reconcileDeliveryReceipt: reconcileSpyA,
+    });
+
+    const dbA = new Map<
+      string,
+      {
+        status: string;
+        error_code: string | null;
+        sent_chunks: number;
+        delivery_attempt: number;
+        platform_message_ids: string[];
+        files_status: Array<{
+          path: string;
+          workspace_id?: string | null;
+          status: string;
+          reason: string | null;
+          idempotency_key?: string | null;
+          platform_message_id?: string | null;
+        }>;
+      }
+    >();
+    dbA.set(`deliverables:${runId}`, {
+      status: "unknown",
+      error_code: "gateway_restarted",
+      sent_chunks: 0,
+      delivery_attempt: 1,
+      platform_message_ids: [],
+      files_status: [],
+    });
+    dbA.set(`deliverables-links:${runId}`, {
+      status: "unknown",
+      error_code: "gateway_restarted",
+      sent_chunks: 0,
+      delivery_attempt: 1,
+      platform_message_ids: [],
+      files_status: [
+        {
+          path: "results/a.pdf",
+          workspace_id: "ws-a",
+          status: "dispatching",
+          reason: null,
+          idempotency_key: `deliverables-links:${runId}:chunk:0:abcd`,
+        },
+        {
+          path: "results/b.pdf",
+          workspace_id: "ws-a",
+          status: "dispatching",
+          reason: null,
+          idempotency_key: `deliverables-links:${runId}:chunk:0:abcd`,
+        },
+        {
+          path: "results/c.pdf",
+          workspace_id: "ws-b",
+          status: "queued",
+          reason: null,
+          idempotency_key: `deliverables-links:${runId}:chunk:1:ef01`,
+        },
+      ],
+    });
+
+    const makeStatefulBackend = (db: typeof dbA) =>
+      makeMockBackend({
+        authorizeAndClaimDelivery: vi.fn(async (req) => {
+          const existing = db.get(req.delivery_key);
+          if (existing && existing.status === "sent") {
+            return {
+              claim_status: "already_completed" as const,
+              status: "sent" as const,
+              platform: "feishu",
+              target_address: "feishu:@me",
+              is_current: true,
+              delivery_attempt: existing.delivery_attempt,
+              first_response_json: {
+                status: "sent",
+                code: null,
+                address: "feishu:@me",
+                current: true,
+                duplicate: true,
+                message: "already sent",
+                files: existing.files_status,
+              },
+            };
+          }
+          const isItemKey =
+            req.delivery_key.startsWith("deliverables-links:") &&
+            req.delivery_key.includes(":item:");
+          const noConfirmed =
+            existing &&
+            existing.sent_chunks === 0 &&
+            existing.platform_message_ids.length === 0 &&
+            existing.files_status.every(
+              (f) => f.status !== "sent" && f.status !== "linked" && !f.platform_message_id,
+            );
+          const allowReclaim =
+            Boolean(isItemKey) &&
+            existing?.status === "unknown" &&
+            Boolean(req.reclaim_verified_unsent) &&
+            Boolean(noConfirmed);
+          if (
+            existing &&
+            (existing.status === "unknown" || existing.status === "in_flight") &&
+            !allowReclaim
+          ) {
+            return {
+              claim_status: "in_flight_or_unknown" as const,
+              existing_status: existing.status,
+              error_code: existing.error_code,
+              sent_chunks: existing.sent_chunks,
+              platform_message_ids: [...existing.platform_message_ids],
+              platform: "feishu",
+              target_address: "feishu:@me",
+              recipient_id: "ou_alice",
+              dm_recipient_platform_user_id: "ou_alice",
+              is_current: true,
+              delivery_attempt: existing.delivery_attempt,
+              files_status: existing.files_status,
+            };
+          }
+          const nextAttempt = existing ? existing.delivery_attempt + 1 : 1;
+          db.set(req.delivery_key, {
+            status: "in_flight",
+            error_code: null,
+            sent_chunks: 0,
+            delivery_attempt: nextAttempt,
+            platform_message_ids: [],
+            files_status: [],
+          });
+          return {
+            claim_status: "claimed" as const,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            recipient_id: "ou_alice",
+            dm_recipient_platform_user_id: "ou_alice",
+            is_current: true,
+            delivery_attempt: nextAttempt,
+            workspace_id: "ws-a",
+            home_workspace_id: "ws-home",
+            prior_run_files: [],
+          };
+        }),
+        updateDeliveryProgress: vi.fn(async (req: I7DeliveriesProgressRequest) => {
+          const row = db.get(req.delivery_key);
+          if (row) {
+            if (typeof req.sent_chunks === "number") row.sent_chunks = req.sent_chunks;
+            if (Array.isArray(req.platform_message_ids)) row.platform_message_ids = [...req.platform_message_ids];
+            if (Array.isArray(req.files_status)) row.files_status = [...req.files_status];
+            if (typeof req.status === "string") row.status = req.status;
+          }
+          return { ok: true, delivery_key: req.delivery_key, status: req.status ?? "in_flight", sent_to_current_count: 1 };
+        }),
+      });
+
+    const svcA = new DeliveryService({
+      backend: makeStatefulBackend(dbA),
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuA]]),
+      webBaseUrl: WEB_BASE,
+    });
+    const resA = await svcA.executeDelivery({
+      deliveryKey: `deliverables:${runId}`,
+      kind: "fallback",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      workspaceId: "ws-a",
+      runId,
+      platform: "feishu",
+      target: "feishu:@me",
+      text: "",
+      files,
+      downloadMode: "deliverable",
+      activityOrigin: "replay",
+    });
+    expect(resA.status).toBe("sent");
+    // Shared chunk idempotency key reconciled ONCE for both a.pdf & b.pdf; ZERO duplicate send!
+    expect(reconcileSpyA).toHaveBeenCalledTimes(1);
+    expect(sentTextsA).toHaveLength(1);
+    expect(sentTextsA[0]).toContain("c.pdf");
+    expect(sentTextsA[0]).not.toContain("a.pdf");
+    expect(sentTextsA[0]).not.toContain("b.pdf");
+    expect(dbA.get(`deliverables-links:${runId}`)?.status).toBe("sent");
+
+    // Scenario B: Subkey `:item:` rows in DB (real-DB behavior: `unknown` does NOT auto-reclaim when uncertain!):
+    // - item 1 (`a.pdf`): `unknown` + `gateway_restarted` with `files_status: [{ status: "linked" }]` -> adopts & settles via I-7 (no send)
+    // - item 2 (`b.pdf`): `unknown` + `gateway_restarted` with `files_status: [{ status: "dispatching" }]` -> platform proves `not_sent` -> re-claims with `reclaim_verified_unsent: true` & sends!
+    // - item 3 (`c.pdf`): `unknown` + `files_status: [{ status: "unknown" }]` -> platform returns `unknown` -> stays `unknown`, parent NOT settled to `sent`!
+    const runIdB = "run-bt2-subkeys-realdb";
+    const { createHash } = await import("node:crypto");
+    const itemKeyFor = (ws: string, path: string) =>
+      `deliverables-links:${runIdB}:item:${createHash("sha256").update(`${ws}\0${path}`).digest("hex").slice(0, 24)}`;
+    const kA = itemKeyFor("ws-a", "results/a.pdf");
+    const kB = itemKeyFor("ws-a", "results/b.pdf");
+    const kC = itemKeyFor("ws-b", "results/c.pdf");
+
+    const dbB = new Map<string, typeof dbA extends Map<string, infer V> ? V : never>();
+    dbB.set(`deliverables:${runIdB}`, {
+      status: "unknown",
+      error_code: "gateway_restarted",
+      sent_chunks: 0,
+      delivery_attempt: 1,
+      platform_message_ids: [],
+      files_status: [],
+    });
+    dbB.set(`deliverables-links:${runIdB}`, {
+      status: "unknown",
+      error_code: "gateway_restarted",
+      sent_chunks: 0,
+      delivery_attempt: 1,
+      platform_message_ids: [],
+      files_status: [
+        { path: "results/a.pdf", workspace_id: "ws-a", status: "queued", reason: null },
+        { path: "results/b.pdf", workspace_id: "ws-a", status: "queued", reason: null },
+        { path: "results/c.pdf", workspace_id: "ws-b", status: "queued", reason: null },
+      ],
+    });
+    dbB.set(kA, {
+      status: "unknown",
+      error_code: "gateway_restarted",
+      sent_chunks: 1,
+      delivery_attempt: 1,
+      platform_message_ids: ["om_a_prev"],
+      files_status: [
+        { path: "results/a.pdf", workspace_id: "ws-a", status: "linked", reason: null, platform_message_id: "om_a_prev" },
+      ],
+    });
+    dbB.set(kB, {
+      status: "unknown",
+      error_code: "gateway_restarted",
+      sent_chunks: 0,
+      delivery_attempt: 1,
+      platform_message_ids: [],
+      files_status: [
+        { path: "results/b.pdf", workspace_id: "ws-a", status: "dispatching", reason: null, idempotency_key: kB },
+      ],
+    });
+    dbB.set(kC, {
+      status: "unknown",
+      error_code: "unavailable",
+      sent_chunks: 0,
+      delivery_attempt: 1,
+      platform_message_ids: [],
+      files_status: [
+        { path: "results/c.pdf", workspace_id: "ws-b", status: "unknown", reason: "timeout", idempotency_key: kC },
+      ],
+    });
+
+    const sentTextsB: string[] = [];
+    let cReceiptStatus: "unknown" | "confirmed" = "unknown";
+    const feishuB = makeStubAdapter("feishu", {
+      sendTextChunk: vi.fn(async (opts: SendTextChunkOptions) => {
+        sentTextsB.push(opts.text);
+        return { messageId: `om_b_${sentTextsB.length}`, resolvedAddress: opts.targetAddress };
+      }),
+      reconcileDeliveryReceipt: vi.fn(async (opts) => {
+        if (opts.deliveryKey === kB) {
+          return { status: "not_sent" as const };
+        }
+        if (opts.deliveryKey === kC) {
+          return cReceiptStatus === "confirmed"
+            ? { status: "confirmed" as const, messageId: "om_c_confirmed" }
+            : { status: "unknown" as const };
+        }
+        return { status: "unknown" as const };
+      }),
+    });
+
+    const backendB = makeStatefulBackend(dbB);
+    const svcB = new DeliveryService({
+      backend: backendB,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuB]]),
+      webBaseUrl: WEB_BASE,
+    });
+
+    // Pass 1: a.pdf adopted & settled (`sent`), b.pdf verified not_sent -> reclaimed & sent, c.pdf stays unknown -> parent stays unknown!
+    const resB1 = await svcB.executeDelivery({
+      deliveryKey: `deliverables:${runIdB}`,
+      kind: "fallback",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      workspaceId: "ws-a",
+      runId: runIdB,
+      platform: "feishu",
+      target: "feishu:@me",
+      text: "",
+      files,
+      downloadMode: "deliverable",
+      activityOrigin: "replay",
+    });
+    expect(resB1.status).toBe("unknown");
+    expect(sentTextsB).toHaveLength(1);
+    expect(sentTextsB[0]).toContain("b.pdf");
+    expect(dbB.get(kA)?.status).toBe("sent");
+    expect(dbB.get(kB)?.status).toBe("sent");
+    expect(dbB.get(kB)?.delivery_attempt).toBe(2);
+    expect(dbB.get(kC)?.status).toBe("unknown");
+    expect(dbB.get(`deliverables-links:${runIdB}`)?.status).toBe("unknown");
+
+    // Pass 2: once c.pdf's receipt is confirmed by platform -> adopted without re-sending, c.pdf + parent BOTH settle to `sent`!
+    cReceiptStatus = "confirmed";
+    sentTextsB.length = 0;
+    const resB2 = await svcB.executeDelivery({
+      deliveryKey: `deliverables:${runIdB}`,
+      kind: "fallback",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      workspaceId: "ws-a",
+      runId: runIdB,
+      platform: "feishu",
+      target: "feishu:@me",
+      text: "",
+      files,
+      downloadMode: "deliverable",
+      activityOrigin: "replay",
+    });
+    expect(resB2.status).toBe("sent");
+    expect(sentTextsB).toHaveLength(0);
+    expect(dbB.get(kC)?.status).toBe("sent");
+    expect(dbB.get(`deliverables-links:${runIdB}`)?.status).toBe("sent");
   });
 });

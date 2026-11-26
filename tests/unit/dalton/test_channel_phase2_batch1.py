@@ -3085,3 +3085,182 @@ async def test_bt1_feishu_pending_topics_initiator_first_cap_warning_and_paginat
     assert res_overflow.get("pending_candidates_truncated") is True
     assert res_overflow.get("pending_candidates_has_more") is True
     assert any("pending" in rec.message.lower() and "oc_grp_overflow" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_bt2_deliverables_links_unknown_subkey_reclaim_guards_and_parent_i7_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BT2:
+    1. `deliverables-links:<runId>:item:<digest>` in `unknown` / `gateway_restarted` with
+       uncertain `files_status` (`dispatching` / `unknown`) MUST NOT `ON CONFLICT` reclaim
+       in I-6; it returns `in_flight_or_unknown` with `files_status` and `platform_message_ids`.
+    2. A provably-unsent `unknown` / `gateway_restarted` `:item:` row (0 chunks, 0 receipts,
+       empty or `queued`/`failed` `files_status`) or one reclaimed with `reclaim_verified_unsent=True`
+       (and zero confirmed receipts) IS reclaimed via `ON CONFLICT` incrementing `delivery_attempt`.
+    3. A confirmed `:item:` row (`linked` or `platform_message_ids`) is NEVER reclaimed even when
+       `reclaim_verified_unsent=True`.
+    4. I-7 `update_delivery_progress` allows attempt-fenced `unknown -> sent` settlement for
+       `deliverables-links:` keys (clearing `error_code`), while rejecting stale attempts and
+       non-`deliverables-links:` `unknown -> sent` with 409.
+    """
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(
+        cg_db,
+        "require_channel_platform_capability",
+        create_autospec(cg_db.require_channel_platform_capability, return_value=None),
+    )
+
+    # Pure transition-validator assertions (covers Discord + Feishu + stale attempt + non-link keys)
+    assert (
+        cg_db._validate_delivery_status_transition(
+            prev_status="unknown",
+            status="sent",
+            outcome=None,
+            platform="discord",
+            kind="fallback",
+            error_code="gateway_restarted",
+            discord_body_phase=None,
+            current_attempt=1,
+            requested_attempt=1,
+            delivery_key="deliverables-links:run-bt2-val",
+        )
+        == "sent"
+    )
+    with pytest.raises(HTTPException) as exc_stale:
+        cg_db._validate_delivery_status_transition(
+            prev_status="unknown",
+            status="sent",
+            outcome=None,
+            platform="feishu",
+            kind="fallback",
+            error_code="gateway_restarted",
+            discord_body_phase=None,
+            current_attempt=2,
+            requested_attempt=1,
+            delivery_key="deliverables-links:run-bt2-val",
+        )
+    assert exc_stale.value.status_code == 409
+
+    with pytest.raises(HTTPException) as exc_non_links:
+        cg_db._validate_delivery_status_transition(
+            prev_status="unknown",
+            status="sent",
+            outcome=None,
+            platform="feishu",
+            kind="fallback",
+            error_code="gateway_restarted",
+            discord_body_phase=None,
+            current_attempt=1,
+            requested_attempt=1,
+            delivery_key="fallback:run-bt2-val",
+        )
+    assert exc_non_links.value.status_code == 409
+
+    # Exercise `authorize_and_claim_delivery` against `_LockOrderTrackingCursor`
+    cur = _LockOrderTrackingCursor()
+    conn = _FakeConn(cur)
+    run_id = "run-bt2-py"
+    tid = "77777777-7777-4777-8777-777777777777"
+    base_row = {
+        "kind": "fallback",
+        "user_id": "user-alice",
+        "thread_id": tid,
+        "run_id": run_id,
+        "is_current": True,
+        "has_non_empty_text": False,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "unknown",
+        "sent_chunks": 0,
+        "total_chunks": 1,
+        "platform_message_ids": [],
+        "source_scope_key": "dm:ou_alice",
+        "source_generation": 2,
+        "activity_origin": "conversation",
+        "delivery_attempt": 1,
+        "error_code": "gateway_restarted",
+    }
+
+    # Case 1: `unknown` + `gateway_restarted` with `dispatching` in files_status -> MUST NOT reclaim
+    k_disp = f"deliverables-links:{run_id}:item:dispatching01"
+    cur.deliveries[k_disp] = {
+        **base_row,
+        "delivery_key": k_disp,
+        "files_status": [
+            {"workspace_id": "ws-a", "path": "results/a.pdf", "status": "dispatching"}
+        ],
+    }
+    res_disp = await cg_db.authorize_and_claim_delivery(
+        delivery_key=k_disp,
+        kind="fallback",
+        user_id="user-alice",
+        thread_id=tid,
+        run_id=run_id,
+        platform="feishu",
+        target="feishu:@me",
+        has_non_empty_text=False,
+        total_chunks=1,
+        source_scope_key="dm:ou_alice",
+        source_generation=2,
+        activity_origin="replay",
+        conn=conn,
+    )
+    assert res_disp["claim_status"] == "in_flight_or_unknown"
+    assert res_disp["existing_status"] == "unknown"
+    assert res_disp["error_code"] == "gateway_restarted"
+    assert res_disp["platform_message_ids"] == []
+    assert res_disp["files_status"][0]["status"] == "dispatching"
+
+    # Case 2: Confirmed `:item:` (`linked` + `platform_message_ids`) MUST NOT reclaim even with `reclaim_verified_unsent=True`
+    k_linked = f"deliverables-links:{run_id}:item:linked02"
+    cur.deliveries[k_linked] = {
+        **base_row,
+        "delivery_key": k_linked,
+        "sent_chunks": 1,
+        "platform_message_ids": ["om_confirmed_02"],
+        "files_status": [
+            {
+                "workspace_id": "ws-a",
+                "path": "results/b.pdf",
+                "status": "linked",
+                "platform_message_id": "om_confirmed_02",
+            }
+        ],
+    }
+    res_linked = await cg_db.authorize_and_claim_delivery(
+        delivery_key=k_linked,
+        kind="fallback",
+        user_id="user-alice",
+        thread_id=tid,
+        run_id=run_id,
+        platform="feishu",
+        target="feishu:@me",
+        has_non_empty_text=False,
+        total_chunks=1,
+        source_scope_key="dm:ou_alice",
+        source_generation=2,
+        activity_origin="replay",
+        reclaim_verified_unsent=True,
+        conn=conn,
+    )
+    assert res_linked["claim_status"] == "in_flight_or_unknown"
+    assert res_linked["platform_message_ids"] == ["om_confirmed_02"]
+    assert res_linked["files_status"][0]["status"] == "linked"
+
+    # Case 3: Provably-unsent `gateway_restarted` `:item:` (`files_status: []`, 0 chunks, 0 receipts)
+    # and `reclaim_verified_unsent=True` on uncertain-but-unconfirmed `:item:` both pass the guard.
+    assert cg_db._is_provably_unsent_deliverable_link_item(
+        {"sent_chunks": 0, "platform_message_ids": [], "files_status": []}
+    ) is True
+    assert cg_db._is_provably_unsent_deliverable_link_item(
+        {
+            "sent_chunks": 0,
+            "platform_message_ids": [],
+            "files_status": [{"status": "queued"}],
+        }
+    ) is True
+    assert cg_db._is_provably_unsent_deliverable_link_item(cur.deliveries[k_disp]) is False
+    assert cg_db._has_no_confirmed_deliverable_link_receipt(cur.deliveries[k_disp]) is True
+    assert cg_db._has_no_confirmed_deliverable_link_receipt(cur.deliveries[k_linked]) is False

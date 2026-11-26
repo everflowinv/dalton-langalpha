@@ -1150,6 +1150,7 @@ export class FeishuChannelAdapter implements ChannelAdapter {
           fallbackReplyToMessageIds: options.fallbackReplyToMessageIds,
           replyInThread: options.replyInThread,
           allowDirectFallback: options.allowDirectFallback,
+          idempotencyKey: options.idempotencyKey,
         })
       : await sendMessageFeishu(client, {
           to: target,
@@ -1158,6 +1159,7 @@ export class FeishuChannelAdapter implements ChannelAdapter {
           fallbackReplyToMessageIds: options.fallbackReplyToMessageIds,
           replyInThread: options.replyInThread,
           allowDirectFallback: options.allowDirectFallback,
+          idempotencyKey: options.idempotencyKey,
         });
 
     let externalTopicId: string | null =

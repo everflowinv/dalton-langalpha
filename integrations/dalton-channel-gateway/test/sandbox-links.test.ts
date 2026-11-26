@@ -606,4 +606,56 @@ describe("channel chunkers preserve rewritten Markdown links and underscores", (
     ].join("\n");
     expect(rewriteSandboxLinks(fencedDef, WEB_BASE, THREAD_ID)).toBe(fencedDef);
   });
+
+  it("BT3: stray backtick before a fenced code block does not pair into the fence and three chained multiline backtick spans all stay protected", () => {
+    // 1) Stray single backtick before a fenced code block containing a backtick inside:
+    //    must NOT pair into the fence or suppress rewriting the normal link after the fence.
+    const strayBeforeFence = [
+      "这里有一个孤立反引号 ` 在围栏前面。",
+      "",
+      "```bash",
+      "echo `date` /home/workspace/inside_fence.md",
+      "```",
+      "",
+      "围栏后的普通链接：[报告](/home/workspace/results/after_fence.md)",
+    ].join("\n");
+    const strayBeforeFenceExpected = [
+      "这里有一个孤立反引号 ` 在围栏前面。",
+      "",
+      "```bash",
+      "echo `date` /home/workspace/inside_fence.md",
+      "```",
+      "",
+      `围栏后的普通链接：[报告](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Fafter_fence.md)`,
+    ].join("\n");
+    expect(rewriteSandboxLinks(strayBeforeFence, WEB_BASE, THREAD_ID)).toBe(
+      strayBeforeFenceExpected,
+    );
+
+    // 2) Three chained consecutive multiline backtick spans: the 3rd span's reference definition
+    //    MUST stay verbatim while links outside all three spans are still rewritten.
+    const threeChainedSpans = [
+      "`span 1 line 1",
+      "span 1 line 2` `span 2 line 1",
+      "span 2 line 2` `span 3 line 1",
+      "",
+      "[r3]: /home/workspace/inside_third_span.md",
+      "span 3 line 2`",
+      "",
+      "正文提到 [r3]，以及外部链接 [外部](/home/workspace/results/outside.md)。",
+    ].join("\n");
+    const threeChainedExpected = [
+      "`span 1 line 1",
+      "span 1 line 2` `span 2 line 1",
+      "span 2 line 2` `span 3 line 1",
+      "",
+      "[r3]: /home/workspace/inside_third_span.md",
+      "span 3 line 2`",
+      "",
+      `正文提到 [r3]，以及外部链接 [外部](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Foutside.md)。`,
+    ].join("\n");
+    expect(rewriteSandboxLinks(threeChainedSpans, WEB_BASE, THREAD_ID)).toBe(
+      threeChainedExpected,
+    );
+  });
 });

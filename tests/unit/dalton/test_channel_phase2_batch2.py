@@ -2300,11 +2300,27 @@ def test_bw2_internal_thread_run_replay_endpoint_ownership_and_direct_run_lookup
         CapabilityId,
     )
     from src.server.database.conversation import replay_rows as replay_rows_mod
+    from src.server.services import account as account_mod
+    from src.server.services import membership as membership_mod
+    from src.server.services.account_contract import Account, Org
     from src.server.services.history import replay as replay_mod
     from src.server.services.history.replay.lines import Line
+    from src.server.utils import api as api_mod
 
     _enable_channels_env(monkeypatch)
     monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "test-bw2-service-token-32bytes!!")
+    monkeypatch.setattr(api_mod, "_SERVICE_TOKEN", "test-bw2-service-token-32bytes!!")
+    monkeypatch.setattr(membership_mod, "teams_door_open", lambda: False)
+
+    platforms_mock = create_autospec(
+        cr_mod.resolve_authorized_automation_run_platforms,
+        return_value=["feishu"],
+    )
+    monkeypatch.setattr(
+        cr_mod,
+        "resolve_authorized_automation_run_platforms",
+        platforms_mock,
+    )
 
     # 1) Route must be registered under CHANNEL_GATEWAY capability
     assert (
@@ -2389,11 +2405,10 @@ def test_bw2_internal_thread_run_replay_endpoint_ownership_and_direct_run_lookup
             "checkpoint",
         )
 
-    monkeypatch.setattr(
-        replay_mod,
-        "read_replay_page",
-        create_autospec(replay_mod.read_replay_page, side_effect=_fake_read_replay_page),
+    read_replay_mock = create_autospec(
+        replay_mod.read_replay_page, side_effect=_fake_read_replay_page
     )
+    monkeypatch.setattr(replay_mod, "read_replay_page", read_replay_mock)
     monkeypatch.setattr(
         replay_mod,
         "finish_lines",
@@ -2486,3 +2501,107 @@ def test_bw2_internal_thread_run_replay_endpoint_ownership_and_direct_run_lookup
         },
     )
     assert r_shared_deny.status_code == 403
+
+    # 6) Suspended account MUST be refused with 403 via ServiceUserId -> admit_caller
+    suspended_account = Account(
+        org=Org("org-1", "Acme", suspended=True),
+        features={"teams": True},
+    )
+    monkeypatch.setattr(membership_mod, "teams_door_open", lambda: True)
+    monkeypatch.setattr(
+        account_mod,
+        "read_standing",
+        create_autospec(
+            account_mod.read_standing,
+            return_value=account_mod.Standing(suspended_account, suspended_account),
+        ),
+    )
+    r_suspended = client.get(
+        f"/api/v1/dalton/channels/internal/threads/{THREAD_ID}/runs/{deep_run_id}/replay",
+        headers=svc_headers,
+    )
+    assert r_suspended.status_code == 403
+    monkeypatch.setattr(membership_mod, "teams_door_open", lambda: False)
+
+    # 7) Platform sub-capability disabled (CHANNEL_FEISHU off while CHANNEL_GATEWAY stays on) -> 403
+    multiuser_mock.return_value = False
+    monkeypatch.setenv("DALTON_CAP_CHANNEL_FEISHU", "false")
+    r_plat_off = client.get(
+        f"/api/v1/dalton/channels/internal/threads/{THREAD_ID}/runs/{deep_run_id}/replay",
+        headers=svc_headers,
+    )
+    assert r_plat_off.status_code == 403
+    monkeypatch.setenv("DALTON_CAP_CHANNEL_FEISHU", "true")
+
+    # 8) No authorized automation target for this run -> 403
+    platforms_mock.return_value = []
+    r_no_target = client.get(
+        f"/api/v1/dalton/channels/internal/threads/{THREAD_ID}/runs/{deep_run_id}/replay",
+        headers=svc_headers,
+    )
+    assert r_no_target.status_code == 403
+    platforms_mock.return_value = ["feishu"]
+
+    # 9) When read_replay_page returns a page whose events do NOT carry target run_id,
+    #    replay_done MUST NOT stamp `run_id: deep_run_id`.
+    async def _fake_wrong_page(rows: Any, **kwargs: Any):
+        return (
+            SimpleNamespace(
+                lines=[
+                    Line(
+                        event="user_message",
+                        data_json=json.dumps({"turn_index": 2, "run_id": "run-wrong-turn"}),
+                        flags=0,
+                    ),
+                ],
+                first_turn_index=2,
+                has_more=False,
+            ),
+            "checkpoint",
+        )
+
+    read_replay_mock.side_effect = _fake_wrong_page
+    r_wrong = client.get(
+        f"/api/v1/dalton/channels/internal/threads/{THREAD_ID}/runs/{deep_run_id}/replay",
+        headers=svc_headers,
+    )
+    assert r_wrong.status_code == 200
+    assert f'"run_id": "{deep_run_id}"' not in r_wrong.text
+
+
+@pytest.mark.asyncio
+async def test_bw2_resolve_authorized_automation_run_platforms() -> None:
+    """BW2: `resolve_authorized_automation_run_platforms` extracts only `ok=True` target platforms."""
+    from contextlib import asynccontextmanager
+
+    import psycopg
+
+    from src.dalton.database import channel_gateway as cg_db
+
+    fake_cur = create_autospec(psycopg.AsyncCursor, instance=True)
+    fake_cur.fetchall.return_value = [
+        {
+            "targets": [
+                {"entry": "feishu:@me", "address": "feishu:@me", "ok": True},
+                {"entry": "discord:123", "address": "discord:123", "ok": False},
+                {"entry": "wechat:@me", "address": "wechat:@me", "ok": True},
+                {"entry": "feishu:oc_grp", "address": "feishu:oc_grp", "ok": True},
+            ]
+        }
+    ]
+    fake_conn = create_autospec(psycopg.AsyncConnection, instance=True)
+
+    @asynccontextmanager
+    async def _cur_ctx(*args: Any, **kwargs: Any):
+        yield fake_cur
+
+    fake_conn.cursor.side_effect = _cur_ctx
+
+    platforms = await cg_db.resolve_authorized_automation_run_platforms(
+        thread_id=THREAD_ID,
+        run_id="run-auto-1",
+        user_id=USER_ID,
+        execution_id="22222222-2222-4222-8222-222222222222",
+        conn=fake_conn,
+    )
+    assert platforms == ["feishu", "weixin"]

@@ -730,7 +730,11 @@ export class AgentRoutesHandler {
     body: AgentAutomationRunFinishRequest,
   ): Promise<{
     status: number;
-    data: { targets?: AgentAutomationRunFinishTargetRow[]; detail?: string };
+    data: {
+      targets?: AgentAutomationRunFinishTargetRow[];
+      detail?: string;
+      retryable?: boolean;
+    };
   }> {
     // Shape B check: if another caller in this gateway process is already finishing `executionId`
     if (this.activeFinishExecutors.has(executionId)) {
@@ -819,7 +823,7 @@ export class AgentRoutesHandler {
     }
 
     // Shape A: execute finish deliveries and finalize in DB
-    const finalRows = await this.executeAutomationRunFinish({
+    const detailed = await this.executeAutomationRunFinishDetailed({
       executionId,
       userId: claimed.data.user_id || userId,
       threadId: claimed.data.thread_id ?? body.thread_id ?? null,
@@ -835,7 +839,19 @@ export class AgentRoutesHandler {
       targets: claimed.data.targets ?? [],
     });
 
-    return { status: 200, data: { targets: finalRows } };
+    if (detailed.replayPending) {
+      return {
+        status: 503,
+        data: {
+          detail:
+            "Target run replay could not be completed yet; retry finish to settle charts and widgets.",
+          retryable: true,
+          targets: detailed.targets,
+        },
+      };
+    }
+
+    return { status: 200, data: { targets: detailed.targets } };
   }
 
   /**
@@ -854,6 +870,27 @@ export class AgentRoutesHandler {
     finalText: string | null;
     targets: AutomationRunTargetRecord[];
   }): Promise<AgentAutomationRunFinishTargetRow[]> {
+    const detailed = await this.executeAutomationRunFinishDetailed(params);
+    return detailed.targets;
+  }
+
+  private async executeAutomationRunFinishDetailed(params: {
+    executionId: string;
+    userId: string;
+    threadId: string | null;
+    runId?: string | null;
+    initialSnapshots?: ChartSnapshotItem[];
+    outboundBlocked?: boolean;
+    automationName: string;
+    finishStatus: AgentAutomationRunFinishRequest["status"];
+    finalText: string | null;
+    targets: AutomationRunTargetRecord[];
+  }): Promise<{
+    targets: AgentAutomationRunFinishTargetRow[];
+    replayPending: boolean;
+    replayRetryable: boolean;
+    replayHttpStatus: number | null;
+  }> {
     const {
       executionId,
       userId,
@@ -884,6 +921,8 @@ export class AgentRoutesHandler {
         typeof params.outboundBlocked === "boolean" ? params.outboundBlocked : undefined;
 
       let replayTargetMissing = false;
+      let replayRetryable = false;
+      let replayHttpStatus: number | null = null;
       if (
         finishStatus === "completed" &&
         threadId &&
@@ -897,9 +936,12 @@ export class AgentRoutesHandler {
             userId,
             threadId,
             targetRunId: effectiveRunId,
+            executionId,
           });
+          replayHttpStatus = recovered.httpStatus ?? null;
           if (!recovered.found) {
             replayTargetMissing = true;
+            replayRetryable = Boolean(recovered.retryable);
           } else {
             autoCharts = recovered.charts;
             autoWidgets = recovered.widgets;
@@ -914,6 +956,7 @@ export class AgentRoutesHandler {
         } catch {
           // Target run replay could not be read; keep pending recovery state instead of marking finished.
           replayTargetMissing = true;
+          replayRetryable = true;
         }
       }
 
@@ -1084,14 +1127,19 @@ export class AgentRoutesHandler {
         );
       }
 
-      return results.map((r) => ({
-        entry: r.entry,
-        address: r.address,
-        name: r.name,
-        reached: Boolean(r.reached),
-        via: r.via ?? null,
-        error: r.error ?? null,
-      }));
+      return {
+        targets: results.map((r) => ({
+          entry: r.entry,
+          address: r.address,
+          name: r.name,
+          reached: Boolean(r.reached),
+          via: r.via ?? null,
+          error: r.error ?? null,
+        })),
+        replayPending: replayTargetMissing,
+        replayRetryable,
+        replayHttpStatus,
+      };
     } finally {
       this.activeFinishExecutors.delete(executionId);
     }

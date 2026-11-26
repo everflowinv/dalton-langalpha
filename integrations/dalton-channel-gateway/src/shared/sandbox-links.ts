@@ -561,17 +561,38 @@ interface CodeRange {
   end: number;
 }
 
+function mergeSortedCodeRanges(ranges: CodeRange[]): CodeRange[] {
+  if (ranges.length <= 1) return ranges;
+  ranges.sort((a, b) => a.start - b.start || a.end - b.end);
+  const merged: CodeRange[] = [ranges[0]!];
+  for (let idx = 1; idx < ranges.length; idx += 1) {
+    const cur = ranges[idx]!;
+    const prev = merged[merged.length - 1]!;
+    if (cur.start <= prev.end) {
+      if (cur.end > prev.end) {
+        prev.end = cur.end;
+      }
+    } else {
+      merged.push({ start: cur.start, end: cur.end });
+    }
+  }
+  return merged;
+}
+
 /**
- * Scans Markdown code zones BEFORE reference definition / link collection:
- * 1. Fenced code blocks (``` / ~~~, including inside blockquotes and unterminated fences).
- * 2. 4-space / tab indented code blocks (so unmatched backticks inside them cannot pair outward).
- * 3. Inline backtick code spans, including multiline backtick spans across blank lines.
- *
- * Single-line inline code spans that serve purely as a Markdown link label (`[`foo`](dest)`)
- * are left unprotected so the spaced-destination link fallback can still rewrite the outer link.
+ * Scans Markdown code zones BEFORE reference definition / link collection in two passes:
+ * Pass A (block-level code boundaries):
+ *   1. Fenced code blocks (``` / ~~~, including inside blockquotes and unterminated fences).
+ *   2. 4-space / tab indented code blocks, plus Markdown AST `code` nodes (covers lists, etc.).
+ * Pass B (inline & multiline backtick spans strictly OUTSIDE block-level code boundaries):
+ *   - Scans each non-code gap linearly so stray backticks before a fence NEVER pair with
+ *     backticks inside or across a fenced/indented code block, and arbitrary chains of
+ *     consecutive multiline backtick spans are all protected.
+ *   - Single-line inline code spans that serve purely as a Markdown link label (`[`foo`](dest)`)
+ *     are left unprotected so the spaced-destination link fallback can still rewrite the outer link.
  */
-function findProtectedCodeRanges(text: string): CodeRange[] {
-  const ranges: CodeRange[] = [];
+function findProtectedCodeRanges(text: string, tree?: MdastNode): CodeRange[] {
+  const blockRanges: CodeRange[] = [];
   const len = text.length;
   let i = 0;
   let prevLineBlankOrIndentedCode = true;
@@ -629,6 +650,26 @@ function findProtectedCodeRanges(text: string): CodeRange[] {
     return { cols, nextPos: pos };
   };
 
+  // Pass A.1: collect block-level `code` nodes from the Markdown AST (lists, quotes, indented, fenced).
+  if (tree) {
+    const collectAstCode = (node: MdastNode): void => {
+      if (node.type === "code") {
+        const offsets = getNodeOffsets(node);
+        if (offsets) {
+          blockRanges.push({ start: offsets.start, end: offsets.end });
+        }
+        return;
+      }
+      if (Array.isArray(node.children)) {
+        for (const child of node.children) {
+          collectAstCode(child);
+        }
+      }
+    };
+    collectAstCode(tree);
+  }
+
+  // Pass A.2: line-level fenced & indented code block scan (covers unterminated quoted fences).
   while (i < len) {
     const lineStart = i;
     const lineEnd = readLineEnd(lineStart);
@@ -652,7 +693,7 @@ function findProtectedCodeRanges(text: string): CodeRange[] {
 
     // 4-space / tab indented code line after a blank or indented-code line
     if (indentCols >= 4 && prevLineBlankOrIndentedCode) {
-      ranges.push({ start: lineStart, end: lineEnd });
+      blockRanges.push({ start: lineStart, end: lineEnd });
       prevLineBlankOrIndentedCode = true;
       i = skipLineBreak(lineEnd);
       continue;
@@ -713,7 +754,7 @@ function findProtectedCodeRanges(text: string): CodeRange[] {
             }
             scanPos = skipLineBreak(curLineEnd);
           }
-          ranges.push({ start: lineStart, end: blockEnd });
+          blockRanges.push({ start: lineStart, end: blockEnd });
           prevLineBlankOrIndentedCode = false;
           i = scanPos;
           continue;
@@ -721,101 +762,65 @@ function findProtectedCodeRanges(text: string): CodeRange[] {
       }
     }
 
-    // Scan inline content on this line (and allow backtick runs to span multiple lines).
     prevLineBlankOrIndentedCode = false;
-    let pos = nextPos;
-    while (pos < lineEnd) {
+    i = skipLineBreak(lineEnd);
+  }
+
+  const mergedBlocks = mergeSortedCodeRanges(blockRanges);
+  const allRanges: CodeRange[] = mergedBlocks.map((r) => ({ ...r }));
+
+  // Pass B: scan inline & multiline backtick spans strictly within each non-block-code gap.
+  const scanBacktickGap = (segStart: number, segEnd: number): void => {
+    let pos = segStart;
+    while (pos < segEnd) {
       const ch = text[pos]!;
-      if (ch === "\\" && pos + 1 < lineEnd) {
+      if (ch === "\\" && pos + 1 < segEnd && text[pos + 1] !== "\n") {
         pos += 2;
         continue;
       }
       if (ch === "`") {
         let run = 0;
-        while (pos + run < len && text[pos + run] === "`") {
+        while (pos + run < segEnd && text[pos + run] === "`") {
           run += 1;
         }
-        const close = findClosingBacktickRun(text, pos + run, run);
+        const close = findClosingBacktickRun(text, pos + run, run, segEnd);
         if (close !== -1) {
           const spanEnd = close + run;
-          const isSingleLine = spanEnd <= lineEnd;
+          const isSingleLine = !text.slice(pos, spanEnd).includes("\n");
           const isSpacedLinkLabel =
             isSingleLine &&
             pos > 0 &&
             text[pos - 1] === "[" &&
+            spanEnd + 1 < len &&
             text[spanEnd] === "]" &&
             text[spanEnd + 1] === "(";
           if (!isSpacedLinkLabel) {
-            ranges.push({ start: pos, end: spanEnd });
+            allRanges.push({ start: pos, end: spanEnd });
           }
-          if (spanEnd <= lineEnd) {
-            pos = spanEnd;
-            continue;
-          }
-          // Multiline backtick span ended on a later line: resume scanning the remainder of that line.
-          const endLineEnd = readLineEnd(spanEnd);
           pos = spanEnd;
-          if (pos >= endLineEnd) {
-            i = skipLineBreak(endLineEnd);
-          } else {
-            // Continue scanning remaining inline characters on the closing line.
-            let tailPos = pos;
-            while (tailPos < endLineEnd) {
-              const tch = text[tailPos]!;
-              if (tch === "\\" && tailPos + 1 < endLineEnd) {
-                tailPos += 2;
-                continue;
-              }
-              if (tch === "`") {
-                let tailRun = 0;
-                while (tailPos + tailRun < len && text[tailPos + tailRun] === "`") {
-                  tailRun += 1;
-                }
-                const tailClose = findClosingBacktickRun(text, tailPos + tailRun, tailRun);
-                if (tailClose !== -1) {
-                  const tailEnd = tailClose + tailRun;
-                  const tailSingle = tailEnd <= endLineEnd;
-                  const tailSpacedLabel =
-                    tailSingle &&
-                    tailPos > 0 &&
-                    text[tailPos - 1] === "[" &&
-                    text[tailEnd] === "]" &&
-                    text[tailEnd + 1] === "(";
-                  if (!tailSpacedLabel) {
-                    ranges.push({ start: tailPos, end: tailEnd });
-                  }
-                  if (tailEnd <= endLineEnd) {
-                    tailPos = tailEnd;
-                    continue;
-                  }
-                  // Nested multiline span on the same tail line: jump straight to its end line
-                  i = skipLineBreak(readLineEnd(tailEnd));
-                  tailPos = -1;
-                  break;
-                }
-                tailPos += tailRun;
-                continue;
-              }
-              tailPos += 1;
-            }
-            if (tailPos !== -1) {
-              i = skipLineBreak(endLineEnd);
-            }
-          }
-          pos = -1;
-          break;
+          continue;
         }
         pos += run;
         continue;
       }
       pos += 1;
     }
-    if (pos !== -1) {
-      i = skipLineBreak(lineEnd);
+  };
+
+  let gapCursor = 0;
+  for (const blk of mergedBlocks) {
+    if (blk.start > gapCursor) {
+      scanBacktickGap(gapCursor, blk.start);
+    }
+    if (blk.end > gapCursor) {
+      gapCursor = blk.end;
     }
   }
+  if (gapCursor < len) {
+    scanBacktickGap(gapCursor, len);
+  }
 
-  return ranges;
+  return mergeSortedCodeRanges(allRanges);
 }
 
 function startsInsideCodeRange(
@@ -1299,7 +1304,7 @@ export function rewriteSandboxLinks(
   // Pass 0 (BT3): identify all code zones (fenced blocks, indented code, inline and multiline backtick spans)
   // BEFORE collecting reference definitions so `[x]: /home/workspace/...` inside code zones is never parsed
   // as an active definition or rewritten.
-  const protectedCodeRanges = findProtectedCodeRanges(text);
+  const protectedCodeRanges = findProtectedCodeRanges(text, tree);
 
   // Pass 1: collect all reference link definitions and count their references (excluding code zones).
   const definitionsById = new Map<string, DefinitionInfo>();

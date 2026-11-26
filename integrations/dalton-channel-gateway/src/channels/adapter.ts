@@ -84,6 +84,11 @@ export interface SendTextChunkOptions {
    */
   deliveryKey?: string | null;
   /**
+   * Optional per-chunk / per-item idempotency identifier propagated to platforms
+   * that support native send deduplication (e.g. Feishu `im.message.create` `uuid`).
+   */
+  idempotencyKey?: string | null;
+  /**
    * Thread address already stored for this delivery. When set, Discord posts
    * into that thread and does not create another one.
    */
@@ -105,6 +110,24 @@ export interface SendTextChunkOptions {
   /** Optional Discord message components (e.g. ActionRow with Link Button). */
   components?: Array<Record<string, unknown>>;
 }
+
+export interface ReconcileDeliveryReceiptOptions {
+  targetAddress: string;
+  recipientPlatformUserId?: string | null;
+  deliveryKey: string;
+  idempotencyKey?: string | null;
+  deliveryAttempt?: number;
+  threadScopeKey?: string | null;
+  workspaceId?: string | null;
+  path?: string | null;
+  text?: string | null;
+  weixinAccountId?: string | null;
+}
+
+export type ReconcileDeliveryReceiptResult =
+  | { status: "confirmed"; messageId: string; reason?: string | null }
+  | { status: "not_sent"; reason?: string | null }
+  | { status: "unknown"; reason?: string | null };
 
 export interface SendTextChunkResult {
   messageId: string;
@@ -513,6 +536,16 @@ export interface ChannelAdapter {
     sessionKey: string;
     code: string;
   }): Promise<WeixinQrWaitResult>;
+
+  /**
+   * Optional receipt / idempotency reconciliation for uncertain (`dispatching` /
+   * `unknown` / `gateway_restarted`) deliverable link items during crash recovery.
+   * Returns `"confirmed"` when the platform confirms delivery, `"not_sent"` when
+   * provably absent, or `"unknown"` when delivery state cannot be determined.
+   */
+  reconcileDeliveryReceipt?(
+    options: ReconcileDeliveryReceiptOptions,
+  ): Promise<ReconcileDeliveryReceiptResult>;
 
   /**
    * Optional best-effort processing status feedback (reaction and/or typing indicator).

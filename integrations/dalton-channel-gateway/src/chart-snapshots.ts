@@ -140,6 +140,7 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
   userId: string;
   threadId: string;
   targetRunId: string;
+  executionId?: string | null;
   pageSize?: number;
   maxPages?: number;
 }): Promise<{
@@ -148,6 +149,8 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
   snapshots: ChartSnapshotItem[];
   widgets: CollectedHtmlWidgetRef[];
   outboundBlocked?: boolean;
+  retryable?: boolean;
+  httpStatus?: number | null;
 }> {
   const chartsMap = new Map<string, CollectedChartLayerRef>();
   const widgetsMap = new Map<string, CollectedHtmlWidgetRef>();
@@ -158,12 +161,18 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
     events: AsyncIterable<{ event: string; data: string }>,
   ): Promise<{
     foundTargetRunInPage: boolean;
+    sawReplayDone: boolean;
+    sawTargetPlaceholderOnly: boolean;
     pageHasMore: boolean;
     pageFirstTurnIndex: number | null;
     earliestTurnInPage: number | null;
   }> => {
     let currentRunId: string | null = null;
-    let foundTargetRunInPage = false;
+    let sawTargetStubHeader = false;
+    let sawTargetPageEvent = false;
+    let sawTargetReplayUnavailable = false;
+    let sawTargetActiveInSnapshot = false;
+    let sawReplayDone = false;
     let pageHasMore = false;
     let pageFirstTurnIndex: number | null = null;
     let earliestTurnInPage: number | null = null;
@@ -202,19 +211,30 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
         sse.event === "turn_separator" ||
         sse.event === "turn_start"
       ) {
-        const evtRunId =
+        const terminalEvtRunId =
           typeof data.response_id === "string" && data.response_id.trim()
             ? data.response_id.trim()
             : typeof data.run_id === "string" && data.run_id.trim()
               ? data.run_id.trim()
-              : typeof data.report_run_id === "string" && data.report_run_id.trim()
-                ? data.report_run_id.trim()
-                : null;
+              : null;
+        const stubReportRunId =
+          typeof data.report_run_id === "string" && data.report_run_id.trim()
+            ? data.report_run_id.trim()
+            : null;
+        const evtRunId = terminalEvtRunId ?? stubReportRunId;
         if (evtRunId) {
           currentRunId = evtRunId;
         }
-        if (currentRunId === params.targetRunId) {
-          foundTargetRunInPage = true;
+        if (terminalEvtRunId === params.targetRunId) {
+          // `items.py:_user_message_item` stamps `run_id` only once the turn is terminal.
+          sawTargetPageEvent = true;
+          if (sse.event === "user_message") {
+            collectReportSourceChartLayers(data.metadata, chartsMap);
+          }
+        } else if (stubReportRunId === params.targetRunId) {
+          // `report_run_id` alone marks a system/in-progress stub header; wait for
+          // actual non-placeholder turn events before considering the turn found.
+          sawTargetStubHeader = true;
           if (sse.event === "user_message") {
             collectReportSourceChartLayers(data.metadata, chartsMap);
           }
@@ -222,15 +242,89 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
         continue;
       }
 
-      const rId =
+      if (sse.event === "snapshot") {
+        const activeRuns = Array.isArray(data.active_runs) ? data.active_runs : [];
+        for (const item of activeRuns) {
+          if (
+            item &&
+            typeof item === "object" &&
+            !Array.isArray(item) &&
+            typeof (item as Record<string, unknown>).run_id === "string" &&
+            ((item as Record<string, unknown>).run_id as string).trim() ===
+              params.targetRunId
+          ) {
+            sawTargetActiveInSnapshot = true;
+          }
+        }
+        continue;
+      }
+
+      const ownRunId =
         typeof data.response_id === "string" && data.response_id.trim()
           ? data.response_id.trim()
           : typeof data.run_id === "string" && data.run_id.trim()
             ? data.run_id.trim()
-            : currentRunId;
+            : null;
+      const rId = ownRunId ?? currentRunId;
 
-      if (rId === params.targetRunId && sse.event !== "replay_done") {
-        foundTargetRunInPage = true;
+      if (sse.event === "error") {
+        const errType =
+          typeof data.type === "string" ? data.type.trim().toLowerCase() : "";
+        if (
+          errType === "replay_unavailable" &&
+          (rId === params.targetRunId || rId === null)
+        ) {
+          sawTargetReplayUnavailable = true;
+        }
+        continue;
+      }
+
+      if (sse.event === "replay_done") {
+        sawReplayDone = true;
+        // BW2: NEVER derive `found` from `replay_done.run_id`; `found` requires
+        // actual target turn events in the page AND this complete closing frame.
+        if (typeof data.has_more === "boolean") {
+          pageHasMore = data.has_more;
+        }
+        if (pageFirstTurnIndex === null) {
+          if (typeof data.oldest_turn_index === "number") {
+            pageFirstTurnIndex = data.oldest_turn_index;
+          } else if (typeof data.first_turn_index === "number") {
+            pageFirstTurnIndex = data.first_turn_index;
+          }
+        }
+        const rawSnapsByRun = data.chart_snapshots_by_run;
+        if (
+          rawSnapsByRun &&
+          typeof rawSnapsByRun === "object" &&
+          !Array.isArray(rawSnapsByRun)
+        ) {
+          const runSnaps = (rawSnapsByRun as Record<string, unknown>)[
+            params.targetRunId
+          ];
+          const parsedSnaps = parseChartSnapshotsList(runSnaps);
+          if (parsedSnaps.length > 0) {
+            snapshots = parsedSnaps;
+          }
+        }
+        const rawBlockedByRun = data.outbound_blocked_by_run;
+        if (
+          rawBlockedByRun &&
+          typeof rawBlockedByRun === "object" &&
+          !Array.isArray(rawBlockedByRun)
+        ) {
+          const rawBlocked = (rawBlockedByRun as Record<string, unknown>)[
+            params.targetRunId
+          ];
+          if (typeof rawBlocked === "boolean") {
+            outboundBlocked = rawBlocked;
+          }
+        }
+        continue;
+      }
+
+      if (rId === params.targetRunId) {
+        sawTargetPageEvent = true;
       }
 
       if (sse.event === "tool_call_result" && rId === params.targetRunId) {
@@ -291,56 +385,22 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
         }
         continue;
       }
-
-      if (sse.event === "replay_done") {
-        if (
-          typeof data.run_id === "string" &&
-          data.run_id.trim() === params.targetRunId
-        ) {
-          foundTargetRunInPage = true;
-        }
-        if (typeof data.has_more === "boolean") {
-          pageHasMore = data.has_more;
-        }
-        if (pageFirstTurnIndex === null) {
-          if (typeof data.oldest_turn_index === "number") {
-            pageFirstTurnIndex = data.oldest_turn_index;
-          } else if (typeof data.first_turn_index === "number") {
-            pageFirstTurnIndex = data.first_turn_index;
-          }
-        }
-        const rawSnapsByRun = data.chart_snapshots_by_run;
-        if (
-          rawSnapsByRun &&
-          typeof rawSnapsByRun === "object" &&
-          !Array.isArray(rawSnapsByRun)
-        ) {
-          const runSnaps = (rawSnapsByRun as Record<string, unknown>)[
-            params.targetRunId
-          ];
-          const parsedSnaps = parseChartSnapshotsList(runSnaps);
-          if (parsedSnaps.length > 0) {
-            snapshots = parsedSnaps;
-          }
-        }
-        const rawBlockedByRun = data.outbound_blocked_by_run;
-        if (
-          rawBlockedByRun &&
-          typeof rawBlockedByRun === "object" &&
-          !Array.isArray(rawBlockedByRun)
-        ) {
-          const rawBlocked = (rawBlockedByRun as Record<string, unknown>)[
-            params.targetRunId
-          ];
-          if (typeof rawBlocked === "boolean") {
-            outboundBlocked = rawBlocked;
-          }
-        }
-      }
     }
+
+    const sawTargetPlaceholderOnly =
+      (sawTargetStubHeader && !sawTargetPageEvent) ||
+      sawTargetReplayUnavailable ||
+      sawTargetActiveInSnapshot;
+    const foundTargetRunInPage =
+      sawReplayDone &&
+      !sawTargetReplayUnavailable &&
+      !sawTargetActiveInSnapshot &&
+      sawTargetPageEvent;
 
     return {
       foundTargetRunInPage,
+      sawReplayDone,
+      sawTargetPlaceholderOnly,
       pageHasMore,
       pageFirstTurnIndex,
       earliestTurnInPage,
@@ -349,27 +409,42 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
 
   // BW2: Prefer direct run-scoped replay by run_id (no page ceiling).
   if (typeof params.backend.replayThreadRun === "function") {
-    const resp = await params.backend.replayThreadRun(
-      params.userId,
-      params.threadId,
-      params.targetRunId,
-    );
+    const execId = params.executionId?.trim();
+    const resp = execId
+      ? await params.backend.replayThreadRun(
+          params.userId,
+          params.threadId,
+          params.targetRunId,
+          { executionId: execId },
+        )
+      : await params.backend.replayThreadRun(
+          params.userId,
+          params.threadId,
+          params.targetRunId,
+        );
     if (!resp.isSse || !resp.events) {
+      const retryable =
+        resp.status === 0 || resp.status === 429 || resp.status >= 500;
       return {
         found: false,
         charts: [],
         snapshots: [],
         widgets: [],
         outboundBlocked: undefined,
+        retryable,
+        httpStatus: resp.status,
       };
     }
-    const { foundTargetRunInPage } = await consumeSseStream(resp.events);
+    const { foundTargetRunInPage, sawReplayDone, sawTargetPlaceholderOnly } =
+      await consumeSseStream(resp.events);
     return {
       found: foundTargetRunInPage,
       charts: [...chartsMap.values()],
       snapshots,
       widgets: [...widgetsMap.values()],
       outboundBlocked,
+      retryable: !foundTargetRunInPage && (!sawReplayDone || sawTargetPlaceholderOnly),
+      httpStatus: resp.status,
     };
   }
 
@@ -378,6 +453,8 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
   const maxPages = Math.max(1, params.maxPages ?? 50);
   let beforeTurn: number | undefined;
   let foundTargetRun = false;
+  let sawRetryableFailure = false;
+  let lastHttpStatus: number | null = null;
 
   for (let page = 0; page < maxPages; page += 1) {
     const resp = await params.backend.replayThreadMessages(
@@ -387,12 +464,18 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
         ? { limit: pageSize, beforeTurn }
         : { limit: pageSize },
     );
+    lastHttpStatus = resp.status;
     if (!resp.isSse || !resp.events) {
+      if (resp.status === 0 || resp.status === 429 || resp.status >= 500) {
+        sawRetryableFailure = true;
+      }
       break;
     }
 
     const {
       foundTargetRunInPage,
+      sawReplayDone,
+      sawTargetPlaceholderOnly,
       pageHasMore,
       pageFirstTurnIndex,
       earliestTurnInPage,
@@ -401,6 +484,12 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
     if (foundTargetRunInPage) {
       foundTargetRun = true;
       break;
+    }
+    if (!sawReplayDone || sawTargetPlaceholderOnly) {
+      sawRetryableFailure = true;
+      if (!sawReplayDone) {
+        break;
+      }
     }
     if (!pageHasMore) {
       break;
@@ -422,6 +511,8 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
     snapshots,
     widgets: [...widgetsMap.values()],
     outboundBlocked,
+    retryable: !foundTargetRun && sawRetryableFailure,
+    httpStatus: lastHttpStatus,
   };
 }
 

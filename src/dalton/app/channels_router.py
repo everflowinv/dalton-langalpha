@@ -39,6 +39,7 @@ from src.dalton.database.channel_gateway import (
     recover_channel_state,
     register_and_resolve_inbound,
     register_automation_run,
+    resolve_authorized_automation_run_platforms,
     update_delivery_progress,
     update_inbound_progress,
     update_user_channel_settings,
@@ -47,7 +48,7 @@ from src.dalton.database.channel_gateway import (
 from src.dalton.database import weixin_multi_account as wx_db
 from src.dalton.database.weixin_multi_account import StaleGatewayEpochError
 from src.dalton.settings import redact_weixin_secrets
-from src.server.utils.api import CurrentUserId
+from src.server.utils.api import CurrentUserId, ServiceUserId
 
 logger = logging.getLogger(__name__)
 
@@ -361,6 +362,7 @@ class AuthorizeAndClaimDeliveryRequest(BaseModel):
     source_scope_key: str | None = None
     source_generation: int | None = None
     activity_origin: str | None = "none"
+    reclaim_verified_unsent: bool = False
 
 
 class DeliveryProgressRequest(BaseModel):
@@ -938,20 +940,20 @@ async def internal_snapshots_download_endpoint(
 
 @channels_router.get(
     "/internal/threads/{thread_id}/runs/{run_id}/replay",
-    dependencies=[Depends(require_channel_service_token)],
 )
 async def internal_thread_run_replay_endpoint(
     thread_id: str,
     run_id: str,
-    request: Request,
-    user_id: str | None = Query(default=None),
+    x_user_id: ServiceUserId,
+    execution_id: str | None = Query(default=None),
     source: Literal["auto", "checkpoint"] = Query(default="auto"),
 ) -> Any:
     """Read-only SSE replay of a single target turn addressed directly by ``run_id``.
 
-    Enforces the same thread ownership / shared-workspace read checks as
-    ``GET /api/v1/threads/{thread_id}/messages/replay`` and never writes back
-    replay caches (``persist=False``).
+    Enforces account admission via ``ServiceUserId``, platform sub-capability checks
+    resolved from authorized automation targets, and the same thread ownership /
+    shared-workspace read checks as ``GET /api/v1/threads/{thread_id}/messages/replay``.
+    Never writes back replay caches (``persist=False``).
     """
     from src.server.database.conversation.replay_rows import get_replay_thread_data
     from src.server.database.pool import DATABASE_UNAVAILABLE
@@ -965,12 +967,41 @@ async def internal_thread_run_replay_endpoint(
     from src.server.services.shared_workspaces.viewer import name_turn_senders
     from src.server.utils.api import database_unavailable
 
-    x_user_id = _resolve_internal_user_id(request, user_id)
     cleaned_run_id = str(run_id or "").strip()
     if not cleaned_run_id:
         raise HTTPException(status_code=400, detail="run_id is required")
 
     try:
+        authorized_platforms = await resolve_authorized_automation_run_platforms(
+            thread_id=thread_id,
+            run_id=cleaned_run_id,
+            user_id=x_user_id,
+            execution_id=execution_id,
+        )
+        if not authorized_platforms:
+            raise HTTPException(
+                status_code=403,
+                detail="No authorized channel automation target for this run",
+            )
+        enabled_platform_found = False
+        last_cap_exc: HTTPException | None = None
+        for plat in authorized_platforms:
+            try:
+                require_channel_platform_capability(plat)
+                enabled_platform_found = True
+                break
+            except HTTPException as exc:
+                last_cap_exc = exc
+        if not enabled_platform_found:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    last_cap_exc.detail
+                    if last_cap_exc is not None
+                    else "Channel platform capability is disabled"
+                ),
+            )
+
         rows = await get_replay_thread_data(thread_id)
         if rows is None:
             raise HTTPException(status_code=404, detail="Thread not found")
@@ -1046,15 +1077,30 @@ async def internal_thread_run_replay_endpoint(
 
         async def event_generator():
             seq = 0
+            matched_page_run = False
             for line in replay_lines:
                 seq += 1
+                try:
+                    payload = json.loads(line.data_json)
+                except Exception:
+                    payload = None
+                if isinstance(payload, dict):
+                    ev_rid = str(
+                        payload.get("response_id")
+                        or payload.get("run_id")
+                        or payload.get("report_run_id")
+                        or ""
+                    ).strip()
+                    if ev_rid == cleaned_run_id:
+                        matched_page_run = True
                 yield f"id: {seq}\nevent: {line.event}\ndata: {line.data_json}\n\n"
 
             done: dict[str, object] = {
                 "thread_id": thread_id,
-                "run_id": cleaned_run_id,
                 "turn_index": target_turn_index,
             }
+            if matched_page_run:
+                done["run_id"] = cleaned_run_id
             if not is_non_owner_reader and has_capability(CapabilityId.CHANNEL_GATEWAY):
                 from src.dalton.channel_chart_snapshots import (
                     resolve_replay_chart_snapshots_by_run,
@@ -1343,6 +1389,7 @@ async def internal_deliveries_authorize_and_claim_endpoint(
             source_scope_key=body.source_scope_key,
             source_generation=body.source_generation,
             activity_origin=body.activity_origin,
+            reclaim_verified_unsent=body.reclaim_verified_unsent,
             gateway_epoch=epoch,
             require_gateway_epoch=True,
         )
