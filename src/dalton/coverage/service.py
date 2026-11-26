@@ -19,6 +19,8 @@ from src.dalton.access_tiers import get_user_tier as get_identity_tier
 from src.dalton.company_identity import is_company_system_user
 from src.dalton.coverage.models import (
     DEDICATED_COMPANY_KEYS,
+    TIER_ORDER,
+    VALID_TIERS,
     _ensure_json_obj,
     build_coverage_doc,
     company_to_row,
@@ -725,10 +727,10 @@ def _roster_rank_beats(
 ) -> bool:
     c_tier, c_updated, c_uid = challenger
     i_tier, i_updated, i_uid = incumbent
-    c_core = c_tier == "core"
-    i_core = i_tier == "core"
-    if c_core != i_core:
-        return c_core
+    c_rank = TIER_ORDER.get(str(c_tier or "").strip().lower(), 99)
+    i_rank = TIER_ORDER.get(str(i_tier or "").strip().lower(), 99)
+    if c_rank != i_rank:
+        return c_rank < i_rank
     if c_updated != i_updated:
         return c_updated > i_updated
     return c_uid < i_uid
@@ -858,7 +860,7 @@ async def get_user_tier(
     if row is None:
         return None
     tier = str(row.get("tier") or "").strip().lower()
-    return tier if tier in ("core", "watch") else None
+    return tier if tier in VALID_TIERS else None
 
 
 def _extract_aliases_from_rows(
@@ -994,6 +996,27 @@ async def render_coverage_yaml(user_id: str, *, conn: Any = None) -> str:
     """Render `coverage.yaml` YAML string for `user_id` from `dalton_coverage`."""
     doc = await get_user_coverage(user_id, conn=conn)
     doc.pop("units_unavailable", None)
+    try:
+        from src.dalton.watchlist.policies import get_user_tier_policies
+
+        policies = await get_user_tier_policies(user_id, conn=conn)
+        doc["tier_policies"] = {
+            t: p.to_dict() for t, p in policies.items()
+        }
+        tiers = doc.get("tiers")
+        if isinstance(tiers, dict) and "radar" not in tiers:
+            from src.dalton.coverage.models import DEFAULT_TIER_MEANINGS
+
+            radar_count = sum(
+                1 for c in (doc.get("companies") or [])
+                if str(c.get("tier") or "").lower() == "radar"
+            )
+            tiers["radar"] = {
+                "meaning": DEFAULT_TIER_MEANINGS["radar"],
+                "count": radar_count,
+            }
+    except Exception:
+        pass
     return dump_coverage_yaml(doc)
 
 
@@ -1556,6 +1579,7 @@ async def list_user_coverage_summary(user_id: str) -> dict[str, Any]:
     companies: list[dict[str, Any]] = []
     core_list: list[dict[str, Any]] = []
     watch_list: list[dict[str, Any]] = []
+    radar_list: list[dict[str, Any]] = []
     stale_list: list[dict[str, Any]] = []
 
     for r in rows:
@@ -1571,6 +1595,11 @@ async def list_user_coverage_summary(user_id: str) -> dict[str, Any]:
         stale_group_labels = [sg["label"] for sg in stale_groups]
         comp_with_meta = {
             **comp,
+            "tags": list(r.get("tags") or comp.get("tags") or []),
+            "sort_order": int(r.get("sort_order") or 0),
+            "is_pinned": bool(r.get("is_pinned", False)),
+            "is_private": bool(r.get("is_private", False)),
+            "task_overrides": r.get("task_overrides"),
             "source": r.get("source"),
             "group_id": r.get("group_id") or (gids[0] if gids else None),
             "group_ids": gids,
@@ -1585,8 +1614,11 @@ async def list_user_coverage_summary(user_id: str) -> dict[str, Any]:
         uid, companies, raw_rows=rows
     )
     for comp_with_meta in companies:
-        if comp_with_meta["tier"] == "core":
+        c_tier = str(comp_with_meta.get("tier") or "").strip().lower()
+        if c_tier == "core":
             core_list.append(comp_with_meta)
+        elif c_tier == "radar":
+            radar_list.append(comp_with_meta)
         else:
             watch_list.append(comp_with_meta)
         if comp_with_meta["group_stale"]:
@@ -1623,12 +1655,14 @@ async def list_user_coverage_summary(user_id: str) -> dict[str, Any]:
         "counts": {
             "core": len(core_list),
             "watch": len(watch_list),
+            "radar": len(radar_list),
             "total": len(companies),
             "stale": len(stale_list),
             "groups": len(groups),
         },
         "core": core_list,
         "watch": watch_list,
+        "radar": radar_list,
         "stale": stale_list,
         "stale_tickers": [c["ticker"] for c in stale_list],
         "companies": companies,
@@ -2819,7 +2853,13 @@ async def query_user_earnings_calendar(
             }
         )
 
-    items.sort(key=lambda x: (str(x["date"]), 0 if x["tier"] == "core" else 1, str(x["symbol"])))
+    items.sort(
+        key=lambda x: (
+            str(x["date"]),
+            TIER_ORDER.get(str(x.get("tier") or "").lower(), 3),
+            str(x["symbol"]),
+        )
+    )
     pub_at = mirror_row.get("published_at")
     return {
         "data": items,
@@ -2927,6 +2967,7 @@ async def seed_user_coverage_from_yaml(
 
     core_count = sum(1 for r in rows if r["tier"] == "core")
     watch_count = sum(1 for r in rows if r["tier"] == "watch")
+    radar_count = sum(1 for r in rows if r["tier"] == "radar")
 
     if not apply:
         return {
@@ -2937,6 +2978,7 @@ async def seed_user_coverage_from_yaml(
             "planned_count": len(rows),
             "core_count": core_count,
             "watch_count": watch_count,
+            "radar_count": radar_count,
             "written_count": 0,
         }
 
@@ -2977,6 +3019,7 @@ async def seed_user_coverage_from_yaml(
         "planned_count": len(rows),
         "core_count": core_count,
         "watch_count": watch_count,
+        "radar_count": radar_count,
         "written_count": len(upserted),
         "automation": automation_res or None,
         "home_synced": home_synced,

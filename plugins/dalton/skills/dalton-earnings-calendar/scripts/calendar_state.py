@@ -32,7 +32,9 @@ MAX_MIRROR_BYTES = 1_048_576  # 1 MB
 CHAIN_BY_TIER = {
     "core": ["tm3", "t0", "tp1"],
     "watch": ["t0"],
+    "radar": [],
 }
+VALID_STAGES = ("tm3", "t0", "tp1")
 
 
 def _default_state_path() -> Path:
@@ -138,17 +140,29 @@ def _minimal_coverage_yaml_parse(text: str) -> dict:
     return {"companies": companies}
 
 
-def load_coverage(coverage_path: Path | None = None) -> dict[str, dict]:
+def load_coverage_doc(coverage_path: Path | None = None) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Return ``(companies_by_ticker, tier_policies_by_tier)`` from ``coverage.yaml``."""
     p = coverage_path or _default_coverage_path()
     if not p or not p.exists():
-        return {}
+        return {}, {}
     raw = _load_yaml_or_json(p)
     result: dict[str, dict] = {}
     for item in raw.get("companies") or []:
         if isinstance(item, dict) and item.get("ticker"):
             t = str(item["ticker"]).upper()
             result[t] = item
-    return result
+    raw_policies = raw.get("tier_policies")
+    policies: dict[str, dict] = {}
+    if isinstance(raw_policies, dict):
+        for tier_k, pol in raw_policies.items():
+            if isinstance(pol, dict):
+                policies[str(tier_k).strip().lower()] = pol
+    return result, policies
+
+
+def load_coverage(coverage_path: Path | None = None) -> dict[str, dict]:
+    companies, _ = load_coverage_doc(coverage_path)
+    return companies
 
 
 def load_ledger(state_path: Path, create: bool = False) -> dict:
@@ -220,10 +234,48 @@ def slug_ticker(ticker: str) -> str:
     return ticker.strip().lower().replace(".", "-")
 
 
-def default_automations_for(ticker: str, quarter: str, tier: str = "Core") -> dict[str, str]:
+def resolve_earnings_stages(
+    tier: str | None,
+    *,
+    tier_policies: dict[str, dict] | None = None,
+    task_overrides: dict | None = None,
+) -> list[str]:
+    """Resolve ordered earnings automation stages for ``tier``.
+
+    Order of precedence: per-company ``task_overrides.earnings_stages`` ->
+    user ``tier_policies[tier].earnings_stages`` -> ``CHAIN_BY_TIER``.
+    ``radar`` and any unknown tier default to the empty list ``[]``.
+    """
+    if isinstance(task_overrides, dict) and isinstance(task_overrides.get("earnings_stages"), list):
+        ov_set = {str(s or "").strip().lower() for s in task_overrides["earnings_stages"]}
+        return [s for s in VALID_STAGES if s in ov_set]
+    tier_key = str(tier or "").strip().lower()
+    if isinstance(tier_policies, dict):
+        pol = tier_policies.get(tier_key)
+        if isinstance(pol, dict) and isinstance(pol.get("earnings_stages"), list):
+            p_set = {str(s or "").strip().lower() for s in pol["earnings_stages"]}
+            return [s for s in VALID_STAGES if s in p_set]
+    return list(CHAIN_BY_TIER.get(tier_key, []))
+
+
+def default_automations_for(
+    ticker: str,
+    quarter: str,
+    tier: str = "Core",
+    *,
+    workspace_id: str | None = "present",
+    tier_policies: dict[str, dict] | None = None,
+    task_overrides: dict | None = None,
+) -> dict[str, str]:
+    if not workspace_id:
+        return {}
     t_slug = slug_ticker(ticker)
     q_slug = quarter.strip().lower().replace(" ", "")
-    keys = CHAIN_BY_TIER.get(tier.lower(), ["tm3", "t0", "tp1"])
+    keys = resolve_earnings_stages(
+        tier,
+        tier_policies=tier_policies,
+        task_overrides=task_overrides,
+    )
     return {k: f"dalton-{t_slug}-earn-{q_slug}-{k}.json" for k in keys}
 
 
@@ -239,22 +291,27 @@ def cmd_list(args: argparse.Namespace) -> int:
     for t in all_tickers:
         cov = coverage.get(t, {})
         ent = entries.get(t, {})
+        if cov.get("is_private") and not ent:
+            continue
         tier = str(ent.get("tier") or cov.get("tier") or "Watch").capitalize()
         grp = (cov.get("earnings") or {}).get("group") if isinstance(cov.get("earnings"), dict) else None
         status = ent.get("status", "pending")
         date_status = ent.get("date_status", "unannounced")
+        ws_obj = cov.get("workspace") if isinstance(cov.get("workspace"), dict) else {}
         ws_status = (
-            (cov.get("workspace") or {}).get("status")
-            if isinstance(cov.get("workspace"), dict)
-            else ("active" if ent.get("workspace_id") else "unknown")
+            ws_obj.get("status")
+            if ws_obj.get("status")
+            else ("active" if (ent.get("workspace_id") or ws_obj.get("workspace_id")) else "none")
         )
+        ws_id = ent.get("workspace_id") or ws_obj.get("workspace_id")
         row = {
             "ticker": t,
             "name": ent.get("name") or cov.get("name") or t,
             "tier": tier,
             "group": grp,
             "workspace_status": ws_status,
-            "workspace_id": ent.get("workspace_id"),
+            "workspace_id": ws_id,
+            "has_workspace": bool(ws_id),
             "status": status,
             "date_status": date_status,
             "quarter": ent.get("quarter"),
@@ -313,14 +370,27 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 def cmd_check(args: argparse.Namespace) -> int:
     state_path = Path(args.state) if args.state else _default_state_path()
+    cov_path = Path(getattr(args, "coverage", None)) if getattr(args, "coverage", None) else _default_coverage_path()
+    coverage, tier_policies = load_coverage_doc(cov_path)
     ledger = load_ledger(state_path, create=False)
     ticker = args.ticker.upper()
     entry = ledger.get("entries", {}).get(ticker)
+    cov = coverage.get(ticker, {})
 
     is_confirmed = bool(entry and entry.get("status") == "confirmed" and entry.get("date_status") == "confirmed")
     old_date = entry.get("date") if entry else None
     same_date = bool(is_confirmed and old_date == args.date)
-    has_autos = bool(entry and entry.get("automations"))
+    tier_val = (entry or {}).get("tier") or cov.get("tier")
+    expected_stages = (
+        resolve_earnings_stages(
+            tier_val,
+            tier_policies=tier_policies,
+            task_overrides=cov.get("task_overrides") if isinstance(cov, dict) else None,
+        )
+        if (entry and entry.get("workspace_id"))
+        else []
+    )
+    has_autos = (not expected_stages) or bool(entry and entry.get("automations"))
     recorded = bool(same_date and has_autos)
     date_changed = bool(is_confirmed and old_date and old_date != args.date)
 
@@ -342,7 +412,7 @@ def cmd_check(args: argparse.Namespace) -> int:
 def cmd_mark(args: argparse.Namespace) -> int:
     state_path = Path(args.state) if args.state else _default_state_path()
     cov_path = Path(args.coverage) if args.coverage else _default_coverage_path()
-    coverage = load_coverage(cov_path)
+    coverage, tier_policies = load_coverage_doc(cov_path)
     ledger = load_ledger(state_path, create=True)
 
     ticker = args.ticker.upper()
@@ -351,8 +421,13 @@ def cmd_mark(args: argparse.Namespace) -> int:
     now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
     name = args.name or existing.get("name") or cov.get("name") or ticker
-    tier = (args.tier or existing.get("tier") or cov.get("tier") or "Core").capitalize()
-    workspace_id = args.workspace_id if args.workspace_id is not None else existing.get("workspace_id")
+    tier = (args.tier or existing.get("tier") or cov.get("tier") or "watch").capitalize()
+    cov_ws_id = (cov.get("workspace") or {}).get("workspace_id") if isinstance(cov.get("workspace"), dict) else None
+    workspace_id = (
+        args.workspace_id
+        if args.workspace_id is not None
+        else (existing.get("workspace_id") or cov_ws_id)
+    )
     fiscal_note = args.fiscal_note or existing.get("fiscal_note") or cov.get("note") or "FY=CY"
     history = list(existing.get("history") or [])
 
@@ -385,7 +460,14 @@ def cmd_mark(args: argparse.Namespace) -> int:
         elif existing.get("automations") and existing.get("quarter") == args.quarter:
             automations = existing["automations"]
         else:
-            automations = default_automations_for(ticker, args.quarter, tier=tier)
+            automations = default_automations_for(
+                ticker,
+                args.quarter,
+                tier=tier,
+                workspace_id=workspace_id,
+                tier_policies=tier_policies,
+                task_overrides=cov.get("task_overrides") if isinstance(cov, dict) else None,
+            )
 
         new_entry = {
             "name": name,
@@ -657,6 +739,9 @@ def cmd_diff(args: argparse.Namespace) -> int:
     date_mismatch: list[dict] = []
     automation_issues: list[dict] = []
 
+    cov_path = Path(getattr(args, "coverage", None)) if getattr(args, "coverage", None) else _default_coverage_path()
+    coverage, tier_policies = load_coverage_doc(cov_path)
+
     for r in confirmed_scans:
         t = str(r["ticker"]).upper()
         scan_date = r.get("earnings_date")
@@ -684,8 +769,13 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
         # Check automations presence when workspace_id is active/present
         if ent.get("workspace_id"):
-            tier_key = str(ent.get("tier") or "Core").lower()
-            expected_keys = CHAIN_BY_TIER.get(tier_key, ["tm3", "t0", "tp1"])
+            cov = coverage.get(t, {})
+            tier_key = str(ent.get("tier") or cov.get("tier") or "").lower()
+            expected_keys = resolve_earnings_stages(
+                tier_key,
+                tier_policies=tier_policies,
+                task_overrides=cov.get("task_overrides") if isinstance(cov, dict) else None,
+            )
             autos = ent.get("automations") or {}
             missing_keys = [k for k in expected_keys if not autos.get(k)]
             if missing_keys:

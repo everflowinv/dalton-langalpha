@@ -278,7 +278,15 @@ async def get_retry_checkpoint(thread_id: str, checkpoint_id: str | None = None)
 
 # --- DALTON-HOOK(cos-settings-tools): begin ---
 WEB_CONFIRM_ACTION_TYPES: frozenset[str] = frozenset(
-    {"create_workspace", "archive_workspace"}
+    {
+        "create_workspace",
+        "archive_workspace",
+        # DALTON-HOOK(watchlist): personal watchlist mutations require web-session confirmation
+        "watchlist_batch_add",
+        "watchlist_set_tier",
+        "watchlist_remove",
+        "watchlist_tier_policy",
+    }
 )
 
 
@@ -371,6 +379,26 @@ def _snapshot_matches_action(
             snapshot.get("workspace_id") == action_req.get("workspace_id")
             and snapshot.get("computer_id") == action_req.get("computer_id")
         )
+    # --- DALTON-HOOK(watchlist): begin ---
+    if action_type in {
+        "watchlist_batch_add",
+        "watchlist_set_tier",
+        "watchlist_remove",
+        "watchlist_tier_policy",
+    }:
+        return (
+            snapshot.get("tool_call_id") == action_req.get("tool_call_id")
+            and snapshot.get("owner_user_id") == action_req.get("owner_user_id")
+            and snapshot.get("expected_roster_hash")
+            == action_req.get("expected_roster_hash")
+            and snapshot.get("expected_policy_versions")
+            == action_req.get("expected_policy_versions")
+            and snapshot.get("target_tickers") == action_req.get("target_tickers")
+            and snapshot.get("target_tier") == action_req.get("target_tier")
+            and snapshot.get("affected_workspaces")
+            == action_req.get("affected_workspaces")
+        )
+    # --- DALTON-HOOK(watchlist): end ---
     return False
 
 

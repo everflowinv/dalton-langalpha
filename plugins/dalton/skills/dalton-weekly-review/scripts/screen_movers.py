@@ -38,105 +38,6 @@ warnings.filterwarnings("ignore")
 PRIVATE_TICKERS = {"SPCX", "OPENAI", "ANTHROPIC"}
 PRIVATE_NAMES = {"SpaceX", "OpenAI", "Anthropic"}
 
-# 内置回退名单：name -> (ticker, peer_group, sheet_section, tier)
-BUILTIN_TICKERS: dict[str, tuple[str, str, str, str]] = {
-    # Live Position
-    "Google": ("GOOGL", "megacap", "Live Position", "Core"),
-    "Amazon": ("AMZN", "megacap", "Live Position", "Core"),
-    "DoorDash": ("DASH", "delivery", "Live Position", "Core"),
-    "Affirm": ("AFRM", "bnpl", "Live Position", "Core"),
-    "EchoStar": ("ECHO", "space", "Live Position", "Watch"),
-    "D.R. Horton": ("DHI", "homebuilder", "Live Position", "Watch"),
-    "唯品会": ("VIPS", "cn_ecom_vertical", "Live Position", "Watch"),
-    "亚朵": ("ATAT", "cn_travel_local", "Live Position", "Core"),
-    "Boss直聘": ("BZ", "cn_internet_small", "Live Position", "Core"),
-    # US Mega Tech
-    "Apple": ("AAPL", "megacap", "US Mega Tech", "Watch"),
-    "Microsoft": ("MSFT", "megacap", "US Mega Tech", "Core"),
-    "SpaceX": ("SPCX", "space", "US Mega Tech", "Core"),
-    "Meta": ("META", "megacap", "US Mega Tech", "Core"),
-    "Tesla": ("TSLA", "megacap", "US Mega Tech", "Watch"),
-    # US Internet
-    "Netflix": ("NFLX", "streaming_media", "US Internet", "Watch"),
-    "Spotify": ("SPOT", "streaming_media", "US Internet", "Watch"),
-    "MercadoLibre": ("MELI", "ecom", "US Internet", "Watch"),
-    "Sea": ("SE", "ecom", "US Internet", "Watch"),
-    "Coupang": ("CPNG", "ecom", "US Internet", "Watch"),
-    "Grab": ("GRAB", "delivery", "US Internet", ""),
-    "Uber": ("UBER", "delivery", "US Internet", "Core"),
-    "Instacart": ("CART", "delivery", "US Internet", ""),
-    "Lyft": ("LYFT", "delivery", "US Internet", ""),
-    "Booking": ("BKNG", "online_travel", "US Internet", "Watch"),
-    "Airbnb": ("ABNB", "online_travel", "US Internet", "Watch"),
-    "Expedia": ("EXPE", "online_travel", "US Internet", "Watch"),
-    "Roblox": ("RBLX", "games_adtech", "US Internet", "Watch"),
-    "Duolingo": ("DUOL", "social_apps", "US Internet", "Watch"),
-    "AppLovin": ("APP", "games_adtech", "US Internet", "Watch"),
-    "Unity": ("U", "games_adtech", "US Internet", "Watch"),
-    "Reddit": ("RDDT", "social_apps", "US Internet", "Watch"),
-    "Pinterest": ("PINS", "social_apps", "US Internet", ""),
-    "Snap": ("SNAP", "social_apps", "US Internet", ""),
-    # US Financial
-    "JPMorgan": ("JPM", "banks", "US Financial", "Watch"),
-    "BofA": ("BAC", "banks", "US Financial", "Watch"),
-    "Visa": ("V", "networks", "US Financial", "Core"),
-    "Mastercard": ("MA", "networks", "US Financial", "Core"),
-    "Shopify": ("SHOP", "ecom", "US Financial", "Watch"),
-    "PayPal": ("PYPL", "payments", "US Financial", "Watch"),
-    "Block": ("XYZ", "payments", "US Financial", "Watch"),
-    "SoFi": ("SOFI", "fintech_lenders", "US Financial", "Watch"),
-    "Klarna": ("KLAR", "bnpl", "US Financial", "Watch"),
-    "Sezzle": ("SEZL", "bnpl", "US Financial", "Watch"),
-    "Upstart": ("UPST", "fintech_lenders", "US Financial", "Watch"),
-    "Robinhood": ("HOOD", "brokers", "US Financial", "Core"),
-    "Interactive Brokers": ("IBKR", "brokers", "US Financial", "Core"),
-    "Blackstone": ("BX", "alts", "US Financial", "Watch"),
-    "KKR": ("KKR", "alts", "US Financial", "Watch"),
-    "Apollo": ("APO", "alts", "US Financial", "Watch"),
-    "S&P Global": ("SPGI", "ratings_info", "US Financial", "Core"),
-    "Moody's": ("MCO", "ratings_info", "US Financial", "Core"),
-    "Berkshire": ("BRK-B", "insurers", "US Financial", "Watch"),
-    "Progressive": ("PGR", "insurers", "US Financial", "Watch"),
-    "Marsh": ("MRSH", "ins_brokers", "US Financial", "Watch"),
-    "Aon": ("AON", "ins_brokers", "US Financial", "Watch"),
-    "Gallagher": ("AJG", "ins_brokers", "US Financial", "Watch"),
-    "CME": ("CME", "exchanges", "US Financial", "Watch"),
-    "ICE": ("ICE", "exchanges", "US Financial", "Watch"),
-    "Cboe": ("CBOE", "exchanges", "US Financial", "Watch"),
-    "Nasdaq": ("NDAQ", "exchanges", "US Financial", "Core"),
-    # US Software
-    "Palantir": ("PLTR", "infra_software", "US Software", "Watch"),
-    "Salesforce": ("CRM", "app_software", "US Software", "Watch"),
-    "ServiceNow": ("NOW", "app_software", "US Software", ""),
-    "Cloudflare": ("NET", "infra_software", "US Software", "Watch"),
-    "Huron": ("HURN", "it_services", "US Software", "Watch"),
-    # Global Consumer & Homebuilder
-    "Philip Morris": ("PM", "staples", "Global Consumer", "Watch"),
-    "Walmart": ("WMT", "mass_retail", "Global Consumer", "Watch"),
-    "Marriott": ("MAR", "lodging_cruise", "Global Consumer", "Watch"),
-    "Hilton": ("HLT", "lodging_cruise", "Global Consumer", "Watch"),
-    "Rocket Lab": ("RKLB", "space", "US Space", "Watch"),
-    "Planet Labs": ("PL", "space", "US Space", "Watch"),
-    "Quanta": ("PWR", "ai_construction", "AI Construction", "Watch"),
-    "Comfort Systems": ("FIX", "ai_construction", "AI Construction", "Watch"),
-    "Sterling": ("STRL", "ai_construction", "AI Construction", "Watch"),
-    "Pulte": ("PHM", "homebuilder", "Homebuilder", "Watch"),
-    "Toll Brothers": ("TOL", "homebuilder", "Homebuilder", "Watch"),
-    # China Internet & Consumer
-    "腾讯": ("0700.HK", "cn_mega", "China Internet", "Core"),
-    "阿里巴巴": ("BABA", "cn_mega", "China Internet", "Core"),
-    "拼多多": ("PDD", "cn_mega", "China Internet", "Core"),
-    "网易": ("NTES", "cn_mega", "China Internet", "Core"),
-    "美团": ("3690.HK", "cn_mega", "China Internet", "Core"),
-    "京东": ("JD", "cn_mega", "China Internet", "Watch"),
-    "百度": ("BIDU", "cn_mega", "China Internet", "Watch"),
-    "携程": ("TCOM", "cn_travel_local", "China Internet", "Core"),
-    "贝壳": ("BEKE", "cn_internet_small", "China Internet", "Core"),
-    "富途": ("FUTU", "cn_brokers_exch", "China Internet", "Core"),
-    "华住": ("HTHT", "cn_travel_local", "China Consumer", "Core"),
-    "智谱": ("2513.HK", "cn_ai", "AI Native", "Core"),
-}
-
 EXTRA_PEERS: dict[str, list[str]] = {
     "space": ["UFO"],
     "homebuilder": ["XHB", "ITB"],
@@ -202,11 +103,11 @@ def load_universe_from_coverage(coverage_path: str | None) -> tuple[list[dict[st
         for c in data["companies"]:
             t = str(c.get("ticker") or "").strip().upper()
             name = str(c.get("name") or t).strip()
-            if not t or t in PRIVATE_TICKERS or name in PRIVATE_NAMES:
+            if not t or c.get("is_private") or t in PRIVATE_TICKERS or name in PRIVATE_NAMES:
                 skipped_private.append(f"{name} ({t})")
                 continue
             raw_tier = str(c.get("tier") or "").strip().capitalize()
-            tier = raw_tier if raw_tier in ("Core", "Watch") else ""
+            tier = raw_tier if raw_tier in ("Core", "Watch", "Radar") else ""
             group = str(c.get("peer_group") or "default").strip()
             sec = str(c.get("sheet_section") or "").strip()
             held = bool(c.get("held") or sec == "Live Position")
@@ -517,8 +418,13 @@ def main() -> int:
         )
     )
 
-    unflagged_watch = [r for r in rows if not r["deep"] and not r["flags"]]
+    unflagged_watch = [
+        r for r in rows if not r["deep"] and not r["flags"] and r.get("tier") != "Radar"
+    ]
     unflagged_watch.sort(key=lambda r: (0 if r.get("held") else 1, r["ticker"]))
+
+    radar_rows = [r for r in rows if r.get("tier") == "Radar"]
+    radar_rows.sort(key=lambda r: (0 if r.get("held") else 1, r["ticker"]))
 
     result = {
         "ok": data_ok,
@@ -530,6 +436,7 @@ def main() -> int:
         "core": core_rows,
         "flagged": flagged_rows,
         "unflagged_watch": unflagged_watch,
+        "radar": radar_rows,
         "rows": rows,
     }
 

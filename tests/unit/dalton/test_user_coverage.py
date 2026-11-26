@@ -695,65 +695,172 @@ async def test_cos_coverage_tool_binding_actions_and_quarterly_preflight(
         ),
     )
 
+    import src.dalton.tools.coverage_tools as cov_tools_mod
+    import src.dalton.watchlist.policies as wl_policies_mod
+    import src.dalton.watchlist.reconciler as wl_reconciler_mod
+    import src.dalton.watchlist.service as wl_service_mod
+    from src.tools.secretary import _commands as sec_commands
+
+    reconcile_jobs_store: dict[str, dict[str, Any]] = {}
+    reconciled_batches: list[list[str]] = []
+
+    async def _fake_insert_job(
+        uid: str,
+        *,
+        trigger_action: str,
+        target_policy_versions: Any,
+        pending_tickers: Any,
+        override_user_pause: bool = False,
+        job_id: str | None = None,
+        conn: Any = None,
+    ) -> dict[str, Any]:
+        _ = (override_user_pause, conn)
+        jid = job_id or f"job-{len(reconcile_jobs_store) + 1}"
+        job = {
+            "job_id": jid,
+            "user_id": uid,
+            "trigger_action": trigger_action,
+            "target_policy_versions": dict(target_policy_versions),
+            "pending_tickers": list(pending_tickers),
+            "completed_tickers": [],
+            "failed_items": [],
+            "yaml_synced": False,
+            "status": "pending",
+        }
+        reconcile_jobs_store[jid] = job
+        return dict(job)
+
+    async def _fake_reconcile_job(
+        self: Any,
+        uid: str,
+        jid: str,
+        *,
+        sync_home: bool = True,
+    ) -> dict[str, Any]:
+        _ = self
+        job = reconcile_jobs_store[jid]
+        reconciled_batches.append(list(job["pending_tickers"]))
+        job["completed_tickers"] = list(job["pending_tickers"])
+        job["pending_tickers"] = []
+        if sync_home:
+            await _fake_sync_home(uid)
+            job["yaml_synced"] = True
+        job["status"] = "completed"
+        return {
+            "ok": True,
+            "job_id": jid,
+            "status": "completed",
+            "yaml_synced": job["yaml_synced"],
+            "failed_items": [],
+        }
+
+    hitl_mock = create_autospec(
+        sec_commands.hitl_confirm,
+        return_value=(True, {"decisions": [{"type": "approve"}]}),
+    )
+    monkeypatch.setattr(cov_tools_mod, "hitl_confirm", hitl_mock)
+    monkeypatch.setattr(
+        wl_service_mod,
+        "_user_workspace_tickers",
+        create_autospec(
+            wl_service_mod._user_workspace_tickers,
+            return_value={"NVDA": "ws-nvda-123"},
+        ),
+    )
+    monkeypatch.setattr(
+        wl_service_mod,
+        "resolve_company_workspace_id",
+        create_autospec(
+            wl_reconciler_mod.resolve_company_workspace_id,
+            side_effect=lambda uid, sym, *, cov_row=None, conn=None: (
+                "ws-nvda-123" if str(sym).upper() == "NVDA" else None
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        wl_service_mod,
+        "list_all_user_automations",
+        create_autospec(wl_service_mod.list_all_user_automations, return_value=[]),
+    )
+    monkeypatch.setattr(
+        wl_service_mod,
+        "get_user_tier_policies",
+        create_autospec(
+            wl_policies_mod.get_user_tier_policies,
+            return_value=dict(wl_policies_mod.DEFAULT_TIER_POLICIES),
+        ),
+    )
+    monkeypatch.setattr(
+        wl_service_mod,
+        "insert_reconcile_job",
+        create_autospec(wl_policies_mod.insert_reconcile_job, side_effect=_fake_insert_job),
+    )
+    monkeypatch.setattr(
+        wl_service_mod,
+        "ensure_user_earnings_calendar_automation",
+        create_autospec(
+            wl_service_mod.ensure_user_earnings_calendar_automation,
+            side_effect=_fake_ensure_cal_auto,
+        ),
+    )
+    monkeypatch.setattr(
+        wl_policies_mod,
+        "list_unfinished_reconcile_jobs",
+        create_autospec(wl_policies_mod.list_unfinished_reconcile_jobs, return_value=[]),
+    )
+    monkeypatch.setattr(wl_reconciler_mod.TierPolicyReconciler, "reconcile_job", _fake_reconcile_job)
+
     tool = build_coverage_tools(role="chief_of_staff")[0]
     cfg = {"configurable": {"user_id": USER_ALICE}}
+    call_seq = 0
 
-    # 1) add specific tickers (one valid, one invalid) -> non-empty roster triggers idempotent ensure of dalton-earnings-calendar
-    add_out = json.loads(
-        await tool.ainvoke(
-            {"action": "add", "tickers": ["NVDA", "FAKE999"], "tier": "core"},
+    async def _invoke_cov(args: dict[str, Any]) -> dict[str, Any]:
+        nonlocal call_seq
+        call_seq += 1
+        res = await tool.ainvoke(
+            {
+                "name": "dalton_coverage",
+                "id": f"tc-cov-{call_seq}",
+                "type": "tool_call",
+                "args": args,
+            },
             config=cfg,
         )
-    )
+        return json.loads(res.update["messages"][0].content)
+
+    # 1) add specific tickers (one valid, one invalid) -> ≤5 net-new tickers is exempt from confirmation
+    #    and non-empty roster triggers idempotent ensure of dalton-earnings-calendar
+    add_out = await _invoke_cov({"action": "add", "tickers": ["NVDA", "FAKE999"], "tier": "core"})
     assert add_out["ok"] is True
     assert [x["ticker"] for x in add_out["added"]] == ["NVDA"]
     assert add_out["not_found"] == ["FAKE999"]
     assert auto_created_calls == [USER_ALICE]
     assert len(home_writes) >= 1
+    assert hitl_mock.call_count == 0
 
-    # 2) set_tier — also moves the company's delta task to the new tier's schedule
-
-    import src.dalton.autonomy.tracking as tracking_mod
-
-    resync = create_autospec(
-        tracking_mod.resync_delta_schedule,
-        return_value={"ticker": "NVDA", "updated": True},
-    )
-    monkeypatch.setattr(tracking_mod, "resync_delta_schedule", resync)
-    tier_out = json.loads(
-        await tool.ainvoke(
-            {"action": "set_tier", "tickers": ["NVDA"], "tier": "watch"},
-            config=cfg,
-        )
-    )
+    # 2) set_tier — triggers confirmation and writes outbox + reconciles NVDA
+    reconciled_batches.clear()
+    tier_out = await _invoke_cov({"action": "set_tier", "tickers": ["NVDA"], "tier": "watch"})
     assert tier_out["ok"] is True
     assert tier_out["updated"] == ["NVDA"]
     assert (await coverage_pkg.get_user_tier(USER_ALICE, "NVDA")) == "watch"
-    resync.assert_awaited_once_with(USER_ALICE, "NVDA", tier="watch")
-    assert tier_out["delta_schedule"] == [{"ticker": "NVDA", "updated": True}]
+    assert hitl_mock.call_count == 1
+    assert reconciled_batches == [["NVDA"]]
     # A ticker outside the roster is reported not_found and its tasks are left alone.
-    resync.reset_mock()
-    miss_out = json.loads(
-        await tool.ainvoke(
-            {"action": "set_tier", "tickers": ["NVDA", "ZZZZ"], "tier": "watch"},
-            config=cfg,
-        )
-    )
+    reconciled_batches.clear()
+    miss_out = await _invoke_cov({"action": "set_tier", "tickers": ["NVDA", "ZZZZ"], "tier": "watch"})
     assert "ZZZZ" in miss_out["not_found"]
-    resync.assert_awaited_once_with(USER_ALICE, "NVDA", tier="watch")
+    assert reconciled_batches == [["NVDA"]]
     # Set back to core so we verify group sync preserves user's manual tier
-    await tool.ainvoke({"action": "set_tier", "tickers": ["NVDA"], "tier": "core"}, config=cfg)
+    await _invoke_cov({"action": "set_tier", "tickers": ["NVDA"], "tier": "core"})
 
     # 3) preview_group -> does NOT write to DB
-    prev_out = json.loads(
-        await tool.ainvoke(
-            {
-                "action": "preview_group",
-                "label": "美股半导体大票",
-                "criteria": {"country": "US", "industry": "Semiconductors", "market_cap_min": 50_000_000_000},
-            },
-            config=cfg,
-        )
+    prev_out = await _invoke_cov(
+        {
+            "action": "preview_group",
+            "label": "美股半导体大票",
+            "criteria": {"country": "US", "industry": "Semiconductors", "market_cap_min": 50_000_000_000},
+        }
     )
     assert prev_out["ok"] is True
     assert prev_out["preview_only"] is True
@@ -761,16 +868,13 @@ async def test_cos_coverage_tool_binding_actions_and_quarterly_preflight(
     assert await store.count_coverage_rows(USER_ALICE) == 1  # Still only NVDA
 
     # 4) add_group -> writes group + AVGO & AMD with source='group', while NVDA keeps tier='core' & source='chat'
-    grp_out = json.loads(
-        await tool.ainvoke(
-            {
-                "action": "add_group",
-                "label": "美股半导体大票",
-                "criteria": {"country": "US", "industry": "Semiconductors"},
-                "default_tier": "watch",
-            },
-            config=cfg,
-        )
+    grp_out = await _invoke_cov(
+        {
+            "action": "add_group",
+            "label": "美股半导体大票",
+            "criteria": {"country": "US", "industry": "Semiconductors"},
+            "default_tier": "watch",
+        }
     )
     assert grp_out["ok"] is True
     group_id = grp_out["group"]["group_id"]
@@ -857,24 +961,20 @@ async def test_cos_coverage_tool_binding_actions_and_quarterly_preflight(
     assert "group_stale" not in amd_row["extra"]
 
     # 6) list shows stale_tickers
-    list_out = json.loads(await tool.ainvoke({"action": "list"}, config=cfg))
+    list_out = await _invoke_cov({"action": "list"})
     assert "AMD" in list_out["stale_tickers"]
 
     # 7) remove_group removes group-only entries (AVGO, AMD, QCOM) and keeps NVDA (added via chat)
-    rm_grp_out = json.loads(
-        await tool.ainvoke({"action": "remove_group", "group_id": group_id}, config=cfg)
-    )
+    rm_grp_out = await _invoke_cov({"action": "remove_group", "group_id": group_id})
     assert rm_grp_out["ok"] is True
     assert set(rm_grp_out["removed_tickers"]) == {"AMD", "AVGO", "QCOM"}
     assert await store.get_coverage_row(USER_ALICE, "NVDA") is not None
 
-    # 8) remove ticker with active workspace warns that workspace and automations are not deleted
-    rm_out = json.loads(
-        await tool.ainvoke({"action": "remove", "tickers": ["NVDA"]}, config=cfg)
-    )
+    # 8) remove ticker with active workspace warns that workspace and history are preserved while tasks pause
+    rm_out = await _invoke_cov({"action": "remove", "tickers": ["NVDA"]})
     assert rm_out["ok"] is True
     assert rm_out["removed"] == ["NVDA"]
-    assert "workspace 和自动任务不会被删除" in (rm_out["workspace_notice"] or "")
+    assert "workspace 和历史文档不会被删除" in (rm_out["workspace_notice"] or "")
 
 
 @pytest.mark.asyncio

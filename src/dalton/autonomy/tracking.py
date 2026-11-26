@@ -421,7 +421,18 @@ def _derive_status_and_details(
     ]
 
     total_expected = len(countable_names)
-    if len(existing_standard) == total_expected and len(active_tasks) == total_expected:
+    if len(expected_names) == 0:
+        any_active_company = any(
+            str(r.get("status") or "").lower() == "active"
+            for r in company_rows
+        )
+        if any_active_company:
+            status = "enabled"
+            label = LABEL_ENABLED_ZH
+        else:
+            status = "disabled"
+            label = LABEL_DISABLED_ZH
+    elif len(existing_standard) == total_expected and len(active_tasks) == total_expected:
         status = "enabled"
         label = LABEL_ENABLED_ZH
     elif len(existing_standard) == 0 or (
@@ -1734,6 +1745,10 @@ async def enable_tracking(
                     continue
                 if _replaced_by_tracker(r):
                     continue
+                if not specs:
+                    r_meta = r.get("metadata") if isinstance(r.get("metadata"), Mapping) else {}
+                    if bool(r_meta.get("paused_by_policy")) or bool(r_meta.get("handoff_paused_reason")):
+                        continue
                 if str(r.get("status") or "").lower() == "paused" and r.get("automation_id"):
                     resume_spec: dict[str, Any] = {
                         "action": "resume",
@@ -2018,6 +2033,9 @@ async def resync_delta_schedule(
 
     async with user_automations_lock(uid) as conn:
         resolved_tier = await resolve_default_tier(t_upper, tier, user_id=uid, conn=conn)
+        from src.dalton.watchlist.policies import get_default_tier_policy
+
+        tier_policy = get_default_tier_policy(resolved_tier)
         new_cron, new_tz = resolve_delta_schedule(resolved_tier)
 
         rows = await list_all_user_automations(
@@ -2056,8 +2074,10 @@ async def resync_delta_schedule(
 
         from src.server.services.automation_scheduler import AutomationScheduler
 
-        new_next_run_at = AutomationScheduler.calculate_first_run(new_cron, new_tz)
-        new_next_run_iso = _iso_or_none(new_next_run_at)
+        if tier_policy.delta_enabled:
+            new_next_run_at = AutomationScheduler.calculate_first_run(new_cron, new_tz)
+        else:
+            new_next_run_at = None
         conn_kw = {"conn": conn} if conn is not None else {}
 
         outer_ctx = get_current_history_context()
@@ -2069,9 +2089,10 @@ async def resync_delta_schedule(
             else uid
         )
         changes: list[dict[str, Any]] = []
+        paused_ids_for_skip: list[str] = []
         with automation_history_context(
             actor_user_id=effective_actor,
-            action="update",
+            action="pause" if not tier_policy.delta_enabled else "update",
             skip_if_unchanged=True,
         ):
             for row in open_rows:
@@ -2089,18 +2110,41 @@ async def resync_delta_schedule(
                 new_meta["ticker"] = t_upper
                 new_meta["tier"] = resolved_tier
 
+                update_kwargs: dict[str, Any] = {
+                    "cron_expression": new_cron,
+                    "timezone": new_tz,
+                    "metadata": new_meta,
+                }
+                if not tier_policy.delta_enabled:
+                    new_meta["paused_by_policy"] = True
+                    update_kwargs["status"] = "paused"
+                    update_kwargs["next_run_at"] = None
+                    paused_ids_for_skip.append(auto_id)
+                else:
+                    row_status = str(row.get("status") or "active").strip().lower()
+                    has_blocker = bool(
+                        new_meta.get("paused_by_user")
+                        or new_meta.get("handoff_paused_reason")
+                    )
+                    if row_status == "paused" and new_meta.get("paused_by_policy") and not has_blocker:
+                        new_meta.pop("paused_by_policy", None)
+                        update_kwargs["status"] = "active"
+                        update_kwargs["next_run_at"] = new_next_run_at
+                    elif row_status == "paused":
+                        update_kwargs["next_run_at"] = new_next_run_at
+                    else:
+                        new_meta.pop("paused_by_policy", None)
+                        update_kwargs["next_run_at"] = new_next_run_at
+
                 updated_row = await auto_db.update_automation(
                     auto_id,
                     uid,
-                    cron_expression=new_cron,
-                    timezone=new_tz,
-                    next_run_at=new_next_run_at,
-                    metadata=new_meta,
+                    **update_kwargs,
                     **conn_kw,
                 )
                 effective_row = updated_row if isinstance(updated_row, dict) else row
                 effective_status = str(
-                    effective_row.get("status") or row.get("status") or "active"
+                    effective_row.get("status") or update_kwargs.get("status") or row.get("status") or "active"
                 )
                 changes.append(
                     {
@@ -2115,9 +2159,19 @@ async def resync_delta_schedule(
                         "old_timezone": old_tz,
                         "new_timezone": new_tz,
                         "old_next_run_at": old_next_run,
-                        "new_next_run_at": new_next_run_iso,
+                        "new_next_run_at": _iso_or_none(update_kwargs.get("next_run_at")),
                     }
                 )
+
+        if paused_ids_for_skip and conn is not None:
+            from src.server.database import automation_executions as exec_db
+
+            await exec_db.skip_unstarted_executions_for_automations(
+                paused_ids_for_skip,
+                reason="watchlist_policy",
+                error_message="Skipped unstarted execution because tier policy disabled delta.",
+                conn=conn,
+            )
 
         primary = changes[0]
         return {
