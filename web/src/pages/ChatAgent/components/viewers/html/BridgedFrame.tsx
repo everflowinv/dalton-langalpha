@@ -1,16 +1,27 @@
-import React, { useEffect, useEffectEvent, useReducer, useRef, useState } from 'react';
+import React, { useEffect, useEffectEvent, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { Loader } from '@/components/ui/loader';
 import { DURATION } from '@/lib/motion';
 import { useTranslation } from 'react-i18next';
 import { AppBridge, type BridgeOptions } from '@/lib/appBridge/AppBridge';
+// DALTON-HOOK(mobile-web): normalize workspace-relative paths when classifying current vs linked docs
+import { artifactPathKey } from '@/hooks/useArtifact';
 import { HostedFrame } from '../HostedFrame';
 import { framedDirectly, messageOrigin, sendFrameTo } from '../frameHost';
 import { frameSwap, isReady, isShown, NO_SWAP, type FramedDoc, type FrameSwap, type FrameSwapAction } from './frameSwap';
-import { SETTLE_CAP_MS, type PageToViewer } from './pageProtocol';
+// DALTON-HOOK(mobile-web): export unified HtmlFrameDocState for viewer/header state machine
+import { SETTLE_CAP_MS, type HtmlFrameDocState, type PageToViewer } from './pageProtocol';
 import { SERVED_HTML_PERMISSIONS } from './sandbox';
 import { usePageBridge, type PageBridge } from './usePageBridge';
 import { withServeView } from './wsfilesUrl';
 import './BridgedFrame.css';
+
+export type { HtmlFrameDocState } from './pageProtocol';
+
+type RawFrameDoc =
+  | { kind: 'pending' }
+  | { kind: 'path'; path: string }
+  | { kind: 'root' }
+  | { kind: 'unbridged' };
 
 /**
  * How long a loaded document may keep building itself before it replaces the
@@ -86,7 +97,20 @@ interface BridgedFrameProps {
    */
   overlay?: (bridge: PageBridge, view: FrameView) => React.ReactNode;
   /** Handed the frame's bridge whenever it changes, for whoever holds the frame. */
-  onBridge?: (bridge: PageBridge) => void;
+  // DALTON-HOOK(mobile-web): include frameKey on onBridge so callers reject stale frames across tab switches
+  onBridge?: (bridge: PageBridge, frameKey: string | null) => void;
+  /**
+   * DALTON-HOOK(mobile-web): normalized workspace-relative key of the document
+   * opened for this frame, used to distinguish `current` from `linked`.
+   */
+  expectedDocKey?: string | null;
+  /** DALTON-HOOK(mobile-web): optional workspace rootDir for path normalization. */
+  docRoot?: string | null;
+  /**
+   * DALTON-HOOK(mobile-web): reports the frame's document state
+   * (`pending` / `current` / `bridged_root` / `linked` / `unbridged`) paired with `frameKey`.
+   */
+  onDocStateChange?: (state: HtmlFrameDocState, frameKey: string | null) => void;
   /**
    * A document the frame loaded, a link inside it followed included, that
    * never said hello: not a bridged document, so most likely an error page
@@ -116,8 +140,9 @@ interface BridgedFrameProps {
  * source's `src` does: the document in the frame is already loaded, and a new
  * address would reload it under the reader.
  */
+// DALTON-HOOK(mobile-web): accept expectedDocKey, docRoot, and onDocStateChange props
 export function BridgedFrame({
-  source, title, groundKey, notice, overlay, onBridge, onUnbridged, onLoad, kit,
+  source, title, groundKey, notice, overlay, onBridge, expectedDocKey = null, docRoot = null, onDocStateChange, onUnbridged, onLoad, kit,
 }: BridgedFrameProps): React.ReactElement {
   const { t } = useTranslation();
   const frameKey = source?.key ?? null;
@@ -159,8 +184,9 @@ export function BridgedFrame({
 
   const frameRef = useRef<HTMLIFrameElement>(null);
   const bridge = usePageBridge({ frameRef, origin: frame?.origin ?? null, frameKey: current });
-  const reportBridge = useEffectEvent((b: PageBridge) => onBridge?.(b));
-  useEffect(() => { reportBridge(bridge); }, [bridge]);
+  // DALTON-HOOK(mobile-web): emit frameKey alongside bridge to prevent cross-tab bleed
+  const reportBridge = useEffectEvent((b: PageBridge, key: string | null) => onBridge?.(b, key));
+  useEffect(() => { reportBridge(bridge, current); }, [bridge, current]);
 
   // Where the reader was, carried to the next document, and the ground the
   // document paints, drawn behind the frame so a swap or a load on a dark
@@ -182,10 +208,38 @@ export function BridgedFrame({
   // renders again; `loads` restarts the wait for each load.
   const greeted = useRef(false);
   const waiting = useRef(false);
+  // DALTON-HOOK(mobile-web): monotonic navigation sequence & active frameKey guard for grace timeouts
+  const navSeqRef = useRef(0);
+  const currentKeyRef = useRef<string | null>(current);
+  useLayoutEffect(() => {
+    currentKeyRef.current = current;
+  }, [current]);
   // The address of the document this frame was last sent from to take its
   // view again, until the next document says hello.
   const carried = useRef<string | null>(null);
   const [loads, setLoads] = useState(0);
+  // DALTON-HOOK(mobile-web): track frame document state scoped to `current` frameKey
+  const [docTracking, setDocTracking] = useState<{ key: string | null; raw: RawFrameDoc }>({
+    key: current,
+    raw: { kind: 'pending' },
+  });
+  const rawDoc: RawFrameDoc = docTracking.key === current ? docTracking.raw : { kind: 'pending' };
+  const docState = useMemo<HtmlFrameDocState>(() => {
+    if (rawDoc.kind === 'pending') return { kind: 'pending' };
+    if (rawDoc.kind === 'root') return { kind: 'bridged_root' };
+    if (rawDoc.kind === 'unbridged') return { kind: 'unbridged', currentUrl: null };
+    if (expectedDocKey && artifactPathKey(rawDoc.path, docRoot) !== expectedDocKey) {
+      return { kind: 'linked', path: rawDoc.path };
+    }
+    return { kind: 'current', path: rawDoc.path };
+  }, [rawDoc, expectedDocKey, docRoot]);
+  const reportDocState = useEffectEvent((state: HtmlFrameDocState, key: string | null) => {
+    onDocStateChange?.(state, key);
+  });
+  useEffect(() => {
+    reportDocState(docState, current);
+  }, [docState, current]);
+
   const onFrameLoad = (key: string) => {
     dispatch({ type: 'loaded', key });
     onLoad?.();
@@ -193,28 +247,41 @@ export function BridgedFrame({
       greeted.current = false;
       return;
     }
+    // DALTON-HOOK(mobile-web): bump navSeqRef and enter pending while waiting for page:ready
+    navSeqRef.current += 1;
     waiting.current = true;
+    setDocTracking({ key, raw: { kind: 'pending' } });
     setLoads((n) => n + 1);
   };
   // A link in the document led somewhere that speaks no bridge (an image, a
   // raw error): what is drawn over the document no longer sits on anything.
   const [offPageOf, setOffPageOf] = useState<string | null>(null);
-  const unbridged = useEffectEvent(() => {
-    setOffPageOf(current);
+  const unbridged = useEffectEvent((key: string | null) => {
+    // DALTON-HOOK(mobile-web): clear stale bridge.path and report unbridged with currentUrl: null
+    bridge.clearPath?.();
+    setOffPageOf(key);
+    setDocTracking({ key, raw: { kind: 'unbridged' } });
     onUnbridged?.();
   });
   useEffect(() => {
     if (!waiting.current) return;
+    // DALTON-HOOK(mobile-web): verify navigation sequence & frameKey before firing unbridged timeout
+    const seq = navSeqRef.current;
+    const key = currentKeyRef.current;
     const timer = setTimeout(() => {
-      if (!waiting.current) return;
+      if (!waiting.current || navSeqRef.current !== seq || currentKeyRef.current !== key) return;
       waiting.current = false;
-      unbridged();
+      unbridged(key);
     }, UNBRIDGED_GRACE_MS);
     return () => clearTimeout(timer);
   }, [loads]);
   useEffect(() => {
     greeted.current = false;
     waiting.current = false;
+    // DALTON-HOOK(mobile-web): invalidate pending grace timers and reset doc state on frameKey change
+    navSeqRef.current += 1;
+    setOffPageOf(null);
+    setDocTracking({ key: current, raw: { kind: 'pending' } });
   }, [current]);
 
   const onMessage = useEffectEvent((message: PageToViewer) => {
@@ -247,16 +314,31 @@ export function BridgedFrame({
         const el = frameRef.current;
         if (!next || !el || carried.current === message.doc) return;
         carried.current = message.doc;
+        navSeqRef.current += 1;
         if (waiting.current) waiting.current = false;
         else greeted.current = true;
+        setDocTracking({ key: current, raw: { kind: 'pending' } });
         sendFrameTo(el, next);
         return;
       }
       case 'page:ready': {
         carried.current = null;
-        setOffPageOf(null);
+        // DALTON-HOOK(mobile-web): invalidate active grace timer and map pathState to docState
+        navSeqRef.current += 1;
         if (waiting.current) waiting.current = false;
         else greeted.current = true;
+        if (message.pathState === 'path' && message.path) {
+          setOffPageOf(null);
+          setDocTracking({ key: current, raw: { kind: 'path', path: message.path } });
+        } else if (message.pathState === 'root') {
+          setOffPageOf(null);
+          setDocTracking({ key: current, raw: { kind: 'root' } });
+        } else {
+          // invalid or unrecognized: clear stale bridge.path and enter unbridged (currentUrl: null)
+          bridge.clearPath?.();
+          setOffPageOf(current);
+          setDocTracking({ key: current, raw: { kind: 'unbridged' } });
+        }
         // The first hello of a new frame, not a link inside it to another file.
         const pending = carry.current;
         if (!pending || pending.key !== current || pending.done) return;

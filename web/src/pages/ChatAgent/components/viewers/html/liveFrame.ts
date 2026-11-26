@@ -1,9 +1,10 @@
-import { useEffect, useEffectEvent, useMemo, useState } from 'react';
+import { useCallback, useEffect, useEffectEvent, useMemo, useState } from 'react';
 import { useOwnFileGrant } from '@/hooks/useOwnFileGrant';
 import { useWorkspaceFileGrant } from '@/hooks/useWorkspaceFileGrant';
 import { notePageLoads, notePageOpen } from '@/lib/pageLoads';
 import { useWorkspaceFolders } from '../../../contexts/WorkspaceContext';
-import type { FrameSource } from './BridgedFrame';
+import type { FrameSource, HtmlFrameDocState } from './BridgedFrame';
+import { docStatesEqual } from './pageProtocol'; // DALTON-HOOK(mobile-web)
 import { useBridgeMessage, type PageBridge } from './usePageBridge';
 import { SERVED_HTML_SANDBOX } from './sandbox';
 import { buildServeUrl, type ServeInject } from './wsfilesUrl';
@@ -41,7 +42,12 @@ export interface LiveFrame {
   /** The frame's bridge once it has handed one over (`onBridge`). */
   bridge: PageBridge | null;
   /** For the frame's `onBridge`. */
-  onBridge: (bridge: PageBridge) => void;
+  // DALTON-HOOK(mobile-web): frameKey prevents stale frames from writing into a newly activated tab
+  onBridge: (bridge: PageBridge, frameKey?: string | null) => void;
+  // DALTON-HOOK(mobile-web): active frame document state (pending immediately on tab switch) and attachment flag
+  docState: HtmlFrameDocState;
+  hasDocState: boolean;
+  onDocStateChange: (state: HtmlFrameDocState, frameKey?: string | null) => void;
 }
 
 /**
@@ -67,16 +73,51 @@ export function useLiveFrame({
   const [first, setFirst] = useState({ file, anchor });
   if (first.file !== file) setFirst({ file, anchor });
   const firstAnchor = first.file === file ? first.anchor : anchor;
+  // DALTON-HOOK(mobile-web): derive frameKey independent of prefix so bridge attachment works even before/without a grant, while still isolating tab switches
+  const activeKey = `${inject}:${file}:${revision ?? ''}`;
   const source = useMemo<FrameSource | null>(() => {
     if (!prefix) return null;
     const url = buildServeUrl(prefix, filePath, { inject, root, revision });
     return {
-      key: `${inject}:${file}:${revision ?? ''}`,
+      key: activeKey,
       src: firstAnchor ? `${url}#${encodeURIComponent(firstAnchor)}` : url,
       sandbox: SERVED_HTML_SANDBOX,
     };
-  }, [prefix, file, filePath, inject, root, revision, firstAnchor]);
-  const [bridge, setBridge] = useState<PageBridge | null>(null);
+  }, [prefix, activeKey, filePath, inject, root, revision, firstAnchor]);
+  // DALTON-HOOK(mobile-web): key bridge and docState by active frameKey so tab switches immediately return pending/null
+  const [bridgeEntry, setBridgeEntry] = useState<{ key: string | null; bridge: PageBridge | null }>({
+    key: null,
+    bridge: null,
+  });
+  const [docEntry, setDocEntry] = useState<{ key: string | null; state: HtmlFrameDocState }>({
+    key: null,
+    state: { kind: 'pending' },
+  });
+  const onBridge = useCallback(
+    (next: PageBridge, frameKey?: string | null) => {
+      const resolvedKey = frameKey !== undefined ? frameKey : (next.frameKey !== undefined ? next.frameKey : activeKey);
+      if (resolvedKey !== activeKey) return;
+      setBridgeEntry({ key: resolvedKey, bridge: next });
+    },
+    [activeKey],
+  );
+  const onDocStateChange = useCallback(
+    (next: HtmlFrameDocState, frameKey?: string | null) => {
+      const resolvedKey = frameKey !== undefined ? frameKey : activeKey;
+      if (resolvedKey !== activeKey) return;
+      setDocEntry((prev) =>
+        prev.key === resolvedKey && docStatesEqual(prev.state, next)
+          ? prev
+          : { key: resolvedKey, state: next },
+      );
+    },
+    [activeKey],
+  );
+  const bridge = bridgeEntry.key === activeKey ? bridgeEntry.bridge : null;
+  // DALTON-HOOK(mobile-web): distinguish a live BridgedFrame that has reported state from an unattached/mocked frame
+  const hasDocState = docEntry.key !== null;
+  const docState: HtmlFrameDocState =
+    docEntry.key === activeKey ? docEntry.state : { kind: 'pending' };
   useFragmentScroll(bridge, anchor, anchorSeq);
   useFrameLinks(bridge, onOpenLink);
   useBridgeMessage(bridge, 'page:loads', (message) => {
@@ -96,7 +137,11 @@ export function useLiveFrame({
     failed: !prefix && !!grant.error,
     retry: () => void grant.refetch(),
     bridge,
-    onBridge: setBridge,
+    // DALTON-HOOK(mobile-web): return frameKey-guarded onBridge and unified docState callbacks
+    onBridge,
+    docState,
+    hasDocState,
+    onDocStateChange,
   };
 }
 

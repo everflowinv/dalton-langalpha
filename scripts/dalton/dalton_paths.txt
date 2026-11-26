@@ -621,3 +621,6 @@ web/src/pages/SharedChat/__tests__/OwnerArtifactView.test.tsx
 web/src/__tests__/App.deepLinkAuthRedirect.test.tsx
 web/src/__tests__/useFileDeepLink.coldLoad.test.tsx
 web/src/pages/ChatAgent/hooks/useComputerFoldersReady.ts
+# External member permissions Batch 3: preview bridge docLocation & unified HtmlFrameDocState unit and Playwright E2E tests.
+web/src/pages/ChatAgent/components/viewers/html/__tests__/HtmlFrameDocState.test.tsx
+web/e2e/external-member-perms-b3.spec.js

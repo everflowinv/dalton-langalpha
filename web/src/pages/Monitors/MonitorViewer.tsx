@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
@@ -9,12 +9,14 @@ import { Select } from '@/components/ui/select';
 import { toast } from '@/components/ui/use-toast';
 import { ListError, TagBadge } from '@/components/mcp/McpPrimitives';
 import { apiErrorStatus } from '@/api/errors';
+import { artifactPathKey } from '@/hooks/useArtifact';
 import { useCapabilities } from '@/hooks/useCapabilities';
 import { useLocale } from '@/hooks/useLocale';
 import { GRANT_RENEW_MARGIN_MS, MIN_RENEW_INTERVAL_MS, msUntilRenewal } from '@/lib/expiry';
 import { formatTimestamp } from '@/lib/format';
 import { queryKeys } from '@/lib/queryKeys';
-import { BridgedFrame, type FrameSource } from '@/pages/ChatAgent/components/viewers/html/BridgedFrame';
+import { BridgedFrame, type FrameSource, type HtmlFrameDocState } from '@/pages/ChatAgent/components/viewers/html/BridgedFrame';
+import { docStatesEqual } from '@/pages/ChatAgent/components/viewers/html/pageProtocol';
 import { SERVED_HTML_SANDBOX } from '@/pages/ChatAgent/components/viewers/html/sandbox';
 import { buildServeUrl, versionPrefix } from '@/pages/ChatAgent/components/viewers/html/wsfilesUrl';
 import type { PageBridge } from '@/pages/ChatAgent/components/viewers/html/usePageBridge';
@@ -69,7 +71,6 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     receivedAt: number;
   } | null>(null);
   const [copied, setCopied] = useState(false);
-  const [bridge, setBridge] = useState<PageBridge | null>(null);
 
   useEffect(() => {
     setSelectedSeq(null);
@@ -114,22 +115,6 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     return () => window.clearTimeout(timer);
   }, [publicMode, activeGrant, slug, detailQuery]);
 
-  // Push current monitor_grant into the framed document whenever bridge is ready or grant renews.
-  useEffect(() => {
-    if (!bridge?.ready || !activeGrant) return;
-    bridge.post({
-      type: 'page:monitor-grant',
-      grant: activeGrant.grant,
-      dataBase: activeGrant.dataBase,
-      expiresIn: activeGrant.expiresIn,
-    });
-  }, [bridge, bridge?.ready, bridge?.session, activeGrant]);
-
-  // Route cross-monitor links clicked inside the sandboxed frame via React Router so target ACLs are re-checked.
-  useBridgeMessage(bridge, 'page:navigate-monitor', (message) => {
-    navigate(message.path);
-  });
-
   const effectiveSeq = publicMode
     ? (monitor?.published_seq || 1)
     : (selectedSeq ?? (monitor?.published_seq || detail?.versions[0]?.seq || 1));
@@ -154,6 +139,55 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
       sandbox: SERVED_HTML_SANDBOX,
     };
   }, [monitor, activeGrant, effectiveSeq, effectiveEntryPath, publicMode]);
+
+  // Guard bridge & unified HtmlFrameDocState by frameKey so monitor/version switches never bleed stale paths.
+  const currentFrameKey = frameSource?.key ?? null;
+  const [bridgeEntry, setBridgeEntry] = useState<{ key: string | null; bridge: PageBridge | null }>({
+    key: null,
+    bridge: null,
+  });
+  const [docEntry, setDocEntry] = useState<{ key: string | null; state: HtmlFrameDocState }>({
+    key: null,
+    state: { kind: 'pending' },
+  });
+  const handleBridge = useCallback(
+    (next: PageBridge, frameKey?: string | null) => {
+      const resolvedKey = frameKey !== undefined ? frameKey : (next.frameKey !== undefined ? next.frameKey : currentFrameKey);
+      if (resolvedKey !== currentFrameKey) return;
+      setBridgeEntry({ key: resolvedKey, bridge: next });
+    },
+    [currentFrameKey],
+  );
+  const handleDocStateChange = useCallback(
+    (next: HtmlFrameDocState, frameKey: string | null) => {
+      if (frameKey !== currentFrameKey) return;
+      setDocEntry((prev) =>
+        prev.key === frameKey && docStatesEqual(prev.state, next)
+          ? prev
+          : { key: frameKey, state: next },
+      );
+    },
+    [currentFrameKey],
+  );
+  const bridge = currentFrameKey !== null && bridgeEntry.key === currentFrameKey ? bridgeEntry.bridge : null;
+  const docState: HtmlFrameDocState =
+    currentFrameKey !== null && docEntry.key === currentFrameKey ? docEntry.state : { kind: 'pending' };
+
+  // Push current monitor_grant into the framed document whenever bridge is ready or grant renews.
+  useEffect(() => {
+    if (!bridge?.ready || !activeGrant) return;
+    bridge.post({
+      type: 'page:monitor-grant',
+      grant: activeGrant.grant,
+      dataBase: activeGrant.dataBase,
+      expiresIn: activeGrant.expiresIn,
+    });
+  }, [bridge, bridge?.ready, bridge?.session, activeGrant]);
+
+  // Route cross-monitor links clicked inside the sandboxed frame via React Router so target ACLs are re-checked.
+  useBridgeMessage(bridge, 'page:navigate-monitor', (message) => {
+    navigate(message.path);
+  });
 
   const permalink = monitor
     ? monitorShareUrl(monitor.slug, monitor.visibility)
@@ -200,7 +234,14 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     );
   }
 
-  const canOpenSource = !publicMode && Boolean(monitor.can_manage && monitor.source_kind === 'workspace' && monitor.workspace_id);
+  const isUnbridgedDoc = docState.kind === 'unbridged';
+  const isLinkedDoc = docState.kind === 'linked';
+  const showOpenInNewWindow = docState.kind !== 'unbridged' || docState.currentUrl !== null;
+  const canOpenSource =
+    !publicMode &&
+    !isUnbridgedDoc &&
+    !isLinkedDoc &&
+    Boolean(monitor.can_manage && monitor.source_kind === 'workspace' && monitor.workspace_id);
 
   return (
     <div className="monitors-viewer">
@@ -266,20 +307,22 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
             <span className="hidden sm:inline">{t('monitors:copyLink')}</span>
           </Button>
 
-          <a
-            href={permalink}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="tap-target inline-flex h-[30px] items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium hover:bg-(--color-bg-hover)"
-            aria-label={t('monitors:openInNewWindow')}
-            style={{
-              borderColor: 'var(--color-border-muted)',
-              color: 'var(--color-text-primary)',
-            }}
-          >
-            <ExternalLink className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">{t('monitors:openInNewWindow')}</span>
-          </a>
+          {showOpenInNewWindow && (
+            <a
+              href={permalink}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="tap-target inline-flex h-[30px] items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium hover:bg-(--color-bg-hover)"
+              aria-label={t('monitors:openInNewWindow')}
+              style={{
+                borderColor: 'var(--color-border-muted)',
+                color: 'var(--color-text-primary)',
+              }}
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">{t('monitors:openInNewWindow')}</span>
+            </a>
+          )}
 
           {canOpenSource && (
             <Button
@@ -302,12 +345,14 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
         </div>
       </header>
 
-      <div className="monitors-frame-host">
+      <div className="monitors-frame-host" data-doc-state={docState.kind}>
         <BridgedFrame
           source={frameSource}
           title={monitor.title}
           groundKey={monitor.monitor_id}
-          onBridge={setBridge}
+          expectedDocKey={effectiveEntryPath ? artifactPathKey(effectiveEntryPath) : null}
+          onBridge={handleBridge}
+          onDocStateChange={handleDocStateChange}
           onUnbridged={() => {
             void detailQuery.refetch();
           }}

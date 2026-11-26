@@ -143,10 +143,31 @@ export interface PageSelection extends PagePressed {
   compose: boolean;
 }
 
+// DALTON-HOOK(mobile-web): tri-state + unrecognized location classification on page:ready
+export type PageReadyPathState = 'path' | 'root' | 'invalid' | 'unrecognized';
+
+// DALTON-HOOK(mobile-web): unified document state machine shared by all bridged HTML frames
+export type HtmlFrameDocState =
+  | { kind: 'pending' }
+  | { kind: 'current'; path: string }
+  | { kind: 'bridged_root' }
+  | { kind: 'linked'; path: string }
+  | { kind: 'unbridged'; currentUrl: string | null };
+
+// DALTON-HOOK(mobile-web): structural equality helper for HtmlFrameDocState transitions
+export function docStatesEqual(a: HtmlFrameDocState, b: HtmlFrameDocState): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === 'current' && b.kind === 'current') return a.path === b.path;
+  if (a.kind === 'linked' && b.kind === 'linked') return a.path === b.path;
+  if (a.kind === 'unbridged' && b.kind === 'unbridged') return a.currentUrl === b.currentUrl;
+  return true;
+}
+
 /** What the document's bridge reports, as the viewer reads it. */
 export type PageToViewer =
   /** The bridge is listening; `path` is the workspace file the document is, which a link can change. */
-  | { type: 'page:ready'; path: string | null }
+  // DALTON-HOOK(mobile-web): classify page:ready location as path / root / invalid / unrecognized
+  | { type: 'page:ready'; path: string | null; pathState: PageReadyPathState }
   /** The colour the document paints behind itself, null for none. */
   | { type: 'page:ground'; color: string | null }
   | { type: 'page:scroll'; x: number; y: number; moving: boolean }
@@ -263,8 +284,18 @@ function text(limit: number, keepEnds = false) {
 /** A path a workspace file could have. */
 // eslint-disable-next-line no-control-regex
 const filePath = z.string().check(z.maxLength(MAX_DOC_PATH), z.regex(/^[^\u0000-\u001f\u007f]+$/));
+// DALTON-HOOK(mobile-web): reject backslashes, `..` traversal segments, and empty paths after trimming leading slashes
+function isSafeDocPath(value: string): boolean {
+  if (value.includes('\\')) return false;
+  const trimmed = value.replace(/^\/+/, '');
+  if (!trimmed) return false;
+  return !trimmed.split('/').some((seg) => seg === '..');
+}
 /** The file a document says it is, in a hello or a report. */
-const docPath = z.pipe(filePath, z.transform((path) => path.replace(/^\/+/, '')));
+const docPath = z.pipe(
+  filePath.check(z.refine(isSafeDocPath)),
+  z.transform((path) => path.replace(/^\/+/, '')),
+);
 
 const coord = z.number().check(z.gte(-MAX_COORD), z.lte(MAX_COORD));
 const extent = z.number().check(z.gte(0), z.lte(MAX_COORD));
@@ -401,12 +432,48 @@ function click<K extends 'page:pick' | 'page:area'>(type: K, anchor: typeof pick
   );
 }
 
+// DALTON-HOOK(mobile-web): validate raw page:ready own properties before Zod strips optional keys
+const pageReadyVersion = z.optional(z.number());
+
+function parsePageReady(raw: Record<string, unknown>): Extract<PageToViewer, { type: 'page:ready' }> | null {
+  if (raw.type !== 'page:ready') return null;
+  if (!pageReadyVersion.safeParse(raw.v).success) return null;
+
+  const hasOwn = (k: string) => Object.prototype.hasOwnProperty.call(raw, k);
+  const hasPath = hasOwn('path');
+  const hasRoot = hasOwn('root');
+  const hasInvalidPath = hasOwn('invalidPath');
+
+  // Step 1: reject non-boolean root/invalidPath, explicit invalidPath: true, or multiple location own properties
+  const locationKeyCount = Number(hasPath) + Number(hasRoot) + Number(hasInvalidPath);
+  if (
+    (hasRoot && typeof raw.root !== 'boolean') ||
+    (hasInvalidPath && typeof raw.invalidPath !== 'boolean') ||
+    raw.invalidPath === true ||
+    locationKeyCount > 1
+  ) {
+    return { type: 'page:ready', path: null, pathState: 'invalid' };
+  }
+
+  // Step 2: only `path` own property present -> strict docPath validation (no lenient wrapper)
+  if (hasPath) {
+    const parsed = docPath.safeParse(raw.path);
+    return parsed.success
+      ? { type: 'page:ready', path: parsed.data, pathState: 'path' }
+      : { type: 'page:ready', path: null, pathState: 'invalid' };
+  }
+
+  // Step 3: only `root: true` own property present -> confirmed pathless version root
+  if (hasRoot && raw.root === true) {
+    return { type: 'page:ready', path: null, pathState: 'root' };
+  }
+
+  // Step 4: missing path and root !== true / invalidPath !== true -> unrecognized
+  return { type: 'page:ready', path: null, pathState: 'unrecognized' };
+}
+
 /** One per type: a nested union where a type's message can also say `clear`. */
 const pageToViewer = z.discriminatedUnion('type', [
-  z.pipe(
-    z.object({ type: z.literal('page:ready'), v: z.optional(z.number()), path: lenient(docPath) }),
-    z.transform((m) => ({ type: m.type, path: m.path ?? null })),
-  ),
   z.object({ type: z.literal('page:ground'), color: z.nullable(z.string().check(z.regex(RGB))) }),
   z.object({ type: z.literal('page:scroll'), x: coord, y: coord, moving: z.boolean() }),
   z.object({ type: z.literal('page:settled') }),
@@ -499,14 +566,25 @@ const pageToViewer = z.discriminatedUnion('type', [
   z.object({ type: z.literal('page:adding'), held: z.boolean(), next: z.boolean() }),
 ]);
 
+// DALTON-HOOK(mobile-web): tri-state wire union for page:ready (validated on raw own properties in parsePageReady)
+export type PageReadyWire =
+  | { type: 'page:ready'; v?: number; path: string }
+  | { type: 'page:ready'; v?: number; root: true }
+  | { type: 'page:ready'; v?: number; invalidPath: true }
+  | { type: 'page:ready'; v?: number };
+
 /**
  * What the bridge sends, as it sends it. Every message also carries `v`, the
  * bridge's version, which the viewer does not read.
  */
-export type PageToViewerWire = z.input<typeof pageToViewer>;
+export type PageToViewerWire = PageReadyWire | z.input<typeof pageToViewer>;
 
 /** A message from the document, or null for one not to trust. */
 export function parsePageMessage(data: unknown): PageToViewer | null {
+  // DALTON-HOOK(mobile-web): inspect raw page:ready own properties before Zod strips optional keys
+  if (data !== null && typeof data === 'object' && !Array.isArray(data) && (data as Record<string, unknown>).type === 'page:ready') {
+    return parsePageReady(data as Record<string, unknown>);
+  }
   const read = pageToViewer.safeParse(data);
   return read.success ? read.data : null;
 }

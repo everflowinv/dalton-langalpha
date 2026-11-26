@@ -1972,3 +1972,76 @@ describe('the page bridge on an opaque origin', () => {
     expect(doc.cookie).toBe('b=2');
   });
 });
+
+// DALTON-HOOK(mobile-web): tri-state docLocation() prefix, root, and invalidPath coverage
+describe('the page bridge classifies docLocation into path, root, or invalidPath on page:ready', () => {
+  const readyFor = (url: string) => served(url).sent.find((m) => m.type === 'page:ready');
+
+  it('extracts workspace-relative paths from all 6 left-anchored served prefixes without truncating inner markers', () => {
+    const cases: Array<[string, string]> = [
+      ['https://api.example.com/api/v1/wsfiles/g/grant-1/results/report.html?inject=view', 'results/report.html'],
+      ['https://api.example.com/api/v1/public/shared/tok-1/files/serve/results/report.html?inject=view', 'results/report.html'],
+      ['https://api.example.com/api/v1/artifacts/g/art-grant/v/3/reports/index.html', 'reports/index.html'],
+      ['https://api.example.com/api/v1/dalton/monitors/g/mon-grant/v/5/hk-momentum/index.html', 'hk-momentum/index.html'],
+      ['https://api.example.com/api/v1/dalton/monitors/public/pm-pulse/v/4/dashboard.html', 'dashboard.html'],
+      ['https://artifact-x.example.com/g/art-grant/v/2/charts/q3.html', 'charts/q3.html'],
+      ['https://page-x.example.com/v/7/index.html', 'index.html'],
+      // Embedded /v/2/ and files/serve/ inside the workspace path must not truncate the match.
+      ['https://api.example.com/api/v1/wsfiles/g/grant-1/sub/v/2/report.html?inject=view', 'sub/v/2/report.html'],
+      ['https://api.example.com/api/v1/public/shared/tok-1/files/serve/files/serve/report.html?inject=view', 'files/serve/report.html'],
+      ['https://page-x.example.com/v/3/sub/v/2/report.html', 'sub/v/2/report.html'],
+      // Percent-encoded valid filename and double-dot inside a filename segment are preserved.
+      ['https://page-x.example.com/v/3/reports/q1..q2%20summary.html', 'reports/q1..q2 summary.html'],
+    ];
+    for (const [url, expectedPath] of cases) {
+      expect(readyFor(url)).toEqual({ type: 'page:ready', v: 1, path: expectedPath });
+    }
+  });
+
+  it('sends root: true for left-anchored pathless version root entry points', () => {
+    const roots = [
+      'https://api.example.com/api/v1/dalton/monitors/public/public-market-pulse/v/4/',
+      'https://api.example.com/api/v1/dalton/monitors/public/public-market-pulse/v/4',
+      'https://api.example.com/api/v1/dalton/monitors/g/mon-grant/v/4/',
+      'https://api.example.com/api/v1/artifacts/g/art-grant/v/3/',
+      'https://artifact-x.example.com/g/art-grant/v/3/',
+      'https://page-x.example.com/v/3/',
+      'https://page-x.example.com/v/3',
+    ];
+    for (const url of roots) {
+      const msg = readyFor(url);
+      expect(msg).toEqual({ type: 'page:ready', v: 1, root: true });
+      expect(Object.prototype.hasOwnProperty.call(msg, 'path')).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(msg, 'invalidPath')).toBe(false);
+    }
+  });
+
+  it('sends invalidPath: true for traversal, backslashes, control chars, bad encoding, overlong paths, and unrecognized prefixes', () => {
+    const overlong = 'a'.repeat(1025);
+    const invalidUrls = [
+      // Encoded slashes keep traversal segments intact past WHATWG URL normalization so docLocation() rejects them.
+      'https://page-x.example.com/v/3/a%2F%2e%2e%2Fsecret.html',
+      'https://page-x.example.com/v/3/%2e%2e%2Fsecret.html',
+      'https://page-x.example.com/v/3/a%2F%2e%2e',
+      'https://api.example.com/api/v1/public/shared/tok-1/files/serve/a%2F..%2Fb.html',
+      'https://page-x.example.com/v/3/a%5Cb.html',
+      'https://page-x.example.com/v/3/a%00b.html',
+      'https://page-x.example.com/v/3/a%0Ab.html',
+      'https://page-x.example.com/v/3/a%7Fb.html',
+      'https://page-x.example.com/v/3/%E0%A4%A',
+      `https://page-x.example.com/v/3/${overlong}`,
+      'https://page-x.example.com/v/3//',
+      // Unrecognized prefixes (not left-anchored to one of the 6 served routes).
+      'https://api.example.com/foo/v/3/index.html',
+      'https://api.example.com/random/page.html',
+      'https://api.example.com/api/v1/wsfiles/g/grant-1/',
+      'https://api.example.com/api/v1/public/shared/tok-1/files/serve/',
+    ];
+    for (const url of invalidUrls) {
+      const msg = readyFor(url);
+      expect(msg).toEqual({ type: 'page:ready', v: 1, invalidPath: true });
+      expect(Object.prototype.hasOwnProperty.call(msg, 'path')).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(msg, 'root')).toBe(false);
+    }
+  });
+});

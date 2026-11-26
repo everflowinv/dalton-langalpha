@@ -69,7 +69,8 @@ describe('BridgedFrame after a scripted navigation', () => {
     expect(page.sent).toHaveLength(1);
 
     // Viewed, its own script takes it there again: once more.
-    say({ type: 'page:ready', path: 'r/next.html' });
+    // DALTON-HOOK(mobile-web): include pathState on parsed page:ready message
+    say({ type: 'page:ready', path: 'r/next.html', pathState: 'path' });
     say({ type: 'page:frame-loads', doc: NEXT });
     expect(page.sent).toHaveLength(2);
   });
@@ -86,7 +87,8 @@ describe('BridgedFrame after a scripted navigation', () => {
     const { frame, onUnbridged } = renderFrame();
     fireEvent.load(frame);
     say({ type: 'page:frame-loads', doc: NEXT });
-    say({ type: 'page:ready', path: 'r/next.html' });
+    // DALTON-HOOK(mobile-web): include pathState on parsed page:ready message
+    say({ type: 'page:ready', path: 'r/next.html', pathState: 'path' });
     fireEvent.load(frame);
     act(() => { vi.advanceTimersByTime(5000); });
     expect(onUnbridged).not.toHaveBeenCalled();

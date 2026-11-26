@@ -16,6 +16,7 @@ import { DocumentErrorFallback, DocumentLoadingFallback } from './fallbacks';
 import type { useFileFocus } from './useFileFocus';
 import type { DownloadState } from '../../utils/downloadNotice';
 import type { HtmlArtifactView } from '../viewers/html/ArtifactFrames';
+import type { HtmlFrameDocState } from '../viewers/html/pageProtocol'; // DALTON-HOOK(mobile-web)
 import type { ViewerCommentsTarget } from '../viewers/comments/ViewerComments';
 import { MarkdownFile } from '../viewers/comments/markdown/MarkdownFile';
 import { CodeFile } from '../viewers/comments/code/CodeFile';
@@ -82,8 +83,8 @@ export interface FileViewerProps {
   teamReadOnly?: boolean;
   /** The owner's comments and versions on an HTML file. Left out, the file shows alone. */
   htmlArtifact?: HtmlArtifactView | null;
-  // DALTON-HOOK(mobile-web): reports the document path shown in a read-only HTML ViewFrame
-  onHtmlDocChange?: ((docPath: string | null) => void) | null;
+  // DALTON-HOOK(mobile-web): reports the unified document state shown in any bridged HTML frame
+  onHtmlDocChange?: ((state: HtmlFrameDocState) => void) | null;
   /** The owner's comments on a file a viewer in the app draws (Markdown, code, PDF, a sheet). Left out, the file shows alone. */
   comments?: ViewerCommentsTarget | null;
 }
@@ -222,7 +223,7 @@ export function FileViewer(props: FileViewerProps): React.ReactElement {
             source={props.htmlSource}
             artifact={props.htmlArtifact ?? null}
             onOpenLink={props.onFrameLink}
-            // DALTON-HOOK(mobile-web): forward shown doc path from read-only HTML ViewFrame
+            // DALTON-HOOK(mobile-web): forward unified HtmlFrameDocState from HtmlViewer (owner & read-only frames)
             onShownDocChange={props.onHtmlDocChange}
           />
         </DocumentErrorBoundary>

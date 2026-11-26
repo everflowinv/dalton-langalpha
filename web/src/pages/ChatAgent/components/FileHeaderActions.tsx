@@ -44,6 +44,7 @@ import type { PanelAccess } from './filePanel/types';
 import type { ArtifactVersionView } from './filePanel/useArtifactVersionView'; // DALTON-HOOK(mobile-web)
 import { OUTCOME_MS, summarizeSendAllOutcome } from './viewers/html/comments/CommentTools'; // DALTON-HOOK(mobile-web)
 import type { CommentUi } from './viewers/html/comments/useCommentUi'; // DALTON-HOOK(mobile-web)
+import type { HtmlFrameDocState } from './viewers/html/pageProtocol'; // DALTON-HOOK(mobile-web)
 
 const PDF_SCALE_CHOICES = [0.8, 1, 1.25];
 // DALTON-HOOK(monitors): inert fallback client for tests that render FileHeaderActions without QueryClientProvider
@@ -107,7 +108,9 @@ interface FileHeaderActionsProps {
    * box and toolbar do. Null while the file's viewer is not up.
    */
   artifactDoc?: string | null;
-  // DALTON-HOOK(mobile-web): open a linked in-frame HTML report as its own tab from the mobile More menu
+  // DALTON-HOOK(mobile-web): unified HTML frame document state machine (pending/current/bridged_root/linked/unbridged)
+  htmlDocState?: HtmlFrameDocState | null;
+  // DALTON-HOOK(mobile-web): open a linked in-frame HTML report as its own tab from desktop or mobile header
   onOpenDocAsTab?: ((path: string) => void) | null;
   /** An HTML file's view: its markup rather than its page, and the switch between them. */
   htmlSource?: boolean;
@@ -163,6 +166,9 @@ function resolveHeaderActionFlags({
   canDownload,
   canEdit,
   mobileHtmlTools,
+  // DALTON-HOOK(mobile-web): suppress file-level actions on linked/unbridged HTML frames
+  suppressFileActions = false,
+  isUnbridgedHtmlDoc = false,
 }: {
   isHtml: boolean;
   access: PanelAccess;
@@ -174,23 +180,25 @@ function resolveHeaderActionFlags({
   canDownload: boolean;
   canEdit: boolean;
   mobileHtmlTools: MobileHtmlTools | null;
+  suppressFileActions?: boolean;
+  isUnbridgedHtmlDoc?: boolean;
 }): HeaderActionFlags {
-  const showPublish = Boolean(openPublish);
+  const showPublish = Boolean(openPublish) && !suppressFileActions;
   const showOwnerArtifactMenu = showPublish && isHtml && access.kind === 'owner';
-  const showCommentTools = Boolean(mobileHtmlTools);
+  const showCommentTools = Boolean(mobileHtmlTools) && !isUnbridgedHtmlDoc;
   return {
-    showToggleHtmlSource: isHtml && Boolean(onToggleHtmlSource),
-    showUnshareOnly: Boolean(openUnshareOnly && unshareShared),
+    showToggleHtmlSource: isHtml && Boolean(onToggleHtmlSource) && !suppressFileActions,
+    showUnshareOnly: Boolean(openUnshareOnly && unshareShared) && !suppressFileActions,
     showPublish,
     showOwnerArtifactMenu,
     showOpenUrl: Boolean(openUrl),
-    showDownload: canDownload,
-    showEdit: canEdit,
+    showDownload: canDownload && !suppressFileActions,
+    showEdit: canEdit && !suppressFileActions,
     // Matches useFileComments.tsx: tools renders CommentTools + PinPageButton when `path && ui`;
     // crumbs renders ArtifactCrumbs when `path && openPublish`.
     showCommentTools,
-    showPinDashboard: showCommentTools,
-    showArtifactCrumbs: showCommentTools && showPublish && Boolean(mobileHtmlTools?.versionView),
+    showPinDashboard: showCommentTools && !suppressFileActions,
+    showArtifactCrumbs: showCommentTools && showPublish && Boolean(mobileHtmlTools?.versionView) && !suppressFileActions,
   };
 }
 
@@ -213,6 +221,7 @@ function FileHeaderActions({
   // DALTON-HOOK(external-share-guard): stop-only entry for external members
   openUnshareOnly = null,
   artifactDoc = null,
+  htmlDocState = null, // DALTON-HOOK(mobile-web)
   onOpenDocAsTab = null, // DALTON-HOOK(mobile-web)
   htmlSource = false,
   onToggleHtmlSource = null,
@@ -383,7 +392,33 @@ function FileHeaderActions({
   const isMd = isMarkdownFile(selectedFile, fileMime);
   const isHtml = isHtmlFile(selectedFile);
   const isText = isTextMime(fileMime);
-  const openUrl = isHtml ? served.openUrl : undefined;
+  // DALTON-HOOK(mobile-web): unify desktop & mobile HTML action gating around HtmlFrameDocState
+  const activeHtmlDocState = isHtml && !htmlSource ? htmlDocState : null;
+  const isPendingHtmlDoc = activeHtmlDocState?.kind === 'pending';
+  const isUnbridgedHtmlDoc = activeHtmlDocState?.kind === 'unbridged';
+  const isLinkedHtmlDoc = activeHtmlDocState
+    ? activeHtmlDocState.kind === 'linked'
+    : Boolean(
+        isMobile &&
+        isHtml &&
+        !htmlSource &&
+        artifactDoc &&
+        artifactPathKey(artifactDoc, root) !== artifactPathKey(selectedFile, root),
+      );
+  const linkedDocPath =
+    activeHtmlDocState?.kind === 'linked'
+      ? activeHtmlDocState.path
+      : isLinkedHtmlDoc
+        ? artifactDoc
+        : null;
+  // Never fall back to tab A's served.openUrl when the frame is linked or unbridged (currentUrl: null)
+  const openUrl = !isHtml
+    ? undefined
+    : isUnbridgedHtmlDoc
+      ? (activeHtmlDocState?.kind === 'unbridged' ? activeHtmlDocState.currentUrl ?? undefined : undefined)
+      : isLinkedHtmlDoc
+        ? undefined
+        : served.openUrl;
 
   const renderDropdownItems = () => {
     if (isMd) {
@@ -497,6 +532,7 @@ function FileHeaderActions({
   const hasHistoricalPublicMonitor =
     !unshareRecord?.shared && unshareMonitor?.visibility === 'public';
   // DALTON-HOOK(mobile-web): compute visibility flags once and share them across both desktop toolbar and mobile HTML overflow menu
+  const suppressFileActions = isLinkedHtmlDoc || isUnbridgedHtmlDoc;
   const actions = resolveHeaderActionFlags({
     isHtml,
     access,
@@ -511,15 +547,14 @@ function FileHeaderActions({
     canDownload,
     canEdit,
     mobileHtmlTools,
+    suppressFileActions,
+    isUnbridgedHtmlDoc,
   });
-  const isLinkedHtmlDoc = Boolean(
-    isHtml && artifactDoc && artifactPathKey(artifactDoc, root) !== artifactPathKey(selectedFile, root),
-  );
   const hasHtmlOverflowActions =
     isMobile &&
     isHtml &&
     Boolean(
-      (isLinkedHtmlDoc && onOpenDocAsTab) ||
+      (isLinkedHtmlDoc && linkedDocPath && onOpenDocAsTab) ||
       actions.showCommentTools ||
       actions.showPublish ||
       actions.showUnshareOnly ||
@@ -531,11 +566,13 @@ function FileHeaderActions({
 
   return (
     <>
+      {/* DALTON-HOOK(mobile-web): forward linkedDocPath and pending state to mobile overflow menu */}
       {hasHtmlOverflowActions ? (
         <MobileHtmlOverflowMenu
           workspaceId={workspaceId}
           selectedFile={selectedFile}
-          artifactDoc={artifactDoc}
+          linkedDocPath={linkedDocPath}
+          isPendingHtmlDoc={isPendingHtmlDoc}
           onOpenDocAsTab={onOpenDocAsTab}
           access={access}
           actions={actions}
@@ -559,6 +596,19 @@ function FileHeaderActions({
       ) : (
         /* DALTON-HOOK(mobile-web): desktop flat HTML action toolbar sharing the same `actions` flags as mobile */
         <>
+          {/* DALTON-HOOK(mobile-web): when viewing an in-frame linked report B on desktop, offer "Open in its own tab" */}
+          {isLinkedHtmlDoc && linkedDocPath && onOpenDocAsTab && (
+            <button
+              type="button"
+              onClick={() => onOpenDocAsTab(linkedDocPath)}
+              className="file-panel-icon-btn"
+              title={t('filePanel:openReportInTab')}
+              aria-label={t('filePanel:openReportInTab')}
+              data-testid="file-header-open-doc-tab"
+            >
+              <ExternalLink className="h-4 w-4" />
+            </button>
+          )}
           {/* One switch for the two views, showing where it goes. */}
           {actions.showToggleHtmlSource && onToggleHtmlSource && (
             <button
@@ -577,6 +627,7 @@ function FileHeaderActions({
               className="file-panel-icon-btn"
               title={t('artifact.unshareOnly')}
               aria-label={t('artifact.unshareOnly')}
+              disabled={isPendingHtmlDoc}
             >
               <Link2Off className="h-4 w-4" />
             </button>
@@ -588,6 +639,7 @@ function FileHeaderActions({
               workspaceId={workspaceId}
               path={artifactDoc ?? selectedFile}
               onPublish={openPublish}
+              disabled={isPendingHtmlDoc}
             />
           ) : (
             <button
@@ -595,6 +647,7 @@ function FileHeaderActions({
               className="file-panel-icon-btn"
               title={t('artifact.publish')}
               aria-label={t('artifact.publish')}
+              disabled={isPendingHtmlDoc}
             >
               <Link2 className="h-4 w-4" />
             </button>
@@ -608,6 +661,7 @@ function FileHeaderActions({
               className="file-panel-icon-btn"
               title={t('filePanel:openInNewTab')}
               aria-label={t('filePanel:openInNewTab')}
+              disabled={isPendingHtmlDoc}
             >
               <ExternalLink className="h-4 w-4" />
             </button>
@@ -619,6 +673,7 @@ function FileHeaderActions({
                   // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on non-HTML file header actions
                   className="file-panel-icon-btn tap-target"
                   aria-label={t('filePanel:downloadOptions') ?? 'Download options'}
+                  disabled={isPendingHtmlDoc}
                 >
                   <Download className="h-4 w-4" />
                 </button>
@@ -634,6 +689,7 @@ function FileHeaderActions({
               onClick={onStartEdit}
               className="file-panel-icon-btn tap-target"
               title={t('filePanel:editFile')}
+              disabled={isPendingHtmlDoc}
             >
               <Pencil className="h-4 w-4" />
             </button>
@@ -733,10 +789,12 @@ function useArtifactMenuState({
  * unbound. `path` is the document the frame shows, so after a link inside it
  * the menu is about the file being commented on, not the one the tab opened.
  */
-function ArtifactMenu({ workspaceId, path, onPublish }: {
+function ArtifactMenu({ workspaceId, path, onPublish, disabled = false }: {
   workspaceId: string;
   path: string;
   onPublish: (path: string) => void;
+  // DALTON-HOOK(mobile-web): disable publish/bind menu trigger while framed HTML doc identity is pending
+  disabled?: boolean;
 }): React.ReactElement {
   const { t } = useTranslation();
   // DALTON-HOOK(mobile-web): reuse shared ArtifactMenu state hook with MobileHtmlOverflowMenu
@@ -745,7 +803,7 @@ function ArtifactMenu({ workspaceId, path, onPublish }: {
   return (
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
-        <button className="file-panel-icon-btn" title={t('artifact.publish')} aria-label={t('artifact.publish')}>
+        <button className="file-panel-icon-btn" title={t('artifact.publish')} aria-label={t('artifact.publish')} disabled={disabled}>
           <Link2 className="h-4 w-4" />
         </button>
       </DropdownMenuTrigger>
@@ -784,7 +842,8 @@ const MOBILE_LIVE_VERSION = 'live';
 function MobileHtmlOverflowMenu({
   workspaceId,
   selectedFile,
-  artifactDoc,
+  linkedDocPath,
+  isPendingHtmlDoc,
   onOpenDocAsTab,
   access,
   actions,
@@ -807,7 +866,9 @@ function MobileHtmlOverflowMenu({
 }: {
   workspaceId: string;
   selectedFile: string;
-  artifactDoc: string | null;
+  // DALTON-HOOK(mobile-web): linked document path and pending flag derived from HtmlFrameDocState
+  linkedDocPath: string | null;
+  isPendingHtmlDoc: boolean;
   onOpenDocAsTab: ((path: string) => void) | null;
   access: PanelAccess;
   actions: HeaderActionFlags;
@@ -833,11 +894,9 @@ function MobileHtmlOverflowMenu({
   const queryClient = useQueryClient();
   const root = useWorkspaceFolders()?.rootDir;
   const isOwner = access.kind === 'owner';
-  const tabKey = artifactPathKey(selectedFile, root);
-  // DALTON-HOOK(mobile-web): when an in-frame link navigated to another report (B != tab A),
-  // hide all tab-document actions and offer only "Open this report in its own tab" + comments.
-  const isLinkedDoc = Boolean(artifactDoc && artifactPathKey(artifactDoc, root) !== tabKey);
-  const commentDocPath = isLinkedDoc && artifactDoc ? artifactDoc : selectedFile;
+  // DALTON-HOOK(mobile-web): reuse linkedDocPath resolved from unified HtmlFrameDocState
+  const isLinkedDoc = Boolean(linkedDocPath);
+  const commentDocPath = isLinkedDoc && linkedDocPath ? linkedDocPath : selectedFile;
   const commentDocKey = artifactPathKey(commentDocPath, root);
 
   const versionView = !isLinkedDoc ? (mobileHtmlTools?.versionView ?? null) : null;
@@ -1000,18 +1059,18 @@ function MobileHtmlOverflowMenu({
           }}
         >
           {/* DALTON-HOOK(mobile-web): when viewing an in-frame linked report B inside tab A, offer only "Open in its own tab" + comments */}
-          {isLinkedDoc && artifactDoc && (
+          {isLinkedDoc && linkedDocPath && (
             <>
               {onOpenDocAsTab && (
                 <DropdownMenuItem
-                  onSelect={() => onOpenDocAsTab(artifactDoc)}
+                  onSelect={() => onOpenDocAsTab(linkedDocPath)}
                   data-testid="file-header-mobile-open-doc-tab"
                 >
                   <ExternalLink className="h-3.5 w-3.5" />
                   <span className="flex-1">{t('filePanel:openReportInTab')}</span>
                 </DropdownMenuItem>
               )}
-              {onOpenDocAsTab && mobileHtmlTools && <DropdownMenuSeparator />}
+              {onOpenDocAsTab && actions.showCommentTools && mobileHtmlTools && <DropdownMenuSeparator />}
             </>
           )}
 
@@ -1053,7 +1112,7 @@ function MobileHtmlOverflowMenu({
               )}
               {!isLinkedDoc && actions.showPinDashboard && (
                 <DropdownMenuItem
-                  disabled={pin.pending}
+                  disabled={pin.pending || isPendingHtmlDoc}
                   onSelect={pin.pinIt}
                   data-testid="file-header-mobile-pin-dashboard"
                 >
@@ -1073,7 +1132,7 @@ function MobileHtmlOverflowMenu({
             <>
               {crumbs.showUpdate && openPublish && (
                 <DropdownMenuItem
-                  disabled={crumbs.updatePending}
+                  disabled={crumbs.updatePending || isPendingHtmlDoc}
                   onSelect={crumbs.onUpdate}
                   data-testid="file-header-mobile-update"
                   title={versionStatusFullNote ?? undefined}
@@ -1177,7 +1236,7 @@ function MobileHtmlOverflowMenu({
 
           {/* DALTON-HOOK(mobile-web): owner ArtifactMenu publish & thread binding/unbinding (same visibility flags & state as desktop) */}
           {!isLinkedDoc && actions.showPublish && openPublish && (
-            <DropdownMenuItem onSelect={() => openPublish(selectedFile)} data-testid="file-header-mobile-publish">
+            <DropdownMenuItem disabled={isPendingHtmlDoc} onSelect={() => openPublish(selectedFile)} data-testid="file-header-mobile-publish">
               <Link2 className="h-3.5 w-3.5" />
               {actions.showOwnerArtifactMenu && (menu.artifact?.shared || menu.hasPublicMonitor) ? t('artifact.manage') : t('artifact.publishEllipsis')}
             </DropdownMenuItem>
@@ -1189,6 +1248,7 @@ function MobileHtmlOverflowMenu({
           )}
           {!isLinkedDoc && actions.showOwnerArtifactMenu && menu.showBind && (
             <DropdownMenuItem
+              disabled={isPendingHtmlDoc}
               data-testid="file-header-mobile-bind"
               onSelect={menu.onBind}
             >
@@ -1198,6 +1258,7 @@ function MobileHtmlOverflowMenu({
           )}
           {!isLinkedDoc && actions.showOwnerArtifactMenu && menu.showUnbind && (
             <DropdownMenuItem
+              disabled={isPendingHtmlDoc}
               data-testid="file-header-mobile-unbind"
               onSelect={menu.onUnbind}
             >
@@ -1206,7 +1267,7 @@ function MobileHtmlOverflowMenu({
             </DropdownMenuItem>
           )}
           {!isLinkedDoc && actions.showUnshareOnly && openUnshareOnly && (
-            <DropdownMenuItem onSelect={() => openUnshareOnly(selectedFile)} data-testid="file-header-mobile-unshare">
+            <DropdownMenuItem disabled={isPendingHtmlDoc} onSelect={() => openUnshareOnly(selectedFile)} data-testid="file-header-mobile-unshare">
               <Link2Off className="h-3.5 w-3.5" />
               {t('artifact.unshareOnly')}
             </DropdownMenuItem>
@@ -1222,6 +1283,7 @@ function MobileHtmlOverflowMenu({
           )}
           {!isLinkedDoc && actions.showOpenUrl && openUrl && (
             <DropdownMenuItem
+              disabled={isPendingHtmlDoc}
               onSelect={() => window.open(openUrl, '_blank', 'noopener,noreferrer')}
               data-testid="file-header-mobile-open-url"
             >
@@ -1230,7 +1292,7 @@ function MobileHtmlOverflowMenu({
             </DropdownMenuItem>
           )}
           {!isLinkedDoc && actions.showEdit && (
-            <DropdownMenuItem onSelect={onStartEdit} data-testid="file-header-mobile-edit">
+            <DropdownMenuItem disabled={isPendingHtmlDoc} onSelect={onStartEdit} data-testid="file-header-mobile-edit">
               <Pencil className="h-3.5 w-3.5" />
               {t('filePanel:editFile')}
             </DropdownMenuItem>
@@ -1238,11 +1300,12 @@ function MobileHtmlOverflowMenu({
           {!isLinkedDoc && actions.showDownload && (actions.showToggleHtmlSource || actions.showOpenUrl || actions.showEdit) && <DropdownMenuSeparator />}
           {!isLinkedDoc && actions.showDownload && (
             <>
-              <DropdownMenuItem onSelect={download} disabled={downloadPending} data-testid="file-header-mobile-download">
+              {/* DALTON-HOOK(mobile-web): disable download and PDF export while HTML frame doc state is pending */}
+              <DropdownMenuItem onSelect={download} disabled={downloadPending || isPendingHtmlDoc} data-testid="file-header-mobile-download">
                 <Download className="h-3.5 w-3.5" />
                 {t('filePanel:download')}
               </DropdownMenuItem>
-              <DropdownMenuItem onSelect={() => void onExportHtmlPdf()} data-testid="file-header-mobile-save-pdf">
+              <DropdownMenuItem disabled={isPendingHtmlDoc} onSelect={() => void onExportHtmlPdf()} data-testid="file-header-mobile-save-pdf">
                 <FileDown className="h-3.5 w-3.5" />
                 {t('filePanel:saveAsPdf')}
               </DropdownMenuItem>
