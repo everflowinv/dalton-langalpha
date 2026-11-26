@@ -527,6 +527,27 @@ ALLOWED_HOOKS=(
   # Sync plugin-local sec_issuer_map.json beside dalton_sec_mcp_server.py in core sandboxes
   # (manifest hashing, upload batch, and prune allowlist in src/ptc_agent/core/sandbox/assets.py).
   "sec-issuer-map"
+  # Frontend fix bundle 4 (BU4): the Drive guidance an operator and a user read.
+  # langalpha-doc drive.md names the administrator's deployment switch
+  # (features.drive.enabled) before the user's own, since the first hides the
+  # second while off; and the multipart-cleanup startup warning (setup.py)
+  # names MinIO's stale_uploads_expiry beside the lifecycle rule MinIO lacks.
+  "drive-guidance"
+  # Frontend fix bundle 4 (BA4): closing the New workspace dialog puts focus back
+  # on the control that opened it. The click handler hands the dialog its own
+  # control (CreateWorkspaceHost.openDialog, AppSidebar, CommandPalette,
+  # useLocalSources, WorkspaceGallery and its GalleryActions / GalleryEmptyState
+  # prop types), and the dialog ranks that over its two guesses
+  # (CreateWorkspaceModal): Safari leaves focus where a click found it, and Voice
+  # Control, a virtual cursor and a script's click() give neither.
+  "dialog-focus-return"
+  # Frontend fix bundle 4 (AE2): a machine that finishes being prepared while
+  # Settings is open is announced when its status frame arrives. Settings mounts
+  # a page-level ComputersDialogHost with no status fan-out above it (ChatAgent
+  # brings its own), and the list polls only a spec change, so the outcome waited
+  # for the next list read. The host takes `statusFanout` for that
+  # (ComputersDialogHost, Settings.tsx).
+  "page-host-status-fanout"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

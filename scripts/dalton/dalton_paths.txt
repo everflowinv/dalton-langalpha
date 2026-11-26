@@ -641,3 +641,7 @@ web/src/components/ui/__tests__/chat-input.priceSource.dalton.test.tsx
 # AD5 + Bundle 2: server-side report delivery confirmation and workspace create/dedup tests.
 tests/unit/server/test_workspace_bundle2.py
 web/src/pages/Automations/__tests__/Automations.reportDeliveryConfirm.test.tsx
+# Frontend fix bundle 4: where focus lands when the New workspace dialog closes (DALTON-HOOK(dialog-focus-return)),
+# and a machine that finishes preparing while Settings is open (DALTON-HOOK(page-host-status-fanout)).
+web/src/pages/ChatAgent/components/__tests__/CreateWorkspaceModal.focusReturn.test.tsx
+web/src/pages/Settings/__tests__/Settings.computerReady.test.tsx

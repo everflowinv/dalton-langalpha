@@ -153,7 +153,7 @@ docker compose -f docker-compose.yml -f docker-compose.dalton.yml exec -T \
   3. 电脑 CLI 凭据（`computer_cli_tokens`）的 Drive 权限与真实调用者绑定（或在允许跨用户执行的计算机上隔离其 Drive API 权限），防止跨用户回合经公开 Drive API 读写属主 Drive。
 - **对象存储分片清理与启动告警说明**：后端启动时会调用 `has_multipart_cleanup_rule(min_days=7, prefix="uploads/")` 检查主存储桶（`STORAGE_BUCKET_NAME`）是否配置了「中止未完成分片上传且 `DaysAfterInitiation >= 7`」的清理规则。
   - 当存储桶缺少该规则或天数为 6 天及以下时，后端会输出一条 `WARNING` 日志提醒运维配置，该检查仅作告警提示，正常放行启动。
-  - 独立核心安装自带的 `scripts/standalone/minio_init.py` 仅负责创建私有桶并清理匿名桶策略；后续启用 Drive 前，S3 / R2 环境配置 `AbortIncompleteMultipartUpload`（`DaysAfterInitiation >= 7`），内置 MinIO 环境通过 MinIO 原生的 `stale_uploads_expiry` 配置分片清理。
+  - 独立核心安装自带的 `scripts/standalone/minio_init.py` 仅负责创建私有桶并清理匿名桶策略；后续启用 Drive 前，S3 / R2 环境配置 `AbortIncompleteMultipartUpload`（`DaysAfterInitiation >= 7`），内置 MinIO 环境通过 MinIO 原生的 `stale_uploads_expiry` 配置分片清理（环境变量 `MINIO_API_STALE_UPLOADS_EXPIRY`，`docker-compose.core.yml` 默认 `24h`；启用 Drive 时设为 `168h` 及以上，因为 Drive 分片上传最长保持打开 6 天）。MinIO 经 S3 生命周期接口查不到这项设置，所以在内置 MinIO 上该启动告警每次都会出现，启动日志同时写明这两种配置方式。
 
 ## 3. 宿主机 `launchd` 服务运维
 

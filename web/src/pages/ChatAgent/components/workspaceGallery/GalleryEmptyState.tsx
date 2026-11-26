@@ -1,3 +1,4 @@
+import type { MouseEvent } from 'react';
 import { Plus, SlidersHorizontal } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
@@ -9,7 +10,8 @@ interface GalleryEmptyStateProps {
   /** The search that matched nothing, named back with a way to clear it. */
   query?: string;
   onClearSearch?: () => void;
-  onNewWorkspace: () => void;
+  /** The button's own click: the gallery keeps the control for focus to return to. */
+  onNewWorkspace: (event: MouseEvent<HTMLButtonElement>) => void; // DALTON-HOOK(dialog-focus-return)
 }
 
 /**
