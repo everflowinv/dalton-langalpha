@@ -68,27 +68,29 @@ _DSN_ENV_VARS = (
 )
 
 
+from tests.integration.dalton._db_guard import extract_effective_test_db_name
+
+
 def resolve_validated_test_dsn(explicit_dsn: str | None = None) -> str:
     """Resolve and validate that the Postgres DSN targets an isolated `*_test` database."""
     raw = (explicit_dsn or "").strip()
+    source = "explicit_dsn"
     if not raw:
         for var in _DSN_ENV_VARS:
             candidate = os.environ.get(var, "").strip()
             if candidate:
                 raw = candidate
+                source = var
                 break
     if not raw:
         raise RuntimeError(
             "No test Postgres DSN configured (set DALTON_CHANNEL_GATEWAY_TEST_DSN, "
             "DALTON_TEST_DB_DSN, or TEST_DATABASE_URL)."
         )
-    parsed = urlsplit(raw)
-    db_name = (parsed.path or "").lstrip("/")
-    if not db_name.endswith("_test"):
-        raise RuntimeError(
-            f"Refusing to run Weixin integration harness against non-test database {db_name!r} "
-            "(database name must end with '_test')."
-        )
+    try:
+        extract_effective_test_db_name(raw, source=source)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
     return raw
 
 

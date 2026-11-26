@@ -162,14 +162,14 @@ def _skip_or_fail_infra(reason: str) -> None:
     pytest.skip(reason)
 
 
+from tests.integration.dalton._db_guard import extract_effective_test_db_name
+
+
 def _assert_isolated_test_dsn(dsn: str, *, source: str) -> str:
-    parsed = urlsplit(dsn)
-    db_name = (parsed.path or "").strip().lstrip("/")
-    if not db_name or not db_name.endswith("_test"):
-        pytest.fail(
-            f"Refusing to run chat upload integration tests against non-test database "
-            f"{db_name!r} (from {source}; database name must end with '_test')"
-        )
+    try:
+        db_name = extract_effective_test_db_name(dsn, source=source)
+    except ValueError as exc:
+        pytest.fail(str(exc))
     prod_db = (os.environ.get("DB_NAME") or "").strip().lstrip("/")
     if prod_db and not prod_db.endswith("_test") and db_name == prod_db:
         pytest.fail(
@@ -189,9 +189,20 @@ def _resolve_isolated_test_dsn() -> str:
             except psycopg.OperationalError as exc:
                 _skip_or_fail_infra(f"Test database from {var} is unreachable: {exc}")
 
-    host = (os.environ.get("TEST_DB_HOST") or "localhost").strip()
-    port = (os.environ.get("TEST_DB_PORT") or "5432").strip()
-    name = (os.environ.get("TEST_DB_NAME") or "langalpha_test").strip().lstrip("/")
+    host = (os.environ.get("TEST_DB_HOST") or "").strip()
+    port = (os.environ.get("TEST_DB_PORT") or "").strip()
+    name = (os.environ.get("TEST_DB_NAME") or "").strip().lstrip("/")
+    missing = [
+        k
+        for k, v in (("TEST_DB_HOST", host), ("TEST_DB_PORT", port), ("TEST_DB_NAME", name))
+        if not v
+    ]
+    if missing:
+        pytest.fail(
+            "Refusing to run chat upload integration tests without explicit test DB configuration "
+            f"(missing {', '.join(missing)}; or set one of {', '.join(_DSN_ENV_VARS)}). "
+            "Falling back to localhost:5432 is disabled."
+        )
     user = os.environ.get("TEST_DB_USER") or "postgres"
     password = os.environ.get("TEST_DB_PASSWORD") or "postgres"
     sslmode = (os.environ.get("TEST_DB_SSLMODE") or "prefer").strip()

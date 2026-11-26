@@ -90,10 +90,10 @@ def test_universe_counts_and_core_sync() -> None:
     cov = screen_movers.covered(screen_movers.TICKERS)
     core = screen_movers.covered(screen_movers.TICKERS, "Core")
     watch = screen_movers.covered(screen_movers.TICKERS, "Watch")
-    assert len(cov) == 105
-    assert len(core) == 27
+    assert len(cov) == 106
+    assert len(core) == 28
     assert len(watch) == 78
-    assert len(cli.CORE) == 27
+    assert len(cli.CORE) == 28
     assert {c["name"] for c in cli.CORE} == set(core)
     raw_tickers = [v[0] for v in screen_movers.TICKERS.values()]
     assert len(raw_tickers) == len(set(raw_tickers))

@@ -90,7 +90,129 @@ BUILTIN_TICKER_CIKS: dict[str, tuple[str, str]] = {
     "PDD": ("0001737806", "PDD Holdings Inc."),
     "JD": ("0001549802", "JD.com, Inc."),
     "BIDU": ("0001329099", "Baidu, Inc."),
+    "NTES": ("0001110646", "NetEase, Inc."),
+    "BILI": ("0001723690", "Bilibili Inc."),
+    "LI": ("0001791706", "Li Auto Inc."),
+    "NIO": ("0001736541", "NIO Inc."),
+    "XPEV": ("0001810997", "XPeng Inc."),
+    "TCOM": ("0001269238", "Trip.com Group Limited"),
+    "YUMC": ("0001673358", "Yum China Holdings, Inc."),
+    "ZTO": ("0001677250", "ZTO Express (Cayman) Inc."),
+    "HSBC": ("0001089113", "HSBC HOLDINGS PLC"),
+    "TM": ("0001094517", "TOYOTA MOTOR CORP"),
+    "SONY": ("0000313838", "SONY GROUP CORP"),
+    "ASML": ("0000937966", "ASML HOLDING NV"),
+    "SAP": ("0001000184", "SAP SE"),
+    "NVO": ("0000353278", "NOVO NORDISK A S"),
+    "AZN": ("0000901832", "ASTRAZENECA PLC"),
+    "SHEL": ("0001306965", "Shell plc"),
+    "PKX": ("0000889132", "POSCO HOLDINGS INC."),
 }
+
+def _load_sec_issuer_map_data() -> dict[str, Any]:
+    """Load the plugin's canonical SEC issuer map JSON without importing ``src``."""
+    here = Path(__file__).resolve()
+    candidates = (
+        here.with_name("sec_issuer_map.json"),
+        *(parent / "plugins" / "dalton_sec" / "sec_issuer_map.json" for parent in here.parents),
+    )
+    for path in candidates:
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8"))
+    return {}
+
+
+_SEC_ISSUER_MAP_DATA: dict[str, Any] = _load_sec_issuer_map_data()
+
+DUAL_LISTED_SEC_ALIASES: dict[str, str] = {
+    str(k).upper(): str(v).upper()
+    for k, v in (_SEC_ISSUER_MAP_DATA.get("dual_listed_sec_issuer_map") or {}).items()
+}
+
+_CONFIRMED_NON_SEC_ISSUERS: frozenset[str] = frozenset(
+    str(item).upper() for item in (_SEC_ISSUER_MAP_DATA.get("confirmed_non_sec_issuers") or ())
+)
+
+_NON_SEC_MARKET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(str(pat), re.IGNORECASE), str(label))
+    for pat, label in (_SEC_ISSUER_MAP_DATA.get("non_sec_market_patterns") or ())
+)
+
+_A_SHARE_RE = re.compile(r"^(?:\d{6}\.(?:SH|SZ|SS|BJ)|(?:SH|SZ|BJ)\d{6})$", re.IGNORECASE)
+_HK_RE = re.compile(r"^(?:HK:)?0*(\d{1,5})(?:\.HK)?$", re.IGNORECASE)
+
+
+def _hk_candidates(raw: str) -> tuple[str, ...]:
+    m_hk = _HK_RE.fullmatch(raw)
+    if not m_hk:
+        return ()
+    if not (
+        raw.endswith(".HK")
+        or raw.startswith("HK:")
+        or (raw.isdigit() and len(raw) == 5 and raw.startswith("0"))
+    ):
+        return ()
+    num = int(m_hk.group(1))
+    return (f"{num:04d}.HK", f"{num}.HK", f"{num:05d}", f"HK:{num:04d}", f"HK:{num:05d}")
+
+
+def _detect_non_sec_ticker(ticker: str | None) -> str | None:
+    """Return a market label when ``ticker`` matches a non-US exchange format."""
+    raw = str(ticker or "").strip()
+    if not raw:
+        return None
+    for pat, label in _NON_SEC_MARKET_PATTERNS:
+        if pat.fullmatch(raw):
+            return label
+    return None
+
+
+def _resolve_sec_issuer_alias(ticker: str | None) -> str | None:
+    """Resolve a known dual-listed / ADR ticker (e.g. ``9988.HK`` or ``7203.T``) to its SEC ticker."""
+    raw = str(ticker or "").strip().upper()
+    if not raw:
+        return None
+    if raw in DUAL_LISTED_SEC_ALIASES:
+        return DUAL_LISTED_SEC_ALIASES[raw]
+    for cand in _hk_candidates(raw):
+        if cand in DUAL_LISTED_SEC_ALIASES:
+            return DUAL_LISTED_SEC_ALIASES[cand]
+    return None
+
+
+def _is_confirmed_non_sec_ticker(ticker: str | None) -> bool:
+    """Return True only when ``ticker`` is confirmed to have no SEC registration / CIK."""
+    raw = str(ticker or "").strip().upper()
+    if not raw:
+        return False
+    if _A_SHARE_RE.fullmatch(raw):
+        return True
+    if raw in _CONFIRMED_NON_SEC_ISSUERS:
+        return True
+    for cand in _hk_candidates(raw):
+        if cand in _CONFIRMED_NON_SEC_ISSUERS:
+            return True
+    if raw.startswith(("KR:", "KS:", "KQ:")):
+        code = raw.split(":", 1)[1].strip()
+        if f"{code}.KS" in _CONFIRMED_NON_SEC_ISSUERS or f"{code}.KQ" in _CONFIRMED_NON_SEC_ISSUERS:
+            return True
+    return False
+
+
+def _classify_sec_ticker(ticker: str | None) -> tuple[str, str | None, str | None]:
+    """Classify ``ticker`` into ``direct`` / ``mapped`` / ``confirmed_non_sec`` / ``unmapped_non_us``."""
+    raw = str(ticker or "").strip()
+    if not raw:
+        return ("direct", raw, None)
+    mapped = _resolve_sec_issuer_alias(raw)
+    market_label = _detect_non_sec_ticker(raw)
+    if mapped is not None:
+        return ("mapped", mapped, market_label)
+    if market_label is not None:
+        if _is_confirmed_non_sec_ticker(raw):
+            return ("confirmed_non_sec", None, market_label)
+        return ("unmapped_non_us", None, market_label)
+    return ("direct", raw, None)
 
 # Canonical concept alias groups (ordered by modern US-GAAP prevalence)
 CONCEPT_ALIASES: dict[str, list[str]] = {
@@ -210,6 +332,9 @@ def _http_get_json(url: str, cache_key: str, ttl_seconds: int = 86400) -> dict[s
 def resolve_cik(ticker_or_cik: str) -> tuple[str, str]:
     """Return `(cik10, company_name)` for a ticker or numeric CIK."""
     cleaned = ticker_or_cik.strip().upper()
+    alias_sec = _resolve_sec_issuer_alias(cleaned)
+    if alias_sec is not None:
+        cleaned = alias_sec
     if cleaned.isdigit() or (cleaned.startswith("CIK") and cleaned[3:].isdigit()):
         digits = cleaned[3:] if cleaned.startswith("CIK") else cleaned
         return digits.zfill(10), cleaned
@@ -1390,9 +1515,29 @@ def _list_filings_impl(
     *,
     extended_shape: bool = False,
 ) -> _FilingsOut:
+    # Classify using shared issuer map: resolve known ADRs (e.g. 9988.HK -> BABA, 7203.T -> TM),
+    # reject confirmed non-SEC issuers, and distinguish unmapped non-US tickers without claiming sec_filer=False.
+    ticker_kind, mapped_sec_ticker, non_sec_market = _classify_sec_ticker(ticker)
+    effective_ticker = mapped_sec_ticker or ticker
+    if ticker_kind == "confirmed_non_sec":
+        return make_error(
+            "not_found",
+            f"该证券不在 SEC 申报：{ticker} 属于{non_sec_market}，无 SEC 身份（CIK），未请求 SEC。",
+            symbol=ticker.upper(),
+            error_code="not_sec_filer",
+            sec_filer=False,
+        )
+    if ticker_kind == "unmapped_non_us":
+        return make_error(
+            "not_found",
+            f"未找到 {ticker} 对应的美股/ADR 代码或 SEC CIK 映射（属于{non_sec_market}）；若该公司以 ADR/20-F 在 SEC 申报，请改用其美股代码或 10 位 CIK 查询。",
+            symbol=ticker.upper(),
+            error_code="sec_issuer_mapping_not_found",
+            sec_filer=None,
+        )
     try:
         as_of_iso = _validate_as_of(as_of) if extended_shape else (as_of[:10] if as_of else None)
-        cik10, company_name = resolve_cik(ticker)
+        cik10, company_name = resolve_cik(effective_ticker)
         sub = fetch_submissions(cik10)
         recent = ((sub.get("filings") or {}).get("recent")) or {}
         if extended_shape and form is not None and str(form).strip():

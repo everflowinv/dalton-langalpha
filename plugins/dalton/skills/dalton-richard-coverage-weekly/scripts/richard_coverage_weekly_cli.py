@@ -2,7 +2,7 @@
 """
 CLI and workflow state helpers for dalton-richard-coverage-weekly.
 
-Consolidates Richard's 105-company coverage metadata (27 Core + 78 Watch),
+Consolidates Richard's 106-company coverage metadata (28 Core + 78 Watch),
 Friday-to-Friday window computation, target building, batch source sweeps
 via Dalton tools.researchdata (AlphaEngine / x-timeline / xueqiu), and
 idempotent Feishu doc receipt tracking under
@@ -64,7 +64,7 @@ APPEND_PROGRESS_FILE = "doc.progress.json"
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 ET_TZ = ZoneInfo("America/New_York")
 
-# Core 27 search names; must stay in sync with screen_movers.TICKERS where tier == "Core".
+# Core 28 search names; must stay in sync with screen_movers.TICKERS where tier == "Core".
 CORE: list[dict[str, Any]] = [
     {"name": "Google", "search_names": ["Alphabet", "Google", "谷歌", "GOOGL"]},
     {"name": "Amazon", "search_names": ["Amazon", "亚马逊", "AMZN"]},
@@ -75,6 +75,7 @@ CORE: list[dict[str, Any]] = [
     {"name": "Microsoft", "search_names": ["Microsoft", "微软", "MSFT"]},
     {"name": "SpaceX", "search_names": ["SpaceX", "SPCX"]},
     {"name": "Meta", "search_names": ["Meta Platforms", "Meta", "META"]},
+    {"name": "Anthropic", "search_names": ["Anthropic", "Claude", "ANT"]},
     {"name": "智谱", "search_names": ["智谱", "Zhipu", "Z.ai", "2513.HK"]},
     {"name": "Uber", "search_names": ["Uber", "UBER"]},
     {"name": "Visa", "search_names": ["Visa", "V"]},
@@ -106,6 +107,7 @@ AE_QUERY: dict[str, tuple[str, str | None]] = {
     "MSFT": ("Microsoft", "微软"),
     "SPCX": ("SpaceX", None),
     "META": ("Meta Platforms", "Meta"),
+    "ANT": ("Anthropic", None),
     "2513.HK": ("智谱", "Zhipu"),
     "UBER": ("Uber", "优步"),
     "V": ("Visa", "维萨"),
@@ -137,6 +139,7 @@ REL_KEYS: dict[str, list[str]] = {
     "MSFT": ["Microsoft", "微软", "Azure", "OpenAI"],
     "SPCX": ["SpaceX", "Starlink", "星链"],
     "META": ["Meta", "Facebook"],
+    "ANT": ["Anthropic", "Claude", "ANT"],
     "2513.HK": ["智谱", "Zhipu", "GLM"],
     "UBER": ["Uber", "优步"],
     "V": ["Visa", "维萨"],

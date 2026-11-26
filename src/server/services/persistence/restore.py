@@ -826,8 +826,17 @@ async def _stage_relayed_file(
     staged = _staging_name()
     # The staging name is excluded at the root of the walk, which is the
     # project folder, so that is also where it has to land.
-    if not await sandbox.aupload_file_bytes(layout.join(staged), content):
-        return None
+    # DALTON-HOOK(by4-relay-staging-guard): clear ambient ProjectContext before
+    # uploading so path folding cannot redirect the staging file into another workspace.
+    from ptc_agent.core.project_context import _current as _project_ctx_var
+
+    _proj_token = _project_ctx_var.set(None) if _project_ctx_var.get() is not None else None
+    try:
+        if not await sandbox.aupload_file_bytes(layout.join(staged), content):
+            return None
+    finally:
+        if _proj_token is not None:
+            _project_ctx_var.reset(_proj_token)
     return staged, hashlib.sha256(content).hexdigest(), len(content)
 
 
@@ -847,13 +856,21 @@ async def _relayed_pack_items(
     chunk keeps the relay path at the direct path's fidelity, and memory
     at one chunk at a time.
     """
+    # DALTON-HOOK(by4-relay-staging-guard): clear ambient ProjectContext before pack staging upload
+    from ptc_agent.core.project_context import _current as _project_ctx_var
+
     items: list[dict[str, Any]] = []
     for pack_sha256, members in packs.items():
         rel = f".wsfiles-relay-{pack_sha256}"
         try:
             data = await fetch_blob(user_id, pack_sha256)
             size = len(data)
-            ok = await sandbox.aupload_file_bytes(layout.join(rel), data)
+            _proj_token = _project_ctx_var.set(None) if _project_ctx_var.get() is not None else None
+            try:
+                ok = await sandbox.aupload_file_bytes(layout.join(rel), data)
+            finally:
+                if _proj_token is not None:
+                    _project_ctx_var.reset(_proj_token)
             del data
         except Exception as e:
             ok = False
@@ -1107,7 +1124,8 @@ async def _restamp_dirs(
     in place and would not stamp them either.
     """
     try:
-        outcomes = await pull_direct(sandbox, items, layout=layout)
+        # DALTON-HOOK(by4-relay-staging-guard): unlocked dir-only restamp must not sweep concurrent relay staging files
+        outcomes = await pull_direct(sandbox, items, layout=layout, sweep_orphans=False)
     except Exception as e:  # noqa: BLE001 - the files are in place either way
         logger.warning(
             f"Could not stamp {len(items)} deferred dir(s) for workspace "

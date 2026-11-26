@@ -95,20 +95,33 @@ def cleanup_dalton_tables():
     yield
 
 
+from tests.integration.dalton._db_guard import extract_effective_test_db_name
+
+
 def _get_test_dsn() -> str:
     for var in _DSN_ENV_VARS:
         val = os.environ.get(var, "").strip()
         if val:
-            db_name = urlsplit(val).path.lstrip("/")
-            if not db_name.endswith("_test"):
-                pytest.fail(
-                    f"Refusing to run snapshot integration tests against non-test DB {db_name!r} (from {var})"
-                )
+            try:
+                extract_effective_test_db_name(val, source=var)
+            except ValueError as exc:
+                pytest.fail(str(exc))
             return val
 
-    host = os.getenv("TEST_DB_HOST", "localhost")
-    port = os.getenv("TEST_DB_PORT", "5432")
-    name = (os.getenv("TEST_DB_NAME", "langalpha_test") or "").strip().lstrip("/")
+    host = (os.getenv("TEST_DB_HOST") or "").strip()
+    port = (os.getenv("TEST_DB_PORT") or "").strip()
+    name = (os.getenv("TEST_DB_NAME") or "").strip().lstrip("/")
+    missing = [
+        k
+        for k, v in (("TEST_DB_HOST", host), ("TEST_DB_PORT", port), ("TEST_DB_NAME", name))
+        if not v
+    ]
+    if missing:
+        pytest.fail(
+            "Refusing to run snapshot integration tests without explicit test DB configuration "
+            f"(missing {', '.join(missing)}; or set one of {', '.join(_DSN_ENV_VARS)}). "
+            "Falling back to localhost:5432 is disabled."
+        )
     if not name.endswith("_test"):
         pytest.fail(
             f"Refusing to run snapshot integration tests against non-test DB {name!r} (from TEST_DB_NAME)"

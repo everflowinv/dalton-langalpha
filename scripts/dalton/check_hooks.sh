@@ -520,6 +520,13 @@ ALLOWED_HOOKS=(
   "channel-chart-snapshot"
   # Channel phase 2 batch 2: web deep-link query params (?chart=&layer= and ?widget=) in ChatView.
   "channel-deep-links"
+  # BY4 prod audit fix: clear ambient ProjectContext before relayed staging uploads so path
+  # folding cannot redirect .wsfiles-relay-* into another workspace, and disable orphan sweep
+  # in unlocked _restamp_dirs (src/server/services/persistence/restore.py).
+  "by4-relay-staging-guard"
+  # Sync plugin-local sec_issuer_map.json beside dalton_sec_mcp_server.py in core sandboxes
+  # (manifest hashing, upload batch, and prune allowlist in src/ptc_agent/core/sandbox/assets.py).
+  "sec-issuer-map"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
