@@ -582,8 +582,9 @@ function mergeSortedCodeRanges(ranges: CodeRange[]): CodeRange[] {
 /**
  * Scans Markdown code zones BEFORE reference definition / link collection in two passes:
  * Pass A (block-level code boundaries):
- *   1. Fenced code blocks (``` / ~~~, including inside blockquotes and unterminated fences).
- *   2. 4-space / tab indented code blocks, plus Markdown AST `code` nodes (covers lists, etc.).
+ *   Uses the CommonMark/GFM Markdown AST (`code` nodes from `mdast-util-from-markdown`)
+ *   as the authoritative source of truth for all fenced, indented, list-nested, quoted,
+ *   and unterminated code blocks.
  * Pass B (inline & multiline backtick spans strictly OUTSIDE block-level code boundaries):
  *   - Scans each non-code gap linearly so stray backticks before a fence NEVER pair with
  *     backticks inside or across a fenced/indented code block, and arbitrary chains of
@@ -594,63 +595,8 @@ function mergeSortedCodeRanges(ranges: CodeRange[]): CodeRange[] {
 function findProtectedCodeRanges(text: string, tree?: MdastNode): CodeRange[] {
   const blockRanges: CodeRange[] = [];
   const len = text.length;
-  let i = 0;
-  let prevLineBlankOrIndentedCode = true;
 
-  const readLineEnd = (pos: number): number => {
-    const nl = text.indexOf("\n", pos);
-    return nl === -1 ? len : nl;
-  };
-
-  const skipLineBreak = (lineEnd: number): number =>
-    lineEnd < len ? lineEnd + 1 : len;
-
-  const parseQuotePrefix = (
-    lineStart: number,
-    lineEnd: number,
-  ): { depth: number; contentStart: number } => {
-    let pos = lineStart;
-    let depth = 0;
-    while (pos < lineEnd) {
-      let sp = 0;
-      while (pos + sp < lineEnd && sp < 3 && text[pos + sp] === " ") {
-        sp += 1;
-      }
-      if (pos + sp < lineEnd && text[pos + sp] === ">") {
-        depth += 1;
-        pos += sp + 1;
-        if (pos < lineEnd && (text[pos] === " " || text[pos] === "\t")) {
-          pos += 1;
-        }
-        continue;
-      }
-      break;
-    }
-    return { depth, contentStart: pos };
-  };
-
-  const countLeadingIndent = (
-    from: number,
-    lineEnd: number,
-  ): { cols: number; nextPos: number } => {
-    let cols = 0;
-    let pos = from;
-    while (pos < lineEnd) {
-      const ch = text[pos]!;
-      if (ch === " ") {
-        cols += 1;
-        pos += 1;
-      } else if (ch === "\t") {
-        cols += 4 - (cols % 4);
-        pos += 1;
-      } else {
-        break;
-      }
-    }
-    return { cols, nextPos: pos };
-  };
-
-  // Pass A.1: collect block-level `code` nodes from the Markdown AST (lists, quotes, indented, fenced).
+  // Pass A: collect authoritative block-level `code` nodes from the Markdown AST.
   if (tree) {
     const collectAstCode = (node: MdastNode): void => {
       if (node.type === "code") {
@@ -667,103 +613,6 @@ function findProtectedCodeRanges(text: string, tree?: MdastNode): CodeRange[] {
       }
     };
     collectAstCode(tree);
-  }
-
-  // Pass A.2: line-level fenced & indented code block scan (covers unterminated quoted fences).
-  while (i < len) {
-    const lineStart = i;
-    const lineEnd = readLineEnd(lineStart);
-    const { depth: quoteDepth, contentStart } = parseQuotePrefix(
-      lineStart,
-      lineEnd,
-    );
-    const { cols: indentCols, nextPos } = countLeadingIndent(
-      contentStart,
-      lineEnd,
-    );
-    const trimmedContent = text
-      .slice(nextPos, lineEnd)
-      .replace(/\r$/, "");
-
-    if (trimmedContent.length === 0) {
-      prevLineBlankOrIndentedCode = true;
-      i = skipLineBreak(lineEnd);
-      continue;
-    }
-
-    // 4-space / tab indented code line after a blank or indented-code line
-    if (indentCols >= 4 && prevLineBlankOrIndentedCode) {
-      blockRanges.push({ start: lineStart, end: lineEnd });
-      prevLineBlankOrIndentedCode = true;
-      i = skipLineBreak(lineEnd);
-      continue;
-    }
-
-    // Fenced code block opening (0-3 leading spaces + >=3 ` or ~)
-    if (
-      indentCols <= 3 &&
-      nextPos < lineEnd &&
-      (text[nextPos] === "`" || text[nextPos] === "~")
-    ) {
-      const fenceChar = text[nextPos]!;
-      let fenceLen = 0;
-      while (nextPos + fenceLen < lineEnd && text[nextPos + fenceLen] === fenceChar) {
-        fenceLen += 1;
-      }
-      if (fenceLen >= 3) {
-        const info = text
-          .slice(nextPos + fenceLen, lineEnd)
-          .replace(/\r$/, "");
-        const validFence = fenceChar === "~" || !info.includes("`");
-        if (validFence) {
-          let scanPos = skipLineBreak(lineEnd);
-          let blockEnd = lineEnd;
-          while (scanPos < len) {
-            const curLineEnd = readLineEnd(scanPos);
-            const curQuote = parseQuotePrefix(scanPos, curLineEnd);
-            if (quoteDepth > 0 && curQuote.depth < quoteDepth) {
-              // Blockquote ended; unterminated quoted fence ends at previous line.
-              break;
-            }
-            const curIndent = countLeadingIndent(
-              curQuote.contentStart,
-              curLineEnd,
-            );
-            blockEnd = curLineEnd;
-            if (
-              curIndent.cols <= 3 &&
-              curIndent.nextPos < curLineEnd &&
-              text[curIndent.nextPos] === fenceChar
-            ) {
-              let closeLen = 0;
-              while (
-                curIndent.nextPos + closeLen < curLineEnd &&
-                text[curIndent.nextPos + closeLen] === fenceChar
-              ) {
-                closeLen += 1;
-              }
-              if (closeLen >= fenceLen) {
-                const afterClose = text
-                  .slice(curIndent.nextPos + closeLen, curLineEnd)
-                  .replace(/\r$/, "");
-                if (/^[ \t]*$/.test(afterClose)) {
-                  scanPos = skipLineBreak(curLineEnd);
-                  break;
-                }
-              }
-            }
-            scanPos = skipLineBreak(curLineEnd);
-          }
-          blockRanges.push({ start: lineStart, end: blockEnd });
-          prevLineBlankOrIndentedCode = false;
-          i = scanPos;
-          continue;
-        }
-      }
-    }
-
-    prevLineBlankOrIndentedCode = false;
-    i = skipLineBreak(lineEnd);
   }
 
   const mergedBlocks = mergeSortedCodeRanges(blockRanges);

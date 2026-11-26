@@ -921,6 +921,7 @@ export class AgentRoutesHandler {
         typeof params.outboundBlocked === "boolean" ? params.outboundBlocked : undefined;
 
       let replayTargetMissing = false;
+      let replayDenied = false;
       let replayRetryable = false;
       let replayHttpStatus: number | null = null;
       if (
@@ -940,13 +941,30 @@ export class AgentRoutesHandler {
           });
           replayHttpStatus = recovered.httpStatus ?? null;
           if (!recovered.found) {
-            replayTargetMissing = true;
-            replayRetryable = Boolean(recovered.retryable);
+            if (replayHttpStatus === 403 && !recovered.retryable) {
+              // Permanent permission/platform-capability refusal: settle targets
+              // according to their permissions instead of looping 503 in `finishing`.
+              replayDenied = true;
+            } else {
+              replayTargetMissing = true;
+              replayRetryable = Boolean(recovered.retryable);
+            }
           } else {
             autoCharts = recovered.charts;
             autoWidgets = recovered.widgets;
-            if (autoInitialSnapshots.length === 0 && recovered.snapshots.length > 0) {
-              autoInitialSnapshots = recovered.snapshots;
+            if (recovered.snapshots.length > 0) {
+              if (autoInitialSnapshots.length === 0) {
+                autoInitialSnapshots = recovered.snapshots;
+              } else {
+                const merged = new Map<string, ChartSnapshotItem>();
+                for (const s of autoInitialSnapshots) {
+                  merged.set(`${s.chart_id}\0${s.layer_id}`, s);
+                }
+                for (const s of recovered.snapshots) {
+                  merged.set(`${s.chart_id}\0${s.layer_id}`, s);
+                }
+                autoInitialSnapshots = [...merged.values()];
+              }
             }
             if (typeof recovered.outboundBlocked === "boolean") {
               autoOutboundBlocked =
@@ -960,8 +978,13 @@ export class AgentRoutesHandler {
         }
       }
 
+      // BW2: Never claim the `:charts` idempotency key before replay has completed (`found`).
+      // Summary delivery still runs idempotently; charts and widgets are delivered together
+      // once the full replay succeeds.
       const hasAutomationChartsOrWidgets =
         finishStatus === "completed" &&
+        !replayTargetMissing &&
+        !replayDenied &&
         Boolean(effectiveRunId) &&
         (autoCharts.length > 0 ||
           autoInitialSnapshots.length > 0 ||
@@ -1077,7 +1100,9 @@ export class AgentRoutesHandler {
             ...t,
             reached: false,
             via: null,
-            error: "Automation completed without sending a message or final summary.",
+            error: replayDenied
+              ? "Target platform capability or replay permission denied; charts and widgets were not delivered."
+              : "Automation completed without sending a message or final summary.",
           });
           continue;
         }

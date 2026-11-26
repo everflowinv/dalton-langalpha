@@ -3264,3 +3264,55 @@ async def test_bt2_deliverables_links_unknown_subkey_reclaim_guards_and_parent_i
     assert cg_db._is_provably_unsent_deliverable_link_item(cur.deliveries[k_disp]) is False
     assert cg_db._has_no_confirmed_deliverable_link_receipt(cur.deliveries[k_disp]) is True
     assert cg_db._has_no_confirmed_deliverable_link_receipt(cur.deliveries[k_linked]) is False
+
+    # Case 4: Partial parent `deliverables-links:<runId>` MUST NOT return `already_completed`;
+    # it stays recoverable per-item (`in_flight_or_unknown`, `existing_status="partial"`) and
+    # allows attempt-fenced `partial -> sent` settlement once all links are confirmed.
+    parent_partial_key = f"deliverables-links:{run_id}"
+    cur.deliveries[parent_partial_key] = {
+        **base_row,
+        "delivery_key": parent_partial_key,
+        "status": "partial",
+        "error_code": "rate_limited",
+        "sent_chunks": 1,
+        "total_chunks": 2,
+        "platform_message_ids": ["om_chunk0"],
+        "files_status": [
+            {"workspace_id": "ws-a", "path": "results/a.pdf", "status": "linked", "platform_message_id": "om_chunk0"},
+            {"workspace_id": "ws-a", "path": "results/b.pdf", "status": "failed"},
+        ],
+    }
+    res_partial = await cg_db.authorize_and_claim_delivery(
+        delivery_key=parent_partial_key,
+        kind="fallback",
+        user_id="user-alice",
+        thread_id=tid,
+        run_id=run_id,
+        platform="feishu",
+        target="feishu:@me",
+        has_non_empty_text=False,
+        total_chunks=2,
+        source_scope_key="dm:ou_alice",
+        source_generation=2,
+        activity_origin="replay",
+        conn=conn,
+    )
+    assert res_partial["claim_status"] == "in_flight_or_unknown"
+    assert res_partial["existing_status"] == "partial"
+    assert res_partial["delivery_attempt"] == 1
+    assert len(res_partial["files_status"]) == 2
+    assert (
+        cg_db._validate_delivery_status_transition(
+            prev_status="partial",
+            status="sent",
+            outcome=None,
+            platform="feishu",
+            kind="fallback",
+            error_code="rate_limited",
+            discord_body_phase=None,
+            current_attempt=1,
+            requested_attempt=1,
+            delivery_key=parent_partial_key,
+        )
+        == "sent"
+    )

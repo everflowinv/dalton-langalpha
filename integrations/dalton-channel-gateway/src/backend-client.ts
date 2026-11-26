@@ -107,8 +107,14 @@ export async function* parseSseStream(
     }
   }
   buffer += decoder.decode();
-  if (buffer.trim().length > 0) {
-    const parsed = processBlock(buffer);
+  // Per the WHATWG SSE specification, an event frame is complete only when terminated
+  // by a blank line (`\r?\n\r?\n`). Never flush an unterminated trailing buffer at EOF,
+  // so a mid-frame truncation of `replay_done` cannot masquerade as a complete replay.
+  let trailingMatch: RegExpExecArray | null;
+  while ((trailingMatch = /\r?\n\r?\n/.exec(buffer)) !== null) {
+    const block = buffer.slice(0, trailingMatch.index);
+    buffer = buffer.slice(trailingMatch.index + trailingMatch[0].length);
+    const parsed = processBlock(block);
     if (parsed) {
       yield parsed;
     }

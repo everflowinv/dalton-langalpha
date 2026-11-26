@@ -4,7 +4,36 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-const LOCAL_PG_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+const LOCAL_PG_HOSTS = new Set([
+  "127.0.0.1",
+  "localhost",
+  "::1",
+  "[::1]",
+  "host.docker.internal",
+]);
+
+function isLocalOrContainerPgHost(hostname: string): boolean {
+  const lower = hostname.trim().toLowerCase();
+  if (!lower) return false;
+  if (LOCAL_PG_HOSTS.has(lower)) return true;
+  // Single-label DNS hostnames inside container networks (e.g. `postgres`, `db`, `pg-test`)
+  if (/^[a-z0-9][a-z0-9-]*$/.test(lower)) return true;
+  // Internal / local domain suffixes
+  if (lower.endsWith(".local") || lower.endsWith(".internal") || lower.endsWith(".localhost")) {
+    return true;
+  }
+  // RFC1918 private IPv4 ranges used by Docker / Compose / CI bridge networks
+  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(lower);
+  if (ipv4) {
+    const a = Number(ipv4[1]);
+    const b = Number(ipv4[2]);
+    if (a === 10) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 127) return true;
+  }
+  return false;
+}
 
 export interface IsolatedPostgresDatabase {
   dsn: string;
@@ -32,10 +61,15 @@ export function buildIsolatedTestDbName(tag: string, uniqueSuffix?: string): str
 }
 
 /**
- * Validate that `baseDsn` points to a local `*_test` database and return a new DSN
- * pointing at `newDbName`.
+ * Validate that `baseDsn` points to a `*_test` database on a local/container host
+ * (or when explicitly authorized via `allowNonLocal` with a dedicated test admin DSN)
+ * and return a new DSN pointing at `newDbName`.
  */
-export function replaceDsnDatabase(baseDsn: string, newDbName: string): string {
+export function replaceDsnDatabase(
+  baseDsn: string,
+  newDbName: string,
+  options?: { allowNonLocal?: boolean },
+): string {
   const parsed = new URL(baseDsn);
   if (parsed.protocol !== "postgresql:" && parsed.protocol !== "postgres:") {
     throw new Error(`Unsupported Postgres protocol "${parsed.protocol}"`);
@@ -44,9 +78,9 @@ export function replaceDsnDatabase(baseDsn: string, newDbName: string): string {
   if (!origDb.endsWith("_test") || origDb.length <= "_test".length) {
     throw new Error(`Refusing to isolate non-test DB "${origDb}"`);
   }
-  if (!LOCAL_PG_HOSTS.has(parsed.hostname.toLowerCase())) {
+  if (!options?.allowNonLocal && !isLocalOrContainerPgHost(parsed.hostname)) {
     throw new Error(
-      `Refusing to create/drop isolated test DB on non-local host "${parsed.hostname}"`,
+      `Refusing to create/drop isolated test DB on non-local host "${parsed.hostname}" without explicit adminDsn`,
     );
   }
   if (!/^[a-z][a-z0-9_]*_test$/.test(newDbName) || newDbName.length > 63) {
@@ -86,18 +120,28 @@ with psycopg.connect(admin_dsn, autocommit=True) as conn:
 /**
  * Create a fresh, empty isolated `*_test` PostgreSQL database for a single gateway
  * real-Postgres test file and return a `drop()` cleanup callback.
+ *
+ * Supports local loopback hosts, container-network `*_test` hosts (e.g. `postgres`),
+ * and arbitrary test hosts when an explicit `adminDsn` (or `DALTON_TEST_PG_ADMIN_DSN`)
+ * is provided for `CREATE DATABASE` / `DROP DATABASE`.
  */
 export async function createIsolatedPostgresDatabase(options: {
   baseDsn: string;
   tag: string;
   pythonBin: string;
   repoRoot: string;
+  adminDsn?: string;
 }): Promise<IsolatedPostgresDatabase> {
+  const explicitAdminDsn =
+    options.adminDsn?.trim() || process.env.DALTON_TEST_PG_ADMIN_DSN?.trim() || "";
   const dbName = buildIsolatedTestDbName(options.tag);
-  const isolatedDsn = replaceDsnDatabase(options.baseDsn, dbName);
+  const isolatedDsn = replaceDsnDatabase(options.baseDsn, dbName, {
+    allowNonLocal: Boolean(explicitAdminDsn),
+  });
+  const effectiveAdminDsn = explicitAdminDsn || options.baseDsn;
   await execFileAsync(
     options.pythonBin,
-    ["-c", PY_CREATE_DB_SCRIPT, options.baseDsn, dbName],
+    ["-c", PY_CREATE_DB_SCRIPT, effectiveAdminDsn, dbName],
     { cwd: options.repoRoot, timeout: 30_000 },
   );
   let dropped = false;
@@ -110,7 +154,7 @@ export async function createIsolatedPostgresDatabase(options: {
       try {
         await execFileAsync(
           options.pythonBin,
-          ["-c", PY_DROP_DB_SCRIPT, options.baseDsn, dbName],
+          ["-c", PY_DROP_DB_SCRIPT, effectiveAdminDsn, dbName],
           { cwd: options.repoRoot, timeout: 30_000 },
         );
       } catch {

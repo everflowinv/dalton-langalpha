@@ -41,18 +41,18 @@ describe("BI2: gateway real-Postgres test isolation and vitest config", () => {
 
     const cfg = mod.default?.test;
     expect(cfg).toBeDefined();
+    // Vitest 3.2.7 reads `fileParallelism` from the root config; root MUST disable file parallelism.
+    expect(cfg?.fileParallelism).toBe(false);
     if (Array.isArray(cfg?.projects)) {
       const pgProject = cfg.projects.find((p) => p.test?.name === "real-postgres");
       expect(pgProject?.test?.fileParallelism).toBe(false);
       expect(pgProject?.test?.include).toEqual(expectedRealPgFiles);
       const unitProject = cfg.projects.find((p) => p.test?.name === "unit");
       expect(unitProject?.test?.exclude).toEqual(expectedRealPgFiles);
-    } else {
-      expect(cfg?.fileParallelism).toBe(false);
     }
   });
 
-  it("generates unique *_test database names and rewrites local *_test DSNs safely", () => {
+  it("generates unique *_test database names and rewrites local/container *_test DSNs safely", () => {
     const nameA = buildIsolatedTestDbName("real-http-postgres");
     const nameB = buildIsolatedTestDbName("real-http-postgres");
     expect(nameA).not.toBe(nameB);
@@ -66,6 +66,24 @@ describe("BI2: gateway real-Postgres test isolation and vitest config", () => {
       nameA,
     );
     expect(isolated).toBe(`postgresql://postgres:secret@127.0.0.1:5432/${nameA}`);
+
+    // Container-network `*_test` DSNs (single-label service hostname / RFC1918 IP) are supported
+    expect(
+      replaceDsnDatabase("postgresql://postgres:secret@postgres:5432/dalton_shared_test", nameA),
+    ).toBe(`postgresql://postgres:secret@postgres:5432/${nameA}`);
+    expect(
+      replaceDsnDatabase("postgresql://postgres:secret@172.18.0.2:5432/dalton_shared_test", nameA),
+    ).toBe(`postgresql://postgres:secret@172.18.0.2:5432/${nameA}`);
+
+    // Non-local public host requires explicit admin authorization (`allowNonLocal: true`)
+    expect(() =>
+      replaceDsnDatabase("postgresql://postgres:secret@db.example.com:5432/dalton_shared_test", nameA),
+    ).toThrow(/non-local host/);
+    expect(
+      replaceDsnDatabase("postgresql://postgres:secret@db.example.com:5432/dalton_shared_test", nameA, {
+        allowNonLocal: true,
+      }),
+    ).toBe(`postgresql://postgres:secret@db.example.com:5432/${nameA}`);
 
     expect(() =>
       replaceDsnDatabase("postgresql://postgres:secret@127.0.0.1:5432/production", nameA),

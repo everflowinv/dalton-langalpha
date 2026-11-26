@@ -886,6 +886,17 @@ export class DeliveryService {
                 reclaimVerifiedUnsent: true,
               });
             }
+          } else if (
+            claim.existing_status === "unknown" &&
+            !options.reclaimVerifiedUnsent
+          ) {
+            // BT2 At-least-once semantics: when the adapter does not implement platform
+            // receipt reconciliation (e.g. Discord / Weixin), re-claim and resend under
+            // the original `:item:` idempotency key instead of staying permanently `unknown`.
+            return await this.executeDelivery({
+              ...options,
+              reclaimVerifiedUnsent: true,
+            });
           }
         }
       }
@@ -893,16 +904,18 @@ export class DeliveryService {
         options.downloadMode === "deliverable" &&
         options.runId &&
         options.deliveryKey === `deliverables-links:${options.runId}` &&
-        claim.existing_status === "unknown"
+        (claim.existing_status === "unknown" ||
+          claim.existing_status === "partial")
       ) {
-        // BT2: `deliverables-links:${runId}` itself crashed mid-flight and was swept to `unknown`.
-        // Reconcile every `(workspace_id, normalized_path)`:
+        // BT2: `deliverables-links:${runId}` crashed mid-flight (`unknown`) or partially failed
+        // (`partial`). Reconcile every `(workspace_id, normalized_path)` with at-least-once semantics:
         // - Adopt items already confirmed (`sent`/`linked`/`platform_message_id`).
-        // - For items that reached `dispatching`/`pending`/`unknown` on the parent row (or when
-        //   the parent row sent chunks with empty `files_status`), reconcile with the platform
-        //   receipt / idempotency key BEFORE ever sending under a new per-item key.
-        // - Send provably-unsent items under deterministic per-item keys.
-        // - Once all items are confirmed, settle parent `deliverables-links:${runId}` to `sent` via I-7.
+        // - For items in uncertain state (`dispatching`/`pending`/`unknown`, or legacy parent rows
+        //   missing pre-dispatch `files_status` records): if the adapter implements
+        //   `reconcileDeliveryReceipt`, reconcile first (e.g. Feishu idempotent `uuid` replay);
+        //   otherwise resend per-item rather than staying permanently stuck in `unknown`.
+        // - Send unconfirmed/failed/queued items under deterministic per-item keys.
+        // - Only once all items are confirmed, settle parent `deliverables-links:${runId}` to `sent` via I-7.
         const fallbackWsId =
           (options.workspaceId ?? "").trim() ||
           (claim.workspace_id ?? "").trim() ||
@@ -1045,14 +1058,42 @@ export class DeliveryService {
         let lastFailureMessage: string | null = null;
         let lastAddress: string | null = resolvedAddr;
 
-        const parentSentChunksWithoutFileRecords =
-          (claim.sent_chunks ?? 0) > 0 && parentFilesStatus.length === 0;
+        // Pre-upgrade legacy parent rows (`status: unknown`, empty `files_status`, even when
+        // `sent_chunks === 0`) lack pre-dispatch WAL records and must be treated as uncertain.
+        const parentMissingPreDispatchRecords =
+          claim.existing_status === "unknown" && parentFilesStatus.length === 0;
         const reconcileCache = new Map<
           string,
           Awaited<
             ReturnType<NonNullable<ChannelAdapter["reconcileDeliveryReceipt"]>>
           >
         >();
+        const uncertainChunkLinesByIdemKey = new Map<string, string[]>();
+        for (const item of allCandidates) {
+          if (lookupConfirmed(item.wsId, item.normPath)) continue;
+          const parentEntry = lookupParentEntry(item.wsId, item.normPath);
+          const parentEntryStatus = (parentEntry?.status ?? "")
+            .trim()
+            .toLowerCase();
+          const uncertain =
+            parentEntryStatus === "dispatching" ||
+            parentEntryStatus === "pending" ||
+            parentEntryStatus === "unknown" ||
+            parentMissingPreDispatchRecords;
+          if (!uncertain) continue;
+          const idemKey = parentEntry?.idempotency_key ?? options.deliveryKey;
+          const line = buildWorkspaceFileDeepLinkLine(
+            item.ref.filename || basename(item.ref.path) || item.ref.path,
+            item.ref.path,
+            this.webBaseUrl,
+            options.threadId,
+            item.wsId || null,
+            fallbackWsId || null,
+          );
+          const group = uncertainChunkLinesByIdemKey.get(idemKey) ?? [];
+          group.push(line);
+          uncertainChunkLinesByIdemKey.set(idemKey, group);
+        }
 
         for (const item of allCandidates) {
           const confirmed = lookupConfirmed(item.wsId, item.normPath);
@@ -1081,7 +1122,7 @@ export class DeliveryService {
             parentEntryStatus === "dispatching" ||
             parentEntryStatus === "pending" ||
             parentEntryStatus === "unknown" ||
-            parentSentChunksWithoutFileRecords;
+            parentMissingPreDispatchRecords;
 
           if (isParentItemUncertain) {
             const idemKey =
@@ -1091,17 +1132,22 @@ export class DeliveryService {
               typeof parentAdapter.reconcileDeliveryReceipt === "function" &&
               resolvedAddr
             ) {
-              const cacheKey = `${idemKey}::${item.wsId}::${item.normPath}`;
-              let rec = reconcileCache.get(idemKey) ?? reconcileCache.get(cacheKey);
+              let rec = reconcileCache.get(idemKey);
               if (!rec) {
-                const expectedLinkLine = buildWorkspaceFileDeepLinkLine(
-                  item.ref.filename || basename(item.ref.path) || item.ref.path,
-                  item.ref.path,
-                  this.webBaseUrl,
-                  options.threadId,
-                  item.wsId || null,
-                  fallbackWsId || null,
-                );
+                const expectedChunkText = (
+                  uncertainChunkLinesByIdemKey.get(idemKey) ?? [
+                    buildWorkspaceFileDeepLinkLine(
+                      item.ref.filename ||
+                        basename(item.ref.path) ||
+                        item.ref.path,
+                      item.ref.path,
+                      this.webBaseUrl,
+                      options.threadId,
+                      item.wsId || null,
+                      fallbackWsId || null,
+                    ),
+                  ]
+                ).join("\n");
                 rec = await parentAdapter.reconcileDeliveryReceipt({
                   targetAddress: resolvedAddr,
                   recipientPlatformUserId:
@@ -1115,13 +1161,10 @@ export class DeliveryService {
                     claim.thread_scope_key ?? options.threadScopeKey ?? null,
                   workspaceId: item.wsId || null,
                   path: item.ref.path,
-                  text: expectedLinkLine,
+                  text: expectedChunkText,
                   weixinAccountId: claim.weixin_account_id ?? null,
                 });
-                reconcileCache.set(
-                  parentEntry?.idempotency_key ? idemKey : cacheKey,
-                  rec,
-                );
+                reconcileCache.set(idemKey, rec);
               }
               if (rec.status === "confirmed") {
                 if (rec.messageId) recoveredMsgIds.add(rec.messageId);
@@ -1153,19 +1196,10 @@ export class DeliveryService {
               });
               continue;
             }
-            // Cannot verify whether the platform received the in-flight/dispatching chunk:
-            // never duplicate-send under a new per-item key.
-            anyUnknown = true;
-            lastFailureCode = "in_flight";
-            lastFailureMessage =
-              "Deliverable link was dispatching before crash and cannot be verified without platform receipt.";
-            recoveredFiles.push({
-              path: item.ref.path,
-              workspace_id: item.wsId || null,
-              status: "unknown",
-              reason: lastFailureMessage,
-              idempotency_key: idemKey,
-            });
+            // BT2 At-least-once semantics: adapter has no platform receipt reconciliation
+            // (e.g. Discord / Weixin). Resend under deterministic per-item key rather than
+            // leaving the link permanently stuck in `unknown`.
+            unconfirmedItems.push(item);
             continue;
           }
 
@@ -1217,7 +1251,10 @@ export class DeliveryService {
             anyUnknown = true;
             lastFailureCode = itemRes.code ?? "in_flight";
             lastFailureMessage = itemRes.message;
-          } else if (itemRes.status === "failed") {
+          } else if (
+            itemRes.status === "failed" ||
+            itemRes.status === "partial"
+          ) {
             anyFailed = true;
             lastFailureCode = itemRes.code ?? "unavailable";
             lastFailureMessage = itemRes.message;
@@ -1239,8 +1276,11 @@ export class DeliveryService {
           };
         }
         if (anyFailed) {
+          const hasConfirmedLink = recoveredFiles.some(
+            (f) => f.status === "linked" || f.status === "sent",
+          );
           return {
-            status: "failed",
+            status: hasConfirmedLink ? "partial" : "failed",
             code: lastFailureCode ?? "unavailable",
             address: lastAddress,
             current: Boolean(claim.is_current),

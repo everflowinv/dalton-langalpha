@@ -2567,11 +2567,74 @@ def test_bw2_internal_thread_run_replay_endpoint_ownership_and_direct_run_lookup
     )
     assert r_wrong.status_code == 200
     assert f'"run_id": "{deep_run_id}"' not in r_wrong.text
+    assert "run-wrong-turn" not in r_wrong.text
+
+    # 10) When read_replay_page(limit=1) returns BOTH an earlier committed turn (turn 0)
+    #     and the subsequent uncheckpointed target turn (turn 1), the route MUST emit ONLY
+    #     target turn 1's events and strip turn 0's events completely.
+    async def _fake_mixed_two_turn_page(rows: Any, **kwargs: Any):
+        return (
+            SimpleNamespace(
+                lines=[
+                    Line(
+                        event="user_message",
+                        data_json=json.dumps({"turn_index": 0, "run_id": "run-prev-committed"}),
+                        flags=0,
+                    ),
+                    Line(
+                        event="artifact",
+                        data_json=json.dumps(
+                            {
+                                "turn_index": 0,
+                                "response_id": "run-prev-committed",
+                                "artifact_type": "chart_layer",
+                                "artifact_id": "layer-prev-leak",
+                                "payload": {"chart_id": "AAPL:1day", "layer_id": "layer-prev-leak"},
+                            }
+                        ),
+                        flags=0,
+                    ),
+                    Line(
+                        event="user_message",
+                        data_json=json.dumps({"turn_index": 1, "run_id": deep_run_id}),
+                        flags=0,
+                    ),
+                    Line(
+                        event="artifact",
+                        data_json=json.dumps(
+                            {
+                                "turn_index": 1,
+                                "response_id": deep_run_id,
+                                "artifact_type": "html_widget",
+                                "artifact_id": "widget-target-only",
+                                "payload": {"title": "Target Widget"},
+                            }
+                        ),
+                        flags=0,
+                    ),
+                ],
+                first_turn_index=0,
+                has_more=False,
+            ),
+            "checkpoint",
+        )
+
+    read_replay_mock.side_effect = _fake_mixed_two_turn_page
+    r_filtered = client.get(
+        f"/api/v1/dalton/channels/internal/threads/{THREAD_ID}/runs/{deep_run_id}/replay",
+        headers=svc_headers,
+    )
+    assert r_filtered.status_code == 200
+    assert "run-prev-committed" not in r_filtered.text
+    assert "layer-prev-leak" not in r_filtered.text
+    assert "widget-target-only" in r_filtered.text
+    assert f'"run_id": "{deep_run_id}"' in r_filtered.text
 
 
 @pytest.mark.asyncio
 async def test_bw2_resolve_authorized_automation_run_platforms() -> None:
-    """BW2: `resolve_authorized_automation_run_platforms` extracts only `ok=True` target platforms."""
+    """BW2: `resolve_authorized_automation_run_platforms` extracts only `ok=True` target platforms
+    and strictly matches `(thread_id, run_id)` without NULL wildcards."""
     from contextlib import asynccontextmanager
 
     import psycopg
@@ -2605,3 +2668,20 @@ async def test_bw2_resolve_authorized_automation_run_platforms() -> None:
         conn=fake_conn,
     )
     assert platforms == ["feishu", "weixin"]
+    sql_with_exec = str(fake_cur.execute.call_args_list[0].args[0])
+    assert "IS NULL" not in sql_with_exec.upper()
+    assert "thread_id = %s::uuid" in sql_with_exec
+    assert "run_id = %s" in sql_with_exec
+
+    # Also verify non-execution_id query requires exact `(thread_id, run_id)` with NO NULL wildcard
+    await cg_db.resolve_authorized_automation_run_platforms(
+        thread_id=THREAD_ID,
+        run_id="run-auto-1",
+        user_id=USER_ID,
+        execution_id=None,
+        conn=fake_conn,
+    )
+    sql_without_exec = str(fake_cur.execute.call_args_list[1].args[0])
+    assert "IS NULL" not in sql_without_exec.upper()
+    assert "thread_id = %s::uuid" in sql_without_exec
+    assert "run_id = %s" in sql_without_exec

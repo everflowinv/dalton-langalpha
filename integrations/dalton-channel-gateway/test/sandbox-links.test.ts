@@ -657,5 +657,30 @@ describe("channel chunkers preserve rewritten Markdown links and underscores", (
     expect(rewriteSandboxLinks(threeChainedSpans, WEB_BASE, THREAD_ID)).toBe(
       threeChainedExpected,
     );
+
+    // 3) Top-level fenced code block containing a `> ``` ` line inside it:
+    //    must NOT close the fence early or treat the real closing ``` as a new fence;
+    //    normal links after the fence MUST still be rewritten.
+    const quotedFenceInsideTopLevel = [
+      "```markdown",
+      "[inside](/home/workspace/results/inside_fence.md)",
+      "> ```",
+      "still inside fence",
+      "```",
+      "",
+      "围栏后的普通链接：[报告](/home/workspace/results/after_quoted_fence.md)",
+    ].join("\n");
+    const quotedFenceInsideTopLevelExpected = [
+      "```markdown",
+      "[inside](/home/workspace/results/inside_fence.md)",
+      "> ```",
+      "still inside fence",
+      "```",
+      "",
+      `围栏后的普通链接：[报告](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Fafter_quoted_fence.md)`,
+    ].join("\n");
+    expect(rewriteSandboxLinks(quotedFenceInsideTopLevel, WEB_BASE, THREAD_ID)).toBe(
+      quotedFenceInsideTopLevelExpected,
+    );
   });
 });

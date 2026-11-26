@@ -11299,6 +11299,109 @@ async def test_bt2_real_pg_deliverables_links_unknown_subkeys_and_parent_i7_sett
                 prow = await cur.fetchone()
                 assert prow["status"] == "sent"
                 assert prow["error_code"] is None
+
+        # 7) Partial parent `deliverables-links:` stays recoverable per-item (never `already_completed`)
+        #    and settles `partial -> sent` via attempt-fenced I-7, clearing error_code.
+        parent_partial_key = f"deliverables-links:{run_id}-partial"
+        created_deliveries.append(parent_partial_key)
+        part_claim = await cg_db.authorize_and_claim_delivery(
+            delivery_key=parent_partial_key,
+            kind="fallback",
+            user_id=user_a,
+            thread_id=tid,
+            run_id=run_id,
+            platform=platform,
+            target=dm_addr,
+            has_non_empty_text=False,
+            total_chunks=2,
+            source_scope_key=dm_scope,
+            source_generation=gen,
+            activity_origin="conversation",
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
+        assert part_claim["claim_status"] == "claimed"
+        await cg_db.update_delivery_progress(
+            delivery_key=parent_partial_key,
+            delivery_attempt=1,
+            sent_chunks=1,
+            total_chunks=2,
+            platform_message_ids=["om_pg_chunk0"],
+            files_status=[
+                {
+                    "path": "results/a.pdf",
+                    "workspace_id": "ws-a",
+                    "status": "linked",
+                    "platform_message_id": "om_pg_chunk0",
+                },
+                {
+                    "path": "results/b.pdf",
+                    "workspace_id": "ws-a",
+                    "status": "failed",
+                    "reason": "rate_limited",
+                },
+            ],
+            status="partial",
+            error_code="rate_limited",
+            error_message="chunk 1 rejected",
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
+        part_retry = await cg_db.authorize_and_claim_delivery(
+            delivery_key=parent_partial_key,
+            kind="fallback",
+            user_id=user_a,
+            thread_id=tid,
+            run_id=run_id,
+            platform=platform,
+            target=dm_addr,
+            has_non_empty_text=False,
+            total_chunks=2,
+            source_scope_key=dm_scope,
+            source_generation=gen,
+            activity_origin="replay",
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
+        assert part_retry["claim_status"] == "in_flight_or_unknown"
+        assert part_retry["existing_status"] == "partial"
+        part_settled = await cg_db.update_delivery_progress(
+            delivery_key=parent_partial_key,
+            delivery_attempt=1,
+            sent_chunks=2,
+            total_chunks=2,
+            platform_message_ids=["om_pg_chunk0", "om_pg_chunk1"],
+            files_status=[
+                {
+                    "path": "results/a.pdf",
+                    "workspace_id": "ws-a",
+                    "status": "linked",
+                    "platform_message_id": "om_pg_chunk0",
+                },
+                {
+                    "path": "results/b.pdf",
+                    "workspace_id": "ws-a",
+                    "status": "linked",
+                    "platform_message_id": "om_pg_chunk1",
+                },
+            ],
+            first_response_json={"status": "sent", "duplicate": False, "files": []},
+            status="sent",
+            error_code=None,
+            error_message=None,
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
+        assert part_settled["status"] == "sent"
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT status, error_code FROM dalton_channel_deliveries WHERE delivery_key = %s",
+                    (parent_partial_key,),
+                )
+                part_row = await cur.fetchone()
+                assert part_row["status"] == "sent"
+                assert part_row["error_code"] is None
     finally:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:

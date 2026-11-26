@@ -1064,10 +1064,52 @@ async def internal_thread_run_replay_endpoint(
                 detail=f"Checkpoint replay unavailable: {exc}",
             )
 
-        replay_lines = page.lines
-        await finish_lines(thread_id, replay_lines)
+        target_lines: list[Any] = []
+        matched_page_run = False
+        current_turn_index: int | None = None
+        current_run_id: str | None = None
+        for line in page.lines:
+            try:
+                payload = json.loads(line.data_json)
+            except Exception:
+                payload = None
+            if not isinstance(payload, dict):
+                continue
+            raw_ti = payload.get("turn_index")
+            ev_ti: int | None = None
+            if isinstance(raw_ti, int) and not isinstance(raw_ti, bool):
+                ev_ti = raw_ti
+            elif isinstance(raw_ti, str) and raw_ti.strip().isdigit():
+                ev_ti = int(raw_ti.strip())
+            ev_rid = (
+                str(
+                    payload.get("response_id")
+                    or payload.get("run_id")
+                    or payload.get("report_run_id")
+                    or ""
+                ).strip()
+                or None
+            )
+            if line.event in ("user_message", "turn_separator", "turn_start"):
+                current_turn_index = ev_ti
+                current_run_id = ev_rid
+            eff_ti = ev_ti if ev_ti is not None else current_turn_index
+            eff_rid = ev_rid or current_run_id
+            # BW2: `read_replay_page(limit=1)` can include both a prior committed turn and
+            # a subsequent uncheckpointed target turn. Emit ONLY events for the target turn.
+            if eff_ti is not None and eff_ti != target_turn_index:
+                continue
+            if eff_rid is not None and eff_rid != cleaned_run_id:
+                continue
+            if eff_ti != target_turn_index and eff_rid != cleaned_run_id:
+                continue
+            if ev_rid == cleaned_run_id:
+                matched_page_run = True
+            target_lines.append(line)
+
+        await finish_lines(thread_id, target_lines)
         if is_holder(rows.owner_id):
-            await name_turn_senders(thread_id, replay_lines)
+            await name_turn_senders(thread_id, target_lines)
 
         target_queries = [
             q
@@ -1077,22 +1119,8 @@ async def internal_thread_run_replay_endpoint(
 
         async def event_generator():
             seq = 0
-            matched_page_run = False
-            for line in replay_lines:
+            for line in target_lines:
                 seq += 1
-                try:
-                    payload = json.loads(line.data_json)
-                except Exception:
-                    payload = None
-                if isinstance(payload, dict):
-                    ev_rid = str(
-                        payload.get("response_id")
-                        or payload.get("run_id")
-                        or payload.get("report_run_id")
-                        or ""
-                    ).strip()
-                    if ev_rid == cleaned_run_id:
-                        matched_page_run = True
                 yield f"id: {seq}\nevent: {line.event}\ndata: {line.data_json}\n\n"
 
             done: dict[str, object] = {

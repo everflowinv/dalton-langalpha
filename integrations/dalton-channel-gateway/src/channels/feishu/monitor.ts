@@ -42,6 +42,8 @@ import {
   type ProcessingFeedbackContext,
   type ProcessingFeedbackHandle,
   type ProcessingFeedbackOutcome,
+  type ReconcileDeliveryReceiptOptions,
+  type ReconcileDeliveryReceiptResult,
   type SendCardImageInput,
   type SendCardOptions,
   type SendCardResult,
@@ -1195,6 +1197,72 @@ export class FeishuChannelAdapter implements ChannelAdapter {
         ? { usedDirectFallback: res.usedDirectFallback }
         : {}),
     };
+  }
+
+  /**
+   * BT2: Idempotent Feishu receipt reconciliation via `im.message.create` with the
+   * same deterministic `uuid` derived from `idempotencyKey`. If Feishu already
+   * accepted the message before the crash, Feishu deduplicates on `uuid` and returns
+   * the existing `message_id`; if the crash happened before Feishu received the
+   * request, Feishu delivers it once now and returns its `message_id`.
+   */
+  async reconcileDeliveryReceipt(
+    options: ReconcileDeliveryReceiptOptions,
+  ): Promise<ReconcileDeliveryReceiptResult> {
+    const idempotencyKey = (
+      options.idempotencyKey ??
+      options.deliveryKey ??
+      ""
+    ).trim();
+    const text = (options.text ?? "").trim();
+    if (!idempotencyKey || !text) {
+      return {
+        status: "unknown",
+        reason: "Missing idempotencyKey or text for Feishu uuid replay.",
+      };
+    }
+
+    const target = resolveDaltonOutboundTarget({
+      targetAddress: options.targetAddress,
+      recipientPlatformUserId: options.recipientPlatformUserId,
+    });
+    if (!target) {
+      return {
+        status: "not_sent",
+        reason: `Unable to resolve Feishu target for address "${options.targetAddress}"`,
+      };
+    }
+
+    const client = this.getClient();
+    try {
+      const res = shouldUseFeishuCard(text)
+        ? await sendStructuredCardFeishu(client, {
+            to: target,
+            text,
+            idempotencyKey,
+          })
+        : await sendMessageFeishu(client, {
+            to: target,
+            text,
+            idempotencyKey,
+          });
+      return {
+        status: "confirmed",
+        messageId: res.messageId,
+        reason: "feishu_idempotent_uuid_replay",
+      };
+    } catch (err) {
+      if (err instanceof ChannelDeliveryError && err.outcome === "failed") {
+        return {
+          status: "not_sent",
+          reason: err.message,
+        };
+      }
+      return {
+        status: "unknown",
+        reason: err instanceof Error ? err.message : String(err),
+      };
+    }
   }
 
   async sendPlainText(options: {

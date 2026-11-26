@@ -2202,4 +2202,635 @@ describe("Channel Phase 2 Batch 1 — Group Deep Links & DM Deliverables", () =>
     expect(dbB.get(kC)?.status).toBe("sent");
     expect(dbB.get(`deliverables-links:${runIdB}`)?.status).toBe("sent");
   });
+
+  it("BT2: FeishuChannelAdapter.reconcileDeliveryReceipt replays im.message.create with same uuid across crash-before-send, crash-after-platform-before-I7, and legacy parent keys", async () => {
+    const runId = "run-bt2-feishu-uuid";
+    const files = [
+      { path: "results/alpha.pdf", workspace_id: "ws-a" },
+      { path: "results/beta.pdf", workspace_id: "ws-a" },
+    ];
+
+    // Simulated Feishu im.message.create with real platform uuid deduplication
+    const seenByUuid = new Map<string, { messageId: string; content: string }>();
+    const deliveredMessages: Array<{ uuid?: string; messageId: string; content: string }> = [];
+    let crashAfterCreateBeforeReturn = false;
+    let createCalls = 0;
+
+    const createMock = vi.fn(
+      async (req: { data: { receive_id: string; content: string; msg_type: string; uuid?: string } }) => {
+        createCalls += 1;
+        const uuid = req.data.uuid;
+        let record = uuid ? seenByUuid.get(uuid) : undefined;
+        if (!record) {
+          record = {
+            messageId: `om_fs_uuid_${deliveredMessages.length + 1}`,
+            content: req.data.content,
+          };
+          if (uuid) {
+            seenByUuid.set(uuid, record);
+          }
+          deliveredMessages.push({
+            uuid,
+            messageId: record.messageId,
+            content: req.data.content,
+          });
+        }
+        if (crashAfterCreateBeforeReturn) {
+          throw new ChannelDeliveryError("Simulated crash after Feishu accepted message, before I-7", {
+            outcome: "unknown",
+            code: "unavailable",
+          });
+        }
+        return { code: 0, data: { message_id: record.messageId } };
+      },
+    );
+
+    const feishuReal = new FeishuChannelAdapter({
+      appId: "cli_test",
+      appSecret: "sec_test",
+      botOpenId: "ou_bot",
+      clientFactory: () =>
+        ({
+          im: { message: { create: createMock, reply: vi.fn(), get: vi.fn() } },
+        }) as unknown as ReturnType<
+          NonNullable<NonNullable<ConstructorParameters<typeof FeishuChannelAdapter>[0]>["clientFactory"]>
+        >,
+    });
+    vi.spyOn(feishuReal, "isConnected").mockReturnValue(true);
+
+    type Row = {
+      status: string;
+      error_code: string | null;
+      sent_chunks: number;
+      delivery_attempt: number;
+      platform_message_ids: string[];
+      files_status: Array<{
+        path: string;
+        workspace_id?: string | null;
+        status: string;
+        reason: string | null;
+        idempotency_key?: string | null;
+        platform_message_id?: string | null;
+      }>;
+    };
+    const makeDbBackend = (db: Map<string, Row>) =>
+      makeMockBackend({
+        authorizeAndClaimDelivery: vi.fn(async (req) => {
+          const existing = db.get(req.delivery_key);
+          if (existing && existing.status === "sent") {
+            return {
+              claim_status: "already_completed" as const,
+              status: "sent" as const,
+              platform: "feishu",
+              target_address: "feishu:@me",
+              is_current: true,
+              delivery_attempt: existing.delivery_attempt,
+              first_response_json: {
+                status: "sent",
+                code: null,
+                address: "feishu:@me",
+                current: true,
+                duplicate: true,
+                message: "already sent",
+                files: existing.files_status,
+              },
+            };
+          }
+          const isItemKey =
+            req.delivery_key.startsWith("deliverables-links:") &&
+            req.delivery_key.includes(":item:");
+          const noConfirmed =
+            existing &&
+            existing.sent_chunks === 0 &&
+            existing.platform_message_ids.length === 0 &&
+            existing.files_status.every(
+              (f) => f.status !== "sent" && f.status !== "linked" && !f.platform_message_id,
+            );
+          const allowReclaim =
+            Boolean(isItemKey) &&
+            existing?.status === "unknown" &&
+            Boolean(req.reclaim_verified_unsent) &&
+            Boolean(noConfirmed);
+          if (
+            existing &&
+            (existing.status === "unknown" || existing.status === "in_flight") &&
+            !allowReclaim
+          ) {
+            return {
+              claim_status: "in_flight_or_unknown" as const,
+              existing_status: existing.status,
+              error_code: existing.error_code,
+              sent_chunks: existing.sent_chunks,
+              platform_message_ids: [...existing.platform_message_ids],
+              platform: "feishu",
+              target_address: "feishu:@me",
+              recipient_id: "ou_alice",
+              dm_recipient_platform_user_id: "ou_alice",
+              is_current: true,
+              delivery_attempt: existing.delivery_attempt,
+              files_status: existing.files_status,
+            };
+          }
+          const nextAttempt = existing ? existing.delivery_attempt + 1 : 1;
+          db.set(req.delivery_key, {
+            status: "in_flight",
+            error_code: null,
+            sent_chunks: 0,
+            delivery_attempt: nextAttempt,
+            platform_message_ids: [],
+            files_status: [],
+          });
+          return {
+            claim_status: "claimed" as const,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            recipient_id: "ou_alice",
+            dm_recipient_platform_user_id: "ou_alice",
+            is_current: true,
+            delivery_attempt: nextAttempt,
+            workspace_id: "ws-a",
+            home_workspace_id: "ws-home",
+            prior_run_files: [],
+          };
+        }),
+        updateDeliveryProgress: vi.fn(async (req: I7DeliveriesProgressRequest) => {
+          const row = db.get(req.delivery_key);
+          if (row) {
+            if (typeof req.sent_chunks === "number") row.sent_chunks = req.sent_chunks;
+            if (Array.isArray(req.platform_message_ids)) row.platform_message_ids = [...req.platform_message_ids];
+            if (Array.isArray(req.files_status)) row.files_status = [...req.files_status];
+            if (typeof req.status === "string") row.status = req.status;
+          }
+          return { ok: true, delivery_key: req.delivery_key, status: req.status ?? "in_flight", sent_to_current_count: 1 };
+        }),
+      });
+
+    // Window 1: Crash AFTER Feishu accepted message (uuid recorded in seenByUuid) and BEFORE I-7 wrote `linked`
+    const db1 = new Map<string, Row>();
+    db1.set(`deliverables:${runId}`, {
+      status: "unknown",
+      error_code: "gateway_restarted",
+      sent_chunks: 0,
+      delivery_attempt: 1,
+      platform_message_ids: [],
+      files_status: [],
+    });
+    const svc1 = new DeliveryService({
+      backend: makeDbBackend(db1),
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuReal]]),
+      webBaseUrl: WEB_BASE,
+    });
+    crashAfterCreateBeforeReturn = true;
+    const crashed = await svc1.executeDelivery({
+      deliveryKey: `deliverables:${runId}`,
+      kind: "fallback",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      workspaceId: "ws-a",
+      runId,
+      platform: "feishu",
+      target: "feishu:@me",
+      text: "",
+      files,
+      downloadMode: "deliverable",
+      activityOrigin: "replay",
+    });
+    expect(crashed.status).toBe("unknown");
+    expect(deliveredMessages).toHaveLength(1);
+    expect(deliveredMessages[0]!.uuid).toBeTruthy();
+
+    // Restart recovery: Feishu reconcileDeliveryReceipt replays im.message.create with the SAME uuid ->
+    // Feishu deduplicates (still ONLY 1 delivered message!), confirms receipt, and settles parent to `sent`.
+    crashAfterCreateBeforeReturn = false;
+    const recovered1 = await svc1.executeDelivery({
+      deliveryKey: `deliverables:${runId}`,
+      kind: "fallback",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      workspaceId: "ws-a",
+      runId,
+      platform: "feishu",
+      target: "feishu:@me",
+      text: "",
+      files,
+      downloadMode: "deliverable",
+      activityOrigin: "replay",
+    });
+    expect(recovered1.status).toBe("sent");
+    expect(createCalls).toBe(2);
+    expect(deliveredMessages).toHaveLength(1);
+    expect(db1.get(`deliverables-links:${runId}`)?.status).toBe("sent");
+
+    // Window 2: Crash BEFORE platform send (WAL wrote `dispatching`, zero calls reached Feishu)
+    const runId2 = "run-bt2-feishu-before-send";
+    const db2 = new Map<string, Row>();
+    db2.set(`deliverables:${runId2}`, {
+      status: "unknown",
+      error_code: "gateway_restarted",
+      sent_chunks: 0,
+      delivery_attempt: 1,
+      platform_message_ids: [],
+      files_status: [],
+    });
+    db2.set(`deliverables-links:${runId2}`, {
+      status: "unknown",
+      error_code: "gateway_restarted",
+      sent_chunks: 0,
+      delivery_attempt: 1,
+      platform_message_ids: [],
+      files_status: [
+        {
+          path: "results/alpha.pdf",
+          workspace_id: "ws-a",
+          status: "dispatching",
+          reason: null,
+          idempotency_key: `deliverables-links:${runId2}:chunk:0:1234`,
+        },
+        {
+          path: "results/beta.pdf",
+          workspace_id: "ws-a",
+          status: "dispatching",
+          reason: null,
+          idempotency_key: `deliverables-links:${runId2}:chunk:0:1234`,
+        },
+      ],
+    });
+    const svc2 = new DeliveryService({
+      backend: makeDbBackend(db2),
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuReal]]),
+      webBaseUrl: WEB_BASE,
+    });
+    const countBefore2 = deliveredMessages.length;
+    const recovered2 = await svc2.executeDelivery({
+      deliveryKey: `deliverables:${runId2}`,
+      kind: "fallback",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      workspaceId: "ws-a",
+      runId: runId2,
+      platform: "feishu",
+      target: "feishu:@me",
+      text: "",
+      files,
+      downloadMode: "deliverable",
+      activityOrigin: "replay",
+    });
+    expect(recovered2.status).toBe("sent");
+    expect(deliveredMessages.length).toBe(countBefore2 + 1);
+    // Both links from the dispatching chunk are included in the single replayed message
+    expect(deliveredMessages.at(-1)!.content).toContain("alpha.pdf");
+    expect(deliveredMessages.at(-1)!.content).toContain("beta.pdf");
+    expect(db2.get(`deliverables-links:${runId2}`)?.status).toBe("sent");
+
+    // Window 3: Pre-upgrade legacy parent key (`sent_chunks: 0`, `files_status: []`, `status: "unknown"`)
+    const runId3 = "run-bt2-feishu-legacy-parent";
+    const db3 = new Map<string, Row>();
+    db3.set(`deliverables:${runId3}`, {
+      status: "unknown",
+      error_code: "gateway_restarted",
+      sent_chunks: 0,
+      delivery_attempt: 1,
+      platform_message_ids: [],
+      files_status: [],
+    });
+    db3.set(`deliverables-links:${runId3}`, {
+      status: "unknown",
+      error_code: "gateway_restarted",
+      sent_chunks: 0,
+      delivery_attempt: 1,
+      platform_message_ids: [],
+      files_status: [],
+    });
+    const svc3 = new DeliveryService({
+      backend: makeDbBackend(db3),
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuReal]]),
+      webBaseUrl: WEB_BASE,
+    });
+    const countBefore3 = deliveredMessages.length;
+    const recovered3 = await svc3.executeDelivery({
+      deliveryKey: `deliverables:${runId3}`,
+      kind: "fallback",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      workspaceId: "ws-a",
+      runId: runId3,
+      platform: "feishu",
+      target: "feishu:@me",
+      text: "",
+      files,
+      downloadMode: "deliverable",
+      activityOrigin: "replay",
+    });
+    expect(recovered3.status).toBe("sent");
+    expect(deliveredMessages.length).toBe(countBefore3 + 1);
+    expect(deliveredMessages.at(-1)!.content).toContain("alpha.pdf");
+    expect(deliveredMessages.at(-1)!.content).toContain("beta.pdf");
+    expect(db3.get(`deliverables-links:${runId3}`)?.status).toBe("sent");
+  });
+
+  it("BT2: adapters without reconcileDeliveryReceipt recover at-least-once across pre-send crash, post-platform pre-I7 crash, legacy parent, and partial parent completion", async () => {
+    const { createHash } = await import("node:crypto");
+    type Row = {
+      status: string;
+      error_code: string | null;
+      sent_chunks: number;
+      delivery_attempt: number;
+      platform_message_ids: string[];
+      files_status: Array<{
+        path: string;
+        workspace_id?: string | null;
+        status: string;
+        reason: string | null;
+        idempotency_key?: string | null;
+        platform_message_id?: string | null;
+      }>;
+    };
+
+    const makeBackend = (db: Map<string, Row>, platform: "discord" | "feishu") =>
+      makeMockBackend({
+        authorizeAndClaimDelivery: vi.fn(async (req) => {
+          const existing = db.get(req.delivery_key);
+          const isParentLinks =
+            req.delivery_key.startsWith("deliverables-links:") &&
+            !req.delivery_key.includes(":item:");
+          const isItemKey =
+            req.delivery_key.startsWith("deliverables-links:") &&
+            req.delivery_key.includes(":item:");
+          if (
+            existing &&
+            (existing.status === "sent" ||
+              (existing.status === "partial" && !isParentLinks))
+          ) {
+            return {
+              claim_status: "already_completed" as const,
+              status: existing.status as "sent" | "partial",
+              platform,
+              target_address: `${platform}:@me`,
+              is_current: true,
+              delivery_attempt: existing.delivery_attempt,
+              first_response_json: {
+                status: existing.status,
+                code: null,
+                address: `${platform}:@me`,
+                current: true,
+                duplicate: true,
+                message: "already sent",
+                files: existing.files_status,
+              },
+            };
+          }
+          const noConfirmed =
+            existing &&
+            existing.sent_chunks === 0 &&
+            existing.platform_message_ids.length === 0 &&
+            existing.files_status.every(
+              (f) => f.status !== "sent" && f.status !== "linked" && !f.platform_message_id,
+            );
+          const allowReclaim =
+            Boolean(isItemKey) &&
+            existing?.status === "unknown" &&
+            Boolean(req.reclaim_verified_unsent) &&
+            Boolean(noConfirmed);
+          if (
+            existing &&
+            (existing.status === "unknown" ||
+              existing.status === "in_flight" ||
+              (existing.status === "partial" && isParentLinks)) &&
+            !allowReclaim
+          ) {
+            return {
+              claim_status: "in_flight_or_unknown" as const,
+              existing_status: existing.status,
+              error_code: existing.error_code,
+              sent_chunks: existing.sent_chunks,
+              platform_message_ids: [...existing.platform_message_ids],
+              platform,
+              target_address: `${platform}:@me`,
+              recipient_id: "user_discord_1",
+              dm_recipient_platform_user_id: "user_discord_1",
+              is_current: true,
+              delivery_attempt: existing.delivery_attempt,
+              files_status: existing.files_status,
+            };
+          }
+          const nextAttempt = existing ? existing.delivery_attempt + 1 : 1;
+          db.set(req.delivery_key, {
+            status: "in_flight",
+            error_code: null,
+            sent_chunks: 0,
+            delivery_attempt: nextAttempt,
+            platform_message_ids: [],
+            files_status: [],
+          });
+          return {
+            claim_status: "claimed" as const,
+            platform,
+            target_address: `${platform}:@me`,
+            recipient_id: "user_discord_1",
+            dm_recipient_platform_user_id: "user_discord_1",
+            is_current: true,
+            delivery_attempt: nextAttempt,
+            workspace_id: "ws-a",
+            home_workspace_id: "ws-home",
+            prior_run_files: [],
+          };
+        }),
+        updateDeliveryProgress: vi.fn(async (req: I7DeliveriesProgressRequest) => {
+          const row = db.get(req.delivery_key);
+          if (row) {
+            if (typeof req.sent_chunks === "number") row.sent_chunks = req.sent_chunks;
+            if (Array.isArray(req.platform_message_ids)) row.platform_message_ids = [...req.platform_message_ids];
+            if (Array.isArray(req.files_status)) row.files_status = [...req.files_status];
+            if (typeof req.status === "string") {
+              row.status = req.status;
+              if (req.status === "sent") row.error_code = null;
+            }
+          }
+          return { ok: true, delivery_key: req.delivery_key, status: req.status ?? "in_flight", sent_to_current_count: 1 };
+        }),
+      });
+
+    // 1) Adapter WITHOUT `reconcileDeliveryReceipt` (Discord):
+    //    - item A crashed BEFORE platform send (WAL wrote `dispatching`, swept to `unknown`/`gateway_restarted`)
+    //    - item B crashed AFTER platform received, BEFORE I-7 wrote `linked` (subkey `unknown`/`gateway_restarted` with `dispatching`)
+    //    Both MUST recover via at-least-once re-claim under their original `:item:` key and settle parent to `sent`.
+    const runId1 = "run-bt2-no-reconcile";
+    const itemKeyFor = (rid: string, ws: string, path: string) =>
+      `deliverables-links:${rid}:item:${createHash("sha256").update(`${ws}\0${path}`).digest("hex").slice(0, 24)}`;
+    const kItemA = itemKeyFor(runId1, "ws-a", "results/before_send.pdf");
+    const kItemB = itemKeyFor(runId1, "ws-a", "results/after_platform.pdf");
+
+    const db1 = new Map<string, Row>();
+    db1.set(`deliverables:${runId1}`, {
+      status: "unknown",
+      error_code: "gateway_restarted",
+      sent_chunks: 0,
+      delivery_attempt: 1,
+      platform_message_ids: [],
+      files_status: [],
+    });
+    db1.set(`deliverables-links:${runId1}`, {
+      status: "unknown",
+      error_code: "gateway_restarted",
+      sent_chunks: 0,
+      delivery_attempt: 1,
+      platform_message_ids: [],
+      files_status: [
+        {
+          path: "results/before_send.pdf",
+          workspace_id: "ws-a",
+          status: "dispatching",
+          reason: null,
+          idempotency_key: kItemA,
+        },
+        {
+          path: "results/after_platform.pdf",
+          workspace_id: "ws-a",
+          status: "queued",
+          reason: null,
+          idempotency_key: kItemB,
+        },
+      ],
+    });
+    // Subkey B already reached `dispatching` then crashed after platform accept and before I-7
+    db1.set(kItemB, {
+      status: "unknown",
+      error_code: "gateway_restarted",
+      sent_chunks: 0,
+      delivery_attempt: 1,
+      platform_message_ids: [],
+      files_status: [
+        {
+          path: "results/after_platform.pdf",
+          workspace_id: "ws-a",
+          status: "dispatching",
+          reason: null,
+          idempotency_key: kItemB,
+        },
+      ],
+    });
+
+    const sentCalls1: Array<{ text: string; idempotencyKey?: string | null }> = [];
+    const discordNoReconcile = makeStubAdapter("discord", {
+      sendTextChunk: vi.fn(async (opts: SendTextChunkOptions) => {
+        sentCalls1.push({ text: opts.text, idempotencyKey: opts.idempotencyKey });
+        return { messageId: `dc_msg_${sentCalls1.length}`, resolvedAddress: opts.targetAddress };
+      }),
+    });
+    expect(discordNoReconcile.reconcileDeliveryReceipt).toBeUndefined();
+
+    const svc1 = new DeliveryService({
+      backend: makeBackend(db1, "discord"),
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["discord", discordNoReconcile]]),
+      webBaseUrl: WEB_BASE,
+    });
+    const res1 = await svc1.executeDelivery({
+      deliveryKey: `deliverables:${runId1}`,
+      kind: "fallback",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      workspaceId: "ws-a",
+      runId: runId1,
+      platform: "discord",
+      target: "discord:@me",
+      text: "",
+      files: [
+        { path: "results/before_send.pdf", workspace_id: "ws-a" },
+        { path: "results/after_platform.pdf", workspace_id: "ws-a" },
+      ],
+      downloadMode: "deliverable",
+      activityOrigin: "replay",
+    });
+    expect(res1.status).toBe("sent");
+    expect(sentCalls1).toHaveLength(2);
+    expect(sentCalls1.map((c) => c.idempotencyKey)).toEqual([kItemA, kItemB]);
+    expect(db1.get(kItemB)?.delivery_attempt).toBe(2);
+    expect(db1.get(kItemB)?.status).toBe("sent");
+    expect(db1.get(`deliverables-links:${runId1}`)?.status).toBe("sent");
+
+    // 2) Partial parent recovery: chunk 0 succeeds (`c1.pdf`, `c2.pdf`), chunk 1 explicitly rejected
+    //    (`outcome: "failed"`) -> parent settles to `partial`. Retry recovers ONLY `c3.pdf` & `c4.pdf`
+    //    and settles parent `partial -> sent` via I-7; third call hits `already_completed`.
+    const runId2 = "run-bt2-partial-parent";
+    const db2 = new Map<string, Row>();
+    db2.set(`deliverables:${runId2}`, {
+      status: "unknown",
+      error_code: "gateway_restarted",
+      sent_chunks: 0,
+      delivery_attempt: 1,
+      platform_message_ids: [],
+      files_status: [],
+    });
+    let rejectChunk1 = true;
+    const sentTexts2: string[] = [];
+    const discordPartial = makeStubAdapter("discord", {
+      splitTextChunks: (text: string) => {
+        const lines = text.split("\n").filter((l) => l.length > 0);
+        const chunks: string[] = [];
+        for (let idx = 0; idx < lines.length; idx += 2) {
+          chunks.push(lines.slice(idx, idx + 2).join("\n"));
+        }
+        return chunks.length > 0 ? chunks : [text];
+      },
+      sendTextChunk: vi.fn(async (opts: SendTextChunkOptions) => {
+        if (rejectChunk1 && opts.chunkIndex === 1) {
+          throw new ChannelDeliveryError("Chunk 1 explicitly rejected by platform", {
+            outcome: "failed",
+            code: "rate_limited",
+          });
+        }
+        sentTexts2.push(opts.text);
+        return { messageId: `dc_part_${sentTexts2.length}`, resolvedAddress: opts.targetAddress };
+      }),
+    });
+    const svc2 = new DeliveryService({
+      backend: makeBackend(db2, "discord"),
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["discord", discordPartial]]),
+      webBaseUrl: WEB_BASE,
+    });
+    const partialOpts = {
+      deliveryKey: `deliverables:${runId2}`,
+      kind: "fallback" as const,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      workspaceId: "ws-a",
+      runId: runId2,
+      platform: "discord" as const,
+      target: "discord:@me",
+      text: "",
+      files: [
+        { path: "results/c1.pdf", workspace_id: "ws-a" },
+        { path: "results/c2.pdf", workspace_id: "ws-a" },
+        { path: "results/c3.pdf", workspace_id: "ws-a" },
+        { path: "results/c4.pdf", workspace_id: "ws-b" },
+      ],
+      downloadMode: "deliverable" as const,
+      activityOrigin: "replay" as const,
+    };
+
+    const firstAttempt = await svc2.executeDelivery(partialOpts);
+    expect(firstAttempt.status).toBe("partial");
+    expect(db2.get(`deliverables-links:${runId2}`)?.status).toBe("partial");
+    expect(sentTexts2).toHaveLength(1);
+    expect(sentTexts2[0]).toContain("c1.pdf");
+    expect(sentTexts2[0]).toContain("c2.pdf");
+
+    // Second attempt: recovers failed/remaining c3 & c4 without re-sending c1 & c2, settles parent to `sent`
+    rejectChunk1 = false;
+    sentTexts2.length = 0;
+    const secondAttempt = await svc2.executeDelivery(partialOpts);
+    expect(secondAttempt.status).toBe("sent");
+    expect(sentTexts2.join("\n")).not.toContain("c1.pdf");
+    expect(sentTexts2.join("\n")).not.toContain("c2.pdf");
+    expect(sentTexts2.join("\n")).toContain("c3.pdf");
+    expect(sentTexts2.join("\n")).toContain("c4.pdf");
+    expect(db2.get(`deliverables-links:${runId2}`)?.status).toBe("sent");
+
+    // Third attempt: parent is now `sent` -> hits `already_completed`, sends nothing
+    sentTexts2.length = 0;
+    const thirdAttempt = await svc2.executeDelivery(partialOpts);
+    expect(thirdAttempt.status).toBe("sent");
+    expect(thirdAttempt.duplicate).toBe(true);
+    expect(sentTexts2).toHaveLength(0);
+  });
 });

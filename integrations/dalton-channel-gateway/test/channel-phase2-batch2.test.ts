@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { AgentRoutesHandler } from "../src/agent-routes.js";
 import {
   BackendHttpError,
+  parseSseStream,
   type BackendClient,
   type ChartSnapshotItem,
   type ChartSnapshotsStatusResponse,
@@ -21,6 +22,7 @@ import {
   buildDiscordLinkButtonRow,
   buildHtmlWidgetDeepLink,
   deliverTurnChartsAndWidgets,
+  extractRunChartsAndWidgetsFromReplay,
   FEISHU_CHART_IMAGE_MAX_BYTES,
   waitForChartSnapshotsReady,
 } from "../src/chart-snapshots.js";
@@ -2974,5 +2976,328 @@ describe("Channel Phase 2 Batch 2: chart_layer DM snapshots & interactive deep l
     ]);
     expect(feishuRetry.sentTexts).toHaveLength(1);
     expect(JSON.stringify(feishuRetry.sentCards)).toContain("layer-after-503");
+  });
+
+  it("BW2: does NOT claim :charts key when replay returns 503 with non-empty chart_snapshots; delivers snapshots + replay widgets/layers together once replay succeeds", async () => {
+    const targetRunId = "run-bw2-nonempty-snaps-503";
+    const execId = "exec-bw2-nonempty-snaps-503";
+    const feishu = makeMockAdapter("feishu");
+    let replayAttempt = 0;
+    const claimedChartKeys: string[] = [];
+    const claimedSummaryKeys: string[] = [];
+    const settledKeys = new Set<string>();
+    const markFinishedCalls: boolean[] = [];
+
+    const initialSnapshots: ChartSnapshotItem[] = [
+      {
+        status: "ready",
+        chart_id: "NVDA:1day",
+        layer_id: "layer-snap-initial-1",
+        title: "Initial Ready Snapshot",
+        snapshot_key: SNAP_KEY,
+        sha256: "a".repeat(64),
+      },
+    ];
+
+    const backend = makeMockBackend({
+      authorizeAndClaimDelivery: vi.fn(async (req) => {
+        if (req.delivery_key.endsWith(":charts")) {
+          claimedChartKeys.push(req.delivery_key);
+        }
+        if (req.delivery_key.endsWith(":summary")) {
+          claimedSummaryKeys.push(req.delivery_key);
+        }
+        if (settledKeys.has(req.delivery_key)) {
+          return {
+            claim_status: "already_completed" as const,
+            status: "sent" as const,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            is_current: false,
+            delivery_attempt: 1,
+            first_response_json: {
+              status: "sent",
+              code: null,
+              address: "feishu:@me",
+              current: false,
+              duplicate: true,
+              message: "already sent",
+              files: [],
+            },
+          };
+        }
+        return {
+          claim_status: "claimed" as const,
+          platform: "feishu",
+          target_address: "feishu:@me",
+          recipient_id: "ou_alice",
+          dm_recipient_platform_user_id: "ou_alice",
+          is_current: false,
+          delivery_attempt: 1,
+        };
+      }),
+      updateDeliveryProgress: vi.fn(async (req) => {
+        if (req.status === "sent" || req.status === "partial") {
+          settledKeys.add(req.delivery_key);
+        }
+        return { ok: true, delivery_key: req.delivery_key, status: req.status ?? "sent", sent_to_current_count: 1 };
+      }),
+      finishAutomationRun: vi.fn(async (_id, req) => {
+        markFinishedCalls.push(Boolean(req.mark_finished));
+        return {
+          status: 200,
+          data: {
+            execution_id: execId,
+            status: req.mark_finished ? ("finished" as const) : ("finishing" as const),
+            previous_status: req.mark_finished ? ("finishing" as const) : ("registered" as const),
+            user_id: "user-alice",
+            workspace_id: "ws-1",
+            thread_id: THREAD_ID,
+            run_id: targetRunId,
+            chart_snapshots: initialSnapshots,
+            outbound_blocked: false,
+            automation_name: "Non-Empty Snapshots 503 Brief",
+            finish_status: "completed",
+            final_text: "含预设快照的定时摘要。",
+            targets: [
+              {
+                entry: "feishu:@me",
+                address: "feishu:@me",
+                name: "Feishu DM",
+                ok: true,
+                message: null,
+                agent_sent: false,
+              },
+            ],
+          },
+        };
+      }),
+      replayThreadRun: vi.fn(async () => {
+        replayAttempt += 1;
+        if (replayAttempt === 1) {
+          return {
+            status: 503,
+            isSse: false as const,
+            errorBody: { detail: "Replay temporarily unavailable" },
+          };
+        }
+        return {
+          status: 200,
+          isSse: true as const,
+          events: (async function* () {
+            yield {
+              event: "user_message",
+              data: JSON.stringify({ turn_index: 1, run_id: targetRunId }),
+            };
+            yield {
+              event: "artifact",
+              data: JSON.stringify({
+                artifact_type: "chart_layer",
+                artifact_id: "layer-replay-only-2",
+                response_id: targetRunId,
+                payload: {
+                  chart_id: "AAPL:1day",
+                  layer_id: "layer-replay-only-2",
+                  title: "Replay Only Chart",
+                },
+              }),
+            };
+            yield {
+              event: "artifact",
+              data: JSON.stringify({
+                artifact_type: "html_widget",
+                artifact_id: "widget-replay-only-1",
+                response_id: targetRunId,
+                payload: { title: "Replay Only Widget" },
+              }),
+            };
+            yield {
+              event: "replay_done",
+              data: JSON.stringify({
+                thread_id: THREAD_ID,
+                run_id: targetRunId,
+                turn_index: 1,
+                outbound_blocked_by_run: { [targetRunId]: false },
+              }),
+            };
+          })(),
+        };
+      }),
+    });
+
+    const adapters = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]);
+    const deliveryService = new DeliveryService({ backend, adapters, webBaseUrl: WEB_BASE });
+    const routes = new AgentRoutesHandler({ backend, adapters, deliveryService, webBaseUrl: WEB_BASE });
+
+    // Attempt 1: replay returns 503 while chart_snapshots is NON-EMPTY ->
+    // summary is sent once, :charts key MUST NOT be claimed, zero chart/widget cards sent, returns 503.
+    const res1 = await routes.handleFinishAutomationRun("user-alice", execId, {
+      status: "completed",
+      thread_id: THREAD_ID,
+      run_id: targetRunId,
+      final_text: "含预设快照的定时摘要。",
+    });
+    expect(res1.status).toBe(503);
+    expect(res1.data.retryable).toBe(true);
+    expect(markFinishedCalls).toEqual([false]);
+    expect(claimedSummaryKeys).toEqual([`automation:${execId}:feishu:@me:summary`]);
+    expect(claimedChartKeys).toEqual([]);
+    expect(feishu.sentTexts).toHaveLength(1);
+    expect(feishu.sentCards).toHaveLength(0);
+
+    // Attempt 2: replay succeeds -> summary deduped (still 1 text), :charts claimed ONCE,
+    // delivering BOTH initial snapshot (layer-snap-initial-1) AND replay layer + html_widget together!
+    const res2 = await routes.handleFinishAutomationRun("user-alice", execId, {
+      status: "completed",
+      thread_id: THREAD_ID,
+      run_id: targetRunId,
+      final_text: "含预设快照的定时摘要。",
+    });
+    expect(res2.status).toBe(200);
+    expect(markFinishedCalls).toEqual([false, false, true]);
+    expect(claimedChartKeys).toEqual([`automation:${execId}:feishu:@me:charts`]);
+    expect(feishu.sentTexts).toHaveLength(1);
+    const cardsJson = JSON.stringify(feishu.sentCards);
+    expect(cardsJson).toContain("layer-snap-initial-1");
+    expect(cardsJson).toContain("layer-replay-only-2");
+    expect(cardsJson).toContain("widget-replay-only-1");
+  });
+
+  it("BW2: rejects raw SSE stream truncated before replay_done blank-line terminator, and settles permanent 403 refusal without 503 retry loop", async () => {
+    const targetRunId = "run-bw2-raw-sse-trunc";
+
+    const makeRawStream = (raw: string): ReadableStream<Uint8Array> =>
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(raw));
+          controller.close();
+        },
+      });
+
+    // 1) Truncated raw SSE byte stream: `replay_done` lacks the blank-line frame terminator (`\n\n`)
+    const truncatedRaw = [
+      "id: 1",
+      "event: user_message",
+      `data: ${JSON.stringify({ turn_index: 1, run_id: targetRunId })}`,
+      "",
+      "id: 2",
+      "event: replay_done",
+      `data: ${JSON.stringify({ thread_id: THREAD_ID, run_id: targetRunId, turn_index: 1 })}`,
+      "", // single trailing newline only — NO blank line terminating the SSE frame!
+    ].join("\n");
+
+    const truncBackend = makeMockBackend({
+      replayThreadRun: vi.fn(async () => ({
+        status: 200,
+        isSse: true as const,
+        events: parseSseStream(makeRawStream(truncatedRaw)),
+      })),
+    });
+    const truncRes = await extractRunChartsAndWidgetsFromReplay({
+      backend: truncBackend,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      targetRunId,
+      executionId: "exec-raw-trunc",
+    });
+    expect(truncRes.found).toBe(false);
+    expect(truncRes.retryable).toBe(true);
+
+    // Same payload WITH proper blank-line terminator (`\n\n`) is accepted as found=true
+    const completeBackend = makeMockBackend({
+      replayThreadRun: vi.fn(async () => ({
+        status: 200,
+        isSse: true as const,
+        events: parseSseStream(makeRawStream(`${truncatedRaw}\n`)),
+      })),
+    });
+    const okRes = await extractRunChartsAndWidgetsFromReplay({
+      backend: completeBackend,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      targetRunId,
+      executionId: "exec-raw-ok",
+    });
+    expect(okRes.found).toBe(true);
+
+    // 2) Sole target platform disabled -> replay returns permanent 403 -> /finish MUST settle
+    //    according to target permissions (`mark_finished: true`, HTTP 200) instead of returning 503.
+    const exec403 = "exec-bw2-403-disabled";
+    const feishu403 = makeMockAdapter("feishu");
+    const markFinished403: boolean[] = [];
+    const claimedChartKeys403: string[] = [];
+    const backend403 = makeMockBackend({
+      authorizeAndClaimDelivery: vi.fn(async (req) => {
+        if (req.delivery_key.endsWith(":charts")) {
+          claimedChartKeys403.push(req.delivery_key);
+        }
+        return {
+          claim_status: "denied" as const,
+          status: "failed" as const,
+          code: "not_allowed" as const,
+          message: "Channel platform capability channel_feishu is disabled.",
+        };
+      }),
+      finishAutomationRun: vi.fn(async (_id, req) => {
+        markFinished403.push(Boolean(req.mark_finished));
+        return {
+          status: 200,
+          data: {
+            execution_id: exec403,
+            status: req.mark_finished ? ("finished" as const) : ("finishing" as const),
+            previous_status: req.mark_finished ? ("finishing" as const) : ("registered" as const),
+            user_id: "user-alice",
+            workspace_id: "ws-1",
+            thread_id: THREAD_ID,
+            run_id: targetRunId,
+            chart_snapshots: [
+              {
+                status: "ready",
+                chart_id: "NVDA:1day",
+                layer_id: "layer-403-1",
+                title: "Blocked Chart",
+                snapshot_key: SNAP_KEY,
+              },
+            ],
+            outbound_blocked: false,
+            automation_name: "Disabled Platform Brief",
+            finish_status: "completed",
+            final_text: "平台已关闭的摘要。",
+            targets: [
+              {
+                entry: "feishu:@me",
+                address: "feishu:@me",
+                name: "Feishu DM",
+                ok: true,
+                message: null,
+                agent_sent: false,
+              },
+            ],
+          },
+        };
+      }),
+      replayThreadRun: vi.fn(async () => ({
+        status: 403,
+        isSse: false as const,
+        errorBody: { detail: "Channel platform capability is disabled" },
+      })),
+    });
+    const adapters403 = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu403]]);
+    const delivery403 = new DeliveryService({ backend: backend403, adapters: adapters403, webBaseUrl: WEB_BASE });
+    const routes403 = new AgentRoutesHandler({ backend: backend403, adapters: adapters403, deliveryService: delivery403, webBaseUrl: WEB_BASE });
+
+    const res403 = await routes403.handleFinishAutomationRun("user-alice", exec403, {
+      status: "completed",
+      thread_id: THREAD_ID,
+      run_id: targetRunId,
+      final_text: "平台已关闭的摘要。",
+    });
+    expect(res403.status).toBe(200);
+    expect(markFinished403).toEqual([false, true]);
+    expect(claimedChartKeys403).toEqual([]);
+    expect(res403.data.targets).toHaveLength(1);
+    expect(res403.data.targets?.[0]?.reached).toBe(false);
+    expect(feishu403.sentTexts).toHaveLength(0);
+    expect(feishu403.sentCards).toHaveLength(0);
   });
 });
