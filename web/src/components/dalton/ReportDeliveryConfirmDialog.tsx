@@ -147,7 +147,7 @@ export default function ReportDeliveryConfirmDialog({
           </div>
 
           {error && (
-            <p className="text-sm" role="alert" style={{ color: 'var(--color-destructive, #dc2626)' }}>
+            <p className="text-sm" role="alert" style={{ color: 'var(--color-loss)' }}>
               {error}
             </p>
           )}

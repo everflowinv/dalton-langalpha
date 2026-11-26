@@ -474,6 +474,9 @@
       "createAnyway": "Create anyway",
       "ownerLabel": "Owner: {{owner}}",
       "leadLabel": "Lead: {{lead}}"
+    },
+    "dedup": {
+      "unavailableTitle": "Company deduplication unavailable"
     }
   },
   "computer": {

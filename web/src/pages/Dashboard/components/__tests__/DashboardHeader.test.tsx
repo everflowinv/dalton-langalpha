@@ -44,7 +44,8 @@ describe('DashboardHeader search', () => {
     fireEvent.pointerDown(field);
     expect(palette.preload).toHaveBeenCalled();
     fireEvent.click(field);
-    expect(palette.open).toHaveBeenCalledWith({ kind: 'tickers' });
+    // DALTON-HOOK(dialog-focus-return): PaletteTrigger passes its button so dialogs opened from it return focus here
+    expect(palette.open).toHaveBeenCalledWith({ kind: 'tickers' }, { returnFocusTo: field });
     expect(document.querySelector('.dashboard-search-dropdown')).toBeNull();
 
     // A hardware keyboard's / opens it too.

@@ -10,7 +10,6 @@ import asyncio
 import contextlib
 import contextvars
 import logging
-import threading
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -50,7 +49,6 @@ logger = logging.getLogger(__name__)
 _SUPPRESS_DAYTONA_RAW_SPANS: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_suppress_daytona_raw_spans", default=False
 )
-_DAYTONA_OTEL_LOCK = threading.Lock()
 
 _PASSTHROUGH_ARCHIVE_ERRORS = (
     ArchiveUnsupportedError,
@@ -63,32 +61,12 @@ _PASSTHROUGH_ARCHIVE_ERRORS = (
 
 
 def _install_daytona_otel_guard() -> None:
-    """Idempotently wrap ``daytona._utils.otel_decorator.get_tracer`` with a ContextVar gate.
+    """Idempotently wrap ``daytona._utils.otel_decorator.get_tracer`` via the Daytona provider boundary."""
+    from ptc_agent.core.sandbox.providers._daytona_errors import (
+        install_daytona_otel_guard,
+    )
 
-    Locked Daytona SDK ``@with_instrumentation()`` methods (``get``, ``archive``,
-    ``refresh_data``) record ``str(error)`` and tracebacks into their own child spans
-    before callers can catch the exception. Returning ``NoOpTracer`` only while the
-    current async task is inside ``suppress_daytona_raw_spans()`` prevents raw provider
-    bodies from reaching any OTLP span without affecting unrelated tasks.
-    """
-    try:
-        import daytona._utils.otel_decorator as daytona_otel
-    except Exception:
-        return
-    if getattr(daytona_otel.get_tracer, "_dalton_raw_span_guard", False):
-        return
-    with _DAYTONA_OTEL_LOCK:
-        if getattr(daytona_otel.get_tracer, "_dalton_raw_span_guard", False):
-            return
-        orig_get_tracer = daytona_otel.get_tracer
-
-        def _guarded_get_tracer():
-            if _SUPPRESS_DAYTONA_RAW_SPANS.get():
-                return otel_trace.NoOpTracer()
-            return orig_get_tracer()
-
-        _guarded_get_tracer._dalton_raw_span_guard = True  # type: ignore[attr-defined]
-        daytona_otel.get_tracer = _guarded_get_tracer
+    install_daytona_otel_guard(_SUPPRESS_DAYTONA_RAW_SPANS.get)
 
 
 @contextlib.contextmanager
@@ -104,27 +82,19 @@ def suppress_daytona_raw_spans():
 
 def _is_daytona_post_submit_refresh_404(exc: BaseException) -> bool:
     """Detect when Daytona SDK's ``archive()`` submitted successfully and its internal ``refresh_data()`` got 404."""
-    from daytona import DaytonaNotFoundError
+    from ptc_agent.core.sandbox.providers._daytona_errors import (
+        is_daytona_post_submit_refresh_404,
+    )
 
-    if not isinstance(exc, DaytonaNotFoundError):
-        return False
-    # AsyncSandbox.archive wraps AsyncSandbox.refresh_data's DaytonaNotFoundError
-    # via @intercept_errors(message_prefix="Failed to archive sandbox: "), setting
-    # __cause__ to refresh_data's DaytonaNotFoundError (message starts with
-    # "Failed to refresh sandbox data:").
-    if isinstance(exc.__cause__, DaytonaNotFoundError):
-        return True
-    return "Failed to refresh sandbox data:" in str(exc)
+    return is_daytona_post_submit_refresh_404(exc)
 
 
 async def archive_daytona_sandbox(sdk_sandbox: Any, sandbox_id: str) -> None:
     """Call Daytona SDK ``archive()`` under raw-span suppression and normalize post-submit 404."""
-    from daytona import DaytonaNotFoundError
-
     with suppress_daytona_raw_spans():
         try:
             await sdk_sandbox.archive()
-        except DaytonaNotFoundError as exc:
+        except Exception as exc:
             if _is_daytona_post_submit_refresh_404(exc):
                 raise ArchivePostSubmitGoneError(
                     sandbox_id,
@@ -239,21 +209,19 @@ def classify_archive_provider_error(
             503,
             "Sandbox is temporarily unavailable. Please retry.",
         )
-    try:
-        from daytona import DaytonaError, DaytonaNotFoundError
-    except Exception:
-        DaytonaError = None  # type: ignore[assignment]
-        DaytonaNotFoundError = None  # type: ignore[assignment]
-    if DaytonaNotFoundError is not None and isinstance(exc, DaytonaNotFoundError):
+    from ptc_agent.core.sandbox.providers._daytona_errors import (
+        classify_daytona_archive_error,
+    )
+
+    daytona_kind = classify_daytona_archive_error(exc)
+    if daytona_kind == "sandbox_gone":
         return ("sandbox_gone", 503, "Sandbox is no longer available.")
-    if DaytonaError is not None and isinstance(exc, DaytonaError):
-        status_code = getattr(exc, "status_code", None)
-        if status_code in (408, 429, 500, 502, 503, 504):
-            return (
-                "sandbox_transient",
-                503,
-                "Sandbox is temporarily unavailable. Please retry.",
-            )
+    if daytona_kind == "sandbox_transient":
+        return (
+            "sandbox_transient",
+            503,
+            "Sandbox is temporarily unavailable. Please retry.",
+        )
     if isinstance(exc, RuntimeError) and "sandbox is in transient state" in str(exc):
         return (
             "sandbox_transient_state",

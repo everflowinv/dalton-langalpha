@@ -474,6 +474,9 @@
       "createAnyway": "仍然新建",
       "ownerLabel": "所有者 {{owner}}",
       "leadLabel": "主分析师 {{lead}}"
+    },
+    "dedup": {
+      "unavailableTitle": "公司查重暂不可用"
     }
   },
   "computer": {
