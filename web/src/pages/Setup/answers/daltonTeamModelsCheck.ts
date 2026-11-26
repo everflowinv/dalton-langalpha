@@ -32,16 +32,37 @@ const MODELS_STALE_MS = 5 * 60_000;
 const PROVIDER_MODELS_STALE_MS = 10 * 60_000;
 
 // DALTON-HOOK(dalton-setup): track per-generation refreshed providers and client-wide in-flight forced refreshes
+interface InFlightRefresh {
+  gen: number;
+  promise: Promise<AvailableModels>;
+}
+
 interface RefreshTracker {
   gen: number;
   providers: Set<string>;
   /** Forced refreshes already in flight when this retry generation started, shareable even if they settle before provider refresh runs. */
-  sharedInFlight: Map<string, Promise<AvailableModels>>;
+  sharedInFlight: Map<string, InFlightRefresh>;
+  /** Providers for which this retry generation already issued its own follow-up refresh=1 after a reused refresh failed or was stale. */
+  retriedProviders: Set<string>;
 }
 
 const retryGenerationByClient = new WeakMap<QueryClient, number>();
 const refreshedProvidersByClient = new WeakMap<QueryClient, RefreshTracker>();
-const inFlightRefreshByClient = new WeakMap<QueryClient, Map<string, Promise<AvailableModels>>>();
+const inFlightRefreshByClient = new WeakMap<QueryClient, Map<string, InFlightRefresh>>();
+
+/** True only when the server answered with a live, non-fallback provider list. */
+function isLiveRefreshResult(data: AvailableModels): boolean {
+  return !data.cached && data.status !== 'fallback';
+}
+
+function isLatestRetryGeneration(queryClient: QueryClient, retryGeneration: number): boolean {
+  if (retryGeneration <= 0) return false;
+  const latestGen = Math.max(
+    retryGenerationByClient.get(queryClient) ?? 0,
+    refreshedProvidersByClient.get(queryClient)?.gen ?? 0,
+  );
+  return retryGeneration >= latestGen;
+}
 
 /** Read the latest explicit retry generation for a QueryClient. */
 export function getDaltonTeamModelsRetryGeneration(queryClient: QueryClient): number {
@@ -61,6 +82,7 @@ export function bumpDaltonTeamModelsRetry(queryClient: QueryClient): number {
     gen: next,
     providers: new Set<string>(),
     sharedInFlight: inFlight && inFlight.size > 0 ? new Map(inFlight) : new Map(),
+    retriedProviders: new Set<string>(),
   });
   return next;
 }
@@ -69,16 +91,21 @@ function getOrCreateRefreshTracker(queryClient: QueryClient, retryGeneration: nu
   if (retryGeneration <= 0) return undefined;
   let tracker = refreshedProvidersByClient.get(queryClient);
   if (!tracker || tracker.gen < retryGeneration) {
-    tracker = { gen: retryGeneration, providers: new Set<string>(), sharedInFlight: new Map() };
+    tracker = {
+      gen: retryGeneration,
+      providers: new Set<string>(),
+      sharedInFlight: new Map(),
+      retriedProviders: new Set<string>(),
+    };
     refreshedProvidersByClient.set(queryClient, tracker);
   }
   return tracker;
 }
 
-function getOrCreateInFlightMap(queryClient: QueryClient): Map<string, Promise<AvailableModels>> {
+function getOrCreateInFlightMap(queryClient: QueryClient): Map<string, InFlightRefresh> {
   let map = inFlightRefreshByClient.get(queryClient);
   if (!map) {
-    map = new Map<string, Promise<AvailableModels>>();
+    map = new Map<string, InFlightRefresh>();
     inFlightRefreshByClient.set(queryClient, map);
   }
   return map;
@@ -88,10 +115,12 @@ function getOrCreateInFlightMap(queryClient: QueryClient): Map<string, Promise<A
  * DALTON-HOOK(dalton-setup): cancel any in-flight normal provider list request and force-refresh with `?refresh=1`.
  * In-flight forced refreshes are tracked per QueryClient (across retry generations), registered
  * synchronously before `await cancelQueries`, and snapshotted onto each new retry generation at
- * retry start (`bumpDaltonTeamModelsRetry`), so consecutive retry clicks reuse the in-flight forced
- * refresh even if it finishes while pre-refresh invalidations are still pending. A throttled
- * `cached: true` response is never marked as refreshed so a later retry can re-attempt once the
- * cooldown clears.
+ * retry start (`bumpDaltonTeamModelsRetry`), so consecutive retry clicks reuse a live forced
+ * refresh even if it finishes while pre-refresh invalidations are still pending. Only a live,
+ * non-fallback response (`!cached && status !== 'fallback'`) marks the provider refreshed or
+ * satisfies a newer retry generation; if a reused earlier-generation refresh throws or returns
+ * `cached: true` / `status: 'fallback'`, the latest retry generation issues at most one fresh
+ * `?refresh=1` of its own (subject to server throttling).
  */
 export async function forceRefreshProviderAvailableModels(
   queryClient: QueryClient,
@@ -100,27 +129,55 @@ export async function forceRefreshProviderAvailableModels(
 ): Promise<AvailableModels> {
   const whole = queryKeys.providerModels.available(provider, '');
   const tracker = getOrCreateRefreshTracker(queryClient, retryGeneration);
+  const ownTracker = tracker && tracker.gen === retryGeneration ? tracker : undefined;
   const inFlight = getOrCreateInFlightMap(queryClient);
-  const existing = inFlight.get(provider) ?? tracker?.sharedInFlight.get(provider);
+  const existing = inFlight.get(provider) ?? ownTracker?.sharedInFlight.get(provider);
   if (existing) {
+    let outcome: { ok: true; data: AvailableModels } | { ok: false; err: unknown };
     try {
-      const data = await existing;
-      if (!data.cached) {
-        if (tracker && refreshedProvidersByClient.get(queryClient) === tracker) {
+      outcome = { ok: true, data: await existing.promise };
+    } catch (err) {
+      outcome = { ok: false, err };
+    }
+
+    if (outcome.ok && isLiveRefreshResult(outcome.data)) {
+      if (tracker && refreshedProvidersByClient.get(queryClient) === tracker) {
+        tracker.providers.add(provider);
+      }
+      return outcome.data;
+    }
+
+    if (ownTracker?.sharedInFlight.get(provider) === existing) {
+      ownTracker.sharedInFlight.delete(provider);
+    }
+    if (inFlight.get(provider) === existing) {
+      inFlight.delete(provider);
+    }
+
+    if (existing.gen < retryGeneration && isLatestRetryGeneration(queryClient, retryGeneration)) {
+      const currentInFlight = inFlight.get(provider);
+      if (currentInFlight && currentInFlight.gen >= retryGeneration) {
+        const data = await currentInFlight.promise;
+        if (isLiveRefreshResult(data) && tracker && refreshedProvidersByClient.get(queryClient) === tracker) {
           tracker.providers.add(provider);
         }
-      } else if (tracker?.sharedInFlight.get(provider) === existing && inFlight.get(provider) !== existing) {
-        tracker.sharedInFlight.delete(provider);
+        return data;
       }
-      return data;
-    } catch (err) {
-      if (tracker?.sharedInFlight.get(provider) === existing && inFlight.get(provider) !== existing) {
-        tracker.sharedInFlight.delete(provider);
+      if (!ownTracker?.retriedProviders.has(provider)) {
+        ownTracker?.retriedProviders.add(provider);
+      } else if (outcome.ok) {
+        return outcome.data;
+      } else {
+        throw outcome.err;
       }
-      throw err;
+    } else if (outcome.ok) {
+      return outcome.data;
+    } else {
+      throw outcome.err;
     }
   }
 
+  let entry!: InFlightRefresh;
   const run = (async (): Promise<AvailableModels> => {
     await queryClient.cancelQueries({ queryKey: whole, exact: true });
     let forcedRan = false;
@@ -134,13 +191,13 @@ export async function forceRefreshProviderAvailableModels(
       retry: false,
     });
     // DALTON-HOOK(dalton-setup): the forced response replaces the list, so drop per-search caches;
-    // mark the provider refreshed only when the server answered live (not its rate-limited cache)
+    // mark the provider refreshed only when the server answered live (not its rate-limited cache or fallback)
     if (forcedRan) {
       queryClient.removeQueries({
         queryKey: queryKeys.providerModels.availableFor(provider),
         predicate: (q) => q.queryKey.at(-1) !== whole.at(-1),
       });
-      if (!data.cached) {
+      if (isLiveRefreshResult(data)) {
         const latestTracker = refreshedProvidersByClient.get(queryClient);
         if (latestTracker && latestTracker.gen >= retryGeneration) {
           latestTracker.providers.add(provider);
@@ -150,11 +207,12 @@ export async function forceRefreshProviderAvailableModels(
     return data;
   })();
 
-  inFlight.set(provider, run);
+  entry = { gen: retryGeneration, promise: run };
+  inFlight.set(provider, entry);
   try {
     return await run;
   } finally {
-    if (inFlight.get(provider) === run) {
+    if (inFlight.get(provider) === entry) {
       inFlight.delete(provider);
     }
   }
