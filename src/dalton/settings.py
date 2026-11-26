@@ -2018,6 +2018,53 @@ def is_chat_upload_cleanup_enabled() -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
+def _parse_bool_env_or_channels_yaml(env_var: str, yaml_key: str, default: bool = True) -> bool:
+    """Resolve a channel runtime switch from ``env_var`` -> merged YAML ``channels.<yaml_key>`` -> ``default``.
+
+    Kept outside ``DaltonConfig`` so ``DaltonConfig.model_dump()`` stays byte-identical
+    for Everflow parity snapshots while honoring both ``dalton.yaml`` and ``dalton.core.yaml``.
+    """
+    raw = os.getenv(env_var)
+    if raw is not None and raw.strip():
+        cleaned = raw.strip().lower()
+        if cleaned in ("0", "false", "no", "off"):
+            return False
+        if cleaned in ("1", "true", "yes", "on"):
+            return True
+    raw_yaml = _load_profile_dalton_raw(resolve_profile())
+    channels_cfg = raw_yaml.get("channels")
+    if isinstance(channels_cfg, Mapping) and isinstance(channels_cfg.get(yaml_key), bool):
+        return bool(channels_cfg[yaml_key])
+    return bool(default)
+
+
+def is_channel_interactive_actions_enabled() -> bool:
+    """Static switch for channel interactive action buttons (``DALTON_CHANNEL_INTERACTIVE_ACTIONS_ENABLED``)."""
+    return _parse_bool_env_or_channels_yaml(
+        "DALTON_CHANNEL_INTERACTIVE_ACTIONS_ENABLED",
+        "interactive_actions_enabled",
+        default=True,
+    )
+
+
+def is_channel_interrupt_ledger_enabled() -> bool:
+    """Static switch for channel HITL interrupt resume ledger (``DALTON_CHANNEL_INTERRUPT_LEDGER_ENABLED``)."""
+    return _parse_bool_env_or_channels_yaml(
+        "DALTON_CHANNEL_INTERRUPT_LEDGER_ENABLED",
+        "interrupt_ledger_enabled",
+        default=True,
+    )
+
+
+def is_channel_bt2_link_recovery_enabled() -> bool:
+    """Static switch for BT2 deliverable link crash recovery enrollment (``DALTON_CHANNEL_BT2_LINK_RECOVERY_ENABLED``)."""
+    return _parse_bool_env_or_channels_yaml(
+        "DALTON_CHANNEL_BT2_LINK_RECOVERY_ENABLED",
+        "bt2_link_recovery_enabled",
+        default=True,
+    )
+
+
 
 
 

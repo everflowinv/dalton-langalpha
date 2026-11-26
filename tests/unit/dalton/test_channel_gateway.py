@@ -1713,7 +1713,14 @@ class InMemoryChannelStore:
             return []
 
         if "UPDATE dalton_channel_deliveries SET sent_chunks = %s" in norm:
-            schunks, tchunks, pmids, fstat, fresp, st, ecode, emsg, dkey = params
+            if len(params) == 11:
+                schunks, tchunks, pmids, fstat, fresp, st, _st2, is_bt2_p, ecode, emsg, dkey = params
+            elif len(params) == 10:
+                schunks, tchunks, pmids, fstat, fresp, st, ecode, emsg, _lease_s, dkey = params
+                is_bt2_p = False
+            else:
+                schunks, tchunks, pmids, fstat, fresp, st, ecode, emsg, dkey = params
+                is_bt2_p = False
             r = self.deliveries[str(dkey)]
             r["sent_chunks"] = int(schunks)
             r["total_chunks"] = int(tchunks)
@@ -1723,7 +1730,9 @@ class InMemoryChannelStore:
                 fresp.obj if hasattr(fresp, "obj") else fresp
             )
             r["status"] = str(st)
-            if ecode is not None:
+            if str(st) == "sent" and is_bt2_p:
+                r["error_code"] = None
+            elif ecode is not None:
                 r["error_code"] = str(ecode)
             if emsg is not None:
                 r["error_message"] = str(emsg)

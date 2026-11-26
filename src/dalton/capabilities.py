@@ -1159,6 +1159,13 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("channels_router.py", "internal_inbound_progress_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_steers_reconcile_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_recover_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_action_tokens_mint_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_action_tokens_bind_card_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_action_tokens_inspect_gate_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_action_tokens_consume_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_interrupt_resumes_claim_text_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_interrupt_resumes_ack_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_interrupt_runtime_config_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_automation_runs_register_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_automation_runs_finish_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_weixin_accounts_reconcile_endpoint"): (

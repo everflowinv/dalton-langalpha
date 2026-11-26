@@ -177,3 +177,8 @@ internal_llm:
     - "gemini-4-hydrogen-high-oauth"
     - "gemini-4-argon-medium-oauth"
     - "gpt-6.2-sol-oauth"
+
+channels:
+  interactive_actions_enabled: true
+  interrupt_ledger_enabled: true
+  bt2_link_recovery_enabled: true

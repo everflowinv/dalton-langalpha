@@ -694,6 +694,14 @@ async def download_verified_deliverable(
                 "message": "delivery_key, workspace_id, and valid relative path are required.",
             },
         )
+    if cleaned_key.startswith("deliverables-links:"):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "deliverable_recipient_denied",
+                "message": "Binary deliverable download is restricted to non-link source DM deliveries.",
+            },
+        )
 
     allowed_req, req_reason = is_deliverable_path_allowed(norm_rel)
     if not allowed_req:
