@@ -1,82 +1,38 @@
 """Federated research connector (`dalton_research_all` at `/mcp/federated`).
 
-Implements §0.2 #4/#6, §2.2 #2, §2.3 #1/#2, and §6.4 #3:
+Implements generic multi-source federation over `ConnectorRegistry`:
 - Mounts whenever ANY internal research source capability is enabled.
 - Enforces **per-source `effective_capabilities()`** checks on every `search`,
-  `list`, `read` (`get_document`), and `sales_mail` call:
+  `list`, `read` (`get_document`), and registered alias call:
   - Disabled explicit sources or prefixes immediately return `capability_disabled`.
-  - Unspecified `sources` fans out strictly across currently enabled sources.
-- Batch 3 single-authority rule (§0.2 #6): when `alphaengine` is enabled, the
-  federated `all` AlphaEngine leg forwards through the legacy bridge (`:8960/mcp`)
-  rather than accessing `:8950` or its SQLite cache directly.
-- Partial-failure contract (§2.3 #2): returns `"ok": true, "status": "partial"`,
-  per-source `"source_status"`, and preserves `"alphaengine"` / `"guidepoint"`
-  top-level summary blocks whenever any enabled leg times out (> `fanout_grace_s`)
-  or fails while another enabled leg succeeds.
-- Prefix `read` dispatch (§2.3 #1): `wiki:`, `mail:`, `digest:`, `tmtb:`,
-  `funda:`, `image:` (verifying the image owner's capability!).
+  - Unspecified `sources` fans out strictly across currently enabled registered sources.
+- Partial-failure contract: returns `"ok": true, "status": "partial"`,
+  per-source `"source_status"`, and preserves top-level summary blocks for any
+  source registered with `top_level_block=True` whenever any enabled leg times
+  out (> `fanout_grace_s`) or fails while another enabled leg succeeds.
+- Prefix `read` dispatch: dynamically resolves registered prefixes and `image:`
+  (verifying the image owner's capability).
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
-from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
-import httpx
-
-from src.dalton.capabilities import CapabilityId
-from src.dalton.research_host.auth import CURRENT_CALLER_HEADERS
-from src.dalton.research_host.connector_registry import ConnectorRegistry
+from src.dalton.capabilities import (
+    BRIDGE_ROUTE_CAPABILITY_MAP,
+    INTERNAL_RESEARCH_CAPABILITIES,
+    CapabilityId,
+)
+from src.dalton.research_host.connector_registry import ConnectorRegistry, FederatedSourceSpec
 from src.dalton.research_host.wiki_store import OpenWikiStore
 
 logger = logging.getLogger("dalton-research-host.federated")
 
-ALL_INTERNAL_RESEARCH_CAPABILITIES: tuple[CapabilityId, ...] = (
-    CapabilityId.COMPANY_WIKI,
-    CapabilityId.SALES_NOTES,
-    CapabilityId.TMTB,
-    CapabilityId.FUNDA_AI,
-    CapabilityId.GUIDEPOINT,
-    CapabilityId.ALPHAENGINE,
-)
-
-SOURCE_TO_CAPABILITY: dict[str, CapabilityId] = {
-    "company-wiki": CapabilityId.COMPANY_WIKI,
-    "sales-notes": CapabilityId.SALES_NOTES,
-    "tmtb": CapabilityId.TMTB,
-    "funda-ai": CapabilityId.FUNDA_AI,
-    "guidepoint": CapabilityId.GUIDEPOINT,
-    "alphaengine": CapabilityId.ALPHAENGINE,
-}
-
-PREFIX_TO_SOURCE: dict[str, str] = {
-    "wiki": "company-wiki",
-    "mail": "sales-notes",
-    "digest": "sales-notes",
-    "tmtb": "tmtb",
-    "funda": "funda-ai",
-}
-
-SOURCE_ALLOWED_PARAMS: dict[str, frozenset[str]] = {
-    "company-wiki": frozenset({"company", "sector", "tag", "search_mode", "no_decay", "media", "indexed_since"}),
-    "sales-notes": frozenset({"sender", "layer", "search_mode", "media"}),
-    "tmtb": frozenset({"sender", "search_mode", "media"}),
-    "funda-ai": frozenset({"sender", "search_mode", "media"}),
-    "guidepoint": frozenset({"size", "keywords", "recency_bias", "start_date", "end_date"}),
-    "alphaengine": frozenset({"search_in", "fresh", "sort", "meeting_scope"}),
-}
-
-SOURCE_PREFIXES: dict[str, tuple[str, ...]] = {
-    "company-wiki": ("wiki",),
-    "sales-notes": ("mail", "digest"),
-    "tmtb": ("tmtb",),
-    "funda-ai": ("funda",),
-}
+ALL_INTERNAL_RESEARCH_CAPABILITIES: tuple[CapabilityId, ...] = INTERNAL_RESEARCH_CAPABILITIES
 
 DEFAULT_FANOUT_GRACE_S: float = 20.0
 
@@ -85,9 +41,14 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _extract_sources(results: list[dict[str, Any]], extra_blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _extract_sources(
+    results: list[dict[str, Any]],
+    extra_blocks: list[dict[str, Any]],
+    source_specs: dict[str, FederatedSourceSpec] | None = None,
+) -> list[dict[str, Any]]:
     sources: list[dict[str, Any]] = []
     seen: set[str] = set()
+    specs = source_specs or {}
     for blk in extra_blocks:
         for src in blk.get("_sources") or []:
             if isinstance(src, dict):
@@ -103,14 +64,16 @@ def _extract_sources(results: list[dict[str, Any]], extra_blocks: list[dict[str,
             continue
         seen.add(doc_id)
         src_name = str(item.get("source") or "research")
+        spec = specs.get(src_name)
+        identity = spec.provenance_identity if spec is not None else "internal_note"
         sources.append(
             {
                 "document_id": doc_id[:200],
                 "identifier": doc_id[:200],
                 "route": src_name,
                 "source_type": "research_doc",
-                "identity": "internal_note" if src_name != "guidepoint" else "expert",
-                "detail": "internal_note" if src_name != "guidepoint" else "expert",
+                "identity": identity,
+                "detail": identity,
                 "publisher": str(item.get("original_source") or src_name)[:120],
                 "provider": f"dalton_research_all:{src_name}",
                 "title": str(item.get("title") or doc_id)[:300],
@@ -122,142 +85,6 @@ def _extract_sources(results: list[dict[str, Any]], extra_blocks: list[dict[str,
         if len(sources) >= 50:
             break
     return sources
-
-
-class LegacyBridgeAlphaEngineProxy:
-    """Forwards Batch 3 `all.search` AlphaEngine leg to the legacy bridge (`:8960/mcp`).
-
-    Keeps the legacy bridge as the single authoritative handler for AlphaEngine
-    (SQLite v4 cache, usage_file, circuit breaker) throughout Batch 3 (§0.2 #6, §6.4 #3).
-    """
-
-    def __init__(
-        self,
-        *,
-        bridge_mcp_url: str,
-        bridge_token: str = "",
-        timeout_s: float = 45.0,
-        client_factory: Callable[..., httpx.AsyncClient] | None = None,
-    ) -> None:
-        self.bridge_mcp_url = str(bridge_mcp_url or "").strip()
-        self.bridge_token = str(bridge_token or "").strip()
-        self.timeout_s = float(timeout_s)
-        self._client_factory = client_factory or httpx.AsyncClient
-
-    async def search(
-        self,
-        query: str,
-        start: str | None,
-        end: str | None,
-        limit: int,
-        params: dict[str, Any],
-        caller_key: str,
-    ) -> dict[str, Any]:
-        if not self.bridge_mcp_url:
-            return {
-                "ok": False,
-                "status": "error",
-                "reason": "Legacy bridge MCP URL not configured for AlphaEngine forwarding",
-                "results": [],
-                "count": 0,
-            }
-        arguments: dict[str, Any] = {
-            "route": "alphaengine",
-            "operation": "search_library",
-            "query": query,
-            "limit": min(max(1, int(limit)), 50),
-        }
-        if start:
-            arguments["start"] = start
-        if end:
-            arguments["end"] = end
-        ae_params: dict[str, Any] = {}
-        for k in ("search_in", "fresh", "sort", "meeting_scope"):
-            if k in params and params[k] is not None:
-                ae_params[k] = params[k]
-        if ae_params:
-            arguments["params"] = ae_params
-
-        rpc_body = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": "research", "arguments": arguments},
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        if self.bridge_token:
-            headers["Authorization"] = f"Bearer {self.bridge_token}"
-        caller_hdrs = CURRENT_CALLER_HEADERS.get()
-        if caller_hdrs:
-            for hdr_name in ("x-dalton-caller-token", "x-dalton-caller-scope"):
-                if caller_hdrs.get(hdr_name):
-                    headers[hdr_name] = caller_hdrs[hdr_name]
-        if caller_key and caller_key != "anonymous":
-            headers["X-Dalton-Caller-Key"] = caller_key
-        async with self._client_factory(timeout=self.timeout_s, trust_env=False) as client:
-            resp = await client.post(self.bridge_mcp_url, json=rpc_body, headers=headers)
-        if resp.status_code != 200:
-            return {
-                "ok": False,
-                "status": "error",
-                "reason": f"Legacy bridge HTTP {resp.status_code}",
-                "results": [],
-                "count": 0,
-            }
-        body = resp.json()
-        if "error" in body:
-            err = body["error"]
-            msg = err.get("message") if isinstance(err, dict) else str(err)
-            return {
-                "ok": False,
-                "status": "error",
-                "reason": str(msg or "legacy bridge error"),
-                "results": [],
-                "count": 0,
-            }
-        res_obj = body.get("result") or {}
-        payload = res_obj.get("structuredContent")
-        if not isinstance(payload, dict):
-            for block in res_obj.get("content") or []:
-                if isinstance(block, dict) and isinstance(block.get("text"), str):
-                    try:
-                        cand = json.loads(block["text"])
-                        if isinstance(cand, dict):
-                            payload = cand
-                            break
-                    except ValueError:
-                        continue
-        if not isinstance(payload, dict):
-            return {
-                "ok": False,
-                "status": "error",
-                "reason": "Unrecognized AlphaEngine response from legacy bridge",
-                "results": [],
-                "count": 0,
-            }
-        inner_data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-        inner_sc = inner_data.get("structuredContent") if isinstance(inner_data.get("structuredContent"), dict) else {}
-        rows = (
-            inner_sc.get("results")
-            if isinstance(inner_sc.get("results"), list)
-            else (payload.get("results") if isinstance(payload.get("results"), list) else [])
-        )
-        ok = bool(payload.get("ok", not res_obj.get("isError", False)))
-        return {
-            "ok": ok,
-            "status": str(payload.get("status") or ("ok" if ok else "error")),
-            "results": rows,
-            "count": len(rows),
-            "cursor": inner_sc.get("cursor"),
-            "has_more": bool(inner_sc.get("has_more", False)),
-            "total_upstream": inner_sc.get("total_upstream"),
-            "returned": len(rows),
-            "_sources": payload.get("_sources") or [],
-            **({"reason": str(payload.get("error") or payload.get("reason") or "")} if not ok else {}),
-        }
 
 
 class FederatedResearchConnector:
@@ -274,12 +101,45 @@ class FederatedResearchConnector:
         wiki_store: OpenWikiStore,
         *,
         fanout_grace_s: float = DEFAULT_FANOUT_GRACE_S,
-        alphaengine_proxy: LegacyBridgeAlphaEngineProxy | None = None,
     ) -> None:
         self.registry = registry
         self.wiki_store = wiki_store
         self.fanout_grace_s = float(fanout_grace_s)
-        self.alphaengine_proxy = alphaengine_proxy
+
+    def _source_capability(self, source_id: str) -> CapabilityId | None:
+        spec = self.registry.federated_sources.get(source_id)
+        if spec is not None:
+            return spec.capability
+        leg = self.registry.federated_search_legs.get(source_id)
+        if leg is not None:
+            return leg[0]
+        req = BRIDGE_ROUTE_CAPABILITY_MAP.get(source_id)
+        if isinstance(req, CapabilityId):
+            return req
+        return None
+
+    def _source_prefixes(self, source_id: str) -> tuple[str, ...]:
+        spec = self.registry.federated_sources.get(source_id)
+        if spec is not None and spec.prefixes:
+            return spec.prefixes
+        inferred = tuple(
+            pref for pref, sid in self.registry.prefix_to_source.items() if sid == source_id
+        )
+        if inferred:
+            return inferred
+        if source_id == "company-wiki":
+            return ("wiki",)
+        return ()
+
+    def _source_allowed_params(self, source_id: str) -> frozenset[str] | None:
+        spec = self.registry.federated_sources.get(source_id)
+        if spec is not None and spec.allowed_params:
+            return spec.allowed_params
+        if source_id == "company-wiki":
+            return frozenset(
+                {"company", "sector", "tag", "search_mode", "no_decay", "media", "indexed_since"}
+            )
+        return None
 
     def _enabled_prefixes_desc(
         self,
@@ -287,15 +147,16 @@ class FederatedResearchConnector:
     ) -> str:
         if active_caps is None:
             enabled_sources = list(self.registry.federated_search_legs.keys())
-            if self.alphaengine_proxy is not None and "alphaengine" not in enabled_sources:
-                enabled_sources.append("alphaengine")
         else:
             enabled_sources = self._enabled_sources(active_caps)
         enabled_prefixes: list[str] = []
+        seen_prefs: set[str] = set()
         for src in enabled_sources:
-            for pref in SOURCE_PREFIXES.get(src, ()):
-                enabled_prefixes.append(f"'{pref}:'")
-        if any(src in SOURCE_PREFIXES for src in enabled_sources):
+            for pref in self._source_prefixes(src):
+                if pref not in seen_prefs:
+                    seen_prefs.add(pref)
+                    enabled_prefixes.append(f"'{pref}:'")
+        if enabled_prefixes:
             enabled_prefixes.append("'image:'")
         return ", ".join(enabled_prefixes) if enabled_prefixes else "'wiki:', 'image:'"
 
@@ -306,8 +167,6 @@ class FederatedResearchConnector:
     ) -> list[dict[str, Any]]:
         if active_caps is None:
             enabled_sources = list(self.registry.federated_search_legs.keys())
-            if self.alphaengine_proxy is not None and "alphaengine" not in enabled_sources:
-                enabled_sources.append("alphaengine")
         else:
             enabled_sources = self._enabled_sources(active_caps)
 
@@ -317,7 +176,8 @@ class FederatedResearchConnector:
         param_hints = ["sources", "offset", "max_chars"]
         seen_hints = set(param_hints)
         for src in enabled_sources:
-            for key in sorted(SOURCE_ALLOWED_PARAMS.get(src, ())):
+            allowed = self._source_allowed_params(src) or ()
+            for key in sorted(allowed):
                 if key not in seen_hints:
                     seen_hints.add(key)
                     param_hints.append(key)
@@ -359,34 +219,50 @@ class FederatedResearchConnector:
                 "inputSchema": {"type": "object", "properties": shared_props},
             },
         ]
-        # Advertise `sales_mail` ONLY when at least one of its backing capabilities is enabled
-        sales_mail_sources = [s for s in ("sales-notes", "tmtb") if s in enabled_sources]
-        if sales_mail_sources:
-            tools.append(
-                {
-                    "name": "sales_mail",
-                    "description": f"Compatibility alias querying enabled sources among {', '.join(sales_mail_sources)}.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "operation": {"type": "string", "enum": ["search", "read", "list"], "default": "search"},
-                            **shared_props,
+        # Advertise registered alias tools (e.g. `sales_mail`) ONLY when at least one backing source is enabled
+        alias_groups = dict(self.registry.federated_aliases)
+        if "sales_mail" not in alias_groups and any(
+            s in self.registry.federated_search_legs for s in ("sales-notes", "tmtb")
+        ):
+            alias_groups["sales_mail"] = ("sales-notes", "tmtb")
+        for alias_name, alias_members in alias_groups.items():
+            active_members = [s for s in alias_members if s in enabled_sources]
+            if active_members:
+                tools.append(
+                    {
+                        "name": alias_name,
+                        "description": f"Compatibility alias querying enabled sources among {', '.join(active_members)}.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "operation": {
+                                    "type": "string",
+                                    "enum": ["search", "read", "list"],
+                                    "default": "search",
+                                },
+                                **shared_props,
+                            },
                         },
-                    },
-                }
-            )
+                    }
+                )
         return tools
 
     def _enabled_sources(self, active_caps: frozenset[CapabilityId]) -> list[str]:
         enabled: list[str] = []
-        for src_id, cap in SOURCE_TO_CAPABILITY.items():
-            if cap not in active_caps:
-                continue
-            if src_id in self.registry.federated_search_legs:
-                enabled.append(src_id)
-            elif src_id == "alphaengine" and self.alphaengine_proxy is not None:
+        for src_id, (cap, _fn) in self.registry.federated_search_legs.items():
+            if cap in active_caps:
                 enabled.append(src_id)
         return enabled
+
+    def _resolve_prefix_source(self, prefix: str) -> str | None:
+        if prefix in self.registry.prefix_to_source:
+            return self.registry.prefix_to_source[prefix]
+        for src_id, spec in self.registry.federated_sources.items():
+            if prefix in spec.prefixes:
+                return src_id
+        if prefix == "wiki":
+            return "company-wiki"
+        return None
 
     async def _handle_read(
         self,
@@ -413,30 +289,31 @@ class FederatedResearchConnector:
             )
             return res
 
-        target_source = PREFIX_TO_SOURCE.get(prefix)
-        if target_source is None:
+        target_source = self._resolve_prefix_source(prefix)
+        registered = self.registry.prefix_read_handlers.get(prefix)
+        if registered is None and target_source is None:
             return {
                 "ok": False,
                 "status": "bad_request",
                 "error": f"Unsupported document prefix '{prefix}:'",
             }
-        if allowed_sources is not None and target_source not in allowed_sources:
+        if target_source is not None and allowed_sources is not None and target_source not in allowed_sources:
             return {
                 "ok": False,
                 "status": "capability_disabled",
                 "error_code": "capability_disabled",
                 "error": f"Document '{doc_str}' belongs to '{target_source}', which is not permitted on this route.",
             }
-        req_cap = SOURCE_TO_CAPABILITY[target_source]
-        if req_cap not in active_caps:
-            return {
-                "ok": False,
-                "status": "capability_disabled",
-                "error_code": "capability_disabled",
-                "http_status": 403,
-                "error": f"Capability '{req_cap.value}' is disabled.",
-            }
-        registered = self.registry.prefix_read_handlers.get(prefix)
+        if target_source is not None:
+            req_cap = self._source_capability(target_source)
+            if req_cap is not None and req_cap not in active_caps:
+                return {
+                    "ok": False,
+                    "status": "capability_disabled",
+                    "error_code": "capability_disabled",
+                    "http_status": 403,
+                    "error": f"Capability '{req_cap.value}' is disabled.",
+                }
         if registered is None:
             return {
                 "ok": False,
@@ -472,26 +349,20 @@ class FederatedResearchConnector:
         # Strip federated-only parameters and keep only each source's supported filter keys
         base_leg_params = {k: v for k, v in params.items() if k != "sources"}
         tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
+        legs = self.registry.federated_list_legs if operation == "list" else self.registry.federated_search_legs
         for src in target_sources:
-            allowed_keys = SOURCE_ALLOWED_PARAMS.get(src)
-            src_params = (
-                {k: v for k, v in base_leg_params.items() if k in allowed_keys}
-                if allowed_keys is not None
-                else dict(base_leg_params)
-            )
-            if src == "alphaengine":
-                if self.alphaengine_proxy is not None and operation == "search":
-                    tasks[src] = asyncio.create_task(
-                        self.alphaengine_proxy.search(query, start, end, limit, src_params, caller_key)
-                    )
-                continue
-            legs = self.registry.federated_list_legs if operation == "list" else self.registry.federated_search_legs
             entry = legs.get(src)
             if entry is None:
                 continue
             cap, fn = entry
             if cap not in active_caps:
                 continue
+            allowed_keys = self._source_allowed_params(src)
+            src_params = (
+                {k: v for k, v in base_leg_params.items() if k in allowed_keys}
+                if allowed_keys is not None
+                else dict(base_leg_params)
+            )
             tasks[src] = asyncio.create_task(fn(query, start, end, limit, src_params, caller_key))
 
         if not tasks:
@@ -559,11 +430,15 @@ class FederatedResearchConnector:
                         "results": [],
                     }
 
-        # Fuse local four-library results via RRF; keep alphaengine and guidepoint top-level blocks
-        local_sources = ("company-wiki", "sales-notes", "tmtb", "funda-ai")
+        # Fuse local library sources via RRF; emit top-level blocks for sources registered with top_level_block=True
+        top_level_sources: list[str] = []
         fused: dict[str, dict[str, Any]] = {}
-        for src in local_sources:
-            batch = outcomes.get(src)
+        for src, batch in outcomes.items():
+            spec = self.registry.federated_sources.get(src)
+            if spec is not None and spec.top_level_block:
+                top_level_sources.append(src)
+            if spec is not None and not spec.fuse_local:
+                continue
             if not batch or not batch.get("ok"):
                 continue
             for rank, item in enumerate(batch.get("results") or [], 1):
@@ -602,7 +477,7 @@ class FederatedResearchConnector:
             for b in outcomes.values()
         )
         has_any_hits = bool(hits) or any(
-            bool(outcomes.get(s, {}).get("results")) for s in ("alphaengine", "guidepoint")
+            bool(outcomes.get(s, {}).get("results")) for s in top_level_sources
         )
         if not any_ok:
             top_status = "error"
@@ -627,28 +502,18 @@ class FederatedResearchConnector:
             "retrieved_at": _now_iso(),
         }
         extra_blocks: list[dict[str, Any]] = []
-        if "alphaengine" in outcomes:
-            ae = outcomes["alphaengine"]
-            out["alphaengine"] = {
-                "ok": bool(ae.get("ok")),
-                "status": str(ae.get("status") or ("ok" if ae.get("ok") else "error")),
-                "count": int(ae.get("count") if ae.get("count") is not None else len(ae.get("results") or [])),
-                "results": list(ae.get("results") or []),
-                **({"reason": str(ae.get("reason"))} if ae.get("reason") else {}),
+        for src in top_level_sources:
+            blk = outcomes[src]
+            out[src] = {
+                "ok": bool(blk.get("ok")),
+                "status": str(blk.get("status") or ("ok" if blk.get("ok") else "error")),
+                "count": int(blk.get("count") if blk.get("count") is not None else len(blk.get("results") or [])),
+                "results": list(blk.get("results") or []),
+                **({"reason": str(blk.get("reason"))} if blk.get("reason") else {}),
             }
-            extra_blocks.append(ae)
-        if "guidepoint" in outcomes:
-            gp = outcomes["guidepoint"]
-            out["guidepoint"] = {
-                "ok": bool(gp.get("ok")),
-                "status": str(gp.get("status") or ("ok" if gp.get("ok") else "error")),
-                "count": int(gp.get("count") if gp.get("count") is not None else len(gp.get("results") or [])),
-                "results": list(gp.get("results") or []),
-                **({"reason": str(gp.get("reason"))} if gp.get("reason") else {}),
-            }
-            extra_blocks.append(gp)
+            extra_blocks.append(blk)
 
-        sources_list = _extract_sources(hits, extra_blocks)
+        sources_list = _extract_sources(hits, extra_blocks, self.registry.federated_sources)
         if sources_list:
             out["_sources"] = sources_list
         return out
@@ -679,39 +544,45 @@ class FederatedResearchConnector:
         start = str(arguments["start"]) if arguments.get("start") is not None else None
         end = str(arguments["end"]) if arguments.get("end") is not None else None
 
-        # Compatibility route: `sales_mail` strictly scopes to enabled among (sales-notes, tmtb)
-        if tool_name == "sales_mail":
+        alias_groups = dict(self.registry.federated_aliases)
+        if "sales_mail" not in alias_groups:
+            alias_groups["sales_mail"] = ("sales-notes", "tmtb")
+
+        if tool_name in alias_groups:
             op = str(arguments.get("operation") or "search").strip().lower()
-            allowed_sm = [
+            members = alias_groups[tool_name]
+            allowed_members = [
                 src
-                for src in ("sales-notes", "tmtb")
-                if SOURCE_TO_CAPABILITY[src] in active_caps and src in self.registry.federated_search_legs
+                for src in members
+                if (cap := self._source_capability(src)) is not None
+                and cap in active_caps
+                and src in self.registry.federated_search_legs
             ]
-            if not allowed_sm:
+            if not allowed_members:
                 return {
                     "ok": False,
                     "status": "capability_disabled",
                     "error_code": "capability_disabled",
                     "http_status": 403,
-                    "error": "Neither sales_notes nor tmtb capability is enabled.",
+                    "error": f"No backing capability is enabled for '{tool_name}'.",
                 }
             if op in ("read", "get_document"):
                 return await self._handle_read(
                     str(arguments.get("document") or ""),
                     params,
                     active_caps=active_caps,
-                    allowed_sources=set(allowed_sm),
+                    allowed_sources=set(allowed_members),
                 )
             query = str(arguments.get("query") or arguments.get("ticker") or "").strip()
             if op == "search" and not query:
-                return {"ok": False, "status": "bad_request", "error": "sales_mail search requires query"}
+                return {"ok": False, "status": "bad_request", "error": f"{tool_name} search requires query"}
             return await self._run_fanout_search(
                 query=query,
                 start=start,
                 end=end,
                 limit=limit,
                 params={"layer": "all", "media": "text", **params},
-                target_sources=allowed_sm,
+                target_sources=allowed_members,
                 active_caps=active_caps,
                 caller_key=caller_key,
                 operation=op if op in ("search", "list") else "search",
@@ -723,7 +594,7 @@ class FederatedResearchConnector:
             if isinstance(req_sources_raw, list) and req_sources_raw:
                 allowed_override = {str(s) for s in req_sources_raw}
                 for s in allowed_override:
-                    cap = SOURCE_TO_CAPABILITY.get(s)
+                    cap = self._source_capability(s)
                     if cap is not None and cap not in active_caps:
                         return {
                             "ok": False,
@@ -753,9 +624,9 @@ class FederatedResearchConnector:
                 target_sources: list[str] = []
                 for s in req_sources:
                     s_clean = str(s).strip()
-                    if s_clean not in SOURCE_TO_CAPABILITY:
+                    cap = self._source_capability(s_clean)
+                    if cap is None:
                         return {"ok": False, "status": "bad_request", "error": f"Unknown source: {s_clean}"}
-                    cap = SOURCE_TO_CAPABILITY[s_clean]
                     if cap not in active_caps:
                         return {
                             "ok": False,

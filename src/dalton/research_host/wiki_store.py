@@ -46,7 +46,7 @@ _IMAGE_SOURCE_CAPABILITY: dict[str, CapabilityId] = {
     "funda-ai": CapabilityId.FUNDA_AI,
 }
 
-# Reused credential/secret detection patterns matching legacy `researchdata_bridge.py:21340-21389`.
+# Reused credential/secret detection patterns matching legacy host ingest scanner.
 _INGEST_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "private_key_pem",
@@ -97,7 +97,7 @@ def detect_ingest_secret(*texts: str) -> str | None:
 
 
 def raw_bytes_scan_text(file_bytes: bytes, *, suffix: str = "") -> str:
-    """Build a full raw-byte scan buffer matching legacy `researchdata_bridge._inspect_binary_file_for_wiki`.
+    """Build a full raw-byte scan buffer matching legacy host binary file inspection.
 
     Covers raw latin-1 and UTF-8 byte views (catching secrets embedded in PNG/JPEG
     metadata chunks, PDF `/Info` dictionaries, comments, and non-body objects) plus

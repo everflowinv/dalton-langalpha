@@ -40,7 +40,7 @@ Options:
   --ref <git-ref>     Git commit/tag/branch to export from (default: HEAD)
   --output <dir>      Export clean release tree into this directory (created fresh)
   --tar <file.tar.gz> Write compressed release tarball to this path
-  --report <file>     Also write the proprietary-term scan report to this path
+  --report <file>     Also write the release verification report to this path
   --include-ci        Also export CI compose overlay & standalone test harness
                       (docker-compose.ci.yml, tests/fakes, tests/standalone)
   -h, --help          Show this help
@@ -166,21 +166,8 @@ SHORT_SHA="${COMMIT_SHA:0:9}"
 RELEASE_TOP_DIR="dalton-core-${SHORT_SHA}"
 
 # Explicit allowlist of paths required to build and run Standalone Core.
-# Proprietary / Everflow-only paths are excluded by omission:
-#   - plugins/dalton_data/  (excluded in Batch 1: backend starts cleanly because
-#       src/dalton/data_map/health.py:539 lazy-imports dalton_sec_mcp_server inside
-#       fault-isolated _run_single_probe; Batch 2 extracts open-source plugins/dalton_sec/)
-#   - scripts/dalton/researchdata_bridge.py
-#   - scripts/dalton/research_runtime/
-#   - scripts/dalton/ops/
-#   - scripts/dalton/launchd/
-#   - scripts/dalton/data_assets/
-#   - scripts/dalton/monitor_feeds/
-#   - scripts/dalton/realrun/
-#   - integrations/dalton-channel-gateway/
-#   - deploy/dalton/
-#   - agent_config.dalton.yaml, config.dalton.yaml, docker-compose.dalton.yml
-#   - web/.env.dalton
+# Host-only Everflow runtime, ops, launchd, channel gateway, and *.dalton.*
+# deployment overlays are excluded by omission and post-extract denylist.
 ALLOWLIST_REQUIRED=(
   "LICENSE"
   "README.md"
@@ -302,6 +289,8 @@ DENY_PATHS=(
   "scripts/dalton/researchdata_bridge.py"
   "scripts/dalton/research_runtime"
   "scripts/dalton/ops"
+  "scripts/dalton/launchd"
+  "scripts/standalone/package_release.sh"
   "web/.env.dalton"
   "docs-site/src/content/docs/everflow"
   "docs-site/src/content/docs/explore/deliver-to-feishu.mdx"
@@ -320,38 +309,23 @@ find "$EXPORT_ROOT" -type f -name '*.dalton.yaml' -delete
 # Record release provenance metadata (clean, no working-tree state)
 printf '%s\n' "$COMMIT_SHA" > "${EXPORT_ROOT}/.release_git_sha"
 
-# Scan exported tree for proprietary/Everflow terms.
-# Batch 1: report-only (never fails exit code). Batch 2/3 will promote hits to errors.
-SCAN_TERMS=(
-  "everflowinv"
-  "Proprietary"
-  "researchdata_bridge"
-  "alphaengine"
-  "guidepoint"
-)
-
+# Out-of-package release gate check (when invoked from full repo checkout with ops checker present)
 SCAN_OUTPUT="$STAGE_DIR/scan_report.txt"
-{
-  echo "=== Standalone Core Release Scan Report (ref=${GIT_REF}, sha=${COMMIT_SHA:0:12}) ==="
-  echo "Mode: report-only (Batch 1; promoted to hard gate in Batch 2/3)"
-  for term in "${SCAN_TERMS[@]}"; do
-    echo ""
-    echo "--- Term: ${term} ---"
-    hits="$(grep -rnI --binary-files=without-match -F "$term" "$EXPORT_ROOT" 2>/dev/null || true)"
-    if [[ -z "$hits" ]]; then
-      echo "(0 matches)"
-    else
-      count="$(printf '%s\n' "$hits" | wc -l | tr -d ' ')"
-      echo "Total matches: ${count}"
-      # sed stops after 40 lines itself; `| head` would close the pipe early and
-      # fail the export under pipefail (SIGPIPE) once there are many hits.
-      printf '%s\n' "$hits" | sed -n "1,40{s|${EXPORT_ROOT}/||g;p;}"
-      if [[ "$count" -gt 40 ]]; then
-        echo "... ($((count - 40)) more lines truncated)"
-      fi
-    fi
-  done
-} > "$SCAN_OUTPUT"
+TOOL_REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+OUT_OF_PKG_CHECKER=""
+if [[ -f "${TOOL_REPO_ROOT}/scripts/dalton/ops/check_core_release_package.py" ]]; then
+  OUT_OF_PKG_CHECKER="${TOOL_REPO_ROOT}/scripts/dalton/ops/check_core_release_package.py"
+elif [[ -f "${REPO_ROOT}/scripts/dalton/ops/check_core_release_package.py" ]]; then
+  OUT_OF_PKG_CHECKER="${REPO_ROOT}/scripts/dalton/ops/check_core_release_package.py"
+fi
+if [[ -n "$OUT_OF_PKG_CHECKER" ]]; then
+  python3 "$OUT_OF_PKG_CHECKER" --export-dir "$EXPORT_ROOT" --repo-root "$REPO_ROOT" --report-only > "$SCAN_OUTPUT" 2>&1 || true
+else
+  {
+    echo "=== Standalone Core Release Scan Report (ref=${GIT_REF}, sha=${COMMIT_SHA:0:12}) ==="
+    echo "Exported clean allowlisted Standalone Core release tree."
+  } > "$SCAN_OUTPUT"
+fi
 
 cat "$SCAN_OUTPUT"
 

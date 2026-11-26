@@ -348,7 +348,6 @@ def test_package_release_exports_clean_allowlist_and_include_ci_option(
         "scripts/standalone/init.sh",
         "scripts/dalton/Dockerfile.dalton",
         "scripts/dalton/Dockerfile.postgres",
-        "docs-site/src/content/docs/everflow/monitors.md",
         ".release_git_sha",
     ):
         assert (out_dir / expected).exists(), f"Missing expected core file: {expected}"
@@ -362,6 +361,9 @@ def test_package_release_exports_clean_allowlist_and_include_ci_option(
         "scripts/dalton/researchdata_bridge.py",
         "scripts/dalton/research_runtime",
         "scripts/dalton/ops",
+        "scripts/dalton/launchd",
+        "scripts/standalone/package_release.sh",
+        "docs-site/src/content/docs/everflow/monitors.md",
         "agent_config.dalton.yaml",
         "config.dalton.yaml",
         "src/dalton/nested.dalton.yaml",

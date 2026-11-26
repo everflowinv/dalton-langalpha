@@ -276,6 +276,12 @@ async def _admit(
     from_path: bool = False,
 ) -> AdmittedTurn:
     body = _client_body(body, raw_request)
+    # DALTON-HOOK(maintenance-gate): block new turns during maintenance window (503 maintenance_in_progress)
+    from src.dalton.maintenance_gate import enforce_maintenance_admission_for_thread
+
+    await enforce_maintenance_admission_for_thread(
+        workspace_id=body.workspace_id, thread_id=thread_id, context="thread_message"
+    )
     checked = await cli_approval.admit_turn(
         raw_request, principal, body, thread_id, from_path=from_path
     )
@@ -2225,6 +2231,12 @@ async def retry_thread(
         retried_wake_fields,
     )
 
+    # DALTON-HOOK(maintenance-gate): block retry turns during maintenance window (503 maintenance_in_progress)
+    from src.dalton.maintenance_gate import enforce_maintenance_admission_for_thread
+
+    await enforce_maintenance_admission_for_thread(
+        thread_id=thread_id, context="thread_retry"
+    )
     checked = await cli_approval.admit_retry(raw_request, principal, thread_id, body)
     auth = await limit(principal.user_id)
     scope = RunScope(user_id=auth.user_id, burst_slot_id=auth.burst_slot_id)

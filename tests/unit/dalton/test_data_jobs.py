@@ -133,6 +133,11 @@ def _make_autospec_db(cursor_side_effects: list[dict] | None = None):
         ):
             nonlocal current_step
             sql_text = str(query)
+            if "pg_advisory_xact_lock_shared" in sql_text:
+                state.setdefault("advisory_locks", []).append((sql_text, params))
+                current_step = {}
+                cur.rowcount = 1
+                return
             state["executed"].append((sql_text, params))
             current_step = steps.pop(0) if steps else {}
             cur.rowcount = current_step.get("rowcount", 1)

@@ -50,10 +50,7 @@ from src.dalton.provenance.declared_sources import expand_declared_sources
 from src.dalton.research_host.app import ResearchHostConfig, ResearchHostRuntime, create_app
 from src.dalton.research_host.auth import verify_caller_token
 from src.dalton.research_host.connector_registry import ConnectorRegistry
-from src.dalton.research_host.federated import (
-    FederatedResearchConnector,
-    LegacyBridgeAlphaEngineProxy,
-)
+from src.dalton.research_host.federated import FederatedResearchConnector
 from src.dalton.research_host.wiki_store import CompanyWikiConnector, OpenWikiStore
 from src.dalton.sandbox_caller_identity import sign_caller_token
 from src.dalton.tools import build_dalton_tools
@@ -790,41 +787,41 @@ async def test_sales_notes_tmtb_partition_isolation_funda_and_guidepoint_lock(
         with open(lock_path, "a+", encoding="utf-8") as fh:
             with pytest.raises(BlockingIOError):
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        def _gp_handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers.get("authorization") == "Bearer gp-access-live"
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "structuredContent": {
+                            "data": [{"id": "gp-1", "transcript_name": "Cloud Expert Call", "date": "2026-08-09"}]
+                        }
+                    },
+                },
+            )
+
+        orig_client = httpx.AsyncClient
+
+        def _gp_client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+            kwargs["transport"] = httpx.MockTransport(_gp_handler)
+            return orig_client(*args, **kwargs)
+
+        gp_conn = gp_mod.GuidepointConnector(
+            token_manager=tm,
+            http_client_factory=create_autospec(httpx.AsyncClient, side_effect=_gp_client_factory),
+        )
+        gp_out = await gp_conn.call_tool(
+            "search_library",
+            {"query": "NVDA cloud"},
+            active_caps=frozenset({CapabilityId.GUIDEPOINT}),
+        )
+        assert gp_out["ok"] is True
+        assert gp_out["data"]["structuredContent"]["data"][0]["id"] == "gp-1"
     finally:
         tm.release_owner_lock()
-
-    def _gp_handler(request: httpx.Request) -> httpx.Response:
-        assert request.headers.get("authorization") == "Bearer gp-access-live"
-        return httpx.Response(
-            200,
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": {
-                    "structuredContent": {
-                        "data": [{"id": "gp-1", "transcript_name": "Cloud Expert Call", "date": "2026-08-09"}]
-                    }
-                },
-            },
-        )
-
-    orig_client = httpx.AsyncClient
-
-    def _gp_client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
-        kwargs["transport"] = httpx.MockTransport(_gp_handler)
-        return orig_client(*args, **kwargs)
-
-    gp_conn = gp_mod.GuidepointConnector(
-        token_manager=tm,
-        http_client_factory=create_autospec(httpx.AsyncClient, side_effect=_gp_client_factory),
-    )
-    gp_out = await gp_conn.call_tool(
-        "search_library",
-        {"query": "NVDA cloud"},
-        active_caps=frozenset({CapabilityId.GUIDEPOINT}),
-    )
-    assert gp_out["ok"] is True
-    assert gp_out["data"]["structuredContent"]["data"][0]["id"] == "gp-1"
 
 
 @pytest.mark.asyncio
@@ -869,9 +866,21 @@ async def test_federated_all_per_source_capabilities_partial_timeout_and_alphaen
     registry = ConnectorRegistry()
     registry.register_connector(CompanyWikiConnector(wiki_store))
     registry.register_federated_source("company-wiki", CapabilityId.COMPANY_WIKI, search_fn=_wiki_search)
-    registry.register_federated_source("sales-notes", CapabilityId.SALES_NOTES, search_fn=_sn_search)
-    registry.register_federated_source("tmtb", CapabilityId.TMTB, search_fn=_tm_search)
-    registry.register_prefix_reader("mail", CapabilityId.SALES_NOTES, _sn_read)
+    registry.register_federated_source(
+        "sales-notes",
+        CapabilityId.SALES_NOTES,
+        search_fn=_sn_search,
+        allowed_params=frozenset({"sender", "layer", "search_mode", "media"}),
+        prefixes=("mail", "digest"),
+    )
+    registry.register_federated_source(
+        "tmtb",
+        CapabilityId.TMTB,
+        search_fn=_tm_search,
+        allowed_params=frozenset({"sender", "search_mode", "media"}),
+        prefixes=("tmtb",),
+    )
+    registry.register_prefix_reader("mail", CapabilityId.SALES_NOTES, _sn_read, source_id="sales-notes")
 
     async def _slow_gp(
         q: str, s: str | None, e: str | None, l: int, p: dict[str, Any], _c: str
@@ -880,7 +889,14 @@ async def test_federated_all_per_source_capabilities_partial_timeout_and_alphaen
         await asyncio.sleep(0.5)
         return {"ok": True, "results": []}
 
-    registry.register_federated_source("guidepoint", CapabilityId.GUIDEPOINT, search_fn=_slow_gp)
+    registry.register_federated_source(
+        "guidepoint",
+        CapabilityId.GUIDEPOINT,
+        search_fn=_slow_gp,
+        top_level_block=True,
+        fuse_local=False,
+        provenance_identity="expert",
+    )
 
     def _ae_handler(request: httpx.Request) -> httpx.Response:
         assert str(request.url) == "http://127.0.0.1:8960/mcp"
@@ -905,16 +921,24 @@ async def test_federated_all_per_source_capabilities_partial_timeout_and_alphaen
         kwargs["transport"] = httpx.MockTransport(_ae_handler)
         return orig_async_client(*args, **kwargs)
 
+    runtime_dir = str(REPO_ROOT / "scripts" / "dalton" / "research_runtime")
+    if runtime_dir not in sys.path:
+        sys.path.insert(0, runtime_dir)
+    from host_connectors.bridge_alphaengine_proxy import (
+        LegacyBridgeAlphaEngineProxy,
+        register_alphaengine_bridge_proxy,
+    )
+
     ae_proxy = LegacyBridgeAlphaEngineProxy(
         bridge_mcp_url="http://127.0.0.1:8960/mcp",
         client_factory=create_autospec(httpx.AsyncClient, side_effect=_ae_client_factory),
     )
+    register_alphaengine_bridge_proxy(registry, bridge_mcp_url="", proxy=ae_proxy)
 
     fed = FederatedResearchConnector(
         registry,
         wiki_store,
         fanout_grace_s=0.05,
-        alphaengine_proxy=ae_proxy,
     )
 
     active = frozenset(
@@ -2296,8 +2320,20 @@ async def test_federated_dynamic_tools_list_param_filtering_and_nonblocking_sqli
         return await asyncio.to_thread(_blocking_slow_sqlite, p)
 
     reg = ConnectorRegistry()
-    reg.register_federated_source("company-wiki", CapabilityId.COMPANY_WIKI, search_fn=_fast_wiki_leg)
-    reg.register_federated_source("sales-notes", CapabilityId.SALES_NOTES, search_fn=_slow_sales_leg)
+    reg.register_federated_source(
+        "company-wiki",
+        CapabilityId.COMPANY_WIKI,
+        search_fn=_fast_wiki_leg,
+        allowed_params=frozenset({"company", "sector", "tag", "search_mode", "no_decay", "media", "indexed_since"}),
+        prefixes=("wiki",),
+    )
+    reg.register_federated_source(
+        "sales-notes",
+        CapabilityId.SALES_NOTES,
+        search_fn=_slow_sales_leg,
+        allowed_params=frozenset({"sender", "layer", "search_mode", "media"}),
+        prefixes=("mail", "digest"),
+    )
     fed = FederatedResearchConnector(reg, wiki_store, fanout_grace_s=0.05)
 
     # With sales-notes enabled, `sales_mail` IS advertised

@@ -43,7 +43,7 @@ COVERED_BRIDGE_CALLER_FILES: set[str] = {
     "plugins/dalton/skills/dalton-stock-move/scripts/cn_price_fallback.py",
     "plugins/dalton/skills/dalton-conventions/scripts/connector_transport.py",
     "src/dalton/data_map/health.py",
-    "src/dalton/research_host/federated.py",
+    "scripts/dalton/research_runtime/host_connectors/bridge_alphaengine_proxy.py",
 }
 
 DOCUMENTED_TOOLS_CALL_EXCEPTIONS: dict[str, str] = {
@@ -560,7 +560,13 @@ def test_connector_transport_legacy_fallback_matches_bridge_route_contract(
 async def test_federated_alphaengine_proxy_matches_bridge_route_contract() -> None:
     """Verify LegacyBridgeAlphaEngineProxy sends a contract-compliant research/alphaengine tools/call."""
     import httpx
-    from src.dalton.research_host.federated import LegacyBridgeAlphaEngineProxy
+    from pathlib import Path
+    import sys
+
+    runtime_dir = str(Path(__file__).resolve().parents[3] / "scripts" / "dalton" / "research_runtime")
+    if runtime_dir not in sys.path:
+        sys.path.insert(0, runtime_dir)
+    from host_connectors.bridge_alphaengine_proxy import LegacyBridgeAlphaEngineProxy
 
     seen_bodies: list[dict[str, Any]] = []
     seen_headers: list[dict[str, str]] = []

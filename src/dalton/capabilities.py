@@ -25,6 +25,7 @@ import sys
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TypeVar
 
@@ -784,6 +785,232 @@ BATCH3_CONNECTOR_BUNDLED_PLUGINS: frozenset[str] = frozenset(
     }
 )
 
+# Batch 3 legacy bridge routes migrated to split connectors / `dalton-research-host`
+# once `is_batch3_connectors_enabled()` is True (§6.4b (1) #3).
+BATCH3_CUTOVER_BRIDGE_ROUTES: frozenset[str] = frozenset(
+    {
+        "sec",
+        "fred",
+        "treasury",
+        "company-wiki",
+        "guidepoint",
+        "sales-notes",
+        "sales-mail",
+        "tmtb",
+        "funda-ai",
+        "all",
+    }
+)
+
+BATCH3_CUTOVER_INGEST_TARGETS: frozenset[str] = frozenset(
+    {
+        "wiki",
+        "sales-notes",
+    }
+)
+
+# Profile, capability, and cutover control keys that MUST reside exclusively in
+# the shared repository `.env` (never in host service credential files).
+CAPABILITY_CONTROL_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "APP_ENV",
+        "DALTON_PROFILE",
+        "DALTON_HOST_PLATFORM",
+        "DALTON_ENABLED",
+        "DALTON_RESEARCH_HOST_URL",
+        "DALTON_RESEARCH_HOST_BASE_URL",
+    }
+)
+
+
+def is_capability_control_env_key(key: str | None) -> bool:
+    """Return True if ``key`` controls deployment profile, capabilities, or cutover state."""
+    cleaned = str(key or "").strip()
+    if not cleaned:
+        return False
+    return cleaned in CAPABILITY_CONTROL_ENV_KEYS or cleaned.startswith("DALTON_CAP_")
+
+
+def load_deployment_capability_env(
+    *,
+    repo_env_file: Path | str | None = None,
+    service_env_file: Path | str | None = None,
+    environ: Mapping[str, str] | None = None,
+    allowed_service_keys: Collection[str] | None = None,
+    loaded_files: list[Path] | None = None,
+) -> dict[str, str]:
+    """Merge deployment capability and host service environment in one canonical order.
+
+    Precedence (highest to lowest, §6.4b (1) #1):
+      1. Explicit process environment variables (``environ`` or ``os.environ``).
+      2. Shared repository root ``.env`` via ``src.dalton.config_env.load_shared_dotenv``
+         (supports ``DALTON_REPO_ENV_FILE`` / ``DALTON_DOTENV_PATH`` and ``PYTHON_DOTENV_DISABLED``).
+      3. Optional host-side private service credential file (e.g.
+         ``~/.config/dalton/research-host.env`` or ``~/.config/dalton/researchdata-bridge.env``).
+         Profile, capability, and cutover control keys (``is_capability_control_env_key``)
+         are ALWAYS ignored from ``service_env_file`` with a warning so services can never
+         diverge from the shared repository ``.env``.
+    """
+    from src.dalton.config_env import load_shared_dotenv, parse_and_resolve_dotenv
+
+    merged: dict[str, str] = dict(os.environ if environ is None else environ)
+    shared_loaded = load_shared_dotenv(repo_env_file, environ=merged)
+    if shared_loaded is not None and loaded_files is not None:
+        loaded_files.append(shared_loaded)
+
+    svc_raw = str(service_env_file).strip() if service_env_file is not None else ""
+    if svc_raw:
+        svc_path = Path(svc_raw).expanduser()
+        if svc_path.is_file():
+            resolved_svc = svc_path.resolve()
+            parsed_svc = parse_and_resolve_dotenv(
+                resolved_svc,
+                base_env=merged,
+                override=False,
+            )
+            allowed_set = (
+                frozenset(str(k).strip() for k in allowed_service_keys if str(k).strip())
+                if allowed_service_keys is not None
+                else None
+            )
+            for raw_k, val in parsed_svc.items():
+                key = str(raw_k or "").strip()
+                if not key:
+                    continue
+                if is_capability_control_env_key(key):
+                    logger.warning(
+                        "Ignoring capability/profile/cutover control key %r in service env file %s "
+                        "(control keys must be defined only in shared repository .env)",
+                        key,
+                        resolved_svc,
+                    )
+                    continue
+                if allowed_set is not None and key not in allowed_set:
+                    logger.warning(
+                        "Ignoring non-allowlisted key %r in service env file %s",
+                        key,
+                        resolved_svc,
+                    )
+                    continue
+                merged.setdefault(key, val)
+            if loaded_files is not None:
+                loaded_files.append(resolved_svc)
+
+    return merged
+
+
+def find_capability_env_conflicts(
+    *,
+    repo_env_file: Path | str | None = None,
+    service_env_file: Path | str | None = None,
+    environ: Mapping[str, str] | None = None,
+    extra_sources: Mapping[str, Mapping[str, str]] | None = None,
+    expected_bridge_env_file: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """Detect profile/capability/cutover env overrides and host routing conflicts (§6.4b (1) #1).
+
+    Checks:
+      1. Any capability/profile/cutover control key placed in ``service_env_file``.
+      2. Process env (``environ``) or ``extra_sources`` (e.g. ``launchctl getenv``,
+         loaded ``.plist`` ``EnvironmentVariables``, running host processes) overriding
+         control keys relative to ``repo_env_file``.
+      3. ``DALTON_BRIDGE_ENV_FILE`` resolving to an unexpected path (while allowing the
+         canonical resolved ``~/.config/dalton/researchdata-bridge.env`` path).
+      4. ``DALTON_GUIDEPOINT_MCP_URL`` injected in ``extra_sources`` or overriding
+         ``service_env_file``.
+    """
+    from src.dalton.config_env import parse_and_resolve_dotenv, resolve_shared_dotenv_path
+
+    conflicts: list[dict[str, Any]] = []
+    proc_env: Mapping[str, str] = os.environ if environ is None else environ
+
+    repo_vals: dict[str, str] = {}
+    resolved_repo = resolve_shared_dotenv_path(repo_env_file, environ=proc_env)
+    if resolved_repo is not None and resolved_repo.is_file():
+        repo_vals = parse_and_resolve_dotenv(resolved_repo, base_env={}, override=True)
+
+    svc_vals: dict[str, str] = {}
+    resolved_svc: Path | None = None
+    if service_env_file is not None and str(service_env_file).strip():
+        cand_svc = Path(service_env_file).expanduser()
+        if cand_svc.is_file():
+            resolved_svc = cand_svc.resolve()
+            svc_vals = parse_and_resolve_dotenv(resolved_svc, base_env={}, override=True)
+            for key, val in sorted(svc_vals.items()):
+                if is_capability_control_env_key(key):
+                    conflicts.append(
+                        {
+                            "source": f"service_env:{resolved_svc}",
+                            "key": key,
+                            "value": val,
+                            "repo_value": repo_vals.get(key),
+                            "reason": "control_key_in_service_env",
+                        }
+                    )
+
+    expected_bridge_path = (
+        Path(expected_bridge_env_file).expanduser().resolve()
+        if expected_bridge_env_file is not None and str(expected_bridge_env_file).strip()
+        else (Path.home() / ".config" / "dalton" / "researchdata-bridge.env").resolve()
+    )
+
+    def _scan_mapping(source_name: str, mapping: Mapping[str, str], *, is_external: bool) -> None:
+        for key, raw_val in sorted(mapping.items()):
+            val = str(raw_val or "").strip()
+            if is_capability_control_env_key(key):
+                repo_val = repo_vals.get(key)
+                if repo_val is not None and val != str(repo_val).strip():
+                    conflicts.append(
+                        {
+                            "source": source_name,
+                            "key": key,
+                            "value": val,
+                            "repo_value": str(repo_val).strip(),
+                            "reason": "control_key_override",
+                        }
+                    )
+                elif repo_val is None and val and is_external:
+                    conflicts.append(
+                        {
+                            "source": source_name,
+                            "key": key,
+                            "value": val,
+                            "repo_value": None,
+                            "reason": "control_key_injected",
+                        }
+                    )
+            elif key == "DALTON_BRIDGE_ENV_FILE" and val:
+                actual_path = Path(val).expanduser().resolve()
+                if actual_path != expected_bridge_path:
+                    conflicts.append(
+                        {
+                            "source": source_name,
+                            "key": key,
+                            "value": str(actual_path),
+                            "expected_value": str(expected_bridge_path),
+                            "reason": "unexpected_bridge_env_file_path",
+                        }
+                    )
+            elif key == "DALTON_GUIDEPOINT_MCP_URL" and val:
+                svc_gp = str(svc_vals.get("DALTON_GUIDEPOINT_MCP_URL") or "").strip()
+                if is_external or (svc_gp and val != svc_gp):
+                    conflicts.append(
+                        {
+                            "source": source_name,
+                            "key": key,
+                            "value": val,
+                            "service_value": svc_gp or None,
+                            "reason": "guidepoint_url_env_override",
+                        }
+                    )
+
+    _scan_mapping("process_env", proc_env, is_external=False)
+    if extra_sources:
+        for src_name, src_map in extra_sources.items():
+            _scan_mapping(str(src_name), src_map, is_external=True)
+
+    return conflicts
+
 
 def is_batch3_connectors_enabled(
     *,
@@ -1000,6 +1227,42 @@ def is_bridge_route_enabled(
     return True
 
 
+def is_bridge_route_migrated_to_connector(
+    route_id: str | None,
+    *,
+    profile: DeploymentProfile | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Return True iff legacy bridge MCP ``route_id`` has cut over to Batch 3 connectors (§6.4b (1) #3)."""
+    cleaned = str(route_id or "").strip().lower()
+    if cleaned not in BATCH3_CUTOVER_BRIDGE_ROUTES:
+        return False
+    return is_batch3_connectors_enabled(profile=profile, environ=environ)
+
+
+def is_bridge_ingest_migrated_to_connector(
+    target: str | None,
+    *,
+    profile: DeploymentProfile | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Return True iff legacy bridge ingest endpoint ``target`` has cut over to ``research-host`` (§6.4b (1) #3)."""
+    cleaned = str(target or "").strip().lower().strip("/")
+    alias_map = {
+        "wiki": "wiki",
+        "wiki/ingest": "wiki",
+        "company-wiki": "wiki",
+        "company_wiki": "wiki",
+        "sales-notes": "sales-notes",
+        "sales_notes": "sales-notes",
+        "sales-notes/ingest": "sales-notes",
+    }
+    normalized = alias_map.get(cleaned, cleaned)
+    if normalized not in BATCH3_CUTOVER_INGEST_TARGETS:
+        return False
+    return is_batch3_connectors_enabled(profile=profile, environ=environ)
+
+
 # ---------------------------------------------------------------------------
 # Declarative registries for anti-leakage gate tests (§3.4 #1)
 # ---------------------------------------------------------------------------
@@ -1051,6 +1314,8 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         # --- router.py ---
         ("router.py", "get_capabilities_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_openclaw_health_endpoint"): CORE_CAPABILITY,
+        ("router.py", "get_maintenance_admission_status_endpoint"): CORE_CAPABILITY,
+        ("router.py", "probe_maintenance_admission_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_browser_memory_diagnostics_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_native_models_status_endpoint"): CapabilityId.NATIVE_OAUTH_SYNC,
         ("router.py", "check_native_models_endpoint"): CapabilityId.NATIVE_OAUTH_SYNC,
@@ -1277,6 +1542,7 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("research_host/app.py", "healthz"): CORE_CAPABILITY,
         ("research_host/app.py", "get_drain"): CORE_CAPABILITY,
         ("research_host/app.py", "set_drain"): CORE_CAPABILITY,
+        ("research_host/app.py", "acquire_connector_lock"): CORE_CAPABILITY,
         ("research_host/app.py", "get_wiki_pause_writes"): CapabilityId.COMPANY_WIKI,
         ("research_host/app.py", "set_wiki_pause_writes"): CapabilityId.COMPANY_WIKI,
         ("research_host/app.py", "mcp_endpoint"): INTERNAL_RESEARCH_CAPABILITIES,

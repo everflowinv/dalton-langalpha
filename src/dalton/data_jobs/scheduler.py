@@ -878,6 +878,18 @@ async def claim_next_queued_run(
         claimed_generation: int | None = None
         try:
             async with conn.transaction():
+                from src.dalton.maintenance_gate import (
+                    MaintenanceAdmissionPausedError,
+                    enforce_maintenance_admission_in_txn,
+                )
+
+                try:
+                    await enforce_maintenance_admission_in_txn(
+                        conn, context="data_task_claim"
+                    )
+                except MaintenanceAdmissionPausedError as exc:
+                    raise _ClaimRollback("maintenance_in_progress") from exc
+
                 async with conn.cursor(row_factory=dict_row) as cur:
                     await cur.execute(
                         """

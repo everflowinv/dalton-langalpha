@@ -86,6 +86,23 @@ async def call_bridge_sales_notes_ingest(payload: dict[str, Any]) -> tuple[int, 
             "error": "sales_notes capability is disabled.",
         }
 
+    if not bool(payload.get("dry_run", False)):
+        from src.dalton.maintenance_gate import (
+            MaintenanceAdmissionPausedError,
+            enforce_maintenance_admission_with_shared_lock,
+        )
+
+        via = payload.get("ingested_via")
+        ws_id = str(via.get("workspace_id") or "").strip() if isinstance(via, dict) else None
+        try:
+            await enforce_maintenance_admission_with_shared_lock(
+                workspace_id=ws_id or None,
+                context="sales_notes_ingest",
+            )
+        except MaintenanceAdmissionPausedError as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {"ok": False, "error": str(exc.detail)}
+            return 503, dict(detail)
+
     use_research_host = (
         has_explicit_research_host_url()
         or resolve_profile() is DeploymentProfile.CORE

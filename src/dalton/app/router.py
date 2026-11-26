@@ -218,6 +218,76 @@ async def get_openclaw_health_endpoint(
     return await probe_health(user_id=user_id)
 
 
+def _require_maintenance_service_token(request: Request) -> None:
+    """Validate ``X-Service-Token`` for host-side maintenance gate probes (fail closed when configured)."""
+    from src.config import env as server_env
+    from src.dalton.auth import is_dalton_service_request
+
+    configured = os.getenv("INTERNAL_SERVICE_TOKEN") or getattr(
+        server_env, "INTERNAL_SERVICE_TOKEN", ""
+    )
+    if not configured:
+        return
+    sent = request.headers.get("X-Service-Token", "")
+    if not is_dalton_service_request(sent_token=sent, configured_token=configured):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing X-Service-Token",
+        )
+
+
+@router.get("/maintenance/admission")
+@handle_api_exceptions("get maintenance admission status", logger)
+async def get_maintenance_admission_status_endpoint(
+    request: Request,
+) -> dict[str, Any]:
+    """Read-only maintenance gate status for host ops verification (§6.4b (1) #2)."""
+    _require_dalton_enabled()
+    _require_maintenance_service_token(request)
+    from src.dalton.maintenance_gate import (
+        read_maintenance_state,
+        resolve_maintenance_state_file,
+    )
+
+    state = read_maintenance_state()
+    return {
+        "ok": True,
+        **state.to_dict(),
+        "exists": state.exists,
+        "state_file": str(resolve_maintenance_state_file()),
+    }
+
+
+@router.post("/maintenance/admission/probe")
+@handle_api_exceptions("probe maintenance admission gate", logger)
+async def probe_maintenance_admission_endpoint(
+    request: Request,
+    workspace_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Admission probe endpoint: returns 503 ``maintenance_in_progress`` when paused (§6.4b (1) #2)."""
+    _require_dalton_enabled()
+    _require_maintenance_service_token(request)
+    from src.dalton.maintenance_gate import enforce_maintenance_admission
+
+    target_ws = workspace_id
+    if target_ws is None:
+        try:
+            body = await request.json()
+            if isinstance(body, dict) and body.get("workspace_id"):
+                target_ws = str(body["workspace_id"]).strip() or None
+        except Exception:
+            pass
+    state = enforce_maintenance_admission(
+        workspace_id=target_ws,
+        context="maintenance_probe",
+    )
+    return {
+        "ok": True,
+        "admitted": True,
+        **state.to_dict(),
+    }
+
+
 @router.get("/diagnostics/browser-memory")
 @handle_api_exceptions("get browser memory diagnostics", logger)
 async def get_browser_memory_diagnostics_endpoint(
@@ -2566,6 +2636,9 @@ async def run_system_job_now_endpoint(
     from src.dalton.coverage.identity import CoverageIdentityUnavailableError
 
     owner_id = await _authorize_system_job_mutation(key, user_id)
+    from src.dalton.maintenance_gate import enforce_maintenance_admission
+
+    enforce_maintenance_admission(context=f"system_job_run:{key}")
     scope, _ = classify_system_job_key(key)
     try:
         if scope == "data":

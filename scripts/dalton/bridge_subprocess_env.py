@@ -167,7 +167,18 @@ RESEARCH_RUNTIME_ENV_KEYS: frozenset[str] = frozenset(
         "DALTON_EMBED_PYTHON",
         "DALTON_HOST_PLATFORM",
         "EDGAR_IDENTITY",
+        "DALTON_BRIDGE_ENV_FILE",
+        "DALTON_GUIDEPOINT_MCP_URL",
+        "DALTON_BRIDGE_INTERNAL_CALL",
+        "DALTON_REQUEST_DEADLINE_EPOCH_MS",
     }
+)
+
+# Internal bridge/probe markers that MUST be stripped from runner=host data task subprocesses.
+HOST_TASK_STRIPPED_INTERNAL_ENV_KEYS: tuple[str, ...] = (
+    "DALTON_BRIDGE_INTERNAL_CALL",
+    "DALTON_REQUEST_DEADLINE_EPOCH_MS",
+    "DALTON_OPS_CONTROLLED_PROBE",
 )
 
 # Per-route secret keys explicitly allowed for research_runtime skills that require them
@@ -415,6 +426,7 @@ def build_host_task_subprocess_env(
     cleaned = build_nonarchive_subprocess_env(
         base_env,
         extra_env=extra_env,
+        drop_keys=HOST_TASK_STRIPPED_INTERNAL_ENV_KEYS,
         repo_root=repo_root,
     )
     stripped_provider_keys = _nonarchive_stripped_provider_keys(repo_root)
@@ -425,6 +437,7 @@ def build_host_task_subprocess_env(
                 not key
                 or raw_val is None
                 or key in BRIDGE_TOKEN_ENV_KEYS
+                or key in HOST_TASK_STRIPPED_INTERNAL_ENV_KEYS
                 or _is_shell_injection_key(key)
                 or _is_stripped_credential_key(key)
                 or key in stripped_provider_keys
@@ -438,10 +451,13 @@ def build_host_task_subprocess_env(
                 not key
                 or raw_val is None
                 or key in BRIDGE_TOKEN_ENV_KEYS
+                or key in HOST_TASK_STRIPPED_INTERNAL_ENV_KEYS
                 or _is_shell_injection_key(key)
             ):
                 continue
             cleaned[key] = str(raw_val)
+    for stripped_k in HOST_TASK_STRIPPED_INTERNAL_ENV_KEYS:
+        cleaned.pop(stripped_k, None)
     return cleaned
 
 

@@ -10,6 +10,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 import urllib.request
 import urllib.error
 from datetime import date, datetime, timezone
@@ -81,6 +82,52 @@ def _resolve_research_host_token() -> str:
         os.environ.get("DALTON_RESEARCH_HOST_TOKEN", "").strip()
         or _read_bridge_env_fallback("DALTON_RESEARCH_HOST_TOKEN")
     )
+
+
+def _is_bridge_internal_call() -> bool:
+    return os.environ.get("DALTON_BRIDGE_INTERNAL_CALL", "").strip() == "1"
+
+
+def _is_ops_controlled_probe() -> bool:
+    return os.environ.get("DALTON_OPS_CONTROLLED_PROBE", "").strip() == "1"
+
+
+def _is_host_direct_paused() -> bool:
+    """Return True when external host-direct Guidepoint calls are paused for maintenance (§6.4b (1) #2)."""
+    if _is_bridge_internal_call() or _is_ops_controlled_probe():
+        return False
+    env_flag = (
+        os.environ.get("DALTON_HOST_DIRECT_PAUSED", "").strip()
+        or _read_bridge_env_fallback("DALTON_HOST_DIRECT_PAUSED").strip()
+    )
+    if env_flag.lower() in ("1", "true", "yes", "on"):
+        return True
+    gate_override = os.environ.get("DALTON_MAINTENANCE_ADMISSION_FILE", "").strip()
+    if gate_override:
+        gate_path = Path(gate_override).expanduser()
+    else:
+        gate_path = Path(__file__).resolve().parents[4] / "var" / "dalton" / "maintenance-admission.json"
+    if gate_path.is_file():
+        try:
+            data = json.loads(gate_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and bool(data.get("pause_host_direct", False)):
+                return True
+        except (OSError, ValueError):
+            pass
+    return False
+
+
+def _effective_timeout_s(requested_timeout: float) -> float:
+    """Compute remaining timeout bounded by shared `DALTON_REQUEST_DEADLINE_EPOCH_MS` if present."""
+    eff = max(0.1, float(requested_timeout))
+    raw_ms = os.environ.get("DALTON_REQUEST_DEADLINE_EPOCH_MS", "").strip()
+    if raw_ms:
+        try:
+            rem = (int(raw_ms) / 1000.0) - time.time()
+            eff = min(eff, max(0.1, rem))
+        except ValueError:
+            pass
+    return max(0.1, eff)
 LIBRARY_SOURCES = {"company-wiki", "sales-notes", "tmtb", "funda-ai", "all"}
 # AlphaEngine 业绩会 ASR 稿类型；roic.ai 自 2026-08 整站 403，已停用。
 TRANSCRIPT_TYPE_ID = "IND_SECOND_5FA442AE"
@@ -323,22 +370,34 @@ def native_request(route, args, execute_request=False):
     result = {"operation": operation, "parameters": params}
     if not execute_request:
         return result
+    if rid == "guidepoint" and _is_host_direct_paused():
+        return {
+            "ok": False,
+            "status": "maintenance_host_direct_paused",
+            "error_code": "maintenance_host_direct_paused",
+            "error": "External host-direct Guidepoint calls are paused during maintenance.",
+            **result,
+        }
+    eff_timeout_s = _effective_timeout_s(args.timeout)
     target_url = _resolve_guidepoint_mcp_url() if rid == "guidepoint" else NATIVE_SOURCES[rid]
     req_headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
+        "X-Dalton-Request-Timeout-Ms": str(max(100, int(eff_timeout_s * 1000))),
     }
+    rpc_params_args = dict(params)
     if rid == "guidepoint":
+        rpc_params_args["timeout"] = max(1, int(eff_timeout_s)) if eff_timeout_s >= 1.0 else eff_timeout_s
         host_token = _resolve_research_host_token()
         if host_token:
             req_headers["Authorization"] = f"Bearer {host_token}"
     request = urllib.request.Request(target_url, data=json.dumps({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": operation, "arguments": params},
+        "params": {"name": operation, "arguments": rpc_params_args},
     }).encode(), headers=req_headers)
     try:
         # Local services must not be sent through an outbound HTTP proxy.
-        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=args.timeout) as response:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=eff_timeout_s) as response:
             raw = response.read().decode()
         message = json.loads(raw) if raw.lstrip().startswith("{") else json.loads(
             [line[5:].strip() for line in raw.splitlines() if line.startswith("data:")][-1])
@@ -522,18 +581,39 @@ def fetch_transcripts(reg, args, fallback_cmd):
 
 
 def execute(cmd, timeout):
-    proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, start_new_session=True)
+    eff_timeout = _effective_timeout_s(timeout)
+    internal_call = _is_bridge_internal_call()
+    proc = subprocess.Popen(
+        cmd,
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=not internal_call,
+    )
     try:
-        out, err = proc.communicate(timeout=timeout)
+        out, err = proc.communicate(timeout=eff_timeout)
     except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGTERM)
-        try:
-            proc.communicate(timeout=3)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
+        if internal_call:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
             proc.communicate()
-        return {"ok": False, "status": "timeout", "error": f"超过 {timeout} 秒，已停止取数进程组", "hint": "缩小窗口或按底层 skill 的 self-test 排查。"}
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.communicate()
+        return {"ok": False, "status": "timeout", "error": f"超过 {eff_timeout:.1f} 秒，已停止取数进程组", "hint": "缩小窗口或按底层 skill 的 self-test 排查。"}
     try:
         payload = json.loads(out)
     except json.JSONDecodeError:

@@ -520,6 +520,10 @@ ALLOWED_HOOKS=(
   "channel-chart-snapshot"
   # Channel phase 2 batch 2: web deep-link query params (?chart=&layer= and ?widget=) in ChatView.
   "channel-deep-links"
+  # Research-host cutover Batch 3b: persistent maintenance admission gate coordinated by
+  # PostgreSQL transaction advisory locks across messaging, automations, wakeups,
+  # report-back, START before_commit, and subagent_runs.
+  "maintenance-gate"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

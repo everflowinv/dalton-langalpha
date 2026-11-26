@@ -131,6 +131,9 @@ logger = logging.getLogger("researchdata_bridge")
 _current_corr_id: ContextVar[str | None] = ContextVar(
     "researchdata_bridge_corr_id", default=None
 )
+_current_deadline_epoch_ms: ContextVar[int | None] = ContextVar(
+    "researchdata_bridge_deadline_epoch_ms", default=None
+)
 
 MAX_REQUEST_BYTES = 256 * 1024  # 256 KiB
 _MARKET_DIGEST_OUTPUT_SAVE_REQUEST_BYTES = 1024 * 1024  # save route only
@@ -1124,12 +1127,27 @@ def _read_env_file_dict(path: Path) -> dict[str, str]:
 _ENV_FILE_NO_OS_EXPORT_KEYS = frozenset({"DALTON_RESEARCH_CODE", "DALTON_RESEARCH_HOME"})
 
 
+def _import_dalton_capabilities() -> Any | None:
+    """Import ``src.dalton.capabilities`` cleanly even when launched from scripts/dalton/."""
+    repo_root = str(_SCRIPT_DIR.parents[1])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    try:
+        from src.dalton import capabilities as caps_mod
+
+        return caps_mod
+    except Exception:
+        return None
+
+
 def _load_env_file(path: Path) -> None:
     """Load simple KEY=VALUE lines into `os.environ`.
 
     `GEMINI_API_KEY` is authoritative from `path` (never inherited from process environment),
     while non-secret `DALTON_BRIDGE_*` runtime knobs only populate `os.environ` if unset.
+    Capability/profile/cutover control keys are never accepted from the service env file.
     """
+    caps_mod = _import_dalton_capabilities()
     parsed = _read_env_file_dict(path)
     if "GEMINI_API_KEY" in parsed and parsed["GEMINI_API_KEY"].strip():
         os.environ["GEMINI_API_KEY"] = parsed["GEMINI_API_KEY"].strip()
@@ -1137,6 +1155,13 @@ def _load_env_file(path: Path) -> None:
         os.environ.pop("GEMINI_API_KEY", None)
     for k, v in parsed.items():
         if k == "GEMINI_API_KEY" or k in _ENV_FILE_NO_OS_EXPORT_KEYS:
+            continue
+        if caps_mod is not None and caps_mod.is_capability_control_env_key(k):
+            logger.warning(
+                "Ignoring capability/profile/cutover control key %r in bridge env file %s",
+                k,
+                path,
+            )
             continue
         if k not in os.environ:
             os.environ[k] = v
@@ -1185,6 +1210,30 @@ class BridgeConfig:
             )
         )
         self.env_path: Path = env_path
+        caps_mod = _import_dalton_capabilities()
+        repo_env_file = (
+            os.environ.get("DALTON_REPO_ENV_FILE", "").strip()
+            or os.environ.get("DALTON_DOTENV_PATH", "").strip()
+            or None
+        )
+        if caps_mod is not None:
+            merged_cap_env = caps_mod.load_deployment_capability_env(
+                repo_env_file=repo_env_file,
+                service_env_file=env_path,
+                environ=os.environ,
+            )
+            for k, v in merged_cap_env.items():
+                if (
+                    k == "GEMINI_API_KEY"
+                    or k in _ENV_FILE_NO_OS_EXPORT_KEYS
+                    or caps_mod.is_capability_control_env_key(k)
+                ):
+                    continue
+                if k not in os.environ:
+                    os.environ[k] = v
+            self.capability_env: dict[str, str] = dict(merged_cap_env)
+        else:
+            self.capability_env = dict(os.environ)
         _load_env_file(env_path)
         env_file_vals = _read_env_file_dict(env_path)
         resolved_env = {**env_file_vals, **os.environ}
@@ -8188,6 +8237,8 @@ class ResearchDataBridge:
         self._singleflight_runners: dict[int, dict[str, Any]] = {}
         self._asr_owner_lock: Any | None = None
         self._asr_draining: bool = False
+        self._research_draining: bool = False
+        self._ingest_inflight: int = 0
         if not getattr(cfg, "admin_token", ""):
             logger.warning(
                 "DALTON_BRIDGE_ADMIN_TOKEN is not set (checked env and ~/.config/dalton/researchdata-bridge.env); "
@@ -8228,6 +8279,47 @@ class ResearchDataBridge:
                 "x-search",
             }
 
+    def research_drain_status(self) -> dict[str, Any]:
+        """Return bridge research/ingest drain flag and live concurrency counters (§6.4b (1) #2)."""
+        conc_snap = self._get_concurrency().status_snapshot()
+        return {
+            "ok": True,
+            "draining": bool(getattr(self, "_research_draining", False)),
+            "inflight": int(conc_snap.get("global_inflight", 0)),
+            "queued": int(conc_snap.get("total_queued", 0)),
+            "ingest_inflight": int(getattr(self, "_ingest_inflight", 0)),
+        }
+
+    def set_research_draining(self, draining: bool = True) -> dict[str, Any]:
+        """Toggle bridge research/ingest drain mode."""
+        self._research_draining = bool(draining)
+        return self.research_drain_status()
+
+    def _effective_capability_env(self) -> dict[str, str]:
+        base = dict(getattr(self.cfg, "capability_env", {}) or {})
+        base.update(os.environ)
+        return base
+
+    def _is_route_migrated(self, route: str) -> bool:
+        caps_mod = _import_dalton_capabilities()
+        if caps_mod is None:
+            return False
+        return bool(
+            caps_mod.is_bridge_route_migrated_to_connector(
+                route, environ=self._effective_capability_env()
+            )
+        )
+
+    def _is_ingest_migrated(self, target: str) -> bool:
+        caps_mod = _import_dalton_capabilities()
+        if caps_mod is None:
+            return False
+        return bool(
+            caps_mod.is_bridge_ingest_migrated_to_connector(
+                target, environ=self._effective_capability_env()
+            )
+        )
+
     def compute_timeout(self, tool_name: str, arguments: dict[str, Any]) -> int:
         """Compute clamped timeout in seconds for a tool call."""
         ceiling = max(10, self.cfg.caller_budget_s - 25)
@@ -8250,11 +8342,9 @@ class ResearchDataBridge:
                 )
 
         req_timeout = arguments.get("timeout")
-        if isinstance(req_timeout, int) and req_timeout > 0:
-            chosen = min(req_timeout, max_s)
-        else:
-            chosen = default_s
-        return max(5, min(chosen, max_s, ceiling))
+        if isinstance(req_timeout, int) and not isinstance(req_timeout, bool) and req_timeout > 0:
+            return max(1, min(req_timeout, max_s, ceiling))
+        return max(5, min(default_s, max_s, ceiling))
 
     def _research_code_root(self) -> Path:
         """Resolve active research_runtime code directory."""
@@ -8271,18 +8361,37 @@ class ResearchDataBridge:
         return Path.home() / "Library" / "Application Support" / "Everflow" / "research"
 
     async def _run_stdio_rpc(
-        self, requests: list[dict[str, Any]], timeout_s: float
+        self,
+        requests: list[dict[str, Any]],
+        timeout_s: float,
     ) -> list[dict[str, Any]]:
         """Spawn a single `researchdata_mcp.py` subprocess, send JSON-RPC lines, and read responses."""
         code_root = self._research_code_root()
         home_root = self._research_home_root()
+        eff_timeout_s = max(0.1, float(timeout_s))
+        ctx_deadline_ms = _current_deadline_epoch_ms.get()
+        eff_deadline_ms = (
+            int(ctx_deadline_ms)
+            if ctx_deadline_ms is not None
+            else int((time.time() + eff_timeout_s) * 1000)
+        )
         extra_env: dict[str, str] = {
             "DALTON_RESEARCH_CODE": str(code_root),
             "DALTON_RESEARCH_HOME": str(home_root),
+            "DALTON_BRIDGE_INTERNAL_CALL": "1",
+            "DALTON_REQUEST_DEADLINE_EPOCH_MS": str(eff_deadline_ms),
         }
 
         env_path = getattr(self.cfg, "env_path", None)
         env_file_vars = _read_env_file_dict(env_path) if isinstance(env_path, Path) else {}
+        if isinstance(env_path, Path):
+            extra_env["DALTON_BRIDGE_ENV_FILE"] = str(env_path)
+        gp_mcp_url = (
+            os.environ.get("DALTON_GUIDEPOINT_MCP_URL", "").strip()
+            or env_file_vars.get("DALTON_GUIDEPOINT_MCP_URL", "").strip()
+        )
+        if gp_mcp_url:
+            extra_env["DALTON_GUIDEPOINT_MCP_URL"] = gp_mcp_url
         edgar_identity = (
             os.environ.get("EDGAR_IDENTITY", "").strip()
             or env_file_vars.get("EDGAR_IDENTITY", "").strip()
@@ -8326,6 +8435,7 @@ class ResearchDataBridge:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
         try:
             payload_bytes = (
@@ -8334,13 +8444,17 @@ class ResearchDataBridge:
             ).encode("utf-8")
             stdout_bytes, _stderr_bytes = await asyncio.wait_for(
                 proc.communicate(input=payload_bytes),
-                timeout=timeout_s,
+                timeout=eff_timeout_s,
             )
         except BaseException:
             try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+                if proc.pid:
+                    os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
             await _reap_process(proc)
             raise
 
@@ -13689,6 +13803,23 @@ class ResearchDataBridge:
                     req_id, err_cat, is_error=True
                 )
         else:
+            if route and self._is_route_migrated(route):
+                err_migrated: dict[str, Any] = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "route_migrated",
+                    "error_code": "route_migrated",
+                    "error": (
+                        f"Route '{route}' has migrated from researchdata bridge to Batch 3 connectors / dalton-research-host."
+                    ),
+                }
+                _apply_error_and_empty_contract(
+                    tool_name, route, operation, err_migrated, norm_params_view
+                )
+                return self._make_tool_result_response(
+                    req_id, err_migrated, is_error=True
+                )
             if route and route in handoff:
                 err_payload: dict[str, Any] = {
                     "_declared_sources": [],
@@ -14010,6 +14141,9 @@ class ResearchDataBridge:
         )
 
         t0 = time.monotonic()
+        deadline_mono = t0 + float(eff_timeout)
+        deadline_epoch_ms = int((time.time() + float(eff_timeout)) * 1000)
+        _deadline_tok = _current_deadline_epoch_ms.set(deadline_epoch_ms)
         test_delay_s = self.cfg.resolve_test_delay_s()
         direct_cancel_ctx: dict[str, Any] = {}
         fanout_ae_cancel_ctx: dict[str, Any] = {}
@@ -14151,10 +14285,7 @@ class ResearchDataBridge:
                                 asyncio.sleep(test_delay_s),
                                 timeout=float(eff_timeout),
                             )
-                        elapsed_so_far = time.monotonic() - t0
-                        remaining_budget_s = max(
-                            5.0, float(eff_timeout) - elapsed_so_far + 5.0
-                        )
+                        remaining_budget_s = max(0.1, deadline_mono - time.monotonic())
                         rpc_req = {
                             "jsonrpc": "2.0",
                             "id": req_id if req_id is not None else 1,
@@ -14163,7 +14294,8 @@ class ResearchDataBridge:
                         }
                         stdio_attempts += 1
                         return await self._run_stdio_rpc(
-                            [rpc_req], timeout_s=remaining_budget_s
+                            [rpc_req],
+                            timeout_s=remaining_budget_s,
                         )
 
                 local_task = asyncio.create_task(_run_local_all())
@@ -14510,10 +14642,7 @@ class ResearchDataBridge:
                             asyncio.sleep(test_delay_s),
                             timeout=rem_delay,
                         )
-                    elapsed_so_far = time.monotonic() - t0
-                    remaining_budget_s = max(
-                        5.0, float(eff_timeout) - elapsed_so_far + 5.0
-                    )
+                    remaining_budget_s = max(0.1, deadline_mono - time.monotonic())
                     rpc_req = {
                         "jsonrpc": "2.0",
                         "id": req_id if req_id is not None else 1,
@@ -14547,7 +14676,8 @@ class ResearchDataBridge:
                         stdio_attempts += 1
                         try:
                             resps = await self._run_stdio_rpc(
-                                [rpc_req], timeout_s=remaining_budget_s
+                                [rpc_req],
+                                timeout_s=remaining_budget_s,
                             )
                         except asyncio.TimeoutError:
                             # P0 fix1 5: the outer asyncio.TimeoutError handler
@@ -14746,6 +14876,8 @@ class ResearchDataBridge:
                     "isError": True,
                 },
             }
+        finally:
+            _current_deadline_epoch_ms.reset(_deadline_tok)
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         resp = resps[0] if resps else {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": "Empty response from researchdata_mcp"}}
@@ -17131,28 +17263,46 @@ class ResearchDataBridge:
         registered for one company while another write creates it as a
         directory. Previews do not wait. Wiki writes are rare and rate-limited.
         """
-        if bool(body.get("dry_run", False)):
-            return await self._handle_wiki_ingest_unlocked(body)
-        # The wait is bounded: the backend gives the whole call a budget only a
-        # few seconds above the CLI's own timeout, so a write queued longer
-        # would be reported failed to the user and then land anyway. A busy
-        # answer writes nothing and the caller retries.
-        try:
-            await asyncio.wait_for(
-                self._wiki_write_lock.acquire(), timeout=WIKI_WRITE_QUEUE_WAIT_S
-            )
-        except TimeoutError:
+        if bool(getattr(self, "_research_draining", False)):
             return 503, {
                 "ok": False,
-                "status": "busy",
-                "error_code": "wiki_write_busy",
-                "retryable": True,
-                "error": "另一份资料正在写入 company-wiki，本次没有写入；请稍后重试（同一请求重试不会重复入库）。",
+                "status": "draining",
+                "error_code": "service_draining",
+                "error": "Bridge is draining; retry shortly.",
             }
+        if self._is_ingest_migrated("wiki"):
+            return 410, {
+                "ok": False,
+                "status": "route_migrated",
+                "error_code": "route_migrated",
+                "error": "Endpoint /wiki/ingest has migrated to dalton-research-host /ingest/wiki.",
+            }
+        self._ingest_inflight = int(getattr(self, "_ingest_inflight", 0)) + 1
         try:
-            return await self._handle_wiki_ingest_unlocked(body)
+            if bool(body.get("dry_run", False)):
+                return await self._handle_wiki_ingest_unlocked(body)
+            # The wait is bounded: the backend gives the whole call a budget only a
+            # few seconds above the CLI's own timeout, so a write queued longer
+            # would be reported failed to the user and then land anyway. A busy
+            # answer writes nothing and the caller retries.
+            try:
+                await asyncio.wait_for(
+                    self._wiki_write_lock.acquire(), timeout=WIKI_WRITE_QUEUE_WAIT_S
+                )
+            except TimeoutError:
+                return 503, {
+                    "ok": False,
+                    "status": "busy",
+                    "error_code": "wiki_write_busy",
+                    "retryable": True,
+                    "error": "另一份资料正在写入 company-wiki，本次没有写入；请稍后重试（同一请求重试不会重复入库）。",
+                }
+            try:
+                return await self._handle_wiki_ingest_unlocked(body)
+            finally:
+                self._wiki_write_lock.release()
         finally:
-            self._wiki_write_lock.release()
+            self._ingest_inflight = max(0, int(getattr(self, "_ingest_inflight", 1)) - 1)
 
     async def _handle_wiki_ingest_unlocked(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         target_type = str(body.get("target_type") or "").strip().lower()
@@ -18133,6 +18283,27 @@ class ResearchDataBridge:
         are the wiki ingest's; dedup rides the CLI's own doc_key (a repeat of
         the same body returns `duplicate`), with request-id replay on top.
         """
+        if bool(getattr(self, "_research_draining", False)):
+            return 503, {
+                "ok": False,
+                "status": "draining",
+                "error_code": "service_draining",
+                "error": "Bridge is draining; retry shortly.",
+            }
+        if self._is_ingest_migrated("sales-notes"):
+            return 410, {
+                "ok": False,
+                "status": "route_migrated",
+                "error_code": "route_migrated",
+                "error": "Endpoint /sales-notes/ingest has migrated to dalton-research-host /ingest/sales-notes.",
+            }
+        self._ingest_inflight = int(getattr(self, "_ingest_inflight", 0)) + 1
+        try:
+            return await self._handle_sales_notes_ingest_body(body)
+        finally:
+            self._ingest_inflight = max(0, int(getattr(self, "_ingest_inflight", 1)) - 1)
+
+    async def _handle_sales_notes_ingest_body(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         institution = str(body.get("institution") or "").strip()
         title = str(body.get("title") or "").strip()
         if not institution:
@@ -25706,8 +25877,9 @@ async def _handle_client(
                     )
             conc_snap = bridge._get_concurrency().status_snapshot()
             health_payload = {
-                "ok": True,
-                "status": "ok",
+                "ok": not bool(getattr(bridge, "_research_draining", False)),
+                "status": "draining" if bool(getattr(bridge, "_research_draining", False)) else "ok",
+                "draining": bool(getattr(bridge, "_research_draining", False)),
                 "server_version": bridge.server_version,
                 "max_inflight": bridge.cfg.max_inflight,
                 "max_inflight_per_caller": getattr(bridge.cfg, "max_inflight_per_caller", 2),
@@ -25717,6 +25889,7 @@ async def _handle_client(
                 "inflight": conc_snap["global_inflight"],
                 "queued": conc_snap["total_queued"],
                 "global_queued": conc_snap["global_queued"],
+                "ingest_inflight": int(getattr(bridge, "_ingest_inflight", 0)),
                 "orphan_upstream": bridge._count_orphan_upstream(),
                 "callers": conc_snap["callers"],
                 "embed_max_inflight": bridge.cfg.embed_max_inflight,
@@ -25832,6 +26005,19 @@ async def _handle_client(
                 return
 
             if rpc_method == "tools/call":
+                if bool(getattr(bridge, "_research_draining", False)):
+                    await _send_http(
+                        writer,
+                        503,
+                        "Service Unavailable",
+                        {
+                            "ok": False,
+                            "status": "draining",
+                            "error_code": "service_draining",
+                            "error": "Bridge is draining; retry shortly.",
+                        },
+                    )
+                    return
                 # Only trust caller identity from a verified HMAC-SHA256 signed
                 # `X-Dalton-Caller-Token` (scoped per-request); unsigned headers
                 # or failed/expired tokens never grant workspace/user buckets
@@ -25897,8 +26083,27 @@ async def _handle_client(
             )
             return
 
-        # Unified admin token gate for all non-MCP routes (/embed, /jobs/*, and future routes)
+        # Unified admin token gate for all non-MCP routes (/admin/drain, /embed, /jobs/*, and future routes)
         if not await _require_admin_token(bridge, headers, writer):
+            return
+
+        # Route 2b: GET/POST /admin/drain (admin token required; research & ingest graceful drain)
+        if path == "/admin/drain":
+            if method == "GET":
+                await _send_http(writer, 200, "OK", bridge.research_drain_status())
+                return
+            if method == "POST":
+                try:
+                    drain_body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+                    if not isinstance(drain_body, dict):
+                        raise ValueError("Expected JSON object")
+                except Exception:
+                    await _send_http(writer, 400, "Bad Request", {"ok": False, "error": "Parse error"})
+                    return
+                status = bridge.set_research_draining(bool(drain_body.get("drain", True)))
+                await _send_http(writer, 200, "OK", status)
+                return
+            await _send_http(writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"})
             return
 
         # Route 3: POST /embed (admin token required; path tokens rejected)
@@ -25969,11 +26174,12 @@ async def _handle_client(
                 await _send_http(writer, 400, "Bad Request", {"ok": False, "error": "Parse error"})
                 return
             code, payload = await bridge.handle_wiki_ingest(ingest_body)
-            status_label = (
-                "OK"
-                if code == 200
-                else ("Bad Request" if code == 400 else "Bad Gateway")
-            )
+            status_label = {
+                200: "OK",
+                400: "Bad Request",
+                410: "Gone",
+                503: "Service Unavailable",
+            }.get(code, "Bad Gateway")
             await _send_http(writer, code, status_label, payload)
             return
 
@@ -25993,11 +26199,12 @@ async def _handle_client(
                 await _send_http(writer, 400, "Bad Request", {"ok": False, "error": "Parse error"})
                 return
             code, payload = await bridge.handle_sales_notes_ingest(sn_body)
-            status_label = (
-                "OK"
-                if code == 200
-                else ("Bad Request" if code == 400 else "Bad Gateway")
-            )
+            status_label = {
+                200: "OK",
+                400: "Bad Request",
+                410: "Gone",
+                503: "Service Unavailable",
+            }.get(code, "Bad Gateway")
             await _send_http(writer, code, status_label, payload)
             return
 
