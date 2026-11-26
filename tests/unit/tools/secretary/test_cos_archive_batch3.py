@@ -117,7 +117,32 @@ async def test_archive_snapshot_precheck_rules(monkeypatch):
 
     orig_get_comp = computer_db.get_computer_for_workspace
 
-    # 1. Running CoS computer -> guided to web BEFORE card
+    # 1. Running CoS computer on Docker / E2B / SSH -> rejected as archive_unsupported BEFORE web guidance
+    for kind in ("docker", "e2b", "ssh"):
+        monkeypatch.setattr(
+            computer_db,
+            "get_computer_for_workspace",
+            create_autospec(
+                orig_get_comp,
+                return_value={
+                    "computer_id": COMP_COS,
+                    "name": f"{kind}-cos-box",
+                    "kind": kind,
+                    "status": "running",
+                    "provider_ref": "sbx-cos",
+                    "config": {},
+                },
+            ),
+        )
+        snap_unsupported_running = await build_archive_workspace_snapshot(
+            USER_ID, _tool_call(action="archive", workspace_id=WS_NVDA)
+        )
+        assert snap_unsupported_running is not None
+        assert snap_unsupported_running["precheck_error_code"] == "archive_unsupported"
+        assert "Daytona" in snap_unsupported_running["precheck_error"]
+        assert "网页端" not in snap_unsupported_running["precheck_error"]
+
+    # 2. Running CoS computer on Daytona -> guided to web BEFORE card
     monkeypatch.setattr(
         computer_db,
         "get_computer_for_workspace",
@@ -140,7 +165,7 @@ async def test_archive_snapshot_precheck_rules(monkeypatch):
     assert snap_cos["precheck_error_code"] == "running_cos_computer"
     assert "网页端" in snap_cos["precheck_error"]
 
-    # 2. Docker / E2B / SSH -> rejected BEFORE card with archive_unsupported
+    # 3. Stopped Docker / E2B / SSH -> rejected BEFORE card with archive_unsupported
     for kind in ("docker", "e2b", "ssh"):
         monkeypatch.setattr(
             computer_db,
@@ -317,7 +342,24 @@ async def test_manage_workspaces_archive_executes_only_from_snapshot_and_verifie
     assert data_sc["code"] == "scope_changed"
     assert data_sc["error"] == "情况已变化，请重新发起"
 
-    # 3. SandboxTransientError with secrets -> whitelisted log only, no secret leakage
+    # 3. Provider still archiving -> reports in_progress / 归档进行中
+    ws_mgr.archive_workspace.reset_mock()
+    ws_mgr.archive_workspace.side_effect = None
+    ws_mgr.archive_workspace.return_value = {
+        "status": "stopped",
+        "archive_state": "archiving",
+    }
+    res_ing = await chief_of_staff_workspaces.ainvoke(
+        _tool_call(action="archive", workspace_id=WS_NVDA, state=state),
+        config=_cfg(),
+    )
+    data_ing = _payload(res_ing)
+    assert data_ing["success"] is True
+    assert data_ing["in_progress"] is True
+    assert data_ing["archive_state"] == "archiving"
+    assert "归档进行中" in data_ing["message"]
+
+    # 4. SandboxTransientError with secrets -> whitelisted log only, no secret leakage
     caplog.set_level(logging.WARNING)
     caplog.clear()
     ws_mgr.archive_workspace.side_effect = SandboxTransientError(

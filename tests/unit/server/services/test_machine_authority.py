@@ -839,19 +839,27 @@ class TestArchiveClaim(_Base):
     @pytest.mark.asyncio
     @pytest.mark.parametrize("wins", [True, False])
     async def test_archive_claim_blocks_start_before_provider_call(self, wins):
+        from unittest.mock import create_autospec
+
+        from ptc_agent.core.sandbox.runtime import RuntimeState, SandboxRuntime
+        from src.server.database import computer as computer_db
+
         manager = self._manager()
-        manager._machine_has_active_tasks = AsyncMock(return_value=False)
+        manager._machine_has_active_tasks = create_autospec(
+            manager._machine_has_active_tasks, return_value=False
+        )
         row = _computer(shadowed=[], status="stopped")
         claimed_row = {**row, "status": "stopping", "config": {"archiving": True}}
-        claim = AsyncMock(
-            return_value=claimed_row
-            if wins
-            else None
+        claim = create_autospec(
+            computer_db.claim_computer_for_archive,
+            return_value=claimed_row if wins else None,
         )
         if not wins:
             claim.side_effect = RuntimeError("Computer changed while preparing archive; retry")
-        status = AsyncMock(return_value=row)
-        runtime = SimpleNamespace(archives=True, archive=AsyncMock())
+        status = create_autospec(computer_db.update_computer_status, return_value=row)
+        runtime = create_autospec(SandboxRuntime, instance=True)
+        runtime.archives = True
+        runtime.refresh_state.return_value = RuntimeState.ARCHIVED
 
         @asynccontextmanager
         async def detached(*_args, **_kwargs):
@@ -864,14 +872,16 @@ class TestArchiveClaim(_Base):
             yield runtime
 
         manager._detached_runtime = detached
-        manager._stop_result = AsyncMock(return_value=row)
+        manager._stop_result = create_autospec(manager._stop_result, return_value=row)
         with (
             patch(f"{_MACHINES}.claim_computer_for_archive", claim),
             patch(f"{_MACHINES}.update_computer_status", status),
         ):
             if wins:
-                await manager._archive_machine(COMPUTER_ID)
+                res = await manager._archive_machine(COMPUTER_ID)
                 runtime.archive.assert_awaited_once()
+                runtime.refresh_state.assert_awaited_once()
+                assert res["archive_state"] == "archived"
                 assert status.await_args_list[-1].args == (COMPUTER_ID, "stopped")
                 # DALTON-HOOK(cos-settings-tools): settling the stop drops config.archiving
                 assert status.await_args_list[-1].kwargs == {
@@ -885,23 +895,33 @@ class TestArchiveClaim(_Base):
 
     @pytest.mark.asyncio
     async def test_failed_archive_keeps_recovery_claim_when_provider_unreachable(self):
+        from unittest.mock import create_autospec
+
+        from ptc_agent.core.sandbox.runtime import SandboxRuntime
+        from src.server.services.computer_errors import ArchiveProviderError
+
         manager = self._manager()
-        manager._machine_has_active_tasks = AsyncMock(return_value=False)
-        manager._claim_machine_for_archive = AsyncMock(
-            return_value=_computer(shadowed=[], status="stopping")
+        manager._machine_has_active_tasks = create_autospec(
+            manager._machine_has_active_tasks, return_value=False
         )
-        manager._reconcile_provider_stop = AsyncMock(side_effect=RuntimeError("unreachable"))
-        manager._settle_machine_stop = AsyncMock()
-        runtime = SimpleNamespace(
-            archives=True, archive=AsyncMock(side_effect=RuntimeError("archive failed"))
+        manager._claim_machine_for_archive = create_autospec(
+            manager._claim_machine_for_archive,
+            return_value=_computer(shadowed=[], status="stopping"),
         )
+        manager._reconcile_provider_stop = create_autospec(
+            manager._reconcile_provider_stop, side_effect=RuntimeError("unreachable")
+        )
+        manager._settle_machine_stop = create_autospec(manager._settle_machine_stop)
+        runtime = create_autospec(SandboxRuntime, instance=True)
+        runtime.archives = True
+        runtime.archive.side_effect = RuntimeError("archive failed")
 
         @asynccontextmanager
         async def detached(*_args, **_kwargs):
             yield runtime
 
         manager._detached_runtime = detached
-        with pytest.raises(RuntimeError, match="archive failed"):
+        with pytest.raises(ArchiveProviderError, match="archive_failed"):
             await manager._archive_machine(COMPUTER_ID)
         manager._reconcile_provider_stop.assert_awaited_once()
         manager._settle_machine_stop.assert_not_awaited()

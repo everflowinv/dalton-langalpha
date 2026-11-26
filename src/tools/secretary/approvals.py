@@ -408,6 +408,14 @@ async def build_archive_workspace_snapshot(
         snapshot["computer_name"] = computer_name
         snapshot["computer_kind"] = computer_kind
 
+        if not provider_supports_archive(computer_kind):
+            snapshot["precheck_error"] = (
+                f'电脑「{computer_name}」（提供商：{computer_kind or "unknown"}）不支持冷归档；'
+                "只有 Daytona 云端电脑支持冷归档，当前电脑停止即可释放计算资源。"
+            )
+            snapshot["precheck_error_code"] = "archive_unsupported"
+            return snapshot
+
         active_cos_computer_id = current_computer_id
         if active_cos_computer_id is None:
             try:
@@ -430,14 +438,6 @@ async def build_archive_workspace_snapshot(
                 "请前往网页端沙箱设置面板（概览页）先停止该电脑，再执行整机归档。"
             )
             snapshot["precheck_error_code"] = "running_cos_computer"
-            return snapshot
-
-        if not provider_supports_archive(computer_kind):
-            snapshot["precheck_error"] = (
-                f'电脑「{computer_name}」（提供商：{computer_kind or "unknown"}）不支持冷归档；'
-                "只有 Daytona 云端电脑支持冷归档，当前电脑停止即可释放计算资源。"
-            )
-            snapshot["precheck_error_code"] = "archive_unsupported"
             return snapshot
 
         cfg = computer.get("config") or {}

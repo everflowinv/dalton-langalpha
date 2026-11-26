@@ -416,9 +416,9 @@ async def stage_workspace_move(
         await cur.execute(
             """
             SELECT 1 FROM workspaces WHERE computer_id = %s
-            ORDER BY created_at, workspace_id
+            ORDER BY workspace_id
             FOR UPDATE
-            """,
+            """,  # DALTON-HOOK(cos-settings-tools): align lock order with claim_computer_for_archive
             (source,),
         )
         if await computer_run_in_progress(cur, source):

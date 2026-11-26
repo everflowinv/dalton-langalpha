@@ -1014,6 +1014,7 @@ async def workspaces_archive(
     from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
     from src.server.services.computer_errors import (
         ApprovalScopeChangedError,
+        ArchiveProviderError,
         ArchiveScopeChangedError,
         ArchiveUnsupportedError,
         ComputerArchivingError,
@@ -1025,7 +1026,7 @@ async def workspaces_archive(
 
     try:
         workspace_manager = WorkspaceManager.get_instance()
-        await workspace_manager.archive_workspace(
+        result = await workspace_manager.archive_workspace(
             snap_ws_id,
             expected_computer_id=snap_comp_id,
             expected_workspaces=snap_expected,
@@ -1033,9 +1034,22 @@ async def workspaces_archive(
         visible_count = sum(
             1 for w in snap_expected if not bool(w.get("is_stand_in"))
         )
+        archive_state = (
+            "archiving"
+            if isinstance(result, dict) and result.get("archive_state") == "archiving"
+            else "archived"
+        )
+        in_progress = archive_state == "archiving"
         return success_command(
             {
                 "success": True,
+                "in_progress": in_progress,
+                "archive_state": archive_state,
+                "message": (
+                    "归档进行中，后台将在归档完成后自动收尾。"
+                    if in_progress
+                    else "归档已完成。"
+                ),
                 "workspace_id": snap_ws_id,
                 "workspace_name": snap_ws_name,
                 "computer_id": snap_comp_id,
@@ -1077,6 +1091,20 @@ async def workspaces_archive(
             "该电脑当前有活跃任务或迁移进行中，请稍后再试。",
             tool_call_id,
             code="busy",
+            message_status="error",
+        )
+    except ArchiveProviderError as exc:
+        logger.warning(
+            "workspace_archive_failed stage=archive category=%s workspace_id=%s computer_id=%s exc_type=%s",
+            exc.category,
+            snap_ws_id,
+            snap_comp_id,
+            type(exc).__name__,
+        )
+        return error_command(
+            "沙箱提供商暂时不可用或归档未完成，请稍后重试。",
+            tool_call_id,
+            code=exc.category,
             message_status="error",
         )
     except (SandboxGoneError, SandboxTransientError, SSHConnectError) as exc:

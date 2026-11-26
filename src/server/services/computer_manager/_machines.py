@@ -34,6 +34,7 @@ from src.server.database.computer import (
     get_computer_by_provider_ref,
     get_computer_for_workspace,
     get_computers_for_user,
+    get_live_workspaces_for_archive_snapshot,
     get_primary_computer,
     try_bind_computer_provider_ref,
     try_claim_computer_for_start,
@@ -88,6 +89,9 @@ from src.server.services.computer_manager._types import (
     _MACHINE_DECISION_LOCK_TIMEOUT_MS,
     ComputerBinding,
     WorkspaceNotOnComputer,
+)
+from src.server.services.path_lock_coordination import (
+    computer_stop_heartbeat_present,  # DALTON-HOOK(cos-settings-tools)
 )
 from src.server.database.shared_workspaces import is_holder
 
@@ -784,11 +788,13 @@ class MachineLifecycleMixin:
         """Probe provider for a stopped computer carrying ``config.archiving=true``.
 
         Caller must hold ``self._observed_lock(computer_id, ...)``. Clears
-        ``config.archiving`` only when the provider confirms a terminal state
-        (not ``archiving``).
+        ``config.archiving`` only when no active archive worker holds the stop
+        heartbeat and the provider confirms a terminal state (not ``archiving``).
         """
         computer_id = str(computer["computer_id"])
         if not (computer.get("config") or {}).get("archiving"):
+            return computer
+        if await computer_stop_heartbeat_present(computer_id) is True:
             return computer
         sandbox_id = computer.get("provider_ref")
         if not sandbox_id:
@@ -828,6 +834,54 @@ class MachineLifecycleMixin:
             await update_computer_activity(computer_id)
             return await get_computer(computer_id) or computer
         return computer
+
+    async def _ensure_not_archiving_locked(
+        self, computer: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Shared archive-fence reconciliation for computer start and workspace start/session acquire.
+
+        Caller holds ``self._observed_lock(computer_id, ...)``. Reconciles a
+        ``stopping`` or ``stopped`` computer carrying ``config.archiving=true``
+        and raises ``ComputerArchivingError`` if the fence still stands.
+        """
+        computer_id = str(computer["computer_id"])
+        if not (computer.get("config") or {}).get("archiving"):
+            return computer
+        status = computer.get("status")
+        if status == ComputerStatus.STOPPING:
+            await self._correct_stuck_stopping(
+                self._binding_from_computer("", computer)
+            )
+            computer = await get_computer(computer_id) or computer
+            status = computer.get("status")
+        if (
+            status == ComputerStatus.STOPPED
+            and (computer.get("config") or {}).get("archiving")
+        ):
+            computer = await self._reconcile_stopped_archiving_locked(computer)
+        if (computer.get("config") or {}).get("archiving"):
+            raise ComputerArchivingError(
+                "This computer is currently being archived. Wait for archiving to finish before starting it."
+            )
+        return computer
+
+    async def ensure_computer_not_archiving(
+        self, computer_id: str
+    ) -> bool:
+        """Reconcile any ``config.archiving`` fence on ``computer_id`` and refuse start while active.
+
+        Returns True iff an archiving fence was present and reconciled clear,
+        False when no archiving fence was set on the computer.
+        """
+        computer = await get_computer(computer_id)
+        if computer is None or not (computer.get("config") or {}).get("archiving"):
+            return False
+        async with self._observed_lock(computer_id, "computer.archiving.reconcile"):
+            fresh = await get_computer(computer_id)
+            if fresh is None or not (fresh.get("config") or {}).get("archiving"):
+                return False
+            await self._ensure_not_archiving_locked(fresh)
+            return True
 
     async def reconcile_archiving_computer(
         self, computer_id: str
@@ -1278,18 +1332,11 @@ class MachineLifecycleMixin:
             await refuse_machine_use(computer["kind"], computer.get("user_id"))
 
             # --- DALTON-HOOK(cos-settings-tools): begin ---
-            # Probe a stopped computer carrying a residual config.archiving fence:
-            # clear once provider left 'archiving', otherwise keep refusing start.
-            if (
-                status == ComputerStatus.STOPPED
-                and (computer.get("config") or {}).get("archiving")
-            ):
-                computer = await self._reconcile_stopped_archiving_locked(computer)
+            # Shared archive-fence reconciliation: clear once provider left 'archiving',
+            # otherwise refuse start with ComputerArchivingError.
+            if (computer.get("config") or {}).get("archiving"):
+                computer = await self._ensure_not_archiving_locked(computer)
                 status = computer["status"]
-                if (computer.get("config") or {}).get("archiving"):
-                    raise ComputerArchivingError(
-                        "This computer is currently being archived. Wait for archiving to finish before starting it."
-                    )
             # --- DALTON-HOOK(cos-settings-tools): end ---
 
             if status in CLAIMABLE_FOR_START:
@@ -1486,6 +1533,13 @@ class MachineLifecycleMixin:
         # DALTON-HOOK(cos-settings-tools): optional confirmation snapshot for whole-computer archive
         expected_workspaces: Any = None,
     ) -> Optional[Dict[str, Any]]:
-        return await self._archive_machine(
-            computer_id, expected_workspaces=expected_workspaces
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        snapshot = (
+            expected_workspaces
+            if expected_workspaces is not None
+            else await get_live_workspaces_for_archive_snapshot(computer_id)
         )
+        return await self._archive_machine(
+            computer_id, expected_workspaces=snapshot
+        )
+        # --- DALTON-HOOK(cos-settings-tools): end ---

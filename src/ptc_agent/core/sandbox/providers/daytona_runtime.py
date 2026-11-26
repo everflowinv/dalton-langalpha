@@ -169,7 +169,12 @@ class DaytonaRuntime(SandboxRuntime):
         return _STATE_MAP.get(_raw_state(self._sandbox), RuntimeState.ERROR)
 
     async def refresh_state(self) -> RuntimeState:
-        await self._sandbox.refresh_data()
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        try:
+            await self._sandbox.refresh_data()
+        except DaytonaNotFoundError as exc:
+            raise SandboxGoneError(self.id, "Daytona sandbox not found") from exc
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         return await self.get_state()
 
     # -- Execution --

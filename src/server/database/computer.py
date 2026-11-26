@@ -639,16 +639,69 @@ async def clear_computer_archiving(
     async with _computer_cursor(conn) as cur:
         await cur.execute(
             f"""
-            UPDATE computers
-            SET config = COALESCE(config, '{{}}'::jsonb) - 'archiving',
-                updated_at = NOW()
-            WHERE computer_id = %s
-              AND {FENCE_NOT_DELETED}
-              AND COALESCE(config, '{{}}'::jsonb) @> '{{"archiving": true}}'::jsonb
+            WITH comp AS (
+                UPDATE computers
+                SET config = COALESCE(config, '{{}}'::jsonb) - 'archiving',
+                    updated_at = NOW()
+                WHERE computer_id = %s
+                  AND {FENCE_NOT_DELETED}
+                  AND COALESCE(config, '{{}}'::jsonb) @> '{{"archiving": true}}'::jsonb
+                RETURNING computer_id, status
+            ),
+            ws AS (
+                UPDATE workspaces w
+                SET status = 'stopped', stopped_at = NOW()
+                FROM comp
+                WHERE w.computer_id = comp.computer_id
+                  AND comp.status = 'stopped'
+                  AND w.status = 'stopping'
+            )
+            SELECT computer_id FROM comp
             """,
             (cid,),
         )
-        return cur.rowcount > 0
+        return await cur.fetchone() is not None
+
+
+async def reset_abandoned_archiving_computer(
+    computer_id: str,
+    *,
+    expected_updated_at: Optional[datetime] = None,
+    conn=None,
+) -> Optional[Dict[str, Any]]:
+    """Reset one abandoned ``stopping`` archiving computer back to ``stopped`` without shadow-writing workspaces.
+
+    Matches only a row still in ``stopping`` with ``config.archiving = true`` (and
+    the exact ``expected_updated_at`` when given) so startup recovery never stomps
+    a newer claim or overwrites live workspaces on that computer.
+    """
+    cid = normalize_uuid(computer_id)
+    if cid is None:
+        return None
+    updated_guard = (
+        "\n              AND updated_at = %(expected_updated_at)s"
+        if expected_updated_at is not None
+        else ""
+    )
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            UPDATE computers
+            SET status = 'stopped',
+                stopped_at = NOW(),
+                updated_at = NOW()
+            WHERE computer_id = %(computer_id)s
+              AND status = 'stopping'
+              AND COALESCE(config, '{{}}'::jsonb) @> '{{"archiving": true}}'::jsonb{updated_guard}
+            RETURNING {_COMPUTER_COLS}
+            """,
+            {
+                "computer_id": cid,
+                "expected_updated_at": expected_updated_at,
+            },
+        )
+        row = await cur.fetchone()
+    return dict(row) if row is not None else None
 
 
 async def get_archiving_computers_by_status(
@@ -1433,6 +1486,12 @@ async def try_claim_computer_for_start(
             "\n                  AND c.provider_ref IS NOT DISTINCT FROM"
             " %(expected_ref)s"
         )
+    # DALTON-HOOK(cos-settings-tools): atomically refuse starting a computer while config.archiving=true
+    archiving_guard = (
+        "\n                  AND NOT COALESCE(c.config, '{}'::jsonb)"
+        " @> '{\"archiving\": true}'::jsonb"
+    )
+    computer_guard = f"{ref_guard}{archiving_guard}"
 
     params = {
         "computer_id": computer_id,
@@ -1446,7 +1505,7 @@ async def try_claim_computer_for_start(
                 computer_set="status = 'starting'",
                 workspace_set="status = 'starting'",
                 computer_fence="status = %(from_status)s",
-                computer_guard=ref_guard,
+                computer_guard=computer_guard,
                 # Only the projects that were down move; a sibling left behind in
                 # another state is not this claim's to reinterpret.
                 workspace_fence="status = %(from_status)s",

@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError, connect_failure
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
 from src.server.services.computer_errors import (
+    ArchiveProviderError,
     ArchiveScopeChangedError,
     ArchiveUnsupportedError,
     ComputerArchivingError,
@@ -21,6 +22,14 @@ from src.server.services.computer_errors import (
 from src.server.utils.error_sanitization import sandbox_failure_http
 
 logger = logging.getLogger(__name__)
+
+_PROVIDER_ERROR_MESSAGES: dict[str, str] = {
+    "sandbox_gone": "Sandbox is no longer available.",
+    "sandbox_transient": "Sandbox is temporarily unavailable. Please try again in a moment.",
+    "ssh_connect_refused": "Computer connection was refused.",
+    "archive_unexpected_state": "Archive did not reach archived state. Please try again.",
+    "archive_failed": "Sandbox provider failed while archiving. Please try again.",
+}
 
 
 @contextlib.asynccontextmanager
@@ -115,6 +124,27 @@ async def archive_http_errors(
             detail={
                 "code": "not_stopped",
                 "message": "Only stopped computers can be archived.",
+            },
+        ) from None
+    except ArchiveProviderError as exc:
+        logger.warning(
+            "archive_http_error category=%s action=archive computer_id=%s workspace_id=%s exc_type=%s",
+            exc.category,
+            cid,
+            ws_id,
+            type(exc).__name__,
+        )
+        default_msg = (
+            "Failed to archive computer"
+            if target_kind == "computer"
+            else "Failed to archive workspace"
+        )
+        raise HTTPException(
+            status_code=exc.http_status,
+            detail={
+                "code": exc.category,
+                "message": exc.user_message
+                or _PROVIDER_ERROR_MESSAGES.get(exc.category, default_msg),
             },
         ) from None
     except (SandboxGoneError, SandboxTransientError, SSHConnectError) as exc:

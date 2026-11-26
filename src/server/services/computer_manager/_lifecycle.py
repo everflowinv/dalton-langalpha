@@ -322,6 +322,19 @@ class SessionLifecycleMixin:
                 )
 
             if session is None:
+                # --- DALTON-HOOK(cos-settings-tools): begin ---
+                # Share the same archive-fence reconciliation with /workspaces/{id}/start
+                # and _start_machine so session acquisition cannot bypass config.archiving.
+                comp_for_fence = await get_computer(computer_id)
+                if comp_for_fence is not None and (
+                    comp_for_fence.get("config") or {}
+                ).get("archiving"):
+                    await self._ensure_not_archiving_locked(comp_for_fence)
+                    refreshed_ws = await db_get_workspace(workspace_id)
+                    if refreshed_ws is not None:
+                        workspace = refreshed_ws
+                        status = workspace["status"]
+                # --- DALTON-HOOK(cos-settings-tools): end ---
                 if status in CLAIMABLE_FOR_START or status == ComputerStatus.STARTING:
                     # Claim under the lock, but wait outside it: a 60-300s archived restore
                     # would block all workspace operations beyond the 60s lock-acquire ceiling.
@@ -2003,9 +2016,24 @@ class SessionLifecycleMixin:
         expected_workspace_id: str | None = None,
     ) -> Dict[str, Any]:
         """Archive moves the machine's disk to storage; transactional DB fences guard it."""
+        from opentelemetry import trace as otel_trace
+        from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
         from src.server.services.computer_errors import (
+            ArchiveProviderError,
+            ArchiveScopeChangedError,
             ArchiveUnsupportedError,
+            ComputerArchivingError,
             ComputerBusyError,
+            ComputerNotStoppedError,
+        )
+
+        _PASSTHROUGH_ERRORS = (
+            ArchiveUnsupportedError,
+            ArchiveScopeChangedError,
+            ComputerArchivingError,
+            ComputerBusyError,
+            ComputerNotStoppedError,
+            ArchiveProviderError,
         )
 
         async with self._observed_lock(computer_id, "computer.archive"):
@@ -2025,6 +2053,7 @@ class SessionLifecycleMixin:
             binding = self._binding_from_computer(workspace_id or "", computer)
             sandbox_id = computer["provider_ref"]
 
+            archive_state = "archiving"
             async with computer_stop_heartbeat(computer_id):
                 try:
                     async with self._detached_runtime(sandbox_id, binding=binding) as runtime:
@@ -2033,19 +2062,50 @@ class SessionLifecycleMixin:
                                 "Provider does not support archiving"
                             )
                         await runtime.archive()
-                    await self._settle_machine_stop(
-                        computer_id, ComputerStatus.STOPPED, clear_archiving=True
-                    )
+                        try:
+                            post_state: RuntimeState | None = await runtime.refresh_state()
+                        except SandboxGoneError:
+                            # Sandbox disappeared after archive was issued -> terminal gone.
+                            post_state = None
+
+                    if post_state is None or post_state == RuntimeState.ARCHIVED:
+                        await self._settle_machine_stop(
+                            computer_id, ComputerStatus.STOPPED, clear_archiving=True
+                        )
+                        archive_state = "archived"
+                    elif post_state == RuntimeState.ARCHIVING:
+                        # Daytona archive runs asynchronously: settle status to 'stopped'
+                        # while keeping config.archiving=True until reconciliation confirms
+                        # a terminal provider state.
+                        await self._settle_machine_stop(
+                            computer_id, ComputerStatus.STOPPED, clear_archiving=False
+                        )
+                        archive_state = "archiving"
+                    else:
+                        raise ArchiveProviderError(
+                            "archive_unexpected_state",
+                            http_status=503,
+                            message="Archive did not reach archived state; please retry.",
+                        )
                 except Exception as exc:
-                    category = (
-                        "archive_unsupported"
-                        if isinstance(exc, ArchiveUnsupportedError)
-                        else "sandbox_gone"
-                        if isinstance(exc, SandboxGoneError)
-                        else "sandbox_transient"
-                        if isinstance(exc, SandboxTransientError)
-                        else "archive_failed"
-                    )
+                    refused = connect_failure(exc)
+                    if isinstance(exc, ArchiveProviderError):
+                        category = exc.category
+                    elif isinstance(exc, ArchiveUnsupportedError):
+                        category = "archive_unsupported"
+                    elif isinstance(exc, SSHConnectError) or refused is not None:
+                        category = "ssh_connect_refused"
+                    elif isinstance(exc, SandboxGoneError):
+                        category = "sandbox_gone"
+                    elif isinstance(exc, SandboxTransientError):
+                        category = "sandbox_transient"
+                    else:
+                        category = "archive_failed"
+
+                    span = otel_trace.get_current_span()
+                    if span is not None and span.is_recording():
+                        span.set_attribute("error.category", category)
+
                     logger.warning(
                         "archive_machine_failed category=%s computer_id=%s workspace_id=%s exc_type=%s",
                         category,
@@ -2062,8 +2122,41 @@ class SessionLifecycleMixin:
                             workspace_id or "",
                             type(rec_exc).__name__,
                         )
-                    raise
 
-            logger.info("archive_machine_completed computer_id=%s", computer_id)
-            return await self._stop_result(computer_id, workspace_id)
+                    if isinstance(exc, _PASSTHROUGH_ERRORS):
+                        raise
+
+                    if category == "ssh_connect_refused":
+                        status_code = 422 if (refused is not None and refused.answered) else 503
+                        raise ArchiveProviderError(
+                            category,
+                            http_status=status_code,
+                            message="Computer connection was refused while archiving.",
+                        ) from None
+                    if category == "sandbox_gone":
+                        raise ArchiveProviderError(
+                            category,
+                            http_status=503,
+                            message="Sandbox is no longer available.",
+                        ) from None
+                    if category == "sandbox_transient":
+                        raise ArchiveProviderError(
+                            category,
+                            http_status=503,
+                            message="Sandbox is temporarily unavailable. Please retry.",
+                        ) from None
+                    raise ArchiveProviderError(
+                        category,
+                        http_status=503,
+                        message="Archive failed due to a sandbox provider error.",
+                    ) from None
+
+            logger.info(
+                "archive_machine_completed computer_id=%s archive_state=%s",
+                computer_id,
+                archive_state,
+            )
+            result = dict(await self._stop_result(computer_id, workspace_id))
+            result["archive_state"] = archive_state
+            return result
     # --- DALTON-HOOK(cos-settings-tools): end ---

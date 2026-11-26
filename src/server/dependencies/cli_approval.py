@@ -504,14 +504,22 @@ async def computer_archive(
     *,
     workspace_id: str | None = None,
     body: Any = None,
+    expected_workspaces: Any = None,
 ) -> None:
     """Before a computer's token archives another computer (whole-computer confirmation)."""
-    from src.server.database.computer import get_live_workspaces_for_archive_snapshot
+    from src.server.database.computer import (
+        get_live_workspaces_for_archive_snapshot,
+        normalize_archive_workspace_snapshot,
+    )
 
     computer_id = str(computer["computer_id"])
 
     async def build(call: CliCall | None) -> Ask:
-        snapshot = await get_live_workspaces_for_archive_snapshot(computer_id)
+        snapshot = (
+            normalize_archive_workspace_snapshot(expected_workspaces)
+            if expected_workspaces is not None
+            else await get_live_workspaces_for_archive_snapshot(computer_id)
+        )
         visible = [w for w in snapshot if not w.get("is_stand_in")]
         path: dict[str, Any] = (
             {"workspace_id": workspace_id}
@@ -529,6 +537,10 @@ async def computer_archive(
                 "workspace_names": [w["name"] for w in visible],
             },
             computer_id=computer_id,
+            acts_on={
+                "computer_id": computer_id,
+                "expected_workspaces": snapshot,
+            },
         )
 
     await gate(request, principal, build)

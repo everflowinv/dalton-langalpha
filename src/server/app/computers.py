@@ -103,6 +103,7 @@ from src.server.services.computer_start_failure import (
     start_failure_from_row,
 )
 from src.server.services.computer_errors import (
+    ComputerArchivingError,  # DALTON-HOOK(cos-settings-tools)
     ComputerBusyError,
     ComputerRemovalRefused,
     ComputerRepairRefused,
@@ -235,6 +236,13 @@ async def _computer_action_errors(action: str, computer_id: str, *, spec: bool =
         ) from None
     except ComputerBusyError as e:
         raise HTTPException(status_code=409, detail=spec_refusal("busy", str(e))) from None
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    except ComputerArchivingError as e:
+        raise HTTPException(
+            status_code=409,
+            detail=spec_refusal("computer_archiving", str(e)),
+        ) from None
+    # --- DALTON-HOOK(cos-settings-tools): end ---
     except ComputerNameTaken as e:
         # Names the holder, so a client words it in its own language.
         raise HTTPException(
@@ -1116,6 +1124,8 @@ async def archive_computer(
     body: Optional[ArchiveRequest] = None,
 ):
     from src.dalton.services.archive_http import archive_http_errors
+    from src.server.database.computer import get_live_workspaces_for_archive_snapshot
+    from src.server.dependencies.principal import forbidden
     from src.server.services.computer_errors import ArchiveScopeChangedError
 
     async with archive_http_errors(
@@ -1123,32 +1133,59 @@ async def archive_computer(
         computer_id=computer_id,
     ):
         computer = await _reached_computer(computer_id, principal.user_id, manage=True)
-        if principal.computer_id is not None:
-            await cli_approval.computer_archive(
-                request, principal, computer, body=body
-            )
         if (
             body is not None
             and body.expected_computer_id is not None
             and str(body.expected_computer_id) != str(computer_id)
         ):
             raise ArchiveScopeChangedError("情况已变化，请重新发起")
+        expected_workspaces = (
+            [w.model_dump() for w in body.expected_workspaces]
+            if body is not None and body.expected_workspaces is not None
+            else None
+        )
+        if principal.computer_id is not None:
+            if str(computer_id) == str(principal.computer_id):
+                raise forbidden(
+                    "A computer cannot stop, archive or remove itself"
+                )
+            if expected_workspaces is None:
+                expected_workspaces = await get_live_workspaces_for_archive_snapshot(
+                    computer_id
+                )
+            await cli_approval.computer_archive(
+                request,
+                principal,
+                computer,
+                body=body,
+                expected_workspaces=expected_workspaces,
+            )
         manager = _computer_manager()
         with computer_cause("archive"):
-            if body is not None and body.expected_workspaces is not None:
+            if expected_workspaces is not None:
                 updated = await manager.archive_computer(
                     computer_id,
-                    expected_workspaces=[
-                        w.model_dump() for w in body.expected_workspaces
-                    ],
+                    expected_workspaces=expected_workspaces,
                 )
             else:
                 updated = await manager.archive_computer(computer_id)
-        logger.info("archive_computer_completed computer_id=%s", computer_id)
+        in_progress = (
+            isinstance(updated, dict)
+            and updated.get("archive_state") == "archiving"
+        )
+        logger.info(
+            "archive_computer_completed computer_id=%s archive_state=%s",
+            computer_id,
+            "archiving" if in_progress else "archived",
+        )
         return ComputerActionResponse(
             computer_id=computer_id,
             status=(updated or {}).get("status") or "stopped",
-            message="Computer archived successfully",
+            message=(
+                "Computer archiving in progress"
+                if in_progress
+                else "Computer archived successfully"
+            ),
         )
 # --- DALTON-HOOK(cos-settings-tools): end ---
 

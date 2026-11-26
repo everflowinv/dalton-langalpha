@@ -10,13 +10,15 @@ from __future__ import annotations
 import asyncio
 import uuid
 
+from unittest.mock import create_autospec
+
 import pytest
 
 from src.server.database import computer as computer_db
 from src.server.database import workspace as workspace_db
 from src.server.database import workspace_move as move_db
-from src.server.database.pool import get_db_connection
 from src.server.database.workspace_move import MoveRefused
+from src.server.services import workspace_manager as wm_mod
 from src.server.services.computer_errors import (
     ArchiveScopeChangedError,
     ComputerBusyError,
@@ -27,9 +29,9 @@ from src.server.services.workspace_manager import WorkspaceManager
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
 
-async def _seed_user_and_computers():
+async def _seed_user_and_computers(get_conn):
     user_id = f"it-cos-b3-{uuid.uuid4().hex[:12]}"
-    async with get_db_connection() as conn, conn.transaction():
+    async with get_conn() as conn, conn.transaction():
         await conn.execute(
             "INSERT INTO users (user_id, email) VALUES (%s, %s) ON CONFLICT DO NOTHING",
             (user_id, f"{user_id}@example.test"),
@@ -57,16 +59,20 @@ async def _seed_user_and_computers():
     return user_id, str(comp_a["computer_id"]), str(comp_b["computer_id"]), str(ws_1["workspace_id"])
 
 
-async def _cleanup_user(user_id: str):
-    async with get_db_connection() as conn, conn.transaction():
+async def _cleanup_user(get_conn, user_id: str):
+    async with get_conn() as conn, conn.transaction():
         await conn.execute("DELETE FROM workspace_moves WHERE user_id = %s", (user_id,))
         await conn.execute("DELETE FROM workspaces WHERE user_id = %s", (user_id,))
         await conn.execute("DELETE FROM computers WHERE user_id = %s", (user_id,))
         await conn.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
 
 
-async def test_dual_conn_snapshot_drift_and_stale_staged_move_block_archive():
-    user_id, comp_a, comp_b, ws_1 = await _seed_user_and_computers()
+async def test_dual_conn_snapshot_drift_and_stale_staged_move_block_archive(
+    patched_get_db_connection,
+):
+    user_id, comp_a, comp_b, ws_1 = await _seed_user_and_computers(
+        patched_get_db_connection
+    )
     try:
         snapshot = await computer_db.get_live_workspaces_for_archive_snapshot(comp_a)
         assert len(snapshot) == 1
@@ -83,7 +89,7 @@ async def test_dual_conn_snapshot_drift_and_stale_staged_move_block_archive():
 
         # 2. Refresh snapshot, insert a stale 'staged' move (heartbeat 10m ago) -> archive stays blocked.
         fresh_snapshot = await computer_db.get_live_workspaces_for_archive_snapshot(comp_a)
-        async with get_db_connection() as conn, conn.transaction():
+        async with patched_get_db_connection() as conn, conn.transaction():
             await conn.execute(
                 """
                 INSERT INTO workspace_moves (
@@ -103,7 +109,7 @@ async def test_dual_conn_snapshot_drift_and_stale_staged_move_block_archive():
             )
 
         # Same for stale 'committed' move.
-        async with get_db_connection() as conn, conn.transaction():
+        async with patched_get_db_connection() as conn, conn.transaction():
             await conn.execute(
                 "UPDATE workspace_moves SET phase = 'committed' WHERE user_id = %s",
                 (user_id,),
@@ -113,11 +119,15 @@ async def test_dual_conn_snapshot_drift_and_stale_staged_move_block_archive():
                 comp_a, expected_workspaces=fresh_snapshot, expected_workspace_id=ws_1
             )
     finally:
-        await _cleanup_user(user_id)
+        await _cleanup_user(patched_get_db_connection, user_id)
 
 
-async def test_dual_conn_archiving_fence_blocks_create_and_move_and_survives_startup_reset():
-    user_id, comp_a, comp_b, ws_1 = await _seed_user_and_computers()
+async def test_dual_conn_archiving_fence_blocks_create_start_and_move_and_survives_startup_reset(
+    patched_get_db_connection, monkeypatch
+):
+    user_id, comp_a, comp_b, ws_1 = await _seed_user_and_computers(
+        patched_get_db_connection
+    )
     try:
         snapshot = await computer_db.get_live_workspaces_for_archive_snapshot(comp_a)
         claimed = await computer_db.claim_computer_for_archive(
@@ -139,8 +149,25 @@ async def test_dual_conn_archiving_fence_blocks_create_and_move_and_survives_sta
             )
         assert exc_out.value.code == "busy"
 
-        # Startup recovery resets status='stopping' -> 'stopped' while preserving config.archiving=true.
+        # Startup recovery with live heartbeat skips writeback.
         wm = object.__new__(WorkspaceManager)
+        monkeypatch.setattr(
+            wm_mod,
+            "computer_stop_heartbeat_present",
+            create_autospec(wm_mod.computer_stop_heartbeat_present, return_value=True),
+        )
+        assert await wm.recover_archiving_computers_on_startup() == 0
+        row_still_stopping = await computer_db.get_computer(comp_a)
+        assert row_still_stopping is not None
+        assert row_still_stopping["status"] == "stopping"
+
+        # Startup recovery with expired heartbeat resets ONLY computer row to 'stopped',
+        # preserving config.archiving=true and NOT shadow-writing live workspaces.
+        monkeypatch.setattr(
+            wm_mod,
+            "computer_stop_heartbeat_present",
+            create_autospec(wm_mod.computer_stop_heartbeat_present, return_value=False),
+        )
         recovered = await wm.recover_archiving_computers_on_startup()
         assert recovered >= 1
         row_after_restart = await computer_db.get_computer(comp_a)
@@ -148,24 +175,39 @@ async def test_dual_conn_archiving_fence_blocks_create_and_move_and_survives_sta
         assert row_after_restart["status"] == "stopped"
         assert (row_after_restart.get("config") or {}).get("archiving") is True
 
+        # Start claim is atomically refused by SQL fence while config.archiving=true.
+        start_claim = await computer_db.try_claim_computer_for_start(
+            comp_a, from_status="stopped"
+        )
+        assert start_claim is None
+
         # Fence STILL blocks new workspace creation until provider terminal state clears it.
         created_after_restart = await workspace_db.create_workspace_on_computer(
             user_id, f"GOOG-{uuid.uuid4().hex[:6]}", comp_a
         )
         assert created_after_restart is None
 
-        # Once terminal provider state clears fence, create succeeds again.
+        # Once terminal provider state clears fence, create and start succeed again.
         assert await computer_db.clear_computer_archiving(comp_a) is True
         created_after_clear = await workspace_db.create_workspace_on_computer(
             user_id, f"GOOG-{uuid.uuid4().hex[:6]}", comp_a
         )
         assert created_after_clear is not None
+        start_after_clear = await computer_db.try_claim_computer_for_start(
+            comp_a, from_status="stopped"
+        )
+        assert start_after_clear is not None
+        assert start_after_clear["status"] == "starting"
     finally:
-        await _cleanup_user(user_id)
+        await _cleanup_user(patched_get_db_connection, user_id)
 
 
-async def test_dual_conn_move_and_archive_serialize_without_deadlock():
-    user_id, comp_a, comp_b, ws_1 = await _seed_user_and_computers()
+async def test_dual_conn_move_and_archive_serialize_without_deadlock(
+    patched_get_db_connection,
+):
+    user_id, comp_a, comp_b, ws_1 = await _seed_user_and_computers(
+        patched_get_db_connection
+    )
     try:
         snapshot = await computer_db.get_live_workspaces_for_archive_snapshot(comp_a)
         results = await asyncio.gather(
@@ -186,4 +228,98 @@ async def test_dual_conn_move_and_archive_serialize_without_deadlock():
             assert isinstance(move_res, MoveRefused)
             assert move_res.code == "busy"
     finally:
-        await _cleanup_user(user_id)
+        await _cleanup_user(patched_get_db_connection, user_id)
+
+
+async def test_dual_conn_staging_and_archive_interleave_without_deadlock(
+    patched_get_db_connection,
+):
+    """Interleave ``stage_workspace_move`` and ``claim_computer_for_archive`` on two workspaces
+    whose ``created_at`` order is opposite to their ``workspace_id`` order.
+
+    With unified ``ORDER BY workspace_id FOR UPDATE`` locking, both transactions
+    serialize cleanly on the first workspace row with zero PostgreSQL deadlock.
+    """
+    user_id, comp_a, comp_b, ws_1 = await _seed_user_and_computers(
+        patched_get_db_connection
+    )
+    try:
+        ws_2_row = await workspace_db.create_workspace_on_computer(
+            user_id, f"AAPL-{uuid.uuid4().hex[:6]}", comp_a
+        )
+        assert ws_2_row is not None
+        ws_2 = str(ws_2_row["workspace_id"])
+
+        # Force created_at order to be the reverse of workspace_id order.
+        low_id, high_id = sorted([ws_1, ws_2])
+        async with patched_get_db_connection() as conn, conn.transaction():
+            await conn.execute(
+                "UPDATE workspaces SET created_at = NOW() - interval '2 hours' WHERE workspace_id = %s",
+                (high_id,),
+            )
+            await conn.execute(
+                "UPDATE workspaces SET created_at = NOW() - interval '1 hour' WHERE workspace_id = %s",
+                (low_id,),
+            )
+
+        move_id = str(uuid.uuid4())
+        runner_id = str(uuid.uuid4())
+        async with patched_get_db_connection() as conn, conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO workspace_moves (
+                    move_id, user_id, workspace_id, source_computer_id,
+                    target_computer_id, make_primary, from_backup, phase,
+                    runner_id, source_folder, heartbeat_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, FALSE, FALSE, 'backing_up',
+                    %s, 'NVDA', NOW()
+                )
+                """,
+                (move_id, user_id, low_id, comp_a, comp_b, runner_id),
+            )
+
+        snapshot = await computer_db.get_live_workspaces_for_archive_snapshot(comp_a)
+        assert [w["workspace_id"] for w in snapshot] == [low_id, high_id]
+
+        # Hold a brief row lock on high_id on a separate connection so both
+        # stage_workspace_move and claim_computer_for_archive overlap in flight
+        # while traversing workspaces in ORDER BY workspace_id order.
+        gate_locked = asyncio.Event()
+        release_gate = asyncio.Event()
+
+        async def _hold_high_row():
+            async with patched_get_db_connection() as conn, conn.transaction():
+                await conn.execute(
+                    "SELECT 1 FROM workspaces WHERE workspace_id = %s FOR UPDATE",
+                    (high_id,),
+                )
+                gate_locked.set()
+                await release_gate.wait()
+
+        holder = asyncio.create_task(_hold_high_row())
+        await gate_locked.wait()
+
+        stage_task = asyncio.create_task(
+            move_db.stage_workspace_move(
+                move_id, runner_id, source_folder="NVDA", leftovers_path=None
+            )
+        )
+        archive_task = asyncio.create_task(
+            computer_db.claim_computer_for_archive(
+                comp_a, expected_workspaces=snapshot, expected_workspace_id=low_id
+            )
+        )
+        await asyncio.sleep(0.15)
+        release_gate.set()
+
+        await holder
+        stage_res, archive_res = await asyncio.gather(
+            stage_task, archive_task, return_exceptions=True
+        )
+        assert not isinstance(stage_res, Exception), f"stage failed: {stage_res!r}"
+        assert stage_res is not None
+        assert stage_res["phase"] == "staged"
+        assert isinstance(archive_res, ComputerBusyError)
+    finally:
+        await _cleanup_user(patched_get_db_connection, user_id)

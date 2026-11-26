@@ -215,6 +215,27 @@ class ArchiveUnsupportedError(RuntimeError):
 
 class ComputerNotStoppedError(RuntimeError):
     """The computer must be stopped before it can be archived."""
+
+
+class ArchiveProviderError(RuntimeError):
+    """Sanitized domain error when a sandbox provider fails during archive.
+
+    Carries only a fixed error category and safe message — raised ``from None``
+    inside the archive service so raw provider errors never reach tracing spans
+    or external callers.
+    """
+
+    def __init__(
+        self,
+        category: str,
+        *,
+        http_status: int = 503,
+        message: str | None = None,
+    ) -> None:
+        self.category = category
+        self.http_status = http_status
+        self.user_message = message
+        super().__init__(category)
 # --- DALTON-HOOK(cos-settings-tools): end ---
 
 
