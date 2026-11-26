@@ -1993,19 +1993,32 @@ async def test_archive_machine_daytona_sdk_post_submit_refresh_404_succeeds_and_
 
 @pytest.mark.asyncio
 async def test_docker_normal_stop_reconcile_failure_preserves_original_error_and_http_status(
-    monkeypatch,
+    monkeypatch, caplog
 ):
-    """Non-archiving Docker stop reconciliation keeps original error type & HTTP status (no 400 regression).
+    """Non-archiving Docker stop reconciliation keeps original error type & HTTP status (no 400 regression)
+    while recording only fixed error categories (never raw provider text) in outer safe_aspan and HTTP logs.
 
     Archiving reconciliation keeps ArchiveProviderError and preserves its http_status (e.g. 503)
     at both /computers/{id}/start and /workspaces/{id}/start.
     """
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    from src.observability import tracing as tracing_mod
     from src.server.app import computers as computers_app
     from src.server.app import setup as setup_app
     from src.server.app import workspaces as workspaces_app
     from src.server.services.computer_manager import _lifecycle
     from src.server.services.computer_manager._types import ComputerBinding
     from src.server.utils.error_sanitization import SANDBOX_UNREACHABLE_PREFIX
+
+    exporter = InMemorySpanExporter()
+    provider_tp = TracerProvider()
+    provider_tp.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(tracing_mod, "tracer", provider_tp.get_tracer("test-reconcile-outer"))
 
     @asynccontextmanager
     async def _noop_lock(*_a, **_kw):
@@ -2014,10 +2027,9 @@ async def test_docker_normal_stop_reconcile_failure_preserves_original_error_and
     def _make_docker_manager(exc_to_raise: Exception) -> WorkspaceManager:
         wm = object.__new__(WorkspaceManager)
         wm._machines = {}
-        wm._observed_lock = create_autospec(
-            wm._observed_lock,
-            side_effect=lambda *_a, **_kw: _noop_lock(),
-        )
+        wm._acquire_machine_lock = _noop_lock
+        # Use the REAL _observed_lock -> safe_aspan to verify outer span redaction.
+        wm._observed_lock = WorkspaceManager._observed_lock.__get__(wm, WorkspaceManager)
         wm._binding_from_computer = create_autospec(
             wm._binding_from_computer,
             side_effect=lambda ws_id, row: ComputerBinding(
@@ -2038,6 +2050,35 @@ async def test_docker_normal_stop_reconcile_failure_preserves_original_error_and
             side_effect=lambda *_a, **_kw: _failing_detached(),
         )
         return wm
+
+    def _assert_no_secrets_in_spans_and_logs(
+        expected_category: str,
+        *,
+        expected_log_substrs: tuple[str, ...] = (),
+    ) -> None:
+        spans = exporter.get_finished_spans()
+        reconcile_spans = [sp for sp in spans if sp.name == "computer.stopping.reconcile"]
+        assert reconcile_spans, "Expected real computer.stopping.reconcile span"
+        for sp in reconcile_spans:
+            assert sp.attributes.get("error.category") == expected_category
+            assert len(sp.events) == 0, f"Expected no raw exception events on span, got {sp.events!r}"
+            blob = (
+                repr(dict(sp.attributes))
+                + "\n"
+                + repr(sp.status.description)
+                + "\n"
+                + "\n".join(repr(dict(ev.attributes or {})) for ev in sp.events)
+            )
+            for secret in ("DO_NOT_LOG", "sk-proj_", "s3cr3tP4ss", "AIzaSyA", "eyJhbGci"):
+                assert secret not in blob, f"Leaked {secret!r} in span {sp.name}: {blob}"
+        log_msgs = [r.getMessage() for r in caplog.records]
+        for sub in expected_log_substrs:
+            assert any(sub in m for m in log_msgs), f"Missing {sub!r} in logs: {log_msgs}"
+        for rec in caplog.records:
+            assert rec.exc_info is None, f"Unexpected exc_info in outer log: {rec.getMessage()}"
+            msg = rec.getMessage()
+            for secret in ("DO_NOT_LOG", "sk-proj_", "s3cr3tP4ss", "AIzaSyA", "eyJhbGci"):
+                assert secret not in msg, f"Leaked {secret!r} in log: {msg}"
 
     docker_stopping = _computer_row(
         kind="docker",
@@ -2096,8 +2137,13 @@ async def test_docker_normal_stop_reconcile_failure_preserves_original_error_and
         create_autospec(home_placement.runs_in, return_value=WS_1),
     )
 
-    # 1. Docker SandboxTransientError -> re-raised untouched -> 503 via _sandbox_failure_handler (NOT 400).
-    transient_err = SandboxTransientError("docker daemon timed out")
+    caplog.set_level(logging.WARNING)
+
+    # 1. Docker SandboxTransientError with secrets -> re-raised untouched -> 503 (NOT 400),
+    #    outer span & both route logs record only fixed category (no raw body).
+    exporter.clear()
+    caplog.clear()
+    transient_err = SandboxTransientError(FAKE_SECRET_BODY)
     wm_transient = _make_docker_manager(transient_err)
     with pytest.raises(SandboxTransientError) as exc_direct:
         await wm_transient.reconcile_stopping_computer(COMP_A)
@@ -2118,9 +2164,19 @@ async def test_docker_normal_stop_reconcile_failure_preserves_original_error_and
     assert SANDBOX_UNREACHABLE_PREFIX in comp_503.json()["detail"]
     assert ws_503.status_code == 503
     assert SANDBOX_UNREACHABLE_PREFIX in ws_503.json()["detail"]
+    _assert_no_secrets_in_spans_and_logs(
+        "sandbox_transient",
+        expected_log_substrs=(
+            "computer_action_sandbox_unreachable action=start category=sandbox_transient",
+            "workspace_action_sandbox_unreachable action=start category=sandbox_transient",
+        ),
+    )
 
-    # 2. Docker unexpected ConnectionError -> re-raised untouched -> 500 (NOT 400).
-    conn_err = ConnectionError("docker socket closed")
+    # 2. Docker unexpected ConnectionError with secrets -> re-raised untouched -> 500 (NOT 400),
+    #    outer span & both route logs record only fixed category (no raw body, no exc_info).
+    exporter.clear()
+    caplog.clear()
+    conn_err = ConnectionError(FAKE_SECRET_BODY)
     wm_conn = _make_docker_manager(conn_err)
     with pytest.raises(ConnectionError):
         await wm_conn.reconcile_stopping_computer(COMP_A)
@@ -2140,9 +2196,18 @@ async def test_docker_normal_stop_reconcile_failure_preserves_original_error_and
     assert comp_500.json()["detail"] == "Failed to start computer"
     assert ws_500.status_code == 500
     assert ws_500.json()["detail"] == "Failed to start workspace"
+    _assert_no_secrets_in_spans_and_logs(
+        "reconcile_failed",
+        expected_log_substrs=(
+            "computer_action_failed action=start category=reconcile_failed",
+            "workspace_action_failed action=start category=reconcile_failed",
+        ),
+    )
 
     # 3. Archiving Daytona computer with 503 -> sanitized ArchiveProviderError(http_status=503)
-    #    preserves 503 on both start endpoints instead of falling through RuntimeError -> 400.
+    #    preserves 503 on both start endpoints and records only fixed category on real outer span.
+    exporter.clear()
+    caplog.clear()
     old_ts = datetime.now(timezone.utc) - timedelta(seconds=600)
     archiving_stopping = _computer_row(
         kind="daytona",
@@ -2183,6 +2248,7 @@ async def test_docker_normal_stop_reconcile_failure_preserves_original_error_and
     for body_text in (arch_comp_503.text, arch_ws_503.text):
         for secret in ("DO_NOT_LOG", "sk-proj_", "s3cr3tP4ss", "AIzaSyA", "eyJhbGci"):
             assert secret not in body_text
+    _assert_no_secrets_in_spans_and_logs("sandbox_transient")
 
 
 @pytest.mark.asyncio

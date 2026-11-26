@@ -230,6 +230,18 @@ async def _computer_action_errors(action: str, computer_id: str, *, spec: bool =
         # another 422 for the same machine.
         if connect_failure(e) is not None:
             raise sandbox_failure_http(e) from None
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        sanitized_category = getattr(e, "_dalton_sanitized_error_category", None)
+        if sanitized_category is not None:
+            logger.warning(
+                "computer_action_sandbox_unreachable action=%s category=%s computer_id=%s exc_type=%s",
+                action,
+                sanitized_category,
+                computer_id,
+                type(e).__name__,
+            )
+            raise sandbox_failure_http(e) from None
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         raise
     except MachineBusyError as e:
         raise HTTPException(
@@ -289,6 +301,20 @@ async def _computer_action_errors(action: str, computer_id: str, *, spec: bool =
             raise sandbox_failure_http(e) from None
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        sanitized_category = getattr(e, "_dalton_sanitized_error_category", None)
+        if sanitized_category is not None:
+            logger.error(
+                "computer_action_failed action=%s category=%s computer_id=%s exc_type=%s",
+                action,
+                sanitized_category,
+                computer_id,
+                type(e).__name__,
+            )
+            raise HTTPException(
+                status_code=500, detail=f"Failed to {action} computer"
+            ) from None
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         logger.exception(f"Error {action} computer {computer_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to {action} computer")
 

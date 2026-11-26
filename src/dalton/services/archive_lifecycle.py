@@ -269,17 +269,36 @@ def classify_archive_provider_error(
     )
 
 
+SANITIZED_ERROR_CATEGORY_ATTR = "_dalton_sanitized_error_category"
+
+
+def mark_sanitized_error(exc: Exception, category: str) -> str:
+    """Annotate the active span with fixed ``error.category`` and tag ``exc`` so outer
+    ``safe_aspan`` and HTTP boundaries record only whitelisted fields, never raw text.
+    """
+    span = otel_trace.get_current_span()
+    if span is not None and span.is_recording():
+        span.set_attribute("error.category", category)
+        span.set_attribute("error.type", type(exc).__name__)
+    try:
+        setattr(exc, SANITIZED_ERROR_CATEGORY_ATTR, category)
+    except (AttributeError, TypeError):
+        pass
+    return category
+
+
 def sanitize_reconcile_exception(exc: Exception) -> ArchiveProviderError:
     """Annotate the active span with fixed ``error.category`` and return a sanitized error."""
     category, http_status, message = classify_archive_provider_error(
         exc, default_category="reconcile_failed"
     )
-    span = otel_trace.get_current_span()
-    if span is not None and span.is_recording():
-        span.set_attribute("error.category", category)
-    if isinstance(exc, ArchiveProviderError):
-        return exc
-    return ArchiveProviderError(category, http_status=http_status, message=message)
+    sanitized = (
+        exc
+        if isinstance(exc, ArchiveProviderError)
+        else ArchiveProviderError(category, http_status=http_status, message=message)
+    )
+    mark_sanitized_error(sanitized, category)
+    return sanitized
 
 
 async def reconcile_stopping_locked(
@@ -289,8 +308,8 @@ async def reconcile_stopping_locked(
 
     Only archiving rows convert provider exceptions into ``ArchiveProviderError``;
     ordinary stop/start reconciliations (e.g. Docker) preserve their original
-    exception type and HTTP status mapping while still suppressing raw Daytona
-    SDK child spans.
+    exception type and HTTP status mapping while tagging the fixed error category
+    so outer ``safe_aspan`` and HTTP error boundaries log/record whitelisted fields only.
     """
     from src.server.services.computer_manager import _lifecycle
 
@@ -305,6 +324,10 @@ async def reconcile_stopping_locked(
             )
         except Exception as exc:
             if not is_archiving:
+                category, _, _ = classify_archive_provider_error(
+                    exc, default_category="reconcile_failed"
+                )
+                mark_sanitized_error(exc, category)
                 raise
             sanitized = sanitize_reconcile_exception(exc)
             raise sanitized from None
@@ -515,13 +538,16 @@ async def archive_machine_impl(
                         )
 
                 if isinstance(exc, _PASSTHROUGH_ARCHIVE_ERRORS):
+                    mark_sanitized_error(exc, category)
                     raise
 
-                raise ArchiveProviderError(
+                sanitized = ArchiveProviderError(
                     category,
                     http_status=status_code,
                     message=safe_msg,
-                ) from None
+                )
+                mark_sanitized_error(sanitized, category)
+                raise sanitized from None
 
         logger.info(
             "archive_machine_completed computer_id=%s archive_state=%s",
@@ -623,9 +649,11 @@ async def ensure_not_archiving_locked_impl(
     ):
         computer = await manager._reconcile_stopped_archiving_locked(computer)
     if (computer.get("config") or {}).get("archiving"):
-        raise ComputerArchivingError(
+        err = ComputerArchivingError(
             "This computer is currently being archived. Wait for archiving to finish before starting it."
         )
+        mark_sanitized_error(err, "computer_archiving")
+        raise err
     return computer
 
 

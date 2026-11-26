@@ -156,6 +156,18 @@ async def _workspace_action_errors(action: str, workspace_id: str):
         # except an owner's SSH machine, which answers as its computer's start.
         if connect_failure(e) is not None:
             raise sandbox_failure_http(e) from None
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        sanitized_category = getattr(e, "_dalton_sanitized_error_category", None)
+        if sanitized_category is not None:
+            logger.warning(
+                "workspace_action_sandbox_unreachable action=%s category=%s workspace_id=%s exc_type=%s",
+                action,
+                sanitized_category,
+                workspace_id,
+                type(e).__name__,
+            )
+            raise sandbox_failure_http(e) from None
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         raise
     except (WorkspaceNameTaken, WorkspaceNameInvalid) as e:
         # Before the ValueError arm: an unusable name is not a missing workspace.
@@ -188,6 +200,20 @@ async def _workspace_action_errors(action: str, workspace_id: str):
             raise sandbox_failure_http(e) from None
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        sanitized_category = getattr(e, "_dalton_sanitized_error_category", None)
+        if sanitized_category is not None:
+            logger.error(
+                "workspace_action_failed action=%s category=%s workspace_id=%s exc_type=%s",
+                action,
+                sanitized_category,
+                workspace_id,
+                type(e).__name__,
+            )
+            raise HTTPException(
+                status_code=500, detail=f"Failed to {action} workspace"
+            ) from None
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         logger.exception(f"Error {action} workspace {workspace_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to {action} workspace")
 

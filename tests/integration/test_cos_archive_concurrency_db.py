@@ -26,7 +26,7 @@ from src.server.services.computer_errors import (
 from src.server.services.workspace_manager import WorkspaceManager
 
 
-pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
+pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="session")]
 
 
 async def _seed_user_and_computers(get_conn):
@@ -259,6 +259,7 @@ async def test_dual_conn_move_and_archive_serialize_without_deadlock(
 
 async def test_dual_conn_staging_and_archive_interleave_without_deadlock(
     patched_get_db_connection,
+    test_db_pool,
 ):
     """Interleave ``stage_workspace_move`` and ``claim_computer_for_archive`` on two workspaces
     whose ``created_at`` order is opposite to their ``workspace_id`` order.
@@ -266,6 +267,8 @@ async def test_dual_conn_staging_and_archive_interleave_without_deadlock(
     With unified ``ORDER BY workspace_id FOR UPDATE`` locking, both transactions
     serialize cleanly on the first workspace row with zero PostgreSQL deadlock.
     """
+    # holder + stage_task + archive_task + observer query need 4 concurrent pool slots.
+    assert test_db_pool.max_size >= 4
     user_id, comp_a, comp_b, ws_1 = await _seed_user_and_computers(
         patched_get_db_connection
     )
@@ -358,8 +361,8 @@ async def test_dual_conn_staging_and_archive_interleave_without_deadlock(
             loop = asyncio.get_running_loop()
             deadline = loop.time() + 5.0
             waiting_count = 0
-            async with patched_get_db_connection() as obs_conn:
-                while loop.time() < deadline:
+            while loop.time() < deadline:
+                async with patched_get_db_connection() as obs_conn:
                     async with obs_conn.cursor() as cur:
                         await cur.execute(
                             """
@@ -385,9 +388,9 @@ async def test_dual_conn_staging_and_archive_interleave_without_deadlock(
                         )
                         row = await cur.fetchone()
                         waiting_count = int(row["waiting_count"]) if row is not None else 0
-                    if waiting_count >= 2:
-                        break
-                    await asyncio.sleep(0.02)
+                if waiting_count >= 2:
+                    break
+                await asyncio.sleep(0.02)
             assert waiting_count >= 2, (
                 f"Expected both stage and archive transactions to enter PG lock wait "
                 f"chain behind holder_pid={holder_pid}, observed waiting_count={waiting_count}"
