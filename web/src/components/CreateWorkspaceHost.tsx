@@ -78,7 +78,7 @@ export function CreateWorkspaceHost({ children }: { children: ReactNode }) {
     lastPressedRef.current = null;
     const recentPress = pressed && performance.now() - pressed.at < 1000 ? pressed.el : null;
     // DALTON-HOOK(dialog-focus-return): the control the click handler named comes first. The two guesses
-    // stand in for an opener that has none to give: the desktop app menu, the palette's own row.
+    // stand in for an opener that has none to give (such as the desktop app menu).
     setOpener(opener ?? (focused instanceof HTMLElement && focused !== document.body ? focused : recentPress));
     setOpen(true);
   }, []);

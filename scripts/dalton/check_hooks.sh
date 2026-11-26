@@ -527,17 +527,18 @@ ALLOWED_HOOKS=(
   "drive-guidance"
   # Frontend fix bundle 4 (BA4): closing the New workspace dialog puts focus back
   # on the control that opened it. The click handler hands the dialog its own
-  # control (CreateWorkspaceHost.openDialog, AppSidebar, WorkspaceGallery and its
-  # GalleryActions / GalleryEmptyState prop types), and the dialog ranks that over
-  # its two guesses (CreateWorkspaceModal): Safari leaves focus where a click found
-  # it, and Voice Control, a virtual cursor and a script's click() give neither.
+  # control (CreateWorkspaceHost.openDialog, AppSidebar, CommandPalette,
+  # useLocalSources, WorkspaceGallery and its GalleryActions / GalleryEmptyState
+  # prop types), and the dialog ranks that over its two guesses
+  # (CreateWorkspaceModal): Safari leaves focus where a click found it, and Voice
+  # Control, a virtual cursor and a script's click() give neither.
   "dialog-focus-return"
   # Frontend fix bundle 4 (AE2): a machine that finishes being prepared while
-  # Settings or Setup's Claude Code step is open is announced when its status
-  # frame arrives. Those pages mount a page-level ComputersDialogHost with no
-  # status fan-out above it (ChatAgent brings its own), and the list polls only
-  # a spec change, so the outcome waited for the next list read. The host takes
-  # `statusFanout` for that (ComputersDialogHost, Settings.tsx, ClaudeCodeStep).
+  # Settings is open is announced when its status frame arrives. Settings mounts
+  # a page-level ComputersDialogHost with no status fan-out above it (ChatAgent
+  # brings its own), and the list polls only a spec change, so the outcome waited
+  # for the next list read. The host takes `statusFanout` for that
+  # (ComputersDialogHost, Settings.tsx).
   "page-host-status-fanout"
 )
 

@@ -711,23 +711,26 @@ def test_minio_init_dedups_asr_bucket_by_endpoint_and_bucket_name(monkeypatch):
 
 
 def test_langalpha_doc_drive_guide_leads_with_the_administrators_switch():
-    """While ``features.drive.enabled`` is off the Experiments row is hidden too, so
-    a user sent straight to Experiments looks for a setting that is not there. The
-    reference names the administrator's switch first and the user's own second."""
+    """The Drive reference names the active overlay config files, startup guard,
+    and ``gate: none`` (Settings omits the Experiments page in this deployment)."""
     # The prose the agent reads: without the hook marker standing over it.
     source = LANGALPHA_DOC_DRIVE.read_text(encoding="utf-8")
     intro = re.sub(r"<!--.*?-->", "", source, flags=re.DOTALL).split("## What it is")[0]
 
-    # The switch that hides the other one, by the key the administrator sets.
+    # Active overlay files and exact keys.
+    assert "config.dalton.yaml" in intro
+    assert "config.core.yaml" in intro
+    assert "config.yaml" not in intro
     assert "features.drive.enabled" in intro
-    deployment_at = intro.index("features.drive.enabled")
-    assert "administrator" in intro[: deployment_at + 200]
+    assert "features.drive.gate: none" in intro
 
-    # Then where the user's own switch is, once the deployment's is on.
-    users_at = intro.index("Experiments")
-    assert deployment_at < users_at
+    # Startup guard for colleague access and computer CLI tokens.
+    assert "colleague_sharing" in intro
+    assert "computer_cli_tokens" in intro
 
-    # The sentence that made the user's switch sound like the only one.
+    # Settings omits Experiments; no vague "leaves this switch with the administrator" wording.
+    assert "Experiments" in intro
+    assert "leaves this switch with the administrator" not in intro
     assert "A user turns it on among the experiments in their settings." not in intro
 
 
@@ -755,3 +758,4 @@ def test_multipart_cleanup_warning_says_what_to_set_on_minio():
     assert "AbortIncompleteMultipartUpload" in message
     assert "stale_uploads_expiry" in message
     assert "MINIO_API_STALE_UPLOADS_EXPIRY" in message
+    assert "168h" in message

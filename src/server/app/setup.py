@@ -901,7 +901,7 @@ async def lifespan(app: FastAPI):
                 "Add an AbortIncompleteMultipartUpload lifecycle rule of at least 7 days. "
                 # DALTON-HOOK(drive-guidance): MinIO has no such rule; say what stands in for it
                 "On MinIO the equivalent is its stale_uploads_expiry setting "
-                "(MINIO_API_STALE_UPLOADS_EXPIRY, 24h by default), set to 7 days or longer "
+                "(MINIO_API_STALE_UPLOADS_EXPIRY, 24h by default), set to 168h or longer "
                 "before turning the Drive on; MinIO keeps that setting to itself, so this "
                 "warning appears there either way."
             )

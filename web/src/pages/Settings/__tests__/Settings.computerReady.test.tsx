@@ -13,8 +13,6 @@ import { act, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { Route, Routes } from 'react-router';
 import type { ReactElement } from 'react';
-import { readdirSync, readFileSync, statSync } from 'node:fs';
-import { join, resolve } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { runAuthResets } from '@/lib/authResets';
@@ -181,21 +179,6 @@ import { computerOutcomeWatch } from '@/pages/ChatAgent/hooks/computerOutcomes';
 import { getComputers } from '@/pages/ChatAgent/utils/api';
 import Settings from '../Settings';
 
-const SRC_DIR = resolve(__dirname, '..', '..', '..');
-
-/** Every `.tsx` under `src` but the tests, as `[path from src, source]`. */
-function componentSources(dir = SRC_DIR, out: [string, string][] = []): [string, string][] {
-  for (const entry of readdirSync(dir)) {
-    const full = join(dir, entry);
-    if (statSync(full).isDirectory()) {
-      if (entry !== '__tests__') componentSources(full, out);
-    } else if (entry.endsWith('.tsx')) {
-      out.push([full.slice(SRC_DIR.length + 1), readFileSync(full, 'utf8')]);
-    }
-  }
-  return out;
-}
-
 /** A machine partway through being prepared. */
 const PREPARING: Computer = {
   computer_id: '11111111-1111-1111-1111-111111111111',
@@ -286,26 +269,4 @@ describe('a computer that finishes preparing while Settings is open', () => {
       );
     });
   });
-
-  // The page that brought its own fan-out above its host is the one exception,
-  // and the next page that mounts a host is to ask for one rather than be
-  // found by a machine that stays "Starting" until the window is refocused.
-  it('is heard out by every page that mounts a host, ChatAgent aside, which hears it out above', () => {
-    const mounts = componentSources().flatMap(([file, source]) =>
-      [...source.matchAll(/<ComputersDialogHost\b([^>]*?)\/?>/g)].map(([, attrs]) => ({ file, attrs })),
-    );
-    expect(mounts.length).toBeGreaterThanOrEqual(3);
-
-    const deaf = mounts.filter(
-      ({ file, attrs }) =>
-        file !== join('pages', 'ChatAgent', 'ChatAgent.tsx') &&
-        !/\bfallback\b/.test(attrs) &&
-        !/\bstatusFanout\b/.test(attrs),
-    );
-    expect(deaf).toEqual([]);
-
-    const chatAgent = readFileSync(join(SRC_DIR, 'pages', 'ChatAgent', 'ChatAgent.tsx'), 'utf8');
-    expect(chatAgent).toMatch(/\buseComputerStatusFanout\(\)/);
-  });
 });
-

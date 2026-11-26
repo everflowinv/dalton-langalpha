@@ -32,7 +32,8 @@ import type { PaletteItem } from './types';
  * skills of where new work goes, the app's pages, settings and actions, and
  * the tickers opened lately. Every keystroke matches these at once.
  */
-export function useLocalSources(v: Verbs) {
+// DALTON-HOOK(dialog-focus-return): accept the palette's return-focus callback for modal actions
+export function useLocalSources(v: Verbs, returnFocus?: () => HTMLElement | null) {
   const { t, newWork } = v;
   const navigate = useNavigate();
   const location = useLocation();
@@ -161,7 +162,11 @@ export function useLocalSources(v: Verbs) {
     ...(newWork.canStartThread ? [action('newThread', t('palette.action.newThread'), SquarePen, () => v.newThread(undefined), newWork.where, true)] : []),
     // A turn later: the dialog's field takes focus as it mounts, and in the
     // same commit the palette's focus trap would take it back.
-    action('newWorkspace', t('palette.action.newWorkspace'), FolderPlus, () => window.setTimeout(() => openCreateWorkspace?.(), 0)),
+    // DALTON-HOOK(dialog-focus-return): pass the persistent control that opened the palette so cancelling restores focus there
+    action('newWorkspace', t('palette.action.newWorkspace'), FolderPlus, () => {
+      const opener = returnFocus?.() ?? null;
+      window.setTimeout(() => openCreateWorkspace?.(opener), 0);
+    }),
     // On the page already, the automation and run open there stay in the
     // address: a discard the page asks about first may be declined.
     action('newAutomation', t('palette.action.newAutomation'), Timer, () => {

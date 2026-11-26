@@ -218,7 +218,7 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
               <button
                 type="button"
                 className="sidebar-rail-toggle"
-                onClick={() => palette?.open()}
+                onClick={(e) => palette?.open(undefined, { returnFocusTo: e.currentTarget })} // DALTON-HOOK(dialog-focus-return): remember this persistent trigger across palette/modal closes
                 onPointerEnter={palette?.preload}
                 aria-label={searchLabel}
                 aria-keyshortcuts={paletteKeyShortcuts()}
@@ -239,7 +239,7 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
                 <TooltipTrigger asChild>
                   <button
                     className="sidebar-nav-item tap-target"
-                    onClick={() => palette.open()}
+                    onClick={(e) => palette.open(undefined, { returnFocusTo: e.currentTarget })} // DALTON-HOOK(dialog-focus-return): remember this persistent trigger across palette/modal closes
                     onPointerEnter={palette.preload}
                     aria-label={t('palette.search')}
                     aria-keyshortcuts={paletteKeyShortcuts()}
@@ -305,7 +305,7 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
         <button
           type="button"
           className="sidebar-collapse-btn"
-          onClick={() => palette?.open()}
+          onClick={(e) => palette?.open(undefined, { returnFocusTo: e.currentTarget })} // DALTON-HOOK(dialog-focus-return): remember this persistent trigger across palette/modal closes
           onPointerEnter={palette?.preload}
           aria-label={searchLabel}
           aria-keyshortcuts={paletteKeyShortcuts()}
@@ -328,7 +328,7 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
         {palette && (
           <button
             className="sidebar-panel-item"
-            onClick={() => palette.open()}
+            onClick={(e) => palette.open(undefined, { returnFocusTo: e.currentTarget })} // DALTON-HOOK(dialog-focus-return): remember this persistent trigger across palette/modal closes
             onPointerEnter={palette.preload}
             aria-keyshortcuts={paletteKeyShortcuts()}
           >

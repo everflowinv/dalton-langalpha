@@ -14,11 +14,14 @@
 import { useEffect, useRef, useState } from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { fireEvent, screen, waitFor } from '@testing-library/react';
+import { queryOptions } from '@tanstack/react-query';
 
 import { renderWithProviders } from '@/test/utils';
 import type { Workspace } from '@/types/api';
 import { computersApi } from './computersDialogApi';
 import { CreateWorkspaceHost, useOpenCreateWorkspace } from '@/components/CreateWorkspaceHost';
+import { CommandPaletteProvider, useCommandPalette } from '@/components/CommandPalette/CommandPaletteProvider';
+import { clientOs } from '@/lib/clientOs';
 
 vi.mock('@/config/brand', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/config/brand')>()),
@@ -34,8 +37,43 @@ vi.mock('../../utils/api', async () => ({
   setComputerSpec: vi.fn(),
   reorderWorkspaces: vi.fn(),
   createWorkspace: vi.fn(),
+  getRecentThreads: vi.fn(async () => ({ threads: [] })),
   getWorkspaceThreads: vi.fn(async () => ({ threads: [], total: 0 })),
 }));
+
+vi.mock('@/api/search', () => ({
+  searchConversations: vi.fn(async () => ({
+    threads: [],
+    turns: [],
+    files: [],
+    next_cursor: { threads: null, turns: null, files: null },
+    failed: [],
+  })),
+  getSearchPreview: vi.fn(async () => {
+    throw new Error('no preview');
+  }),
+}));
+vi.mock('@/lib/dalton/searchApi', () => ({
+  fetchGlobalSearch: vi.fn(async () => ({ conversations: [], documents: [] })),
+}));
+vi.mock('@/hooks/useSkills', () => ({ useSkills: () => ({ data: [] }) }));
+vi.mock('@/hooks/useHomeWorkspace', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/hooks/useHomeWorkspace')>()),
+  homeWorkspaceQuery: () =>
+    queryOptions({ queryKey: ['workspaces', 'home'], queryFn: async () => ({ workspace_id: 'home', is_home: true, name: 'Home' }) }),
+  useHomeWorkspaceId: () => 'home',
+  resolveChatWorkspace: vi.fn(async () => 'home'),
+}));
+vi.mock('@/hooks/useSymbolSearch', () => ({ useSymbolSearch: () => ({ hits: [], loading: false }) }));
+vi.mock('@/lib/quotes', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  useQuotes: () => ({ quotes: {} }),
+}));
+vi.mock('@/contexts/ThemeContext', () => ({ useTheme: () => ({ theme: 'light' }) }));
+vi.mock('@/hooks/useAppearance', () => ({ useAppearance: () => ({ pickTheme: vi.fn() }) }));
+vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ userId: null, logout: vi.fn() }) }));
+vi.mock('@/components/nav/useNavItems', () => ({ useNavItems: () => [] }));
+vi.mock('@/pages/Settings/panels/usePreferenceWrite', () => ({ useSaveFailureToast: () => vi.fn() }));
 
 vi.mock('@/components/ui/use-toast', () => ({ toast: vi.fn() }));
 vi.mock('@/lib/dalton/coverage', async (importOriginal) => ({
@@ -140,5 +178,61 @@ describe('the New workspace dialog returns focus to its opener', () => {
 
       expect(document.activeElement).toBe(trigger);
     }
+  });
+
+  it('returns focus to the persistent control that opened the command palette when New workspace is clicked and cancelled', async () => {
+    function PaletteTriggerButton() {
+      const palette = useCommandPalette();
+      return (
+        <button
+          type="button"
+          onClick={(e) => palette?.open(undefined, { returnFocusTo: e.currentTarget })}
+        >
+          Open palette
+        </button>
+      );
+    }
+
+    renderWithProviders(
+      <CreateWorkspaceHost>
+        <CommandPaletteProvider>
+          <PaletteTriggerButton />
+          <textarea aria-label="Composer" />
+        </CommandPaletteProvider>
+      </CreateWorkspaceHost>,
+    );
+
+    // 1. Opened from a persistent button: click "New workspace" in the palette, then click Cancel.
+    const paletteButton = screen.getByRole('button', { name: 'Open palette' });
+    fireEvent.click(paletteButton);
+    const input = await screen.findByRole('combobox');
+    fireEvent.change(input, { target: { value: 'new workspace' } });
+    const row = await screen.findByRole('option', { name: /New workspace|新建工作区/ });
+    fireEvent.pointerDown(row);
+    fireEvent.click(row);
+
+    await screen.findByRole('dialog');
+    await waitFor(() => expect(screen.queryByRole('combobox')).not.toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /^(Cancel|取消)$/ }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+
+    expect(document.activeElement).toBe(paletteButton);
+
+    // 2. Opened by shortcut from the composer: click "New workspace" in the palette, then press Escape.
+    const composer = screen.getByLabelText('Composer');
+    composer.focus();
+    fireEvent.keyDown(composer, {
+      key: 'k',
+      ...(clientOs() === 'windows' ? { ctrlKey: true } : { metaKey: true }),
+    });
+    const input2 = await screen.findByRole('combobox');
+    fireEvent.change(input2, { target: { value: 'new workspace' } });
+    const row2 = await screen.findByRole('option', { name: /New workspace|新建工作区/ });
+    fireEvent.pointerDown(row2);
+    fireEvent.click(row2);
+
+    await closeWithEscape();
+
+    expect(document.activeElement).toBe(composer);
   });
 });
