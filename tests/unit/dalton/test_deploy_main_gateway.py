@@ -282,8 +282,8 @@ fi
 if [[ "$*" == *"--input-type=module"* ]]; then
   check_dir="$(pwd)"
   trace_dir="$check_dir"
-  if [[ "${{!#}}" == */dist/index.mjs ]]; then
-    entry_arg="${{!#}}"
+  entry_arg="${{DALTON_GATEWAY_IMPORT_PATH:-${{!#}}}}"
+  if [[ "$entry_arg" == */dist/index.mjs ]]; then
     check_dir="$(dirname "$(dirname "$entry_arg")")"
     nm_target="$(readlink "${{check_dir}}/node_modules" 2>/dev/null || true)"
     if [ -n "$nm_target" ]; then
@@ -2514,3 +2514,13 @@ def test_gateway_staging_has_pnpm_build_approvals_with_or_without_source_file(
     staged_cfg = (staging / "pnpm-workspace.yaml").read_text()
     assert "esbuild: true" in staged_cfg
     assert "protobufjs: false" in staged_cfg
+
+
+def test_gateway_import_check_passes_the_entry_path_outside_argv():
+    """The gateway starts itself when process.argv[1] ends with index.mjs, so the
+    release import check hands the entry path over through the environment."""
+    script = (_REPO_ROOT / "scripts/dalton/ops/prod/deploy_main.sh").read_text()
+    check = [ln for ln in script.splitlines() if "await import(pathToFileURL" in ln]
+    assert check, "import check not found"
+    assert all("process.argv" not in ln for ln in check)
+    assert any("DALTON_GATEWAY_IMPORT_PATH" in ln for ln in check)

@@ -1038,7 +1038,9 @@ verify_gateway_release_import() {
       return 1
     fi
   fi
-  out=$(node --input-type=module -e 'import { resolve } from "node:path"; import { pathToFileURL } from "node:url"; await import(pathToFileURL(resolve(process.argv[1])).href);' "${tmp_iso}/dist/index.mjs" 2>&1) || rc=$?
+  # The entry path goes in through the environment, not argv: the gateway starts itself when
+  # process.argv[1] ends with index.mjs, and an import check must only load the module.
+  out=$(DALTON_GATEWAY_IMPORT_PATH="${tmp_iso}/dist/index.mjs" node --input-type=module -e 'import { resolve } from "node:path"; import { pathToFileURL } from "node:url"; await import(pathToFileURL(resolve(process.env.DALTON_GATEWAY_IMPORT_PATH)).href);' 2>&1) || rc=$?
   rm -rf "$tmp_iso"
   ACTIVE_GATEWAY_IMPORT_TMP=""
   if [ "$rc" -ne 0 ]; then
