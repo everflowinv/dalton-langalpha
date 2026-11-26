@@ -60,6 +60,8 @@ def projection_sources() -> list[Path]:
             _SRC / "server/utils/text_phase.py",
             # DALTON-HOOK(thinking-leak): the display filter shapes replayed assistant text
             _SRC / "server/utils/thinking_leak.py",
+            # DALTON-HOOK(share-redaction): mixed-phase text block splitter shapes replayed lines
+            _SRC / "dalton/history_phase.py",
             _SRC / "server/database/provenance.py",
             _SRC / "server/services/runs/credit_usage.py",
             _SRC / "server/contracts/status.py",

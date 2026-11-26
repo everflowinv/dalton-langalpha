@@ -159,7 +159,8 @@ async def _replay(
     thread = {
         "conversation_thread_id": _THREAD_ID,
         "workspace_id": "ws-1",
-        "share_permissions": {},
+        # DALTON-HOOK(share-redaction): exercise rich-share allow_files=True order redaction
+        "share_permissions": {"allow_files": True},
         "owner_id": "owner-1",
     }
     queries = [{"turn_index": 0, "content": "buy one share", "metadata": {}}]

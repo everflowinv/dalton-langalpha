@@ -22,6 +22,7 @@ from src.dalton import transcription_storage as _store
 logger = logging.getLogger(__name__)
 
 CHAT_UPLOAD_KEY_PREFIX = "chat-uploads"
+PRIVATE_CHAT_UPLOAD_KEY_PREFIX = "private-media/chat-uploads"
 _VERIFY_CHUNK_BYTES = 1024 * 1024
 _STREAM_CHUNK_BYTES = 4 * 1024 * 1024
 
@@ -220,19 +221,21 @@ def is_chat_upload_storage_configured() -> bool:
 
 
 def build_chat_upload_key(workspace_id: str, upload_id: str, safe_filename: str) -> str:
-    """Build an isolated object key under ``chat-uploads/<workspace_id>/<upload_id>/<safe_filename>``."""
+    """Build an isolated object key under ``private-media/chat-uploads/<workspace_id>/<upload_id>/<safe_filename>``."""
     ws = str(workspace_id or "").strip().strip("/")
     uid = str(upload_id or "").strip().strip("/")
     name = str(safe_filename or "attachment").strip().strip("/") or "attachment"
     if not ws or not uid or "/" in ws or "/" in uid or "/" in name:
         raise ValueError("Invalid chat upload key component")
-    return f"{CHAT_UPLOAD_KEY_PREFIX}/{ws}/{uid}/{name}"
+    return f"{PRIVATE_CHAT_UPLOAD_KEY_PREFIX}/{ws}/{uid}/{name}"
 
 
 def is_chat_upload_key(object_key: str) -> bool:
-    """Guard ensuring cleanup never touches keys outside ``chat-uploads/``."""
+    """Guard ensuring operations stay under ``private-media/chat-uploads/`` or legacy ``chat-uploads/``."""
     cleaned = str(object_key or "").strip().lstrip("/")
-    return cleaned.startswith(f"{CHAT_UPLOAD_KEY_PREFIX}/")
+    return cleaned.startswith(f"{PRIVATE_CHAT_UPLOAD_KEY_PREFIX}/") or cleaned.startswith(
+        f"{CHAT_UPLOAD_KEY_PREFIX}/"
+    )
 
 
 def is_chat_upload_key_for_workspace(object_key: str, workspace_id: str) -> bool:
@@ -241,7 +244,25 @@ def is_chat_upload_key_for_workspace(object_key: str, workspace_id: str) -> bool
     if not ws or "/" in ws:
         return False
     cleaned = str(object_key or "").strip().lstrip("/")
-    return cleaned.startswith(f"{CHAT_UPLOAD_KEY_PREFIX}/{ws}/")
+    return cleaned.startswith(f"{PRIVATE_CHAT_UPLOAD_KEY_PREFIX}/{ws}/") or cleaned.startswith(
+        f"{CHAT_UPLOAD_KEY_PREFIX}/{ws}/"
+    )
+
+
+def resolve_existing_chat_upload_key(object_key: str) -> str:
+    """Resolve existing chat-upload object key across ``private-media/chat-uploads/`` and legacy ``chat-uploads/``."""
+    cleaned = str(object_key or "").strip().lstrip("/")
+    if not is_chat_upload_key(cleaned):
+        return cleaned
+    if object_size(cleaned) is not None:
+        return cleaned
+    if cleaned.startswith(f"{PRIVATE_CHAT_UPLOAD_KEY_PREFIX}/"):
+        alt = cleaned[len("private-media/") :]
+    else:
+        alt = f"private-media/{cleaned}"
+    if object_size(alt) is not None:
+        return alt
+    return cleaned
 
 
 def open_multipart_upload(object_key: str, *, content_type: str) -> str | None:
@@ -249,14 +270,29 @@ def open_multipart_upload(object_key: str, *, content_type: str) -> str | None:
         raise ValueError(f"Refusing non-chat-upload object key: {object_key!r}")
     if not _has_dedicated_env():
         return _store.open_multipart_upload(object_key, content_type=content_type)
+    from src.dalton.share_media import is_acl_not_supported_error, storage_private_acl_kwargs
+
+    acl_kwargs = storage_private_acl_kwargs(
+        object_key, provider="s3", endpoint_url=_endpoint_url()
+    )
+    params: dict[str, Any] = {
+        "Bucket": _bucket_name(),
+        "Key": resolve_full_key(object_key),
+        "ContentType": content_type,
+        **acl_kwargs,
+    }
     try:
-        created = _get_client().create_multipart_upload(
-            Bucket=_bucket_name(),
-            Key=resolve_full_key(object_key),
-            ContentType=content_type,
-        )
+        created = _get_client().create_multipart_upload(**params)
         return created["UploadId"]
     except Exception as exc:
+        if acl_kwargs and is_acl_not_supported_error(exc):
+            params.pop("ACL", None)
+            try:
+                created = _get_client().create_multipart_upload(**params)
+                return created["UploadId"]
+            except Exception as retry_exc:
+                logger.error("Failed to open a multipart upload for %s: %s", object_key, retry_exc)
+                return None
         logger.error("Failed to open a multipart upload for %s: %s", object_key, exc)
         return None
 

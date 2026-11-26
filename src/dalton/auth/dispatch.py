@@ -13,12 +13,14 @@ Eliminates the passwordless ``local-dev-user`` bypass when ``DALTON_AUTH_MODE`` 
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
 import re
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request, WebSocket, WebSocketException, status
 from fastapi.security import HTTPAuthorizationCredentials
@@ -559,6 +561,210 @@ def resolve_messaging_service_flags(
     return (matched or is_dispatch), (matched or is_dispatch)
 
 
+_PROXY_FORWARD_HEADERS = frozenset(
+    {
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-forwarded-port",
+        "x-real-ip",
+        "cf-connecting-ip",
+        "true-client-ip",
+    }
+)
+_LOOPBACK_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _normalize_origin_str(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    val = str(raw).strip()
+    if not val or val.lower() == "null":
+        return None
+    try:
+        parts = urlsplit(val)
+    except Exception:
+        return None
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower().rstrip(".")
+    if scheme not in ("http", "https") or not host:
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    default_port = 443 if scheme == "https" else 80
+    if ":" in host and not host.startswith("["):
+        host_fmt = f"[{host}]"
+    else:
+        host_fmt = host
+    if port is not None and port != default_port:
+        return f"{scheme}://{host_fmt}:{port}"
+    return f"{scheme}://{host_fmt}"
+
+
+def _trusted_app_origins_for_loopback() -> frozenset[str]:
+    from src.config import env
+    from src.config.settings import get_allowed_origins
+
+    origins: set[str] = set()
+    for candidate in (
+        getattr(env, "PUBLIC_APP_URL", ""),
+        getattr(env, "SERVER_BASE_URL", ""),
+        *(get_allowed_origins() or ()),
+        *(os.getenv("DALTON_TRUSTED_APP_ORIGINS", "").split(",")),
+    ):
+        cand = str(candidate or "").strip()
+        if not cand or "*" in cand:
+            continue
+        norm = _normalize_origin_str(cand)
+        if norm:
+            origins.add(norm)
+    return frozenset(origins)
+
+
+def _scope_headers_map(scope: Mapping[str, Any]) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for raw_k, raw_v in scope.get("headers") or ():
+        k = (
+            raw_k.decode("latin-1") if isinstance(raw_k, (bytes, bytearray)) else str(raw_k)
+        ).lower()
+        v = (
+            raw_v.decode("latin-1") if isinstance(raw_v, (bytes, bytearray)) else str(raw_v)
+        )
+        headers[k] = v
+    return headers
+
+
+def _extract_host_hostname(host_header: str) -> str | None:
+    if not host_header:
+        return None
+    try:
+        name = urlsplit(f"//{host_header.strip()}").hostname
+        return name.lower().rstrip(".") if name else None
+    except ValueError:
+        return None
+
+
+def is_trusted_local_loopback_request(scope: Mapping[str, Any] | None) -> bool:
+    """Return True iff ``scope`` is a direct local loopback request with zero reverse-proxy headers.
+
+    Enforces all four conditions independently of ``LANGALPHA_OWNER_SECRET``:
+    1. Transport peer IP in ``scope['client']`` is loopback (``127.0.0.0/8`` or ``::1``;
+       Starlette in-process ``TestClient`` peer ``'testclient'`` is accepted only when
+       ``Host`` is ``testserver`` or a loopback host).
+    2. Zero reverse-proxy forwarding headers (``Forwarded``, ``X-Forwarded-*``,
+       ``X-Real-IP``, ``CF-Connecting-IP``, ``True-Client-IP``).
+    3. ``Host`` header hostname is a loopback host (``127.0.0.1``, ``localhost``, ``::1``).
+    4. Optional ``Origin`` header is not ``"null"`` and matches same-origin or
+       ``TRUSTED_APP_ORIGINS``.
+    """
+    if not isinstance(scope, Mapping):
+        return False
+
+    headers = _scope_headers_map(scope)
+
+    # 2. Reject any reverse-proxy forwarding header immediately
+    for hname in _PROXY_FORWARD_HEADERS:
+        if hname in headers:
+            return False
+
+    # 1. Check transport peer IP
+    client = scope.get("client")
+    if not isinstance(client, (tuple, list)) or len(client) < 1 or not client[0]:
+        return False
+    peer_host = str(client[0]).strip()
+    is_inprocess_testclient = peer_host == "testclient"
+    if not is_inprocess_testclient:
+        try:
+            if not ipaddress.ip_address(peer_host).is_loopback:
+                return False
+        except ValueError:
+            return False
+
+    # 3. Check Host header
+    host_raw = headers.get("host", "").strip()
+    hostname = _extract_host_hostname(host_raw)
+    if is_inprocess_testclient:
+        if hostname not in (*_LOOPBACK_HOSTNAMES, "testserver"):
+            return False
+    else:
+        if hostname not in _LOOPBACK_HOSTNAMES:
+            return False
+
+    # 4. Optional browser Origin header must not be opaque "null" and must match same-origin or trusted app origins
+    raw_origin = headers.get("origin")
+    if raw_origin is not None and raw_origin.strip() != "":
+        norm_origin = _normalize_origin_str(raw_origin)
+        if norm_origin is None:
+            return False
+        raw_scheme = str(scope.get("scheme") or "http").lower()
+        http_scheme = {"wss": "https", "ws": "http"}.get(raw_scheme, raw_scheme)
+        same_origin = _normalize_origin_str(f"{http_scheme}://{host_raw}")
+        trusted = _trusted_app_origins_for_loopback()
+        if norm_origin != same_origin and norm_origin not in trusted:
+            return False
+
+    return True
+
+
+def is_trusted_oss_local_owner(scope: Mapping[str, Any] | None) -> bool:
+    """Authoritative owner gate for ``HOST_MODE == 'oss'`` & ``DALTON_AUTH_MODE == 'oss'``.
+
+    - When ``LANGALPHA_OWNER_SECRET`` is configured: delegates to constant-time
+      ``owner_requests.is_owner(scope)`` (``X-LangAlpha-Owner`` header).
+    - When ``LANGALPHA_OWNER_SECRET`` is unset: refuses desktop-app empty-secret state
+      (``LANGALPHA_DESKTOP_APP == '1'``) and requires a direct non-proxied loopback
+      request via :func:`is_trusted_local_loopback_request`.
+    """
+    from src.server.auth import owner_requests
+
+    if not isinstance(scope, Mapping):
+        return False
+    secret = os.environ.get(owner_requests.OWNER_SECRET_ENV, "")
+    if secret:
+        return owner_requests.is_owner(scope)
+    if os.environ.get("LANGALPHA_DESKTOP_APP") == "1":
+        return False
+    return is_trusted_local_loopback_request(scope)
+
+
+def verify_oss_local_owner(scope: Mapping[str, Any] | None) -> None:
+    """Raise HTTP 401 when ``scope`` fails :func:`is_trusted_oss_local_owner`."""
+    from src.server.auth import owner_requests
+
+    if not is_trusted_oss_local_owner(scope):
+        raise HTTPException(status_code=401, detail=owner_requests.REFUSAL)
+
+
+async def verify_oss_websocket_owner(websocket: WebSocket) -> None:
+    """Reject untrusted OSS WebSocket handshakes with HTTP 401 (when supported) or WS 1008."""
+    from starlette.responses import JSONResponse
+    from src.server.auth import owner_requests
+
+    if is_trusted_oss_local_owner(websocket.scope):
+        return
+    reason = owner_requests.REFUSAL
+    extensions = websocket.scope.get("extensions") if isinstance(websocket.scope, Mapping) else None
+    if (
+        isinstance(extensions, Mapping)
+        and "websocket.http.response" in extensions
+        and hasattr(websocket, "send_denial_response")
+    ):
+        try:
+            await websocket.send_denial_response(
+                JSONResponse(status_code=401, content={"detail": reason})
+            )
+            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION, reason=reason)
+        except WebSocketException:
+            raise
+        except Exception:
+            pass
+    await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=reason)
+    raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION, reason=reason)
+
+
 async def dispatch_oss_user_id(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None,
@@ -568,6 +774,7 @@ async def dispatch_oss_user_id(
     """Resolve user_id in ``HOST_MODE == 'oss'`` for required-auth HTTP dependencies."""
     mode = get_dalton_auth_mode()
     if mode == "oss":
+        verify_oss_local_owner(request.scope)
         reject_company_system_auth(local_dev_user_id)
         _note_caller(request, local_dev_user_id, "session")
         return local_dev_user_id
@@ -593,12 +800,16 @@ async def dispatch_oss_optional_user_id(
     - Absent ``Authorization`` header -> ``None`` (anonymous).
     - Present ``Authorization`` header with empty/invalid/non-Bearer format or
       invalid/revoked JWT -> ``401`` (never silently downgraded to anonymous).
-    Under explicit ``oss`` mode: returns ``local_dev_user_id``.
+    Under explicit ``oss`` mode: returns ``local_dev_user_id`` only for trusted
+    local owner requests; otherwise returns ``None`` (anonymous) when no Bearer
+    credentials are presented.
     """
     mode = get_dalton_auth_mode()
     if mode == "oss":
-        reject_company_system_auth(local_dev_user_id)
-        return local_dev_user_id
+        if is_trusted_oss_local_owner(request.scope):
+            reject_company_system_auth(local_dev_user_id)
+            return local_dev_user_id
+        return None
     if mode == "local":
         if credentials is None or not credentials.credentials:
             headers = getattr(request, "headers", None)
@@ -617,10 +828,11 @@ async def dispatch_oss_jwt_user_id(
     credentials: HTTPAuthorizationCredentials | None,
     *,
     local_dev_user_id: str,
+    request: Request | None = None,
 ) -> str:
     """Resolve user_id for ``jwt_bearer.verify_jwt_token`` in ``HOST_MODE == 'oss'``."""
     info = await dispatch_oss_auth_info(
-        credentials, local_dev_user_id=local_dev_user_id
+        credentials, local_dev_user_id=local_dev_user_id, request=request
     )
     return info.user_id
 
@@ -629,12 +841,14 @@ async def dispatch_oss_auth_info(
     credentials: HTTPAuthorizationCredentials | None,
     *,
     local_dev_user_id: str,
+    request: Request | None = None,
 ) -> Any:
     """Resolve :class:`AuthInfo` for ``jwt_bearer.get_current_auth_info`` in ``HOST_MODE == 'oss'``."""
     from src.server.auth.jwt_bearer import AuthInfo
 
     mode = get_dalton_auth_mode()
     if mode == "oss":
+        verify_oss_local_owner(request.scope if request is not None else None)
         reject_company_system_auth(local_dev_user_id)
         return AuthInfo(user_id=local_dev_user_id)
     if mode == "local":
@@ -659,6 +873,7 @@ async def dispatch_oss_websocket(
     """
     mode = get_dalton_auth_mode()
     if mode == "oss":
+        await verify_oss_websocket_owner(websocket)
         if is_company_system_user(local_dev_user_id):
             await websocket.close(
                 code=status.WS_1008_POLICY_VIOLATION, reason="Invalid or expired token"

@@ -2418,13 +2418,19 @@ async def _run_in_thread_until_settled(
 
 async def _read_upstream_object_bytes(object_key: str) -> bytes:
     """Read upstream attachment object bytes; 409 when absent, 503 on transient store errors."""
+    from src.dalton.share_media import candidate_upstream_keys
+
     def _read() -> bytes | None:
-        try:
-            return get_upstream_attachment_bytes(object_key)
-        except Exception as exc:
-            if _is_missing_object_error(exc):
-                return None
-            raise _TransientAttachmentStorageError() from exc
+        for cand in candidate_upstream_keys(object_key):
+            try:
+                raw = get_upstream_attachment_bytes(cand)
+            except Exception as exc:
+                if _is_missing_object_error(exc):
+                    continue
+                raise _TransientAttachmentStorageError() from exc
+            if raw is not None:
+                return raw
+        return None
 
     raw_bytes = await _run_in_thread_until_settled(_read)
     if raw_bytes is not None:

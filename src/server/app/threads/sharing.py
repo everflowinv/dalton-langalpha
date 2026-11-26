@@ -10,7 +10,7 @@ import json
 from datetime import datetime, timezone
 
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Query
 
 # DALTON-HOOK(colleague-dispatch): auth_api module import and tier checks for sharing guards
 from src.server.utils import api as auth_api
@@ -18,9 +18,10 @@ from src.server.utils.api import (
     CurrentUserId,
 )
 from src.server.models.conversation import (
+    SharePermissions,
+    ShareRedactionSummary,  # DALTON-HOOK(share-redaction)
     ThreadShareRequest,
     ThreadShareResponse,
-    SharePermissions,
 )
 from src.dalton.access_tiers import get_user_tier as _default_get_user_tier
 from src.dalton.settings import (
@@ -246,8 +247,13 @@ async def update_thread_share(
             **existing_perms,
             **effective_req_permissions.model_dump(exclude_unset=True),
         }
-        # Enforce: download requires files
-        if merged.get("allow_download") and not merged.get("allow_files"):
+        # DALTON-HOOK(share-redaction): normalize allow_download=False whenever allow_files is False
+        if (
+            "allow_files" in effective_req_permissions.model_fields_set
+            and not merged.get("allow_files")
+        ):
+            merged["allow_download"] = False
+        elif merged.get("allow_download") and not merged.get("allow_files"):
             merged["allow_files"] = True
         kwargs["share_permissions"] = merged
         effective_perms = merged
@@ -265,6 +271,20 @@ async def update_thread_share(
         raise HTTPException(status_code=404, detail="Thread not found")
     _record_share_change(x_user_id, thread_id, thread, updated)
 
+    # DALTON-HOOK(share-redaction): warm raw turn_slices in background on share enable & compute DB-only summary
+    from src.dalton.share_redaction import (
+        schedule_warm_shared_thread_slices,
+        summarize_thread_share_redaction,
+    )
+
+    if updated.get("is_shared"):
+        schedule_warm_shared_thread_slices(thread_id)
+    summary_dict: dict | None = None
+    try:
+        summary_dict = await summarize_thread_share_redaction(thread_id)
+    except Exception:
+        summary_dict = None
+
     share_token = updated.get("share_token")
     perms = updated.get("share_permissions") or {}
     if isinstance(perms, str):
@@ -276,11 +296,17 @@ async def update_thread_share(
         share_url=f"/s/{share_token}" if updated["is_shared"] and share_token else None,
         permissions=SharePermissions(**(perms if isinstance(perms, dict) else {})),
         audiences=await offered(owner_id, thread_audience(_perms(perms))),
+        redaction_summary=ShareRedactionSummary(**summary_dict) if summary_dict is not None else None,
     )
 
 
 @router.get("/{thread_id}/share", response_model=ThreadShareResponse)
-async def get_thread_share(thread_id: str, x_user_id: CurrentUserId):
+async def get_thread_share(
+    thread_id: str,
+    x_user_id: CurrentUserId,
+    # DALTON-HOOK(share-redaction): on-demand DB-only summary when share panel opens
+    include_summary: bool = Query(False),
+):
     """Get current share status and permissions for a thread."""
     owner_id = (await _authorize_thread_share(thread_id, x_user_id)).owner_id
 
@@ -300,10 +326,20 @@ async def get_thread_share(thread_id: str, x_user_id: CurrentUserId):
     if isinstance(perms, str):
         perms = json.loads(perms)
 
+    # DALTON-HOOK(share-redaction): only scan DB rows when panel explicitly asks for include_summary=true
+    summary_obj: ShareRedactionSummary | None = None
+    if include_summary:
+        from src.dalton.share_redaction import summarize_thread_share_redaction
+
+        summary_obj = ShareRedactionSummary(
+            **(await summarize_thread_share_redaction(thread_id))
+        )
+
     return ThreadShareResponse(
         is_shared=is_shared,
         share_token=share_token if is_shared else None,
         share_url=f"/s/{share_token}" if is_shared and share_token else None,
         permissions=SharePermissions(**(perms if isinstance(perms, dict) else {})),
         audiences=await offered(owner_id, thread_audience(_perms(perms))),
+        redaction_summary=summary_obj,
     )

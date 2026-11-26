@@ -168,7 +168,12 @@ async def build_attachment_metadata(
     attachment has none without storage.
     """
     batch_id = uuid.uuid4().hex[:12]
-    prefix = f"attachments/{thread_id}/{batch_id}" if thread_id else f"attachments/{batch_id}"
+    # DALTON-HOOK(share-redaction): write new inline attachments under private-media/ prefix
+    prefix = (
+        f"private-media/attachments/{thread_id}/{batch_id}"
+        if thread_id
+        else f"private-media/attachments/{batch_id}"
+    )
 
     async def entry(att: TurnAttachment) -> Dict[str, Any]:
         meta: Dict[str, Any] = {"name": att.name, "type": att.kind, "size": att.size}

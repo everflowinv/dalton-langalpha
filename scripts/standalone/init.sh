@@ -1320,8 +1320,17 @@ main() {
   fi
   local compose_build_cmd="env -u VITE_DALTON_AUTH ${compose_base_cmd} build"
   local compose_start_cmd="${compose_base_cmd} up -d"
-  local vite_auth
+  local vite_auth auth_mode_cur owner_secret_cur
   vite_auth="$(get_env_value_any "VITE_DALTON_AUTH")"
+  auth_mode_cur="$(get_env_value_any "DALTON_AUTH_MODE")"
+  owner_secret_cur="$(get_env_value_any "LANGALPHA_OWNER_SECRET")"
+
+  if [[ "${auth_mode_cur:-}" == "oss" && -z "${owner_secret_cur:-}" ]]; then
+    warn "Unkeyed DALTON_AUTH_MODE=oss behind the Compose Caddy 'edge' proxy rejects owner API & WebSocket requests with HTTP 401."
+    warn "Switch to local auth in .env: set DALTON_AUTH_MODE=local and VITE_DALTON_AUTH=local, remove DALTON_ALLOW_DEV_OSS_AUTH, then rebuild:"
+    warn "  env -u VITE_DALTON_AUTH ${compose_base_cmd} build backend edge && ${compose_start_cmd}"
+    warn "Then open ${public_url}/setup/admin with BOOTSTRAP_SETUP_TOKEN to create your admin account."
+  fi
 
   printf "\n== Next Steps ==\n"
   if [[ "$NON_INTERACTIVE" -eq 0 ]]; then

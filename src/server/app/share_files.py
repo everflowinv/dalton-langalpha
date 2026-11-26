@@ -240,8 +240,12 @@ async def _stored_listing(target: SharedFileTarget, normalized_path: str) -> lis
 async def list_shared_files(
     share_token: str,
     path: str = Query(".", description="Directory to list."),
+    response: Response = None,  # DALTON-HOOK(share-redaction)
 ):
     """List files in a shared thread's workspace. Requires allow_files permission."""
+    # DALTON-HOOK(share-redaction): enforce Cache-Control: no-store on all public file routes
+    if response is not None:
+        response.headers["Cache-Control"] = "no-store"
     # Reject `..` before it reaches the sandbox path validator, which only
     # prefix-checks the work dir and does not resolve `..`, so an unresolved
     # `../../etc/passwd` would otherwise read outside the workspace on a live
@@ -266,13 +270,20 @@ async def list_shared_files(
 
 
 @share_files_router.post("/shared/{share_token}/files/resolve")
-async def resolve_shared_file(share_token: str, body: ResolveFileRefRequest):
+async def resolve_shared_file(
+    share_token: str,
+    body: ResolveFileRefRequest,
+    response: Response = None,  # DALTON-HOOK(share-redaction)
+):
     """Resolve a file reference inside a shared thread's workspace.
 
     Matches against the same listing the shared file panel browses, so it never
     wakes a sandbox and never finds a file that listing would hide, the share
     scope included.
     """
+    # DALTON-HOOK(share-redaction): enforce Cache-Control: no-store on all public file routes
+    if response is not None:
+        response.headers["Cache-Control"] = "no-store"
     target = await resolve_shared_files(share_token, require_files=True)
     if is_unbound(target.workspace):
         return {"status": "unavailable", "reason": HOME_NOT_ON_COMPUTER_REASON, "matches": []}
@@ -308,8 +319,12 @@ async def read_shared_file(
         le=DEFAULT_READ_LIMIT_LINES,
         description="Max lines.",
     ),
+    response: Response = None,  # DALTON-HOOK(share-redaction)
 ):
     """Read a text file from a shared thread's workspace. Requires allow_files permission."""
+    # DALTON-HOOK(share-redaction): enforce Cache-Control: no-store on all public file routes
+    if response is not None:
+        response.headers["Cache-Control"] = "no-store"
     # See list_shared_files: reject `..` before the sandbox validator, which
     # does not resolve it.
     if _has_traversal(path):
@@ -385,7 +400,11 @@ async def download_shared_file(
     return StreamingResponse(
         iter([content]),
         media_type=resolved.mime or "application/octet-stream",
-        headers={"Content-Disposition": content_disposition(filename)},
+        headers={
+            "Content-Disposition": content_disposition(filename),
+            # DALTON-HOOK(share-redaction): enforce Cache-Control: no-store on all public file routes
+            "Cache-Control": "no-store",
+        },
     )
 
 
@@ -441,7 +460,7 @@ async def serve_shared_file(
         target = await resolve_shared_files(share_token, require_files=True)
 
         if format == "pdf":
-            return await render_workspace_file_pdf(
+            resp = await render_workspace_file_pdf(
                 target.workspace_id,
                 path,
                 workspace=target.workspace,
@@ -451,8 +470,11 @@ async def serve_shared_file(
                 visible=target.visible,
                 serve_base=prefix,
             )
+            # DALTON-HOOK(share-redaction): override _WSFILES_CACHE_CONTROL to no-store for public shares
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
 
-        return await serve_workspace_file(
+        resp = await serve_workspace_file(
             target.workspace_id,
             path,
             # A visitor never comments, so any bridge asked for is the view's.
@@ -460,6 +482,9 @@ async def serve_shared_file(
             workspace=target.workspace,
             visible=target.visible,
         )
+        # DALTON-HOOK(share-redaction): override _WSFILES_CACHE_CONTROL to no-store for public shares
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
     except (SandboxGoneError, SandboxTransientError):
         # This route is unauthenticated, so it must never distinguish "sandbox
         # down" from "no such file", a 503 would confirm that a guessed
@@ -467,6 +492,7 @@ async def serve_shared_file(
         # here; this keeps the 404 posture from depending on that.
         page = unavailable_response(request, 404)
         if page is not None:
+            page.headers["Cache-Control"] = "no-store"
             return page
         raise HTTPException(status_code=404, detail=_NOT_FOUND) from None
     except HTTPException as exc:
@@ -475,5 +501,9 @@ async def serve_shared_file(
         # (Accept without text/html) keep the default JSON error.
         page = unavailable_response(request, exc.status_code)
         if page is not None:
+            # DALTON-HOOK(share-redaction): propagate no-store and Clear-Site-Data on 403 HTML fallback
+            page.headers["Cache-Control"] = "no-store"
+            if exc.status_code == 403:
+                page.headers["Clear-Site-Data"] = '"cache"'
             return page
         raise

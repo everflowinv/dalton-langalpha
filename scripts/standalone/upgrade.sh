@@ -1417,3 +1417,15 @@ printf "  Edge TLS mode    : %s\n" "$TLS_MODE"
 printf "\n  Next steps:\n"
 printf "  - Verify running containers: %s\n" "$(fmt_cmd docker compose "${COMPOSE_PRINT_ARGS[@]}" ps)"
 printf "  - Keep %s and %s until you confirm normal operation.\n" "$PRE_UPGRADE_BACKUP" "$SNAPSHOT_DIR"
+
+UPGRADED_AUTH_MODE="$(read_env_file_var "$ENV_FILE" "DALTON_AUTH_MODE" "")"
+UPGRADED_OWNER_SECRET="$(read_env_file_var "$ENV_FILE" "LANGALPHA_OWNER_SECRET" "")"
+if [[ "$UPGRADED_AUTH_MODE" == "oss" && -z "$UPGRADED_OWNER_SECRET" ]]; then
+  warn "Detected DALTON_AUTH_MODE=oss without LANGALPHA_OWNER_SECRET behind the Compose Caddy 'edge' proxy."
+  warn "Owner API & WebSocket requests proxied through 'edge' now return HTTP 401 (public /s/* and /a/* links remain accessible)."
+  warn "To switch this instance to local sign-in:"
+  warn "  1. In ${ENV_FILE}, set DALTON_AUTH_MODE=local, VITE_DALTON_AUTH=local, and remove DALTON_ALLOW_DEV_OSS_AUTH."
+  warn "     (If JWT_SIGNING_SECRET or BOOTSTRAP_SETUP_TOKEN is missing, run: bash scripts/standalone/init.sh --domain ${DOMAIN})"
+  warn "  2. Rebuild & restart: env -u VITE_DALTON_AUTH $(fmt_cmd docker compose "${COMPOSE_PRINT_ARGS[@]}" build backend edge) && $(fmt_cmd docker compose "${COMPOSE_PRINT_ARGS[@]}" up -d)"
+  warn "  3. Open /setup/admin with BOOTSTRAP_SETUP_TOKEN to create the first local admin account."
+fi

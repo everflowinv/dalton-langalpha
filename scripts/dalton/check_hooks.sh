@@ -520,6 +520,9 @@ ALLOWED_HOOKS=(
   "channel-chart-snapshot"
   # Channel phase 2 batch 2: web deep-link query params (?chart=&layer= and ?widget=) in ChatView.
   "channel-deep-links"
+  # AU1 Public share redaction: strict allow_files=false redaction, controlled media,
+  # org-library/activity title & summary scrubbing, and unkeyed OSS loopback gate.
+  "share-redaction"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -581,6 +581,15 @@ class ThreadShareRequest(BaseModel):
     )
 
 
+class ShareRedactionSummary(BaseModel):
+    """DB-only counts of items hidden when ``allow_files=false`` (DALTON-HOOK(share-redaction))."""
+
+    widgets: int = 0
+    tool_calls: int = 0
+    images: int = 0
+    attachments: int = 0
+
+
 class ThreadShareResponse(BaseModel):
     """Response model for thread share status."""
     is_shared: bool = Field(..., description="Whether the thread is publicly shared")
@@ -593,6 +602,8 @@ class ThreadShareResponse(BaseModel):
         default_factory=lambda: ["public"],
         description="The audiences the owner may choose for the link now",
     )
+    # DALTON-HOOK(share-redaction): optional DB-only redaction summary populated on share panel open & update
+    redaction_summary: Optional[ShareRedactionSummary] = None
 
 
 # ==================== Feedback Models ====================

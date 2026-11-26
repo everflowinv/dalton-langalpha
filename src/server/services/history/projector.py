@@ -48,8 +48,6 @@ from src.server.utils.content_normalizer import normalize_text_content
 from src.server.utils.error_sanitization import (
     sanitize_error_text as _sanitize_error_text,
 )
-# DALTON-HOOK(thinking-leak): replay shows the same filtered assistant text as the live stream.
-from src.server.utils.thinking_leak import visible_assistant_text
 from src.server.utils.text_phase import agreed_phase, block_phase
 
 if TYPE_CHECKING:
@@ -319,15 +317,17 @@ def _project_ai_message(
     # A compaction before this call: live, its signal fires before the call
     # streams, so the notice sits between the calls it fell between.
     events.extend(_stamped_summary(message, agent))
-    text, reasoning, phase = split_content_blocks(message.content)
-    if is_close_out_reply(message):
-        # Live the plan's close-out is never streamed, and its reasoning is
-        # kept only for the provider: its plan calls alone are shown.
-        text = reasoning = None
+    # DALTON-HOOK(share-redaction): split mixed-phase AIMessage blocks into ordered per-phase segments
+    from src.dalton.history_phase import split_content_blocks_by_phase
+
     tool_calls = _filter_tool_calls(message.tool_calls or [])
-    # DALTON-HOOK(thinking-leak): the checkpoint message is left as stored.
-    if text:
-        text = visible_assistant_text(text, followed_by_tool_call=bool(tool_calls)) or None
+    text_segments, reasoning = (
+        ([], None)
+        if is_close_out_reply(message)
+        else split_content_blocks_by_phase(
+            message.content, followed_by_tool_call=bool(tool_calls)
+        )
+    )
 
     if reasoning:
         events.append(
@@ -340,13 +340,14 @@ def _project_ai_message(
             HistoryEvent("reasoning-signal", agent, message_id, {"signal": "complete"})
         )
 
-    if text:
+    for idx, (seg_text, seg_phase) in enumerate(text_segments):
+        is_last = idx == len(text_segments) - 1
         text_data: dict[str, Any] = {
-            "content": text,
-            "finish_reason": None if tool_calls else "stop",
+            "content": seg_text,
+            "finish_reason": None if (tool_calls or not is_last) else "stop",
         }
-        if phase:
-            text_data["phase"] = phase
+        if seg_phase:
+            text_data["phase"] = seg_phase
         events.append(HistoryEvent("text", agent, message_id, text_data))
 
     if tool_calls:

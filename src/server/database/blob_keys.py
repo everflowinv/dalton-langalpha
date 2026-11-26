@@ -117,7 +117,8 @@ def attachment_key(attachment_id: str, name: str) -> str:
         raise BlobError(msg)
     lines = name.splitlines()
     segment = (lines[0].strip()[:120] if lines else "").replace("/", "_") or "file"
-    return f"{ATTACHMENT_KEY_PREFIX}{attachment_id}/{segment}"
+    # DALTON-HOOK(share-redaction): write new staged chat attachments under private-media/ prefix
+    return f"private-media/{ATTACHMENT_KEY_PREFIX}{attachment_id}/{segment}"
 
 
 # --- registry SQL -------------------------------------------------------------

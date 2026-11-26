@@ -1855,6 +1855,10 @@ if self_hosted():
 
 # Include all routers
 app.include_router(threads_router)  # /api/v1/threads/* - Thread CRUD, messages, control
+# DALTON-HOOK(share-redaction): mount controlled owner thread media endpoint
+from src.dalton.share_media import owner_media_router as _dalton_owner_media_router
+
+app.include_router(_dalton_owner_media_router)
 app.include_router(search_router)  # /api/v1/search - Conversation search (command palette)
 app.include_router(sessions_router)  # /api/v1/sessions - Active session stats
 app.include_router(home_router)  # /api/v1/workspaces/home* - Home and its stand-in

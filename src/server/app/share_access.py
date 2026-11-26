@@ -219,23 +219,43 @@ async def resolve_shared_files(
     thread = await get_shared_thread(share_token)
     perms = get_permissions(thread)
 
-    if require_files:
-        require_permission(perms, "allow_files")
-    if require_download:
-        require_permission(perms, "allow_download")
+    # DALTON-HOOK(share-redaction): enforce effective allow_files before download/file access (closes allow_files=false,allow_download=true bypass)
+    from src.dalton.share_redaction import resolve_effective_share_permissions
+
+    _deny_headers = {"Cache-Control": "no-store", "Clear-Site-Data": '"cache"'}
+    if require_files or require_download:
+        eff_pre = await resolve_effective_share_permissions(thread)
+        if not eff_pre.allow_files:
+            raise HTTPException(
+                status_code=403,
+                detail="Permission 'allow_files' not granted for this shared thread",
+                headers=_deny_headers,
+            )
+        if require_download and not eff_pre.allow_download:
+            raise HTTPException(
+                status_code=403,
+                detail="Permission 'allow_download' not granted for this shared thread",
+                headers=_deny_headers,
+            )
 
     workspace_id = str(thread["workspace_id"])
     workspace, work_dir = await _serving_workspace(workspace_id)
 
-    # DALTON-HOOK(monitors): refuse historical or non-admin shared-thread workspace
-    # file access while keeping public conversation replay accessible.
-    if (require_files or require_download) and not await shared_thread_allows_files(
-        thread, workspace
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="仅管理员开启的公开对话分享允许访问工作区文件",
-        )
+    # DALTON-HOOK(share-redaction): re-verify effective permissions with resolved workspace owner
+    if require_files or require_download:
+        eff = await resolve_effective_share_permissions(thread, workspace)
+        if not eff.allow_files:
+            raise HTTPException(
+                status_code=403,
+                detail="仅管理员开启的公开对话分享允许访问工作区文件",
+                headers=_deny_headers,
+            )
+        if require_download and not eff.allow_download:
+            raise HTTPException(
+                status_code=403,
+                detail="Permission 'allow_download' not granted for this shared thread",
+                headers=_deny_headers,
+            )
 
     raw_root = perms.get(SHARE_ROOT_PATH_KEY) or ""
     if not raw_root:

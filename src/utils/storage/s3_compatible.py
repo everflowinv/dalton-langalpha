@@ -68,14 +68,32 @@ def upload_file(key: str, file_path: str, content_type: str | None = None) -> bo
 
     try:
         client = _get_client()
+        # DALTON-HOOK(share-redaction): attach object-level private ACL for all non-avatar keys
+        from src.dalton.share_media import (
+            is_acl_not_supported_error,
+            storage_private_acl_kwargs,
+        )
+
+        acl_kwargs = storage_private_acl_kwargs(
+            key, provider="s3", endpoint_url=StorageConfig.ENDPOINT_URL
+        )
         put_args: dict[str, Any] = {
             "Bucket": StorageConfig.BUCKET_NAME,
             "Key": key,
             "ContentType": content_type,
+            **acl_kwargs,
         }
         with path_obj.open("rb") as f:
             put_args["Body"] = f
-            client.put_object(**put_args)
+            try:
+                client.put_object(**put_args)
+            except ClientError as exc:
+                if acl_kwargs and is_acl_not_supported_error(exc):
+                    put_args.pop("ACL", None)
+                    f.seek(0)
+                    client.put_object(**put_args)
+                else:
+                    raise
         logger.debug(f"Uploaded {path_obj} as {key}")
         return True
     except ClientError:
@@ -125,13 +143,30 @@ def upload_bytes(
 
     try:
         client = _get_client()
+        # DALTON-HOOK(share-redaction): attach object-level private ACL for all non-avatar keys
+        from src.dalton.share_media import (
+            is_acl_not_supported_error,
+            storage_private_acl_kwargs,
+        )
+
+        acl_kwargs = storage_private_acl_kwargs(
+            key, provider="s3", endpoint_url=StorageConfig.ENDPOINT_URL
+        )
         put_args: dict[str, Any] = {
             "Bucket": StorageConfig.BUCKET_NAME,
             "Key": key,
             "Body": data,
             "ContentType": content_type,
+            **acl_kwargs,
         }
-        client.put_object(**put_args)
+        try:
+            client.put_object(**put_args)
+        except ClientError as exc:
+            if acl_kwargs and is_acl_not_supported_error(exc):
+                put_args.pop("ACL", None)
+                client.put_object(**put_args)
+            else:
+                raise
         logger.debug(f"Uploaded bytes as {key}")
         return True
     except ClientError:
@@ -354,12 +389,33 @@ def create_signed_multipart_upload(
 
 def open_multipart_upload(key: str, *, content_type: str) -> str | None:
     """Start a multipart upload under ``key``; its upload id, or ``None`` if refused."""
+    # DALTON-HOOK(share-redaction): attach object-level private ACL on multipart initiation for non-avatar keys
+    from src.dalton.share_media import (
+        is_acl_not_supported_error,
+        storage_private_acl_kwargs,
+    )
+
+    acl_kwargs = storage_private_acl_kwargs(
+        key, provider="s3", endpoint_url=StorageConfig.ENDPOINT_URL
+    )
+    params: dict[str, Any] = {
+        "Bucket": StorageConfig.BUCKET_NAME,
+        "Key": key,
+        "ContentType": content_type,
+        **acl_kwargs,
+    }
     try:
-        created = _get_client().create_multipart_upload(
-            Bucket=StorageConfig.BUCKET_NAME, Key=key, ContentType=content_type
-        )
+        created = _get_client().create_multipart_upload(**params)
         return created["UploadId"]
     except Exception as e:
+        if acl_kwargs and is_acl_not_supported_error(e):
+            params.pop("ACL", None)
+            try:
+                created = _get_client().create_multipart_upload(**params)
+                return created["UploadId"]
+            except Exception as retry_e:
+                logger.error(f"Failed to open a multipart upload for {key}: {retry_e}")
+                return None
         logger.error(f"Failed to open a multipart upload for {key}: {e}")
         return None
 
