@@ -874,6 +874,7 @@ async def create_workspace_on_computer(
     # --- DALTON-HOOK(workspace-dedup): begin ---
     target_ticker: Optional[str] = None,
     raise_on_duplicate_conflict: bool = False,
+    on_workspace_inserted: Optional[Any] = None,
     # --- DALTON-HOOK(workspace-dedup): end ---
     conn=None,
 ) -> Optional[Dict[str, Any]]:
@@ -1032,6 +1033,9 @@ async def create_workspace_on_computer(
                             await start_new_workspace_selection(
                                 cur, user_id, workspace_id, like_workspace_id=selection_from
                             )
+                            # DALTON-HOOK(workspace-dedup): commit company identity in the same transaction as workspace insert
+                            if on_workspace_inserted is not None:
+                                await on_workspace_inserted(owned, row)
                     break
                 except UniqueViolation as e:
                     if _violated_index(e) not in (_COMPUTER_DIR_INDEX, None):
@@ -1306,7 +1310,7 @@ async def get_workspaces_for_user(
         raise
 
 
-# --- DALTON-HOOK(cos-settings-tools): begin ---
+# DALTON-HOOK(cos-settings-tools): thin delegation to src/dalton locked duplicate recheck (keeps all Dalton SQL out of upstream)
 async def check_duplicate_snapshot_unchanged(
     cur,
     user_id: str,
@@ -1316,346 +1320,24 @@ async def check_duplicate_snapshot_unchanged(
     expected_duplicate_workspace_name: Optional[str] = None,
     verified_company_candidates: Optional[Iterable[Tuple[Any, ...]]] = None,
     check_colleague_duplicate: bool = False,
-    # DALTON-HOOK(workspace-dedup): optional explicit ticker and conflict output for web concurrent create recheck
     target_ticker: Optional[str] = None,
     conflict_out: Optional[Dict[str, Any]] = None,
     conn: Any = None,
 ) -> bool:
-    """Deterministic Phase 2 duplicate verification under ``lock_user_writes``.
-
-    Runs entirely inside a single savepoint on the caller's transaction
-    connection — never calls an LLM and never acquires a second connection from
-    the pool. Any SQL error (including ``dalton_user_roles`` or workspace/unit
-    reads) rolls back the savepoint so the outer transaction stays usable and
-    fails closed by returning ``False`` (triggering ``scope_changed``).
-
-    Shares the exact same canonical ticker normalizer
-    (``normalize_ticker_key`` / ``canonical_workspace_ticker_key``) and
-    internal-team owner classifier (``is_internal_team_owner``) as Phase 1.
-
-    Returns ``False`` when:
-    - Any live workspace of ``user_id`` other than
-      ``expected_duplicate_workspace_id`` shares the same ``workspace_name_key``,
-      canonical ticker key (``700.HK`` / ``0700.HK`` / ``00700``), or company
-      knowledge document ticker;
-    - A listed ``expected_duplicate_workspace_id`` was deleted, renamed away
-      from ``expected_duplicate_workspace_name``, or no longer duplicates
-      ``name``;
-    - ``check_colleague_duplicate`` is True and any live internal-team
-      colleague workspace shares the same ``workspace_name_key``, canonical
-      ticker key, active company coverage unit canonical ticker key, or company
-      knowledge document canonical ticker key;
-    - Any candidate ``(workspace_id, name, unit_ticker[, doc_ticker])`` observed
-      during the lock-free Phase 1 check was deleted, renamed, or changed its
-      active company unit / knowledge doc canonical ticker key, or a new live
-      candidate workspace appeared since Phase 1.
-    """
-    from src.dalton.coverage.identity import (
-        canonical_workspace_ticker_key,
-        normalize_ticker_key,
+    from src.dalton.coverage.locked_recheck import (
+        check_duplicate_snapshot_unchanged as _dalton_check_duplicate_snapshot_unchanged,
     )
-    from src.tools.secretary.approvals import is_duplicate_name
 
-    target_ticker_keys: set[str] = set()
-    name_ticker_key = canonical_workspace_ticker_key(name)
-    if name_ticker_key is not None:
-        target_ticker_keys.add(name_ticker_key)
-    explicit_ticker_key = normalize_ticker_key(target_ticker)
-    if explicit_ticker_key is not None:
-        target_ticker_keys.add(explicit_ticker_key)
-
-    try:
-        target_name_key: Optional[str] = workspace_name_key(name)
-    except WorkspaceNameInvalid:
-        target_name_key = None
-
-    def _same_name_or_ticker(
-        target: str, candidate: str, *, candidate_is_ticker: bool = False
-    ) -> bool:
-        if is_duplicate_name(target, candidate):
-            return True
-        if target_ticker_keys:
-            cand_key = (
-                normalize_ticker_key(candidate)
-                if candidate_is_ticker
-                else canonical_workspace_ticker_key(candidate)
-            )
-            if cand_key is not None and cand_key in target_ticker_keys:
-                return True
-        return False
-
-    def _record_conflict(ws_id: Optional[str], *, exact_name: Optional[Tuple[str, str]] = None) -> None:
-        if conflict_out is None:
-            return
-        if ws_id:
-            conflict_out["workspace_id"] = ws_id
-        if exact_name is not None:
-            conflict_out["exact_name_taken"] = exact_name
-
-    has_verified_snapshot = verified_company_candidates is not None
-    candidates_list = list(verified_company_candidates) if verified_company_candidates is not None else []
-    verified_ids = {str(cand[0]) for cand in candidates_list}
-
-    def _unpack_candidate(cand: Tuple[Any, ...]) -> Tuple[str, str, Optional[str], bool, Optional[str]]:
-        if len(cand) >= 4:
-            return str(cand[0]), str(cand[1]), cand[2], True, cand[3]
-        return str(cand[0]), str(cand[1]), cand[2], False, None
-
-    async def _run_checks(check_cur) -> bool:
-        await check_cur.execute(
-            f"""
-            SELECT workspace_id,
-                   name,
-                   NULLIF(BTRIM(COALESCE(config->>'dalton_historical_duplicate_of', '')), '') IS NOT NULL AS is_historical_duplicate,
-                   (
-                       SELECT NULLIF(BTRIM(kv.content->>'ticker'), '')
-                       FROM dalton_knowledge_versions kv
-                       WHERE kv.workspace_id = workspaces.workspace_id
-                         AND kv.schema_valid = TRUE
-                         AND kv.doc_key = 'company'
-                       ORDER BY kv.version_no DESC
-                       LIMIT 1
-                   ) AS doc_ticker
-            FROM workspaces
-            WHERE user_id = %(user_id)s AND {FENCE_LIVE_WORKSPACE}
-            """,
-            {"user_id": user_id},
-        )
-        live_rows = await check_cur.fetchall()
-        matched_expected = False
-        for live_ws in live_rows:
-            live_id = str(live_ws["workspace_id"])
-            live_name = str(live_ws.get("name") or "")
-            is_hist = bool(live_ws.get("is_historical_duplicate"))
-            live_doc_ticker = normalize_ticker_key(live_ws.get("doc_ticker"))
-            if (
-                expected_duplicate_workspace_id is not None
-                and live_id == expected_duplicate_workspace_id
-            ):
-                if (
-                    expected_duplicate_workspace_name is not None
-                    and live_name != expected_duplicate_workspace_name
-                ):
-                    return False
-                matches_expected = _same_name_or_ticker(name, live_name) or (
-                    not is_hist
-                    and live_doc_ticker is not None
-                    and _same_name_or_ticker(
-                        name, live_doc_ticker, candidate_is_ticker=True
-                    )
-                )
-                if not matches_expected:
-                    return False
-                matched_expected = True
-                continue
-            if _same_name_or_ticker(name, live_name):
-                exact_pair: Optional[Tuple[str, str]] = None
-                if target_name_key is not None:
-                    try:
-                        if workspace_name_key(live_name) == target_name_key:
-                            exact_pair = (live_name, live_id)
-                    except WorkspaceNameInvalid:
-                        pass
-                _record_conflict(live_id, exact_name=exact_pair)
-                return False
-            if (
-                not is_hist
-                and live_doc_ticker is not None
-                and _same_name_or_ticker(name, live_doc_ticker, candidate_is_ticker=True)
-            ):
-                _record_conflict(live_id)
-                return False
-            if (
-                has_verified_snapshot
-                and not check_colleague_duplicate
-                and not is_hist
-                and live_id not in verified_ids
-            ):
-                return False
-        if expected_duplicate_workspace_id is not None and not matched_expected:
-            return False
-
-        if check_colleague_duplicate:
-            from src.dalton import settings as dalton_settings
-            from src.dalton.sharing import is_internal_team_owner
-
-            internal_user_ids: Optional[set[str]] = None
-            if dalton_settings.is_dalton_local_auth_enabled():
-                await check_cur.execute(
-                    """
-                    SELECT user_id
-                    FROM dalton_user_roles
-                    WHERE tier IN ('admin', 'internal')
-                    """
-                )
-                internal_user_ids = {
-                    str(r["user_id"]).strip()
-                    for r in await check_cur.fetchall()
-                    if r and r.get("user_id")
-                }
-
-            await check_cur.execute(
-                """
-                SELECT w.workspace_id::text AS workspace_id,
-                       w.user_id,
-                       w.name,
-                       u.email AS owner_email,
-                       (
-                           SELECT cu.ticker
-                           FROM dalton_coverage_units cu
-                           WHERE cu.workspace_id = w.workspace_id
-                             AND cu.status = 'active'
-                             AND cu.kind = 'company'
-                           ORDER BY cu.updated_at DESC NULLS LAST
-                           LIMIT 1
-                       ) AS unit_ticker,
-                       (
-                           SELECT NULLIF(BTRIM(kv.content->>'ticker'), '')
-                           FROM dalton_knowledge_versions kv
-                           WHERE kv.workspace_id = w.workspace_id
-                             AND kv.schema_valid = TRUE
-                             AND kv.doc_key = 'company'
-                           ORDER BY kv.version_no DESC
-                           LIMIT 1
-                       ) AS doc_ticker
-                FROM workspaces w
-                LEFT JOIN users u ON u.user_id = w.user_id
-                WHERE w.status NOT IN ('deleted', 'unbound')
-                  AND (w.config->'home_stand_in') IS DISTINCT FROM 'true'::jsonb
-                  AND NULLIF(BTRIM(COALESCE(w.config->>'dalton_historical_duplicate_of', '')), '') IS NULL
-                """
-            )
-            team_rows = await check_cur.fetchall()
-            live_by_id: dict[str, dict[str, Any]] = {}
-            for row in team_rows:
-                ws_id_s = str(row["workspace_id"])
-                ws_owner = str(row.get("user_id") or "").strip()
-                ws_name = str(row.get("name") or "").strip()
-                ws_email = row.get("owner_email")
-                unit_ticker = normalize_ticker_key(row.get("unit_ticker"))
-                doc_ticker = normalize_ticker_key(row.get("doc_ticker"))
-                live_by_id[ws_id_s] = {
-                    "name": ws_name,
-                    "unit_ticker": unit_ticker,
-                    "doc_ticker": doc_ticker,
-                }
-                if not ws_name:
-                    continue
-                if not is_internal_team_owner(
-                    ws_owner,
-                    ws_email,
-                    local_internal_user_ids=internal_user_ids,
-                ):
-                    continue
-                if (
-                    expected_duplicate_workspace_id is not None
-                    and ws_id_s == expected_duplicate_workspace_id
-                ):
-                    continue
-                if _same_name_or_ticker(name, ws_name):
-                    _record_conflict(ws_id_s)
-                    return False
-                if unit_ticker is not None and _same_name_or_ticker(
-                    name, unit_ticker, candidate_is_ticker=True
-                ):
-                    _record_conflict(ws_id_s)
-                    return False
-                if doc_ticker is not None and _same_name_or_ticker(
-                    name, doc_ticker, candidate_is_ticker=True
-                ):
-                    _record_conflict(ws_id_s)
-                    return False
-                if has_verified_snapshot and ws_id_s not in verified_ids:
-                    return False
-
-            for cand in candidates_list:
-                cand_id, cand_name, cand_ticker, has_doc_ticker, cand_doc_ticker = (
-                    _unpack_candidate(cand)
-                )
-                current = live_by_id.get(cand_id)
-                if current is None:
-                    return False
-                if current["name"] != cand_name.strip():
-                    return False
-                if current["unit_ticker"] != normalize_ticker_key(cand_ticker):
-                    return False
-                if has_doc_ticker and current["doc_ticker"] != normalize_ticker_key(
-                    cand_doc_ticker
-                ):
-                    return False
-        elif candidates_list:
-            cand_ids = [str(cand[0]) for cand in candidates_list]
-            await check_cur.execute(
-                """
-                SELECT w.workspace_id::text AS workspace_id,
-                       w.name,
-                       (
-                           SELECT cu.ticker
-                           FROM dalton_coverage_units cu
-                           WHERE cu.workspace_id = w.workspace_id
-                             AND cu.status = 'active'
-                             AND cu.kind = 'company'
-                           ORDER BY cu.updated_at DESC NULLS LAST
-                           LIMIT 1
-                       ) AS unit_ticker,
-                       (
-                           SELECT NULLIF(BTRIM(kv.content->>'ticker'), '')
-                           FROM dalton_knowledge_versions kv
-                           WHERE kv.workspace_id = w.workspace_id
-                             AND kv.schema_valid = TRUE
-                             AND kv.doc_key = 'company'
-                           ORDER BY kv.version_no DESC
-                           LIMIT 1
-                       ) AS doc_ticker
-                FROM workspaces w
-                WHERE w.workspace_id = ANY(%(ws_ids)s::uuid[])
-                  AND w.status NOT IN ('deleted', 'unbound')
-                  AND (w.config->'home_stand_in') IS DISTINCT FROM 'true'::jsonb
-                  AND NULLIF(BTRIM(COALESCE(w.config->>'dalton_historical_duplicate_of', '')), '') IS NULL
-                """,
-                {"ws_ids": cand_ids},
-            )
-            current_by_id = {
-                str(r["workspace_id"]): {
-                    "name": str(r.get("name") or "").strip(),
-                    "unit_ticker": normalize_ticker_key(r.get("unit_ticker")),
-                    "doc_ticker": normalize_ticker_key(r.get("doc_ticker")),
-                }
-                for r in await check_cur.fetchall()
-            }
-            for cand in candidates_list:
-                cand_id, cand_name, cand_ticker, has_doc_ticker, cand_doc_ticker = (
-                    _unpack_candidate(cand)
-                )
-                current = current_by_id.get(cand_id)
-                if current is None:
-                    return False
-                if current["name"] != cand_name.strip():
-                    return False
-                if current["unit_ticker"] != normalize_ticker_key(cand_ticker):
-                    return False
-                if has_doc_ticker and current["doc_ticker"] != normalize_ticker_key(
-                    cand_doc_ticker
-                ):
-                    return False
-
-        return True
-
-    try:
-        if conn is not None:
-            async with conn.transaction():
-                async with conn.cursor(row_factory=dict_row) as sp_cur:
-                    return await _run_checks(sp_cur)
-        return await _run_checks(cur)
-    except Exception as exc:
-        # The savepoint above rolled back cleanly on any SQL error so the outer
-        # transaction stays healthy; fail closed as scope_changed.
-        logger.warning(
-            "Locked duplicate snapshot recheck unavailable (%s); aborting with scope_changed",
-            type(exc).__name__,
-        )
-        return False
-# --- DALTON-HOOK(cos-settings-tools): end ---
+    return await _dalton_check_duplicate_snapshot_unchanged(
+        cur, user_id, name,
+        expected_duplicate_workspace_id=expected_duplicate_workspace_id,
+        expected_duplicate_workspace_name=expected_duplicate_workspace_name,
+        verified_company_candidates=verified_company_candidates,
+        check_colleague_duplicate=check_colleague_duplicate,
+        target_ticker=target_ticker,
+        conflict_out=conflict_out,
+        conn=conn,
+    )
 
 
 async def update_workspace(

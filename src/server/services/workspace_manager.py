@@ -159,8 +159,9 @@ class WorkspaceManager(ComputerManager):
         verified_company_candidates: Optional[Any] = None,
         check_colleague_duplicate: bool = False,
         # --- DALTON-HOOK(cos-settings-tools): end ---
-        # DALTON-HOOK(workspace-dedup): optional target ticker for locked duplicate recheck on web create
+        # DALTON-HOOK(workspace-dedup): optional target ticker & same-tx insert hook for web create dedup
         target_ticker: Optional[str] = None,
+        on_workspace_inserted: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Create a project on the user's computer and return it straight away.
 
@@ -284,6 +285,9 @@ class WorkspaceManager(ComputerManager):
                 create_kwargs["check_colleague_duplicate"] = True
             if target_ticker is not None:
                 create_kwargs["target_ticker"] = target_ticker
+        # DALTON-HOOK(workspace-dedup): forward same-transaction company identity hook
+        if on_workspace_inserted is not None:
+            create_kwargs["on_workspace_inserted"] = on_workspace_inserted
         workspace = await create_workspace_on_computer(
             user_id,
             name,

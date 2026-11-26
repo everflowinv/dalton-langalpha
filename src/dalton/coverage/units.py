@@ -486,7 +486,11 @@ async def is_workspace_coverage_registration_active(user_id: str | None) -> bool
     return await is_internal_or_admin(uid)
 
 
-async def authorize_coverage_unit_registration(caller: Any) -> str:
+async def authorize_coverage_unit_registration(
+    caller: Any,
+    *,
+    conn: Any = None,
+) -> str:
     """Enforce the shared coverage-unit write gate for ``POST /coverage/units`` and workspace auto-registration.
 
     Requires:
@@ -513,7 +517,12 @@ async def authorize_coverage_unit_registration(caller: Any) -> str:
         uid = str(caller or "").strip()
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
-    if not await is_internal_or_admin(uid):
+    allowed = (
+        await is_internal_or_admin(uid, conn=conn)
+        if conn is not None
+        else await is_internal_or_admin(uid)
+    )
+    if not allowed:
         raise HTTPException(
             status_code=403,
             detail="Only internal or admin team members can access coverage units.",
@@ -636,7 +645,8 @@ async def auto_register_workspace_coverage_unit(
 
     try:
         uid = await authorize_coverage_unit_registration(
-            principal if principal is not None else user_id
+            principal if principal is not None else user_id,
+            conn=conn,
         )
     except HTTPException as exc:
         if exc.status_code == 404:

@@ -2,12 +2,14 @@
 
 Replaces SQL-level ``t.user_id = a.user_id`` thread joins so:
 - Upstream SQL queries never reference Dalton tables or columns.
-- Linked thread and colleague workspace accessibility follow the exact same
-  web read rules as ``src.dalton.sharing.require_thread_access`` and
-  ``src.dalton.sharing.require_workspace_access`` (respecting colleague sharing
-  capability, colleague dispatch toggle, team membership, external-member
-  isolation, foreign Home/stand-in guards, workspace sharing level, and
-  deleted/unbound workspace status).
+- Linked thread accessibility follows the exact same web read rules as
+  ``src.server.database.conversation.threads_read.get_thread_auth_meta`` +
+  ``src.dalton.sharing.require_thread_access`` (including preserving an
+  initiator's readable thread link when a colleague workspace was soft-deleted
+  while colleague dispatch is on, and blocking external members from viewing
+  colleague-initiated threads inside their own workspace).
+- Workspace ID visibility is resolved independently from thread readability
+  (never returning a deleted/unbound or hidden non-accessible workspace ID).
 - Inaccessible links are stripped (``conversation_thread_id = None`` and, when
   no accessible fallback workspace applies, ``workspace_id = None``), keeping
   the execution record itself intact.
@@ -24,6 +26,7 @@ from psycopg.rows import dict_row
 
 from src.dalton import sharing as sharing_mod
 from src.server.database import conversation as conv_db
+from src.server.database.home_workspace import is_reserved_row
 from src.server.database.pool import get_db_connection
 from src.server.utils.pg_sanitize import normalize_uuid
 
@@ -78,66 +81,11 @@ async def _load_workspace_for_access(
         return None
 
 
-async def _resolve_thread_workspace_for_caller(
-    thread_id: str,
-    user_id: str,
-    *,
-    conn: Any = None,
-) -> str | None:
-    """Return the thread's live ``workspace_id`` if ``user_id`` can read it on web, else None."""
-    if not sharing_mod._sharing_auth_enabled():
-        # Without Dalton colleague sharing, only threads in live caller-owned
-        # workspaces are readable, and the SQL join already matched those.
-        return None
-    try:
-        meta = await conv_db.get_thread_auth_meta(thread_id, conn=conn)
-    except Exception as exc:
-        logger.warning(
-            "Execution history thread metadata lookup failed (%s); hiding thread link",
-            type(exc).__name__,
-        )
-        return None
-    if not meta:
-        return None
-
-    ws_status = str(meta.get("workspace_status") or "").strip().lower()
-    if ws_status in ("deleted", "unbound"):
-        return None
-
-    ws_id = str(meta.get("workspace_id") or "").strip()
-    if not ws_id:
-        return None
-
-    ws_owner = str(meta.get("workspace_owner_id") or "").strip()
-    thread_owner = str(
-        meta.get("thread_user_id") or meta.get("user_id") or ""
-    ).strip()
-    ws_dict = {
-        "workspace_id": ws_id,
-        "user_id": ws_owner,
-        "status": meta.get("workspace_status"),
-        "config": _coerce_config_dict(meta.get("workspace_config")),
-    }
-    try:
-        await sharing_mod.require_thread_access(
-            thread_id,
-            user_id,
-            channel="web",
-            need="read",
-            conn=conn,
-            owner_id=thread_owner or None,
-            workspace_owner_id=ws_owner or None,
-            workspace_id=ws_dict,
-        )
-    except (HTTPException, PermissionError):
-        return None
-    return ws_id
-
-
 async def _resolve_workspace_for_caller(
     workspace_id: str,
     user_id: str,
     *,
+    workspace: dict[str, Any] | None = None,
     conn: Any = None,
 ) -> str | None:
     """Return ``workspace_id`` if live and readable by ``user_id`` on web, else None."""
@@ -145,7 +93,9 @@ async def _resolve_workspace_for_caller(
         # Without Dalton colleague sharing, only caller-owned live workspaces
         # (already flagged by _task_workspace_owned in SQL) are readable.
         return None
-    ws = await _load_workspace_for_access(workspace_id, conn=conn)
+    ws = workspace if workspace is not None else await _load_workspace_for_access(
+        workspace_id, conn=conn
+    )
     if not ws:
         return None
     ws_status = str(ws.get("status") or "").strip().lower()
@@ -165,6 +115,95 @@ async def _resolve_workspace_for_caller(
     return str(ws["workspace_id"])
 
 
+async def _resolve_thread_access_for_caller(
+    thread_id: str,
+    user_id: str,
+    *,
+    conn: Any = None,
+) -> tuple[bool, str | None]:
+    """Resolve ``(can_read_thread, accessible_workspace_id)`` using real web read rules.
+
+    Thread readability delegates directly to ``conv_db.get_thread_auth_meta``
+    and ``sharing_mod.require_thread_access(..., channel='web', need='read')``
+    without prematurely rejecting soft-deleted colleague workspaces.
+    Workspace ID eligibility is decided independently:
+    - A deleted/unbound workspace never returns ``workspace_id`` (the caller
+      still keeps ``conversation_thread_id`` when ``require_thread_access``
+      permits reading their own thread).
+    - Caller's own live workspace returns ``ws_id``.
+    - A colleague's live workspace returns ``ws_id`` when readable via
+      ``require_workspace_access`` or via the ``thread_only`` web shell rule
+      (``colleague_dispatch`` enabled and caller initiated the thread in a
+      live non-reserved workspace).
+    """
+    uid = str(user_id or "").strip()
+    if not uid:
+        return False, None
+    try:
+        meta = await conv_db.get_thread_auth_meta(thread_id, conn=conn)
+    except Exception as exc:
+        logger.warning(
+            "Execution history thread metadata lookup failed (%s); hiding thread link",
+            type(exc).__name__,
+        )
+        return False, None
+    if not meta:
+        return False, None
+
+    ws_id = str(meta.get("workspace_id") or "").strip()
+    if not ws_id:
+        return False, None
+
+    ws_owner = str(meta.get("workspace_owner_id") or "").strip()
+    thread_owner = str(
+        meta.get("thread_user_id") or meta.get("user_id") or ""
+    ).strip()
+    ws_status = str(meta.get("workspace_status") or "").strip().lower()
+    ws_dict = {
+        "workspace_id": ws_id,
+        "user_id": ws_owner,
+        "status": meta.get("workspace_status"),
+        "config": _coerce_config_dict(meta.get("workspace_config")),
+    }
+    try:
+        await sharing_mod.require_thread_access(
+            thread_id,
+            uid,
+            channel="web",
+            need="read",
+            conn=conn,
+            owner_id=thread_owner or None,
+            workspace_owner_id=ws_owner or None,
+            workspace_id=ws_dict,
+        )
+    except (HTTPException, PermissionError):
+        return False, None
+
+    # Thread is readable on web; independently decide whether workspace_id is
+    # returnable.
+    if ws_status in ("deleted", "unbound"):
+        return True, None
+    if ws_owner == uid:
+        return True, ws_id
+
+    # Live colleague workspace: allow workspace_id when web workspace read is
+    # granted OR when the web thread_only workspace shell rule applies
+    # (colleague_dispatch enabled, caller initiated the thread, non-reserved).
+    if (
+        sharing_mod._sharing_auth_enabled()
+        and sharing_mod.is_colleague_dispatch_enabled()
+        and uid == thread_owner
+        and thread_owner != ws_owner
+        and not is_reserved_row(ws_dict)
+    ):
+        return True, ws_id
+
+    resolved_ws = await _resolve_workspace_for_caller(
+        ws_id, uid, workspace=ws_dict, conn=conn
+    )
+    return True, resolved_ws
+
+
 async def resolve_execution_history_page_links(
     user_id: str,
     rows: list[dict[str, Any]],
@@ -175,13 +214,18 @@ async def resolve_execution_history_page_links(
 
     Expects rows from ``list_executions`` carrying upstream-only helper columns
     ``_owned_thread_workspace_id``, ``_task_workspace_id``, and
-    ``_task_workspace_owned`` (all stripped before returning). Rows already
+    ``_task_workspace_owned`` (all stripped before returning). In single-user
+    OSS mode (multi-user and colleague sharing auth both off), rows already
     matched by the owner-only live-workspace SQL join incur zero extra queries.
     """
     if not rows:
         return rows
 
-    thread_cache: dict[str, str | None] = {}
+    auth_active = (
+        sharing_mod._multiuser_auth_enabled()
+        or sharing_mod._sharing_auth_enabled()
+    )
+    thread_cache: dict[str, tuple[bool, str | None]] = {}
     workspace_cache: dict[str, str | None] = {}
 
     async def _resolve_fallback_ws(
@@ -217,16 +261,27 @@ async def resolve_execution_history_page_links(
         tid = str(raw_thread_id).strip() if raw_thread_id is not None else ""
 
         if tid:
-            if owned_thread_ws is not None:
-                row["workspace_id"] = owned_thread_ws
+            if not auth_active:
+                if owned_thread_ws is not None:
+                    row["workspace_id"] = owned_thread_ws
+                else:
+                    row["conversation_thread_id"] = None
+                    row["workspace_id"] = await _resolve_fallback_ws(
+                        task_ws, task_ws_owned
+                    )
                 continue
+
             if tid not in thread_cache:
-                thread_cache[tid] = await _resolve_thread_workspace_for_caller(
+                thread_cache[tid] = await _resolve_thread_access_for_caller(
                     tid, user_id, conn=conn
                 )
-            resolved_ws = thread_cache[tid]
-            if resolved_ws is not None:
-                row["workspace_id"] = resolved_ws
+            can_read_thread, resolved_ws = thread_cache[tid]
+            if can_read_thread:
+                row["workspace_id"] = (
+                    resolved_ws
+                    if resolved_ws is not None
+                    else await _resolve_fallback_ws(task_ws, task_ws_owned)
+                )
             else:
                 row["conversation_thread_id"] = None
                 row["workspace_id"] = await _resolve_fallback_ws(
