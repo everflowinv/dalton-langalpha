@@ -10,6 +10,7 @@ import {
   parseChartSnapshotsList,
   type CollectedChartLayerRef,
   type CollectedHtmlWidgetRef,
+  type PendingChartDeliveryReceipt,
 } from "./chart-snapshots.js";
 import { DeliveryService } from "./delivery-service.js";
 import {
@@ -53,6 +54,16 @@ export class AgentRoutesHandler {
    * Distinguishes Shape A (claim & execute) from Shape B (concurrent caller sees mid-post rows).
    */
   readonly activeFinishExecutors = new Set<string>();
+
+  /**
+   * Process-local pending `:charts` I-7 receipts whose platform send succeeded
+   * but whose I-7 progress write failed transiently, so subsequent `/finish`
+   * retries can settle I-7 with the same `delivery_attempt` without resending.
+   */
+  private readonly pendingChartReceipts = new Map<
+    string,
+    PendingChartDeliveryReceipt
+  >();
 
   constructor(options: {
     backend: BackendClient;
@@ -1078,11 +1089,15 @@ export class AgentRoutesHandler {
           charts: autoCharts,
           initialSnapshots: autoInitialSnapshots,
           widgets: autoWidgets,
+          pendingReceipts: this.pendingChartReceipts,
         });
         if (chartRes.inFlight) {
           chartsInFlight = true;
         }
-        return chartRes.settled && chartRes.sentImages + chartRes.sentLinks > 0;
+        return Boolean(
+          chartRes.settled &&
+            (chartRes.delivered ?? chartRes.sentImages + chartRes.sentLinks > 0),
+        );
       };
 
       for (const t of targets) {

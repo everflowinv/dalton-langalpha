@@ -906,6 +906,39 @@ async function resolveWeixinPreflightForChart(
   return null;
 }
 
+export interface PendingChartDeliveryReceipt {
+  deliveryKey: string;
+  platform: ChannelPlatform;
+  deliveryAttempt?: number;
+  sentImages: number;
+  sentLinks: number;
+  totalItems: number;
+  platformMessageIds: string[];
+  finalStatus: "sent" | "partial" | "failed";
+  timedOutPending: boolean;
+}
+
+const MAX_PENDING_CHART_RECEIPTS = 500;
+const DEFAULT_PENDING_CHART_RECEIPTS = new Map<
+  string,
+  PendingChartDeliveryReceipt
+>();
+
+function rememberPendingChartReceipt(
+  store: Map<string, PendingChartDeliveryReceipt>,
+  receipt: PendingChartDeliveryReceipt,
+): void {
+  if (store.has(receipt.deliveryKey)) {
+    store.delete(receipt.deliveryKey);
+  } else if (store.size >= MAX_PENDING_CHART_RECEIPTS) {
+    const oldest = store.keys().next().value;
+    if (oldest !== undefined) {
+      store.delete(oldest);
+    }
+  }
+  store.set(receipt.deliveryKey, receipt);
+}
+
 export interface DeliverChartsAndWidgetsParams {
   backend: BackendClient;
   adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
@@ -927,6 +960,8 @@ export interface DeliverChartsAndWidgetsParams {
   charts: CollectedChartLayerRef[];
   initialSnapshots?: ChartSnapshotItem[];
   widgets?: CollectedHtmlWidgetRef[];
+  /** Process-local pending I-7 receipts awaiting settlement without resending to the platform. */
+  pendingReceipts?: Map<string, PendingChartDeliveryReceipt>;
   waitTimeoutMs?: number;
   pollIntervalMs?: number;
   nowFn?: () => number;
@@ -935,7 +970,9 @@ export interface DeliverChartsAndWidgetsParams {
 
 export interface DeliverChartsAndWidgetsResult {
   settled: boolean;
-  /** True when another worker currently holds an active `in_flight` claim on this charts key. */
+  /** True when at least one chart/widget was delivered in this call or an earlier settled delivery. */
+  delivered?: boolean;
+  /** True when another worker holds an active `in_flight` claim or an I-7 receipt is still pending settlement. */
   inFlight?: boolean;
   sentImages: number;
   sentLinks: number;
@@ -995,17 +1032,31 @@ export async function deliverTurnChartsAndWidgets(
     .map((ck) => chartByKey.get(ck)!);
 
   if (orderedCharts.length === 0 && uniqueWidgets.length === 0) {
-    return { settled: true, sentImages: 0, sentLinks: 0, timedOutPending: false };
+    return {
+      settled: true,
+      delivered: false,
+      sentImages: 0,
+      sentLinks: 0,
+      timedOutPending: false,
+    };
   }
 
   const adapter = params.adapters.get(params.platform);
   if (!adapter) {
-    return { settled: false, sentImages: 0, sentLinks: 0, timedOutPending: false };
+    return {
+      settled: false,
+      delivered: false,
+      sentImages: 0,
+      sentLinks: 0,
+      timedOutPending: false,
+    };
   }
 
   const deliveryKey = params.deliveryKey ?? `charts:${params.runId}`;
   const deliveryKind = params.deliveryKind ?? "fallback";
   const totalItems = orderedCharts.length + uniqueWidgets.length;
+  const pendingReceipts =
+    params.pendingReceipts ?? DEFAULT_PENDING_CHART_RECEIPTS;
 
   let claim: I6AuthorizeAndClaimResponse;
   try {
@@ -1034,12 +1085,30 @@ export async function deliverTurnChartsAndWidgets(
     });
   } catch (err) {
     if (isStaleGatewayEpochError(err)) throw err;
-    return { settled: false, sentImages: 0, sentLinks: 0, timedOutPending: false };
+    return {
+      settled: false,
+      delivered: false,
+      inFlight: pendingReceipts.has(deliveryKey),
+      sentImages: 0,
+      sentLinks: 0,
+      timedOutPending: false,
+    };
   }
 
   if (claim.claim_status === "already_completed") {
+    pendingReceipts.delete(deliveryKey);
+    const completedStatus =
+      claim.status ??
+      (typeof claim.first_response_json?.status === "string"
+        ? claim.first_response_json.status
+        : undefined);
+    const alreadyDelivered =
+      completedStatus === undefined
+        ? true
+        : completedStatus === "sent" || completedStatus === "partial";
     return {
       settled: true,
+      delivered: alreadyDelivered,
       inFlight: false,
       sentImages: 0,
       sentLinks: 0,
@@ -1050,14 +1119,72 @@ export async function deliverTurnChartsAndWidgets(
     const inFlight =
       claim.claim_status === "in_flight_or_unknown" &&
       claim.existing_status !== "unknown";
+    if (inFlight) {
+      const pending = pendingReceipts.get(deliveryKey);
+      const attemptMatches =
+        pending !== undefined &&
+        (pending.deliveryAttempt === undefined ||
+          claim.delivery_attempt === undefined ||
+          pending.deliveryAttempt === claim.delivery_attempt);
+      if (attemptMatches) {
+        const retryAttempt =
+          pending.deliveryAttempt ??
+          (typeof claim.delivery_attempt === "number"
+            ? claim.delivery_attempt
+            : undefined);
+        try {
+          await params.backend.updateDeliveryProgress(
+            {
+              delivery_key: pending.deliveryKey,
+              sent_chunks: pending.sentImages + pending.sentLinks,
+              total_chunks: pending.totalItems,
+              platform_message_ids: pending.platformMessageIds,
+              status: pending.finalStatus,
+              outcome: pending.finalStatus,
+              delivery_attempt: retryAttempt,
+            },
+            { platform: pending.platform },
+          );
+          pendingReceipts.delete(deliveryKey);
+          const settled =
+            pending.finalStatus === "sent" || pending.finalStatus === "partial";
+          return {
+            settled,
+            delivered: settled && pending.sentImages + pending.sentLinks > 0,
+            inFlight: false,
+            sentImages: pending.sentImages,
+            sentLinks: pending.sentLinks,
+            timedOutPending: pending.timedOutPending,
+          };
+        } catch (err) {
+          if (isStaleGatewayEpochError(err)) throw err;
+          if (err instanceof BackendHttpError && err.status === 409) {
+            pendingReceipts.delete(deliveryKey);
+          }
+          return {
+            settled: false,
+            delivered: false,
+            inFlight: true,
+            sentImages: pending.sentImages,
+            sentLinks: pending.sentLinks,
+            timedOutPending: pending.timedOutPending,
+          };
+        }
+      }
+    } else {
+      pendingReceipts.delete(deliveryKey);
+    }
     return {
       settled: claim.claim_status === "denied",
+      delivered: false,
       inFlight,
       sentImages: 0,
       sentLinks: 0,
       timedOutPending: false,
     };
   }
+
+  pendingReceipts.delete(deliveryKey);
 
   const effectiveTarget = claim.target_address ?? params.targetAddress;
   const recipientId = claim.recipient_id ?? claim.dm_recipient_platform_user_id ?? null;
@@ -1426,21 +1553,46 @@ export async function deliverTurnChartsAndWidgets(
     failures === 0 ? "sent" : sentImages + sentLinks > 0 ? "partial" : "failed";
 
   try {
-    await params.backend.updateDeliveryProgress({
-      delivery_key: deliveryKey,
-      sent_chunks: sentImages + sentLinks,
-      total_chunks: totalItems,
-      platform_message_ids: sentMessageIds,
-      status: finalStatus,
-      outcome: finalStatus,
-      delivery_attempt: deliveryAttempt,
-    });
+    await params.backend.updateDeliveryProgress(
+      {
+        delivery_key: deliveryKey,
+        sent_chunks: sentImages + sentLinks,
+        total_chunks: totalItems,
+        platform_message_ids: sentMessageIds,
+        status: finalStatus,
+        outcome: finalStatus,
+        delivery_attempt: deliveryAttempt,
+      },
+      { platform: params.platform },
+    );
   } catch (err) {
     if (isStaleGatewayEpochError(err)) throw err;
+    rememberPendingChartReceipt(pendingReceipts, {
+      deliveryKey,
+      platform: params.platform,
+      deliveryAttempt,
+      sentImages,
+      sentLinks,
+      totalItems,
+      platformMessageIds: sentMessageIds,
+      finalStatus,
+      timedOutPending: waited.timedOut,
+    });
+    return {
+      settled: false,
+      delivered: false,
+      inFlight: true,
+      sentImages,
+      sentLinks,
+      timedOutPending: waited.timedOut,
+    };
   }
 
+  const settled = finalStatus === "sent" || finalStatus === "partial";
   return {
-    settled: finalStatus === "sent" || finalStatus === "partial",
+    settled,
+    delivered: settled && sentImages + sentLinks > 0,
+    inFlight: false,
     sentImages,
     sentLinks,
     timedOutPending: waited.timedOut,

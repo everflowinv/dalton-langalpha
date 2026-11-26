@@ -101,13 +101,22 @@ export function parseEffectiveLibpqParams(dsn: string): Record<string, string> {
       params.dbname = pathDb;
     }
     // Query parameters override URI components per libpq URI precedence (last wins).
-    for (const [rawKey, rawVal] of parsed.searchParams.entries()) {
-      const key = rawKey.trim();
-      if (!key) continue;
-      if (rawVal === "" && key in params) {
-        continue;
+    // libpq decodes RFC 3986 percent-encoding ONLY (preserving literal `+`, NOT form-encoding).
+    const rawQuery = parsed.search.startsWith("?") ? parsed.search.slice(1) : "";
+    if (rawQuery) {
+      for (const pair of rawQuery.split("&")) {
+        if (!pair) continue;
+        const eqIdx = pair.indexOf("=");
+        const rawKey = eqIdx === -1 ? pair : pair.slice(0, eqIdx);
+        const rawVal = eqIdx === -1 ? "" : pair.slice(eqIdx + 1);
+        const key = decodeURIComponent(rawKey).trim();
+        const val = decodeURIComponent(rawVal);
+        if (!key) continue;
+        if (val === "" && key in params) {
+          continue;
+        }
+        params[key] = val;
       }
-      params[key] = rawVal;
     }
     return params;
   }
@@ -206,11 +215,10 @@ function buildUriFromLibpqParams(params: Record<string, string>, dbName: string)
     remaining.push(["port", port]);
   }
 
-  const query = new URLSearchParams();
-  for (const [k, v] of remaining) {
-    query.append(k, v);
-  }
-  const qs = query.toString();
+  // libpq URI parser decodes `%20` (RFC 3986), NOT `+` (x-www-form-urlencoded).
+  const qs = remaining
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .join("&");
   return `postgresql://${netloc}/${encodeURIComponent(dbName)}${qs ? `?${qs}` : ""}`;
 }
 
@@ -267,9 +275,15 @@ export function replaceDsnDatabase(
 
   const rebuilt = buildUriFromLibpqParams(params, newDbName);
   const verified = parseEffectiveLibpqParams(rebuilt);
-  if (verified.dbname !== newDbName) {
+  const expected: Record<string, string> = { ...params, dbname: newDbName };
+  const verifiedKeys = Object.keys(verified).sort();
+  const expectedKeys = Object.keys(expected).sort();
+  if (
+    verifiedKeys.length !== expectedKeys.length ||
+    expectedKeys.some((k, idx) => verifiedKeys[idx] !== k || verified[k] !== expected[k])
+  ) {
     throw new Error(
-      `Rebuilt isolated DSN resolved to "${verified.dbname ?? ""}" instead of "${newDbName}"`,
+      `Rebuilt isolated DSN effective params mismatch: expected ${JSON.stringify(expected)}, got ${JSON.stringify(verified)}`,
     );
   }
   return rebuilt;
@@ -285,7 +299,8 @@ base_dsn, db_name, allow_non_local_raw = sys.argv[1], sys.argv[2], sys.argv[3]
 allow_non_local = allow_non_local_raw == "1"
 assert db_name.endswith("_test") and len(db_name) <= 63
 
-params = dict(ci.conninfo_to_dict(base_dsn))
+orig_params = dict(ci.conninfo_to_dict(base_dsn))
+params = dict(orig_params)
 if params.get("service"):
     raise ValueError(f"Refusing to isolate DSN with libpq service={params['service']!r}")
 orig_db = str(params.get("dbname") or "").strip()
@@ -352,14 +367,16 @@ if host is not None and str(host) != "":
 elif port is not None and str(port) != "":
     extra.append(("port", str(port)))
 
-qs = urlencode(extra)
+qs = urlencode(extra, quote_via=quote, safe="")
 rebuilt = f"postgresql://{netloc}/{quote(db_name, safe='')}"
 if qs:
     rebuilt += f"?{qs}"
 
 effective = ci.conninfo_to_dict(rebuilt)
-assert effective.get("dbname") == db_name, (
-    f"Expected rebuilt libpq dbname={db_name!r}, got {effective.get('dbname')!r}"
+expected_effective = {str(k): str(v) for k, v in orig_params.items()}
+expected_effective["dbname"] = db_name
+assert effective == expected_effective, (
+    f"Rebuilt libpq effective params mismatch: expected {expected_effective!r}, got {effective!r}"
 )
 print(json.dumps({"dsn": rebuilt, "dbname": effective["dbname"]}))
 `;

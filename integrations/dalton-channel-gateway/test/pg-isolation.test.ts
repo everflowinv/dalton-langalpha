@@ -191,6 +191,49 @@ describe("BI2: gateway real-Postgres test isolation and vitest config", () => {
           repoRoot: REPO_ROOT,
         }),
       ).rejects.toThrow();
+
+      // 8) Spaces in libpq query options MUST be encoded with `%20` (never `+`),
+      //    and all effective connection parameters before/after rebuild must match identically except `dbname`.
+      const dsnWithSpacedOptions =
+        "postgresql://postgres:secret@127.0.0.1:5432/ignored_test?dbname=shared_test&options=-c%20search_path%3Dpublic&application_name=gw%20test+1";
+      const rebuiltTsSpaced = replaceDsnDatabase(dsnWithSpacedOptions, nameA);
+      expect(rebuiltTsSpaced).not.toContain("-c+search_path");
+      expect(rebuiltTsSpaced).toContain("options=-c%20search_path%3Dpublic");
+      expect(parseEffectiveLibpqParams(rebuiltTsSpaced)).toEqual({
+        ...parseEffectiveLibpqParams(dsnWithSpacedOptions),
+        dbname: nameA,
+      });
+
+      const rebuiltLibpqSpaced = await rebuildIsolatedDsnWithLibpq({
+        baseDsn: dsnWithSpacedOptions,
+        dbName: nameA,
+        pythonBin: VENV_PYTHON,
+        repoRoot: REPO_ROOT,
+      });
+      expect(rebuiltLibpqSpaced).not.toContain("-c+search_path");
+      expect(rebuiltLibpqSpaced).toContain("options=-c%20search_path%3Dpublic");
+
+      const { stdout: beforeAfterStdout } = await execFileAsync(
+        VENV_PYTHON,
+        [
+          "-c",
+          "import json, sys, psycopg.conninfo as ci; print(json.dumps({'before': ci.conninfo_to_dict(sys.argv[1]), 'after_ts': ci.conninfo_to_dict(sys.argv[2]), 'after_py': ci.conninfo_to_dict(sys.argv[3])}))",
+          dsnWithSpacedOptions,
+          rebuiltTsSpaced,
+          rebuiltLibpqSpaced,
+        ],
+        { cwd: REPO_ROOT, timeout: 10_000 },
+      );
+      const parsedBeforeAfter = JSON.parse(beforeAfterStdout.trim()) as {
+        before: Record<string, string>;
+        after_ts: Record<string, string>;
+        after_py: Record<string, string>;
+      };
+      const expectedEffective = { ...parsedBeforeAfter.before, dbname: nameA };
+      expect(parsedBeforeAfter.after_ts).toEqual(expectedEffective);
+      expect(parsedBeforeAfter.after_py).toEqual(expectedEffective);
+      expect(parsedBeforeAfter.after_py.options).toBe("-c search_path=public");
+      expect(parsedBeforeAfter.after_py.application_name).toBe("gw test+1");
     }
   });
 });

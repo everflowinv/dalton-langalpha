@@ -39,6 +39,7 @@ import {
 import {
   type CollectedChartLayerRef,
   type CollectedHtmlWidgetRef,
+  type PendingChartDeliveryReceipt,
   chartLayerCompositeKey,
   collectPublishedChartLayers,
   collectReportSourceChartLayers,
@@ -391,6 +392,10 @@ export class ChannelGatewayOrchestrator {
   private readonly inFlightChartSettlements = new Map<
     string,
     Promise<boolean>
+  >();
+  private readonly pendingChartReceipts = new Map<
+    string,
+    PendingChartDeliveryReceipt
   >();
   private static readonly MAX_SETTLED_DELIVERABLE_KEYS = 2_000;
   private readonly logger = createSubsystemLogger("orchestrator");
@@ -10906,6 +10911,7 @@ export class ChannelGatewayOrchestrator {
         initialSnapshots: params.initialSnapshots,
         widgets: params.widgets,
         outboundBlocked: params.outboundBlocked,
+        pendingReceipts: this.pendingChartReceipts,
         nowFn: this.nowFn,
       });
       if (res.settled) {

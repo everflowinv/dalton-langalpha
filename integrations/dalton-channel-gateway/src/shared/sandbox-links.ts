@@ -580,17 +580,22 @@ function mergeSortedCodeRanges(ranges: CodeRange[]): CodeRange[] {
 }
 
 /**
- * Scans Markdown code zones BEFORE reference definition / link collection strictly
- * within Markdown block boundaries:
- * - When the CommonMark + GFM table AST (`tree`) is available (always true in
- *   `rewriteSandboxLinks`), `code` nodes cover every fenced, indented, list-nested,
- *   quoted, and unterminated code block, and `inlineCode` nodes cover every single-line
- *   and same-paragraph multiline backtick span without ever pairing stray backticks
- *   across paragraph, heading, list-item, blockquote, or table-cell boundaries.
- * - Single-line inline code spans that serve purely as a Markdown link label (`[`foo`](dest)`)
- *   are left unprotected so the spaced-destination link fallback can still rewrite the outer link.
+ * Collects Markdown code zones from the CommonMark + GFM table AST BEFORE reference
+ * definition / link collection strictly within Markdown block boundaries:
+ * - `allCodeRanges` covers every `code` and `inlineCode` node (fenced, indented,
+ *   list-nested, quoted, unterminated code blocks, and single-line or same-paragraph
+ *   multiline backtick spans) without ever pairing stray backticks across paragraph,
+ *   heading, list-item, blockquote, or table-cell boundaries.
+ * - `protectedCodeRanges` excludes single-line inline code spans that serve purely as
+ *   a Markdown link label (`[`foo`](dest)`) so the spaced-destination link fallback can
+ *   still rewrite the outer link, while the fallback still reuses `allCodeRanges` to
+ *   keep the inline code verbatim if the outer `[...](` turns out not to be a link.
  */
-function findProtectedCodeRanges(text: string, tree?: MdastNode): CodeRange[] {
+function collectAstCodeRanges(
+  text: string,
+  tree: MdastNode,
+): { protectedCodeRanges: CodeRange[]; allCodeRanges: CodeRange[] } {
+  const protectedRanges: CodeRange[] = [];
   const allRanges: CodeRange[] = [];
   const len = text.length;
 
@@ -602,77 +607,56 @@ function findProtectedCodeRanges(text: string, tree?: MdastNode): CodeRange[] {
     text[end] === "]" &&
     text[end + 1] === "(";
 
-  if (tree) {
-    const collectAstCode = (node: MdastNode): void => {
-      if (node.type === "code") {
-        const offsets = getNodeOffsets(node);
-        if (offsets) {
-          allRanges.push({ start: offsets.start, end: offsets.end });
-        }
-        return;
+  const collectAstCode = (node: MdastNode): void => {
+    if (node.type === "code") {
+      const offsets = getNodeOffsets(node);
+      if (offsets) {
+        const range = { start: offsets.start, end: offsets.end };
+        allRanges.push(range);
+        protectedRanges.push(range);
       }
-      if (node.type === "inlineCode") {
-        const offsets = getNodeOffsets(node);
-        if (offsets && !isSingleLineSpacedLinkLabel(offsets.start, offsets.end)) {
-          allRanges.push({ start: offsets.start, end: offsets.end });
-        }
-        return;
-      }
-      if (Array.isArray(node.children)) {
-        for (const child of node.children) {
-          collectAstCode(child);
+      return;
+    }
+    if (node.type === "inlineCode") {
+      const offsets = getNodeOffsets(node);
+      if (offsets) {
+        const range = { start: offsets.start, end: offsets.end };
+        allRanges.push(range);
+        if (!isSingleLineSpacedLinkLabel(offsets.start, offsets.end)) {
+          protectedRanges.push(range);
         }
       }
-    };
-    collectAstCode(tree);
-    return mergeSortedCodeRanges(allRanges);
-  }
-
-  // Fallback when invoked without an AST: scan inline backticks per paragraph block
-  // (split on blank lines) so stray backticks in separate paragraphs never pair.
-  const scanBacktickBlock = (segStart: number, segEnd: number): void => {
-    let pos = segStart;
-    while (pos < segEnd) {
-      const ch = text[pos]!;
-      if (ch === "\\" && pos + 1 < segEnd && text[pos + 1] !== "\n") {
-        pos += 2;
-        continue;
+      return;
+    }
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) {
+        collectAstCode(child);
       }
-      if (ch === "`") {
-        let run = 0;
-        while (pos + run < segEnd && text[pos + run] === "`") {
-          run += 1;
-        }
-        const close = findClosingBacktickRun(text, pos + run, run, segEnd);
-        if (close !== -1) {
-          const spanEnd = close + run;
-          if (!isSingleLineSpacedLinkLabel(pos, spanEnd)) {
-            allRanges.push({ start: pos, end: spanEnd });
-          }
-          pos = spanEnd;
-          continue;
-        }
-        pos += run;
-        continue;
-      }
-      pos += 1;
     }
   };
 
-  let blockStart = 0;
-  const blankLineRe = /\r?\n[ \t]*\r?\n/g;
-  let match: RegExpExecArray | null;
-  while ((match = blankLineRe.exec(text)) !== null) {
-    if (match.index > blockStart) {
-      scanBacktickBlock(blockStart, match.index);
-    }
-    blockStart = match.index + match[0].length;
-  }
-  if (blockStart < len) {
-    scanBacktickBlock(blockStart, len);
-  }
+  collectAstCode(tree);
+  return {
+    protectedCodeRanges: mergeSortedCodeRanges(protectedRanges),
+    allCodeRanges: mergeSortedCodeRanges(allRanges),
+  };
+}
 
-  return mergeSortedCodeRanges(allRanges);
+function firstCodeRangeIndexEndingAfter(
+  offset: number,
+  ranges: readonly CodeRange[],
+): number {
+  let lo = 0;
+  let hi = ranges.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (ranges[mid]!.end <= offset) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
 }
 
 function startsInsideCodeRange(
@@ -968,59 +952,63 @@ function rewritePlainProse(prose: string): string {
 }
 
 function rewriteUnprotectedGap(
-  gap: string,
+  text: string,
+  gapStart: number,
+  gapEnd: number,
+  astCodeRanges: readonly CodeRange[],
   publicWebBaseUrl: string | null,
   normalizedThreadId: string | null,
   normalizedWorkspaceId: string | null = null,
 ): string {
-  if (!gap) return gap;
+  if (gapEnd <= gapStart) return "";
   const out: string[] = [];
-  let proseStart = 0;
-  let i = 0;
+  let proseStart = gapStart;
+  let i = gapStart;
   let currentLineEnd = -1;
   let nextCloseBracket = -1;
+  let codeIdx = firstCodeRangeIndexEndingAfter(gapStart, astCodeRanges);
 
   const flushProse = (until: number): void => {
     if (until > proseStart) {
-      out.push(rewritePlainProse(gap.slice(proseStart, until)));
+      out.push(rewritePlainProse(text.slice(proseStart, until)));
     }
   };
 
-  while (i < gap.length) {
-    const ch = gap[i]!;
-
-    // Inline code span: preserve verbatim
-    if (ch === "`") {
-      let run = 0;
-      while (i + run < gap.length && gap[i + run] === "`") {
-        run += 1;
-      }
-      const close = findClosingBacktickRun(gap, i + run, run);
-      if (close !== -1) {
-        flushProse(i);
-        out.push(gap.slice(i, close + run));
-        i = close + run;
-        proseStart = i;
-        continue;
-      }
-      i += run;
+  while (i < gapEnd) {
+    // Reuse AST code ranges verbatim instead of re-pairing backticks across blocks/paragraphs.
+    while (codeIdx < astCodeRanges.length && astCodeRanges[codeIdx]!.end <= i) {
+      codeIdx += 1;
+    }
+    const activeCode =
+      codeIdx < astCodeRanges.length && astCodeRanges[codeIdx]!.start <= i
+        ? astCodeRanges[codeIdx]!
+        : null;
+    if (activeCode) {
+      const codeEnd = Math.min(activeCode.end, gapEnd);
+      flushProse(i);
+      out.push(text.slice(i, codeEnd));
+      i = codeEnd;
+      proseStart = i;
       continue;
     }
+
+    const ch = text[i]!;
 
     // Spaced-destination markdown link/image fallback
     if (
       ch === "[" ||
-      (ch === "!" && i + 1 < gap.length && gap[i + 1] === "[")
+      (ch === "!" && i + 1 < gapEnd && text[i + 1] === "[")
     ) {
       if (currentLineEnd < i) {
-        const nl = gap.indexOf("\n", i);
-        currentLineEnd = nl === -1 ? gap.length : nl;
+        const nl = text.indexOf("\n", i);
+        currentLineEnd = nl === -1 || nl > gapEnd ? gapEnd : nl;
       }
       if (nextCloseBracket < i) {
-        nextCloseBracket = gap.indexOf("]", i);
+        const cb = text.indexOf("]", i);
+        nextCloseBracket = cb === -1 || cb >= gapEnd ? -1 : cb;
       }
       if (nextCloseBracket !== -1 && nextCloseBracket < currentLineEnd) {
-        const parsed = parseSpacedMarkdownLinkAt(gap, i, currentLineEnd);
+        const parsed = parseSpacedMarkdownLinkAt(text, i, currentLineEnd);
         if (parsed) {
           const classified = classifyLinkDestination(parsed.dest);
           flushProse(i);
@@ -1037,7 +1025,7 @@ function rewriteUnprotectedGap(
               ),
             );
           } else {
-            out.push(gap.slice(i, parsed.end));
+            out.push(text.slice(i, parsed.end));
           }
           i = parsed.end;
           proseStart = i;
@@ -1049,7 +1037,7 @@ function rewriteUnprotectedGap(
     i += 1;
   }
 
-  flushProse(gap.length);
+  flushProse(gapEnd);
   return out.join("");
 }
 
@@ -1156,7 +1144,7 @@ export function rewriteSandboxLinks(
   // Pass 0 (BT3): identify all code zones (fenced blocks, indented code, inline and multiline backtick spans)
   // BEFORE collecting reference definitions so `[x]: /home/workspace/...` inside code zones is never parsed
   // as an active definition or rewritten.
-  const protectedCodeRanges = findProtectedCodeRanges(text, tree);
+  const { protectedCodeRanges, allCodeRanges } = collectAstCodeRanges(text, tree);
 
   // Pass 1: collect all reference link definitions and count their references (excluding code zones).
   const definitionsById = new Map<string, DefinitionInfo>();
@@ -1579,7 +1567,10 @@ export function rewriteSandboxLinks(
     if (action.start > cursor) {
       out.push(
         rewriteUnprotectedGap(
-          text.slice(cursor, action.start),
+          text,
+          cursor,
+          action.start,
+          allCodeRanges,
           publicWebBaseUrl,
           normalizedThreadId,
           normalizedWorkspaceId,
@@ -1597,7 +1588,10 @@ export function rewriteSandboxLinks(
   if (cursor < text.length) {
     out.push(
       rewriteUnprotectedGap(
-        text.slice(cursor),
+        text,
+        cursor,
+        text.length,
+        allCodeRanges,
         publicWebBaseUrl,
         normalizedThreadId,
         normalizedWorkspaceId,

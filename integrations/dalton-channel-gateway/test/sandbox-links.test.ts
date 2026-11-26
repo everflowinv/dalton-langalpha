@@ -753,4 +753,46 @@ describe("channel chunkers preserve rewritten Markdown links and underscores", (
       quotedFenceInsideTopLevelExpected,
     );
   });
+
+  it("BT3: fallback scanner reuses AST code ranges so spaced-filename links between cross-paragraph stray backticks are still rewritten", () => {
+    // Stray backticks in paragraph 1 and paragraph 3 must NOT pair inside the gap scanner
+    // and swallow a spaced-destination file link (or bare sandbox path) in paragraph 2.
+    const spacedAcrossParagraphs = [
+      "第一段包含一个孤立反引号 ` 未闭合。",
+      "",
+      "第二段有带空格文件链接 [季度报告](/home/workspace/Quarterly Report.md)，以及裸路径 /home/workspace/notes/summary.md。",
+      "",
+      "第三段也有一个孤立反引号 ` 未闭合。",
+    ].join("\n");
+    const spacedAcrossParagraphsExpected = [
+      "第一段包含一个孤立反引号 ` 未闭合。",
+      "",
+      `第二段有带空格文件链接 [季度报告](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2FQuarterly%20Report.md)，以及裸路径 notes/summary.md。`,
+      "",
+      "第三段也有一个孤立反引号 ` 未闭合。",
+    ].join("\n");
+    expect(rewriteSandboxLinks(spacedAcrossParagraphs, WEB_BASE, THREAD_ID)).toBe(
+      spacedAcrossParagraphsExpected,
+    );
+
+    // Same guarantee across list items and GFM table cells for spaced-filename links.
+    const spacedAcrossList = [
+      "- 第一项孤立反引号 `",
+      "- 第二项：[季度报告](/home/workspace/Quarterly Report.md)",
+      "- 第三项孤立反引号 `",
+    ].join("\n");
+    expect(rewriteSandboxLinks(spacedAcrossList, WEB_BASE, THREAD_ID)).toBe(
+      [
+        "- 第一项孤立反引号 `",
+        `- 第二项：[季度报告](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2FQuarterly%20Report.md)`,
+        "- 第三项孤立反引号 `",
+      ].join("\n"),
+    );
+
+    // Real inline code span wrapping a spaced-filename link still stays verbatim,
+    // and an unclosed `[`inlineCode`](` still protects the AST inlineCode verbatim.
+    const realInlineCode =
+      "示例 `[季度报告](/home/workspace/Quarterly Report.md)`，以及未闭合 [`/home/workspace/Quarterly Report.md`](no-close。";
+    expect(rewriteSandboxLinks(realInlineCode, WEB_BASE, THREAD_ID)).toBe(realInlineCode);
+  });
 });
