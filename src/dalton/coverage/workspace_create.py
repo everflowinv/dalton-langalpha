@@ -63,28 +63,99 @@ async def _resolve_fallback_colleague_check(user_id: str) -> bool:
         return False
 
 
-def _build_in_tx_identity_hook(
+def resolve_effective_company_ticker(
+    *,
+    raw_coverage_kind: str,
+    explicit_ticker: str | None,
+    suggestion: Any | None = None,
+) -> tuple[str | None, str | None]:
+    """Return ``(effective_ticker_raw, effective_ticker_key)`` for company dedup
+    locking and same-transaction identity persistence.
+
+    Uses the exact same effective company ticker for both Phase 2 ``ws_ticker:``
+    locking / recheck and in-transaction ``dalton_company_ticker`` stamping
+    (including web "create without registering" where only ``suggestion.ticker``
+    is present). Never returns a ticker for sector workspaces.
+    """
+    if raw_coverage_kind == "sector":
+        return None, None
+    explicit_raw = str(explicit_ticker or "").strip() or None
+    suggested_raw = (
+        str(getattr(suggestion, "ticker", None) or "").strip() or None
+        if (
+            suggestion is not None
+            and getattr(suggestion, "coverage_kind", None) == "company"
+        )
+        else None
+    )
+    effective_raw = explicit_raw or suggested_raw
+    effective_key = normalize_ticker_key(effective_raw) if effective_raw else None
+    return effective_raw, effective_key
+
+
+async def resolve_cos_colleague_dedup(user_id: str) -> bool:
+    """Return True when Chief of Staff locked recheck should include colleague
+    workspaces and acquire the shared normalized ``ws_ticker:`` advisory lock."""
+    if not dedup_mod.is_company_dedup_active():
+        return False
+    from src.dalton.company_identity import is_company_system_user
+
+    if is_company_system_user(user_id):
+        return False
+    return await _resolve_fallback_colleague_check(user_id)
+
+
+async def format_cos_duplicate_conflict_error(
+    user_id: str,
+    name: str,
+    conflict: DuplicateWorkspaceConflictError,
+) -> tuple[str, str, dict[str, Any]]:
+    """Convert a locked-recheck ``DuplicateWorkspaceConflictError`` into a
+    Chief of Staff tool error tuple ``(message, code, extra_fields)``."""
+    if conflict.conflicting_workspace_id:
+        det_dup = await dedup_mod.build_deterministic_duplicate_match(
+            user_id,
+            name,
+            conflict.conflicting_workspace_id,
+            channel="cos",
+        )
+        if det_dup is not None and det_dup.matches:
+            extra_fields: dict[str, Any] = {
+                "message": det_dup.message,
+                "matches": det_dup.matches_payload(),
+            }
+            suggestion = det_dup.suggestion_payload()
+            if suggestion is not None:
+                extra_fields["suggestion"] = suggestion
+            return det_dup.message, "company_workspace_exists", extra_fields
+    return "情况已变化，请重新发起", "scope_changed", {"message_status": "error"}
+
+
+def build_in_tx_identity_hook(
     *,
     user_id: str,
-    request: Any,
-    principal: Any,
+    workspace_name: str,
+    coverage_kind: str | None,
+    ticker: str | None,
+    display_name: str | None,
     wants_coverage: bool,
     raw_coverage_kind: str,
-    explicit_ticker_key: str | None,
+    effective_ticker_key: str | None,
     registration_state: dict[str, Any],
+    principal: Any = None,
 ) -> Any | None:
     """Build an ``on_workspace_inserted(conn, ws_row)`` hook that commits
     company identity (coverage unit and/or canonical company ticker config) in
     the exact same transaction as ``INSERT INTO workspaces``."""
     should_stamp_ticker = bool(
-        explicit_ticker_key is not None and raw_coverage_kind != "sector"
+        effective_ticker_key is not None and raw_coverage_kind != "sector"
     )
     if not wants_coverage and not should_stamp_ticker:
         return None
 
     async def _on_workspace_inserted(conn: Any, ws_row: dict[str, Any]) -> None:
         ws_id = str(ws_row["workspace_id"])
-        ws_name = str(ws_row.get("name") or request.name)
+        ws_name = str(ws_row.get("name") or workspace_name)
         registered_company_unit = False
 
         if wants_coverage:
@@ -94,9 +165,9 @@ def _build_in_tx_identity_hook(
                         user_id,
                         workspace_id=ws_id,
                         workspace_name=ws_name,
-                        coverage_kind=request.coverage_kind,
-                        ticker=request.ticker,
-                        display_name=request.display_name,
+                        coverage_kind=coverage_kind,
+                        ticker=ticker,
+                        display_name=display_name,
                         principal=principal,
                         conn=conn,
                     )
@@ -120,9 +191,10 @@ def _build_in_tx_identity_hook(
                 registration_state["result"] = (None, msg, detail)
 
         # Stamp canonical company ticker onto workspace.config in the same tx
-        # whenever an explicit company ticker was supplied and no bound company
-        # coverage unit carries it yet (e.g. ticker without coverage_kind,
-        # external caller, or non-fatal unit warning).
+        # whenever an effective company ticker was resolved and no bound company
+        # coverage unit carries it yet (e.g. ticker without coverage_kind, web
+        # "create without registering" with model-suggested ticker, external
+        # caller, or non-fatal unit warning).
         if should_stamp_ticker and not registered_company_unit:
             try:
                 async with conn.transaction():
@@ -134,12 +206,12 @@ def _build_in_tx_identity_hook(
                             WHERE workspace_id = %s::uuid
                             """,
                             (
-                                Json({WORKSPACE_COMPANY_TICKER_CONFIG_KEY: explicit_ticker_key}),
+                                Json({WORKSPACE_COMPANY_TICKER_CONFIG_KEY: effective_ticker_key}),
                                 ws_id,
                             ),
                         )
                 cfg = dict(ws_row.get("config") or {})
-                cfg[WORKSPACE_COMPANY_TICKER_CONFIG_KEY] = explicit_ticker_key
+                cfg[WORKSPACE_COMPANY_TICKER_CONFIG_KEY] = effective_ticker_key
                 ws_row["config"] = cfg
             except Exception as exc:
                 logger.warning(
@@ -149,6 +221,35 @@ def _build_in_tx_identity_hook(
                 )
 
     return _on_workspace_inserted
+
+
+async def resolve_coverage_registration_result(
+    *,
+    user_id: str,
+    workspace_id: str,
+    workspace_name: str,
+    coverage_kind: str | None,
+    ticker: str | None,
+    display_name: str | None,
+    wants_coverage: bool,
+    registration_state: dict[str, Any],
+    principal: Any = None,
+) -> tuple[dict[str, Any] | None, str | None, dict[str, Any] | None]:
+    if not wants_coverage:
+        return None, None, None
+    if registration_state["ran"]:
+        return registration_state["result"]
+    # Fallback when WorkspaceManager.create_workspace was replaced by a
+    # unit-test mock that did not invoke create_workspace_on_computer.
+    return await units_mod.auto_register_workspace_coverage_unit(
+        user_id,
+        workspace_id=workspace_id,
+        workspace_name=workspace_name,
+        coverage_kind=coverage_kind,
+        ticker=ticker,
+        display_name=display_name,
+        principal=principal,
+    )
 
 
 async def _attach_coverage_registration_result(
@@ -162,22 +263,19 @@ async def _attach_coverage_registration_result(
 ) -> dict[str, Any]:
     if not wants_coverage:
         return workspace
-    if registration_state["ran"]:
-        unit_row, unit_warning, unit_warning_detail = registration_state["result"]
-    else:
-        # Fallback when WorkspaceManager.create_workspace was replaced by a
-        # unit-test mock that did not invoke create_workspace_on_computer.
-        unit_row, unit_warning, unit_warning_detail = (
-            await units_mod.auto_register_workspace_coverage_unit(
-                user_id,
-                workspace_id=str(workspace["workspace_id"]),
-                workspace_name=str(workspace.get("name") or request.name),
-                coverage_kind=request.coverage_kind,
-                ticker=request.ticker,
-                display_name=request.display_name,
-                principal=principal,
-            )
+    unit_row, unit_warning, unit_warning_detail = (
+        await resolve_coverage_registration_result(
+            user_id=user_id,
+            workspace_id=str(workspace["workspace_id"]),
+            workspace_name=str(workspace.get("name") or request.name),
+            coverage_kind=request.coverage_kind,
+            ticker=request.ticker,
+            display_name=request.display_name,
+            wants_coverage=wants_coverage,
+            registration_state=registration_state,
+            principal=principal,
         )
+    )
     if (
         unit_row is not None
         or unit_warning is not None
@@ -213,11 +311,9 @@ async def create_workspace_for_web(
         coverage_active = await units_mod.is_workspace_coverage_registration_active(x_user_id)
     wants_coverage = bool(requested_coverage and coverage_active)
 
-    explicit_ticker_raw = str(request.ticker or "").strip() or None
-    explicit_ticker_key = (
-        normalize_ticker_key(explicit_ticker_raw)
-        if explicit_ticker_raw and raw_coverage_kind != "sector"
-        else None
+    _, explicit_ticker_key = resolve_effective_company_ticker(
+        raw_coverage_kind=raw_coverage_kind,
+        explicit_ticker=request.ticker,
     )
 
     if request.allow_duplicate_company:
@@ -244,13 +340,16 @@ async def create_workspace_for_web(
             matched_ids,
         )
         registration_state: dict[str, Any] = {"ran": False, "result": (None, None, None)}
-        in_tx_hook = _build_in_tx_identity_hook(
+        in_tx_hook = build_in_tx_identity_hook(
             user_id=x_user_id,
-            request=request,
+            workspace_name=request.name,
+            coverage_kind=request.coverage_kind,
+            ticker=request.ticker,
+            display_name=request.display_name,
             principal=principal,
             wants_coverage=wants_coverage,
             raw_coverage_kind=raw_coverage_kind,
-            explicit_ticker_key=explicit_ticker_key,
+            effective_ticker_key=explicit_ticker_key,
             registration_state=registration_state,
         )
         create_kwargs: dict[str, Any] = {
@@ -327,14 +426,22 @@ async def create_workspace_for_web(
                     },
                 )
 
+        effective_ticker, effective_ticker_key = resolve_effective_company_ticker(
+            raw_coverage_kind=raw_coverage_kind,
+            explicit_ticker=request.ticker,
+            suggestion=dup.suggestion if dup is not None else None,
+        )
         registration_state = {"ran": False, "result": (None, None, None)}
-        in_tx_hook = _build_in_tx_identity_hook(
+        in_tx_hook = build_in_tx_identity_hook(
             user_id=x_user_id,
-            request=request,
+            workspace_name=request.name,
+            coverage_kind=request.coverage_kind,
+            ticker=request.ticker,
+            display_name=request.display_name,
             principal=principal,
             wants_coverage=wants_coverage,
             raw_coverage_kind=raw_coverage_kind,
-            explicit_ticker_key=explicit_ticker_key,
+            effective_ticker_key=effective_ticker_key,
             registration_state=registration_state,
         )
 
@@ -347,12 +454,6 @@ async def create_workspace_for_web(
         }
         if in_tx_hook is not None:
             create_kwargs["on_workspace_inserted"] = in_tx_hook
-
-        effective_ticker = explicit_ticker_raw or (
-            dup.suggestion.ticker
-            if dup is not None and dup.suggestion is not None
-            else None
-        )
 
         dedup_snap = dedup_snapshots[-1] if dedup_snapshots else None
         if dedup_snap is not None and not dedup_snap.active:

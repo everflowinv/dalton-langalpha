@@ -26,6 +26,7 @@ import sqlite3
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec, patch
+import uuid
 
 from fastapi import Request
 from httpx import ASGITransport, AsyncClient
@@ -159,8 +160,15 @@ def _make_in_memory_workspace_db(
                 lk = _get_ticker_lock(ticker_key)
                 await lk.acquire()
                 self._conn.held_locks.append(lk)
+                self._conn.acquired_keys.append(f"ws_ticker:{ticker_key}")
                 lock_events.append(f"acquire:ws_ticker:{ticker_key}")
                 self._rows = []
+                return
+
+            if "SELECT name, kind FROM computers" in text:
+                cid = str((params or {}).get("computer_id") or COMP_A)
+                comp_name = "Alice Box" if cid == COMP_A else "Bob Box"
+                self._rows = [{"name": comp_name, "kind": "docker"}]
                 return
 
             if "FROM dalton_user_roles" in text:
@@ -410,9 +418,12 @@ def _make_in_memory_workspace_db(
         async def fetchone(self) -> dict[str, Any] | None:
             return self._rows[0] if self._rows else None
 
+    lock_sequences: list[list[str]] = []
+
     class _MemConn:
         def __init__(self) -> None:
             self.held_locks: list[asyncio.Lock] = []
+            self.acquired_keys: list[str] = []
 
         def cursor(self, **_kwargs):
             return _MemCursor(self)
@@ -422,6 +433,9 @@ def _make_in_memory_workspace_db(
             yield
 
         def release_locks(self) -> None:
+            if self.acquired_keys:
+                lock_sequences.append(list(self.acquired_keys))
+                self.acquired_keys.clear()
             while self.held_locks:
                 lk = self.held_locks.pop()
                 lk.release()
@@ -447,6 +461,7 @@ def _make_in_memory_workspace_db(
         lk = _get_lock(uid)
         await lk.acquire()
         cur._conn.held_locks.append(lk)
+        cur._conn.acquired_keys.append(f"user:{uid}")
         lock_events.append(f"acquire:{uid}")
 
     return {
@@ -454,6 +469,7 @@ def _make_in_memory_workspace_db(
         "docs_by_ws": docs_by_ws,
         "units_by_ws": units_by_ws,
         "lock_events": lock_events,
+        "lock_sequences": lock_sequences,
         "executed_sql": executed_sql,
         "get_db_connection": _get_db_connection,
         "folder_allocation": _folder_allocation,
@@ -1023,19 +1039,358 @@ async def test_e2_web_cross_user_concurrent_alias_same_ticker_serializes_with_ti
     assert detail["code"] == "company_workspace_exists"
     assert detail["matches"][0]["workspace_id"] == db_state["workspaces"][0]["workspace_id"]
 
-    # Verify lock ordering: both users took lock_user_writes BEFORE ws_ticker:00700.
-    events = db_state["lock_events"]
-    assert "acquire:ws_ticker:00700" in events
-    first_ticker_idx = events.index("acquire:ws_ticker:00700")
-    assert (
-        events.index(f"acquire:{USER_A}") < first_ticker_idx
-        or events.index(f"acquire:{USER_B}") < first_ticker_idx
+    # Verify per-connection lock ordering: every transaction took its own
+    # lock_user_writes strictly BEFORE ws_ticker:00700.
+    ticker_seqs = [seq for seq in db_state["lock_sequences"] if "ws_ticker:00700" in seq]
+    assert len(ticker_seqs) >= 2
+    assert {seq[0] for seq in ticker_seqs} == {f"user:{USER_A}", f"user:{USER_B}"}
+    for seq in ticker_seqs:
+        assert seq[0].startswith("user:")
+        assert seq.index("ws_ticker:00700") > 0
+
+
+@pytest.mark.asyncio
+async def test_e2_web_and_cos_mixed_concurrent_alias_same_ticker_shares_ticker_lock_and_same_tx_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 Item 1: Web and Chief of Staff concurrently creating different
+    ticker-less aliases for the same company ('腾讯控股' vs 'Tencent',
+    '0700.HK' vs '700.HK') with LLM returning empty matches share the same
+    normalized ws_ticker advisory lock (strictly after lock_user_writes) and
+    commit company identity in the workspace insert transaction; only ONE
+    workspace is created. Also verifies bootstrap_cloud_primary_computer
+    forwards target_ticker into locked recheck."""
+    from src.server.app.workspaces import router as ws_router
+    from src.server.dependencies.principal import Principal, get_principal
+    import src.tools.secretary.tools as sec_tools
+
+    db_state = _make_in_memory_workspace_db()
+    _patch_web_create_env(monkeypatch, db_state)
+
+    comp_a = _computer_row(COMP_A, USER_A)
+    comp_a["name"] = "Alice Box"
+    comp_b = _computer_row(COMP_B, USER_B)
+    comp_b["name"] = "Bob Box"
+    comp_by_user = {USER_A: comp_a, USER_B: comp_b}
+    comp_by_id = {COMP_A: comp_a, COMP_B: comp_b}
+
+    async def _ensure_primary(_self, uid: str, *, default_name=None, resource_tier=None):
+        del default_name, resource_tier
+        return dict(comp_by_user[uid])
+
+    async def _get_computer(cid: str, *, conn=None):
+        del conn
+        return dict(comp_by_id[str(cid)])
+
+    monkeypatch.setattr(
+        WorkspaceManager,
+        "ensure_primary_computer",
+        create_autospec(_REAL_ENSURE_PRIMARY, side_effect=_ensure_primary),
     )
-    # Every ticker lock acquisition was preceded by a user lock acquisition.
-    ticker_indices = [i for i, ev in enumerate(events) if ev == "acquire:ws_ticker:00700"]
-    assert len(ticker_indices) >= 2
-    assert events.index(f"acquire:{USER_A}") < max(ticker_indices)
-    assert events.index(f"acquire:{USER_B}") < max(ticker_indices)
+    monkeypatch.setattr(
+        ws_db,
+        "get_computer",
+        create_autospec(_REAL_GET_COMPUTER, side_effect=_get_computer),
+    )
+    monkeypatch.setattr(
+        "src.server.services.workspace_manager.get_computer",
+        create_autospec(_REAL_GET_COMPUTER, side_effect=_get_computer),
+    )
+    monkeypatch.setattr(
+        sec_tools,
+        "hitl_confirm",
+        create_autospec(sec_tools.hitl_confirm, return_value=(True, {})),
+    )
+    orig_is_resuming = sec_tools._is_resuming_interrupt
+    monkeypatch.setattr(
+        sec_tools,
+        "_is_resuming_interrupt",
+        create_autospec(orig_is_resuming, return_value=True),
+    )
+    monkeypatch.setattr(
+        sec_tools,
+        "_folder_ready_result",
+        create_autospec(
+            sec_tools._folder_ready_result,
+            return_value={"folder_ready": False, "folder_hint": "pending"},
+        ),
+    )
+    monkeypatch.setattr(
+        units_mod,
+        "is_workspace_coverage_registration_active",
+        create_autospec(units_mod.is_workspace_coverage_registration_active, return_value=True),
+    )
+
+    registration_saw_held_lock: list[bool] = []
+
+    async def _fake_auto_register(
+        user_id: str,
+        *,
+        workspace_id: str,
+        workspace_name: str,
+        coverage_kind: str | None,
+        ticker: str | None = None,
+        display_name: str | None = None,
+        principal: Any = None,
+        conn: Any = None,
+    ):
+        del display_name, principal
+        registration_saw_held_lock.append(bool(conn is not None and conn.held_locks))
+        unit = {
+            "unit_id": str(uuid.uuid4()),
+            "kind": coverage_kind or "company",
+            "status": "active",
+            "owner_user_id": user_id,
+            "lead_analyst_user_id": user_id,
+            "display_name": workspace_name,
+            "workspace_id": workspace_id,
+            "ticker": ticker,
+        }
+        db_state["units_by_ws"][workspace_id] = unit
+        return unit, None, None
+
+    monkeypatch.setattr(
+        units_mod,
+        "auto_register_workspace_coverage_unit",
+        create_autospec(
+            units_mod.auto_register_workspace_coverage_unit, side_effect=_fake_auto_register
+        ),
+    )
+    monkeypatch.setattr(dedup_mod, "dalton_complete", _make_llm_mock())
+
+    app = create_test_app(ws_router)
+    app.dependency_overrides[get_principal] = lambda: Principal(
+        user_id=USER_A, auth="session", computer_id=None
+    )
+
+    cos_snap = {
+        "action": "create_workspace",
+        "tool_call_id": "call-cos-mix-u1",
+        "workspace_name": "Tencent",
+        "workspace_description": "",
+        "computer_id": COMP_B,
+        "computer_name": "Bob Box",
+        "computer_kind": "docker",
+        "computer_is_own_machine": False,
+        "bootstrap_cloud_primary": False,
+    }
+
+    orig_collect = dedup_mod._collect_candidates
+    monkeypatch.setattr(dedup_mod, "_collect_candidates", _wrap_collect_with_barrier(orig_collect))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        web_resp, cos_cmd = await asyncio.gather(
+            client.post(
+                "/api/v1/workspaces",
+                json={
+                    "name": "腾讯控股",
+                    "computer_id": COMP_A,
+                    "coverage_kind": "company",
+                    "ticker": "0700.HK",
+                },
+            ),
+            sec_tools.workspaces_create(
+                USER_B,
+                "Tencent",
+                None,
+                "call-cos-mix-u1",
+                preapproved=False,
+                snapshot=cos_snap,
+                coverage_kind="company",
+                ticker="700.HK",
+            ),
+        )
+
+    cos_body = json.loads(cos_cmd.update["messages"][0].content)
+    assert (web_resp.status_code == 201) ^ bool(cos_body.get("success") is True)
+    assert len(db_state["workspaces"]) == 1
+    assert len(db_state["units_by_ws"]) == 1
+    assert registration_saw_held_lock == [True]
+    ticker_seqs = [seq for seq in db_state["lock_sequences"] if "ws_ticker:00700" in seq]
+    assert len(ticker_seqs) >= 2
+    assert {seq[0] for seq in ticker_seqs} == {f"user:{USER_A}", f"user:{USER_B}"}
+    for seq in ticker_seqs:
+        assert seq.index("ws_ticker:00700") > 0
+
+    # Also verify CoS with explicit ticker & no coverage_kind stamps dalton_company_ticker in-tx
+    # on the preapproved path and blocks a second user's alias.
+    monkeypatch.setattr(
+        sec_tools,
+        "_is_resuming_interrupt",
+        create_autospec(orig_is_resuming, return_value=False),
+    )
+    monkeypatch.setattr(dedup_mod, "_collect_candidates", orig_collect)
+    cos_snap_baba = {
+        **cos_snap,
+        "tool_call_id": "call-cos-baba",
+        "workspace_name": "阿里巴巴",
+    }
+    res_baba = await sec_tools.workspaces_create(
+        USER_B,
+        "阿里巴巴",
+        None,
+        "call-cos-baba",
+        preapproved=True,
+        snapshot=cos_snap_baba,
+        ticker="9988.HK",
+    )
+    baba_body = json.loads(res_baba.update["messages"][0].content)
+    assert baba_body["success"] is True
+    baba_ws = next(w for w in db_state["workspaces"] if w["name"] == "阿里巴巴")
+    assert baba_ws["config"].get(locked_recheck_mod.WORKSPACE_COMPANY_TICKER_CONFIG_KEY) == "09988"
+
+    # Second user trying via CoS with alias + same ticker is caught deterministically.
+    cos_snap_baba_a = {
+        **cos_snap,
+        "tool_call_id": "call-cos-baba-a",
+        "workspace_name": "Alibaba",
+        "computer_id": COMP_A,
+        "computer_name": "Alice Box",
+    }
+    res_baba_dup = await sec_tools.workspaces_create(
+        USER_A,
+        "Alibaba",
+        None,
+        "call-cos-baba-a",
+        preapproved=True,
+        snapshot=cos_snap_baba_a,
+        ticker="09988",
+    )
+    baba_dup_body = json.loads(res_baba_dup.update["messages"][0].content)
+    assert baba_dup_body["success"] is False
+    assert baba_dup_body["code"] == "scope_changed"
+
+    # Verify bootstrap_cloud_primary_computer forwards target_ticker to locked recheck.
+    import inspect
+    from src.server.services.computer_manager._machines import MachineLifecycleMixin
+
+    sig = inspect.signature(MachineLifecycleMixin.bootstrap_cloud_primary_computer)
+    assert "target_ticker" in sig.parameters
+
+
+@pytest.mark.asyncio
+async def test_e2_web_skip_coverage_suggestion_concurrent_aliases_use_suggested_ticker_for_lock_and_same_tx_stamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 Item 3 (Codex 中-1): When two members choose 'Create without registering'
+    (skip_coverage_suggestion=True, no explicit ticker or coverage_kind) for
+    different ticker-less aliases of the same company, the model-suggested
+    company ticker drives BOTH the ws_ticker advisory lock AND the in-transaction
+    dalton_company_ticker config stamp so only ONE workspace is created even if
+    follow-up LLM calls return empty matches."""
+    from src.server.app.workspaces import router as ws_router
+    from src.server.dependencies.principal import Principal, get_principal
+
+    # Seed one unrelated workspace so Phase 1 invokes the LLM (and returns a
+    # high-confidence company suggestion without any duplicate match).
+    unrelated_ws = {
+        "workspace_id": str(uuid.uuid4()),
+        "user_id": USER_A,
+        "name": "Macro Notes",
+        "status": "stopped",
+        "config": {},
+        "owner_name": "Alice",
+        "owner_email": "alice@team.com",
+    }
+    db_state = _make_in_memory_workspace_db(initial_workspaces=[unrelated_ws])
+    _patch_web_create_env(monkeypatch, db_state)
+
+    comp_a = _computer_row(COMP_A, USER_A)
+    comp_b = _computer_row(COMP_B, USER_B)
+    comp_by_user = {USER_A: comp_a, USER_B: comp_b}
+    comp_by_id = {COMP_A: comp_a, COMP_B: comp_b}
+
+    async def _ensure_primary(_self, uid: str, *, default_name=None, resource_tier=None):
+        del default_name, resource_tier
+        return dict(comp_by_user[uid])
+
+    async def _get_computer(cid: str, *, conn=None):
+        del conn
+        return dict(comp_by_id[str(cid)])
+
+    monkeypatch.setattr(
+        WorkspaceManager,
+        "ensure_primary_computer",
+        create_autospec(_REAL_ENSURE_PRIMARY, side_effect=_ensure_primary),
+    )
+    monkeypatch.setattr(
+        ws_db,
+        "get_computer",
+        create_autospec(_REAL_GET_COMPUTER, side_effect=_get_computer),
+    )
+    monkeypatch.setattr(
+        "src.server.services.workspace_manager.get_computer",
+        create_autospec(_REAL_GET_COMPUTER, side_effect=_get_computer),
+    )
+    monkeypatch.setattr(
+        dedup_mod, "_collect_candidates", _wrap_collect_with_barrier(dedup_mod._collect_candidates)
+    )
+
+    # Phase 1 suggests company ticker '0700.HK' with empty matches; subsequent
+    # retry calls return empty matches and no suggestion.
+    call_count = 0
+
+    async def _suggest_then_empty(*, user_prompt: str, **_unused: Any):
+        nonlocal call_count
+        del user_prompt
+        call_count += 1
+        if call_count <= 2:
+            return SimpleNamespace(
+                ok=True,
+                data=DedupLlmResult(
+                    matches=[],
+                    suggested_kind="company",
+                    suggested_confidence="high",
+                    suggested_ticker="0700.HK",
+                    suggested_display_name="腾讯控股",
+                ),
+            )
+        return SimpleNamespace(ok=True, data=DedupLlmResult(matches=[]))
+
+    monkeypatch.setattr(
+        dedup_mod,
+        "dalton_complete",
+        create_autospec(dedup_mod.dalton_complete, side_effect=_suggest_then_empty),
+    )
+
+    app = create_test_app(ws_router)
+
+    async def _principal_from_header(request: Request) -> Principal:
+        return Principal(user_id=request.headers["X-User-Id"], auth="session")
+
+    app.dependency_overrides[get_principal] = _principal_from_header
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp_a, resp_b = await asyncio.gather(
+            client.post(
+                "/api/v1/workspaces",
+                headers={"X-User-Id": USER_A},
+                json={"name": "腾讯控股", "skip_coverage_suggestion": True},
+            ),
+            client.post(
+                "/api/v1/workspaces",
+                headers={"X-User-Id": USER_B},
+                json={"name": "Tencent", "skip_coverage_suggestion": True},
+            ),
+        )
+
+    assert sorted([resp_a.status_code, resp_b.status_code]) == [201, 409]
+    created_rows = [
+        w for w in db_state["workspaces"] if w["workspace_id"] != unrelated_ws["workspace_id"]
+    ]
+    assert len(created_rows) == 1
+    assert db_state["units_by_ws"] == {}
+    assert (
+        created_rows[0]["config"].get(
+            locked_recheck_mod.WORKSPACE_COMPANY_TICKER_CONFIG_KEY
+        )
+        == "00700"
+    )
+    conflict_resp = resp_b if resp_b.status_code == 409 else resp_a
+    assert conflict_resp.json()["detail"]["code"] == "company_workspace_exists"
+    ticker_seqs = [seq for seq in db_state["lock_sequences"] if "ws_ticker:00700" in seq]
+    assert len(ticker_seqs) >= 2
+    assert {seq[0] for seq in ticker_seqs} == {f"user:{USER_A}", f"user:{USER_B}"}
 
 
 @pytest.mark.asyncio

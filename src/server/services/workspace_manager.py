@@ -196,17 +196,23 @@ class WorkspaceManager(ComputerManager):
         if bootstrap_cloud_primary:
             if chosen:
                 raise ApprovalScopeChangedError("情况已变化，请重新发起")
+            bootstrap_kwargs: Dict[str, Any] = {
+                "default_name": name,
+                "resource_tier": resource_tier,
+                "expected_kind": expected_computer_kind,
+                "check_duplicate_snapshot": bool(verify_snapshot and check_duplicate_snapshot),
+                "workspace_name": name,
+                "expected_duplicate_workspace_id": expected_duplicate_workspace_id,
+                "expected_duplicate_workspace_name": expected_duplicate_workspace_name,
+                "verified_company_candidates": verified_company_candidates if verify_snapshot else None,
+                "check_colleague_duplicate": bool(verify_snapshot and check_colleague_duplicate),
+            }
+            # DALTON-HOOK(workspace-dedup): forward target_ticker into cloud-primary bootstrap recheck
+            if verify_snapshot and target_ticker is not None:
+                bootstrap_kwargs["target_ticker"] = target_ticker
             computer = await self.bootstrap_cloud_primary_computer(
                 user_id,
-                default_name=name,
-                resource_tier=resource_tier,
-                expected_kind=expected_computer_kind,
-                check_duplicate_snapshot=bool(verify_snapshot and check_duplicate_snapshot),
-                workspace_name=name,
-                expected_duplicate_workspace_id=expected_duplicate_workspace_id,
-                expected_duplicate_workspace_name=expected_duplicate_workspace_name,
-                verified_company_candidates=verified_company_candidates if verify_snapshot else None,
-                check_colleague_duplicate=bool(verify_snapshot and check_colleague_duplicate),
+                **bootstrap_kwargs,
             )
         elif chosen:
             try:

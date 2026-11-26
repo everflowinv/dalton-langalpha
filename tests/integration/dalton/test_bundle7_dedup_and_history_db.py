@@ -77,6 +77,7 @@ def _enable_everflow_env(
     import src.config.settings as app_settings
     import src.dalton.settings as dalton_settings_mod
 
+    monkeypatch.setenv("APP_ENV", "dalton")
     monkeypatch.setenv("DALTON_PROFILE", "everflow")
     monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
     monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "true")
@@ -109,144 +110,154 @@ async def bundle7_live_pool(
         open=False,
     )
     await local_pool.open()
-    await local_pool.wait()
+    try:
+        await local_pool.wait()
 
-    @asynccontextmanager
-    async def _live_get_db_connection(conn=None):
-        if conn is not None:
-            yield conn
-            return
-        async with local_pool.connection(timeout=10) as owned:
-            yield owned
+        @asynccontextmanager
+        async def _live_get_db_connection(conn=None):
+            if conn is not None:
+                yield conn
+                return
+            async with local_pool.connection(timeout=10) as owned:
+                yield owned
 
-    async def _live_session_connection():
-        conn = await psycopg.AsyncConnection.connect(
-            test_db_uri, **pool_mod._CONNECTION_KWARGS
-        )
-        await pool_mod._configure_postgres_connection(conn)
-        return conn
-
-    orig_gdc = pool_mod.get_db_connection
-    holders = {
-        pool_mod,
-        computer_db,
-        user_db,
-        ws_db,
-        ws_folders_db,
-        exec_db,
-        conv_db,
-        dedup_mod,
-        locked_recheck_mod,
-        ws_create_mod,
-        units_mod,
-        cu_db,
-        history_access_mod,
-        *(
-            module
-            for name, module in list(sys.modules.items())
-            if name.startswith(("src.", "ptc_agent."))
-            and getattr(module, "get_db_connection", None) is orig_gdc
-        ),
-    }
-
-    with ExitStack() as stack:
-        stack.enter_context(
-            patch.object(
-                pool_mod,
-                "get_db_connection_string",
-                create_autospec(pool_mod.get_db_connection_string, return_value=test_db_uri),
+        async def _live_session_connection():
+            conn = await psycopg.AsyncConnection.connect(
+                test_db_uri, **pool_mod._CONNECTION_KWARGS
             )
-        )
-        stack.enter_context(
-            patch.object(
-                pool_mod,
-                "get_or_create_pool",
-                create_autospec(pool_mod.get_or_create_pool, return_value=local_pool),
-            )
-        )
-        stack.enter_context(
-            patch.object(
-                pool_mod,
-                "open_session_connection",
-                create_autospec(
-                    pool_mod.open_session_connection, side_effect=_live_session_connection
-                ),
-            )
-        )
-        gdc_spec = create_autospec(orig_gdc, side_effect=_live_get_db_connection)
-        for module in holders:
-            if hasattr(module, "get_db_connection"):
-                stack.enter_context(
-                    patch.object(module, "get_db_connection", gdc_spec)
+            await pool_mod._configure_postgres_connection(conn)
+            return conn
+
+        orig_gdc = pool_mod.get_db_connection
+        holders = {
+            pool_mod,
+            computer_db,
+            user_db,
+            ws_db,
+            ws_folders_db,
+            exec_db,
+            conv_db,
+            dedup_mod,
+            locked_recheck_mod,
+            ws_create_mod,
+            units_mod,
+            cu_db,
+            history_access_mod,
+            *(
+                module
+                for name, module in list(sys.modules.items())
+                if name.startswith(("src.", "ptc_agent."))
+                and getattr(module, "get_db_connection", None) is orig_gdc
+            ),
+        }
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    pool_mod,
+                    "get_db_connection_string",
+                    create_autospec(
+                        pool_mod.get_db_connection_string, return_value=test_db_uri
+                    ),
                 )
-        await close_shared_lock_session()
-        try:
-            yield local_pool
-        finally:
+            )
+            stack.enter_context(
+                patch.object(
+                    pool_mod,
+                    "get_or_create_pool",
+                    create_autospec(pool_mod.get_or_create_pool, return_value=local_pool),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    pool_mod,
+                    "open_session_connection",
+                    create_autospec(
+                        pool_mod.open_session_connection,
+                        side_effect=_live_session_connection,
+                    ),
+                )
+            )
+            gdc_spec = create_autospec(orig_gdc, side_effect=_live_get_db_connection)
+            for module in holders:
+                if hasattr(module, "get_db_connection"):
+                    stack.enter_context(
+                        patch.object(module, "get_db_connection", gdc_spec)
+                    )
+            await close_shared_lock_session()
             try:
+                yield local_pool
+            finally:
                 await close_shared_lock_session()
                 async with local_pool.connection() as cleanup_conn:
-                    async with cleanup_conn.cursor() as cur:
-                        await cur.execute(
-                            """
-                            DELETE FROM automation_executions
-                            WHERE automation_id IN (
-                                SELECT automation_id FROM automations WHERE user_id LIKE 'b7-%'
+                    async with cleanup_conn.transaction():
+                        async with cleanup_conn.cursor() as cur:
+                            await cur.execute(
+                                """
+                                DELETE FROM automation_executions
+                                WHERE automation_id IN (
+                                    SELECT automation_id FROM automations WHERE user_id LIKE 'b7-%'
+                                )
+                                """
                             )
-                            """
-                        )
-                        await cur.execute(
-                            "DELETE FROM automations WHERE user_id LIKE 'b7-%'"
-                        )
-                        await cur.execute(
-                            """
-                            DELETE FROM conversation_threads
-                            WHERE user_id LIKE 'b7-%'
-                               OR workspace_id IN (
-                                   SELECT workspace_id FROM workspaces WHERE user_id LIKE 'b7-%'
-                               )
-                            """
-                        )
-                        await cur.execute(
-                            """
-                            DELETE FROM dalton_knowledge_versions
-                            WHERE user_id LIKE 'b7-%'
-                               OR workspace_id IN (
-                                   SELECT workspace_id FROM workspaces WHERE user_id LIKE 'b7-%'
-                               )
-                            """
-                        )
-                        await cur.execute(
-                            """
-                            DELETE FROM dalton_workspace_sharing
-                            WHERE workspace_id IN (
-                                SELECT workspace_id FROM workspaces WHERE user_id LIKE 'b7-%'
+                            await cur.execute(
+                                "DELETE FROM automations WHERE user_id LIKE 'b7-%'"
                             )
-                            """
-                        )
-                        await cur.execute(
-                            """
-                            DELETE FROM dalton_coverage_units
-                            WHERE owner_user_id LIKE 'b7-%'
-                               OR workspace_id IN (
-                                   SELECT workspace_id FROM workspaces WHERE user_id LIKE 'b7-%'
-                               )
-                            """
-                        )
-                        await cur.execute(
-                            "DELETE FROM dalton_coverage WHERE user_id LIKE 'b7-%'"
-                        )
-                        await cur.execute(
-                            "DELETE FROM workspaces WHERE user_id LIKE 'b7-%'"
-                        )
-                        await cur.execute(
-                            "DELETE FROM computers WHERE user_id LIKE 'b7-%'"
-                        )
-                        await cur.execute(
-                            "DELETE FROM users WHERE user_id LIKE 'b7-%'"
-                        )
-            finally:
-                await local_pool.close()
+                            await cur.execute(
+                                """
+                                DELETE FROM conversation_threads
+                                WHERE user_id LIKE 'b7-%'
+                                   OR workspace_id IN (
+                                       SELECT workspace_id FROM workspaces WHERE user_id LIKE 'b7-%'
+                                   )
+                                """
+                            )
+                            await cur.execute(
+                                "ALTER TABLE dalton_knowledge_versions DISABLE TRIGGER trg_dalton_kv_guard"
+                            )
+                            await cur.execute(
+                                """
+                                DELETE FROM dalton_knowledge_versions
+                                WHERE user_id LIKE 'b7-%'
+                                   OR workspace_id IN (
+                                       SELECT workspace_id FROM workspaces WHERE user_id LIKE 'b7-%'
+                                   )
+                                """
+                            )
+                            await cur.execute(
+                                "ALTER TABLE dalton_knowledge_versions ENABLE TRIGGER trg_dalton_kv_guard"
+                            )
+                            await cur.execute(
+                                """
+                                DELETE FROM dalton_workspace_sharing
+                                WHERE workspace_id IN (
+                                    SELECT workspace_id FROM workspaces WHERE user_id LIKE 'b7-%'
+                                )
+                                """
+                            )
+                            await cur.execute(
+                                """
+                                DELETE FROM dalton_coverage_units
+                                WHERE owner_user_id LIKE 'b7-%'
+                                   OR workspace_id IN (
+                                       SELECT workspace_id FROM workspaces WHERE user_id LIKE 'b7-%'
+                                   )
+                                """
+                            )
+                            await cur.execute(
+                                "DELETE FROM dalton_coverage WHERE user_id LIKE 'b7-%'"
+                            )
+                            await cur.execute(
+                                "DELETE FROM workspaces WHERE user_id LIKE 'b7-%'"
+                            )
+                            await cur.execute(
+                                "DELETE FROM computers WHERE user_id LIKE 'b7-%'"
+                            )
+                            await cur.execute(
+                                "DELETE FROM users WHERE user_id LIKE 'b7-%'"
+                            )
+    finally:
+        await local_pool.close()
 
 
 def _wrap_collect_barrier(orig_collect: Any, barrier_limit: int = 2) -> Any:
@@ -836,11 +847,15 @@ async def test_e2_web_cross_user_concurrent_alias_same_ticker_real_postgres_crea
         assert sorted([resp_a.status_code, resp_b.status_code]) == [201, 409]
         winner_resp = resp_a if resp_a.status_code == 201 else resp_b
         conflict_resp = resp_b if resp_b.status_code == 409 else resp_a
-        assert conflict_resp.json()["detail"]["code"] == "company_workspace_exists"
-        assert (
-            conflict_resp.json()["detail"]["matches"][0]["workspace_id"]
-            == winner_resp.json()["workspace_id"]
-        )
+        # Default sharing for new workspaces is web_access='hidden': colleague
+        # matches report can_read=False and omit workspace_id.
+        detail_1 = conflict_resp.json()["detail"]
+        assert detail_1["code"] == "company_workspace_exists"
+        assert len(detail_1["matches"]) == 1
+        match_1 = detail_1["matches"][0]
+        assert match_1["can_read"] is False
+        assert "workspace_id" not in match_1
+        assert match_1["workspace_name"] == winner_resp.json()["name"]
 
         # Case 2: Two different users WITHOUT coverage_kind (same-tx config ticker stamp).
         monkeypatch.setattr(dedup_mod, "_collect_candidates", _wrap_collect_barrier(orig_collect))
@@ -866,8 +881,16 @@ async def test_e2_web_cross_user_concurrent_alias_same_ticker_real_postgres_crea
         )
         assert sorted([resp_c.status_code, resp_d.status_code]) == [201, 409]
         cfg_winner = resp_c if resp_c.status_code == 201 else resp_d
+        cfg_conflict = resp_d if resp_d.status_code == 409 else resp_c
         cfg_owner = uid_a if resp_c.status_code == 201 else uid_b
         cfg_ws_id = cfg_winner.json()["workspace_id"]
+        detail_2 = cfg_conflict.json()["detail"]
+        assert detail_2["code"] == "company_workspace_exists"
+        assert len(detail_2["matches"]) == 1
+        match_2 = detail_2["matches"][0]
+        assert match_2["can_read"] is False
+        assert "workspace_id" not in match_2
+        assert match_2["workspace_name"] == cfg_winner.json()["name"]
 
         # Verify PUT whole-config replacement preserves dalton_company_ticker and
         # refuses client overrides in real PostgreSQL.
@@ -911,6 +934,286 @@ async def test_e2_web_cross_user_concurrent_alias_same_ticker_real_postgres_crea
     assert unit_rows[0]["ticker_key"] == "00700"
     cfg_row = next(r for r in ws_rows if r["workspace_id"] == cfg_ws_id)
     assert cfg_row["config"] == {"theme": "light", "dalton_company_ticker": "09988"}
+
+
+async def test_e2_web_and_cos_mixed_concurrent_alias_same_ticker_real_postgres_creates_only_one(
+    bundle7_live_pool: AsyncConnectionPool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 Item 1 (real PG): Two different internal members concurrently creating
+    different ticker-less aliases for the same security — one via Web and one via
+    Chief of Staff (both interactive snapshot and preapproved) — with LLM returning
+    empty matches share the same normalized ws_ticker advisory lock and commit
+    company identity in the workspace insert transaction; only ONE workspace is
+    created per company."""
+    from src.server.app.workspaces import router as ws_router
+    from src.server.dependencies.principal import Principal, get_principal
+    import src.tools.secretary.tools as sec_tools
+
+    uid_web = f"b7-mix-w-{uuid.uuid4().hex[:8]}"
+    uid_cos = f"b7-mix-c-{uuid.uuid4().hex[:8]}"
+    email_web = f"{uid_web}@team.local"
+    email_cos = f"{uid_cos}@team.local"
+    await create_user(user_id=uid_web, email=email_web, name="Web Alice")
+    await create_user(user_id=uid_cos, email=email_cos, name="CoS Bob")
+    comp_web = await create_computer(
+        uid_web,
+        kind="docker",
+        name="Alice Box",
+        is_primary=True,
+        status="stopped",
+        provider_ref=f"b7-mixw-{uuid.uuid4()}",
+    )
+    comp_cos = await create_computer(
+        uid_cos,
+        kind="docker",
+        name="Bob Box",
+        is_primary=True,
+        status="stopped",
+        provider_ref=f"b7-mixc-{uuid.uuid4()}",
+    )
+    comp_web_id = str(comp_web["computer_id"])
+    comp_cos_id = str(comp_cos["computer_id"])
+    comp_by_user = {uid_web: comp_web, uid_cos: comp_cos}
+
+    ws_mgr = object.__new__(WorkspaceManager)
+
+    async def _ensure_primary(_self, uid: str, *, default_name=None, resource_tier=None):
+        del default_name, resource_tier
+        return dict(comp_by_user[uid])
+
+    async def _resolve_binding(_self, _wid: str, *, workspace=None):
+        del workspace
+        return None
+
+    monkeypatch.setattr(
+        WorkspaceManager,
+        "ensure_primary_computer",
+        create_autospec(WorkspaceManager.ensure_primary_computer, side_effect=_ensure_primary),
+    )
+    monkeypatch.setattr(
+        WorkspaceManager,
+        "resolve_binding",
+        create_autospec(WorkspaceManager.resolve_binding, side_effect=_resolve_binding),
+    )
+    monkeypatch.setattr(
+        "src.server.app.workspaces.WorkspaceManager.get_instance",
+        create_autospec(WorkspaceManager.get_instance, return_value=ws_mgr),
+    )
+    monkeypatch.setattr(
+        sec_tools,
+        "hitl_confirm",
+        create_autospec(sec_tools.hitl_confirm, return_value=(True, {})),
+    )
+    orig_is_resuming = sec_tools._is_resuming_interrupt
+    monkeypatch.setattr(
+        sec_tools,
+        "_is_resuming_interrupt",
+        create_autospec(orig_is_resuming, return_value=True),
+    )
+    _enable_everflow_env(monkeypatch, (email_web, email_cos))
+    monkeypatch.setattr(
+        dedup_mod,
+        "is_coverage_units_enabled",
+        create_autospec(_REAL_IS_COV_ENABLED, return_value=True),
+    )
+    monkeypatch.setattr(
+        "src.dalton.settings.is_coverage_units_enabled",
+        create_autospec(_REAL_IS_COV_ENABLED, return_value=True),
+    )
+    monkeypatch.setattr(
+        "src.dalton.settings.get_dalton_settings",
+        create_autospec(_REAL_GET_DALTON_SETTINGS, return_value=SimpleNamespace(enabled=True)),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "is_dalton_supabase_auth_enabled",
+        create_autospec(_REAL_IS_SUPA_AUTH, return_value=True),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "get_user_tier",
+        create_autospec(dedup_mod.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "is_internal_or_admin",
+        create_autospec(access_tiers_mod.is_internal_or_admin, return_value=True),
+    )
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "is_admin_user",
+        create_autospec(access_tiers_mod.is_admin_user, return_value=False),
+    )
+    monkeypatch.setattr(
+        "src.dalton.settings.is_dalton_local_auth_enabled",
+        create_autospec(_REAL_IS_LOCAL_AUTH, return_value=False),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "is_dalton_local_auth_enabled",
+        create_autospec(_REAL_IS_LOCAL_AUTH, return_value=False),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "get_dalton_allowed_emails",
+        create_autospec(_REAL_ALLOWED_EMAILS, return_value=frozenset({email_web, email_cos})),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "is_invite_pm",
+        create_autospec(_REAL_IS_INVITE_PM, return_value=False),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "is_company_system_user",
+        create_autospec(_REAL_IS_COMPANY_USER, return_value=False),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "resolve_assist_model",
+        create_autospec(dedup_mod.resolve_assist_model, return_value="gpt-4o-mini"),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "resolve_assist_fallback_models",
+        create_autospec(dedup_mod.resolve_assist_fallback_models, return_value=[]),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "model_requires_user_oauth",
+        create_autospec(dedup_mod.model_requires_user_oauth, return_value=False),
+    )
+    # LLM always returns empty matches.
+    monkeypatch.setattr(dedup_mod, "dalton_complete", _make_llm_stub())
+
+    app = create_test_app(ws_router)
+    app.dependency_overrides[get_principal] = lambda: Principal(
+        user_id=uid_web, auth="session", computer_id=None
+    )
+
+    cos_snap_1 = {
+        "action": "create_workspace",
+        "tool_call_id": "call-cos-mix-1",
+        "workspace_name": "Tencent",
+        "workspace_description": "",
+        "computer_id": comp_cos_id,
+        "computer_name": "Bob Box",
+        "computer_kind": "docker",
+        "computer_is_own_machine": False,
+        "bootstrap_cloud_primary": False,
+    }
+    cos_snap_2 = {
+        "action": "create_workspace",
+        "tool_call_id": "call-cos-mix-2",
+        "workspace_name": "Alibaba",
+        "workspace_description": "",
+        "computer_id": comp_cos_id,
+        "computer_name": "Bob Box",
+        "computer_kind": "docker",
+        "computer_is_own_machine": False,
+        "bootstrap_cloud_primary": False,
+    }
+
+    orig_collect = dedup_mod._collect_candidates
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # Case 1: Web + interactive CoS (with coverage_kind='company', ticker-less aliases).
+        monkeypatch.setattr(dedup_mod, "_collect_candidates", _wrap_collect_barrier(orig_collect))
+        web_resp_1, cos_cmd_1 = await asyncio.gather(
+            client.post(
+                "/api/v1/workspaces",
+                json={
+                    "name": "腾讯控股",
+                    "computer_id": comp_web_id,
+                    "coverage_kind": "company",
+                    "ticker": "0700.HK",
+                },
+            ),
+            sec_tools.workspaces_create(
+                uid_cos,
+                "Tencent",
+                None,
+                "call-cos-mix-1",
+                preapproved=False,
+                snapshot=cos_snap_1,
+                coverage_kind="company",
+                ticker="700.HK",
+            ),
+        )
+        cos_body_1 = json.loads(cos_cmd_1.update["messages"][0].content)
+        assert (web_resp_1.status_code == 201) ^ bool(cos_body_1.get("success") is True)
+        if web_resp_1.status_code == 409:
+            detail_w1 = web_resp_1.json()["detail"]
+            assert detail_w1["code"] == "company_workspace_exists"
+            assert detail_w1["matches"][0]["can_read"] is False
+            assert "workspace_id" not in detail_w1["matches"][0]
+        else:
+            assert cos_body_1["code"] == "scope_changed"
+
+        # Case 2: Web + preapproved CoS (ticker without coverage_kind -> same-tx config stamp).
+        monkeypatch.setattr(
+            sec_tools,
+            "_is_resuming_interrupt",
+            create_autospec(orig_is_resuming, return_value=False),
+        )
+        monkeypatch.setattr(dedup_mod, "_collect_candidates", _wrap_collect_barrier(orig_collect))
+        web_resp_2, cos_cmd_2 = await asyncio.gather(
+            client.post(
+                "/api/v1/workspaces",
+                json={
+                    "name": "阿里巴巴",
+                    "computer_id": comp_web_id,
+                    "ticker": "9988.HK",
+                },
+            ),
+            sec_tools.workspaces_create(
+                uid_cos,
+                "Alibaba",
+                None,
+                "call-cos-mix-2",
+                preapproved=True,
+                snapshot=cos_snap_2,
+                ticker="09988",
+            ),
+        )
+        cos_body_2 = json.loads(cos_cmd_2.update["messages"][0].content)
+        assert (web_resp_2.status_code == 201) ^ bool(cos_body_2.get("success") is True)
+        if web_resp_2.status_code == 409:
+            detail_w2 = web_resp_2.json()["detail"]
+            assert detail_w2["code"] == "company_workspace_exists"
+            assert detail_w2["matches"][0]["can_read"] is False
+            assert "workspace_id" not in detail_w2["matches"][0]
+        else:
+            assert cos_body_2["code"] == "scope_changed"
+
+    async with bundle7_live_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT workspace_id::text AS workspace_id, user_id, name, config
+                FROM workspaces
+                WHERE user_id = ANY(%s::text[]) AND status <> 'deleted'
+                ORDER BY created_at ASC
+                """,
+                ([uid_web, uid_cos],),
+            )
+            ws_rows = await cur.fetchall()
+            await cur.execute(
+                """
+                SELECT workspace_id::text AS workspace_id, ticker_key
+                FROM dalton_coverage_units
+                WHERE owner_user_id = ANY(%s::text[]) AND status = 'active'
+                """,
+                ([uid_web, uid_cos],),
+            )
+            unit_rows = await cur.fetchall()
+    # Exactly 1 workspace for 00700 + 1 workspace for 09988 across Web + CoS.
+    assert len(ws_rows) == 2
+    assert len(unit_rows) == 1
+    assert unit_rows[0]["ticker_key"] == "00700"
+    assert any(r["workspace_id"] == unit_rows[0]["workspace_id"] for r in ws_rows)
+    baba_row = next(r for r in ws_rows if r["workspace_id"] != unit_rows[0]["workspace_id"])
+    assert (baba_row.get("config") or {}).get("dalton_company_ticker") == "09988"
 
 
 async def test_bd4_locked_recheck_reads_real_postgres_company_knowledge_doc_ticker(
