@@ -93,6 +93,7 @@ from src.server.services.computer_errors import (
     ComputerArchivingError,  # DALTON-HOOK(cos-settings-tools)
     ComputerNotFoundError,
     ComputerPreparingError,
+    DuplicateWorkspaceConflictError,  # DALTON-HOOK(workspace-dedup)
     NeedsComputer,
     UnknownResourceTier,
 )
@@ -281,7 +282,10 @@ async def create_workspace(
             or computer_id
         )
         # --- DALTON-HOOK(workspace-dedup): begin ---
-        from src.dalton.coverage.dedup import find_existing_company_workspace
+        from src.dalton.coverage.dedup import (
+            build_deterministic_duplicate_match,
+            find_existing_company_workspace,
+        )
         from src.dalton.coverage.units import is_workspace_coverage_registration_active
 
         raw_coverage_kind = str(request.coverage_kind or "").strip().lower()
@@ -290,6 +294,21 @@ async def create_workspace(
         if requested_coverage:
             coverage_active = await is_workspace_coverage_registration_active(x_user_id)
         wants_coverage = bool(requested_coverage and coverage_active)
+
+        def _raise_company_workspace_exists(dup_match: Any) -> None:
+            detail: dict[str, Any] = {
+                "code": "company_workspace_exists",
+                "message": dup_match.message,
+                "matches": dup_match.matches_payload(),
+            }
+            suggestion = dup_match.suggestion_payload()
+            if suggestion is not None:
+                detail["suggestion"] = suggestion
+            raise HTTPException(
+                status_code=409,
+                detail=detail,
+            )
+
         if request.allow_duplicate_company:
             matched_ids: list[str] = []
             try:
@@ -313,67 +332,132 @@ async def create_workspace(
                 request.name,
                 matched_ids,
             )
+            manager = WorkspaceManager.get_instance()
+            with computer_cause("create"):
+                workspace = await manager.create_workspace(
+                    user_id=x_user_id,
+                    name=request.name,
+                    description=request.description,
+                    config=request.config,
+                    computer_id=computer_id,
+                )
         else:
-            dup = None
-            try:
-                dup = await find_existing_company_workspace(
-                    x_user_id, request.name, channel="web"
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Company workspace dedup check failed (%s); proceeding",
-                    type(exc).__name__,
-                )
-            if dup is not None and dup.matches:
-                detail: dict[str, Any] = {
-                    "code": "company_workspace_exists",
-                    "message": dup.message,
-                    "matches": dup.matches_payload(),
+            max_dedup_attempts = 3
+            workspace = None
+            for attempt in range(max_dedup_attempts):
+                dup = None
+                dedup_snapshots: list[Any] = []
+                try:
+                    dup = await find_existing_company_workspace(
+                        x_user_id,
+                        request.name,
+                        channel="web",
+                        snapshot_out=dedup_snapshots,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Company workspace dedup check failed (%s); proceeding",
+                        type(exc).__name__,
+                    )
+                if dup is not None and dup.matches:
+                    _raise_company_workspace_exists(dup)
+                if (
+                    dup is not None
+                    and dup.suggestion is not None
+                    and not wants_coverage
+                    and not request.skip_coverage_suggestion
+                    and principal.unlimited
+                ):
+                    if coverage_active is None:
+                        coverage_active = await is_workspace_coverage_registration_active(x_user_id)
+                    if coverage_active:
+                        suggestion = dup.suggestion_payload()
+                        kind_label = (
+                            "公司" if dup.suggestion.coverage_kind == "company" else "行业"
+                        )
+                        ticker_note = (
+                            f"（代码 {dup.suggestion.ticker}）"
+                            if dup.suggestion.ticker
+                            else ""
+                        )
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "coverage_suggestion",
+                                "message": f"「{request.name}」识别为{kind_label}{ticker_note}，是否自动登记覆盖单元并创建工作区？",
+                                "suggestion": suggestion,
+                            },
+                        )
+
+                create_kwargs: dict[str, Any] = {
+                    "user_id": x_user_id,
+                    "name": request.name,
+                    "description": request.description,
+                    "config": request.config,
+                    "computer_id": computer_id,
                 }
-                suggestion = dup.suggestion_payload()
-                if suggestion is not None:
-                    detail["suggestion"] = suggestion
-                raise HTTPException(
-                    status_code=409,
-                    detail=detail,
-                )
-            if (
-                dup is not None
-                and dup.suggestion is not None
-                and not wants_coverage
-                and not request.skip_coverage_suggestion
-                and principal.unlimited
-            ):
-                if coverage_active is None:
-                    coverage_active = await is_workspace_coverage_registration_active(x_user_id)
-                if coverage_active:
-                    suggestion = dup.suggestion_payload()
-                    kind_label = (
-                        "公司" if dup.suggestion.coverage_kind == "company" else "行业"
+                dedup_snap = dedup_snapshots[-1] if dedup_snapshots else None
+                if dedup_snap is not None and dedup_snap.active:
+                    create_kwargs["check_duplicate_snapshot"] = True
+                    create_kwargs["verified_company_candidates"] = (
+                        dedup_snap.checked_candidates
                     )
-                    ticker_note = (
-                        f"（代码 {dup.suggestion.ticker}）"
-                        if dup.suggestion.ticker
-                        else ""
+                    if dedup_snap.check_colleague_workspaces:
+                        create_kwargs["check_colleague_duplicate"] = True
+                    effective_ticker = str(request.ticker or "").strip() or (
+                        dup.suggestion.ticker
+                        if dup is not None and dup.suggestion is not None
+                        else None
                     )
+                    if effective_ticker:
+                        create_kwargs["target_ticker"] = effective_ticker
+
+                manager = WorkspaceManager.get_instance()
+                try:
+                    with computer_cause("create"):
+                        workspace = await manager.create_workspace(**create_kwargs)
+                    break
+                except DuplicateWorkspaceConflictError as conflict:
+                    if conflict.conflicting_workspace_id:
+                        dup_after = None
+                        try:
+                            dup_after = await find_existing_company_workspace(
+                                x_user_id, request.name, channel="web"
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Post-conflict company dedup check failed (%s)",
+                                type(exc).__name__,
+                            )
+                        if dup_after is not None and dup_after.matches:
+                            _raise_company_workspace_exists(dup_after)
+                        det_dup = await build_deterministic_duplicate_match(
+                            x_user_id,
+                            request.name,
+                            conflict.conflicting_workspace_id,
+                            channel="web",
+                        )
+                        if det_dup is not None and det_dup.matches:
+                            _raise_company_workspace_exists(det_dup)
+                    if attempt + 1 < max_dedup_attempts:
+                        continue
+                    dup_final = None
+                    try:
+                        dup_final = await find_existing_company_workspace(
+                            x_user_id, request.name, channel="web"
+                        )
+                    except Exception:
+                        dup_final = None
+                    if dup_final is not None and dup_final.matches:
+                        _raise_company_workspace_exists(dup_final)
                     raise HTTPException(
                         status_code=409,
                         detail={
-                            "code": "coverage_suggestion",
-                            "message": f"「{request.name}」识别为{kind_label}{ticker_note}，是否自动登记覆盖单元并创建工作区？",
-                            "suggestion": suggestion,
+                            "code": "workspace_create_conflict",
+                            "message": "工作区列表刚刚发生变化，请重试。",
                         },
-                    )
+                    ) from None
         # --- DALTON-HOOK(workspace-dedup): end ---
-        manager = WorkspaceManager.get_instance()
-        with computer_cause("create"):
-            workspace = await manager.create_workspace(
-                user_id=x_user_id,
-                name=request.name,
-                description=request.description,
-                config=request.config,
-                computer_id=computer_id,
-            )
 
         # --- DALTON-HOOK(workspace-dedup): begin ---
         if wants_coverage:

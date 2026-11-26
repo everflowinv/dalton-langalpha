@@ -159,6 +159,8 @@ class WorkspaceManager(ComputerManager):
         verified_company_candidates: Optional[Any] = None,
         check_colleague_duplicate: bool = False,
         # --- DALTON-HOOK(cos-settings-tools): end ---
+        # DALTON-HOOK(workspace-dedup): optional target ticker for locked duplicate recheck on web create
+        target_ticker: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a project on the user's computer and return it straight away.
 
@@ -263,8 +265,11 @@ class WorkspaceManager(ComputerManager):
                 create_kwargs["expected_computer_name"] = expected_computer_name
             if expected_computer_kind is not None:
                 create_kwargs["expected_computer_kind"] = expected_computer_kind
-        if verify_snapshot and check_duplicate_snapshot:
+        if check_duplicate_snapshot:
             create_kwargs["check_duplicate_snapshot"] = True
+            # DALTON-HOOK(workspace-dedup): raise DuplicateWorkspaceConflictError when web create runs locked recheck without verify_snapshot
+            if not verify_snapshot:
+                create_kwargs["raise_on_duplicate_conflict"] = True
             if expected_duplicate_workspace_id is not None:
                 create_kwargs["expected_duplicate_workspace_id"] = (
                     expected_duplicate_workspace_id
@@ -277,6 +282,8 @@ class WorkspaceManager(ComputerManager):
                 create_kwargs["verified_company_candidates"] = verified_company_candidates
             if check_colleague_duplicate:
                 create_kwargs["check_colleague_duplicate"] = True
+            if target_ticker is not None:
+                create_kwargs["target_ticker"] = target_ticker
         workspace = await create_workspace_on_computer(
             user_id,
             name,
