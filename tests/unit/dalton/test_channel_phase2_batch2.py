@@ -2280,3 +2280,209 @@ def test_run_end_chart_payload_returns_unknown_outbound_blocked_on_missing_or_mi
     )
     assert "persisted_outbound_blocked" not in fin_meta
     assert "persisted_chart_snapshots" not in fin_meta
+
+
+def test_bw2_internal_thread_run_replay_endpoint_ownership_and_direct_run_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BW2: read-only run-scoped replay endpoint in channels_router reads a target run directly
+    by run_id regardless of how many newer turns exist, enforces the same ownership checks as
+    /messages/replay, and is registered in DALTON_ROUTE_CAPABILITY_REGISTRY.
+    """
+    from types import SimpleNamespace
+
+    from fastapi import FastAPI, HTTPException
+    from fastapi.testclient import TestClient
+
+    from src.dalton.app import channels_router as cr_mod
+    from src.dalton.capabilities import (
+        DALTON_ROUTE_CAPABILITY_REGISTRY,
+        CapabilityId,
+    )
+    from src.server.database.conversation import replay_rows as replay_rows_mod
+    from src.server.services.history import replay as replay_mod
+    from src.server.services.history.replay.lines import Line
+
+    _enable_channels_env(monkeypatch)
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "test-bw2-service-token-32bytes!!")
+
+    # 1) Route must be registered under CHANNEL_GATEWAY capability
+    assert (
+        DALTON_ROUTE_CAPABILITY_REGISTRY.get(
+            ("channels_router.py", "internal_thread_run_replay_endpoint")
+        )
+        == CapabilityId.CHANNEL_GATEWAY
+    )
+
+    # Build a synthetic thread with 600 turns; target run is turn 1 (beyond 500-turn pagination)
+    deep_run_id = "run-turn-1-of-600"
+    responses_by_turn: dict[int, dict[str, Any]] = {
+        1: {
+            "conversation_response_id": deep_run_id,
+            "turn_index": 1,
+            "metadata": {
+                "chart_snapshots": [
+                    {
+                        "chart_id": "NVDA:1day",
+                        "layer_id": "layer-bw2-1",
+                        "status": "ready",
+                        "snapshot_key": f"channel-snapshots/{THREAD_ID}/abc/chart_layer-bw2-1.png",
+                    }
+                ],
+                "colleague_outbound_blocked": False,
+            },
+        },
+        600: {
+            "conversation_response_id": "run-turn-600-latest",
+            "turn_index": 600,
+            "metadata": {},
+        },
+    }
+    fake_rows = SimpleNamespace(
+        thread_id=THREAD_ID,
+        owner_id=USER_ID,
+        workspace_owner_id=USER_ID,
+        thread={"workspace_id": WORKSPACE_ID, "latest_run_id": "run-turn-600-latest"},
+        queries=[{"turn_index": 1, "metadata": {}}, {"turn_index": 600, "metadata": {}}],
+        responses_by_turn=responses_by_turn,
+        open_runs={},
+    )
+
+    get_replay_mock = create_autospec(
+        replay_rows_mod.get_replay_thread_data,
+        return_value=fake_rows,
+    )
+    monkeypatch.setattr(replay_rows_mod, "get_replay_thread_data", get_replay_mock)
+
+    captured_read_kwargs: list[dict[str, Any]] = []
+
+    async def _fake_read_replay_page(rows: Any, **kwargs: Any):
+        captured_read_kwargs.append(dict(kwargs))
+        return (
+            SimpleNamespace(
+                lines=[
+                    Line(
+                        event="user_message",
+                        data_json=json.dumps({"turn_index": 1, "run_id": deep_run_id}),
+                        flags=0,
+                    ),
+                    Line(
+                        event="artifact",
+                        data_json=json.dumps(
+                            {
+                                "artifact_type": "chart_layer",
+                                "artifact_id": "layer-bw2-1",
+                                "response_id": deep_run_id,
+                                "payload": {
+                                    "chart_id": "NVDA:1day",
+                                    "layer_id": "layer-bw2-1",
+                                    "title": "Deep Turn 1 Chart",
+                                },
+                            }
+                        ),
+                        flags=0,
+                    ),
+                ],
+                first_turn_index=1,
+                has_more=False,
+            ),
+            "checkpoint",
+        )
+
+    monkeypatch.setattr(
+        replay_mod,
+        "read_replay_page",
+        create_autospec(replay_mod.read_replay_page, side_effect=_fake_read_replay_page),
+    )
+    monkeypatch.setattr(
+        replay_mod,
+        "finish_lines",
+        create_autospec(replay_mod.finish_lines, return_value=None),
+    )
+    monkeypatch.setattr(
+        ccs,
+        "resolve_replay_chart_snapshots_by_run",
+        create_autospec(
+            ccs.resolve_replay_chart_snapshots_by_run,
+            return_value={
+                deep_run_id: [
+                    {
+                        "chart_id": "NVDA:1day",
+                        "layer_id": "layer-bw2-1",
+                        "status": "ready",
+                    }
+                ]
+            },
+        ),
+    )
+
+    from src.dalton import settings as dalton_settings
+
+    multiuser_mock = create_autospec(
+        dalton_settings.is_dalton_multiuser_auth_enabled, return_value=False
+    )
+    monkeypatch.setattr(
+        dalton_settings,
+        "is_dalton_multiuser_auth_enabled",
+        multiuser_mock,
+    )
+
+    app = FastAPI()
+    app.include_router(cr_mod.channels_router, prefix="/api/v1/dalton")
+    client = TestClient(app)
+    svc_headers = {
+        "X-Service-Token": "test-bw2-service-token-32bytes!!",
+        "X-User-Id": USER_ID,
+    }
+
+    # 2) Owner reads turn 1 directly by run_id -> 200 SSE, read-only (persist=False), scoped to turn 1
+    r_ok = client.get(
+        f"/api/v1/dalton/channels/internal/threads/{THREAD_ID}/runs/{deep_run_id}/replay",
+        headers=svc_headers,
+    )
+    assert r_ok.status_code == 200
+    assert "text/event-stream" in r_ok.headers["content-type"]
+    assert captured_read_kwargs[-1]["before_turn"] == 2
+    assert captured_read_kwargs[-1]["limit"] == 1
+    assert captured_read_kwargs[-1]["persist"] is False
+    assert "layer-bw2-1" in r_ok.text
+    assert "chart_snapshots_by_run" in r_ok.text
+    assert "outbound_blocked_by_run" in r_ok.text
+
+    # 3) Non-owner is rejected with 403 Forbidden (matches /messages/replay ownership check)
+    r_forbid = client.get(
+        f"/api/v1/dalton/channels/internal/threads/{THREAD_ID}/runs/{deep_run_id}/replay",
+        headers={
+            "X-Service-Token": "test-bw2-service-token-32bytes!!",
+            "X-User-Id": "user-bob-other",
+        },
+    )
+    assert r_forbid.status_code == 403
+
+    # 4) Unknown run_id returns 404
+    r_missing = client.get(
+        f"/api/v1/dalton/channels/internal/threads/{THREAD_ID}/runs/run-does-not-exist/replay",
+        headers=svc_headers,
+    )
+    assert r_missing.status_code == 404
+
+    # 5) Multiuser auth enabled -> delegates to require_thread_access; denied returns 403
+    from src.dalton import sharing as dalton_sharing
+
+    multiuser_mock.return_value = True
+    monkeypatch.setattr(
+        dalton_sharing,
+        "require_thread_access",
+        create_autospec(
+            dalton_sharing.require_thread_access,
+            side_effect=HTTPException(status_code=403, detail="Forbidden"),
+        ),
+    )
+    r_shared_deny = client.get(
+        f"/api/v1/dalton/channels/internal/threads/{THREAD_ID}/runs/{deep_run_id}/replay",
+        headers={
+            "X-Service-Token": "test-bw2-service-token-32bytes!!",
+            "X-User-Id": "user-bob-other",
+        },
+    )
+    assert r_shared_deny.status_code == 403

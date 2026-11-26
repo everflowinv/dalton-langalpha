@@ -866,6 +866,9 @@ async def _record_pending_bot_topic_reply_in_tx(
     return dict(inserted) if inserted else None
 
 
+MAX_PENDING_BOT_TOPIC_CANDIDATES = 50
+
+
 async def lookup_bot_topic(
     *,
     platform: str,
@@ -874,6 +877,9 @@ async def lookup_bot_topic(
     external_topic_id: str | None = None,
     canonical_scope_key: str | None = None,
     root_message_id: str | None = None,
+    initiator_platform_user_id: str | None = None,
+    pending_limit: int | None = None,
+    pending_offset: int = 0,
     conn: Any = None,
 ) -> dict[str, Any]:
     """Read-only lookup of a confirmed registered bot topic for inbound follow-up or outbound routing."""
@@ -893,6 +899,13 @@ async def lookup_bot_topic(
     ext_tid = str(external_topic_id or "").strip() or None
     scope = str(canonical_scope_key or "").strip() or None
     root_mid = str(root_message_id or "").strip() or None
+    init_puid = str(initiator_platform_user_id or "").strip() or None
+    eff_offset = max(0, int(pending_offset or 0))
+    eff_limit = (
+        min(max(1, int(pending_limit)), MAX_PENDING_BOT_TOPIC_CANDIDATES)
+        if pending_limit is not None
+        else MAX_PENDING_BOT_TOPIC_CANDIDATES
+    )
 
     empty_resp: dict[str, Any] = {
         "found": False,
@@ -914,6 +927,8 @@ async def lookup_bot_topic(
         async with owned_conn.cursor(row_factory=dict_row) as cur:
             row = None
             pending_candidates: list[dict[str, Any]] = []
+            has_more_pending = False
+            pending_truncated = False
             if cleaned_mode == "inbound_followup":
                 await cur.execute(
                     """
@@ -941,13 +956,37 @@ async def lookup_bot_topic(
                           AND chat_address = %s
                           AND status = 'pending'
                           AND first_reply_message_id IS NOT NULL
-                        ORDER BY CASE WHEN %s::varchar IS NOT NULL AND root_message_id = %s THEN 0 ELSE 1 END,
-                                 last_active_at DESC
-                        LIMIT 5
+                        ORDER BY
+                          CASE WHEN %s::varchar IS NOT NULL AND root_message_id = %s THEN 0 ELSE 1 END,
+                          CASE WHEN %s::varchar IS NOT NULL AND initiator_platform_user_id = %s THEN 0 ELSE 1 END,
+                          last_active_at DESC,
+                          canonical_scope_key ASC
+                        LIMIT %s OFFSET %s
                         """,
-                        (cleaned_plat, topic_addr, root_mid, root_mid),
+                        (
+                            cleaned_plat,
+                            topic_addr,
+                            root_mid,
+                            root_mid,
+                            init_puid,
+                            init_puid,
+                            eff_limit + 1,
+                            eff_offset,
+                        ),
                     )
-                    for pending_row in await cur.fetchall() or []:
+                    fetched_pending = list(await cur.fetchall() or [])
+                    if len(fetched_pending) > eff_limit:
+                        has_more_pending = True
+                        fetched_pending = fetched_pending[:eff_limit]
+                        if eff_offset + eff_limit >= MAX_PENDING_BOT_TOPIC_CANDIDATES:
+                            pending_truncated = True
+                            logger.warning(
+                                "Pending Feishu bot topics in %s exceeded cap (%d) at offset=%d; truncating candidates",
+                                topic_addr,
+                                MAX_PENDING_BOT_TOPIC_CANDIDATES,
+                                eff_offset,
+                            )
+                    for pending_row in fetched_pending:
                         if (
                             pending_row.get("canonical_scope_key")
                             and pending_row.get("first_reply_message_id")
@@ -1026,7 +1065,15 @@ async def lookup_bot_topic(
 
     if not row:
         if pending_candidates:
-            return {**empty_resp, "pending_candidates": pending_candidates}
+            resp_pending: dict[str, Any] = {
+                **empty_resp,
+                "pending_candidates": pending_candidates,
+            }
+            if has_more_pending:
+                resp_pending["pending_candidates_has_more"] = True
+            if pending_truncated:
+                resp_pending["pending_candidates_truncated"] = True
+            return resp_pending
         return empty_resp
     return {
         "found": True,

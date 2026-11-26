@@ -130,16 +130,20 @@ export function collectReportSourceChartLayers(
 /**
  * Extract charts (from `artifact`, `tool_call_result.artifact.chart_layers`, and
  * `user_message.metadata.report_source.chart_layers`), persisted `chart_snapshots`, and
- * `html_widget` artifacts for `targetRunId` from a `/messages/replay` SSE stream.
+ * `html_widget` artifacts for `targetRunId` via direct run-scoped replay (`replayThreadRun`,
+ * avoiding any 50-page / 500-turn ceiling) with paginated `/messages/replay` fallback when
+ * `replayThreadRun` is unavailable.
  */
 export async function extractRunChartsAndWidgetsFromReplay(params: {
-  backend: Pick<BackendClient, "replayThreadMessages">;
+  backend: Pick<BackendClient, "replayThreadMessages"> &
+    Partial<Pick<BackendClient, "replayThreadRun">>;
   userId: string;
   threadId: string;
   targetRunId: string;
   pageSize?: number;
   maxPages?: number;
 }): Promise<{
+  found: boolean;
   charts: CollectedChartLayerRef[];
   snapshots: ChartSnapshotItem[];
   widgets: CollectedHtmlWidgetRef[];
@@ -150,29 +154,21 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
   let snapshots: ChartSnapshotItem[] = [];
   let outboundBlocked: boolean | undefined;
 
-  const pageSize = Math.max(1, params.pageSize ?? 10);
-  const maxPages = Math.max(1, params.maxPages ?? 50);
-  let beforeTurn: number | undefined;
-
-  for (let page = 0; page < maxPages; page += 1) {
-    const resp = await params.backend.replayThreadMessages(
-      params.userId,
-      params.threadId,
-      beforeTurn !== undefined
-        ? { limit: pageSize, beforeTurn }
-        : { limit: pageSize },
-    );
-    if (!resp.isSse || !resp.events) {
-      break;
-    }
-
+  const consumeSseStream = async (
+    events: AsyncIterable<{ event: string; data: string }>,
+  ): Promise<{
+    foundTargetRunInPage: boolean;
+    pageHasMore: boolean;
+    pageFirstTurnIndex: number | null;
+    earliestTurnInPage: number | null;
+  }> => {
     let currentRunId: string | null = null;
     let foundTargetRunInPage = false;
     let pageHasMore = false;
     let pageFirstTurnIndex: number | null = null;
     let earliestTurnInPage: number | null = null;
 
-    for await (const sse of resp.events) {
+    for await (const sse of events) {
       if (sse.event === ":comment") continue;
       let data: Record<string, unknown>;
       try {
@@ -297,6 +293,12 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
       }
 
       if (sse.event === "replay_done") {
+        if (
+          typeof data.run_id === "string" &&
+          data.run_id.trim() === params.targetRunId
+        ) {
+          foundTargetRunInPage = true;
+        }
         if (typeof data.has_more === "boolean") {
           pageHasMore = data.has_more;
         }
@@ -337,7 +339,70 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
       }
     }
 
-    if (foundTargetRunInPage || !pageHasMore) {
+    return {
+      foundTargetRunInPage,
+      pageHasMore,
+      pageFirstTurnIndex,
+      earliestTurnInPage,
+    };
+  };
+
+  // BW2: Prefer direct run-scoped replay by run_id (no page ceiling).
+  if (typeof params.backend.replayThreadRun === "function") {
+    const resp = await params.backend.replayThreadRun(
+      params.userId,
+      params.threadId,
+      params.targetRunId,
+    );
+    if (!resp.isSse || !resp.events) {
+      return {
+        found: false,
+        charts: [],
+        snapshots: [],
+        widgets: [],
+        outboundBlocked: undefined,
+      };
+    }
+    const { foundTargetRunInPage } = await consumeSseStream(resp.events);
+    return {
+      found: foundTargetRunInPage,
+      charts: [...chartsMap.values()],
+      snapshots,
+      widgets: [...widgetsMap.values()],
+      outboundBlocked,
+    };
+  }
+
+  // Fallback for older backends / unit stubs that only implement paginated replayThreadMessages.
+  const pageSize = Math.max(1, params.pageSize ?? 10);
+  const maxPages = Math.max(1, params.maxPages ?? 50);
+  let beforeTurn: number | undefined;
+  let foundTargetRun = false;
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const resp = await params.backend.replayThreadMessages(
+      params.userId,
+      params.threadId,
+      beforeTurn !== undefined
+        ? { limit: pageSize, beforeTurn }
+        : { limit: pageSize },
+    );
+    if (!resp.isSse || !resp.events) {
+      break;
+    }
+
+    const {
+      foundTargetRunInPage,
+      pageHasMore,
+      pageFirstTurnIndex,
+      earliestTurnInPage,
+    } = await consumeSseStream(resp.events);
+
+    if (foundTargetRunInPage) {
+      foundTargetRun = true;
+      break;
+    }
+    if (!pageHasMore) {
       break;
     }
     const nextBeforeTurn = pageFirstTurnIndex ?? earliestTurnInPage;
@@ -352,6 +417,7 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
   }
 
   return {
+    found: foundTargetRun,
     charts: [...chartsMap.values()],
     snapshots,
     widgets: [...widgetsMap.values()],

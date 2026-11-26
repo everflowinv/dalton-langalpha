@@ -549,4 +549,61 @@ describe("channel chunkers preserve rewritten Markdown links and underscores", (
       .join("");
     expect(restored).toBe(codeLine);
   });
+
+  it("BT3: preserves reference link definitions inside multiline backtick spans and fenced code blocks verbatim", () => {
+    const singleBacktickMultiline = [
+      "示例：",
+      "`line 1",
+      "",
+      "[x]: /home/workspace/secret.md",
+      "`",
+      "",
+      "正文提到 [x]。",
+    ].join("\n");
+    expect(rewriteSandboxLinks(singleBacktickMultiline, WEB_BASE, THREAD_ID)).toBe(
+      singleBacktickMultiline,
+    );
+
+    const doubleBacktickMultiline = [
+      "说明：``first line",
+      "",
+      "[def]: /home/workspace/internal.pdf",
+      "last line``",
+    ].join("\n");
+    expect(rewriteSandboxLinks(doubleBacktickMultiline, WEB_BASE, THREAD_ID)).toBe(
+      doubleBacktickMultiline,
+    );
+
+    // A definition inside a multiline backtick span must NOT shadow a real definition outside code.
+    const mixedInput = [
+      "代码里的样例：`header",
+      "",
+      "[r1]: /home/workspace/inside_code.md",
+      "`",
+      "",
+      "真实引用见 [外部报告][r1]。",
+      "",
+      "[r1]: /home/workspace/outside_real.md",
+    ].join("\n");
+    const mixedExpected = [
+      "代码里的样例：`header",
+      "",
+      "[r1]: /home/workspace/inside_code.md",
+      "`",
+      "",
+      `真实引用见 [外部报告](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Foutside_real.md)。`,
+      "",
+    ].join("\n");
+    expect(rewriteSandboxLinks(mixedInput, WEB_BASE, THREAD_ID)).toBe(mixedExpected);
+
+    // Fenced code blocks containing reference definitions also stay untouched.
+    const fencedDef = [
+      "```markdown",
+      "[f1]: /home/workspace/fenced.md",
+      "```",
+      "",
+      "正文提到 [f1]。",
+    ].join("\n");
+    expect(rewriteSandboxLinks(fencedDef, WEB_BASE, THREAD_ID)).toBe(fencedDef);
+  });
 });

@@ -883,11 +883,13 @@ export class AgentRoutesHandler {
       let autoOutboundBlocked: boolean | undefined =
         typeof params.outboundBlocked === "boolean" ? params.outboundBlocked : undefined;
 
+      let replayTargetMissing = false;
       if (
         finishStatus === "completed" &&
         threadId &&
         effectiveRunId &&
-        typeof this.backend.replayThreadMessages === "function"
+        (typeof this.backend.replayThreadRun === "function" ||
+          typeof this.backend.replayThreadMessages === "function")
       ) {
         try {
           const recovered = await extractRunChartsAndWidgetsFromReplay({
@@ -896,17 +898,22 @@ export class AgentRoutesHandler {
             threadId,
             targetRunId: effectiveRunId,
           });
-          autoCharts = recovered.charts;
-          autoWidgets = recovered.widgets;
-          if (autoInitialSnapshots.length === 0 && recovered.snapshots.length > 0) {
-            autoInitialSnapshots = recovered.snapshots;
-          }
-          if (typeof recovered.outboundBlocked === "boolean") {
-            autoOutboundBlocked =
-              autoOutboundBlocked === true || recovered.outboundBlocked;
+          if (!recovered.found) {
+            replayTargetMissing = true;
+          } else {
+            autoCharts = recovered.charts;
+            autoWidgets = recovered.widgets;
+            if (autoInitialSnapshots.length === 0 && recovered.snapshots.length > 0) {
+              autoInitialSnapshots = recovered.snapshots;
+            }
+            if (typeof recovered.outboundBlocked === "boolean") {
+              autoOutboundBlocked =
+                autoOutboundBlocked === true || recovered.outboundBlocked;
+            }
           }
         } catch {
-          // Best-effort replay enrichment; snapshots from finish_automation_run still work.
+          // Target run replay could not be read; keep pending recovery state instead of marking finished.
+          replayTargetMissing = true;
         }
       }
 
@@ -1063,17 +1070,19 @@ export class AgentRoutesHandler {
         }
       }
 
-      await this.backend.finishAutomationRun(
-        executionId,
-        {
-          status: finishStatus,
-          thread_id: threadId,
-          final_text: finalText,
-          targets: results,
-          mark_finished: true,
-        },
-        userId,
-      );
+      if (!replayTargetMissing) {
+        await this.backend.finishAutomationRun(
+          executionId,
+          {
+            status: finishStatus,
+            thread_id: threadId,
+            final_text: finalText,
+            targets: results,
+            mark_finished: true,
+          },
+          userId,
+        );
+      }
 
       return results.map((r) => ({
         entry: r.entry,

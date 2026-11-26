@@ -118,6 +118,27 @@ export async function abortableRetrySleep(
   });
 }
 
+function normalizeDeliverablePath(rawPath: string): string {
+  const segments: string[] = [];
+  for (const seg of rawPath.trim().replace(/\\/g, "/").split("/")) {
+    if (!seg || seg === ".") continue;
+    segments.push(seg);
+  }
+  return segments.join("/");
+}
+
+function buildDeliverableLinkItemKey(
+  runId: string,
+  workspaceId: string,
+  normalizedPath: string,
+): string {
+  const digest = createHash("sha256")
+    .update(`${workspaceId}\0${normalizedPath}`)
+    .digest("hex")
+    .slice(0, 24);
+  return `deliverables-links:${runId}:item:${digest}`;
+}
+
 export interface LinkOnlyFileRef {
   path: string;
   workspace_id?: string | null;
@@ -147,6 +168,12 @@ export interface ExecuteDeliveryOptions {
   linkFallbackOnDeliverableMismatch?: boolean;
   /** When true, emit web login deep links only (never download/upload binaries) for un-delivered DM deliverables. */
   forceLinkOnly?: boolean;
+  /** Confirmed `(workspace_id, path)` outcomes carried from an earlier `unknown` deliverable claim during link recovery. */
+  priorConfirmedDeliverables?: Array<{
+    workspace_id?: string | null;
+    path: string;
+    status: string;
+  }>;
   replyToMessageId?: string | null;
   newThread?: boolean;
   threadScopeKey?: string | null;
@@ -424,8 +451,9 @@ export class DeliveryService {
     const trimmedText = rawText.trim();
     const hasNonEmptyText = trimmedText.length > 0;
     const files = options.files ?? [];
+    const linkOnlyFiles = options.linkOnlyFiles ?? [];
 
-    if (!hasNonEmptyText && files.length === 0) {
+    if (!hasNonEmptyText && files.length === 0 && linkOnlyFiles.length === 0) {
       return {
         status: "failed",
         code: null,
@@ -474,7 +502,6 @@ export class DeliveryService {
         )
       : rawText;
     const hasOutboundText = outboundText.trim().length > 0;
-    const linkOnlyFiles = options.linkOnlyFiles ?? [];
 
     if (!hasOutboundText && files.length === 0 && linkOnlyFiles.length === 0) {
       return {
@@ -572,6 +599,13 @@ export class DeliveryService {
         options.runId &&
         !options.forceLinkOnly
       ) {
+        const carriedConfirmed = [
+          ...(options.priorConfirmedDeliverables ?? []),
+          ...(claim.files_status ?? []).filter((f) => {
+            const st = (f.status ?? "").trim().toLowerCase();
+            return st === "sent" || st === "linked";
+          }),
+        ];
         // Keep the original `deliverables:${runId}` row as `unknown` (never re-uploading binary files)
         // and deliver web login deep links via an independent, deduplicable key based on `prior_run_files`.
         return this.executeDelivery({
@@ -584,7 +618,190 @@ export class DeliveryService {
                 ? ""
                 : options.text,
           forceLinkOnly: true,
+          priorConfirmedDeliverables: carriedConfirmed,
         });
+      }
+      if (
+        options.downloadMode === "deliverable" &&
+        options.runId &&
+        options.deliveryKey === `deliverables-links:${options.runId}` &&
+        claim.existing_status === "unknown"
+      ) {
+        // BT2: `deliverables-links:${runId}` itself crashed mid-flight and was swept to `unknown`.
+        // Recover remaining unconfirmed links idempotently per `(workspace_id, normalized_path)`:
+        // skip links already confirmed (`sent`/`linked`), and send each remaining link under its
+        // deterministic per-item key so already-sent links are never duplicated across restarts.
+        const fallbackWsId =
+          (options.workspaceId ?? "").trim() ||
+          (claim.workspace_id ?? "").trim() ||
+          (claim.home_workspace_id ?? "").trim() ||
+          "";
+        const confirmedByWsPath = new Set<string>();
+        const legacyConfirmedByPath = new Set<string>();
+        const alreadyConfirmedOutcomes: AgentSendFileOutcome[] = [];
+        const recordConfirmed = (
+          f: { workspace_id?: string | null; path: string; status: string },
+        ): void => {
+          const st = (f.status ?? "").trim().toLowerCase();
+          if (st !== "sent" && st !== "linked") return;
+          const normPath = normalizeDeliverablePath(f.path);
+          if (!normPath) return;
+          const wsKey = (f.workspace_id ?? "").trim();
+          if (wsKey) {
+            confirmedByWsPath.add(`${wsKey}::${normPath}`);
+          } else {
+            legacyConfirmedByPath.add(normPath);
+          }
+        };
+        for (const f of options.priorConfirmedDeliverables ?? []) {
+          recordConfirmed(f);
+        }
+        for (const f of claim.files_status ?? []) {
+          recordConfirmed(f);
+        }
+        const isAlreadyConfirmed = (wsId: string, normPath: string): boolean => {
+          if (wsId && confirmedByWsPath.has(`${wsId}::${normPath}`)) {
+            return true;
+          }
+          const canUseLegacy = !wsId || !fallbackWsId || wsId === fallbackWsId;
+          return canUseLegacy && legacyConfirmedByPath.has(normPath);
+        };
+
+        const seenCandidates = new Set<string>();
+        const unconfirmedItems: Array<{
+          wsId: string;
+          normPath: string;
+          ref: LinkOnlyFileRef;
+        }> = [];
+        const pushCandidate = (ref: LinkOnlyFileRef): void => {
+          const normPath = normalizeDeliverablePath(ref.path);
+          if (!normPath) return;
+          const wsId = (ref.workspace_id ?? "").trim() || fallbackWsId;
+          const dedupeKey = `${wsId}::${normPath}`;
+          if (seenCandidates.has(dedupeKey)) return;
+          seenCandidates.add(dedupeKey);
+          if (isAlreadyConfirmed(wsId, normPath)) {
+            alreadyConfirmedOutcomes.push({
+              path: ref.path,
+              workspace_id: wsId || null,
+              status: "linked",
+              reason: ref.reason ?? "already_confirmed",
+            });
+            return;
+          }
+          unconfirmedItems.push({ wsId, normPath, ref });
+        };
+        for (const linkRef of linkOnlyFiles) {
+          pushCandidate(linkRef);
+        }
+        for (const fileRef of files) {
+          pushCandidate({
+            path: fileRef.path,
+            workspace_id: fileRef.workspace_id ?? null,
+            filename: basename(fileRef.path) || fileRef.path,
+            reason: "prior_unknown_delivery_link_only",
+          });
+        }
+
+        const resolvedAddr = claim.target_address ?? options.target ?? null;
+        if (unconfirmedItems.length === 0) {
+          return {
+            status: "sent",
+            code: null,
+            address: resolvedAddr,
+            current: Boolean(claim.is_current),
+            duplicate: true,
+            message: "All deliverable links were already confirmed.",
+            files: alreadyConfirmedOutcomes,
+          };
+        }
+
+        const recoveredFiles: AgentSendFileOutcome[] = [...alreadyConfirmedOutcomes];
+        let anyUnknown = false;
+        let anyFailed = false;
+        let allDuplicate = true;
+        let lastFailureCode: AgentSendResponse["code"] = null;
+        let lastFailureMessage: string | null = null;
+        let lastAddress: string | null = resolvedAddr;
+
+        for (const item of unconfirmedItems) {
+          const itemKey = buildDeliverableLinkItemKey(
+            options.runId,
+            item.wsId,
+            item.normPath,
+          );
+          const itemRes = await this.executeDelivery({
+            ...options,
+            deliveryKey: itemKey,
+            text: "",
+            files: [],
+            linkOnlyFiles: [
+              {
+                path: item.ref.path,
+                workspace_id: item.wsId || null,
+                filename:
+                  item.ref.filename || basename(item.ref.path) || item.ref.path,
+                reason: item.ref.reason ?? "prior_unknown_delivery_link_only",
+              },
+            ],
+            forceLinkOnly: true,
+            priorConfirmedDeliverables: undefined,
+          });
+          if (itemRes.address) {
+            lastAddress = itemRes.address;
+          }
+          if (Array.isArray(itemRes.files)) {
+            recoveredFiles.push(...itemRes.files);
+          }
+          if (!itemRes.duplicate) {
+            allDuplicate = false;
+          }
+          if (itemRes.status === "unknown") {
+            anyUnknown = true;
+            lastFailureCode = itemRes.code ?? "in_flight";
+            lastFailureMessage = itemRes.message;
+          } else if (itemRes.status === "failed") {
+            anyFailed = true;
+            lastFailureCode = itemRes.code ?? "unavailable";
+            lastFailureMessage = itemRes.message;
+          }
+        }
+
+        if (anyUnknown) {
+          return {
+            status: "unknown",
+            code: lastFailureCode ?? "in_flight",
+            address: lastAddress,
+            current: Boolean(claim.is_current),
+            duplicate: false,
+            message:
+              lastFailureMessage ??
+              "One or more deliverable links remain unknown after recovery.",
+            files: recoveredFiles,
+          };
+        }
+        if (anyFailed) {
+          return {
+            status: "failed",
+            code: lastFailureCode ?? "unavailable",
+            address: lastAddress,
+            current: Boolean(claim.is_current),
+            duplicate: false,
+            message:
+              lastFailureMessage ??
+              "One or more deliverable links failed during recovery.",
+            files: recoveredFiles,
+          };
+        }
+        return {
+          status: "sent",
+          code: null,
+          address: lastAddress,
+          current: Boolean(claim.is_current),
+          duplicate: allDuplicate,
+          message: `Delivered remaining deliverable links to ${lastAddress ?? "target"}.`,
+          files: recoveredFiles,
+        };
       }
       return {
         status: "unknown",
@@ -714,15 +931,6 @@ export class DeliveryService {
       line: string;
       outcome: AgentSendFileOutcome;
     }> = [];
-
-    const normalizeDeliverablePath = (rawPath: string): string => {
-      const segments: string[] = [];
-      for (const seg of rawPath.trim().replace(/\\/g, "/").split("/")) {
-        if (!seg || seg === ".") continue;
-        segments.push(seg);
-      }
-      return segments.join("/");
-    };
 
     const priorByWsAndPath = new Map<string, string>();
     const legacyPriorByPath = new Map<string, string>();

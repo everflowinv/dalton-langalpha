@@ -556,6 +556,288 @@ function findClosingBacktickRun(
   return -1;
 }
 
+interface CodeRange {
+  start: number;
+  end: number;
+}
+
+/**
+ * Scans Markdown code zones BEFORE reference definition / link collection:
+ * 1. Fenced code blocks (``` / ~~~, including inside blockquotes and unterminated fences).
+ * 2. 4-space / tab indented code blocks (so unmatched backticks inside them cannot pair outward).
+ * 3. Inline backtick code spans, including multiline backtick spans across blank lines.
+ *
+ * Single-line inline code spans that serve purely as a Markdown link label (`[`foo`](dest)`)
+ * are left unprotected so the spaced-destination link fallback can still rewrite the outer link.
+ */
+function findProtectedCodeRanges(text: string): CodeRange[] {
+  const ranges: CodeRange[] = [];
+  const len = text.length;
+  let i = 0;
+  let prevLineBlankOrIndentedCode = true;
+
+  const readLineEnd = (pos: number): number => {
+    const nl = text.indexOf("\n", pos);
+    return nl === -1 ? len : nl;
+  };
+
+  const skipLineBreak = (lineEnd: number): number =>
+    lineEnd < len ? lineEnd + 1 : len;
+
+  const parseQuotePrefix = (
+    lineStart: number,
+    lineEnd: number,
+  ): { depth: number; contentStart: number } => {
+    let pos = lineStart;
+    let depth = 0;
+    while (pos < lineEnd) {
+      let sp = 0;
+      while (pos + sp < lineEnd && sp < 3 && text[pos + sp] === " ") {
+        sp += 1;
+      }
+      if (pos + sp < lineEnd && text[pos + sp] === ">") {
+        depth += 1;
+        pos += sp + 1;
+        if (pos < lineEnd && (text[pos] === " " || text[pos] === "\t")) {
+          pos += 1;
+        }
+        continue;
+      }
+      break;
+    }
+    return { depth, contentStart: pos };
+  };
+
+  const countLeadingIndent = (
+    from: number,
+    lineEnd: number,
+  ): { cols: number; nextPos: number } => {
+    let cols = 0;
+    let pos = from;
+    while (pos < lineEnd) {
+      const ch = text[pos]!;
+      if (ch === " ") {
+        cols += 1;
+        pos += 1;
+      } else if (ch === "\t") {
+        cols += 4 - (cols % 4);
+        pos += 1;
+      } else {
+        break;
+      }
+    }
+    return { cols, nextPos: pos };
+  };
+
+  while (i < len) {
+    const lineStart = i;
+    const lineEnd = readLineEnd(lineStart);
+    const { depth: quoteDepth, contentStart } = parseQuotePrefix(
+      lineStart,
+      lineEnd,
+    );
+    const { cols: indentCols, nextPos } = countLeadingIndent(
+      contentStart,
+      lineEnd,
+    );
+    const trimmedContent = text
+      .slice(nextPos, lineEnd)
+      .replace(/\r$/, "");
+
+    if (trimmedContent.length === 0) {
+      prevLineBlankOrIndentedCode = true;
+      i = skipLineBreak(lineEnd);
+      continue;
+    }
+
+    // 4-space / tab indented code line after a blank or indented-code line
+    if (indentCols >= 4 && prevLineBlankOrIndentedCode) {
+      ranges.push({ start: lineStart, end: lineEnd });
+      prevLineBlankOrIndentedCode = true;
+      i = skipLineBreak(lineEnd);
+      continue;
+    }
+
+    // Fenced code block opening (0-3 leading spaces + >=3 ` or ~)
+    if (
+      indentCols <= 3 &&
+      nextPos < lineEnd &&
+      (text[nextPos] === "`" || text[nextPos] === "~")
+    ) {
+      const fenceChar = text[nextPos]!;
+      let fenceLen = 0;
+      while (nextPos + fenceLen < lineEnd && text[nextPos + fenceLen] === fenceChar) {
+        fenceLen += 1;
+      }
+      if (fenceLen >= 3) {
+        const info = text
+          .slice(nextPos + fenceLen, lineEnd)
+          .replace(/\r$/, "");
+        const validFence = fenceChar === "~" || !info.includes("`");
+        if (validFence) {
+          let scanPos = skipLineBreak(lineEnd);
+          let blockEnd = lineEnd;
+          while (scanPos < len) {
+            const curLineEnd = readLineEnd(scanPos);
+            const curQuote = parseQuotePrefix(scanPos, curLineEnd);
+            if (quoteDepth > 0 && curQuote.depth < quoteDepth) {
+              // Blockquote ended; unterminated quoted fence ends at previous line.
+              break;
+            }
+            const curIndent = countLeadingIndent(
+              curQuote.contentStart,
+              curLineEnd,
+            );
+            blockEnd = curLineEnd;
+            if (
+              curIndent.cols <= 3 &&
+              curIndent.nextPos < curLineEnd &&
+              text[curIndent.nextPos] === fenceChar
+            ) {
+              let closeLen = 0;
+              while (
+                curIndent.nextPos + closeLen < curLineEnd &&
+                text[curIndent.nextPos + closeLen] === fenceChar
+              ) {
+                closeLen += 1;
+              }
+              if (closeLen >= fenceLen) {
+                const afterClose = text
+                  .slice(curIndent.nextPos + closeLen, curLineEnd)
+                  .replace(/\r$/, "");
+                if (/^[ \t]*$/.test(afterClose)) {
+                  scanPos = skipLineBreak(curLineEnd);
+                  break;
+                }
+              }
+            }
+            scanPos = skipLineBreak(curLineEnd);
+          }
+          ranges.push({ start: lineStart, end: blockEnd });
+          prevLineBlankOrIndentedCode = false;
+          i = scanPos;
+          continue;
+        }
+      }
+    }
+
+    // Scan inline content on this line (and allow backtick runs to span multiple lines).
+    prevLineBlankOrIndentedCode = false;
+    let pos = nextPos;
+    while (pos < lineEnd) {
+      const ch = text[pos]!;
+      if (ch === "\\" && pos + 1 < lineEnd) {
+        pos += 2;
+        continue;
+      }
+      if (ch === "`") {
+        let run = 0;
+        while (pos + run < len && text[pos + run] === "`") {
+          run += 1;
+        }
+        const close = findClosingBacktickRun(text, pos + run, run);
+        if (close !== -1) {
+          const spanEnd = close + run;
+          const isSingleLine = spanEnd <= lineEnd;
+          const isSpacedLinkLabel =
+            isSingleLine &&
+            pos > 0 &&
+            text[pos - 1] === "[" &&
+            text[spanEnd] === "]" &&
+            text[spanEnd + 1] === "(";
+          if (!isSpacedLinkLabel) {
+            ranges.push({ start: pos, end: spanEnd });
+          }
+          if (spanEnd <= lineEnd) {
+            pos = spanEnd;
+            continue;
+          }
+          // Multiline backtick span ended on a later line: resume scanning the remainder of that line.
+          const endLineEnd = readLineEnd(spanEnd);
+          pos = spanEnd;
+          if (pos >= endLineEnd) {
+            i = skipLineBreak(endLineEnd);
+          } else {
+            // Continue scanning remaining inline characters on the closing line.
+            let tailPos = pos;
+            while (tailPos < endLineEnd) {
+              const tch = text[tailPos]!;
+              if (tch === "\\" && tailPos + 1 < endLineEnd) {
+                tailPos += 2;
+                continue;
+              }
+              if (tch === "`") {
+                let tailRun = 0;
+                while (tailPos + tailRun < len && text[tailPos + tailRun] === "`") {
+                  tailRun += 1;
+                }
+                const tailClose = findClosingBacktickRun(text, tailPos + tailRun, tailRun);
+                if (tailClose !== -1) {
+                  const tailEnd = tailClose + tailRun;
+                  const tailSingle = tailEnd <= endLineEnd;
+                  const tailSpacedLabel =
+                    tailSingle &&
+                    tailPos > 0 &&
+                    text[tailPos - 1] === "[" &&
+                    text[tailEnd] === "]" &&
+                    text[tailEnd + 1] === "(";
+                  if (!tailSpacedLabel) {
+                    ranges.push({ start: tailPos, end: tailEnd });
+                  }
+                  if (tailEnd <= endLineEnd) {
+                    tailPos = tailEnd;
+                    continue;
+                  }
+                  // Nested multiline span on the same tail line: jump straight to its end line
+                  i = skipLineBreak(readLineEnd(tailEnd));
+                  tailPos = -1;
+                  break;
+                }
+                tailPos += tailRun;
+                continue;
+              }
+              tailPos += 1;
+            }
+            if (tailPos !== -1) {
+              i = skipLineBreak(endLineEnd);
+            }
+          }
+          pos = -1;
+          break;
+        }
+        pos += run;
+        continue;
+      }
+      pos += 1;
+    }
+    if (pos !== -1) {
+      i = skipLineBreak(lineEnd);
+    }
+  }
+
+  return ranges;
+}
+
+function startsInsideCodeRange(
+  start: number,
+  ranges: readonly CodeRange[],
+): boolean {
+  let lo = 0;
+  let hi = ranges.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const r = ranges[mid]!;
+    if (r.end <= start) {
+      lo = mid + 1;
+    } else if (r.start > start) {
+      hi = mid - 1;
+    } else {
+      return true;
+    }
+  }
+  return false;
+}
+
 function findMatchingBracketClose(
   text: string,
   bracketOpen: number,
@@ -1014,7 +1296,12 @@ export function rewriteSandboxLinks(
 
   const tree = parseChannelMarkdown(text);
 
-  // Pass 1: collect all reference link definitions and count their references.
+  // Pass 0 (BT3): identify all code zones (fenced blocks, indented code, inline and multiline backtick spans)
+  // BEFORE collecting reference definitions so `[x]: /home/workspace/...` inside code zones is never parsed
+  // as an active definition or rewritten.
+  const protectedCodeRanges = findProtectedCodeRanges(text);
+
+  // Pass 1: collect all reference link definitions and count their references (excluding code zones).
   const definitionsById = new Map<string, DefinitionInfo>();
   const collectDefinitions = (node: MdastNode): void => {
     if (node.type === "code" || node.type === "inlineCode") {
@@ -1022,6 +1309,9 @@ export function rewriteSandboxLinks(
     }
     if (node.type === "definition") {
       const offsets = getNodeOffsets(node);
+      if (offsets && startsInsideCodeRange(offsets.start, protectedCodeRanges)) {
+        return;
+      }
       const id = (node.identifier ?? "").toLowerCase();
       if (offsets && id && !definitionsById.has(id)) {
         const extracted = extractRawBracketLabel(
@@ -1058,6 +1348,10 @@ export function rewriteSandboxLinks(
         return;
       }
       if (node.type === "linkReference" || node.type === "imageReference") {
+        const offsets = getNodeOffsets(node);
+        if (offsets && startsInsideCodeRange(offsets.start, protectedCodeRanges)) {
+          return;
+        }
         const id = (node.identifier ?? "").toLowerCase();
         const def = definitionsById.get(id);
         if (def) {
@@ -1074,7 +1368,11 @@ export function rewriteSandboxLinks(
   }
 
   // Pass 2: walk AST top-down and record non-overlapping edits and protected ranges.
-  const actions: TextSegmentAction[] = [];
+  const actions: TextSegmentAction[] = protectedCodeRanges.map((r) => ({
+    start: r.start,
+    end: r.end,
+    kind: "protect" as const,
+  }));
 
   const visit = (node: MdastNode, insideOuterLink: boolean): void => {
     const offsets = getNodeOffsets(node);
@@ -1104,6 +1402,9 @@ export function rewriteSandboxLinks(
 
     if (node.type === "definition") {
       if (!offsets) return;
+      if (startsInsideCodeRange(offsets.start, protectedCodeRanges)) {
+        return;
+      }
       const id = (node.identifier ?? "").toLowerCase();
       const info = definitionsById.get(id);
       if (!info || info.start !== offsets.start) {
@@ -1185,6 +1486,9 @@ export function rewriteSandboxLinks(
 
     if (node.type === "linkReference" || node.type === "imageReference") {
       if (!offsets) return;
+      if (startsInsideCodeRange(offsets.start, protectedCodeRanges)) {
+        return;
+      }
       const isImage = node.type === "imageReference";
       const id = (node.identifier ?? "").toLowerCase();
       const info = definitionsById.get(id);
@@ -1256,6 +1560,9 @@ export function rewriteSandboxLinks(
 
     if (node.type === "link") {
       if (!offsets) return;
+      if (startsInsideCodeRange(offsets.start, protectedCodeRanges)) {
+        return;
+      }
       const url = typeof node.url === "string" ? node.url : "";
       const classification = classifyLinkDestination(url);
       const isAutolink =
@@ -1335,6 +1642,9 @@ export function rewriteSandboxLinks(
 
     if (node.type === "image") {
       if (!offsets) return;
+      if (startsInsideCodeRange(offsets.start, protectedCodeRanges)) {
+        return;
+      }
       const url = typeof node.url === "string" ? node.url : "";
       const classification = classifyLinkDestination(url);
       if (classification.kind === "keep") {

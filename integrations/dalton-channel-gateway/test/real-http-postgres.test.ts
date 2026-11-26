@@ -21,6 +21,10 @@ import { createGatewayApp } from "../src/server.js";
 import type { ChannelPlatform } from "../src/types.js";
 import { makeInboundRequestKey } from "../src/uuid.js";
 import { fetchGatewayServer } from "./helpers.js";
+import {
+  createIsolatedPostgresDatabase,
+  type IsolatedPostgresDatabase,
+} from "./pg-isolation.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "../../..");
@@ -182,6 +186,13 @@ async function startOrAttachRealBackend(
 
   const pyBin = resolvePythonBin();
   const scriptPath = resolve(REPO_ROOT, scriptRel);
+  const isolatedDb: IsolatedPostgresDatabase =
+    await createIsolatedPostgresDatabase({
+      baseDsn: dsn,
+      tag: "real_http",
+      pythonBin: pyBin,
+      repoRoot: REPO_ROOT,
+    });
 
   let proc: ChildProcess | null = null;
   try {
@@ -189,7 +200,9 @@ async function startOrAttachRealBackend(
       cwd: REPO_ROOT,
       env: {
         ...process.env,
-        DALTON_CHANNEL_GATEWAY_TEST_DSN: dsn,
+        DALTON_CHANNEL_GATEWAY_TEST_DSN: isolatedDb.dsn,
+        DALTON_TEST_DB_DSN: isolatedDb.dsn,
+        TEST_DATABASE_URL: isolatedDb.dsn,
         PYTHONPATH: process.env.PYTHONPATH
           ? `${REPO_ROOT}${delimiter}${process.env.PYTHONPATH}`
           : REPO_ROOT,
@@ -207,7 +220,7 @@ async function startOrAttachRealBackend(
             `Timed out waiting for HARNESS_READY.\nstdout: ${stdoutBuf}\nstderr: ${stderrBuf}`,
           ),
         );
-      }, 30_000);
+      }, 60_000);
 
       childProc.stdout?.on("data", (chunk: Buffer) => {
         stdoutBuf += chunk.toString("utf8");
@@ -237,28 +250,32 @@ async function startOrAttachRealBackend(
     return {
       baseUrl,
       stop: async () => {
-        if (!childProc || childProc.exitCode !== null) {
-          return;
+        try {
+          if (childProc && childProc.exitCode === null) {
+            childProc.kill("SIGTERM");
+            await new Promise<void>((res) => {
+              const killTimer = setTimeout(() => {
+                if (childProc.exitCode === null) {
+                  childProc.kill("SIGKILL");
+                }
+                res();
+              }, 5_000);
+              childProc.once("exit", () => {
+                clearTimeout(killTimer);
+                res();
+              });
+            });
+          }
+        } finally {
+          await isolatedDb.drop();
         }
-        childProc.kill("SIGTERM");
-        await new Promise<void>((res) => {
-          const killTimer = setTimeout(() => {
-            if (childProc.exitCode === null) {
-              childProc.kill("SIGKILL");
-            }
-            res();
-          }, 5_000);
-          childProc.once("exit", () => {
-            clearTimeout(killTimer);
-            res();
-          });
-        });
       },
     };
   } catch (err) {
     if (proc && proc.exitCode === null) {
       proc.kill("SIGKILL");
     }
+    await isolatedDb.drop();
     throw err;
   }
 }

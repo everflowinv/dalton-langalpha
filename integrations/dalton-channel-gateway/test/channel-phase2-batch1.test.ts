@@ -1514,4 +1514,254 @@ describe("Channel Phase 2 Batch 1 — Group Deep Links & DM Deliverables", () =>
     expect(recoveredCombined).toContain("overflow_4.pdf");
     expect(recoveredCombined).toContain("bin_1.pdf");
   });
+
+  it("BT1: Feishu unmentioned topic lookup passes initiator_platform_user_id and skips negative cache when truncated", async () => {
+    const lookupMock = vi.fn(async (_req: unknown) => ({
+      found: false,
+      status: null,
+      canonical_scope_key: null,
+      external_topic_id: null,
+      root_message_id: null,
+      first_reply_message_id: null,
+      initiator_platform_user_id: null,
+      initiator_dalton_user_id: null,
+      pending_candidates: [],
+      pending_candidates_has_more: true,
+      pending_candidates_truncated: true,
+    }));
+    const feishu = new FeishuChannelAdapter({
+      appId: "cli_test",
+      appSecret: "sec_test",
+      botOpenId: "ou_bot",
+    });
+    feishu.setBackendClient(makeMockBackend({ lookupBotTopic: lookupMock }));
+    const received: InboundChannelEvent[] = [];
+    feishu.onInboundEvent(async (ev) => {
+      received.push(ev);
+    });
+
+    const rawEvent = {
+      sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+      message: {
+        message_id: "om_trunc_1",
+        thread_id: "omt_trunc_topic",
+        chat_id: "oc_grp_trunc",
+        chat_type: "group",
+        message_type: "text",
+        content: JSON.stringify({ text: "追问 1" }),
+      },
+    };
+    await feishu.receiveRawEvent(rawEvent);
+    expect(lookupMock).toHaveBeenCalledTimes(1);
+    expect(lookupMock.mock.calls[0]?.[0]).toMatchObject({
+      platform: "feishu",
+      chat_address: "feishu:oc_grp_trunc",
+      match_mode: "inbound_followup",
+      external_topic_id: "omt_trunc_topic",
+      initiator_platform_user_id: "ou_alice",
+    });
+
+    // Because pending_candidates_truncated was true, topic MUST NOT be negatively cached;
+    // the next message retries lookup instead of being silently dropped from cache.
+    await feishu.receiveRawEvent({
+      ...rawEvent,
+      message: { ...rawEvent.message, message_id: "om_trunc_2" },
+    });
+    expect(lookupMock).toHaveBeenCalledTimes(2);
+    expect(received).toHaveLength(0);
+  });
+
+  it("BT2: recovers remaining unsent links per (workspace_id, path) when deliverables-links:${runId} becomes unknown after crash without duplicating confirmed links", async () => {
+    const runId = "run-bt2-links-crash";
+    const binaryFiles = [
+      { path: "results/doc.pdf", workspace_id: "ws-a" },
+      { path: "results/doc.pdf", workspace_id: "ws-b" },
+    ];
+    const overflowFiles = [
+      { path: "results/link_2.pdf", workspace_id: "ws-a", filename: "link_2.pdf", reason: "deliverable_overflow_link" },
+      { path: "results/link_4.pdf", workspace_id: "ws-b", filename: "link_4.pdf", reason: "deliverable_overflow_link" },
+    ];
+
+    // Pack 2 lines per chunk so 4 links span 2 chunks during deliverables-links:${runId}:
+    // chunk 0: ws-a::results/link_2.pdf + ws-b::results/link_4.pdf (linkOnlyFiles first)
+    // chunk 1: ws-a::results/doc.pdf + ws-b::results/doc.pdf (files next)
+    let crashLinksChunk1 = true;
+    let crashSecondItem = false;
+    const sentChunkTexts: string[] = [];
+    const feishu = makeStubAdapter("feishu", {
+      splitTextChunks: (text: string) => {
+        const lines = text.split("\n").filter((l) => l.length > 0);
+        const chunks: string[] = [];
+        for (let idx = 0; idx < lines.length; idx += 2) {
+          chunks.push(lines.slice(idx, idx + 2).join("\n"));
+        }
+        return chunks.length > 0 ? chunks : [text];
+      },
+      sendTextChunk: vi.fn(async (opts: SendTextChunkOptions): Promise<SendTextChunkResult> => {
+        if (crashLinksChunk1 && opts.chunkIndex === 1) {
+          throw new ChannelDeliveryError("Simulated gateway exit during deliverables-links chunk 1", {
+            outcome: "unknown",
+            code: "unavailable",
+          });
+        }
+        if (crashSecondItem && opts.text.includes("ws-b")) {
+          throw new ChannelDeliveryError("Simulated crash on second per-item recovery", {
+            outcome: "failed",
+            code: "unavailable",
+          });
+        }
+        sentChunkTexts.push(opts.text);
+        return { messageId: `om_bt2_${sentChunkTexts.length}`, resolvedAddress: opts.targetAddress };
+      }),
+    });
+
+    const deliveriesState = new Map<
+      string,
+      {
+        status: string;
+        sent_chunks: number;
+        files_status: Array<{ path: string; workspace_id?: string | null; status: string; reason: string | null }>;
+      }
+    >();
+    // Seed initial `deliverables:${runId}` as `unknown` (first crash before any files confirmed)
+    deliveriesState.set(`deliverables:${runId}`, {
+      status: "unknown",
+      sent_chunks: 0,
+      files_status: [],
+    });
+
+    const backend = makeMockBackend({
+      authorizeAndClaimDelivery: vi.fn(async (req) => {
+        const existing = deliveriesState.get(req.delivery_key);
+        if (existing && (existing.status === "sent" || existing.status === "partial")) {
+          const completedStatus = existing.status as "sent" | "partial";
+          return {
+            claim_status: "already_completed" as const,
+            status: completedStatus,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            is_current: true,
+            delivery_attempt: 1,
+            first_response_json: {
+              status: completedStatus,
+              code: null,
+              address: "feishu:@me",
+              current: true,
+              duplicate: true,
+              message: "already sent",
+              files: existing.files_status,
+            },
+          };
+        }
+        if (existing && (existing.status === "unknown" || existing.status === "in_flight")) {
+          return {
+            claim_status: "in_flight_or_unknown" as const,
+            existing_status: existing.status,
+            sent_chunks: existing.sent_chunks,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            is_current: true,
+            delivery_attempt: 1,
+            files_status: existing.files_status,
+          };
+        }
+        const priorRunFiles = Array.from(deliveriesState.entries())
+          .filter(([k]) => k !== req.delivery_key)
+          .flatMap(([k, row]) =>
+            row.files_status.map((f) => ({
+              delivery_key: k,
+              delivery_status: row.status,
+              workspace_id: f.workspace_id ?? null,
+              path: f.path,
+              status: f.status,
+            })),
+          );
+        deliveriesState.set(req.delivery_key, {
+          status: "in_flight",
+          sent_chunks: 0,
+          files_status: [],
+        });
+        return {
+          claim_status: "claimed" as const,
+          platform: "feishu",
+          target_address: "feishu:@me",
+          recipient_id: "ou_alice",
+          dm_recipient_platform_user_id: "ou_alice",
+          is_current: true,
+          delivery_attempt: 1,
+          workspace_id: "ws-a",
+          home_workspace_id: "ws-home",
+          prior_run_files: priorRunFiles,
+        };
+      }),
+      updateDeliveryProgress: vi.fn(async (req: I7DeliveriesProgressRequest) => {
+        const row = deliveriesState.get(req.delivery_key);
+        if (row) {
+          if (typeof req.sent_chunks === "number") row.sent_chunks = req.sent_chunks;
+          if (Array.isArray(req.files_status)) row.files_status = [...req.files_status];
+          if (typeof req.status === "string") row.status = req.status;
+        }
+        return { ok: true, delivery_key: req.delivery_key, status: req.status ?? "in_flight", sent_to_current_count: 1 };
+      }),
+    });
+
+    const svc = new DeliveryService({
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]),
+      webBaseUrl: WEB_BASE,
+    });
+
+    const baseOpts = {
+      deliveryKey: `deliverables:${runId}`,
+      kind: "fallback" as const,
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      workspaceId: "ws-a",
+      runId,
+      platform: "feishu" as const,
+      target: "feishu:@me",
+      text: "",
+      files: binaryFiles,
+      linkOnlyFiles: overflowFiles,
+      downloadMode: "deliverable" as const,
+      linkFallbackOnDeliverableMismatch: true,
+      activityOrigin: "replay" as const,
+    };
+
+    // Attempt 1: `deliverables-links:${runId}` sends chunk 0 (link_2.pdf + link_4.pdf), then crashes on chunk 1
+    await svc.executeDelivery(baseOpts);
+    const linksRow = deliveriesState.get(`deliverables-links:${runId}`)!;
+    linksRow.status = "unknown";
+    expect(linksRow.sent_chunks).toBe(1);
+    expect(
+      linksRow.files_status.filter((f) => f.status === "linked").map((f) => `${f.workspace_id}::${f.path}`),
+    ).toEqual(["ws-a::results/link_2.pdf", "ws-b::results/link_4.pdf"]);
+
+    // Attempt 2: restart recovery crashes on ws-b::results/doc.pdf AFTER ws-a::results/doc.pdf succeeds
+    crashLinksChunk1 = false;
+    crashSecondItem = true;
+    sentChunkTexts.length = 0;
+    const partialRes = await svc.executeDelivery(baseOpts);
+    expect(partialRes.status).toBe("failed");
+    expect(sentChunkTexts.join("\n")).not.toContain("link_2.pdf");
+    expect(sentChunkTexts.join("\n")).not.toContain("link_4.pdf");
+    expect(sentChunkTexts).toHaveLength(1);
+    expect(sentChunkTexts[0]).toContain("doc.pdf");
+
+    // Attempt 3: next restart sends ONLY ws-b::results/doc.pdf (same path, different workspace!) and does not duplicate ws-a::results/doc.pdf
+    crashSecondItem = false;
+    sentChunkTexts.length = 0;
+    const finalRes = await svc.executeDelivery(baseOpts);
+    expect(finalRes.status).toBe("sent");
+    expect(sentChunkTexts).toHaveLength(1);
+    expect(sentChunkTexts[0]).toContain("ws-b");
+    expect(sentChunkTexts[0]).toContain("doc.pdf");
+    expect(feishu.sentFiles).toHaveLength(0);
+
+    // Attempt 4: subsequent replay is completely idempotent (sends zero additional messages)
+    sentChunkTexts.length = 0;
+    const idempotentRes = await svc.executeDelivery(baseOpts);
+    expect(idempotentRes.status).toBe("sent");
+    expect(sentChunkTexts).toHaveLength(0);
+  });
 });

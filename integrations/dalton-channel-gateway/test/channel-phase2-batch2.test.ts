@@ -2472,4 +2472,186 @@ describe("Channel Phase 2 Batch 2: chart_layer DM snapshots & interactive deep l
     expect(feishuUnfinished.sentTexts).toHaveLength(0);
     expect(feishuUnfinished.sentCards).toHaveLength(0);
   });
+
+  it("BW2: reads target run directly by run_id beyond 500 turns and preserves pending finishing state when target run cannot be read", async () => {
+    const deepRunId = "run-auto-turn-1-of-600";
+    const execId = "exec-bw2-deep";
+
+    // 1) When replayThreadRun is available, target run at turn 1 (beyond 50 pages / 500 turns)
+    //    is read directly in 1 call without paginating replayThreadMessages, and charts are delivered.
+    const feishuDirect = makeMockAdapter("feishu");
+    const markFinishedCallsDirect: boolean[] = [];
+    const replayThreadMessagesSpy = vi.fn(async () => {
+      throw new Error("Should not paginate replayThreadMessages when replayThreadRun is available");
+    });
+    const replayThreadRunSpy = vi.fn(async (_uid: string, _tid: string, rid: string) => ({
+      status: 200,
+      isSse: true as const,
+      events: (async function* () {
+        yield {
+          event: "user_message",
+          data: JSON.stringify({ turn_index: 1, run_id: rid }),
+        };
+        yield {
+          event: "artifact",
+          data: JSON.stringify({
+            artifact_type: "chart_layer",
+            artifact_id: "layer-turn1-deep",
+            response_id: rid,
+            payload: {
+              chart_id: "NVDA:1day",
+              layer_id: "layer-turn1-deep",
+              title: "Deep Historical Chart",
+            },
+          }),
+        };
+        yield {
+          event: "replay_done",
+          data: JSON.stringify({
+            thread_id: THREAD_ID,
+            run_id: rid,
+            turn_index: 1,
+            outbound_blocked_by_run: { [rid]: false },
+          }),
+        };
+      })(),
+    }));
+
+    const directBackend = makeMockBackend({
+      finishAutomationRun: vi.fn(async (_id, req) => {
+        markFinishedCallsDirect.push(Boolean(req.mark_finished));
+        return {
+          status: 200,
+          data: {
+            execution_id: execId,
+            status: req.mark_finished ? ("finished" as const) : ("finishing" as const),
+            previous_status: req.mark_finished ? ("finishing" as const) : ("registered" as const),
+            user_id: "user-alice",
+            workspace_id: "ws-1",
+            thread_id: THREAD_ID,
+            run_id: deepRunId,
+            chart_snapshots: [],
+            outbound_blocked: false,
+            automation_name: "Deep Turn Brief",
+            finish_status: "completed",
+            final_text: "深度历史回合摘要。",
+            targets: [
+              {
+                entry: "feishu:@me",
+                address: "feishu:@me",
+                name: "Feishu DM",
+                ok: true,
+                message: null,
+                agent_sent: false,
+              },
+            ],
+          },
+        };
+      }),
+      replayThreadMessages: replayThreadMessagesSpy,
+      replayThreadRun: replayThreadRunSpy,
+    });
+    const directAdapters = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuDirect]]);
+    const directDelivery = new DeliveryService({
+      backend: directBackend,
+      adapters: directAdapters,
+      webBaseUrl: WEB_BASE,
+    });
+    const directRoutes = new AgentRoutesHandler({
+      backend: directBackend,
+      adapters: directAdapters,
+      deliveryService: directDelivery,
+      webBaseUrl: WEB_BASE,
+    });
+
+    const directResp = await directRoutes.handleFinishAutomationRun("user-alice", execId, {
+      status: "completed",
+      thread_id: THREAD_ID,
+      run_id: deepRunId,
+      final_text: "深度历史回合摘要。",
+    });
+    expect(directResp.status).toBe(200);
+    expect(replayThreadRunSpy).toHaveBeenCalledTimes(1);
+    expect(replayThreadRunSpy).toHaveBeenCalledWith("user-alice", THREAD_ID, deepRunId);
+    expect(replayThreadMessagesSpy).not.toHaveBeenCalled();
+    expect(JSON.stringify(feishuDirect.sentCards)).toContain("layer-turn1-deep");
+    expect(markFinishedCallsDirect).toEqual([false, true]);
+
+    // 2) When the target run cannot be read (e.g. 404 / unreachable or beyond fallback page cap),
+    //    executeAutomationRunFinish MUST keep pending recovery state (MUST NOT call mark_finished: true).
+    const feishuMissing = makeMockAdapter("feishu");
+    const markFinishedCallsMissing: boolean[] = [];
+    const missingBackend = makeMockBackend({
+      finishAutomationRun: vi.fn(async (_id, req) => {
+        markFinishedCallsMissing.push(Boolean(req.mark_finished));
+        return {
+          status: 200,
+          data: {
+            execution_id: "exec-bw2-missing",
+            status: "finishing" as const,
+            previous_status: "finishing" as const,
+            user_id: "user-alice",
+            workspace_id: "ws-1",
+            thread_id: THREAD_ID,
+            run_id: deepRunId,
+            chart_snapshots: [],
+            outbound_blocked: false,
+            automation_name: "Missing Run Brief",
+            finish_status: "completed",
+            final_text: "等待目标回合可读取。",
+            targets: [
+              {
+                entry: "feishu:@me",
+                address: "feishu:@me",
+                name: "Feishu DM",
+                ok: true,
+                message: null,
+                agent_sent: false,
+              },
+            ],
+          },
+        };
+      }),
+      replayThreadRun: vi.fn(async () => ({
+        status: 404,
+        isSse: false as const,
+        errorBody: { detail: "Run not found in thread" },
+      })),
+    });
+    const missingAdapters = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuMissing]]);
+    const missingDelivery = new DeliveryService({
+      backend: missingBackend,
+      adapters: missingAdapters,
+      webBaseUrl: WEB_BASE,
+    });
+    const missingRoutes = new AgentRoutesHandler({
+      backend: missingBackend,
+      adapters: missingAdapters,
+      deliveryService: missingDelivery,
+      webBaseUrl: WEB_BASE,
+    });
+
+    await missingRoutes.executeAutomationRunFinish({
+      executionId: "exec-bw2-missing",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: deepRunId,
+      initialSnapshots: [],
+      outboundBlocked: false,
+      automationName: "Missing Run Brief",
+      finishStatus: "completed",
+      finalText: "等待目标回合可读取。",
+      targets: [
+        {
+          entry: "feishu:@me",
+          address: "feishu:@me",
+          name: "Feishu DM",
+          ok: true,
+          message: null,
+          agent_sent: false,
+        },
+      ],
+    });
+    expect(markFinishedCallsMissing).toEqual([]);
+  });
 });

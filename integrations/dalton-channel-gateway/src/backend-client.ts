@@ -558,6 +558,9 @@ export interface InternalTopicLookupRequest {
   external_topic_id?: string | null;
   canonical_scope_key?: string | null;
   root_message_id?: string | null;
+  initiator_platform_user_id?: string | null;
+  pending_limit?: number | null;
+  pending_offset?: number | null;
 }
 
 export interface InternalTopicLookupResponse {
@@ -570,6 +573,8 @@ export interface InternalTopicLookupResponse {
   initiator_platform_user_id?: string | null;
   initiator_dalton_user_id?: string | null;
   pending_candidates?: PendingBotTopicCandidate[];
+  pending_candidates_has_more?: boolean;
+  pending_candidates_truncated?: boolean;
 }
 
 export interface VerifyDmRecipientResponse {
@@ -1530,6 +1535,13 @@ export interface BackendClient {
     userId: string,
     threadId: string,
     beforeTurnOrOptions?: number | ReplayThreadMessagesOptions,
+  ): Promise<SseOrErrorResponse>;
+
+  replayThreadRun?(
+    userId: string,
+    threadId: string,
+    runId: string,
+    opts?: { source?: "auto" | "checkpoint" },
   ): Promise<SseOrErrorResponse>;
 
   watchThread(
@@ -2650,6 +2662,24 @@ export class HttpBackendClient implements BackendClient {
           source: opts.source ?? "auto",
           limit: String(opts.limit ?? 5),
           ...(opts.beforeTurn !== undefined ? { before_turn: String(opts.beforeTurn) } : {}),
+        },
+      },
+    );
+  }
+
+  async replayThreadRun(
+    userId: string,
+    threadId: string,
+    runId: string,
+    opts?: { source?: "auto" | "checkpoint" },
+  ): Promise<SseOrErrorResponse> {
+    return await this.sseRequest(
+      "GET",
+      `/api/v1/dalton/channels/internal/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/replay`,
+      {
+        userId,
+        query: {
+          source: opts?.source ?? "auto",
         },
       },
     );
