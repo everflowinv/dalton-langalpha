@@ -3,12 +3,25 @@ import { isDaltonBuild } from '@/config/brand';
 
 export type ClearLocalHandle = (() => void) & { confirm: () => void };
 
+export type NullHandleBinder = (createdId: string) => void;
+
 export type DaltonTuningHold<V> = {
   value: V;
   clearToken?: symbol;
   restoreHeld?: DaltonTuningHold<V>;
   restoreDeferred?: { threadId: string; value: V } | null;
 } | null;
+
+export interface TuningClearSession<V> {
+  shownThreadRef: MutableRefObject<string | null>;
+  sessionEpochRef: MutableRefObject<number>;
+  createdRef: MutableRefObject<string | null>;
+  heldRef: MutableRefObject<DaltonTuningHold<V>>;
+  deferredPickRef: MutableRefObject<{ threadId: string; value: V } | null>;
+  boundNullHandlesRef: MutableRefObject<Set<NullHandleBinder>>;
+  setHeld: Dispatch<SetStateAction<DaltonTuningHold<V>>>;
+  setDeferredPick: Dispatch<SetStateAction<{ threadId: string; value: V } | null>>;
+}
 
 /**
  * Removes a failed optimistic effort value either from `held` directly or from
@@ -40,33 +53,56 @@ export function shouldDeferCreatedRowTuningSave<V>(held: DaltonTuningHold<V>): b
 }
 
 /**
- * Creates a tokenized local-effort clear handle that follows the same thread
- * creation (`null -> realThreadId`) via `sessionEpochRef`, while still ignoring
- * stale callbacks after switching away from an existing thread.
+ * True when a `null -> liveThreadId` transition represents the thread created
+ * by this view's first send (rather than navigating from a new chat directly
+ * to an unrelated existing thread).
  */
-export function createClearLocalTuningHandle<V>(params: {
-  originThreadId: string | null;
-  originSessionEpoch: number;
-  shownThreadRef: MutableRefObject<string | null>;
-  sessionEpochRef: MutableRefObject<number>;
-  createdRef: MutableRefObject<string | null>;
-  heldRef: MutableRefObject<DaltonTuningHold<V>>;
-  deferredPickRef: MutableRefObject<{ threadId: string; value: V } | null>;
-  setHeld: Dispatch<SetStateAction<DaltonTuningHold<V>>>;
-  setDeferredPick: Dispatch<SetStateAction<{ threadId: string; value: V } | null>>;
-}): ClearLocalHandle {
+export function isCreatedThreadTransition(
+  prevThreadId: string | null,
+  liveThreadId: string | null,
+  createdThreadId: string | null | undefined,
+): boolean {
+  if (prevThreadId !== null || liveThreadId === null) return false;
+  if (!isDaltonBuild || createdThreadId === undefined) return true;
+  return createdThreadId === liveThreadId;
+}
+
+/**
+ * Binds any pending null-origin `clearLocal` handles to the newly created
+ * thread id so they follow ONLY that thread and ignore any subsequent switch
+ * to another thread.
+ */
+export function bindNullHandlesToThread(
+  handles: Set<NullHandleBinder>,
+  createdId: string,
+): void {
+  if (handles.size === 0) return;
+  for (const bind of handles) bind(createdId);
+  handles.clear();
+}
+
+/**
+ * Creates a tokenized local-effort clear handle. When created before a thread
+ * id exists (`originThreadId === null`), the handle binds to the single thread
+ * id subsequently created by that first send and invalidates if the view
+ * switches to any other thread.
+ */
+export function createClearLocalTuningHandle<V>(
+  originThreadId: string | null,
+  session: TuningClearSession<V>,
+): ClearLocalHandle {
   const {
-    originThreadId,
-    originSessionEpoch,
     shownThreadRef,
     sessionEpochRef,
     createdRef,
     heldRef,
     deferredPickRef,
+    boundNullHandlesRef,
     setHeld,
     setDeferredPick,
-  } = params;
+  } = session;
 
+  const originSessionEpoch = sessionEpochRef.current;
   const token = Symbol('clearLocal');
   const prevDeferred = deferredPickRef.current;
   if (prevDeferred !== null) {
@@ -85,10 +121,20 @@ export function createClearLocalTuningHandle<V>(params: {
   heldRef.current = cleared;
   setHeld(cleared);
 
+  let boundThreadId: string | null = originThreadId;
+  if (originThreadId === null) {
+    boundNullHandlesRef.current.add((createdId: string) => {
+      if (boundThreadId === null && sessionEpochRef.current === originSessionEpoch) {
+        boundThreadId = createdId;
+      }
+    });
+  }
+
   const isSameThreadSession = () => {
     if (sessionEpochRef.current !== originSessionEpoch) return false;
-    if (originThreadId !== null && shownThreadRef.current !== originThreadId) return false;
-    return true;
+    const shown = shownThreadRef.current;
+    if (boundThreadId !== null) return shown === boundThreadId;
+    return shown === null;
   };
 
   const restore = () => {

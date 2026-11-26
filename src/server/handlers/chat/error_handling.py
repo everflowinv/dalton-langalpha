@@ -515,6 +515,10 @@ async def handle_workflow_error(
                 run_thread_id=ex_thread,
                 retryable=can_retry(existing),
             )
+            # DALTON-HOOK(antigravity-series): expose adopted run's effective llm_model on SSE duplicate_request
+            _existing_meta = existing.get("metadata")
+            if isinstance(_existing_meta, dict) and isinstance(_existing_meta.get("llm_model"), str) and _existing_meta["llm_model"]:
+                error_payload["llm_model"] = _existing_meta["llm_model"]
             # The run is another message's turn: retrying it would rerun
             # that message, and adopting it shows this one as its query.
             if e.steered:

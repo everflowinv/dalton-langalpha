@@ -32,8 +32,9 @@ import type { ComposerDraft, ComposerScope, ComposerSend, ContextPayload, ModelO
 import { isLargePaste, getModelDisplayName, MAX_FILES, sameMention } from './chat-input.helpers'; // DALTON-HOOK(chat-attachment-count)
 import { useToast } from './use-toast';
 import { effortOptions, isCodexModel, resolveEffort } from '@/lib/modelTuning';
-// DALTON-HOOK(antigravity-series): series display name, effort switching, and collapsed picker wiring
+// DALTON-HOOK(antigravity-series): series display name, effort switching, collapsed picker wiring, and modelPickSeq forwarding
 import { inspectSavedAntigravityModel, sameAntigravitySeries } from '@/lib/antigravitySeries';
+import { attachComposerModelPickSeq } from '@/lib/dalton/threadModelDalton';
 import { ChatInputWidgetDeck, MentionAutocompleteList, SlashCommandList } from './chat-input.parts';
 import {
   ComposerAttachments, ComposerChips, DraftTokenLayer, DropOverlay, FilesHoldHint, SendStopButton, ToolbarOverflowMenu, VoiceButton, VoiceOverlay,
@@ -207,6 +208,8 @@ export interface ChatInputProps {
   /** The model a send names where the host's thread names another than the
    *  pill shows (`useThreadModel`'s `sendModel`); unset, the pill's. */
   sendModel?: string | null;
+  // DALTON-HOOK(antigravity-series): sequence of the active manual model pick for composer getModelOptions()
+  sendModelSeq?: number | null;
   /**
    * The thread's own reasoning effort and fast mode, over what Settings gives
    * its model, owned by a thread host (`useThreadTuning`), which also receives
@@ -302,6 +305,8 @@ function ChatInput({
   model: hostModel,
   onPickModel = null,
   sendModel: hostSendModel,
+  // DALTON-HOOK(antigravity-series): active manual model pick sequence forwarded into getModelOptions
+  sendModelSeq: hostSendModelSeq = null,
   // Thread effort and fast mode
   tuning: hostTuning,
   onPickReasoningEffort = null,
@@ -704,14 +709,15 @@ function ChatInput({
   // Expose addContext method for external callers (e.g. FilePanel, message selection)
   useImperativeHandle(ref, () => ({
     getModelOptions() {
-      return {
+      // DALTON-HOOK(antigravity-series): attach active manual pick sequence for Dalton HITL/composer readers
+      return attachComposerModelPickSeq({
         model: sentModel,
         reasoningEffort: sentEffort,
         fastMode: resolvedFastMode,
         marketWatch: effectiveMarketWatch,
         subagentsAllowed: draftSubagents,
         ...ownOverrides,
-      };
+      }, { sendModel: sentModel, sendModelSeq: hostSendModelSeq })!;
     },
     // DALTON-HOOK(automation-effort): omit saved composer effort (and unsent Antigravity effort variant) on retry unless explicitly picked for this retry
     getRetryModelOptions() {
@@ -744,14 +750,14 @@ function ChatInput({
           }
         : {};
       // DALTON-HOOK(automation-effort): retry submits the variant only when it was picked for this retry
-      return {
+      return attachComposerModelPickSeq({
         model: retryModel,
         reasoningEffort: matchedExplicit ? explicit.effort : null,
         fastMode: resolvedFastMode,
         marketWatch: effectiveMarketWatch,
         subagentsAllowed: draftSubagents,
         ...retryOwnOverrides,
-      };
+      }, { sendModel: sentModel, sendModelSeq: hostSendModelSeq })!;
     },
     addContext(ctx) {
       // Dictation rewrites the draft from what it held when it started.
@@ -845,7 +851,7 @@ function ChatInput({
     focus() {
       textareaRef.current?.focus();
     },
-  }), [sentModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, ownTuning.fastMode, hostTuning, isLoading, retryTargetId, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, holdsStale, restoreSlash, pruneDraft, handleFiles, abandonListening, setMessage, giveBackDraft, tryAttachWidgetSnapshot]);
+  }), [sentModel, hostSendModelSeq, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, ownTuning.fastMode, hostTuning, isLoading, retryTargetId, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, holdsStale, restoreSlash, pruneDraft, handleFiles, abandonListening, setMessage, giveBackDraft, tryAttachWidgetSnapshot]);
 
   // Subscribe to ContextBus so this input mirrors the global widget-context
   // deck. Multiple chat inputs can be visible simultaneously (hero card +

@@ -1,9 +1,16 @@
 import { isDaltonBuild } from '@/config/brand';
+import type { ChatMessage } from '@/types/chat';
+import { finalizeAssistantMessage } from '@/pages/ChatAgent/session/stream/finalizeMessage';
+import { updateMessage } from '@/pages/ChatAgent/hooks/utils/messageHelpers';
 
 export interface ActiveTurnModel {
   model: string | null;
   pickSeq: number | null;
   admitted: boolean;
+  /** True when 409 adopted an earlier run whose actual model is unknown (e.g.
+   *  submission 1 did not name an explicit model and the server omitted
+   *  `llm_model`), so the user's current pick must NOT be consumed. */
+  modelUnknown?: boolean;
 }
 
 export interface SubmittedTurnPick {
@@ -84,7 +91,7 @@ export function isUnstartedResendFrame(event: Record<string, unknown>): boolean 
 /**
  * True when an SSE frame proves the server actually admitted and started a run
  * for this request (not a hold, not a steer merged into another run, not a
- * refusal frame, and not an unstarted resend notice).
+ * refusal frame, and not an unstarted retry/error frame lacking `run_id`).
  */
 export function isStreamRunAdmissionEvent(
   event: Record<string, unknown>,
@@ -141,10 +148,13 @@ export function createTurnModelTracker(): TurnModelTracker {
         }
         return { model: serverModel, pickSeq: null, admitted: true };
       }
-      if (recorded) {
+      if (recorded && recorded.model !== null) {
         return { model: recorded.model, pickSeq: recorded.pickSeq, admitted: true };
       }
-      return null;
+      // Adopted run's actual model is unknown (e.g. submission 1 relied on the
+      // thread's saved model without naming llm_model and the server response
+      // omitted llm_model): keep any newer pick unconsumed.
+      return { model: null, pickSeq: null, admitted: true, modelUnknown: true };
     },
   };
 }
@@ -165,13 +175,31 @@ export function applyAdoptedDuplicateTurnModel(
   }
 }
 
+export interface WorkflowStatusProbe {
+  can_reconnect?: boolean;
+  run_id?: string | null;
+  status?: string;
+  latest_turn_index?: number | null;
+}
+
+export interface RunLivenessProbe {
+  runs?: Array<{ run_id: string; thread_id?: string; status?: string }>;
+}
+
+export type HitlDisconnectOutcome =
+  | 'confirmed_reconnect'
+  | 'unconfirmed_reconnect'
+  | 'unadmitted';
+
 export interface HitlResumeModelGuardDeps {
   requestKey: string;
   pick: SubmittedTurnPick;
   tracker: TurnModelTracker;
   setActiveTurnModel: (updater: (prev: ActiveTurnModel | null) => ActiveTurnModel | null) => void;
-  getWorkflowStatus: (threadId: string) => Promise<{ can_reconnect?: boolean; run_id?: string | null }>;
+  getWorkflowStatus: (threadId: string) => Promise<WorkflowStatusProbe>;
+  getRunLiveness?: (runId: string) => Promise<RunLivenessProbe>;
   threadId: string;
+  turnIndexBefore?: number | null;
 }
 
 function parseRunIdFromLocation(contentLocation: string | null | undefined): string | null {
@@ -186,22 +214,46 @@ function parseRunIdFromLocation(contentLocation: string | null | undefined): str
   }
 }
 
+/**
+ * Marks a refused or unstarted HITL resume placeholder bubble as `unadmitted`
+ * so `projectTurns` / `newestKnownTurn()` does not assign it a backend turn
+ * number and the next successful retry takes the right turn index.
+ */
+export function markHitlBubbleUnadmitted(
+  setMessages: (updater: (prev: ChatMessage[]) => ChatMessage[]) => void,
+  assistantMessageId: string,
+  finalizeCompleted: boolean,
+): void {
+  setMessages((prev) =>
+    updateMessage(prev, assistantMessageId, (msg) =>
+      finalizeCompleted
+        ? { ...finalizeAssistantMessage(msg, 'completed'), unadmitted: true, isHistory: false }
+        : { ...msg, isStreaming: false, unadmitted: true, isHistory: false },
+    ),
+  );
+}
+
 export interface HitlResumeModelGuard {
   /** Returns true when `event` is an admission refusal frame that must be handled as refused. */
   observeEvent: (event: Record<string, unknown>, isSubagent: boolean) => boolean;
   onRunIdResolved: () => void;
   onDuplicateAdopted: (err: unknown) => void;
   /**
-   * Verifies a stream disconnect that happened before any admission signal.
-   * Returns `'unadmitted'` when status proves this request never started on the
-   * server, or `'reconnect'` to hand off to reconnect (with `activeTurnModel`
-   * confirmed only when the server's active run matches this request's run id).
+   * Verifies a pre-first-frame disconnect, unstarted `resend` notice, or
+   * empty-body clean close without any admission signal:
+   * - `'confirmed_reconnect'`: proven live or terminal via `Content-Location`
+   *   `run_id` (confirmed via `/status` or `/dispatches/liveness`).
+   * - `'unadmitted'`: proven never started (explicit `retry/resend` without
+   *   `run_id`, or `/status` proves thread is still paused at `turnIndexBefore`
+   *   with no matching run row).
+   * - `'unconfirmed_reconnect'`: indeterminate — keep history reload via
+   *   reconnect while keeping model selection unconfirmed (`admitted: false`).
    */
   verifyDisconnect: (
     contentLocation: string | null | undefined,
     isResendNotice: boolean,
     onConfirmedRun: (runId: string) => void,
-  ) => Promise<'reconnect' | 'unadmitted'>;
+  ) => Promise<HitlDisconnectOutcome>;
   /** True when a Dalton resume stream closed cleanly without ever receiving an admission signal. */
   isUnadmittedCleanEnd: () => boolean;
 }
@@ -210,7 +262,7 @@ export interface HitlResumeModelGuard {
  * Encapsulates Dalton's HITL resume admission tracking so `useChatMessages.ts`
  * stays thin while ensuring `activeTurnModel.admitted` only flips true on real
  * server admission signals (non-hold non-refusal frame, `onRunIdResolved`,
- * verified disconnect run match, or verified 409 duplicate adoption).
+ * verified disconnect/terminal run match, or verified 409 duplicate adoption).
  */
 export function createHitlResumeModelGuard({
   requestKey,
@@ -218,7 +270,9 @@ export function createHitlResumeModelGuard({
   tracker,
   setActiveTurnModel,
   getWorkflowStatus,
+  getRunLiveness,
   threadId,
+  turnIndexBefore = null,
 }: HitlResumeModelGuardDeps): HitlResumeModelGuard {
   let serverAdmitted = false;
   let refused = false;
@@ -236,6 +290,19 @@ export function createHitlResumeModelGuard({
   const unadmit = () => {
     if (!isDaltonBuild) return;
     setActiveTurnModel((prev) => (prev && prev.admitted ? { ...prev, admitted: false } : prev));
+  };
+
+  const probeRunExists = async (
+    expectedRunId: string,
+  ): Promise<'found' | 'absent' | 'unknown'> => {
+    if (!getRunLiveness) return 'unknown';
+    try {
+      const liveness = await getRunLiveness(expectedRunId);
+      if (liveness?.runs?.some((r) => r.run_id === expectedRunId)) return 'found';
+      return 'absent';
+    } catch {
+      return 'unknown';
+    }
   };
 
   return {
@@ -268,37 +335,54 @@ export function createHitlResumeModelGuard({
       applyAdoptedDuplicateTurnModel(tracker, requestKey, err, setActiveTurnModel);
     },
     async verifyDisconnect(contentLocation, isResendNotice, onConfirmedRun) {
-      if (!isDaltonBuild) return 'reconnect';
-      if (serverAdmitted) return 'reconnect';
+      if (!isDaltonBuild) return 'confirmed_reconnect';
+      if (serverAdmitted) return 'confirmed_reconnect';
       if (isResendNotice) {
         unadmit();
-        return 'reconnect';
+        return 'unadmitted';
       }
-      if (!threadId || threadId === '__default__') return 'unadmitted';
+      if (!threadId || threadId === '__default__') {
+        unadmit();
+        return 'unadmitted';
+      }
       const expectedRunId = parseRunIdFromLocation(contentLocation);
       try {
         const status = await getWorkflowStatus(threadId);
-        if (!status?.can_reconnect) {
+        if (status?.can_reconnect) {
+          if (expectedRunId && status.run_id === expectedRunId) {
+            onConfirmedRun(expectedRunId);
+            return 'confirmed_reconnect';
+          }
+          if (expectedRunId && (await probeRunExists(expectedRunId)) === 'found') {
+            onConfirmedRun(expectedRunId);
+            return 'confirmed_reconnect';
+          }
+          unadmit();
+          return 'unconfirmed_reconnect';
+        }
+        // Not reconnectable: the run may have already finished (terminal) or never started.
+        const runProbe = expectedRunId ? await probeRunExists(expectedRunId) : 'unknown';
+        if (expectedRunId && runProbe === 'found') {
+          onConfirmedRun(expectedRunId);
+          return 'confirmed_reconnect';
+        }
+        const stillOnPriorInterrupt =
+          status?.status === 'interrupted'
+          && typeof status.latest_turn_index === 'number'
+          && turnIndexBefore !== null
+          && status.latest_turn_index <= turnIndexBefore
+          && (!expectedRunId || runProbe === 'absent');
+        if (stillOnPriorInterrupt) {
           unadmit();
           return 'unadmitted';
         }
-        if (expectedRunId) {
-          if (status.run_id === expectedRunId) {
-            onConfirmedRun(expectedRunId);
-            return 'reconnect';
-          }
-          if (status.run_id && status.run_id !== expectedRunId) {
-            unadmit();
-            return 'unadmitted';
-          }
-        }
-        // Reconnect without falsely confirming the pick when no run_id matched.
+        // Indeterminate: keep history reload via reconnect, keep model selection unconfirmed.
         unadmit();
-        return 'reconnect';
+        return 'unconfirmed_reconnect';
       } catch {
-        // Offline / status unreachable: let reconnect retry, keeping admitted: false.
+        // Offline / status unreachable: keep history reload via reconnect, keep admitted: false.
         unadmit();
-        return 'reconnect';
+        return 'unconfirmed_reconnect';
       }
     },
     isUnadmittedCleanEnd() {

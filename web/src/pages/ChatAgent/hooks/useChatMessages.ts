@@ -15,6 +15,7 @@ import {
   applyAdoptedDuplicateTurnModel,
   createHitlResumeModelGuard,
   createTurnModelTracker,
+  markHitlBubbleUnadmitted,
   type ActiveTurnModel,
 } from '@/lib/dalton/turnAdmission';
 import { queryKeys } from '@/lib/queryKeys';
@@ -24,7 +25,7 @@ import { useHomeTimezone } from '@/hooks/useHomeTimezone';
 import { getIsMobileSnapshot } from '@/hooks/useIsMobile';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { useUser } from '@/hooks/useUser';
-import { sendChatMessageStream, sendRetryStream, getWorkflowStatus, sendHitlResponse, fetchThreadTurns, cancelWorkflow } from '../utils/api';
+import { sendChatMessageStream, sendRetryStream, getWorkflowStatus, getHandoffLiveness, sendHitlResponse, fetchThreadTurns, cancelWorkflow } from '../utils/api';
 import { readWorkflowStatus } from '../utils/primedStatus';
 import { useLocalRunPublisher } from '@/lib/threadLifecycle/useLocalRunPublisher';
 import { subscribeThreadCompactions } from '@/lib/threadLifecycle/feedClient';
@@ -248,9 +249,17 @@ export function useChatMessages(
     return workspaceId ? getStoredThreadId(workspaceId) : '__default__';
   });
   const [isLoading, setIsLoading] = useState(false);
-  // DALTON-HOOK(antigravity-series): track active turn model & per-requestKey first-submitted pick in Dalton builds
+  // DALTON-HOOK(antigravity-series): track active turn model, created thread id, & per-requestKey first-submitted pick in Dalton builds
   const [activeTurnModel, setActiveTurnModel] = useState<ActiveTurnModel | null>(null);
+  const [createdThreadId, setCreatedThreadId] = useState<string | null>(null);
   const turnModelTrackerRef = useRef(createTurnModelTracker());
+  const setThreadIdFromSend: React.Dispatch<React.SetStateAction<string>> = useCallback((next) => {
+    const resolved = typeof next === 'function' ? next(threadIdRef.current) : next;
+    if (isDaltonBuild && (!threadIdRef.current || threadIdRef.current === '__default__') && resolved && resolved !== '__default__') {
+      setCreatedThreadId(resolved);
+    }
+    setThreadId(resolved);
+  }, []);
   useEffect(() => {
     if (!isLoading) setActiveTurnModel(null);
   }, [isLoading]);
@@ -867,7 +876,8 @@ export function useChatMessages(
     setReloadTrigger,
     setHasActiveSubagents,
     pause,
-    setThreadId,
+    // DALTON-HOOK(antigravity-series): record server-created thread id when runtime transitions from __default__
+    setThreadId: setThreadIdFromSend,
     setTurnStatus,
     clearTurnStatus,
     // ref containers (stable identity, ref-current reads)
@@ -1027,6 +1037,8 @@ export function useChatMessages(
         if (currentThreadId && currentThreadId !== '__default__') {
           provenanceBuffer.clear();
         }
+        // DALTON-HOOK(antigravity-series): clear createdThreadId when navigation/workspace change switches threads
+        if (isDaltonBuild) setCreatedThreadId(null);
         setThreadId(newThreadId);
       }
 
@@ -1263,8 +1275,9 @@ export function useChatMessages(
     requestKeys.settle(requestKey, 'accepted'); // consumed by the accepted copy
     // A new chat's copy may have made the thread: the reload, the route and
     // the next send all read the state.
+    // DALTON-HOOK(antigravity-series): record createdThreadId when duplicate adoption transitions from __default__
+    setThreadIdFromSend(dupThreadId);
     threadIdRef.current = dupThreadId;
-    setThreadId(dupThreadId);
     latchRun(runId);
     // A settled copy has no stream to join, so the reconnect gives up and
     // reloads. The server holds that whole turn, so the reload has to replace
@@ -3135,7 +3148,8 @@ export function useChatMessages(
       sharedWithWorkspace,
       queryClient,
       threadIdRef,
-      setThreadId,
+      // DALTON-HOOK(antigravity-series): record createdThreadId when ensureThreadId mints the first thread
+      setThreadId: setThreadIdFromSend,
       wasStoppedRef,
       signal: abortController.signal,
     }).finally(releaseCreate);
@@ -3584,7 +3598,8 @@ export function useChatMessages(
     beginRun();
 
     // A resume is a turn of its own on the backend, with no user bubble.
-    const assistantMessage = createAssistantMessage(assistantMessageId, newestKnownTurn() + 1);
+    const turnBefore = newestKnownTurn();
+    const assistantMessage = createAssistantMessage(assistantMessageId, turnBefore + 1);
     setMessages((prev) => appendMessage(prev, assistantMessage));
     currentMessageRef.current = assistantMessageId;
 
@@ -3620,14 +3635,8 @@ export function useChatMessages(
     // Once the stream is open, a refusal arrives as a frame.
     let refusalFrame: SSEEvent | null = null;
     // DALTON-HOOK(antigravity-series): track HITL resume admission, START refusal frames, and first-submitted model per requestKey
-    const resumeModelGuard = createHitlResumeModelGuard({
-      requestKey,
-      pick: { model: model || null, pickSeq: resumeOpts.modelPickSeq ?? null },
-      tracker: turnModelTrackerRef.current,
-      setActiveTurnModel,
-      getWorkflowStatus,
-      threadId,
-    });
+    const readRunLiveness = (runId: string) => (typeof getHandoffLiveness === 'function' ? getHandoffLiveness({ threads: [], runs: [runId], steers: [] }) : Promise.resolve({ runs: [] }));
+    const resumeModelGuard = createHitlResumeModelGuard({ requestKey, pick: { model: model || null, pickSeq: resumeOpts.modelPickSeq ?? null }, tracker: turnModelTrackerRef.current, setActiveTurnModel, getWorkflowStatus, getRunLiveness: readRunLiveness, threadId, turnIndexBefore: turnBefore });
     const processEvent = (event: SSEEvent) => {
       // DALTON-HOOK(cos-settings-tools): capture START admission refusal frames (stale_fork, scope_changed, running, workspace_moving, etc.)
       if (resumeModelGuard.observeEvent(event, isSubagentEvent(event))) refusalFrame = event;
@@ -3675,8 +3684,8 @@ export function useChatMessages(
       if (recoverStaleAnswer(refusalFrame)) return;
       // DALTON-HOOK(cos-settings-tools): settle scope_changed stream refusal without restoring pending controls
       if (settleScopeChangedRefusal(refusalFrame)) return;
-      // DALTON-HOOK(antigravity-series): other START refusal frames (running, workspace_moving, etc.) stay unadmitted and re-arm pause
-      if (refusalFrame) return;
+      // DALTON-HOOK(antigravity-series): mark START refusal bubble unadmitted so retry keeps the right turn index
+      if (refusalFrame) { markHitlBubbleUnadmitted(setMessages, assistantMessageId, false); return; }
 
       // Ahead of the disconnect for the same reason as a send: the run a
       // retry notice names is over, and the drop after it is the server's. A
@@ -3689,23 +3698,13 @@ export function useChatMessages(
         return;
       }
 
-      if ((result?.disconnected || refs.retryNotice?.recovery === 'resend') && !notice) {
-        // DALTON-HOOK(antigravity-series): verify pre-first-frame disconnect for this request before confirming or reconnecting
-        if (await resumeModelGuard.verifyDisconnect(result?.contentLocation, refs.retryNotice?.recovery === 'resend', latchAdmittedRun) === 'unadmitted') {
-          setMessages((prev) => updateMessage(prev, assistantMessageId, (msg) => ({ ...finalizeAssistantMessage(msg, 'completed'), unadmitted: true })));
-          return;
-        }
-        console.log('[HITL] Stream disconnected, attempting reconnect');
+      // DALTON-HOOK(antigravity-series): verify pre-first-frame disconnect, unstarted resend, or empty close before confirming or reloading
+      if ((result?.disconnected || refs.retryNotice?.recovery === 'resend' || resumeModelGuard.isUnadmittedCleanEnd()) && !notice) {
+        const outcome = await resumeModelGuard.verifyDisconnect(result?.contentLocation, refs.retryNotice?.recovery === 'resend', latchAdmittedRun);
+        if (outcome === 'unadmitted') { markHitlBubbleUnadmitted(setMessages, assistantMessageId, true); return; }
         wasDisconnected = true;
-        // A dropped link, not a refusal: the run is live and reconnect owns it.
-        admitted = true;
+        if (outcome === 'confirmed_reconnect') admitted = true; else pauseGone = true;
         attemptReconnectAfterDisconnect(assistantMessageId);
-        return;
-      }
-
-      // DALTON-HOOK(antigravity-series): empty-body 200 close without an admission signal stays unadmitted in Dalton builds
-      if (resumeModelGuard.isUnadmittedCleanEnd()) {
-        setMessages((prev) => updateMessage(prev, assistantMessageId, (msg) => ({ ...finalizeAssistantMessage(msg, 'completed'), unadmitted: true })));
         return;
       }
 
@@ -4690,8 +4689,9 @@ export function useChatMessages(
     threadId,
     threadModels,
     isLoading,
-    // DALTON-HOOK(antigravity-series): expose activeTurnModel for Dalton turn-pick matching
+    // DALTON-HOOK(antigravity-series): expose activeTurnModel & createdThreadId for Dalton turn-pick & tuning handle binding
     activeTurnModel,
+    createdThreadId,
     marketWatch,
     hasActiveSubagents,
     awaitingReportBack,

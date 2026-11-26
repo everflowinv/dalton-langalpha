@@ -1,9 +1,18 @@
+import type { MutableRefObject } from 'react';
 import { isDaltonBuild } from '@/config/brand';
 import type { Thread } from '@/types/api';
 
 export interface ManualModelPick {
   model: string;
   seq: number;
+}
+
+export interface DeferredSharedPick {
+  threadId: string;
+  picked: string;
+  before: string | null;
+  seq: number;
+  onSettled?: (saved: boolean) => void;
 }
 
 export interface TrackedTurnPick {
@@ -21,6 +30,7 @@ export interface ActiveTurnModelInfo {
   model: string | null;
   pickSeq?: number | null;
   admitted?: boolean;
+  modelUnknown?: boolean;
 }
 
 export interface PendingSettledTracker {
@@ -28,6 +38,21 @@ export interface PendingSettledTracker {
   revoke: () => void;
   take: (model: string) => ((saved: boolean) => void) | undefined;
   confirmIfMatching: (model: string | null) => void;
+}
+
+/**
+ * Settles a `deferredSharedPick`'s `onSettled` callback at most once (clearing
+ * the callback reference before invoking so StrictMode or duplicate exits
+ * never fire it twice).
+ */
+export function settleDeferredSharedPick(
+  pick: DeferredSharedPick | null | undefined,
+  saved: boolean,
+): void {
+  if (!isDaltonBuild || !pick?.onSettled) return;
+  const cb = pick.onSettled;
+  pick.onSettled = undefined;
+  cb(saved);
 }
 
 /**
@@ -74,7 +99,7 @@ export function createPendingSettledTracker(): PendingSettledTracker {
  * Resolves whether an admitted turn consumed the current manual pick or an
  * already-saved personal thread model, and whether an unsent newer pick must be
  * protected across the turn (including when 409 adopts an older run whose model
- * differs from the user's current selection).
+ * differs from the user's current selection or is unknown).
  */
 export function resolveTurnPickConsumption(params: {
   turnModel: ActiveTurnModelInfo | null;
@@ -105,6 +130,7 @@ export function resolveTurnPickConsumption(params: {
     && currentPick
     && turnModel !== null
     && turnModel.model === null
+    && !turnModel.modelUnknown
     && !hasPending
     && !hasDeferredShared
     && snapshot.thread?.llm_model === currentPick.model,
@@ -113,6 +139,7 @@ export function resolveTurnPickConsumption(params: {
   const matchesCurrentPick = Boolean(
     currentPick
     && turnModel !== null
+    && !turnModel.modelUnknown
     && (
       (turnModel.model === currentPick.model && (turnModel.pickSeq == null || turnModel.pickSeq === currentPick.seq))
       || implicitSavedPersonalPick
@@ -154,6 +181,56 @@ export function resolveTurnPickConsumption(params: {
   }
 
   return { matchesCurrentPick, consumedPick: null, preserveUnsentSeq };
+}
+
+export interface TurnPickRecordingRefs {
+  manualPickRef: MutableRefObject<ManualModelPick | null>;
+  isSharedOrUnresolvedRef: MutableRefObject<boolean>;
+  pendingRef: MutableRefObject<string | null>;
+  deferredSharedPickRef: MutableRefObject<DeferredSharedPick | null>;
+  preservedUnsentSeqRef: MutableRefObject<number | null>;
+}
+
+/**
+ * Thin-hook helper for `useThreadModel.ts`: computes consumed turn pick and
+ * records unsent-pick protection in `preservedUnsentSeqRef`.
+ */
+export function recordDaltonTurnPick(
+  turnModel: ActiveTurnModelInfo | null,
+  snapshot: { thread: Thread | undefined; updatedAt: number },
+  liveThreadId: string | null,
+  refs: TurnPickRecordingRefs,
+): TrackedTurnPick | null {
+  const { consumedPick, preserveUnsentSeq } = resolveTurnPickConsumption({
+    turnModel,
+    currentPick: refs.manualPickRef.current,
+    liveThreadId,
+    isSharedOrUnresolved: refs.isSharedOrUnresolvedRef.current,
+    hasPending: refs.pendingRef.current !== null,
+    hasDeferredShared: refs.deferredSharedPickRef.current !== null,
+    snapshot,
+  });
+  if (preserveUnsentSeq !== null) refs.preservedUnsentSeqRef.current = preserveUnsentSeq;
+  return consumedPick;
+}
+
+/**
+ * Attaches `modelPickSeq` to composer options returned by `getModelOptions`
+ * when the options carry the thread's active manual `sendModel` in Dalton
+ * builds (used by `ChatView.tsx` and `MarketChatPanel.tsx` for HITL resumes).
+ */
+export function attachComposerModelPickSeq<
+  T extends { model?: string | null; modelPickSeq?: number | null },
+>(
+  options: T | undefined,
+  threadModel: { sendModel: string | null; sendModelSeq: number | null },
+): T | undefined {
+  if (!options || !isDaltonBuild) return options;
+  if (options.modelPickSeq != null) return options;
+  if (options.model && options.model === threadModel.sendModel && threadModel.sendModelSeq != null) {
+    return { ...options, modelPickSeq: threadModel.sendModelSeq };
+  }
+  return options;
 }
 
 /**

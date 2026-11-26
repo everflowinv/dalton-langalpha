@@ -3,7 +3,11 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from '@/components/ui/use-toast';
 // DALTON-HOOK(antigravity-series): gate chained extraUpdates rollback preservation & peer effort inspection to Dalton builds
 import { isDaltonBuild } from '@/config/brand';
-import { hasPendingModelEffortUpdate } from '@/lib/dalton/threadFieldSaveDalton';
+import {
+  getConfirmedEffortMap,
+  hasPendingModelEffortUpdate,
+  resolveDaltonFieldRollback,
+} from '@/lib/dalton/threadFieldSaveDalton';
 import { queryKeys } from '@/lib/queryKeys';
 import { threadFieldMutationKey, type ThreadField } from '@/lib/threadFieldMutations';
 import type { Thread } from '@/types/api';
@@ -37,21 +41,6 @@ type Known<F extends ThreadField> = {
   value: Thread[F];
   extra?: Partial<Thread>;
 } | null;
-
-// DALTON-HOOK(antigravity-series): track server-confirmed reasoning_effort per QueryClient+thread while serialized llm_model/reasoning_effort PATCHes are in flight in Dalton builds
-const confirmedEffortByClient = new WeakMap<
-  ReturnType<typeof useQueryClient>,
-  Map<string, Thread['reasoning_effort']>
->();
-
-function getConfirmedEffortMap(qc: ReturnType<typeof useQueryClient>) {
-  let map = confirmedEffortByClient.get(qc);
-  if (!map) {
-    map = new Map<string, Thread['reasoning_effort']>();
-    confirmedEffortByClient.set(qc, map);
-  }
-  return map;
-}
 
 /**
  * Saves one field of a thread row the way a composer needs it. The cached
@@ -194,32 +183,9 @@ export function useThreadFieldSave<F extends ThreadField>({
       // stands in only when the chain began in another mount.
       const confirmed = confirmedRef.current;
       const restored = confirmed.has(save.threadId) ? confirmed.get(save.threadId) : context?.previous;
-      // DALTON-HOOK(antigravity-series): respect serialized peer llm_model/reasoning_effort mutations and use latest confirmedEffort on rollback (only skip effort rollback when a queued model PATCH itself mutates reasoning_effort)
-      const effortMap = isDaltonBuild && isModelOrEffortField ? getConfirmedEffortMap(queryClient) : null;
-      const modelMutatesEffort = hasPendingModelEffortUpdate(queryClient, save.threadId, field);
-      const effortOut = isDaltonBuild && field === 'llm_model'
-        && queryClient.isMutating({ mutationKey: threadFieldMutationKey(save.threadId, 'reasoning_effort') }) > 0;
-      if (restored && !modelMutatesEffort) {
-        const currentRow = queryClient.getQueryData<Thread>(queryKeys.threads.detail(save.threadId));
-        const restoredValue = field === 'reasoning_effort' && effortMap?.has(save.threadId)
-          ? (effortMap.get(save.threadId) as Thread[F])
-          : restored.value;
-        let restoredExtra = restored.extra;
-        if (restoredExtra && 'reasoning_effort' in restoredExtra && effortMap?.has(save.threadId)) {
-          restoredExtra = { ...restoredExtra, reasoning_effort: effortMap.get(save.threadId) };
-        }
-        const safeExtra = restoredExtra && save.extraUpdates && currentRow
-          ? Object.fromEntries(
-              Object.entries(restoredExtra).filter(
-                ([k]) => !(effortOut && k === 'reasoning_effort')
-                  && currentRow[k as keyof Thread] === save.extraUpdates?.[k as keyof ThreadUpdates],
-              ),
-            ) as Partial<Thread>
-          : restoredExtra && effortOut
-            ? Object.fromEntries(Object.entries(restoredExtra).filter(([k]) => k !== 'reasoning_effort')) as Partial<Thread>
-            : restoredExtra;
-        writeField(save.threadId, restoredValue, safeExtra);
-      }
+      // DALTON-HOOK(antigravity-series): resolve serialized model/effort rollback via Dalton module
+      const rollback = resolveDaltonFieldRollback({ queryClient, field, save, restored });
+      if (rollback) writeField(save.threadId, rollback.value, rollback.extra);
       if (shownThreadRef.current === save.threadId) onFailed(save);
       toast({ description: failedMessage, variant: 'destructive' });
     },

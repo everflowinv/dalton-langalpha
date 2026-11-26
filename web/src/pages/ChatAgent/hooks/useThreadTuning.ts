@@ -6,11 +6,14 @@ import type { ThreadTuning } from '@/components/ui/chat-input.types';
 import { isDaltonBuild } from '@/config/brand';
 import { useThreadWriteAccess } from '@/lib/dalton/useThreadWriteAccess';
 import {
+  bindNullHandlesToThread,
   createClearLocalTuningHandle,
+  isCreatedThreadTransition,
   scrubFailedTuningHold,
   shouldDeferCreatedRowTuningSave,
   type ClearLocalHandle,
   type DaltonTuningHold,
+  type NullHandleBinder,
 } from '@/lib/dalton/threadTuningDalton';
 import type { Thread } from '@/types/api';
 import { threadDetailQuery } from '../utils/threadQueries';
@@ -42,8 +45,9 @@ interface UseThreadTuningOptions {
    * takes it up, so a new `key` replaces whatever the view held.
    */
   landing?: { key: string; reasoningEffort: string | null; fastMode: boolean | null } | null;
-  // DALTON-HOOK(antigravity-series): workspace id to detect shared workspaces before issuing PATCH
+  // DALTON-HOOK(antigravity-series): workspace id to detect shared workspaces before issuing PATCH, and createdThreadId to bind null-origin clearLocal handles only to the thread created by this send
   workspaceId?: string | null;
+  createdThreadId?: string | null;
 }
 
 /**
@@ -63,7 +67,7 @@ interface UseThreadTuningOptions {
  * because the create failed and the legacy send minted the thread, is saved
  * on the row once it is read.
  */
-export function useThreadTuning({ threadId, landing = null, workspaceId = null }: UseThreadTuningOptions) {
+export function useThreadTuning({ threadId, landing = null, workspaceId = null, createdThreadId }: UseThreadTuningOptions) {
   const { t } = useTranslation();
   const liveThreadId = threadId && threadId !== '__default__' ? threadId : null;
 
@@ -90,6 +94,7 @@ export function useThreadTuning({ threadId, landing = null, workspaceId = null }
     failedMessage: t('chat.pills.effortFailed'),
     skipSave,
     isUnresolved,
+    createdThreadId,
   });
   const fast = useThreadOverride({
     liveThreadId,
@@ -99,6 +104,7 @@ export function useThreadTuning({ threadId, landing = null, workspaceId = null }
     failedMessage: t('chat.pills.fastModeFailed'),
     skipSave,
     isUnresolved,
+    createdThreadId,
   });
 
   const tuning = useMemo<ThreadTuning>(
@@ -128,15 +134,17 @@ function useThreadOverride<F extends TuningField>({
   failedMessage,
   skipSave = false,
   isUnresolved = false,
+  createdThreadId,
 }: {
   liveThreadId: string | null;
   thread: Thread | undefined;
   field: F;
   landing: { key: string; value: Override<F> } | null;
   failedMessage: string;
-  // DALTON-HOOK(antigravity-series): allow shared/unresolved workspace turns to skip or defer PATCH in useThreadOverride
+  // DALTON-HOOK(antigravity-series): allow shared/unresolved workspace turns to skip or defer PATCH and bind null-origin clearLocal handles to the created thread
   skipSave?: boolean;
   isUnresolved?: boolean;
+  createdThreadId?: string | null;
 }) {
   // Undefined while there is no row: none yet, or one not read (loading, failed).
   const rowValue: Override<F> | undefined = liveThreadId && thread
@@ -149,8 +157,9 @@ function useThreadOverride<F extends TuningField>({
   const [deferredPick, setDeferredPick] = useState<{ threadId: string; value: Override<F> } | null>(null);
   const heldRef = useRef<Hold<Override<F>>>(held);
   const deferredPickRef = useRef<{ threadId: string; value: Override<F> } | null>(deferredPick);
-  // DALTON-HOOK(antigravity-series): monotonic epoch increments only when leaving a live thread (not null -> first-created id)
+  // DALTON-HOOK(antigravity-series): monotonic epoch & null-origin handle binders track the created thread and invalidate on switch to another thread
   const sessionEpochRef = useRef(0);
+  const boundNullHandlesRef = useRef<Set<NullHandleBinder>>(new Set());
   // A pick belongs to the thread it was made on, and one instance can move
   // between threads. A thread being created by its first send is not a move.
   const [heldThreadId, setHeldThreadId] = useState(liveThreadId);
@@ -159,8 +168,12 @@ function useThreadOverride<F extends TuningField>({
   let nextDeferredPick = deferredPick;
   if (heldThreadId !== liveThreadId) {
     setHeldThreadId(liveThreadId);
-    if (heldThreadId) {
+    // DALTON-HOOK(antigravity-series): bind null-origin handles only on real creation; invalidate on switch away or null->other existing thread
+    if (isCreatedThreadTransition(heldThreadId, liveThreadId, createdThreadId)) {
+      bindNullHandlesToThread(boundNullHandlesRef.current, liveThreadId!);
+    } else if (heldThreadId || (isDaltonBuild && liveThreadId !== null)) {
       sessionEpochRef.current += 1;
+      boundNullHandlesRef.current.clear();
       nextHeld = null;
       nextDeferredPick = null;
       setHeld(null);
@@ -210,7 +223,9 @@ function useThreadOverride<F extends TuningField>({
   const shownBeforeRef = useRef(liveThreadId);
   const createdRef = useRef<string | null>(null);
   useEffect(() => {
-    if (shownBeforeRef.current === null && liveThreadId) createdRef.current = liveThreadId;
+    // DALTON-HOOK(antigravity-series): only mark null->id as createdRef when the transition is this send's created thread
+    if (isCreatedThreadTransition(shownBeforeRef.current, liveThreadId, createdThreadId)) createdRef.current = liveThreadId;
+    else if (shownBeforeRef.current !== liveThreadId) createdRef.current = null;
     shownBeforeRef.current = liveThreadId;
     if (!liveThreadId || skipSave || createdRef.current !== liveThreadId || rowValue === undefined) return;
     // DALTON-HOOK(antigravity-series): do not PATCH a temporary optimistic clearLocal before the deferred model switch settles
@@ -218,7 +233,7 @@ function useThreadOverride<F extends TuningField>({
     createdRef.current = null;
     if (held === null || deferredPick !== null) return;
     void save({ threadId: liveThreadId, value: held.value, before: null });
-  }, [deferredPick, held, liveThreadId, rowValue, save, skipSave]);
+  }, [createdThreadId, deferredPick, held, liveThreadId, rowValue, save, skipSave]);
 
   // DALTON-HOOK(antigravity-series): flush a deferred tuning pick via PATCH once write permission resolves to confirmed personal, or drop it on shared threads
   useEffect(() => {
@@ -268,20 +283,11 @@ function useThreadOverride<F extends TuningField>({
   const shownThreadRef = useRef(liveThreadId);
   shownThreadRef.current = liveThreadId;
 
-  // DALTON-HOOK(antigravity-series): delegate tokenized clearLocal handle (follows null->id thread creation) to Dalton module
-  const clearLocal = useCallback((): ClearLocalHandle => (
-    createClearLocalTuningHandle({
-      originThreadId: liveThreadId,
-      originSessionEpoch: sessionEpochRef.current,
-      shownThreadRef,
-      sessionEpochRef,
-      createdRef,
-      heldRef,
-      deferredPickRef,
-      setHeld,
-      setDeferredPick,
-    })
-  ), [liveThreadId]);
+  // DALTON-HOOK(antigravity-series): delegate tokenized clearLocal handle (bound to created thread id) to Dalton module
+  const clearLocal = useCallback(
+    (): ClearLocalHandle => createClearLocalTuningHandle(liveThreadId, { shownThreadRef, sessionEpochRef, createdRef, heldRef, deferredPickRef, boundNullHandlesRef, setHeld, setDeferredPick }),
+    [liveThreadId],
+  );
 
   // DALTON-HOOK(antigravity-series): derive displayed value and first-send overrides from adjusted nextHeld
   const value: Override<F> | undefined = nextHeld ? nextHeld.value : liveThreadId ? rowValue : null as Override<F>;

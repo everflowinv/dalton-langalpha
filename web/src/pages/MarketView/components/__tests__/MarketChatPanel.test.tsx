@@ -1911,5 +1911,51 @@ describe('MarketChatPanel', () => {
         ci.getModelOptions = null;
       }
     });
+
+    // DALTON-HOOK(antigravity-series): R5 — MarketChatPanel forwards sendModelSeq to ChatInput and attaches modelPickSeq on HITL readComposerOptions
+    it('forwards sendModelSeq to ChatInput and attaches modelPickSeq on HITL readComposerOptions in Dalton builds', async () => {
+      agSeriesMock.enabled = true;
+      agSeriesMock.isDaltonBuild = true;
+      agSeriesMock.useCustomPermissions = true;
+      agSeriesMock.featuresData = [{ key: 'shared_workspaces', enabled: false }];
+      ci.getModelOptions = () => ({
+        model: (ci.props?.sendModel as string | null | undefined) ?? null,
+        reasoningEffort: null,
+        fastMode: false,
+      });
+
+      api.getThread.mockResolvedValue({
+        thread_id: 'thread-xyz',
+        llm_model: 'gemini-4-neon-medium-oauth',
+        reasoning_effort: null,
+        fast_mode: null,
+      });
+      api.updateThread.mockResolvedValueOnce({
+        thread_id: 'thread-xyz',
+        llm_model: 'gemini-4-neon-high-oauth',
+        reasoning_effort: null,
+        fast_mode: null,
+      });
+
+      try {
+        renderPanel({ scope: 'workspace', activeWorkspaceId: 'ws-1' });
+        await vi.waitFor(() => expect(ci.props!.model).toBe('gemini-4-neon-medium-oauth'));
+
+        await act(async () => {
+          await (ci.props!.onPickModel as (model: string) => Promise<boolean>)('gemini-4-neon-high-oauth');
+        });
+
+        expect(ci.props!.sendModelSeq).toEqual(expect.any(Number));
+        const { useChatMessages } = await import('@/pages/ChatAgent/hooks/useChatMessages');
+        const lastCall = vi.mocked(useChatMessages).mock.calls.at(-1);
+        const readComposerOptions = (lastCall?.[2] as { readComposerOptions?: () => Record<string, unknown> | undefined } | undefined)?.readComposerOptions;
+        expect(readComposerOptions?.()).toMatchObject({
+          model: 'gemini-4-neon-high-oauth',
+          modelPickSeq: ci.props!.sendModelSeq,
+        });
+      } finally {
+        ci.getModelOptions = null;
+      }
+    });
   });
 });

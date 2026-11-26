@@ -17,7 +17,7 @@ import { useWorkspace } from '@/hooks/useWorkspace';
 import { isDaltonAuth } from '@/config/daltonAuth';
 // DALTON-HOOK(antigravity-series): scope MarketChatPanel workspaceId & Antigravity effort reset to Dalton builds
 import { isDaltonBuild } from '@/config/brand';
-import { buildWidgetPromptModelOptions } from '@/lib/dalton/threadModelDalton';
+import { attachComposerModelPickSeq, buildWidgetPromptModelOptions } from '@/lib/dalton/threadModelDalton';
 import { usePreferences } from '@/hooks/usePreferences';
 // DALTON-HOOK(antigravity-series): inspect picked Antigravity variants to clear local effort alongside ChatView
 import { useAllModels } from '@/hooks/useAllModels';
@@ -406,7 +406,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       : 'market_view';
   }, [symbol]);
 
-  const readComposerOptions = useCallback(() => chatInputRef.current?.getModelOptions?.(), []);
+  // DALTON-HOOK(antigravity-series): attach active manual modelPickSeq when reading composer options for HITL resumes
+  const threadModelSeqRef = useRef<{ sendModel: string | null; sendModelSeq: number | null }>({ sendModel: null, sendModelSeq: null });
+  const readComposerOptions = useCallback(() => attachComposerModelPickSeq(chatInputRef.current?.getModelOptions?.(), threadModelSeqRef.current), []);
   const chat = useChatMessages(activeWorkspaceId, initialThreadId, {
     onPreviewUrl: handlePreview,
     platform: platformValue,
@@ -471,21 +473,23 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   useActiveThreadPublisher(threadId, { canMarkSeen });
 
   // The Chief of Staff's turn may start on another Default than the account's.
-  // DALTON-HOOK(antigravity-series): in Dalton builds pass activeWorkspaceId (including Home) and activeTurnModel like ChatView so shared threads skip 403 PATCH and queued sends never clear a newer unsent pick; non-Dalton keeps origin/dalton/main behavior
+  // DALTON-HOOK(antigravity-series): in Dalton builds pass activeWorkspaceId (including Home), activeTurnModel, and createdThreadId like ChatView
   const threadWorkspaceId = isDaltonBuild ? activeWorkspaceId : null;
   const threadModel = useThreadModel({
     threadId,
     isLoading,
     chiefOfStaff: scope === 'all',
     ...(threadWorkspaceId ? { workspaceId: threadWorkspaceId } : {}),
-    ...(isDaltonBuild ? { activeTurnModel: chat.activeTurnModel } : {}),
+    ...(isDaltonBuild ? { activeTurnModel: chat.activeTurnModel, createdThreadId: chat.createdThreadId } : {}),
   });
+  threadModelSeqRef.current = threadModel;
   const { pickModel: pickThreadModel } = threadModel;
   const threadSubagents = useThreadSubagents({ threadId });
   const { toSend: subagentsToSend } = threadSubagents;
   const threadTuning = useThreadTuning({
     threadId,
     ...(threadWorkspaceId ? { workspaceId: threadWorkspaceId } : {}),
+    ...(isDaltonBuild ? { createdThreadId: chat.createdThreadId } : {}),
   });
   const { toSend: tuningToSend, clearLocalEffort } = threadTuning;
   const { seriesCatalog, customModels, metadata: modelMetadata, rawApiResponse } = useAllModels();
@@ -1060,6 +1064,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         onScopeChange={onScopeChange}
         model={threadModel.model}
         sendModel={threadModel.sendModel}
+        // DALTON-HOOK(antigravity-series): pass sendModelSeq so real ChatInput.getModelOptions() carries modelPickSeq
+        sendModelSeq={threadModel.sendModelSeq}
         // DALTON-HOOK(antigravity-series): clear local effort when switching to an Antigravity variant (aligned with ChatView)
         onPickModel={handlePickThreadModel}
         subagentsAllowed={threadSubagents.allowed}

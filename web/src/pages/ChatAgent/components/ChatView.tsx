@@ -17,6 +17,7 @@ import { ScrollArea } from '../../../components/ui/scroll-area';
 import { usePreferences } from '@/hooks/usePreferences';
 // DALTON-HOOK(antigravity-series): gate Dalton-only turn-pick & effort rollback behavior to Dalton builds
 import { isDaltonBuild } from '@/config/brand';
+import { attachComposerModelPickSeq } from '@/lib/dalton/threadModelDalton';
 // DALTON-HOOK(antigravity-series): clear local thread effort on Antigravity switch without extra PATCH
 import { useAllModels } from '@/hooks/useAllModels';
 import { inspectSavedAntigravityModel } from '@/lib/antigravitySeries';
@@ -398,7 +399,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
   // Chat messages management - writes the subagent cards above.
   // Send, edit, regenerate and retry come from useTranscriptFollow below.
-  const readComposerOptions = useCallback(() => chatInputRef.current?.getModelOptions?.(), []);
+  // DALTON-HOOK(antigravity-series): attach active manual modelPickSeq when reading composer options for HITL resumes
+  const threadModelSeqRef = useRef<{ sendModel: string | null; sendModelSeq: number | null }>({ sendModel: null, sendModelSeq: null });
+  const readComposerOptions = useCallback(() => attachComposerModelPickSeq(chatInputRef.current?.getModelOptions?.(), threadModelSeqRef.current), []);
   // Filled by useChatCover below. A send that fails at a file's foot comes
   // back to the box; in the chat it stays on screen with its Retry.
   const coverReads = useChatCoverReads();
@@ -475,15 +478,16 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
   const activeThreadId =
     currentThreadId && currentThreadId !== '__default__' ? currentThreadId : threadId;
-  // DALTON-HOOK(antigravity-series): pass workspaceId and activeTurnModel so shared workspaces skip 403 PATCH and queued sends never clear a newer unsent pick
+  // DALTON-HOOK(antigravity-series): pass workspaceId, activeTurnModel, and createdThreadId for shared guard, queued-send safety, and creation binding
   const threadModel = useThreadModel({
     threadId: activeThreadId,
     isLoading,
     initialModel: navModel,
     chiefOfStaff: isHome,
     workspaceId,
-    ...(isDaltonBuild ? { activeTurnModel: chat.activeTurnModel } : {}),
+    ...(isDaltonBuild ? { activeTurnModel: chat.activeTurnModel, createdThreadId: chat.createdThreadId } : {}),
   });
+  threadModelSeqRef.current = threadModel;
   const { pickModel: pickThreadModel, thread: threadRecord } = threadModel;
   // DALTON-HOOK(colleague-dispatch): determine whether the active thread is read-only for the caller
   const effectiveThreadRecord = useMemo(() => {
@@ -563,11 +567,12 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     landing: subagentsLanding,
   });
   const { toSend: subagentsToSend } = threadSubagents;
-  // DALTON-HOOK(antigravity-series): pass workspaceId to useThreadTuning so shared workspaces stay local
+  // DALTON-HOOK(antigravity-series): pass workspaceId & createdThreadId to useThreadTuning for shared local-only mode and null-origin handle binding
   const threadTuning = useThreadTuning({
     threadId: currentThreadId,
     landing: tuningLanding,
     workspaceId,
+    ...(isDaltonBuild ? { createdThreadId: chat.createdThreadId } : {}),
   });
   const { toSend: tuningToSend, clearLocalEffort } = threadTuning;
   const { seriesCatalog, customModels, metadata: modelMetadata, rawApiResponse } = useAllModels();
@@ -2324,6 +2329,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         onAction={handleAction}
                         model={threadModel.model}
                         sendModel={threadModel.sendModel}
+                        // DALTON-HOOK(antigravity-series): pass sendModelSeq so real ChatInput.getModelOptions() carries modelPickSeq
+                        sendModelSeq={threadModel.sendModelSeq}
                         // DALTON-HOOK(antigravity-series): clear local effort alongside Antigravity model switch
                         onPickModel={handlePickThreadModel}
                         threadModels={threadModels}

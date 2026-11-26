@@ -474,6 +474,10 @@ async def _reject_duplicate_request(
             run_status=existing["status"],
             retryable=can_retry(existing),
         )
+        # DALTON-HOOK(antigravity-series): expose adopted run's effective llm_model on 409 duplicate_request
+        _existing_meta = existing.get("metadata")
+        if isinstance(_existing_meta, dict) and isinstance(_existing_meta.get("llm_model"), str) and _existing_meta["llm_model"]:
+            detail["llm_model"] = _existing_meta["llm_model"]
         # A steer's run is another message's turn, not one to retry or adopt.
         if keyed.steered:
             detail["steered"] = True

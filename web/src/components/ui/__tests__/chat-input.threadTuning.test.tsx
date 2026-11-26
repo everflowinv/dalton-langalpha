@@ -30,6 +30,14 @@ const mocks = vi.hoisted(() => ({
   preferences: null as unknown,
   mutateAsync: vi.fn(),
   mutate: vi.fn(),
+  isDaltonBuild: false,
+}));
+
+vi.mock('@/config/brand', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/config/brand')>()),
+  get isDaltonBuild() {
+    return mocks.isDaltonBuild;
+  },
 }));
 
 // DALTON-HOOK(automation-effort): Antigravity series catalog and metadata used by series-effort retry tests
@@ -512,5 +520,36 @@ describe('ChatInput: the thread owns its effort and fast mode', () => {
 
     // Retry must NOT submit the earlier Antigravity effort variant as llm_model.
     expect(inputRef.current?.getRetryModelOptions?.().model).toBeNull();
+  });
+
+  // DALTON-HOOK(antigravity-series): R5 — real ChatInput.getModelOptions() exposes modelPickSeq from sendModelSeq in Dalton builds
+  it('exposes modelPickSeq on getModelOptions() when sendModelSeq is provided in Dalton builds', () => {
+    mocks.isDaltonBuild = true;
+    try {
+      const inputRef = createRef<ChatInputHandle>();
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      queryClient.setQueryData(queryKeys.user.preferences(), mocks.preferences);
+      render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <ChatInput
+              ref={inputRef}
+              onSend={vi.fn()}
+              model="gemini-4-neon-high-oauth"
+              sendModel="gemini-4-neon-high-oauth"
+              sendModelSeq={17}
+              tuning={{ reasoningEffort: null, fastMode: false }}
+            />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+
+      expect(inputRef.current?.getModelOptions()).toMatchObject({
+        model: 'gemini-4-neon-high-oauth',
+        modelPickSeq: 17,
+      });
+    } finally {
+      mocks.isDaltonBuild = false;
+    }
   });
 });

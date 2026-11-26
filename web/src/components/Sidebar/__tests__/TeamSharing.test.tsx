@@ -213,6 +213,7 @@ vi.mock('@/pages/ChatAgent/hooks/useChatMessages', () => ({
     isShared: true,
     threadModels: STABLE_CHAT_HELPERS.threadModels,
     activeTurnModel: null,
+    createdThreadId: null,
     marketWatch: null,
     handleSendMessage: mockSendMessage,
     stopWorkflow: STABLE_CHAT_HELPERS.stopWorkflow,
