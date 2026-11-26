@@ -901,9 +901,7 @@ describe('TeamModelCatalogCard', () => {
     await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(1));
     const sentPayload = h.updateTeamCatalogModel.mock.calls[0][1];
     expect(sentPayload.parameters).toEqual({ max_output_tokens: 131072 });
-    expect(sentPayload.dalton_meta?.notional_pricing).toMatchObject({
-      input: 1.5,
-      output: 6,
+    expect(sentPayload.dalton_meta?.notional_pricing).toEqual({
       cached_input: null,
     });
   });
@@ -962,15 +960,13 @@ describe('TeamModelCatalogCard', () => {
     });
     await waitFor(() => expect(screen.queryByTestId('team-model-edit-sheet')).toBeNull());
 
-    // 3. Keep reasoning enabled but clear reasoning.write -> submits reasoning.write: null
+    // 3. Keep reasoning enabled but clear reasoning.write -> submits ONLY reasoning.write: null
     fireEvent.click(screen.getByTestId('edit-model-gpt-5-btn'));
     await screen.findByTestId('team-model-edit-sheet');
     fireEvent.change(screen.getByTestId('edit-model-reasoning-write-input'), { target: { value: '' } });
     fireEvent.click(screen.getByTestId('edit-sheet-save-btn'));
     await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(3));
-    expect(h.updateTeamCatalogModel.mock.calls[2][1].reasoning).toMatchObject({
-      efforts: ['low', 'medium', 'high'],
-      default: 'medium',
+    expect(h.updateTeamCatalogModel.mock.calls[2][1].reasoning).toEqual({
       write: null,
     });
     await waitFor(() => expect(screen.queryByTestId('team-model-edit-sheet')).toBeNull());
@@ -1137,5 +1133,576 @@ describe('TeamModelCatalogCard', () => {
     expect(await screen.findByTestId('revision-row-v5')).toBeInTheDocument();
     expect(screen.getByTestId('rollback-to-v5-btn')).toBeInTheDocument();
     expect(dialog.textContent).not.toMatch(/-oauth/i);
+  });
+
+  it('submits only changed nested pricing, pricing_meta, notional_pricing, and reasoning subfields on 409 conflict retry', async () => {
+    const initial = makeOverview({ revision: 7 });
+    const afterBobCashEdit = makeOverview({
+      revision: 9,
+      models: [
+        {
+          ...initial.models[0],
+          pricing: { input: 3.0, cached_input: 0.25, output: 10, unit: 'per_1m_tokens' },
+          pricing_meta: { source_kind: 'official', estimated: false, verified_at: '2026-11-26' },
+          reasoning: { efforts: ['low', 'medium', 'high'], default: 'medium', write: 'extra_body.reasoning_effort' },
+        },
+        initial.models[1],
+      ],
+    });
+    const afterBobNotionalEdit = makeOverview({
+      revision: 11,
+      models: [
+        afterBobCashEdit.models[0],
+        {
+          ...initial.models[1],
+          dalton_meta: {
+            ...initial.models[1].dalton_meta,
+            notional_pricing: {
+              input: 2.0,
+              cached_input: 0.15,
+              output: 6,
+              source_kind: 'estimated',
+              estimated: true,
+              note: 'Updated by Bob',
+            },
+          },
+        },
+      ],
+    });
+
+    let currentOverview = initial;
+    h.fetchTeamModelCatalog.mockImplementation(async () => currentOverview);
+
+    h.updateTeamCatalogModel
+      .mockRejectedValueOnce(
+        makeConflictError({
+          code: 'revision_conflict',
+          message: 'Expected revision 7, current is 9.',
+          expected_revision: 7,
+          current_revision: 9,
+        }),
+      )
+      .mockResolvedValueOnce({ revision: 10, model_key: 'gpt-5' })
+      .mockResolvedValueOnce({ revision: 10, model_key: 'gpt-5' })
+      .mockRejectedValueOnce(
+        makeConflictError({
+          code: 'revision_conflict',
+          message: 'Expected revision 9, current is 11.',
+          expected_revision: 9,
+          current_revision: 11,
+        }),
+      )
+      .mockResolvedValueOnce({ revision: 12, model_key: 'gemini-4-neon-high-oauth' });
+
+    renderCard();
+    await waitFor(() => expect(screen.getByTestId('edit-model-gpt-5-btn')).toBeInTheDocument());
+
+    // 1. Cash model: edit ONLY output rate and reasoning.default; Bob changed input rate, verified_at, and reasoning.write
+    fireEvent.click(screen.getByTestId('edit-model-gpt-5-btn'));
+    await screen.findByTestId('team-model-edit-sheet');
+    fireEvent.change(screen.getByTestId('edit-model-cash-output'), { target: { value: '12' } });
+    fireEvent.change(screen.getByTestId('edit-model-reasoning-default-select'), { target: { value: 'high' } });
+    currentOverview = afterBobCashEdit;
+    fireEvent.click(screen.getByTestId('edit-sheet-save-btn'));
+
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByTestId('edit-sheet-conflict-resubmit-btn')).toBeEnabled());
+    fireEvent.click(screen.getByTestId('edit-sheet-conflict-resubmit-btn'));
+
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(2));
+    expect(h.updateTeamCatalogModel.mock.calls[1][1]).toEqual({
+      pricing: { output: 12 },
+      reasoning: { default: 'high' },
+      expected_revision: 9,
+      comment: undefined,
+    });
+    await waitFor(() => expect(screen.queryByTestId('team-model-edit-sheet')).toBeNull());
+
+    // 2. Clear ONLY pricing_meta.verified_at -> sends ONLY pricing_meta: { verified_at: null } with no pricing object
+    fireEvent.click(screen.getByTestId('edit-model-gpt-5-btn'));
+    await screen.findByTestId('team-model-edit-sheet');
+    fireEvent.change(screen.getByTestId('edit-model-price-verified-at'), { target: { value: '' } });
+    fireEvent.click(screen.getByTestId('edit-sheet-save-btn'));
+
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(3));
+    expect(h.updateTeamCatalogModel.mock.calls[2][1]).toEqual({
+      pricing_meta: { verified_at: null },
+      expected_revision: 9,
+      comment: undefined,
+    });
+    await waitFor(() => expect(screen.queryByTestId('team-model-edit-sheet')).toBeNull());
+
+    // 3. Subscription model: edit ONLY notional output and clear notional cached_input while Bob changed notional input & note
+    fireEvent.click(screen.getByTestId('edit-model-gemini-4-neon-high-oauth-btn'));
+    await screen.findByTestId('team-model-edit-sheet');
+    fireEvent.change(screen.getByTestId('edit-model-notional-output'), { target: { value: '7.5' } });
+    fireEvent.change(screen.getByTestId('edit-model-notional-cached'), { target: { value: '' } });
+    currentOverview = afterBobNotionalEdit;
+    fireEvent.click(screen.getByTestId('edit-sheet-save-btn'));
+
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(4));
+    await waitFor(() => expect(screen.getByTestId('edit-sheet-conflict-resubmit-btn')).toBeEnabled());
+    fireEvent.click(screen.getByTestId('edit-sheet-conflict-resubmit-btn'));
+
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(5));
+    expect(h.updateTeamCatalogModel.mock.calls[4][1]).toEqual({
+      dalton_meta: {
+        notional_pricing: {
+          output: 7.5,
+          cached_input: null,
+        },
+      },
+      expected_revision: 11,
+      comment: undefined,
+    });
+  });
+
+  it('compares catalog variant base_url against opened baseline so renaming a model on a concurrently updated variant omits provider_variant_update', async () => {
+    const baseOverview = makeOverview({
+      revision: 7,
+      models: [
+        {
+          model_key: 'acme-chat',
+          model_id: 'acme-chat-v1',
+          provider: 'acme-gw',
+          provider_sdk: 'openai',
+          provider_display_name: 'Acme Gateway',
+          provider_connected: true,
+          catalog_defined_provider: true,
+          display_name: 'Acme Chat',
+          visible: true,
+          source: 'team_added',
+          status: 'visible',
+          intelligence: 4,
+          speed: 4,
+          plain_language: 4,
+          context: 128000,
+          compaction_profile: 'moderate',
+          input_modalities: ['text'],
+          reasoning: null,
+          pricing: { input: 1, output: 2, unit: 'per_1m_tokens' },
+          pricing_meta: { source_kind: 'official', estimated: false },
+          dalton_meta: { family: 'acme', billing: 'cash', tool_calling: true },
+        },
+      ],
+      provider_variants: [
+        {
+          provider_slug: 'acme-gw',
+          display_name: 'Acme Gateway',
+          sdk: 'openai',
+          parent_provider: 'openai',
+          access_type: 'api_key',
+          billing: 'cash',
+          base_url: 'https://gw-v1.acme.example.com/v1',
+          credential_configured: true,
+          key_fingerprint: 'sk-...1111',
+          bound_base_url: 'https://gw-v1.acme.example.com/v1',
+          updated_at: '2026-11-24T10:00:00Z',
+        },
+      ],
+    });
+    const bobUpdatedVariantUrl = makeOverview({
+      ...baseOverview,
+      revision: 8,
+      provider_variants: [
+        {
+          ...baseOverview.provider_variants[0],
+          base_url: 'https://gw-v2.acme.example.com/v1',
+          bound_base_url: 'https://gw-v2.acme.example.com/v1',
+          key_fingerprint: 'sk-...2222',
+        },
+      ],
+    });
+
+    h.fetchTeamModelCatalog
+      .mockResolvedValueOnce(baseOverview)
+      .mockResolvedValueOnce(bobUpdatedVariantUrl)
+      .mockResolvedValue(bobUpdatedVariantUrl);
+
+    h.updateTeamCatalogModel
+      .mockRejectedValueOnce(
+        makeConflictError({
+          code: 'revision_conflict',
+          message: 'Expected revision 7, current is 8.',
+          expected_revision: 7,
+          current_revision: 8,
+        }),
+      )
+      .mockResolvedValueOnce({ revision: 9, model_key: 'acme-chat' });
+
+    renderCard();
+    await waitFor(() => expect(screen.getByTestId('edit-model-acme-chat-btn')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId('edit-model-acme-chat-btn'));
+    const nameInput = (await screen.findByTestId('edit-model-display-name-input')) as HTMLInputElement;
+    fireEvent.change(nameInput, { target: { value: 'Acme Chat Renamed' } });
+    fireEvent.click(screen.getByTestId('edit-sheet-save-btn'));
+
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByTestId('edit-sheet-conflict-resubmit-btn')).toBeEnabled());
+    expect(screen.getByTestId('edit-sheet-conflict-field-variant_base_url').textContent).toContain(
+      'https://gw-v2.acme.example.com/v1',
+    );
+
+    fireEvent.click(screen.getByTestId('edit-sheet-conflict-resubmit-btn'));
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(2));
+    expect(h.updateTeamCatalogModel.mock.calls[1][1]).toEqual({
+      display_name: 'Acme Chat Renamed',
+      expected_revision: 8,
+      comment: undefined,
+    });
+    expect(h.updateTeamCatalogModel.mock.calls[1][1].provider_variant_update).toBeUndefined();
+  });
+
+  it('requires reviewing an updated variant base_url before submitting a key-only rotation after 409 conflict', async () => {
+    const baseOverview = makeOverview({
+      revision: 7,
+      models: [
+        {
+          model_key: 'acme-chat',
+          model_id: 'acme-chat-v1',
+          provider: 'acme-gw',
+          provider_sdk: 'openai',
+          provider_display_name: 'Acme Gateway',
+          provider_connected: true,
+          catalog_defined_provider: true,
+          display_name: 'Acme Chat',
+          visible: true,
+          source: 'team_added',
+          status: 'visible',
+          intelligence: 4,
+          speed: 4,
+          plain_language: 4,
+          context: 128000,
+          compaction_profile: 'moderate',
+          input_modalities: ['text'],
+          reasoning: null,
+          pricing: { input: 1, output: 2, unit: 'per_1m_tokens' },
+          pricing_meta: { source_kind: 'official', estimated: false },
+          dalton_meta: { family: 'acme', billing: 'cash', tool_calling: true },
+        },
+      ],
+      provider_variants: [
+        {
+          provider_slug: 'acme-gw',
+          display_name: 'Acme Gateway',
+          sdk: 'openai',
+          parent_provider: 'openai',
+          access_type: 'api_key',
+          billing: 'cash',
+          base_url: 'https://gw-v1.acme.example.com/v1',
+          credential_configured: true,
+          key_fingerprint: 'sk-...1111',
+          bound_base_url: 'https://gw-v1.acme.example.com/v1',
+          updated_at: '2026-11-24T10:00:00Z',
+        },
+      ],
+    });
+    const bobUpdatedVariantUrl = makeOverview({
+      ...baseOverview,
+      revision: 8,
+      provider_variants: [
+        {
+          ...baseOverview.provider_variants[0],
+          base_url: 'https://gw-v2.acme.example.com/v1',
+          bound_base_url: 'https://gw-v2.acme.example.com/v1',
+          key_fingerprint: 'sk-...2222',
+        },
+      ],
+    });
+
+    h.fetchTeamModelCatalog
+      .mockResolvedValueOnce(baseOverview)
+      .mockResolvedValueOnce(bobUpdatedVariantUrl)
+      .mockResolvedValue(bobUpdatedVariantUrl);
+
+    h.updateTeamCatalogModel
+      .mockRejectedValueOnce(
+        makeConflictError({
+          code: 'revision_conflict',
+          message: 'Expected revision 7, current is 8.',
+          expected_revision: 7,
+          current_revision: 8,
+        }),
+      )
+      .mockResolvedValueOnce({ revision: 9, model_key: 'acme-chat' });
+
+    renderCard();
+    await waitFor(() => expect(screen.getByTestId('edit-model-acme-chat-btn')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId('edit-model-acme-chat-btn'));
+    fireEvent.change(await screen.findByTestId('inline-variant-api-key-input'), {
+      target: { value: 'sk-key-only-rotation' },
+    });
+    fireEvent.click(screen.getByTestId('edit-sheet-save-btn'));
+
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByTestId('edit-sheet-conflict-resubmit-btn')).toBeEnabled());
+
+    // Clicking retry MUST NOT silently overwrite v2 URL with stale v1 URL
+    fireEvent.click(screen.getByTestId('edit-sheet-conflict-resubmit-btn'));
+    expect(await screen.findByTestId('edit-sheet-error')).toBeInTheDocument();
+    expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(1);
+    expect((screen.getByTestId('inline-variant-base-url-input') as HTMLInputElement).value).toBe(
+      'https://gw-v2.acme.example.com/v1',
+    );
+    expect((screen.getByTestId('inline-variant-api-key-input') as HTMLInputElement).value).toBe('');
+
+    // After admin reviews the updated v2 URL and re-confirms key, saving submits against v8 with v2 URL
+    fireEvent.change(screen.getByTestId('inline-variant-api-key-input'), {
+      target: { value: 'sk-confirmed-for-v2' },
+    });
+    fireEvent.click(screen.getByTestId('edit-sheet-save-btn'));
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(2));
+    expect(h.updateTeamCatalogModel.mock.calls[1][1]).toEqual({
+      expected_revision: 8,
+      comment: undefined,
+      provider_variant_update: {
+        provider_slug: 'acme-gw',
+        display_name: 'Acme Gateway',
+        sdk: 'openai',
+        parent_provider: 'openai',
+        access_type: 'api_key',
+        billing: 'cash',
+        base_url: 'https://gw-v2.acme.example.com/v1',
+        api_key: 'sk-confirmed-for-v2',
+      },
+    });
+  });
+
+  it('preserves last-curated confirmation and refreshed revision across 409 without looping and disables restore-default confirm during catalog reread', async () => {
+    // Part A: Already-confirmed last curated removal hits 409 (Bob renamed the model) -> retry submits on v9 without conflict loop
+    const initial = makeOverview({ revision: 7 });
+    const bobRenamedAtV9 = makeOverview({
+      revision: 9,
+      models: [
+        initial.models[0],
+        {
+          ...initial.models[1],
+          display_name: 'Gemini 4 Neon Renamed By Bob',
+        },
+      ],
+    });
+    h.fetchTeamModelCatalog
+      .mockResolvedValueOnce(initial)
+      .mockResolvedValueOnce(bobRenamedAtV9)
+      .mockResolvedValue(bobRenamedAtV9);
+
+    h.updateTeamCatalogModel
+      .mockRejectedValueOnce(
+        makeConflictError({
+          code: 'revision_conflict',
+          message: 'Expected revision 7, current is 9.',
+          expected_revision: 7,
+          current_revision: 9,
+        }),
+      )
+      .mockResolvedValueOnce({ revision: 10, model_key: 'gemini-4-neon-high-oauth' });
+
+    const { unmount } = renderCard();
+    await waitFor(() => expect(screen.getByTestId('edit-model-gemini-4-neon-high-oauth-btn')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId('edit-model-gemini-4-neon-high-oauth-btn'));
+    await screen.findByTestId('team-model-edit-sheet');
+    fireEvent.click(screen.getByTestId('edit-model-curated-toggle'));
+    fireEvent.click(screen.getByTestId('edit-sheet-save-btn'));
+    fireEvent.click(await screen.findByTestId('edit-sheet-last-curated-confirm-btn'));
+
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(1));
+    expect(h.updateTeamCatalogModel.mock.calls[0][1].expected_revision).toBe(7);
+
+    await waitFor(() => expect(screen.getByTestId('edit-sheet-conflict-resubmit-btn')).toBeEnabled());
+    fireEvent.click(screen.getByTestId('edit-sheet-conflict-resubmit-btn'));
+
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(2));
+    expect(h.updateTeamCatalogModel.mock.calls[1][1]).toEqual({
+      curated_setup_member: false,
+      expected_revision: 9,
+      comment: undefined,
+    });
+    unmount();
+
+    // Part B: Model newly becomes last curated during conflict -> confirmation retains refreshed revision (v8, not v7)
+    h.fetchTeamModelCatalog.mockReset();
+    h.updateTeamCatalogModel.mockReset();
+    const twoCuratedV7 = makeOverview({
+      revision: 7,
+      curated_setup: ['gpt-5', 'gemini-4-neon-high-oauth'],
+      dalton_setup_candidates: ['gpt-5', 'gemini-4-neon-high-oauth'],
+    });
+    const soleCuratedV8 = makeOverview({
+      revision: 8,
+      curated_setup: ['gemini-4-neon-high-oauth'],
+      dalton_setup_candidates: ['gemini-4-neon-high-oauth'],
+    });
+    h.fetchTeamModelCatalog
+      .mockResolvedValueOnce(twoCuratedV7)
+      .mockResolvedValueOnce(soleCuratedV8)
+      .mockResolvedValue(soleCuratedV8);
+    h.updateTeamCatalogModel
+      .mockRejectedValueOnce(
+        makeConflictError({
+          code: 'revision_conflict',
+          message: 'Expected revision 7, current is 8.',
+          expected_revision: 7,
+          current_revision: 8,
+        }),
+      )
+      .mockResolvedValueOnce({ revision: 9, model_key: 'gemini-4-neon-high-oauth' });
+
+    const { unmount: unmountB } = renderCard();
+    await waitFor(() => expect(screen.getByTestId('edit-model-gemini-4-neon-high-oauth-btn')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('edit-model-gemini-4-neon-high-oauth-btn'));
+    await screen.findByTestId('team-model-edit-sheet');
+    fireEvent.click(screen.getByTestId('edit-model-curated-toggle'));
+    fireEvent.click(screen.getByTestId('edit-sheet-save-btn'));
+
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByTestId('edit-sheet-conflict-resubmit-btn')).toBeEnabled());
+    fireEvent.click(screen.getByTestId('edit-sheet-conflict-resubmit-btn'));
+
+    // Now it asks for last-curated confirmation AND confirming MUST submit with refreshed revision 8
+    fireEvent.click(await screen.findByTestId('edit-sheet-last-curated-confirm-btn'));
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(2));
+    expect(h.updateTeamCatalogModel.mock.calls[1][1]).toEqual({
+      curated_setup_member: false,
+      expected_revision: 8,
+      comment: undefined,
+    });
+    unmountB();
+
+    // Part C: Restore-default confirm button and trigger are disabled while catalog reread is pending
+    h.fetchTeamModelCatalog.mockReset();
+    h.updateTeamCatalogModel.mockReset();
+    let resolveReread!: (value: TeamCatalogOverviewResponse) => void;
+    const deferredReread = new Promise<TeamCatalogOverviewResponse>((resolve) => {
+      resolveReread = resolve;
+    });
+    h.fetchTeamModelCatalog
+      .mockResolvedValueOnce(initial)
+      .mockReturnValueOnce(deferredReread)
+      .mockResolvedValue(bobRenamedAtV9);
+    h.updateTeamCatalogModel.mockRejectedValueOnce(
+      makeConflictError({
+        code: 'revision_conflict',
+        message: 'Expected revision 7, current is 9.',
+        expected_revision: 7,
+        current_revision: 9,
+      }),
+    );
+
+    renderCard();
+    await waitFor(() => expect(screen.getByTestId('edit-model-gpt-5-btn')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('edit-model-gpt-5-btn'));
+    await screen.findByTestId('team-model-edit-sheet');
+
+    // Open restore-default confirm box, then trigger a 409 save while reread is still loading
+    fireEvent.click(screen.getByTestId('edit-sheet-restore-default-btn'));
+    expect(await screen.findByTestId('restore-default-confirm-btn')).toBeEnabled();
+    fireEvent.change(screen.getByTestId('edit-model-display-name-input'), {
+      target: { value: 'GPT-5 Draft' },
+    });
+    fireEvent.click(screen.getByTestId('edit-sheet-save-btn'));
+
+    expect(await screen.findByTestId('edit-sheet-conflict-syncing')).toBeInTheDocument();
+    expect(screen.getByTestId('restore-default-confirm-btn')).toBeDisabled();
+    expect(screen.getByTestId('edit-sheet-restore-default-btn')).toBeDisabled();
+    expect(screen.getByTestId('edit-sheet-save-btn')).toBeDisabled();
+    expect(screen.getByTestId('edit-sheet-conflict-resubmit-btn')).toBeDisabled();
+
+    resolveReread(bobRenamedAtV9);
+    await waitFor(() => expect(screen.getByTestId('edit-sheet-conflict-resubmit-btn')).toBeEnabled());
+    expect(screen.getByTestId('restore-default-confirm-btn')).toBeEnabled();
+  });
+
+  it('chooses max_tokens over max_output_tokens for a google-named variant using the openai SDK without overwriting concurrent edits', async () => {
+    const initial = makeOverview({
+      revision: 7,
+      models: [
+        {
+          model_key: 'google-proxy-chat',
+          model_id: 'gemini-3-pro',
+          provider: 'google',
+          provider_sdk: 'openai',
+          provider_display_name: 'Google OpenAI Proxy',
+          provider_connected: true,
+          catalog_defined_provider: true,
+          display_name: 'Google Proxy Chat',
+          visible: true,
+          source: 'team_added',
+          status: 'visible',
+          intelligence: 4,
+          speed: 4,
+          plain_language: 4,
+          context: 200000,
+          compaction_profile: 'moderate',
+          input_modalities: ['text'],
+          reasoning: null,
+          parameters: { max_tokens: 8192 },
+          pricing: { input: 1, output: 2, unit: 'per_1m_tokens' },
+          pricing_meta: { source_kind: 'official', estimated: false },
+          dalton_meta: { family: 'google-gemini', billing: 'cash', tool_calling: true },
+        },
+      ],
+      provider_variants: [
+        {
+          provider_slug: 'google',
+          display_name: 'Google OpenAI Proxy',
+          sdk: 'openai',
+          parent_provider: 'openai',
+          access_type: 'api_key',
+          billing: 'cash',
+          base_url: 'https://google-openai-proxy.example.com/v1',
+          credential_configured: true,
+          key_fingerprint: 'sk-...goog',
+          bound_base_url: 'https://google-openai-proxy.example.com/v1',
+          updated_at: '2026-11-24T10:00:00Z',
+        },
+      ],
+    });
+    const bobRenamed = makeOverview({
+      ...initial,
+      revision: 9,
+      models: [
+        {
+          ...initial.models[0],
+          display_name: 'Google Proxy Renamed By Bob',
+        },
+      ],
+    });
+
+    h.fetchTeamModelCatalog
+      .mockResolvedValueOnce(initial)
+      .mockResolvedValueOnce(bobRenamed)
+      .mockResolvedValue(bobRenamed);
+    h.updateTeamCatalogModel
+      .mockRejectedValueOnce(
+        makeConflictError({
+          code: 'revision_conflict',
+          message: 'Expected revision 7, current is 9.',
+          expected_revision: 7,
+          current_revision: 9,
+        }),
+      )
+      .mockResolvedValueOnce({ revision: 10, model_key: 'google-proxy-chat' });
+
+    renderCard();
+    await waitFor(() => expect(screen.getByTestId('edit-model-google-proxy-chat-btn')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId('edit-model-google-proxy-chat-btn'));
+    await screen.findByTestId('team-model-edit-sheet');
+    fireEvent.change(screen.getByTestId('edit-model-max-tokens-input'), { target: { value: '16384' } });
+    fireEvent.click(screen.getByTestId('edit-sheet-save-btn'));
+
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByTestId('edit-sheet-conflict-resubmit-btn')).toBeEnabled());
+    fireEvent.click(screen.getByTestId('edit-sheet-conflict-resubmit-btn'));
+
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(2));
+    expect(h.updateTeamCatalogModel.mock.calls[1][1]).toEqual({
+      parameters: { max_tokens: 16384 },
+      expected_revision: 9,
+      comment: undefined,
+    });
   });
 });

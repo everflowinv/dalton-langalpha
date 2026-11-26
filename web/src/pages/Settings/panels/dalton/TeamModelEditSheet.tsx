@@ -15,6 +15,7 @@ import type {
   TeamCatalogModelUpsertPayload,
   TeamCatalogPriceSourceKind,
   TeamCatalogPricingCard,
+  TeamCatalogPricingMeta,
   TeamCatalogProviderVariant,
   TeamCatalogReasoningConfig,
   TeamCatalogTestCallResponse,
@@ -85,7 +86,12 @@ type ConflictOperation = 'save_model' | 'restore_default' | 'save_variant';
 interface RevisionConflictState {
   requiredRevision: number;
   operation: ConflictOperation;
+  confirmedLastCurated?: boolean;
   refreshStatus: 'loading' | 'ready' | 'failed';
+}
+
+interface PendingLastCuratedConfirm {
+  expectedRevision: number;
 }
 
 interface ConflictFieldItem {
@@ -99,6 +105,7 @@ interface ConflictFieldItem {
 interface EditBaseline {
   modelId: string;
   provider: string;
+  variantBaseUrl: string;
   displayName: string;
   visible: boolean;
   promptGuidance: string;
@@ -116,6 +123,7 @@ interface EditBaseline {
   speed: string;
   plainLanguage: string;
   billingMode: TeamCatalogBillingMode;
+  hasCashPricing: boolean;
   cashInput: string;
   cashCachedInput: string;
   cashCache5m: string;
@@ -143,6 +151,7 @@ interface EditBaseline {
 const EMPTY_BASELINE: EditBaseline = {
   modelId: '',
   provider: '',
+  variantBaseUrl: '',
   displayName: '',
   visible: true,
   promptGuidance: '',
@@ -160,6 +169,7 @@ const EMPTY_BASELINE: EditBaseline = {
   speed: '',
   plainLanguage: '',
   billingMode: 'cash',
+  hasCashPricing: false,
   cashInput: '',
   cashCachedInput: '',
   cashCache5m: '',
@@ -199,8 +209,8 @@ function resolveMaxOutputParamKey(
   existingParams?: Record<string, unknown> | null,
 ): 'max_output_tokens' | 'max_tokens' {
   const sdk = (providerSdk ?? '').trim().toLowerCase();
-  if (sdk === 'antigravity' || sdk === 'gemini') {
-    return 'max_output_tokens';
+  if (sdk) {
+    return sdk === 'antigravity' || sdk === 'gemini' ? 'max_output_tokens' : 'max_tokens';
   }
   const prov = providerName.trim().toLowerCase();
   if (
@@ -356,7 +366,6 @@ export function TeamModelEditSheet({
   const [priceNote, setPriceNote] = useState('');
   const [taskCostRefModel, setTaskCostRefModel] = useState('');
   const [taskCostTimes, setTaskCostTimes] = useState('');
-  const [pricingTouched, setPricingTouched] = useState(false);
 
   // Group 3: Context Window & Modalities
   const [contextWindow, setContextWindow] = useState('200000');
@@ -381,14 +390,16 @@ export function TeamModelEditSheet({
 
   // Opened snapshot baseline (for expected_revision, diff-only edit patches & conflict comparison)
   const [baseRevision, setBaseRevision] = useState(revision);
+  const [acknowledgedRevision, setAcknowledgedRevision] = useState<number | null>(null);
   const [baseline, setBaseline] = useState<EditBaseline>(EMPTY_BASELINE);
+  const [variantUrlBaseline, setVariantUrlBaseline] = useState('');
 
   // Comment, test-call result, conflict state & confirmations
   const [comment, setComment] = useState('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<TeamCatalogTestCallResponse | null>(null);
   const [confirmRestoreDefault, setConfirmRestoreDefault] = useState(false);
-  const [confirmLastCurated, setConfirmLastCurated] = useState(false);
+  const [confirmLastCurated, setConfirmLastCurated] = useState<PendingLastCuratedConfirm | null>(null);
   const [revisionConflict, setRevisionConflict] = useState<RevisionConflictState | null>(null);
 
   const visibleProviderOptions = useMemo(
@@ -426,12 +437,12 @@ export function TeamModelEditSheet({
     setTestResult(null);
     setCopiedFromSibling(null);
     setConfirmRestoreDefault(false);
-    setConfirmLastCurated(false);
+    setConfirmLastCurated(null);
     setRevisionConflict(null);
     setComment('');
     setVariantApiKey('');
     setBaseRevision(snapRevision);
-    setPricingTouched(mode === 'create' || mode === 'clone');
+    setAcknowledgedRevision(null);
     setOpenGroups({
       identity: true,
       pricing: !isMobile,
@@ -475,7 +486,14 @@ export function TeamModelEditSheet({
       setPromptGuidance(initPrompt);
 
       const provMeta = visibleProviderOptions.find((p) => p.provider === snapModel.provider);
-      setVariantBaseUrl(provMeta?.isVariant ? (provMeta.baseUrl ?? '') : '');
+      const initVariantBaseUrl =
+        snapVariant?.provider_slug === snapModel.provider
+          ? snapVariant.base_url
+          : provMeta?.isVariant
+            ? (provMeta.baseUrl ?? '')
+            : '';
+      setVariantBaseUrl(initVariantBaseUrl);
+      setVariantUrlBaseline(initVariantBaseUrl);
 
       const effBilling: TeamCatalogBillingMode =
         snapModel.dalton_meta?.billing === 'subscription' || provMeta?.billing === 'subscription'
@@ -584,6 +602,7 @@ export function TeamModelEditSheet({
       setBaseline({
         modelId: snapModel.model_id,
         provider: snapModel.provider,
+        variantBaseUrl: initVariantBaseUrl,
         displayName: initDisplayName,
         visible: snapModel.visible,
         promptGuidance: initPrompt,
@@ -601,6 +620,15 @@ export function TeamModelEditSheet({
         speed: initSpd,
         plainLanguage: initPlain,
         billingMode: effBilling,
+        hasCashPricing: Boolean(
+          snapModel.pricing &&
+            (snapModel.pricing.input != null ||
+              snapModel.pricing.output != null ||
+              snapModel.pricing.cached_input != null ||
+              snapModel.pricing.cache_read != null ||
+              snapModel.pricing.cache_5m != null ||
+              snapModel.pricing.cache_1h != null),
+        ),
         cashInput: initCashIn,
         cashCachedInput: initCashCached,
         cashCache5m: initCash5m,
@@ -634,10 +662,12 @@ export function TeamModelEditSheet({
     // Create new model defaults
     const defaultProv = visibleProviderOptions[0]?.provider ?? 'openai';
     const defaultProvMeta = visibleProviderOptions[0];
+    const defaultVariantUrl = defaultProvMeta?.isVariant ? (defaultProvMeta.baseUrl ?? '') : '';
     setModelKey('');
     setDisplayName('');
     setProvider(defaultProv);
-    setVariantBaseUrl(defaultProvMeta?.isVariant ? (defaultProvMeta.baseUrl ?? '') : '');
+    setVariantBaseUrl(defaultVariantUrl);
+    setVariantUrlBaseline(defaultVariantUrl);
     setModelId('');
     setVisible(true);
     setPromptGuidance('');
@@ -677,6 +707,7 @@ export function TeamModelEditSheet({
     setBaseline({
       ...EMPTY_BASELINE,
       provider: defaultProv,
+      variantBaseUrl: defaultVariantUrl,
       billingMode: initBilling,
     });
   };
@@ -703,7 +734,14 @@ export function TeamModelEditSheet({
     // Always clear any previously entered write-only API key when switching provider or variant
     setVariantApiKey('');
     const provMeta = visibleProviderOptions.find((p) => p.provider === nextProvider);
-    setVariantBaseUrl(provMeta?.isVariant ? (provMeta.baseUrl ?? '') : '');
+    const nextVariantUrl =
+      nextProvider === baseline.provider && baseline.variantBaseUrl
+        ? baseline.variantBaseUrl
+        : provMeta?.isVariant
+          ? (provMeta.baseUrl ?? '')
+          : '';
+    setVariantBaseUrl(nextVariantUrl);
+    setVariantUrlBaseline(nextVariantUrl);
     if (mode !== 'create') return;
 
     const sibling = allModels.find((m) => m.provider === nextProvider);
@@ -786,13 +824,26 @@ export function TeamModelEditSheet({
     }
   };
 
+  const resolvedLatestRevision = revisionConflict
+    ? Math.max(revisionConflict.requiredRevision, latestRevision ?? 0)
+    : (latestRevision ?? baseRevision);
+  const conflictCatalogSynced = Boolean(
+    revisionConflict &&
+      revisionConflict.refreshStatus === 'ready' &&
+      latestRevision !== undefined &&
+      latestRevision >= revisionConflict.requiredRevision,
+  );
+  const conflictSyncPending = Boolean(revisionConflict && !conflictCatalogSynced);
+
   const beginConflictRecovery = async (
     requiredRevision: number,
     operation: ConflictOperation,
+    options?: { confirmedLastCurated?: boolean },
   ) => {
     setRevisionConflict({
       requiredRevision,
       operation,
+      confirmedLastCurated: options?.confirmedLastCurated,
       refreshStatus: 'loading',
     });
     if (!onRefreshCatalog) {
@@ -832,9 +883,15 @@ export function TeamModelEditSheet({
   };
 
   const handleRestoreDefault = async (overrideExpectedRevision?: number) => {
-    if (!model) return;
+    if (!model || conflictSyncPending) return;
     setErrorMsg(null);
-    const targetExpectedRev = overrideExpectedRevision ?? baseRevision;
+    const targetExpectedRev =
+      overrideExpectedRevision ??
+      (conflictCatalogSynced ? resolvedLatestRevision : (acknowledgedRevision ?? baseRevision));
+    if (conflictCatalogSynced) {
+      setAcknowledgedRevision(targetExpectedRev);
+      setRevisionConflict(null);
+    }
     try {
       await restoreDefaultMutation.mutateAsync({
         modelKey: model.model_key,
@@ -860,6 +917,7 @@ export function TeamModelEditSheet({
   };
 
   const handleSaveVariantOnly = async (overrideExpectedRevision?: number) => {
+    if (conflictSyncPending) return;
     setErrorMsg(null);
     const slug = variantSlug.trim();
     const baseUrl = variantBaseUrl.trim();
@@ -875,7 +933,13 @@ export function TeamModelEditSheet({
       setErrorMsg(t('settings:dalton.teamCatalog.variantApiKeyRequired'));
       return;
     }
-    const targetExpectedRev = overrideExpectedRevision ?? baseRevision;
+    const targetExpectedRev =
+      overrideExpectedRevision ??
+      (conflictCatalogSynced ? resolvedLatestRevision : (acknowledgedRevision ?? baseRevision));
+    if (conflictCatalogSynced) {
+      setAcknowledgedRevision(targetExpectedRev);
+      setRevisionConflict(null);
+    }
     try {
       await upsertVariantMutation.mutateAsync({
         isUpdate: mode === 'edit_variant',
@@ -913,6 +977,7 @@ export function TeamModelEditSheet({
     overrideExpectedRevision?: number;
     confirmedLastCurated?: boolean;
   }) => {
+    if (conflictSyncPending) return;
     setErrorMsg(null);
     const cleanKey = modelKey.trim();
     const cleanModelId = modelId.trim();
@@ -928,6 +993,10 @@ export function TeamModelEditSheet({
       return;
     }
 
+    const targetExpectedRev =
+      options?.overrideExpectedRevision ??
+      (conflictCatalogSynced ? resolvedLatestRevision : (acknowledgedRevision ?? baseRevision));
+
     // Everflow last visible curated model risk confirmation (covers hiding OR un-curating from the EditSheet)
     const removesLastVisibleCuratedEverflow =
       !isCoreProfile &&
@@ -938,12 +1007,11 @@ export function TeamModelEditSheet({
       (!visible || !inCuratedSetup);
 
     if (removesLastVisibleCuratedEverflow && !options?.confirmedLastCurated) {
-      setConfirmLastCurated(true);
+      setConfirmLastCurated({ expectedRevision: targetExpectedRev });
       return;
     }
-    setConfirmLastCurated(false);
+    setConfirmLastCurated(null);
 
-    const targetExpectedRev = options?.overrideExpectedRevision ?? baseRevision;
     const isEdit = mode === 'edit';
 
     try {
@@ -973,15 +1041,34 @@ export function TeamModelEditSheet({
         }
       }
 
-      // Single-transaction inline catalog provider variant update (strictly from currently selected variant)
+      // Single-transaction inline catalog provider variant update:
+      // compare against the opened variant URL baseline so remote URL updates are never overwritten.
       const variantUrlTrimmed = variantBaseUrl.trim();
       const variantKeyTrimmed = variantApiKey.trim();
+      const baselineVariantUrlTrimmed = variantUrlBaseline.trim();
+      const latestVariantBaseUrl = (selectedProviderMeta?.baseUrl ?? '').trim();
+      const variantUrlChanged =
+        Boolean(variantUrlTrimmed) && variantUrlTrimmed !== baselineVariantUrlTrimmed;
+      const variantUrlChangedRemotely =
+        Boolean(selectedProviderMeta?.isVariant) &&
+        Boolean(latestVariantBaseUrl) &&
+        latestVariantBaseUrl !== baselineVariantUrlTrimmed;
       const variantNeedsUpdate =
         Boolean(selectedProviderMeta?.isVariant) &&
-        (Boolean(variantKeyTrimmed) ||
-          (Boolean(variantUrlTrimmed) && variantUrlTrimmed !== (selectedProviderMeta?.baseUrl ?? '')));
+        (Boolean(variantKeyTrimmed) || variantUrlChanged);
       if (variantNeedsUpdate && selectedProviderMeta) {
-        const cleanUrl = variantUrlTrimmed || selectedProviderMeta.baseUrl || '';
+        if (!variantUrlChanged && Boolean(variantKeyTrimmed) && variantUrlChangedRemotely) {
+          setVariantBaseUrl(latestVariantBaseUrl);
+          setVariantUrlBaseline(latestVariantBaseUrl);
+          setVariantApiKey('');
+          setErrorMsg(
+            t('settings:dalton.teamCatalog.variantBaseUrlChangedReviewRequired', {
+              latestBaseUrl: latestVariantBaseUrl,
+            }),
+          );
+          return;
+        }
+        const cleanUrl = variantUrlTrimmed || latestVariantBaseUrl;
         if (!cleanUrl.startsWith('https://')) {
           setErrorMsg(t('settings:dalton.teamCatalog.variantHttpsRequired'));
           return;
@@ -1021,23 +1108,43 @@ export function TeamModelEditSheet({
         payload.input_modalities = modalities;
       }
 
-      // Parameters: update max output using the provider's actual parameter name without swapping keys
+      // Parameters: select max output key strictly from the final saved provider's SDK (name fallback only when SDK is absent)
       if (maxTokVal !== null) {
         if (!isEdit || maxTokens.trim() !== baseline.maxTokens.trim()) {
+          const effectiveSavedProvider =
+            isEdit && cleanProvider === baseline.provider.trim() && latestModel?.provider
+              ? latestModel.provider
+              : cleanProvider;
+          const effectiveSavedProviderMeta =
+            visibleProviderOptions.find((p) => p.provider === effectiveSavedProvider) ??
+            (effectiveSavedProvider === cleanProvider ? selectedProviderMeta : null);
+          const effectiveSavedProviderSdk =
+            effectiveSavedProviderMeta?.sdk ??
+            (effectiveSavedProvider === (latestModel?.provider ?? '') ? latestModel?.provider_sdk : null) ??
+            (effectiveSavedProvider === (model?.provider ?? '') ? model?.provider_sdk : null);
+          const existingSavedParams =
+            isEdit && effectiveSavedProvider === (latestModel?.provider ?? model?.provider ?? '')
+              ? (latestModel?.parameters ?? model?.parameters)
+              : null;
           const targetMaxKey = resolveMaxOutputParamKey(
-            cleanProvider,
-            selectedProviderMeta?.sdk ?? (cleanProvider === (model?.provider ?? '') ? model?.provider_sdk : null),
-            isEdit && cleanProvider === (model?.provider ?? '') ? model?.parameters : null,
+            effectiveSavedProvider,
+            effectiveSavedProviderSdk,
+            existingSavedParams,
           );
           if (targetMaxKey === 'max_output_tokens') {
             payload.parameters = {
               max_output_tokens: maxTokVal,
-              ...(isEdit && baseline.hasMaxTokensKey ? { max_tokens: null } : {}),
+              ...(isEdit && (baseline.hasMaxTokensKey || existingSavedParams?.max_tokens != null)
+                ? { max_tokens: null }
+                : {}),
             };
           } else {
             payload.parameters = {
               max_tokens: maxTokVal,
-              ...(isEdit && baseline.hasMaxOutputTokensKey ? { max_output_tokens: null } : {}),
+              ...(isEdit &&
+              (baseline.hasMaxOutputTokensKey || existingSavedParams?.max_output_tokens != null)
+                ? { max_output_tokens: null }
+                : {}),
             };
           }
         }
@@ -1064,56 +1171,71 @@ export function TeamModelEditSheet({
         }
       }
 
-      // Reasoning: only send when changed in edit mode; turning off submits null; clearing write submits write: null
-      const reasoningChanged =
-        !isEdit ||
-        reasoningEnabled !== baseline.hasReasoning ||
-        (reasoningEnabled &&
-          (!sameStringList(reasoningEfforts, baseline.reasoningEfforts) ||
-            reasoningDefault !== baseline.reasoningDefault ||
-            reasoningWrite.trim() !== baseline.reasoningWrite.trim()));
-      if (reasoningChanged) {
+      // Reasoning: diff sub-fields individually in edit mode; turning off submits null; clearing write submits write: null
+      if (!isEdit) {
         if (reasoningEnabled && reasoningEfforts.length > 0) {
-          const nextReasoning: TeamCatalogReasoningConfig = {
+          payload.reasoning = {
             efforts: reasoningEfforts,
             default: reasoningDefault || reasoningEfforts[0],
+            ...(reasoningWrite.trim() ? { write: reasoningWrite.trim() } : {}),
           };
-          if (reasoningWrite.trim()) {
-            nextReasoning.write = reasoningWrite.trim();
-          } else if (isEdit && baseline.reasoningWrite.trim()) {
-            nextReasoning.write = null;
-          }
-          payload.reasoning = nextReasoning;
-        } else if (isEdit && baseline.hasReasoning) {
+        }
+      } else if (!reasoningEnabled) {
+        if (baseline.hasReasoning) {
           payload.reasoning = null;
+        }
+      } else if (reasoningEfforts.length > 0) {
+        const cleanDefault = reasoningDefault || reasoningEfforts[0];
+        const cleanWrite = reasoningWrite.trim();
+        if (!baseline.hasReasoning) {
+          payload.reasoning = {
+            efforts: reasoningEfforts,
+            default: cleanDefault,
+            ...(cleanWrite ? { write: cleanWrite } : {}),
+          };
+        } else {
+          const nextReasoning: TeamCatalogReasoningConfig = {};
+          if (!sameStringList(reasoningEfforts, baseline.reasoningEfforts)) {
+            nextReasoning.efforts = reasoningEfforts;
+          }
+          if (cleanDefault !== baseline.reasoningDefault) {
+            nextReasoning.default = cleanDefault;
+          }
+          if (cleanWrite !== baseline.reasoningWrite.trim()) {
+            nextReasoning.write = cleanWrite || null;
+          }
+          if (Object.keys(nextReasoning).length > 0) {
+            payload.reasoning = nextReasoning;
+          }
         }
       }
 
-      const priceMetaChanged =
-        priceSourceKind !== baseline.priceSourceKind ||
-        priceEstimated !== baseline.priceEstimated ||
-        priceSourceUrl.trim() !== baseline.priceSourceUrl.trim() ||
-        priceVerifiedAt.trim() !== baseline.priceVerifiedAt.trim() ||
-        priceNote.trim() !== baseline.priceNote.trim();
-
-      const priceMeta = {
+      const effectivePriceEstimated = priceSourceKind === 'estimated' ? true : priceEstimated;
+      const buildFullPriceMeta = (): TeamCatalogPricingMeta => ({
         source_kind: priceSourceKind,
-        estimated: priceSourceKind === 'estimated' ? true : priceEstimated,
-        ...(priceSourceUrl.trim()
-          ? { source_url: priceSourceUrl.trim() }
-          : isEdit && baseline.priceSourceUrl.trim()
-            ? { source_url: null }
-            : {}),
-        ...(priceVerifiedAt.trim()
-          ? { verified_at: priceVerifiedAt.trim() }
-          : isEdit && baseline.priceVerifiedAt.trim()
-            ? { verified_at: null }
-            : {}),
-        ...(priceNote.trim()
-          ? { note: priceNote.trim() }
-          : isEdit && baseline.priceNote.trim()
-            ? { note: null }
-            : {}),
+        estimated: effectivePriceEstimated,
+        ...(priceSourceUrl.trim() ? { source_url: priceSourceUrl.trim() } : {}),
+        ...(priceVerifiedAt.trim() ? { verified_at: priceVerifiedAt.trim() } : {}),
+        ...(priceNote.trim() ? { note: priceNote.trim() } : {}),
+      });
+      const buildDiffPriceMeta = (): TeamCatalogPricingMeta => {
+        const metaPatch: TeamCatalogPricingMeta = {};
+        if (priceSourceKind !== baseline.priceSourceKind) {
+          metaPatch.source_kind = priceSourceKind;
+        }
+        if (effectivePriceEstimated !== baseline.priceEstimated) {
+          metaPatch.estimated = effectivePriceEstimated;
+        }
+        if (priceSourceUrl.trim() !== baseline.priceSourceUrl.trim()) {
+          metaPatch.source_url = priceSourceUrl.trim() || null;
+        }
+        if (priceVerifiedAt.trim() !== baseline.priceVerifiedAt.trim()) {
+          metaPatch.verified_at = priceVerifiedAt.trim() || null;
+        }
+        if (priceNote.trim() !== baseline.priceNote.trim()) {
+          metaPatch.note = priceNote.trim() || null;
+        }
+        return metaPatch;
       };
 
       const daltonMeta: NonNullable<TeamCatalogModelUpsertPayload['dalton_meta']> = {};
@@ -1157,77 +1279,94 @@ export function TeamModelEditSheet({
           setErrorMsg(t('settings:dalton.teamCatalog.cashPricingRequired'));
           return;
         }
-        const cashRatesChanged =
-          !isEdit ||
-          billingMode !== baseline.billingMode ||
-          cashInput.trim() !== baseline.cashInput.trim() ||
-          cashCachedInput.trim() !== baseline.cashCachedInput.trim() ||
-          cashCache5m.trim() !== baseline.cashCache5m.trim() ||
-          cashCache1h.trim() !== baseline.cashCache1h.trim() ||
-          cashOutput.trim() !== baseline.cashOutput.trim();
-        if ((cashRatesChanged || (pricingTouched && priceMetaChanged)) && (inRate !== null || outRate !== null)) {
-          payload.pricing = {
-            input: inRate ?? 0,
-            output: outRate ?? 0,
-            ...(cachedRate !== null
-              ? { cached_input: cachedRate }
-              : isEdit && baseline.cashCachedInput.trim()
-                ? { cached_input: null }
-                : {}),
-            ...(cache5mRate !== null
-              ? { cache_5m: cache5mRate }
-              : isEdit && baseline.cashCache5m.trim()
-                ? { cache_5m: null }
-                : {}),
-            ...(cache1hRate !== null
-              ? { cache_1h: cache1hRate }
-              : isEdit && baseline.cashCache1h.trim()
-                ? { cache_1h: null }
-                : {}),
-            unit: 'per_1m_tokens',
-          };
-          payload.pricing_meta = priceMeta;
+        const creatingCashPricingCard =
+          !isEdit || billingMode !== baseline.billingMode || !baseline.hasCashPricing;
+        if (creatingCashPricingCard) {
+          if (inRate !== null || outRate !== null) {
+            payload.pricing = {
+              input: inRate ?? 0,
+              output: outRate ?? 0,
+              ...(cachedRate !== null ? { cached_input: cachedRate } : {}),
+              ...(cache5mRate !== null ? { cache_5m: cache5mRate } : {}),
+              ...(cache1hRate !== null ? { cache_1h: cache1hRate } : {}),
+              unit: 'per_1m_tokens',
+            };
+            payload.pricing_meta = buildFullPriceMeta();
+          }
+        } else {
+          const pricingPatch: TeamCatalogPricingCard = {};
+          if (cashInput.trim() !== baseline.cashInput.trim()) {
+            pricingPatch.input = inRate;
+          }
+          if (cashOutput.trim() !== baseline.cashOutput.trim()) {
+            pricingPatch.output = outRate;
+          }
+          if (cashCachedInput.trim() !== baseline.cashCachedInput.trim()) {
+            pricingPatch.cached_input = cachedRate;
+          }
+          if (cashCache5m.trim() !== baseline.cashCache5m.trim()) {
+            pricingPatch.cache_5m = cache5mRate;
+          }
+          if (cashCache1h.trim() !== baseline.cashCache1h.trim()) {
+            pricingPatch.cache_1h = cache1hRate;
+          }
+          if (Object.keys(pricingPatch).length > 0) {
+            payload.pricing = pricingPatch;
+          }
+          const metaPatch = buildDiffPriceMeta();
+          if (Object.keys(metaPatch).length > 0) {
+            payload.pricing_meta = metaPatch;
+          }
         }
       } else {
         const nIn = parseOptionalNumber(notionalInput);
         const nOut = parseOptionalNumber(notionalOutput);
         const nCached = parseOptionalNumber(notionalCachedInput);
-        const notionalChanged =
-          !isEdit ||
-          billingMode !== baseline.billingMode ||
-          notionalInput.trim() !== baseline.notionalInput.trim() ||
-          notionalCachedInput.trim() !== baseline.notionalCachedInput.trim() ||
-          notionalOutput.trim() !== baseline.notionalOutput.trim() ||
-          notionalRef.trim() !== baseline.notionalRef.trim() ||
-          priceMetaChanged;
-        if (notionalChanged) {
-          if (nIn !== null || nOut !== null || nCached !== null) {
-            const nextNotional: TeamCatalogPricingCard = {
+        const creatingNotionalCard =
+          !isEdit || billingMode !== baseline.billingMode || !baseline.hasNotionalPricing;
+        if (nIn !== null || nOut !== null || nCached !== null) {
+          if (creatingNotionalCard) {
+            daltonMeta.notional_pricing = {
               input: nIn ?? 0,
               output: nOut ?? 0,
-              ...(nCached !== null
-                ? { cached_input: nCached }
-                : isEdit && baseline.notionalCachedInput.trim()
-                  ? { cached_input: null }
-                  : {}),
-              ...priceMeta,
+              ...(nCached !== null ? { cached_input: nCached } : {}),
+              ...buildFullPriceMeta(),
             };
-            daltonMeta.notional_pricing = nextNotional;
             if (!isEdit || baseline.notionalRef.trim()) {
               daltonMeta.notional_ref = null;
             }
-          } else if (notionalRef.trim()) {
+          } else {
+            const npPatch: TeamCatalogPricingCard = {};
+            if (notionalInput.trim() !== baseline.notionalInput.trim()) {
+              npPatch.input = nIn;
+            }
+            if (notionalOutput.trim() !== baseline.notionalOutput.trim()) {
+              npPatch.output = nOut;
+            }
+            if (notionalCachedInput.trim() !== baseline.notionalCachedInput.trim()) {
+              npPatch.cached_input = nCached;
+            }
+            Object.assign(npPatch, buildDiffPriceMeta());
+            if (Object.keys(npPatch).length > 0) {
+              daltonMeta.notional_pricing = npPatch;
+            }
+            if (notionalRef.trim() !== baseline.notionalRef.trim()) {
+              daltonMeta.notional_ref = notionalRef.trim() || null;
+            }
+          }
+        } else if (notionalRef.trim()) {
+          if (!isEdit || notionalRef.trim() !== baseline.notionalRef.trim()) {
             daltonMeta.notional_ref = notionalRef.trim();
-            if (isEdit && baseline.hasNotionalPricing) {
-              daltonMeta.notional_pricing = null;
-            }
-          } else if (isEdit) {
-            if (baseline.hasNotionalPricing) {
-              daltonMeta.notional_pricing = null;
-            }
-            if (baseline.notionalRef.trim()) {
-              daltonMeta.notional_ref = null;
-            }
+          }
+          if (isEdit && baseline.hasNotionalPricing) {
+            daltonMeta.notional_pricing = null;
+          }
+        } else if (isEdit) {
+          if (baseline.hasNotionalPricing) {
+            daltonMeta.notional_pricing = null;
+          }
+          if (baseline.notionalRef.trim()) {
+            daltonMeta.notional_ref = null;
           }
         }
       }
@@ -1256,6 +1395,11 @@ export function TeamModelEditSheet({
         payload.curated_setup_member = inCuratedSetup;
       }
 
+      if (conflictCatalogSynced) {
+        setAcknowledgedRevision(targetExpectedRev);
+        setRevisionConflict(null);
+      }
+
       if (isEdit) {
         await updateModelMutation.mutateAsync({ modelKey: cleanKey, payload });
       } else {
@@ -1273,7 +1417,9 @@ export function TeamModelEditSheet({
       if (parsed.code === 'revision_conflict') {
         const requiredRev =
           parsed.currentRevision ?? Math.max((latestRevision ?? targetExpectedRev), targetExpectedRev + 1);
-        void beginConflictRecovery(requiredRev, 'save_model');
+        void beginConflictRecovery(requiredRev, 'save_model', {
+          confirmedLastCurated: Boolean(options?.confirmedLastCurated),
+        });
       }
       setErrorMsg(parsed.message);
     }
@@ -1337,16 +1483,6 @@ export function TeamModelEditSheet({
     );
   };
 
-  const resolvedLatestRevision = revisionConflict
-    ? Math.max(revisionConflict.requiredRevision, latestRevision ?? 0)
-    : (latestRevision ?? baseRevision);
-  const conflictCatalogSynced = Boolean(
-    revisionConflict &&
-      revisionConflict.refreshStatus === 'ready' &&
-      latestRevision !== undefined &&
-      latestRevision >= revisionConflict.requiredRevision,
-  );
-
   const conflictedFields: ConflictFieldItem[] = (() => {
     if (!revisionConflict || !conflictCatalogSynced) return [];
     const items: ConflictFieldItem[] = [];
@@ -1392,6 +1528,15 @@ export function TeamModelEditSheet({
         latestModel.provider,
         provider.trim(),
       );
+      if (selectedProviderMeta?.isVariant && baseline.variantBaseUrl) {
+        pushIfRemoteChanged(
+          'variant_base_url',
+          t('settings:dalton.teamCatalog.variantBaseUrlLabel'),
+          baseline.variantBaseUrl,
+          (selectedProviderMeta.baseUrl ?? '').trim(),
+          variantBaseUrl.trim(),
+        );
+      }
       pushIfRemoteChanged(
         'visible',
         t('settings:dalton.teamCatalog.visibleInPickerLabel'),
@@ -1494,6 +1639,28 @@ export function TeamModelEditSheet({
         ),
         formatRateTuple(cashInput, cashCachedInput, cashOutput),
       );
+      const latestPm =
+        (latestModel.dalton_meta?.billing === 'subscription'
+          ? latestModel.dalton_meta?.notional_pricing
+          : latestModel.pricing_meta) ?? null;
+      pushIfRemoteChanged(
+        'pricing_meta',
+        t('settings:dalton.teamCatalog.priceSourceLabel'),
+        [baseline.priceSourceKind, baseline.priceVerifiedAt, baseline.priceSourceUrl, baseline.priceNote]
+          .filter(Boolean)
+          .join(' · '),
+        [
+          latestPm?.source_kind || 'official',
+          latestPm?.verified_at ?? '',
+          latestPm?.source_url ?? '',
+          latestPm?.note ?? latestPm?.source ?? '',
+        ]
+          .filter(Boolean)
+          .join(' · '),
+        [priceSourceKind, priceVerifiedAt.trim(), priceSourceUrl.trim(), priceNote.trim()]
+          .filter(Boolean)
+          .join(' · '),
+      );
       const latestNp = latestModel.dalton_meta?.notional_pricing;
       const latestNotionalCached =
         latestNp?.cached_input != null
@@ -1567,8 +1734,6 @@ export function TeamModelEditSheet({
     }
     return items;
   })();
-
-  const conflictSyncPending = Boolean(revisionConflict && !conflictCatalogSynced);
 
   return (
     <div
@@ -1765,13 +1930,18 @@ export function TeamModelEditSheet({
                       if (!conflictCatalogSynced) return;
                       const nextRev = resolvedLatestRevision;
                       const op = revisionConflict.operation;
+                      const wasConfirmedLastCurated = Boolean(revisionConflict.confirmedLastCurated);
+                      setAcknowledgedRevision(nextRev);
                       setRevisionConflict(null);
                       if (op === 'restore_default') {
                         void handleRestoreDefault(nextRev);
                       } else if (op === 'save_variant') {
                         void handleSaveVariantOnly(nextRev);
                       } else {
-                        void handleSaveModel({ overrideExpectedRevision: nextRev });
+                        void handleSaveModel({
+                          overrideExpectedRevision: nextRev,
+                          confirmedLastCurated: wasConfirmedLastCurated,
+                        });
                       }
                     }}
                     data-testid="edit-sheet-conflict-resubmit-btn"
@@ -2129,7 +2299,7 @@ export function TeamModelEditSheet({
                         checked={visible}
                         onChange={() => {
                           setVisible((v) => !v);
-                          setConfirmLastCurated(false);
+                          setConfirmLastCurated(null);
                         }}
                         disabled={busy}
                         ariaLabel={t('settings:dalton.teamCatalog.visibleInPickerLabel')}
@@ -2217,7 +2387,6 @@ export function TeamModelEditSheet({
                         value={billingMode}
                         onChange={(e) => {
                           setBillingMode(e.target.value as TeamCatalogBillingMode);
-                          setPricingTouched(true);
                         }}
                         disabled={busy || selectedProviderMeta?.billing === 'subscription'}
                         className={selectCls}
@@ -2238,8 +2407,7 @@ export function TeamModelEditSheet({
                         onChange={(e) => {
                           const next = e.target.value as TeamCatalogPriceSourceKind;
                           setPriceSourceKind(next);
-                          if (next === 'estimated') setPriceEstimated(true);
-                          setPricingTouched(true);
+                          setPriceEstimated(next === 'estimated');
                         }}
                         disabled={busy}
                         className={selectCls}
@@ -2265,10 +2433,7 @@ export function TeamModelEditSheet({
                           step="any"
                           min="0"
                           value={cashInput}
-                          onChange={(e) => {
-                            setCashInput(e.target.value);
-                            setPricingTouched(true);
-                          }}
+                          onChange={(e) => setCashInput(e.target.value)}
                           className={inputCls}
                           data-testid="edit-model-cash-input"
                         />
@@ -2283,10 +2448,7 @@ export function TeamModelEditSheet({
                           step="any"
                           min="0"
                           value={cashCachedInput}
-                          onChange={(e) => {
-                            setCashCachedInput(e.target.value);
-                            setPricingTouched(true);
-                          }}
+                          onChange={(e) => setCashCachedInput(e.target.value)}
                           className={inputCls}
                           data-testid="edit-model-cash-cached"
                         />
@@ -2301,10 +2463,7 @@ export function TeamModelEditSheet({
                           step="any"
                           min="0"
                           value={cashOutput}
-                          onChange={(e) => {
-                            setCashOutput(e.target.value);
-                            setPricingTouched(true);
-                          }}
+                          onChange={(e) => setCashOutput(e.target.value)}
                           className={inputCls}
                           data-testid="edit-model-cash-output"
                         />
@@ -2319,10 +2478,7 @@ export function TeamModelEditSheet({
                           step="any"
                           min="0"
                           value={cashCache5m}
-                          onChange={(e) => {
-                            setCashCache5m(e.target.value);
-                            setPricingTouched(true);
-                          }}
+                          onChange={(e) => setCashCache5m(e.target.value)}
                           className={inputCls}
                         />
                       </div>
@@ -2336,10 +2492,7 @@ export function TeamModelEditSheet({
                           step="any"
                           min="0"
                           value={cashCache1h}
-                          onChange={(e) => {
-                            setCashCache1h(e.target.value);
-                            setPricingTouched(true);
-                          }}
+                          onChange={(e) => setCashCache1h(e.target.value)}
                           className={inputCls}
                         />
                       </div>
@@ -2416,12 +2569,10 @@ export function TeamModelEditSheet({
                       <Input
                         id="price-verified-at"
                         value={priceVerifiedAt}
-                        onChange={(e) => {
-                          setPriceVerifiedAt(e.target.value);
-                          setPricingTouched(true);
-                        }}
+                        onChange={(e) => setPriceVerifiedAt(e.target.value)}
                         placeholder="2026-11-25"
                         className={inputCls}
+                        data-testid="edit-model-price-verified-at"
                       />
                     </div>
                     <div className="space-y-1">
@@ -2431,12 +2582,10 @@ export function TeamModelEditSheet({
                       <Input
                         id="price-source-url"
                         value={priceSourceUrl}
-                        onChange={(e) => {
-                          setPriceSourceUrl(e.target.value);
-                          setPricingTouched(true);
-                        }}
+                        onChange={(e) => setPriceSourceUrl(e.target.value)}
                         placeholder="https://..."
                         className={inputCls}
+                        data-testid="edit-model-price-source-url"
                       />
                     </div>
                     <div className="space-y-1">
@@ -2446,11 +2595,9 @@ export function TeamModelEditSheet({
                       <Input
                         id="price-note"
                         value={priceNote}
-                        onChange={(e) => {
-                          setPriceNote(e.target.value);
-                          setPricingTouched(true);
-                        }}
+                        onChange={(e) => setPriceNote(e.target.value)}
                         className={inputCls}
+                        data-testid="edit-model-price-note"
                       />
                     </div>
                   </div>
@@ -2623,6 +2770,7 @@ export function TeamModelEditSheet({
                                     : 'var(--color-text-secondary)',
                                 }}
                                 aria-pressed={active}
+                                data-testid={`reasoning-effort-chip-${eff}`}
                               >
                                 {eff}
                               </button>
@@ -2641,6 +2789,7 @@ export function TeamModelEditSheet({
                             onChange={(e) => setReasoningDefault(e.target.value)}
                             className={selectCls}
                             style={selectStyle}
+                            data-testid="edit-model-reasoning-default-select"
                           >
                             {reasoningEfforts.map((eff) => (
                               <option key={eff} value={eff}>
@@ -2794,7 +2943,7 @@ export function TeamModelEditSheet({
                       checked={inCuratedSetup}
                       onChange={() => {
                         setInCuratedSetup((v) => !v);
-                        setConfirmLastCurated(false);
+                        setConfirmLastCurated(null);
                       }}
                       disabled={busy}
                       ariaLabel={t('settings:dalton.teamCatalog.curatedToggleLabel')}
@@ -2835,7 +2984,7 @@ export function TeamModelEditSheet({
                     type="button"
                     variant="ghost"
                     size="sm"
-                    onClick={() => setConfirmLastCurated(false)}
+                    onClick={() => setConfirmLastCurated(null)}
                   >
                     {t('common.cancel')}
                   </Button>
@@ -2843,8 +2992,13 @@ export function TeamModelEditSheet({
                     type="button"
                     variant="destructive"
                     size="sm"
-                    disabled={busy}
-                    onClick={() => void handleSaveModel({ confirmedLastCurated: true })}
+                    disabled={busy || conflictSyncPending}
+                    onClick={() =>
+                      void handleSaveModel({
+                        overrideExpectedRevision: confirmLastCurated.expectedRevision,
+                        confirmedLastCurated: true,
+                      })
+                    }
                     data-testid="edit-sheet-last-curated-confirm-btn"
                   >
                     {t('settings:dalton.teamCatalog.lastCuratedEditConfirmAction')}
@@ -2871,7 +3025,7 @@ export function TeamModelEditSheet({
                     type="button"
                     variant="destructive"
                     size="sm"
-                    disabled={busy}
+                    disabled={busy || conflictSyncPending}
                     onClick={() => void handleRestoreDefault()}
                     data-testid="restore-default-confirm-btn"
                   >
@@ -2916,7 +3070,7 @@ export function TeamModelEditSheet({
                 variant="outline"
                 size="sm"
                 className="gap-1.5"
-                disabled={busy}
+                disabled={busy || conflictSyncPending}
                 onClick={() => setConfirmRestoreDefault(true)}
                 data-testid="edit-sheet-restore-default-btn"
               >

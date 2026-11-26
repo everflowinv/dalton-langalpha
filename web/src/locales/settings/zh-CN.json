@@ -818,6 +818,7 @@
       "variantAccessTypeLabel": "接入方式",
       "variantBaseUrlLabel": "HTTPS 绑定地址（base_url）",
       "variantBaseUrlHint": "请输入完整 https:// 地址（含路径），凭据仅授权发往此地址。",
+      "variantBaseUrlChangedReviewRequired": "该变体的基础地址已更新为 {{latestBaseUrl}}，请核对新地址并重新确认密钥后再保存。",
       "variantApiKeyLabel": "专属 API Key（只写）",
       "variantApiKeyPlaceholder": "输入该变体专属 API Key",
       "variantApiKeyRotatePlaceholder": "留空保持现有凭据，填写新密钥则轮换绑定",

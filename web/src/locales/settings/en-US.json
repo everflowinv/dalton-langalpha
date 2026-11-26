@@ -736,6 +736,7 @@
       "variantAccessTypeLabel": "Access type",
       "variantBaseUrlLabel": "HTTPS bound URL (base_url)",
       "variantBaseUrlHint": "Enter a full https:// URL including path. The credential is bound strictly to this URL.",
+      "variantBaseUrlChangedReviewRequired": "This variant's base URL has been updated to {{latestBaseUrl}}. Review the new URL and re-confirm the API key before saving.",
       "variantApiKeyLabel": "Dedicated API Key (write-only)",
       "variantApiKeyPlaceholder": "Enter the API key dedicated to this variant",
       "variantApiKeyRotatePlaceholder": "Leave blank to keep current key, or enter a new key to rotate",
