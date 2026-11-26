@@ -180,23 +180,53 @@ async def claim_workspace_move(
                 """,
                 {**params, "interrupted": Json({"code": "interrupted"})},
             )
-            # The computer a removal waits on is written below; it is locked
-            # here, with the target and in the commit's order, ahead of the
-            # workspace.
+            # --- DALTON-HOOK(cos-settings-tools): begin ---
+            # Pre-read source computer so source, target, and any removing
+            # computer are all locked in deterministic ORDER BY computer_id
+            # order ahead of the workspace row, matching claim_computer_for_archive.
             await cur.execute(
                 f"""
-                SELECT computer_id, files_backup, {_INTENT_TAKEN_AT}
+                SELECT computer_id
+                FROM workspaces
+                WHERE workspace_id = %(workspace_id)s
+                  AND user_id = %(user_id)s
+                  AND {FENCE_NOT_DELETED}
+                """,
+                params,
+            )
+            pre_ws = await cur.fetchone()
+            pre_source = (
+                str(pre_ws["computer_id"])
+                if pre_ws is not None and pre_ws.get("computer_id") is not None
+                else None
+            )
+            params["source"] = pre_source
+            # The source computer, target, and any computer a removal waits on
+            # are locked here in ORDER BY computer_id order ahead of workspaces.
+            await cur.execute(
+                f"""
+                SELECT computer_id, files_backup, config,
+                       ({_TAKES_A_WORKSPACE}) AS takes_workspace,
+                       {_INTENT_TAKEN_AT}
                 FROM computers
                 WHERE user_id = %(user_id)s AND (
                     (computer_id = %(target)s AND {_TAKES_A_WORKSPACE})
-                    OR (computer_id = %(removing)s::uuid AND {FENCE_NOT_DELETED}))
+                    OR (computer_id = %(removing)s::uuid AND {FENCE_NOT_DELETED})
+                    OR (computer_id = %(source)s::uuid AND {FENCE_NOT_DELETED}))
                 ORDER BY computer_id
-                FOR {"UPDATE" if removal else "SHARE"}
+                FOR {"UPDATE" if (removal or pre_source) else "SHARE"}
                 """,
                 params,
             )
             locked = {str(r["computer_id"]): r for r in await cur.fetchall()}
-            computer = locked.get(target)
+            target_row = locked.get(target)
+            computer = (
+                target_row
+                if target_row is not None and target_row.get("takes_workspace")
+                else None
+            )
+            source_row = locked.get(pre_source) if pre_source is not None else None
+            # --- DALTON-HOOK(cos-settings-tools): end ---
             if removal and params["removing"] not in locked:
                 raise MoveRefused("not_found")
             await cur.execute(
@@ -224,6 +254,13 @@ async def claim_workspace_move(
             # and making a computer primary moves nothing but Home.
             if is_home_row(workspace) != make_primary:
                 raise MoveRefused("not_movable")
+            # --- DALTON-HOOK(cos-settings-tools): begin ---
+            actual_source = str(workspace["computer_id"])
+            if pre_source is None or actual_source != pre_source:
+                raise MoveRefused("move_in_progress")
+            if source_row is None or (source_row.get("config") or {}).get("archiving"):
+                raise MoveRefused("busy")
+            # --- DALTON-HOOK(cos-settings-tools): end ---
             if expected_source is not None and str(workspace["computer_id"]) != str(
                 expected_source
             ):
@@ -379,9 +416,9 @@ async def stage_workspace_move(
         await cur.execute(
             """
             SELECT 1 FROM workspaces WHERE computer_id = %s
-            ORDER BY created_at, workspace_id
+            ORDER BY workspace_id
             FOR UPDATE
-            """,
+            """,  # DALTON-HOOK(cos-settings-tools): align lock order with claim_computer_for_archive
             (source,),
         )
         if await computer_run_in_progress(cur, source):

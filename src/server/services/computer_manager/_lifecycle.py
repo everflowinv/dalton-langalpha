@@ -322,6 +322,19 @@ class SessionLifecycleMixin:
                 )
 
             if session is None:
+                # --- DALTON-HOOK(cos-settings-tools): begin ---
+                # Share the same archive-fence reconciliation with /workspaces/{id}/start
+                # and _start_machine so session acquisition cannot bypass config.archiving.
+                comp_for_fence = await get_computer(computer_id)
+                if comp_for_fence is not None and (
+                    comp_for_fence.get("config") or {}
+                ).get("archiving"):
+                    await self._ensure_not_archiving_locked(comp_for_fence)
+                    refreshed_ws = await db_get_workspace(workspace_id)
+                    if refreshed_ws is not None:
+                        workspace = refreshed_ws
+                        status = workspace["status"]
+                # --- DALTON-HOOK(cos-settings-tools): end ---
                 if status in CLAIMABLE_FOR_START or status == ComputerStatus.STARTING:
                     # Claim under the lock, but wait outside it: a 60-300s archived restore
                     # would block all workspace operations beyond the 60s lock-acquire ceiling.
@@ -564,20 +577,29 @@ class SessionLifecycleMixin:
                     computer_id,
                 )
                 return
-        await self._reconcile_provider_stop(binding)
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        from src.dalton.services.archive_lifecycle import (
+            archive_claim_in_grace_window,
+            suppress_daytona_raw_spans,
+        )
+
+        if heartbeat is False and archive_claim_in_grace_window(
+            await get_computer(computer_id), heartbeat=False
+        ):
+            return
+        with suppress_daytona_raw_spans():
+            await self._reconcile_provider_stop(binding)
+        # --- DALTON-HOOK(cos-settings-tools): end ---
 
     async def reconcile_stopping_computer(
         self, computer_id: str
     ) -> Dict[str, Any] | None:
         """Repair an abandoned stop before an explicit start evaluates the row."""
         async with self._observed_lock(computer_id, "computer.stopping.reconcile"):
-            computer = await get_computer(computer_id)
-            if not computer or computer.get("status") != ComputerStatus.STOPPING:
-                return computer
-            await self._correct_stuck_stopping(
-                self._binding_from_computer("", computer)
-            )
-            return await get_computer(computer_id)
+            # DALTON-HOOK(cos-settings-tools): convert provider exceptions before leaving the span
+            from src.dalton.services.archive_lifecycle import reconcile_stopping_locked
+
+            return await reconcile_stopping_locked(self, computer_id)
 
     async def _owner_machine_state(
         self, binding: ComputerBinding
@@ -649,13 +671,19 @@ class SessionLifecycleMixin:
                 await self._settle_unanswered_stop(computer_id)
                 return True
         else:
+            # DALTON-HOOK(cos-settings-tools): suppress raw Daytona SDK spans during stop reconciliation
+            from src.dalton.services.archive_lifecycle import suppress_daytona_raw_spans
+
             try:
-                async with self._detached_runtime(sandbox_id, binding=binding) as runtime:
-                    actual_state = await runtime.get_state()
-            except SandboxGoneError as e:
+                with suppress_daytona_raw_spans():
+                    async with self._detached_runtime(sandbox_id, binding=binding) as runtime:
+                        actual_state = await runtime.get_state()
+            except SandboxGoneError:
+                # DALTON-HOOK(cos-settings-tools): whitelisted structured log on missing sandbox
                 logger.warning(
-                    f"Sandbox {sandbox_id} is gone for computer {computer_id} during "
-                    f"stopping-state recovery ({e}); settling the row to 'stopped'"
+                    "stopping_reconcile_sandbox_gone computer_id=%s sandbox_id=%s",
+                    computer_id,
+                    sandbox_id,
                 )
                 await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
                 return False
@@ -671,7 +699,13 @@ class SessionLifecycleMixin:
         # the start's reconnect is what recovers it or rebuilds from the backup,
         # so a row left 'stopping' would refuse that start forever. An archive
         # in progress only ends down, and one has been seen to run for days.
-        if state in ("stopped", "archived", "archiving", "error"):
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        if state == "archiving":
+            await self._settle_machine_stop(
+                computer_id, ComputerStatus.STOPPED, clear_archiving=False
+            )
+        # --- DALTON-HOOK(cos-settings-tools): end ---
+        elif state in ("stopped", "archived", "error"):
             await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
         elif state == "running":
             await self._settle_machine_stop(computer_id, ComputerStatus.RUNNING)
@@ -1943,22 +1977,20 @@ class SessionLifecycleMixin:
             return with_stop_backup_result(stop_result, backup_outcome)
 
         except Exception as e:
-            logger.error(f"Error stopping computer {computer_id}: {e}")
-            try:
-                if await self._reconcile_provider_stop(binding):
-                    stop_result = await self._stop_result(computer_id, workspace_id)
-                    # DALTON-HOOK(stop-backup-attach): include skipped workspace count in reconciled stop result
-                    from src.dalton.services.stop_backup import with_stop_backup_result
+            # --- DALTON-HOOK(cos-settings-tools): begin ---
+            from src.dalton.services.archive_lifecycle import (
+                reconcile_failed_stop_sanitized,
+            )
 
-                    return with_stop_backup_result(stop_result, backup_outcome)
-            except Exception:
-                # Leave the durable stopping claim for the existing recovery
-                # path once this owner releases its heartbeat.
-                logger.warning(
-                    "Could not reconcile failed stop for computer %s",
-                    computer_id,
-                    exc_info=True,
-                )
+            if await reconcile_failed_stop_sanitized(
+                self, binding, computer_id=computer_id, workspace_id=workspace_id, exc=e
+            ):
+                stop_result = await self._stop_result(computer_id, workspace_id)
+                # DALTON-HOOK(stop-backup-attach): include skipped workspace count in reconciled stop result
+                from src.dalton.services.stop_backup import with_stop_backup_result
+
+                return with_stop_backup_result(stop_result, backup_outcome)
+            # --- DALTON-HOOK(cos-settings-tools): end ---
             raise
 
     async def _stop_result(
@@ -1974,40 +2006,23 @@ class SessionLifecycleMixin:
             raise ValueError(f"Computer {computer_id} not found")
         return row
 
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
     async def _archive_machine(
-        self, computer_id: str, *, workspace_id: str | None = None
+        self,
+        computer_id: str,
+        *,
+        workspace_id: str | None = None,
+        expected_workspaces: Any = None,
+        expected_workspace_id: str | None = None,
     ) -> Dict[str, Any]:
-        """Archive moves the machine's disk to storage; its row is the only gate."""
-        async with self._observed_lock(computer_id, "computer.archive"):
-            # Gate across the machine so archive cannot freeze a sibling's live run.
-            if await self._machine_has_active_tasks(
-                computer_id, workspace_id=workspace_id
-            ):
-                raise RuntimeError(
-                    "Cannot archive a computer that still has work running"
-                )
+        """Archive moves the machine's disk to storage; transactional DB fences guard it."""
+        from src.dalton.services.archive_lifecycle import archive_machine_impl
 
-            computer = await self._claim_machine_for_archive(computer_id)
-            binding = self._binding_from_computer(workspace_id or "", computer)
-            sandbox_id = computer["provider_ref"]
-
-            async with computer_stop_heartbeat(computer_id):
-                try:
-                    async with self._detached_runtime(sandbox_id, binding=binding) as runtime:
-                        if not runtime.archives:
-                            raise RuntimeError("Provider does not support archiving")
-                        await runtime.archive()
-                    await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
-                except Exception:
-                    try:
-                        await self._reconcile_provider_stop(binding)
-                    except Exception:
-                        logger.warning(
-                            "Could not reconcile failed archive for computer %s",
-                            computer_id,
-                            exc_info=True,
-                        )
-                    raise
-
-            logger.info(f"Computer {computer_id} archived successfully")
-            return await self._stop_result(computer_id, workspace_id)
+        return await archive_machine_impl(
+            self,
+            computer_id,
+            workspace_id=workspace_id,
+            expected_workspaces=expected_workspaces,
+            expected_workspace_id=expected_workspace_id,
+        )
+    # --- DALTON-HOOK(cos-settings-tools): end ---

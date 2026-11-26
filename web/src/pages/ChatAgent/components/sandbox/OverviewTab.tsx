@@ -86,11 +86,19 @@ interface OverviewTabProps {
   preparing?: boolean;
   /** The workspace's folder on that machine. */
   dirName?: string | null;
+  // --- DALTON-HOOK(cos-settings-tools): begin ---
+  /** Whether the computer's sandbox provider supports cold archiving (Daytona only). */
+  archivable?: boolean;
+  /** Opens the whole-computer archive confirmation dialog. */
+  onArchiveClick?: () => void;
+  // --- DALTON-HOOK(cos-settings-tools): end ---
 }
 
-export function OverviewTab({ stats, isRunning, actionLoading, refreshing, onStartStop, canStop = true, onRefresh, computerName, dirName, recoverableCreating = false, preparing = false }: OverviewTabProps) {
+export function OverviewTab({ stats, isRunning, actionLoading, refreshing, onStartStop, canStop = true, onRefresh, computerName, dirName, recoverableCreating = false, preparing = false, archivable, onArchiveClick }: OverviewTabProps) {
   const { t } = useTranslation();
   const locale = useLocale();
+  // DALTON-HOOK(cos-settings-tools): show Archive only when provider supports cold archiving (archivable === true)
+  const canArchive = (archivable ?? stats.archivable === true) === true;
   const isTransitioning =
     actionLoading || (!!stats.state && !TERMINAL_STATES.has(stats.state) &&
       !(stats.state === 'creating' && recoverableCreating));
@@ -195,9 +203,10 @@ export function OverviewTab({ stats, isRunning, actionLoading, refreshing, onSta
               )
               : <RefreshCw className="h-3 w-3" aria-hidden="true" />}
           </button>
-          {!isRunning && stats.state === 'stopped' && (
+          {/* DALTON-HOOK(cos-settings-tools): gate Archive button on archivable === true and open confirmation dialog */}
+          {canArchive && !isRunning && stats.state === 'stopped' && (
             <button
-              onClick={() => onStartStop('archive')}
+              onClick={() => (onArchiveClick ? onArchiveClick() : onStartStop('archive'))}
               disabled={isTransitioning}
               data-computer-power
               className={cn('flex items-center gap-1.5 px-3 py-1.5', ACTION_CLASS, 'disabled:opacity-50')}

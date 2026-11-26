@@ -648,3 +648,8 @@ web/src/pages/Settings/__tests__/Settings.computerReady.test.tsx
 # BY4: stop-path temporary attach backup and concurrent relay staging race tests.
 tests/unit/server/services/test_stop_backup_attach.py
 tests/unit/ptc_agent/core/sandbox/test_wsfiles_relay_race.py
+# Chief of Staff settings tools Batch 3: dedicated archive fence, CoS archive, concurrency DB, and UI confirmation tests (DALTON-HOOK(cos-settings-tools)).
+tests/unit/server/services/test_cos_archive_fence_batch3.py
+tests/unit/tools/secretary/test_cos_archive_batch3.py
+tests/integration/test_cos_archive_concurrency_db.py
+web/src/pages/ChatAgent/components/__tests__/ArchiveConfirmation.test.tsx

@@ -41,6 +41,8 @@ ALLOCATION_KINDS: tuple[str, ...] = ("daytona", "e2b")
 # (Daytona's auto-stop, E2B's pause deadline). The server's idle sweep runs
 # ahead of that only for these; for the rest the setting is the sweep's.
 SELF_STOPPING_KINDS: tuple[str, ...] = ("daytona", "e2b")
+# DALTON-HOOK(cos-settings-tools): kinds whose runtime supports cold archive (``SandboxRuntime.archives``)
+ARCHIVABLE_KINDS: tuple[str, ...] = ("daytona",)
 # Two ways to split the kinds, each into a pair, asked without importing a
 # provider module (a turn's admission asks where Home's stand-in may run).
 #
@@ -108,6 +110,13 @@ def is_machine_kind(kind: str) -> bool:
     if not isinstance(kind, str) or kind not in _PROVIDERS:
         raise ValueError(f"Unknown sandbox provider: {kind!r}")
     return kind in MACHINE_KINDS
+
+
+# --- DALTON-HOOK(cos-settings-tools): begin ---
+def provider_supports_archive(kind: str | None) -> bool:
+    """Whether a computer of ``kind`` supports cold archiving without importing vendor SDKs."""
+    return isinstance(kind, str) and kind in ARCHIVABLE_KINDS
+# --- DALTON-HOOK(cos-settings-tools): end ---
 
 
 def builds_computers(sandbox: SandboxConfig) -> bool:

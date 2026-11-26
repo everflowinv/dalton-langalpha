@@ -544,7 +544,8 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
           );
         }
 
-        if (block.type === 'delete_workspace' || block.type === 'stop_workspace' || block.type === 'delete_thread') {
+        // DALTON-HOOK(cos-settings-tools): render archive_workspace through SecretaryConfirmCard
+        if (block.type === 'delete_workspace' || block.type === 'stop_workspace' || block.type === 'delete_thread' || block.type === 'archive_workspace') {
           const sad = secretaryActionProposals[(block as SecretaryActionRenderBlock).segment.proposalId!];
           if (!sad) return null;
           return (
