@@ -20,6 +20,7 @@ import {
   bumpDaltonTeamModelsRetry,
   collectRejectedProviders,
   forceRefreshProviderAvailableModels,
+  getDaltonTeamModelsRetryGeneration,
   REJECTED_CREDENTIAL_REASONS,
 } from './daltonTeamModelsCheck';
 import { useDaltonTeamModelsAvailable } from './useTeamModelsAvailable';
@@ -163,6 +164,8 @@ function useDaltonTeamModelsImpl(): DaltonTeamModelsState {
       queryClient.invalidateQueries({ queryKey: queryKeys.features.all }),
       queryClient.invalidateQueries({ queryKey: queryKeys.user.preferences() }),
     ]).then(async () => {
+      // DALTON-HOOK(dalton-setup): bail out if a newer retry superseded this one while invalidations were in flight
+      if (getDaltonTeamModelsRetryGeneration(queryClient) !== retryGen) return;
       const credsStatus = useSharedQuery
         ? queryClient.getQueryData<{ enabled?: boolean }>(queryKeys.dalton.credentialsStatus(userId))
         : null;
