@@ -564,9 +564,90 @@ for (const mode of VIEWPORT_MODES) {
         });
       });
 
+      await page.addInitScript(() => {
+        if (window === window.top) {
+          const log = { ready: [], pong: [] };
+          window.__b3MonitorHandshake = log;
+          window.addEventListener(
+            'message',
+            (event) => {
+              const data = event.data;
+              if (!data || typeof data !== 'object') return;
+              const fromMonitorFrame = Array.from(document.querySelectorAll('iframe.bridged-frame-doc')).some(
+                (el) => el.contentWindow === event.source,
+              );
+              if (!fromMonitorFrame) return;
+              if (data.type === 'page:ready') {
+                log.ready.push({
+                  root: data.root === true,
+                  docId: typeof data.docId === 'string' ? data.docId : null,
+                  origin: event.origin,
+                });
+              } else if (data.type === 'page:pong') {
+                log.pong.push({
+                  seq: typeof data.seq === 'number' ? data.seq : null,
+                  docId: typeof data.docId === 'string' ? data.docId : null,
+                  origin: event.origin,
+                });
+              }
+            },
+            true,
+          );
+        } else {
+          const pings = [];
+          window.__b3MonitorPings = pings;
+          window.addEventListener(
+            'message',
+            (event) => {
+              const data = event.data;
+              if (event.source !== window.parent || !data || typeof data !== 'object') return;
+              if (data.type === 'page:ping' && typeof data.seq === 'number') {
+                pings.push(data.seq);
+              }
+            },
+            true,
+          );
+        }
+      });
+
       await page.goto(`/m/${slug}`);
       const frame = page.frameLocator('iframe.bridged-frame-doc').first();
       await expect(frame.locator('h1')).toHaveText('Public Monitor Root', { timeout: 10000 });
+
+      const iframeHandle = await page.locator('iframe.bridged-frame-doc').first().elementHandle();
+      const childFrame = await iframeHandle?.contentFrame();
+      expect(childFrame).toBeTruthy();
+
+      // Verify the root entry sent page:ready (root: true, valid docId) and replied to page:ping
+      // with a page:pong matching both seq and docId before asserting UI state.
+      await expect
+        .poll(
+          async () => {
+            const [hostLog, childPings] = await Promise.all([
+              page.evaluate(() => window.__b3MonitorHandshake ?? { ready: [], pong: [] }),
+              childFrame.evaluate(() => window.__b3MonitorPings ?? []),
+            ]);
+            const ready =
+              hostLog.ready.find((m) => m.root && typeof m.docId === 'string' && m.docId.length > 0) ?? null;
+            const matchedPong = ready
+              ? hostLog.pong.find(
+                  (m) =>
+                    m.docId === ready.docId &&
+                    typeof m.seq === 'number' &&
+                    m.seq >= 1 &&
+                    childPings.includes(m.seq),
+                ) ?? null
+              : null;
+            return {
+              hasReady: ready !== null,
+              hasPing: childPings.length > 0,
+              hasMatchedPong: matchedPong !== null,
+            };
+          },
+          { timeout: 5000 },
+        )
+        .toEqual({ hasReady: true, hasPing: true, hasMatchedPong: true });
+
       await expect(page.locator('.monitors-frame-host')).toHaveAttribute('data-doc-state', 'unbridged', { timeout: 5000 });
       await expect(page.getByRole('button', { name: /Copy link|复制链接/i })).toBeVisible();
       await expect(page.getByRole('link', { name: /Open in new window|新窗口打开/i })).toHaveCount(0);

@@ -24,7 +24,7 @@ type RawFrameDoc =
   | { kind: 'unbridged' };
 
 type ReadyCandidate = {
-  docId: string | null;
+  docId: string;
   raw: RawFrameDoc;
   claimsRoot: boolean;
 };
@@ -262,7 +262,7 @@ export function BridgedFrame({
   // renders again; `loads` restarts the wait for each load.
   // DALTON-HOOK(mobile-web): treat page:ready as a candidate only and publish confirmed doc state
   // once page:pong matches both the latest load's navSeq and a recorded candidate docId.
-  const candidatesRef = useRef<{ key: string; docs: Map<string | null, ReadyCandidate> } | null>(null);
+  const candidatesRef = useRef<{ key: string; docs: Map<string, ReadyCandidate> } | null>(null);
   const waiting = useRef(false);
   const navSeqRef = useRef(0);
   const currentKeyRef = useRef<string | null>(current);
@@ -386,15 +386,17 @@ export function BridgedFrame({
         setGround(message.color);
         return;
       case 'page:pong': {
-        // DALTON-HOOK(mobile-web): confirm the document that finished load matches both latest navSeq and a candidate docId
+        // DALTON-HOOK(mobile-web): require valid matching docId on both page:ready and page:pong
+        // before confirming doc state or publishing bridge.path.
         if (!waiting.current || message.seq !== navSeqRef.current || current === null) {
           return;
         }
         const bucket = candidatesRef.current;
         if (!bucket || bucket.key !== current) return;
-        const docId = message.docId ?? null;
+        const docId = typeof message.docId === 'string' && message.docId.length > 0 ? message.docId : null;
+        if (!docId) return;
         const candidate = bucket.docs.get(docId);
-        if (!candidate) return;
+        if (!candidate || candidate.docId !== docId) return;
 
         let confirmedRaw = candidate.raw;
         if (candidate.claimsRoot) {
@@ -406,11 +408,15 @@ export function BridgedFrame({
         }
         rootNavAllowedRef.current = { key: current, allowed: false };
 
-        if (confirmedRaw.kind === 'unbridged') {
+        if (confirmedRaw.kind === 'path') {
+          bridge.setPath?.(confirmedRaw.path);
+          setOffPageOf(null);
+        } else if (confirmedRaw.kind === 'root') {
+          bridge.clearPath?.();
+          setOffPageOf(null);
+        } else {
           bridge.clearPath?.();
           setOffPageOf(current);
-        } else {
-          setOffPageOf(null);
         }
 
         waiting.current = false;
@@ -446,32 +452,34 @@ export function BridgedFrame({
       case 'page:ready': {
         carried.current = null;
         if (current === null) return;
-        // DALTON-HOOK(mobile-web): record page:ready as a candidate only; never publish state or
-        // cancel the active load wait until a page:pong matching both navSeq and docId confirms it.
-        const docId = message.docId ?? null;
-        let candidate: ReadyCandidate;
-        if (message.pathState === 'path' && message.path) {
-          candidate = { docId, raw: { kind: 'path', path: message.path }, claimsRoot: false };
-        } else if (message.pathState === 'root') {
-          candidate = { docId, raw: { kind: 'root' }, claimsRoot: true };
-        } else {
-          candidate = { docId, raw: { kind: 'unbridged' }, claimsRoot: false };
-        }
+        // DALTON-HOOK(mobile-web): record page:ready as a candidate only when a valid docId is present;
+        // never publish state or cancel the active load wait until a page:pong matching both navSeq and docId confirms it.
+        const docId = typeof message.docId === 'string' && message.docId.length > 0 ? message.docId : null;
+        if (docId) {
+          let candidate: ReadyCandidate;
+          if (message.pathState === 'path' && message.path) {
+            candidate = { docId, raw: { kind: 'path', path: message.path }, claimsRoot: false };
+          } else if (message.pathState === 'root') {
+            candidate = { docId, raw: { kind: 'root' }, claimsRoot: true };
+          } else {
+            candidate = { docId, raw: { kind: 'unbridged' }, claimsRoot: false };
+          }
 
-        let bucket = candidatesRef.current;
-        if (!bucket || bucket.key !== current) {
-          bucket = { key: current, docs: new Map() };
-          candidatesRef.current = bucket;
-        }
-        bucket.docs.delete(docId);
-        bucket.docs.set(docId, candidate);
-        if (bucket.docs.size > 8) {
-          const oldestKey = bucket.docs.keys().next().value;
-          if (oldestKey !== undefined) bucket.docs.delete(oldestKey);
-        }
+          let bucket = candidatesRef.current;
+          if (!bucket || bucket.key !== current) {
+            bucket = { key: current, docs: new Map() };
+            candidatesRef.current = bucket;
+          }
+          bucket.docs.delete(docId);
+          bucket.docs.set(docId, candidate);
+          if (bucket.docs.size > 8) {
+            const oldestKey = bucket.docs.keys().next().value;
+            if (oldestKey !== undefined) bucket.docs.delete(oldestKey);
+          }
 
-        if (waiting.current) {
-          post({ type: 'page:ping', seq: navSeqRef.current });
+          if (waiting.current) {
+            post({ type: 'page:ping', seq: navSeqRef.current });
+          }
         }
 
         // The first hello of a new frame, not a link inside it to another file.

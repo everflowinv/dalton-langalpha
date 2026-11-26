@@ -19,9 +19,10 @@ export interface PageBridge {
    * Null when the hello named none.
    */
   path: string | null;
-  // DALTON-HOOK(mobile-web): frame identity, last page:ready pathState, and unbridged path reset
+  // DALTON-HOOK(mobile-web): frame identity, last page:ready pathState, and confirmed path setters
   readonly frameKey?: string | null;
   readonly pathState?: PageReadyPathState | null;
+  readonly setPath?: (path: string | null) => void;
   readonly clearPath?: () => void;
   /** Send to the page. Dropped until it is ready: before then the frame may hold another document. */
   post: (message: ViewerToPage) => void;
@@ -99,7 +100,10 @@ export function usePageBridge({ frameRef, origin, frameKey }: UsePageBridgeOptio
     return () => { all.delete(listener); };
   }, []);
 
-  // DALTON-HOOK(mobile-web): clear stale path when a frame navigates to an unbridged/invalid page
+  // DALTON-HOOK(mobile-web): publish confirmed path only after matching page:pong, and allow clearing on unbridged/root
+  const setPath = useCallback((nextPath: string | null) => {
+    setHello((prev) => (prev.key !== framedKey.current || prev.path === nextPath ? prev : { ...prev, path: nextPath }));
+  }, []);
   const clearPath = useCallback(() => {
     setHello((prev) => (prev.path === null ? prev : { ...prev, path: null }));
   }, []);
@@ -108,8 +112,8 @@ export function usePageBridge({ frameRef, origin, frameKey }: UsePageBridgeOptio
   const path = ready ? hello.path : null;
   const pathState = ready ? hello.pathState : null;
   const bridge = useMemo<PageBridge>(
-    () => ({ ready, session, path, frameKey, pathState, clearPath, post, subscribe }),
-    [ready, session, path, frameKey, pathState, clearPath, post, subscribe],
+    () => ({ ready, session, path, frameKey, pathState, setPath, clearPath, post, subscribe }),
+    [ready, session, path, frameKey, pathState, setPath, clearPath, post, subscribe],
   );
 
   const pushTheme = useCallback(() => post({ type: 'page:theme', css: resolveThemeVars() }), [post]);
@@ -121,11 +125,12 @@ export function usePageBridge({ frameRef, origin, frameKey }: UsePageBridgeOptio
     if (!message) return;
     if (message.type === 'page:ready') {
       heardKey.current = frameKey;
-      // DALTON-HOOK(mobile-web): invalid/unrecognized/root messages carry path: null, clearing any prior path
+      // DALTON-HOOK(mobile-web): do not publish bridge.path on page:ready;
+      // wait for BridgedFrame to publish the confirmed candidate path after a matching page:pong.
       setHello((prev) => ({
         key: frameKey,
         count: prev.count + 1,
-        path: message.pathState === 'path' ? message.path : null,
+        path: prev.key === frameKey ? prev.path : null,
         pathState: message.pathState,
       }));
       pushTheme();

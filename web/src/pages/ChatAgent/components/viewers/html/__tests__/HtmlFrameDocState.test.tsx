@@ -294,8 +294,8 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('usePageBridge tri-state path clearing and frameKey', () => {
-  it('clears bridge.path immediately on invalid/unrecognized page:ready and via clearPath()', () => {
+describe('usePageBridge confirmed path publishing and frameKey', () => {
+  it('keeps bridge.path unchanged on page:ready and publishes or clears it only via setPath()/clearPath()', () => {
     const iframe = document.createElement('iframe');
     document.body.appendChild(iframe);
     vi.spyOn(iframe.contentWindow!, 'postMessage').mockImplementation(() => {});
@@ -307,18 +307,27 @@ describe('usePageBridge tri-state path clearing and frameKey', () => {
     expect(result.current.frameKey).toBe('view:ws:a.html:');
     expect(result.current.path).toBeNull();
 
-    // Valid path sets bridge.path and pathState: 'path'.
-    postFromFrame(iframe, { type: 'page:ready', v: 1, path: 'reports/a.html' });
+    // page:ready marks ready and records pathState, but does NOT publish bridge.path prematurely.
+    postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-a', path: 'reports/a.html' });
+    expect(result.current.ready).toBe(true);
+    expect(result.current.path).toBeNull();
+    expect(result.current.pathState).toBe('path');
+
+    // Publishing confirmed path via setPath updates bridge.path.
+    act(() => result.current.setPath?.('reports/a.html'));
+    expect(result.current.path).toBe('reports/a.html');
+
+    // Later page:ready messages (valid or invalid/conflicting) do NOT overwrite the confirmed bridge.path.
+    postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-bad', path: undefined, root: true });
+    expect(result.current.path).toBe('reports/a.html');
+    expect(result.current.pathState).toBe('invalid');
+
+    postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-b', path: 'reports/b.html' });
     expect(result.current.path).toBe('reports/a.html');
     expect(result.current.pathState).toBe('path');
 
-    // Conflicting { path: undefined, root: true } immediately clears stale bridge.path -> null.
-    postFromFrame(iframe, { type: 'page:ready', v: 1, path: undefined, root: true });
-    expect(result.current.path).toBeNull();
-    expect(result.current.pathState).toBe('invalid');
-
-    // Valid path again, then explicit clearPath() (unbridged timeout).
-    postFromFrame(iframe, { type: 'page:ready', v: 1, path: 'reports/b.html' });
+    // Confirmed path update and explicit clearPath() (unbridged/root) update bridge.path.
+    act(() => result.current.setPath?.('reports/b.html'));
     expect(result.current.path).toBe('reports/b.html');
     act(() => result.current.clearPath?.());
     expect(result.current.path).toBeNull();
@@ -355,9 +364,10 @@ describe('BridgedFrame unified HtmlFrameDocState & race guards', () => {
     expect(docStates.at(-1)).toEqual({ kind: 'pending' });
     expect(onBridge).toHaveBeenCalledWith(expect.objectContaining({ frameKey: 'view:ws:reports/a.html:' }), 'view:ws:reports/a.html:');
 
-    // 1. Current document A (page:ready alone stays pending until load + matching page:pong).
+    // 1. Current document A (page:ready alone stays pending and keeps bridge.path null until load + matching page:pong).
     postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-a', path: 'reports/a.html' });
     expect(docStates.at(-1)).toEqual({ kind: 'pending' });
+    expect(latestBridge.current?.path).toBeNull();
     fireEvent.load(iframe);
     expect(pings).toHaveLength(1);
     postFromFrame(iframe, { type: 'page:pong', v: 1, seq: pings[0], docId: 'doc-a' });
@@ -562,9 +572,10 @@ describe('BridgedFrame unified HtmlFrameDocState & race guards', () => {
     expect(docStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
   });
 
-  it('treats page:ready as a candidate only and prevents a delayed old page:ready arriving after a new load from overwriting state', () => {
+  it('treats page:ready as a candidate only and prevents a delayed old page:ready arriving after a new load from overwriting state or bridge.path', () => {
     vi.useFakeTimers();
     const docStates: HtmlFrameDocState[] = [];
+    const latestBridge: { current: PageBridge | null } = { current: null };
     const onUnbridged = vi.fn();
 
     const { container } = renderWithProviders(
@@ -577,6 +588,7 @@ describe('BridgedFrame unified HtmlFrameDocState & race guards', () => {
         title="Report A"
         groundKey="reports/a.html"
         expectedDocKey="reports/a.html"
+        onBridge={(bridge) => { latestBridge.current = bridge; }}
         onDocStateChange={(state) => docStates.push(state)}
         onUnbridged={onUnbridged}
       />,
@@ -588,6 +600,7 @@ describe('BridgedFrame unified HtmlFrameDocState & race guards', () => {
     // 1. Confirm initial doc A.
     confirmDoc(iframe, pings, { type: 'page:ready', v: 1, docId: 'doc-a', path: 'reports/a.html' });
     expect(docStates.at(-1)).toEqual({ kind: 'current', path: 'reports/a.html' });
+    expect(latestBridge.current?.path).toBe('reports/a.html');
 
     // 2. New unbridged doc loads -> delayed old page:ready(doc-a) arrives AFTER the new load.
     //    Old ready must stay candidate-only (never overwriting pending or cancelling the wait),
@@ -599,26 +612,96 @@ describe('BridgedFrame unified HtmlFrameDocState & race guards', () => {
     act(() => { vi.advanceTimersByTime(2500); });
     expect(onUnbridged).toHaveBeenCalledTimes(1);
     expect(docStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
+    expect(latestBridge.current?.path).toBeNull();
 
-    // Even a late stale ready arriving after timeout cannot overwrite unbridged.
+    // Even a late stale ready arriving after timeout cannot overwrite unbridged or bridge.path.
     postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-a', path: 'reports/a.html' });
     expect(docStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
+    expect(latestBridge.current?.path).toBeNull();
 
     // 3. New bridged doc B sends ready and loads, then delayed old ready(doc-a) arrives BEFORE B's pong.
-    //    State stays pending until B's pong matches both latest load seq and doc-b.
+    //    State stays pending and bridge.path is not published until B's pong matches both latest load seq and doc-b,
+    //    at which point bridge.path points to B (so CommentLayer reads B's comments, not A's).
     postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-b', path: 'reports/b.html' });
+    expect(latestBridge.current?.path).toBeNull();
     const pingsBeforeB = pings.length;
     fireEvent.load(iframe);
     expect(docStates.at(-1)).toEqual({ kind: 'pending' });
     expect(pings.length).toBeGreaterThan(pingsBeforeB);
     const seqB = pings.at(-1)!;
-    // Delayed old ready from A arrives while waiting for B's pong -> must NOT overwrite or drop candidate doc-b.
+    // Delayed old ready from A arrives while waiting for B's pong -> must NOT overwrite candidate doc-b or bridge.path.
     postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-a', path: 'reports/a.html' });
     expect(docStates.at(-1)).toEqual({ kind: 'pending' });
+    expect(latestBridge.current?.path).toBeNull();
     postFromFrame(iframe, { type: 'page:pong', v: 1, seq: seqB, docId: 'doc-b' });
     expect(docStates.at(-1)).toEqual({ kind: 'linked', path: 'reports/b.html' });
+    expect(latestBridge.current?.path).toBe('reports/b.html');
+    // Another delayed old ready from A after B is confirmed must leave both docState and bridge.path on B.
+    postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-a', path: 'reports/a.html' });
+    expect(docStates.at(-1)).toEqual({ kind: 'linked', path: 'reports/b.html' });
+    expect(latestBridge.current?.path).toBe('reports/b.html');
     act(() => { vi.advanceTimersByTime(3000); });
     expect(onUnbridged).toHaveBeenCalledTimes(1);
+  });
+
+  it('requires valid matching docId on both page:ready and page:pong, rejecting handshakes where both omit docId', () => {
+    vi.useFakeTimers();
+    const docStates: HtmlFrameDocState[] = [];
+    const latestBridge: { current: PageBridge | null } = { current: null };
+    const onUnbridged = vi.fn();
+
+    const { container } = renderWithProviders(
+      <BridgedFrame
+        source={{
+          key: 'view:ws:reports/a.html:',
+          src: '/api/v1/public/shared/tok-1/files/serve/reports/a.html?inject=view',
+          sandbox: 'allow-scripts',
+        }}
+        title="Report A"
+        groundKey="reports/a.html"
+        expectedDocKey="reports/a.html"
+        onBridge={(bridge) => { latestBridge.current = bridge; }}
+        onDocStateChange={(state) => docStates.push(state)}
+        onUnbridged={onUnbridged}
+      />,
+    );
+
+    const iframe = container.querySelector('iframe')!;
+    const pings = trackPings(vi.spyOn(iframe.contentWindow!, 'postMessage'));
+
+    // 1. Initial load: both page:ready and page:pong omit docId -> must NOT confirm even if seq matches.
+    postFromFrame(iframe, { type: 'page:ready', v: 1, path: 'reports/a.html' });
+    fireEvent.load(iframe);
+    expect(pings).toHaveLength(0);
+    for (const seq of [1, 2, 3]) {
+      postFromFrame(iframe, { type: 'page:pong', v: 1, seq });
+    }
+    expect(docStates.at(-1)).toEqual({ kind: 'pending' });
+    expect(latestBridge.current?.path).toBeNull();
+    act(() => { vi.advanceTimersByTime(2500); });
+    expect(onUnbridged).toHaveBeenCalledTimes(1);
+    expect(docStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
+    expect(latestBridge.current?.path).toBeNull();
+
+    // 2. Subsequent load after a valid doc A (so load emits a real page:ping with observed seq):
+    //    doc B sends page:ready without docId and replies with page:pong carrying the exact matching seq
+    //    but also without docId -> must NOT share a null key or confirm doc B.
+    confirmDoc(iframe, pings, { type: 'page:ready', v: 1, docId: 'doc-a', path: 'reports/a.html' });
+    expect(docStates.at(-1)).toEqual({ kind: 'current', path: 'reports/a.html' });
+    expect(latestBridge.current?.path).toBe('reports/a.html');
+
+    postFromFrame(iframe, { type: 'page:ready', v: 1, path: 'reports/b.html' });
+    const pingsBeforeB = pings.length;
+    fireEvent.load(iframe);
+    expect(docStates.at(-1)).toEqual({ kind: 'pending' });
+    expect(pings.length).toBeGreaterThan(pingsBeforeB);
+    const seqB = pings.at(-1)!;
+    postFromFrame(iframe, { type: 'page:pong', v: 1, seq: seqB });
+    expect(docStates.at(-1)).toEqual({ kind: 'pending' });
+    act(() => { vi.advanceTimersByTime(2500); });
+    expect(onUnbridged).toHaveBeenCalledTimes(2);
+    expect(docStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
+    expect(latestBridge.current?.path).toBeNull();
   });
 });
 
