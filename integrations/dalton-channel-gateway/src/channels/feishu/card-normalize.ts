@@ -47,9 +47,10 @@ const INLINE_CODE_PERIOD_RE = new RegExp(
 const FENCE_OPEN_RE = /^[ ]{0,3}(`{3,}|~{3,})(.*)$/;
 const FENCE_CLOSE_BACKTICK_RE = /^[ ]{0,3}(`{3,})[ \t]*$/;
 const FENCE_CLOSE_TILDE_RE = /^[ ]{0,3}(~{3,})[ \t]*$/;
+const RANGE_TILDE_RE = / ?[~～] ?/g;
 
 function shouldStripInlineCodeBackticks(inner: string): boolean {
-  if (!inner || inner !== inner.trim()) {
+  if (!inner || inner !== inner.trim() || inner.includes("$")) {
     return false;
   }
   return (
@@ -118,7 +119,7 @@ function stripInlineCodeOnLine(line: string): string {
     const closeEnd = closeStart + runLen;
     const inner = line.slice(runEnd, closeStart);
     if (runLen === 1 && shouldStripInlineCodeBackticks(inner)) {
-      out += inner;
+      out += inner.replace(RANGE_TILDE_RE, "至");
     } else {
       out += line.slice(tickPos, closeEnd);
     }

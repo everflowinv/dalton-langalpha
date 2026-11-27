@@ -64,10 +64,11 @@ _LINE_SPLIT_RE = re.compile(r"(\r?\n)")
 _FENCE_OPEN_RE = re.compile(r"\A[ ]{0,3}(`{3,}|~{3,})(.*)\Z")
 _FENCE_CLOSE_BACKTICK_RE = re.compile(r"\A[ ]{0,3}(`{3,})[ \t]*\Z")
 _FENCE_CLOSE_TILDE_RE = re.compile(r"\A[ ]{0,3}(~{3,})[ \t]*\Z")
+_RANGE_TILDE_RE = re.compile(r" ?[~～] ?")
 
 
 def _should_strip_inline_code_backticks(inner: str) -> bool:
-    if not inner or inner != inner.strip():
+    if not inner or inner != inner.strip() or "$" in inner:
         return False
     return bool(
         _INLINE_CODE_QUANTITY_RE.match(inner)
@@ -126,7 +127,7 @@ def _strip_inline_code_on_line(line: str) -> str:
         close_end = close_start + run_len
         inner = line[run_end:close_start]
         if run_len == 1 and _should_strip_inline_code_backticks(inner):
-            out.append(inner)
+            out.append(_RANGE_TILDE_RE.sub("至", inner))
         else:
             out.append(line[tick_pos:close_end])
         i = close_end
@@ -237,6 +238,8 @@ def _normalize_element_list(
     elements: Sequence[Any],
     path_prefix: str,
     normalized_paths: list[str],
+    *,
+    strip_inline_code: bool = False,
 ) -> list[Any]:
     rebuilt: list[Any] = []
     for idx, raw_el in enumerate(elements):
@@ -248,18 +251,25 @@ def _normalize_element_list(
         tag_lower = _read_tag_lower(raw_el)
         if tag_lower in _TEXT_ELEMENT_TAGS:
             normalized_paths.append(el_path)
+            raw_content = _extract_text_element_content(raw_el)
             rebuilt.append(
                 {
                     "tag": "markdown",
-                    "content": normalize_feishu_markdown_inline_code(
-                        _extract_text_element_content(raw_el)
+                    "content": (
+                        normalize_feishu_markdown_inline_code(raw_content)
+                        if strip_inline_code
+                        else raw_content
                     ),
                 }
             )
             continue
 
         cloned: dict[str, Any] = deepcopy(dict(raw_el))
-        if tag_lower == "markdown" and isinstance(cloned.get("content"), str):
+        if (
+            strip_inline_code
+            and tag_lower == "markdown"
+            and isinstance(cloned.get("content"), str)
+        ):
             next_content = normalize_feishu_markdown_inline_code(cloned["content"])
             if next_content != cloned["content"]:
                 cloned["content"] = next_content
@@ -277,6 +287,7 @@ def _normalize_element_list(
                     col["elements"],
                     f"{el_path}.columns[{col_idx}].elements",
                     normalized_paths,
+                    strip_inline_code=strip_inline_code,
                 )
                 next_cols.append(next_col)
             cloned["columns"] = next_cols
@@ -287,6 +298,7 @@ def _normalize_element_list(
                 cloned["elements"],
                 f"{el_path}.elements",
                 normalized_paths,
+                strip_inline_code=strip_inline_code,
             )
         rebuilt.append(cloned)
     return rebuilt
@@ -294,11 +306,16 @@ def _normalize_element_list(
 
 def normalize_feishu_card(
     card: Mapping[str, Any],
+    *,
+    strip_inline_code: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
     """Normalize one Feishu Schema 2.0 card without mutating the input.
 
     Returns ``(normalized_card, normalized_paths)`` where ``normalized_paths``
     contains only structural field paths (never card body text).
+    ``strip_inline_code`` defaults to ``False`` so submission/storage digests
+    keep the submitted card body intact; pass ``strip_inline_code=True`` for
+    outbound display paths without a digest contract (e.g. completion notify).
     """
     normalized_paths: list[str] = []
     out: dict[str, Any] = deepcopy(dict(card))
@@ -314,6 +331,7 @@ def normalize_feishu_card(
             body["elements"],
             "body.elements",
             normalized_paths,
+            strip_inline_code=strip_inline_code,
         )
         out["body"] = next_body
 
@@ -322,6 +340,7 @@ def normalize_feishu_card(
             out["elements"],
             "elements",
             normalized_paths,
+            strip_inline_code=strip_inline_code,
         )
 
     return out, normalized_paths
@@ -329,17 +348,23 @@ def normalize_feishu_card(
 
 def normalize_feishu_cards(
     cards: Sequence[Any],
+    *,
+    strip_inline_code: bool = False,
 ) -> tuple[list[Any], list[str]]:
     """Normalize a list of Feishu cards and collect prefixed warning paths."""
     if len(cards) == 1 and isinstance(cards[0], list):
-        inner_cards, inner_warnings = normalize_feishu_cards(cards[0])
+        inner_cards, inner_warnings = normalize_feishu_cards(
+            cards[0], strip_inline_code=strip_inline_code
+        )
         return [inner_cards], inner_warnings
 
     normalized_cards: list[Any] = []
     warnings: list[str] = []
     for idx, item in enumerate(cards):
         if isinstance(item, Mapping):
-            norm_card, card_paths = normalize_feishu_card(item)
+            norm_card, card_paths = normalize_feishu_card(
+                item, strip_inline_code=strip_inline_code
+            )
             normalized_cards.append(norm_card)
             for path in card_paths:
                 warnings.append(f"cards[{idx}].{path}")

@@ -34,6 +34,7 @@ from src.dalton.llm.model_prefs import (
     resolve_dalton_notify_routes,
     resolve_dalton_notify_targets,
 )
+from src.dalton.notify.card_normalize import normalize_feishu_card
 from src.dalton.notify.channel_transport import (
     GATEWAY_DELIVERY_READ_TIMEOUT_S,
     UNCERTAIN_NOTIFY_ERROR_CODES,
@@ -6701,6 +6702,7 @@ async def on_automation_settled(
             frontend_base_url=resolved_frontend_url,
             title_override=payoff_title_override,
         )
+        card_dict, _ = normalize_feishu_card(card_dict, strip_inline_code=True)
         via_gateway = (
             notify_via_gateway_enabled()
             and _post_notify_is_bridge(post_notify_fn)

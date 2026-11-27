@@ -203,12 +203,12 @@ _INLINE_CODE_SAMPLES: list[tuple[str, str]] = [
         "营收 16,956.0（+46.7% / -11.9%），估值 3.2x，目标价 150.0。",
     ),
     (
-        "金额 `$150.0`、`-$2.3B`、`USD 45.2B`、`452 亿美元`，利差 `+50bps`、`-2.5 ppt`。",
-        "金额 $150.0、-$2.3B、USD 45.2B、452 亿美元，利差 +50bps、-2.5 ppt。",
+        "金额 `$150.0`、`-$2.3B`、`$150.0 至 $170.0`、`USD 45.2B`、`452 亿美元`，利差 `+50bps`、`-2.5 ppt`。",
+        "金额 `$150.0`、`-$2.3B`、`$150.0 至 $170.0`、USD 45.2B、452 亿美元，利差 +50bps、-2.5 ppt。",
     ),
     (
-        "区间 `15%–18%`、`15% 至 18%`、`10-20`、`2.5x~3.5x`、`120亿至130亿美元`。",
-        "区间 15%–18%、15% 至 18%、10-20、2.5x~3.5x、120亿至130亿美元。",
+        "区间 `15%–18%`、`15% 至 18%`、`10-20`、`15%~18%`、`15% ~ 18%`、`15%～18%`、`2.5x~3.5x`、`120亿至130亿美元`。",
+        "区间 15%–18%、15% 至 18%、10-20、15%至18%、15%至18%、15%至18%、2.5x至3.5x、120亿至130亿美元。",
     ),
     # Stock tickers -> stripped
     (
@@ -217,8 +217,8 @@ _INLINE_CODE_SAMPLES: list[tuple[str, str]] = [
     ),
     # Periods -> stripped
     (
-        "期间 `2026Q3`、`2026M11`、`FY26E`、`4Q27E`、`2026H1`、`1H26`、`FY2025`、`2026FY`、`2025Q1–2026Q3`、`2026-11-27`。",
-        "期间 2026Q3、2026M11、FY26E、4Q27E、2026H1、1H26、FY2025、2026FY、2025Q1–2026Q3、2026-11-27。",
+        "期间 `2026Q3`、`2026M11`、`FY26E`、`4Q27E`、`2026H1`、`1H26`、`FY2025`、`2026FY`、`2025Q1–2026Q3`、`2025Q1~2026Q3`、`2026-11-27`。",
+        "期间 2026Q3、2026M11、FY26E、4Q27E、2026H1、1H26、FY2025、2026FY、2025Q1–2026Q3、2025Q1至2026Q3、2026-11-27。",
     ),
     # Paths, commands, snake_case & technical identifiers -> preserved
     (
@@ -308,7 +308,18 @@ def test_normalize_feishu_card_strips_markdown_inline_code_without_mutating_or_l
         },
     }
     before = deepcopy(card)
-    norm, paths = normalize_feishu_card(card)
+    # Default strip_inline_code=False preserves inline code backticks (digest contract)
+    # while still converting structural tags like text -> markdown.
+    norm_default, paths_default = normalize_feishu_card(card)
+    assert card == before
+    assert paths_default == ["body.elements[2]"]
+    assert "`16,956.0`" in norm_default["body"]["elements"][0]["content"]
+    assert norm_default["body"]["elements"][2] == {
+        "tag": "markdown",
+        "content": "A 股 `601100.SS` 同比 `-11.9%`（`4Q27E`），命令 `pytest -q`",
+    }
+
+    norm, paths = normalize_feishu_card(card, strip_inline_code=True)
 
     assert card == before
     assert paths == [
@@ -338,6 +349,6 @@ def test_normalize_feishu_card_strips_markdown_inline_code_without_mutating_or_l
     )
 
     # Idempotent on second pass
-    norm_2, paths_2 = normalize_feishu_card(norm)
+    norm_2, paths_2 = normalize_feishu_card(norm, strip_inline_code=True)
     assert norm_2 == norm
     assert paths_2 == []

@@ -6424,12 +6424,12 @@ describe("Feishu Schema 2.0 card normalization and 200621 fallback", () => {
         "营收 16,956.0（+46.7% / -11.9%），估值 3.2x，目标价 150.0。",
       ],
       [
-        "金额 `$150.0`、`-$2.3B`、`USD 45.2B`、`452 亿美元`，利差 `+50bps`、`-2.5 ppt`。",
-        "金额 $150.0、-$2.3B、USD 45.2B、452 亿美元，利差 +50bps、-2.5 ppt。",
+        "金额 `$150.0`、`-$2.3B`、`$150.0 至 $170.0`、`USD 45.2B`、`452 亿美元`，利差 `+50bps`、`-2.5 ppt`。",
+        "金额 `$150.0`、`-$2.3B`、`$150.0 至 $170.0`、USD 45.2B、452 亿美元，利差 +50bps、-2.5 ppt。",
       ],
       [
-        "区间 `15%–18%`、`15% 至 18%`、`10-20`、`2.5x~3.5x`、`120亿至130亿美元`。",
-        "区间 15%–18%、15% 至 18%、10-20、2.5x~3.5x、120亿至130亿美元。",
+        "区间 `15%–18%`、`15% 至 18%`、`10-20`、`15%~18%`、`15% ~ 18%`、`15%～18%`、`2.5x~3.5x`、`120亿至130亿美元`。",
+        "区间 15%–18%、15% 至 18%、10-20、15%至18%、15%至18%、15%至18%、2.5x至3.5x、120亿至130亿美元。",
       ],
       // Stock tickers -> stripped
       [
@@ -6438,8 +6438,8 @@ describe("Feishu Schema 2.0 card normalization and 200621 fallback", () => {
       ],
       // Periods -> stripped
       [
-        "期间 `2026Q3`、`2026M11`、`FY26E`、`4Q27E`、`2026H1`、`1H26`、`FY2025`、`2026FY`、`2025Q1–2026Q3`、`2026-11-27`。",
-        "期间 2026Q3、2026M11、FY26E、4Q27E、2026H1、1H26、FY2025、2026FY、2025Q1–2026Q3、2026-11-27。",
+        "期间 `2026Q3`、`2026M11`、`FY26E`、`4Q27E`、`2026H1`、`1H26`、`FY2025`、`2026FY`、`2025Q1–2026Q3`、`2025Q1~2026Q3`、`2026-11-27`。",
+        "期间 2026Q3、2026M11、FY26E、4Q27E、2026H1、1H26、FY2025、2026FY、2025Q1–2026Q3、2025Q1至2026Q3、2026-11-27。",
       ],
       // Paths, commands, snake_case & technical identifiers -> preserved
       [
@@ -6619,6 +6619,37 @@ describe("Feishu Schema 2.0 card normalization and 200621 fallback", () => {
     expect(infoLines[0]).toContain("body.elements[0]");
     expect(infoLines[0]).not.toContain("SECRET_CARD_BODY_CONTENT");
     expect(infoLines[0]).not.toContain("DO_NOT_LOG");
+  });
+
+  it("sendCardFeishu strips numeric inline code backticks at send time while keeping code identifiers", async () => {
+    const { sendCardFeishu } = await import("../src/channels/feishu/send.js");
+    const { client, calls } = createFakeLarkClient();
+
+    const res = await sendCardFeishu(client, {
+      to: "chat:oc_inline_strip",
+      card: {
+        schema: "2.0",
+        header: {
+          title: { tag: "plain_text", content: "AI 金融日报" },
+        },
+        body: {
+          elements: [
+            {
+              tag: "markdown",
+              content:
+                "营收 `16,956.0`，增速 `15%~18%`，金额 `$150.0`，字段 `revenue_yoy_pct`。",
+            },
+          ],
+        },
+      },
+    });
+
+    expect(res.messageId).toBe("om_created_1");
+    expect(calls.messageCreate).toHaveLength(1);
+    const sent = JSON.parse(calls.messageCreate[0].data.content);
+    expect(sent.body.elements[0].content).toBe(
+      "营收 16,956.0，增速 15%至18%，金额 `$150.0`，字段 `revenue_yoy_pct`。",
+    );
   });
 
   it("sendCardFeishu falls back once to minimal markdown-only card on 200621 and succeeds", async () => {
