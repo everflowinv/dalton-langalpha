@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo, useContext } from 'react'; // DALTON-HOOK(share-redaction)
 import { Link } from 'react-router';
+import { QueryClientContext } from '@tanstack/react-query'; // DALTON-HOOK(share-redaction)
 import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { ArrowLeft, FolderOpen, PanelRight } from 'lucide-react';
 // DALTON-HOOK(mobile-web): PanInfo no longer needed after disabling content-area drag-to-close on mobile FilePanel
@@ -35,10 +36,20 @@ import {
   handleHistoryHtmlWidget, // DALTON-HOOK(shared-widgets): replay inline widgets in shared chats
 } from '../ChatAgent/hooks/utils/historyEventHandlers';
 import type { PairState } from '../ChatAgent/hooks/utils/historyEventHandlers';
-// DALTON-HOOK(share-redaction): permission-downgrade detection, shared image cache revocation, and redaction context
+// DALTON-HOOK(share-redaction): permission-downgrade detection, shared image/file cache revocation, and redaction context
 import { apiErrorStatus } from '@/api/errors';
 import { SharedRedactionProvider } from '@/components/dalton/RedactedSharePlaceholders';
 import { buildSharedImageScope, revokeSharedImageScope } from '@/lib/dalton/sharedImageCache';
+import {
+  classifyShareForbidden,
+  clearSharedFileBodies,
+  createShareFileEpoch,
+  isShareDowngradeActive,
+  runGuardedShareFileRead,
+  type ShareDowngradeRecord,
+  type ShareFileEpoch,
+  type ShareForbiddenSource,
+} from '@/lib/dalton/shareFileGuard';
 import {
   replaySharedThread,
   getSharedFiles,
@@ -363,43 +374,69 @@ export default function SharedChatView({
   useEffect(() => () => dragCleanupRef.current?.(), []);
 
   const scrollAreaRef = useRef<HTMLDivElement>(null);
-  // DALTON-HOOK(share-redaction): pagination, downgrade revocation, and 403 fail-closed state
+  // DALTON-HOOK(share-redaction): pagination, downgrade revocation, file-read epoch, and 403 fail-closed state
+  const queryClient = useContext(QueryClientContext);
   const [historyPage, setHistoryPage] = useState<{ firstTurnIndex: number | null; hasMore: boolean }>({
     firstTurnIndex: null,
     hasMore: false,
   });
   const [loadingOlder, setLoadingOlder] = useState(false);
-  const [downgradedToken, setDowngradedToken] = useState<string | null>(null);
+  const [downgrade, setDowngrade] = useState<ShareDowngradeRecord | null>(null);
   const shouldAutoScrollRef = useRef(true);
   const replayAbortRef = useRef<AbortController | null>(null);
   const olderAbortRef = useRef<AbortController | null>(null);
   const filesAbortRef = useRef<AbortController | null>(null);
+  const fileEpochRef = useRef<ShareFileEpoch>(createShareFileEpoch());
+  const rotateFileEpoch = useCallback(() => {
+    fileEpochRef.current.revoke();
+    fileEpochRef.current = createShareFileEpoch();
+  }, []);
 
   // Permissions (fail-closed: anything other than explicit true is false)
   const permissions = (metadata.permissions || {}) as Record<string, unknown>;
-  const canBrowseFiles = permissions.allow_files === true && downgradedToken !== shareToken;
+  const rawAllowFiles = permissions.allow_files === true;
+  const downgradeActive = isShareDowngradeActive(downgrade, shareToken, refreshStamp, rawAllowFiles);
+  const canBrowseFiles = rawAllowFiles && !downgradeActive;
   const canDownload = canBrowseFiles && permissions.allow_download === true;
   const sharedImageScope = useMemo(
     () => buildSharedImageScope(shareToken, canBrowseFiles),
     [shareToken, canBrowseFiles],
   );
 
-  const handleForbiddenDowngrade = useCallback(() => {
-    setDowngradedToken((prev) => (prev === shareToken ? prev : shareToken));
-    onPermissionForbidden?.();
-  }, [shareToken, onPermissionForbidden]);
+  // DALTON-HOOK(share-redaction): clear stale 403 downgrade record once fresher metadata restores allow_files=true
+  useEffect(() => {
+    if (downgrade !== null && !downgradeActive) {
+      setDowngrade(null);
+    }
+  }, [downgrade, downgradeActive]);
 
-  const guardForbidden = useCallback(
-    <T,>(promise: Promise<T>): Promise<T> =>
-      promise.catch((err: unknown) => {
-        const status = apiErrorStatus(err) ?? (err as { status?: number })?.status;
-        if (status === 403) handleForbiddenDowngrade();
-        throw err;
+  const handleForbiddenDowngrade = useStableHandler(() => {
+    rotateFileEpoch();
+    setDowngrade((prev) =>
+      prev?.token === shareToken && prev.stamp === refreshStamp ? prev : { token: shareToken, stamp: refreshStamp },
+    );
+    onPermissionForbidden?.();
+  });
+
+  const handleDownloadForbidden = useStableHandler(() => {
+    onPermissionForbidden?.();
+    toast({ description: t('share.downloadNotPermitted'), variant: 'destructive' });
+  });
+
+  const guardFileRead = useCallback(
+    <T,>(source: ShareForbiddenSource, read: (signal: AbortSignal) => Promise<T>, onDiscard?: (value: T) => void) =>
+      runGuardedShareFileRead({
+        epoch: fileEpochRef.current,
+        source,
+        read,
+        onFilesForbidden: handleForbiddenDowngrade,
+        onDownloadForbidden: handleDownloadForbidden,
+        onDiscard,
       }),
-    [handleForbiddenDowngrade],
+    [handleForbiddenDowngrade, handleDownloadForbidden],
   );
 
-  // DALTON-HOOK(share-redaction): on allow_files downgrade (true -> false), abort in-flight loads, revoke scoped image cache, and clear state before redacted replay
+  // DALTON-HOOK(share-redaction): on allow_files downgrade (true -> false), abort in-flight loads, rotate file epoch, revoke caches, and clear state before redacted replay
   const prevPermRef = useRef<{ token: string; allowFiles: boolean }>({ token: shareToken, allowFiles: canBrowseFiles });
   useEffect(() => {
     const prev = prevPermRef.current;
@@ -408,8 +445,10 @@ export default function SharedChatView({
       replayAbortRef.current?.abort();
       olderAbortRef.current?.abort();
       filesAbortRef.current?.abort();
+      rotateFileEpoch();
       revokeSharedImageScope(shareToken);
       if (accessRef.current !== shareToken) revokeSharedImageScope(accessRef.current);
+      void clearSharedFileBodies(queryClient);
       setMessages([]);
       setFiles([]);
       setShowFilePanel(false);
@@ -419,7 +458,23 @@ export default function SharedChatView({
       setLoading(true);
       filesFetchRef.current = { token: undefined, state: 'idle' };
     }
-  }, [shareToken, canBrowseFiles]);
+  }, [shareToken, canBrowseFiles, queryClient, rotateFileEpoch]);
+
+  // DALTON-HOOK(share-redaction): abort all in-flight loads and revoke image + file-body caches on unmount
+  useEffect(() => {
+    if (!fileEpochRef.current.isCurrent()) {
+      fileEpochRef.current = createShareFileEpoch();
+    }
+    return () => {
+      replayAbortRef.current?.abort();
+      olderAbortRef.current?.abort();
+      filesAbortRef.current?.abort();
+      rotateFileEpoch();
+      revokeSharedImageScope(shareToken);
+      if (accessRef.current !== shareToken) revokeSharedImageScope(accessRef.current);
+      void clearSharedFileBodies(queryClient);
+    };
+  }, [shareToken, queryClient, rotateFileEpoch]);
 
   // Replay the conversation (re-runs on shareToken change or allow_files downgrade)
   // DALTON-HOOK(share-redaction): abortable paginated replay with history_page & steering_delivered support
@@ -525,8 +580,9 @@ export default function SharedChatView({
         filesFetchRef.current = { token: shareToken, state: listed.length ? 'loaded' : 'idle' };
       } catch (err: unknown) {
         if (!cancelled && !controller.signal.aborted) {
+          // DALTON-HOOK(share-redaction): classify list 403 as file-permission revocation
           const status = apiErrorStatus(err) ?? (err as { status?: number })?.status;
-          if (status === 403) handleForbiddenDowngrade();
+          if (status === 403 && classifyShareForbidden('list') === 'files') handleForbiddenDowngrade();
           filesFetchRef.current = { token: shareToken, state: 'idle' };
         }
       }
@@ -548,26 +604,32 @@ export default function SharedChatView({
 
   // The panel's adapter over the public endpoints. The serve prefix stands in
   // for the workspace, which a share never names.
-  // DALTON-HOOK(share-redaction): guard public file/preview reads for 403 downgrade and attach refresh stamp
+  // DALTON-HOOK(share-redaction): bind public file/preview/download reads to file epoch and source-classified 403 handling
   const servePrefix = sharedServePrefix(access);
+  const revokeLateObjectUrl = useCallback((url: string) => {
+    if (typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(url);
+  }, []);
   const fileApiAdapter = useMemo(() => ({
-    readFile: (path: string) => guardForbidden(readSharedFile(access, path)),
+    readFile: (path: string) => guardFileRead('read', (signal) => readSharedFile(access, path, { signal })),
     // HTML files read their full source here; the public read endpoint caps at
     // its own line limit, and the preview renders via the served URL regardless.
-    readFileFull: (path: string) => guardForbidden(readSharedFile(access, path)),
+    readFileFull: (path: string) => guardFileRead('read', (signal) => readSharedFile(access, path, { signal })),
     // Previews read under the serve prefix (allow_files), matching the rendered
     // report; only the explicit save uses the download endpoint (allow_download).
-    downloadFile: (path: string) => guardForbidden(servedObjectUrl(servePrefix, path, { refreshStamp })),
-    downloadFileAsArrayBuffer: (path: string) => guardForbidden(servedBytes(servePrefix, path, { refreshStamp })),
-    triggerDownload: (path: string) => guardForbidden(downloadSharedFile(access, path)),
+    downloadFile: (path: string) =>
+      guardFileRead('serve', (signal) => servedObjectUrl(servePrefix, path, { refreshStamp, signal }), revokeLateObjectUrl),
+    downloadFileAsArrayBuffer: (path: string) =>
+      guardFileRead('serve', (signal) => servedBytes(servePrefix, path, { refreshStamp, signal })),
+    triggerDownload: (path: string) => guardFileRead('download', (signal) => downloadSharedFile(access, path, { signal })),
     servePrefix,
     resolveFile: (candidates: string[], recentWrites: string[]) =>
-      guardForbidden(resolveSharedFile(access, candidates, recentWrites)),
-  }), [access, servePrefix, refreshStamp, guardForbidden]);
+      guardFileRead('resolve', (signal) => resolveSharedFile(access, candidates, recentWrites, { signal })),
+  }), [access, servePrefix, refreshStamp, guardFileRead, revokeLateObjectUrl]);
 
   const imageDownloader = useCallback(
-    (path: string) => guardForbidden(servedObjectUrl(servePrefix, path, { refreshStamp })),
-    [servePrefix, refreshStamp, guardForbidden],
+    (path: string) =>
+      guardFileRead('serve', (signal) => servedObjectUrl(servePrefix, path, { refreshStamp, signal }), revokeLateObjectUrl),
+    [servePrefix, refreshStamp, guardFileRead, revokeLateObjectUrl],
   );
 
   // A share is a finished thread: nothing runs, and nothing will come back.
@@ -647,17 +709,20 @@ export default function SharedChatView({
           try {
             // The same lookup opening the card takes, so one card cannot open
             // a report and then fail to save it.
+            // DALTON-HOOK(share-redaction): guard deliverable-card resolve and download with file epoch and source-classified 403 handling
             const target = await downloadTarget(
               path,
-              (candidates, recentWrites) => resolveSharedFile(access, candidates, recentWrites),
+              (candidates, recentWrites) =>
+                guardFileRead('resolve', (signal) => resolveSharedFile(access, candidates, recentWrites, { signal })),
               getRecentWritePaths(),
             );
             // Namesakes the lookup could not pick between leave nothing to
             // save, so the click lands on the panel that asks, exactly as Open
             // does with the same answer.
             if (!target.placed) return void handleOpenFile(path, fileWorkspaceId);
-            await downloadSharedFile(access, target.path);
+            await guardFileRead('download', (signal) => downloadSharedFile(access, target.path, { signal }));
           } catch (err: unknown) {
+            if ((err as { name?: string })?.name === 'AbortError' || apiErrorStatus(err) === 403) return;
             console.error('[SharedChatView] Download failed:', err);
             // A reader on a shared link has no other way to learn the save did
             // not happen: there is no panel error to fall back on here.
@@ -665,7 +730,7 @@ export default function SharedChatView({
           }
         }
       : undefined,
-  }), [handleOpenFile, handleOpenChart, canDownload, access, getRecentWritePaths, t]);
+  }), [handleOpenFile, handleOpenChart, canDownload, access, getRecentWritePaths, guardFileRead, t]);
 
   // Deep link: `?file=<path>` opens that report directly once metadata + file
   // permission are known. One-shot — the share-link target from §1.3b.

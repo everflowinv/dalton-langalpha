@@ -639,5 +639,6 @@ web/src/pages/Settings/utils/priceSource.ts
 web/src/pages/Settings/utils/__tests__/priceSource.test.ts
 web/src/components/ui/__tests__/chat-input.priceSource.dalton.test.tsx
 # AU1 Public share redaction frontend Vitest suites (DALTON-HOOK(share-redaction)).
+web/src/pages/SharedChat/__tests__/SharePage.redaction.test.tsx
 web/src/pages/SharedChat/__tests__/SharedChatView.redaction.test.tsx
 web/src/pages/ChatAgent/components/__tests__/ThreadSharePanel.redaction.test.tsx

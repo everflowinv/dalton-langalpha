@@ -11,6 +11,14 @@ import { getSharedMetadata, type ShareMetadata } from './api';
 import ShareUnavailable from './ShareUnavailable';
 import SharedAppView from './SharedAppView';
 import { withCopy } from '@/i18n';
+// DALTON-HOOK(share-redaction): revocation unmount and initial-revalidation gate helpers
+import {
+  advanceShareRevalidationGate,
+  createShareRevalidationGate,
+  getStaleThreadFilesGate,
+  isShareRevalidated,
+  shouldUnmountShareView,
+} from '@/lib/dalton/shareFileGuard';
 
 // A file or app page never loads the chat replay, and an app page never loads
 // the file viewers.
@@ -142,13 +150,18 @@ export default function SharePage(): React.ReactElement {
     return () => document.removeEventListener('visibilitychange', onVisibilityChange);
   }, [isPublicThread, refetchMetadata]);
 
+  // DALTON-HOOK(share-redaction): require a fresh successful revalidation on this mount before painting cached allow_files=true
   const mountKey = `${shareToken}:${userId ?? ''}:${asVisitor}:${path ?? ''}`;
-  const [revalidatedKey, setRevalidatedKey] = useState<string | null>(null);
+  const { isFetching, isSuccess, isError, dataUpdatedAt } = metadata;
+  const [mountGate, setMountGate] = useState(() =>
+    createShareRevalidationGate(mountKey, { isFetching, isSuccess, isError, dataUpdatedAt }),
+  );
+  const hasRevalidated = isShareRevalidated(mountGate, mountKey, { isFetching, isSuccess, isError, dataUpdatedAt });
   useEffect(() => {
-    if (!metadata.isFetching && (metadata.isSuccess || metadata.isError)) {
-      setRevalidatedKey(mountKey);
-    }
-  }, [metadata.isFetching, metadata.isSuccess, metadata.isError, mountKey]);
+    setMountGate((prev) =>
+      advanceShareRevalidationGate(prev, mountKey, { isFetching, isSuccess, isError, dataUpdatedAt }),
+    );
+  }, [mountKey, isFetching, isSuccess, isError, dataUpdatedAt]);
 
   // A failed refetch keeps the last answer, and the page it drew keeps working
   // until that answer's own credential lapses. A visitor's link answering 404
@@ -161,7 +174,8 @@ export default function SharePage(): React.ReactElement {
   // DALTON-HOOK(colleague-access): legacy shared link paused pending owner confirmation (HTTP 503)
   const paused = metadata.isError && apiErrorStatus(metadata.error) === 503
     && apiErrorObject(metadata.error)?.code === 'auto_publish_paused';
-  if (!data || ((gone || membersOnly) && followsLink(data))) {
+  // DALTON-HOOK(share-redaction): unmount shared thread and public file views on 404 or 401 members_only
+  if (!data || shouldUnmountShareView(data, gone || membersOnly)) {
     if (!metadata.isError) return <Loading />;
     if (gone) return <ShareUnavailable />;
     if (membersOnly) return <ShareUnavailable variant="membersOnly" />;
@@ -176,14 +190,11 @@ export default function SharePage(): React.ReactElement {
     return <ShareUnavailable variant="failed" onRetry={() => void metadata.refetch()} />;
   }
 
-  // DALTON-HOOK(share-redaction): do not paint stale cached allow_files=true view while initial mount revalidation is in flight
-  if (
-    data.kind === 'thread' &&
-    data.permissions?.allow_files === true &&
-    metadata.isFetching &&
-    revalidatedKey !== mountKey
-  ) {
-    return <Loading />;
+  // DALTON-HOOK(share-redaction): gate stale cached allow_files=true until initial mount revalidation succeeds
+  const staleGate = getStaleThreadFilesGate(data, { isFetching, isError }, hasRevalidated);
+  if (staleGate === 'loading') return <Loading />;
+  if (staleGate === 'failed') {
+    return <ShareUnavailable variant="failed" onRetry={() => void metadata.refetch()} />;
   }
 
   switch (data.kind) {

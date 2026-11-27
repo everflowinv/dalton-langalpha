@@ -336,13 +336,15 @@ export async function resolveSharedFile(
   shareToken: string,
   candidates: string[],
   recentWrites: string[] = [],
+  opts?: { signal?: AbortSignal }, // DALTON-HOOK(share-redaction)
 ): Promise<FileRefResolution> {
-  // DALTON-HOOK(share-redaction): bypass browser HTTP cache on public file resolve requests
+  // DALTON-HOOK(share-redaction): bypass browser HTTP cache and forward AbortSignal on public file resolve requests
   const res = await fetch(`${baseURL}/api/v1/public/shared/${shareToken}/files/resolve`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ candidates, recent_writes: recentWrites }),
     cache: 'no-store',
+    ...(opts?.signal ? { signal: opts.signal } : {}),
   });
   if (!res.ok) {
     if (res.status === 403) throw sharedFileError(res.status, 'File access not permitted');
@@ -357,9 +359,11 @@ export async function resolveSharedFile(
 export async function readSharedFile(
   shareToken: string,
   path: string,
+  opts?: { signal?: AbortSignal }, // DALTON-HOOK(share-redaction)
 ): Promise<SharedFileReadResponse> {
   const params = new URLSearchParams({ path });
-  const res = await served(`${baseURL}/api/v1/public/shared/${shareToken}/files/read?${params}`, 'read');
+  // DALTON-HOOK(share-redaction): forward AbortSignal on public file read requests
+  const res = await served(`${baseURL}/api/v1/public/shared/${shareToken}/files/read?${params}`, 'read', opts?.signal);
   return res.json() as Promise<SharedFileReadResponse>;
 }
 
@@ -367,8 +371,15 @@ export async function readSharedFile(
  * Save a file from a chat share. This is the one read gated on
  * `allow_download`; previews go through {@link sharedServePrefix}.
  */
-export async function downloadSharedFile(shareToken: string, path: string): Promise<void> {
+export async function downloadSharedFile(
+  shareToken: string,
+  path: string,
+  opts?: { signal?: AbortSignal }, // DALTON-HOOK(share-redaction)
+): Promise<void> {
   const params = new URLSearchParams({ path });
-  const res = await served(`${baseURL}/api/v1/public/shared/${shareToken}/files/download?${params}`, 'download');
-  saveBlob(await res.blob(), path.split('/').pop() || 'download');
+  // DALTON-HOOK(share-redaction): forward AbortSignal and skip saveBlob if aborted before save
+  const res = await served(`${baseURL}/api/v1/public/shared/${shareToken}/files/download?${params}`, 'download', opts?.signal);
+  const blob = await res.blob();
+  if (opts?.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  saveBlob(blob, path.split('/').pop() || 'download');
 }

@@ -1036,7 +1036,8 @@
     "boundaryListLastTwo": "{{first}} and {{second}}",
     "boundaryListLastMany": "{{head}}, and {{last}}",
     "previewVisitorView": "Preview visitor view",
-    "previewMemberView": "Preview member view"
+    "previewMemberView": "Preview member view",
+    "downloadNotPermitted": "Downloads are turned off for this share."
   },
   "shareLink": {
     "title": "Share {{file}}",

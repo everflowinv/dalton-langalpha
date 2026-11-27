@@ -2,7 +2,12 @@ import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
+import { QueryClient } from '@tanstack/react-query';
 import { renderWithProviders } from '@/test/utils';
+import { queryKeys } from '@/lib/queryKeys';
+import { isSharedFileBodyQueryKey } from '@/lib/dalton/shareFileGuard';
+import type { ApiAdapter } from '../../ChatAgent/components/filePanel/types';
+import type { toast as ToastFn } from '@/components/ui/use-toast';
 import type {
   getSharedFiles as GetSharedFilesFn,
   readSharedFile as ReadSharedFileFn,
@@ -31,6 +36,8 @@ const h = vi.hoisted(() => ({
   downloadSharedFileMock: vi.fn<typeof DownloadSharedFileFn>(),
   servedObjectUrlMock: vi.fn<typeof ServedObjectUrlFn>(),
   servedBytesMock: vi.fn<typeof ServedBytesFn>(),
+  toastSpy: vi.fn<typeof ToastFn>(),
+  capturedApiAdapter: null as ApiAdapter | null,
 }));
 
 vi.mock('react-router', async (importOriginal) => {
@@ -55,8 +62,22 @@ vi.mock('../../ChatAgent/hooks/usePTCDispatchStatus', () => ({
   DispatchStatusProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
 }));
 
+vi.mock('@/components/ui/use-toast', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/components/ui/use-toast')>();
+  return {
+    ...actual,
+    toast: (...args: Parameters<typeof ToastFn>) => {
+      h.toastSpy(...args);
+      return actual.toast(...args);
+    },
+  };
+});
+
 vi.mock('../../ChatAgent/components/FilePanel', () => ({
-  default: () => <div data-testid="file-panel" />,
+  default: ({ apiAdapter }: { apiAdapter?: ApiAdapter }) => {
+    h.capturedApiAdapter = apiAdapter ?? null;
+    return <div data-testid="file-panel" />;
+  },
 }));
 
 vi.mock('../../ChatAgent/components/markdown/MermaidDiagram', () => ({
@@ -101,6 +122,7 @@ describe('SharedChatView redaction, paging, downgrade, and regression', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    h.capturedApiAdapter = null;
     URL.revokeObjectURL = vi.fn<typeof URL.revokeObjectURL>();
     h.getSharedFilesMock.mockResolvedValue({ path: '.', files: [], source: 'live' });
     h.servedObjectUrlMock.mockResolvedValue('blob:served-img');
@@ -421,7 +443,7 @@ describe('SharedChatView redaction, paging, downgrade, and regression', () => {
     }
   });
 
-  it('attaches credentials: include on trusted-origin owner /messages/replay in transport.ts', async () => {
+  it('attaches credentials: include and cache: no-store on trusted-origin owner /messages/replay in transport.ts', async () => {
     const originalFetch = globalThis.fetch;
     const fetchMock = vi.fn<typeof fetch>(async () =>
       new Response('event: replay_done\ndata: {}\n\n', { status: 200 }),
@@ -433,8 +455,259 @@ describe('SharedChatView redaction, paging, downgrade, and regression', () => {
       });
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(fetchMock.mock.calls[0][1]?.credentials).toBe('include');
+      expect(fetchMock.mock.calls[0][1]?.cache).toBe('no-store');
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  it('treats download 403 as download-only refusal without downgrading file browsing, replaying, or revoking image cache', async () => {
+    const revokeSpy = vi.spyOn(sharedImageCache, 'revokeSharedImageScope');
+    const onPermissionForbidden = vi.fn<() => void>();
+    const err403 = Object.assign(new Error('File download not permitted'), { response: { status: 403 } });
+    h.downloadSharedFileMock.mockRejectedValueOnce(err403);
+
+    h.replayMock.mockImplementationOnce(async (_token, onEvent) => {
+      onEvent?.({ event: 'user_message', turn_index: 0, content: 'Open report' });
+      onEvent?.({ event: 'message_chunk', turn_index: 0, role: 'assistant', content_type: 'text', content: 'Report ready' });
+      onEvent?.({ event: 'replay_done', thread_id: 'thread-1' });
+    });
+
+    const { container } = renderWithProviders(
+      <SharedChatView
+        shareToken="tok-dl403"
+        metadata={makeMetadata(true, { permissions: { allow_files: true, allow_download: true } })}
+        refreshStamp={1000}
+        onPermissionForbidden={onPermissionForbidden}
+      />,
+    );
+
+    expect(await screen.findByText('Report ready')).toBeInTheDocument();
+    const toggleBtn = container.querySelector('button[data-panel-toggle="header"]');
+    expect(toggleBtn).not.toBeNull();
+    fireEvent.click(toggleBtn!);
+    await waitFor(() => expect(h.capturedApiAdapter).not.toBeNull());
+
+    await expect(h.capturedApiAdapter!.triggerDownload!('report.md')).rejects.toBe(err403);
+
+    expect(onPermissionForbidden).toHaveBeenCalledTimes(1);
+    expect(h.toastSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        description: expect.stringMatching(/Downloads are turned off for this share\.|当前分享未开放下载/),
+      }),
+    );
+    // File browsing stays enabled, replay is NOT refetched, image cache is NOT revoked
+    expect(h.replayMock).toHaveBeenCalledTimes(1);
+    expect(revokeSpy).not.toHaveBeenCalled();
+    expect(screen.getByTestId('file-panel')).toBeInTheDocument();
+
+    revokeSpy.mockRestore();
+  });
+
+  it('downgrades on /files/serve or /files/read 403 and recovers when newer metadata refreshStamp affirms allow_files=true', async () => {
+    const revokeSpy = vi.spyOn(sharedImageCache, 'revokeSharedImageScope');
+    const onPermissionForbidden = vi.fn<() => void>();
+    const err403 = Object.assign(new Error('File access not permitted'), { response: { status: 403 } });
+    h.readSharedFileMock.mockRejectedValueOnce(err403);
+
+    h.replayMock
+      .mockImplementationOnce(async (_token, onEvent) => {
+        onEvent?.({ event: 'user_message', turn_index: 0, content: 'Q' });
+        onEvent?.({ event: 'message_chunk', turn_index: 0, role: 'assistant', content_type: 'text', content: 'Initial full replay' });
+        onEvent?.({ event: 'replay_done', thread_id: 'thread-1' });
+      })
+      .mockImplementationOnce(async (_token, onEvent) => {
+        onEvent?.({ event: 'user_message', turn_index: 0, content: 'Q' });
+        onEvent?.({ event: 'message_chunk', turn_index: 0, role: 'assistant', content_type: 'text', content: 'Downgraded text replay' });
+        onEvent?.({ event: 'replay_done', thread_id: 'thread-1' });
+      })
+      .mockImplementationOnce(async (_token, onEvent) => {
+        onEvent?.({ event: 'user_message', turn_index: 0, content: 'Q' });
+        onEvent?.({ event: 'message_chunk', turn_index: 0, role: 'assistant', content_type: 'text', content: 'Recovered full replay' });
+        onEvent?.({ event: 'replay_done', thread_id: 'thread-1' });
+      });
+
+    const { container, rerender } = renderWithProviders(
+      <SharedChatView
+        shareToken="tok-recover"
+        metadata={makeMetadata(true)}
+        refreshStamp={1000}
+        onPermissionForbidden={onPermissionForbidden}
+      />,
+    );
+
+    expect(await screen.findByText('Initial full replay')).toBeInTheDocument();
+    fireEvent.click(container.querySelector('button[data-panel-toggle="header"]')!);
+    await waitFor(() => expect(h.capturedApiAdapter).not.toBeNull());
+
+    await expect(h.capturedApiAdapter!.readFile!('secret.md')).rejects.toBe(err403);
+
+    await waitFor(() => expect(screen.getByText('Downgraded text replay')).toBeInTheDocument());
+    expect(onPermissionForbidden).toHaveBeenCalledTimes(1);
+    expect(revokeSpy).toHaveBeenCalledWith('tok-recover');
+    expect(container.querySelector('button[data-panel-toggle="header"]')).toBeNull();
+
+    // Metadata revalidation confirms allow_files=true with a strictly newer refreshStamp
+    rerender(
+      <SharedChatView
+        shareToken="tok-recover"
+        metadata={makeMetadata(true)}
+        refreshStamp={2000}
+        onPermissionForbidden={onPermissionForbidden}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByText('Recovered full replay')).toBeInTheDocument());
+    expect(container.querySelector('button[data-panel-toggle="header"]')).not.toBeNull();
+    expect(h.replayMock).toHaveBeenCalledTimes(3);
+
+    revokeSpy.mockRestore();
+  });
+
+  it('aborts in-flight readSharedFile and downloadSharedFile on downgrade, keeping React Query file bodies empty and skipping saveBlob', async () => {
+    const actualApi = await vi.importActual<typeof import('../api')>('../api');
+    const originalFetch = globalThis.fetch;
+    const originalCreateObjectURL = URL.createObjectURL;
+    const createObjectUrlSpy = vi.fn<typeof URL.createObjectURL>(() => 'blob:should-not-save');
+    const anchorClickSpy = vi.fn<() => void>();
+    const realCreateElement = document.createElement.bind(document);
+    const createElSpy = vi.spyOn(document, 'createElement').mockImplementation(((tagName: string) => {
+      const el = realCreateElement(tagName);
+      if (tagName === 'a') (el as HTMLAnchorElement).click = anchorClickSpy;
+      return el;
+    }) as typeof document.createElement);
+    URL.createObjectURL = createObjectUrlSpy;
+
+    let capturedReadSignal: AbortSignal | undefined;
+    let resolveSlowRead!: (value: { path: string; content: string; mime: string; offset: number; limit: number; truncated: boolean }) => void;
+    h.readSharedFileMock.mockImplementationOnce((_token, _path, opts) => {
+      capturedReadSignal = opts?.signal;
+      return new Promise((resolve) => {
+        resolveSlowRead = resolve;
+      });
+    });
+
+    let resolveSlowDownloadFetch!: (res: Response) => void;
+    const fetchMock = vi.fn<typeof fetch>(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveSlowDownloadFetch = resolve;
+        }),
+    );
+    globalThis.fetch = fetchMock;
+    h.downloadSharedFileMock.mockImplementationOnce((token, path, opts) =>
+      actualApi.downloadSharedFile(token, path, opts),
+    );
+
+    h.replayMock
+      .mockImplementationOnce(async (_token, onEvent) => {
+        onEvent?.({ event: 'user_message', turn_index: 0, content: 'Files' });
+        onEvent?.({ event: 'message_chunk', turn_index: 0, role: 'assistant', content_type: 'text', content: 'Full files view' });
+        onEvent?.({ event: 'replay_done', thread_id: 'thread-1' });
+      })
+      .mockImplementationOnce(async (_token, onEvent) => {
+        onEvent?.({ event: 'user_message', turn_index: 0, content: 'Files' });
+        onEvent?.({ event: 'message_chunk', turn_index: 0, role: 'assistant', content_type: 'text', content: 'Redacted view' });
+        onEvent?.({ event: 'replay_done', thread_id: 'thread-1' });
+      });
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 5 * 60_000 } },
+    });
+    const existingAdapterKey = queryKeys.workspaceFiles.body('adapter:existing', 'old.md', 'text');
+    queryClient.setQueryData(existingAdapterKey, { text: 'stale cached body' });
+
+    try {
+      const { container, rerender } = renderWithProviders(
+        <SharedChatView
+          shareToken="tok-inflight"
+          metadata={makeMetadata(true, { permissions: { allow_files: true, allow_download: true } })}
+        />,
+        { queryClient },
+      );
+
+      expect(await screen.findByText('Full files view')).toBeInTheDocument();
+      fireEvent.click(container.querySelector('button[data-panel-toggle="header"]')!);
+      await waitFor(() => expect(h.capturedApiAdapter).not.toBeNull());
+
+      const adapter = h.capturedApiAdapter!;
+      const bodyKey = queryKeys.workspaceFiles.body('adapter:inflight', 'slow.md', 'text');
+      let innerReadError: unknown = null;
+      const bodyQueryError = queryClient
+        .fetchQuery({
+          queryKey: bodyKey,
+          queryFn: () =>
+            adapter.readFile!('slow.md').catch((err: unknown) => {
+              innerReadError = err;
+              throw err;
+            }),
+        })
+        .catch((err: unknown) => err);
+      const downloadError = adapter.triggerDownload!('secret.pdf').catch((err: unknown) => err);
+
+      await waitFor(() => {
+        expect(capturedReadSignal).toBeDefined();
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      });
+
+      // Downgrade while both requests are in flight
+      rerender(
+        <SharedChatView
+          shareToken="tok-inflight"
+          metadata={makeMetadata(false)}
+        />,
+      );
+
+      await waitFor(() => expect(screen.getByText('Redacted view')).toBeInTheDocument());
+      expect(capturedReadSignal!.aborted).toBe(true);
+
+      // Slow responses arrive after downgrade
+      resolveSlowRead({ path: 'slow.md', content: 'SECRET_LATE_BODY', mime: 'text/markdown', offset: 0, limit: 100, truncated: false });
+      resolveSlowDownloadFetch(new Response(new Blob(['SECRET_PDF']), { status: 200 }));
+
+      await expect(bodyQueryError).resolves.toBeInstanceOf(Error);
+      await waitFor(() => expect(innerReadError).toMatchObject({ name: 'AbortError' }));
+      await expect(downloadError).resolves.toMatchObject({ name: 'AbortError' });
+
+      expect(
+        queryClient.getQueryCache().findAll({ predicate: (q) => isSharedFileBodyQueryKey(q.queryKey) }),
+      ).toHaveLength(0);
+      expect(createObjectUrlSpy).not.toHaveBeenCalled();
+      expect(anchorClickSpy).not.toHaveBeenCalled();
+    } finally {
+      globalThis.fetch = originalFetch;
+      URL.createObjectURL = originalCreateObjectURL;
+      createElSpy.mockRestore();
+    }
+  });
+
+  it('renders redacted html_widget placeholder as static card with zero iframes even when metadata allow_files=true', async () => {
+    h.replayMock.mockImplementationOnce(async (_token, onEvent) => {
+      onEvent?.({ event: 'user_message', turn_index: 0, content: 'Show dashboard' });
+      onEvent?.({
+        event: 'message_chunk',
+        turn_index: 0,
+        role: 'assistant',
+        content_type: 'text',
+        content: 'Widget summary below.',
+      });
+      onEvent?.({
+        event: 'artifact',
+        turn_index: 0,
+        artifact_type: 'html_widget',
+        artifact_id: 'w-stale-meta',
+        status: 'completed',
+        payload: { redacted: true },
+      });
+      onEvent?.({ event: 'replay_done', thread_id: 'thread-1' });
+    });
+
+    const { container } = renderWithProviders(
+      <SharedChatView shareToken="tok-stale-widget" metadata={makeMetadata(true)} />,
+    );
+
+    expect(await screen.findByText('Widget summary below.')).toBeInTheDocument();
+    expect(screen.getByText(/Interactive widget hidden|交互组件已隐藏/)).toBeInTheDocument();
+    expect(container.querySelectorAll('iframe')).toHaveLength(0);
   });
 });

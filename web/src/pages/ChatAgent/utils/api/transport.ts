@@ -105,11 +105,16 @@ export async function streamFetch(
   const sentAs = initialToken ? authGeneration() : undefined;
   let res: Response;
   const fullUrl = `${baseURL}${url}`;
-  // DALTON-HOOK(share-redaction): include credentials on trusted-origin owner replay streams
-  const fetchOpts: RequestInit =
-    opts.credentials === undefined && /\/api\/v1\/threads\/[^/]+\/messages\/replay(?:[?#]|$)/.test(url) && isTrustedOwnerReplayOrigin(fullUrl)
-      ? { ...opts, credentials: 'include' }
-      : opts;
+  // DALTON-HOOK(share-redaction): include credentials and cache:'no-store' on trusted-origin owner replay streams
+  const isTrustedOwnerReplay =
+    /\/api\/v1\/threads\/[^/]+\/messages\/replay(?:[?#]|$)/.test(url) && isTrustedOwnerReplayOrigin(fullUrl);
+  const fetchOpts: RequestInit = isTrustedOwnerReplay
+    ? {
+        ...opts,
+        ...(opts.credentials === undefined ? { credentials: 'include' } : {}),
+        ...(opts.cache === undefined ? { cache: 'no-store' } : {}),
+      }
+    : opts;
   try {
     res = await fetch(fullUrl, fetchOpts);
     // DALTON-HOOK(standalone-core): refresh once via cookie and retry SSE request on 401 in local auth mode

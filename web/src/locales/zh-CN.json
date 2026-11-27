@@ -1032,7 +1032,8 @@
     "boundaryListLastTwo": "{{first}}及 {{second}}",
     "boundaryListLastMany": "{{head}}及 {{last}}",
     "previewVisitorView": "预览访客视角",
-    "previewMemberView": "预览成员视角"
+    "previewMemberView": "预览成员视角",
+    "downloadNotPermitted": "当前分享未开放下载"
   },
   "shareLink": {
     "title": "分享 {{file}}",

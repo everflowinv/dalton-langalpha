@@ -5,6 +5,7 @@ import '@testing-library/jest-dom';
 import i18n from '@/i18n';
 import { renderWithProviders } from '@/test/utils';
 import type { CallerIdentity, CallerIdentitySnapshot } from '@/hooks/useCallerIdentity';
+import type { useShareLinkMutations } from '@/hooks/useShareLink';
 import type { ShareRedactionSummary, ThreadShareStatus } from '@/types/api';
 import type { getThreadShareStatus as GetThreadShareStatusFn } from '../../utils/api/threads';
 
@@ -43,7 +44,12 @@ vi.mock('@/hooks/useCallerIdentity', () => ({
 
 vi.mock('@/hooks/useShareLink', () => ({
   useSharedLinks: () => ({ data: [] }),
-  useShareLinkMutations: () => ({ patch: { isPending: false, mutate: vi.fn<() => void>() } }),
+  useShareLinkMutations: () => ({
+    patch: {
+      isPending: false,
+      mutate: vi.fn<ReturnType<typeof useShareLinkMutations>['patch']['mutate']>(),
+    },
+  }),
 }));
 
 vi.mock('@/components/organization/LibraryPublishRow', () => ({
