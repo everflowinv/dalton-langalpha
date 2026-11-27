@@ -192,12 +192,12 @@ export function WatchlistFullTable({
         case 'price':
           return c.is_private
             ? null
-            : inExtSession && extInfo.mainPrice != null
+            : inExtSession
               ? extInfo.mainPrice
               : (m?.price ?? null);
         case 'chg_1d':
-          return inExtSession && extInfo.mainChangePct != null
-            ? roundQuote2(extInfo.mainChangePct)
+          return inExtSession
+            ? (extInfo.mainChangePct != null ? roundQuote2(extInfo.mainChangePct) : null)
             : (m?.chg_1d ?? null);
         case 'chg_1w':
           return m?.chg_1w ?? null;
@@ -331,8 +331,7 @@ export function WatchlistFullTable({
       const extInfo = extendedDisplayByTicker[company.ticker];
       const inExtSession = extInfo != null && extInfo.session !== 'regular';
       const code = extInfo?.currency ?? quoteCurrency(m?.currency ?? null, company.ticker, 'equity');
-      const mainPrice =
-        inExtSession && extInfo.mainPrice != null ? extInfo.mainPrice : (m?.price ?? null);
+      const mainPrice = inExtSession ? extInfo.mainPrice : (m?.price ?? null);
       const extBadge = extInfo?.ext ?? null;
       return (
         <td
@@ -343,7 +342,7 @@ export function WatchlistFullTable({
           <span className="block leading-tight">
             {mainPrice != null
               ? formatExtendedQuotePrice(mainPrice, code, locale, extInfo?.places)
-              : metricsLoading
+              : !inExtSession && metricsLoading
                 ? '…'
                 : DASH}
           </span>
@@ -365,9 +364,10 @@ export function WatchlistFullTable({
       col === 'chg_1y'
     ) {
       const extInfo = col === 'chg_1d' ? extendedDisplayByTicker[company.ticker] : undefined;
+      const inExtSession = extInfo != null && extInfo.session !== 'regular';
       const val =
-        col === 'chg_1d' && extInfo && extInfo.session !== 'regular' && extInfo.mainChangePct != null
-          ? roundQuote2(extInfo.mainChangePct)
+        col === 'chg_1d' && inExtSession
+          ? (extInfo.mainChangePct != null ? roundQuote2(extInfo.mainChangePct) : null)
           : m?.[col];
       return (
         <td

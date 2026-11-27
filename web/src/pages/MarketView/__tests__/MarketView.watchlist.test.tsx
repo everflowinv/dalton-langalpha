@@ -604,9 +604,9 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
         holdingSymbols={new Set()}
         sortField="market_cap"
         sortDir="desc"
-        onSelectSymbol={vi.fn<(symbol: string) => void>()}
-        onRequestTierChange={vi.fn()}
-        onRequestRemove={vi.fn()}
+        onSelectSymbol={vi.fn<WatchlistFullTableProps['onSelectSymbol']>()}
+        onRequestTierChange={vi.fn<WatchlistFullTableProps['onRequestTierChange']>()}
+        onRequestRemove={vi.fn<WatchlistFullTableProps['onRequestRemove']>()}
       />,
     );
 
@@ -1013,5 +1013,143 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
     } finally {
       Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: prevInnerWidth });
     }
+  });
+
+  it('r5: keeps missing 1D regular change as dash in pre-market and hides stale prior-session AH when entering pre-market, matching Dashboard', () => {
+    const preStatus: MarketStatusInput = { market: 'extended-hours', earlyHours: true, afterHours: false };
+    const company = { ticker: 'GOOG', name: 'Alphabet Inc.', tier: 'core' as const, is_private: false };
+
+    const buildDashboardRow = (quote: QuoteRow): WatchlistRow => {
+      const sp = snapshotToStockPrice(quote.symbol, quote);
+      return {
+        watchlist_item_id: `w-${quote.symbol}`,
+        ...sp,
+        previousClose: sp.previousClose ?? null,
+        earlyTradingChangePercent: sp.earlyTradingChangePercent ?? null,
+        lateTradingChangePercent: sp.lateTradingChangePercent ?? null,
+        currency: sp.currency ?? 'USD',
+        assetClass: 'equity',
+      };
+    };
+
+    // Case 1: Pre-market snapshot has PM price (`early_trading_change_percent`) but lacks regular_trading_change(_percent).
+    // Even if `/metrics` or unprinted quote carries chg_1d = 0 or 0.47, WatchlistFullTable MUST keep `—` just like Dashboard!
+    const preMissingRegularQuote: QuoteRow = {
+      symbol: 'GOOG',
+      price: null,
+      previous_close: 320.76,
+      change: 1.5,
+      change_percent: 0.4676,
+      regular_trading_change: null,
+      regular_trading_change_percent: null,
+      early_trading_change: 1.5,
+      early_trading_change_percent: 0.4676,
+      market_status: 'early_trading',
+      currency: 'USD',
+    };
+
+    const { container: dash1, unmount: unmountDash1 } = render(
+      <MemoryRouter>
+        <table>
+          <tbody>
+            <WatchlistRowItem item={buildDashboardRow(preMissingRegularQuote)} marketStatus={preStatus} />
+          </tbody>
+        </table>
+      </MemoryRouter>,
+    );
+    const { container: mv1, unmount: unmountMv1 } = render(
+      <WatchlistFullTable
+        companies={[company]}
+        metrics={{
+          GOOG: {
+            ...mocks.watchlistMetrics.items.NVDA,
+            ticker: 'GOOG',
+            price: 320.76,
+            chg_1d: 0,
+            currency: 'USD',
+          },
+        }}
+        quotes={{ GOOG: preMissingRegularQuote }}
+        marketStatus={preStatus}
+        metricsLoading={false}
+        visibleColumns={['price', 'chg_1d']}
+        groupedByTier={false}
+        holdingSymbols={new Set()}
+        onSelectSymbol={vi.fn<WatchlistFullTableProps['onSelectSymbol']>()}
+        onRequestTierChange={vi.fn<WatchlistFullTableProps['onRequestTierChange']>()}
+        onRequestRemove={vi.fn<WatchlistFullTableProps['onRequestRemove']>()}
+      />,
+    );
+
+    const dash1Cells = dash1.querySelectorAll('td');
+    const mv1Row = mv1.querySelector('[data-testid="watchlist-row-GOOG"]')!;
+    const mv1PriceCell = mv1Row.querySelectorAll('td')[1];
+    const mv1ChgCell = mv1Row.querySelectorAll('td')[2];
+
+    expect(dash1Cells[1].textContent).toBe('$320.76');
+    expect(mv1PriceCell.firstElementChild?.textContent).toBe('$320.76');
+    expect(dash1Cells[2].firstElementChild?.textContent).toBe('—');
+    expect(mv1ChgCell.textContent).toBe('—');
+    expect(mv1ChgCell.textContent).not.toContain('0.00%');
+    expect(dash1.querySelector('.dash-ext')?.textContent).toBe('PM$322.26+0.47%');
+    expect(mv1PriceCell.querySelector('.dash-ext')?.textContent).toBe('PM$322.26+0.47%');
+    unmountDash1();
+    unmountMv1();
+
+    // Case 2: Market has entered pre-market (`earlyHours: true`), cached quote only has stale prior-session AH.
+    // Neither Dashboard nor MarketView may show `AH`!
+    const staleAhInPreQuote: QuoteRow = {
+      symbol: 'GOOG',
+      price: 317.28,
+      regular_close: 317.28,
+      previous_close: 320.76,
+      change: -3.48,
+      change_percent: -1.0849,
+      regular_trading_change: -3.48,
+      regular_trading_change_percent: -1.0849,
+      early_trading_change: null,
+      early_trading_change_percent: null,
+      late_trading_change: 0.82,
+      late_trading_change_percent: 0.2584,
+      currency: 'USD',
+    };
+
+    const { container: dash2, unmount: unmountDash2 } = render(
+      <MemoryRouter>
+        <table>
+          <tbody>
+            <WatchlistRowItem item={buildDashboardRow(staleAhInPreQuote)} marketStatus={preStatus} />
+          </tbody>
+        </table>
+      </MemoryRouter>,
+    );
+    const { container: mv2, unmount: unmountMv2 } = render(
+      <WatchlistFullTable
+        companies={[company]}
+        metrics={{
+          GOOG: {
+            ...mocks.watchlistMetrics.items.NVDA,
+            ticker: 'GOOG',
+            price: 317.28,
+            chg_1d: -1.08,
+            currency: 'USD',
+          },
+        }}
+        quotes={{ GOOG: staleAhInPreQuote }}
+        marketStatus={preStatus}
+        metricsLoading={false}
+        visibleColumns={['price', 'chg_1d']}
+        groupedByTier={false}
+        holdingSymbols={new Set()}
+        onSelectSymbol={vi.fn<WatchlistFullTableProps['onSelectSymbol']>()}
+        onRequestTierChange={vi.fn<WatchlistFullTableProps['onRequestTierChange']>()}
+        onRequestRemove={vi.fn<WatchlistFullTableProps['onRequestRemove']>()}
+      />,
+    );
+
+    expect(dash2.querySelector('.dash-ext')).toBeNull();
+    expect(mv2.querySelector('.dash-ext')).toBeNull();
+    unmountDash2();
+    unmountMv2();
   });
 });

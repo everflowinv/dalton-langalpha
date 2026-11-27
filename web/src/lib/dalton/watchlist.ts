@@ -4,6 +4,13 @@ import { api } from '@/api/client';
 import { queryKeys } from '@/lib/queryKeys';
 import { isDaltonBuild } from '@/config/brand';
 import { quoteKey, roundQuote2, type QuoteRow } from '@/lib/quotes';
+import {
+  extractSelectedPriceTradeTsMs,
+  parsePriceTimestampMs,
+  shouldPreferIncomingPrice,
+} from '@/lib/dalton/quotes/quoteMerge';
+
+export { parsePriceTimestampMs };
 
 export type WatchlistTier = 'core' | 'watch' | 'radar';
 
@@ -369,42 +376,10 @@ function recomputeSummaryFromItems(
   };
 }
 
-/** Parse a Unix sec/ms or ISO timestamp into Unix epoch milliseconds. */
-export function parsePriceTimestampMs(ts: unknown): number | null {
-  if (ts == null || typeof ts === 'boolean') return null;
-  if (typeof ts === 'number') {
-    if (!Number.isFinite(ts) || ts <= 0) return null;
-    return ts < 1e11 ? Math.round(ts * 1000) : Math.round(ts);
-  }
-  if (typeof ts === 'string') {
-    const trimmed = ts.trim();
-    if (!trimmed) return null;
-    if (/^\d+(\.\d+)?$/.test(trimmed)) {
-      const num = Number(trimmed);
-      if (!Number.isFinite(num) || num <= 0) return null;
-      return num < 1e11 ? Math.round(num * 1000) : Math.round(num);
-    }
-    const parsed = Date.parse(trimmed);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
-  }
-  return null;
-}
-
-function extractQuoteTimestampMs(quote: QuoteRow): number | null {
-  const record = quote as Record<string, unknown>;
-  const candidates = [
-    parsePriceTimestampMs(quote.live_tick_at),
-    parsePriceTimestampMs(quote.as_of),
-    parsePriceTimestampMs(quote.freshness?.actual_latest),
-    parsePriceTimestampMs(record.timestamp),
-    parsePriceTimestampMs(record.updated_at),
-  ].filter((v): v is number => v != null);
-  return candidates.length > 0 ? Math.max(...candidates) : null;
-}
-
 function mergeMetricRow(
   prevRow: WatchlistMetricRow | undefined,
   nextRow: WatchlistMetricRow,
+  options: { allowClearEarnings?: boolean } = {},
 ): WatchlistMetricRow {
   if (!prevRow || nextRow.is_private) return nextRow;
 
@@ -415,34 +390,20 @@ function mergeMetricRow(
 
   if (nextRow.price == null) {
     chg1d = nextRow.chg_1d ?? prevRow.chg_1d;
-  } else if (prevRow.price == null) {
-    price = nextRow.price;
-    chg1d = nextRow.chg_1d ?? prevRow.chg_1d;
-    priceSource = nextRow.price_source ?? null;
-    priceTs = nextRow.price_ts ?? null;
   } else {
-    const prevIsSnapshot = prevRow.price_source === 'snapshot';
-    const nextIsDailyClose = nextRow.price_source === 'daily_close';
-    const prevIsDailyClose = prevRow.price_source === 'daily_close';
-    const nextIsSnapshot = nextRow.price_source === 'snapshot';
-
-    let takeNext = true;
-    if (prevIsSnapshot && nextIsDailyClose) {
-      takeNext = false;
-    } else if (prevIsDailyClose && nextIsSnapshot) {
-      takeNext = true;
-    } else {
-      const prevTs = parsePriceTimestampMs(prevRow.price_ts);
-      const nextTs = parsePriceTimestampMs(nextRow.price_ts);
-      if (prevTs != null && nextTs != null) {
-        takeNext = nextTs >= prevTs;
-      } else if (prevTs != null && nextTs == null) {
-        takeNext = false;
-      } else {
-        takeNext = true;
-      }
-    }
-
+    const takeNext = shouldPreferIncomingPrice(
+      {
+        price: prevRow.price,
+        tradeTsMs: parsePriceTimestampMs(prevRow.price_ts),
+        priceSource: prevRow.price_source ?? null,
+      },
+      {
+        price: nextRow.price,
+        tradeTsMs: parsePriceTimestampMs(nextRow.price_ts),
+        priceSource: nextRow.price_source ?? null,
+      },
+      'incoming',
+    );
     if (takeNext) {
       price = nextRow.price;
       chg1d = nextRow.chg_1d ?? prevRow.chg_1d;
@@ -473,7 +434,25 @@ function mergeMetricRow(
     vol_ratio_5_20: nextRow.vol_ratio_5_20 ?? prevRow.vol_ratio_5_20,
     market_cap: nextRow.market_cap ?? prevRow.market_cap,
     market_cap_currency: nextRow.market_cap_currency ?? prevRow.market_cap_currency,
-    next_earnings: nextRow.next_earnings ?? prevRow.next_earnings,
+    next_earnings: options.allowClearEarnings
+      ? (nextRow.next_earnings ?? null)
+      : (nextRow.next_earnings ?? prevRow.next_earnings),
+  };
+}
+
+/** Merge a full-roster `/metrics` refresh into the cached response, allowing expired `next_earnings` to clear to `null`. */
+export function mergeFullWatchlistMetricsResponse(
+  prev: WatchlistMetricsResponse,
+  next: WatchlistMetricsResponse,
+): WatchlistMetricsResponse {
+  const mergedItems: Record<string, WatchlistMetricRow> = {};
+  for (const [sym, row] of Object.entries(next.items ?? {})) {
+    mergedItems[sym] = mergeMetricRow(prev.items[sym], row, { allowClearEarnings: true });
+  }
+  return {
+    ...next,
+    items: mergedItems,
+    summary: recomputeSummaryFromItems(next.summary ?? prev.summary, mergedItems),
   };
 }
 
@@ -573,7 +552,8 @@ export function mergeQuotesIntoWatchlistMetrics(
       quoteChg1d = roundQuote2(((quotePrice - prevClose) / prevClose) * 100);
     }
     const quoteCurrencyCode = quote.currency ?? null;
-    const quoteTs = extractQuoteTimestampMs(quote);
+    const quoteTs = extractSelectedPriceTradeTsMs(quote, quotePrice);
+    const quotePriceSource = quote.source === 'daily' ? 'daily_close' : 'snapshot';
 
     if (!metric) {
       if (quotePrice == null && quoteChg1d == null && quoteCurrencyCode == null) continue;
@@ -621,14 +601,20 @@ export function mergeQuotesIntoWatchlistMetrics(
     }
 
     // Both `/metrics` and `useQuotes` have prices:
-    // 1. `daily_close` fallback from `/metrics` NEVER overwrites a live `useQuotes` price.
-    // 2. Otherwise compare trade timestamps; strictly newer quote wins, ties favor `/metrics`.
-    const metricTs = parsePriceTimestampMs(metric.price_ts);
-    const metricIsDailyClose = metric.price_source === 'daily_close';
-    const quoteWins =
-      quotePrice != null &&
-      (metricIsDailyClose ||
-        (quoteTs != null && (metricTs == null || quoteTs > metricTs)));
+    // Use the unified selected-price trade-timestamp merge rule; ties preserve `/metrics`.
+    const quoteWins = shouldPreferIncomingPrice(
+      {
+        price: metric.price,
+        tradeTsMs: parsePriceTimestampMs(metric.price_ts),
+        priceSource: metric.price_source ?? null,
+      },
+      {
+        price: quotePrice,
+        tradeTsMs: quoteTs,
+        priceSource: quotePriceSource,
+      },
+      'existing',
+    );
 
     if (quoteWins) {
       out[ticker] = {
@@ -695,15 +681,7 @@ export function usePersonalWatchlistMetrics(
       state.appliedGen = gen;
       const prev = queryClient.getQueryData<WatchlistMetricsResponse>(queryKey);
       if (prev) {
-        const mergedItems: Record<string, WatchlistMetricRow> = {};
-        for (const [sym, row] of Object.entries(data.items ?? {})) {
-          mergedItems[sym] = mergeMetricRow(prev.items[sym], row);
-        }
-        return {
-          ...data,
-          items: mergedItems,
-          summary: recomputeSummaryFromItems(data.summary ?? prev.summary, mergedItems),
-        };
+        return mergeFullWatchlistMetricsResponse(prev, data);
       }
       return data;
     },
