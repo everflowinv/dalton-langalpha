@@ -39,6 +39,7 @@ _FEISHU_APP_KEYS: tuple[str, str] = (FEISHU_APP_ID_KEY, FEISHU_APP_SECRET_KEY)
 _VAULT_UNSET_CODES: frozenset[str] = frozenset(
     {"dalton_disabled", "owner_unconfigured", "vault_credentials_missing"}
 )
+_MAX_VAULT_REQUERIES = 2
 
 
 @dataclass(frozen=True)
@@ -423,11 +424,11 @@ async def resolve_credential_group(group_name: str) -> CredentialGroupResult:
     """Asynchronously resolve one credential group using the same single-source precedence.
 
     When ``group_name == "feishu_app"`` and neither startup ``env`` nor ``saved`` rows hold
-    any ``feishu_app`` key, queries the primary administrator's Vault live. If the active
-    snapshot changes during the await, re-evaluates the source against the current snapshot;
-    when the source is still Vault, queries Vault again against the current snapshot, adopts
-    that result, preserves this request's own Vault error detail, and writes the slot only
-    when the base snapshot version is current or newer.
+    any ``feishu_app`` key, queries the primary administrator's Vault live. After every Vault
+    lookup, re-evaluates source precedence and snapshot version against the active snapshot;
+    if the snapshot advanced, re-queries live up to ``_MAX_VAULT_REQUERIES`` times (2). When
+    slot write is rejected because a newer snapshot exists or re-queries are exhausted, returns
+    both values and revision strictly from the current snapshot.
     """
     spec = get_credential_group_spec(group_name)
     if spec is None:
@@ -452,11 +453,10 @@ async def resolve_credential_group(group_name: str) -> CredentialGroupResult:
 
     # 3. Live Vault lookup for feishu_app with version-checked worker-slot update.
     if spec.vault_fallback:
-        pair, vault_error, err = await query_feishu_vault_pair_strict()
+        for attempt in range(_MAX_VAULT_REQUERIES + 1):
+            pair, vault_error, err = await query_feishu_vault_pair_strict()
 
-        current = get_active_snapshot()
-        if current is not snap:
-            # Re-evaluate source against the latest snapshot; if still Vault, re-query live.
+            current = get_active_snapshot()
             non_vault = _evaluate_non_vault_source(
                 group_name,
                 spec.keys,
@@ -465,39 +465,65 @@ async def resolve_credential_group(group_name: str) -> CredentialGroupResult:
                 at_start=setup_env._snapshot(),
             )
             if non_vault is not None:
+                _last_feishu_vault_error.set(None)
                 return non_vault
-            snap = current
-            pair, vault_error, err = await query_feishu_vault_pair_strict()
-            current = get_active_snapshot()
-            if current is not snap:
-                non_vault = _evaluate_non_vault_source(
+
+            if current is not snap and attempt < _MAX_VAULT_REQUERIES:
+                snap = current
+                continue
+
+            updated = (
+                update_active_snapshot_vault(
+                    pair,
+                    feishu_vault_error=vault_error,
+                    expected=snap,
+                )
+                if current is snap
+                else None
+            )
+            if updated is not None:
+                _last_feishu_vault_error.set(err)
+                return _build_vault_result(
                     group_name,
                     spec.keys,
                     pair_required=spec.pair_required,
-                    snap=current,
-                    at_start=setup_env._snapshot(),
+                    revision=updated.revision,
+                    pair=pair,
+                    vault_error=vault_error,
                 )
-                if non_vault is not None:
-                    return non_vault
 
-        # Preserve this request's own error detail even when concurrent refreshes move the snapshot.
-        _last_feishu_vault_error.set(err)
-        updated = update_active_snapshot_vault(
-            pair,
-            feishu_vault_error=vault_error,
-            expected=snap,
-        )
-        effective_revision = (
-            updated.revision if updated is not None else get_active_snapshot().revision
-        )
-        return _build_vault_result(
-            group_name,
-            spec.keys,
-            pair_required=spec.pair_required,
-            revision=effective_revision,
-            pair=pair,
-            vault_error=vault_error,
-        )
+            # Slot write rejected because a newer snapshot replaced ``snap`` (or source switched
+            # to env/saved); derive both values and revision strictly from the current snapshot.
+            latest = get_active_snapshot()
+            non_vault = _evaluate_non_vault_source(
+                group_name,
+                spec.keys,
+                pair_required=spec.pair_required,
+                snap=latest,
+                at_start=setup_env._snapshot(),
+            )
+            if non_vault is not None:
+                _last_feishu_vault_error.set(None)
+                return non_vault
+
+            if latest.feishu_vault_error:
+                _last_feishu_vault_error.set(err if vault_error else None)
+            elif (
+                latest.feishu_vault_pair is None
+                and err is not None
+                and err.code in _VAULT_UNSET_CODES
+            ):
+                _last_feishu_vault_error.set(err)
+            else:
+                _last_feishu_vault_error.set(None)
+            return _build_vault_result(
+                group_name,
+                spec.keys,
+                pair_required=spec.pair_required,
+                revision=latest.revision,
+                pair=latest.feishu_vault_pair,
+                vault_error=latest.feishu_vault_error,
+            )
 
     # 4. Unset.
     return CredentialGroupResult(

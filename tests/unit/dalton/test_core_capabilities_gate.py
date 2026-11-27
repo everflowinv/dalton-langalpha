@@ -3268,6 +3268,144 @@ class TestDeploymentCredentialsReadContract:
         assert updated_s3.version > s2.version
         assert get_active_snapshot() is updated_s3
 
+    @pytest.mark.asyncio
+    async def test_resolve_credential_group_second_query_rotation_and_requery_cap_uses_current_snapshot(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+
+        from src.dalton.deployment_credentials import resolve_credential_group
+        from src.dalton.deployment_credentials import snapshot as snap_mod
+        from src.dalton.deployment_credentials.snapshot import (
+            build_snapshot,
+            get_active_snapshot,
+            set_active_snapshot,
+        )
+
+        old_secret = "test-secret-not-real-r4-old-0001"
+        rotated_secret = "test-secret-not-real-r4-rot-0002"
+        newest_secret = "test-secret-not-real-r4-new-0003"
+        saved_secret = "test-secret-not-real-r4-sav-0004"
+
+        old_pair = {
+            "DALTON_FEISHU_APP_ID": "cli_r4_old",
+            "DALTON_FEISHU_APP_SECRET": old_secret,
+        }
+        rotated_pair = {
+            "DALTON_FEISHU_APP_ID": "cli_r4_rotated",
+            "DALTON_FEISHU_APP_SECRET": rotated_secret,
+        }
+        newest_pair = {
+            "DALTON_FEISHU_APP_ID": "cli_r4_newest",
+            "DALTON_FEISHU_APP_SECRET": newest_secret,
+        }
+        saved_pair = {
+            "DALTON_FEISHU_APP_ID": "cli_r4_saved",
+            "DALTON_FEISHU_APP_SECRET": saved_secret,
+        }
+        orig_query = snap_mod.query_feishu_vault_pair_strict
+
+        with caplog.at_level(logging.DEBUG):
+            # Case A: Snapshot advances during both query 1 and query 2 (rotation on 2nd query);
+            # query 3 (2nd re-query) succeeds against the rotated snapshot.
+            set_active_snapshot(build_snapshot(10, {}))
+            calls_a = 0
+
+            async def _query_rotates_during_second():
+                nonlocal calls_a
+                calls_a += 1
+                if calls_a == 1:
+                    set_active_snapshot(build_snapshot(11, {}, feishu_vault_pair=old_pair))
+                    return old_pair, False, None
+                if calls_a == 2:
+                    set_active_snapshot(build_snapshot(12, {}, feishu_vault_pair=rotated_pair))
+                    return old_pair, False, None
+                return rotated_pair, False, None
+
+            monkeypatch.setattr(
+                snap_mod,
+                "query_feishu_vault_pair_strict",
+                create_autospec(
+                    orig_query,
+                    side_effect=_query_rotates_during_second,
+                ),
+            )
+            res_a = await resolve_credential_group(group_name="feishu_app")
+            assert calls_a == 3
+            assert res_a.source == "vault_readonly"
+            assert res_a.ready is True
+            assert res_a.revision == 12
+            assert dict(res_a.values) == rotated_pair
+
+            # Case B: Snapshot keeps advancing across all 3 queries (initial + 2 re-queries);
+            # slot write is rejected and result + revision come strictly from the current snapshot.
+            set_active_snapshot(build_snapshot(20, {}))
+            calls_b = 0
+
+            async def _query_always_stale_vs_current():
+                nonlocal calls_b
+                calls_b += 1
+                if calls_b == 1:
+                    set_active_snapshot(build_snapshot(21, {}, feishu_vault_pair=old_pair))
+                elif calls_b == 2:
+                    set_active_snapshot(build_snapshot(22, {}, feishu_vault_pair=rotated_pair))
+                else:
+                    set_active_snapshot(build_snapshot(23, {}, feishu_vault_pair=newest_pair))
+                return old_pair, False, None
+
+            monkeypatch.setattr(
+                snap_mod,
+                "query_feishu_vault_pair_strict",
+                create_autospec(
+                    orig_query,
+                    side_effect=_query_always_stale_vs_current,
+                ),
+            )
+            res_b = await resolve_credential_group(group_name="feishu_app")
+            assert calls_b == 3
+            assert res_b.source == "vault_readonly"
+            assert res_b.ready is True
+            assert res_b.revision == 23
+            assert dict(res_b.values) == newest_pair
+            assert get_active_snapshot().revision == 23
+            assert dict(get_active_snapshot().feishu_vault_pair or {}) == newest_pair
+
+            # Case C: Source switches to saved during the final allowed re-query;
+            # result + revision come strictly from the current saved snapshot.
+            set_active_snapshot(build_snapshot(30, {}))
+            calls_c = 0
+
+            async def _query_switches_to_saved_on_final():
+                nonlocal calls_c
+                calls_c += 1
+                if calls_c == 1:
+                    set_active_snapshot(build_snapshot(31, {}, feishu_vault_pair=old_pair))
+                elif calls_c == 2:
+                    set_active_snapshot(build_snapshot(32, {}, feishu_vault_pair=rotated_pair))
+                else:
+                    set_active_snapshot(build_snapshot(33, saved_pair))
+                return old_pair, False, None
+
+            monkeypatch.setattr(
+                snap_mod,
+                "query_feishu_vault_pair_strict",
+                create_autospec(
+                    orig_query,
+                    side_effect=_query_switches_to_saved_on_final,
+                ),
+            )
+            res_c = await resolve_credential_group(group_name="feishu_app")
+            assert calls_c == 3
+            assert res_c.source == "saved"
+            assert res_c.ready is True
+            assert res_c.revision == 33
+            assert dict(res_c.values) == saved_pair
+
+        for secret in (old_secret, rotated_secret, newest_secret, saved_secret):
+            assert secret not in caplog.text
+
     def test_feishu_event_group_ready_with_at_least_one_valid_key_when_sibling_invalid(
         self,
     ) -> None:
