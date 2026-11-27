@@ -660,3 +660,5 @@ tests/unit/server/services/test_cos_archive_fence_batch3.py
 tests/unit/tools/secretary/test_cos_archive_batch3.py
 tests/integration/test_cos_archive_concurrency_db.py
 web/src/pages/ChatAgent/components/__tests__/ArchiveConfirmation.test.tsx
+# workspace-file-storage (Batch 1 Step 2): frontend download-ticket unit test.
+web/src/pages/ChatAgent/utils/api/__tests__/files.dlToken.test.ts

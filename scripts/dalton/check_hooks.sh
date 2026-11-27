@@ -564,6 +564,9 @@ ALLOWED_HOOKS=(
   "company-system-blob-key"
   "backfill-readback-verify"
   "workspace-file-streaming"
+  "workspace-file-write-mode"
+  "workspace-file-exclusions"
+  "workspace-file-download-ticket"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

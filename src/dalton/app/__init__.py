@@ -12,6 +12,9 @@ from src.dalton.app.oauth_native import router as _oauth_native_router
 from src.dalton.app.router import router as _dalton_api_router
 from src.dalton.app.transcriptions import router as _transcriptions_router
 from src.dalton.app.watchlist import router as _watchlist_router
+from src.dalton.app.workspace_file_download import (
+    router as _workspace_file_download_router,
+)
 from src.dalton.auth.local_router import register_local_auth_routers
 # DALTON-HOOK(monitors): mount monitor panel endpoints under /api/v1/dalton/monitors
 from src.dalton.monitors.router import router as _monitors_router
@@ -28,6 +31,7 @@ dalton_router.include_router(_transcriptions_router)
 if is_core_profile():
     dalton_router.include_router(_chat_uploads_sandbox_relay_router)
 dalton_router.include_router(_chat_uploads_router)
+dalton_router.include_router(_workspace_file_download_router)
 # DALTON-HOOK(monitors): include monitor panel router on dalton_router
 dalton_router.include_router(_monitors_router)
 register_local_auth_routers(dalton_router)

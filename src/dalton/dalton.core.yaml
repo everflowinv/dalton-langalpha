@@ -63,3 +63,9 @@ conversations:
 
 internal_llm:
   allowed_models: []
+
+workspace_files:
+  write_inline_only: false
+  exclude_dir_names: []
+  exclude_rel_dirs: []
+  exclude_rel_globs: []

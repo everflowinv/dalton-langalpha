@@ -320,6 +320,15 @@ class _Exclusions:
         self.tails = tuple(t.strip("/") for t in (spec.get("exclude_tails") or ()))
         self.name_patterns = tuple(spec.get("exclude_name_patterns") or ())
         self.same_as = _identities(spec.get("exclude_same_as") or ())
+        # DALTON-HOOK(workspace-file-exclusions): non-empty globs prune mirrored rows on next sync (§4)
+        self.rel_globs = tuple(p.strip("/") for p in (spec.get("exclude_rel_globs") or ()) if p and p.strip("/"))
+
+    def _left_out_by_glob(self, rel: str, *, is_dir: bool = False) -> bool:
+        if not self.rel_globs:
+            return False
+        if ".git" in rel.split("/") or rel == "work/uploads" or rel.startswith("work/uploads/") or (is_dir and rel == "work"):
+            return False
+        return any(fnmatch.fnmatchcase(rel, pat) for pat in self.rel_globs)
 
     def _left_out_by_copy(self, child: Any, rel: str) -> bool:
         full = self.tail_base + rel
@@ -370,6 +379,7 @@ class _Exclusions:
                 or rel in self.rel_files
                 or rel in self.rel_dirs
                 or rel.startswith(self.rel_dir_prefixes)
+                or self._left_out_by_glob(rel)  # DALTON-HOOK(workspace-file-exclusions)
             )
             return None if left_out else "symlink"
         if child.is_dir(follow_symlinks=False):
@@ -377,10 +387,11 @@ class _Exclusions:
                 name in self.dir_names
                 or rel in self.rel_dirs
                 or rel.startswith(self.rel_dir_prefixes)
+                or self._left_out_by_glob(rel, is_dir=True)  # DALTON-HOOK(workspace-file-exclusions)
             )
             return None if left_out else "dir"
         if child.is_file(follow_symlinks=False):
-            left_out = name in self.basenames or rel in self.rel_files or name.endswith(self.suffixes)
+            left_out = name in self.basenames or rel in self.rel_files or name.endswith(self.suffixes) or self._left_out_by_glob(rel)  # DALTON-HOOK(workspace-file-exclusions)
             return None if left_out else "file"
         # Sockets, fifos and devices are not files a backup can carry.
         return None

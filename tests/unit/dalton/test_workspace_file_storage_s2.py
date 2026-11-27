@@ -1,0 +1,1628 @@
+"""Unit tests for Batch 1 Step 2: storage_config, write-inline-only & upload fallback,
+startup reference gate, 60s download ticket, MinIO bucket rules, and exclude_rel_globs.
+
+All storage facade and database doubles use ``create_autospec``; S3/DB/sandbox test
+fakes use explicit classes with concrete method signatures (no ``Mock(**kwargs)``).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
+from unittest.mock import create_autospec, patch
+
+import pytest
+import yaml
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.testclient import TestClient
+
+from ptc_agent.core.paths import SandboxLayout
+from ptc_agent.core.sandbox import wsfiles_transfer_runtime as transfer_rt
+from src.dalton import (
+    download_ticket,
+    storage_bucket_rules,
+    storage_config,
+    storage_refs,
+)
+from src.dalton.app import workspace_file_download
+from src.dalton.auth import bootstrap as auth_bootstrap
+from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID
+from src.dalton.profile import DaltonStartupConfigError
+from src.dalton.settings import (
+    DALTON_CORE_YAML_PATH,
+    DALTON_YAML_PATH,
+    DaltonConfig,
+    _load_profile_dalton_raw,
+)
+from src.server.app.workspace_files import crud as ws_crud
+from src.server.database import workspace_file as wf_db
+from src.server.services import workspace_file_containment as containment
+from src.server.services.persistence import backup, blobs, download_link, restore, transfer
+from src.server.services.persistence.sync_result import UnsavedFile
+from src.server.services.persistence.transfer import PACK_CUTOFF, ScanEntry, ScanResult
+from tests.unit.server.services._no_db import NoDbConn
+
+
+# ---------------------------------------------------------------------------
+# Helpers & explicit fakes (no Mock(**kwargs))
+# ---------------------------------------------------------------------------
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _entry(
+    path: str,
+    data: bytes,
+    *,
+    mode: int = 0o644,
+    mtime_ns: int = 1_700_000_000_000_000_000,
+    is_binary: bool = False,
+) -> ScanEntry:
+    return ScanEntry(
+        path=path,
+        kind="file",
+        size=len(data),
+        mtime_ns=mtime_ns,
+        mode=mode,
+        sha256=_sha(data),
+        symlink_target=None,
+        is_binary=is_binary,
+    )
+
+
+def _scan(*entries: ScanEntry) -> ScanResult:
+    return ScanResult(
+        entries=list(entries),
+        oversized=[],
+        errors=[],
+        hashed=len(entries),
+        reused=0,
+    )
+
+
+class _FakeSandboxConfig:
+    def __init__(self, provider: str = "docker") -> None:
+        self.sandbox = type("_Sb", (), {"provider": provider})()
+
+
+class _FakeSandbox:
+    """Explicit sandbox double for sync/restore tests."""
+
+    def __init__(
+        self,
+        files: dict[str, bytes],
+        *,
+        working_dir: str = "/workspace",
+        dir_name: str = "ws-s2",
+        provider: str = "docker",
+    ) -> None:
+        self.working_dir = working_dir
+        self.recreatable = True
+        self._dir_name = dir_name
+        self._prefix = f"{working_dir}/{dir_name}/"
+        self.config = _FakeSandboxConfig(provider=provider)
+        self.files: dict[str, bytes] = dict(files)
+        self.uploaded_staged: dict[str, bytes] = {}
+        self.restored_files: dict[str, bytes] = {}
+
+    async def adownload_file_bytes(self, abs_path: str) -> bytes | None:
+        if abs_path.startswith(self._prefix):
+            rel = abs_path[len(self._prefix) :]
+        elif abs_path.startswith(f"{self.working_dir}/"):
+            rel = abs_path[len(self.working_dir) + 1 :]
+        else:
+            rel = abs_path
+        return self.files.get(rel)
+
+    async def aupload_file_bytes(self, abs_path: str, data: bytes) -> bool:
+        self.uploaded_staged[abs_path] = data
+        return True
+
+    async def acreate_directory(self, _path: str) -> bool:
+        return True
+
+    async def acreate_directories(self, _paths: list[str]) -> bool:
+        return True
+
+    async def _runtime_call(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        return None
+
+
+class _FakeClientError(Exception):
+    def __init__(self, code: str, message: str = "") -> None:
+        super().__init__(message or code)
+        self.response = {"Error": {"Code": code, "Message": message or code}}
+
+
+class _FakeS3Client:
+    """Explicit S3 client double with concrete method signatures."""
+
+    def __init__(
+        self,
+        *,
+        buckets: set[str] | None = None,
+        versioning: dict[str, str] | None = None,
+        lifecycle: dict[str, list[dict[str, Any]]] | None = None,
+        policy: dict[str, str] | None = None,
+        corrupt_readback: str | None = None,
+    ) -> None:
+        self.buckets: set[str] = set(buckets or {"dalton-main", "dalton-asr"})
+        self.versioning: dict[str, str] = dict(versioning or {})
+        self.lifecycle: dict[str, list[dict[str, Any]]] = {
+            k: list(v) for k, v in (lifecycle or {}).items()
+        }
+        self.policy: dict[str, str] = dict(policy or {})
+        self.corrupt_readback = corrupt_readback
+
+    def head_bucket(self, *, Bucket: str) -> dict[str, Any]:
+        if Bucket not in self.buckets:
+            raise _FakeClientError("404", f"Missing bucket {Bucket}")
+        return {}
+
+    def get_bucket_policy(self, *, Bucket: str) -> dict[str, Any]:
+        if self.corrupt_readback == "policy":
+            return {"Policy": json.dumps({"Version": "2012-10-17", "Statement": []})}
+        if Bucket not in self.policy:
+            raise _FakeClientError("NoSuchBucketPolicy")
+        return {"Policy": self.policy[Bucket]}
+
+    def put_bucket_policy(self, *, Bucket: str, Policy: str) -> dict[str, Any]:
+        self.policy[Bucket] = Policy
+        return {}
+
+    def delete_bucket_policy(self, *, Bucket: str) -> dict[str, Any]:
+        if Bucket not in self.policy:
+            raise _FakeClientError("NoSuchBucketPolicy")
+        del self.policy[Bucket]
+        return {}
+
+    def get_bucket_versioning(self, *, Bucket: str) -> dict[str, Any]:
+        if self.corrupt_readback == "versioning":
+            return {"Status": "Suspended"}
+        status = self.versioning.get(Bucket)
+        return {"Status": status} if status is not None else {}
+
+    def put_bucket_versioning(
+        self, *, Bucket: str, VersioningConfiguration: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.versioning[Bucket] = str(VersioningConfiguration.get("Status") or "")
+        return {}
+
+    def get_bucket_lifecycle_configuration(self, *, Bucket: str) -> dict[str, Any]:
+        if self.corrupt_readback == "lifecycle":
+            return {"Rules": []}
+        if Bucket not in self.lifecycle:
+            raise _FakeClientError("NoSuchLifecycleConfiguration")
+        return {"Rules": list(self.lifecycle[Bucket])}
+
+    def put_bucket_lifecycle_configuration(
+        self, *, Bucket: str, LifecycleConfiguration: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.lifecycle[Bucket] = list(LifecycleConfiguration.get("Rules") or [])
+        return {}
+
+
+class _FakeProbeCursor:
+    def __init__(self, handler: Any) -> None:
+        self._handler = handler
+        self._result: Any = None
+
+    async def __aenter__(self) -> _FakeProbeCursor:
+        return self
+
+    async def __aexit__(self, *args: Any) -> bool:
+        return False
+
+    async def execute(self, sql: str, params: Any = None) -> None:
+        self._result = self._handler(sql, params)
+
+    async def fetchone(self) -> Any:
+        return self._result
+
+
+class _FakeProbeConn:
+    def __init__(self, handler: Any) -> None:
+        self._handler = handler
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield
+
+    def cursor(self) -> _FakeProbeCursor:
+        return _FakeProbeCursor(self._handler)
+
+
+# ---------------------------------------------------------------------------
+# 1. storage_config.py tests
+# ---------------------------------------------------------------------------
+
+
+class TestStorageConfig:
+    def test_bucket_resolution_matrix_storage_vs_s3_bucket(self) -> None:
+        # STORAGE_BUCKET_NAME unset
+        assert storage_config.resolve_storage_bucket("s3", env={}) == ""
+        assert (
+            storage_config.resolve_storage_bucket("s3", env={"S3_BUCKET_NAME": "legacy-b"})
+            == "legacy-b"
+        )
+        # STORAGE_BUCKET_NAME explicit empty string disables without falling back to S3_BUCKET_NAME
+        assert (
+            storage_config.resolve_storage_bucket(
+                "s3", env={"STORAGE_BUCKET_NAME": "", "S3_BUCKET_NAME": "legacy-b"}
+            )
+            == ""
+        )
+        assert (
+            storage_config.resolve_storage_bucket(
+                "s3", env={"STORAGE_BUCKET_NAME": "   ", "S3_BUCKET_NAME": "legacy-b"}
+            )
+            == ""
+        )
+        # STORAGE_BUCKET_NAME non-empty wins over S3_BUCKET_NAME
+        assert (
+            storage_config.resolve_storage_bucket(
+                "s3",
+                env={"STORAGE_BUCKET_NAME": "dalton-main", "S3_BUCKET_NAME": "legacy-b"},
+            )
+            == "dalton-main"
+        )
+        # OSS reads OSS_BUCKET_NAME
+        assert (
+            storage_config.resolve_storage_bucket("oss", env={"OSS_BUCKET_NAME": "oss-b"})
+            == "oss-b"
+        )
+
+    def test_endpoint_resolution_falls_back_to_s3_endpoint(self) -> None:
+        assert storage_config.resolve_storage_endpoint_url(env={}) == ""
+        assert (
+            storage_config.resolve_storage_endpoint_url(
+                env={"S3_ENDPOINT_URL": "http://127.0.0.1:9000"}
+            )
+            == "http://127.0.0.1:9000"
+        )
+        assert (
+            storage_config.resolve_storage_endpoint_url(
+                env={
+                    "STORAGE_ENDPOINT_URL": "  ",
+                    "S3_ENDPOINT_URL": "http://127.0.0.1:9000",
+                }
+            )
+            == "http://127.0.0.1:9000"
+        )
+        assert (
+            storage_config.resolve_storage_endpoint_url(
+                env={
+                    "STORAGE_ENDPOINT_URL": "http://minio:9000",
+                    "S3_ENDPOINT_URL": "http://127.0.0.1:9000",
+                }
+            )
+            == "http://minio:9000"
+        )
+
+    def test_env_provider_none_overrides_yaml_s3(self) -> None:
+        yaml_s3 = {"storage": {"provider": "s3"}}
+        assert (
+            storage_config.resolve_storage_provider(
+                env={"STORAGE_PROVIDER": "none"}, agent_config=yaml_s3
+            )
+            == "none"
+        )
+        assert (
+            storage_config.resolve_storage_provider(
+                env={"STORAGE_PROVIDER": "  NONE "}, agent_config=yaml_s3
+            )
+            == "none"
+        )
+        # Empty yaml provider delegates to env
+        assert (
+            storage_config.resolve_storage_provider(
+                env={"STORAGE_PROVIDER": "s3"}, agent_config={"storage": {"provider": ""}}
+            )
+            == "s3"
+        )
+        # Everflow existing config: yaml s3 + no bucket -> disabled
+        resolved = storage_config.resolve(env={}, agent_config=yaml_s3)
+        assert resolved.is_storage_enabled is False
+        assert resolved.provider == "none"
+
+    @pytest.mark.parametrize("bad_provider", ["oss", "r2"])
+    def test_core_profile_rejects_non_s3_providers_everflow_allows(
+        self, bad_provider: str
+    ) -> None:
+        core_env = {"DALTON_PROFILE": "core", "STORAGE_PROVIDER": bad_provider}
+        with pytest.raises(DaltonStartupConfigError) as exc_info:
+            storage_config.validate_core_storage_provider(
+                env=core_env, agent_config={"storage": {"provider": ""}}
+            )
+        assert storage_config.CORE_STORAGE_PROVIDER_ERROR in str(exc_info.value)
+
+        # Also rejected if set via yaml in core profile
+        with pytest.raises(DaltonStartupConfigError) as exc_yaml:
+            storage_config.validate_core_storage_provider(
+                env={"DALTON_PROFILE": "core"},
+                agent_config={"storage": {"provider": bad_provider}},
+            )
+        assert storage_config.CORE_STORAGE_PROVIDER_ERROR in str(exc_yaml.value)
+
+        # Core allows s3 and none
+        storage_config.validate_core_storage_provider(
+            env={"DALTON_PROFILE": "core", "STORAGE_PROVIDER": "s3"},
+            agent_config={"storage": {"provider": ""}},
+        )
+        storage_config.validate_core_storage_provider(
+            env={"DALTON_PROFILE": "core", "STORAGE_PROVIDER": "none"},
+            agent_config={"storage": {"provider": "s3"}},
+        )
+
+        # Everflow does NOT restrict oss / r2
+        storage_config.validate_core_storage_provider(
+            env={"STORAGE_PROVIDER": bad_provider},
+            agent_config={"storage": {"provider": bad_provider}},
+        )
+
+    def test_core_defaults_off_by_default_and_opt_in(self) -> None:
+        core_env = {"DALTON_PROFILE": "core"}
+        yaml_s3 = {"storage": {"provider": "s3"}}
+        cfg_default = storage_config.resolve(env=core_env, agent_config=yaml_s3)
+        assert cfg_default.is_storage_enabled is False
+        assert cfg_default.bucket_name == ""
+        assert cfg_default.endpoint_url == ""
+
+        cfg_with_defaults = storage_config.resolve(
+            env=core_env, agent_config=yaml_s3, apply_core_defaults=True
+        )
+        assert cfg_with_defaults.is_storage_enabled is True
+        assert cfg_with_defaults.bucket_name == "dalton-storage"
+        assert cfg_with_defaults.endpoint_url == "http://minio:9000"
+
+        # Explicit empty STORAGE_BUCKET_NAME="" disables even when apply_core_defaults=True
+        cfg_explicit_off = storage_config.resolve(
+            env={"DALTON_PROFILE": "core", "STORAGE_BUCKET_NAME": ""},
+            agent_config=yaml_s3,
+            apply_core_defaults=True,
+        )
+        assert cfg_explicit_off.is_storage_enabled is False
+        assert cfg_explicit_off.bucket_name == ""
+
+    def test_show_cli_prints_json_with_no_secrets(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        sentinels = {
+            "STORAGE_ACCESS_KEY_ID": "AKIA-SENTINEL-ACCESS-111",
+            "STORAGE_SECRET_ACCESS_KEY": "SECRET-SENTINEL-KEY-222",
+            "AWS_SECRET_ACCESS_KEY": "AWS-SENTINEL-KEY-333",
+            "MINIO_ROOT_PASSWORD": "MINIO-SENTINEL-PASS-444",
+            "JWT_SIGNING_SECRET": "JWT-SENTINEL-SECRET-555",
+            "INTERNAL_SERVICE_TOKEN": "INTERNAL-SENTINEL-666",
+        }
+        for k, v in sentinels.items():
+            monkeypatch.setenv(k, v)
+        monkeypatch.setenv("STORAGE_BUCKET_NAME", "dalton-main")
+        monkeypatch.setenv("STORAGE_ENDPOINT_URL", "http://minio:9000")
+
+        rc = storage_config.main(["show"])
+        assert rc == 0
+        out = capsys.readouterr().out.strip()
+        parsed = json.loads(out)
+        assert set(parsed.keys()) == {
+            "is_storage_enabled",
+            "provider",
+            "bucket_name",
+            "endpoint_url",
+            "write_inline_only",
+            "exclude_rel_globs",
+        }
+        assert parsed["is_storage_enabled"] is True
+        assert parsed["bucket_name"] == "dalton-main"
+        for secret_val in sentinels.values():
+            assert secret_val not in out
+
+
+# ---------------------------------------------------------------------------
+# 2. Write-inline-only switch tests
+# ---------------------------------------------------------------------------
+
+
+class TestWriteInlineOnlySwitch:
+    @pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "on", " Yes "])
+    def test_env_truthy_values(self, raw: str) -> None:
+        assert storage_config.is_wsfiles_write_inline_only(
+            env={"DALTON_WSFILES_WRITE_INLINE_ONLY": raw}
+        ) is True
+
+    @pytest.mark.parametrize("raw", ["0", "false", "FALSE", "no", "off", " No "])
+    def test_env_falsy_values(self, raw: str) -> None:
+        assert storage_config.is_wsfiles_write_inline_only(
+            env={"DALTON_WSFILES_WRITE_INLINE_ONLY": raw}
+        ) is False
+
+    def test_invalid_env_logs_warning_and_returns_false(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="src.dalton.storage_config"):
+            val = storage_config.is_wsfiles_write_inline_only(
+                env={"DALTON_WSFILES_WRITE_INLINE_ONLY": "maybe"}
+            )
+        assert val is False
+        assert any("DALTON_WSFILES_WRITE_INLINE_ONLY" in rec.message for rec in caplog.records)
+
+    def test_yaml_fallback_and_live_re_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("DALTON_WSFILES_WRITE_INLINE_ONLY", raising=False)
+        assert storage_config.is_wsfiles_write_inline_only() is False
+
+        with patch.object(
+            storage_config,
+            "_load_dalton_workspace_files_raw",
+            return_value={"write_inline_only": True},
+        ):
+            assert storage_config.is_wsfiles_write_inline_only() is True
+            monkeypatch.setenv("DALTON_WSFILES_WRITE_INLINE_ONLY", "0")
+            assert storage_config.is_wsfiles_write_inline_only() is False
+            monkeypatch.setenv("DALTON_WSFILES_WRITE_INLINE_ONLY", "1")
+            assert storage_config.is_wsfiles_write_inline_only() is True
+
+
+# ---------------------------------------------------------------------------
+# 3. Write routing + cold restore (§7 Acceptance 3 ②) + Upload fallback
+# ---------------------------------------------------------------------------
+
+
+class TestWriteRoutingAndFallback:
+    WS = "ws-s2-routing"
+    USER = "user-s2"
+    ROOT = "/workspace"
+    DIR_NAME = "ws-s2"
+    LAYOUT = SandboxLayout.for_root(ROOT).for_workspace(DIR_NAME)
+    CLOCK = datetime(2026, 11, 27, 12, 0, 0, tzinfo=timezone.utc)
+
+    @asynccontextmanager
+    async def _fake_lock(self, _ws: str, *, conn: Any = None):
+        yield NoDbConn()
+
+    @pytest.mark.asyncio
+    async def test_write_inline_only_routing_and_packed_member_transition(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Switch ON: 10 MiB & <=256 KiB non-git -> inline; 150 MiB & .git -> object storage;
+        unchanged packed member stays packed, changed packed member moves inline clearing pack pointers.
+        """
+        small_unchanged = b"unchanged-small"
+        small_changed_old = b"old-small"
+        small_changed_new = b"new-small-content"
+        git_head = b"ref: refs/heads/main\n"
+        ten_mib = b"\x00\xff" + b"A" * ((10 << 20) - 2)
+        one_fifty_mib = b"\x00\xff" + b"B" * ((150 << 20) - 2)
+
+        old_chunk = _sha(small_unchanged + small_changed_old + git_head)
+        existing = {
+            "unchanged.txt": {
+                "kind": "file",
+                "file_size": len(small_unchanged),
+                "content_hash": _sha(small_unchanged),
+                "mtime_ns": 1_700_000_000_000_000_000,
+                "permissions": "0644",
+                "pack_sha256": old_chunk,
+                "pack_offset": 0,
+                "blob_sha256": None,
+                "is_binary": False,
+            },
+            "changed.txt": {
+                "kind": "file",
+                "file_size": len(small_changed_old),
+                "content_hash": _sha(small_changed_old),
+                "mtime_ns": 1_700_000_000_000_000_000,
+                "permissions": "0644",
+                "pack_sha256": old_chunk,
+                "pack_offset": len(small_unchanged),
+                "blob_sha256": None,
+                "is_binary": False,
+            },
+            ".git/HEAD": {
+                "kind": "file",
+                "file_size": len(git_head),
+                "content_hash": _sha(git_head),
+                "mtime_ns": 1_700_000_000_000_000_000,
+                "permissions": "0644",
+                "pack_sha256": old_chunk,
+                "pack_offset": len(small_unchanged) + len(small_changed_old),
+                "blob_sha256": None,
+                "is_binary": False,
+            },
+        }
+        sandbox_files = {
+            "unchanged.txt": small_unchanged,
+            "changed.txt": small_changed_new,
+            ".git/HEAD": git_head,
+            "ten.bin": ten_mib,
+            "huge.bin": one_fifty_mib,
+        }
+        sandbox = _FakeSandbox(sandbox_files, working_dir=self.ROOT, dir_name=self.DIR_NAME)
+        scan_result = _scan(
+            _entry("unchanged.txt", small_unchanged),
+            _entry("changed.txt", small_changed_new),
+            _entry(".git/HEAD", git_head),
+            _entry("ten.bin", ten_mib, is_binary=True),
+            _entry("huge.bin", one_fifty_mib, is_binary=True),
+        )
+
+        stored_rows: dict[str, dict[str, Any]] = {}
+        stored_blobs: dict[str, bytes] = {}
+
+        async def _fake_upsert(_ws: str, rows: list[dict[str, Any]], *, conn: Any = None) -> int:
+            for r in rows:
+                stored_rows[r["file_path"]] = dict(r)
+            return len(rows)
+
+        async def _fake_store_blob(_uid: str, sha: str, content: bytes) -> None:
+            stored_blobs[sha] = content
+
+        async def _fake_pack_direct(
+            _sb: Any, members: list[dict[str, Any]], *, layout: Any, release: list[str] | None = None
+        ) -> dict[str, Any]:
+            # Only .git/HEAD should reach pack_direct
+            payload = b"".join(sandbox_files[m["path"]] for m in members)
+            chunk_sha = _sha(payload)
+            chunk_path = f"_internal/packs/chunk-{chunk_sha}"
+            sandbox.files[chunk_path] = payload
+            out_members = []
+            offset = 0
+            for m in members:
+                raw = sandbox_files[m["path"]]
+                out_members.append(
+                    {"path": m["path"], "offset": offset, "size": len(raw), "sha256": m["sha256"]}
+                )
+                offset += len(raw)
+            return {
+                "chunks": [
+                    {
+                        "path": chunk_path,
+                        "sha256": chunk_sha,
+                        "size": len(payload),
+                        "members": out_members,
+                    }
+                ],
+                "changed": [],
+            }
+
+        monkeypatch.setenv("DALTON_WSFILES_WRITE_INLINE_ONLY", "1")
+        with (
+            patch("src.utils.storage.BLOB_TRANSFER_MODE", "relay"),
+            patch("src.utils.storage.STORAGE_PROVIDER", "s3"),
+            patch.object(backup, "workspace_sync_lock", self._fake_lock),
+            patch.object(backup, "manifest_clock", create_autospec(backup.manifest_clock, return_value=self.CLOCK)),
+            patch.object(backup, "get_file_metadata_for_sync", create_autospec(backup.get_file_metadata_for_sync, return_value=existing)),
+            patch.object(backup, "files_restore_incomplete", create_autospec(backup.files_restore_incomplete, return_value=False)),
+            patch.object(backup, "delete_removed_files", create_autospec(backup.delete_removed_files, return_value=0)),
+            patch.object(backup, "get_workspace_total_size", create_autospec(backup.get_workspace_total_size, return_value=0)),
+            patch.object(backup, "bulk_upsert_files", create_autospec(wf_db.bulk_upsert_files, side_effect=_fake_upsert)),
+            patch.object(blobs, "bulk_upsert_files", create_autospec(wf_db.bulk_upsert_files, side_effect=_fake_upsert)),
+            patch.object(backup, "bulk_update_file_stamps", create_autospec(backup.bulk_update_file_stamps, return_value=None)),
+            patch.object(backup, "is_storage_enabled", return_value=True),
+            patch.object(backup, "workspace_owner", create_autospec(backup.workspace_owner, return_value=self.USER)),
+            patch.object(blobs, "registered_blobs", create_autospec(blobs.registered_blobs, return_value=set())),
+            patch.object(blobs, "store_blob", create_autospec(blobs.store_blob, side_effect=_fake_store_blob)),
+            patch.object(blobs, "pack_direct", create_autospec(blobs.pack_direct, side_effect=_fake_pack_direct)) as mock_pack,
+            patch.object(blobs, "unlink_direct", create_autospec(blobs.unlink_direct, return_value=1)),
+            patch.object(backup, "scan_workspace", create_autospec(backup.scan_workspace, return_value=scan_result)),
+        ):
+            res = await backup.sync_to_db(self.WS, sandbox, layout=self.LAYOUT)
+
+        assert res.unsaved == []
+        # Unchanged packed member stays untouched (not overwritten in stored_rows)
+        assert "unchanged.txt" not in stored_rows
+        # Changed small non-git file moved inline and cleared pack pointers
+        assert stored_rows["changed.txt"]["content_text"] == small_changed_new.decode()
+        assert stored_rows["changed.txt"]["pack_sha256"] is None
+        assert stored_rows["changed.txt"]["pack_offset"] is None
+        assert stored_rows["changed.txt"]["blob_sha256"] is None
+        # 10 MiB non-git file written inline
+        assert stored_rows["ten.bin"]["content_binary"] == ten_mib
+        assert stored_rows["ten.bin"]["blob_sha256"] is None
+        assert stored_rows["ten.bin"]["pack_sha256"] is None
+        # 150 MiB file written to main bucket as blob pointer
+        assert stored_rows["huge.bin"]["blob_sha256"] == _sha(one_fifty_mib)
+        assert stored_rows["huge.bin"]["content_binary"] is None
+        assert _sha(one_fifty_mib) in stored_blobs
+        # .git/HEAD stayed in pack_members and packed to main bucket
+        assert stored_rows[".git/HEAD"]["pack_sha256"] is not None
+        assert stored_rows[".git/HEAD"]["content_text"] is None
+        packed_paths = [m["path"] for m in mock_pack.await_args.args[1]]
+        assert packed_paths == [".git/HEAD"]
+
+    @pytest.mark.asyncio
+    async def test_write_inline_only_off_keeps_existing_behavior(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        small_data = b"hello-pack"
+        ten_mib = b"Z" * (10 << 20)
+        sandbox_files = {"small.txt": small_data, "ten.bin": ten_mib}
+        sandbox = _FakeSandbox(sandbox_files, working_dir=self.ROOT, dir_name=self.DIR_NAME)
+        scan_result = _scan(
+            _entry("small.txt", small_data),
+            _entry("ten.bin", ten_mib, is_binary=True),
+        )
+        stored_rows: dict[str, dict[str, Any]] = {}
+        stored_blobs: dict[str, bytes] = {}
+
+        async def _fake_upsert(_ws: str, rows: list[dict[str, Any]], *, conn: Any = None) -> int:
+            for r in rows:
+                stored_rows[r["file_path"]] = dict(r)
+            return len(rows)
+
+        async def _fake_store_blob(_uid: str, sha: str, content: bytes) -> None:
+            stored_blobs[sha] = content
+
+        async def _fake_pack_direct(
+            _sb: Any, members: list[dict[str, Any]], *, layout: Any, release: list[str] | None = None
+        ) -> dict[str, Any]:
+            payload = b"".join(sandbox_files[m["path"]] for m in members)
+            csha = _sha(payload)
+            cpath = f"_internal/packs/chunk-{csha}"
+            sandbox.files[cpath] = payload
+            return {
+                "chunks": [
+                    {
+                        "path": cpath,
+                        "sha256": csha,
+                        "size": len(payload),
+                        "members": [
+                            {"path": m["path"], "offset": 0, "size": m["size"], "sha256": m["sha256"]}
+                            for m in members
+                        ],
+                    }
+                ],
+                "changed": [],
+            }
+
+        monkeypatch.setenv("DALTON_WSFILES_WRITE_INLINE_ONLY", "0")
+        with (
+            patch("src.utils.storage.BLOB_TRANSFER_MODE", "relay"),
+            patch("src.utils.storage.STORAGE_PROVIDER", "s3"),
+            patch.object(backup, "workspace_sync_lock", self._fake_lock),
+            patch.object(backup, "manifest_clock", create_autospec(backup.manifest_clock, return_value=self.CLOCK)),
+            patch.object(backup, "get_file_metadata_for_sync", create_autospec(backup.get_file_metadata_for_sync, return_value={})),
+            patch.object(backup, "files_restore_incomplete", create_autospec(backup.files_restore_incomplete, return_value=False)),
+            patch.object(backup, "delete_removed_files", create_autospec(backup.delete_removed_files, return_value=0)),
+            patch.object(backup, "get_workspace_total_size", create_autospec(backup.get_workspace_total_size, return_value=0)),
+            patch.object(backup, "bulk_upsert_files", create_autospec(wf_db.bulk_upsert_files, side_effect=_fake_upsert)),
+            patch.object(blobs, "bulk_upsert_files", create_autospec(wf_db.bulk_upsert_files, side_effect=_fake_upsert)),
+            patch.object(backup, "bulk_update_file_stamps", create_autospec(backup.bulk_update_file_stamps, return_value=None)),
+            patch.object(backup, "is_storage_enabled", return_value=True),
+            patch.object(backup, "workspace_owner", create_autospec(backup.workspace_owner, return_value=self.USER)),
+            patch.object(blobs, "registered_blobs", create_autospec(blobs.registered_blobs, return_value=set())),
+            patch.object(blobs, "store_blob", create_autospec(blobs.store_blob, side_effect=_fake_store_blob)),
+            patch.object(blobs, "pack_direct", create_autospec(blobs.pack_direct, side_effect=_fake_pack_direct)),
+            patch.object(blobs, "unlink_direct", create_autospec(blobs.unlink_direct, return_value=1)),
+            patch.object(backup, "scan_workspace", create_autospec(backup.scan_workspace, return_value=scan_result)),
+        ):
+            res = await backup.sync_to_db(self.WS, sandbox, layout=self.LAYOUT)
+
+        assert res.unsaved == []
+        assert stored_rows["small.txt"]["pack_sha256"] is not None
+        assert stored_rows["ten.bin"]["blob_sha256"] == _sha(ten_mib)
+        assert stored_rows["ten.bin"]["content_binary"] is None
+
+    @pytest.mark.asyncio
+    async def test_acceptance_3_2_rewrite_150m_and_10m_inline_only_then_cold_restore(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """§7 Acceptance 3 ②: with DALTON_WSFILES_WRITE_INLINE_ONLY=1, overwrite 150 MiB
+        and 10 MiB files, sync, then cold-restore: both restore with new contents,
+        150 MiB is a pointer row and 10 MiB is an inline row.
+        """
+        old_150_sha = _sha(b"old-150")
+        old_10_sha = _sha(b"old-10")
+        new_150 = b"\x00\xff\x02" + b"\x02" * ((150 << 20) - 3)
+        new_10 = b"\x00\xff\x03" + b"\x03" * ((10 << 20) - 3)
+
+        existing = {
+            "big150.bin": {
+                "kind": "file",
+                "file_size": 150 << 20,
+                "content_hash": old_150_sha,
+                "mtime_ns": 1_600_000_000_000_000_000,
+                "permissions": "0644",
+                "blob_sha256": old_150_sha,
+                "pack_sha256": None,
+                "pack_offset": None,
+                "is_binary": True,
+            },
+            "mid10.bin": {
+                "kind": "file",
+                "file_size": 10 << 20,
+                "content_hash": old_10_sha,
+                "mtime_ns": 1_600_000_000_000_000_000,
+                "permissions": "0644",
+                "blob_sha256": old_10_sha,
+                "pack_sha256": None,
+                "pack_offset": None,
+                "is_binary": True,
+            },
+        }
+        sandbox_files = {"big150.bin": new_150, "mid10.bin": new_10}
+        sync_sandbox = _FakeSandbox(sandbox_files, working_dir=self.ROOT, dir_name=self.DIR_NAME)
+        scan_result = _scan(
+            _entry("big150.bin", new_150, is_binary=True),
+            _entry("mid10.bin", new_10, is_binary=True),
+        )
+        manifest_rows: dict[str, dict[str, Any]] = {}
+        blob_store: dict[str, bytes] = {}
+
+        async def _fake_upsert(_ws: str, rows: list[dict[str, Any]], *, conn: Any = None) -> int:
+            for r in rows:
+                manifest_rows[r["file_path"]] = dict(r)
+            return len(rows)
+
+        async def _fake_store_blob(_uid: str, sha: str, content: bytes) -> None:
+            blob_store[sha] = content
+
+        monkeypatch.setenv("DALTON_WSFILES_WRITE_INLINE_ONLY", "1")
+        with (
+            patch("src.utils.storage.BLOB_TRANSFER_MODE", "relay"),
+            patch("src.utils.storage.STORAGE_PROVIDER", "s3"),
+            patch.object(backup, "workspace_sync_lock", self._fake_lock),
+            patch.object(backup, "manifest_clock", create_autospec(backup.manifest_clock, return_value=self.CLOCK)),
+            patch.object(backup, "get_file_metadata_for_sync", create_autospec(backup.get_file_metadata_for_sync, return_value=existing)),
+            patch.object(backup, "files_restore_incomplete", create_autospec(backup.files_restore_incomplete, return_value=False)),
+            patch.object(backup, "delete_removed_files", create_autospec(backup.delete_removed_files, return_value=0)),
+            patch.object(backup, "get_workspace_total_size", create_autospec(backup.get_workspace_total_size, return_value=0)),
+            patch.object(backup, "bulk_upsert_files", create_autospec(wf_db.bulk_upsert_files, side_effect=_fake_upsert)),
+            patch.object(blobs, "bulk_upsert_files", create_autospec(wf_db.bulk_upsert_files, side_effect=_fake_upsert)),
+            patch.object(backup, "bulk_update_file_stamps", create_autospec(backup.bulk_update_file_stamps, return_value=None)),
+            patch.object(backup, "is_storage_enabled", return_value=True),
+            patch.object(backup, "workspace_owner", create_autospec(backup.workspace_owner, return_value=self.USER)),
+            patch.object(blobs, "registered_blobs", create_autospec(blobs.registered_blobs, return_value=set())),
+            patch.object(blobs, "store_blob", create_autospec(blobs.store_blob, side_effect=_fake_store_blob)),
+            patch.object(backup, "scan_workspace", create_autospec(backup.scan_workspace, return_value=scan_result)),
+        ):
+            sync_res = await backup.sync_to_db(self.WS, sync_sandbox, layout=self.LAYOUT)
+
+        assert sync_res.unsaved == []
+        # Verify storage shapes: 150 MiB is pointer row, 10 MiB is inline row (pointers cleared)
+        assert manifest_rows["big150.bin"]["blob_sha256"] == _sha(new_150)
+        assert manifest_rows["big150.bin"]["content_binary"] is None
+        assert manifest_rows["mid10.bin"]["blob_sha256"] is None
+        assert manifest_rows["mid10.bin"]["pack_sha256"] is None
+        assert manifest_rows["mid10.bin"]["content_binary"] == new_10
+
+        # Cold restore into a brand new sandbox
+        restore_sandbox = _FakeSandbox({}, working_dir=self.ROOT, dir_name=self.DIR_NAME)
+
+        async def _fake_pull_direct(sb: _FakeSandbox, items: list[dict[str, Any]], **_kw: Any) -> dict[str, Any]:
+            out: dict[str, Any] = {}
+            for item in items:
+                staged_rel = item["file"]
+                staged_abs = f"{self.LAYOUT.workspace}/{staged_rel}"
+                sb.restored_files[item["path"]] = sb.uploaded_staged[staged_abs]
+                out[item["path"]] = {"status": "ok"}
+            return out
+
+        async def _fake_get_files(*_a: Any, **_kw: Any) -> list[dict[str, Any]]:
+            return [dict(v) for v in manifest_rows.values()]
+
+        async def _fake_fetch_blob(_uid: str, sha: str) -> bytes | None:
+            return blob_store.get(sha)
+
+        @asynccontextmanager
+        async def _noop_lock(*_a: Any, **_kw: Any):
+            yield NoDbConn()
+
+        from src.server.services.persistence import resolve as persist_resolve
+
+        with (
+            patch("src.utils.storage.BLOB_TRANSFER_MODE", "relay"),
+            patch("src.utils.storage.STORAGE_PROVIDER", "s3"),
+            patch.object(restore, "workspace_sync_lock", _noop_lock),
+            patch.object(restore, "hold_workspace_skill_sync", _noop_lock),
+            patch.object(restore, "set_files_restore_incomplete", create_autospec(restore.set_files_restore_incomplete, return_value=True)),
+            patch.object(restore, "workspace_owner", create_autospec(restore.workspace_owner, return_value=self.USER)),
+            patch.object(restore, "get_files_for_workspace", create_autospec(wf_db.get_files_for_workspace, side_effect=_fake_get_files)),
+            patch.object(restore, "pull_direct", create_autospec(restore.pull_direct, side_effect=_fake_pull_direct)),
+            patch.object(persist_resolve, "fetch_blob", create_autospec(persist_resolve.fetch_blob, side_effect=_fake_fetch_blob)),
+        ):
+            restored_res = await restore.restore_to_sandbox(
+                self.WS, restore_sandbox, layout=self.LAYOUT
+            )
+
+        assert restored_res == {"restored": 2, "errors": 0}
+        assert _sha(restore_sandbox.restored_files["big150.bin"]) == _sha(new_150)
+        assert len(restore_sandbox.restored_files["big150.bin"]) == 150 << 20
+        assert _sha(restore_sandbox.restored_files["mid10.bin"]) == _sha(new_10)
+        assert len(restore_sandbox.restored_files["mid10.bin"]) == 10 << 20
+
+    @pytest.mark.asyncio
+    async def test_upload_failure_bounded_64m_inline_fallback_and_git_hold(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Failed non-git <=100 MiB uploads fall back inline within 64 MiB budget with WARNING;
+        over-budget, >100 MiB, .git files, and reason=='changed' stay in unsaved and .git stays held.
+        """
+        ten_mib = b"F" * (10 << 20)
+        huge = b"H" * (110 << 20)
+        changed_data = b"C" * (1 << 20)
+        git_obj = b"G" * (PACK_CUTOFF + 10)
+        git_ok = b"K" * (PACK_CUTOFF + 20)
+        small_pack_fail = b"small-packed-fail"
+
+        sandbox_files = {
+            f"f{i}.bin": bytes([i]) + ten_mib[1:] for i in range(7)
+        }
+        sandbox_files["huge.bin"] = huge
+        sandbox_files["changed.bin"] = changed_data
+        sandbox_files[".git/objects/aa/fail"] = git_obj
+        sandbox_files[".git/objects/bb/ok"] = git_ok
+        sandbox_files["small.txt"] = small_pack_fail
+
+        sandbox = _FakeSandbox(sandbox_files, working_dir=self.ROOT, dir_name=self.DIR_NAME)
+        entries = [
+            _entry(f"f{i}.bin", sandbox_files[f"f{i}.bin"], is_binary=True)
+            for i in range(7)
+        ] + [
+            _entry("huge.bin", huge, is_binary=True),
+            _entry("changed.bin", changed_data, is_binary=True),
+            _entry(".git/objects/aa/fail", git_obj, is_binary=True),
+            _entry(".git/objects/bb/ok", git_ok, is_binary=True),
+            _entry("small.txt", small_pack_fail, is_binary=False),
+        ]
+        scan_result = _scan(*entries)
+
+        inline_upserted: dict[str, dict[str, Any]] = {}
+        final_rows_upserted: list[dict[str, Any]] = []
+
+        async def _fake_blobs_upsert(_ws: str, rows: list[dict[str, Any]], *, conn: Any = None) -> int:
+            for r in rows:
+                inline_upserted[r["file_path"]] = dict(r)
+            return len(rows)
+
+        async def _fake_backup_upsert(_ws: str, rows: list[dict[str, Any]], *, conn: Any = None) -> int:
+            final_rows_upserted.extend(rows)
+            return len(rows)
+
+        async def _fake_persist_blobs(
+            _uid: str, _ws: str, _sb: Any, blob_entries: list[ScanEntry], *, layout: Any
+        ) -> tuple[list[dict[str, Any]], list[UnsavedFile]]:
+            ok_rows = []
+            unsaved = []
+            for e in blob_entries:
+                if e.path == ".git/objects/bb/ok":
+                    ok_rows.append({"file_path": e.path, "blob_sha256": e.sha256})
+                elif e.path == "changed.bin":
+                    unsaved.append(UnsavedFile(e.path, "changed", e.size))
+                else:
+                    unsaved.append(UnsavedFile(e.path, "failed", e.size))
+            return ok_rows, unsaved
+
+        async def _fake_persist_packed(
+            _uid: str, _ws: str, _sb: Any, members: list[ScanEntry], _existing: Any, **_kw: Any
+        ) -> tuple[list[dict[str, Any]], list[UnsavedFile], int]:
+            return [], [UnsavedFile(m.path, "failed", m.size) for m in members], 0
+
+        monkeypatch.setenv("DALTON_WSFILES_WRITE_INLINE_ONLY", "0")
+        with (
+            caplog.at_level(logging.WARNING, logger="src.dalton.wsfiles_write_mode"),
+            patch("src.utils.storage.BLOB_TRANSFER_MODE", "relay"),
+            patch("src.utils.storage.STORAGE_PROVIDER", "s3"),
+            patch.object(backup, "workspace_sync_lock", self._fake_lock),
+            patch.object(backup, "manifest_clock", create_autospec(backup.manifest_clock, return_value=self.CLOCK)),
+            patch.object(backup, "get_file_metadata_for_sync", create_autospec(backup.get_file_metadata_for_sync, return_value={})),
+            patch.object(backup, "files_restore_incomplete", create_autospec(backup.files_restore_incomplete, return_value=False)),
+            patch.object(backup, "delete_removed_files", create_autospec(backup.delete_removed_files, return_value=0)),
+            patch.object(backup, "get_workspace_total_size", create_autospec(backup.get_workspace_total_size, return_value=0)),
+            patch.object(backup, "bulk_upsert_files", create_autospec(wf_db.bulk_upsert_files, side_effect=_fake_backup_upsert)),
+            patch.object(blobs, "bulk_upsert_files", create_autospec(wf_db.bulk_upsert_files, side_effect=_fake_blobs_upsert)),
+            patch.object(backup, "bulk_update_file_stamps", create_autospec(backup.bulk_update_file_stamps, return_value=None)),
+            patch.object(backup, "is_storage_enabled", return_value=True),
+            patch.object(backup, "workspace_owner", create_autospec(backup.workspace_owner, return_value=self.USER)),
+            patch.object(backup, "_persist_blobs", create_autospec(blobs._persist_blobs, side_effect=_fake_persist_blobs)),
+            patch.object(backup, "_persist_packed", create_autospec(blobs._persist_packed, side_effect=_fake_persist_packed)),
+            patch.object(backup, "scan_workspace", create_autospec(backup.scan_workspace, return_value=scan_result)),
+        ):
+            res = await backup.sync_to_db(self.WS, sandbox, layout=self.LAYOUT)
+
+        # First 6 x 10 MiB = 60 MiB + small.txt (17 B) <= 64 MiB fell back inline!
+        for i in range(6):
+            assert f"f{i}.bin" in inline_upserted
+        assert "small.txt" in inline_upserted
+        # 7th 10 MiB file would push total to 70 MiB > 64 MiB -> stays unsaved
+        assert "f6.bin" not in inline_upserted
+        # >100 MiB, changed, and .git never fall back inline
+        assert "huge.bin" not in inline_upserted
+        assert "changed.bin" not in inline_upserted
+        assert ".git/objects/aa/fail" not in inline_upserted
+
+        unsaved_map = {(u.path, u.reason) for u in res.unsaved}
+        assert ("f6.bin", "failed") in unsaved_map
+        assert ("huge.bin", "failed") in unsaved_map
+        assert ("changed.bin", "changed") in unsaved_map
+        assert (".git/objects/aa/fail", "failed") in unsaved_map
+        # hold_repos protected the git repo whole (dropped .git/objects/bb/ok from final_rows)
+        assert (".git", "history_held") in unsaved_map
+        assert all(r["file_path"] != ".git/objects/bb/ok" for r in final_rows_upserted)
+        # Succeeded fallback files are not in unsaved, not in final rows, and counted in synced
+        for i in range(6):
+            assert all(u.path != f"f{i}.bin" for u in res.unsaved)
+            assert all(r["file_path"] != f"f{i}.bin" for r in final_rows_upserted)
+        assert res.synced == 7  # 6 x 10 MiB + small.txt
+        # One WARNING per fallback file naming path, size, workspace
+        warn_msgs = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warn_msgs) == 7
+        assert any("f0.bin" in m and self.WS in m and str(len(ten_mib)) in m for m in warn_msgs)
+
+
+# ---------------------------------------------------------------------------
+# 4. Startup reference gate tests
+# ---------------------------------------------------------------------------
+
+
+class TestStartupReferenceGate:
+    @pytest.mark.asyncio
+    async def test_skips_probes_when_storage_enabled(self) -> None:
+        called = False
+
+        def _handler(_sql: str, _params: Any = None) -> Any:
+            nonlocal called
+            called = True
+            return (True,)
+
+        with patch.object(storage_refs, "is_storage_enabled", return_value=True):
+            outcomes = await storage_refs.enforce_storage_off_startup_gate(
+                conn=_FakeProbeConn(_handler)
+            )
+        assert outcomes == []
+        assert called is False
+
+    @pytest.mark.asyncio
+    async def test_passes_when_storage_off_and_no_references(self) -> None:
+        def _handler(sql: str, params: Any = None) -> Any:
+            if sql.startswith("SELECT set_config"):
+                return ("5s",)
+            if sql.startswith("SELECT to_regclass"):
+                return (params[0],)
+            return (False,)
+
+        with patch.object(storage_refs, "is_storage_enabled", return_value=False):
+            outcomes = await storage_refs.enforce_storage_off_startup_gate(
+                conn=_FakeProbeConn(_handler)
+            )
+        assert len(outcomes) == len(storage_refs.MAIN_BUCKET_CONSUMER_PROBES)
+        assert all(not o.has_references and o.error is None for o in outcomes)
+
+    @pytest.mark.asyncio
+    async def test_refuses_when_consumer_hits_and_allows_override_with_critical(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        def _handler(sql: str, params: Any = None) -> Any:
+            if sql.startswith("SELECT set_config"):
+                return ("5s",)
+            if sql.startswith("SELECT to_regclass"):
+                return (params[0],)
+            if "FROM workspace_files" in sql:
+                return (True,)
+            return (False,)
+
+        monkeypatch.delenv(storage_refs.ALLOW_UNMIGRATED_ENV, raising=False)
+        with patch.object(storage_refs, "is_storage_enabled", return_value=False):
+            with pytest.raises(DaltonStartupConfigError) as exc_info:
+                await storage_refs.enforce_storage_off_startup_gate(
+                    conn=_FakeProbeConn(_handler)
+                )
+        msg = str(exc_info.value)
+        assert storage_refs.STORAGE_OFF_GATE_ERROR_PREFIX in msg
+        assert "workspace_files" in msg
+        assert "重建后端容器" in msg
+
+        # Override env degrades refusal to CRITICAL log
+        monkeypatch.setenv(storage_refs.ALLOW_UNMIGRATED_ENV, "1")
+        with (
+            caplog.at_level(logging.CRITICAL),
+            patch.object(storage_refs, "is_storage_enabled", return_value=False),
+        ):
+            outcomes = await storage_refs.enforce_storage_off_startup_gate(
+                conn=_FakeProbeConn(_handler)
+            )
+        assert any(o.name == "workspace_files" and o.has_references for o in outcomes)
+        assert any(
+            r.levelno == logging.CRITICAL and "workspace_files" in r.message
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_table_skipped_and_query_error_refuses(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        def _missing_handler(sql: str, params: Any = None) -> Any:
+            if sql.startswith("SELECT set_config"):
+                return ("5s",)
+            if sql.startswith("SELECT to_regclass"):
+                return (None,) if params[0] == "public.drive_contents" else (params[0],)
+            return (False,)
+
+        with (
+            caplog.at_level(logging.INFO, logger="src.dalton.storage_refs"),
+            patch.object(storage_refs, "is_storage_enabled", return_value=False),
+        ):
+            outcomes = await storage_refs.enforce_storage_off_startup_gate(
+                conn=_FakeProbeConn(_missing_handler)
+            )
+        drive_out = next(o for o in outcomes if o.name == "drive_contents")
+        assert drive_out.skipped_missing_table is True
+        assert drive_out.error is None
+
+        # Query failure must refuse startup (fail-closed)
+        def _error_handler(sql: str, params: Any = None) -> Any:
+            if sql.startswith("SELECT set_config"):
+                return ("5s",)
+            if sql.startswith("SELECT to_regclass"):
+                return (params[0],)
+            if "FROM user_skills" in sql:
+                raise RuntimeError("statement timeout")
+            return (False,)
+
+        with patch.object(storage_refs, "is_storage_enabled", return_value=False):
+            with pytest.raises(DaltonStartupConfigError) as exc_err:
+                await storage_refs.enforce_storage_off_startup_gate(
+                    conn=_FakeProbeConn(_error_handler)
+                )
+        assert "user_skills" in str(exc_err.value)
+
+    @pytest.mark.asyncio
+    async def test_run_auth_db_startup_hook_calls_storage_checks(self) -> None:
+        mock_validate_provider = create_autospec(
+            storage_config.validate_core_storage_provider, return_value=None
+        )
+        mock_gate = create_autospec(
+            storage_refs.enforce_storage_off_startup_gate, return_value=[]
+        )
+        mock_validate_auth = create_autospec(
+            auth_bootstrap.validate_dalton_auth_config, return_value=None
+        )
+        with (
+            patch.object(storage_config, "validate_core_storage_provider", mock_validate_provider),
+            patch.object(storage_refs, "enforce_storage_off_startup_gate", mock_gate),
+            patch.object(auth_bootstrap, "validate_dalton_auth_config", mock_validate_auth),
+            patch.object(auth_bootstrap, "is_dalton_local_auth_enabled", return_value=False),
+            patch.object(auth_bootstrap, "get_dalton_auth_mode", return_value="oss"),
+        ):
+            res = await auth_bootstrap.run_auth_db_startup_hook("oss")
+
+        assert res is True
+        mock_validate_provider.assert_called_once()
+        mock_gate.assert_awaited_once()
+        mock_validate_auth.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# 5. Download ticket tests
+# ---------------------------------------------------------------------------
+
+
+class TestDownloadTicket:
+    def test_issue_verify_roundtrip_skew_and_uniform_401(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("JWT_SIGNING_SECRET", "s" * 40)
+        now = 1_700_000_000
+        tok = download_ticket.issue_download_ticket(
+            user_id="u-1",
+            workspace_id="ws-1",
+            path="reports/big.parquet",
+            backup_ok=True,
+            now=now,
+        )
+        assert tok is not None
+
+        # Reusable within 60s and within 5s clock skew boundary
+        claims1 = download_ticket.verify_download_ticket(tok, now=now + 30)
+        claims2 = download_ticket.verify_download_ticket(tok, now=now + 65)
+        assert claims1 == claims2
+        assert claims1.user_id == "u-1"
+        assert claims1.workspace_id == "ws-1"
+        assert claims1.path == "reports/big.parquet"
+        assert claims1.backup_ok is True
+
+        # Expired past 5s skew
+        bad_cases: list[tuple[str, int]] = [(tok, now + 66)]
+
+        # Tampered payload
+        p_b64, s_b64 = tok.split(".")
+        raw_payload = json.loads(download_ticket._b64url_decode(p_b64).decode())
+        tampered_payload = dict(raw_payload, uid="u-2")
+        bad_payload_b64 = download_ticket._b64url_encode(
+            json.dumps(tampered_payload, separators=(",", ":"), sort_keys=True).encode()
+        )
+        bad_cases.append((f"{bad_payload_b64}.{s_b64}", now + 1))
+
+        # Tampered signature
+        bad_sig = "A" * len(s_b64)
+        bad_cases.append((f"{p_b64}.{bad_sig}", now + 1))
+
+        # Properly signed wrong typ & missing field
+        key = download_ticket._derive_ticket_hmac_key()
+        assert key is not None
+        for mutated in (
+            {**raw_payload, "typ": "ws_ticket"},
+            {k: v for k, v in raw_payload.items() if k != "nonce"},
+        ):
+            pb = download_ticket._b64url_encode(
+                json.dumps(mutated, separators=(",", ":"), sort_keys=True).encode()
+            )
+            sb = download_ticket._b64url_encode(
+                download_ticket.hmac.new(key, pb.encode("ascii"), hashlib.sha256).digest()
+            )
+            bad_cases.append((f"{pb}.{sb}", now + 1))
+
+        details: set[str] = set()
+        for bad_tok, ts in bad_cases:
+            with pytest.raises(HTTPException) as exc:
+                download_ticket.verify_download_ticket(bad_tok, now=ts)
+            assert exc.value.status_code == 401
+            details.add(str(exc.value.detail))
+        assert details == {download_ticket.INVALID_DOWNLOAD_TICKET_DETAIL}
+
+    def test_no_secret_seeds_issues_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("JWT_SIGNING_SECRET", raising=False)
+        monkeypatch.delenv("INTERNAL_SERVICE_TOKEN", raising=False)
+        monkeypatch.delenv("DALTON_BRIDGE_ADMIN_TOKEN", raising=False)
+        assert (
+            download_ticket.issue_download_ticket(
+                user_id="u-1", workspace_id="ws-1", path="a.bin", backup_ok=True
+            )
+            is None
+        )
+
+    def test_redemption_route_delegates_and_rejects_company_and_suspended(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "internal-seed-12345")
+        monkeypatch.delenv("JWT_SIGNING_SECRET", raising=False)
+        app = FastAPI()
+        app.include_router(workspace_file_download.router)
+        client = TestClient(app)
+
+        mock_dl = create_autospec(
+            ws_crud.download_workspace_file,
+            return_value=Response(content=b"stream-ok", media_type="application/octet-stream"),
+        )
+        mock_admit = create_autospec(workspace_file_download.admit_caller, return_value=None)
+
+        tok = download_ticket.issue_download_ticket(
+            user_id="user-42",
+            workspace_id="ws-99",
+            path="dir/big.bin",
+            backup_ok=True,
+        )
+        assert tok is not None
+
+        with (
+            patch.object(ws_crud, "download_workspace_file", mock_dl),
+            patch.object(workspace_file_download, "admit_caller", mock_admit),
+        ):
+            resp = client.get("/api/v1/dalton/workspace-files/download", params={"dl_token": tok})
+
+        assert resp.status_code == 200
+        assert resp.content == b"stream-ok"
+        mock_dl.assert_awaited_once()
+        kw = mock_dl.await_args.kwargs
+        assert kw["workspace_id"] == "ws-99"
+        assert kw["x_user_id"] == "user-42"
+        assert kw["path"] == "dir/big.bin"
+        assert kw["attachment"] is True
+        assert kw["backup_ok"] is True
+
+        # Company system identity rejected
+        sys_tok = download_ticket.issue_download_ticket(
+            user_id=COMPANY_SYSTEM_USER_ID,
+            workspace_id="ws-99",
+            path="dir/big.bin",
+            backup_ok=False,
+        )
+        assert sys_tok is not None
+        mock_dl.reset_mock()
+        with patch.object(ws_crud, "download_workspace_file", mock_dl):
+            resp_sys = client.get(
+                "/api/v1/dalton/workspace-files/download", params={"dl_token": sys_tok}
+            )
+        assert resp_sys.status_code in (401, 403)
+        mock_dl.assert_not_awaited()
+
+        # Suspended account rejected by admit_caller (403)
+        suspended_admit = create_autospec(
+            workspace_file_download.admit_caller,
+            side_effect=HTTPException(status_code=403, detail="Account suspended"),
+        )
+        with (
+            patch.object(ws_crud, "download_workspace_file", mock_dl),
+            patch.object(workspace_file_download, "admit_caller", suspended_admit),
+        ):
+            resp_susp = client.get(
+                "/api/v1/dalton/workspace-files/download", params={"dl_token": tok}
+            )
+        assert resp_susp.status_code == 403
+        mock_dl.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_download_link_sign_skips_when_browser_endpoint_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_signed = create_autospec(
+            download_link.get_signed_url, return_value="https://browser.example.com/signed"
+        )
+        monkeypatch.setenv("STORAGE_BROWSER_ENDPOINT_URL", "")
+        with patch.object(download_link, "get_signed_url", mock_signed):
+            res_empty = await download_link._sign("u-1", "a" * 64, "big.bin")
+        assert res_empty is None
+        mock_signed.assert_not_called()
+
+        monkeypatch.setenv("STORAGE_BROWSER_ENDPOINT_URL", "https://browser.example.com")
+        with patch.object(download_link, "get_signed_url", mock_signed):
+            res_set = await download_link._sign("u-1", "a" * 64, "big.bin")
+        assert res_set == "https://browser.example.com/signed"
+        mock_signed.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_download_url_ticket_issuance_boundaries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("JWT_SIGNING_SECRET", "k" * 40)
+
+        # Backup: >8 MiB -> dl_token issued; <=8 MiB or missing locator -> omitted
+        big_locator = {"file_size": (8 << 20) + 1}
+        small_locator = {"file_size": 8 << 20}
+        with patch.object(
+            download_ticket,
+            "get_file_locator",
+            create_autospec(wf_db.get_file_locator, return_value=big_locator),
+        ):
+            out_big = await download_ticket.maybe_attach_backup_download_ticket(
+                {"url": None},
+                user_id="u-1",
+                workspace_id="ws-1",
+                path="big.bin",
+                normalized_path="big.bin",
+                backup_ok=True,
+            )
+        assert out_big.get("dl_token")
+
+        with patch.object(
+            download_ticket,
+            "get_file_locator",
+            create_autospec(wf_db.get_file_locator, return_value=small_locator),
+        ):
+            out_small = await download_ticket.maybe_attach_backup_download_ticket(
+                {"url": None},
+                user_id="u-1",
+                workspace_id="ws-1",
+                path="small.bin",
+                normalized_path="small.bin",
+                backup_ok=True,
+            )
+        assert "dl_token" not in out_small
+
+        with patch.object(
+            download_ticket,
+            "get_file_locator",
+            create_autospec(wf_db.get_file_locator, return_value=None),
+        ):
+            out_missing = await download_ticket.maybe_attach_backup_download_ticket(
+                {"url": None},
+                user_id="u-1",
+                workspace_id="ws-1",
+                path="missing.bin",
+                normalized_path="missing.bin",
+                backup_ok=True,
+            )
+        assert "dl_token" not in out_missing
+
+        # Live: >8 MiB -> dl_token issued; error reading size -> omitted
+        big_slice = containment.ContainedSlice(
+            canonical="/workspace/ws/big.bin",
+            size=(8 << 20) + 100,
+            version=None,
+            head=b"\x00",
+            content=b"\x00",
+        )
+        with patch.object(
+            download_ticket,
+            "read_contained_sandbox_range",
+            create_autospec(containment.read_contained_sandbox_range, return_value=big_slice),
+        ):
+            out_live = await download_ticket.maybe_attach_live_download_ticket(
+                {"url": None},
+                user_id="u-1",
+                workspace_id="ws-1",
+                path="big.bin",
+                backup_ok=False,
+                sandbox=object(),
+                canonical="/workspace/ws/big.bin",
+                work_dir="/workspace/ws",
+            )
+        assert out_live.get("dl_token")
+
+        with patch.object(
+            download_ticket,
+            "read_contained_sandbox_range",
+            create_autospec(
+                containment.read_contained_sandbox_range,
+                side_effect=RuntimeError("stat failed"),
+            ),
+        ):
+            out_err = await download_ticket.maybe_attach_live_download_ticket(
+                {"url": None},
+                user_id="u-1",
+                workspace_id="ws-1",
+                path="big.bin",
+                backup_ok=False,
+                sandbox=object(),
+                canonical="/workspace/ws/big.bin",
+                work_dir="/workspace/ws",
+            )
+        assert "dl_token" not in out_err
+
+        # Route-level non-owner and virtual file return {"url": None} with no dl_token
+        ws_other = {"workspace_id": "ws-1", "user_id": "owner-1", "status": "stopped"}
+        with patch.object(
+            ws_crud,
+            "reached_workspace_on_computer",
+            create_autospec(ws_crud.reached_workspace_on_computer, return_value=(ws_other, None)),
+        ):
+            res_non_owner = await ws_crud.workspace_file_download_url(
+                workspace_id="ws-1", x_user_id="colleague-2", path="big.bin"
+            )
+        assert res_non_owner == {"url": None}
+
+        ws_own = {"workspace_id": "ws-1", "user_id": "owner-1", "status": "stopped"}
+        with (
+            patch.object(
+                ws_crud,
+                "reached_workspace_on_computer",
+                create_autospec(ws_crud.reached_workspace_on_computer, return_value=(ws_own, None)),
+            ),
+            patch(
+                "src.server.app.workspace_files._shared.owner_work_dir",
+                return_value="/workspace/ws-1",
+            ),
+            patch.object(ws_crud, "_virtual_file", return_value="virtual-kind"),
+        ):
+            res_virtual = await ws_crud.workspace_file_download_url(
+                workspace_id="ws-1", x_user_id="owner-1", path=".agents/virtual.json"
+            )
+        assert res_virtual == {"url": None}
+
+
+# ---------------------------------------------------------------------------
+# 6. MinIO bucket rules tests
+# ---------------------------------------------------------------------------
+
+
+class TestStorageBucketRules:
+    def test_main_and_secondary_rules_merge_versioning_and_policy(self) -> None:
+        unmanaged_rule = {
+            "ID": "custom-operator-rule",
+            "Status": "Enabled",
+            "Filter": {"Prefix": "tmp/"},
+            "Expiration": {"Days": 7},
+        }
+        stale_uploads_rule = {
+            "ID": storage_bucket_rules.RULE_ID_UPLOADS_EXPIRE,
+            "Status": "Enabled",
+            "Filter": {"Prefix": "uploads/"},
+            "Expiration": {"Days": 2},
+        }
+        client = _FakeS3Client(
+            buckets={"dalton-main", "dalton-asr"},
+            versioning={"dalton-main": "Suspended", "dalton-asr": "Suspended"},
+            lifecycle={
+                "dalton-main": [unmanaged_rule],
+                "dalton-asr": [unmanaged_rule, stale_uploads_rule],
+            },
+            policy={
+                "dalton-asr": json.dumps(
+                    {
+                        "Version": "2012-10-17",
+                        "Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::dalton-asr/*"}],
+                    }
+                )
+            },
+        )
+
+        res_main = storage_bucket_rules.apply_bucket_rules(
+            client, bucket="dalton-main", role="main", key_prefix="", uploads_expire_days=2
+        )
+        assert res_main.versioning_status == "Enabled"
+        assert client.versioning["dalton-main"] == "Enabled"
+        assert res_main.managed_rule_ids == (
+            "dalton-uploads-expire",
+            "dalton-noncurrent-expire",
+            "dalton-expired-delete-marker",
+        )
+        assert len(res_main.preserved_rules) == 1
+        assert res_main.preserved_rules[0]["ID"] == "custom-operator-rule"
+        main_policy = json.loads(client.policy["dalton-main"])
+        assert len(main_policy["Statement"]) == 1
+        assert main_policy["Statement"][0]["Action"] == ["s3:GetObject"]
+        assert main_policy["Statement"][0]["Resource"] == ["arn:aws:s3:::dalton-main/avatars/*"]
+
+        res_sec = storage_bucket_rules.apply_bucket_rules(
+            client, bucket="dalton-asr", role="secondary", key_prefix=""
+        )
+        assert res_sec.versioning_status == "Enabled"
+        assert client.versioning["dalton-asr"] == "Enabled"
+        assert res_sec.managed_rule_ids == (
+            "dalton-noncurrent-expire",
+            "dalton-expired-delete-marker",
+        )
+        assert res_sec.removed_secondary_uploads_rule is True
+        sec_ids = [r["ID"] for r in client.lifecycle["dalton-asr"]]
+        assert "custom-operator-rule" in sec_ids
+        assert "dalton-uploads-expire" not in sec_ids
+        assert "dalton-asr" not in client.policy
+
+    def test_key_prefix_applied_to_lifecycle_and_policy(self) -> None:
+        client = _FakeS3Client(buckets={"shared-bucket"})
+        res = storage_bucket_rules.apply_bucket_rules(
+            client,
+            bucket="shared-bucket",
+            role="main",
+            key_prefix="staging",
+            uploads_expire_days=1,
+        )
+        assert res.key_prefix == "staging/"
+        rules_by_id = {r["ID"]: r for r in client.lifecycle["shared-bucket"]}
+        assert rules_by_id["dalton-uploads-expire"]["Filter"]["Prefix"] == "staging/uploads/"
+        assert rules_by_id["dalton-uploads-expire"]["Expiration"]["Days"] == 1
+        assert rules_by_id["dalton-noncurrent-expire"]["Filter"]["Prefix"] == "staging/"
+        assert rules_by_id["dalton-expired-delete-marker"]["Filter"]["Prefix"] == "staging/"
+        pol = json.loads(client.policy["shared-bucket"])
+        assert pol["Statement"][0]["Resource"] == ["arn:aws:s3:::shared-bucket/staging/avatars/*"]
+
+    @pytest.mark.parametrize("corrupt", ["versioning", "lifecycle", "policy"])
+    def test_readback_mismatch_raises(self, corrupt: str) -> None:
+        client = _FakeS3Client(buckets={"dalton-main"}, corrupt_readback=corrupt)
+        with pytest.raises(storage_bucket_rules.BucketRuleVerificationError):
+            storage_bucket_rules.apply_bucket_rules(
+                client, bucket="dalton-main", role="main"
+            )
+
+    def test_policy_verification_rejects_get_object_version(self) -> None:
+        bad_policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": ["s3:GetObject", "s3:GetObjectVersion"],
+                    "Resource": ["arn:aws:s3:::dalton-main/avatars/*"],
+                }
+            ],
+        }
+        with pytest.raises(storage_bucket_rules.BucketRuleVerificationError):
+            storage_bucket_rules.verify_bucket_policy(
+                bad_policy, bucket="dalton-main", role="main"
+            )
+
+
+# ---------------------------------------------------------------------------
+# 7. Exclusion globs tests
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FakeDirEntry:
+    name: str
+    entry_kind: str  # "file" | "dir" | "symlink"
+
+    def is_symlink(self) -> bool:
+        return self.entry_kind == "symlink"
+
+    def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+        return self.entry_kind == "dir"
+
+    def is_file(self, *, follow_symlinks: bool = True) -> bool:
+        return self.entry_kind == "file"
+
+
+class TestExclusionGlobs:
+    EXPECTED_BASE_KEYS = {
+        "exclude_dir_names",
+        "exclude_rel_dirs",
+        "exclude_rel_dir_prefixes",
+        "exclude_rel_files",
+        "exclude_basenames",
+        "exclude_root_basenames",
+        "exclude_root_basename_prefixes",
+        "exclude_suffixes",
+        "whole_dir_names",
+        "max_whole_dir_bytes",
+        "max_file_bytes",
+    }
+
+    def test_empty_config_preserves_exact_exclusion_spec_keys(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("DALTON_WSFILES_EXCLUDE_REL_DIRS", raising=False)
+        monkeypatch.delenv("DALTON_WSFILES_EXCLUDE_REL_GLOBS", raising=False)
+        spec = transfer.exclusion_spec(100 << 20)
+        assert set(spec.keys()) == self.EXPECTED_BASE_KEYS
+        assert "exclude_rel_globs" not in spec
+
+    def test_env_overrides_yaml_and_appends_to_spec(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with patch.object(
+            storage_config,
+            "_load_dalton_workspace_files_raw",
+            return_value={
+                "exclude_dir_names": ["custom_cache"],
+                "exclude_rel_dirs": ["yaml/dir"],
+                "exclude_rel_globs": ["yaml/*/cache"],
+            },
+        ):
+            monkeypatch.setenv("DALTON_WSFILES_EXCLUDE_REL_DIRS", " data/prices_long , , ")
+            monkeypatch.setenv("DALTON_WSFILES_EXCLUDE_REL_GLOBS", "cn_screening_*/data, *.tmp_glob")
+            spec = transfer.exclusion_spec(100 << 20)
+
+        assert "custom_cache" in spec["exclude_dir_names"]
+        assert "node_modules" in spec["exclude_dir_names"]
+        assert "data/prices_long" in spec["exclude_rel_dirs"]
+        assert "yaml/dir" not in spec["exclude_rel_dirs"]
+        assert spec["exclude_rel_globs"] == ["cn_screening_*/data", "*.tmp_glob"]
+
+    def test_runtime_exclusions_glob_and_hardcoded_protections(self) -> None:
+        ex = transfer_rt._Exclusions(
+            {
+                "whole_dir_names": [".git"],
+                "exclude_rel_globs": [
+                    "cn_screening_*/data",
+                    "data/*.cache",
+                    "*",
+                    "work/*",
+                    "work/uploads*",
+                    ".git*",
+                ],
+            }
+        )
+        # Matching dir and file are excluded
+        assert ex.kind(_FakeDirEntry("data", "dir"), "cn_screening_a/data", False) is None
+        assert ex.kind(_FakeDirEntry("foo.cache", "file"), "data/foo.cache", False) is None
+        assert ex.kind(_FakeDirEntry("other.txt", "file"), "work/other.txt", False) is None
+
+        # Hardcoded protections: .git (root and nested), work dir, work/uploads, and children survive
+        assert ex.kind(_FakeDirEntry(".git", "dir"), ".git", True) == "dir"
+        assert ex.kind(_FakeDirEntry("HEAD", "file"), ".git/HEAD", False) == "file"
+        assert ex.kind(_FakeDirEntry(".git", "dir"), "sub/repo/.git", False) == "dir"
+        assert ex.kind(_FakeDirEntry("work", "dir"), "work", True) == "dir"
+        assert ex.kind(_FakeDirEntry("uploads", "dir"), "work/uploads", False) == "dir"
+        assert ex.kind(_FakeDirEntry("doc.pdf", "file"), "work/uploads/doc.pdf", False) == "file"
+
+    def test_dalton_config_validates_yaml_with_workspace_files(self) -> None:
+        _load_profile_dalton_raw.cache_clear()
+        raw_everflow = yaml.safe_load(DALTON_YAML_PATH.read_text(encoding="utf-8"))
+        raw_core = yaml.safe_load(DALTON_CORE_YAML_PATH.read_text(encoding="utf-8"))
+        assert "workspace_files" in raw_everflow
+        assert "workspace_files" in raw_core
+        assert raw_everflow["workspace_files"] == {
+            "write_inline_only": False,
+            "exclude_dir_names": [],
+            "exclude_rel_dirs": [],
+            "exclude_rel_globs": [],
+        }
+        assert raw_core["workspace_files"] == {
+            "write_inline_only": False,
+            "exclude_dir_names": [],
+            "exclude_rel_dirs": [],
+            "exclude_rel_globs": [],
+        }
+        # DaltonConfig must accept both YAML files without raising validation errors
+        cfg_e = DaltonConfig.model_validate(raw_everflow)
+        cfg_c = DaltonConfig.model_validate(raw_core)
+        assert cfg_e.enabled is True
+        assert cfg_c.enabled is True

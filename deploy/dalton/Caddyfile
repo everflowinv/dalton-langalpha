@@ -18,6 +18,7 @@
 			fields {
 				request>uri query {
 					replace token REDACTED
+					replace dl_token REDACTED
 				}
 			}
 		}

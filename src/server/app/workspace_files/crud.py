@@ -1472,7 +1472,12 @@ async def workspace_file_download_url(
                 )
             except FileNotFoundError:
                 raise HTTPException(status_code=404, detail="File not found") from None
-        return {"url": url}
+            # DALTON-HOOK(workspace-file-download-ticket): issue 60s backend ticket for >8 MiB files when no presigned URL
+            from src.dalton.download_ticket import maybe_attach_live_download_ticket
+
+            return await maybe_attach_live_download_ticket(
+                {"url": url}, user_id=x_user_id, workspace_id=workspace_id, path=path, backup_ok=backup_ok, sandbox=sandbox, canonical=canonical, work_dir=live_paths.work_dir,
+            )
 
     async def backup(source: FromBackup) -> dict[str, str | None]:
         # No link for a file the backup lacks: /files/download then says
@@ -1482,7 +1487,12 @@ async def workspace_file_download_url(
         url = await backup_download_link(
             workspace, path, paths.work_dir, paths.previous_dirs
         )
-        return {"url": url, **source.marks}
+        # DALTON-HOOK(workspace-file-download-ticket): issue 60s backend ticket for >8 MiB backup files when no presigned URL
+        from src.dalton.download_ticket import maybe_attach_backup_download_ticket
+
+        return await maybe_attach_backup_download_ticket(
+            {"url": url, **source.marks}, user_id=x_user_id, workspace_id=workspace_id, path=path, normalized_path=normalized_path, backup_ok=backup_ok,
+        )
 
     return await files_from(workspace_id, workspace, live, backup, away_ok=backup_ok)
 

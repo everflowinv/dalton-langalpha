@@ -154,14 +154,18 @@ async function saveWorkspaceFile(
   // A large file is handed out as a short-lived storage link the browser
   // streams to disk itself; buffering it as a blob would hold the whole file
   // in tab memory. A null url means the file is small enough to fetch here.
-  const { data } = await api.get<{ url: string | null; source?: string; unreachable?: string }>(
+  const { data } = await api.get<{ url: string | null; dl_token?: string | null; source?: string; unreachable?: string }>(
     `/api/v1/workspaces/${workspaceId}/files/download-url`,
     { params: { path: filePath, ...BACKUP_OK } },
   );
+  // DALTON-HOOK(workspace-file-download-ticket): stream >8 MiB files via short-lived backend ticket when no presigned url
+  const ticketUrl = !data?.url && data?.dl_token
+    ? api.getUri({ url: '/api/v1/dalton/workspace-files/download', params: { dl_token: data.dl_token } })
+    : null;
   // Without a bearer token the download route itself is a plain GET, so the
   // browser can stream it to disk too; with one, only a blob can carry it.
   // DALTON-HOOK(dalton-auth): direct GET carries no bearer token; fetch blob when Dalton auth is enabled
-  const direct = data?.url ?? (isPlatformMode || isDaltonAuth ? null : directDownloadUrl(workspaceId, filePath));
+  const direct = data?.url ?? ticketUrl ?? (isPlatformMode || isDaltonAuth ? null : directDownloadUrl(workspaceId, filePath));
   // A download the browser makes never shows its header here, so where it
   // comes from is read off this answer; a blob says by its own header.
   const blob = direct ? null : await downloadWorkspaceBlob(workspaceId, filePath, report);

@@ -551,6 +551,10 @@ async def _sync_locked(
     pack_members: list[ScanEntry] = []
     # Object keys are scoped to the owner; read once for the whole pass.
     user_id = await workspace_owner(workspace_id, conn=conn) if blobs_on else None
+    # DALTON-HOOK(workspace-file-write-mode): read per-pass Level-1 inline-only write switch
+    from src.dalton import wsfiles_write_mode as _wsfiles_write_mode
+
+    write_inline_only = _wsfiles_write_mode.is_write_inline_only_active(blobs_on=blobs_on)
 
     # While the mirror is known incomplete a stamp that moved on an
     # unchanged entry may be the restore's own failed chmod or utime, and
@@ -591,7 +595,8 @@ async def _sync_locked(
             # The scan reports why in ``errors`` and already counted it.
             continue
 
-        if blobs_on and entry.size <= PACK_CUTOFF:
+        # DALTON-HOOK(workspace-file-write-mode): bypass packing for non-git files when write_inline_only is active
+        if blobs_on and entry.size <= PACK_CUTOFF and not _wsfiles_write_mode.should_skip_pack_for_write_mode(entry, write_inline_only=write_inline_only):
             # Small files are decided as a set, below: whether the
             # pack they share needs rewriting depends on all of them.
             pack_members.append(entry)
@@ -625,11 +630,12 @@ async def _sync_locked(
 
     if needs_bytes:
         if blobs_on:
-            persisted, unsaved = await _persist_blobs(
-                user_id, workspace_id, sandbox, needs_bytes, layout=layout
+            # DALTON-HOOK(workspace-file-write-mode): route <=100 MiB non-git entries inline when write_inline_only is on
+            await _wsfiles_write_mode.persist_needs_bytes_for_blobs_on(
+                user_id=user_id, workspace_id=workspace_id, sandbox=sandbox, needs_bytes=needs_bytes,
+                write_inline_only=write_inline_only, layout=layout, conn=conn, started_at=started_at,
+                rows=rows, result=result, persist_blobs_fn=_persist_blobs, persist_inline_by_repo_fn=_persist_inline_by_repo,
             )
-            rows.extend(persisted)
-            result.unsaved.extend(unsaved)
         else:
             # Inline rows carry their own bytes, so they are written in
             # bounded batches rather than joining ``rows`` and being held
@@ -662,12 +668,20 @@ async def _sync_locked(
             may_prune=may_prune,
             # A held repository's packed rows are kept, not gone: counted as
             # left, they would rewrite the pack set on every pass it is held.
-            withheld=withheld | kept_rows,
+            # DALTON-HOOK(workspace-file-write-mode): keep unchanged inline-only packed rows out of left
+            withheld=withheld | kept_rows | _wsfiles_write_mode.unchanged_inline_only_packed_paths(scan.entries, existing, write_inline_only=write_inline_only),
             layout=layout,
         )
         rows.extend(packed)
         result.unsaved.extend(unsaved)
         result.skipped += skipped
+
+    # DALTON-HOOK(workspace-file-write-mode): bounded 64 MiB inline fallback for failed non-git uploads before hold_repos
+    if blobs_on:
+        rows = await _wsfiles_write_mode.fallback_failed_uploads_inline(
+            workspace_id=workspace_id, sandbox=sandbox, scan_entries=scan.entries, rows=rows, result=result,
+            scanned_unsaved=scanned_unsaved, layout=layout, conn=conn, started_at=started_at, persist_inline_by_repo_fn=_persist_inline_by_repo,
+        )
 
     # A file in a repository that failed to upload holds the repository too,
     # now that the rest of it is stored: its new rows are dropped (inline

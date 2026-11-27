@@ -1,14 +1,29 @@
 #!/usr/bin/env bash
-# Idempotently provision, harden, and verify the Dalton MinIO / S3-compatible bucket:
+# Idempotently provision, harden, and verify a Dalton MinIO / S3-compatible bucket:
 #   1. Create the bucket if it does not exist.
-#   2. Enforce private access (`mc anonymous set none`, clear bucket policy, verify private).
-#   3. Verify CORS for configured browser origins only (PUT / GET / HEAD, expose ETag).
-#      MinIO loads CORS at startup from `MINIO_API_CORS_ALLOW_ORIGIN` in docker-compose.dalton.yml
-#      (no `mc admin service restart`, which would interrupt in-flight multipart uploads).
-#   4. Configure `<STORAGE_KEY_PREFIX>uploads/` 1-2 day object expiration via S3 Lifecycle
-#      (`Expiration.Days`), and verify MinIO's incomplete multipart upload cleanup
-#      (`api.stale_uploads_expiry` / `MINIO_API_STALE_UPLOADS_EXPIRY`, default 24h, and
-#      `api.stale_uploads_cleanup_interval` / `MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL`, default 6h).
+#   2. Reset anonymous access (`mc anonymous set none`), then apply role-specific
+#      bucket policy via `src/dalton/storage_bucket_rules.py`:
+#      - `main`: anonymous read-only `s3:GetObject` (no `s3:GetObjectVersion`) on
+#        `<STORAGE_KEY_PREFIX>avatars/*` only; read-back verified as a single statement.
+#      - `secondary`: strictly private (no bucket policy); read-back verified.
+#   3. Enable Bucket Versioning (`Status=Enabled`) on both roles and read-back verify.
+#      NOTE: Once Bucket Versioning is enabled on a bucket, it can only be suspended
+#      (`Suspended`) and cannot be turned off completely.
+#   4. Configure and read-back verify per-role S3 Lifecycle rules (merging with and
+#      preserving any unmanaged rule IDs):
+#      - `main`: `dalton-uploads-expire` (`<prefix>uploads/` 1-2d),
+#        `dalton-noncurrent-expire` (30d), `dalton-expired-delete-marker`.
+#      - `secondary`: `dalton-noncurrent-expire` (30d) and
+#        `dalton-expired-delete-marker` only (removes any `dalton-uploads-expire`
+#        so legitimate `uploads/{ws}/` transcription audio is preserved).
+#   5. Verify MinIO `api.stale_uploads_expiry` (default 24h) and
+#      `api.stale_uploads_cleanup_interval` (default 6h).
+#   6. Verify CORS when required (`secondary`, or `main` with
+#      `STORAGE_BROWSER_UPLOADS=true`); skipped on `main` when browser uploads are off.
+#
+# Note: After modifying `.env`, recreate the backend container (重建后端容器, e.g.
+# `deploy_main.sh --recreate` or `docker compose ... up -d --no-deps backend`);
+# `docker restart` does not reload `env_file`.
 #
 # Credentials are read strictly from environment variables and are never printed
 # or passed on process command lines.
@@ -16,32 +31,128 @@
 set -euo pipefail
 set +x
 
+usage() {
+  cat <<'EOF'
+Usage: scripts/dalton/configure_minio.sh [--role main|secondary] [--bucket NAME] [-h|--help]
+
+Idempotently provision and verify a Dalton MinIO / S3-compatible bucket:
+  - Creates bucket and resets anonymous access (`mc anonymous set none`).
+  - Applies and read-back verifies bucket policy (`main`: avatars/* s3:GetObject only;
+    `secondary`: strictly private).
+  - Enables and verifies Bucket Versioning (`Status=Enabled`).
+    IMPORTANT: Bucket Versioning cannot be disabled once enabled (only suspended).
+  - Merges and verifies per-role Lifecycle rules (preserves unmanaged rule IDs;
+    `uploads/` expiration is configured ONLY on `main` and removed from `secondary`).
+  - Verifies MinIO `api` stale multipart upload cleanup (`MINIO_API_STALE_UPLOADS_EXPIRY=24h`).
+  - Verifies CORS preflight on `secondary`, or on `main` only when
+    `STORAGE_BROWSER_UPLOADS` is truthy (`1/true/yes/on`).
+
+Options:
+  --role main|secondary   Bucket role (default: main).
+  --bucket NAME           Target bucket name. Optional for `main` (defaults to
+                          STORAGE_BUCKET_NAME, then S3_BUCKET_NAME); REQUIRED for
+                          `secondary` (e.g. --role secondary --bucket dalton-asr).
+  -h, --help              Show this help and exit.
+
+Note: After editing `.env`, recreate the backend container (重建后端容器) so
+Docker Compose reloads `env_file` (`docker restart` does not).
+EOF
+}
+
+ROLE="main"
+BUCKET_OVERRIDE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --role)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --role requires a value (main or secondary)." >&2
+        exit 1
+      fi
+      ROLE="$2"
+      shift 2
+      ;;
+    --role=*)
+      ROLE="${1#*=}"
+      shift
+      ;;
+    --bucket)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --bucket requires a bucket name." >&2
+        exit 1
+      fi
+      BUCKET_OVERRIDE="$2"
+      shift 2
+      ;;
+    --bucket=*)
+      BUCKET_OVERRIDE="${1#*=}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "ERROR: Unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+case "$ROLE" in
+  main|secondary) ;;
+  *)
+    echo "ERROR: Invalid --role '$ROLE' (expected 'main' or 'secondary')." >&2
+    exit 1
+    ;;
+esac
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 export STORAGE_ENDPOINT_URL="${STORAGE_ENDPOINT_URL:-${S3_ENDPOINT_URL:-http://127.0.0.1:9000}}"
-export STORAGE_BUCKET_NAME="${STORAGE_BUCKET_NAME:-${S3_BUCKET_NAME:-}}"
 export STORAGE_ACCESS_KEY_ID="${STORAGE_ACCESS_KEY_ID:-${MINIO_ROOT_USER:-${AWS_ACCESS_KEY_ID:-}}}"
 export STORAGE_SECRET_ACCESS_KEY="${STORAGE_SECRET_ACCESS_KEY:-${MINIO_ROOT_PASSWORD:-${AWS_SECRET_ACCESS_KEY:-}}}"
 export STORAGE_REGION="${STORAGE_REGION:-${S3_REGION:-us-east-1}}"
 export STORAGE_ADDRESSING_STYLE="${STORAGE_ADDRESSING_STYLE:-path}"
 export STORAGE_KEY_PREFIX="${STORAGE_KEY_PREFIX:-}"
+export STORAGE_BROWSER_UPLOADS="${STORAGE_BROWSER_UPLOADS:-false}"
 export DALTON_CORS_ALLOWED_ORIGINS="${DALTON_CORS_ALLOWED_ORIGINS:-${MINIO_API_CORS_ALLOW_ORIGIN:-${CORS_ALLOWED_ORIGINS:-}}}"
 export DALTON_UPLOADS_EXPIRE_DAYS="${DALTON_UPLOADS_EXPIRE_DAYS:-2}"
 export MINIO_API_STALE_UPLOADS_EXPIRY="${MINIO_API_STALE_UPLOADS_EXPIRY:-24h}"
 export MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL="${MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL:-6h}"
 
-if [[ -z "$STORAGE_BUCKET_NAME" ]]; then
-  echo "ERROR: STORAGE_BUCKET_NAME is required." >&2
+if [[ -n "$BUCKET_OVERRIDE" ]]; then
+  TARGET_BUCKET="$BUCKET_OVERRIDE"
+elif [[ "$ROLE" == "main" ]]; then
+  TARGET_BUCKET="${STORAGE_BUCKET_NAME:-${S3_BUCKET_NAME:-}}"
+else
+  echo "ERROR: --bucket NAME is required when --role secondary (e.g. --role secondary --bucket dalton-asr)." >&2
   exit 1
 fi
+
+if [[ -z "$TARGET_BUCKET" ]]; then
+  echo "ERROR: Target bucket is required (pass --bucket NAME or set STORAGE_BUCKET_NAME)." >&2
+  exit 1
+fi
+export TARGET_BUCKET
+export TARGET_ROLE="$ROLE"
 
 if [[ -z "$STORAGE_ACCESS_KEY_ID" || -z "$STORAGE_SECRET_ACCESS_KEY" ]]; then
   echo "ERROR: STORAGE_ACCESS_KEY_ID and STORAGE_SECRET_ACCESS_KEY are required." >&2
   exit 1
 fi
 
-if [[ -z "$DALTON_CORS_ALLOWED_ORIGINS" ]]; then
-  echo "ERROR: DALTON_CORS_ALLOWED_ORIGINS is required (comma-separated browser origins, e.g. https://dalton.example.com)." >&2
+BROWSER_UPLOADS_NORM="$(printf '%s' "$STORAGE_BROWSER_UPLOADS" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+REQUIRE_CORS=0
+if [[ "$ROLE" == "secondary" ]]; then
+  REQUIRE_CORS=1
+elif [[ "$BROWSER_UPLOADS_NORM" == "1" || "$BROWSER_UPLOADS_NORM" == "true" || "$BROWSER_UPLOADS_NORM" == "yes" || "$BROWSER_UPLOADS_NORM" == "on" ]]; then
+  REQUIRE_CORS=1
+fi
+
+if [[ "$REQUIRE_CORS" -eq 1 && -z "$DALTON_CORS_ALLOWED_ORIGINS" ]]; then
+  echo "ERROR: DALTON_CORS_ALLOWED_ORIGINS is required for role='$ROLE' with browser uploads enabled (comma-separated browser origins, e.g. https://dalton.example.com)." >&2
   exit 1
 fi
 
@@ -79,12 +190,10 @@ PY
 export MC_HOST_dalton="$MC_URL"
 unset MC_URL
 
-# 1 & 2. Ensure bucket exists and enforce anonymous=none via `mc`, then verify read-back
-"$MC_BIN" --config-dir "$MC_TMP_DIR" mb --ignore-existing "dalton/${STORAGE_BUCKET_NAME}" >/dev/null
-"$MC_BIN" --config-dir "$MC_TMP_DIR" anonymous set none "dalton/${STORAGE_BUCKET_NAME}" >/dev/null
-# `anonymous get-json` prints the bucket policy itself (`{}` when private);
-# the permission comes from `--json anonymous get`.
-ANON_JSON="$("$MC_BIN" --config-dir "$MC_TMP_DIR" --json anonymous get "dalton/${STORAGE_BUCKET_NAME}")"
+# 1 & 2. Ensure bucket exists and clear anonymous access via `mc`, then verify read-back
+"$MC_BIN" --config-dir "$MC_TMP_DIR" mb --ignore-existing "dalton/${TARGET_BUCKET}" >/dev/null
+"$MC_BIN" --config-dir "$MC_TMP_DIR" anonymous set none "dalton/${TARGET_BUCKET}" >/dev/null
+ANON_JSON="$("$MC_BIN" --config-dir "$MC_TMP_DIR" --json anonymous get "dalton/${TARGET_BUCKET}")"
 export ANON_JSON
 "$PYTHON_BIN" - <<'PY'
 import json
@@ -96,11 +205,11 @@ permission = str(data.get("permission") or "").lower()
 if permission not in ("none", "private"):
     print(f"ERROR: Bucket anonymous permission is {permission!r}, expected 'none'.", file=sys.stderr)
     sys.exit(1)
-print(f"[minio-config] Verified mc anonymous permission is '{permission}'.")
+print(f"[minio-config] Verified mc anonymous permission reset to '{permission}'.")
 PY
 unset ANON_JSON
 
-# Verify MinIO `api` subsystem stale_uploads cleanup settings (without restarting MinIO)
+# 3. Verify MinIO `api` subsystem stale_uploads cleanup settings (without restarting MinIO)
 API_CFG_OUT="$("$MC_BIN" --config-dir "$MC_TMP_DIR" admin config get dalton api)"
 export API_CFG_OUT
 "$PYTHON_BIN" - <<'PY'
@@ -122,8 +231,16 @@ print(
 PY
 unset API_CFG_OUT
 
-# 3 & 4. S3 API configuration and live verification (private policy, CORS preflight, and lifecycle Expiration)
-"$PYTHON_BIN" - <<'PY'
+# 4. S3 API policy, Bucket Versioning (Enabled), and per-role Lifecycle merge & read-back verification
+PYTHONPATH="$REPO_ROOT" "$PYTHON_BIN" -m src.dalton.storage_bucket_rules apply \
+  --bucket "$TARGET_BUCKET" \
+  --role "$ROLE" \
+  --prefix "$STORAGE_KEY_PREFIX" \
+  --uploads-expire-days "$DALTON_UPLOADS_EXPIRE_DAYS"
+
+# 5. CORS preflight verification (required on secondary; on main only when STORAGE_BROWSER_UPLOADS is truthy)
+if [[ "$REQUIRE_CORS" -eq 1 ]]; then
+  "$PYTHON_BIN" - <<'PY'
 import os
 import sys
 import urllib.error
@@ -134,14 +251,11 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 endpoint = os.environ["STORAGE_ENDPOINT_URL"].strip().rstrip("/")
-bucket = os.environ["STORAGE_BUCKET_NAME"].strip()
+bucket = os.environ["TARGET_BUCKET"].strip()
 access_key = os.environ["STORAGE_ACCESS_KEY_ID"]
 secret_key = os.environ["STORAGE_SECRET_ACCESS_KEY"]
 region = os.environ.get("STORAGE_REGION", "us-east-1").strip() or "us-east-1"
 addressing_style = os.environ.get("STORAGE_ADDRESSING_STYLE", "path").strip().lower() or "path"
-raw_prefix = os.environ.get("STORAGE_KEY_PREFIX", "").strip().strip("/")
-key_prefix = f"{raw_prefix}/" if raw_prefix else ""
-uploads_prefix = f"{key_prefix}uploads/"
 
 raw_origins = [
     o.strip().rstrip("/")
@@ -166,16 +280,6 @@ for origin in raw_origins:
         )
         sys.exit(1)
 
-try:
-    expire_days = int(os.environ.get("DALTON_UPLOADS_EXPIRE_DAYS", "2"))
-except ValueError:
-    print("ERROR: DALTON_UPLOADS_EXPIRE_DAYS must be an integer (1 or 2).", file=sys.stderr)
-    sys.exit(1)
-
-if expire_days not in (1, 2):
-    print("ERROR: DALTON_UPLOADS_EXPIRE_DAYS must be 1 or 2.", file=sys.stderr)
-    sys.exit(1)
-
 client = boto3.client(
     "s3",
     endpoint_url=endpoint,
@@ -191,18 +295,6 @@ client = boto3.client(
     ),
 )
 
-client.head_bucket(Bucket=bucket)
-
-# Clear any bucket policy so access remains strictly private
-try:
-    client.delete_bucket_policy(Bucket=bucket)
-except ClientError as exc:
-    code = str(exc.response.get("Error", {}).get("Code", ""))
-    if code not in ("NoSuchBucketPolicy", "404", "MethodNotAllowed", "NotImplemented"):
-        raise
-
-# Configure S3 bucket-level CORS if supported by the server; otherwise verify
-# MinIO's server-level CORS (`MINIO_API_CORS_ALLOW_ORIGIN` injected at startup).
 cors_config = {
     "CORSRules": [
         {
@@ -267,8 +359,6 @@ def verify_cors_preflight(target_origin: str, method: str, *, expect_allowed: bo
                 file=sys.stderr,
             )
             sys.exit(1)
-        # MinIO (rs/cors) echoes only the method asked about, so each method
-        # gets its own preflight rather than one asking for all three.
         if method not in allow_methods:
             print(
                 f"ERROR: CORS preflight for {target_origin!r} does not allow {method} "
@@ -301,48 +391,9 @@ if not s3_cors_applied:
     print(
         f"[minio-config] Verified active MinIO CORS preflight for origins: {', '.join(raw_origins)}"
     )
-
-# Configure S3 Lifecycle Expiration on `<STORAGE_KEY_PREFIX>uploads/` (1-2 days).
-# Note: MinIO does not support S3 `AbortIncompleteMultipartUpload` in ILM XML;
-# incomplete multipart uploads are reaped by MinIO's `api.stale_uploads_expiry`
-# (default 24h) verified above.
-lifecycle_rules = [
-    {
-        "ID": "dalton-uploads-expire",
-        "Status": "Enabled",
-        "Filter": {"Prefix": uploads_prefix},
-        "Expiration": {"Days": expire_days},
-    }
-]
-client.put_bucket_lifecycle_configuration(
-    Bucket=bucket,
-    LifecycleConfiguration={"Rules": lifecycle_rules},
-)
-verified = client.get_bucket_lifecycle_configuration(Bucket=bucket)
-matched_rules = []
-for r in verified.get("Rules", []):
-    rule_prefix = (r.get("Filter") or {}).get("Prefix", r.get("Prefix", ""))
-    rule_days = (r.get("Expiration") or {}).get("Days")
-    if (
-        r.get("ID") == "dalton-uploads-expire"
-        and r.get("Status") == "Enabled"
-        and rule_prefix == uploads_prefix
-        and rule_days == expire_days
-    ):
-        matched_rules.append(r.get("ID"))
-
-if not matched_rules:
-    print(
-        f"ERROR: Lifecycle verification failed: rule 'dalton-uploads-expire' "
-        f"(prefix={uploads_prefix!r}, days={expire_days}) not active in read-back: {verified}",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-print(
-    f"[minio-config] Configured and verified lifecycle expiration rule on '{bucket}' "
-    f"(prefix='{uploads_prefix}', expire={expire_days}d)."
-)
 PY
+else
+  echo "[minio-config] Skipping browser PUT CORS preflight check for main bucket '${TARGET_BUCKET}' (STORAGE_BROWSER_UPLOADS=${STORAGE_BROWSER_UPLOADS})."
+fi
 
-echo "[minio-config] Done."
+echo "[minio-config] Done (role=${ROLE}, bucket=${TARGET_BUCKET})."
