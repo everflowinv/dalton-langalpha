@@ -166,7 +166,7 @@ class _FakeConn:
 
 def test_d06X_migration_revisions_and_sql_objects():
     assert d06x_mod.revision == "d06X"
-    assert d06x_mod.down_revision == "d057"
+    assert d06x_mod.down_revision == "d06W"
 
     upgrade_sqls: list[str] = []
     downgrade_sqls: list[str] = []
