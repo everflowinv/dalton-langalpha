@@ -21,8 +21,12 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import os
 import random
+import subprocess
 import sys
+import time
+import tracemalloc
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -80,6 +84,12 @@ def _make_upstream_redactor(secrets: list[tuple[str, str]]) -> SecretRedactor:
     return inst
 
 
+def _patch_get_redactor(redactor: object):
+    """Patch ``sr_mod.get_redactor`` using a signature-checked ``create_autospec`` double."""
+    stub = create_autospec(sr_mod.get_redactor, spec_set=True, return_value=redactor)
+    return patch.object(sr_mod, "get_redactor", stub)
+
+
 async def _collect_stream(body_iter) -> bytes:
     parts: list[bytes] = []
     async for chunk in body_iter:
@@ -127,17 +137,17 @@ def test_secret_redactor_secrets_attribute_shape_lock():
 def test_streaming_redactor_fails_closed_on_missing_or_malformed_secrets():
     """Never silently degrade to unredacted output if upstream renames _secrets."""
     broken_missing = SimpleNamespace()
-    with patch.object(sr_mod, "get_redactor", return_value=broken_missing):
+    with _patch_get_redactor(broken_missing):
         with pytest.raises(RuntimeError, match="_secrets"):
             StreamingSecretRedactor()
 
     broken_shape = SimpleNamespace(_secrets={"API_KEY": "secret123456"})
-    with patch.object(sr_mod, "get_redactor", return_value=broken_shape):
+    with _patch_get_redactor(broken_shape):
         with pytest.raises(TypeError, match="list"):
             StreamingSecretRedactor()
 
     broken_entry = SimpleNamespace(_secrets=[("API_KEY", 12345678)])
-    with patch.object(sr_mod, "get_redactor", return_value=broken_entry):
+    with _patch_get_redactor(broken_entry):
         with pytest.raises(TypeError, match="tuples"):
             StreamingSecretRedactor()
 
@@ -154,7 +164,7 @@ async def test_streaming_redactor_utf8_non_ascii_secret_across_8mib_boundary():
     prefix_len = eight_mib - (len(secret_bytes) // 2)
     payload = b"A" * prefix_len + secret_bytes + b"B" * 4096
 
-    with patch.object(sr_mod, "get_redactor", return_value=redactor):
+    with _patch_get_redactor(redactor):
         stream_r = StreamingSecretRedactor(vault_secrets=None)
         chunks = [payload[:eight_mib], payload[eight_mib:]]
         out_feed = stream_r.feed(chunks[0]) + stream_r.feed(chunks[1]) + stream_r.flush()
@@ -178,7 +188,7 @@ def test_streaming_redactor_latin1_file_non_ascii_secret():
     # Include invalid UTF-8 bytes (\xff\xfe) so redact_bytes takes its latin-1 fallback.
     payload = b"\xff\xfeheader:" + secret_val.encode("latin-1") + b":\xe9tail"
 
-    with patch.object(sr_mod, "get_redactor", return_value=redactor):
+    with _patch_get_redactor(redactor):
         sr = StreamingSecretRedactor(vault_secrets=vault)
         # Split right inside the latin-1 secret
         split = 12
@@ -199,7 +209,7 @@ def test_streaming_redactor_overlapping_secrets_leave_zero_residue():
     }
     payload = b"pre ALPHA12345BETA67890 post ALPHA12345 end"
 
-    with patch.object(sr_mod, "get_redactor", return_value=redactor):
+    with _patch_get_redactor(redactor):
         sr = StreamingSecretRedactor(vault_secrets=vault)
         pieces = [payload[i : i + 5] for i in range(0, len(payload), 5)]
         out = b"".join(sr.feed(p) for p in pieces) + sr.flush()
@@ -233,7 +243,7 @@ async def test_streaming_redactor_unbounded_16kib_tokens_and_prefix_boundaries()
         b"r_short_tok! end",
     ]
 
-    with patch.object(sr_mod, "get_redactor", return_value=redactor):
+    with _patch_get_redactor(redactor):
         out = await _collect_stream(redact_stream(_aiter_chunks(chunks)))
 
     assert out == (
@@ -248,7 +258,7 @@ async def test_streaming_redactor_unbounded_16kib_tokens_and_prefix_boundaries()
 def test_streaming_redactor_unclosed_setup_prefix_digit_cap_64kib():
     """Digit run > 64 KiB after ``sk-ant-oat`` is flushed as non-token to bound memory."""
     redactor = _make_upstream_redactor([])
-    with patch.object(sr_mod, "get_redactor", return_value=redactor):
+    with _patch_get_redactor(redactor):
         sr = StreamingSecretRedactor()
         # Feed prefix + 64 KiB + 10 digits with no closing dash yet.
         huge_digits = b"sk-ant-oat" + (b"7" * (MAX_TOKEN_PREFIX_DIGITS + 10))
@@ -266,18 +276,24 @@ def test_streaming_redactor_randomized_chunk_equivalence_200_trials():
         [
             ("MCP_ASCII", "mcp_secret_token_987654"),
             ("MCP_UTF8", "全局密钥_é_8888"),
+            ("WRAP_TOK_UTF8", "前缀_gxsa_tok1_尾后缀"),
+            ("WRAP_SETUP_UTF8", "前导_sk-ant-oat01-ab_结束"),
         ]
     )
     vault = {
         "VAULT_ONE": "vault_secret_alpha_112233",
         "VAULT_LATIN": "clé_secrète_445566",
+        "WRAP_TOK_L1": "préfixe_gxsr_ab1_süffix",
+        "WRAP_SETUP_L1": "début_sk-ant-oat7-cd_fïn",
         "TOO_SHORT": "1234567",  # < MIN_REDACT_SECRET_LEN, must not redact
     }
 
     utf8_payload = (
         "head 1234567 mcp_secret_token_987654 middle "
         "全局密钥_é_8888 gxsa_tok_123.45-6 "
+        "前缀_gxsa_tok1_尾后缀 "
         "vault_secret_alpha_112233 sk-ant-oat99-abc_DEF-01 "
+        "前导_sk-ant-oat01-ab_结束 "
         "clé_secrète_445566 end"
     ).encode("utf-8")
     expected_utf8 = redactor.redact_bytes(utf8_payload, vault_secrets=vault)
@@ -286,13 +302,15 @@ def test_streaming_redactor_randomized_chunk_equivalence_200_trials():
         b"\xff\xfe binary-ish "
         + "clé_secrète_445566".encode("latin-1")
         + b" \xe9 gxsr_abc-1.2 "
-        + b"mcp_secret_token_987654 "
-        + b"sk-ant-oat01-xyz_99 \x80end"
+        + "préfixe_gxsr_ab1_süffix".encode("latin-1")
+        + b" mcp_secret_token_987654 "
+        + "début_sk-ant-oat7-cd_fïn".encode("latin-1")
+        + b" sk-ant-oat01-xyz_99 \x80end"
     )
     expected_latin1 = redactor.redact_bytes(latin1_payload, vault_secrets=vault)
 
-    with patch.object(sr_mod, "get_redactor", return_value=redactor):
-        for trial in range(220):
+    with _patch_get_redactor(redactor):
+        for trial in range(240):
             data = utf8_payload if trial % 2 == 0 else latin1_payload
             expected = expected_utf8 if trial % 2 == 0 else expected_latin1
             sr = StreamingSecretRedactor(vault_secrets=vault)
@@ -354,7 +372,7 @@ def test_streaming_redactor_staggered_overlapping_secrets_whole_split_and_latin1
     )
 
     rng = random.Random(20261127)
-    with patch.object(sr_mod, "get_redactor", return_value=redactor):
+    with _patch_get_redactor(redactor):
         for payload, forbidden in (
             (
                 utf8_payload,
@@ -423,7 +441,7 @@ def test_streaming_redactor_token_before_literal_and_swallow_bridge():
     )
 
     rng = random.Random(20261128)
-    with patch.object(sr_mod, "get_redactor", return_value=redactor):
+    with _patch_get_redactor(redactor):
         for payload, forbidden in (
             (
                 payload_short,
@@ -500,7 +518,7 @@ def test_streaming_redactor_literal_overlapping_token_leaves_zero_token_tail():
     )
 
     rng = random.Random(20261129)
-    with patch.object(sr_mod, "get_redactor", return_value=redactor):
+    with _patch_get_redactor(redactor):
         for payload, forbidden in (
             (
                 utf8_payload,
@@ -530,6 +548,141 @@ def test_streaming_redactor_literal_overlapping_token_leaves_zero_token_tail():
                 assert out_rand == whole_out
                 for frag in forbidden:
                     assert frag not in out_rand
+
+
+def test_streaming_redactor_short_tail_token_inside_secret_matches_redact_bytes():
+    """Literal starting before a short tail token and ending in next chunk matches redact_bytes (UTF-8 & Latin-1)."""
+    utf8_sb_secret = "密钥头_gxsa_12_尾密"
+    utf8_setup_secret = "前导_sk-ant-oat01-xy_尾密"
+    l1_sb_secret = "café_gxsa_12_étail"
+    l1_setup_secret = "début_sk-ant-oat01-xy_fïn"
+
+    redactor = _make_upstream_redactor(
+        [
+            ("UTF8_SB", utf8_sb_secret),
+            ("UTF8_SETUP", utf8_setup_secret),
+        ]
+    )
+    vault = {
+        "L1_SB": l1_sb_secret,
+        "L1_SETUP": l1_setup_secret,
+    }
+
+    cases = [
+        # (payload, explicit_cut_right_after_short_token, encoding)
+        (
+            b"lead:" + utf8_sb_secret.encode("utf-8") + b":done",
+            len(b"lead:" + "密钥头_gxsa_12".encode("utf-8")),
+        ),
+        (
+            b"lead:" + utf8_setup_secret.encode("utf-8") + b":done",
+            len(b"lead:" + "前导_sk-ant-oat01-xy".encode("utf-8")),
+        ),
+        (
+            b"\xff\xfe:" + l1_sb_secret.encode("latin-1") + b":\x80done",
+            len(b"\xff\xfe:" + "café_gxsa_12".encode("latin-1")),
+        ),
+        (
+            b"\xff\xfe:" + l1_setup_secret.encode("latin-1") + b":\x80done",
+            len(b"\xff\xfe:" + "début_sk-ant-oat01-xy".encode("latin-1")),
+        ),
+    ]
+
+    with _patch_get_redactor(redactor):
+        for payload, explicit_cut in cases:
+            expected = redactor.redact_bytes(payload, vault_secrets=vault)
+            # Explicit cut where the short token matches at chunk-1 tail while
+            # the enclosing literal secret finishes in chunk 2.
+            out_explicit = _run_streaming_chunks(
+                payload, [explicit_cut, len(payload) - explicit_cut], vault_secrets=vault
+            )
+            assert out_explicit == expected
+
+            # Every 2-way split and 1-byte split must also match redact_bytes.
+            for cut in range(1, len(payload)):
+                assert (
+                    _run_streaming_chunks(
+                        payload, [cut, len(payload) - cut], vault_secrets=vault
+                    )
+                    == expected
+                ), f"mismatch at cut={cut}"
+            assert (
+                _run_streaming_chunks(payload, [1] * len(payload), vault_secrets=vault)
+                == expected
+            )
+
+
+def test_streaming_redactor_8mib_self_overlapping_bounded_memory_and_time():
+    """8 MiB highly repetitive chunk with self-overlapping secret stays <64 MiB and sub-second."""
+    eight_mib = 8 * 1024 * 1024
+    # Multi-period correctness check against brute-force overlap merging first.
+    for pat in (b"aaaaaaaa", b"abababab", b"abacababa", b"aaaaabaaaa", b"aabaaabaa"):
+        ext_matchers = sr_mod._compile_period_extensions(pat)
+        sample = (
+            b"zz"
+            + pat
+            + pat[1:]
+            + pat[2:]
+            + b"x"
+            + pat
+            + pat[len(pat) - 1 :] * 5
+            + pat
+            + b"yy"
+        )
+        got = list(sr_mod._iter_literal_spans(sample, pat, ext_matchers))
+        # Brute-force reference
+        raw: list[tuple[int, int]] = []
+        idx = sample.find(pat)
+        while idx != -1:
+            raw.append((idx, idx + len(pat)))
+            idx = sample.find(pat, idx + 1)
+        expected_runs: list[tuple[int, int]] = []
+        for s, e in raw:
+            if expected_runs and s < expected_runs[-1][1]:
+                expected_runs[-1] = (expected_runs[-1][0], max(expected_runs[-1][1], e))
+            else:
+                expected_runs.append((s, e))
+        assert got == expected_runs, f"period mismatch for {pat!r}"
+
+    redactor = _make_upstream_redactor(
+        [
+            ("REP_A", "aaaaaaaa"),
+            ("REP_AB", "abababab"),
+        ]
+    )
+    chunk_a = b"a" * eight_mib
+    chunk_ab = b"ab" * (eight_mib // 2)
+
+    with _patch_get_redactor(redactor):
+        # 1) Direct _collect_merged_spans on full 8 MiB buffer collapses to 1 span.
+        sr_direct = StreamingSecretRedactor()
+        tracemalloc.start()
+        t0 = time.perf_counter()
+        spans = sr_direct._collect_merged_spans(chunk_a, covered=0)
+        dt_direct = time.perf_counter() - t0
+        _, peak_direct = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        assert spans == [(0, eight_mib, b"[REDACTED:REP_A]", None)]
+        assert peak_direct < 64 * 1024 * 1024, f"direct peak too high: {peak_direct}"
+        assert dt_direct < 2.0, f"direct scan too slow: {dt_direct:.3f}s"
+
+        # 2) Full feed() + flush() on 8 MiB repetitive chunks (period 1 and period 2).
+        for chunk, marker in (
+            (chunk_a, b"[REDACTED:REP_A]"),
+            (chunk_ab, b"[REDACTED:REP_AB]"),
+        ):
+            sr = StreamingSecretRedactor()
+            tracemalloc.start()
+            t0 = time.perf_counter()
+            out = sr.feed(chunk) + sr.flush()
+            elapsed = time.perf_counter() - t0
+            _, peak_bytes = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+
+            assert out == marker
+            assert peak_bytes < 64 * 1024 * 1024, f"peak memory too high: {peak_bytes}"
+            assert elapsed < 2.0, f"redaction too slow: {elapsed:.3f}s"
 
 
 # ---------------------------------------------------------------------------
@@ -1771,3 +1924,40 @@ def test_dalton_integration_conftest_disables_dotenv_before_alembic(tmp_path):
     finally:
         with pytest.raises(StopIteration):
             next(gen)
+
+
+def test_dalton_integration_collection_disables_dotenv_before_src_import(tmp_path):
+    """Importing Dalton integration conftest/test sets PYTHON_DOTENV_DISABLED=1 before src.config loads."""
+    repo_root = Path(__file__).resolve().parents[3]
+    env_file = tmp_path / ".env"
+    env_file.write_text("DALTON_COLLECTION_DOTENV_LEAK=must_not_load\n", encoding="utf-8")
+
+    base_env = {k: v for k, v in os.environ.items() if k != "PYTHON_DOTENV_DISABLED"}
+    base_env["DALTON_DOTENV_PATH"] = str(env_file)
+    base_env["DALTON_COLLECTION_DOTENV_LEAK_CLEAR"] = "1"
+    base_env.pop("DALTON_COLLECTION_DOTENV_LEAK", None)
+
+    for import_target in (
+        "tests.integration.dalton.conftest",
+        "tests.integration.dalton.test_workspace_file_stream_db",
+    ):
+        probe = (
+            "import importlib, os; "
+            f"importlib.import_module({import_target!r}); "
+            "assert os.environ.get('PYTHON_DOTENV_DISABLED') == '1'; "
+            "from src.dalton.config_env import load_shared_dotenv; "
+            f"assert load_shared_dotenv({str(env_file)!r}) is None; "
+            "import src.config; "
+            "assert 'DALTON_COLLECTION_DOTENV_LEAK' not in os.environ"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=str(repo_root),
+            env=base_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, (
+            f"subprocess failed for {import_target}: stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )

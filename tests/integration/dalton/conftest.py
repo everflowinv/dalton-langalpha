@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import os
+
+# Disable `.env` loading (both python-dotenv and src.dalton.config_env.load_shared_dotenv)
+# before any application module is imported during pytest collection.
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+
 from pathlib import Path
 from unittest.mock import create_autospec, patch
 

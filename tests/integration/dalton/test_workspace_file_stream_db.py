@@ -8,8 +8,13 @@ and ``tests/integration/dalton/conftest.py`` (never connects to production or re
 from __future__ import annotations
 
 import hashlib
+import os
 import uuid
 from unittest.mock import create_autospec, patch
+
+# Disable `.env` loading before importing any `src.*` module (covers direct
+# module import as well as pytest collection before fixtures execute).
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 
 import psycopg
 import pytest

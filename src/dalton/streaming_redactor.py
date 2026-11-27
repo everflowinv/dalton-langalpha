@@ -8,8 +8,9 @@ unbounded sandbox and Claude setup token patterns from
 
 from __future__ import annotations
 
+import heapq
 import re
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 
 from src.server.utils.secret_redactor import MIN_REDACT_SECRET_LEN, get_redactor
 
@@ -17,6 +18,10 @@ from src.server.utils.secret_redactor import MIN_REDACT_SECRET_LEN, get_redactor
 # chunks. Longer digit runs are treated as non-token plaintext so memory stays
 # strictly bounded on adversarial input.
 MAX_TOKEN_PREFIX_DIGITS = 64 * 1024
+
+# Internal processing window for ``feed()`` so even an 8 MiB chunk packed with
+# dense disjoint matches never materialises millions of spans at once.
+_FEED_WINDOW_BYTES = 256 * 1024
 
 _SANDBOX_TOKEN_PATTERN = rb"gxs[ar]_[A-Za-z0-9_.\-]+"
 _SETUP_TOKEN_PATTERN = rb"sk-ant-oat\d+-[A-Za-z0-9_-]+"
@@ -113,6 +118,57 @@ def _unclosed_token_prefix_len(buf: bytes, start: int) -> int:
     return best
 
 
+def _compile_period_extensions(pat: bytes) -> tuple[re.Pattern[bytes], ...]:
+    """Compile ``(?:ext)+`` matchers for primitive self-overlap periods of ``pat``.
+
+    A positive period ``d < len(pat)`` satisfies ``pat[d:] == pat[:-d]``; when
+    an occurrence ends at ``cur_e``, a strictly overlapping next occurrence
+    starts at ``cur_e - len(pat) + d`` iff ``buf`` matches ``pat[len(pat) - d:]``
+    at ``cur_e``. Dropping any period whose extension starts with a shorter
+    period's extension preserves exact coverage while letting ``(?:ext)+``
+    consume periodic runs in C with O(1) memory.
+    """
+    pat_len = len(pat)
+    exts: list[bytes] = []
+    matchers: list[re.Pattern[bytes]] = []
+    for d in range(1, pat_len):
+        if pat[d:] == pat[:-d]:
+            ext = pat[pat_len - d :]
+            if any(ext.startswith(prev) for prev in exts):
+                continue
+            exts.append(ext)
+            matchers.append(re.compile(rb"(?:" + re.escape(ext) + rb")+"))
+    return tuple(matchers)
+
+
+def _iter_literal_spans(
+    buf: bytes, pat: bytes, ext_matchers: tuple[re.Pattern[bytes], ...]
+) -> Iterator[tuple[int, int]]:
+    """Yield maximal strictly-overlapping merged ``(start, end)`` runs of ``pat``."""
+    pat_len = len(pat)
+    idx = buf.find(pat)
+    if not ext_matchers:
+        while idx != -1:
+            end = idx + pat_len
+            yield idx, end
+            idx = buf.find(pat, end)
+        return
+
+    while idx != -1:
+        cur_s = idx
+        cur_e = idx + pat_len
+        while True:
+            for matcher in ext_matchers:
+                m = matcher.match(buf, cur_e)
+                if m is not None:
+                    cur_e = m.end()
+                    break
+            else:
+                break
+        yield cur_s, cur_e
+        idx = buf.find(pat, cur_e)
+
+
 def _prefer_end_token(a: str | None, b: str | None) -> str | None:
     """Choose the swallowing continuation class when token spans reach buffer end.
 
@@ -177,8 +233,11 @@ class StreamingSecretRedactor:
                 _add_secret(name, value)
 
         sorted_patterns = sorted(pattern_to_repl.keys(), key=len, reverse=True)
-        self._lit_patterns: list[tuple[bytes, bytes]] = [
-            (pat, pattern_to_repl[pat]) for pat in sorted_patterns
+        self._lit_patterns: list[
+            tuple[bytes, bytes, tuple[re.Pattern[bytes], ...]]
+        ] = [
+            (pat, pattern_to_repl[pat], _compile_period_extensions(pat))
+            for pat in sorted_patterns
         ]
         self._max_lit_len = len(sorted_patterns[0]) if sorted_patterns else 0
         self._lit_keep = max(self._max_lit_len - 1, 0)
@@ -197,7 +256,18 @@ class StreamingSecretRedactor:
         """Process the next input chunk and return safe redacted bytes."""
         if not chunk:
             return b""
+        if len(chunk) <= _FEED_WINDOW_BYTES:
+            return self._feed_one(chunk)
+        parts: list[bytes] = []
+        for off in range(0, len(chunk), _FEED_WINDOW_BYTES):
+            piece = self._feed_one(chunk[off : off + _FEED_WINDOW_BYTES])
+            if piece:
+                parts.append(piece)
+        if not parts:
+            return b""
+        return parts[0] if len(parts) == 1 else b"".join(parts)
 
+    def _feed_one(self, chunk: bytes) -> bytes:
         if self._swallowing is not None:
             cont_re = (
                 _SANDBOX_CONT_RE if self._swallowing == "sandbox" else _SETUP_CONT_RE
@@ -253,61 +323,103 @@ class StreamingSecretRedactor:
     def _collect_merged_spans(
         self, buf: bytes, *, covered: int
     ) -> list[tuple[int, int, bytes, str | None]]:
-        """Find all literal & token matches and merge strictly overlapping spans.
+        """Find all literal & token matches and incrementally merge overlapping spans.
+
+        Each literal pattern yields already self-merged disjoint runs, and a
+        bounded k-way min-heap merges across patterns and token streams on the
+        fly so self-overlapping matches never allocate per-occurrence records.
 
         Returns sorted disjoint tuples ``(start, end, replacement, end_token)``
         where ``end_token`` is ``"sandbox"`` / ``"setup"`` if a token match in
         the merged group reaches ``len(buf)``, else ``None``.
         """
         n = len(buf)
-        # Span tuple: (start, end, priority, repl, end_token)
-        # priority: (-1, 0) already-covered prefix (emits b"");
-        #           (0, idx) literals longest-first (global before vault on tie);
-        #           (1, 0) sandbox token; (2, 0) setup token.
-        spans: list[tuple[int, int, tuple[int, int], bytes, str | None]] = []
+        # Priority order (strictly unique per source so heap ties never compare iterators):
+        #   (-1, 0) already-covered prefix (emits b"");
+        #   (0, pat_idx) literals longest-first (global before vault on tie);
+        #   (1, 0) sandbox token; (2, 0) setup token.
+        SpanItem = tuple[int, int, tuple[int, int], bytes, str | None]
 
-        if covered > 0:
-            spans.append((0, covered, (-1, 0), b"", None))
+        def _lit_source(
+            pat_idx: int,
+            pat: bytes,
+            repl: bytes,
+            ext_matchers: tuple[re.Pattern[bytes], ...],
+        ) -> Iterator[SpanItem]:
+            pri = (0, pat_idx)
+            for s, e in _iter_literal_spans(buf, pat, ext_matchers):
+                yield s, e, pri, repl, None
 
-        for pat_idx, (pat, repl) in enumerate(self._lit_patterns):
-            pat_len = len(pat)
-            idx = buf.find(pat)
-            while idx != -1:
-                spans.append((idx, idx + pat_len, (0, pat_idx), repl, None))
-                idx = buf.find(pat, idx + 1)
-
-        for m in _SANDBOX_TOKEN_RE.finditer(buf):
-            end = m.end()
-            spans.append(
-                (
+        def _sandbox_source() -> Iterator[SpanItem]:
+            for m in _SANDBOX_TOKEN_RE.finditer(buf):
+                end = m.end()
+                yield (
                     m.start(),
                     end,
                     (1, 0),
                     _SANDBOX_REPLACEMENT,
                     "sandbox" if end == n else None,
                 )
-            )
 
-        for m in _SETUP_TOKEN_RE.finditer(buf):
-            end = m.end()
-            spans.append(
-                (
+        def _setup_source() -> Iterator[SpanItem]:
+            for m in _SETUP_TOKEN_RE.finditer(buf):
+                end = m.end()
+                yield (
                     m.start(),
                     end,
                     (2, 0),
                     _SETUP_REPLACEMENT,
                     "setup" if end == n else None,
                 )
-            )
 
-        if not spans:
+        heap: list[
+            tuple[
+                int,
+                int,
+                tuple[int, int],
+                bytes,
+                str | None,
+                Iterator[SpanItem] | None,
+            ]
+        ] = []
+
+        if covered > 0:
+            heapq.heappush(heap, (0, -covered, (-1, 0), b"", None, None))
+
+        for pat_idx, (pat, repl, ext_matchers) in enumerate(self._lit_patterns):
+            it = _lit_source(pat_idx, pat, repl, ext_matchers)
+            first = next(it, None)
+            if first is not None:
+                s, e, pri, repl_b, tok = first
+                heapq.heappush(heap, (s, -e, pri, repl_b, tok, it))
+
+        for tok_it in (_sandbox_source(), _setup_source()):
+            first = next(tok_it, None)
+            if first is not None:
+                s, e, pri, repl_b, tok = first
+                heapq.heappush(heap, (s, -e, pri, repl_b, tok, tok_it))
+
+        if not heap:
             return []
 
-        spans.sort(key=lambda item: (item[0], -item[1], item[2]))
-
         merged: list[tuple[int, int, bytes, str | None]] = []
-        cur_s, cur_e, cur_pri, cur_repl, cur_end_tok = spans[0]
-        for s, e, pri, repl, end_tok in spans[1:]:
+        s, neg_e, cur_pri, cur_repl, cur_end_tok, it = heapq.heappop(heap)
+        cur_s, cur_e = s, -neg_e
+        if it is not None:
+            nxt = next(it, None)
+            if nxt is not None:
+                ns, ne, npri, nrepl, ntok = nxt
+                heapq.heappush(heap, (ns, -ne, npri, nrepl, ntok, it))
+
+        while heap:
+            s, neg_e, pri, repl, end_tok, it = heapq.heappop(heap)
+            e = -neg_e
+            if it is not None:
+                nxt = next(it, None)
+                if nxt is not None:
+                    ns, ne, npri, nrepl, ntok = nxt
+                    heapq.heappush(heap, (ns, -ne, npri, nrepl, ntok, it))
+
             if s < cur_e:
                 if e > cur_e:
                     cur_e = e
@@ -317,7 +429,14 @@ class StreamingSecretRedactor:
                 cur_end_tok = _prefer_end_token(cur_end_tok, end_tok)
             else:
                 merged.append((cur_s, cur_e, cur_repl, cur_end_tok))
-                cur_s, cur_e, cur_pri, cur_repl, cur_end_tok = s, e, pri, repl, end_tok
+                cur_s, cur_e, cur_pri, cur_repl, cur_end_tok = (
+                    s,
+                    e,
+                    pri,
+                    repl,
+                    end_tok,
+                )
+
         merged.append((cur_s, cur_e, cur_repl, cur_end_tok))
         return merged
 
@@ -359,12 +478,16 @@ class StreamingSecretRedactor:
                         self._covered_prefix = 0
                     self._swallowing = end_token
                     return b"".join(out)
-                # Short token prefix within lit_keep: keep in tail so a literal
-                # completing in the next chunk merges cleanly before emitting.
-                if ms > pos:
-                    out.append(buf[pos:ms])
-                self._tail = buf[ms:]
-                self._covered_prefix = covered if ms == 0 else 0
+                # Short token prefix within lit_keep: hold from min(ms, hold_start)
+                # so a literal starting before the token and completing in the next
+                # chunk is never prematurely emitted as plaintext.
+                emit_limit = min(ms, hold_start)
+                if emit_limit > pos:
+                    out.append(buf[pos:emit_limit])
+                self._tail = buf[emit_limit:]
+                self._covered_prefix = (
+                    covered - emit_limit if pos == 0 and emit_limit < covered else 0
+                )
                 return b"".join(out)
 
             if me <= hold_start:
