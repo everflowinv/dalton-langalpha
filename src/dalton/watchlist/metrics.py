@@ -1211,7 +1211,7 @@ class WatchlistMetricsService:
 
         today_iso = date.today().isoformat()
 
-        def _assemble_item(
+        async def _assemble_item(
             sym: str,
             bars: list[dict[str, Any]],
             mcap: float | None,
@@ -1301,6 +1301,7 @@ class WatchlistMetricsService:
 
         if not wait_for_cold:
             now_post = time.monotonic()
+            warm_args: list[tuple[str, list[dict[str, Any]], float | None, str | None]] = []
             for sym in listed_symbols:
                 snap = snaps.get(sym) or {}
                 row = rows_by_ticker.get(sym) or {}
@@ -1342,7 +1343,10 @@ class WatchlistMetricsService:
                     elif has_financial and sym in mcap_warming_set:
                         pending_set.add(sym)
 
-                _, payload = _assemble_item(sym, bars, mcap, mcap_currency)
+                warm_args.append((sym, bars, mcap, mcap_currency))
+            for sym, payload in await asyncio.gather(
+                *(_assemble_item(*args) for args in warm_args)
+            ):
                 items[sym] = payload
         else:
             async def _compute_one_cold(sym: str) -> tuple[str, dict[str, Any]]:
@@ -1394,7 +1398,7 @@ class WatchlistMetricsService:
                             user_id=uid,
                         )
 
-                return _assemble_item(sym, bars, mcap, mcap_currency)
+                return await _assemble_item(sym, bars, mcap, mcap_currency)
 
             results = await asyncio.gather(*(_compute_one_cold(sym) for sym in listed_symbols))
             for sym, payload in results:
