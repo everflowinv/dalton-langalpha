@@ -426,22 +426,6 @@ wait_url_down() {
   return 1
 }
 
-wait_url_up() {
-  local url="$1"
-  local timeout_s="$2"
-  local elapsed=0
-  while [[ "${elapsed}" -lt "${timeout_s}" ]]; do
-    local code
-    code="$(http_status_code "${url}")"
-    if [[ "${code}" == "200" ]]; then
-      return 0
-    fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-  return 1
-}
-
 drain_common_args=()
 if [[ -n "${EFF_PLIST_DIR}" ]]; then drain_common_args+=(--plist-dir "${EFF_PLIST_DIR}"); fi
 if [[ -n "${REPO_ENV_PATH}" ]]; then drain_common_args+=(--repo-env "${REPO_ENV_PATH}"); fi
@@ -497,8 +481,8 @@ rh_launchctl_bootstrap "com.dalton.researchdata-bridge" "${BRIDGE_PLIST}" \
 
 rh_wait_owner --target legacy --url "${PROXY_URL}" --timeout "${SERVICE_TIMEOUT}" >/dev/null \
   || fail_with_gate_closed "4/7 wait-legacy-proxy" "Legacy Guidepoint proxy (${PROXY_URL}/healthz) did not report healthy + owner_lock_held=true within ${SERVICE_TIMEOUT}s."
-wait_url_up "${BRIDGE_URL%/}/healthz" "${SERVICE_TIMEOUT}" \
-  || fail_with_gate_closed "4/7 wait-legacy-bridge" "Legacy bridge (${BRIDGE_URL}/healthz) did not return HTTP 200 within ${SERVICE_TIMEOUT}s."
+rh_wait_health --url "${BRIDGE_URL%/}/healthz" --timeout "${SERVICE_TIMEOUT}" >/dev/null \
+  || fail_with_gate_closed "4/7 wait-legacy-bridge" "Legacy bridge (${BRIDGE_URL}/healthz) did not report healthy HTTP 200 within ${SERVICE_TIMEOUT}s."
 
 echo "[5/7] Resolving Compose args and recreating backend container..."
 resolve_compose_args_array "${REPO_ENV_PATH}" \
@@ -509,8 +493,8 @@ resolve_compose_args_array "${REPO_ENV_PATH}" \
   "${DOCKER_BIN_EFF}" compose "${COMPOSE_ARGS[@]}" up -d --no-deps --force-recreate backend
 ) || fail_with_gate_closed "5/7 recreate-backend" "Docker Compose failed to recreate backend. Check docker compose logs backend and verify ${REPO_ENV_PATH}."
 
-wait_url_up "${BACKEND_URL%/}/health" "${SERVICE_TIMEOUT}" \
-  || fail_with_gate_closed "5/7 wait-backend-health" "Backend (${BACKEND_URL}/health) did not return HTTP 200 within ${SERVICE_TIMEOUT}s after recreate."
+rh_wait_health --url "${BACKEND_URL%/}/health" --timeout "${SERVICE_TIMEOUT}" >/dev/null \
+  || fail_with_gate_closed "5/7 wait-backend-health" "Backend (${BACKEND_URL}/health) did not report healthy HTTP 200 within ${SERVICE_TIMEOUT}s after recreate."
 
 run_gate_verify --expected-paused true --backend-url "${BACKEND_URL}" --container-name "${CONTAINER_NAME}" --deadline-s "${GATE_VERIFY_TIMEOUT}" >/dev/null \
   || fail_with_gate_closed "5/7 verify-post-recreate-gate" "Backend came up but closed-gate verification failed. Confirm /app/var/dalton/maintenance-admission.json is mounted properly."
@@ -544,12 +528,10 @@ if [[ "${KEEP_ADMISSION_PAUSED}" -eq 1 ]]; then
   exit 0
 fi
 
-echo "[7/7] Opening maintenance admission gate..."
-run_gate_set --paused false --pause-host-direct false --operation rollback --reason "rollback_verified" \
-  || fail_with_gate_closed "7/7 open-gate" "Failed to open maintenance admission gate. Open it manually after checking Postgres connectivity."
-
-if ! run_gate_verify --expected-paused false --backend-url "${BACKEND_URL}" --container-name "${CONTAINER_NAME}" --deadline-s "${GATE_VERIFY_TIMEOUT}" >/dev/null; then
-  reclose_ok=1
+reclose_after_open_failure() {
+  local fail_step="$1"
+  local fail_msg="$2"
+  local reclose_ok=1
   if ! run_gate_set --paused true --pause-host-direct true --operation rollback --reason "rollback_open_verify_failed"; then
     reclose_ok=0
   elif ! is_gate_fully_closed; then
@@ -559,10 +541,19 @@ if ! run_gate_verify --expected-paused false --backend-url "${BACKEND_URL}" --co
   fi
 
   if [[ "${reclose_ok}" -eq 1 ]]; then
-    fail_with_gate_closed "7/7 verify-gate-open" "Backend did not confirm open admission gate (HTTP 200); gate was re-closed and verified closed for safety."
+    fail_with_gate_closed "${fail_step}" "${fail_msg}; gate was re-closed and verified closed for safety."
   else
-    fail_gate_state_unknown "7/7 reclose-gate" "Backend did not confirm open admission gate (HTTP 200), AND re-closing or verifying closed admission gate FAILED! Immediately close the gate manually (or with --no-db-lock if Postgres is unavailable) and inspect ${RH_ADMISSION_FILE}."
+    fail_gate_state_unknown "7/7 reclose-gate" "${fail_msg}, AND re-closing or verifying closed admission gate FAILED! Immediately close the gate manually (or with --no-db-lock if Postgres is unavailable) and inspect ${RH_ADMISSION_FILE}."
   fi
+}
+
+echo "[7/7] Opening maintenance admission gate..."
+if ! run_gate_set --paused false --pause-host-direct false --operation rollback --reason "rollback_verified"; then
+  reclose_after_open_failure "7/7 open-gate" "Failed to open maintenance admission gate (disk state may have been updated before error)"
+fi
+
+if ! run_gate_verify --expected-paused false --backend-url "${BACKEND_URL}" --container-name "${CONTAINER_NAME}" --deadline-s "${GATE_VERIFY_TIMEOUT}" >/dev/null; then
+  reclose_after_open_failure "7/7 verify-gate-open" "Backend did not confirm open admission gate (HTTP 200)"
 fi
 
 echo "ROLLBACK_OK: restored legacy :8943 + :8960 baseline from ${SNAPSHOT_DIR} and reopened admission gate."

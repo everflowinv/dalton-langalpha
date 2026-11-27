@@ -338,14 +338,46 @@ def _curl_escape_cfg_val(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _http_request(
+def _extract_response_headers(raw_hdrs: Any) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if raw_hdrs is None:
+        return out
+    items_fn = getattr(raw_hdrs, "items", None)
+    if callable(items_fn):
+        try:
+            for k, v in items_fn():
+                if isinstance(k, str) and isinstance(v, str):
+                    out[k.lower()] = v.strip()
+        except Exception:
+            pass
+    return out
+
+
+def _parse_curl_header_dump(raw_text: str) -> dict[str, str]:
+    """Parse the final HTTP response header block from `curl -D` output."""
+    out: dict[str, str] = {}
+    for raw_line in raw_text.splitlines():
+        line = raw_line.rstrip("\r")
+        if not line:
+            continue
+        if line.upper().startswith("HTTP/"):
+            out = {}
+            continue
+        if ":" in line:
+            k, v = line.split(":", 1)
+            out[k.strip().lower()] = v.strip()
+    return out
+
+
+def _http_request_with_headers(
     method: str,
     url: str,
     *,
     headers: Mapping[str, str] | None = None,
     body: bytes | None = None,
     timeout_s: float = 5.0,
-) -> tuple[int | None, Any, str | None]:
+    capture_headers: bool = True,
+) -> tuple[int | None, Any, dict[str, str], str | None]:
     req_headers = dict(headers or {})
     if body is not None and "Content-Type" not in req_headers:
         req_headers["Content-Type"] = "application/json"
@@ -361,6 +393,7 @@ def _http_request(
             method,
         ]
         cfg_path: str | None = None
+        hdr_path: str | None = None
         try:
             if req_headers:
                 fd, cfg_path = tempfile.mkstemp(prefix=".dalton-curl-", suffix=".cfg")
@@ -378,44 +411,63 @@ def _http_request(
                         pass
                     raise
                 cmd.extend(["-K", cfg_path])
+            if capture_headers:
+                h_fd, hdr_path = tempfile.mkstemp(prefix=".dalton-curl-", suffix=".hdr")
+                try:
+                    os.fchmod(h_fd, 0o600)
+                finally:
+                    try:
+                        os.close(h_fd)
+                    except OSError:
+                        pass
+                cmd.extend(["-D", hdr_path])
             if body is not None:
                 cmd.extend(["--data-binary", body.decode("utf-8", errors="replace")])
             cmd.extend(["-w", "\n%{http_code}", url])
             rc, out, err = _run_cmd(cmd, timeout_s=max(5.0, timeout_s + 2.0))
-        finally:
-            if cfg_path:
+            resp_headers: dict[str, str] = {}
+            if hdr_path and os.path.isfile(hdr_path):
                 try:
-                    os.unlink(cfg_path)
+                    resp_headers = _parse_curl_header_dump(Path(hdr_path).read_text(encoding="utf-8", errors="replace"))
                 except OSError:
-                    pass
+                    resp_headers = {}
+        finally:
+            for tmp_p in (cfg_path, hdr_path):
+                if tmp_p:
+                    try:
+                        os.unlink(tmp_p)
+                    except OSError:
+                        pass
         if rc != 0:
-            return None, None, f"curl failed (rc={rc}): {_sanitize_error_text(err.strip())}"
+            return None, None, {}, f"curl failed (rc={rc}): {_sanitize_error_text(err.strip())}"
         if "\n" in out:
             body_text, code_str = out.rsplit("\n", 1)
         else:
             body_text, code_str = "", out.strip()
         code_str = code_str.strip()
         if not code_str.isdigit():
-            return None, None, f"curl returned non-numeric status: {code_str!r}"
+            return None, None, {}, f"curl returned non-numeric status: {code_str!r}"
         code = int(code_str)
         if code == 0:
-            return None, None, "curl connection failed (status 000)"
+            return None, None, {}, "curl connection failed (status 000)"
         try:
             parsed = json.loads(body_text) if body_text.strip() else {}
         except ValueError:
             parsed = body_text
-        return code, parsed, None
+        return code, parsed, resp_headers, None
 
     req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            resp_headers = _extract_response_headers(getattr(resp, "headers", None))
             raw = resp.read().decode("utf-8", errors="replace")
             try:
                 parsed = json.loads(raw) if raw.strip() else {}
             except ValueError:
                 parsed = raw
-            return int(resp.status), parsed, None
+            return int(resp.status), parsed, resp_headers, None
     except urllib.error.HTTPError as exc:
+        resp_headers = _extract_response_headers(getattr(exc, "headers", None))
         raw = ""
         try:
             raw = exc.read().decode("utf-8", errors="replace")
@@ -425,9 +477,28 @@ def _http_request(
             parsed = json.loads(raw) if raw.strip() else {}
         except ValueError:
             parsed = raw
-        return int(exc.code), parsed, None
+        return int(exc.code), parsed, resp_headers, None
     except Exception as exc:
-        return None, None, f"{type(exc).__name__}: {_sanitize_error_text(str(exc))}"
+        return None, None, {}, f"{type(exc).__name__}: {_sanitize_error_text(str(exc))}"
+
+
+def _http_request(
+    method: str,
+    url: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    body: bytes | None = None,
+    timeout_s: float = 5.0,
+) -> tuple[int | None, Any, str | None]:
+    code, parsed, _resp_headers, err = _http_request_with_headers(
+        method,
+        url,
+        headers=headers,
+        body=body,
+        timeout_s=timeout_s,
+        capture_headers=False,
+    )
+    return code, parsed, err
 
 
 def _run_cmd(
@@ -4518,19 +4589,113 @@ def _extract_mcp_payload(parsed: Any) -> tuple[dict[str, Any] | None, str | None
             snippet = str(content[0].get("text") or "")[:200]
         return None, f"tool returned isError=true ({snippet})"
     content = result.get("content")
-    if isinstance(content, list) and content and isinstance(content[0], dict):
-        text = content[0].get("text")
-        if isinstance(text, str) and text.strip():
-            try:
-                inner = json.loads(text)
-                if isinstance(inner, dict):
-                    return inner, None
-            except ValueError:
-                pass
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "text":
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                try:
+                    inner = json.loads(text)
+                    if isinstance(inner, dict):
+                        return inner, None
+                    if isinstance(inner, list):
+                        return {"data": inner}, None
+                except ValueError:
+                    continue
     structured = result.get("structuredContent")
     if isinstance(structured, dict):
         return structured, None
     return result, None
+
+
+def _call_legacy_proxy_guidepoint_mcp(
+    base_url: str,
+    *,
+    query: str = "cloud",
+    size: int = 1,
+    timeout_s: float = 15.0,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Call `:8943/mcp` `search_library` with the same MCP handshake & JSON/SSE decoding as `gp_search.py`.
+
+    1. `initialize` (`protocolVersion=2025-03-26`) -> capture `Mcp-Session-Id` header and verify JSON/SSE `result`.
+    2. Best-effort `notifications/initialized` with `Mcp-Session-Id`.
+    3. `tools/call` `search_library` with `Mcp-Session-Id`, `Accept: application/json, text/event-stream`,
+       and `X-Dalton-Request-Timeout-Ms`.
+    """
+    mcp_url = f"{base_url.rstrip('/')}/mcp"
+    deadline_mono = time.monotonic() + max(0.5, float(timeout_s))
+
+    def _rpc(payload: dict[str, Any], session_id: str | None = None) -> tuple[int | None, Any, str | None, str | None]:
+        rem_s = max(0.1, deadline_mono - time.monotonic())
+        hdrs: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "X-Dalton-Request-Timeout-Ms": str(max(100, int(rem_s * 1000))),
+        }
+        if session_id:
+            hdrs["Mcp-Session-Id"] = session_id
+        code, body, resp_hdrs, err = _http_request_with_headers(
+            "POST",
+            mcp_url,
+            headers=hdrs,
+            body=json.dumps(payload).encode("utf-8"),
+            timeout_s=rem_s,
+            capture_headers=True,
+        )
+        sid = resp_hdrs.get("mcp-session-id") or session_id
+        return code, body, sid, err
+
+    init_code, init_body, sid, init_err = _rpc(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "dalton-ops-probe", "version": "1.0"},
+            },
+        }
+    )
+    if init_err or init_code != 200:
+        return None, f"proxy :8943/mcp initialize -> HTTP {init_code} ({init_err or 'error'})"
+    init_msg, init_dec_err = _decode_mcp_json_or_sse(init_body)
+    if init_dec_err or init_msg is None:
+        return None, f"proxy :8943/mcp initialize decode failed: {init_dec_err}"
+    if init_msg.get("error"):
+        return None, f"proxy :8943/mcp initialize error: {init_msg['error']}"
+    if not isinstance(init_msg.get("result"), dict):
+        return None, "proxy :8943/mcp initialize missing result object"
+
+    # Best-effort initialized notification (matches gp_search.py:174-177)
+    try:
+        _rpc({"jsonrpc": "2.0", "method": "notifications/initialized"}, sid)
+    except Exception:
+        pass
+
+    rem_call = max(0.1, deadline_mono - time.monotonic())
+    call_timeout = max(1, int(rem_call)) if rem_call >= 1.0 else rem_call
+    call_code, call_body, _sid2, call_err = _rpc(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "search_library",
+                "arguments": {"query": query, "size": int(size), "timeout": call_timeout},
+            },
+        },
+        sid,
+    )
+    if call_err or call_code != 200:
+        return None, f"proxy :8943/mcp search_library -> HTTP {call_code} ({call_err or 'error'})"
+    inner, m_err = _extract_mcp_payload(call_body)
+    if m_err or inner is None:
+        return None, f"proxy :8943/mcp search_library failed: {m_err}"
+    if inner.get("ok") is False:
+        return None, f"proxy :8943/mcp search_library error: {inner.get('error')}"
+    return inner, None
 
 
 def _run_probe_with_retries(
@@ -4689,31 +4854,14 @@ def cmd_probe_services(args: argparse.Namespace) -> int:
             return True, "legacy bridge guidepoint search_library succeeded"
 
         def _probe_proxy_direct_guidepoint() -> tuple[bool, str]:
-            rpc = json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 3,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "search_library",
-                        "arguments": {"query": query, "size": 1},
-                    },
-                }
-            ).encode("utf-8")
-            code, body, err = _http_request(
-                "POST",
-                f"{proxy_base}/mcp",
-                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
-                body=rpc,
+            _inner, p_err = _call_legacy_proxy_guidepoint_mcp(
+                proxy_base,
+                query=query,
+                size=1,
                 timeout_s=timeout_s,
             )
-            if err or code != 200:
-                return False, f"proxy :8943/mcp search_library -> HTTP {code} ({err or 'error'})"
-            inner, m_err = _extract_mcp_payload(body)
-            if m_err or inner is None:
-                return False, f"proxy :8943/mcp search_library failed: {m_err}"
-            if inner.get("ok") is False:
-                return False, f"proxy :8943/mcp search_library error: {inner.get('error')}"
+            if p_err:
+                return False, p_err
             return True, "proxy :8943 direct guidepoint search_library succeeded"
 
         probes: list[tuple[str, Callable[[], tuple[bool, str]]]] = [
@@ -4913,6 +5061,37 @@ def cmd_wait_owner(args: argparse.Namespace) -> int:
         time.sleep(min(poll_s, max(0.01, deadline - time.monotonic())))
 
 
+def cmd_wait_health(args: argparse.Namespace) -> int:
+    """Bounded poll on a health endpoint until HTTP 200 (and not explicitly `ok: false`)."""
+    url = str(args.url).strip()
+    timeout_s = max(0.5, float(args.timeout))
+    poll_s = max(0.05, float(args.poll_interval))
+    req_timeout = max(1.0, min(5.0, timeout_s))
+    deadline = time.monotonic() + timeout_s
+    last_reason = "no response received"
+
+    while True:
+        rem = max(0.2, deadline - time.monotonic())
+        code, body, err = _http_request("GET", url, timeout_s=min(req_timeout, rem))
+        if err or code != 200:
+            last_reason = f"GET {url} -> {code} ({err or 'unexpected status'})"
+        elif isinstance(body, dict) and body.get("ok") is False:
+            last_reason = f"GET {url} -> HTTP 200 with ok=False"
+        else:
+            if isinstance(body, (dict, list)):
+                print(json.dumps(body, ensure_ascii=False, indent=2))
+            else:
+                print(str(body))
+            return 0
+        if time.monotonic() >= deadline:
+            print(
+                f"ERROR: wait-health ({url}) timed out after {timeout_s:.1f}s: {last_reason}",
+                file=sys.stderr,
+            )
+            return 1
+        time.sleep(min(poll_s, max(0.01, deadline - time.monotonic())))
+
+
 def _resolve_tokens_path_for_ops(args: argparse.Namespace, repo_root: Path, home_dir: Path) -> Path:
     if getattr(args, "tokens_file", None):
         return Path(args.tokens_file).expanduser().resolve()
@@ -4928,6 +5107,146 @@ def _resolve_tokens_path_for_ops(args: argparse.Namespace, repo_root: Path, home
     return sources["guidepoint_tokens"]
 
 
+def _resolve_legacy_proxy_ops_context(
+    args: argparse.Namespace,
+    repo_root: Path,
+    home_dir: Path,
+) -> tuple[Path, Path, Path, str]:
+    """Resolve `(tokens_path, gp_env_path, proxy_plist, admin_token)` using `resolve_legacy_proxy_effective_paths`."""
+    eff_plist_dir = (
+        Path(args.plist_dir).expanduser().resolve()
+        if getattr(args, "plist_dir", None)
+        else (
+            Path(os.environ["DALTON_LAUNCH_AGENTS_DIR"]).expanduser().resolve()
+            if str(os.environ.get("DALTON_LAUNCH_AGENTS_DIR") or "").strip()
+            else (home_dir / "Library" / "LaunchAgents")
+        )
+    )
+    eff_bridge_env = (
+        Path(args.bridge_env).expanduser().resolve()
+        if getattr(args, "bridge_env", None)
+        else (
+            Path(os.environ["DALTON_BRIDGE_ENV_FILE"]).expanduser().resolve()
+            if str(os.environ.get("DALTON_BRIDGE_ENV_FILE") or "").strip()
+            else (home_dir / ".config" / "dalton" / "researchdata-bridge.env")
+        )
+    )
+    proxy_plist = eff_plist_dir / "com.dalton.guidepoint-mcp-proxy.plist"
+    explicit_gp_env = (
+        Path(args.guidepoint_env).expanduser().resolve()
+        if getattr(args, "guidepoint_env", None)
+        else None
+    )
+    explicit_tokens = (
+        Path(args.tokens_file).expanduser().resolve()
+        if getattr(args, "tokens_file", None)
+        else None
+    )
+
+    try:
+        bse_mod = _import_bridge_subprocess_env(repo_root)
+        gl_mod = _import_guidepoint_lock(repo_root)
+        bridge_vals = _parse_simple_env_file(eff_bridge_env)
+        resolved_proxy = bse_mod.resolve_legacy_proxy_effective_paths(
+            repo_root=repo_root,
+            home_dir=home_dir,
+            existing_proxy_plist_path=proxy_plist,
+            bridge_env_vals=bridge_vals,
+            guidepoint_env_path=explicit_gp_env,
+        )
+        eff_proxy_env = dict(resolved_proxy.get("effective_env") or {"HOME": str(home_dir)})
+        gp_env_path = (
+            explicit_gp_env
+            if explicit_gp_env is not None
+            else Path(str(resolved_proxy["guidepoint_env_file"])).expanduser().resolve()
+        )
+        tokens_path = (
+            explicit_tokens
+            if explicit_tokens is not None
+            else gl_mod.resolve_guidepoint_tokens_file(environ=eff_proxy_env)
+        )
+        admin_tok = str(eff_proxy_env.get("GUIDEPOINT_PROXY_ADMIN_TOKEN") or "").strip()
+        return tokens_path, gp_env_path, proxy_plist, admin_tok
+    except ImportError:
+        if explicit_gp_env is None or explicit_tokens is None:
+            raise
+        gp_vals = _parse_simple_env_file(explicit_gp_env)
+        admin_tok = str(gp_vals.get("GUIDEPOINT_PROXY_ADMIN_TOKEN") or "").strip()
+        if not admin_tok and proxy_plist.is_file():
+            p_ev, _p_err = _load_plist_env_vars_strict(proxy_plist)
+            if p_ev:
+                admin_tok = str(p_ev.get("GUIDEPOINT_PROXY_ADMIN_TOKEN") or "").strip()
+        return explicit_tokens, explicit_gp_env, proxy_plist, admin_tok
+
+
+def _matches_refresher_command(target: str, cmdline: str) -> bool:
+    """Return True when a `ps` command line corresponds to the live refresher process."""
+    text = cmdline.strip()
+    if not text:
+        return False
+    # Exclude test runners and ops helper invocations referencing script names in arguments.
+    if "pytest" in text or "preflight.py" in text or "rollback_research_host.sh" in text:
+        return False
+    if target == "legacy":
+        return bool(
+            re.search(r"(?:^|[\s/])guidepoint_mcp_proxy(?:_run\.sh|\.py)(?:\s|$)", text)
+        )
+    return bool(
+        re.search(
+            r"(?:^|\s)(?:-m\s+src\.dalton\.research_host|[^\s]*src/dalton/research_host(?:/__main__\.py)?)(?:\s|$)",
+            text,
+        )
+    )
+
+
+def _is_refresher_process_stopped(target: str) -> tuple[bool, str]:
+    """Confirm via `launchctl print` / `launchctl list` AND process table (`ps`) that refresher exited.
+
+    Fail-closed: returns `(False, detail)` if the service is loaded with a running PID/active state,
+    a matching process exists in `ps`, or either verification command fails.
+    """
+    label = "com.dalton.guidepoint-mcp-proxy" if target == "legacy" else "com.dalton.research-host"
+    domain = str(os.environ.get("DALTON_LAUNCHD_DOMAIN") or "").strip()
+    if not domain:
+        uid_val = str(os.environ.get("DALTON_LAUNCHD_UID") or "").strip() or str(os.getuid())
+        domain = f"gui/{uid_val}"
+    lc_bin = str(os.environ.get("LAUNCHCTL_BIN") or "launchctl").strip() or "launchctl"
+    ps_bin = str(os.environ.get("PS_BIN") or "ps").strip() or "ps"
+
+    rc_p, out_p, _err_p = _run_cmd([lc_bin, "print", f"{domain}/{label}"], timeout_s=5.0)
+    if rc_p == 0 and out_p:
+        m_pid = re.search(r"^\s*pid\s*=\s*([0-9]+)\b", out_p, flags=re.MULTILINE)
+        if m_pid and int(m_pid.group(1)) > 0:
+            return False, f"launchctl print reports {label} running (pid={m_pid.group(1)})"
+        if re.search(r"^\s*state\s*=\s*running\b", out_p, flags=re.MULTILINE) or re.search(
+            r"^service\s+\S+\s*=\s*active\b", out_p, flags=re.MULTILINE
+        ):
+            return False, f"launchctl print reports {label} active"
+
+    rc_l, out_l, err_l = _run_cmd([lc_bin, "list"], timeout_s=5.0)
+    if rc_l != 0:
+        return False, f"launchctl list failed (rc={rc_l}: {err_l.strip() or 'error'})"
+    pids = _parse_launchctl_list_pids(out_l)
+    if label in pids and pids[label] is not None and pids[label] > 0:
+        return False, f"launchctl list reports {label} running (pid={pids[label]})"
+
+    rc_ps, out_ps, err_ps = _run_cmd([ps_bin, "-axo", "pid=,command="], timeout_s=5.0)
+    if rc_ps != 0:
+        return False, f"ps process check failed (rc={rc_ps}: {err_ps.strip() or 'error'})"
+    self_pids = {os.getpid(), os.getppid()}
+    for raw_line in out_ps.splitlines():
+        m = re.match(r"^\s*([0-9]+)\s+(.*)$", raw_line)
+        if not m:
+            continue
+        pid_val = int(m.group(1))
+        if pid_val in self_pids:
+            continue
+        if _matches_refresher_command(target, m.group(2)):
+            return False, f"process table reports {target} alive (pid={pid_val})"
+
+    return True, f"{label} confirmed exited via launchctl and process table"
+
+
 def _list_token_tmp_files(tokens_path: Path) -> list[Path]:
     if not tokens_path.parent.is_dir():
         return []
@@ -4937,13 +5256,18 @@ def _list_token_tmp_files(tokens_path: Path) -> list[Path]:
 def cmd_drain_refresher(args: argparse.Namespace) -> int:
     """Drain the active Guidepoint token refresher cleanly before `launchctl bootout`.
 
-    1. Checks `/healthz`; if unreachable and `--allow-down`, verifies no `.guidepoint_mcp_tokens.*.tmp`
-       files remain and returns 0.
+    1. Polls `/healthz` up to `--timeout`; when unreachable with `--allow-down`, skips drain ONLY
+       after confirming via `launchctl print` / `launchctl list` AND `ps` that the refresher process
+       has actually exited (and zero `.guidepoint_mcp_tokens.*.tmp` files remain). If the process
+       is still alive while `/healthz` times out, continues polling until `--timeout` and exits 1.
     2. If the refresher holds the owner lock and the access token has `<= refresh_skew_s` (60s)
-       remaining, performs a controlled refresh while it is still the sole lock holder and
-       verifies the updated token landed on disk with no leftover `.tmp` files.
-    3. Sends `POST /admin/drain` (`{"drain": true}`) when the service admin token is available.
-    4. Polls `/healthz` until `in_flight == 0` AND zero `.guidepoint_mcp_tokens.*.tmp` files exist.
+       remaining, performs a controlled refresh while it is still the sole lock holder (using the
+       full MCP session handshake for `:8943`) and verifies the updated token landed on disk with
+       no leftover `.tmp` files.
+    3. Sends `POST /admin/drain` (`{"drain": true}`) using the resolved admin token (legacy proxy
+       reuses `resolve_legacy_proxy_effective_paths`, including `GUIDEPOINT_ENV_FILE`); fails if
+       not already draining and the admin token is missing.
+    4. Polls `/healthz` until `draining=true` AND `in_flight == 0` AND zero `.tmp` files exist.
     """
     repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
     home_dir = Path(args.home).expanduser().resolve() if args.home else Path.home().resolve()
@@ -4955,26 +5279,32 @@ def cmd_drain_refresher(args: argparse.Namespace) -> int:
     skew_s = max(0.0, float(args.refresh_skew_s))
     allow_down = bool(args.allow_down)
 
-    try:
-        tokens_path = _resolve_tokens_path_for_ops(args, repo_root, home_dir)
-    except Exception as exc:
-        print(f"ERROR: failed to resolve Guidepoint tokens path: {exc}", file=sys.stderr)
-        return 1
-
     repo_env_path = Path(args.repo_env).expanduser().resolve() if args.repo_env else (repo_root / ".env")
     rh_env_path = (
         Path(args.research_host_env).expanduser().resolve()
         if args.research_host_env
         else (home_dir / ".config" / "dalton" / "research-host.env")
     )
-    gp_env_path = (
-        Path(args.guidepoint_env).expanduser().resolve()
-        if args.guidepoint_env
-        else (tokens_path.parent / "guidepoint_mcp.env")
-    )
     repo_vals = _parse_simple_env_file(repo_env_path)
     rh_vals = _parse_simple_env_file(rh_env_path)
-    gp_vals = _parse_simple_env_file(gp_env_path)
+
+    gp_env_path: Path | None = None
+    proxy_plist: Path | None = None
+    admin_tok = ""
+    try:
+        if target == "legacy":
+            tokens_path, gp_env_path, proxy_plist, admin_tok = _resolve_legacy_proxy_ops_context(
+                args, repo_root, home_dir
+            )
+        else:
+            tokens_path = _resolve_tokens_path_for_ops(args, repo_root, home_dir)
+            admin_tok = (
+                str(rh_vals.get("DALTON_RESEARCH_ADMIN_TOKEN") or "").strip()
+                or str(repo_vals.get("DALTON_RESEARCH_ADMIN_TOKEN") or "").strip()
+            )
+    except Exception as exc:
+        print(f"ERROR: failed to resolve Guidepoint refresher context: {exc}", file=sys.stderr)
+        return 1
 
     deadline = time.monotonic() + timeout_s
 
@@ -4987,35 +5317,56 @@ def cmd_drain_refresher(args: argparse.Namespace) -> int:
                 return False, tmps
             time.sleep(min(poll_s, max(0.01, deadline - time.monotonic())))
 
-    code, body, err = _http_request("GET", f"{base_url}/healthz", timeout_s=min(5.0, timeout_s))
-    if err or code is None:
-        if allow_down:
-            clean, tmps = _wait_no_tmp()
-            if not clean:
-                print(
-                    f"ERROR: refresher ({target}) is down but temp token file(s) remain: {[p.name for p in tmps]}",
-                    file=sys.stderr,
+    # Phase 1: Reach /healthz (bounded poll); --allow-down skips drain ONLY when process exit is verified.
+    body: dict[str, Any] | None = None
+    init_last_err = "no response received"
+    while True:
+        req_t = min(5.0, max(0.2, deadline - time.monotonic()))
+        code, raw_body, err = _http_request("GET", f"{base_url}/healthz", timeout_s=req_t)
+        if not err and code == 200 and isinstance(raw_body, dict):
+            body = raw_body
+            break
+        if err or code is None:
+            if allow_down:
+                stopped, proc_detail = _is_refresher_process_stopped(target)
+                if stopped:
+                    clean, tmps = _wait_no_tmp()
+                    if not clean:
+                        print(
+                            f"ERROR: refresher ({target}) exited but temp token file(s) remain: {[p.name for p in tmps]}",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    print(
+                        json.dumps(
+                            {
+                                "ok": True,
+                                "target": target,
+                                "status": "already_down",
+                                "in_flight": 0,
+                                "tmp_files": 0,
+                                "controlled_refresh": False,
+                                "process_check": proc_detail,
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                    return 0
+                init_last_err = (
+                    f"GET {base_url}/healthz failed ({err or 'unreachable'}) while process still alive ({proc_detail})"
                 )
-                return 1
+            else:
+                init_last_err = f"cannot reach {base_url}/healthz ({err or 'unreachable'})"
+        else:
+            init_last_err = f"unexpected {base_url}/healthz response (HTTP {code})"
+
+        if time.monotonic() >= deadline:
             print(
-                json.dumps(
-                    {
-                        "ok": True,
-                        "target": target,
-                        "status": "already_down",
-                        "in_flight": 0,
-                        "tmp_files": 0,
-                        "controlled_refresh": False,
-                    },
-                    ensure_ascii=False,
-                )
+                f"ERROR: drain-refresher ({target}) timed out after {timeout_s:.1f}s ({init_last_err})",
+                file=sys.stderr,
             )
-            return 0
-        print(f"ERROR: cannot reach {base_url}/healthz ({err or 'unreachable'})", file=sys.stderr)
-        return 1
-    if code != 200 or not isinstance(body, dict):
-        print(f"ERROR: unexpected {base_url}/healthz response (HTTP {code})", file=sys.stderr)
-        return 1
+            return 1
+        time.sleep(min(poll_s, max(0.01, deadline - time.monotonic())))
 
     if target == "research-host":
         probes_b = body.get("probes")
@@ -5047,27 +5398,18 @@ def cmd_drain_refresher(args: argparse.Namespace) -> int:
                 if remaining_s <= skew_s:
                     rem_budget = max(2.0, deadline - time.monotonic())
                     if target == "legacy":
-                        rpc_body = json.dumps(
-                            {
-                                "jsonrpc": "2.0",
-                                "id": 101,
-                                "method": "tools/call",
-                                "params": {
-                                    "name": "search_library",
-                                    "arguments": {"query": "cloud", "size": 1},
-                                },
-                            }
-                        ).encode("utf-8")
-                        r_code, r_body, r_err = _http_request(
-                            "POST",
-                            f"{base_url}/mcp",
-                            headers={
-                                "Content-Type": "application/json",
-                                "Accept": "application/json, text/event-stream",
-                            },
-                            body=rpc_body,
+                        _inner, r_mcp_err = _call_legacy_proxy_guidepoint_mcp(
+                            base_url,
+                            query="cloud",
+                            size=1,
                             timeout_s=rem_budget,
                         )
+                        if r_mcp_err:
+                            print(
+                                f"ERROR: controlled token refresh via {target} failed: {r_mcp_err}",
+                                file=sys.stderr,
+                            )
+                            return 1
                     else:
                         rh_tok = (
                             str(rh_vals.get("DALTON_RESEARCH_HOST_TOKEN") or "").strip()
@@ -5101,19 +5443,19 @@ def cmd_drain_refresher(args: argparse.Namespace) -> int:
                             body=rpc_body,
                             timeout_s=rem_budget,
                         )
-                    if r_err or r_code != 200:
-                        print(
-                            f"ERROR: controlled token refresh via {target} failed: HTTP {r_code} ({r_err or 'error'})",
-                            file=sys.stderr,
-                        )
-                        return 1
-                    inner, m_err = _extract_mcp_payload(r_body)
-                    if m_err or inner is None or inner.get("ok") is False:
-                        print(
-                            f"ERROR: controlled token refresh via {target} returned error: {m_err or (inner or {}).get('error')}",
-                            file=sys.stderr,
-                        )
-                        return 1
+                        if r_err or r_code != 200:
+                            print(
+                                f"ERROR: controlled token refresh via {target} failed: HTTP {r_code} ({r_err or 'error'})",
+                                file=sys.stderr,
+                            )
+                            return 1
+                        inner, m_err = _extract_mcp_payload(r_body)
+                        if m_err or inner is None or inner.get("ok") is False:
+                            print(
+                                f"ERROR: controlled token refresh via {target} returned error: {m_err or (inner or {}).get('error')}",
+                                file=sys.stderr,
+                            )
+                            return 1
                     clean_after, tmps_after = _wait_no_tmp()
                     if not clean_after:
                         print(
@@ -5121,7 +5463,7 @@ def cmd_drain_refresher(args: argparse.Namespace) -> int:
                             file=sys.stderr,
                         )
                         return 1
-                    tok_ok, new_ts, tok_reason = _inspect_guidepoint_tokens_file(tokens_path)
+                    tok_ok, _new_ts, tok_reason = _inspect_guidepoint_tokens_file(tokens_path)
                     if not tok_ok:
                         print(
                             f"ERROR: tokens file invalid after controlled refresh ({tok_reason})",
@@ -5141,28 +5483,22 @@ def cmd_drain_refresher(args: argparse.Namespace) -> int:
                         return 1
                     controlled_refresh = True
 
-    # Request drain mode on the live refresher if its admin token is configured
-    admin_tok = ""
-    if target == "legacy":
-        admin_tok = str(gp_vals.get("GUIDEPOINT_PROXY_ADMIN_TOKEN") or "").strip()
+    # Phase 3: Enter drain mode; require admin token when refresher is not already draining.
+    if body.get("draining") is not True:
         if not admin_tok:
-            plist_dir = (
-                Path(args.plist_dir).expanduser().resolve()
-                if getattr(args, "plist_dir", None)
-                else (home_dir / "Library" / "LaunchAgents")
-            )
-            proxy_plist = plist_dir / "com.dalton.guidepoint-mcp-proxy.plist"
-            if proxy_plist.is_file():
-                p_ev, _p_err = _load_plist_env_vars_strict(proxy_plist)
-                if p_ev:
-                    admin_tok = str(p_ev.get("GUIDEPOINT_PROXY_ADMIN_TOKEN") or "").strip()
-    else:
-        admin_tok = (
-            str(rh_vals.get("DALTON_RESEARCH_ADMIN_TOKEN") or "").strip()
-            or str(repo_vals.get("DALTON_RESEARCH_ADMIN_TOKEN") or "").strip()
-        )
-
-    if admin_tok and body.get("draining") is not True:
+            if target == "legacy":
+                print(
+                    f"ERROR: cannot drain {base_url}: missing GUIDEPOINT_PROXY_ADMIN_TOKEN "
+                    f"(checked {gp_env_path} and {proxy_plist})",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"ERROR: cannot drain {base_url}: missing DALTON_RESEARCH_ADMIN_TOKEN "
+                    f"(checked {rh_env_path} and {repo_env_path})",
+                    file=sys.stderr,
+                )
+            return 1
         d_code, d_body, d_err = _http_request(
             "POST",
             f"{base_url}/admin/drain",
@@ -5180,44 +5516,54 @@ def cmd_drain_refresher(args: argparse.Namespace) -> int:
             )
             return 1
 
+    # Phase 4: Confirm draining=true AND in_flight==0 AND zero .tmp files on disk.
     last_detail = ""
     while True:
         h_code, h_body, h_err = _http_request(
             "GET",
             f"{base_url}/healthz",
-            timeout_s=min(5.0, max(1.0, deadline - time.monotonic())),
+            timeout_s=min(5.0, max(0.2, deadline - time.monotonic())),
         )
         if h_err or h_code is None:
             if allow_down:
-                clean, tmps = _wait_no_tmp()
-                if not clean:
+                stopped, proc_detail = _is_refresher_process_stopped(target)
+                if stopped:
+                    clean, tmps = _wait_no_tmp()
+                    if not clean:
+                        print(
+                            f"ERROR: refresher ({target}) stopped while temp token file(s) remain: {[p.name for p in tmps]}",
+                            file=sys.stderr,
+                        )
+                        return 1
                     print(
-                        f"ERROR: refresher ({target}) stopped while temp token file(s) remain: {[p.name for p in tmps]}",
-                        file=sys.stderr,
+                        json.dumps(
+                            {
+                                "ok": True,
+                                "target": target,
+                                "status": "stopped_clean",
+                                "in_flight": 0,
+                                "tmp_files": 0,
+                                "controlled_refresh": controlled_refresh,
+                                "process_check": proc_detail,
+                            },
+                            ensure_ascii=False,
+                        )
                     )
-                    return 1
-                print(
-                    json.dumps(
-                        {
-                            "ok": True,
-                            "target": target,
-                            "status": "stopped_clean",
-                            "in_flight": 0,
-                            "tmp_files": 0,
-                            "controlled_refresh": controlled_refresh,
-                        },
-                        ensure_ascii=False,
-                    )
+                    return 0
+                last_detail = (
+                    f"GET {base_url}/healthz -> {h_code} ({h_err}); process still alive ({proc_detail})"
                 )
-                return 0
-            last_detail = f"GET {base_url}/healthz -> {h_code} ({h_err})"
+            else:
+                last_detail = f"GET {base_url}/healthz -> {h_code} ({h_err})"
         elif h_code != 200 or not isinstance(h_body, dict):
             last_detail = f"GET {base_url}/healthz -> HTTP {h_code} (invalid body)"
         else:
+            is_draining = h_body.get("draining") is True
             in_flight = h_body.get("in_flight")
             tmps = _list_token_tmp_files(tokens_path)
             if (
-                isinstance(in_flight, int)
+                is_draining
+                and isinstance(in_flight, int)
                 and not isinstance(in_flight, bool)
                 and in_flight == 0
                 and not tmps
@@ -5228,7 +5574,7 @@ def cmd_drain_refresher(args: argparse.Namespace) -> int:
                             "ok": True,
                             "target": target,
                             "status": "drained",
-                            "draining": bool(h_body.get("draining")),
+                            "draining": True,
                             "in_flight": 0,
                             "tmp_files": 0,
                             "controlled_refresh": controlled_refresh,
@@ -5237,7 +5583,10 @@ def cmd_drain_refresher(args: argparse.Namespace) -> int:
                     )
                 )
                 return 0
-            last_detail = f"in_flight={in_flight!r}, tmp_files={[p.name for p in tmps]}"
+            last_detail = (
+                f"draining={h_body.get('draining')!r}, in_flight={in_flight!r}, "
+                f"tmp_files={[p.name for p in tmps]}"
+            )
 
         if time.monotonic() >= deadline:
             print(
@@ -5441,6 +5790,11 @@ def _build_subcommand_parser() -> argparse.ArgumentParser:
     p_wo.add_argument("--timeout", type=float, default=30.0)
     p_wo.add_argument("--poll-interval", type=float, default=0.5)
 
+    p_wh = sub.add_parser("wait-health")
+    p_wh.add_argument("--url", required=True)
+    p_wh.add_argument("--timeout", type=float, default=30.0)
+    p_wh.add_argument("--poll-interval", type=float, default=0.5)
+
     p_dr = sub.add_parser("drain-refresher")
     p_dr.add_argument("--repo", required=True)
     p_dr.add_argument("--home", default=None)
@@ -5493,6 +5847,7 @@ _SUBCOMMANDS = frozenset(
         "gate-verify",
         "probe-services",
         "wait-owner",
+        "wait-health",
         "drain-refresher",
         "wait-lock-free",
     }
@@ -5541,6 +5896,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_probe_services(ns)
         if ns.subcommand == "wait-owner":
             return cmd_wait_owner(ns)
+        if ns.subcommand == "wait-health":
+            return cmd_wait_health(ns)
         if ns.subcommand == "drain-refresher":
             return cmd_drain_refresher(ns)
         if ns.subcommand == "wait-lock-free":

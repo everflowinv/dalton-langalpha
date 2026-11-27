@@ -80,13 +80,32 @@ bash scripts/dalton/ops/prod/snapshot_research_host.sh --label precheck
 
 ## 二、停机切换（维护窗口内逐步执行）
 
-请在无人使用的维护时段按顺序执行以下 9 步。执行前先在当前终端记录用户域标识：
+请在无人使用的维护时段按顺序执行以下 10 步。执行前先在当前终端记录用户域标识：
 
 ```bash
 DOMAIN="gui/$(id -u)"
 ```
 
-### 第 1 步：落闸并确认后端 `:8000` 返回 `503`
+### 第 1 步：发布并校验固定恢复入口（落闸前，在线完成）
+
+在落闸停机之前，先将当前已验证的一键回滚、快照与运维脚本原子发布至固定恢复目录 `var/dalton/cutover-snapshots/recovery-bin/`，并立即核验 SHA-256 清单完整性。本步在线完成，线上服务保持正常运行：
+
+```bash
+set -euo pipefail
+.venv/bin/python scripts/dalton/ops/prod/preflight.py recovery-publish \
+  --repo "$(pwd)" \
+  --src-dir "$(pwd)/scripts/dalton/ops/prod" \
+  --gp-lock-src "$(pwd)/scripts/dalton/research_runtime/guidepoint_lock.py" \
+  --source-commit "$(git rev-parse HEAD)" && \
+  .venv/bin/python scripts/dalton/ops/prod/preflight.py manifest-verify \
+    --recovery-dir var/dalton/cutover-snapshots/recovery-bin
+```
+
+**成功判据**：两项命令均返回退出码 `0`，`var/dalton/cutover-snapshots/recovery-bin/recovery-manifest.json` 哈希校验通过，且 `var/dalton/cutover-snapshots/recovery-bin/rollback_research_host.sh` 就绪可执行。校验通过后再进入第 2 步。
+
+**失败处理**：本步期间准入闸门保持开放，线上服务维持正常访问；若本步报错，直接停止流程，排查目录权限、磁盘空间或源文件完整性后重新执行本步，确认通过再进入后续停机步骤。
+
+### 第 2 步：落闸并确认后端 `:8000` 返回 `503`
 
 关闭后端准入闸门及外部宿主机直调开关，再核对容器内文件修订号与 `:8000` 准入探针实际返回 `503`：
 
@@ -106,7 +125,7 @@ set -euo pipefail
 
 **成功判据**：`gate-set` 输出 `"paused": true` 与 `"pause_host_direct": true`；`gate-verify` 输出 `"status": "verified"` 且 `"probe_status_code": 503`。
 
-**失败回滚命令**：若本步失败且尚未改动服务配置，直接重新开闸恢复线上访问：
+**失败回滚命令**：本步尚未修改服务配置，若需中止切换，直接重新开闸恢复线上访问：
 
 ```bash
 set -euo pipefail
@@ -118,7 +137,7 @@ set -euo pipefail
   --reason "abort_before_cutover"
 ```
 
-### 第 2 步：等待后端与数据任务空闲
+### 第 3 步：等待后端与数据任务空闲
 
 调用维护模式空闲等待脚本，确认进行中的对话回合、子智能体任务以及已领取的数据任务槽位连续两次归零：
 
@@ -129,9 +148,9 @@ bash scripts/dalton/ops/prod/wait_backend_idle.sh --max-wait-seconds 600
 
 **成功判据**：退出码 `0`，输出 `idle (maintenance mode, checks=...) threads=0 subagents=0 data_slots=0 data_runs=0`。
 
-**失败回滚命令**：若在窗口内持续忙碌决定改期，执行第 1 步的开闸命令即可恢复对外服务。
+**失败回滚命令**：若在窗口内持续忙碌决定改期，执行第 2 步的开闸命令即可恢复对外服务。
 
-### 第 3 步：保存停机前完整快照并固定前端版本
+### 第 4 步：保存停机前完整快照并固定前端版本
 
 在修改任何配置文件或停服前，保存本次切换的权威回滚快照（涵盖 `.env`、三份 plist、宿主机服务环境文件、实际解析路径上的 Guidepoint 令牌文件、交接日志、`web/releases/current` 指向，并在 `web/releases/.pinned-releases/` 标记保留切换前的前端发布目录），将快照路径存入 `SNAP_DIR` 并记录到值班日志中供观察期使用：
 
@@ -146,24 +165,19 @@ SNAP_DIR="$(bash scripts/dalton/ops/prod/snapshot_research_host.sh --label cutov
 
 **成功判据**：输出 `SNAPSHOT_VERIFY_OK: <快照目录>`，终端打印非空的 `SNAP_DIR`。
 
-**失败回滚命令**：若快照写入或校验失败，保持原服务运行，按第 1 步开闸命令恢复访问并排查缺失文件、磁盘空间或目录权限。
+**失败回滚命令**：若快照写入或校验失败，保持原服务运行，按第 2 步开闸命令恢复访问并排查缺失文件、磁盘空间或目录权限。
 
-### 第 4 步：发布恢复目录、排空并停止 `:8943` 与旧桥 `:8960`
+### 第 5 步：排空并停止 `:8943` 与旧桥 `:8960`
 
-先将当前已验证的一键回滚、快照与运维脚本原子发布至固定恢复目录 `var/dalton/cutover-snapshots/recovery-bin/`（含 SHA-256 哈希清单）；再对当前刷新方 `:8943` 执行停前排空（访问令牌剩余 TTL ≤ 60 秒时，在它仍是唯一持锁方时先完成一次受控刷新并确认落盘，随后停止接单并确认 `/healthz` 的 `in_flight == 0` 且令牌目录清零 `.guidepoint_mcp_tokens.*.tmp`）；随后卸载 `:8943` 与 `:8960` 并确认刷新锁 `.guidepoint.owner.lock` 已释放：
+先对当前刷新方 `:8943` 执行停前排空：`drain-refresher` 复用预检有效环境解析（含 `GUIDEPOINT_ENV_FILE`）读取管理员凭据；当访问令牌剩余 TTL ≤ 60 秒时，在它仍是唯一持锁方时先通过完整 MCP 会话握手完成一次受控刷新并确认落盘，再向 `/admin/drain` 发送排空指令，并持续确认 `/healthz` 同时满足 `draining=true`、`in_flight == 0` 且令牌目录清零 `.guidepoint_mcp_tokens.*.tmp`；排空完成后卸载 `:8943` 与 `:8960` 并确认刷新锁 `.guidepoint.owner.lock` 已释放：
 
 ```bash
 set -euo pipefail
-.venv/bin/python scripts/dalton/ops/prod/preflight.py recovery-publish \
+.venv/bin/python scripts/dalton/ops/prod/preflight.py drain-refresher \
   --repo "$(pwd)" \
-  --src-dir "$(pwd)/scripts/dalton/ops/prod" \
-  --gp-lock-src "$(pwd)/scripts/dalton/research_runtime/guidepoint_lock.py" \
-  --source-commit "$(git rev-parse HEAD)" && \
-  .venv/bin/python scripts/dalton/ops/prod/preflight.py drain-refresher \
-    --repo "$(pwd)" \
-    --home "${HOME}" \
-    --target legacy \
-    --url http://127.0.0.1:8943 && \
+  --home "${HOME}" \
+  --target legacy \
+  --url http://127.0.0.1:8943 && \
   launchctl bootout "${DOMAIN}/com.dalton.guidepoint-mcp-proxy" && \
   launchctl bootout "${DOMAIN}/com.dalton.researchdata-bridge" && \
   .venv/bin/python scripts/dalton/ops/prod/preflight.py wait-lock-free \
@@ -178,7 +192,7 @@ lsof -nP -iTCP:8943 -sTCP:LISTEN || true
 lsof -nP -iTCP:8960 -sTCP:LISTEN || true
 ```
 
-**成功判据**：`recovery-publish`、`drain-refresher`（输出 `"in_flight": 0`、`"tmp_files": 0`）与 `wait-lock-free`（输出 `"free": true`）均返回 `0`；两次 `lsof` 均为空输出，表明 `:8943` 与 `:8960` 已完全停止。
+**成功判据**：`drain-refresher`（输出 `"draining": true`、`"in_flight": 0`、`"tmp_files": 0`）与 `wait-lock-free`（输出 `"free": true`）均返回 `0`；两次 `lsof` 均为空输出，表明 `:8943` 与 `:8960` 已完全停止。
 
 **失败回滚命令**：
 
@@ -186,7 +200,7 @@ lsof -nP -iTCP:8960 -sTCP:LISTEN || true
 bash var/dalton/cutover-snapshots/recovery-bin/rollback_research_host.sh "${SNAP_DIR}"
 ```
 
-### 第 5 步：迁移 Guidepoint 令牌刷新权并切换 LaunchAgent 配置
+### 第 6 步：迁移 Guidepoint 令牌刷新权并切换 LaunchAgent 配置
 
 先向交接日志写入未完成切换意图，再将 Guidepoint 令牌刷新权 `target_owner` 原子切换为 `research_host_8951`；随后移除旧代理 `plist`，安装已渲染的新版研究宿主 `plist` 与新版旧桥 `plist`：
 
@@ -224,7 +238,7 @@ set -euo pipefail
 bash var/dalton/cutover-snapshots/recovery-bin/rollback_research_host.sh "${SNAP_DIR}"
 ```
 
-### 第 6 步：启动 `:8951`（新研究宿主服务）并限时轮询验活
+### 第 7 步：启动 `:8951`（新研究宿主服务）并限时轮询验活
 
 加载并启动 `com.dalton.research-host`，随后在 30 秒内轮询 `:8951/healthz`（服务健康检查端点），严格确认 `probes.guidepoint.owner_lock_held` 为 `true`：
 
@@ -245,7 +259,7 @@ launchctl bootstrap "${DOMAIN}" "${HOME}/Library/LaunchAgents/com.dalton.researc
 bash var/dalton/cutover-snapshots/recovery-bin/rollback_research_host.sh "${SNAP_DIR}"
 ```
 
-### 第 7 步：更新 `.env` 与桥配置、拉起精简旧桥并重建后端容器
+### 第 8 步：更新 `.env` 与桥配置、拉起精简旧桥、重建后端容器并限时轮询验活
 
 1. 在仓库根目录 `.env` 中写入研究宿主切流配置（与 `~/.config/dalton/research-host.env` 中的令牌保持一致）：
    - `DALTON_RESEARCH_HOST_URL=http://host.docker.internal:8951`
@@ -253,7 +267,7 @@ bash var/dalton/cutover-snapshots/recovery-bin/rollback_research_host.sh "${SNAP
    - `DALTON_RESEARCH_ADMIN_TOKEN=<与 research-host.env 相同的管理令牌>`
    - `DALTON_EXTRA_PLUGINS_DIR=/app/scripts/dalton/research_runtime/extra_plugins`
 2. 在 `~/.config/dalton/researchdata-bridge.env` 中将 `DALTON_GUIDEPOINT_MCP_URL` 更新为 `http://127.0.0.1:8951/mcp/guidepoint`，并写入对应的 `DALTON_RESEARCH_HOST_TOKEN`。
-3. 重新加载精简后的旧研究数据桥 `:8960`（旧桥读取新 `.env` 后关闭已迁移路由并统一返回 `route_migrated`），再通过 `preflight.py compose-args` 统一解析 `COMPOSE_FILE` 参数强制重建后端容器并核对健康与闭闸状态：
+3. 重新加载精简后的旧研究数据桥 `:8960`（旧桥读取新 `.env` 后关闭已迁移路由并统一返回 `route_migrated`）并限时轮询 `:8960/healthz` 至就绪；随后通过 `preflight.py compose-args` 统一解析 `COMPOSE_FILE` 参数强制重建后端容器，限时轮询 `:8000/health` 至就绪后再核验闭闸状态：
 
 ```bash
 set -euo pipefail
@@ -261,24 +275,28 @@ COMPOSE_LINES="$(.venv/bin/python scripts/dalton/ops/prod/preflight.py compose-a
   COMPOSE_ARGS=() && \
   while IFS= read -r line; do if [ -n "${line}" ]; then COMPOSE_ARGS+=("${line}"); fi; done <<< "${COMPOSE_LINES}" && \
   launchctl bootstrap "${DOMAIN}" "${HOME}/Library/LaunchAgents/com.dalton.researchdata-bridge.plist" && \
-  curl -fsS http://127.0.0.1:8960/healthz | .venv/bin/python -m json.tool && \
+  .venv/bin/python scripts/dalton/ops/prod/preflight.py wait-health \
+    --url http://127.0.0.1:8960/healthz \
+    --timeout 30 && \
   docker compose "${COMPOSE_ARGS[@]}" up -d --no-deps --force-recreate backend && \
-  curl -fsS http://127.0.0.1:8000/health && \
+  .venv/bin/python scripts/dalton/ops/prod/preflight.py wait-health \
+    --url http://127.0.0.1:8000/health \
+    --timeout 60 && \
   .venv/bin/python scripts/dalton/ops/prod/preflight.py gate-verify \
     --repo "$(pwd)" \
     --expected-paused true \
     --backend-url http://127.0.0.1:8000
 ```
 
-**成功判据**：`:8960/healthz` 与 `:8000/health` 均返回 HTTP `200`，`gate-verify` 输出 `"status": "verified"` 且 `"probe_status_code": 503`。
+**成功判据**：两处 `wait-health` 在时限内均返回退出码 `0` 并输出 HTTP `200` 健康响应，`gate-verify` 输出 `"status": "verified"` 且 `"probe_status_code": 503`。
 
-**失败回滚命令**：
+**失败回滚命令**：若任一步超时或报错，立即执行回滚：
 
 ```bash
 bash var/dalton/cutover-snapshots/recovery-bin/rollback_research_host.sh "${SNAP_DIR}"
 ```
 
-### 第 8 步：实调验收
+### 第 9 步：实调验收
 
 1. 运行服务端实调探针，一次性校验 `:8951/healthz` 的 `probes.guidepoint.owner_lock_held`、公司知识库 `company-wiki` 的 `search`、Guidepoint 的 `search_library`、旧桥 `:8960` 已迁移路由关闭返回 `route_migrated` 以及后端健康状态（令牌由脚本直接从环境文件读取，命令行参数保持零凭据）：
 
@@ -303,7 +321,7 @@ set -euo pipefail
   --reason "single_workspace_verification"
 ```
 
-**成功判据**：`probe-services` 全部探针输出 `[OK]` 且退出码为 `0`；测试工作区研究对话成功返回公司知识库与 Guidepoint 检索结果，工具溯源正常，页面无报错。
+**成功判据**：`probe-services` 全部探针输出 `[OK]` 且退出码为 `0`；测试工作区研究对话成功返回公司知识库与 Guidepoint 检索结果，工具溯源正常，页面状态正常。
 
 **失败回滚命令**：任一探针或对话验收异常时立即执行恢复目录下的一键回滚（脚本会先收回单工作区豁免并全量闭闸）：
 
@@ -311,9 +329,9 @@ set -euo pipefail
 bash var/dalton/cutover-snapshots/recovery-bin/rollback_research_host.sh "${SNAP_DIR}"
 ```
 
-### 第 9 步：开闸并标记切换完成
+### 第 10 步：开闸并标记切换完成
 
-全部验收通过后，按顺序开放准入闸门、核对 `:8000` 探针恢复 `200`，最后才将交接日志标记为 `completed=true`（采用 `set -euo pipefail` 与 `&&` 串联，确保前一步失败时立即中止）：
+全部验收通过后，按顺序开放准入闸门、核对 `:8000` 探针恢复 `200`，并在核验通过后将交接日志标记为 `completed=true`（采用 `set -euo pipefail` 与 `&&` 串联，前一步报错时即刻中止）：
 
 ```bash
 set -euo pipefail
@@ -336,8 +354,7 @@ set -euo pipefail
 **成功判据**：`gate-verify` 输出 `"status": "verified"` 且 `"probe_status_code": 200`；`journal-set` 退出码 `0`。保留 `${SNAP_DIR}` 目录与 `web/releases/.pinned-releases/` 保留标记直至观察期结束（观察期结束后再清理保留标记以恢复常规版本轮转）。
 
 **失败回滚命令**：
-- 若 `gate-set` 或 `gate-verify` 失败，保持交接日志为未完成态（保持不写 `completed=true`）。
-- 若闸门已经打开（例如 `gate-set --paused false` 已生效但 `gate-verify` 失败或出现线上异常），立即执行恢复目录下的一键回滚命令（脚本第一步会立即落闸再恢复切换前服务）：
+- 若 `gate-set` 或 `gate-verify` 失败，交接日志保持为未完成态；此时立即执行恢复目录下的一键回滚命令（脚本第一步先落闸并核验闭闸，再恢复切换前服务）：
 
 ```bash
 bash var/dalton/cutover-snapshots/recovery-bin/rollback_research_host.sh "${SNAP_DIR}"
@@ -352,13 +369,13 @@ bash var/dalton/cutover-snapshots/recovery-bin/rollback_research_host.sh "${SNAP
 在切换过程中或观察期内出现以下任一情况，立即执行一键回滚：
 
 - `com.dalton.research-host`（`:8951`）启动失败、健康检查失败，或 `probes.guidepoint.owner_lock_held` 为 `false`（未能持有 Guidepoint 令牌刷新锁）。
-- 仓库 `.env` 更新或后端容器重建失败，导致 `:8000/health` 在维护窗口内超时未恢复正常。
+- 仓库 `.env` 更新或后端容器重建失败，导致 `:8000/health` 在维护窗口内超时仍待就绪。
 - 实调验收中公司知识库 `search`、Guidepoint `search_library` 或真实研究对话出现权限拒绝、令牌刷新失败或检索结果异常。
 - 精简旧桥 `:8960` 的保留路由在切换后出现异常。
 
 ### 3.2 执行一键回滚
 
-从固定恢复目录 `var/dalton/cutover-snapshots/recovery-bin/` 执行一键回滚（即使工作树被回退仍可独立运行）。先运行只读演练模式核对将要恢复的快照路径与步骤，确认无误后执行正式回滚；**观察期内回滚必须显式传入第 3 步记录的 `SNAP_DIR`**（紧急情况下省略目录参数时，脚本会跳过校验失败的目录，自动选取 `var/dalton/cutover-snapshots/` 下最新的有效快照）：
+从固定恢复目录 `var/dalton/cutover-snapshots/recovery-bin/` 执行一键回滚（即使工作树被回退仍可独立运行）。先运行只读演练模式核对将要恢复的快照路径与步骤，确认无误后执行正式回滚；**观察期内回滚必须显式传入第 4 步记录的 `SNAP_DIR`**（紧急情况下省略目录参数时，脚本会跳过校验失败的目录，自动选取 `var/dalton/cutover-snapshots/` 下最新的有效快照）：
 
 ```bash
 set -euo pipefail
@@ -366,17 +383,17 @@ bash var/dalton/cutover-snapshots/recovery-bin/rollback_research_host.sh --dry-r
   bash var/dalton/cutover-snapshots/recovery-bin/rollback_research_host.sh "${SNAP_DIR}"
 ```
 
-> 若在执行第 4 步发布恢复目录前需要回滚，可直接执行 `bash scripts/dalton/ops/prod/rollback_research_host.sh "${SNAP_DIR}"`。
+> 固定恢复目录已在停机切换第 1 步落闸前发布并校验就绪，所有停机步骤失败后均可直接从该目录执行回滚；如需应急，也可直接运行仓库内的 `bash scripts/dalton/ops/prod/rollback_research_host.sh "${SNAP_DIR}"`。
 
 一键回滚脚本按以下顺序幂等执行，支持在修复环境问题后重复运行：
 
 1. 先落闸并核验维护准入闸门已关闭（在快照校验与 Compose 参数解析之前完成），再校验快照目录 SHA-256 清单完整性，后端在线时等待在途对话与数据任务空闲。
-2. 对 `com.dalton.research-host`（`:8951`）执行停前排空（TTL ≤ 60 秒时先受控刷新并确认落盘，停止接单并确认 `in_flight == 0` 且无 `.guidepoint_mcp_tokens.*.tmp`），卸载并确认端口已停止响应。
+2. 对 `com.dalton.research-host`（`:8951`）执行停前排空（仅在经 `launchctl` 与进程表确认进程已退出时跳过排空；存活时先在 TTL ≤ 60 秒条件下受控刷新并确认落盘，再发送 `/admin/drain` 并确认 `/healthz` 同时满足 `draining=true`、`in_flight == 0` 且无 `.guidepoint_mcp_tokens.*.tmp`），随后卸载并确认端口停止响应。
 3. 排空并停止 `:8943`，停止 `:8960`，确认 `.guidepoint.owner.lock` 已释放；从快照原子还原 `.env`、三份 `plist`、宿主机环境文件、交接日志与 `web/releases/current` 指向（若目标前端发布目录缺失则保持闭闸并报错；Guidepoint 令牌文件比较 `obtained_at` 或 `mtime`，保留更新的现网令牌，仅在缺失或损坏时用快照兜底）。
-4. 重新加载并启动旧 Guidepoint 代理（`:8943`）与旧研究数据桥（`:8960`），限时轮询确认 `:8943` 已持锁。
-5. 通过 `preflight.py compose-args` 按还原后的 `.env`（认 `COMPOSE_FILE`）解析编排参数，强制重建 `backend` 容器并核对健康状态与闭闸状态。
-6. 实调旧桥 Wiki `search`、旧桥 Guidepoint `search_library` 与 `:8943/mcp` 直调（支持 JSON 与 SSE 响应解码）验证业务可用。
-7. 全部探针通过后开放准入闸门并核验；若开闸校验失败则重新落闸并核验实际闭闸状态，重闭闸失败时明确报错提示人工闭闸。
+4. 重新加载并启动旧 Guidepoint 代理（`:8943`）与旧研究数据桥（`:8960`），分别限时轮询确认 `:8943` 已持锁、`:8960/healthz` 健康就绪。
+5. 通过 `preflight.py compose-args` 按还原后的 `.env`（认 `COMPOSE_FILE`）解析编排参数，强制重建 `backend` 容器，限时轮询 `:8000/health` 健康就绪后再核验闭闸状态。
+6. 实调旧桥 Wiki `search`、旧桥 Guidepoint `search_library` 与 `:8943/mcp` 直调（采用完整 MCP 会话握手与 JSON/SSE 响应解码）验证业务可用。
+7. 全部探针通过后开放准入闸门并核验；开闸命令报错或开闸校验失败均进入同一条重新落闸并读回验证路径，重闭闸失败时明确报错提示人工闭闸。
 
 ### 3.3 回滚后验收
 

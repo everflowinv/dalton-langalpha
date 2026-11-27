@@ -309,6 +309,8 @@
 
 ### 6.4b 第 3b 批（Everflow 切换）：宿主机 `com.dalton.research-host` 切流、Guidepoint 令牌刷新权交接与部署回退
 
+> **现行切换方式说明**：Everflow 生产切换已改为停机手动切换，现行前置检查、恢复入口发布、停前排空、快照保存、分步切流与一键回滚步骤统一以 `scripts/dalton/ops/prod/RESEARCH_HOST_SWITCH_RUNBOOK.md` 为准。下文保留原设计方案作为历史架构背景参考。
+
 - **前置条件、现网事实与职责边界**：
   - **现网 `:8943` 代理标签核实结论**：经生产宿主机 `launchctl`（`launchd` 命令行控制工具）`launchctl list` 与 `lsof`（List Open Files，列出打开文件与监听网络套接字的系统命令）交叉核对，监听 `127.0.0.1:8943` 的生产进程 `launchd` 标签确认为 **`com.dalton.guidepoint-mcp-proxy`**（预检阶段同步比对 `com.dalton.guidepoint-mcp-proxy` 的 `PID`〔Process ID，进程标识符〕与 `127.0.0.1:8943` 监听进程 `PID` 完全一致）。
   - **前置依赖**：

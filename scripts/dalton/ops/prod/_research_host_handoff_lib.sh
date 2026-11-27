@@ -365,6 +365,12 @@ rh_wait_owner() {
     "$@"
 }
 
+rh_wait_health() {
+  rh_paths
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" wait-health \
+    "$@"
+}
+
 rh_drain_refresher() {
   rh_paths
   PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" drain-refresher \

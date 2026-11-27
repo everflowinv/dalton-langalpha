@@ -127,6 +127,7 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
     bridge_token = "test-bridge-secret-token-alpha"
     rh_token = "test-rh-secret-token-beta"
     rh_admin_token = "test-rh-admin-secret-gamma"
+    proxy_admin_token = "test-proxy-admin-secret-epsilon"
     svc_token = "test-internal-svc-secret-delta"
 
     repo_env = repo / ".env"
@@ -162,7 +163,12 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
     gp_cfg_dir = research_home / "config"
     gp_cfg_dir.mkdir(parents=True)
     gp_env = gp_cfg_dir / "guidepoint_mcp.env"
-    gp_env.write_text("GUIDEPOINT_CLIENT_ID=fake-cid\nGUIDEPOINT_CLIENT_SECRET=fake-csec\n", encoding="utf-8")
+    gp_env.write_text(
+        f"GUIDEPOINT_CLIENT_ID=fake-cid\n"
+        f"GUIDEPOINT_CLIENT_SECRET=fake-csec\n"
+        f"GUIDEPOINT_PROXY_ADMIN_TOKEN={proxy_admin_token}\n",
+        encoding="utf-8",
+    )
     gp_env.chmod(0o600)
 
     now_ts = int(time.time())
@@ -297,6 +303,10 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
                     print(f"missing plist {{plist_path}}", file=sys.stderr)
                     sys.exit(1)
                 loaded[lbl] = plist_path
+                if lbl == "com.dalton.guidepoint-mcp-proxy":
+                    state["draining_8943"] = False
+                elif lbl == "com.dalton.research-host":
+                    state["draining_8951"] = False
                 state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
                 sys.exit(0)
             sys.exit(0)
@@ -366,6 +376,27 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
         ),
     )
 
+    fake_ps = _write_exec(
+        bin_dir / "ps",
+        textwrap.dedent(
+            f"""\
+            #!{sys.executable}
+            import json, sys
+            from pathlib import Path
+
+            state = json.loads(Path({str(state_file)!r}).read_text(encoding="utf-8"))
+            loaded = state.get("loaded", {{}})
+            if "com.dalton.guidepoint-mcp-proxy" in loaded:
+                print("2001 /opt/homebrew/bin/python3.12 /repo/scripts/dalton/research_runtime/scripts/guidepoint_mcp_proxy.py")
+            if "com.dalton.research-host" in loaded:
+                print("2002 /repo/.venv/bin/python -m src.dalton.research_host")
+            for extra in state.get("extra_ps_lines", []):
+                print(extra)
+            sys.exit(0)
+            """
+        ),
+    )
+
     fake_curl = _write_exec(
         bin_dir / "curl",
         textwrap.dedent(
@@ -381,6 +412,8 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
             journal_file = Path({str(journal_file)!r})
             repo_env_file = Path({str(repo_env)!r})
             tokens_file = Path({str(tokens_file)!r})
+            expected_rh_admin = {rh_admin_token!r}
+            expected_proxy_admin = {proxy_admin_token!r}
 
             args = sys.argv[1:]
             with argv_log.open("a", encoding="utf-8") as fh:
@@ -391,6 +424,7 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
             cfg_headers = {{}}
             write_fmt = ""
             out_file = ""
+            hdr_dump_file = ""
             url = ""
 
             i = 0
@@ -409,6 +443,9 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
                         if ":" in hdr:
                             hk, hv = hdr.split(":", 1)
                             cfg_headers[hk.strip().lower()] = hv.strip()
+                    i += 2
+                elif a == "-D" and i + 1 < len(args):
+                    hdr_dump_file = args[i + 1]
                     i += 2
                 elif a == "-w" and i + 1 < len(args):
                     write_fmt = args[i + 1]
@@ -430,8 +467,13 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
             state = json.loads(state_path.read_text(encoding="utf-8"))
             loaded = state.get("loaded", {{}})
 
-            def emit(code: int, payload: object) -> None:
+            def emit(code: int, payload: object, resp_headers: dict | None = None) -> None:
                 body_str = json.dumps(payload) if not isinstance(payload, str) else payload
+                if hdr_dump_file:
+                    hdr_lines = [f"HTTP/1.1 {{code}} OK"]
+                    for hk, hv in (resp_headers or {{}}).items():
+                        hdr_lines.append(f"{{hk}}: {{hv}}")
+                    Path(hdr_dump_file).write_text("\\r\\n".join(hdr_lines) + "\\r\\n\\r\\n", encoding="utf-8")
                 if out_file and out_file != "/dev/null":
                     Path(out_file).write_text(body_str, encoding="utf-8")
                 elif not out_file:
@@ -445,16 +487,24 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
                     sys.stdout.write(write_fmt.replace("%{{http_code}}", "000").replace("\\\\n", "\\n"))
                 sys.exit(7)
 
+            def timed_out() -> None:
+                sys.stderr.write("curl: (28) Operation timed out\\n")
+                sys.exit(28)
+
             # :8951 research-host (real production /healthz JSON shape)
             if ":8951" in url:
                 up = ("com.dalton.research-host" in loaded) or (os.environ.get("FAKE_KEEP_8951_UP") == "1")
                 if not up:
                     conn_refused()
                 if url.endswith("/admin/drain"):
+                    if cfg_headers.get("authorization") != f"Bearer {{expected_rh_admin}}":
+                        emit(401, {{"ok": False, "error": "Unauthorized"}})
                     state["draining_8951"] = True
                     state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
                     emit(200, {{"ok": True, "draining": True, "in_flight": int(state.get("in_flight_8951", 0))}})
                 if url.endswith("/healthz"):
+                    if os.environ.get("FAKE_TIMEOUT_8951_HEALTHZ") == "1":
+                        timed_out()
                     draining_8951 = bool(state.get("draining_8951", False))
                     in_flight_8951 = int(state.get("in_flight_8951", 0))
                     if in_flight_8951 > 0:
@@ -493,15 +543,19 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
                     emit(200, {{"jsonrpc": "2.0", "id": 102, "result": {{"content": [{{"type": "text", "text": json.dumps({{"ok": True, "data": []}})}}]}}}})
                 emit(200, {{"ok": True}})
 
-            # :8943 legacy guidepoint proxy
+            # :8943 legacy guidepoint proxy (enforces MCP session handshake on /mcp)
             if ":8943" in url:
                 if "com.dalton.guidepoint-mcp-proxy" not in loaded:
                     conn_refused()
                 if url.endswith("/admin/drain"):
+                    if cfg_headers.get("authorization") != f"Bearer {{expected_proxy_admin}}":
+                        emit(401, {{"ok": False, "error": "Unauthorized"}})
                     state["draining_8943"] = True
                     state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
                     emit(200, {{"ok": True, "draining": True, "in_flight": int(state.get("in_flight_8943", 0))}})
                 if url.endswith("/healthz"):
+                    if os.environ.get("FAKE_TIMEOUT_8943_HEALTHZ") == "1":
+                        timed_out()
                     owner = "legacy_proxy_8943"
                     if journal_file.is_file():
                         j = json.loads(journal_file.read_text(encoding="utf-8"))
@@ -527,23 +581,57 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
                 if url.endswith("/mcp"):
                     if os.environ.get("FAKE_FAIL_GUIDEPOINT_PROBE") == "1":
                         emit(500, {{"error": "simulated guidepoint proxy failure"}})
-                    if os.environ.get("FAKE_REFRESH_TOKENS_ON_MCP") == "1" and tokens_file.is_file():
-                        import time as _t
-                        cur_tok = json.loads(tokens_file.read_text(encoding="utf-8"))
-                        obt = float(cur_tok.get("obtained_at", 0) or 0)
-                        exp = float(cur_tok.get("expires_in", 600) or 600)
-                        if (obt + exp) - _t.time() <= 60:
-                            cur_tok["access_token"] = "tok-refreshed-legacy"
-                            cur_tok["refresh_token"] = "ref-refreshed-legacy"
-                            cur_tok["obtained_at"] = int(_t.time())
-                            cur_tok["expires_in"] = 600
-                            tokens_file.write_text(json.dumps(cur_tok) + "\\n", encoding="utf-8")
-                    state.setdefault("probes", []).append("proxy_8943_search_library")
-                    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
-                    payload_obj = {{"jsonrpc": "2.0", "id": 3, "result": {{"content": [{{"type": "text", "text": json.dumps({{"ok": True, "data": [{{"id": "gp-1"}}]}})}}]}}}}
-                    if os.environ.get("FAKE_PROXY_SSE") == "1":
-                        emit(200, "event: message\\ndata: " + json.dumps(payload_obj) + "\\n\\n")
-                    emit(200, payload_obj)
+                    req_obj = json.loads(data) if data else {{}}
+                    rpc_method = str(req_obj.get("method") or "")
+                    session_id = "fake-gp-session-8943"
+                    if rpc_method == "initialize":
+                        init_obj = {{
+                            "jsonrpc": "2.0",
+                            "id": req_obj.get("id", 1),
+                            "result": {{
+                                "protocolVersion": "2025-03-26",
+                                "capabilities": {{"tools": {{}}}},
+                                "serverInfo": {{"name": "guidepoint-mcp", "version": "1.0"}},
+                            }},
+                        }}
+                        hdrs = {{"Mcp-Session-Id": session_id, "Content-Type": "text/event-stream" if os.environ.get("FAKE_PROXY_SSE") == "1" else "application/json"}}
+                        if os.environ.get("FAKE_PROXY_SSE") == "1":
+                            emit(200, "event: message\\ndata: " + json.dumps(init_obj) + "\\n\\n", hdrs)
+                        emit(200, init_obj, hdrs)
+                    if rpc_method == "notifications/initialized":
+                        if cfg_headers.get("mcp-session-id") != session_id:
+                            emit(400, {{"jsonrpc": "2.0", "error": {{"code": -32000, "message": "Missing Mcp-Session-Id"}}}})
+                        emit(202, "", {{"Mcp-Session-Id": session_id}})
+                    if rpc_method == "tools/call":
+                        if cfg_headers.get("mcp-session-id") != session_id:
+                            emit(400, {{"jsonrpc": "2.0", "error": {{"code": -32000, "message": "Session required before tools/call"}}}})
+                        if os.environ.get("FAKE_REFRESH_TOKENS_ON_MCP") == "1" and tokens_file.is_file():
+                            import time as _t
+                            cur_tok = json.loads(tokens_file.read_text(encoding="utf-8"))
+                            obt = float(cur_tok.get("obtained_at", 0) or 0)
+                            exp = float(cur_tok.get("expires_in", 600) or 600)
+                            if (obt + exp) - _t.time() <= 60:
+                                cur_tok["access_token"] = "tok-refreshed-legacy"
+                                cur_tok["refresh_token"] = "ref-refreshed-legacy"
+                                cur_tok["obtained_at"] = int(_t.time())
+                                cur_tok["expires_in"] = 600
+                                tokens_file.write_text(json.dumps(cur_tok) + "\\n", encoding="utf-8")
+                        state.setdefault("probes", []).append("proxy_8943_search_library")
+                        state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+                        # Real Guidepoint MCP tools/call shape (structuredContent.data + text JSON without ok field)
+                        payload_obj = {{
+                            "jsonrpc": "2.0",
+                            "id": req_obj.get("id", 3),
+                            "result": {{
+                                "structuredContent": {{"data": [{{"transcriptId": "gp-1", "title": "Cloud Call"}}]}},
+                                "content": [{{"type": "text", "text": json.dumps({{"data": [{{"transcriptId": "gp-1", "title": "Cloud Call"}}]}})}}],
+                            }},
+                        }}
+                        hdrs = {{"Mcp-Session-Id": session_id, "Content-Type": "text/event-stream" if os.environ.get("FAKE_PROXY_SSE") == "1" else "application/json"}}
+                        if os.environ.get("FAKE_PROXY_SSE") == "1":
+                            emit(200, "event: message\\ndata: " + json.dumps(payload_obj) + "\\n\\n", hdrs)
+                        emit(200, payload_obj, hdrs)
+                    emit(400, {{"jsonrpc": "2.0", "error": {{"code": -32601, "message": f"Unsupported method {{rpc_method}}"}}}})
                 emit(200, {{"ok": True}})
 
             # :8960 legacy bridge
@@ -551,6 +639,12 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
                 if "com.dalton.researchdata-bridge" not in loaded:
                     conn_refused()
                 if url.endswith("/healthz"):
+                    delay_n = int(os.environ.get("FAKE_DELAY_8960_HEALTHZ_POLLS", "0") or "0")
+                    seen_n = int(state.get("seen_8960_healthz", 0))
+                    if seen_n < delay_n:
+                        state["seen_8960_healthz"] = seen_n + 1
+                        state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+                        conn_refused()
                     emit(200, {{"ok": True, "inflight": 0, "queued": 0}})
                 if url.endswith("/mcp"):
                     req_obj = json.loads(data) if data else {{}}
@@ -579,6 +673,12 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
                 if not state.get("backend_running", True):
                     conn_refused()
                 if url.endswith("/health"):
+                    delay_n = int(os.environ.get("FAKE_DELAY_8000_HEALTH_POLLS", "0") or "0")
+                    seen_n = int(state.get("seen_8000_health", 0))
+                    if seen_n < delay_n:
+                        state["seen_8000_health"] = seen_n + 1
+                        state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+                        conn_refused()
                     emit(200, {{"status": "ok"}})
                 if "/maintenance/admission/probe" in url:
                     adm = json.loads(adm_file.read_text(encoding="utf-8")) if adm_file.is_file() else {{"paused": False, "revision": 0}}
@@ -604,6 +704,7 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
         "DALTON_LAUNCHD_DOMAIN": "gui/501",
         "DALTON_MAINTENANCE_NO_DB_LOCK": "1",
         "LAUNCHCTL_BIN": str(fake_launchctl),
+        "PS_BIN": str(fake_ps),
         "DOCKER_BIN": str(fake_docker),
         "CURL_BIN": str(fake_curl),
         "DALTON_ROLLBACK_SERVICE_TIMEOUT_S": "3",
@@ -633,7 +734,7 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
         "rh_plist": rh_plist,
         "web_cur": web_cur,
         "adm_file": adm_file,
-        "secrets": [bridge_token, rh_token, rh_admin_token, svc_token],
+        "secrets": [bridge_token, rh_token, rh_admin_token, proxy_admin_token, svc_token],
         "tracked_paths": [
             repo_env,
             bridge_env,
@@ -1138,10 +1239,33 @@ def test_runbook_commands_scripts_and_flags_all_exist_and_follow_writing_rules()
     assert "drain-refresher" in text
     assert "wait-lock-free" in text
     assert "wait-owner" in text
+    assert "wait-health" in text
+    assert "manifest-verify" in text
     assert "compose-args" in text
     assert "set -euo pipefail" in text
     assert "var/dalton/cutover-snapshots/recovery-bin/rollback_research_host.sh" in text
     assert "docker compose -f docker-compose.yml -f docker-compose.dalton.yml" not in text
+
+    # Row 6: recovery-bin publish & manifest-verify MUST occur BEFORE the first gate-set --paused true
+    pub_pos = text.index("recovery-publish")
+    mver_pos = text.index("manifest-verify")
+    first_close_pos = text.index("--paused true")
+    assert pub_pos < mver_pos < first_close_pos, "recovery-bin publish & verify must precede closing gate"
+
+    # Row 4: wait-health MUST appear after launchctl bootstrap (:8960) and docker compose up (:8000) before gate-verify
+    step8_pos = text.index("docker compose \"${COMPOSE_ARGS[@]}\" up -d --no-deps --force-recreate backend")
+    wh_8960_pos = text.index("--url http://127.0.0.1:8960/healthz")
+    wh_8000_pos = text.index("--url http://127.0.0.1:8000/health")
+    gate_ver_after_compose = text.index("gate-verify", step8_pos)
+    assert wh_8960_pos < step8_pos < wh_8000_pos < gate_ver_after_compose
+
+    # Lead Decision 7: researchdata-connectors.md §6.4b begins with manual cutover pointer to runbook
+    design_doc = REPO_ROOT / "docs" / "dalton" / "features" / "researchdata-connectors.md"
+    design_text = design_doc.read_text(encoding="utf-8")
+    sec_pos = design_text.index("### 6.4b")
+    sec_head = design_text[sec_pos : sec_pos + 600]
+    assert "scripts/dalton/ops/prod/RESEARCH_HOST_SWITCH_RUNBOOK.md" in sec_head
+    assert "停机手动切换" in sec_head
 
     # Must not contain retired automated orchestration flags or internal codenames
     for forbidden in (
@@ -1156,7 +1280,9 @@ def test_runbook_commands_scripts_and_flags_all_exist_and_follow_writing_rules()
         "§6.4b",
         "E16",
     ):
-        assert forbidden not in text, f"runbook should not reference retired/internal token: {forbidden}"
+        assert re.search(rf"(?<![A-Za-z0-9_-]){re.escape(forbidden)}(?![A-Za-z0-9_-])", text) is None, (
+            f"runbook should not reference retired/internal token: {forbidden}"
+        )
 
     invocations = _extract_runbook_script_invocations(text)
     assert len(invocations) >= 10, f"expected >= 10 script invocations in runbook, got {len(invocations)}"
@@ -1221,15 +1347,21 @@ def test_runbook_commands_scripts_and_flags_all_exist_and_follow_writing_rules()
 # ---------------------------------------------------------------------------
 
 
-def _prod_rh_healthz(*, owner_lock_held: bool = True, standby: bool = False, in_flight: int = 0) -> dict[str, Any]:
+def _prod_rh_healthz(
+    *,
+    owner_lock_held: bool = True,
+    standby: bool = False,
+    in_flight: int = 0,
+    draining: bool = False,
+) -> dict[str, Any]:
     """Return the exact production `/healthz` JSON shape emitted by `:8951`."""
     return {
-        "ok": True,
-        "status": "ok",
+        "ok": not draining,
+        "status": "draining" if draining else "ok",
         "service": "dalton-research-host",
         "version": "1.0.0",
         "profile": "everflow",
-        "draining": False,
+        "draining": draining,
         "in_flight": in_flight,
         "connectors": {"company-wiki": True, "guidepoint": True},
         "probes": {
@@ -1482,6 +1614,7 @@ def test_drain_refresher_waits_in_flight_tmp_and_performs_controlled_refresh_bef
     # Simulate a leftover .tmp file that disappears on second poll
     tmp_tok = h["tokens_file"].parent / ".guidepoint_mcp_tokens.abc123.tmp"
     call_seq: list[tuple[str, str]] = []
+    drain_state = {"draining": False}
 
     def _fake_http(
         method: str,
@@ -1495,15 +1628,15 @@ def test_drain_refresher_waits_in_flight_tmp_and_performs_controlled_refresh_bef
         if method == "GET" and url.endswith("/healthz"):
             n_health = sum(1 for m, u in call_seq if m == "GET" and u.endswith("/healthz"))
             if n_health == 1:
-                return 200, _prod_rh_healthz(owner_lock_held=True, standby=False, in_flight=1), None
+                return 200, _prod_rh_healthz(owner_lock_held=True, standby=False, in_flight=1, draining=drain_state["draining"]), None
             if n_health == 2:
                 # Still in_flight=1 with a temp file present
                 tmp_tok.write_text("partial", encoding="utf-8")
-                return 200, _prod_rh_healthz(owner_lock_held=True, standby=False, in_flight=1), None
-            # Third poll: tmp gone and in_flight == 0
+                return 200, _prod_rh_healthz(owner_lock_held=True, standby=False, in_flight=1, draining=drain_state["draining"]), None
+            # Third poll: tmp gone, draining=True, and in_flight == 0
             if tmp_tok.exists():
                 tmp_tok.unlink()
-            return 200, _prod_rh_healthz(owner_lock_held=True, standby=False, in_flight=0), None
+            return 200, _prod_rh_healthz(owner_lock_held=True, standby=False, in_flight=0, draining=drain_state["draining"]), None
         if method == "POST" and url.endswith("/mcp/guidepoint"):
             # Controlled refresh persists fresh token to disk
             h["tokens_file"].write_text(
@@ -1524,6 +1657,7 @@ def test_drain_refresher_waits_in_flight_tmp_and_performs_controlled_refresh_bef
                 None,
             )
         if method == "POST" and url.endswith("/admin/drain"):
+            drain_state["draining"] = True
             return 200, {"ok": True, "draining": True, "in_flight": 1}, None
         return 404, {}, "unexpected"
 
@@ -1873,10 +2007,15 @@ def test_probe_services_legacy_proxy_decodes_sse_responses(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Item 7: `:8943/mcp` SSE (`text/event-stream`) responses decode cleanly via shared JSON/SSE decoder."""
+    """Item 7 + R3 Row 3: `:8943/mcp` performs MCP handshake (Mcp-Session-Id) and decodes real JSON/SSE shapes; double rejects sessionless tools/call."""
+    init_sse = (
+        "event: message\n"
+        'data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"guidepoint-mcp","version":"1.0"}}}\n\n'
+    )
+    # Real Guidepoint upstream search_library shape: structuredContent.data + text JSON (no "ok" key)
     sse_ok = (
         "event: message\n"
-        'data: {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\\"ok\\":true,\\"data\\":[{\\"id\\":\\"gp-sse\\"}]}"}]}}\n\n'
+        'data: {"jsonrpc":"2.0","id":3,"result":{"structuredContent":{"data":[{"transcriptId":"gp-sse-1"}]},"content":[{"type":"text","text":"{\\"data\\":[{\\"transcriptId\\":\\"gp-sse-1\\"}]}"}]}}\n\n'
     )
     sse_err = (
         "event: message\n"
@@ -1889,16 +2028,51 @@ def test_probe_services_legacy_proxy_decodes_sse_responses(
     (repo / ".env").write_text("APP_ENV=dalton\n", encoding="utf-8")
     (home / ".config" / "dalton" / "researchdata-bridge.env").write_text("DALTON_BRIDGE_TOKEN=br-tok\n", encoding="utf-8")
 
-    orig_http = preflight._http_request
-    http_ok = create_autospec(orig_http, spec_set=True)
-    http_ok.side_effect = [
-        (200, {"ok": True, "owner_lock_held": True, "draining": False, "in_flight": 0}, None),
-        (200, {"ok": True}, None),
-        (200, {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": json.dumps({"ok": True})}]}}, None),
-        (200, {"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": json.dumps({"ok": True})}]}}, None),
-        (200, sse_ok, None),
-    ]
-    monkeypatch.setattr(preflight, "_http_request", http_ok)
+    orig_http_hdr = preflight._http_request_with_headers
+    seen_mcp_methods: list[tuple[str, str | None]] = []
+
+    def _make_legacy_double(*, call_body: Any) -> Any:
+        def _fake(
+            method: str,
+            url: str,
+            *,
+            headers: Any = None,
+            body: bytes | None = None,
+            timeout_s: float = 5.0,
+            capture_headers: bool = True,
+        ) -> tuple[int | None, Any, dict[str, str], str | None]:
+            hdrs = {k.lower(): v for k, v in (headers or {}).items()}
+            if url.endswith(":8943/healthz"):
+                return 200, {"ok": True, "owner_lock_held": True, "draining": False, "in_flight": 0}, {}, None
+            if url.endswith(":8960/healthz"):
+                return 200, {"ok": True}, {}, None
+            if url.endswith(":8960/mcp"):
+                req_obj = json.loads(body.decode("utf-8")) if body else {}
+                rid = req_obj.get("id", 1)
+                return 200, {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": json.dumps({"ok": True})}]}}, {}, None
+            if url.endswith(":8943/mcp"):
+                req_obj = json.loads(body.decode("utf-8")) if body else {}
+                rpc_method = str(req_obj.get("method") or "")
+                sid = hdrs.get("mcp-session-id")
+                seen_mcp_methods.append((rpc_method, sid))
+                assert "text/event-stream" in hdrs.get("accept", "")
+                if rpc_method == "initialize":
+                    return 200, init_sse, {"mcp-session-id": "sess-gp-real-1", "content-type": "text/event-stream"}, None
+                if rpc_method == "notifications/initialized":
+                    if sid != "sess-gp-real-1":
+                        return 400, {"jsonrpc": "2.0", "error": {"code": -32000, "message": "missing session"}}, {}, None
+                    return 202, "", {"mcp-session-id": "sess-gp-real-1"}, None
+                if rpc_method == "tools/call":
+                    # Double explicitly REJECTS sessionless tools/call
+                    if sid != "sess-gp-real-1":
+                        return 400, {"jsonrpc": "2.0", "error": {"code": -32000, "message": "session required"}}, {}, None
+                    return 200, call_body, {"mcp-session-id": "sess-gp-real-1", "content-type": "text/event-stream"}, None
+                return 400, {"error": "unknown method"}, {}, None
+            return 404, {}, {}, "unexpected url"
+
+        return create_autospec(orig_http_hdr, spec_set=True, side_effect=_fake)
+
+    monkeypatch.setattr(preflight, "_http_request_with_headers", _make_legacy_double(call_body=sse_ok))
     rc_ok = preflight.main(
         [
             "probe-services",
@@ -1911,17 +2085,14 @@ def test_probe_services_legacy_proxy_decodes_sse_responses(
         ]
     )
     assert rc_ok == 0
+    assert seen_mcp_methods == [
+        ("initialize", None),
+        ("notifications/initialized", "sess-gp-real-1"),
+        ("tools/call", "sess-gp-real-1"),
+    ]
 
     # Also verify SSE isError fails cleanly
-    http_bad = create_autospec(orig_http, spec_set=True)
-    http_bad.side_effect = [
-        (200, {"ok": True, "owner_lock_held": True, "draining": False, "in_flight": 0}, None),
-        (200, {"ok": True}, None),
-        (200, {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": json.dumps({"ok": True})}]}}, None),
-        (200, {"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": json.dumps({"ok": True})}]}}, None),
-        (200, sse_err, None),
-    ]
-    monkeypatch.setattr(preflight, "_http_request", http_bad)
+    monkeypatch.setattr(preflight, "_http_request_with_headers", _make_legacy_double(call_body=sse_err))
     rc_bad = preflight.main(
         [
             "probe-services",
@@ -2150,3 +2321,522 @@ def test_compose_args_and_rollback_honor_compose_file_env(tmp_path: Path) -> Non
     compose_lines = [l for l in h["calls_log"].read_text(encoding="utf-8").splitlines() if l.startswith("docker compose ")]
     assert compose_lines, "expected docker compose invocation during rollback"
     assert "docker-compose.override.prod.yml" in compose_lines[-1]
+
+
+# ---------------------------------------------------------------------------
+# 9. Round-3 review fixes: Codex rows 1..6 + Lead decisions 1..7 tests
+# ---------------------------------------------------------------------------
+
+
+def test_drain_refresher_allow_down_rejects_healthz_timeout_while_process_alive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 Row 1: `--allow-down` skips drain ONLY when launchctl + ps confirm process exited; alive process with /healthz timeout keeps polling and exits non-zero (keeping gate closed in rollback)."""
+    h = _build_isolated_harness(tmp_path)
+
+    # A. Direct unit check of `_is_refresher_process_stopped` with create_autospec(_run_cmd)
+    orig_run_cmd = preflight._run_cmd
+    # A1: launchctl print shows running pid -> NOT stopped
+    rc_alive = create_autospec(orig_run_cmd, spec_set=True)
+    rc_alive.side_effect = [
+        (0, "gui/501/com.dalton.guidepoint-mcp-proxy = {\n\tstate = running\n\tpid = 43210\n}\n", ""),
+    ]
+    monkeypatch.setattr(preflight, "_run_cmd", rc_alive)
+    stopped, detail = preflight._is_refresher_process_stopped("legacy")
+    assert stopped is False and "43210" in detail
+
+    # A2: launchctl unloaded, but stray proxy process still in `ps` -> NOT stopped
+    rc_stray = create_autospec(orig_run_cmd, spec_set=True)
+    rc_stray.side_effect = [
+        (113, "", "Could not find service"),
+        (0, "PID\tStatus\tLabel\n", ""),
+        (0, "98765 /opt/homebrew/bin/python3.12 /opt/scripts/guidepoint_mcp_proxy.py\n", ""),
+    ]
+    monkeypatch.setattr(preflight, "_run_cmd", rc_stray)
+    stopped2, detail2 = preflight._is_refresher_process_stopped("legacy")
+    assert stopped2 is False and "98765" in detail2
+
+    # A3: ps fails -> fail-closed (NOT stopped)
+    rc_ps_err = create_autospec(orig_run_cmd, spec_set=True)
+    rc_ps_err.side_effect = [
+        (113, "", ""),
+        (0, "PID\tStatus\tLabel\n", ""),
+        (1, "", "operation not permitted"),
+    ]
+    monkeypatch.setattr(preflight, "_run_cmd", rc_ps_err)
+    stopped3, _ = preflight._is_refresher_process_stopped("legacy")
+    assert stopped3 is False
+
+    # A4: launchctl unloaded AND ps clean -> confirmed stopped
+    rc_clean = create_autospec(orig_run_cmd, spec_set=True)
+    rc_clean.side_effect = [
+        (113, "", ""),
+        (0, "PID\tStatus\tLabel\n", ""),
+        (0, "100 /sbin/launchd\n", ""),
+    ]
+    monkeypatch.setattr(preflight, "_run_cmd", rc_clean)
+    stopped4, _ = preflight._is_refresher_process_stopped("legacy")
+    assert stopped4 is True
+
+    # B. drain-refresher --allow-down with /healthz timeout while process alive -> polls & exits 1
+    orig_http = preflight._http_request
+    timeout_http = create_autospec(orig_http, spec_set=True, return_value=(None, None, "TimeoutError: timed out"))
+    alive_check = create_autospec(
+        preflight._is_refresher_process_stopped,
+        spec_set=True,
+        return_value=(False, "launchctl print reports com.dalton.research-host running (pid=2002)"),
+    )
+    monkeypatch.setattr(preflight, "_http_request", timeout_http)
+    monkeypatch.setattr(preflight, "_is_refresher_process_stopped", alive_check)
+    rc_to = preflight.main(
+        [
+            "drain-refresher",
+            "--repo", str(h["repo"]),
+            "--home", str(h["home"]),
+            "--target", "research-host",
+            "--url", "http://127.0.0.1:8951",
+            "--tokens-file", str(h["tokens_file"]),
+            "--research-host-env", str(h["rh_env"]),
+            "--timeout", "0.5",
+            "--poll-interval", "0.1",
+            "--allow-down",
+        ]
+    )
+    assert rc_to == 1
+    assert timeout_http.call_count >= 2
+    assert alive_check.call_count >= 2
+
+    # C. End-to-end rollback_research_host.sh: :8951 alive but /healthz times out -> MUST NOT bootout and MUST keep gate CLOSED
+    monkeypatch.undo()
+    r_snap = subprocess.run(
+        ["/bin/bash", str(SNAPSHOT_SH), "--label", "r3-timeout", "--print-path"],
+        env=h["env"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert r_snap.returncode == 0, r_snap.stderr
+    snap_dir = r_snap.stdout.strip()
+    _simulate_post_cutover_state(h)
+    h["calls_log"].write_text("", encoding="utf-8")
+
+    r_rb = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), snap_dir],
+        env={
+            **h["env"],
+            "FAKE_TIMEOUT_8951_HEALTHZ": "1",
+            "DALTON_ROLLBACK_SERVICE_TIMEOUT_S": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert r_rb.returncode != 0
+    assert "2/7 drain-research-host" in r_rb.stderr
+    assert "MAINTENANCE ADMISSION GATE REMAINS CLOSED" in r_rb.stderr
+    calls_txt = h["calls_log"].read_text(encoding="utf-8")
+    assert "launchctl bootout gui/501/com.dalton.research-host" not in calls_txt
+    adm = json.loads(h["adm_file"].read_text(encoding="utf-8"))
+    assert adm["paused"] is True and adm["pause_host_direct"] is True
+
+
+def test_forward_drain_resolves_guidepoint_env_admin_token_and_requires_draining_true(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 Row 2: forward drain reuses resolve_legacy_proxy_effective_paths (including GUIDEPOINT_ENV_FILE with tokens in another dir) and requires draining=true + in_flight==0 + zero .tmp."""
+    h = _build_isolated_harness(tmp_path)
+    # Move tokens file to a separate directory from guidepoint_mcp.env; put GUIDEPOINT_PROXY_ADMIN_TOKEN ONLY in guidepoint_mcp.env
+    vault_tokens = tmp_path / "separate-vault" / "guidepoint_mcp_tokens.json"
+    vault_tokens.parent.mkdir(parents=True)
+    vault_tokens.write_text(
+        json.dumps(
+            {
+                "access_token": "tok-separate",
+                "refresh_token": "ref-separate",
+                "obtained_at": int(time.time()) - 10,
+                "expires_in": 600,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    vault_tokens.chmod(0o600)
+    custom_gp_env = tmp_path / "custom-gp-cfg" / "guidepoint_mcp.env"
+    custom_gp_env.parent.mkdir(parents=True)
+    custom_gp_env.write_text(
+        f"GUIDEPOINT_CLIENT_ID=fake-cid\n"
+        f"GUIDEPOINT_CLIENT_SECRET=fake-csec\n"
+        f"GUIDEPOINT_TOKENS_FILE={vault_tokens}\n"
+        f"GUIDEPOINT_PROXY_ADMIN_TOKEN=admin-from-guidepoint-env-only\n",
+        encoding="utf-8",
+    )
+    custom_gp_env.chmod(0o600)
+    _make_plist(
+        h["proxy_plist"],
+        "com.dalton.guidepoint-mcp-proxy",
+        {
+            "GUIDEPOINT_ENV_FILE": str(custom_gp_env),
+            "DALTON_GUIDEPOINT_OWNERSHIP_FILE": str(h["journal_file"]),
+        },
+    )
+
+    # Case 1: resolves admin token via GUIDEPOINT_ENV_FILE, calls POST /admin/drain, confirms draining=True + in_flight=0
+    seen_calls: list[tuple[str, str, str | None]] = []
+    drain_flag = {"draining": False}
+
+    def _fake_http_ok(
+        method: str,
+        url: str,
+        *,
+        headers: Any = None,
+        body: bytes | None = None,
+        timeout_s: float = 5.0,
+    ) -> tuple[int | None, Any, str | None]:
+        auth = (headers or {}).get("Authorization")
+        seen_calls.append((method, url, auth))
+        if method == "GET" and url.endswith("/healthz"):
+            return (
+                200,
+                {
+                    "ok": not drain_flag["draining"],
+                    "owner_lock_held": True,
+                    "draining": drain_flag["draining"],
+                    "in_flight": 0,
+                },
+                None,
+            )
+        if method == "POST" and url.endswith("/admin/drain"):
+            assert auth == "Bearer admin-from-guidepoint-env-only"
+            drain_flag["draining"] = True
+            return 200, {"ok": True, "draining": True, "in_flight": 0}, None
+        return 404, {}, "unexpected"
+
+    orig_http = preflight._http_request
+    monkeypatch.setattr(preflight, "_http_request", create_autospec(orig_http, spec_set=True, side_effect=_fake_http_ok))
+    rc_ok = preflight.main(
+        [
+            "drain-refresher",
+            "--repo", str(h["repo"]),
+            "--home", str(h["home"]),
+            "--plist-dir", str(h["plist_dir"]),
+            "--target", "legacy",
+            "--url", "http://127.0.0.1:8943",
+            "--timeout", "2",
+            "--poll-interval", "0.05",
+        ]
+    )
+    assert rc_ok == 0
+    assert any(m == "POST" and u.endswith("/admin/drain") and a == "Bearer admin-from-guidepoint-env-only" for m, u, a in seen_calls)
+
+    # Case 2: /healthz stays draining=False (even though in_flight==0 and zero .tmp) -> MUST FAIL (exit 1)
+    def _fake_http_never_draining(
+        method: str,
+        url: str,
+        *,
+        headers: Any = None,
+        body: bytes | None = None,
+        timeout_s: float = 5.0,
+    ) -> tuple[int | None, Any, str | None]:
+        if method == "GET" and url.endswith("/healthz"):
+            return 200, {"ok": True, "owner_lock_held": True, "draining": False, "in_flight": 0}, None
+        if method == "POST" and url.endswith("/admin/drain"):
+            return 200, {"ok": True, "draining": False, "in_flight": 0}, None
+        return 404, {}, "unexpected"
+
+    monkeypatch.setattr(
+        preflight, "_http_request", create_autospec(orig_http, spec_set=True, side_effect=_fake_http_never_draining)
+    )
+    rc_not_draining = preflight.main(
+        [
+            "drain-refresher",
+            "--repo", str(h["repo"]),
+            "--home", str(h["home"]),
+            "--plist-dir", str(h["plist_dir"]),
+            "--target", "legacy",
+            "--url", "http://127.0.0.1:8943",
+            "--timeout", "0.5",
+            "--poll-interval", "0.05",
+        ]
+    )
+    assert rc_not_draining == 1
+
+    # Case 3: Missing GUIDEPOINT_PROXY_ADMIN_TOKEN while draining=False -> MUST FAIL immediately (never skip /admin/drain)
+    custom_gp_env.write_text(
+        f"GUIDEPOINT_CLIENT_ID=fake-cid\nGUIDEPOINT_CLIENT_SECRET=fake-csec\nGUIDEPOINT_TOKENS_FILE={vault_tokens}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        preflight, "_http_request", create_autospec(orig_http, spec_set=True, side_effect=_fake_http_never_draining)
+    )
+    rc_missing_tok = preflight.main(
+        [
+            "drain-refresher",
+            "--repo", str(h["repo"]),
+            "--home", str(h["home"]),
+            "--plist-dir", str(h["plist_dir"]),
+            "--target", "legacy",
+            "--url", "http://127.0.0.1:8943",
+            "--timeout", "1",
+            "--poll-interval", "0.05",
+        ]
+    )
+    assert rc_missing_tok == 1
+
+
+def test_legacy_proxy_controlled_refresh_uses_mcp_session_handshake_with_real_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 Row 3: legacy :8943 controlled refresh uses initialize -> Mcp-Session-Id -> notifications/initialized -> tools/call before /admin/drain."""
+    h = _build_isolated_harness(tmp_path)
+    h["tokens_file"].write_text(
+        json.dumps(
+            {
+                "access_token": "tok-expiring-legacy",
+                "refresh_token": "ref-expiring-legacy",
+                "obtained_at": int(time.time()) - 580,
+                "expires_in": 600,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    events: list[str] = []
+    state = {"draining": False}
+    orig_http_hdr = preflight._http_request_with_headers
+
+    def _fake_http_hdr(
+        method: str,
+        url: str,
+        *,
+        headers: Any = None,
+        body: bytes | None = None,
+        timeout_s: float = 5.0,
+        capture_headers: bool = True,
+    ) -> tuple[int | None, Any, dict[str, str], str | None]:
+        hdrs = {k.lower(): v for k, v in (headers or {}).items()}
+        if method == "GET" and url.endswith("/healthz"):
+            events.append(f"healthz:draining={state['draining']}")
+            return 200, {"ok": not state["draining"], "owner_lock_held": True, "draining": state["draining"], "in_flight": 0}, {}, None
+        if method == "POST" and url.endswith("/mcp"):
+            req_obj = json.loads(body.decode("utf-8")) if body else {}
+            m = str(req_obj.get("method") or "")
+            sid = hdrs.get("mcp-session-id")
+            events.append(f"mcp:{m}:sid={sid}")
+            if m == "initialize":
+                return (
+                    200,
+                    {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-03-26", "capabilities": {}}},
+                    {"mcp-session-id": "sess-ctrl-refresh"},
+                    None,
+                )
+            if m == "notifications/initialized":
+                assert sid == "sess-ctrl-refresh"
+                return 202, "", {"mcp-session-id": "sess-ctrl-refresh"}, None
+            if m == "tools/call":
+                # Reject sessionless tools/call
+                if sid != "sess-ctrl-refresh":
+                    return 400, {"jsonrpc": "2.0", "error": {"code": -32000, "message": "missing session"}}, {}, None
+                h["tokens_file"].write_text(
+                    json.dumps(
+                        {
+                            "access_token": "tok-refreshed-via-session",
+                            "refresh_token": "ref-refreshed-via-session",
+                            "obtained_at": int(time.time()),
+                            "expires_in": 600,
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                sse_real = (
+                    "event: message\n"
+                    'data: {"jsonrpc":"2.0","id":3,"result":{"structuredContent":{"data":[{"transcriptId":"T-99"}]},"content":[{"type":"text","text":"{\\"data\\":[{\\"transcriptId\\":\\"T-99\\"}]}"}]}}\n\n'
+                )
+                return 200, sse_real, {"mcp-session-id": "sess-ctrl-refresh", "content-type": "text/event-stream"}, None
+        if method == "POST" and url.endswith("/admin/drain"):
+            assert hdrs.get("authorization") == "Bearer test-proxy-admin-secret-epsilon"
+            state["draining"] = True
+            events.append("admin_drain")
+            return 200, {"ok": True, "draining": True, "in_flight": 0}, {}, None
+        return 404, {}, {}, "unexpected"
+
+    monkeypatch.setattr(
+        preflight, "_http_request_with_headers", create_autospec(orig_http_hdr, spec_set=True, side_effect=_fake_http_hdr)
+    )
+    rc = preflight.main(
+        [
+            "drain-refresher",
+            "--repo", str(h["repo"]),
+            "--home", str(h["home"]),
+            "--plist-dir", str(h["plist_dir"]),
+            "--target", "legacy",
+            "--url", "http://127.0.0.1:8943",
+            "--timeout", "5",
+            "--poll-interval", "0.05",
+        ]
+    )
+    assert rc == 0
+    assert events == [
+        "healthz:draining=False",
+        "mcp:initialize:sid=None",
+        "mcp:notifications/initialized:sid=sess-ctrl-refresh",
+        "mcp:tools/call:sid=sess-ctrl-refresh",
+        "admin_drain",
+        "healthz:draining=True",
+    ]
+    assert json.loads(h["tokens_file"].read_text(encoding="utf-8"))["refresh_token"] == "ref-refreshed-via-session"
+
+
+def test_wait_health_and_rollback_poll_cold_start_until_ready_before_gate_verify(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 Row 4: wait-health polls through cold startup delays (refused/503/ok=false) until HTTP 200, and rollback waits before gate-verify."""
+    orig_http = preflight._http_request
+    poll_ok = create_autospec(orig_http, spec_set=True)
+    poll_ok.side_effect = [
+        (None, None, "connection refused"),
+        (503, {"status": "starting"}, None),
+        (200, {"ok": False}, None),
+        (200, {"ok": True, "status": "ok"}, None),
+    ]
+    monkeypatch.setattr(preflight, "_http_request", poll_ok)
+    rc_ok = preflight.main(
+        ["wait-health", "--url", "http://127.0.0.1:8960/healthz", "--timeout", "5", "--poll-interval", "0.05"]
+    )
+    assert rc_ok == 0
+    assert poll_ok.call_count == 4
+
+    poll_timeout = create_autospec(orig_http, spec_set=True, return_value=(None, None, "connection refused"))
+    monkeypatch.setattr(preflight, "_http_request", poll_timeout)
+    rc_to = preflight.main(
+        ["wait-health", "--url", "http://127.0.0.1:8000/health", "--timeout", "0.5", "--poll-interval", "0.05"]
+    )
+    assert rc_to == 1
+
+    # End-to-end rollback with cold-start delays on BOTH :8960/healthz and :8000/health
+    monkeypatch.undo()
+    h = _build_isolated_harness(tmp_path)
+    r_snap = subprocess.run(
+        ["/bin/bash", str(SNAPSHOT_SH), "--label", "cold-start", "--print-path"],
+        env=h["env"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert r_snap.returncode == 0, r_snap.stderr
+    snap_dir = r_snap.stdout.strip()
+    _simulate_post_cutover_state(h)
+    h["calls_log"].write_text("", encoding="utf-8")
+
+    r_rb = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), snap_dir],
+        env={
+            **h["env"],
+            "FAKE_DELAY_8960_HEALTHZ_POLLS": "2",
+            "FAKE_DELAY_8000_HEALTH_POLLS": "2",
+            "DALTON_ROLLBACK_SERVICE_TIMEOUT_S": "5",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert r_rb.returncode == 0, r_rb.stdout + r_rb.stderr
+    assert "ROLLBACK_OK" in r_rb.stdout
+    calls = h["calls_log"].read_text(encoding="utf-8").splitlines()
+    # :8000/health polled multiple times and succeeded BEFORE post-recreate /maintenance/admission/probe
+    compose_idx = next(i for i, c in enumerate(calls) if c.startswith("docker compose "))
+    health_after_compose = [i for i, c in enumerate(calls) if i > compose_idx and "GET http://127.0.0.1:8000/health" in c]
+    probe_after_compose = [i for i, c in enumerate(calls) if i > compose_idx and "/maintenance/admission/probe" in c]
+    assert probe_after_compose
+    health_before_first_gate_probe = [i for i in health_after_compose if i < probe_after_compose[0]]
+    assert len(health_before_first_gate_probe) >= 3
+
+
+def test_rollback_open_gate_command_failure_recloses_and_verifies_gate(tmp_path: Path) -> None:
+    """R3 Row 5: if `gate-set --paused false` mutates disk then errors (e.g. PG commit failure), rollback re-closes and verifies closed gate (or prints CRITICAL if re-close also fails)."""
+    h = _build_isolated_harness(tmp_path)
+    r_snap = subprocess.run(
+        ["/bin/bash", str(SNAPSHOT_SH), "--label", "r3-open-fail", "--print-path"],
+        env=h["env"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert r_snap.returncode == 0, r_snap.stderr
+    snap_dir = r_snap.stdout.strip()
+
+    # Subcase A: open gate-set writes paused=false to disk then fails (simulating PG commit failure); re-close succeeds!
+    _simulate_post_cutover_state(h)
+    partial_open_py = _write_exec(
+        tmp_path / "py_partial_open_then_fail",
+        textwrap.dedent(
+            f"""\
+            #!{sys.executable}
+            import os, subprocess, sys
+            if "rollback_verified" in sys.argv:
+                # Run the real command so maintenance-admission.json IS atomically replaced with paused=false,
+                # then exit 1 to simulate PostgreSQL COMMIT failure after file replace!
+                subprocess.run([{sys.executable!r}] + sys.argv[1:], check=False)
+                print("ERROR: simulated PG commit failure after file replace", file=sys.stderr)
+                sys.exit(1)
+            os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
+            """
+        ),
+    )
+    r_a = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), snap_dir],
+        env={**h["env"], "DALTON_PYTHON_BIN": str(partial_open_py)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert r_a.returncode != 0
+    assert "7/7 open-gate" in r_a.stderr
+    assert "MAINTENANCE ADMISSION GATE REMAINS CLOSED" in r_a.stderr
+    adm_a = json.loads(h["adm_file"].read_text(encoding="utf-8"))
+    assert adm_a["paused"] is True and adm_a["pause_host_direct"] is True and adm_a["allow_workspace_ids"] == []
+
+    # Subcase B: open gate-set writes paused=false then fails AND re-close ALSO fails -> prints CRITICAL, NOT "REMAINS CLOSED"
+    _simulate_post_cutover_state(h)
+    open_and_reclose_fail_py = _write_exec(
+        tmp_path / "py_open_and_reclose_fail",
+        textwrap.dedent(
+            f"""\
+            #!{sys.executable}
+            import os, subprocess, sys
+            if "rollback_verified" in sys.argv:
+                subprocess.run([{sys.executable!r}] + sys.argv[1:], check=False)
+                print("ERROR: simulated PG commit failure after file replace", file=sys.stderr)
+                sys.exit(1)
+            if "rollback_open_verify_failed" in sys.argv:
+                print("ERROR: simulated PG still down on reclose", file=sys.stderr)
+                sys.exit(1)
+            os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
+            """
+        ),
+    )
+    r_b = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), snap_dir],
+        env={**h["env"], "DALTON_PYTHON_BIN": str(open_and_reclose_fail_py)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert r_b.returncode != 0
+    assert "7/7 reclose-gate" in r_b.stderr
+    assert "CRITICAL" in r_b.stderr
+    assert "MAINTENANCE ADMISSION GATE REMAINS CLOSED" not in r_b.stderr
+    # Disk file remained open because re-close failed — verifying rollback did NOT falsely claim closed!
+    assert json.loads(h["adm_file"].read_text(encoding="utf-8"))["paused"] is False
