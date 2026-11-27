@@ -48,6 +48,7 @@ from src.dalton.data_jobs.notification_payloads import (
     is_feishu_card_within_envelope,
     split_feishu_card_to_chunks,
 )
+from src.dalton.notify.card_normalize import normalize_feishu_cards
 from src.dalton.notify.channel_transport import UNCERTAIN_NOTIFY_ERROR_CODES
 from src.server.database.pool import get_db_connection
 
@@ -1029,7 +1030,12 @@ async def submit_automation_report(
                     )
                     upgrade_delete_ids: list[str] = []
                     if existing:
-                        if _same_saved_body(existing, prepared["content_sha256"]):
+                        if _same_saved_body(
+                            existing,
+                            prepared["content_sha256"],
+                            profile=str(parsed["profile"]),
+                            prepared=prepared,
+                        ):
                             return _success_from_rows(existing, created=False)
                         if not _can_upgrade_oversized_legacy_card_batch(existing, prepared):
                             return _error(
@@ -1431,19 +1437,68 @@ def _payload_dict(raw: Any) -> dict[str, Any]:
     return {}
 
 
-def _same_saved_body(rows: Sequence[Mapping[str, Any]], digest: str) -> bool:
-    """True when every saved row is this report source and carries ``digest``.
+def _normalized_cards_digest(
+    profile: str,
+    cards: Sequence[Any],
+) -> str | None:
+    if not profile or not cards:
+        return None
+    normalized_cards, _ = normalize_feishu_cards(cards)
+    if len(normalized_cards) == 1 and isinstance(normalized_cards[0], list):
+        normalized_cards = normalized_cards[0]
+    if not normalized_cards or not all(isinstance(card, Mapping) for card in normalized_cards):
+        return None
+    return automation_report_content_sha256(
+        profile=profile,
+        content_kind="cards",
+        cards=[dict(card) for card in normalized_cards],
+        failure_text=None,
+    )
+
+
+def _same_saved_body(
+    rows: Sequence[Mapping[str, Any]],
+    digest: str,
+    *,
+    profile: str | None = None,
+    prepared: Mapping[str, Any] | None = None,
+) -> bool:
+    """True when every saved row is this report source and carries ``digest``
+    (or matches the incoming cards after normalizing both saved and incoming cards).
 
     The digest was computed before insert. Replay compares that stored field
-    and does not rebuild it from jsonb, which does not preserve object key order.
+    first and only normalizes both sides for card batches when raw digests
+    differ (e.g. pre-normalization legacy batches replayed with the same cards).
     """
     if not rows:
         return False
+    incoming_norm_digest: str | None = None
+    incoming_norm_computed = False
     for row in rows:
         payload = _payload_dict(row.get("payload_json"))
         if payload.get("source") != REPORT_SOURCE:
             return False
-        if payload.get("content_sha256") != digest:
+        if payload.get("content_sha256") == digest:
+            continue
+        if (
+            not profile
+            or not isinstance(prepared, Mapping)
+            or prepared.get("content_kind") != "cards"
+            or payload.get("content_kind") != "cards"
+            or str(payload.get("profile") or "") != profile
+        ):
+            return False
+        saved_cards = payload.get("cards")
+        incoming_cards = prepared.get("cards")
+        if not isinstance(saved_cards, list) or not isinstance(incoming_cards, list):
+            return False
+        if not incoming_norm_computed:
+            incoming_norm_digest = _normalized_cards_digest(profile, incoming_cards)
+            incoming_norm_computed = True
+        if incoming_norm_digest is None:
+            return False
+        saved_norm_digest = _normalized_cards_digest(profile, saved_cards)
+        if saved_norm_digest != incoming_norm_digest:
             return False
     return True
 
