@@ -54,6 +54,11 @@ _REDIS_INFLIGHT_POLL_SECONDS = 0.05
 # timeout across estimates/income/profile) are cancelled and release the slot before lease expiry.
 _UPSTREAM_SLOT_HARD_TIMEOUT_SECONDS = 12.0
 
+# Separate bound for Redis cache/cooldown writes and lock release performed OUTSIDE the upstream slot.
+# Slow or stalled Redis writes log a warning and fall back to the already-written in-memory snapshot
+# without holding an upstream semaphore slot or stalling singleflight indefinitely.
+_REDIS_WRITE_TIMEOUT_SECONDS = 2.0
+
 # 52/53-week fiscal calendars can shift fiscal year end date by up to ~10 days year over year.
 _FISCAL_YEAR_MATCH_TOLERANCE_DAYS = 15
 
@@ -219,7 +224,9 @@ _SUBUNIT_CURRENCIES: dict[str, tuple[str, float]] = {
     "GBp": ("GBP", 0.01),
     "GBX": ("GBP", 0.01),
     "ILA": ("ILS", 0.01),
+    "ILa": ("ILS", 0.01),
     "ZAC": ("ZAR", 0.01),
+    "ZAc": ("ZAR", 0.01),
 }
 
 _CONSENSUS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -397,8 +404,10 @@ def _is_eligible_fy_end(
 def _normalize_currency(raw: Any) -> tuple[str | None, float]:
     """Return ``(major_iso_currency, unit_scale_to_major)``.
 
-    Handles minor subunits such as Yahoo's ``GBp`` / ``GBX`` (pence -> 0.01 GBP)
-    and normalizes ``RMB`` / ``CNH`` to ``CNY``.
+    Handles minor subunits such as Yahoo's ``GBp`` / ``GBX`` (pence -> 0.01 GBP),
+    ``ZAc`` / ``ZAC`` (cents -> 0.01 ZAR), and ``ILA`` / ``ILa`` (agorot -> 0.01 ILS),
+    and normalizes ``RMB`` / ``CNH`` to ``CNY``. Returns ``(None, 1.0)`` when the
+    currency unit is missing or unrecognized (e.g. unknown mixed-case subunit codes).
     """
     if not isinstance(raw, str):
         return None, 1.0
@@ -412,7 +421,22 @@ def _normalize_currency(raw: Any) -> tuple[str | None, float]:
         return "CNY", 1.0
     if upper == "GBX":
         return "GBP", 0.01
-    return upper, 1.0
+    if upper == "ZAC":
+        return "ZAR", 0.01
+    if upper == "ILA":
+        return "ILS", 0.01
+    if len(s) == 3 and s.isascii() and s.isalpha() and s.isupper():
+        return s, 1.0
+    return None, 1.0
+
+
+def _scale_eps(eps_val: float | None, scale: float) -> float | None:
+    """Scale an EPS value by *scale* into its major currency unit, preserving ``None``."""
+    if eps_val is None:
+        return None
+    if scale == 1.0:
+        return float(eps_val)
+    return float(eps_val) * scale
 
 
 def infer_quote_currency(symbol: str) -> str:
@@ -635,6 +659,8 @@ class RawConsensusRecord:
     eps_per_quote_unit_confirmed: bool = False
     is_adr: bool | None = None
     last_reported_fy_end: str | None = None
+    fy1_unit_unverified: bool = False
+    fy2_unit_unverified: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -665,6 +691,8 @@ class RawConsensusRecord:
             last_reported_fy_end=str(data["last_reported_fy_end"])[:10]
             if data.get("last_reported_fy_end")
             else None,
+            fy1_unit_unverified=bool(data.get("fy1_unit_unverified", False)),
+            fy2_unit_unverified=bool(data.get("fy2_unit_unverified", False)),
         )
 
 
@@ -776,6 +804,21 @@ def _fx_cooldown_redis_key(fx_key: str) -> str:
     return f"{fx_key}:cd"
 
 
+async def _await_redis_write(coro: Any, *, op: str, key: str) -> None:
+    """Await a Redis write/delete/release with an independent timeout; log and never raise."""
+    try:
+        await asyncio.wait_for(coro, timeout=_REDIS_WRITE_TIMEOUT_SECONDS)
+    except TimeoutError:
+        logger.warning(
+            "[WATCHLIST_CONSENSUS] Redis %s timed out after %.2fs for %s",
+            op,
+            _REDIS_WRITE_TIMEOUT_SECONDS,
+            key,
+        )
+    except Exception as exc:
+        logger.debug("[WATCHLIST_CONSENSUS] Redis %s failed for %s: %s", op, key, exc)
+
+
 async def _write_consensus_cooldown(
     symbol: str,
     err_kind: str,
@@ -787,17 +830,19 @@ async def _write_consensus_cooldown(
     _CONSENSUS_ERROR_COOLDOWN[sym] = (time.monotonic(), err_kind, rec_copy)
     redis_client = await _get_redis_cache_client()
     if redis_client is not None:
-        try:
-            payload: dict[str, Any] = {"kind": err_kind}
-            if rec_copy is not None:
-                payload["record"] = rec_copy
-            await redis_client.set(
-                _consensus_cooldown_redis_key(sym),
+        key = _consensus_cooldown_redis_key(sym)
+        payload: dict[str, Any] = {"kind": err_kind}
+        if rec_copy is not None:
+            payload["record"] = rec_copy
+        await _await_redis_write(
+            redis_client.set(
+                key,
                 json.dumps(payload, ensure_ascii=False, default=str),
                 ttl=int(CONSENSUS_ERROR_COOLDOWN_SECONDS),
-            )
-        except Exception:
-            pass
+            ),
+            op=f"cooldown write ({err_kind})",
+            key=key,
+        )
 
 
 async def _clear_consensus_cooldown(symbol: str) -> None:
@@ -805,10 +850,8 @@ async def _clear_consensus_cooldown(symbol: str) -> None:
     _CONSENSUS_ERROR_COOLDOWN.pop(sym, None)
     redis_client = await _get_redis_cache_client()
     if redis_client is not None and callable(getattr(redis_client, "delete", None)):
-        try:
-            await redis_client.delete(_consensus_cooldown_redis_key(sym))
-        except Exception:
-            pass
+        key = _consensus_cooldown_redis_key(sym)
+        await _await_redis_write(redis_client.delete(key), op="cooldown clear", key=key)
 
 
 async def _read_consensus_cooldown_entry(
@@ -842,24 +885,24 @@ async def _write_fx_cooldown(fx_key: str, err_kind: str) -> None:
     _FX_ERROR_COOLDOWN[fx_key] = (time.monotonic(), err_kind)
     redis_client = await _get_redis_cache_client()
     if redis_client is not None:
-        try:
-            await redis_client.set(
-                _fx_cooldown_redis_key(fx_key),
+        key = _fx_cooldown_redis_key(fx_key)
+        await _await_redis_write(
+            redis_client.set(
+                key,
                 json.dumps({"kind": err_kind}),
                 ttl=int(CONSENSUS_ERROR_COOLDOWN_SECONDS),
-            )
-        except Exception:
-            pass
+            ),
+            op=f"FX cooldown write ({err_kind})",
+            key=key,
+        )
 
 
 async def _clear_fx_cooldown(fx_key: str) -> None:
     _FX_ERROR_COOLDOWN.pop(fx_key, None)
     redis_client = await _get_redis_cache_client()
     if redis_client is not None and callable(getattr(redis_client, "delete", None)):
-        try:
-            await redis_client.delete(_fx_cooldown_redis_key(fx_key))
-        except Exception:
-            pass
+        key = _fx_cooldown_redis_key(fx_key)
+        await _await_redis_write(redis_client.delete(key), op="FX cooldown clear", key=key)
 
 
 async def _read_fx_cooldown(fx_key: str) -> str | None:
@@ -934,10 +977,7 @@ async def _release_redis_lock_safely(
     if key is not None and redis_client is not None:
         release_lock = getattr(redis_client, "release_lock", None)
         if callable(release_lock):
-            try:
-                await release_lock(key, token)
-            except Exception:
-                pass
+            await _await_redis_write(release_lock(key, token), op="lock release", key=key)
 
 
 class _UpstreamSlotLease:
@@ -1218,14 +1258,15 @@ async def _write_consensus_cache(
     _CONSENSUS_CACHE[key] = (now_wall, data)
     redis_client = await _get_redis_cache_client()
     if redis_client is not None:
-        try:
-            await redis_client.set(
+        await _await_redis_write(
+            redis_client.set(
                 key,
                 json.dumps({"fetched_at": now_wall, "data": data}, ensure_ascii=False, default=str),
                 ttl=CONSENSUS_STALE_TTL_SECONDS,
-            )
-        except Exception:
-            pass
+            ),
+            op="consensus cache write",
+            key=key,
+        )
 
 
 async def _read_fx_cache(from_ccy: str, to_ccy: str) -> tuple[float | None, bool]:
@@ -1284,14 +1325,15 @@ async def _write_fx_cache(from_ccy: str, to_ccy: str, rate: float) -> None:
     _FX_CACHE[key] = (now_wall, rate)
     redis_client = await _get_redis_cache_client()
     if redis_client is not None:
-        try:
-            await redis_client.set(
+        await _await_redis_write(
+            redis_client.set(
                 key,
                 json.dumps({"fetched_at": now_wall, "rate": rate}),
                 ttl=FX_STALE_TTL_SECONDS,
-            )
-        except Exception:
-            pass
+            ),
+            op="FX cache write",
+            key=key,
+        )
 
 
 def _fetch_yfinance_fx_sync(from_ccy: str, to_ccy: str) -> float | None:
@@ -1340,14 +1382,17 @@ def _filter_consensus_record_fiscal_years(
     """
     eff_reported = _max_iso_date(last_reported_fy_end, record.last_reported_fy_end)
     dropped_any = False
-    kept_dated: list[tuple[str, float | None]] = []
+    kept_dated: list[tuple[str, float | None, bool]] = []
 
-    for end_raw, eps_val in ((record.fy1_end, record.fy1_eps), (record.fy2_end, record.fy2_eps)):
+    for end_raw, eps_val, unit_unv in (
+        (record.fy1_end, record.fy1_eps, record.fy1_unit_unverified),
+        (record.fy2_end, record.fy2_eps, record.fy2_unit_unverified),
+    ):
         parsed = _parse_iso_date(end_raw)
         if parsed is not None:
             iso = parsed.isoformat()
             if _is_eligible_fy_end(iso, today=today, last_reported_fy_end=eff_reported):
-                kept_dated.append((iso, eps_val))
+                kept_dated.append((iso, eps_val, unit_unv))
             else:
                 dropped_any = True
         elif eps_val is not None:
@@ -1355,9 +1400,13 @@ def _filter_consensus_record_fiscal_years(
             dropped_any = True
 
     kept_dated.sort(key=lambda item: item[0])
-    slots: list[tuple[str | None, float | None]] = list(kept_dated)
-    new_fy1_end, new_fy1_eps = slots[0] if len(slots) >= 1 else (None, None)
-    new_fy2_end, new_fy2_eps = slots[1] if len(slots) >= 2 else (None, None)
+    slots: list[tuple[str | None, float | None, bool]] = list(kept_dated)
+    new_fy1_end, new_fy1_eps, new_fy1_unv = (
+        slots[0] if len(slots) >= 1 else (None, None, False)
+    )
+    new_fy2_end, new_fy2_eps, new_fy2_unv = (
+        slots[1] if len(slots) >= 2 else (None, None, False)
+    )
 
     has_any_eps = new_fy1_eps is not None or new_fy2_eps is not None
     new_analysts = record.analyst_count if has_any_eps else None
@@ -1368,6 +1417,8 @@ def _filter_consensus_record_fiscal_years(
         and new_fy1_eps == record.fy1_eps
         and new_fy2_end == record.fy2_end
         and new_fy2_eps == record.fy2_eps
+        and new_fy1_unv == record.fy1_unit_unverified
+        and new_fy2_unv == record.fy2_unit_unverified
         and eff_reported == record.last_reported_fy_end
         and new_analysts == record.analyst_count
     ):
@@ -1390,6 +1441,8 @@ def _filter_consensus_record_fiscal_years(
             eps_per_quote_unit_confirmed=record.eps_per_quote_unit_confirmed,
             is_adr=record.is_adr,
             last_reported_fy_end=eff_reported,
+            fy1_unit_unverified=new_fy1_unv,
+            fy2_unit_unverified=new_fy2_unv,
         ),
         dropped_any,
     )
@@ -1609,16 +1662,19 @@ def _merge_partial_consensus_record(
 ) -> RawConsensusRecord:
     """Merge eligible dated fiscal years from ``primary`` and ``fallback`` to determine FY1/FY2, then match EPS by date.
 
-    Determines FY1/FY2 strictly from the combined sorted eligible fiscal-year end dates across both
-    sources (handling ±15-day 52/53-week shifts), preferring ``primary`` EPS when available for a
-    fiscal year and filling missing years (including an earlier eligible FY1 when Yahoo ``0y``
-    lacked an endDate) from ``fallback``.
+    Converts each source's EPS into its own major currency unit BEFORE merging (e.g. Yahoo ``GBp``
+    pence and FMP ``GBP`` pounds -> major ``GBP``, ``ZAc``/``ZAR`` -> ``ZAR``, ``ILA``/``ILS`` -> ``ILS``).
+    When a source's currency unit cannot be determined, its EPS is never mixed into the merged record
+    and any year relying solely on that indeterminate source is marked ``unit_unverified`` (displays ``—``).
     """
-    p_ccy, _ = _normalize_currency(primary.estimate_currency)
-    f_ccy, _ = _normalize_currency(fallback.estimate_currency)
-    # Refuse to merge when fallback currency is unverified/missing or incompatible with primary
-    if not f_ccy or (p_ccy and p_ccy != f_ccy):
+    p_ccy, p_scale = _normalize_currency(primary.estimate_currency)
+    f_ccy, f_scale = _normalize_currency(fallback.estimate_currency)
+    # Refuse to merge when neither source has a verified currency or when major currencies conflict.
+    if (not p_ccy and not f_ccy) or (p_ccy and f_ccy and p_ccy != f_ccy):
         return primary
+
+    target_ccy = p_ccy or f_ccy
+    assert target_ccy is not None
 
     ref_today = today or _utc_today()
     eff_reported = _max_iso_date(
@@ -1627,50 +1683,104 @@ def _merge_partial_consensus_record(
         fallback.last_reported_fy_end,
     )
 
-    # Buckets: [end_date_iso, primary_eps, primary_analysts, fallback_eps, fallback_analysts]
+    # Buckets: [end_date_iso, p_eps_major, p_analysts, p_unverified, f_eps_major, f_analysts, f_unverified]
     buckets: list[list[Any]] = []
 
-    def _upsert_primary(end_raw: str | None, eps_val: float | None, analysts: int | None) -> None:
+    def _upsert_primary(
+        end_raw: str | None,
+        eps_val: float | None,
+        analysts: int | None,
+        *,
+        existing_unverified: bool = False,
+    ) -> None:
         parsed = _parse_iso_date(end_raw)
         if parsed is None:
             return
         iso = parsed.isoformat()
         if not _is_eligible_fy_end(iso, today=ref_today, last_reported_fy_end=eff_reported):
             return
+        if p_ccy is not None:
+            scaled_eps = _scale_eps(eps_val, p_scale)
+            unverified = existing_unverified
+        else:
+            scaled_eps = None
+            unverified = existing_unverified or (eps_val is not None)
         for b in buckets:
             if _dates_match_fiscal_year(b[0], iso):
-                if b[1] is None and eps_val is not None:
-                    b[1] = eps_val
+                if b[1] is None and scaled_eps is not None:
+                    b[1] = scaled_eps
                     b[2] = analysts
+                if unverified:
+                    b[3] = True
                 return
-        buckets.append([iso, eps_val, analysts if eps_val is not None else None, None, None])
+        buckets.append(
+            [
+                iso,
+                scaled_eps,
+                analysts if scaled_eps is not None else None,
+                unverified,
+                None,
+                None,
+                False,
+            ]
+        )
 
-    def _upsert_fallback(end_raw: str | None, eps_val: float | None, analysts: int | None) -> None:
+    def _upsert_fallback(
+        end_raw: str | None,
+        eps_val: float | None,
+        analysts: int | None,
+    ) -> None:
         parsed = _parse_iso_date(end_raw)
         if parsed is None:
             return
         iso = parsed.isoformat()
         if not _is_eligible_fy_end(iso, today=ref_today, last_reported_fy_end=eff_reported):
             return
+        if f_ccy is not None:
+            scaled_eps = _scale_eps(eps_val, f_scale)
+            unverified = False
+        else:
+            scaled_eps = None
+            unverified = eps_val is not None
         for b in buckets:
             if _dates_match_fiscal_year(b[0], iso):
-                if b[3] is None and eps_val is not None:
-                    b[3] = eps_val
-                    b[4] = analysts
+                if b[4] is None and scaled_eps is not None:
+                    b[4] = scaled_eps
+                    b[5] = analysts
+                if unverified:
+                    b[6] = True
                 return
-        buckets.append([iso, None, None, eps_val, analysts if eps_val is not None else None])
+        buckets.append(
+            [
+                iso,
+                None,
+                None,
+                False,
+                scaled_eps,
+                analysts if scaled_eps is not None else None,
+                unverified,
+            ]
+        )
 
     # 1. Insert eligible dated fiscal years from primary (sorted chronologically)
-    primary_dated: list[tuple[str, float | None, int | None]] = []
-    for end_raw, eps_val in ((primary.fy1_end, primary.fy1_eps), (primary.fy2_end, primary.fy2_eps)):
+    primary_dated: list[tuple[str, float | None, int | None, bool]] = []
+    for end_raw, eps_val, existing_unv in (
+        (primary.fy1_end, primary.fy1_eps, primary.fy1_unit_unverified),
+        (primary.fy2_end, primary.fy2_eps, primary.fy2_unit_unverified),
+    ):
         parsed = _parse_iso_date(end_raw)
         if parsed is not None:
             primary_dated.append(
-                (parsed.isoformat(), eps_val, primary.analyst_count if eps_val is not None else None)
+                (
+                    parsed.isoformat(),
+                    eps_val,
+                    primary.analyst_count if eps_val is not None else None,
+                    existing_unv,
+                )
             )
     primary_dated.sort(key=lambda item: item[0])
-    for iso, eps_val, analysts in primary_dated:
-        _upsert_primary(iso, eps_val, analysts)
+    for iso, eps_val, analysts, existing_unv in primary_dated:
+        _upsert_primary(iso, eps_val, analysts, existing_unverified=existing_unv)
 
     # 2. Insert eligible dated fiscal years from FMP annual rows + fallback record (never resurrect excluded FYs)
     eligible_rows = _filter_fmp_eligible_estimates(
@@ -1692,31 +1802,39 @@ def _merge_partial_consensus_record(
     buckets.sort(key=lambda b: b[0])
     selected = buckets[:2]
 
-    def _resolve_slot(bucket: list[Any] | None) -> tuple[str | None, float | None, int | None, bool, bool]:
+    def _resolve_slot(
+        bucket: list[Any] | None,
+    ) -> tuple[str | None, float | None, int | None, bool, bool, bool]:
         if bucket is None:
-            return None, None, None, False, False
-        end_iso, p_eps, p_an, f_eps, f_an = bucket
+            return None, None, None, False, False, False
+        end_iso, p_eps, p_an, p_unv, f_eps, f_an, f_unv = bucket
         if p_eps is not None:
-            return end_iso, p_eps, p_an, True, False
+            return end_iso, p_eps, p_an, False, True, False
         if f_eps is not None:
-            return end_iso, f_eps, f_an, False, True
-        return end_iso, None, None, False, False
+            return end_iso, f_eps, f_an, False, False, True
+        return end_iso, None, None, bool(p_unv or f_unv), False, False
 
-    fy1_end, fy1_eps, fy1_an, used_p1, used_f1 = _resolve_slot(
+    fy1_end, fy1_eps, fy1_an, fy1_unv, used_p1, used_f1 = _resolve_slot(
         selected[0] if len(selected) >= 1 else None
     )
-    fy2_end, fy2_eps, fy2_an, used_p2, used_f2 = _resolve_slot(
+    fy2_end, fy2_eps, fy2_an, fy2_unv, used_p2, used_f2 = _resolve_slot(
         selected[1] if len(selected) >= 2 else None
     )
 
     used_primary_eps = used_p1 or used_p2
     used_fallback_eps = used_f1 or used_f2
 
+    # If primary lacked a verified currency and fallback contributed no usable EPS either,
+    # keep primary unchanged so the record stays `unit_unverified` across all years.
+    if p_ccy is None and not used_fallback_eps:
+        return primary
+
     if (
-        fy1_end == primary.fy1_end
-        and fy1_eps == primary.fy1_eps
+        p_ccy is not None
+        and fy1_end == primary.fy1_end
         and fy2_end == primary.fy2_end
-        and fy2_eps == primary.fy2_eps
+        and fy1_unv == primary.fy1_unit_unverified
+        and fy2_unv == primary.fy2_unit_unverified
         and not used_fallback_eps
     ):
         return primary
@@ -1753,7 +1871,7 @@ def _merge_partial_consensus_record(
         fy2_eps=fy2_eps,
         fy1_end=fy1_end,
         fy2_end=fy2_end,
-        estimate_currency=primary.estimate_currency or fallback.estimate_currency,
+        estimate_currency=target_ccy,
         quote_currency=primary.quote_currency or fallback.quote_currency,
         analyst_count=analyst_count,
         provider=combined_provider,
@@ -1763,6 +1881,8 @@ def _merge_partial_consensus_record(
         eps_per_quote_unit_confirmed=confirmed,
         is_adr=primary.is_adr if primary.is_adr is not None else fallback.is_adr,
         last_reported_fy_end=eff_reported,
+        fy1_unit_unverified=fy1_unv,
+        fy2_unit_unverified=fy2_unv,
     )
 
 
@@ -1864,6 +1984,16 @@ def _compute_valuation_from_record(
             unit_verified=False,
         )
 
+    if q_ccy is None:
+        return _empty_payload(
+            "unit_unverified",
+            reason="报价币种单位无法确定，暂不计算估值",
+            est_ccy=est_ccy,
+            q_ccy=None,
+            shares_per_unit=None,
+            unit_verified=False,
+        )
+
     # Share-unit & ADR verification (§6.3.2)
     is_adr = _is_adr_security(
         sym,
@@ -1881,7 +2011,7 @@ def _compute_valuation_from_record(
 
     if not is_adr:
         shares_per_quote_unit = 1.0
-        if est_ccy == q_ccy or q_ccy is None:
+        if est_ccy == q_ccy:
             eff_fx = 1.0
             unit_verified = True
         else:
@@ -1977,30 +2107,44 @@ def _compute_valuation_from_record(
         if _positive_float(latest_price) is not None
         else None
     )
+    fy1_eps_major = _scale_eps(record.fy1_eps, est_scale)
+    fy2_eps_major = _scale_eps(record.fy2_eps, est_scale)
 
-    def _calc_pe(eps_raw: float | None) -> tuple[float | None, str]:
-        if eps_raw is None:
+    def _calc_pe(
+        eps_major: float | None,
+        *,
+        year_unit_unverified: bool = False,
+    ) -> tuple[float | None, str]:
+        if year_unit_unverified:
+            return None, "unit_unverified"
+        if eps_major is None:
             return None, "no_coverage"
-        if eps_raw <= 0:
+        if eps_major <= 0:
             return None, "loss"
         if price_major is None:
             return None, "stale" if is_stale else "no_coverage"
-        eps_quote_unit = eps_raw * est_scale * shares_per_quote_unit * eff_fx
+        eps_quote_unit = eps_major * shares_per_quote_unit * eff_fx
         if eps_quote_unit <= 0:
             return None, "loss"
         pe = round(price_major / eps_quote_unit, 2)
         return pe, ("stale" if is_stale else "ok")
 
-    pe_fy1, pe_fy1_status = _calc_pe(record.fy1_eps)
-    pe_fy2, pe_fy2_status = _calc_pe(record.fy2_eps)
+    pe_fy1, pe_fy1_status = _calc_pe(
+        fy1_eps_major, year_unit_unverified=record.fy1_unit_unverified
+    )
+    pe_fy2, pe_fy2_status = _calc_pe(
+        fy2_eps_major, year_unit_unverified=record.fy2_unit_unverified
+    )
 
     eps_growth_fy2: float | None = None
-    if record.fy1_eps is None or record.fy2_eps is None:
+    if record.fy1_unit_unverified or record.fy2_unit_unverified:
+        eps_growth_status = "unit_unverified"
+    elif fy1_eps_major is None or fy2_eps_major is None:
         eps_growth_status = "no_coverage"
-    elif record.fy1_eps <= 0:
+    elif fy1_eps_major <= 0:
         eps_growth_status = "loss"
     else:
-        eps_growth_fy2 = round(((record.fy2_eps - record.fy1_eps) / record.fy1_eps) * 100.0, 2)
+        eps_growth_fy2 = round(((fy2_eps_major - fy1_eps_major) / fy1_eps_major) * 100.0, 2)
         eps_growth_status = "stale" if is_stale else "ok"
 
     # Overall symbol valuation status
@@ -2012,13 +2156,15 @@ def _compute_valuation_from_record(
         overall_status = "loss"
     elif is_stale:
         overall_status = "stale"
+    elif pe_fy1_status == "unit_unverified" or pe_fy2_status == "unit_unverified":
+        overall_status = "unit_unverified"
     else:
         overall_status = "no_coverage"
 
     return {
         "ticker": sym,
-        "fy1_eps": record.fy1_eps,
-        "fy2_eps": record.fy2_eps,
+        "fy1_eps": fy1_eps_major,
+        "fy2_eps": fy2_eps_major,
         "fy1_end": record.fy1_end,
         "fy2_end": record.fy2_end,
         "estimate_currency": est_ccy,
@@ -2362,13 +2508,15 @@ class WatchlistConsensusAdapter:
                         rate_val = await _run_blocking_holding_slot(
                             _fetch_yfinance_fx_sync, src, dst, timeout=fx_timeout
                         )
-                    pos = _positive_float(rate_val)
-                    if pos is not None:
-                        await _clear_fx_cooldown(cache_key)
-                        await _write_fx_cache(src, dst, pos)
-                        return pos
-                    await _write_fx_cooldown(cache_key, "empty")
-                    return None
+
+                # Upstream slot is already released; singleflight lock stays held through bounded Redis writes.
+                pos = _positive_float(rate_val)
+                if pos is not None:
+                    await _clear_fx_cooldown(cache_key)
+                    await _write_fx_cache(src, dst, pos)
+                    return pos
+                await _write_fx_cooldown(cache_key, "empty")
+                return None
             except (
                 _ConsensusSingleflightBusyError,
                 _ConsensusSlotBusyError,
@@ -2536,13 +2684,15 @@ class WatchlistConsensusAdapter:
                         return cd_rec
                     raise _ConsensusCooldownHitError(cd_kind, cached_dict=r_cached)
 
+                rate_limited = False
+                had_transient_error = False
+                had_rolled_past_fy = False
+                fmp_missing_currency = False
+                primary_missing_currency = False
+                rec: RawConsensusRecord | None = None
+
                 async with _acquire_upstream_slot():
                     slot_deadline = time.monotonic() + _UPSTREAM_SLOT_HARD_TIMEOUT_SECONDS
-                    rate_limited = False
-                    had_transient_error = False
-                    had_rolled_past_fy = False
-                    fmp_missing_currency = False
-                    rec: RawConsensusRecord | None = None
 
                     # 1. Public primary: yfinance (filtered by unified FY eligibility rule)
                     try:
@@ -2562,6 +2712,11 @@ class WatchlistConsensusAdapter:
                             )
                             if rec_dropped:
                                 had_rolled_past_fy = True
+                            if (
+                                (rec.fy1_eps is not None or rec.fy2_eps is not None)
+                                and _normalize_currency(rec.estimate_currency)[0] is None
+                            ):
+                                primary_missing_currency = True
                     except Exception as exc:
                         if _is_rate_limit_exception(exc):
                             rate_limited = True
@@ -2630,67 +2785,74 @@ class WatchlistConsensusAdapter:
                                     exc,
                                 )
 
-                    has_usable_eps = rec is not None and (
-                        rec.fy1_eps is not None or rec.fy2_eps is not None
+                # Upstream slot is already released here; same-symbol singleflight protection stays
+                # active while writing in-memory snapshots and bounded Redis cache/cooldown entries.
+                has_usable_eps = rec is not None and (
+                    rec.fy1_eps is not None or rec.fy2_eps is not None
+                )
+
+                # Decide degradation strictly by whether usable EPS exists (fixes Yahoo empty record + FMP 429)
+                if not has_usable_eps:
+                    if rate_limited:
+                        await _write_consensus_cooldown(sym, "rate_limited")
+                        raise ConsensusRateLimitError(
+                            f"Rate limited fetching consensus for {sym}"
+                        )
+                    if had_transient_error:
+                        await _write_consensus_cooldown(sym, "error")
+                        raise RuntimeError(f"Transient consensus fetch failure for {sym}")
+                    # Ordinary empty or rolled-past-only result -> short cooldown, NEVER 12h success cache!
+                    await _write_consensus_cooldown(sym, "empty")
+                    reason = (
+                        f"Only rolled-past fiscal years available for {sym}"
+                        if had_rolled_past_fy
+                        else f"No usable consensus EPS available for {sym}"
+                    )
+                    raise _ConsensusEmptyCooldownError(reason)
+
+                assert rec is not None
+                rec_dict = rec.to_dict()
+                final_reported = _max_iso_date(
+                    last_reported_fy_end, rec.last_reported_fy_end
+                )
+                if _is_record_rolled_past_fy(
+                    rec_dict, today=ref_today, last_reported_fy_end=final_reported
+                ):
+                    await _write_consensus_cooldown(sym, "empty")
+                    raise _ConsensusEmptyCooldownError(
+                        f"Refusing to cache rolled-past or undated FY record for {sym}"
                     )
 
-                    # Decide degradation strictly by whether usable EPS exists (fixes Yahoo empty record + FMP 429)
-                    if not has_usable_eps:
-                        if rate_limited:
-                            await _write_consensus_cooldown(sym, "rate_limited")
-                            raise ConsensusRateLimitError(
-                                f"Rate limited fetching consensus for {sym}"
-                            )
-                        if had_transient_error:
-                            await _write_consensus_cooldown(sym, "error")
-                            raise RuntimeError(f"Transient consensus fetch failure for {sym}")
-                        # Ordinary empty or rolled-past-only result -> short cooldown, NEVER 12h success cache!
-                        await _write_consensus_cooldown(sym, "empty")
-                        reason = (
-                            f"Only rolled-past fiscal years available for {sym}"
-                            if had_rolled_past_fy
-                            else f"No usable consensus EPS available for {sym}"
-                        )
-                        raise _ConsensusEmptyCooldownError(reason)
-
-                    assert rec is not None
-                    rec_dict = rec.to_dict()
-                    final_reported = _max_iso_date(
-                        last_reported_fy_end, rec.last_reported_fy_end
+                # Temporarily missing reporting currency -> short cooldown (no 12h cache), still display unit_unverified.
+                est_ccy, _ = _normalize_currency(rec.estimate_currency)
+                if est_ccy is None:
+                    await _write_consensus_cooldown(
+                        sym, "missing_currency", record_dict=rec_dict
                     )
-                    if _is_record_rolled_past_fy(
-                        rec_dict, today=ref_today, last_reported_fy_end=final_reported
-                    ):
-                        await _write_consensus_cooldown(sym, "empty")
-                        raise _ConsensusEmptyCooldownError(
-                            f"Refusing to cache rolled-past or undated FY record for {sym}"
-                        )
-
-                    # Temporarily missing reporting currency -> short cooldown (no 12h cache), still display unit_unverified.
-                    est_ccy, _ = _normalize_currency(rec.estimate_currency)
-                    if est_ccy is None:
-                        await _write_consensus_cooldown(
-                            sym, "missing_currency", record_dict=rec_dict
-                        )
-                        return rec_dict
-
-                    # Partial result where FMP single-year fill failed (429 / transient error / outer deadline / missing currency)
-                    # -> short cooldown (no 12h cache) while preserving the available year for display!
-                    is_partial = rec.fy1_eps is None or rec.fy2_eps is None
-                    if is_partial and (
-                        rate_limited or had_transient_error or fmp_missing_currency
-                    ):
-                        partial_kind = (
-                            "partial_rate_limited" if rate_limited else "partial_error"
-                        )
-                        await _write_consensus_cooldown(
-                            sym, partial_kind, record_dict=rec_dict
-                        )
-                        return rec_dict
-
-                    await _clear_consensus_cooldown(sym)
-                    await _write_consensus_cache(sym, rec_dict)
                     return rec_dict
+
+                # Partial result where FMP single-year fill failed (429 / transient error / outer deadline / missing currency)
+                # -> short cooldown (no 12h cache) while preserving the available year for display!
+                is_partial = rec.fy1_eps is None or rec.fy2_eps is None
+                if is_partial and (
+                    rate_limited
+                    or had_transient_error
+                    or fmp_missing_currency
+                    or primary_missing_currency
+                    or rec.fy1_unit_unverified
+                    or rec.fy2_unit_unverified
+                ):
+                    partial_kind = (
+                        "partial_rate_limited" if rate_limited else "partial_error"
+                    )
+                    await _write_consensus_cooldown(
+                        sym, partial_kind, record_dict=rec_dict
+                    )
+                    return rec_dict
+
+                await _clear_consensus_cooldown(sym)
+                await _write_consensus_cache(sym, rec_dict)
+                return rec_dict
             except (
                 _ConsensusSingleflightBusyError,
                 _ConsensusSlotBusyError,

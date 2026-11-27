@@ -2304,3 +2304,359 @@ async def test_outer_slot_deadline_during_fmp_backfill_preserves_yahoo_year_with
     )
     assert after_cd is None
     assert needs_warm_after is True
+
+
+@pytest.mark.asyncio
+async def test_earlier_fy_backfill_normalizes_subunit_currencies_and_blanks_unknown_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r6-1: Per-source EPS currency units (GBp/GBP, ZAc/ZAR, ILA/ILS) are normalized before merging; indeterminate units render `—` (`unit_unverified`) for that year."""
+    import pandas as pd
+    import yfinance as yf
+    from yfinance.scrapers.analysis import Analysis as YfAnalysis
+    import src.data_client.yfinance.yahoo as yahoo_mod
+
+    # 1. Exact regression: FMP FY1 £1 (GBP), Yahoo FY2 200p (GBp, 0y undated), price 2000p (GBp) -> FY1 P/E 20x, FY2 P/E 10x, EPS growth 100%
+    fake_lse_ticker = create_autospec(yf.Ticker, instance=True)
+    fake_lse_ticker.earnings_estimate = pd.DataFrame(
+        {"avg": [100.0, 200.0], "numberOfAnalysts": [18, 16]},
+        index=["0y", "+1y"],
+    )
+    fake_lse_analysis = create_autospec(YfAnalysis, instance=True)
+    fake_lse_analysis._earnings_trend = [
+        {"period": "0y"},  # missing endDate -> dropped so FMP backfills earlier eligible FY1
+        {"period": "+1y", "endDate": "2027-12-31", "earningsEstimate": {"currency": "GBp"}},
+    ]
+    fake_lse_ticker._analysis = fake_lse_analysis
+    fake_lse_ticker.info = {
+        "currency": "GBp",
+        "financialCurrency": "GBp",
+        "quoteType": "EQUITY",
+        "longName": "London Subunit Plc",
+    }
+    monkeypatch.setattr(
+        yahoo_mod,
+        "yahoo_ticker",
+        create_autospec(yahoo_mod.yahoo_ticker, return_value=fake_lse_ticker),
+    )
+
+    fmp_gbp = create_autospec(FMPClient, instance=True)
+    fmp_gbp.get_analyst_estimates.return_value = [
+        {"date": "2026-12-31", "epsAvg": 1.0, "numAnalystsEps": 20},  # £1 in GBP
+        {"date": "2027-12-31", "epsAvg": 2.05, "numAnalystsEps": 16},
+    ]
+    fmp_gbp.get_income_statement.return_value = [
+        {"date": "2025-12-31", "reportedCurrency": "GBP"}
+    ]
+    fmp_gbp.get_profile.return_value = [
+        {"symbol": "LSE1.L", "currency": "GBp", "companyName": "London Subunit Plc", "isAdr": False}
+    ]
+
+    adapter_lse = consensus_mod.WatchlistConsensusAdapter(
+        fmp_client=fmp_gbp,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+    lse_val = await adapter_lse.get_valuation("LSE1.L", latest_price=2000.0, quote_currency="GBp")
+    assert lse_val["status"] == "ok"
+    assert lse_val["estimate_currency"] == "GBP"
+    assert lse_val["quote_currency"] == "GBP"
+    assert lse_val["fy1_end"] == "2026-12-31"
+    assert lse_val["fy1_eps"] == 1.0
+    assert lse_val["fy2_end"] == "2027-12-31"
+    assert lse_val["fy2_eps"] == 2.0
+    assert lse_val["pe_fy1"] == 20.0
+    assert lse_val["pe_fy2"] == 10.0
+    assert lse_val["eps_growth_fy2"] == 100.0
+    assert lse_val["provider"] == "yfinance+fmp"
+
+    # 2. Other subunit quote pairs: ZAc/ZAR and ILA/ILS
+    for sym, sub_ccy, maj_ccy in (("JSE1.JO", "ZAc", "ZAR"), ("TASE1.TA", "ILA", "ILS")):
+        merged_sub = consensus_mod._merge_partial_consensus_record(
+            consensus_mod.RawConsensusRecord(
+                symbol=sym,
+                fy1_eps=200.0,
+                fy2_eps=None,
+                fy1_end="2027-12-31",
+                fy2_end=None,
+                estimate_currency=sub_ccy,
+                quote_currency=sub_ccy,
+                analyst_count=12,
+                provider="yfinance",
+            ),
+            consensus_mod.RawConsensusRecord(
+                symbol=sym,
+                fy1_eps=1.0,
+                fy2_eps=2.1,
+                fy1_end="2026-12-31",
+                fy2_end="2027-12-31",
+                estimate_currency=maj_ccy,
+                quote_currency=sub_ccy,
+                analyst_count=14,
+                provider="fmp",
+            ),
+            fallback_annual_rows=[
+                {"date": "2026-12-31", "epsAvg": 1.0, "numAnalystsEps": 14},
+                {"date": "2027-12-31", "epsAvg": 2.1, "numAnalystsEps": 12},
+            ],
+            today=date(2026, 11, 26),
+            last_reported_fy_end="2025-12-31",
+        )
+        val_sub = consensus_mod._compute_valuation_from_record(
+            merged_sub,
+            symbol=sym,
+            latest_price=2000.0,
+            quote_currency_override=sub_ccy,
+        )
+        assert val_sub["status"] == "ok"
+        assert val_sub["estimate_currency"] == maj_ccy
+        assert val_sub["quote_currency"] == maj_ccy
+        assert val_sub["pe_fy1"] == 20.0
+        assert val_sub["pe_fy2"] == 10.0
+        assert val_sub["eps_growth_fy2"] == 100.0
+
+    # 3. Indeterminate currency unit on FMP FY1 (missing reportedCurrency) -> FY1 displays `—` (unit_unverified), Yahoo FY2 stays valid!
+    fmp_no_ccy = create_autospec(FMPClient, instance=True)
+    fmp_no_ccy.get_analyst_estimates.return_value = [
+        {"date": "2026-12-31", "epsAvg": 1.0, "numAnalystsEps": 20},
+        {"date": "2027-12-31", "epsAvg": 2.0, "numAnalystsEps": 16},
+    ]
+    fmp_no_ccy.get_income_statement.return_value = [{"date": "2025-12-31"}]  # missing reportedCurrency
+    fmp_no_ccy.get_profile.return_value = [
+        {"symbol": "LSE2.L", "currency": "GBp", "companyName": "London Unverified FY1", "isAdr": False}
+    ]
+    adapter_unv = consensus_mod.WatchlistConsensusAdapter(
+        fmp_client=fmp_no_ccy,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+    unv_fy1 = await adapter_unv.get_valuation("LSE2.L", latest_price=2000.0, quote_currency="GBp")
+    assert unv_fy1["fy1_end"] == "2026-12-31"
+    assert unv_fy1["fy1_eps"] is None
+    assert unv_fy1["pe_fy1"] is None
+    assert unv_fy1["pe_fy1_status"] == "unit_unverified"
+    assert unv_fy1["fy2_end"] == "2027-12-31"
+    assert unv_fy1["fy2_eps"] == 2.0
+    assert unv_fy1["pe_fy2"] == 10.0
+    assert unv_fy1["pe_fy2_status"] == "ok"
+    assert unv_fy1["eps_growth_fy2"] is None
+    assert unv_fy1["eps_growth_fy2_status"] == "unit_unverified"
+    assert await consensus_mod._read_consensus_cooldown("LSE2.L") == "partial_error"
+
+    # 4. Indeterminate currency unit on primary Yahoo FY2 (unknown subunit "USc") while FMP FY1 GBP is verified -> FY1 ok, FY2 unit_unverified (`—`)!
+    merged_primary_unv = consensus_mod._merge_partial_consensus_record(
+        consensus_mod.RawConsensusRecord(
+            symbol="LSE3.L",
+            fy1_eps=200.0,
+            fy2_eps=None,
+            fy1_end="2027-12-31",
+            fy2_end=None,
+            estimate_currency="USc",  # unknown subunit -> indeterminate unit
+            quote_currency="GBp",
+            analyst_count=10,
+            provider="yfinance",
+        ),
+        consensus_mod.RawConsensusRecord(
+            symbol="LSE3.L",
+            fy1_eps=1.0,
+            fy2_eps=None,
+            fy1_end="2026-12-31",
+            fy2_end=None,
+            estimate_currency="GBP",
+            quote_currency="GBp",
+            analyst_count=12,
+            provider="fmp",
+        ),
+        fallback_annual_rows=[{"date": "2026-12-31", "epsAvg": 1.0, "numAnalystsEps": 12}],
+        today=date(2026, 11, 26),
+        last_reported_fy_end="2025-12-31",
+    )
+    val_primary_unv = consensus_mod._compute_valuation_from_record(
+        merged_primary_unv,
+        symbol="LSE3.L",
+        latest_price=2000.0,
+        quote_currency_override="GBp",
+    )
+    assert val_primary_unv["pe_fy1"] == 20.0
+    assert val_primary_unv["pe_fy1_status"] == "ok"
+    assert val_primary_unv["pe_fy2"] is None
+    assert val_primary_unv["pe_fy2_status"] == "unit_unverified"
+    assert val_primary_unv["eps_growth_fy2"] is None
+    assert val_primary_unv["eps_growth_fy2_status"] == "unit_unverified"
+
+
+@pytest.mark.asyncio
+async def test_slow_redis_write_releases_upstream_slot_holds_singleflight_and_keeps_fetched_year_readable(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """r6-2: Upstream slots are released before Redis cache/cooldown writes; slow Redis writes are bounded independently, keep same-symbol singleflight active until completion, log timeout, and keep fetched years readable."""
+    import logging
+    import pandas as pd
+    import yfinance as yf
+    from yfinance.scrapers.analysis import Analysis as YfAnalysis
+    import src.data_client.yfinance.yahoo as yahoo_mod
+
+    caplog.set_level(logging.WARNING, logger=consensus_mod.logger.name)
+    monkeypatch.setattr(consensus_mod, "_REDIS_WRITE_TIMEOUT_SECONDS", 0.12)
+
+    fake_redis, kv, locks = _make_ttl_redis_mock()
+    orig_set = fake_redis.set.side_effect
+    slow_keys: set[str] = set()
+    write_started: dict[str, asyncio.Event] = {}
+
+    async def _slow_set(key: str, value: Any, ttl: int | None = None) -> bool:
+        if key in slow_keys:
+            ev = write_started.get(key)
+            if ev is not None:
+                ev.set()
+            await asyncio.sleep(5.0)
+        return await orig_set(key, value, ttl=ttl)
+
+    fake_redis.set.side_effect = _slow_set
+    monkeypatch.setattr(
+        consensus_mod,
+        "_get_redis_cache_client",
+        create_autospec(consensus_mod._get_redis_cache_client, return_value=fake_redis),
+    )
+
+    yf_calls: list[str] = []
+
+    def _make_ticker(sym: str) -> Any:
+        yf_calls.append(sym)
+        ticker = create_autospec(yf.Ticker, instance=True)
+        analysis = create_autospec(YfAnalysis, instance=True)
+        if sym == "SLOWPART":
+            ticker.earnings_estimate = pd.DataFrame(
+                {"avg": [4.5], "numberOfAnalysts": [30]},
+                index=["0y"],
+            )
+            analysis._earnings_trend = [
+                {"period": "0y", "endDate": "2027-01-31", "earningsEstimate": {"currency": "USD"}}
+            ]
+        else:
+            ticker.earnings_estimate = pd.DataFrame(
+                {"avg": [5.0, 10.0], "numberOfAnalysts": [30, 28]},
+                index=["0y", "+1y"],
+            )
+            analysis._earnings_trend = [
+                {"period": "0y", "endDate": "2027-01-31", "earningsEstimate": {"currency": "USD"}},
+                {"period": "+1y", "endDate": "2028-01-31", "earningsEstimate": {"currency": "USD"}},
+            ]
+        ticker._analysis = analysis
+        ticker.info = {
+            "currency": "USD",
+            "financialCurrency": "USD",
+            "quoteType": "EQUITY",
+            "longName": f"{sym} Corp",
+        }
+        return ticker
+
+    monkeypatch.setattr(
+        yahoo_mod,
+        "yahoo_ticker",
+        create_autospec(yahoo_mod.yahoo_ticker, side_effect=_make_ticker),
+    )
+
+    # --- Part A: Success cache write path (Standalone Core, no FMP) ---
+    cache_key = consensus_mod._consensus_cache_key("SLOWCACHE")
+    inflight_key = f"{cache_key}:inflight"
+    slow_keys.add(cache_key)
+    write_started[cache_key] = asyncio.Event()
+
+    adapter_core = consensus_mod.WatchlistConsensusAdapter(
+        today_fn=lambda: date(2026, 11, 26),
+    )
+    t_slow_cache = asyncio.create_task(
+        adapter_core.get_valuation("SLOWCACHE", latest_price=100.0, quote_currency="USD")
+    )
+    await asyncio.wait_for(write_started[cache_key].wait(), timeout=2.0)
+
+    # While Redis cache write is stalled:
+    # 1. Both Redis and local upstream semaphore slots are ALREADY released!
+    assert [k for k in locks if k.startswith(consensus_mod._REDIS_SEM_KEY_PREFIX)] == []
+    assert (
+        consensus_mod._get_consensus_semaphore()._value
+        == consensus_mod.MAX_CONSENSUS_CONCURRENCY
+    )
+    # 2. Same-symbol singleflight protection (Redis inflight lock + local task) stays held!
+    assert inflight_key in locks
+    assert await fake_redis.acquire_lock(inflight_key, "other-worker", 15_000) is False
+    assert cache_key in consensus_mod._INFLIGHT_CONSENSUS
+    # 3. Another symbol can proceed immediately without waiting on SLOWCACHE's Redis write!
+    other_val = await adapter_core.get_valuation("OTHERCO", latest_price=100.0, quote_currency="USD")
+    assert other_val["status"] == "ok"
+    assert other_val["pe_fy1"] == 20.0
+    # 4. Concurrent caller for SLOWCACHE coalesces on singleflight (no duplicate upstream fetch)
+    t_coalesced = asyncio.create_task(
+        adapter_core.get_valuation("SLOWCACHE", latest_price=100.0, quote_currency="USD")
+    )
+    # 5. In-memory snapshot is already readable immediately
+    mid_cached, mid_warm = await adapter_core.get_cached_valuation(
+        "SLOWCACHE", latest_price=100.0, quote_currency="USD"
+    )
+    assert mid_cached is not None and mid_cached["status"] == "ok"
+    assert mid_cached["pe_fy1"] == 20.0
+    assert mid_cached["pe_fy2"] == 10.0
+    assert mid_warm is False
+
+    # Bounded Redis write times out cleanly (~0.12s), releases singleflight lock, and logs warning
+    res_cache, res_coalesced = await asyncio.wait_for(
+        asyncio.gather(t_slow_cache, t_coalesced), timeout=2.0
+    )
+    assert res_cache["status"] == "ok" and res_cache["pe_fy1"] == 20.0 and res_cache["pe_fy2"] == 10.0
+    assert res_coalesced["status"] == "ok" and res_coalesced["pe_fy1"] == 20.0
+    assert inflight_key not in locks
+    assert yf_calls.count("SLOWCACHE") == 1
+    assert any("consensus cache write timed out" in rec.message for rec in caplog.records)
+
+    # --- Part B: Partial cooldown write path (Yahoo FY1 fetched, FMP fails, cooldown Redis write stalls) ---
+    cd_key = consensus_mod._consensus_cooldown_redis_key("SLOWPART")
+    part_inflight_key = f"{consensus_mod._consensus_cache_key('SLOWPART')}:inflight"
+    slow_keys.add(cd_key)
+    write_started[cd_key] = asyncio.Event()
+
+    fmp_fail = create_autospec(FMPClient, instance=True)
+    fmp_fail.get_analyst_estimates.side_effect = RuntimeError("FMP 503 during backfill")
+
+    adapter_partial = consensus_mod.WatchlistConsensusAdapter(
+        fmp_client=fmp_fail,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+    t_slow_part = asyncio.create_task(
+        adapter_partial.get_valuation("SLOWPART", latest_price=135.0, quote_currency="USD")
+    )
+    await asyncio.wait_for(write_started[cd_key].wait(), timeout=2.0)
+
+    # While cooldown Redis write is stalled: slot is released, singleflight lock is held, Yahoo FY1 is already readable!
+    assert [k for k in locks if k.startswith(consensus_mod._REDIS_SEM_KEY_PREFIX)] == []
+    assert (
+        consensus_mod._get_consensus_semaphore()._value
+        == consensus_mod.MAX_CONSENSUS_CONCURRENCY
+    )
+    assert part_inflight_key in locks
+    mid_part, mid_part_warm = await adapter_partial.get_cached_valuation(
+        "SLOWPART", latest_price=135.0, quote_currency="USD"
+    )
+    assert mid_part is not None and mid_part["status"] == "ok"
+    assert mid_part["pe_fy1"] == 30.0
+    assert mid_part["pe_fy2"] is None
+    assert mid_part_warm is False
+
+    res_part = await asyncio.wait_for(t_slow_part, timeout=2.0)
+    assert res_part["status"] == "ok"
+    assert res_part["pe_fy1"] == 30.0
+    assert res_part["pe_fy2"] is None
+    assert part_inflight_key not in locks
+    assert consensus_mod._consensus_cache_key("SLOWPART") not in consensus_mod._CONSENSUS_CACHE
+    assert any("cooldown write (partial_error) timed out" in rec.message for rec in caplog.records)
+
+    # Already-fetched Yahoo FY1 remains readable from cooldown snapshot after Redis write timeout
+    after_part, after_part_warm = await adapter_partial.get_cached_valuation(
+        "SLOWPART", latest_price=135.0, quote_currency="USD"
+    )
+    assert after_part is not None and after_part["status"] == "ok"
+    assert after_part["pe_fy1"] == 30.0
+    assert after_part["pe_fy2"] is None
+    assert after_part_warm is False
+    # Confirm Redis kv did not receive the timed-out writes (proving memory snapshot served the reads)
+    assert cache_key not in kv
+    assert cd_key not in kv
