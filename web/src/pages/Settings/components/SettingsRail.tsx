@@ -32,15 +32,11 @@ export function useDaltonSettingsVisibility(
     identity.isInternal && hasCapability('colleague_sharing'),
   );
   const cosSharingNotFound = isNotFoundError(cosSharingError);
-<<<<<<< HEAD
-  const { data: coverageData, isLoading: coverageLoading } = useDaltonCoverageUnits(true);
-  // DALTON-HOOK(weixin-multi-account): delegate external WeChat entry visibility to Dalton hook
-  const weixinAllowExternal = useWeixinExternalVisibility(identity.isExternal, hasCapability);
-=======
   // DALTON-HOOK(watchlist): decouple team coverage units gating via useCapabilities('colleague_sharing')
   const hasColleagueSharing = hasCapability('colleague_sharing');
   const { data: coverageData, isLoading: coverageLoading } = useDaltonCoverageUnits(hasColleagueSharing);
->>>>>>> d1d01ef46 (wip(watchlist-b2): r1)
+  // DALTON-HOOK(weixin-multi-account): delegate external WeChat entry visibility to Dalton hook
+  const weixinAllowExternal = useWeixinExternalVisibility(identity.isExternal, hasCapability);
   const effectiveTier = identity.status === 'ready' ? identity.tier : null;
   return {
     canInvite: identity.canInvite,

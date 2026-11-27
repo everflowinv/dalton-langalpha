@@ -332,7 +332,6 @@ describe('WatchlistConfirmCard & interrupt bucket 4-state lifecycle', () => {
     spyReconcile.mockRestore();
   });
 
-<<<<<<< HEAD
   it('collects archive_workspace and watchlist cards by interruptId on answerBoard and submits together regardless of arrival or click order', () => {
     const makeArchiveEvent = (interruptId: string, toolCallId: string): SSEEvent =>
       ({
@@ -452,7 +451,8 @@ describe('WatchlistConfirmCard & interrupt bucket 4-state lifecycle', () => {
       'intr-arch-b': { decisions: [{ type: 'reject' }] },
       'intr-wl-b': { decisions: [{ type: 'approve' }] },
     });
-=======
+  });
+
   it('renders before -> after policy_diff on watchlist_tier_policy confirmation card', () => {
     const onApprove = vi.fn();
     render(
@@ -498,6 +498,5 @@ describe('WatchlistConfirmCard & interrupt bucket 4-state lifecycle', () => {
     expect(screen.getByText(/\*\/30 6-20 \* \* 1-5 → 0 6-20 \* \* 1-5/)).toBeTruthy();
     expect(screen.getByText(/±4% → ±6%/)).toBeTruthy();
     expect(screen.getByText(/tm3, t0, tp1 → tm3, t0/)).toBeTruthy();
->>>>>>> d1d01ef46 (wip(watchlist-b2): r1)
   });
 });
