@@ -5,6 +5,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { api } from '@/api/client';
 import { queryKeys } from '@/lib/queryKeys';
 import { getQuoteBatcher } from '@/lib/quotes/quoteBatcher';
+import { deriveQuoteDisplay, type QuoteRow } from '@/lib/quotes';
+import { resolveExtendedHoursDisplay } from '@/components/dalton/ExtendedHours';
 import {
   mergeQuotesIntoWatchlistMetrics,
   mergeWatchlistMetricsResponse,
@@ -508,5 +510,89 @@ describe('watchlist pending-only subset polling', () => {
     expect(settled.slice(250).every((r) => r.status === 'rejected')).toBe(true);
     expect(qc2.getQueryData(queryKeys.quote.detail('SYM001'))).toMatchObject({ price: 88.5 });
     expect(qc2.getQueryData(queryKeys.quote.detail('SYM251'))).toBeUndefined();
+  });
+
+  it('resolveExtendedHoursDisplay and deriveQuoteDisplay handle pre, post, overnight, regular, and non-US HK symbols consistently', () => {
+    const usPreQuote: QuoteRow = {
+      symbol: 'GOOG',
+      price: 320.76,
+      previous_close: 320.76,
+      regular_close: 320.76,
+      regular_trading_change: -3.46,
+      regular_trading_change_percent: -1.0672,
+      early_trading_change: 1.5,
+      early_trading_change_percent: 0.4676,
+      currency: 'USD',
+    };
+    const usPostQuote: QuoteRow = {
+      symbol: 'GOOG',
+      price: 317.28,
+      regular_close: 317.28,
+      previous_close: 320.76,
+      change_percent: -0.83,
+      regular_trading_change: -3.48,
+      regular_trading_change_percent: -1.0849,
+      late_trading_change_percent: 0.2584,
+      currency: 'USD',
+    };
+    const hkQuote: QuoteRow = {
+      symbol: '0700.HK',
+      price: 410.2,
+      regular_close: 410.2,
+      previous_close: 400,
+      change: 10.2,
+      change_percent: 2.55,
+      late_trading_change_percent: 0.9,
+      currency: 'HKD',
+    };
+
+    const preRes = resolveExtendedHoursDisplay(
+      usPreQuote,
+      { market: 'extended-hours', earlyHours: true, afterHours: false },
+      { symbol: 'GOOG', locale: 'en-US' },
+    );
+    expect(preRes.session).toBe('pre');
+    expect(preRes.mainPrice).toBe(320.76);
+    expect(preRes.ext).toEqual({ label: 'PM', price: '$322.26', pct: 0.47 });
+
+    const postRes = resolveExtendedHoursDisplay(
+      usPostQuote,
+      { market: 'extended-hours', earlyHours: false, afterHours: true },
+      { symbol: 'GOOG', locale: 'en-US' },
+    );
+    expect(postRes.session).toBe('post');
+    expect(postRes.mainPrice).toBe(317.28);
+    expect(postRes.ext).toEqual({ label: 'AH', price: '$318.10', pct: 0.26 });
+
+    // Overnight (closed after AH end and before next PM start) keeps last AH print
+    const overnightRes = resolveExtendedHoursDisplay(
+      usPostQuote,
+      { market: 'closed', earlyHours: false, afterHours: false },
+      { symbol: 'GOOG', locale: 'en-US' },
+    );
+    expect(overnightRes.session).toBe('post');
+    expect(overnightRes.mainPrice).toBe(317.28);
+    expect(overnightRes.ext).toEqual({ label: 'AH', price: '$318.10', pct: 0.26 });
+
+    // Regular trading hours suppresses extended-hours badge
+    const regularRes = resolveExtendedHoursDisplay(
+      usPostQuote,
+      { market: 'open', earlyHours: false, afterHours: false },
+      { symbol: 'GOOG', locale: 'en-US' },
+    );
+    expect(regularRes.session).toBe('regular');
+    expect(regularRes.ext).toBeNull();
+
+    // Non-US HK listing never shows US extended hours even if stray fields exist
+    const hkDirect = deriveQuoteDisplay(hkQuote, { market: 'extended-hours', earlyHours: false, afterHours: true });
+    expect(hkDirect.session).toBe('regular');
+    expect(hkDirect.extPrice).toBeNull();
+    const hkRes = resolveExtendedHoursDisplay(
+      hkQuote,
+      { market: 'closed', earlyHours: false, afterHours: false },
+      { symbol: '0700.HK', locale: 'en-US' },
+    );
+    expect(hkRes.session).toBe('regular');
+    expect(hkRes.ext).toBeNull();
   });
 });

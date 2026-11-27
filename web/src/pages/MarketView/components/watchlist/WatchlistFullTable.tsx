@@ -4,6 +4,13 @@ import { useTranslation } from 'react-i18next';
 import { useLocale } from '@/hooks/useLocale';
 import { DASH } from '@/lib/format';
 import { formatMoney, quoteCurrency } from '@/lib/bars';
+import { quoteKey, roundQuote2, type MarketStatusInput, type QuoteRow } from '@/lib/quotes';
+import {
+  ExtendedHours,
+  formatExtendedQuotePrice,
+  resolveExtendedHoursDisplay,
+  type ResolvedExtendedHoursDisplay,
+} from '@/components/dalton/ExtendedHours';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -24,6 +31,8 @@ export type WatchlistSortField = 'ticker' | WatchlistColumnKey;
 export interface WatchlistFullTableProps {
   companies: readonly PersonalWatchlistCompany[];
   metrics: Record<string, WatchlistMetricRow>;
+  quotes?: Record<string, QuoteRow | undefined>;
+  marketStatus?: MarketStatusInput | null;
   metricsLoading: boolean;
   visibleColumns: readonly WatchlistColumnKey[];
   groupedByTier: boolean;
@@ -102,6 +111,8 @@ function formatSignedPct(val: number | null | undefined): string {
 export function WatchlistFullTable({
   companies,
   metrics,
+  quotes,
+  marketStatus = null,
   metricsLoading,
   visibleColumns,
   groupedByTier,
@@ -149,21 +160,45 @@ export function WatchlistFullTable({
     }
   };
 
+  const extendedDisplayByTicker = useMemo(() => {
+    const out: Record<string, ResolvedExtendedHoursDisplay> = {};
+    for (const company of companies) {
+      const m = metrics[company.ticker];
+      if (company.is_private || m?.is_private) continue;
+      const quote = quotes?.[quoteKey(company.ticker)];
+      if (!quote) continue;
+      out[company.ticker] = resolveExtendedHoursDisplay(quote, marketStatus, {
+        symbol: company.ticker,
+        fallbackCurrency: m?.currency ?? null,
+        locale,
+      });
+    }
+    return out;
+  }, [companies, metrics, quotes, marketStatus, locale]);
+
   const sortedCompanies = useMemo(() => {
     const list = [...companies];
     if (!sortField) return list;
     const dir = sortDir === 'asc' ? 1 : -1;
     const metricValue = (c: PersonalWatchlistCompany): number | string | null => {
       const m = metrics[c.ticker];
+      const extInfo = extendedDisplayByTicker[c.ticker];
+      const inExtSession = extInfo != null && extInfo.session !== 'regular';
       switch (sortField) {
         case 'ticker':
           return c.ticker;
         case 'tier':
           return TIER_ORDER[c.tier] ?? 9;
         case 'price':
-          return c.is_private ? null : (m?.price ?? null);
+          return c.is_private
+            ? null
+            : inExtSession && extInfo.mainPrice != null
+              ? extInfo.mainPrice
+              : (m?.price ?? null);
         case 'chg_1d':
-          return m?.chg_1d ?? null;
+          return inExtSession && extInfo.mainChangePct != null
+            ? roundQuote2(extInfo.mainChangePct)
+            : (m?.chg_1d ?? null);
         case 'chg_1w':
           return m?.chg_1w ?? null;
         case 'chg_1m':
@@ -215,7 +250,7 @@ export function WatchlistFullTable({
       return (Number(va) - Number(vb)) * dir;
     });
     return list;
-  }, [companies, metrics, sortField, sortDir]);
+  }, [companies, metrics, extendedDisplayByTicker, sortField, sortDir]);
 
   const sections = useMemo(() => {
     if (!groupedByTier) {
@@ -293,14 +328,30 @@ export function WatchlistFullTable({
     }
 
     if (col === 'price') {
-      const code = quoteCurrency(m?.currency ?? null, company.ticker, 'equity');
+      const extInfo = extendedDisplayByTicker[company.ticker];
+      const inExtSession = extInfo != null && extInfo.session !== 'regular';
+      const code = extInfo?.currency ?? quoteCurrency(m?.currency ?? null, company.ticker, 'equity');
+      const mainPrice =
+        inExtSession && extInfo.mainPrice != null ? extInfo.mainPrice : (m?.price ?? null);
+      const extBadge = extInfo?.ext ?? null;
       return (
         <td
           key={col}
-          className="px-2.5 py-2 text-right text-xs font-medium tabular-nums whitespace-nowrap"
+          className={`px-2.5 ${extBadge ? 'py-1.5' : 'py-2'} text-right text-xs font-medium tabular-nums whitespace-nowrap leading-tight`}
           style={{ color: 'var(--color-text-primary)' }}
         >
-          {m?.price != null ? formatMoney(m.price, code, locale) : metricsLoading ? '…' : DASH}
+          <span className="block leading-tight">
+            {mainPrice != null
+              ? formatExtendedQuotePrice(mainPrice, code, locale, extInfo?.places)
+              : metricsLoading
+                ? '…'
+                : DASH}
+          </span>
+          {extBadge && (
+            <span className="block leading-none mt-0.5">
+              <ExtendedHours label={extBadge.label} price={extBadge.price} pct={extBadge.pct} />
+            </span>
+          )}
         </td>
       );
     }
@@ -313,7 +364,11 @@ export function WatchlistFullTable({
       col === 'chg_ytd' ||
       col === 'chg_1y'
     ) {
-      const val = m?.[col];
+      const extInfo = col === 'chg_1d' ? extendedDisplayByTicker[company.ticker] : undefined;
+      const val =
+        col === 'chg_1d' && extInfo && extInfo.session !== 'regular' && extInfo.mainChangePct != null
+          ? roundQuote2(extInfo.mainChangePct)
+          : m?.[col];
       return (
         <td
           key={col}

@@ -12,6 +12,7 @@ import { portfolioHoldingsQuery } from '@/hooks/membershipQueries';
 import { queryKeys } from '@/lib/queryKeys';
 import { apiErrorDetailMessage, apiErrorStatus } from '@/api/errors';
 import { useQuotes } from '@/lib/quotes';
+import { useMarketStatus } from '@/lib/quotes/useMarketStatus';
 import {
   BATCH1_WATCHLIST_COLUMNS,
   DEFAULT_WATCHLIST_COLUMNS,
@@ -240,6 +241,7 @@ export function WatchlistWorkspace({
     refetchInterval: 60_000,
     enabled: listedSymbols.length > 0,
   });
+  const marketStatus = useMarketStatus(listedSymbols.length > 0);
 
   const { data: metricsData, isLoading: metricsLoading } = usePersonalWatchlistMetrics(
     listedSymbols,
@@ -572,6 +574,8 @@ export function WatchlistWorkspace({
           <WatchlistFullTable
             companies={filteredCompanies}
             metrics={metricsMap}
+            quotes={liveQuotes}
+            marketStatus={marketStatus}
             metricsLoading={metricsLoading || quotesLoading}
             visibleColumns={visibleColumns}
             groupedByTier={groupedByTier}
