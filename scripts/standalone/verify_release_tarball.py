@@ -33,15 +33,26 @@ FORBIDDEN_PAX_KEYS: frozenset[str] = frozenset(
 )
 
 # Everflow-only subpaths that must never ship inside a Standalone Core archive.
-# The bridge filename is assembled so this shipped file passes the Core term scan.
 FORBIDDEN_RELEASE_SUBPATHS: tuple[tuple[str, ...], ...] = (
     ("plugins", "dalton_data"),
     ("plugins", "dalton", "skills", "dalton-richard-coverage-weekly"),
     ("plugins", "dalton", "skills", "dalton-ai-app-weekly-monitor"),
-    ("scripts", "dalton", "researchdata" + "_bridge.py"),
-    ("scripts", "dalton", "research_runtime"),
-    ("scripts", "dalton", "ops"),
     ("web", ".env.dalton"),
+)
+
+# `scripts/dalton/` is default-deny: only these files ship in Core (they must
+# match the release allowlist in package_release.sh). Everything else under it
+# (the research runtime, ops and launchd scripts, Everflow-only bridges) is rejected
+# without this shipped file having to name it.
+CORE_SCRIPTS_DALTON_PREFIX: tuple[str, ...] = ("scripts", "dalton")
+CORE_SCRIPTS_DALTON_ALLOWED: frozenset[str] = frozenset(
+    {
+        "Dockerfile.dalton",
+        "Dockerfile.postgres",
+        "docker_entrypoint_dalton.sh",
+        "configure_minio.sh",
+        "log_redaction.py",
+    }
 )
 
 
@@ -49,6 +60,13 @@ def _matches_forbidden_subpath(rel_parts: tuple[str, ...]) -> tuple[str, ...] | 
     for forbidden in FORBIDDEN_RELEASE_SUBPATHS:
         if len(rel_parts) >= len(forbidden) and rel_parts[: len(forbidden)] == forbidden:
             return forbidden
+    prefix_len = len(CORE_SCRIPTS_DALTON_PREFIX)
+    if (
+        len(rel_parts) > prefix_len
+        and rel_parts[:prefix_len] == CORE_SCRIPTS_DALTON_PREFIX
+        and rel_parts[prefix_len] not in CORE_SCRIPTS_DALTON_ALLOWED
+    ):
+        return rel_parts[: prefix_len + 1]
     return None
 
 
