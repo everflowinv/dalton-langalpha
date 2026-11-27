@@ -357,9 +357,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             req = urllib.request.Request(UPSTREAM, data=fwd_body, method=self.command, headers=headers)
             try:
                 with urllib.request.urlopen(req, timeout=rem_s) as resp:
-                    self._relay(resp.status, resp.headers.items(), resp)
+                    self._relay(resp.status, resp.headers.items(), resp, deadline_mono=deadline_mono)
             except urllib.error.HTTPError as e:
-                self._relay(e.code, e.headers.items() if e.headers else [], e)
+                self._relay(
+                    e.code,
+                    e.headers.items() if e.headers else [],
+                    e,
+                    deadline_mono=deadline_mono,
+                )
             except TimeoutError:
                 self._send_json(
                     504,
@@ -389,7 +394,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             with _state_lock:
                 _in_flight = max(0, _in_flight - 1)
 
-    def _relay(self, status, headers, body_stream) -> None:
+    def _relay(
+        self,
+        status,
+        headers,
+        body_stream,
+        *,
+        deadline_mono: float | None = None,
+    ) -> None:
         self.send_response(status)
         for k, v in headers:
             if k.lower() in HOP_BY_HOP or k.lower() == "content-length":
@@ -397,9 +409,39 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.send_header("Connection", "close")
         self.end_headers()
+        raw_sock = getattr(getattr(getattr(body_stream, "fp", None), "raw", None), "_sock", None)
         while True:
-            chunk = body_stream.read(4096)
+            if deadline_mono is not None:
+                rem = deadline_mono - time.monotonic()
+                if rem <= 0.0:
+                    self.close_connection = True
+                    try:
+                        body_stream.close()
+                    except Exception:
+                        pass
+                    break
+                if raw_sock is not None and hasattr(raw_sock, "settimeout"):
+                    try:
+                        raw_sock.settimeout(max(0.05, rem))
+                    except Exception:
+                        pass
+            try:
+                chunk = body_stream.read(4096)
+            except TimeoutError:
+                self.close_connection = True
+                try:
+                    body_stream.close()
+                except Exception:
+                    pass
+                break
             if not chunk:
+                break
+            if deadline_mono is not None and time.monotonic() >= deadline_mono:
+                self.close_connection = True
+                try:
+                    body_stream.close()
+                except Exception:
+                    pass
                 break
             try:
                 self.wfile.write(chunk)

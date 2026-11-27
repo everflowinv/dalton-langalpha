@@ -142,9 +142,17 @@ class GuidepointTokenManager:
             timeout_s = max(0.1, min(30.0, float(raw_timeout)))
         except (TypeError, ValueError):
             timeout_s = 5.0
-        self.acquire_owner_lock(timeout_s=timeout_s)
-        self._tokens = {}
-        self._load_tokens_unlocked()
+        previously_held = self.lock_held
+        if not previously_held:
+            self._owner_lock.acquire(timeout_s=timeout_s)
+        try:
+            self._tokens = {}
+            self._load_tokens_unlocked()
+        except Exception:
+            if not previously_held:
+                self._owner_lock.release()
+                self._standby = True
+            raise
         self._standby = False
         return 200, {
             "ok": True,

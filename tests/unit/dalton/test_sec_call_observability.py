@@ -472,8 +472,11 @@ async def test_failed_request_shares_same_corr_across_all_log_lines(
     # error in _handle_client.
     exec_mock = create_autospec(asyncio.create_subprocess_exec)
 
+    monkeypatch.setattr(rb, "_kill_process_group", create_autospec(rb._kill_process_group))
+
     async def _fake_exec(*cmd: Any, **kwargs: Any) -> asyncio.subprocess.Process:
         proc = create_autospec(asyncio.subprocess.Process, instance=True)
+        proc.pid = 424260
         proc.returncode = 1
         proc.communicate.return_value = (b"", b"fatal crash")
         return proc

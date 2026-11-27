@@ -224,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"whole_export_commercial_hits: {len(report.whole_export_commercial_hits)}")
         for h in report.whole_export_commercial_hits[:20]:
             print(f"  [whole_export] {h['path']}:{h['line']} ({h['term']}): {h['snippet']}")
-        if args.report_only and export_dir is not None:
+        if export_dir is not None:
             resolved_export = export_dir.expanduser().resolve()
             info_hits = _scan_files_for_terms(
                 resolved_export,

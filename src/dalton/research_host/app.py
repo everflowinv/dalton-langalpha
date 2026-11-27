@@ -443,9 +443,12 @@ def create_app(
                 content={"ok": False, "status": "bad_request", "error": "JSON object required"},
             )
         try:
-            result = acquire_fn(body)
-            if inspect.isawaitable(result):
-                result = await result
+            if inspect.iscoroutinefunction(acquire_fn):
+                result = await acquire_fn(body)
+            else:
+                result = await asyncio.to_thread(acquire_fn, body)
+                if inspect.isawaitable(result):
+                    result = await result
         except Exception as exc:
             return JSONResponse(
                 status_code=409,

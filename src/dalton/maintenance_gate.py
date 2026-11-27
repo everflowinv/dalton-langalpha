@@ -14,7 +14,7 @@ Coordinates:
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -39,7 +39,8 @@ MAINTENANCE_SHARED_LOCK_SQL: str = (
 MAINTENANCE_EXCLUSIVE_LOCK_SQL: str = (
     "SELECT pg_advisory_xact_lock(hashtext('dalton_maintenance_admission_gate'))"
 )
-DEFAULT_CONTAINER_VERIFY_DEADLINE_S: float = 120.0
+# Matches ``wait_backend_health`` in ``scripts/dalton/ops/prod/deploy_main.sh`` (80 rounds × 3s = 240s).
+DEFAULT_CONTAINER_VERIFY_DEADLINE_S: float = 240.0
 DEFAULT_CONTAINER_NAME: str = "dalton-langalpha-backend-1"
 DEFAULT_CONTAINER_STATE_FILE: str = "/app/var/dalton/maintenance-admission.json"
 
@@ -249,6 +250,7 @@ async def enforce_maintenance_admission_for_thread(
 async def enforce_maintenance_admission_for_automation(
     automation_id: str,
     *,
+    user_id: str | None = None,
     workspace_id: str | None = None,
     state_file: Path | str | None = None,
     context: str = "automation_trigger",
@@ -258,11 +260,11 @@ async def enforce_maintenance_admission_for_automation(
     if not st.paused:
         return st
     target_ws = str(workspace_id or "").strip() or None
-    if target_ws is None and automation_id and st.allow_workspace_ids:
+    if target_ws is None and automation_id and user_id and st.allow_workspace_ids:
         try:
             from src.server.database import automation as auto_db
 
-            row = await auto_db.get_automation(str(automation_id))
+            row = await auto_db.get_automation(str(automation_id), str(user_id))
             if isinstance(row, Mapping) and row.get("workspace_id"):
                 target_ws = str(row["workspace_id"]).strip() or None
         except Exception as exc:
@@ -274,6 +276,51 @@ async def enforce_maintenance_admission_for_automation(
     if not st.allows_workspace(target_ws):
         raise MaintenanceAdmissionPausedError(st, workspace_id=target_ws, context=context)
     return st
+
+
+async def enforce_maintenance_admission_for_wakeup(
+    workspace_id: str | None,
+    *,
+    release_riders: Callable[[], Awaitable[Any]] | None = None,
+    state_file: Path | str | None = None,
+) -> MaintenanceAdmissionState:
+    """Enforce maintenance admission before posting a wakeup turn, releasing gathered riders if paused."""
+    blocked, state = is_admission_paused(workspace_id, state_file=state_file)
+    if blocked:
+        if release_riders is not None:
+            await release_riders()
+        raise MaintenanceAdmissionPausedError(
+            state, workspace_id=workspace_id, context="wakeup_delivery"
+        )
+    return state
+
+
+async def defer_outbox_job_if_paused(
+    job: Mapping[str, Any],
+    exc: BaseException,
+    *,
+    delay_seconds: float = 60.0,
+) -> bool:
+    """Reschedule a claimed outbox job without burning attempts when blocked by maintenance pause."""
+    if not isinstance(exc, MaintenanceAdmissionPausedError):
+        return False
+    from src.server.database.runs import outbox as outbox_db
+
+    job_id = str(job["hook_outbox_id"])
+    attempts = int(job["attempts"])
+    await outbox_db.reschedule_claimed_job(
+        job_id,
+        attempts=attempts,
+        delay_seconds=delay_seconds,
+    )
+    logger.info(
+        "[maintenance_gate] Deferred outbox job=%s type=%s for %.0fs while maintenance paused (attempts=%d)",
+        job_id,
+        job.get("hook_type"),
+        delay_seconds,
+        attempts,
+    )
+    return True
 
 
 async def acquire_shared_maintenance_lock(conn: Any) -> None:
@@ -579,7 +626,7 @@ def _default_docker_runner(args: list[str], timeout_s: float) -> tuple[int, str,
             ["docker", *args],
             capture_output=True,
             text=True,
-            timeout=max(0.5, timeout_s),
+            timeout=max(0.1, timeout_s),
             check=False,
         )
         return proc.returncode, proc.stdout or "", proc.stderr or ""
@@ -605,7 +652,7 @@ def _default_http_request(
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(req, timeout=max(0.5, timeout_s)) as resp:
+        with opener.open(req, timeout=max(0.1, timeout_s)) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             try:
                 parsed = json.loads(raw) if raw.strip() else {}
@@ -668,15 +715,29 @@ def verify_container_maintenance_gate(
 
     last_container_rev: int | None = None
     last_probe_code: int | None = None
+    last_cat_rc: int | None = None
     last_reason = "container_api_timeout"
+
+    def _deadline_result() -> ContainerGateVerificationResult:
+        is_unavail = last_probe_code is None or last_cat_rc != 0
+        return ContainerGateVerificationResult(
+            status="unavailable" if is_unavail else "mismatch",
+            container_available=not is_unavail,
+            container_revision=last_container_rev,
+            probe_status_code=last_probe_code,
+            reason=last_reason,
+            elapsed_s=max(0.0, now_fn() - t0),
+        )
 
     while True:
         rem = deadline - now_fn()
-        step_timeout = max(0.5, min(5.0, rem if rem > 0 else 0.5))
+        if rem <= 0.0:
+            return _deadline_result()
+        inspect_timeout = min(5.0, rem)
 
         rc, out, _err = run_docker(
             ["inspect", "-f", "{{.State.Running}}", container_name],
-            step_timeout,
+            inspect_timeout,
         )
         if rc != 0 or out.strip().lower() != "true":
             return ContainerGateVerificationResult(
@@ -689,10 +750,15 @@ def verify_container_maintenance_gate(
             )
 
         # 1. Verify container file revision on the shared bind mount
+        rem = deadline - now_fn()
+        if rem <= 0.0:
+            return _deadline_result()
+        cat_timeout = min(5.0, rem)
         c_rc, c_out, _c_err = run_docker(
             ["exec", container_name, "cat", container_state_file],
-            step_timeout,
+            cat_timeout,
         )
+        last_cat_rc = c_rc
         container_rev: int | None = None
         if c_rc == 0 and c_out.strip():
             try:
@@ -704,12 +770,16 @@ def verify_container_maintenance_gate(
         last_container_rev = container_rev
 
         # 2. Verify `:8000` probe endpoint reflects expected pause state and revision
+        rem = deadline - now_fn()
+        if rem <= 0.0:
+            return _deadline_result()
+        http_timeout = min(5.0, rem)
         probe_code, probe_body, probe_err = do_http(
             "POST",
             f"{base_url}/api/v1/dalton/maintenance/admission/probe",
             headers=headers,
             body=b"{}",
-            timeout_s=step_timeout,
+            timeout_s=http_timeout,
         )
         last_probe_code = probe_code
 

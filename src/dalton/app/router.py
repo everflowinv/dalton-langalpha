@@ -219,15 +219,26 @@ async def get_openclaw_health_endpoint(
 
 
 def _require_maintenance_service_token(request: Request) -> None:
-    """Validate ``X-Service-Token`` for host-side maintenance gate probes (fail closed when configured)."""
+    """Validate ``X-Service-Token`` for host-side maintenance gate probes (fail closed)."""
     from src.config import env as server_env
     from src.dalton.auth import is_dalton_service_request
 
-    configured = os.getenv("INTERNAL_SERVICE_TOKEN") or getattr(
-        server_env, "INTERNAL_SERVICE_TOKEN", ""
-    )
+    configured = (
+        os.getenv("INTERNAL_SERVICE_TOKEN")
+        or getattr(server_env, "INTERNAL_SERVICE_TOKEN", "")
+        or ""
+    ).strip()
     if not configured:
-        return
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "ok": False,
+                "status": "maintenance_probe_unconfigured",
+                "error": "maintenance_probe_unconfigured",
+                "error_code": "maintenance_probe_unconfigured",
+                "message": "INTERNAL_SERVICE_TOKEN is not configured.",
+            },
+        )
     sent = request.headers.get("X-Service-Token", "")
     if not is_dalton_service_request(sent_token=sent, configured_token=configured):
         raise HTTPException(

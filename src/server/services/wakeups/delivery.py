@@ -433,14 +433,11 @@ async def _deliver(wake: _Wake) -> _Exit:
         }
 
         # DALTON-HOOK(maintenance-gate): hold wakeup delivery for retry while maintenance admission is paused
-        from src.dalton.maintenance_gate import MaintenanceAdmissionPausedError, is_admission_paused
+        from src.dalton.maintenance_gate import enforce_maintenance_admission_for_wakeup
 
-        _maint_blocked, _maint_state = is_admission_paused(str(thread["workspace_id"]))
-        if _maint_blocked:
-            await _release_riders(wake)
-            raise MaintenanceAdmissionPausedError(
-                _maint_state, workspace_id=str(thread["workspace_id"]), context="wakeup_delivery"
-            )
+        await enforce_maintenance_admission_for_wakeup(
+            str(thread["workspace_id"]), release_riders=lambda: _release_riders(wake)
+        )
 
         outcome, run_id = await post_notification_turn(
             thread_id=thread_id,

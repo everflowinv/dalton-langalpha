@@ -496,7 +496,12 @@ class HookOutboxDrainer:
             await executor(job)
         except asyncio.CancelledError:
             raise  # shutdown: lease expiry re-offers the claimed row
-        except Exception:
+        except Exception as exc:
+            # DALTON-HOOK(maintenance-gate): defer outbox job without burning attempts while maintenance is paused
+            from src.dalton.maintenance_gate import defer_outbox_job_if_paused
+
+            if await defer_outbox_job_if_paused(job, exc):
+                return
             logger.warning(
                 f"[HookOutbox] {hook_type} failed for job={job_id} "
                 f"run={job.get('run_id')} (attempt {attempts})",

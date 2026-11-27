@@ -813,7 +813,9 @@ async def trigger_automation(
     # DALTON-HOOK(maintenance-gate): block manual automation triggers during maintenance window
     from src.dalton.maintenance_gate import enforce_maintenance_admission_for_automation
 
-    await enforce_maintenance_admission_for_automation(str(automation_id))
+    await enforce_maintenance_admission_for_automation(
+        str(automation_id), user_id=principal.user_id
+    )
     checked = await cli_approval.automation_runs(
         http_request, principal, "trigger", automation_id=str(automation_id)
     )

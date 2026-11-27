@@ -934,6 +934,7 @@ async def test_federated_all_per_source_capabilities_partial_timeout_and_alphaen
         client_factory=create_autospec(httpx.AsyncClient, side_effect=_ae_client_factory),
     )
     register_alphaengine_bridge_proxy(registry, bridge_mcp_url="", proxy=ae_proxy)
+    registry.register_federated_alias("sales_mail", ("sales-notes", "tmtb"))
 
     fed = FederatedResearchConnector(
         registry,
@@ -2334,6 +2335,7 @@ async def test_federated_dynamic_tools_list_param_filtering_and_nonblocking_sqli
         allowed_params=frozenset({"sender", "layer", "search_mode", "media"}),
         prefixes=("mail", "digest"),
     )
+    reg.register_federated_alias("sales_mail", ("sales-notes", "tmtb"))
     fed = FederatedResearchConnector(reg, wiki_store, fanout_grace_s=0.05)
 
     # With sales-notes enabled, `sales_mail` IS advertised

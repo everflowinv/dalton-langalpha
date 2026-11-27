@@ -373,10 +373,13 @@ async def test_stdio_rpc_passes_gemini_only_for_library_routes_and_preserves_edg
 
     bridge = rb.ResearchDataBridge(rb.BridgeConfig())
     captured_envs: list[dict[str, str]] = []
+    kill_pg_mock = create_autospec(rb._kill_process_group)
+    monkeypatch.setattr(rb, "_kill_process_group", kill_pg_mock)
 
     async def _fake_exec(*cmd: Any, **kwargs: Any) -> Any:
         captured_envs.append(dict(kwargs.get("env") or {}))
         proc = create_autospec(asyncio.subprocess.Process, instance=True)
+        proc.pid = 424250
         proc.returncode = 0
         proc.communicate.return_value = (
             json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}).encode("utf-8") + b"\n",

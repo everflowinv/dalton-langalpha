@@ -294,30 +294,81 @@ async def test_step1_three_way_capability_env_and_route_migrated_consistency(
     )
 
     # 2. Three-way effective capabilities & cutover verdict match BEFORE cutover
+    #    Test REAL backend capability helper, REAL research-host HTTP app, and REAL legacy bridge requests
     backend_env = load_deployment_capability_env(repo_env_file=repo_env, environ={})
     host_loaded_env: dict[str, str] = {}
     load_shared_and_host_env(env_file=str(host_env), repo_env_file=str(repo_env), environ=host_loaded_env)
-    bridge_merged_env = load_deployment_capability_env(
-        repo_env_file=repo_env, service_env_file=bridge_env, environ={}
-    )
+
+    monkeypatch.setenv("DALTON_DOTENV_PATH", str(repo_env))
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(bridge_env))
+    pre_cfg = bridge_mod.BridgeConfig()
+    pre_bridge = bridge_mod.ResearchDataBridge(pre_cfg)
 
     caps_backend = effective_capabilities(environ=backend_env)
     caps_host = effective_capabilities(environ=host_loaded_env)
-    caps_bridge = effective_capabilities(environ=bridge_merged_env)
+    caps_bridge = effective_capabilities(environ=pre_cfg.capability_env)
     assert caps_backend == caps_host == caps_bridge
     assert CapabilityId.SALES_NOTES not in caps_backend
     assert is_batch3_connectors_enabled(environ=backend_env) is False
     assert is_batch3_connectors_enabled(environ=host_loaded_env) is False
-    assert is_batch3_connectors_enabled(environ=bridge_merged_env) is False
-    assert is_bridge_route_migrated_to_connector("guidepoint", environ=bridge_merged_env) is False
-    assert is_bridge_ingest_migrated_to_connector("wiki", environ=bridge_merged_env) is False
+    assert is_batch3_connectors_enabled(environ=pre_cfg.capability_env) is False
+    assert is_bridge_route_migrated_to_connector("guidepoint", environ=pre_cfg.capability_env) is False
+    assert is_bridge_ingest_migrated_to_connector("wiki", environ=pre_cfg.capability_env) is False
+
+    # Real legacy bridge rejects capability-disabled route on both /mcp and /sales-notes/ingest
+    sn_mcp_resp = await pre_bridge.handle_tools_call(
+        1,
+        {"name": "research", "arguments": {"route": "sales-notes", "query": "NVDA"}},
+    )
+    assert sn_mcp_resp["result"]["isError"] is True
+    sn_mcp_body = json.loads(sn_mcp_resp["result"]["content"][0]["text"])
+    assert sn_mcp_body["error_code"] == "capability_disabled"
+    assert sn_mcp_body["http_status"] == 403
+
+    sn_ing_code, sn_ing_body = await pre_bridge.handle_sales_notes_ingest(
+        {"institution": "MS", "title": "Note", "content": "hi"}
+    )
+    assert sn_ing_code == 403 and sn_ing_body["error_code"] == "capability_disabled"
+
+    # Real research-host rejects /mcp/sales-notes and /ingest/sales-notes with 403 capability_disabled
+    pre_rt = ResearchHostRuntime(
+        ResearchHostConfig(
+            data_root=tmp_path,
+            mcp_token="rh-tok-1",
+            admin_token="rh-adm-1",
+            profile=DeploymentProfile.EVERFLOW,
+            extra_modules=["host_connectors"],
+            extra_python_paths=[str(RESEARCH_RUNTIME_DIR)],
+            environ=host_loaded_env,
+        ),
+        capabilities_provider=lambda: effective_capabilities(environ=host_loaded_env),
+    )
+    pre_app = create_app(runtime=pre_rt)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=pre_app), base_url="http://127.0.0.1:8951"
+    ) as rh_client:
+        r_sn = await rh_client.post(
+            "/mcp/sales-notes",
+            headers={"Authorization": "Bearer rh-tok-1"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        )
+        assert r_sn.status_code == 403
+        assert r_sn.json()["error_code"] == "capability_disabled"
+        r_sn_ing = await rh_client.post(
+            "/ingest/sales-notes",
+            headers={"Authorization": "Bearer rh-adm-1"},
+            json={"institution": "MS", "title": "Note", "content": "hi"},
+        )
+        assert r_sn_ing.status_code == 403
+        assert r_sn_ing.json()["error_code"] == "capability_disabled"
+    await pre_rt.shutdown()
 
     # 3. Post-cutover: adding DALTON_RESEARCH_HOST_URL to shared repo .env flips ALL 3 ends & closes bridge routes
     repo_env.write_text(
         repo_env.read_text(encoding="utf-8") + "DALTON_RESEARCH_HOST_URL=http://host.docker.internal:8951\n",
         encoding="utf-8",
     )
-    monkeypatch.setenv("DALTON_REPO_ENV_FILE", str(repo_env))
+    monkeypatch.setenv("DALTON_DOTENV_PATH", str(repo_env))
     monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(bridge_env))
     cfg = bridge_mod.BridgeConfig()
     backend_post = load_deployment_capability_env(repo_env_file=repo_env, environ={})
@@ -542,7 +593,15 @@ def test_step1_verify_container_maintenance_gate_absent_and_unresponsive() -> No
             return 0, "true\n", ""
         return 0, json.dumps({"revision": 3, "paused": True}), ""
 
-    def _http_unreachable(*_args: Any, **_kwargs: Any) -> tuple[int | None, dict[str, Any] | None, str]:
+    def _http_unreachable(
+        method: str,
+        url: str,
+        *,
+        headers: Any,
+        body: bytes | None,
+        timeout_s: float,
+    ) -> tuple[int | None, dict[str, Any] | None, str]:
+        _ = (method, url, headers, body, timeout_s)
         return None, None, "ConnectionRefusedError: refused"
 
     res_unresp = verify_container_maintenance_gate(
@@ -561,7 +620,15 @@ def test_step1_verify_container_maintenance_gate_absent_and_unresponsive() -> No
     # 3. Container running with matching revision & 503 maintenance_in_progress probe -> `verified`
     fake_now[0] = 0.0
 
-    def _http_paused(*_args: Any, **_kwargs: Any) -> tuple[int | None, dict[str, Any] | None, str]:
+    def _http_paused(
+        method: str,
+        url: str,
+        *,
+        headers: Any,
+        body: bytes | None,
+        timeout_s: float,
+    ) -> tuple[int | None, dict[str, Any] | None, str]:
+        _ = (method, url, headers, body, timeout_s)
         return 503, {"detail": {"error_code": "maintenance_in_progress", "revision": 3}}, ""
 
     res_ok = verify_container_maintenance_gate(
@@ -984,12 +1051,23 @@ urllib.request.OpenerDirector.open = _slow_open
     try:
         seen_proxy_upstream: dict[str, Any] = {}
 
-        def _fake_proxy_urlopen(req, data=None, timeout=None, *a, **kw):
+        def _fake_proxy_urlopen(
+            url: Any,
+            data: Any = None,
+            timeout: Any = socket._GLOBAL_DEFAULT_TIMEOUT,
+            *,
+            context: Any = None,
+        ) -> Any:
+            _ = (data, context)
             seen_proxy_upstream["timeout"] = timeout
-            seen_proxy_upstream["body"] = json.loads((req.data or b"{}").decode("utf-8"))
+            seen_proxy_upstream["body"] = json.loads((url.data or b"{}").decode("utf-8"))
             raise socket.timeout("timed out")
 
-        monkeypatch.setattr(proxy_mod.urllib.request, "urlopen", _fake_proxy_urlopen)
+        monkeypatch.setattr(
+            proxy_mod.urllib.request,
+            "urlopen",
+            create_autospec(proxy_mod.urllib.request.urlopen, side_effect=_fake_proxy_urlopen),
+        )
 
         req_body = json.dumps(
             {
@@ -1036,12 +1114,15 @@ urllib.request.OpenerDirector.open = _slow_open
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {}})
 
         real_async_client = httpx.AsyncClient
+
+        def _build_slow_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+            kwargs["transport"] = httpx.MockTransport(_slow_transport_handler)
+            return real_async_client(*args, **kwargs)
+
         monkeypatch.setattr(
             gp_conn_mod.httpx,
             "AsyncClient",
-            lambda *a, **kw: real_async_client(
-                transport=httpx.MockTransport(_slow_transport_handler), **kw
-            ),
+            create_autospec(real_async_client, side_effect=_build_slow_async_client),
         )
         gp_conn = gp_conn_mod.GuidepointConnector(
             tm, upstream_url="http://127.0.0.1:18999/mcp"
@@ -1248,10 +1329,7 @@ urllib.request.OpenerDirector.open = _fast_open
 
 
 def test_step2_real_package_release_and_core_release_gate(tmp_path: Path) -> None:
-    """Run real `scripts/standalone/package_release.sh` and assert all 3 gates in out-of-package checker."""
-    checker = _load_script_module(
-        "_test_b3b_pkg_checker", SCRIPTS_DALTON_DIR / "ops" / "check_core_release_package.py"
-    )
+    """Run real `scripts/standalone/package_release.sh` and assert all 3 gates on the unmodified git archive export."""
     export_dir = tmp_path / "core_export"
     pkg_res = subprocess.run(
         [
@@ -1268,35 +1346,16 @@ def test_step2_real_package_release_and_core_release_gate(tmp_path: Path) -> Non
         text=True,
         check=False,
     )
-    assert pkg_res.returncode == 0, f"package_release.sh failed:\n{pkg_res.stderr}"
+    assert pkg_res.returncode == 0, f"package_release.sh failed:\n{pkg_res.stdout}\n{pkg_res.stderr}"
 
-    # Overlay working-tree edits of migrated public/standalone targets onto export_dir so this gate
-    # verifies the exact working tree both before and after committing (preserving DENY_PATHS absence).
-    for rel in checker.EXPORT_MIGRATED_TARGETS:
-        src_p = REPO_ROOT / rel
-        dst_p = export_dir / rel
-        if not src_p.exists():
-            continue
-        if src_p.is_file():
-            dst_p.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_p, dst_p)
-        else:
-            if dst_p.exists():
-                shutil.rmtree(dst_p)
-            shutil.copytree(
-                src_p,
-                dst_p,
-                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "package_release.sh"),
-            )
-
-    # Confirm physical absence of package_release.sh & private paths in the real export
+    # Confirm physical absence of package_release.sh & private paths in the unmodified real export
     assert not (export_dir / "scripts" / "standalone" / "package_release.sh").exists()
     assert not (export_dir / "scripts" / "dalton" / "ops").exists()
     assert not (export_dir / "scripts" / "dalton" / "research_runtime").exists()
     assert not (export_dir / "scripts" / "dalton" / "researchdata_bridge.py").exists()
     assert not (export_dir / "plugins" / "dalton_data").exists()
 
-    # Run out-of-package checker CLI and assert exit 0 + zero hits across all 3 gates
+    # Run out-of-package checker CLI directly on the unmodified export and assert exit 0 + zero hits
     cli_res = subprocess.run(
         [
             sys.executable,
@@ -1318,3 +1377,887 @@ def test_step2_real_package_release_and_core_release_gate(tmp_path: Path) -> Non
     assert report["forbidden_paths_present"] == []
     assert report["export_migrated_hits"] == []
     assert report["whole_export_commercial_hits"] == []
+    assert report["whole_export_commercial_hits"] == []
+
+
+# ===========================================================================
+# R2 REVIEW & REGRESSION FIX TESTS (ITEMS 1-13)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_r2_item1_bridge_does_not_leak_shared_dotenv_secrets_to_env_or_subprocesses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 1: shared .env secrets stay out of os.environ, host-task env, and _run_stdio_rpc env; capability_env reads capability keys."""
+    _clean_cap_env(monkeypatch)
+    for k in ("SUPABASE_SECRET_KEY", "REDIS_PASSWORD", "DALTON_RESEARCH_ADMIN_TOKEN"):
+        monkeypatch.delenv(k, raising=False)
+
+    benv = _load_script_module(
+        "_test_r2_benv_item1", SCRIPTS_DALTON_DIR / "bridge_subprocess_env.py"
+    )
+    bridge_mod = _load_script_module(
+        "_test_r2_bridge_item1", SCRIPTS_DALTON_DIR / "researchdata_bridge.py"
+    )
+
+    shared_env = tmp_path / "shared.env"
+    shared_env.write_text(
+        "\n".join(
+            [
+                "APP_ENV=dalton",
+                "DALTON_CAP_SALES_NOTES=false",
+                "SUPABASE_SECRET_KEY=fake-supa-secret-123",
+                "REDIS_PASSWORD=fake-redis-pass-456",
+                "DALTON_RESEARCH_ADMIN_TOKEN=fake-admin-tok-789",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    alt_env = tmp_path / "alt.env"
+    alt_env.write_text("DALTON_CAP_SALES_NOTES=true\n", encoding="utf-8")
+
+    bridge_env = tmp_path / "researchdata-bridge.env"
+    bridge_env.write_text("DALTON_BRIDGE_TOKEN=br-tok-r2\n", encoding="utf-8")
+
+    # Verify DALTON_DOTENV_PATH takes precedence over DALTON_REPO_ENV_FILE (matching resolve_shared_dotenv_path)
+    monkeypatch.setenv("DALTON_DOTENV_PATH", str(shared_env))
+    monkeypatch.setenv("DALTON_REPO_ENV_FILE", str(alt_env))
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(bridge_env))
+
+    cfg = bridge_mod.BridgeConfig()
+    assert "SUPABASE_SECRET_KEY" not in os.environ
+    assert "REDIS_PASSWORD" not in os.environ
+    assert "DALTON_RESEARCH_ADMIN_TOKEN" not in os.environ
+    assert cfg.capability_env.get("DALTON_CAP_SALES_NOTES") == "false"
+
+    # Host task subprocess env strips secrets and DALTON_RESEARCH_ADMIN_TOKEN (even if present in os.environ)
+    host_env = benv.build_host_task_subprocess_env(
+        {**os.environ, "DALTON_RESEARCH_ADMIN_TOKEN": "fake-admin-tok-789"}
+    )
+    assert "SUPABASE_SECRET_KEY" not in host_env
+    assert "REDIS_PASSWORD" not in host_env
+    assert "DALTON_RESEARCH_ADMIN_TOKEN" not in host_env
+    assert "DALTON_RESEARCH_ADMIN_TOKEN" in benv.BRIDGE_TOKEN_ENV_KEYS
+
+    # Actual env passed to asyncio.create_subprocess_exec by _run_stdio_rpc also excludes all three keys
+    monkeypatch.setenv("DALTON_RESEARCH_ADMIN_TOKEN", "fake-admin-tok-789")
+    bridge = bridge_mod.ResearchDataBridge(cfg)
+    captured_envs: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        bridge_mod,
+        "_kill_process_group",
+        create_autospec(bridge_mod._kill_process_group),
+    )
+
+    async def _fake_exec(*cmd: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        _ = cmd
+        captured_envs.append(dict(kwargs.get("env") or {}))
+        proc = create_autospec(asyncio.subprocess.Process, instance=True)
+        proc.pid = 425101
+        proc.returncode = 0
+        proc.communicate.return_value = (
+            json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}).encode("utf-8") + b"\n",
+            b"",
+        )
+        return proc
+
+    monkeypatch.setattr(
+        bridge_mod.asyncio,
+        "create_subprocess_exec",
+        create_autospec(asyncio.create_subprocess_exec, side_effect=_fake_exec),
+    )
+    await bridge._run_stdio_rpc([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}], 5.0)
+    assert captured_envs
+    for secret_key in ("SUPABASE_SECRET_KEY", "REDIS_PASSWORD", "DALTON_RESEARCH_ADMIN_TOKEN"):
+        assert secret_key not in captured_envs[0]
+
+
+def _pid_is_gone_or_zombie(pid: int) -> bool:
+    try:
+        res = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        stat_str = res.stdout.strip()
+        return res.returncode != 0 or not stat_str or stat_str.startswith("Z")
+    except PermissionError:
+        # macOS Seatbelt sandbox blocks exec of setuid /bin/ps; fall back to signal 0 probe.
+        try:
+            os.kill(pid, 0)
+            return False
+        except ProcessLookupError:
+            return True
+
+
+@pytest.mark.asyncio
+async def test_r2_item2_bridge_internal_data_gateway_timeout_reaps_grandchild(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 2: when data_gateway times out BEFORE the bridge and mcp exits normally, _run_stdio_rpc finally kills the process group so bash grandchildren do not survive as orphans."""
+    _clean_cap_env(monkeypatch)
+    bridge_mod = _load_script_module(
+        "_test_r2_bridge_item2", SCRIPTS_DALTON_DIR / "researchdata_bridge.py"
+    )
+
+    # Build a minimal research_runtime copy with a bash skill that spawns a background sleep grandchild
+    rt_code = tmp_path / "rt_code"
+    (rt_code / "scripts").mkdir(parents=True)
+    (rt_code / "config").mkdir(parents=True)
+    (rt_code / "skills" / "findata-analyst").mkdir(parents=True)
+    shutil.copy2(
+        RESEARCH_RUNTIME_DIR / "scripts" / "researchdata_mcp.py",
+        rt_code / "scripts" / "researchdata_mcp.py",
+    )
+    shutil.copy2(
+        RESEARCH_RUNTIME_DIR / "scripts" / "data_gateway.py",
+        rt_code / "scripts" / "data_gateway.py",
+    )
+    shutil.copy2(
+        RESEARCH_RUNTIME_DIR / "config" / "data_sources.json",
+        rt_code / "config" / "data_sources.json",
+    )
+
+    grand_pid_file = tmp_path / "grandchild.pid"
+    run_sh = rt_code / "skills" / "findata-analyst" / "run.sh"
+    run_sh.write_text(
+        f"""#!/usr/bin/env bash
+sleep 30 &
+echo "$!" > {str(grand_pid_file)!r}
+sleep 30
+""",
+        encoding="utf-8",
+    )
+    run_sh.chmod(0o755)
+
+    bridge_env = tmp_path / "bridge.env"
+    bridge_env.write_text("", encoding="utf-8")
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(bridge_env))
+    monkeypatch.setenv("DALTON_RESEARCH_CODE", str(rt_code))
+    monkeypatch.setenv("DALTON_RESEARCH_HOME", str(tmp_path / "home"))
+    cfg = bridge_mod.BridgeConfig()
+    cfg.python_bin = sys.executable
+    cfg.mcp_script = (rt_code / "scripts" / "researchdata_mcp.py").resolve()
+    bridge = bridge_mod.ResearchDataBridge(cfg)
+
+    # Inner request timeout=1s while bridge outer timeout=10s -> data_gateway times out first and returns JSON,
+    # researchdata_mcp.py exits 0 normally, and _run_stdio_rpc finally kills the process group!
+    resps = await bridge._run_stdio_rpc(
+        [
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "finance",
+                    "arguments": {
+                        "route": "sec",
+                        "operation": "list-filings",
+                        "ticker": "AAPL",
+                        "timeout": 1,
+                    },
+                },
+            }
+        ],
+        timeout_s=10.0,
+    )
+    assert resps
+    payload = json.loads(resps[0]["result"]["content"][0]["text"])
+    assert payload["status"] == "timeout"
+
+    assert grand_pid_file.is_file(), "bash grandchild PID was never recorded"
+    grand_pid = int(grand_pid_file.read_text(encoding="utf-8").strip())
+    await asyncio.sleep(0.2)
+    assert _pid_is_gone_or_zombie(grand_pid), f"Grandchild pid={grand_pid} survived as orphan!"
+
+
+@pytest.mark.asyncio
+async def test_r2_item3_route_all_shared_deadline_cancels_all_three_legs_and_zeros_inflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 3: route=all timeout=3 with 3 slow upstreams completes <= 3.5s, cancels all 3 legs, and returns inflight to 0."""
+    _clean_cap_env(monkeypatch)
+    bridge_mod = _load_script_module(
+        "_test_r2_bridge_item3", SCRIPTS_DALTON_DIR / "researchdata_bridge.py"
+    )
+    bridge_env = tmp_path / "bridge.env"
+    bridge_env.write_text("", encoding="utf-8")
+    repo_env = tmp_path / "repo.env"
+    repo_env.write_text("APP_ENV=dalton\n", encoding="utf-8")
+    monkeypatch.setenv("DALTON_DOTENV_PATH", str(repo_env))
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(bridge_env))
+    monkeypatch.setenv("DALTON_BRIDGE_USAGE_FILE", str(tmp_path / "usage.json"))
+    monkeypatch.setenv("DALTON_BRIDGE_MAX_INFLIGHT", "8")
+    monkeypatch.setenv("DALTON_BRIDGE_MAX_INFLIGHT_UNSIGNED", "8")
+
+    cfg = bridge_mod.BridgeConfig()
+    bridge = bridge_mod.ResearchDataBridge(cfg)
+    assert bridge._compute_fanout_timeout({"timeout": 3}, 60) == 3
+
+    cancelled_routes: list[str] = []
+    started_routes: list[str] = []
+
+    async def _slow_rpc(
+        requests: list[dict[str, Any]],
+        timeout_s: float,
+    ) -> list[dict[str, Any]]:
+        route = str(requests[0]["params"]["arguments"]["route"])
+        started_routes.append(route)
+        try:
+            await asyncio.sleep(max(20.0, timeout_s + 10.0))
+        except asyncio.CancelledError:
+            cancelled_routes.append(route)
+            raise
+        return []
+
+    monkeypatch.setattr(
+        bridge,
+        "_run_stdio_rpc",
+        create_autospec(bridge._run_stdio_rpc, side_effect=_slow_rpc),
+    )
+
+    t0 = time.monotonic()
+    resp = await bridge.handle_tools_call(
+        "all-deadline-3s",
+        {
+            "name": "research",
+            "arguments": {
+                "route": "all",
+                "operation": "search",
+                "query": "CATL",
+                "timeout": 3,
+            },
+        },
+    )
+    elapsed = time.monotonic() - t0
+    assert elapsed <= 3.5, f"route=all timeout=3 exceeded 3.5s budget: {elapsed:.2f}s"
+    assert resp["result"]["isError"] is True
+    assert set(started_routes) == {"all", "alphaengine", "guidepoint"}
+    assert set(cancelled_routes) == {"all", "alphaengine", "guidepoint"}
+    assert bridge.research_drain_status()["inflight"] == 0
+
+
+def test_r2_item4_proxy_8943_relay_enforces_total_deadline_on_slow_chunked_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 4: :8943 proxy _relay checks deadline_mono on every chunk; 0.5s x 20 chunks with timeout=2 finishes < 3s and zeros _in_flight."""
+    _clean_cap_env(monkeypatch)
+    gp_lock_mod = _load_script_module(
+        "_test_r2_gp_lock_item4", RESEARCH_RUNTIME_DIR / "guidepoint_lock.py"
+    )
+    proxy_mod = _load_script_module(
+        "_test_r2_gp_proxy_item4", RESEARCH_RUNTIME_DIR / "scripts" / "guidepoint_mcp_proxy.py"
+    )
+
+    journal_file = tmp_path / "handoff-journal.json"
+    token_file = tmp_path / "config" / "guidepoint_mcp_tokens.json"
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_text(
+        json.dumps(
+            {
+                "access_token": "tok-chunk",
+                "refresh_token": "ref-chunk",
+                "obtained_at": time.time(),
+                "expires_in": 600,
+            }
+        ),
+        encoding="utf-8",
+    )
+    gp_lock_mod.set_target_owner(gp_lock_mod.OWNER_LEGACY_PROXY, ownership_file=journal_file)
+    monkeypatch.setenv("DALTON_GUIDEPOINT_OWNERSHIP_FILE", str(journal_file))
+    monkeypatch.setenv("GUIDEPOINT_TOKENS_FILE", str(token_file))
+
+    class _SlowChunkStream:
+        def __init__(self) -> None:
+            self.status = 200
+            self.headers = Message()
+            self.headers["Content-Type"] = "text/event-stream"
+            self.chunks_sent = 0
+            self.closed = False
+
+        def read(self, _n: int = 4096) -> bytes:
+            if self.chunks_sent >= 20:
+                return b""
+            time.sleep(0.5)
+            self.chunks_sent += 1
+            return b"data: chunk\n\n"
+
+        def close(self) -> None:
+            self.closed = True
+
+        def __enter__(self) -> "_SlowChunkStream":
+            return self
+
+        def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> bool:
+            self.close()
+            return False
+
+    stream = _SlowChunkStream()
+
+    def _fake_urlopen(
+        url: Any,
+        data: Any = None,
+        timeout: Any = socket._GLOBAL_DEFAULT_TIMEOUT,
+        *,
+        context: Any = None,
+    ) -> Any:
+        _ = (url, data, timeout, context)
+        return stream
+
+    proxy_mod.initialize_runtime(ownership_file=journal_file, token_store=token_file)
+    try:
+        monkeypatch.setattr(
+            proxy_mod.urllib.request,
+            "urlopen",
+            create_autospec(proxy_mod.urllib.request.urlopen, side_effect=_fake_urlopen),
+        )
+        req_body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_library",
+                    "arguments": {"query": "cloud", "size": 1, "timeout": 2},
+                },
+            }
+        ).encode("utf-8")
+        hdrs = Message()
+        hdrs["Content-Type"] = "application/json"
+        hdrs["Content-Length"] = str(len(req_body))
+
+        handler = object.__new__(proxy_mod.ProxyHandler)
+        handler.command = "POST"
+        handler.path = "/mcp"
+        handler.headers = hdrs
+        handler.rfile = io.BytesIO(req_body)
+        handler.wfile = io.BytesIO()
+        handler.close_connection = False
+        handler.send_response = lambda _code: None
+        handler.send_header = lambda _k, _v: None
+        handler.end_headers = lambda: None
+
+        t0 = time.monotonic()
+        handler._proxy()
+        elapsed = time.monotonic() - t0
+        assert elapsed < 3.0, f"Slow chunked relay exceeded 3s: {elapsed:.2f}s"
+        assert stream.closed is True
+        assert stream.chunks_sent < 10
+        assert proxy_mod.health_payload()["in_flight"] == 0
+    finally:
+        proxy_mod.release_owner_lock()
+
+
+def test_r2_item5_bridge_everflow_prod_all_mapped_routes_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 5 regression guard: under Everflow prod env (APP_ENV=dalton, no DALTON_CAP_*, no DALTON_RESEARCH_HOST_URL), every BRIDGE_ROUTE_CAPABILITY_MAP key is enabled."""
+    from src.dalton.capabilities import BRIDGE_ROUTE_CAPABILITY_MAP, is_research_source_enabled
+
+    _clean_cap_env(monkeypatch)
+    bridge_mod = _load_script_module(
+        "_test_r2_bridge_item5", SCRIPTS_DALTON_DIR / "researchdata_bridge.py"
+    )
+    repo_env = tmp_path / "everflow.env"
+    repo_env.write_text("APP_ENV=dalton\n", encoding="utf-8")
+    bridge_env = tmp_path / "bridge.env"
+    bridge_env.write_text("", encoding="utf-8")
+    monkeypatch.setenv("DALTON_DOTENV_PATH", str(repo_env))
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(bridge_env))
+
+    cfg = bridge_mod.BridgeConfig()
+    bridge = bridge_mod.ResearchDataBridge(cfg)
+    active_caps = bridge._effective_capabilities_cached()
+    for route_id in sorted(BRIDGE_ROUTE_CAPABILITY_MAP):
+        assert is_research_source_enabled(route_id, capabilities=active_caps) is True, (
+            f"Everflow prod route {route_id!r} unexpectedly disabled!"
+        )
+        assert bridge._is_route_capability_disabled(route_id) is False, (
+            f"Bridge unexpectedly disabled Everflow prod route {route_id!r}!"
+        )
+    # Routes not in BRIDGE_ROUTE_CAPABILITY_MAP remain allowed through
+    assert bridge._is_route_capability_disabled("sec") is False
+    assert bridge._is_route_capability_disabled("fred") is False
+
+
+@pytest.mark.asyncio
+async def test_r2_item6_maintenance_pause_defers_command_and_wakeup_outbox_without_burning_attempts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 6: 6 consecutive paused executions of command_report_back & wakeup defer via reschedule_claimed_job without burning attempts, and succeed once resumed."""
+    from src.dalton.maintenance_gate import enforce_maintenance_admission_for_wakeup
+    from src.server.database.runs import outbox as outbox_db
+    from src.server.services import hook_outbox
+    from src.server.services.report_back import command as cmd_rb
+
+    state_file = tmp_path / "maintenance-admission.json"
+    monkeypatch.setenv("DALTON_MAINTENANCE_ADMISSION_FILE", str(state_file))
+    write_maintenance_state_atomic(
+        {
+            "version": 1,
+            "revision": 1,
+            "paused": True,
+            "pause_host_direct": True,
+            "allow_workspace_ids": [],
+            "reason": "maintenance_window",
+            "operation": "switch",
+            "rehearsal_keep_paused_until": None,
+            "updated_at": "2026-11-26T00:00:00+00:00",
+        },
+        state_file=state_file,
+    )
+
+    reschedule_mock = create_autospec(outbox_db.reschedule_claimed_job, return_value="pending")
+    nack_mock = create_autospec(outbox_db.nack_outbox_job, return_value="dead")
+    ack_mock = create_autospec(outbox_db.ack_outbox_job, return_value=True)
+    monkeypatch.setattr(outbox_db, "reschedule_claimed_job", reschedule_mock)
+    monkeypatch.setattr(outbox_db, "nack_outbox_job", nack_mock)
+    monkeypatch.setattr(outbox_db, "ack_outbox_job", ack_mock)
+
+    delivered: list[str] = []
+    riders_released: list[int] = []
+
+    async def _fake_run_report_back(job: dict[str, Any], _pipeline: Any) -> None:
+        delivered.append(f"cmd:{job['hook_outbox_id']}")
+
+    monkeypatch.setattr(
+        cmd_rb,
+        "run_report_back",
+        create_autospec(cmd_rb.run_report_back, side_effect=_fake_run_report_back),
+    )
+
+    async def _wakeup_exec(job: dict[str, Any]) -> None:
+        async def _release() -> None:
+            riders_released.append(1)
+
+        await enforce_maintenance_admission_for_wakeup("ws-wake", release_riders=_release)
+        delivered.append(f"wake:{job['hook_outbox_id']}")
+
+    monkeypatch.setitem(hook_outbox._EXECUTORS, "command_report_back", cmd_rb.execute_command_report_back)
+    monkeypatch.setitem(hook_outbox._EXECUTORS, "wakeup", _wakeup_exec)
+
+    drainer = hook_outbox.HookOutboxDrainer()
+    cmd_job = {
+        "hook_outbox_id": "job-cmd-1",
+        "hook_type": "command_report_back",
+        "attempts": 1,
+        "conversation_thread_id": "thr-cmd-1",
+    }
+    wake_job = {
+        "hook_outbox_id": "job-wake-1",
+        "hook_type": "wakeup",
+        "attempts": 1,
+        "conversation_thread_id": "thr-wake-1",
+    }
+
+    # 6 consecutive runs during pause -> rescheduled every time, 0 nacks, attempts stay at 1
+    for _ in range(6):
+        await drainer._execute(cmd_job)
+        await drainer._execute(wake_job)
+
+    assert reschedule_mock.await_count == 12
+    assert nack_mock.await_count == 0
+    assert ack_mock.await_count == 0
+    assert delivered == []
+    assert len(riders_released) == 6
+    for call in reschedule_mock.await_args_list:
+        assert call.kwargs["attempts"] == 1
+        assert call.kwargs["delay_seconds"] == 60.0
+
+    # Resume admission -> both deliver and ack normally
+    write_maintenance_state_atomic(
+        {
+            "version": 1,
+            "revision": 2,
+            "paused": False,
+            "pause_host_direct": False,
+            "allow_workspace_ids": [],
+            "reason": "resumed",
+            "operation": "switch",
+            "rehearsal_keep_paused_until": None,
+            "updated_at": "2026-11-26T00:01:00+00:00",
+        },
+        state_file=state_file,
+    )
+    await drainer._execute(cmd_job)
+    await drainer._execute(wake_job)
+    assert delivered == ["cmd:job-cmd-1", "wake:job-wake-1"]
+    assert ack_mock.await_count == 2
+    assert nack_mock.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_r2_item7_manual_automation_trigger_allowlist_and_autospec_get_automation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 7: enforce_maintenance_admission_for_automation passes user_id to get_automation (verified with create_autospec)."""
+    from src.dalton.maintenance_gate import enforce_maintenance_admission_for_automation
+    from src.server.database import automation as auto_db
+
+    state_file = tmp_path / "maintenance-admission.json"
+    write_maintenance_state_atomic(
+        {
+            "version": 1,
+            "revision": 1,
+            "paused": True,
+            "pause_host_direct": False,
+            "allow_workspace_ids": ["ws-rehearsal-auto"],
+            "reason": "rehearsal",
+            "operation": "switch",
+            "rehearsal_keep_paused_until": None,
+            "updated_at": "2026-11-26T00:00:00+00:00",
+        },
+        state_file=state_file,
+    )
+
+    async def _get_auto(
+        automation_id: str,
+        user_id: str,
+        *,
+        computer_id: str | None = None,
+        conn: Any = None,
+    ) -> dict[str, Any] | None:
+        _ = (computer_id, conn)
+        if automation_id == "auto-allowed" and user_id == "user-1":
+            return {"automation_id": automation_id, "workspace_id": "ws-rehearsal-auto"}
+        if automation_id == "auto-blocked" and user_id == "user-1":
+            return {"automation_id": automation_id, "workspace_id": "ws-other"}
+        return None
+
+    get_auto_mock = create_autospec(auto_db.get_automation, side_effect=_get_auto)
+    monkeypatch.setattr(auto_db, "get_automation", get_auto_mock)
+
+    st = await enforce_maintenance_admission_for_automation(
+        "auto-allowed", user_id="user-1", state_file=state_file
+    )
+    assert st.paused is True
+    get_auto_mock.assert_awaited_once_with("auto-allowed", "user-1")
+
+    with pytest.raises(MaintenanceAdmissionPausedError) as exc_info:
+        await enforce_maintenance_admission_for_automation(
+            "auto-blocked", user_id="user-1", state_file=state_file
+        )
+    assert exc_info.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_r2_item8_acquire_lock_releases_on_corrupt_tokens_and_does_not_block_healthz(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 8: corrupt token file returns 409 and releases newly acquired lock (standby=True); lock wait runs off event loop so /healthz responds < 1s."""
+    _clean_cap_env(monkeypatch)
+    gp_lock_mod = _load_script_module(
+        "_test_r2_gp_lock_item8", RESEARCH_RUNTIME_DIR / "guidepoint_lock.py"
+    )
+    gp_conn_mod = _load_script_module(
+        "_test_r2_gp_conn_item8", RESEARCH_RUNTIME_DIR / "host_connectors" / "guidepoint.py"
+    )
+
+    journal_file = tmp_path / "handoff-journal.json"
+    token_file = tmp_path / "config" / "guidepoint_mcp_tokens.json"
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_text("{corrupt-json", encoding="utf-8")
+    gp_lock_mod.set_target_owner(gp_lock_mod.OWNER_LEGACY_PROXY, ownership_file=journal_file)
+
+    tm = gp_conn_mod.GuidepointTokenManager(token_file, ownership_file=journal_file)
+    assert tm.initialize_from_ownership(timeout_s=1.0) is False
+    assert tm.standby is True
+
+    rt = ResearchHostRuntime(
+        ResearchHostConfig(
+            data_root=tmp_path,
+            mcp_token="mcp-i8",
+            admin_token="adm-i8",
+            profile=DeploymentProfile.EVERFLOW,
+        ),
+        capabilities_provider=lambda: frozenset({CapabilityId.GUIDEPOINT}),
+    )
+    rt.registry.register_lock_handoff(
+        "guidepoint", tm.acquire_lock_for_handoff, capability=CapabilityId.GUIDEPOINT
+    )
+    rt.registry.register_health_probe("guidepoint", tm.health)
+    app = create_app(runtime=rt)
+
+    # 1. Switch target_owner -> research_host_8951 with corrupt token file -> 409, lock released, standby=True
+    gp_lock_mod.set_target_owner(gp_lock_mod.OWNER_RESEARCH_HOST, ownership_file=journal_file)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8951"
+    ) as client:
+        r_bad = await client.post(
+            "/admin/guidepoint/acquire-lock",
+            headers={"Authorization": "Bearer adm-i8"},
+            json={"timeout_s": 1.0},
+        )
+        assert r_bad.status_code == 409
+        assert tm.lock_held is False
+        assert tm.standby is True
+
+        # Verify another holder can acquire the flock immediately (proves no leaked flock!)
+        external_lock = gp_lock_mod.GuidepointOwnerLock(token_file=token_file)
+        external_lock.acquire(timeout_s=0.5)
+        try:
+            # 2. While external_lock holds the flock and acquire-lock waits 2.0s in thread pool,
+            #    /healthz MUST respond in < 1.0s (event loop not blocked!).
+            acq_task = asyncio.create_task(
+                client.post(
+                    "/admin/guidepoint/acquire-lock",
+                    headers={"Authorization": "Bearer adm-i8"},
+                    json={"timeout_s": 2.0},
+                )
+            )
+            await asyncio.sleep(0.15)
+            t0 = time.monotonic()
+            hz = await client.get("/healthz")
+            hz_elapsed = time.monotonic() - t0
+            assert hz.status_code == 200
+            assert hz_elapsed < 1.0, f"/healthz blocked during acquire-lock wait ({hz_elapsed:.2f}s)"
+            r_timeout = await acq_task
+            assert r_timeout.status_code == 409
+        finally:
+            external_lock.release()
+    await rt.shutdown()
+
+
+def test_r2_item9_verify_container_maintenance_gate_default_240s_and_per_io_deadline() -> None:
+    """Item 9: DEFAULT_CONTAINER_VERIFY_DEADLINE_S == 240s, and every I/O recomputes remaining time so total never exceeds deadline."""
+    from src.dalton.maintenance_gate import DEFAULT_CONTAINER_VERIFY_DEADLINE_S
+
+    assert DEFAULT_CONTAINER_VERIFY_DEADLINE_S == 240.0
+
+    fake_now = [0.0]
+    observed_timeouts: list[tuple[str, float]] = []
+
+    def _clock() -> float:
+        return fake_now[0]
+
+    def _sleep(sec: float) -> None:
+        fake_now[0] += sec
+
+    def _slow_docker(args: list[str], timeout_s: float) -> tuple[int, str, str]:
+        op = args[0]
+        observed_timeouts.append((op, timeout_s))
+        fake_now[0] += min(1.2, timeout_s)
+        if op == "inspect":
+            return 0, "true\n", ""
+        return 0, json.dumps({"revision": 5, "paused": True}), ""
+
+    def _slow_http(
+        method: str,
+        url: str,
+        *,
+        headers: Any,
+        body: bytes | None,
+        timeout_s: float,
+    ) -> tuple[int | None, dict[str, Any] | None, str]:
+        _ = (method, url, headers, body)
+        observed_timeouts.append(("http", timeout_s))
+        fake_now[0] += min(1.2, timeout_s)
+        return None, None, "TimeoutError"
+
+    res = verify_container_maintenance_gate(
+        expected_revision=5,
+        deadline_s=3.0,
+        poll_interval_s=1.0,
+        docker_runner=_slow_docker,
+        http_requester=_slow_http,
+        clock=_clock,
+        sleep_fn=_sleep,
+    )
+    assert res.status == "unavailable"
+    assert res.elapsed_s <= 3.0 + 1e-6
+    assert observed_timeouts == [
+        ("inspect", pytest.approx(3.0)),
+        ("exec", pytest.approx(1.8)),
+        ("http", pytest.approx(0.6)),
+    ]
+
+
+def test_r2_item10_package_release_fails_nonzero_on_proprietary_term_in_public_host(
+    tmp_path: Path,
+) -> None:
+    """Item 10: a commit placing a proprietary term in src/dalton/research_host/ causes package_release.sh to exit non-zero."""
+    fake_repo = tmp_path / "repo"
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+    }
+    subprocess.run(
+        ["git", "clone", "--shared", "--no-tags", str(REPO_ROOT), str(fake_repo)],
+        env=git_env,
+        check=True,
+        capture_output=True,
+    )
+    leak_file = fake_repo / "src" / "dalton" / "research_host" / "leak_test.py"
+    leak_file.write_text('LEAK = "GuidepointTokenManager"\n', encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "src/dalton/research_host/leak_test.py"],
+        cwd=fake_repo,
+        env=git_env,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "leak commit"],
+        cwd=fake_repo,
+        env=git_env,
+        check=True,
+        capture_output=True,
+    )
+
+    out_dir = tmp_path / "should_not_exist"
+    report_file = tmp_path / "scan_report.txt"
+    pkg_res = subprocess.run(
+        [
+            "bash",
+            str(REPO_ROOT / "scripts" / "standalone" / "package_release.sh"),
+            "--repo",
+            str(fake_repo),
+            "--ref",
+            "HEAD",
+            "--output",
+            str(out_dir),
+            "--report",
+            str(report_file),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert pkg_res.returncode != 0, "package_release.sh must fail non-zero when checker detects proprietary leak!"
+    assert not out_dir.exists()
+    assert report_file.is_file(), f"Report missing:\nstdout={pkg_res.stdout}\nstderr={pkg_res.stderr}"
+    report_txt = report_file.read_text(encoding="utf-8")
+    assert "FAIL" in report_txt
+    assert "GuidepointTokenManager" in report_txt
+
+
+@pytest.mark.asyncio
+async def test_r2_item11_federated_sales_mail_alias_only_registered_in_everflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 11: sales_mail alias is present in Everflow (via host_connectors) and absent in Core."""
+    _clean_cap_env(monkeypatch)
+
+    # Core runtime (no extra host_connectors) -> tools/list has NO sales_mail
+    core_rt = ResearchHostRuntime(
+        ResearchHostConfig(
+            data_root=tmp_path / "core",
+            mcp_token="core-tok",
+            admin_token="core-adm",
+            profile=DeploymentProfile.CORE,
+        ),
+        capabilities_provider=lambda: frozenset({CapabilityId.COMPANY_WIKI}),
+    )
+    core_app = create_app(runtime=core_rt)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=core_app), base_url="http://127.0.0.1:8951"
+    ) as client:
+        r_core = await client.post(
+            "/mcp/federated",
+            headers={"Authorization": "Bearer core-tok"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        )
+        assert r_core.status_code == 200
+        core_tools = {t["name"] for t in r_core.json()["result"]["tools"]}
+        assert "sales_mail" not in core_tools
+    await core_rt.shutdown()
+
+    # Everflow runtime (with host_connectors) -> tools/list HAS sales_mail
+    ef_rt = ResearchHostRuntime(
+        ResearchHostConfig(
+            data_root=tmp_path / "ef",
+            mcp_token="ef-tok",
+            admin_token="ef-adm",
+            profile=DeploymentProfile.EVERFLOW,
+            extra_modules=["host_connectors"],
+            extra_python_paths=[str(RESEARCH_RUNTIME_DIR)],
+        ),
+        capabilities_provider=lambda: frozenset(
+            {CapabilityId.COMPANY_WIKI, CapabilityId.SALES_NOTES, CapabilityId.TMTB}
+        ),
+    )
+    ef_app = create_app(runtime=ef_rt)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=ef_app), base_url="http://127.0.0.1:8951"
+    ) as client:
+        r_ef = await client.post(
+            "/mcp/federated",
+            headers={"Authorization": "Bearer ef-tok"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        )
+        assert r_ef.status_code == 200
+        ef_tools = {t["name"] for t in r_ef.json()["result"]["tools"]}
+        assert "sales_mail" in ef_tools
+    await ef_rt.shutdown()
+
+
+def test_r2_item12_host_direct_pause_fails_closed_on_corrupt_gate_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 12: corrupt or non-object maintenance-admission.json is treated as paused by both data_gateway.py and gp_search.py; missing file is unpaused."""
+    _clean_cap_env(monkeypatch)
+    dg_mod = _load_script_module(
+        "_test_r2_dg_item12", RESEARCH_RUNTIME_DIR / "scripts" / "data_gateway.py"
+    )
+    gp_mod = _load_script_module(
+        "_test_r2_gp_item12",
+        RESEARCH_RUNTIME_DIR / "skills" / "guidepoint-transcript-search" / "scripts" / "gp_search.py",
+    )
+
+    gate_file = tmp_path / "maintenance-admission.json"
+    bridge_env = tmp_path / "empty-bridge.env"
+    bridge_env.write_text("", encoding="utf-8")
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(bridge_env))
+    monkeypatch.setenv("DALTON_MAINTENANCE_ADMISSION_FILE", str(gate_file))
+
+    # Missing file -> not paused
+    assert dg_mod._is_host_direct_paused() is False
+    assert gp_mod._is_host_direct_paused() is False
+
+    # Corrupt JSON -> fail closed (paused)
+    gate_file.write_text("{not valid json", encoding="utf-8")
+    assert dg_mod._is_host_direct_paused() is True
+    assert gp_mod._is_host_direct_paused() is True
+
+    # Non-object JSON -> fail closed (paused)
+    gate_file.write_text("[1, 2, 3]", encoding="utf-8")
+    assert dg_mod._is_host_direct_paused() is True
+    assert gp_mod._is_host_direct_paused() is True
+
+
+def test_r2_item13_maintenance_endpoints_return_503_when_service_token_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 13: /maintenance/admission and /maintenance/admission/probe fail closed with 503 maintenance_probe_unconfigured when INTERNAL_SERVICE_TOKEN is empty."""
+    from src.config import env as server_env
+
+    monkeypatch.delenv("INTERNAL_SERVICE_TOKEN", raising=False)
+    monkeypatch.setattr(server_env, "INTERNAL_SERVICE_TOKEN", "", raising=False)
+    app = FastAPI()
+    app.include_router(dalton_router)
+    client = TestClient(app)
+
+    for method, path in (
+        ("GET", "/api/v1/dalton/maintenance/admission"),
+        ("POST", "/api/v1/dalton/maintenance/admission/probe"),
+    ):
+        resp = client.request(method, path)
+        assert resp.status_code == 503
+        detail = resp.json()["detail"]
+        assert detail["error_code"] == "maintenance_probe_unconfigured"

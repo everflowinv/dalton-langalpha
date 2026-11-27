@@ -107,13 +107,15 @@ def _is_host_direct_paused() -> bool:
         gate_path = Path(gate_override).expanduser()
     else:
         gate_path = Path(__file__).resolve().parents[4] / "var" / "dalton" / "maintenance-admission.json"
-    if gate_path.is_file():
+    if gate_path.exists():
         try:
             data = json.loads(gate_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and bool(data.get("pause_host_direct", False)):
+            if not isinstance(data, dict):
+                return True
+            if bool(data.get("pause_host_direct", False)):
                 return True
         except (OSError, ValueError):
-            pass
+            return True
     return False
 
 

@@ -835,6 +835,12 @@ class TestSandboxNetworkAndInitScript:
             encoding="utf-8",
         )
         env_tokens_copy.chmod(0o644)
+        compose_env_copy = script_dir / "_compose_env.sh"
+        compose_env_copy.write_text(
+            (REPO_ROOT / "scripts/standalone/_compose_env.sh").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        compose_env_copy.chmod(0o644)
         (install_dir / ".env.core.example").write_text(
             (REPO_ROOT / ".env.core.example").read_text(encoding="utf-8"),
             encoding="utf-8",

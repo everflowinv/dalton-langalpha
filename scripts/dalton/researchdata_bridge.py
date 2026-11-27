@@ -1059,6 +1059,14 @@ def _parse_csv_scalar(val: Any) -> Any:
         return s
 
 
+def _kill_process_group(pgid: int) -> None:
+    """Force-terminate an entire subprocess process group."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 async def _reap_process(proc: Any) -> None:
     """Wait for a killed subprocess to exit even if this task is cancelled meanwhile.
 
@@ -1211,26 +1219,12 @@ class BridgeConfig:
         )
         self.env_path: Path = env_path
         caps_mod = _import_dalton_capabilities()
-        repo_env_file = (
-            os.environ.get("DALTON_REPO_ENV_FILE", "").strip()
-            or os.environ.get("DALTON_DOTENV_PATH", "").strip()
-            or None
-        )
         if caps_mod is not None:
             merged_cap_env = caps_mod.load_deployment_capability_env(
-                repo_env_file=repo_env_file,
+                repo_env_file=None,
                 service_env_file=env_path,
                 environ=os.environ,
             )
-            for k, v in merged_cap_env.items():
-                if (
-                    k == "GEMINI_API_KEY"
-                    or k in _ENV_FILE_NO_OS_EXPORT_KEYS
-                    or caps_mod.is_capability_control_env_key(k)
-                ):
-                    continue
-                if k not in os.environ:
-                    os.environ[k] = v
             self.capability_env: dict[str, str] = dict(merged_cap_env)
         else:
             self.capability_env = dict(os.environ)
@@ -8300,6 +8294,45 @@ class ResearchDataBridge:
         base.update(os.environ)
         return base
 
+    def _effective_capabilities_cached(self) -> Any:
+        caps_mod = _import_dalton_capabilities()
+        if caps_mod is None:
+            return None
+        env = self._effective_capability_env()
+        cache_key = tuple(
+            sorted(
+                (k, v)
+                for k, v in env.items()
+                if caps_mod.is_capability_control_env_key(k)
+                or k
+                in (
+                    "DALTON_RESEARCHDATA_URL",
+                    "DALTON_BRIDGE_URL",
+                    "CHANNEL_GATEWAY_URL",
+                    "DALTON_TRANSCRIPTION_ENABLED",
+                    "DALTON_DATA_JOBS_ENABLED",
+                )
+            )
+        )
+        cached = getattr(self, "_cached_effective_caps", None)
+        if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == cache_key:
+            return cached[1]
+        active = caps_mod.effective_capabilities(environ=env)
+        self._cached_effective_caps = (cache_key, active)
+        return active
+
+    def _is_route_capability_disabled(self, route: str) -> bool:
+        caps_mod = _import_dalton_capabilities()
+        if caps_mod is None:
+            return False
+        cleaned = str(route or "").strip()
+        if cleaned not in caps_mod.BRIDGE_ROUTE_CAPABILITY_MAP:
+            return False
+        active_caps = self._effective_capabilities_cached()
+        return not bool(
+            caps_mod.is_research_source_enabled(cleaned, capabilities=active_caps)
+        )
+
     def _is_route_migrated(self, route: str) -> bool:
         caps_mod = _import_dalton_capabilities()
         if caps_mod is None:
@@ -8446,17 +8479,16 @@ class ResearchDataBridge:
                 proc.communicate(input=payload_bytes),
                 timeout=eff_timeout_s,
             )
-        except BaseException:
-            try:
-                if proc.pid:
-                    os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
+        finally:
+            if isinstance(proc.pid, int) and proc.pid > 0:
                 try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
+                    _kill_process_group(proc.pid)
+                except (PermissionError, OSError):
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
             await _reap_process(proc)
-            raise
 
         responses: list[dict[str, Any]] = []
         for line in stdout_bytes.decode("utf-8", errors="replace").splitlines():
@@ -8876,7 +8908,7 @@ class ResearchDataBridge:
             chosen = min(req_timeout, default_cap_s)
         else:
             chosen = default_cap_s
-        return max(5, min(chosen, default_cap_s, ceiling))
+        return max(1, min(chosen, default_cap_s, ceiling))
 
     def _build_alphaengine_fanout_args(
         self, arguments: dict[str, Any]
@@ -10067,6 +10099,8 @@ class ResearchDataBridge:
                 raise
             except asyncio.TimeoutError as exc:
                 existing_entry["waiters"].discard(waiter_id)
+                if fanout:
+                    await _cancel_runner_if_unawaited(existing_entry)
                 raise _CachedSearchTimeoutError(
                     bridge_cache=wait_bc,
                     upstream_called=False,
@@ -10270,6 +10304,8 @@ class ResearchDataBridge:
             raise
         except asyncio.TimeoutError as exc:
             entry["waiters"].discard(leader_waiter_id)
+            if fanout:
+                await _cancel_runner_if_unawaited(entry)
             raise _CachedSearchTimeoutError(
                 bridge_cache=leader_timeout_bc,
                 upstream_called=bool(call_state["upstream_started"]),
@@ -10320,14 +10356,15 @@ class ResearchDataBridge:
     ) -> dict[str, Any]:
         """Run the parallel `route='alphaengine'` search via the shared cache layer and normalize its result or failure state."""
         ae_timeout = int(ae_args.get("timeout") or FANOUT_ALPHAENGINE_TIMEOUT_S)
-        shared_budget_s = max(float(ae_budget_s), float(DEFAULT_ROUTE_TIMEOUT_S))
+        eff_ae_budget_s = max(0.1, float(ae_budget_s))
+        shared_budget_s = eff_ae_budget_s
         try:
             cached_res = await self._execute_alphaengine_cached_search(
                 req_id=req_id,
                 op=_ae_cache.OP_SEARCH_LIBRARY,
                 arguments=ae_args,
                 caller_identity=caller_identity,
-                caller_timeout_s=ae_budget_s,
+                caller_timeout_s=eff_ae_budget_s,
                 shared_timeout_s=shared_budget_s,
                 fanout=True,
                 cancel_ctx=cancel_ctx,
@@ -10525,6 +10562,7 @@ class ResearchDataBridge:
         gp_args: dict[str, Any],
         gp_budget_s: float,
         *,
+        deadline_mono: float | None = None,
         caller_key: str = "unsigned",
         caller_display: str = "unsigned",
         is_automation: bool = False,
@@ -10551,15 +10589,23 @@ class ResearchDataBridge:
             "params": {"name": "research", "arguments": gp_args},
         }
         gp_t0 = time.monotonic()
+        eff_budget_s = float(gp_budget_s)
+        if deadline_mono is not None:
+            eff_budget_s = min(eff_budget_s, deadline_mono - gp_t0)
+        eff_budget_s = max(0.1, eff_budget_s)
         try:
             async with self._get_concurrency().acquire_call(
                 caller_key,
                 caller_display,
                 is_automation=is_automation,
-                timeout_s=float(gp_budget_s),
+                timeout_s=eff_budget_s,
                 stats=queue_stats,
             ):
-                remaining_s = max(5.0, float(gp_budget_s) - (time.monotonic() - gp_t0))
+                now_after_slot = time.monotonic()
+                rem_from_budget = eff_budget_s - (now_after_slot - gp_t0)
+                if deadline_mono is not None:
+                    rem_from_budget = min(rem_from_budget, deadline_mono - now_after_slot)
+                remaining_s = max(0.1, rem_from_budget)
                 gp_resps = await self._run_stdio_rpc(
                     [gp_rpc_req], timeout_s=remaining_s
                 )
@@ -13820,6 +13866,22 @@ class ResearchDataBridge:
                 return self._make_tool_result_response(
                     req_id, err_migrated, is_error=True
                 )
+            if route and self._is_route_capability_disabled(route):
+                err_disabled: dict[str, Any] = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "capability_disabled",
+                    "error_code": "capability_disabled",
+                    "http_status": 403,
+                    "error": f"Route '{route}' is disabled by deployment capability configuration.",
+                }
+                _apply_error_and_empty_contract(
+                    tool_name, route, operation, err_disabled, norm_params_view
+                )
+                return self._make_tool_result_response(
+                    req_id, err_disabled, is_error=True
+                )
             if route and route in handoff:
                 err_payload: dict[str, Any] = {
                     "_declared_sources": [],
@@ -14256,14 +14318,15 @@ class ResearchDataBridge:
                 local_q_stats: dict[str, int] = {}
                 ae_q_stats: dict[str, int] = {}
                 gp_q_stats: dict[str, int] = {}
+                rem_now = max(0.1, deadline_mono - time.monotonic())
                 ae_timeout = int(
                     ae_args.get("timeout") or FANOUT_ALPHAENGINE_TIMEOUT_S
                 )
-                ae_budget_s = max(5.0, float(ae_timeout) + 5.0)
+                ae_budget_s = max(0.1, min(float(ae_timeout), rem_now))
                 gp_timeout = int(
                     gp_args.get("timeout") or FANOUT_GUIDEPOINT_TIMEOUT_S
                 )
-                gp_budget_s = max(5.0, float(gp_timeout) + 5.0)
+                gp_budget_s = max(0.1, min(float(gp_timeout), rem_now))
                 grace_s = float(getattr(self.cfg, "fanout_grace_s", 20.0))
                 grace_label = (
                     str(int(grace_s))
@@ -14277,13 +14340,13 @@ class ResearchDataBridge:
                         caller_key,
                         caller_display,
                         is_automation=is_automation,
-                        timeout_s=float(eff_timeout),
+                        timeout_s=max(0.1, deadline_mono - time.monotonic()),
                         stats=local_q_stats,
                     ):
                         if test_delay_s > 0.0:
                             await asyncio.wait_for(
                                 asyncio.sleep(test_delay_s),
-                                timeout=float(eff_timeout),
+                                timeout=max(0.1, deadline_mono - time.monotonic()),
                             )
                         remaining_budget_s = max(0.1, deadline_mono - time.monotonic())
                         rpc_req = {
@@ -14318,6 +14381,7 @@ class ResearchDataBridge:
                         req_id,
                         gp_args,
                         gp_budget_s,
+                        deadline_mono=deadline_mono,
                         caller_key=caller_key,
                         caller_display=caller_display,
                         is_automation=is_automation,
@@ -14327,6 +14391,7 @@ class ResearchDataBridge:
                 try:
                     grace_deadline: float | None = None
                     grace_timed_out: set[asyncio.Task[Any]] = set()
+                    deadline_timed_out: set[asyncio.Task[Any]] = set()
                     pending_all: set[asyncio.Task[Any]] = {
                         local_task,
                         ae_task,
@@ -14342,6 +14407,12 @@ class ResearchDataBridge:
                             and grace_deadline is None
                         ):
                             local_failed_early = local_task.exception()
+                            break
+
+                        now_loop = time.monotonic()
+                        rem_deadline = deadline_mono - now_loop
+                        if rem_deadline <= 0.0:
+                            deadline_timed_out = set(pending_all)
                             break
 
                         # Check whether enough non-skipped sources have returned
@@ -14370,35 +14441,41 @@ class ResearchDataBridge:
                                 + int(gp_non_skipped_done)
                             )
                             if ready_count >= 2:
-                                grace_deadline = time.monotonic() + grace_s
+                                grace_deadline = min(now_loop + grace_s, deadline_mono)
 
-                        wait_timeout: float | None = (
-                            max(0.0, grace_deadline - time.monotonic())
-                            if grace_deadline is not None
-                            else None
-                        )
+                        if grace_deadline is not None:
+                            wait_timeout = max(0.0, min(grace_deadline - now_loop, rem_deadline))
+                        else:
+                            wait_timeout = max(0.0, rem_deadline)
                         done_now, pending_all = await asyncio.wait(
                             pending_all,
                             return_when=asyncio.FIRST_COMPLETED,
                             timeout=wait_timeout,
                         )
-                        if not done_now and pending_all and grace_deadline is not None:
-                            grace_timed_out = set(pending_all)
+                        if not done_now and pending_all:
+                            if grace_deadline is not None and time.monotonic() < deadline_mono:
+                                grace_timed_out = set(pending_all)
+                            else:
+                                deadline_timed_out = set(pending_all)
                             break
 
                     if local_failed_early is not None:
                         raise local_failed_early
 
-                    if grace_timed_out:
-                        await _cancel_and_reap(tuple(grace_timed_out))
+                    timed_out_tasks = grace_timed_out | deadline_timed_out
+                    if timed_out_tasks:
+                        await _cancel_and_reap(tuple(timed_out_tasks))
 
-                    if local_task in grace_timed_out:
+                    if local_task in timed_out_tasks:
                         local_reason = (
                             f"local_all timed out after fanout grace {grace_label}s"
+                            if local_task in grace_timed_out
+                            else f"local_all timed out after {eff_timeout}s"
                         )
                         logger.warning(
-                            "local_all fanout grace timeout grace_s=%.1f corr=%s",
+                            "local_all fanout timeout grace_s=%.1f eff_timeout=%d corr=%s",
                             grace_s,
+                            eff_timeout,
                             corr_id,
                         )
                         fallback_local_payload: dict[str, Any] = {
@@ -14441,17 +14518,23 @@ class ResearchDataBridge:
                     else:
                         resps = local_task.result()
 
-                    if ae_task in grace_timed_out:
+                    if ae_task in timed_out_tasks:
+                        ae_reason = (
+                            f"alphaengine timed out after fanout grace {grace_label}s"
+                            if ae_task in grace_timed_out
+                            else f"alphaengine timed out after {eff_timeout}s"
+                        )
                         logger.warning(
-                            "alphaengine fanout grace timeout grace_s=%.1f corr=%s",
+                            "alphaengine fanout timeout grace_s=%.1f eff_timeout=%d corr=%s",
                             grace_s,
+                            eff_timeout,
                             corr_id,
                         )
                         ae_outcome = {
                             "ok": False,
                             "status": "timeout",
                             "route": "alphaengine",
-                            "reason": f"alphaengine timed out after fanout grace {grace_label}s",
+                            "reason": ae_reason,
                             "count": 0,
                             "results": [],
                             "raw_payload": None,
@@ -14470,17 +14553,23 @@ class ResearchDataBridge:
                     else:
                         ae_outcome = ae_task.result()
 
-                    if gp_task in grace_timed_out:
+                    if gp_task in timed_out_tasks:
+                        gp_reason = (
+                            f"guidepoint timed out after fanout grace {grace_label}s"
+                            if gp_task in grace_timed_out
+                            else f"guidepoint timed out after {eff_timeout}s"
+                        )
                         logger.warning(
-                            "guidepoint fanout grace timeout grace_s=%.1f corr=%s",
+                            "guidepoint fanout timeout grace_s=%.1f eff_timeout=%d corr=%s",
                             grace_s,
+                            eff_timeout,
                             corr_id,
                         )
                         gp_outcome = {
                             "ok": False,
                             "status": "timeout",
                             "route": "guidepoint",
-                            "reason": f"guidepoint timed out after fanout grace {grace_label}s",
+                            "reason": gp_reason,
                             "count": 0,
                             "results": [],
                             "raw_payload": None,
@@ -17277,6 +17366,13 @@ class ResearchDataBridge:
                 "error_code": "route_migrated",
                 "error": "Endpoint /wiki/ingest has migrated to dalton-research-host /ingest/wiki.",
             }
+        if self._is_route_capability_disabled("company-wiki"):
+            return 403, {
+                "ok": False,
+                "status": "capability_disabled",
+                "error_code": "capability_disabled",
+                "error": "Endpoint /wiki/ingest is disabled by deployment capability configuration.",
+            }
         self._ingest_inflight = int(getattr(self, "_ingest_inflight", 0)) + 1
         try:
             if bool(body.get("dry_run", False)):
@@ -18296,6 +18392,13 @@ class ResearchDataBridge:
                 "status": "route_migrated",
                 "error_code": "route_migrated",
                 "error": "Endpoint /sales-notes/ingest has migrated to dalton-research-host /ingest/sales-notes.",
+            }
+        if self._is_route_capability_disabled("sales-notes"):
+            return 403, {
+                "ok": False,
+                "status": "capability_disabled",
+                "error_code": "capability_disabled",
+                "error": "Endpoint /sales-notes/ingest is disabled by deployment capability configuration.",
             }
         self._ingest_inflight = int(getattr(self, "_ingest_inflight", 0)) + 1
         try:

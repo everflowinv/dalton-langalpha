@@ -219,12 +219,8 @@ class FederatedResearchConnector:
                 "inputSchema": {"type": "object", "properties": shared_props},
             },
         ]
-        # Advertise registered alias tools (e.g. `sales_mail`) ONLY when at least one backing source is enabled
+        # Advertise registered alias tools ONLY when at least one backing source is enabled
         alias_groups = dict(self.registry.federated_aliases)
-        if "sales_mail" not in alias_groups and any(
-            s in self.registry.federated_search_legs for s in ("sales-notes", "tmtb")
-        ):
-            alias_groups["sales_mail"] = ("sales-notes", "tmtb")
         for alias_name, alias_members in alias_groups.items():
             active_members = [s for s in alias_members if s in enabled_sources]
             if active_members:
@@ -545,8 +541,6 @@ class FederatedResearchConnector:
         end = str(arguments["end"]) if arguments.get("end") is not None else None
 
         alias_groups = dict(self.registry.federated_aliases)
-        if "sales_mail" not in alias_groups:
-            alias_groups["sales_mail"] = ("sales-notes", "tmtb")
 
         if tool_name in alias_groups:
             op = str(arguments.get("operation") or "search").strip().lower()

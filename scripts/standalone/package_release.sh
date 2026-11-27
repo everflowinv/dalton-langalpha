@@ -318,8 +318,9 @@ if [[ -f "${TOOL_REPO_ROOT}/scripts/dalton/ops/check_core_release_package.py" ]]
 elif [[ -f "${REPO_ROOT}/scripts/dalton/ops/check_core_release_package.py" ]]; then
   OUT_OF_PKG_CHECKER="${REPO_ROOT}/scripts/dalton/ops/check_core_release_package.py"
 fi
+CHECKER_RC=0
 if [[ -n "$OUT_OF_PKG_CHECKER" ]]; then
-  python3 "$OUT_OF_PKG_CHECKER" --export-dir "$EXPORT_ROOT" --repo-root "$REPO_ROOT" --report-only > "$SCAN_OUTPUT" 2>&1 || true
+  python3 "$OUT_OF_PKG_CHECKER" --export-dir "$EXPORT_ROOT" --repo-root "$REPO_ROOT" > "$SCAN_OUTPUT" 2>&1 || CHECKER_RC=$?
 else
   {
     echo "=== Standalone Core Release Scan Report (ref=${GIT_REF}, sha=${COMMIT_SHA:0:12}) ==="
@@ -332,6 +333,11 @@ cat "$SCAN_OUTPUT"
 if [[ -n "$REPORT_PATH" ]]; then
   mkdir -p "$(dirname "$REPORT_PATH")"
   cp "$SCAN_OUTPUT" "$REPORT_PATH"
+fi
+
+if [[ "$CHECKER_RC" -ne 0 ]]; then
+  echo "ERROR: Out-of-package Core release verification failed (rc=${CHECKER_RC})." >&2
+  exit "$CHECKER_RC"
 fi
 
 if [[ -n "$OUTPUT_DIR_ABS" ]]; then
