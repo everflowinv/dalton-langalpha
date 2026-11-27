@@ -63,3 +63,8 @@ conversations:
 
 internal_llm:
   allowed_models: []
+
+channels:
+  interactive_actions_enabled: true
+  interrupt_ledger_enabled: true
+  bt2_link_recovery_enabled: true

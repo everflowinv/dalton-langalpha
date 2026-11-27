@@ -31,7 +31,7 @@ import random
 import re
 import secrets
 from typing import Any, NoReturn
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 
 from fastapi import HTTPException
 import psycopg
@@ -84,6 +84,9 @@ USER_SETTINGS_PKEY_CONSTRAINT = "dalton_channel_user_settings_pkey"
 _TX_RETRY_MAX_ATTEMPTS = 3
 _TX_RETRY_BACKOFF_MIN_SECONDS = 0.02
 _TX_RETRY_BACKOFF_MAX_SECONDS = 0.10
+
+# Deterministic concurrency test hook (always None in production).
+_after_recover_3a_lock_hook: Callable[[str], Awaitable[None]] | None = None
 
 
 def _coerce_utc_datetime(val: Any) -> datetime | None:
@@ -1087,18 +1090,530 @@ async def lookup_bot_topic(
     }
 
 
+BT2_TERMINAL_FAILURE_CODES: frozenset[str] = frozenset(
+    {"not_allowed", "max_attempts_exceeded", "skipped_platform_disabled"}
+)
+BT2_MAX_DELIVERY_ATTEMPTS: int = 8
+BT2_SOURCE_OR_PARENT_LEASE_SECONDS: int = 180
+BT2_ITEM_LEASE_SECONDS: int = 90
+BT2_DENIED_ERROR_MESSAGE: str = "失败，已在网页通知"
+
+
+def is_bt2_links_key(delivery_key: str | None) -> bool:
+    return str(delivery_key or "").strip().startswith("deliverables-links:")
+
+
+def is_bt2_item_key(delivery_key: str | None) -> bool:
+    cleaned = str(delivery_key or "").strip()
+    return cleaned.startswith("deliverables-links:") and ":item:" in cleaned
+
+
+def derive_bt2_parent_links_key(source_delivery_key: str) -> str:
+    cleaned = str(source_delivery_key or "").strip()
+    if cleaned.startswith("deliverables:"):
+        return "deliverables-links:" + cleaned[len("deliverables:") :]
+    return f"deliverables-links:{cleaned}"
+
+
+def derive_bt2_item_hash(workspace_id: str | None, normalized_path: str) -> str:
+    ws = str(workspace_id or "").strip()
+    path = str(normalized_path or "").strip()
+    return hashlib.sha256(f"{ws}::{path}".encode("utf-8")).hexdigest()[:24]
+
+
+def _normalize_bt2_manifest_path(raw_path: Any) -> str:
+    cleaned = str(raw_path or "").strip().replace("\\", "/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    return cleaned.lstrip("/")
+
+
+def build_bt2_deliverable_manifest(
+    requested_files: list[dict[str, Any]] | None,
+    parent_links_key: str,
+) -> list[dict[str, Any]]:
+    """Build deterministic sorted & deduplicated BT2 ``deliverable_manifest``."""
+    if not isinstance(requested_files, list) or not requested_files:
+        return []
+    dedup: dict[tuple[str, str], dict[str, Any]] = {}
+    for entry in requested_files:
+        if not isinstance(entry, dict):
+            continue
+        ws_id = str(entry.get("workspace_id") or "").strip()
+        norm_path = _normalize_bt2_manifest_path(entry.get("path"))
+        if not norm_path:
+            continue
+        key = (ws_id, norm_path)
+        if key in dedup:
+            continue
+        item_hash = derive_bt2_item_hash(ws_id, norm_path)
+        filename = str(entry.get("filename") or norm_path.rsplit("/", 1)[-1]).strip()
+        reason = str(entry.get("reason") or "").strip() or None
+        dedup[key] = {
+            "item_key": f"{parent_links_key}:item:{item_hash}",
+            "item_hash": item_hash,
+            "workspace_id": ws_id,
+            "path": norm_path,
+            "filename": filename,
+            "reason": reason,
+        }
+    return [dedup[k] for k in sorted(dedup.keys())]
+
+
+def _files_status_entry_is_settled(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    st = str(entry.get("status") or "").strip().lower()
+    if st in ("sent", "linked"):
+        return True
+    if st == "failed":
+        reason = str(entry.get("reason") or "").strip().lower()
+        return reason in BT2_TERMINAL_FAILURE_CODES
+    return False
+
+
+def _filter_unconfirmed_bt2_manifest(
+    manifest: Any,
+    files_status: Any,
+) -> list[dict[str, Any]]:
+    if not isinstance(manifest, list) or not manifest:
+        return []
+    settled_keys: set[tuple[str, str]] = set()
+    if isinstance(files_status, list):
+        for fs in files_status:
+            if _files_status_entry_is_settled(fs):
+                settled_keys.add(
+                    (
+                        str(fs.get("workspace_id") or "").strip(),
+                        _normalize_bt2_manifest_path(fs.get("path")),
+                    )
+                )
+    out: list[dict[str, Any]] = []
+    for item in manifest:
+        if not isinstance(item, dict):
+            continue
+        k = (
+            str(item.get("workspace_id") or "").strip(),
+            _normalize_bt2_manifest_path(item.get("path")),
+        )
+        if k not in settled_keys:
+            out.append(dict(item))
+    return out
+
+
+def _filter_confirmed_sent_or_linked_bt2_manifest(
+    manifest: Any,
+    files_status: Any,
+) -> list[dict[str, Any]]:
+    """Deduct items already confirmed as ``sent`` or ``linked`` in ``files_status``
+    (used when rebuilding a legacy parent's ``deliverable_manifest`` from ``requested_files``)."""
+    if not isinstance(manifest, list) or not manifest:
+        return []
+    confirmed_keys: set[tuple[str, str]] = set()
+    if isinstance(files_status, list):
+        for fs in files_status:
+            if not isinstance(fs, dict):
+                continue
+            st = str(fs.get("status") or "").strip().lower()
+            if st in ("sent", "linked"):
+                confirmed_keys.add(
+                    (
+                        str(fs.get("workspace_id") or "").strip(),
+                        _normalize_bt2_manifest_path(fs.get("path")),
+                    )
+                )
+    out: list[dict[str, Any]] = []
+    for item in manifest:
+        if not isinstance(item, dict):
+            continue
+        k = (
+            str(item.get("workspace_id") or "").strip(),
+            _normalize_bt2_manifest_path(item.get("path")),
+        )
+        if k not in confirmed_keys:
+            out.append(dict(item))
+    return out
+
+
+def _initial_pending_files_status(manifest: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "workspace_id": item.get("workspace_id") or "",
+            "path": item.get("path") or "",
+            "status": "pending",
+            "reason": item.get("reason"),
+        }
+        for item in manifest
+    ]
+
+
+def _merge_source_files_status_preserving_pending(
+    manifest: Any,
+    prev_files: Any,
+    incoming_files: Any,
+) -> list[dict[str, Any]]:
+    """Preserve unconfirmed ``pending`` manifest items when a source row settles text as ``sent``."""
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str]] = []
+
+    def _add(item: dict[str, Any], *, overwrite: bool) -> None:
+        ws = str(item.get("workspace_id") or "").strip()
+        p = _normalize_bt2_manifest_path(item.get("path"))
+        if not p:
+            return
+        k = (ws, p)
+        if k not in by_key:
+            order.append(k)
+            by_key[k] = dict(item)
+            by_key[k]["workspace_id"] = ws
+            by_key[k]["path"] = p
+        elif overwrite:
+            if _files_status_entry_is_settled(by_key[k]) and not _files_status_entry_is_settled(item):
+                return
+            merged = dict(item)
+            merged["workspace_id"] = ws
+            merged["path"] = p
+            by_key[k] = merged
+
+    if isinstance(manifest, list):
+        for m in manifest:
+            if isinstance(m, dict):
+                _add(
+                    {
+                        "workspace_id": m.get("workspace_id") or "",
+                        "path": m.get("path") or "",
+                        "status": "pending",
+                        "reason": m.get("reason"),
+                    },
+                    overwrite=False,
+                )
+    if isinstance(prev_files, list):
+        for pf in prev_files:
+            if isinstance(pf, dict):
+                _add(pf, overwrite=True)
+    if isinstance(incoming_files, list):
+        for inc in incoming_files:
+            if isinstance(inc, dict):
+                _add(inc, overwrite=True)
+    return [by_key[k] for k in order]
+
+
+def _is_bt2_dm_address(
+    platform: str, address: str, pinned_recipient: str | None = None
+) -> bool:
+    """Recognize BT2 DM target addresses: ``<plat>:@me``, ``weixin:dm:*``,
+    ``feishu:user:<open_id>``, ``feishu:<pinned_open_id>``, and ``discord:user:<uid>``."""
+    if _is_dm_address(platform, address):
+        return True
+    cleaned_plat = str(platform or "").strip().lower()
+    cleaned_addr = str(address or "").strip()
+    cleaned_pinned = str(pinned_recipient or "").strip()
+    if cleaned_plat == "feishu":
+        if cleaned_addr.startswith("feishu:user:") and len(cleaned_addr) > len("feishu:user:"):
+            return True
+        if cleaned_pinned and cleaned_addr == f"feishu:{cleaned_pinned}":
+            return True
+        # Feishu open_id format (`ou_...`) used directly as `feishu:<open_id>`
+        if cleaned_addr.startswith("feishu:ou_"):
+            return True
+    elif cleaned_plat == "discord":
+        if cleaned_addr.startswith("discord:user:") and len(cleaned_addr) > len("discord:user:"):
+            return True
+    return False
+
+
+async def _verify_delivery_target_live_in_tx(
+    cur: Any,
+    *,
+    auth_mode: str,
+    user_id: str,
+    platform: str,
+    target_address: str,
+    is_current: bool,
+    execution_id: str | None = None,
+    source_scope_key: str | None = None,
+    source_generation: int | None = None,
+    workspace_id: str | None = None,
+    thread_id: str | None = None,
+    pinned_dm_recipient: str | None = None,
+    weixin_account_id: str | None = None,
+    weixin_bot_id: str | None = None,
+    weixin_bot_generation: int | None = None,
+    weixin_recipient_id: str | None = None,
+    require_weixin_tuple: bool = False,
+    is_dm_override: bool | None = None,
+    conn: Any = None,
+) -> tuple[bool, str | None, str | None, str | None]:
+    """Shared real-time authorization check across first I-6, BT2 parent/item I-6,
+    and ``verify_dm_delivery_recipient`` Branch B (§3.5(2)).
+
+    Returns ``(ok, error_code, error_message, resolved_recipient_id)``.
+    """
+    cleaned_mode = str(auth_mode or "current_conversation").strip().lower()
+    cleaned_plat = str(platform or "").strip().lower()
+    cleaned_target = str(target_address or "").strip()
+    cleaned_uid = str(user_id or "").strip()
+    if not cleaned_uid or not cleaned_plat or not cleaned_target:
+        return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+
+    roster_st = await check_team_member_status_live(cleaned_uid, conn=conn)
+    if roster_st == "lookup_error":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "roster_lookup_error",
+                "retryable": True,
+                "message": "Team member roster lookup failed.",
+            },
+        )
+    if roster_st != "active":
+        return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+
+    user_tier = await get_user_tier(cleaned_uid, conn=conn)
+    is_dm = (
+        is_dm_override
+        if is_dm_override is not None
+        else _is_bt2_dm_address(cleaned_plat, cleaned_target, pinned_dm_recipient)
+    )
+    if not is_dm and (user_tier == "external" or cleaned_plat == "weixin"):
+        return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+
+    if cleaned_plat == "weixin":
+        wx_cfg = await wx_db.ensure_and_lock_weixin_config_in_tx(cur, for_update=False)
+        wx_acc_ok, _ = evaluate_weixin_member_access(
+            user_tier,
+            channel_enabled=bool(wx_cfg["enabled"]),
+            db_allow_external=wx_cfg.get("allow_external"),
+        )
+        if not wx_acc_ok:
+            return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+        await cur.execute(
+            """
+            SELECT account_id::text AS account_id, ilink_user_id AS platform_user_id,
+                   ilink_bot_id, bot_generation, status
+            FROM dalton_channel_weixin_accounts
+            WHERE user_id = %s AND status = 'active' AND ilink_user_id IS NOT NULL
+            """,
+            (cleaned_uid,),
+        )
+        id_row = await cur.fetchone()
+    else:
+        await cur.execute(
+            """
+            SELECT platform_user_id
+            FROM dalton_channel_identities
+            WHERE user_id = %s AND platform = %s
+            """,
+            (cleaned_uid, cleaned_plat),
+        )
+        id_row = await cur.fetchone()
+    if not id_row or not id_row.get("platform_user_id"):
+        return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+    live_puid = str(id_row["platform_user_id"]).strip()
+
+    if cleaned_plat == "weixin" and (
+        require_weixin_tuple
+        or weixin_account_id is not None
+        or weixin_bot_id is not None
+        or weixin_bot_generation is not None
+        or weixin_recipient_id is not None
+    ):
+        exp_aid = str(weixin_account_id or "").strip()
+        exp_bot = str(weixin_bot_id or "").strip()
+        exp_recip = str(weixin_recipient_id or pinned_dm_recipient or "").strip()
+        live_aid = str(id_row.get("account_id") or "").strip()
+        live_bot = str(id_row.get("ilink_bot_id") or "").strip()
+        live_gen = id_row.get("bot_generation")
+        if (
+            not exp_aid
+            or live_aid != exp_aid
+            or not exp_bot
+            or live_bot != exp_bot
+            or weixin_bot_generation is None
+            or live_gen is None
+            or int(live_gen) != int(weixin_bot_generation)
+            or not exp_recip
+            or live_puid != exp_recip
+        ):
+            return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+
+    if is_dm and pinned_dm_recipient and live_puid != str(pinned_dm_recipient).strip():
+        return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+
+    if cleaned_mode == "explicit_target":
+        await cur.execute(
+            """
+            SELECT apps FROM dalton_channel_user_settings
+            WHERE user_id = %s
+            """,
+            (cleaned_uid,),
+        )
+        us_row = await cur.fetchone()
+        app_cfg = (
+            (us_row.get("apps") or {}).get(cleaned_plat)
+            if us_row
+            else default_app_settings(cleaned_plat)
+        )
+        if not isinstance(app_cfg, dict):
+            return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+        agent_msgs = app_cfg.get("agent_messages") or {}
+        if not bool(agent_msgs.get("enabled")):
+            return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+        allowed_list = list(agent_msgs.get("allowed") or [])
+        group_check_addr = _normalize_topic_chat_address(cleaned_plat, cleaned_target)
+        norm_dm_addr = f"{cleaned_plat}:@me" if is_dm else group_check_addr
+        if (
+            cleaned_target not in allowed_list
+            and group_check_addr not in allowed_list
+            and (not is_dm or norm_dm_addr not in allowed_list)
+        ):
+            return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+        if not is_dm:
+            grp_ok, _, _ = await _verify_group_target_deliverable(
+                cur,
+                user_id=cleaned_uid,
+                user_tier=user_tier,
+                platform=cleaned_plat,
+                chat_address=group_check_addr,
+                apps_cfg=(us_row.get("apps") if us_row else None),
+                conn=conn,
+            )
+            if not grp_ok:
+                return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+            return True, None, None, extract_chat_id(cleaned_plat, chat_address=group_check_addr)
+        if cleaned_plat == "weixin" and is_current and source_scope_key and source_generation is not None:
+            await cur.execute(
+                """
+                SELECT generation
+                FROM dalton_channel_session_generations
+                WHERE platform = 'weixin' AND scope_key = %s AND dalton_user_id = %s
+                """,
+                (source_scope_key, cleaned_uid),
+            )
+            sg = await cur.fetchone()
+            if sg and sg.get("generation") is not None and int(sg["generation"]) != int(source_generation):
+                return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+        return True, None, None, live_puid
+
+    if cleaned_mode == "automation":
+        eff_exec = normalize_uuid(execution_id)
+        if not eff_exec:
+            return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+        await cur.execute(
+            """
+            SELECT user_id, targets
+            FROM dalton_channel_automation_runs
+            WHERE execution_id = %s::uuid
+            """,
+            (eff_exec,),
+        )
+        auto_row = await cur.fetchone()
+        if not auto_row or str(auto_row.get("user_id") or "") != cleaned_uid:
+            return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+        targets_list = list(auto_row.get("targets") or [])
+        matched = any(
+            isinstance(t, dict)
+            and t.get("ok") is True
+            and str(t.get("address") or "").strip() == cleaned_target
+            for t in targets_list
+        )
+        if not matched:
+            return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+        if not is_dm:
+            grp_ok, _, _ = await _verify_group_target_deliverable(
+                cur,
+                user_id=cleaned_uid,
+                user_tier=user_tier,
+                platform=cleaned_plat,
+                chat_address=cleaned_target,
+                conn=conn,
+            )
+            if not grp_ok:
+                return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+            return True, None, None, extract_chat_id(cleaned_plat, chat_address=cleaned_target)
+        return True, None, None, live_puid
+
+    # auth_mode == "current_conversation"
+    if not is_current:
+        return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+    if not is_dm:
+        grp_ok, _, _ = await _verify_group_target_deliverable(
+            cur,
+            user_id=cleaned_uid,
+            user_tier=user_tier,
+            platform=cleaned_plat,
+            chat_address=_normalize_topic_chat_address(cleaned_plat, cleaned_target),
+            conn=conn,
+        )
+        if not grp_ok:
+            return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+    eff_ws_id = str(workspace_id).strip() if workspace_id else None
+    if not eff_ws_id and thread_id:
+        norm_check_tid = normalize_uuid(thread_id)
+        if norm_check_tid:
+            await cur.execute(
+                """
+                SELECT workspace_id FROM conversation_threads
+                WHERE conversation_thread_id = %s
+                """,
+                (norm_check_tid,),
+            )
+            th_ws_row = await cur.fetchone()
+            if th_ws_row and th_ws_row.get("workspace_id"):
+                eff_ws_id = str(th_ws_row["workspace_id"]).strip()
+    if eff_ws_id:
+        home_ws = get_home_workspace_id(cleaned_uid)
+        if normalize_uuid(eff_ws_id) and normalize_uuid(eff_ws_id) != normalize_uuid(home_ws):
+            ok_ws, _, _ = await _verify_workspace_write_permission(
+                cur, str(eff_ws_id), cleaned_uid, conn=conn
+            )
+            if not ok_ws:
+                return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+    if cleaned_plat == "weixin" and source_scope_key and source_generation is not None:
+        await cur.execute(
+            """
+            SELECT generation
+            FROM dalton_channel_session_generations
+            WHERE platform = 'weixin' AND scope_key = %s AND dalton_user_id = %s
+            """,
+            (source_scope_key, cleaned_uid),
+        )
+        sg = await cur.fetchone()
+        if sg and sg.get("generation") is not None and int(sg["generation"]) != int(source_generation):
+            return False, "not_allowed", BT2_DENIED_ERROR_MESSAGE, None
+    if is_dm:
+        return True, None, None, live_puid
+    return (
+        True,
+        None,
+        None,
+        extract_chat_id(
+            cleaned_plat,
+            chat_address=_normalize_topic_chat_address(cleaned_plat, cleaned_target),
+        ),
+    )
+
+
 async def verify_dm_delivery_recipient(
     *,
     delivery_key: str,
     delivery_attempt: int | None = None,
+    resolved_recipient_id: str | None = None,
     gateway_epoch: int | str | None = None,
     require_gateway_epoch: bool = True,
     conn: Any = None,
 ) -> dict[str, Any]:
     """Verify an in-flight DM delivery's pinned platform recipient is still actively bound.
 
-    Called before Discord/Feishu file sends and again after Feishu file/image upload
-    before dispatching the file message. Weixin delegates to ``preflight_weixin_send``.
+    Dual-branch verification (§3.5(2)):
+    - Branch A (binary source deliveries, ``NOT LIKE 'deliverables-links:%'``):
+      requires current DM (or authorized automation DM) and original inbound pinned recipient.
+    - Branch B (BT2 link child keys, ``deliverables-links:%:item:%``):
+      re-verifies live target authorization by ``authorized_target_meta.auth_mode``
+      (permitting legal non-current explicit DMs such as group ``send_message(target='feishu:@me')``
+      and Feishu background DMs pinned via ``link_dm_recipient_open_id``), verifies live roster &
+      identity binding == pinned recipient, and verifies actual send address & optional
+      ``resolved_recipient_id`` match the exact pinned recipient.
     """
     cleaned_key = str(delivery_key or "").strip()
     if not cleaned_key:
@@ -1114,7 +1629,9 @@ async def verify_dm_delivery_recipient(
                 SELECT delivery_key, kind, user_id, thread_id, run_id,
                        execution_id::text AS execution_id,
                        is_current, platform, target_address, status,
-                       delivery_attempt, dm_recipient_platform_user_id
+                       delivery_attempt, dm_recipient_platform_user_id,
+                       source_scope_key, source_generation,
+                       source_delivery_key, authorized_target_meta
                 FROM dalton_channel_deliveries
                 WHERE delivery_key = %s
                 """,
@@ -1174,12 +1691,140 @@ async def verify_dm_delivery_recipient(
                         "message": "delivery_attempt does not match current attempt.",
                     },
                 )
+
+            user_id = str(row.get("user_id") or "").strip()
+            reject_company_system_auth(user_id)
+            target_addr = str(row.get("target_address") or "").strip()
+
+            # Branch B: BT2 link :item: child key
+            if is_bt2_links_key(cleaned_key):
+                if not is_bt2_item_key(cleaned_key):
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "code": "deliverable_recipient_denied",
+                            "message": "Only BT2 :item: link deliveries may call verify-dm-recipient.",
+                        },
+                    )
+                if (
+                    delivery_attempt is None
+                    or isinstance(delivery_attempt, bool)
+                    or int(delivery_attempt) != current_attempt
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "delivery_attempt_mismatch",
+                            "message": "delivery_attempt is required and must match current attempt for BT2 link deliveries.",
+                        },
+                    )
+                auth_meta = row.get("authorized_target_meta")
+                if not isinstance(auth_meta, dict):
+                    parent_key = cleaned_key.split(":item:", 1)[0]
+                    await cur.execute(
+                        """
+                        SELECT authorized_target_meta
+                        FROM dalton_channel_deliveries
+                        WHERE delivery_key = %s
+                        """,
+                        (parent_key,),
+                    )
+                    p_row = await cur.fetchone()
+                    auth_meta = (
+                        dict(p_row["authorized_target_meta"])
+                        if p_row and isinstance(p_row.get("authorized_target_meta"), dict)
+                        else {}
+                    )
+                auth_mode = str(auth_meta.get("auth_mode") or "current_conversation").strip().lower()
+                pinned_recipient = str(
+                    row.get("dm_recipient_platform_user_id")
+                    or (auth_meta.get("link_dm_recipient_open_id") if platform == "feishu" else None)
+                    or auth_meta.get("dm_recipient_platform_user_id")
+                    or ""
+                ).strip()
+                if not pinned_recipient:
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "code": "deliverable_recipient_denied",
+                            "message": "BT2 link delivery has no pinned DM recipient.",
+                        },
+                    )
+
+                # Verify actual target address matches one of the legal DM shapes for pinned_recipient
+                if platform == "feishu":
+                    allowed_addrs = {
+                        "feishu:@me",
+                        f"feishu:user:{pinned_recipient}",
+                        f"feishu:{pinned_recipient}",
+                    }
+                elif platform == "discord":
+                    allowed_addrs = {
+                        "discord:@me",
+                        f"discord:user:{pinned_recipient}",
+                    }
+                else:
+                    allowed_addrs = set()
+                if target_addr not in allowed_addrs:
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "code": "deliverable_recipient_denied",
+                            "message": "Target DM address does not match pinned recipient.",
+                        },
+                    )
+
+                cleaned_resolved_recip = str(resolved_recipient_id or "").strip()
+                if not cleaned_resolved_recip or cleaned_resolved_recip != pinned_recipient:
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "code": "deliverable_recipient_denied",
+                            "message": "Resolved send recipient is required and must match pinned recipient.",
+                        },
+                    )
+
+                live_ok, _, _, _ = await _verify_delivery_target_live_in_tx(
+                    cur,
+                    auth_mode=auth_mode,
+                    user_id=user_id,
+                    platform=platform,
+                    target_address=target_addr,
+                    is_current=bool(row.get("is_current")),
+                    execution_id=row.get("execution_id") or auth_meta.get("execution_id"),
+                    source_scope_key=row.get("source_scope_key") or auth_meta.get("thread_scope_key"),
+                    source_generation=row.get("source_generation"),
+                    workspace_id=auth_meta.get("workspace_id"),
+                    thread_id=str(row["thread_id"]) if row.get("thread_id") else None,
+                    pinned_dm_recipient=pinned_recipient,
+                    is_dm_override=True,
+                    conn=owned_conn,
+                )
+                if not live_ok:
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "code": "deliverable_recipient_denied",
+                            "message": BT2_DENIED_ERROR_MESSAGE,
+                        },
+                    )
+
+                return {
+                    "authorized": True,
+                    "platform": platform,
+                    "user_id": user_id,
+                    "recipient_id": pinned_recipient,
+                    "delivery_attempt": current_attempt,
+                    "auth_mode": auth_mode,
+                }
+
+            # Branch A: Binary source delivery (unchanged strict current DM / automation DM + original inbound recipient)
             row_kind = str(row.get("kind") or "").strip().lower()
             is_authorized_automation_dm = row_kind == "automation" and bool(
                 row.get("execution_id")
             )
             if (not bool(row.get("is_current")) and not is_authorized_automation_dm) or not _is_dm_address(
-                platform, str(row.get("target_address") or "")
+                platform, target_addr
             ):
                 raise HTTPException(
                     status_code=403,
@@ -1188,8 +1833,6 @@ async def verify_dm_delivery_recipient(
                         "message": "File attachment delivery is restricted to current DM conversations.",
                     },
                 )
-            user_id = str(row.get("user_id") or "").strip()
-            reject_company_system_auth(user_id)
             pinned_recipient = str(row.get("dm_recipient_platform_user_id") or "").strip()
             if not pinned_recipient:
                 raise HTTPException(
@@ -9148,6 +9791,1196 @@ async def _lock_weixin_account_for_key_share_in_tx(
         )
 
 
+async def _can_clear_bt2_run_fallback_pending_in_tx(
+    cur: Any,
+    *,
+    run_id: str | None,
+    settling_delivery_key: str,
+    is_item: bool,
+    parent_row: dict[str, Any] | None = None,
+    locked_inbounds: dict[tuple[str, str], dict[str, Any]] | None = None,
+    locked_bg_runs: dict[tuple[str, str], dict[str, Any]] | None = None,
+) -> bool:
+    """Return True only when the originating run has NO other unsettled deliveries
+    (body text, charts, other explicit file sends, parent BT2 keys, or enrolled
+    unparented sources) so clearing ``fallback_pending`` is safe (§3.5(4))."""
+    cleaned_rid = str(run_id or "").strip()
+    if not cleaned_rid:
+        return False
+
+    # A single `:item:` child failing must NOT clear run-level fallback_pending
+    # unless its parent key has already reached a terminal state.
+    if is_item:
+        if parent_row is None:
+            return False
+        p_st = str(parent_row.get("status") or "").strip().lower()
+        p_err = str(parent_row.get("error_code") or "").strip().lower()
+        parent_terminal = p_st == "sent" or (
+            p_st == "failed" and p_err in BT2_TERMINAL_FAILURE_CODES
+        )
+        if not parent_terminal:
+            return False
+
+    # Inspect all other deliveries for this run_id (read-only; no new row locks).
+    await cur.execute(
+        """
+        SELECT delivery_key, kind, is_current, has_non_empty_text,
+               status, error_code, bt2_enrolled, deliverable_manifest, files_status
+        FROM dalton_channel_deliveries
+        WHERE run_id = %s
+        """,
+        (cleaned_rid,),
+    )
+    all_run_deliveries = [dict(r) for r in await cur.fetchall()]
+    all_keys = {str(d["delivery_key"]) for d in all_run_deliveries}
+    has_sent_non_links = False
+
+    for d in all_run_deliveries:
+        dk = str(d["delivery_key"])
+        st = str(d.get("status") or "").strip().lower()
+        err = str(d.get("error_code") or "").strip().lower()
+        is_links = is_bt2_links_key(dk)
+        is_links_item = is_bt2_item_key(dk)
+        if not is_links and bool(d.get("is_current")) and st == "sent":
+            has_sent_non_links = True
+        if dk == settling_delivery_key:
+            continue
+        if is_links and not is_links_item:
+            # Another BT2 parent key on this run is still unsettled
+            if st in ("in_flight", "partial", "unknown") or (
+                st == "failed" and err not in BT2_TERMINAL_FAILURE_CODES
+            ):
+                return False
+        elif not is_links:
+            # Any body / chart / explicit source delivery still active/unknown/partial
+            if st in ("in_flight", "partial", "unknown"):
+                return False
+            # Any other bt2_enrolled source with unconfirmed files & no parent yet
+            if (
+                bool(d.get("bt2_enrolled"))
+                and isinstance(d.get("deliverable_manifest"), list)
+                and len(d["deliverable_manifest"]) > 0
+            ):
+                expected_parent = derive_bt2_parent_links_key(dk)
+                if expected_parent not in all_keys:
+                    unconfirmed = _filter_unconfirmed_bt2_manifest(
+                        d["deliverable_manifest"], d.get("files_status")
+                    )
+                    if unconfirmed:
+                        return False
+
+    # Do not clear fallback_pending if body text has not yet been delivered/settled
+    # on an active inbound or background run (sent_to_current_count == 0 and no sent
+    # non-links delivery row).
+    for inb in (locked_inbounds or {}).values():
+        inb_st = str(inb.get("status") or "").strip().lower()
+        inb_cnt = int(inb.get("sent_to_current_count") or 0)
+        if inb_cnt == 0 and inb_st in ("pending", "accepted", "streaming") and not has_sent_non_links:
+            return False
+    for bgr in (locked_bg_runs or {}).values():
+        bg_st = str(bgr.get("status") or "").strip().lower()
+        bg_cnt = int(bgr.get("sent_to_current_count") or 0)
+        if bg_cnt == 0 and bg_st in ("pending", "streaming") and not has_sent_non_links:
+            return False
+
+    return True
+
+
+async def _settle_bt2_turn_fallback_pending_in_tx(
+    cur: Any,
+    *,
+    run_id: str | None,
+    settling_delivery_key: str,
+    is_item: bool = False,
+    parent_row: dict[str, Any] | None = None,
+    locked_inbounds: dict[tuple[str, str], dict[str, Any]] | None = None,
+    locked_bg_runs: dict[tuple[str, str], dict[str, Any]] | None = None,
+    error_code: str | None = None,
+) -> bool:
+    """Advance ``fallback_pending = FALSE`` ONLY on already-locked originating turn
+    rows (preserving Lock Order ``7a-1 -> 7a-3 -> 7a-4 -> 7b-0``) and ONLY when no
+    other unsettled obligations remain for ``run_id``."""
+    cleaned_rid = str(run_id or "").strip()
+    if not cleaned_rid:
+        return False
+    if not locked_inbounds and not locked_bg_runs:
+        return False
+    can_clear = await _can_clear_bt2_run_fallback_pending_in_tx(
+        cur,
+        run_id=cleaned_rid,
+        settling_delivery_key=settling_delivery_key,
+        is_item=is_item,
+        parent_row=parent_row,
+        locked_inbounds=locked_inbounds,
+        locked_bg_runs=locked_bg_runs,
+    )
+    if not can_clear:
+        return False
+
+    for plat, mid in sorted((locked_inbounds or {}).keys()):
+        if error_code:
+            await cur.execute(
+                """
+                UPDATE dalton_channel_inbound_events
+                SET fallback_pending = FALSE,
+                    raw_payload = COALESCE(raw_payload, '{}'::jsonb)
+                        || jsonb_build_object('deliverables_links_terminal_error', %s::text),
+                    updated_at = NOW()
+                WHERE platform = %s
+                  AND message_id = %s
+                  AND run_id = %s
+                  AND fallback_pending = TRUE
+                """,
+                (str(error_code), plat, mid, cleaned_rid),
+            )
+        else:
+            await cur.execute(
+                """
+                UPDATE dalton_channel_inbound_events
+                SET fallback_pending = FALSE,
+                    updated_at = NOW()
+                WHERE platform = %s
+                  AND message_id = %s
+                  AND run_id = %s
+                  AND fallback_pending = TRUE
+                """,
+                (plat, mid, cleaned_rid),
+            )
+
+    for tid_k, rid_k in sorted((locked_bg_runs or {}).keys()):
+        await cur.execute(
+            """
+            UPDATE dalton_channel_background_runs
+            SET fallback_pending = FALSE,
+                updated_at = NOW()
+            WHERE thread_id = %s::uuid
+              AND run_id = %s
+              AND fallback_pending = TRUE
+            """,
+            (tid_k, rid_k),
+        )
+    return True
+
+
+async def _lock_weixin_accounts_sorted_for_key_share_in_tx(
+    cur: Any,
+    account_ids: set[str] | list[str],
+) -> tuple[set[str], set[str]]:
+    """Lock ``dalton_channel_weixin_accounts`` at Level 3a strictly in ``account_id ASC`` order.
+
+    Returns ``(attempted_aids, existing_aids)``:
+    - ``attempted_aids``: normalized account IDs for which a Level 3a lock was attempted
+      (deleted accounts cannot deadlock with ``unbind_weixin_account`` and proceed to live
+      verification to settle ``not_allowed``).
+    - ``existing_aids``: subset of rows that currently exist in ``dalton_channel_weixin_accounts``
+      (safe to write into FK column ``weixin_account_id`` without ``ForeignKeyViolation``).
+    """
+    norm_aids = sorted(
+        {norm for raw in account_ids if (norm := normalize_uuid(raw))}
+    )
+    if not norm_aids:
+        return set(), set()
+    await cur.execute(
+        """
+        SELECT account_id::text AS account_id
+        FROM dalton_channel_weixin_accounts
+        WHERE account_id = ANY(%s::uuid[])
+        ORDER BY account_id ASC
+        FOR KEY SHARE
+        """,
+        (norm_aids,),
+    )
+    existing = {str(r["account_id"]) for r in await cur.fetchall() if r.get("account_id")}
+    return set(norm_aids), existing
+
+
+async def _authorize_and_claim_bt2_links_delivery(
+    *,
+    delivery_key: str,
+    user_id: str | None,
+    thread_id: str | None,
+    run_id: str | None,
+    execution_id: str | None,
+    platform: str | None,
+    target: str | None,
+    source_scope_key: str | None,
+    source_generation: int | None,
+    activity_origin: str,
+    requested_files: list[dict[str, Any]] | None,
+    source_delivery_key: str | None,
+    attempt_id: str | None,
+    reclaim_stale_attempt_id: str | None,
+    reclaim_stale_source_attempt_id: str | None,
+    gateway_epoch: int | None,
+    require_gateway_epoch: bool,
+    conn: Any = None,
+) -> dict[str, Any]:
+    """BT2 parent (`deliverables-links:<src>`) and `:item:` child I-6 authorization & claim
+    following Lock Order ②: unlocked pre-read -> ``0b-1 (dalton_inbound) -> 0b-2 (gateway_lease)
+    -> 0b-3 (dalton_delivery) -> 3a (weixin_accounts ASC FOR KEY SHARE) -> 7a (inbound_events ->
+    background_runs -> deliveries ASC FOR UPDATE) -> 7b-0 (interrupt_runtime_config FOR SHARE)``."""
+    for attempt in range(1, _TX_RETRY_MAX_ATTEMPTS + 1):
+        try:
+            return await _run_tx_with_retry(
+                "authorize_and_claim_bt2_links_delivery",
+                conn,
+                lambda c: _authorize_and_claim_bt2_links_delivery_once(
+                    delivery_key=delivery_key,
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    execution_id=execution_id,
+                    platform=platform,
+                    target=target,
+                    source_scope_key=source_scope_key,
+                    source_generation=source_generation,
+                    activity_origin=activity_origin,
+                    requested_files=requested_files,
+                    source_delivery_key=source_delivery_key,
+                    attempt_id=attempt_id,
+                    reclaim_stale_attempt_id=reclaim_stale_attempt_id,
+                    reclaim_stale_source_attempt_id=reclaim_stale_source_attempt_id,
+                    gateway_epoch=gateway_epoch,
+                    require_gateway_epoch=require_gateway_epoch,
+                    conn=c,
+                ),
+            )
+        except wx_db.WeixinLockSetChanged:
+            if attempt >= _TX_RETRY_MAX_ATTEMPTS:
+                raise
+            await asyncio.sleep(0.02 * attempt)
+    raise RuntimeError("authorize_and_claim_bt2_links_delivery retry loop exhausted")
+
+
+async def _authorize_and_claim_bt2_links_delivery_once(
+    *,
+    delivery_key: str,
+    user_id: str | None,
+    thread_id: str | None,
+    run_id: str | None,
+    execution_id: str | None,
+    platform: str | None,
+    target: str | None,
+    source_scope_key: str | None,
+    source_generation: int | None,
+    activity_origin: str,
+    requested_files: list[dict[str, Any]] | None,
+    source_delivery_key: str | None,
+    attempt_id: str | None,
+    reclaim_stale_attempt_id: str | None,
+    reclaim_stale_source_attempt_id: str | None,
+    gateway_epoch: int | None,
+    require_gateway_epoch: bool,
+    conn: Any = None,
+) -> dict[str, Any]:
+    from src.dalton import channel_action_tokens as cat_mod
+
+    cleaned_key = str(delivery_key).strip()
+    is_item = is_bt2_item_key(cleaned_key)
+    parent_key = cleaned_key.split(":item:", 1)[0] if is_item else cleaned_key
+
+    # Determine companion row key to lock in delivery_key ASC order at Level 7a
+    companion_key: str | None = None
+    if is_item:
+        companion_key = parent_key
+    elif source_delivery_key and str(source_delivery_key).strip():
+        cleaned_src_key = str(source_delivery_key).strip()
+        if cleaned_key != derive_bt2_parent_links_key(cleaned_src_key):
+            return {
+                "claim_status": "denied",
+                "status": "failed",
+                "code": "not_allowed",
+                "message": "BT2 parent delivery_key does not match deterministic parent key for source_delivery_key.",
+            }
+        companion_key = cleaned_src_key
+    else:
+        suffix = cleaned_key[len("deliverables-links:") :]
+        if suffix and not suffix.startswith(("tool:", "fallback:", "notice:", "automation:")):
+            companion_key = f"deliverables:{suffix}"
+        elif suffix:
+            companion_key = suffix
+
+    lock_keys = sorted({k for k in (cleaned_key, companion_key) if k})
+
+    # Phase 1: Unlocked pre-read to discover originating run_id, inbound/background_run keys,
+    # and all Weixin account_ids so the write transaction acquires locks in strict ascending order.
+    pre_inb_keys: set[tuple[str, str]] = set()
+    pre_bg_keys: set[tuple[str, str]] = set()
+    pre_wx_aids: set[str] = set()
+    pre_wx_uids: set[str] = set()
+    pre_run_ids: set[str] = set()
+    if run_id and str(run_id).strip():
+        pre_run_ids.add(str(run_id).strip())
+    if platform and str(platform).strip().lower() == "weixin" and user_id and str(user_id).strip():
+        pre_wx_uids.add(str(user_id).strip())
+
+    async with get_db_connection(conn) as pre_conn:
+        async with pre_conn.cursor(row_factory=dict_row) as pre_cur:
+            await pre_cur.execute(
+                """
+                SELECT delivery_key, user_id, run_id, platform,
+                       weixin_account_id::text AS weixin_account_id,
+                       authorized_target_meta
+                FROM dalton_channel_deliveries
+                WHERE delivery_key = ANY(%s::text[])
+                ORDER BY delivery_key ASC
+                """,
+                (lock_keys,),
+            )
+            for pr in await pre_cur.fetchall():
+                if pr.get("run_id"):
+                    pre_run_ids.add(str(pr["run_id"]).strip())
+                pr_plat = str(pr.get("platform") or "").strip().lower()
+                if pr.get("weixin_account_id"):
+                    pre_wx_aids.add(str(pr["weixin_account_id"]))
+                pr_meta = pr.get("authorized_target_meta")
+                if isinstance(pr_meta, dict) and pr_meta.get("weixin_account_id"):
+                    pre_wx_aids.add(str(pr_meta["weixin_account_id"]))
+                if pr_plat == "weixin" and pr.get("user_id"):
+                    pre_wx_uids.add(str(pr["user_id"]).strip())
+
+            if pre_run_ids:
+                sorted_rids = sorted(pre_run_ids)
+                await pre_cur.execute(
+                    """
+                    SELECT platform, message_id, weixin_account_id::text AS weixin_account_id
+                    FROM dalton_channel_inbound_events
+                    WHERE run_id = ANY(%s::text[])
+                      AND fallback_pending = TRUE
+                    ORDER BY platform ASC, message_id ASC
+                    """,
+                    (sorted_rids,),
+                )
+                for ir in await pre_cur.fetchall():
+                    if ir.get("platform") and ir.get("message_id"):
+                        pre_inb_keys.add(
+                            (str(ir["platform"]).strip().lower(), str(ir["message_id"]).strip())
+                        )
+                    if ir.get("weixin_account_id"):
+                        pre_wx_aids.add(str(ir["weixin_account_id"]))
+                await pre_cur.execute(
+                    """
+                    SELECT thread_id::text AS thread_id, run_id,
+                           weixin_account_id::text AS weixin_account_id
+                    FROM dalton_channel_background_runs
+                    WHERE run_id = ANY(%s::text[])
+                      AND fallback_pending = TRUE
+                    ORDER BY thread_id ASC, run_id ASC
+                    """,
+                    (sorted_rids,),
+                )
+                for br in await pre_cur.fetchall():
+                    if br.get("thread_id") and br.get("run_id"):
+                        pre_bg_keys.add((str(br["thread_id"]), str(br["run_id"])))
+                    if br.get("weixin_account_id"):
+                        pre_wx_aids.add(str(br["weixin_account_id"]))
+
+            if pre_wx_uids:
+                await pre_cur.execute(
+                    """
+                    SELECT account_id::text AS account_id
+                    FROM dalton_channel_weixin_accounts
+                    WHERE user_id = ANY(%s::text[])
+                    ORDER BY account_id ASC
+                    """,
+                    (sorted(pre_wx_uids),),
+                )
+                for wr in await pre_cur.fetchall():
+                    if wr.get("account_id"):
+                        pre_wx_aids.add(str(wr["account_id"]))
+
+    sorted_inb_keys = sorted(pre_inb_keys)
+    sorted_bg_keys = sorted(pre_bg_keys)
+
+    # Phase 2: Write transaction in strict Lock Order ②
+    async with get_db_connection(conn) as owned_conn:
+        async with owned_conn.transaction():
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
+                # Level 0b-1: inbound advisory locks in (platform, message_id) ASC order
+                for inb_plat, inb_mid in sorted_inb_keys:
+                    await cur.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                        (f"dalton_inbound:{inb_plat}:{inb_mid}",),
+                    )
+
+                # Level 0b-2: gateway_lease FOR SHARE
+                active_epoch = await wx_db.verify_gateway_epoch_in_tx(
+                    cur,
+                    gateway_epoch,
+                    required=require_gateway_epoch,
+                    platform=platform,
+                    enforce_post_lease_for_non_weixin=False,
+                )
+
+                # Level 0b-3: delivery advisory locks in delivery_key ASC order
+                for lk in lock_keys:
+                    await cur.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                        (f"dalton_delivery:{lk}",),
+                    )
+
+                # Level 3a: Weixin accounts FOR KEY SHARE in account_id ASC order
+                locked_wx_aids, existing_wx_aids = await _lock_weixin_accounts_sorted_for_key_share_in_tx(
+                    cur, pre_wx_aids
+                )
+
+                # Level 7a-1: Lock pre-read inbound_events FOR UPDATE + verify Weixin 3a set
+                locked_inbounds: dict[tuple[str, str], dict[str, Any]] = {}
+                for inb_plat, inb_mid in sorted_inb_keys:
+                    await cur.execute(
+                        """
+                        SELECT platform, message_id, status, run_id, fallback_pending,
+                               sent_to_current_count,
+                               weixin_account_id::text AS weixin_account_id
+                        FROM dalton_channel_inbound_events
+                        WHERE platform = %s AND message_id = %s
+                        FOR UPDATE
+                        """,
+                        (inb_plat, inb_mid),
+                    )
+                    inb_row = await cur.fetchone()
+                    if inb_row:
+                        d_inb = dict(inb_row)
+                        if d_inb.get("weixin_account_id") and str(d_inb["weixin_account_id"]) not in locked_wx_aids:
+                            raise wx_db.WeixinLockSetChanged()
+                        locked_inbounds[(inb_plat, inb_mid)] = d_inb
+
+                # Level 7a-3: Lock pre-read background_runs FOR UPDATE + verify Weixin 3a set
+                locked_bg_runs: dict[tuple[str, str], dict[str, Any]] = {}
+                for bg_tid, bg_rid in sorted_bg_keys:
+                    await cur.execute(
+                        """
+                        SELECT thread_id::text AS thread_id, run_id, status, fallback_pending,
+                               sent_to_current_count,
+                               weixin_account_id::text AS weixin_account_id
+                        FROM dalton_channel_background_runs
+                        WHERE thread_id = %s::uuid AND run_id = %s
+                        FOR UPDATE
+                        """,
+                        (bg_tid, bg_rid),
+                    )
+                    bg_row = await cur.fetchone()
+                    if bg_row:
+                        d_bg = dict(bg_row)
+                        if d_bg.get("weixin_account_id") and str(d_bg["weixin_account_id"]) not in locked_wx_aids:
+                            raise wx_db.WeixinLockSetChanged()
+                        locked_bg_runs[(bg_tid, bg_rid)] = d_bg
+
+                # Level 7a-4: Lock companion and target delivery rows in delivery_key ASC order
+                await cur.execute(
+                    """
+                    SELECT *,
+                           thread_id::text AS thread_id_text,
+                           execution_id::text AS execution_id_text,
+                           weixin_account_id::text AS weixin_account_id_text,
+                           claim_attempt_id::text AS claim_attempt_id_text
+                    FROM dalton_channel_deliveries
+                    WHERE delivery_key = ANY(%s::text[])
+                    ORDER BY delivery_key ASC
+                    FOR UPDATE
+                    """,
+                    (lock_keys,),
+                )
+                locked_by_key: dict[str, dict[str, Any]] = {}
+                for r in await cur.fetchall():
+                    d = dict(r)
+                    d["thread_id"] = d.pop("thread_id_text", None)
+                    d["execution_id"] = d.pop("execution_id_text", None)
+                    d["weixin_account_id"] = d.pop("weixin_account_id_text", None)
+                    d["claim_attempt_id"] = d.pop("claim_attempt_id_text", None)
+                    if d.get("weixin_account_id") and str(d["weixin_account_id"]) not in locked_wx_aids:
+                        raise wx_db.WeixinLockSetChanged()
+                    locked_by_key[str(d["delivery_key"])] = d
+
+                existing = locked_by_key.get(cleaned_key)
+                companion = locked_by_key.get(companion_key) if companion_key else None
+                source_row = companion if not is_item else None
+                parent_row = companion if is_item else None
+
+                # Level 7b-0: read runtime barrier config FOR SHARE
+                if cat_mod._before_7b0_lock_hook is not None:
+                    await cat_mod._before_7b0_lock_hook("i6_bt2")
+                rt_cfg = await cat_mod.read_effective_interrupt_runtime_config_in_tx(cur, for_update=False)
+                if cat_mod._after_7b0_lock_hook is not None:
+                    await cat_mod._after_7b0_lock_hook("i6_bt2")
+                bt2_enabled_now = bool(rt_cfg["bt2_link_recovery_enabled"])
+
+                source_matches_parent = bool(
+                    source_row
+                    and cleaned_key
+                    == derive_bt2_parent_links_key(str(source_row.get("delivery_key") or ""))
+                )
+                if source_row is not None and not source_matches_parent:
+                    return {
+                        "claim_status": "denied",
+                        "status": "failed",
+                        "code": "not_allowed",
+                        "message": "BT2 parent delivery_key does not match deterministic parent key for source_delivery_key.",
+                    }
+                enrolled_from_lineage = bool(
+                    (existing and existing.get("bt2_enrolled"))
+                    or (source_matches_parent and source_row.get("bt2_enrolled"))
+                    or (parent_row and parent_row.get("bt2_enrolled"))
+                )
+                if not bt2_enabled_now and not enrolled_from_lineage:
+                    return {
+                        "claim_status": "denied",
+                        "status": "failed",
+                        "code": "bt2_drain_disabled",
+                        "message": "BT2 link recovery enrollment is disabled during drain mode.",
+                    }
+
+                db_now = await _fetch_db_now(cur)
+                eff_epoch = active_epoch or gateway_epoch
+
+                # When creating/rebuilding parent from source_row: verify source attempt has finished or expired
+                manifest: list[dict[str, Any]] = []
+                if not is_item and existing is None and source_row is not None:
+                    src_status = str(source_row.get("status") or "").strip().lower()
+                    if src_status == "in_flight":
+                        src_lease = _coerce_utc_datetime(source_row.get("claim_lease_expires_at"))
+                        src_epoch = source_row.get("claim_gateway_epoch")
+                        src_aid = str(source_row.get("claim_attempt_id") or "").strip()
+                        stale_match = bool(
+                            reclaim_stale_source_attempt_id
+                            and src_aid
+                            and str(reclaim_stale_source_attempt_id).strip() == src_aid
+                        )
+                        lease_expired = src_lease is not None and src_lease < db_now
+                        epoch_stale = (
+                            eff_epoch is not None
+                            and src_epoch is not None
+                            and int(src_epoch) != int(eff_epoch)
+                        )
+                        if not (stale_match or lease_expired or epoch_stale):
+                            return {
+                                "claim_status": "source_still_active",
+                                "source_delivery_key": str(source_row["delivery_key"]),
+                                "claim_attempt_id": src_aid or None,
+                            }
+                        # Source attempt is stale -> mark source row unknown in same transaction
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_deliveries
+                            SET status = 'unknown',
+                                error_code = COALESCE(error_code, 'attempt_lease_expired'),
+                                updated_at = NOW()
+                            WHERE delivery_key = %s AND status = 'in_flight'
+                            """,
+                            (str(source_row["delivery_key"]),),
+                        )
+                        source_row["status"] = "unknown"
+
+                    # Re-read latest source files_status and keep only unconfirmed manifest items
+                    src_manifest = source_row.get("deliverable_manifest") or []
+                    if not src_manifest and requested_files:
+                        src_manifest = build_bt2_deliverable_manifest(requested_files, parent_key)
+                    manifest = _filter_unconfirmed_bt2_manifest(src_manifest, source_row.get("files_status"))
+                    if not manifest:
+                        return {
+                            "claim_status": "already_completed",
+                            "status": "sent",
+                            "source_delivery_key": str(source_row["delivery_key"]),
+                        }
+                elif not is_item:
+                    if existing is not None and isinstance(existing.get("deliverable_manifest"), list) and existing["deliverable_manifest"]:
+                        manifest = list(existing["deliverable_manifest"])
+                    elif requested_files:
+                        raw_manifest = build_bt2_deliverable_manifest(requested_files, parent_key)
+                        if existing is not None:
+                            manifest = _filter_confirmed_sent_or_linked_bt2_manifest(
+                                raw_manifest, existing.get("files_status")
+                            )
+                            if source_row is not None:
+                                manifest = _filter_unconfirmed_bt2_manifest(
+                                    manifest, source_row.get("files_status")
+                                )
+                        else:
+                            manifest = raw_manifest
+                else:
+                    if parent_row is None:
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "bt2_parent_missing",
+                            "message": "BT2 item child requires an existing parent links delivery row.",
+                        }
+                    if isinstance(parent_row.get("deliverable_manifest"), list):
+                        for entry in parent_row["deliverable_manifest"]:
+                            if isinstance(entry, dict) and str(entry.get("item_key") or "") == cleaned_key:
+                                manifest = [dict(entry)]
+                                break
+                    if not manifest:
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "bt2_parent_missing",
+                            "message": "BT2 item key was not found in parent deliverable_manifest.",
+                        }
+
+                # Check existing row status / reclaim eligibility
+                if existing is not None:
+                    ex_st = str(existing.get("status") or "").strip().lower()
+                    ex_err = str(existing.get("error_code") or "").strip().lower()
+                    if ex_st == "sent" or (ex_st == "failed" and ex_err in BT2_TERMINAL_FAILURE_CODES):
+                        return {
+                            "claim_status": "already_completed",
+                            "status": ex_st,
+                            "error_code": existing.get("error_code"),
+                            "error_message": existing.get("error_message"),
+                            "platform": existing.get("platform"),
+                            "target_address": existing.get("target_address"),
+                            "delivery_attempt": _delivery_attempt(existing),
+                            "deliverable_manifest": existing.get("deliverable_manifest") or [],
+                            "files_status": existing.get("files_status") or [],
+                            "authorized_target_meta": existing.get("authorized_target_meta"),
+                        }
+                    if ex_st == "in_flight":
+                        ex_lease = _coerce_utc_datetime(existing.get("claim_lease_expires_at"))
+                        ex_epoch = existing.get("claim_gateway_epoch")
+                        ex_aid = str(existing.get("claim_attempt_id") or "").strip()
+                        can_reclaim_in_flight = (
+                            (ex_lease is not None and ex_lease < db_now)
+                            or (
+                                eff_epoch is not None
+                                and ex_epoch is not None
+                                and int(ex_epoch) != int(eff_epoch)
+                            )
+                            or bool(
+                                reclaim_stale_attempt_id
+                                and ex_aid
+                                and str(reclaim_stale_attempt_id).strip() == ex_aid
+                            )
+                        )
+                        if not can_reclaim_in_flight:
+                            return {
+                                "claim_status": "already_in_flight",
+                                "status": "in_flight",
+                                "platform": existing.get("platform"),
+                                "target_address": existing.get("target_address"),
+                                "delivery_attempt": _delivery_attempt(existing),
+                                "claim_attempt_id": ex_aid or None,
+                            }
+                    if _delivery_attempt(existing) >= BT2_MAX_DELIVERY_ATTEMPTS:
+                        failed_fs = [
+                            {
+                                "workspace_id": m.get("workspace_id") or "",
+                                "path": m.get("path") or "",
+                                "status": "failed",
+                                "reason": "max_attempts_exceeded",
+                            }
+                            for m in manifest
+                        ]
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_deliveries
+                            SET status = 'failed',
+                                error_code = 'max_attempts_exceeded',
+                                error_message = 'BT2 deliverable link recovery reached max attempts.',
+                                files_status = CASE WHEN %s THEN %s ELSE files_status END,
+                                updated_at = NOW()
+                            WHERE delivery_key = %s
+                            """,
+                            (bool(failed_fs), Jsonb(failed_fs), cleaned_key),
+                        )
+                        await _settle_bt2_turn_fallback_pending_in_tx(
+                            cur,
+                            run_id=existing.get("run_id") or run_id,
+                            settling_delivery_key=cleaned_key,
+                            is_item=is_item,
+                            parent_row=parent_row,
+                            locked_inbounds=locked_inbounds,
+                            locked_bg_runs=locked_bg_runs,
+                            error_code="max_attempts_exceeded",
+                        )
+                        return {
+                            "claim_status": "already_completed",
+                            "status": "failed",
+                            "error_code": "max_attempts_exceeded",
+                            "delivery_attempt": _delivery_attempt(existing),
+                        }
+                    if not is_item and requested_files and not manifest:
+                        # All requested files are already confirmed sent/linked on this legacy
+                        # parent (or its source row); settle parent as sent without re-queuing.
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_deliveries
+                            SET status = 'sent',
+                                error_code = NULL,
+                                error_message = NULL,
+                                updated_at = NOW()
+                            WHERE delivery_key = %s
+                            """,
+                            (cleaned_key,),
+                        )
+                        await _settle_bt2_turn_fallback_pending_in_tx(
+                            cur,
+                            run_id=existing.get("run_id") or run_id,
+                            settling_delivery_key=cleaned_key,
+                            is_item=False,
+                            parent_row=None,
+                            locked_inbounds=locked_inbounds,
+                            locked_bg_runs=locked_bg_runs,
+                            error_code=None,
+                        )
+                        return {
+                            "claim_status": "already_completed",
+                            "status": "sent",
+                            "platform": existing.get("platform"),
+                            "target_address": existing.get("target_address"),
+                            "delivery_attempt": _delivery_attempt(existing),
+                            "deliverable_manifest": existing.get("deliverable_manifest") or [],
+                            "files_status": existing.get("files_status") or [],
+                            "authorized_target_meta": existing.get("authorized_target_meta"),
+                        }
+
+                # Resolve authoritative metadata:
+                # - `:item:` child keys MUST inherit exclusively from existing child row or parent_row
+                #   (never falling back to caller request parameters).
+                # - Parent keys resolve from existing -> source_row -> caller params (§3.5 allows
+                #   first parent creation with requested_files).
+                if is_item:
+                    assert parent_row is not None
+                    parent_auth_meta = (
+                        dict(parent_row["authorized_target_meta"])
+                        if isinstance(parent_row.get("authorized_target_meta"), dict)
+                        else {}
+                    )
+                    existing_auth_meta = (
+                        dict(existing["authorized_target_meta"])
+                        if existing is not None
+                        and isinstance(existing.get("authorized_target_meta"), dict)
+                        else {}
+                    )
+                    auth_meta = {**parent_auth_meta, **existing_auth_meta}
+                    base_row = existing or parent_row
+
+                    def _item_col(col: str) -> Any:
+                        if existing is not None and existing.get(col) is not None:
+                            return existing[col]
+                        return parent_row.get(col)
+
+                    resolved_user_id = str(_item_col("user_id") or "").strip()
+                    resolved_platform = str(
+                        _item_col("platform") or auth_meta.get("platform") or ""
+                    ).strip().lower()
+                    resolved_target_address = str(
+                        _item_col("target_address") or auth_meta.get("target_address") or ""
+                    ).strip()
+                    raw_is_cur = _item_col("is_current")
+                    resolved_is_current = bool(
+                        raw_is_cur if raw_is_cur is not None else auth_meta.get("is_current", False)
+                    )
+                    resolved_tid = normalize_uuid(_item_col("thread_id"))
+                    resolved_rid = str(_item_col("run_id") or "").strip() or None
+                    resolved_exec_id = normalize_uuid(
+                        _item_col("execution_id") or auth_meta.get("execution_id")
+                    )
+                    resolved_scope = str(
+                        _item_col("source_scope_key")
+                        or auth_meta.get("thread_scope_key")
+                        or ""
+                    ).strip() or None
+                    raw_item_gen = _item_col("source_generation")
+                    resolved_gen = int(raw_item_gen) if raw_item_gen is not None else None
+                    resolved_src_key = str(
+                        _item_col("source_delivery_key")
+                        or auth_meta.get("source_delivery_key")
+                        or ""
+                    ).strip() or None
+                    resolved_activity_origin = str(
+                        _item_col("activity_origin") or "none"
+                    ).strip().lower() or "none"
+                    resolved_confirmed_thread_addr = (
+                        _item_col("confirmed_thread_address")
+                        or auth_meta.get("confirmed_thread_address")
+                    )
+                    wx_orig_aid = (
+                        str(_item_col("weixin_account_id") or auth_meta.get("weixin_account_id") or "").strip()
+                        or None
+                    )
+                    wx_orig_bot_id = (
+                        str(_item_col("weixin_bot_id") or auth_meta.get("weixin_bot_id") or "").strip()
+                        or None
+                    )
+                    raw_wx_gen = _item_col("weixin_bot_generation")
+                    if raw_wx_gen is None:
+                        raw_wx_gen = auth_meta.get("weixin_bot_generation")
+                    wx_orig_bot_gen = int(raw_wx_gen) if raw_wx_gen is not None else None
+                    wx_orig_recip = (
+                        str(_item_col("weixin_recipient_id") or auth_meta.get("weixin_recipient_id") or "").strip()
+                        or None
+                    )
+                    row_dm_recipient = _item_col("dm_recipient_platform_user_id")
+                else:
+                    base_row = existing or parent_row or source_row or {}
+                    auth_meta = (
+                        dict(base_row["authorized_target_meta"])
+                        if isinstance(base_row.get("authorized_target_meta"), dict)
+                        else {}
+                    )
+                    resolved_user_id = str(base_row.get("user_id") or user_id or "").strip()
+                    resolved_platform = str(
+                        base_row.get("platform") or auth_meta.get("platform") or platform or ""
+                    ).strip().lower()
+                    resolved_target_address = str(
+                        base_row.get("target_address") or auth_meta.get("target_address") or target or ""
+                    ).strip()
+                    resolved_is_current = bool(
+                        base_row.get("is_current")
+                        if "is_current" in base_row and base_row.get("is_current") is not None
+                        else auth_meta.get("is_current", False)
+                    )
+                    resolved_tid = normalize_uuid(base_row.get("thread_id") or thread_id)
+                    resolved_rid = str(base_row.get("run_id") or run_id or "").strip() or None
+                    resolved_exec_id = normalize_uuid(base_row.get("execution_id") or execution_id or auth_meta.get("execution_id"))
+                    resolved_scope = str(
+                        base_row.get("source_scope_key") or auth_meta.get("thread_scope_key") or source_scope_key or ""
+                    ).strip() or None
+                    resolved_gen = (
+                        int(base_row["source_generation"])
+                        if base_row.get("source_generation") is not None
+                        else (int(source_generation) if source_generation is not None else None)
+                    )
+                    resolved_src_key = str(
+                        base_row.get("source_delivery_key")
+                        or (source_row["delivery_key"] if source_row else None)
+                        or (parent_row.get("source_delivery_key") if parent_row else None)
+                        or source_delivery_key
+                        or ""
+                    ).strip() or None
+                    resolved_activity_origin = activity_origin
+                    resolved_confirmed_thread_addr = (
+                        base_row.get("confirmed_thread_address")
+                        or auth_meta.get("confirmed_thread_address")
+                    )
+                    wx_orig_aid = (
+                        str(base_row.get("weixin_account_id") or auth_meta.get("weixin_account_id") or "").strip()
+                        or None
+                    )
+                    wx_orig_bot_id = (
+                        str(base_row.get("weixin_bot_id") or auth_meta.get("weixin_bot_id") or "").strip()
+                        or None
+                    )
+                    raw_wx_gen = (
+                        base_row.get("weixin_bot_generation")
+                        if base_row.get("weixin_bot_generation") is not None
+                        else auth_meta.get("weixin_bot_generation")
+                    )
+                    wx_orig_bot_gen = int(raw_wx_gen) if raw_wx_gen is not None else None
+                    wx_orig_recip = (
+                        str(base_row.get("weixin_recipient_id") or auth_meta.get("weixin_recipient_id") or "").strip()
+                        or None
+                    )
+                    row_dm_recipient = base_row.get("dm_recipient_platform_user_id")
+                auth_mode = str(auth_meta.get("auth_mode") or ("automation" if resolved_exec_id else ("current_conversation" if resolved_is_current else "explicit_target"))).strip().lower()
+
+                if not resolved_user_id or not resolved_platform or not resolved_target_address:
+                    if is_item:
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "bt2_parent_missing",
+                            "message": "BT2 parent row is missing authoritative target metadata.",
+                        }
+                    return {
+                        "claim_status": "denied",
+                        "status": "failed",
+                        "code": "not_allowed",
+                        "message": BT2_DENIED_ERROR_MESSAGE,
+                    }
+                reject_company_system_auth(resolved_user_id)
+                require_channel_platform_capability(resolved_platform)
+
+                # Pin DM recipient (Feishu uses link_dm_recipient_open_id; others require dm_recipient_platform_user_id)
+                pinned_dm_recipient: str | None = None
+                if resolved_platform == "feishu":
+                    pinned_dm_recipient = str(
+                        row_dm_recipient
+                        or auth_meta.get("link_dm_recipient_open_id")
+                        or auth_meta.get("dm_recipient_platform_user_id")
+                        or ""
+                    ).strip() or None
+                else:
+                    pinned_dm_recipient = str(
+                        row_dm_recipient
+                        or auth_meta.get("dm_recipient_platform_user_id")
+                        or wx_orig_recip
+                        or ""
+                    ).strip() or None
+                is_dm = _is_bt2_dm_address(resolved_platform, resolved_target_address, pinned_dm_recipient)
+                if not is_dm:
+                    pinned_dm_recipient = None
+
+                async def _persist_bt2_terminal_denied(code: str = "not_allowed") -> dict[str, Any]:
+                    failed_fs = [
+                        {
+                            "workspace_id": m.get("workspace_id") or "",
+                            "path": m.get("path") or "",
+                            "status": "failed",
+                            "reason": code,
+                        }
+                        for m in manifest
+                    ]
+                    eff_aid = normalize_uuid(attempt_id) or str(uuid4())
+                    await cur.execute(
+                        """
+                        INSERT INTO dalton_channel_deliveries (
+                            delivery_key, kind, user_id, thread_id, run_id, execution_id,
+                            is_current, has_non_empty_text, platform, target_address,
+                            status, total_chunks, sent_chunks, platform_message_ids,
+                            files_status, error_code, error_message,
+                            source_scope_key, source_generation, activity_origin,
+                            delivery_attempt,
+                            weixin_account_id, weixin_bot_id, weixin_bot_generation, weixin_recipient_id,
+                            dm_recipient_platform_user_id,
+                            bt2_enrolled, source_delivery_key, deliverable_manifest,
+                            authorized_target_meta, claim_attempt_id, claim_gateway_epoch,
+                            created_at, updated_at
+                        )
+                        VALUES (
+                            %s, 'fallback', %s, %s::uuid, %s, %s::uuid,
+                            %s, FALSE, %s, %s,
+                            'failed', 0, 0, '[]'::jsonb,
+                            %s, %s, %s,
+                            %s, %s, %s,
+                            1,
+                            %s::uuid, %s, %s, %s,
+                            %s,
+                            TRUE, %s, %s,
+                            %s, %s::uuid, %s,
+                            NOW(), NOW()
+                        )
+                        ON CONFLICT (delivery_key) DO UPDATE SET
+                            status = 'failed',
+                            error_code = EXCLUDED.error_code,
+                            error_message = EXCLUDED.error_message,
+                            files_status = CASE WHEN jsonb_array_length(EXCLUDED.files_status) > 0 THEN EXCLUDED.files_status ELSE dalton_channel_deliveries.files_status END,
+                            updated_at = NOW()
+                        """,
+                        (
+                            cleaned_key,
+                            resolved_user_id,
+                            resolved_tid,
+                            resolved_rid,
+                            resolved_exec_id,
+                            resolved_is_current,
+                            resolved_platform,
+                            resolved_target_address,
+                            Jsonb(failed_fs),
+                            code,
+                            BT2_DENIED_ERROR_MESSAGE,
+                            resolved_scope,
+                            resolved_gen,
+                            resolved_activity_origin,
+                            wx_orig_aid if (wx_orig_aid and wx_orig_aid in existing_wx_aids) else None,
+                            wx_orig_bot_id,
+                            wx_orig_bot_gen,
+                            wx_orig_recip,
+                            pinned_dm_recipient,
+                            resolved_src_key,
+                            Jsonb(manifest) if manifest else None,
+                            Jsonb(auth_meta) if auth_meta else None,
+                            eff_aid,
+                            eff_epoch,
+                        ),
+                    )
+                    await _settle_bt2_turn_fallback_pending_in_tx(
+                        cur,
+                        run_id=resolved_rid,
+                        settling_delivery_key=cleaned_key,
+                        is_item=is_item,
+                        parent_row=parent_row,
+                        locked_inbounds=locked_inbounds,
+                        locked_bg_runs=locked_bg_runs,
+                        error_code=code,
+                    )
+                    return {
+                        "claim_status": "denied",
+                        "status": "failed",
+                        "code": code,
+                        "message": BT2_DENIED_ERROR_MESSAGE,
+                    }
+
+                # Intentional scope limit (§3.5(2)): production-disabled platforms (e.g. Discord) background DM
+                # without original DM inbound recipient immediately settle as terminal not_allowed.
+                if is_dm and resolved_platform not in ("feishu", "weixin") and not pinned_dm_recipient:
+                    return await _persist_bt2_terminal_denied("not_allowed")
+
+                # Live re-verification by auth_mode (shared with first I-6 and verify-dm-recipient Branch B),
+                # including full Weixin 4-tuple (account_id, bot_id, bot_generation, recipient_id) check!
+                live_ok, live_code, _, resolved_recip = await _verify_delivery_target_live_in_tx(
+                    cur,
+                    auth_mode=auth_mode,
+                    user_id=resolved_user_id,
+                    platform=resolved_platform,
+                    target_address=resolved_target_address,
+                    is_current=resolved_is_current,
+                    execution_id=resolved_exec_id,
+                    source_scope_key=resolved_scope,
+                    source_generation=resolved_gen,
+                    workspace_id=auth_meta.get("workspace_id"),
+                    thread_id=resolved_tid,
+                    pinned_dm_recipient=pinned_dm_recipient,
+                    weixin_account_id=wx_orig_aid,
+                    weixin_bot_id=wx_orig_bot_id,
+                    weixin_bot_generation=wx_orig_bot_gen,
+                    weixin_recipient_id=wx_orig_recip,
+                    require_weixin_tuple=(resolved_platform == "weixin"),
+                    is_dm_override=is_dm,
+                    conn=owned_conn,
+                )
+                if not live_ok:
+                    return await _persist_bt2_terminal_denied(live_code or "not_allowed")
+
+                if is_dm and resolved_platform == "feishu" and not pinned_dm_recipient and resolved_recip:
+                    pinned_dm_recipient = resolved_recip
+                    auth_meta["link_dm_recipient_open_id"] = resolved_recip
+
+                # Refresh confirmed topic anchor for group/topic deliveries if topic became confirmed
+                if not is_dm and resolved_platform in ("feishu", "discord") and resolved_scope:
+                    topic_chat_addr = _normalize_topic_chat_address(resolved_platform, resolved_target_address)
+                    await cur.execute(
+                        """
+                        SELECT external_topic_id, first_reply_message_id, root_message_id
+                        FROM dalton_channel_bot_topics
+                        WHERE platform = %s AND chat_address = %s AND canonical_scope_key = %s AND status = 'confirmed'
+                        LIMIT 1
+                        """,
+                        (resolved_platform, topic_chat_addr, resolved_scope),
+                    )
+                    t_row = await cur.fetchone()
+                    if t_row:
+                        if t_row.get("external_topic_id"):
+                            auth_meta["external_topic_id"] = t_row["external_topic_id"]
+                        if t_row.get("first_reply_message_id"):
+                            auth_meta["first_reply_message_id"] = t_row["first_reply_message_id"]
+                        if t_row.get("root_message_id"):
+                            auth_meta["root_message_id"] = t_row["root_message_id"]
+
+                eff_attempt_id = normalize_uuid(attempt_id) or str(uuid4())
+                lease_seconds = BT2_ITEM_LEASE_SECONDS if is_item else BT2_SOURCE_OR_PARENT_LEASE_SECONDS
+                next_attempt = 1 if existing is None else _delivery_attempt(existing) + 1
+                init_fs = _initial_pending_files_status(manifest)
+                auth_meta.setdefault("auth_mode", auth_mode)
+                auth_meta.setdefault("platform", resolved_platform)
+                auth_meta.setdefault("target_address", resolved_target_address)
+                auth_meta.setdefault("is_current", resolved_is_current)
+                if resolved_src_key:
+                    auth_meta["source_delivery_key"] = resolved_src_key
+                if wx_orig_aid:
+                    auth_meta.setdefault("weixin_account_id", wx_orig_aid)
+                if wx_orig_bot_id:
+                    auth_meta.setdefault("weixin_bot_id", wx_orig_bot_id)
+                if wx_orig_bot_gen is not None:
+                    auth_meta.setdefault("weixin_bot_generation", wx_orig_bot_gen)
+                if wx_orig_recip:
+                    auth_meta.setdefault("weixin_recipient_id", wx_orig_recip)
+
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_deliveries (
+                        delivery_key, kind, user_id, thread_id, run_id, execution_id,
+                        is_current, has_non_empty_text, platform, target_address,
+                        status, total_chunks, sent_chunks, platform_message_ids,
+                        files_status, source_scope_key, source_generation, activity_origin,
+                        delivery_attempt,
+                        weixin_account_id, weixin_bot_id, weixin_bot_generation, weixin_recipient_id,
+                        dm_recipient_platform_user_id,
+                        confirmed_thread_address,
+                        bt2_enrolled, source_delivery_key, deliverable_manifest,
+                        authorized_target_meta, claim_attempt_id, claim_gateway_epoch,
+                        claim_lease_expires_at,
+                        created_at, updated_at
+                    )
+                    VALUES (
+                        %s, 'fallback', %s, %s::uuid, %s, %s::uuid,
+                        %s, FALSE, %s, %s,
+                        'in_flight', 0, 0, '[]'::jsonb,
+                        %s, %s, %s, %s,
+                        1,
+                        %s::uuid, %s, %s, %s,
+                        %s,
+                        %s,
+                        TRUE, %s, %s,
+                        %s, %s::uuid, %s,
+                        NOW() + (%s || ' seconds')::interval,
+                        NOW(), NOW()
+                    )
+                    ON CONFLICT (delivery_key) DO UPDATE SET
+                        status = 'in_flight',
+                        error_code = NULL,
+                        error_message = NULL,
+                        delivery_attempt = dalton_channel_deliveries.delivery_attempt + 1,
+                        bt2_enrolled = TRUE,
+                        source_delivery_key = COALESCE(dalton_channel_deliveries.source_delivery_key, EXCLUDED.source_delivery_key),
+                        deliverable_manifest = CASE
+                            WHEN dalton_channel_deliveries.deliverable_manifest IS NOT NULL
+                             AND jsonb_typeof(dalton_channel_deliveries.deliverable_manifest) = 'array'
+                             AND jsonb_array_length(dalton_channel_deliveries.deliverable_manifest) > 0
+                            THEN dalton_channel_deliveries.deliverable_manifest
+                            ELSE EXCLUDED.deliverable_manifest
+                        END,
+                        authorized_target_meta = COALESCE(EXCLUDED.authorized_target_meta, dalton_channel_deliveries.authorized_target_meta),
+                        dm_recipient_platform_user_id = COALESCE(dalton_channel_deliveries.dm_recipient_platform_user_id, EXCLUDED.dm_recipient_platform_user_id),
+                        weixin_account_id = COALESCE(dalton_channel_deliveries.weixin_account_id, EXCLUDED.weixin_account_id),
+                        weixin_bot_id = COALESCE(dalton_channel_deliveries.weixin_bot_id, EXCLUDED.weixin_bot_id),
+                        weixin_bot_generation = COALESCE(dalton_channel_deliveries.weixin_bot_generation, EXCLUDED.weixin_bot_generation),
+                        weixin_recipient_id = COALESCE(dalton_channel_deliveries.weixin_recipient_id, EXCLUDED.weixin_recipient_id),
+                        claim_attempt_id = EXCLUDED.claim_attempt_id,
+                        claim_gateway_epoch = EXCLUDED.claim_gateway_epoch,
+                        claim_lease_expires_at = EXCLUDED.claim_lease_expires_at,
+                        updated_at = NOW()
+                    """,
+                    (
+                        cleaned_key,
+                        resolved_user_id,
+                        resolved_tid,
+                        resolved_rid,
+                        resolved_exec_id,
+                        resolved_is_current,
+                        resolved_platform,
+                        resolved_target_address,
+                        Jsonb(init_fs),
+                        resolved_scope,
+                        resolved_gen,
+                        resolved_activity_origin,
+                        wx_orig_aid,
+                        wx_orig_bot_id,
+                        wx_orig_bot_gen,
+                        wx_orig_recip,
+                        pinned_dm_recipient,
+                        resolved_confirmed_thread_addr,
+                        resolved_src_key,
+                        Jsonb(manifest) if manifest else None,
+                        Jsonb(auth_meta),
+                        eff_attempt_id,
+                        eff_epoch,
+                        str(lease_seconds),
+                    ),
+                )
+
+                return {
+                    "claim_status": "claimed",
+                    "delivery_key": cleaned_key,
+                    "recipient_id": resolved_recip,
+                    "dm_recipient_platform_user_id": pinned_dm_recipient,
+                    "platform": resolved_platform,
+                    "target_address": resolved_target_address,
+                    "confirmed_thread_address": resolved_confirmed_thread_addr,
+                    "delivery_attempt": next_attempt,
+                    "claim_attempt_id": eff_attempt_id,
+                    "bt2_enrolled": True,
+                    "source_delivery_key": resolved_src_key,
+                    "deliverable_manifest": manifest,
+                    "authorized_target_meta": auth_meta,
+                    "is_current": resolved_is_current,
+                    "external_topic_id": auth_meta.get("external_topic_id"),
+                    "root_message_id": auth_meta.get("root_message_id"),
+                    "first_reply_message_id": auth_meta.get("first_reply_message_id"),
+                }
+
+
 async def authorize_and_claim_delivery(
     *,
     delivery_key: str,
@@ -9165,6 +10998,11 @@ async def authorize_and_claim_delivery(
     source_scope_key: str | None = None,
     source_generation: int | None = None,
     activity_origin: str | None = None,
+    requested_files: list[dict[str, Any]] | None = None,
+    source_delivery_key: str | None = None,
+    attempt_id: str | None = None,
+    reclaim_stale_attempt_id: str | None = None,
+    reclaim_stale_source_attempt_id: str | None = None,
     gateway_epoch: int | None = None,
     require_gateway_epoch: bool = False,
     conn: Any = None,
@@ -9225,6 +11063,38 @@ async def authorize_and_claim_delivery(
         "none",
     ):
         eff_activity_origin = "none"
+
+    # BT2 parent (`deliverables-links:<src>`) and `:item:` child fast-path (§3.5(2))
+    # Runs BEFORE opening the write transaction so unlocked pre-read + Lock Order ②
+    # (`0b-1 -> 0b-2 -> 0b-3 -> 3a -> 7a inbound/bg/deliveries -> 7b-0`) is strictly respected.
+    if is_bt2_links_key(cleaned_key) and (
+        is_bt2_item_key(cleaned_key)
+        or source_delivery_key is not None
+        or requested_files is not None
+        or reclaim_stale_attempt_id is not None
+        or reclaim_stale_source_attempt_id is not None
+        or attempt_id is not None
+    ):
+        return await _authorize_and_claim_bt2_links_delivery(
+            delivery_key=cleaned_key,
+            user_id=cleaned_uid,
+            thread_id=norm_tid,
+            run_id=cleaned_rid,
+            execution_id=eff_exec_id,
+            platform=cleaned_platform,
+            target=cleaned_target,
+            source_scope_key=eff_source_scope,
+            source_generation=eff_source_gen,
+            activity_origin=eff_activity_origin,
+            requested_files=requested_files,
+            source_delivery_key=source_delivery_key,
+            attempt_id=attempt_id,
+            reclaim_stale_attempt_id=reclaim_stale_attempt_id,
+            reclaim_stale_source_attempt_id=reclaim_stale_source_attempt_id,
+            gateway_epoch=gateway_epoch,
+            require_gateway_epoch=require_gateway_epoch,
+            conn=conn,
+        )
 
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
@@ -9293,6 +11163,93 @@ async def authorize_and_claim_delivery(
                     (cleaned_key,),
                 )
                 existing = await cur.fetchone()
+                is_legacy_links_parent = (
+                    is_bt2_links_key(cleaned_key) and not is_bt2_item_key(cleaned_key)
+                )
+                legacy_links_7b0_checked = False
+
+                async def _check_legacy_links_bt2_barrier_in_tx() -> dict[str, Any] | None:
+                    nonlocal legacy_links_7b0_checked
+                    if not is_legacy_links_parent or legacy_links_7b0_checked:
+                        return None
+                    from src.dalton import channel_action_tokens as cat_mod
+
+                    if cat_mod._before_7b0_lock_hook is not None:
+                        await cat_mod._before_7b0_lock_hook("i6_links_legacy")
+                    rt_cfg = await cat_mod.read_effective_interrupt_runtime_config_in_tx(
+                        cur, for_update=False
+                    )
+                    if cat_mod._after_7b0_lock_hook is not None:
+                        await cat_mod._after_7b0_lock_hook("i6_links_legacy")
+                    legacy_links_7b0_checked = True
+                    if not bool(rt_cfg["bt2_link_recovery_enabled"]):
+                        if existing is None:
+                            return {
+                                "claim_status": "denied",
+                                "status": "failed",
+                                "code": "bt2_drain_disabled",
+                                "message": "BT2 link recovery enrollment is disabled during drain mode.",
+                            }
+                        ex_st_bar = str(existing.get("status") or "").strip().lower()
+                        ex_err_bar = str(existing.get("error_code") or "").strip().lower()
+                        ex_is_cur_bar = bool(existing.get("is_current", False))
+                        ex_ct_bar = _delivery_confirmed_thread_address(existing)
+                        ex_bp_bar = _delivery_discord_body_phase(existing)
+                        if ex_st_bar in ("sent", "partial") or (
+                            ex_st_bar == "failed" and ex_err_bar in BT2_TERMINAL_FAILURE_CODES
+                        ):
+                            return {
+                                "claim_status": "already_completed",
+                                "status": ex_st_bar,
+                                "error_code": existing.get("error_code"),
+                                "error_message": existing.get("error_message"),
+                                "first_response_json": existing.get("first_response_json"),
+                                "platform": existing["platform"],
+                                "target_address": existing["target_address"],
+                                "confirmed_thread_address": ex_ct_bar,
+                                "discord_body_phase": ex_bp_bar,
+                                "delivery_attempt": _delivery_attempt(existing),
+                                "thread_scope_key": existing.get("source_scope_key"),
+                                "is_current": ex_is_cur_bar,
+                            }
+                        if ex_st_bar in ("in_flight", "unknown"):
+                            return {
+                                "claim_status": "in_flight_or_unknown",
+                                "status": "unknown",
+                                "existing_status": ex_st_bar,
+                                "error_code": existing.get("error_code"),
+                                "sent_chunks": int(existing.get("sent_chunks") or 0),
+                                "code": "in_flight",
+                                "message": "An earlier attempt of this same call is still delivering it.",
+                                "platform": existing["platform"],
+                                "target_address": existing["target_address"],
+                                "confirmed_thread_address": ex_ct_bar,
+                                "discord_body_phase": ex_bp_bar,
+                                "delivery_attempt": _delivery_attempt(existing),
+                                "thread_scope_key": existing.get("source_scope_key"),
+                                "files_status": existing.get("files_status") or [],
+                                "is_current": ex_is_cur_bar,
+                            }
+                        return {
+                            "claim_status": "denied",
+                            "status": ex_st_bar or "failed",
+                            "code": existing.get("error_code") or "bt2_drain_disabled",
+                            "error_code": existing.get("error_code"),
+                            "error_message": existing.get("error_message"),
+                            "message": (
+                                existing.get("error_message")
+                                or "BT2 link recovery enrollment is disabled during drain mode."
+                            ),
+                            "platform": existing["platform"],
+                            "target_address": existing["target_address"],
+                            "confirmed_thread_address": ex_ct_bar,
+                            "discord_body_phase": ex_bp_bar,
+                            "delivery_attempt": _delivery_attempt(existing),
+                            "thread_scope_key": existing.get("source_scope_key"),
+                            "is_current": ex_is_cur_bar,
+                        }
+                    return None
+
                 # True only when this claim may persist activity_origin conversation -> replay.
                 replay_recovery = False
                 if existing:
@@ -9304,6 +11261,48 @@ async def authorize_and_claim_delivery(
                             platform="weixin",
                         )
                     reject_company_system_auth(existing.get("user_id"))
+                    if is_legacy_links_parent and bool(existing.get("bt2_enrolled")):
+                        # Legacy-format request hitting a BT2-enrolled parent row MUST NOT
+                        # overwrite it via ordinary I-6 ON CONFLICT (§5.4 / r3 Item 1).
+                        ex_st_bt2 = str(existing.get("status") or "").strip().lower()
+                        ex_err_bt2 = str(existing.get("error_code") or "").strip().lower()
+                        ex_is_cur_bt2 = bool(existing.get("is_current", False))
+                        ex_ct_bt2 = _delivery_confirmed_thread_address(existing)
+                        ex_bp_bt2 = _delivery_discord_body_phase(existing)
+                        if ex_st_bt2 == "sent" or (
+                            ex_st_bt2 == "failed" and ex_err_bt2 in BT2_TERMINAL_FAILURE_CODES
+                        ):
+                            return {
+                                "claim_status": "already_completed",
+                                "status": ex_st_bt2,
+                                "error_code": existing.get("error_code"),
+                                "error_message": existing.get("error_message"),
+                                "first_response_json": existing.get("first_response_json"),
+                                "platform": existing["platform"],
+                                "target_address": existing["target_address"],
+                                "confirmed_thread_address": ex_ct_bt2,
+                                "discord_body_phase": ex_bp_bt2,
+                                "delivery_attempt": _delivery_attempt(existing),
+                                "thread_scope_key": existing.get("source_scope_key"),
+                                "is_current": ex_is_cur_bt2,
+                            }
+                        return {
+                            "claim_status": "in_flight_or_unknown",
+                            "status": "unknown",
+                            "existing_status": ex_st_bt2,
+                            "error_code": existing.get("error_code"),
+                            "sent_chunks": int(existing.get("sent_chunks") or 0),
+                            "code": "in_flight",
+                            "message": "An earlier attempt of this same call is still delivering it.",
+                            "platform": existing["platform"],
+                            "target_address": existing["target_address"],
+                            "confirmed_thread_address": ex_ct_bt2,
+                            "discord_body_phase": ex_bp_bt2,
+                            "delivery_attempt": _delivery_attempt(existing),
+                            "thread_scope_key": existing.get("source_scope_key"),
+                            "files_status": existing.get("files_status") or [],
+                            "is_current": ex_is_cur_bt2,
+                        }
                     ex_scope = (
                         str(existing.get("source_scope_key") or "").strip() or None
                     )
@@ -9564,6 +11563,8 @@ async def authorize_and_claim_delivery(
                 resolved_wx_bot_id: str | None = None
                 resolved_wx_bot_gen: int | None = None
                 verified_source_row: dict[str, Any] | None = None
+                resolved_auth_mode: str = "current_conversation"
+                resolved_verified_ws_id: str | None = None
 
                 # Scenario A1: Direct notice replying to an inbound event
                 if cleaned_kind == "notice" and cleaned_inbound_mid and cleaned_platform:
@@ -9762,6 +11763,7 @@ async def authorize_and_claim_delivery(
                     cleaned_kind == "automation"
                     or (cleaned_kind == "agent_send" and eff_exec_id is not None)
                 ):
+                    resolved_auth_mode = "automation"
                     if (
                         eff_source_scope is not None
                         or eff_source_gen is not None
@@ -9905,6 +11907,9 @@ async def authorize_and_claim_delivery(
                                 required=require_gateway_epoch,
                                 platform="weixin",
                             )
+                            legacy_barrier_denied = await _check_legacy_links_bt2_barrier_in_tx()
+                            if legacy_barrier_denied is not None:
+                                return legacy_barrier_denied
                             miss_uid = cleaned_uid or "unlinked:weixin:"
                             await cur.execute(
                                 """
@@ -10207,6 +12212,8 @@ async def authorize_and_claim_delivery(
                         th_row = await cur.fetchone()
                         if th_row and th_row.get("workspace_id"):
                             source_ws_id = th_row["workspace_id"]
+                    if source_ws_id:
+                        resolved_verified_ws_id = str(source_ws_id).strip() or None
                     home_ws_for_user = get_home_workspace_id(resolved_user_id)
                     if source_ws_id and normalize_uuid(source_ws_id) != normalize_uuid(
                         home_ws_for_user
@@ -10227,6 +12234,7 @@ async def authorize_and_claim_delivery(
 
                 # Scenario C: Explicit target proactive send (kind == "agent_send" && target != null)
                 else:
+                    resolved_auth_mode = "explicit_target"
                     if not cleaned_uid or not cleaned_target or ":" not in cleaned_target:
                         return {
                             "claim_status": "denied",
@@ -10344,6 +12352,7 @@ async def authorize_and_claim_delivery(
                             chats_cfg.get(group_check_addr) or {}
                         ).get("workspace_id")
                         if bound_ws:
+                            resolved_verified_ws_id = str(bound_ws).strip() or None
                             ok, _, _ = await _verify_workspace_write_permission(
                                 cur,
                                 str(bound_ws),
@@ -10584,6 +12593,9 @@ async def authorize_and_claim_delivery(
                     async def _block_ambiguous_weixin_delivery(
                         err_code: str, err_msg: str, meta: dict[str, Any]
                     ) -> dict[str, Any]:
+                        legacy_barrier_denied = await _check_legacy_links_bt2_barrier_in_tx()
+                        if legacy_barrier_denied is not None:
+                            return legacy_barrier_denied
                         await cur.execute(
                             """
                             INSERT INTO dalton_channel_deliveries (
@@ -11219,86 +13231,283 @@ async def authorize_and_claim_delivery(
                 # delivery reclaimed as replay persists activity_origin='replay' so
                 # a later progress update does not extend last_conversation_activity_at.
                 next_attempt = 1 if existing is None else _delivery_attempt(existing) + 1
-                await cur.execute(
-                    """
-                    INSERT INTO dalton_channel_deliveries (
-                        delivery_key, kind, user_id, thread_id, run_id, execution_id,
-                        is_current, has_non_empty_text, platform, target_address,
-                        status, total_chunks, sent_chunks, platform_message_ids,
-                        files_status, source_scope_key, source_generation, activity_origin,
-                        delivery_attempt,
-                        weixin_account_id, weixin_bot_id, weixin_bot_generation, weixin_recipient_id,
-                        dm_recipient_platform_user_id,
-                        created_at, updated_at
+                resolved_source_ws_id = (
+                    resolved_verified_ws_id
+                    or (
+                        str(verified_source_row.get("workspace_id")).strip()
+                        if isinstance(verified_source_row, dict)
+                        and verified_source_row.get("workspace_id")
+                        else None
                     )
-                    VALUES (
-                        %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s,
-                        'in_flight', %s, 0, '[]'::jsonb,
-                        '[]'::jsonb, %s, %s, %s,
-                        1,
-                        %s::uuid, %s, %s, %s,
-                        %s,
-                        NOW(), NOW()
-                    )
-                    ON CONFLICT (delivery_key) DO UPDATE SET
-                        status = 'in_flight',
-                        is_current = EXCLUDED.is_current,
-                        has_non_empty_text = EXCLUDED.has_non_empty_text,
-                        platform = EXCLUDED.platform,
-                        target_address = EXCLUDED.target_address,
-                        total_chunks = EXCLUDED.total_chunks,
-                        error_code = NULL,
-                        error_message = NULL,
-                        delivery_attempt = dalton_channel_deliveries.delivery_attempt + 1,
-                        weixin_account_id = COALESCE(EXCLUDED.weixin_account_id, dalton_channel_deliveries.weixin_account_id),
-                        weixin_bot_id = COALESCE(EXCLUDED.weixin_bot_id, dalton_channel_deliveries.weixin_bot_id),
-                        weixin_bot_generation = COALESCE(EXCLUDED.weixin_bot_generation, dalton_channel_deliveries.weixin_bot_generation),
-                        weixin_recipient_id = COALESCE(EXCLUDED.weixin_recipient_id, dalton_channel_deliveries.weixin_recipient_id),
-                        dm_recipient_platform_user_id = COALESCE(dalton_channel_deliveries.dm_recipient_platform_user_id, EXCLUDED.dm_recipient_platform_user_id),
-                        activity_origin = CASE
-                            WHEN %s
-                             AND dalton_channel_deliveries.status = 'failed'
-                             AND dalton_channel_deliveries.activity_origin = 'conversation'
-                            THEN 'replay'
-                            ELSE dalton_channel_deliveries.activity_origin
-                        END,
-                        updated_at = NOW()
-                    """,
-                    (
-                        cleaned_key,
-                        cleaned_kind,
-                        resolved_user_id,
-                        norm_tid,
-                        cleaned_rid,
-                        eff_exec_id,
-                        is_current,
-                        effective_has_non_empty_text,
-                        resolved_platform,
-                        resolved_target_address,
-                        int(total_chunks or 0),
-                        eff_source_scope,
-                        eff_source_gen,
-                        eff_activity_origin,
-                        resolved_wx_account_id,
-                        resolved_wx_bot_id,
-                        resolved_wx_bot_gen,
-                        resolved_recipient_id if resolved_platform == "weixin" else None,
-                        pinned_dm_recipient,
-                        replay_recovery,
-                    ),
                 )
+                bt2_manifest: list[dict[str, Any]] = []
+                bt2_init_files_status: list[dict[str, Any]] = []
+                bt2_auth_meta: dict[str, Any] | None = None
+                bt2_enrolled = False
+                eff_claim_attempt_id = normalize_uuid(attempt_id) if attempt_id else None
+                has_bt2_file_payload = bool(requested_files)
+
+                if has_bt2_file_payload:
+                    # Share the exact same live authorization check between first I-6,
+                    # BT2 parent/child I-6, and verify-dm-recipient Branch B (§3.5(2)).
+                    first_live_ok, first_live_code, first_live_msg, _ = (
+                        await _verify_delivery_target_live_in_tx(
+                            cur,
+                            auth_mode=resolved_auth_mode,
+                            user_id=str(resolved_user_id or ""),
+                            platform=str(resolved_platform or ""),
+                            target_address=str(resolved_target_address or ""),
+                            is_current=is_current,
+                            execution_id=eff_exec_id,
+                            source_scope_key=eff_source_scope,
+                            source_generation=eff_source_gen,
+                            workspace_id=resolved_source_ws_id,
+                            thread_id=norm_tid,
+                            pinned_dm_recipient=pinned_dm_recipient,
+                            weixin_account_id=resolved_wx_account_id,
+                            weixin_bot_id=resolved_wx_bot_id,
+                            weixin_bot_generation=resolved_wx_bot_gen,
+                            weixin_recipient_id=(
+                                resolved_recipient_id if resolved_platform == "weixin" else None
+                            ),
+                            require_weixin_tuple=(resolved_platform == "weixin"),
+                            conn=owned_conn,
+                        )
+                    )
+                    if not first_live_ok:
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": first_live_code or "not_allowed",
+                            "message": first_live_msg or BT2_DENIED_ERROR_MESSAGE,
+                        }
+
+                    from src.dalton import channel_action_tokens as cat_mod
+
+                    if cat_mod._before_7b0_lock_hook is not None:
+                        await cat_mod._before_7b0_lock_hook("i6_files")
+                    rt_cfg = await cat_mod.read_effective_interrupt_runtime_config_in_tx(
+                        cur, for_update=False
+                    )
+                    if cat_mod._after_7b0_lock_hook is not None:
+                        await cat_mod._after_7b0_lock_hook("i6_files")
+                    bt2_enrolled = bool(rt_cfg["bt2_link_recovery_enabled"])
+                    parent_links_key = derive_bt2_parent_links_key(cleaned_key)
+                    bt2_manifest = build_bt2_deliverable_manifest(
+                        requested_files, parent_links_key
+                    )
+                    bt2_init_files_status = _initial_pending_files_status(bt2_manifest)
+                    if eff_claim_attempt_id is None:
+                        eff_claim_attempt_id = str(uuid4())
+                    link_dm_open_id = (
+                        str(resolved_recipient_id).strip()
+                        if resolved_platform == "feishu"
+                        and resolved_target_address
+                        and _is_bt2_dm_address(resolved_platform, resolved_target_address)
+                        and resolved_recipient_id
+                        else None
+                    )
+                    bt2_auth_meta = {
+                        "auth_mode": resolved_auth_mode,
+                        "platform": resolved_platform,
+                        "target_address": resolved_target_address,
+                        "is_current": is_current,
+                        "thread_scope_key": resolved_thread_scope_key or eff_source_scope,
+                        "workspace_id": resolved_source_ws_id,
+                        "execution_id": eff_exec_id,
+                        "external_topic_id": resp_external_topic_id,
+                        "root_message_id": resp_root_message_id,
+                        "first_reply_message_id": resp_first_reply_message_id,
+                        "confirmed_thread_address": _delivery_confirmed_thread_address(existing),
+                        "dm_recipient_platform_user_id": pinned_dm_recipient,
+                        "link_dm_recipient_open_id": link_dm_open_id,
+                        "weixin_account_id": resolved_wx_account_id,
+                        "weixin_bot_id": resolved_wx_bot_id,
+                        "weixin_bot_generation": resolved_wx_bot_gen,
+                        "weixin_recipient_id": (
+                            resolved_recipient_id if resolved_platform == "weixin" else None
+                        ),
+                        "source_delivery_key": cleaned_key,
+                    }
+                    await cur.execute(
+                        """
+                        INSERT INTO dalton_channel_deliveries (
+                            delivery_key, kind, user_id, thread_id, run_id, execution_id,
+                            is_current, has_non_empty_text, platform, target_address,
+                            status, total_chunks, sent_chunks, platform_message_ids,
+                            files_status, source_scope_key, source_generation, activity_origin,
+                            delivery_attempt,
+                            weixin_account_id, weixin_bot_id, weixin_bot_generation, weixin_recipient_id,
+                            dm_recipient_platform_user_id,
+                            bt2_enrolled, source_delivery_key, deliverable_manifest,
+                            authorized_target_meta, claim_attempt_id, claim_gateway_epoch,
+                            claim_lease_expires_at,
+                            created_at, updated_at
+                        )
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s,
+                            'in_flight', %s, 0, '[]'::jsonb,
+                            %s, %s, %s, %s,
+                            1,
+                            %s::uuid, %s, %s, %s,
+                            %s,
+                            %s, %s, %s,
+                            %s, %s::uuid, %s,
+                            NOW() + (%s || ' seconds')::interval,
+                            NOW(), NOW()
+                        )
+                        ON CONFLICT (delivery_key) DO UPDATE SET
+                            status = 'in_flight',
+                            is_current = EXCLUDED.is_current,
+                            has_non_empty_text = EXCLUDED.has_non_empty_text,
+                            platform = EXCLUDED.platform,
+                            target_address = EXCLUDED.target_address,
+                            total_chunks = EXCLUDED.total_chunks,
+                            error_code = NULL,
+                            error_message = NULL,
+                            delivery_attempt = dalton_channel_deliveries.delivery_attempt + 1,
+                            weixin_account_id = COALESCE(EXCLUDED.weixin_account_id, dalton_channel_deliveries.weixin_account_id),
+                            weixin_bot_id = COALESCE(EXCLUDED.weixin_bot_id, dalton_channel_deliveries.weixin_bot_id),
+                            weixin_bot_generation = COALESCE(EXCLUDED.weixin_bot_generation, dalton_channel_deliveries.weixin_bot_generation),
+                            weixin_recipient_id = COALESCE(EXCLUDED.weixin_recipient_id, dalton_channel_deliveries.weixin_recipient_id),
+                            dm_recipient_platform_user_id = COALESCE(dalton_channel_deliveries.dm_recipient_platform_user_id, EXCLUDED.dm_recipient_platform_user_id),
+                            bt2_enrolled = dalton_channel_deliveries.bt2_enrolled OR EXCLUDED.bt2_enrolled,
+                            source_delivery_key = COALESCE(dalton_channel_deliveries.source_delivery_key, EXCLUDED.source_delivery_key),
+                            deliverable_manifest = CASE
+                            WHEN dalton_channel_deliveries.deliverable_manifest IS NOT NULL
+                             AND jsonb_typeof(dalton_channel_deliveries.deliverable_manifest) = 'array'
+                             AND jsonb_array_length(dalton_channel_deliveries.deliverable_manifest) > 0
+                            THEN dalton_channel_deliveries.deliverable_manifest
+                            ELSE EXCLUDED.deliverable_manifest
+                        END,
+                            authorized_target_meta = COALESCE(dalton_channel_deliveries.authorized_target_meta, EXCLUDED.authorized_target_meta),
+                            files_status = CASE
+                                WHEN jsonb_array_length(COALESCE(dalton_channel_deliveries.files_status, '[]'::jsonb)) > 0
+                                THEN dalton_channel_deliveries.files_status
+                                ELSE EXCLUDED.files_status
+                            END,
+                            claim_attempt_id = EXCLUDED.claim_attempt_id,
+                            claim_gateway_epoch = EXCLUDED.claim_gateway_epoch,
+                            claim_lease_expires_at = EXCLUDED.claim_lease_expires_at,
+                            activity_origin = CASE
+                                WHEN %s
+                                 AND dalton_channel_deliveries.status = 'failed'
+                                 AND dalton_channel_deliveries.activity_origin = 'conversation'
+                                THEN 'replay'
+                                ELSE dalton_channel_deliveries.activity_origin
+                            END,
+                            updated_at = NOW()
+                        """,
+                        (
+                            cleaned_key,
+                            cleaned_kind,
+                            resolved_user_id,
+                            norm_tid,
+                            cleaned_rid,
+                            eff_exec_id,
+                            is_current,
+                            effective_has_non_empty_text,
+                            resolved_platform,
+                            resolved_target_address,
+                            int(total_chunks or 0),
+                            Jsonb(bt2_init_files_status),
+                            eff_source_scope,
+                            eff_source_gen,
+                            eff_activity_origin,
+                            resolved_wx_account_id,
+                            resolved_wx_bot_id,
+                            resolved_wx_bot_gen,
+                            resolved_recipient_id if resolved_platform == "weixin" else None,
+                            pinned_dm_recipient,
+                            bt2_enrolled,
+                            cleaned_key,
+                            Jsonb(bt2_manifest),
+                            Jsonb(bt2_auth_meta),
+                            eff_claim_attempt_id,
+                            gateway_epoch,
+                            str(BT2_SOURCE_OR_PARENT_LEASE_SECONDS),
+                            replay_recovery,
+                        ),
+                    )
+                else:
+                    legacy_barrier_denied = await _check_legacy_links_bt2_barrier_in_tx()
+                    if legacy_barrier_denied is not None:
+                        return legacy_barrier_denied
+                    await cur.execute(
+                        """
+                        INSERT INTO dalton_channel_deliveries (
+                            delivery_key, kind, user_id, thread_id, run_id, execution_id,
+                            is_current, has_non_empty_text, platform, target_address,
+                            status, total_chunks, sent_chunks, platform_message_ids,
+                            files_status, source_scope_key, source_generation, activity_origin,
+                            delivery_attempt,
+                            weixin_account_id, weixin_bot_id, weixin_bot_generation, weixin_recipient_id,
+                            dm_recipient_platform_user_id,
+                            created_at, updated_at
+                        )
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s,
+                            'in_flight', %s, 0, '[]'::jsonb,
+                            '[]'::jsonb, %s, %s, %s,
+                            1,
+                            %s::uuid, %s, %s, %s,
+                            %s,
+                            NOW(), NOW()
+                        )
+                        ON CONFLICT (delivery_key) DO UPDATE SET
+                            status = 'in_flight',
+                            is_current = EXCLUDED.is_current,
+                            has_non_empty_text = EXCLUDED.has_non_empty_text,
+                            platform = EXCLUDED.platform,
+                            target_address = EXCLUDED.target_address,
+                            total_chunks = EXCLUDED.total_chunks,
+                            error_code = NULL,
+                            error_message = NULL,
+                            delivery_attempt = dalton_channel_deliveries.delivery_attempt + 1,
+                            weixin_account_id = COALESCE(EXCLUDED.weixin_account_id, dalton_channel_deliveries.weixin_account_id),
+                            weixin_bot_id = COALESCE(EXCLUDED.weixin_bot_id, dalton_channel_deliveries.weixin_bot_id),
+                            weixin_bot_generation = COALESCE(EXCLUDED.weixin_bot_generation, dalton_channel_deliveries.weixin_bot_generation),
+                            weixin_recipient_id = COALESCE(EXCLUDED.weixin_recipient_id, dalton_channel_deliveries.weixin_recipient_id),
+                            dm_recipient_platform_user_id = COALESCE(dalton_channel_deliveries.dm_recipient_platform_user_id, EXCLUDED.dm_recipient_platform_user_id),
+                            activity_origin = CASE
+                                WHEN %s
+                                 AND dalton_channel_deliveries.status = 'failed'
+                                 AND dalton_channel_deliveries.activity_origin = 'conversation'
+                                THEN 'replay'
+                                ELSE dalton_channel_deliveries.activity_origin
+                            END,
+                            updated_at = NOW()
+                        """,
+                        (
+                            cleaned_key,
+                            cleaned_kind,
+                            resolved_user_id,
+                            norm_tid,
+                            cleaned_rid,
+                            eff_exec_id,
+                            is_current,
+                            effective_has_non_empty_text,
+                            resolved_platform,
+                            resolved_target_address,
+                            int(total_chunks or 0),
+                            eff_source_scope,
+                            eff_source_gen,
+                            eff_activity_origin,
+                            resolved_wx_account_id,
+                            resolved_wx_bot_id,
+                            resolved_wx_bot_gen,
+                            resolved_recipient_id if resolved_platform == "weixin" else None,
+                            pinned_dm_recipient,
+                            replay_recovery,
+                        ),
+                    )
 
                 home_ws_id = (
                     get_home_workspace_id(resolved_user_id)
                     if resolved_user_id
                     and not str(resolved_user_id).startswith("unlinked:")
-                    else None
-                )
-                resolved_source_ws_id = (
-                    str(verified_source_row.get("workspace_id")).strip()
-                    if isinstance(verified_source_row, dict)
-                    and verified_source_row.get("workspace_id")
                     else None
                 )
                 resp_claim: dict[str, Any] = {
@@ -11323,6 +13532,11 @@ async def authorize_and_claim_delivery(
                     "home_workspace_id": home_ws_id,
                     "weixin_context_token": weixin_ctx_token,
                 }
+                if has_bt2_file_payload:
+                    resp_claim["bt2_enrolled"] = bt2_enrolled
+                    resp_claim["claim_attempt_id"] = eff_claim_attempt_id
+                    resp_claim["deliverable_manifest"] = bt2_manifest
+                    resp_claim["authorized_target_meta"] = bt2_auth_meta
                 if resolved_platform == "weixin":
                     resp_claim["weixin_account_id"] = resolved_wx_account_id
                     resp_claim["weixin_bot_id"] = resolved_wx_bot_id
@@ -11347,6 +13561,217 @@ def _count_delivered_files(items: Any) -> int:
     )
 
 
+class _DeliveryProgressOriginLockSetChanged(Exception):
+    """Internal control-flow signal: roll back and retry I-7 when the locked
+    delivery row's ``run_id`` or the set of originating inbound/background_run
+    rows to update differs from the unlocked pre-read lock set."""
+
+
+async def _preread_i7_origin_rows(
+    cleaned_key: str,
+    *,
+    is_bt2_parent_key: bool,
+    conn: Any = None,
+) -> dict[str, Any]:
+    """Unlocked pre-read shared by I-7 BT2 parent ``fallback_pending`` clearing
+    and I-7 ``sent_to_current_count`` incrementing so the write transaction locks
+    originating rows in strict Lock Order ②:
+    ``0b-1 -> 0b-2 -> 0b-3 -> 3a -> 6 -> 7a-1 (inbound) -> 7a-3 (background_runs) -> 7a-4 (deliveries)``.
+    """
+    pre_inb_keys: set[tuple[str, str]] = set()
+    pre_bg_keys: set[tuple[str, str]] = set()
+    pre_wx_aids: set[str] = set()
+    pre_run_id: str | None = None
+    mode = "none"
+
+    is_increment_candidate_key = not cleaned_key.startswith(
+        ("deliverables:", "deliverables-links:")
+    )
+    if not is_bt2_parent_key and not is_increment_candidate_key:
+        return {
+            "mode": mode,
+            "pre_run_id": pre_run_id,
+            "inb_keys": [],
+            "bg_keys": [],
+            "wx_aids": pre_wx_aids,
+        }
+
+    async with get_db_connection(conn) as pre_conn:
+        async with pre_conn.cursor(row_factory=dict_row) as pre_cur:
+            await pre_cur.execute(
+                """
+                SELECT run_id, platform, is_current, has_non_empty_text, status,
+                       weixin_account_id::text AS weixin_account_id
+                FROM dalton_channel_deliveries
+                WHERE delivery_key = %s
+                """,
+                (cleaned_key,),
+            )
+            p_del = await pre_cur.fetchone()
+            if not p_del:
+                return {
+                    "mode": mode,
+                    "pre_run_id": pre_run_id,
+                    "inb_keys": [],
+                    "bg_keys": [],
+                    "wx_aids": pre_wx_aids,
+                }
+            p_rid = str(p_del.get("run_id") or "").strip()
+            if is_bt2_parent_key:
+                mode = "bt2_parent"
+                if p_del.get("weixin_account_id"):
+                    pre_wx_aids.add(str(p_del["weixin_account_id"]))
+                if p_rid:
+                    pre_run_id = p_rid
+                    await pre_cur.execute(
+                        """
+                        SELECT platform, message_id, weixin_account_id::text AS weixin_account_id
+                        FROM dalton_channel_inbound_events
+                        WHERE run_id = %s AND fallback_pending = TRUE
+                        ORDER BY platform ASC, message_id ASC
+                        """,
+                        (p_rid,),
+                    )
+                    for ir in await pre_cur.fetchall():
+                        if ir.get("platform") and ir.get("message_id"):
+                            pre_inb_keys.add(
+                                (
+                                    str(ir["platform"]).strip().lower(),
+                                    str(ir["message_id"]).strip(),
+                                )
+                            )
+                        if ir.get("weixin_account_id"):
+                            pre_wx_aids.add(str(ir["weixin_account_id"]))
+                    await pre_cur.execute(
+                        """
+                        SELECT thread_id::text AS thread_id, run_id,
+                               weixin_account_id::text AS weixin_account_id
+                        FROM dalton_channel_background_runs
+                        WHERE run_id = %s AND fallback_pending = TRUE
+                        ORDER BY thread_id ASC, run_id ASC
+                        """,
+                        (p_rid,),
+                    )
+                    for br in await pre_cur.fetchall():
+                        if br.get("thread_id") and br.get("run_id"):
+                            pre_bg_keys.add((str(br["thread_id"]), str(br["run_id"])))
+                        if br.get("weixin_account_id"):
+                            pre_wx_aids.add(str(br["weixin_account_id"]))
+            else:
+                p_status = str(p_del.get("status") or "").strip().lower()
+                if (
+                    bool(p_del.get("is_current"))
+                    and bool(p_del.get("has_non_empty_text"))
+                    and p_rid
+                    and p_status not in ("sent", "partial")
+                ):
+                    mode = "sent_count"
+                    pre_run_id = p_rid
+                    if p_del.get("weixin_account_id"):
+                        pre_wx_aids.add(str(p_del["weixin_account_id"]))
+                    await pre_cur.execute(
+                        """
+                        SELECT platform, message_id, weixin_account_id::text AS weixin_account_id
+                        FROM dalton_channel_inbound_events
+                        WHERE run_id = %s
+                        ORDER BY platform ASC, message_id ASC
+                        """,
+                        (p_rid,),
+                    )
+                    for ir in await pre_cur.fetchall():
+                        if ir.get("platform") and ir.get("message_id"):
+                            pre_inb_keys.add(
+                                (
+                                    str(ir["platform"]).strip().lower(),
+                                    str(ir["message_id"]).strip(),
+                                )
+                            )
+                        if ir.get("weixin_account_id"):
+                            pre_wx_aids.add(str(ir["weixin_account_id"]))
+                    await pre_cur.execute(
+                        """
+                        SELECT thread_id::text AS thread_id, run_id,
+                               weixin_account_id::text AS weixin_account_id
+                        FROM dalton_channel_background_runs
+                        WHERE run_id = %s
+                        ORDER BY thread_id ASC, run_id ASC
+                        """,
+                        (p_rid,),
+                    )
+                    for br in await pre_cur.fetchall():
+                        if br.get("thread_id") and br.get("run_id"):
+                            pre_bg_keys.add((str(br["thread_id"]), str(br["run_id"])))
+                        if br.get("weixin_account_id"):
+                            pre_wx_aids.add(str(br["weixin_account_id"]))
+
+    return {
+        "mode": mode,
+        "pre_run_id": pre_run_id,
+        "inb_keys": sorted(pre_inb_keys),
+        "bg_keys": sorted(pre_bg_keys),
+        "wx_aids": pre_wx_aids,
+    }
+
+
+async def _lock_i7_origin_rows_in_tx(
+    cur: Any,
+    *,
+    sorted_inb_keys: list[tuple[str, str]],
+    sorted_bg_keys: list[tuple[str, str]],
+    locked_wx_aids: set[str],
+) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
+    """Acquire Level 7a-1 (``inbound_events``) and 7a-3 (``background_runs``)
+    ``FOR UPDATE`` locks in ascending primary-key order strictly BEFORE locking
+    Level 7a-4 (``dalton_channel_deliveries``)."""
+    locked_inbounds: dict[tuple[str, str], dict[str, Any]] = {}
+    for inb_plat, inb_mid in sorted_inb_keys:
+        await cur.execute(
+            """
+            SELECT platform, message_id, status, run_id, fallback_pending,
+                   sent_to_current_count,
+                   weixin_account_id::text AS weixin_account_id
+            FROM dalton_channel_inbound_events
+            WHERE platform = %s AND message_id = %s
+            FOR UPDATE
+            """,
+            (inb_plat, inb_mid),
+        )
+        inb_r = await cur.fetchone()
+        if inb_r:
+            d_inb = dict(inb_r)
+            if (
+                d_inb.get("weixin_account_id")
+                and str(d_inb["weixin_account_id"]) not in locked_wx_aids
+            ):
+                raise wx_db.WeixinLockSetChanged()
+            locked_inbounds[(inb_plat, inb_mid)] = d_inb
+
+    locked_bg_runs: dict[tuple[str, str], dict[str, Any]] = {}
+    for bg_tid, bg_rid in sorted_bg_keys:
+        await cur.execute(
+            """
+            SELECT thread_id::text AS thread_id, run_id, status, fallback_pending,
+                   sent_to_current_count,
+                   weixin_account_id::text AS weixin_account_id
+            FROM dalton_channel_background_runs
+            WHERE thread_id = %s::uuid AND run_id = %s
+            FOR UPDATE
+            """,
+            (bg_tid, bg_rid),
+        )
+        bg_r = await cur.fetchone()
+        if bg_r:
+            d_bg = dict(bg_r)
+            if (
+                d_bg.get("weixin_account_id")
+                and str(d_bg["weixin_account_id"]) not in locked_wx_aids
+            ):
+                raise wx_db.WeixinLockSetChanged()
+            locked_bg_runs[(bg_tid, bg_rid)] = d_bg
+
+    return locked_inbounds, locked_bg_runs
+
+
 async def update_delivery_progress(
     *,
     delivery_key: str,
@@ -11362,35 +13787,44 @@ async def update_delivery_progress(
     confirmed_thread_address: str | None = None,
     discord_body_phase: str | None = None,
     delivery_attempt: int | None = None,
+    claim_attempt_id: str | None = None,
     bot_topic_registration: dict[str, Any] | None = None,
     gateway_epoch: int | None = None,
     require_gateway_epoch: bool = False,
     conn: Any = None,
 ) -> dict[str, Any]:
     """I-7 (1): Update `dalton_channel_deliveries`, increment `sent_to_current_count`, and update conversation activity timestamp."""
-    return await _run_tx_with_retry(
-        "update_delivery_progress",
-        conn,
-        lambda c: _update_delivery_progress_once(
-            delivery_key=delivery_key,
-            sent_chunks=sent_chunks,
-            total_chunks=total_chunks,
-            platform_message_ids=platform_message_ids,
-            files_status=files_status,
-            first_response_json=first_response_json,
-            status=status,
-            outcome=outcome,
-            error_code=error_code,
-            error_message=error_message,
-            confirmed_thread_address=confirmed_thread_address,
-            discord_body_phase=discord_body_phase,
-            delivery_attempt=delivery_attempt,
-            bot_topic_registration=bot_topic_registration,
-            gateway_epoch=gateway_epoch,
-            require_gateway_epoch=require_gateway_epoch,
-            conn=c,
-        ),
-    )
+    for attempt in range(1, _TX_RETRY_MAX_ATTEMPTS + 1):
+        try:
+            return await _run_tx_with_retry(
+                "update_delivery_progress",
+                conn,
+                lambda c: _update_delivery_progress_once(
+                    delivery_key=delivery_key,
+                    sent_chunks=sent_chunks,
+                    total_chunks=total_chunks,
+                    platform_message_ids=platform_message_ids,
+                    files_status=files_status,
+                    first_response_json=first_response_json,
+                    status=status,
+                    outcome=outcome,
+                    error_code=error_code,
+                    error_message=error_message,
+                    confirmed_thread_address=confirmed_thread_address,
+                    discord_body_phase=discord_body_phase,
+                    delivery_attempt=delivery_attempt,
+                    claim_attempt_id=claim_attempt_id,
+                    bot_topic_registration=bot_topic_registration,
+                    gateway_epoch=gateway_epoch,
+                    require_gateway_epoch=require_gateway_epoch,
+                    conn=c,
+                ),
+            )
+        except (wx_db.WeixinLockSetChanged, _DeliveryProgressOriginLockSetChanged):
+            if attempt >= _TX_RETRY_MAX_ATTEMPTS:
+                raise
+            await asyncio.sleep(0.02 * attempt)
+    raise RuntimeError("update_delivery_progress retry loop exhausted")
 
 
 async def _update_delivery_progress_once(
@@ -11408,6 +13842,7 @@ async def _update_delivery_progress_once(
     confirmed_thread_address: str | None = None,
     discord_body_phase: str | None = None,
     delivery_attempt: int | None = None,
+    claim_attempt_id: str | None = None,
     bot_topic_registration: dict[str, Any] | None = None,
     gateway_epoch: int | None = None,
     require_gateway_epoch: bool = False,
@@ -11417,9 +13852,29 @@ async def _update_delivery_progress_once(
     if not cleaned_key:
         raise HTTPException(status_code=400, detail="delivery_key is required")
 
+    # Pre-read originating inbound/background_run PKs and Weixin account_ids outside
+    # the write transaction for BOTH BT2 parent fallback settlement AND source-delivery
+    # sent_to_current_count increments so locks are strictly acquired in Lock Order ②:
+    # 0b-1 -> 0b-2 -> 0b-3 -> 3a -> 6 -> 7a-1 (inbound) -> 7a-3 (background_runs) -> 7a-4 (deliveries).
+    is_bt2_parent_key = is_bt2_links_key(cleaned_key) and not is_bt2_item_key(cleaned_key)
+    pre_origin = await _preread_i7_origin_rows(
+        cleaned_key,
+        is_bt2_parent_key=is_bt2_parent_key,
+        conn=conn,
+    )
+    sorted_inb_keys: list[tuple[str, str]] = pre_origin["inb_keys"]
+    sorted_bg_keys: list[tuple[str, str]] = pre_origin["bg_keys"]
+    pre_wx_aids: set[str] = pre_origin["wx_aids"]
+
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
+                # Level 0b-1 (when settling BT2 parent fallback targets)
+                for inb_plat, inb_mid in sorted_inb_keys:
+                    await cur.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                        (f"dalton_inbound:{inb_plat}:{inb_mid}",),
+                    )
                 await wx_db.verify_gateway_epoch_in_tx(
                     cur,
                     gateway_epoch,
@@ -11476,6 +13931,11 @@ async def _update_delivery_progress_once(
                     if pre_topic_addr:
                         await _acquire_bot_topic_lock(cur, src_plat, pre_topic_addr)
 
+                # Level 3a: Weixin accounts FOR KEY SHARE before Level 6 & 7a
+                locked_wx_aids, _ = await _lock_weixin_accounts_sorted_for_key_share_in_tx(
+                    cur, pre_wx_aids
+                )
+
                 if (
                     act_origin == "conversation"
                     and src_uid
@@ -11498,7 +13958,15 @@ async def _update_delivery_progress_once(
                         locked_session_row = dict(s_row)
                     db_now = await _fetch_db_now(cur)
 
-                # 2. Lock delivery row FOR UPDATE
+                # Level 7a-1 & 7a-3: Lock pre-read inbound_events & background_runs BEFORE deliveries
+                locked_bt2_inbounds, locked_bt2_bg_runs = await _lock_i7_origin_rows_in_tx(
+                    cur,
+                    sorted_inb_keys=sorted_inb_keys,
+                    sorted_bg_keys=sorted_bg_keys,
+                    locked_wx_aids=locked_wx_aids,
+                )
+
+                # 2. Lock delivery row FOR UPDATE (Level 7a-4)
                 await cur.execute(
                     """
                     SELECT * FROM dalton_channel_deliveries
@@ -11524,11 +13992,37 @@ async def _update_delivery_progress_once(
 
                 prev_status = str(row["status"])
                 # A named generation must still be the current one before any
-                # column changes. Omitted generations keep the previous update
-                # rules for callers that have not adopted the token.
+                # column changes. Rows that already persist claim_attempt_id (BT2
+                # source/parent/item) strictly require BOTH delivery_attempt AND
+                # claim_attempt_id to be supplied and match. Legacy rows without
+                # claim_attempt_id keep backward-compatible optional checks.
                 current_attempt = _delivery_attempt(row)
                 requested_attempt = _requested_delivery_attempt(delivery_attempt)
-                if (
+                stored_claim_aid = (
+                    str(row["claim_attempt_id"]).strip()
+                    if row.get("claim_attempt_id")
+                    else None
+                )
+                req_claim_aid = (
+                    str(claim_attempt_id).strip()
+                    if claim_attempt_id is not None and str(claim_attempt_id).strip()
+                    else None
+                )
+                if stored_claim_aid is not None:
+                    if (
+                        requested_attempt is None
+                        or requested_attempt != current_attempt
+                        or req_claim_aid is None
+                        or req_claim_aid != stored_claim_aid
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "stale_delivery_attempt",
+                                "message": "Both delivery_attempt and claim_attempt_id are required and must match the current delivery attempt.",
+                            },
+                        )
+                elif (
                     requested_attempt is not None
                     and requested_attempt != current_attempt
                 ):
@@ -11594,16 +14088,117 @@ async def _update_delivery_progress_once(
                 )
                 prev_files = row.get("files_status") or []
                 prev_delivered_files = _count_delivered_files(prev_files)
+                row_manifest = row.get("deliverable_manifest")
+                has_row_manifest = isinstance(row_manifest, list) and len(row_manifest) > 0
                 if files_status is not None:
                     cand_delivered_files = _count_delivered_files(files_status)
-                    new_files_status = (
-                        files_status
-                        if cand_delivered_files >= prev_delivered_files
-                        else prev_files
-                    )
+                    if has_row_manifest and not is_bt2_links_key(cleaned_key):
+                        new_files_status = _merge_source_files_status_preserving_pending(
+                            row_manifest, prev_files, files_status
+                        )
+                    else:
+                        new_files_status = (
+                            files_status
+                            if cand_delivered_files >= prev_delivered_files
+                            else prev_files
+                        )
                 else:
                     cand_delivered_files = prev_delivered_files
-                    new_files_status = prev_files
+                    if has_row_manifest and not is_bt2_links_key(cleaned_key):
+                        new_files_status = _merge_source_files_status_preserving_pending(
+                            row_manifest, prev_files, []
+                        )
+                    else:
+                        new_files_status = prev_files
+
+                # BT2 parent I-7 manifest verification (§3.5(4)):
+                # - Explicit send parent (`source_delivery_key` != `deliverables:<run_id>`):
+                #   verify EVERY manifest item against THIS parent's own `:item:` children or
+                #   its own `source_delivery_key` row's `files_status`.
+                # - Auto-attach DM parent (`deliverables-links:<run_id>` / `source_delivery_key == deliverables:<run_id>`):
+                #   verify against `:item:` children or run-level `is_current = TRUE` `prior_run_files`.
+                is_bt2_parent = is_bt2_links_key(cleaned_key) and not is_bt2_item_key(cleaned_key)
+                if is_bt2_parent and new_status == "sent" and has_row_manifest:
+                    await cur.execute(
+                        """
+                        SELECT delivery_key, status, error_code
+                        FROM dalton_channel_deliveries
+                        WHERE delivery_key LIKE %s
+                        """,
+                        (f"{cleaned_key}:item:%",),
+                    )
+                    child_by_key = {
+                        str(cr["delivery_key"]): dict(cr) for cr in await cur.fetchall()
+                    }
+                    src_key_val = str(row.get("source_delivery_key") or "").strip()
+                    run_id_str = str(row.get("run_id") or "").strip()
+                    is_auto_attach_parent = bool(
+                        run_id_str
+                        and (
+                            src_key_val == f"deliverables:{run_id_str}"
+                            or (not src_key_val and cleaned_key == f"deliverables-links:{run_id_str}")
+                        )
+                    )
+                    confirmed_pairs: set[tuple[str, str]] = set()
+                    if is_auto_attach_parent and run_id_str:
+                        await cur.execute(
+                            """
+                            SELECT files_status
+                            FROM dalton_channel_deliveries
+                            WHERE run_id = %s
+                              AND is_current = TRUE
+                              AND delivery_key <> %s
+                            """,
+                            (run_id_str, cleaned_key),
+                        )
+                        for pr in await cur.fetchall():
+                            if isinstance(pr.get("files_status"), list):
+                                for fs_e in pr["files_status"]:
+                                    if isinstance(fs_e, dict) and str(fs_e.get("status") or "").strip().lower() in ("sent", "linked"):
+                                        confirmed_pairs.add(
+                                            (
+                                                str(fs_e.get("workspace_id") or "").strip(),
+                                                _normalize_bt2_manifest_path(fs_e.get("path")),
+                                            )
+                                        )
+                    elif src_key_val:
+                        await cur.execute(
+                            """
+                            SELECT files_status
+                            FROM dalton_channel_deliveries
+                            WHERE delivery_key = %s
+                            """,
+                            (src_key_val,),
+                        )
+                        s_r = await cur.fetchone()
+                        if s_r and isinstance(s_r.get("files_status"), list):
+                            for fs_e in s_r["files_status"]:
+                                if isinstance(fs_e, dict) and str(fs_e.get("status") or "").strip().lower() in ("sent", "linked"):
+                                    confirmed_pairs.add(
+                                        (
+                                            str(fs_e.get("workspace_id") or "").strip(),
+                                            _normalize_bt2_manifest_path(fs_e.get("path")),
+                                        )
+                                    )
+
+                    all_manifest_confirmed = True
+                    for m_item in row_manifest:
+                        if not isinstance(m_item, dict):
+                            continue
+                        m_ikey = str(m_item.get("item_key") or "").strip()
+                        m_pair = (
+                            str(m_item.get("workspace_id") or "").strip(),
+                            _normalize_bt2_manifest_path(m_item.get("path")),
+                        )
+                        c_row = child_by_key.get(m_ikey)
+                        c_sent = bool(c_row and str(c_row.get("status") or "").strip().lower() == "sent")
+                        if not c_sent and m_pair not in confirmed_pairs:
+                            all_manifest_confirmed = False
+                            break
+                    if not all_manifest_confirmed:
+                        new_status = "partial"
+                    else:
+                        eff_error_code = None
 
                 new_first_resp = (
                     first_response_json
@@ -11686,32 +14281,183 @@ async def _update_delivery_progress_once(
                             root_message_id=reg_root_mid,
                         )
 
-                await cur.execute(
-                    """
-                    UPDATE dalton_channel_deliveries
-                    SET sent_chunks = %s,
-                        total_chunks = %s,
-                        platform_message_ids = %s,
-                        files_status = %s,
-                        first_response_json = %s,
-                        status = %s,
-                        error_code = COALESCE(%s::varchar, error_code),
-                        error_message = COALESCE(%s::text, error_message),
-                        updated_at = NOW()
-                    WHERE delivery_key = %s
-                    """,
-                    (
-                        new_sent_chunks,
-                        new_total_chunks,
-                        Jsonb(new_msg_ids),
-                        Jsonb(new_files_status),
-                        Jsonb(new_first_resp) if new_first_resp is not None else None,
-                        new_status,
-                        eff_error_code,
-                        eff_error_message,
-                        cleaned_key,
-                    ),
+                refresh_lease_seconds: int | None = None
+                if new_status in ("in_flight", "partial") and stored_claim_aid is not None:
+                    refresh_lease_seconds = (
+                        BT2_ITEM_LEASE_SECONDS
+                        if is_bt2_item_key(cleaned_key)
+                        else BT2_SOURCE_OR_PARENT_LEASE_SECONDS
+                    )
+
+                run_id_val = str(row.get("run_id") or "").strip() or None
+                will_increment_sent_count = bool(
+                    bool(row.get("is_current"))
+                    and bool(row.get("has_non_empty_text"))
+                    and not cleaned_key.startswith(("deliverables:", "deliverables-links:"))
+                    and new_status in ("sent", "partial")
+                    and prev_status not in ("sent", "partial")
+                    and run_id_val
                 )
+                if will_increment_sent_count:
+                    # Verify pre-read run_id and locked origin row sets match current DB state
+                    # before performing any writes so updates never acquire locks after 7a-4.
+                    if (
+                        pre_origin["mode"] != "sent_count"
+                        or pre_origin["pre_run_id"] != run_id_val
+                    ):
+                        raise _DeliveryProgressOriginLockSetChanged(
+                            f"I-7 run_id drifted before 7a-4 lock ({pre_origin['pre_run_id']} -> {run_id_val})"
+                        )
+                    await cur.execute(
+                        """
+                        SELECT platform, message_id
+                        FROM dalton_channel_inbound_events
+                        WHERE run_id = %s
+                        ORDER BY platform ASC, message_id ASC
+                        """,
+                        (run_id_val,),
+                    )
+                    actual_inb_keys = {
+                        (str(r["platform"]).strip().lower(), str(r["message_id"]).strip())
+                        for r in await cur.fetchall()
+                        if r.get("platform") and r.get("message_id")
+                    }
+                    await cur.execute(
+                        """
+                        SELECT thread_id::text AS thread_id, run_id
+                        FROM dalton_channel_background_runs
+                        WHERE run_id = %s
+                        ORDER BY thread_id ASC, run_id ASC
+                        """,
+                        (run_id_val,),
+                    )
+                    actual_bg_keys = {
+                        (str(r["thread_id"]), str(r["run_id"]))
+                        for r in await cur.fetchall()
+                        if r.get("thread_id") and r.get("run_id")
+                    }
+                    if (
+                        actual_inb_keys != set(locked_bt2_inbounds.keys())
+                        or actual_bg_keys != set(locked_bt2_bg_runs.keys())
+                        or any(
+                            str(r.get("run_id") or "").strip() != run_id_val
+                            for r in locked_bt2_inbounds.values()
+                        )
+                        or any(
+                            str(r.get("run_id") or "").strip() != run_id_val
+                            for r in locked_bt2_bg_runs.values()
+                        )
+                    ):
+                        raise _DeliveryProgressOriginLockSetChanged(
+                            "I-7 originating inbound/background_run lock set changed"
+                        )
+
+                if refresh_lease_seconds is not None:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_channel_deliveries
+                        SET sent_chunks = %s,
+                            total_chunks = %s,
+                            platform_message_ids = %s,
+                            files_status = %s,
+                            first_response_json = %s,
+                            status = %s,
+                            error_code = COALESCE(%s::varchar, error_code),
+                            error_message = COALESCE(%s::text, error_message),
+                            claim_lease_expires_at = NOW() + (%s || ' seconds')::interval,
+                            updated_at = NOW()
+                        WHERE delivery_key = %s
+                        """,
+                        (
+                            new_sent_chunks,
+                            new_total_chunks,
+                            Jsonb(new_msg_ids),
+                            Jsonb(new_files_status),
+                            Jsonb(new_first_resp) if new_first_resp is not None else None,
+                            new_status,
+                            eff_error_code,
+                            eff_error_message,
+                            str(refresh_lease_seconds),
+                            cleaned_key,
+                        ),
+                    )
+                elif is_bt2_parent and new_status == "sent":
+                    await cur.execute(
+                        """
+                        UPDATE dalton_channel_deliveries
+                        SET sent_chunks = %s,
+                            total_chunks = %s,
+                            platform_message_ids = %s,
+                            files_status = %s,
+                            first_response_json = %s,
+                            status = %s,
+                            error_code = NULL,
+                            error_message = COALESCE(%s::text, error_message),
+                            updated_at = NOW()
+                        WHERE delivery_key = %s
+                        """,
+                        (
+                            new_sent_chunks,
+                            new_total_chunks,
+                            Jsonb(new_msg_ids),
+                            Jsonb(new_files_status),
+                            Jsonb(new_first_resp) if new_first_resp is not None else None,
+                            new_status,
+                            eff_error_message,
+                            cleaned_key,
+                        ),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_channel_deliveries
+                        SET sent_chunks = %s,
+                            total_chunks = %s,
+                            platform_message_ids = %s,
+                            files_status = %s,
+                            first_response_json = %s,
+                            status = %s,
+                            error_code = COALESCE(%s::varchar, error_code),
+                            error_message = COALESCE(%s::text, error_message),
+                            updated_at = NOW()
+                        WHERE delivery_key = %s
+                        """,
+                        (
+                            new_sent_chunks,
+                            new_total_chunks,
+                            Jsonb(new_msg_ids),
+                            Jsonb(new_files_status),
+                            Jsonb(new_first_resp) if new_first_resp is not None else None,
+                            new_status,
+                            eff_error_code,
+                            eff_error_message,
+                            cleaned_key,
+                        ),
+                    )
+
+                bt2_terminal_settled = False
+                if is_bt2_parent and (
+                    new_status == "sent"
+                    or (
+                        new_status == "failed"
+                        and str(eff_error_code or row.get("error_code") or "").strip().lower()
+                        in BT2_TERMINAL_FAILURE_CODES
+                    )
+                ):
+                    bt2_terminal_settled = True
+                    await _settle_bt2_turn_fallback_pending_in_tx(
+                        cur,
+                        run_id=row.get("run_id"),
+                        settling_delivery_key=cleaned_key,
+                        is_item=False,
+                        locked_inbounds=locked_bt2_inbounds,
+                        locked_bg_runs=locked_bt2_bg_runs,
+                        error_code=(
+                            str(eff_error_code or row.get("error_code") or "")
+                            if new_status == "failed"
+                            else None
+                        ),
+                    )
 
                 # 3. Conditionally advance last_conversation_activity_at when new conversation output was delivered
                 made_new_output_progress = (
@@ -11760,41 +14506,35 @@ async def _update_delivery_progress_once(
                         )
 
                 updated_count = 0
-                run_id_val = row.get("run_id")
-                if (
-                    bool(row.get("is_current"))
-                    and bool(row.get("has_non_empty_text"))
-                    and not cleaned_key.startswith(("deliverables:", "deliverables-links:"))
-                    and new_status in ("sent", "partial")
-                    and prev_status not in ("sent", "partial")
-                    and run_id_val
-                ):
-                    await cur.execute(
-                        """
-                        UPDATE dalton_channel_inbound_events
-                        SET sent_to_current_count = sent_to_current_count + 1,
-                            updated_at = NOW()
-                        WHERE run_id = %s
-                        RETURNING sent_to_current_count
-                        """,
-                        (str(run_id_val),),
-                    )
-                    in_res = await cur.fetchone()
-                    if in_res:
-                        updated_count = int(in_res["sent_to_current_count"])
-                    await cur.execute(
-                        """
-                        UPDATE dalton_channel_background_runs
-                        SET sent_to_current_count = sent_to_current_count + 1,
-                            updated_at = NOW()
-                        WHERE run_id = %s
-                        RETURNING sent_to_current_count
-                        """,
-                        (str(run_id_val),),
-                    )
-                    bg_res = await cur.fetchone()
-                    if bg_res and not updated_count:
-                        updated_count = int(bg_res["sent_to_current_count"])
+                if will_increment_sent_count:
+                    for inb_plat, inb_mid in sorted(locked_bt2_inbounds.keys()):
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_inbound_events
+                            SET sent_to_current_count = sent_to_current_count + 1,
+                                updated_at = NOW()
+                            WHERE platform = %s AND message_id = %s
+                            RETURNING sent_to_current_count
+                            """,
+                            (inb_plat, inb_mid),
+                        )
+                        in_res = await cur.fetchone()
+                        if in_res and not updated_count:
+                            updated_count = int(in_res["sent_to_current_count"])
+                    for bg_tid, bg_rid in sorted(locked_bt2_bg_runs.keys()):
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_background_runs
+                            SET sent_to_current_count = sent_to_current_count + 1,
+                                updated_at = NOW()
+                            WHERE thread_id = %s::uuid AND run_id = %s
+                            RETURNING sent_to_current_count
+                            """,
+                            (bg_tid, bg_rid),
+                        )
+                        bg_res = await cur.fetchone()
+                        if bg_res and not updated_count:
+                            updated_count = int(bg_res["sent_to_current_count"])
 
                 return {
                     "ok": True,
@@ -11806,6 +14546,7 @@ async def _update_delivery_progress_once(
                     "delivery_attempt": current_attempt,
                     "bot_topic_registered": registered_topic_id is not None,
                     "external_topic_id": registered_topic_id,
+                    "bt2_terminal_settled": bt2_terminal_settled,
                 }
 
 
@@ -14051,6 +16792,289 @@ async def recover_channel_state(
     raise RuntimeError("recover_channel_state retry loop exhausted")
 
 
+async def _fetch_recovery_interrupt_and_bt2_work_in_tx(
+    cur: Any,
+    *,
+    enabled_platforms: list[str],
+    limit: int = 100,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fetch BT2 unsettled link deliveries (7a), interrupt_resumes (7b-2), and
+    late-patch / send-in-flight action tokens (7b-3) under Lock Order ⑥."""
+    if not enabled_platforms:
+        return [], [], [], []
+
+    # 7a deliveries: shared unsettled BT2 link recovery predicate (§3.5(5) & §5.4)
+    await cur.execute(
+        """
+        SELECT src.delivery_key,
+               src.kind,
+               src.user_id,
+               src.thread_id::text AS thread_id,
+               src.run_id,
+               src.execution_id::text AS execution_id,
+               src.is_current,
+               src.platform,
+               src.target_address,
+               src.status,
+               src.error_code,
+               src.error_message,
+               src.delivery_attempt,
+               src.files_status,
+               src.bt2_enrolled,
+               src.source_delivery_key,
+               src.deliverable_manifest,
+               src.authorized_target_meta,
+               src.claim_attempt_id::text AS claim_attempt_id,
+               src.claim_gateway_epoch,
+               src.claim_lease_expires_at,
+               src.updated_at,
+               CASE
+                   WHEN src.delivery_key LIKE 'deliverables-links:%%' THEN 'parent_links'
+                   ELSE 'source_missing_parent'
+               END AS recovery_kind
+        FROM dalton_channel_deliveries src
+        WHERE src.platform = ANY(%s::varchar[])
+          AND (
+              (
+                  src.delivery_key LIKE 'deliverables-links:%%'
+                  AND src.delivery_key NOT LIKE 'deliverables-links:%%:item:%%'
+                  AND (
+                      src.status IN ('in_flight', 'partial', 'unknown')
+                      OR (
+                          src.status = 'failed'
+                          AND COALESCE(src.error_code, '') NOT IN (
+                              'not_allowed',
+                              'max_attempts_exceeded',
+                              'skipped_platform_disabled'
+                          )
+                      )
+                  )
+              )
+              OR (
+                  src.bt2_enrolled = TRUE
+                  AND src.delivery_key NOT LIKE 'deliverables-links:%%'
+                  AND src.deliverable_manifest IS NOT NULL
+                  AND jsonb_typeof(src.deliverable_manifest) = 'array'
+                  AND jsonb_array_length(src.deliverable_manifest) > 0
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM dalton_channel_deliveries p
+                      WHERE p.delivery_key = CASE
+                          WHEN src.delivery_key LIKE 'deliverables:%%'
+                          THEN 'deliverables-links:' || substr(src.delivery_key, 14)
+                          ELSE 'deliverables-links:' || src.delivery_key
+                      END
+                  )
+                  AND (
+                      src.status = 'in_flight'
+                      OR (
+                          (
+                              src.status IN ('sent', 'partial', 'unknown')
+                              OR (
+                                  src.status = 'failed'
+                                  AND COALESCE(src.error_code, '') NOT IN (
+                                      'not_allowed',
+                                      'max_attempts_exceeded',
+                                      'skipped_platform_disabled'
+                                  )
+                              )
+                          )
+                          AND EXISTS (
+                              SELECT 1
+                              FROM jsonb_array_elements(src.deliverable_manifest) m
+                              WHERE NOT EXISTS (
+                                  SELECT 1
+                                  FROM jsonb_array_elements(COALESCE(src.files_status, '[]'::jsonb)) fs
+                                  WHERE COALESCE(fs->>'workspace_id', '') = COALESCE(m->>'workspace_id', '')
+                                    AND fs->>'path' = m->>'path'
+                                    AND (
+                                        fs->>'status' IN ('sent', 'linked')
+                                        OR (
+                                            fs->>'status' = 'failed'
+                                            AND COALESCE(fs->>'reason', '') IN (
+                                                'not_allowed',
+                                                'max_attempts_exceeded',
+                                                'skipped_platform_disabled'
+                                            )
+                                        )
+                                    )
+                              )
+                          )
+                      )
+                  )
+              )
+          )
+        ORDER BY src.delivery_key ASC
+        LIMIT %s
+        FOR UPDATE SKIP LOCKED
+        """,
+        (enabled_platforms, int(limit)),
+    )
+    bt2_link_recoveries = [dict(r) for r in await cur.fetchall()]
+
+    # 7b-2 interrupt_resumes: origin-channel enabled-platform rows + 3-way-gated card-patch rows
+    await cur.execute(
+        """
+        SELECT thread_id::text AS thread_id,
+               run_id,
+               interrupt_id,
+               claim_id::text AS claim_id,
+               settled_via,
+               settled_by_user_id,
+               platform,
+               token_hash,
+               inbound_message_id,
+               legacy_direct,
+               origin_scope_key,
+               session_generation,
+               origin_chat_address,
+               weixin_account_id::text AS weixin_account_id,
+               weixin_bot_id,
+               weixin_bot_generation,
+               weixin_recipient_id,
+               request_key::text AS request_key,
+               resume_payload,
+               admitted_run_id,
+               card_delivery_address,
+               card_channel_id,
+               card_message_id,
+               card_targets,
+               resume_status,
+               requires_gateway_ack,
+               delivery_settled,
+               lease_expires_at,
+               run_consumed_at,
+               channel_ack_at,
+               attempt_count,
+               next_retry_at,
+               last_error,
+               created_at,
+               updated_at
+        FROM dalton_channel_interrupt_resumes
+        WHERE requires_gateway_ack = TRUE
+          AND channel_ack_at IS NULL
+          AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+          AND (
+              (
+                  platform = ANY(%s::varchar[])
+                  AND (
+                      resume_status IN ('pending_dispatch', 'admitted')
+                      OR (resume_status = 'terminal_failed' AND delivery_settled = FALSE)
+                  )
+              )
+              OR (
+                  delivery_settled = TRUE
+                  AND (
+                      resume_status = 'terminal_failed'
+                      OR (resume_status = 'admitted' AND run_consumed_at IS NOT NULL)
+                  )
+                  AND EXISTS (
+                      SELECT 1
+                      FROM jsonb_array_elements(card_targets) elem
+                      WHERE elem->>'patch_status' = 'pending'
+                        AND (elem->>'platform') = ANY(%s::varchar[])
+                  )
+              )
+          )
+        ORDER BY thread_id ASC, run_id ASC, interrupt_id ASC
+        LIMIT %s
+        FOR UPDATE SKIP LOCKED
+        """,
+        (enabled_platforms, enabled_platforms, int(limit)),
+    )
+    interrupt_resumes: list[dict[str, Any]] = []
+    for raw_ir in await cur.fetchall():
+        ir = dict(raw_ir)
+        ir_status = str(ir.get("resume_status") or "").strip().lower()
+        ir_can_patch = bool(ir.get("delivery_settled")) and (
+            ir_status == "terminal_failed"
+            or (ir_status == "admitted" and ir.get("run_consumed_at") is not None)
+        )
+        ir["can_patch_terminal"] = ir_can_patch
+        # Unified 3-way card-patch gate (§3.2 #4, §3.3 #4): origin-channel recovery
+        # data is returned as usual, while pending `card_targets` are ONLY exposed
+        # once the unified card-patch gate has passed.
+        if not ir_can_patch:
+            ir["card_targets"] = []
+        interrupt_resumes.append(ir)
+
+    # 7b-3 action_tokens: late terminal card patches + send_in_flight reconciliation
+    await cur.execute(
+        """
+        SELECT token_hash,
+               token_role,
+               platform,
+               dalton_user_id,
+               initiator_platform_user_id,
+               origin_chat_type,
+               origin_chat_address,
+               origin_scope_key,
+               card_chat_type,
+               card_delivery_address,
+               card_channel_id,
+               card_message_id,
+               bind_status,
+               late_patch_status,
+               late_patch_attempts,
+               late_patch_next_retry_at,
+               thread_id::text AS thread_id,
+               run_id,
+               interrupt_id,
+               risk_tier,
+               action_type,
+               prompt_summary,
+               consumed_via,
+               created_at
+        FROM dalton_channel_action_tokens
+        WHERE late_patch_status = 'pending'
+          AND platform = ANY(%s::varchar[])
+          AND (late_patch_next_retry_at IS NULL OR late_patch_next_retry_at <= NOW())
+        ORDER BY token_hash ASC
+        LIMIT %s
+        FOR UPDATE SKIP LOCKED
+        """,
+        (enabled_platforms, int(limit)),
+    )
+    late_patch_tokens = [dict(r) for r in await cur.fetchall()]
+
+    await cur.execute(
+        """
+        SELECT token_hash,
+               token_role,
+               platform,
+               dalton_user_id,
+               initiator_platform_user_id,
+               origin_chat_type,
+               origin_chat_address,
+               origin_scope_key,
+               card_chat_type,
+               card_delivery_address,
+               card_channel_id,
+               card_message_id,
+               bind_status,
+               send_attempt_started_at,
+               send_gateway_epoch,
+               send_reconcile_meta,
+               thread_id::text AS thread_id,
+               run_id,
+               interrupt_id,
+               risk_tier,
+               action_type,
+               created_at
+        FROM dalton_channel_action_tokens
+        WHERE bind_status = 'send_in_flight'
+          AND platform = ANY(%s::varchar[])
+        ORDER BY token_hash ASC
+        LIMIT %s
+        FOR UPDATE SKIP LOCKED
+        """,
+        (enabled_platforms, int(limit)),
+    )
+    send_in_flight_tokens = [dict(r) for r in await cur.fetchall()]
+
+    return bt2_link_recoveries, interrupt_resumes, late_patch_tokens, send_in_flight_tokens
+
+
 async def _recover_channel_state_once(
     *,
     mode: str = "startup",
@@ -14060,10 +17084,21 @@ async def _recover_channel_state_once(
     conn: Any = None,
 ) -> dict[str, Any]:
     cleaned_mode = str(mode or "startup").strip().lower()
-    if cleaned_mode not in ("startup", "watch_reconnect"):
+    if cleaned_mode not in ("startup", "watch_reconnect", "interrupt_resumes"):
         raise HTTPException(status_code=400, detail=f"Unsupported recover mode: {mode!r}")
+    enabled_platforms = [
+        p for p in SUPPORTED_PLATFORMS if _platform_enabled_for_recovery(p)
+    ]
+    if not enabled_platforms:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "channel_platforms_disabled",
+                "message": "All channel platform capabilities are disabled.",
+            },
+        )
     norm_tid = normalize_uuid(thread_id) if thread_id else None
-    weixin_on = has_capability(CapabilityId.CHANNEL_WEIXIN)
+    weixin_on = "weixin" in enabled_platforms
 
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
@@ -14071,30 +17106,299 @@ async def _recover_channel_state_once(
                 await wx_db.verify_gateway_epoch_in_tx(
                     cur, gateway_epoch, required=require_gateway_epoch
                 )
+                if cleaned_mode == "interrupt_resumes":
+                    # Lock Order ⑥: 0b-2 -> 3a -> 7a (inbound_events -> thread_watches ->
+                    # background_runs -> deliveries, all SKIP LOCKED) -> 7b-2 -> 7b-3.
+                    locked_ir_aids: list[str] = []
+                    if weixin_on:
+                        await cur.execute(
+                            """
+                            SELECT account_id::text AS account_id
+                            FROM dalton_channel_weixin_accounts
+                            ORDER BY account_id ASC
+                            FOR KEY SHARE
+                            """
+                        )
+                        locked_ir_aids = [
+                            str(r["account_id"])
+                            for r in await cur.fetchall()
+                            if r.get("account_id")
+                        ]
+                        if _after_recover_3a_lock_hook is not None:
+                            await _after_recover_3a_lock_hook("interrupt_resumes")
+                    # 7a-1: inbound_events (ORDER BY PK ASC FOR UPDATE SKIP LOCKED)
+                    await cur.execute(
+                        """
+                        SELECT platform, message_id, weixin_account_id::text AS weixin_account_id
+                        FROM dalton_channel_inbound_events
+                        WHERE platform = ANY(%s::varchar[])
+                          AND (status = 'hitl_claimed' OR fallback_pending = TRUE)
+                        ORDER BY platform ASC, message_id ASC
+                        FOR UPDATE SKIP LOCKED
+                        """,
+                        (enabled_platforms,),
+                    )
+                    locked_ir_inbounds = await cur.fetchall()
+                    if weixin_on:
+                        locked_ir_aid_set = set(locked_ir_aids)
+                        for ir_inb in locked_ir_inbounds:
+                            if ir_inb.get("weixin_account_id") and str(ir_inb["weixin_account_id"]) not in locked_ir_aid_set:
+                                raise wx_db.WeixinLockSetChanged()
+                    # 7a-2: thread_watches (ORDER BY thread_id ASC FOR UPDATE SKIP LOCKED)
+                    await cur.execute(
+                        """
+                        SELECT thread_id::text AS thread_id, weixin_account_id::text AS weixin_account_id
+                        FROM dalton_channel_thread_watches
+                        WHERE watch_active = TRUE
+                          AND platform = ANY(%s::varchar[])
+                        ORDER BY thread_id ASC
+                        FOR UPDATE SKIP LOCKED
+                        """,
+                        (enabled_platforms,),
+                    )
+                    locked_ir_watches = await cur.fetchall()
+                    if weixin_on:
+                        locked_ir_aid_set = set(locked_ir_aids)
+                        for ir_w in locked_ir_watches:
+                            if ir_w.get("weixin_account_id") and str(ir_w["weixin_account_id"]) not in locked_ir_aid_set:
+                                raise wx_db.WeixinLockSetChanged()
+                    # 7a-3: background_runs (ORDER BY thread_id, run_id ASC FOR UPDATE SKIP LOCKED)
+                    await cur.execute(
+                        """
+                        SELECT thread_id::text AS thread_id, run_id,
+                               weixin_account_id::text AS weixin_account_id
+                        FROM dalton_channel_background_runs
+                        WHERE fallback_pending = TRUE
+                          AND platform = ANY(%s::varchar[])
+                        ORDER BY thread_id ASC, run_id ASC
+                        FOR UPDATE SKIP LOCKED
+                        """,
+                        (enabled_platforms,),
+                    )
+                    locked_ir_bgs = await cur.fetchall()
+                    if weixin_on:
+                        locked_ir_aid_set = set(locked_ir_aids)
+                        for ir_bg in locked_ir_bgs:
+                            if ir_bg.get("weixin_account_id") and str(ir_bg["weixin_account_id"]) not in locked_ir_aid_set:
+                                raise wx_db.WeixinLockSetChanged()
+                    # 7a-4 deliveries -> 7b-2 interrupt_resumes -> 7b-3 action_tokens
+                    (
+                        bt2_link_recoveries,
+                        interrupt_resumes,
+                        late_patch_tokens,
+                        send_in_flight_tokens,
+                    ) = await _fetch_recovery_interrupt_and_bt2_work_in_tx(
+                        cur, enabled_platforms=enabled_platforms
+                    )
+                    return {
+                        "mode": "interrupt_resumes",
+                        "interrupt_resumes": _json_safe_rows(interrupt_resumes),
+                        "late_patch_tokens": _json_safe_rows(late_patch_tokens),
+                        "send_in_flight_tokens": _json_safe_rows(send_in_flight_tokens),
+                        "bt2_link_recoveries": _json_safe_rows(bt2_link_recoveries),
+                    }
                 if cleaned_mode == "watch_reconnect":
                     # Strictly do NOT touch dalton_channel_deliveries in_flight rows!
+                    # Lock Order ⑥: 0b-2 -> 3a (weixin_accounts ASC FOR KEY SHARE) -> 7a (thread_watches ASC FOR UPDATE SKIP LOCKED -> background_runs).
+                    # Acquiring 3a BEFORE locking thread_watches eliminates ABBA deadlock with unbind_weixin_account
+                    # when _backfill_watch_notification_runs_in_tx inserts into background_runs (FK -> weixin_accounts).
+                    locked_wr_aids: list[str] = []
+                    if weixin_on:
+                        await cur.execute(
+                            """
+                            SELECT account_id::text AS account_id
+                            FROM dalton_channel_weixin_accounts
+                            ORDER BY account_id ASC
+                            FOR KEY SHARE
+                            """
+                        )
+                        locked_wr_aids = [
+                            str(r["account_id"])
+                            for r in await cur.fetchall()
+                            if r.get("account_id")
+                        ]
+                        if _after_recover_3a_lock_hook is not None:
+                            await _after_recover_3a_lock_hook("watch_reconnect")
                     if norm_tid:
-                        await cur.execute(
-                            """
-                            SELECT * FROM dalton_channel_thread_watches
-                            WHERE thread_id = %s
-                            FOR UPDATE
-                            """,
-                            (norm_tid,),
-                        )
+                        if weixin_on and locked_wr_aids:
+                            await cur.execute(
+                                """
+                                SELECT * FROM dalton_channel_thread_watches
+                                WHERE thread_id = %s
+                                  AND (weixin_account_id IS NULL OR weixin_account_id = ANY(%s::uuid[]))
+                                ORDER BY thread_id ASC
+                                FOR UPDATE SKIP LOCKED
+                                """,
+                                (norm_tid, locked_wr_aids),
+                            )
+                        elif weixin_on:
+                            await cur.execute(
+                                """
+                                SELECT * FROM dalton_channel_thread_watches
+                                WHERE thread_id = %s
+                                  AND weixin_account_id IS NULL
+                                ORDER BY thread_id ASC
+                                FOR UPDATE SKIP LOCKED
+                                """,
+                                (norm_tid,),
+                            )
+                        else:
+                            await cur.execute(
+                                """
+                                SELECT * FROM dalton_channel_thread_watches
+                                WHERE thread_id = %s
+                                  AND platform <> 'weixin'
+                                ORDER BY thread_id ASC
+                                FOR UPDATE SKIP LOCKED
+                                """,
+                                (norm_tid,),
+                            )
                     else:
-                        await cur.execute(
-                            """
-                            SELECT * FROM dalton_channel_thread_watches
-                            WHERE watch_active = TRUE
-                            FOR UPDATE
-                            """
-                        )
+                        if weixin_on and locked_wr_aids:
+                            await cur.execute(
+                                """
+                                SELECT * FROM dalton_channel_thread_watches
+                                WHERE watch_active = TRUE
+                                  AND (weixin_account_id IS NULL OR weixin_account_id = ANY(%s::uuid[]))
+                                ORDER BY thread_id ASC
+                                FOR UPDATE SKIP LOCKED
+                                """,
+                                (locked_wr_aids,),
+                            )
+                        elif weixin_on:
+                            await cur.execute(
+                                """
+                                SELECT * FROM dalton_channel_thread_watches
+                                WHERE watch_active = TRUE
+                                  AND weixin_account_id IS NULL
+                                ORDER BY thread_id ASC
+                                FOR UPDATE SKIP LOCKED
+                                """
+                            )
+                        else:
+                            await cur.execute(
+                                """
+                                SELECT * FROM dalton_channel_thread_watches
+                                WHERE watch_active = TRUE
+                                  AND platform <> 'weixin'
+                                ORDER BY thread_id ASC
+                                FOR UPDATE SKIP LOCKED
+                                """
+                            )
                     watches = [
                         dict(r)
                         for r in await cur.fetchall()
                         if _platform_enabled_for_recovery(r.get("platform"))
                     ]
+                    if weixin_on:
+                        if norm_tid:
+                            if locked_wr_aids:
+                                await cur.execute(
+                                    """
+                                    SELECT 1 FROM dalton_channel_thread_watches
+                                    WHERE thread_id = %s
+                                      AND weixin_account_id IS NOT NULL
+                                      AND NOT (weixin_account_id = ANY(%s::uuid[]))
+                                    LIMIT 1
+                                    """,
+                                    (norm_tid, locked_wr_aids),
+                                )
+                            else:
+                                await cur.execute(
+                                    """
+                                    SELECT 1 FROM dalton_channel_thread_watches
+                                    WHERE thread_id = %s
+                                      AND weixin_account_id IS NOT NULL
+                                    LIMIT 1
+                                    """,
+                                    (norm_tid,),
+                                )
+                        else:
+                            if locked_wr_aids:
+                                await cur.execute(
+                                    """
+                                    SELECT 1 FROM dalton_channel_thread_watches
+                                    WHERE watch_active = TRUE
+                                      AND weixin_account_id IS NOT NULL
+                                      AND NOT (weixin_account_id = ANY(%s::uuid[]))
+                                    LIMIT 1
+                                    """,
+                                    (locked_wr_aids,),
+                                )
+                            else:
+                                await cur.execute(
+                                    """
+                                    SELECT 1 FROM dalton_channel_thread_watches
+                                    WHERE watch_active = TRUE
+                                      AND weixin_account_id IS NOT NULL
+                                    LIMIT 1
+                                    """
+                                )
+                        if await cur.fetchone() is not None:
+                            raise wx_db.WeixinLockSetChanged()
+                    locked_watch_tids = {
+                        str(w["thread_id"]) for w in watches if w.get("thread_id")
+                    }
+                    # If the target watch row(s) exist on an enabled platform but were skipped
+                    # because another transaction holds a row lock (`FOR UPDATE SKIP LOCKED`),
+                    # fail fast with a retryable 409 (`watch_busy`) rather than returning 200 OK
+                    # with an empty watch list (which the gateway would mistake for a settled
+                    # reconnect and prematurely close the watch with `watch_active=false`).
+                    if norm_tid:
+                        if not watches:
+                            await cur.execute(
+                                """
+                                SELECT thread_id::text AS thread_id, platform
+                                FROM dalton_channel_thread_watches
+                                WHERE thread_id = %s
+                                LIMIT 1
+                                """,
+                                (norm_tid,),
+                            )
+                            existing_watch = await cur.fetchone()
+                            if existing_watch is not None and _platform_enabled_for_recovery(
+                                existing_watch.get("platform")
+                            ):
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail={
+                                        "code": "watch_busy",
+                                        "message": (
+                                            "Thread watch is currently locked by another "
+                                            "transaction; retry watch_reconnect."
+                                        ),
+                                        "thread_id": norm_tid,
+                                    },
+                                )
+                    else:
+                        await cur.execute(
+                            """
+                            SELECT thread_id::text AS thread_id, platform
+                            FROM dalton_channel_thread_watches
+                            WHERE watch_active = TRUE
+                            """
+                        )
+                        skipped_watch_tids = sorted(
+                            {
+                                str(r["thread_id"])
+                                for r in await cur.fetchall()
+                                if r.get("thread_id")
+                                and _platform_enabled_for_recovery(r.get("platform"))
+                                and str(r["thread_id"]) not in locked_watch_tids
+                            }
+                        )
+                        if skipped_watch_tids:
+                            raise HTTPException(
+                                status_code=409,
+                                detail={
+                                    "code": "watch_busy",
+                                    "message": (
+                                        "One or more active thread watches are currently "
+                                        "locked by another transaction; retry watch_reconnect."
+                                    ),
+                                    "thread_ids": skipped_watch_tids,
+                                },
+                            )
                     await _backfill_watch_notification_runs_in_tx(cur, watches)
 
                     if norm_tid:
@@ -14119,19 +17423,23 @@ async def _recover_channel_state_once(
                         for r in await cur.fetchall()
                         if _platform_enabled_for_recovery(r.get("platform"))
                     ]
-                    await cur.execute(
-                        """
-                        SELECT * FROM dalton_channel_thread_watches
-                        WHERE (%s::uuid IS NULL AND watch_active = TRUE)
-                           OR thread_id = %s
-                        """,
-                        (norm_tid, norm_tid),
-                    )
-                    updated_watches = [
-                        dict(r)
-                        for r in await cur.fetchall()
-                        if _platform_enabled_for_recovery(r.get("platform"))
-                    ]
+                    if locked_watch_tids:
+                        await cur.execute(
+                            """
+                            SELECT * FROM dalton_channel_thread_watches
+                            WHERE (%s::uuid IS NULL AND watch_active = TRUE)
+                               OR thread_id = %s
+                            """,
+                            (norm_tid, norm_tid),
+                        )
+                        updated_watches = [
+                            dict(r)
+                            for r in await cur.fetchall()
+                            if str(r.get("thread_id") or "") in locked_watch_tids
+                            and _platform_enabled_for_recovery(r.get("platform"))
+                        ]
+                    else:
+                        updated_watches = []
                     await _enrich_recovery_scope_keys(cur, bg_runs, updated_watches)
                     watch_by_tid = {
                         str(w["thread_id"]): w
@@ -14155,23 +17463,17 @@ async def _recover_channel_state_once(
                     }
 
                 # mode == "startup"
-                # R7 (Decision #1): Align lock order strictly with unbind_weixin_account:
-                #   1) dalton_channel_weixin_accounts (ORDER BY account_id ASC FOR KEY SHARE)
-                #      BEFORE locking thread_watches — so backfill INSERT into
-                #      dalton_channel_background_runs (FK -> weixin_accounts KEY SHARE)
-                #      NEVER deadlocks against unbind's accounts FOR UPDATE -> watches FOR UPDATE!
-                #   2) dalton_channel_thread_watches (ORDER BY thread_id ASC FOR UPDATE)
-                #   3) dalton_channel_deliveries (ORDER BY delivery_key ASC FOR UPDATE SKIP LOCKED)
-                #   4) dalton_channel_inbound_events repairs (ORDER BY platform, message_id FOR UPDATE SKIP LOCKED)
-                # R5 (Decision #7): When channel_weixin is disabled, NEVER touch or mutate ANY
-                # Weixin accounts, watches, deliveries, or inbound events.
+                # Lock Order ⑥ (§3.2 #4):
+                #   0b-2: gateway_lease FOR SHARE (already held)
+                #   3a:   dalton_channel_weixin_accounts (ORDER BY account_id ASC FOR KEY SHARE)
+                #   7a:   inbound_events (FOR UPDATE SKIP LOCKED)
+                #         -> thread_watches (ORDER BY thread_id ASC FOR UPDATE SKIP LOCKED)
+                #         -> background_runs (ORDER BY run_id ASC FOR UPDATE SKIP LOCKED)
+                #         -> deliveries (ORDER BY delivery_key ASC FOR UPDATE SKIP LOCKED)
+                #   7b-2: interrupt_resumes (ORDER BY thread_id, run_id, interrupt_id ASC FOR UPDATE SKIP LOCKED)
+                #   7b-3: action_tokens (ORDER BY token_hash ASC FOR UPDATE SKIP LOCKED)
+                locked_aids: list[str] = []
                 if weixin_on:
-                    # R9 (Decision #8): Eliminate lock gap between weixin_accounts and thread_watches.
-                    # 1) Lock existing accounts FOR KEY SHARE in ascending account_id order.
-                    # 2) Lock ONLY active watches whose weixin_account_id is NULL or already in
-                    #    locked_aids, so no watch is ever locked before its account.
-                    # 3) If any newly committed active watch references an unlocked account, raise
-                    #    WeixinLockSetChanged so _run_tx_with_retry rolls back and retries cleanly.
                     await cur.execute(
                         """
                         SELECT account_id::text AS account_id
@@ -14185,26 +17487,140 @@ async def _recover_channel_state_once(
                         for r in await cur.fetchall()
                         if r.get("account_id")
                     ]
+                    if _after_recover_3a_lock_hook is not None:
+                        await _after_recover_3a_lock_hook("startup")
+
+                # 7a-1: Heal invalid pending & pending_cancel inbound events FIRST (SKIP LOCKED)
+                if weixin_on:
+                    await cur.execute(
+                        """
+                        WITH locked AS (
+                            SELECT platform, message_id
+                            FROM dalton_channel_inbound_events
+                            WHERE status = 'pending'
+                              AND platform = ANY(%s::varchar[])
+                              AND (
+                                COALESCE(raw_payload->>'invalid_inbound_event', '') IN ('true', 'True')
+                                OR COALESCE(raw_payload->>'invalid_inbound', '') IN ('true', 'True')
+                                OR raw_payload->>'rejected_reason' = 'invalid_inbound_event'
+                                OR raw_payload->>'deny_reason' = 'invalid_inbound_event'
+                              )
+                            ORDER BY platform ASC, message_id ASC
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        UPDATE dalton_channel_inbound_events ie
+                        SET status = 'ignored',
+                            raw_payload = COALESCE(ie.raw_payload, '{}'::jsonb)
+                                || jsonb_build_object(
+                                    'invalid_inbound_event', TRUE,
+                                    'deny_reason', 'invalid_inbound_event'
+                                ),
+                            updated_at = NOW()
+                        FROM locked l
+                        WHERE ie.platform = l.platform
+                          AND ie.message_id = l.message_id
+                        """,
+                        (enabled_platforms,),
+                    )
+                    await cur.execute(
+                        """
+                        WITH locked AS (
+                            SELECT platform, message_id
+                            FROM dalton_channel_inbound_events
+                            WHERE command_effect_status = 'pending_cancel'
+                              AND platform = ANY(%s::varchar[])
+                              AND (thread_id IS NULL OR run_id IS NULL OR btrim(run_id) = '')
+                            ORDER BY platform ASC, message_id ASC
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        UPDATE dalton_channel_inbound_events ie
+                        SET command_effect_status = 'done',
+                            updated_at = NOW()
+                        FROM locked l
+                        WHERE ie.platform = l.platform
+                          AND ie.message_id = l.message_id
+                        """,
+                        (enabled_platforms,),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        WITH locked AS (
+                            SELECT platform, message_id
+                            FROM dalton_channel_inbound_events
+                            WHERE status = 'pending'
+                              AND platform <> 'weixin'
+                              AND platform = ANY(%s::varchar[])
+                              AND (
+                                COALESCE(raw_payload->>'invalid_inbound_event', '') IN ('true', 'True')
+                                OR COALESCE(raw_payload->>'invalid_inbound', '') IN ('true', 'True')
+                                OR raw_payload->>'rejected_reason' = 'invalid_inbound_event'
+                                OR raw_payload->>'deny_reason' = 'invalid_inbound_event'
+                              )
+                            ORDER BY platform ASC, message_id ASC
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        UPDATE dalton_channel_inbound_events ie
+                        SET status = 'ignored',
+                            raw_payload = COALESCE(ie.raw_payload, '{}'::jsonb)
+                                || jsonb_build_object(
+                                    'invalid_inbound_event', TRUE,
+                                    'deny_reason', 'invalid_inbound_event'
+                                ),
+                            updated_at = NOW()
+                        FROM locked l
+                        WHERE ie.platform = l.platform
+                          AND ie.message_id = l.message_id
+                        """,
+                        (enabled_platforms,),
+                    )
+                    await cur.execute(
+                        """
+                        WITH locked AS (
+                            SELECT platform, message_id
+                            FROM dalton_channel_inbound_events
+                            WHERE command_effect_status = 'pending_cancel'
+                              AND platform <> 'weixin'
+                              AND platform = ANY(%s::varchar[])
+                              AND (thread_id IS NULL OR run_id IS NULL OR btrim(run_id) = '')
+                            ORDER BY platform ASC, message_id ASC
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        UPDATE dalton_channel_inbound_events ie
+                        SET command_effect_status = 'done',
+                            updated_at = NOW()
+                        FROM locked l
+                        WHERE ie.platform = l.platform
+                          AND ie.message_id = l.message_id
+                        """,
+                        (enabled_platforms,),
+                    )
+
+                # 7a-2: Lock active thread_watches (SKIP LOCKED, verifying Weixin 3a lock set)
+                if weixin_on:
                     if locked_aids:
                         await cur.execute(
                             """
                             SELECT * FROM dalton_channel_thread_watches
                             WHERE watch_active = TRUE
+                              AND platform = ANY(%s::varchar[])
                               AND (weixin_account_id IS NULL OR weixin_account_id = ANY(%s::uuid[]))
                             ORDER BY thread_id ASC
-                            FOR UPDATE
+                            FOR UPDATE SKIP LOCKED
                             """,
-                            (locked_aids,),
+                            (enabled_platforms, locked_aids),
                         )
                     else:
                         await cur.execute(
                             """
                             SELECT * FROM dalton_channel_thread_watches
                             WHERE watch_active = TRUE
+                              AND platform = ANY(%s::varchar[])
                               AND weixin_account_id IS NULL
                             ORDER BY thread_id ASC
-                            FOR UPDATE
-                            """
+                            FOR UPDATE SKIP LOCKED
+                            """,
+                            (enabled_platforms,),
                         )
                     active_watches = [
                         dict(r)
@@ -14241,9 +17657,11 @@ async def _recover_channel_state_once(
                         SELECT * FROM dalton_channel_thread_watches
                         WHERE watch_active = TRUE
                           AND platform <> 'weixin'
+                          AND platform = ANY(%s::varchar[])
                         ORDER BY thread_id ASC
-                        FOR UPDATE
-                        """
+                        FOR UPDATE SKIP LOCKED
+                        """,
+                        (enabled_platforms,),
                     )
                     active_watches = [
                         dict(r)
@@ -14252,18 +17670,153 @@ async def _recover_channel_state_once(
                     ]
                 await _backfill_watch_notification_runs_in_tx(cur, active_watches)
 
-                # ① Mark lingering in_flight deliveries for ENABLED platforms as unknown / gateway_restarted
-                # using FOR UPDATE SKIP LOCKED so rows concurrently locked by unbind FK SET NULL
-                # never trigger 40P01.
+                # 7a-1b / 7a-2b / 7a-3: Fetch inbound_events, thread_watches, and lock
+                # background_runs (ORDER BY thread_id, run_id ASC FOR UPDATE SKIP LOCKED)
+                # STRICTLY BEFORE locking & mutating dalton_channel_deliveries (7a-4)!
+                enc_key: str | None = None
+                if weixin_on:
+                    try:
+                        enc_key = get_encryption_key()
+                    except Exception:
+                        enc_key = None
+
+                if enc_key:
+                    await cur.execute(
+                        """
+                        SELECT ie.*,
+                               CASE
+                                   WHEN ie.encrypted_weixin_media_meta IS NOT NULL
+                                   THEN pgp_sym_decrypt(ie.encrypted_weixin_media_meta, %s)
+                                   ELSE NULL
+                               END AS decrypted_weixin_media_json
+                        FROM dalton_channel_inbound_events ie
+                        WHERE ie.status IN ('pending', 'accepted', 'streaming', 'steered', 'pending_resubmit')
+                           OR ie.fallback_pending = TRUE
+                           OR ie.command_reply_pending = TRUE
+                           OR ie.command_effect_status = 'pending_cancel'
+                        ORDER BY ie.created_at ASC
+                        """,
+                        (enc_key,),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        SELECT ie.*
+                        FROM dalton_channel_inbound_events ie
+                        WHERE ie.status IN ('pending', 'accepted', 'streaming', 'steered', 'pending_resubmit')
+                           OR ie.fallback_pending = TRUE
+                           OR ie.command_reply_pending = TRUE
+                           OR ie.command_effect_status = 'pending_cancel'
+                        ORDER BY ie.created_at ASC
+                        """
+                    )
+                inbound_events = [
+                    dict(r)
+                    for r in await cur.fetchall()
+                    if not _payload_marks_invalid_inbound(r.get("raw_payload"))
+                    and _platform_enabled_for_recovery(r.get("platform"))
+                    and str(r.get("status") or "").strip().lower() != "hitl_claimed"
+                ]
+                cleaned_inbound_events: list[dict[str, Any]] = []
+                for r in inbound_events:
+                    if r.get("command_effect_status") == "pending_cancel" and not (
+                        r.get("thread_id") and str(r.get("run_id") or "").strip()
+                    ):
+                        r["command_effect_status"] = "done"
+                        if (
+                            r.get("status")
+                            not in (
+                                "pending",
+                                "accepted",
+                                "streaming",
+                                "steered",
+                                "pending_resubmit",
+                            )
+                            and not r.get("fallback_pending")
+                            and not r.get("command_reply_pending")
+                        ):
+                            continue
+                    dec_json = r.pop("decrypted_weixin_media_json", None)
+                    if dec_json:
+                        try:
+                            dec_atts = json.loads(dec_json)
+                        except Exception:
+                            dec_atts = None
+                        if dec_atts is not None:
+                            r["decrypted_weixin_attachments"] = dec_atts
+                            raw_copy = (
+                                dict(r.get("raw_payload") or {})
+                                if isinstance(r.get("raw_payload"), dict)
+                                else {}
+                            )
+                            raw_copy["weixin_attachments"] = dec_atts
+                            r["_recovery_raw_payload_with_weixin_attachments"] = raw_copy
+                    cleaned_inbound_events.append(r)
+                inbound_events = cleaned_inbound_events
+
+                await cur.execute(
+                    """
+                    SELECT * FROM dalton_channel_thread_watches
+                    WHERE watch_active = TRUE
+                    ORDER BY created_at ASC
+                    """
+                )
+                thread_watches = [
+                    dict(r)
+                    for r in await cur.fetchall()
+                    if _platform_enabled_for_recovery(r.get("platform"))
+                ]
+
+                # 7a-3: Lock background_runs BEFORE deliveries (Lock Order ⑥)
+                await cur.execute(
+                    """
+                    SELECT * FROM dalton_channel_background_runs
+                    WHERE fallback_pending = TRUE
+                    ORDER BY thread_id ASC, run_id ASC
+                    FOR UPDATE SKIP LOCKED
+                    """
+                )
+                background_runs = [
+                    dict(r)
+                    for r in await cur.fetchall()
+                    if _platform_enabled_for_recovery(r.get("platform"))
+                ]
+                background_runs.sort(key=lambda r: r.get("created_at") or datetime.min.replace(tzinfo=timezone.utc))
+                await _enrich_recovery_scope_keys(cur, background_runs, thread_watches)
+                watch_by_tid = {
+                    str(w["thread_id"]): w for w in thread_watches if w.get("thread_id")
+                }
+                for bgr in background_runs:
+                    w_match = watch_by_tid.get(str(bgr.get("thread_id") or ""))
+                    if w_match:
+                        if not bgr.get("scope_key") and w_match.get("scope_key"):
+                            bgr["scope_key"] = w_match["scope_key"]
+                        if (
+                            bgr.get("generation") is None
+                            and w_match.get("generation") is not None
+                        ):
+                            bgr["generation"] = w_match["generation"]
+
+                # 7a-4: Mark lingering in_flight deliveries for ENABLED platforms as unknown / gateway_restarted,
+                # EXCLUDING in-lease BT2 rows (§3.5: BT2 in_flight rows with claim_lease_expires_at >= NOW()
+                # stay in_flight and remain recoverable via bt2_link_recoveries / epoch / lease expiry).
                 if weixin_on:
                     await cur.execute(
                         """
                         SELECT delivery_key
                         FROM dalton_channel_deliveries
                         WHERE status = 'in_flight'
+                          AND platform = ANY(%s::varchar[])
+                          AND NOT (
+                              (delivery_key LIKE 'deliverables-links:%%' OR bt2_enrolled = TRUE)
+                              AND claim_attempt_id IS NOT NULL
+                              AND claim_lease_expires_at IS NOT NULL
+                              AND claim_lease_expires_at >= NOW()
+                          )
                         ORDER BY delivery_key ASC
                         FOR UPDATE SKIP LOCKED
-                        """
+                        """,
+                        (enabled_platforms,),
                     )
                 else:
                     await cur.execute(
@@ -14272,9 +17825,17 @@ async def _recover_channel_state_once(
                         FROM dalton_channel_deliveries
                         WHERE status = 'in_flight'
                           AND platform <> 'weixin'
+                          AND platform = ANY(%s::varchar[])
+                          AND NOT (
+                              (delivery_key LIKE 'deliverables-links:%%' OR bt2_enrolled = TRUE)
+                              AND claim_attempt_id IS NOT NULL
+                              AND claim_lease_expires_at IS NOT NULL
+                              AND claim_lease_expires_at >= NOW()
+                          )
                         ORDER BY delivery_key ASC
                         FOR UPDATE SKIP LOCKED
-                        """
+                        """,
+                        (enabled_platforms,),
                     )
                 locked_in_flight_keys = [
                     str(r["delivery_key"])
@@ -14325,231 +17886,6 @@ async def _recover_channel_state_once(
                                     "error_code": "gateway_restarted",
                                 },
                             )
-
-                # ② Heal invalid pending inbound events (SKIP LOCKED; skip platform='weixin' when disabled)
-                if weixin_on:
-                    await cur.execute(
-                        """
-                        WITH locked AS (
-                            SELECT platform, message_id
-                            FROM dalton_channel_inbound_events
-                            WHERE status = 'pending'
-                              AND (
-                                COALESCE(raw_payload->>'invalid_inbound_event', '') IN ('true', 'True')
-                                OR COALESCE(raw_payload->>'invalid_inbound', '') IN ('true', 'True')
-                                OR raw_payload->>'rejected_reason' = 'invalid_inbound_event'
-                                OR raw_payload->>'deny_reason' = 'invalid_inbound_event'
-                              )
-                            ORDER BY platform ASC, message_id ASC
-                            FOR UPDATE SKIP LOCKED
-                        )
-                        UPDATE dalton_channel_inbound_events ie
-                        SET status = 'ignored',
-                            raw_payload = COALESCE(ie.raw_payload, '{}'::jsonb)
-                                || jsonb_build_object(
-                                    'invalid_inbound_event', TRUE,
-                                    'deny_reason', 'invalid_inbound_event'
-                                ),
-                            updated_at = NOW()
-                        FROM locked l
-                        WHERE ie.platform = l.platform
-                          AND ie.message_id = l.message_id
-                        """
-                    )
-                else:
-                    await cur.execute(
-                        """
-                        WITH locked AS (
-                            SELECT platform, message_id
-                            FROM dalton_channel_inbound_events
-                            WHERE status = 'pending'
-                              AND platform <> 'weixin'
-                              AND (
-                                COALESCE(raw_payload->>'invalid_inbound_event', '') IN ('true', 'True')
-                                OR COALESCE(raw_payload->>'invalid_inbound', '') IN ('true', 'True')
-                                OR raw_payload->>'rejected_reason' = 'invalid_inbound_event'
-                                OR raw_payload->>'deny_reason' = 'invalid_inbound_event'
-                              )
-                            ORDER BY platform ASC, message_id ASC
-                            FOR UPDATE SKIP LOCKED
-                        )
-                        UPDATE dalton_channel_inbound_events ie
-                        SET status = 'ignored',
-                            raw_payload = COALESCE(ie.raw_payload, '{}'::jsonb)
-                                || jsonb_build_object(
-                                    'invalid_inbound_event', TRUE,
-                                    'deny_reason', 'invalid_inbound_event'
-                                ),
-                            updated_at = NOW()
-                        FROM locked l
-                        WHERE ie.platform = l.platform
-                          AND ie.message_id = l.message_id
-                        """
-                    )
-
-                # Heal any historical pending_cancel command rows that lack a pinned target run_id
-                # (SKIP LOCKED; skip platform='weixin' when capability disabled)
-                if weixin_on:
-                    await cur.execute(
-                        """
-                        WITH locked AS (
-                            SELECT platform, message_id
-                            FROM dalton_channel_inbound_events
-                            WHERE command_effect_status = 'pending_cancel'
-                              AND (thread_id IS NULL OR run_id IS NULL OR btrim(run_id) = '')
-                            ORDER BY platform ASC, message_id ASC
-                            FOR UPDATE SKIP LOCKED
-                        )
-                        UPDATE dalton_channel_inbound_events ie
-                        SET command_effect_status = 'done',
-                            updated_at = NOW()
-                        FROM locked l
-                        WHERE ie.platform = l.platform
-                          AND ie.message_id = l.message_id
-                        """
-                    )
-                else:
-                    await cur.execute(
-                        """
-                        WITH locked AS (
-                            SELECT platform, message_id
-                            FROM dalton_channel_inbound_events
-                            WHERE command_effect_status = 'pending_cancel'
-                              AND platform <> 'weixin'
-                              AND (thread_id IS NULL OR run_id IS NULL OR btrim(run_id) = '')
-                            ORDER BY platform ASC, message_id ASC
-                            FOR UPDATE SKIP LOCKED
-                        )
-                        UPDATE dalton_channel_inbound_events ie
-                        SET command_effect_status = 'done',
-                            updated_at = NOW()
-                        FROM locked l
-                        WHERE ie.platform = l.platform
-                          AND ie.message_id = l.message_id
-                        """
-                    )
-
-                # ③ Fetch all recovery sets (filtered by active capabilities; decrypt Weixin media meta)
-                enc_key: str | None = None
-                if weixin_on:
-                    try:
-                        enc_key = get_encryption_key()
-                    except Exception:
-                        enc_key = None
-
-                if enc_key:
-                    await cur.execute(
-                        """
-                        SELECT ie.*,
-                               CASE
-                                   WHEN ie.encrypted_weixin_media_meta IS NOT NULL
-                                   THEN pgp_sym_decrypt(ie.encrypted_weixin_media_meta, %s)
-                                   ELSE NULL
-                               END AS decrypted_weixin_media_json
-                        FROM dalton_channel_inbound_events ie
-                        WHERE ie.status IN ('pending', 'accepted', 'streaming', 'steered', 'pending_resubmit')
-                           OR ie.fallback_pending = TRUE
-                           OR ie.command_reply_pending = TRUE
-                           OR ie.command_effect_status = 'pending_cancel'
-                        ORDER BY ie.created_at ASC
-                        """,
-                        (enc_key,),
-                    )
-                else:
-                    await cur.execute(
-                        """
-                        SELECT ie.*
-                        FROM dalton_channel_inbound_events ie
-                        WHERE ie.status IN ('pending', 'accepted', 'streaming', 'steered', 'pending_resubmit')
-                           OR ie.fallback_pending = TRUE
-                           OR ie.command_reply_pending = TRUE
-                           OR ie.command_effect_status = 'pending_cancel'
-                        ORDER BY ie.created_at ASC
-                        """
-                    )
-                inbound_events = [
-                    dict(r)
-                    for r in await cur.fetchall()
-                    if not _payload_marks_invalid_inbound(r.get("raw_payload"))
-                    and _platform_enabled_for_recovery(r.get("platform"))
-                ]
-                cleaned_inbound_events: list[dict[str, Any]] = []
-                for r in inbound_events:
-                    if r.get("command_effect_status") == "pending_cancel" and not (
-                        r.get("thread_id") and str(r.get("run_id") or "").strip()
-                    ):
-                        r["command_effect_status"] = "done"
-                        if (
-                            r.get("status")
-                            not in (
-                                "pending",
-                                "accepted",
-                                "streaming",
-                                "steered",
-                                "pending_resubmit",
-                            )
-                            and not r.get("fallback_pending")
-                            and not r.get("command_reply_pending")
-                        ):
-                            continue
-                    # Attach decrypted Weixin media attachments to top-level AND raw_payload copy (§3.4 #2)
-                    dec_json = r.pop("decrypted_weixin_media_json", None)
-                    if dec_json:
-                        try:
-                            dec_atts = json.loads(dec_json)
-                        except Exception:
-                            dec_atts = None
-                        if dec_atts is not None:
-                            r["decrypted_weixin_attachments"] = dec_atts
-                            raw_copy = (
-                                dict(r.get("raw_payload") or {})
-                                if isinstance(r.get("raw_payload"), dict)
-                                else {}
-                            )
-                            raw_copy["weixin_attachments"] = dec_atts
-                            r["_recovery_raw_payload_with_weixin_attachments"] = raw_copy
-                    cleaned_inbound_events.append(r)
-                inbound_events = cleaned_inbound_events
-
-                await cur.execute(
-                    """
-                    SELECT * FROM dalton_channel_background_runs
-                    WHERE fallback_pending = TRUE
-                    ORDER BY created_at ASC
-                    """
-                )
-                background_runs = [
-                    dict(r)
-                    for r in await cur.fetchall()
-                    if _platform_enabled_for_recovery(r.get("platform"))
-                ]
-
-                await cur.execute(
-                    """
-                    SELECT * FROM dalton_channel_thread_watches
-                    WHERE watch_active = TRUE
-                    ORDER BY created_at ASC
-                    """
-                )
-                thread_watches = [
-                    dict(r)
-                    for r in await cur.fetchall()
-                    if _platform_enabled_for_recovery(r.get("platform"))
-                ]
-                await _enrich_recovery_scope_keys(cur, background_runs, thread_watches)
-                watch_by_tid = {
-                    str(w["thread_id"]): w for w in thread_watches if w.get("thread_id")
-                }
-                for bgr in background_runs:
-                    w_match = watch_by_tid.get(str(bgr.get("thread_id") or ""))
-                    if w_match:
-                        if not bgr.get("scope_key") and w_match.get("scope_key"):
-                            bgr["scope_key"] = w_match["scope_key"]
-                        if (
-                            bgr.get("generation") is None
-                            and w_match.get("generation") is not None
-                        ):
-                            bgr["generation"] = w_match["generation"]
 
                 await cur.execute(
                     """
@@ -14609,12 +17945,25 @@ async def _recover_channel_state_once(
                     if auto_blocked is not None:
                         auto_row["outbound_blocked"] = auto_blocked
 
+                (
+                    bt2_link_recoveries,
+                    interrupt_resumes,
+                    late_patch_tokens,
+                    send_in_flight_tokens,
+                ) = await _fetch_recovery_interrupt_and_bt2_work_in_tx(
+                    cur, enabled_platforms=enabled_platforms
+                )
+
                 return {
                     "mode": "startup",
                     "inbound_events": _json_safe_rows(inbound_events),
                     "background_runs": _json_safe_rows(background_runs),
                     "thread_watches": _json_safe_rows(thread_watches),
                     "automation_runs": _json_safe_rows(automation_runs),
+                    "interrupt_resumes": _json_safe_rows(interrupt_resumes),
+                    "late_patch_tokens": _json_safe_rows(late_patch_tokens),
+                    "send_in_flight_tokens": _json_safe_rows(send_in_flight_tokens),
+                    "bt2_link_recoveries": _json_safe_rows(bt2_link_recoveries),
                 }
 
 

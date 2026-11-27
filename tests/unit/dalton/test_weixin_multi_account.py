@@ -749,10 +749,16 @@ class InMemoryWeixinMultiAccountStore:
                 w = self.thread_watches.get(str(params[0]))
                 return [dict(w)] if w else []
             if "NOT (weixin_account_id = ANY" in norm:
-                allowed_aids = {str(x) for x in (params[0] or [])}
+                allowed_aids = {str(x) for x in (params[-1] or [])}
+                allowed_plats = (
+                    {str(p).lower() for p in (params[0] or [])}
+                    if "platform = ANY" in norm and len(params) >= 2
+                    else None
+                )
                 for w in self.thread_watches.values():
                     if (
                         w.get("watch_active")
+                        and (allowed_plats is None or str(w.get("platform") or "").lower() in allowed_plats)
                         and w.get("weixin_account_id")
                         and str(w["weixin_account_id"]) not in allowed_aids
                     ):
@@ -764,11 +770,17 @@ class InMemoryWeixinMultiAccountStore:
                         return [{"?column?": 1}]
                 return []
             if "weixin_account_id IS NULL OR weixin_account_id = ANY" in norm:
-                allowed_aids = {str(x) for x in (params[0] or [])}
+                allowed_aids = {str(x) for x in (params[-1] or [])}
+                allowed_plats = (
+                    {str(p).lower() for p in (params[0] or [])}
+                    if "platform = ANY" in norm and len(params) >= 2
+                    else None
+                )
                 return [
                     dict(w)
                     for w in self.thread_watches.values()
                     if w.get("watch_active")
+                    and (allowed_plats is None or str(w.get("platform") or "").lower() in allowed_plats)
                     and (
                         not w.get("weixin_account_id")
                         or str(w["weixin_account_id"]) in allowed_aids

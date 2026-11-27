@@ -117,6 +117,7 @@ _before_lease_update_hook: Callable[[], Awaitable[None]] | None = None
 _after_discovery_hook: Callable[[], Awaitable[None]] | None = None
 _after_user_locks_hook: Callable[[], Awaitable[None]] | None = None
 _after_pending_verify_read_hook: Callable[[], Awaitable[None]] | None = None
+_after_unbind_3a_lock_hook: Callable[[str], Awaitable[None]] | None = None
 
 
 class StaleGatewayEpochError(HTTPException):
@@ -3387,6 +3388,8 @@ async def unbind_weixin_account(
                         (get_encryption_key(), eff_uid),
                     )
                     acc = await cur.fetchone()
+                    if _after_unbind_3a_lock_hook is not None:
+                        await _after_unbind_3a_lock_hook("unbind")
                     if norm_aid and (acc is None or str(acc["account_id"]) != norm_aid):
                         if via_wechat_command:
                             return {"ok": False, "reason": "not_linked"}
