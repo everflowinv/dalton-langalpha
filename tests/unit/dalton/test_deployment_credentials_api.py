@@ -867,6 +867,128 @@ class TestRedirectUriRedactionAndVaultHooks:
         assert "[REDACTED:DALTON_FEISHU_APP_SECRET]" in redacted_vault_text
         assert "cli_vault_only_id" in redacted_vault_text
 
+    def test_short_vault_secret_excluded_from_managed_tokens_and_sandbox_sanitization(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from dataclasses import dataclass, field
+
+        from src.server.utils.secret_redactor import MIN_REDACT_SECRET_LEN
+
+        @dataclass
+        class _DummyMCPServer:
+            name: str
+            url: str = ""
+            command: str = ""
+            args: list[str] = field(default_factory=list)
+            headers: dict[str, str] = field(default_factory=dict)
+            env: dict[str, str] = field(default_factory=dict)
+            enabled: bool = True
+
+        # Ensure management tokens are unset so only deployment Vault secrets are under test.
+        for tok_env in (
+            "DALTON_BRIDGE_ADMIN_TOKEN",
+            "INTERNAL_SERVICE_TOKEN",
+            "DALTON_TRANSCRIPTION_TICKET_SECRET",
+            "DALTON_TRANSCRIPTION_TOKEN",
+            "DALTON_RESEARCH_ADMIN_TOKEN",
+        ):
+            monkeypatch.delenv(tok_env, raising=False)
+
+        short_vault_secret = "api123"
+        assert len(short_vault_secret) < MIN_REDACT_SECRET_LEN
+        dc_snapshot.set_active_snapshot(
+            dc_snapshot.build_snapshot(
+                3,
+                {},
+                feishu_vault_pair={
+                    "DALTON_FEISHU_APP_ID": "cli_short_vault_id",
+                    "DALTON_FEISHU_APP_SECRET": short_vault_secret,
+                },
+            )
+        )
+
+        # Short Vault secret is excluded from managed_secret_token_values() and substring filtering.
+        assert short_vault_secret not in dalton_settings.managed_secret_token_values()
+        unrelated_env = {
+            "API_BASE_URL": f"https://service.example.com/{short_vault_secret}/v1",
+            "SERVICE_TAG": short_vault_secret,
+        }
+        unrelated_server = _DummyMCPServer(
+            name="market-data",
+            url=f"https://mcp.example.com/{short_vault_secret}",
+            args=["--endpoint", short_vault_secret],
+            headers={"X-Tag": short_vault_secret},
+            env={"API_BASE_URL": unrelated_env["API_BASE_URL"]},
+            enabled=True,
+        )
+        sanitized_env = dalton_settings.sanitize_sandbox_env_vars(
+            dict(unrelated_env), servers=[unrelated_server]
+        )
+        assert sanitized_env == unrelated_env
+        assert unrelated_server.enabled is True
+
+        mcp_entry = {
+            "url": unrelated_server.url,
+            "args": list(unrelated_server.args),
+            "headers": dict(unrelated_server.headers),
+            "env": dict(unrelated_server.env),
+            "env_keys": ["API_BASE_URL"],
+        }
+        sanitized_entry = dalton_settings.sanitize_mcp_client_config_server(
+            unrelated_server, dict(mcp_entry)
+        )
+        assert sanitized_entry == mcp_entry
+        assert unrelated_server.enabled is True
+
+        # Vault secret meeting MIN_REDACT_SECRET_LEN is included and still filtered from sandbox configs.
+        long_vault_secret = "test-secret-not-real-vault-long-0011"
+        assert len(long_vault_secret) >= MIN_REDACT_SECRET_LEN
+        dc_snapshot.set_active_snapshot(
+            dc_snapshot.build_snapshot(
+                4,
+                {},
+                feishu_vault_pair={
+                    "DALTON_FEISHU_APP_ID": "cli_long_vault_id",
+                    "DALTON_FEISHU_APP_SECRET": long_vault_secret,
+                },
+            )
+        )
+        assert long_vault_secret in dalton_settings.managed_secret_token_values()
+        leaking_server = _DummyMCPServer(
+            name="leaking-mcp",
+            url="https://mcp.example.com/ok",
+            env={"LEAKED_VAR": f"prefix-{long_vault_secret}"},
+            enabled=True,
+        )
+        env_with_leak = {
+            "SAFE_VAR": "harmless",
+            "LEAKED_VAR": f"prefix-{long_vault_secret}",
+        }
+        with caplog.at_level(logging.DEBUG):
+            cleaned_env = dalton_settings.sanitize_sandbox_env_vars(
+                env_with_leak, servers=[leaking_server]
+            )
+        assert cleaned_env == {"SAFE_VAR": "harmless"}
+        assert leaking_server.enabled is False
+        assert long_vault_secret not in caplog.text
+
+        # Overlapping secrets (shorter saved secret that is a substring of a longer env secret)
+        # are replaced longest-first so no plaintext tail remains.
+        shorter_secret = "test-secret-not-real-overlap"
+        longer_secret = f"{shorter_secret}-extended-0012"
+        monkeypatch.setenv("DALTON_FEISHU_APP_SECRET", longer_secret)
+        dc_snapshot.set_active_snapshot(
+            dc_snapshot.build_snapshot(
+                5,
+                {"DALTON_FEISHU_APP_SECRET": shorter_secret},
+            )
+        )
+        redacted_overlap = dalton_settings.redact_managed_tokens(f"val={longer_secret}")
+        assert redacted_overlap == "val=***"
+        assert longer_secret not in redacted_overlap
+        assert shorter_secret not in redacted_overlap
+        assert "extended-0012" not in redacted_overlap
+
     @pytest.mark.asyncio
     async def test_vault_invalidation_hook_refreshes_on_feishu_keys_and_ignores_errors(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture

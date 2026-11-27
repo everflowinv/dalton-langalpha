@@ -1262,8 +1262,8 @@ def managed_secret_token_values() -> tuple[str, ...]:
     Includes ``DALTON_BRIDGE_ADMIN_TOKEN``, ``INTERNAL_SERVICE_TOKEN``,
     ``DALTON_TRANSCRIPTION_TICKET_SECRET``, ``DALTON_TRANSCRIPTION_TOKEN``,
     ``DALTON_RESEARCH_ADMIN_TOKEN``, and active Batch 1 deployment credential secrets
-    (environment, saved snapshot, and Vault fallback via ``active_deployment_secret_values``).
-    Any may be unset; only non-empty values are returned.
+    meeting ``MIN_REDACT_SECRET_LEN`` (environment, saved snapshot, and Vault fallback
+    via ``active_deployment_secret_values``) so short values stay out of substring filters.
     """
     values: list[str] = []
     seen: set[str] = set()
@@ -1279,9 +1279,10 @@ def managed_secret_token_values() -> tuple[str, ...]:
             values.append(token)
     try:
         from src.dalton.deployment_credentials.snapshot import active_deployment_secret_values
+        from src.server.utils.secret_redactor import MIN_REDACT_SECRET_LEN
 
         for _name, raw in active_deployment_secret_values():
-            if raw and raw not in seen:
+            if raw and len(raw) >= MIN_REDACT_SECRET_LEN and raw not in seen:
                 seen.add(raw)
                 values.append(raw)
     except Exception:
@@ -1298,7 +1299,7 @@ def redact_managed_tokens(text: Any) -> Any:
     """
     if not isinstance(text, str):
         return text
-    for token in managed_secret_token_values():
+    for token in sorted(managed_secret_token_values(), key=len, reverse=True):
         text = text.replace(token, "***")
     return text
 

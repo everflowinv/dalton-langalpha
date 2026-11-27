@@ -3129,6 +3129,145 @@ class TestDeploymentCredentialsReadContract:
         )
         assert get_active_snapshot() is current
 
+    @pytest.mark.asyncio
+    async def test_resolve_credential_group_concurrent_vault_rotation_returns_new_value_and_rejects_older_slot_write(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.deployment_credentials import (
+            get_credential_group,
+            resolve_credential_group,
+        )
+        from src.dalton.deployment_credentials import snapshot as snap_mod
+        from src.dalton.deployment_credentials.snapshot import (
+            build_snapshot,
+            get_active_snapshot,
+            set_active_snapshot,
+            update_active_snapshot_vault,
+        )
+
+        old_secret = "test-secret-not-real-vault-old-r301"
+        new_secret = "test-secret-not-real-vault-new-r302"
+
+        s0 = build_snapshot(3, {}, feishu_vault_pair=None, feishu_vault_error=False)
+        set_active_snapshot(s0)
+
+        first_entered = asyncio.Event()
+        both_started = asyncio.Event()
+        release_second = asyncio.Event()
+        call_count = 0
+
+        async def _vault_query_sequence():
+            nonlocal call_count
+            call_count += 1
+            idx = call_count
+            if idx == 1:
+                first_entered.set()
+                await both_started.wait()
+                # First request finishes first with pre-rotation secret.
+                return (
+                    {
+                        "DALTON_FEISHU_APP_ID": "cli_vault_old_r3",
+                        "DALTON_FEISHU_APP_SECRET": old_secret,
+                    },
+                    False,
+                    None,
+                )
+            if idx == 2:
+                # Signal that both concurrent requests started from the same snapshot S0.
+                both_started.set()
+                await release_second.wait()
+                # Vault rotated before second request finishes; its initial query sees rotated value.
+                return (
+                    {
+                        "DALTON_FEISHU_APP_ID": "cli_vault_new_r3",
+                        "DALTON_FEISHU_APP_SECRET": new_secret,
+                    },
+                    False,
+                    None,
+                )
+            # Re-query triggered because snapshot changed while second request awaited.
+            return (
+                {
+                    "DALTON_FEISHU_APP_ID": "cli_vault_new_r3",
+                    "DALTON_FEISHU_APP_SECRET": new_secret,
+                },
+                False,
+                None,
+            )
+
+        monkeypatch.setattr(
+            snap_mod,
+            "query_feishu_vault_pair_strict",
+            create_autospec(
+                snap_mod.query_feishu_vault_pair_strict,
+                side_effect=_vault_query_sequence,
+            ),
+        )
+
+        task_a = asyncio.create_task(resolve_credential_group(group_name="feishu_app"))
+        await first_entered.wait()
+        task_b = asyncio.create_task(resolve_credential_group(group_name="feishu_app"))
+
+        res_a = await task_a
+        assert res_a.source == "vault_readonly"
+        assert res_a.values["DALTON_FEISHU_APP_ID"] == "cli_vault_old_r3"
+        assert res_a.values["DALTON_FEISHU_APP_SECRET"] == old_secret
+        s1 = get_active_snapshot()
+        assert s1.version > s0.version
+
+        # Now let task_b return after snapshot moved to s1.
+        release_second.set()
+        res_b = await task_b
+        assert res_b.source == "vault_readonly"
+        assert res_b.ready is True
+        assert res_b.values["DALTON_FEISHU_APP_ID"] == "cli_vault_new_r3"
+        assert res_b.values["DALTON_FEISHU_APP_SECRET"] == new_secret
+        assert call_count == 3
+
+        # Active snapshot slot now holds the rotated new secret, and older versions cannot overwrite it.
+        s2 = get_active_snapshot()
+        assert s2.version > s1.version
+        active_group = get_credential_group("feishu_app")
+        assert active_group.source == "vault_readonly"
+        assert active_group.values["DALTON_FEISHU_APP_SECRET"] == new_secret
+
+        assert (
+            update_active_snapshot_vault(
+                {
+                    "DALTON_FEISHU_APP_ID": "cli_stale_overwrite",
+                    "DALTON_FEISHU_APP_SECRET": old_secret,
+                },
+                feishu_vault_error=False,
+                expected=s0,
+            )
+            is None
+        )
+        assert (
+            update_active_snapshot_vault(
+                {
+                    "DALTON_FEISHU_APP_ID": "cli_stale_overwrite",
+                    "DALTON_FEISHU_APP_SECRET": old_secret,
+                },
+                feishu_vault_error=False,
+                expected=s1,
+            )
+            is None
+        )
+        assert get_active_snapshot() is s2
+
+        # Same-or-newer snapshot version is accepted.
+        updated_s3 = update_active_snapshot_vault(
+            {
+                "DALTON_FEISHU_APP_ID": "cli_vault_newest_r3",
+                "DALTON_FEISHU_APP_SECRET": new_secret,
+            },
+            feishu_vault_error=False,
+            expected=s2,
+        )
+        assert updated_s3 is not None
+        assert updated_s3.version > s2.version
+        assert get_active_snapshot() is updated_s3
+
     def test_feishu_event_group_ready_with_at_least_one_valid_key_when_sibling_invalid(
         self,
     ) -> None:

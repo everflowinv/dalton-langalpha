@@ -49,6 +49,7 @@ class CredentialSnapshot:
     values: MappingProxyType[str, str]
     feishu_vault_pair: Mapping[str, str] | None = None
     feishu_vault_error: bool = False
+    version: int = 0
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,7 @@ _INITIAL_SNAPSHOT = CredentialSnapshot(
     values=MappingProxyType({}),
     feishu_vault_pair=None,
     feishu_vault_error=False,
+    version=0,
 )
 
 # Single module-level immutable reference replaced atomically after export(rows) or Vault refresh.
@@ -85,8 +87,21 @@ def get_active_snapshot() -> CredentialSnapshot:
 
 
 def set_active_snapshot(snapshot: CredentialSnapshot) -> None:
-    """Atomically replace the worker's active snapshot via a single reference assignment."""
+    """Atomically replace the worker's active snapshot via a single reference assignment.
+
+    Advances the snapshot's monotonic ``version`` when a caller installs a snapshot whose
+    version is not strictly newer than the active one so older concurrent Vault lookups
+    cannot overwrite newer results.
+    """
     global _active_snapshot
+    if snapshot is not _INITIAL_SNAPSHOT and snapshot.version <= _active_snapshot.version:
+        snapshot = CredentialSnapshot(
+            revision=snapshot.revision,
+            values=snapshot.values,
+            feishu_vault_pair=snapshot.feishu_vault_pair,
+            feishu_vault_error=snapshot.feishu_vault_error,
+            version=_active_snapshot.version + 1,
+        )
     _active_snapshot = snapshot
 
 
@@ -108,6 +123,7 @@ def build_snapshot(
         values=MappingProxyType(dict(rows)),
         feishu_vault_pair=frozen_vault,
         feishu_vault_error=bool(feishu_vault_error),
+        version=_active_snapshot.version + 1,
     )
 
 
@@ -117,13 +133,18 @@ def update_active_snapshot_vault(
     feishu_vault_error: bool,
     expected: CredentialSnapshot,
 ) -> CredentialSnapshot | None:
-    """Atomically update the Vault slot of ``_active_snapshot`` when it still matches ``expected``.
+    """Atomically update the Vault slot of ``_active_snapshot`` when ``expected`` is current or newer.
 
-    Preserves revision and saved rows. Returns ``None`` without replacing ``_active_snapshot``
-    if a concurrent refresh has already installed a newer snapshot.
+    Compares ``(revision, version)`` so queries started against an older snapshot never
+    overwrite a newer Vault result or a snapshot where ``env`` / ``saved`` owns ``feishu_app``.
+    Preserves revision and saved rows while advancing the snapshot version.
     """
     current = _active_snapshot
-    if current is not expected:
+    if (expected.revision, expected.version) < (current.revision, current.version):
+        return None
+    if any(setup_env.set_outside_app(key) for key in _FEISHU_APP_KEYS) or any(
+        key in current.values for key in _FEISHU_APP_KEYS
+    ):
         return None
     frozen_vault = (
         MappingProxyType(dict(feishu_vault_pair))
@@ -135,6 +156,7 @@ def update_active_snapshot_vault(
         values=current.values,
         feishu_vault_pair=frozen_vault,
         feishu_vault_error=bool(feishu_vault_error),
+        version=max(current.version, expected.version) + 1,
     )
     set_active_snapshot(updated)
     return updated
@@ -278,12 +300,84 @@ async def preload_feishu_vault_pair(
     return pair, vault_error
 
 
+def _evaluate_non_vault_source(
+    group_name: str,
+    keys: tuple[str, ...],
+    *,
+    pair_required: bool,
+    snap: CredentialSnapshot,
+    at_start: Mapping[str, str],
+) -> CredentialGroupResult | None:
+    """Resolve ``env`` or ``saved`` source for a group; return ``None`` when neither owns it."""
+    if any(setup_env.set_outside_app(key) for key in keys):
+        ready, values = _evaluate_group_from_mapping(
+            keys, at_start, pair_required=pair_required
+        )
+        return CredentialGroupResult(
+            group=group_name,
+            source="env",
+            revision=snap.revision,
+            ready=ready,
+            values=values,
+        )
+    if any(key in snap.values for key in keys):
+        ready, values = _evaluate_group_from_mapping(
+            keys, snap.values, pair_required=pair_required
+        )
+        return CredentialGroupResult(
+            group=group_name,
+            source="saved",
+            revision=snap.revision,
+            ready=ready,
+            values=values,
+        )
+    return None
+
+
+def _build_vault_result(
+    group_name: str,
+    keys: tuple[str, ...],
+    *,
+    pair_required: bool,
+    revision: int,
+    pair: Mapping[str, str] | None,
+    vault_error: bool,
+) -> CredentialGroupResult:
+    """Build a ``CredentialGroupResult`` from a Vault lookup outcome."""
+    if vault_error:
+        return CredentialGroupResult(
+            group=group_name,
+            source="vault_error",
+            revision=revision,
+            ready=False,
+            values=_EMPTY_MAPPING,
+        )
+    if pair is not None:
+        ready, values = _evaluate_group_from_mapping(
+            keys, pair, pair_required=pair_required
+        )
+        return CredentialGroupResult(
+            group=group_name,
+            source="vault_readonly",
+            revision=revision,
+            ready=ready,
+            values=values,
+        )
+    return CredentialGroupResult(
+        group=group_name,
+        source="unset",
+        revision=revision,
+        ready=False,
+        values=_EMPTY_MAPPING,
+    )
+
+
 def get_credential_group(group_name: str) -> CredentialGroupResult:
     """Synchronously read one credential group from the active worker snapshot.
 
     Enforces single-source precedence per group:
     ``env > saved > vault_readonly / vault_error (feishu_app only) > unset``.
-    Half-configured ``env`` or ``saved`` groups lock to that source with ``ready=False``
+    Half-configured paired ``env`` or ``saved`` groups lock to that source with ``ready=False``
     and empty ``values`` rather than falling back to lower-priority sources.
     """
     spec = get_credential_group_spec(group_name)
@@ -293,53 +387,27 @@ def get_credential_group(group_name: str) -> CredentialGroupResult:
     snap = get_active_snapshot()
     at_start = setup_env._snapshot()
 
-    # 1. Startup environment lock (any key non-empty in _at_start locks the whole group).
-    if any(setup_env.set_outside_app(key) for key in spec.keys):
-        ready, values = _evaluate_group_from_mapping(
-            spec.keys, at_start, pair_required=spec.pair_required
-        )
-        return CredentialGroupResult(
-            group=group_name,
-            source="env",
-            revision=snap.revision,
-            ready=ready,
-            values=values,
-        )
-
-    # 2. Saved DB snapshot at a single REPEATABLE READ revision.
-    if any(key in snap.values for key in spec.keys):
-        ready, values = _evaluate_group_from_mapping(
-            spec.keys, snap.values, pair_required=spec.pair_required
-        )
-        return CredentialGroupResult(
-            group=group_name,
-            source="saved",
-            revision=snap.revision,
-            ready=ready,
-            values=values,
-        )
+    # 1 & 2. Startup environment lock, then saved DB snapshot at one REPEATABLE READ revision.
+    non_vault = _evaluate_non_vault_source(
+        group_name,
+        spec.keys,
+        pair_required=spec.pair_required,
+        snap=snap,
+        at_start=at_start,
+    )
+    if non_vault is not None:
+        return non_vault
 
     # 3. Primary admin Vault read-only fallback (Batch 1: feishu_app only).
     if spec.vault_fallback:
-        if snap.feishu_vault_error:
-            return CredentialGroupResult(
-                group=group_name,
-                source="vault_error",
-                revision=snap.revision,
-                ready=False,
-                values=_EMPTY_MAPPING,
-            )
-        if snap.feishu_vault_pair is not None:
-            ready, values = _evaluate_group_from_mapping(
-                spec.keys, snap.feishu_vault_pair, pair_required=spec.pair_required
-            )
-            return CredentialGroupResult(
-                group=group_name,
-                source="vault_readonly",
-                revision=snap.revision,
-                ready=ready,
-                values=values,
-            )
+        return _build_vault_result(
+            group_name,
+            spec.keys,
+            pair_required=spec.pair_required,
+            revision=snap.revision,
+            pair=snap.feishu_vault_pair,
+            vault_error=snap.feishu_vault_error,
+        )
 
     # 4. Unset.
     return CredentialGroupResult(
@@ -355,84 +423,80 @@ async def resolve_credential_group(group_name: str) -> CredentialGroupResult:
     """Asynchronously resolve one credential group using the same single-source precedence.
 
     When ``group_name == "feishu_app"`` and neither startup ``env`` nor ``saved`` rows hold
-    any ``feishu_app`` key, queries the primary administrator's Vault live and atomically
-    updates this worker's ``_active_snapshot`` Vault slot when the snapshot has not changed
-    during the await.
+    any ``feishu_app`` key, queries the primary administrator's Vault live. If the active
+    snapshot changes during the await, re-evaluates the source against the current snapshot;
+    when the source is still Vault, queries Vault again against the current snapshot, adopts
+    that result, preserves this request's own Vault error detail, and writes the slot only
+    when the base snapshot version is current or newer.
     """
     spec = get_credential_group_spec(group_name)
     if spec is None:
         raise ValueError(f"Unknown credential group: {group_name!r}")
 
+    if spec.vault_fallback:
+        _last_feishu_vault_error.set(None)
+
     snap = get_active_snapshot()
     at_start = setup_env._snapshot()
 
-    # 1. Startup environment lock.
-    if any(setup_env.set_outside_app(key) for key in spec.keys):
-        ready, values = _evaluate_group_from_mapping(
-            spec.keys, at_start, pair_required=spec.pair_required
-        )
-        return CredentialGroupResult(
-            group=group_name,
-            source="env",
-            revision=snap.revision,
-            ready=ready,
-            values=values,
-        )
+    # 1 & 2. Startup environment lock or saved DB snapshot.
+    non_vault = _evaluate_non_vault_source(
+        group_name,
+        spec.keys,
+        pair_required=spec.pair_required,
+        snap=snap,
+        at_start=at_start,
+    )
+    if non_vault is not None:
+        return non_vault
 
-    # 2. Saved DB snapshot.
-    if any(key in snap.values for key in spec.keys):
-        ready, values = _evaluate_group_from_mapping(
-            spec.keys, snap.values, pair_required=spec.pair_required
-        )
-        return CredentialGroupResult(
-            group=group_name,
-            source="saved",
-            revision=snap.revision,
-            ready=ready,
-            values=values,
-        )
-
-    # 3. Live Vault lookup for feishu_app with atomic worker-slot update.
+    # 3. Live Vault lookup for feishu_app with version-checked worker-slot update.
     if spec.vault_fallback:
-        _last_feishu_vault_error.set(None)
         pair, vault_error, err = await query_feishu_vault_pair_strict()
-        # Re-evaluate against the latest snapshot if a concurrent refresh swapped it during await.
-        if get_active_snapshot() is not snap:
-            return get_credential_group(group_name)
-        if err is not None:
-            _last_feishu_vault_error.set(err)
+
+        current = get_active_snapshot()
+        if current is not snap:
+            # Re-evaluate source against the latest snapshot; if still Vault, re-query live.
+            non_vault = _evaluate_non_vault_source(
+                group_name,
+                spec.keys,
+                pair_required=spec.pair_required,
+                snap=current,
+                at_start=setup_env._snapshot(),
+            )
+            if non_vault is not None:
+                return non_vault
+            snap = current
+            pair, vault_error, err = await query_feishu_vault_pair_strict()
+            current = get_active_snapshot()
+            if current is not snap:
+                non_vault = _evaluate_non_vault_source(
+                    group_name,
+                    spec.keys,
+                    pair_required=spec.pair_required,
+                    snap=current,
+                    at_start=setup_env._snapshot(),
+                )
+                if non_vault is not None:
+                    return non_vault
+
+        # Preserve this request's own error detail even when concurrent refreshes move the snapshot.
+        _last_feishu_vault_error.set(err)
         updated = update_active_snapshot_vault(
             pair,
             feishu_vault_error=vault_error,
             expected=snap,
         )
-        if updated is None:
-            return get_credential_group(group_name)
-        if vault_error:
-            return CredentialGroupResult(
-                group=group_name,
-                source="vault_error",
-                revision=updated.revision,
-                ready=False,
-                values=_EMPTY_MAPPING,
-            )
-        if pair is not None:
-            ready, values = _evaluate_group_from_mapping(
-                spec.keys, pair, pair_required=spec.pair_required
-            )
-            return CredentialGroupResult(
-                group=group_name,
-                source="vault_readonly",
-                revision=updated.revision,
-                ready=ready,
-                values=values,
-            )
-        return CredentialGroupResult(
-            group=group_name,
-            source="unset",
-            revision=updated.revision,
-            ready=False,
-            values=_EMPTY_MAPPING,
+        effective_revision = (
+            updated.revision if updated is not None else get_active_snapshot().revision
+        )
+        return _build_vault_result(
+            group_name,
+            spec.keys,
+            pair_required=spec.pair_required,
+            revision=effective_revision,
+            pair=pair,
+            vault_error=vault_error,
         )
 
     # 4. Unset.
