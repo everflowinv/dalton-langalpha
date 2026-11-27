@@ -5742,3 +5742,134 @@ def test_continuation_heading_fingerprint_parity_with_font_tags_and_bold_boundar
     )
 
 
+def test_feishu_credentials_endpoint_live_vault_rotation_and_env_saved_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/feishu-credentials resolves via resolve_feishu_app_credentials() across Vault, env, and saved sources."""
+    from src.dalton.deployment_credentials import get_credential_group
+    from src.dalton.deployment_credentials.snapshot import (
+        build_snapshot,
+        reset_active_snapshot_for_test,
+        set_active_snapshot,
+    )
+    from src.dalton.services import channel_vault_credentials as vault_creds_mod
+    from src.server.services.setup_settings import environment as setup_env
+    from src.server.services.setup_settings.catalog import key_specs
+
+    pm_uid = "pm-vault-rotation-test-001"
+    monkeypatch.setenv("DALTON_ENABLED", "1")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    monkeypatch.setenv("DALTON_PM_USER_IDS", pm_uid)
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", SERVICE_TOKEN)
+    monkeypatch.setenv("DALTON_CAP_CHANNEL_GATEWAY", "true")
+    monkeypatch.setenv("DALTON_CAP_CHANNEL_FEISHU", "true")
+    monkeypatch.delenv("DALTON_FEISHU_APP_ID", raising=False)
+    monkeypatch.delenv("DALTON_FEISHU_APP_SECRET", raising=False)
+    monkeypatch.setattr(setup_env, "_at_start", None)
+    key_specs.cache_clear()
+    reset_active_snapshot_for_test()
+
+    app = FastAPI()
+    app.include_router(dalton_router)
+    client = TestClient(app)
+    endpoint = "/api/v1/dalton/channels/internal/data-task-notifications/feishu-credentials"
+    headers = {"X-Service-Token": SERVICE_TOKEN}
+
+    try:
+        # 1. Vault source: stale secret cached in worker snapshot, Vault rotated to new secret ->
+        #    endpoint reads Vault live, returns new secret, and updates worker snapshot slot.
+        old_secret = "test-secret-not-real-vault-old-001"
+        new_secret = "test-secret-not-real-vault-new-002"
+        set_active_snapshot(
+            build_snapshot(
+                2,
+                {},
+                feishu_vault_pair={
+                    "DALTON_FEISHU_APP_ID": "cli_vault_old",
+                    "DALTON_FEISHU_APP_SECRET": old_secret,
+                },
+            )
+        )
+        monkeypatch.setattr(
+            vault_creds_mod,
+            "get_user_secrets_decrypted",
+            create_autospec(
+                vault_creds_mod.get_user_secrets_decrypted,
+                return_value={
+                    "DALTON_FEISHU_APP_ID": "cli_vault_new",
+                    "DALTON_FEISHU_APP_SECRET": new_secret,
+                },
+            ),
+        )
+        res_vault = client.post(endpoint, headers=headers, json={})
+        assert res_vault.status_code == 200
+        assert res_vault.headers.get("cache-control") == "no-store"
+        assert res_vault.json() == {
+            "credentials": {
+                "DALTON_FEISHU_APP_ID": "cli_vault_new",
+                "DALTON_FEISHU_APP_SECRET": new_secret,
+            }
+        }
+        # Worker snapshot Vault slot was updated atomically.
+        slot = get_credential_group("feishu_app")
+        assert slot.source == "vault_readonly"
+        assert slot.values["DALTON_FEISHU_APP_ID"] == "cli_vault_new"
+        assert slot.values["DALTON_FEISHU_APP_SECRET"] == new_secret
+
+        # 2. Saved source: complete pair returns 200; half pair returns 503 with missing list
+        saved_secret = "test-secret-not-real-saved-003"
+        set_active_snapshot(
+            build_snapshot(
+                3,
+                {
+                    "DALTON_FEISHU_APP_ID": "cli_saved_ok",
+                    "DALTON_FEISHU_APP_SECRET": saved_secret,
+                },
+            )
+        )
+        res_saved = client.post(endpoint, headers=headers, json={})
+        assert res_saved.status_code == 200
+        assert res_saved.headers.get("cache-control") == "no-store"
+        assert res_saved.json() == {
+            "credentials": {
+                "DALTON_FEISHU_APP_ID": "cli_saved_ok",
+                "DALTON_FEISHU_APP_SECRET": saved_secret,
+            }
+        }
+
+        set_active_snapshot(build_snapshot(4, {"DALTON_FEISHU_APP_ID": "cli_saved_half"}))
+        res_saved_half = client.post(endpoint, headers=headers, json={})
+        assert res_saved_half.status_code == 503
+        assert res_saved_half.headers.get("cache-control") == "no-store"
+        assert res_saved_half.json()["code"] == "saved_credentials_missing"
+        assert res_saved_half.json()["missing"] == ["DALTON_FEISHU_APP_SECRET"]
+        assert "cli_saved_half" not in res_saved_half.text
+
+        # 3. Env source: complete pair returns 200; invalid format returns 503 with missing/invalid key
+        env_secret = "test-secret-not-real-env-004"
+        monkeypatch.setenv("DALTON_FEISHU_APP_ID", "cli_env_ok")
+        monkeypatch.setenv("DALTON_FEISHU_APP_SECRET", env_secret)
+        monkeypatch.setattr(setup_env, "_at_start", None)
+        res_env = client.post(endpoint, headers=headers, json={})
+        assert res_env.status_code == 200
+        assert res_env.headers.get("cache-control") == "no-store"
+        assert res_env.json() == {
+            "credentials": {
+                "DALTON_FEISHU_APP_ID": "cli_env_ok",
+                "DALTON_FEISHU_APP_SECRET": env_secret,
+            }
+        }
+
+        monkeypatch.setenv("DALTON_FEISHU_APP_SECRET", "bad secret with space")
+        monkeypatch.setattr(setup_env, "_at_start", None)
+        res_env_bad = client.post(endpoint, headers=headers, json={})
+        assert res_env_bad.status_code == 503
+        assert res_env_bad.headers.get("cache-control") == "no-store"
+        assert res_env_bad.json()["code"] == "env_credentials_invalid"
+        assert res_env_bad.json()["missing"] == ["DALTON_FEISHU_APP_SECRET"]
+        assert "bad secret with space" not in res_env_bad.text
+    finally:
+        reset_active_snapshot_for_test()
+        key_specs.cache_clear()
+
+

@@ -90,6 +90,9 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 DALTON_TOOLS_DIR = REPO_ROOT / "src" / "dalton" / "tools"
 DALTON_APP_DIR = REPO_ROOT / "src" / "dalton" / "app"
 RESEARCH_HOST_APP_PATH = REPO_ROOT / "src" / "dalton" / "research_host" / "app.py"
+DEPLOYMENT_CREDENTIALS_ROUTER_PATH = (
+    REPO_ROOT / "src" / "dalton" / "deployment_credentials" / "router.py"
+)
 SETUP_PY_PATH = REPO_ROOT / "src" / "server" / "app" / "setup.py"
 EVERFLOW_MANIFEST_PATH = (
     REPO_ROOT / "tests" / "unit" / "dalton" / "snapshots" / "everflow" / "app_env_dalton" / "manifest.json"
@@ -788,6 +791,10 @@ def _scan_dalton_app_routes_ast() -> set[tuple[str, str]]:
     ]
     if RESEARCH_HOST_APP_PATH.is_file():
         scan_targets.append(("research_host/app.py", RESEARCH_HOST_APP_PATH))
+    if DEPLOYMENT_CREDENTIALS_ROUTER_PATH.is_file():
+        scan_targets.append(
+            ("deployment_credentials/router.py", DEPLOYMENT_CREDENTIALS_ROUTER_PATH)
+        )
 
     for file_key, py_file in scan_targets:
         tree = ast.parse(py_file.read_text(encoding="utf-8"))
@@ -2800,3 +2807,199 @@ class TestBatch3BackendTextAndSkillGates:
             assert not domain_re.search(assembled), (
                 f"Forbidden internal domain 'everflowinv.com' in Core skill {fp.relative_to(REPO_ROOT)}"
             )
+
+
+class TestDeploymentCredentialsReadContract:
+    """Verify §2.3 read contract, single-source precedence, and redirect URI gating."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_state(self, monkeypatch: pytest.MonkeyPatch):
+        from src.dalton.deployment_credentials.snapshot import reset_active_snapshot_for_test
+        from src.server.services.setup_settings import environment as setup_env
+        from src.server.services.setup_settings.catalog import key_specs
+
+        for key in (
+            "DALTON_GOOGLE_OAUTH_CLIENT_ID",
+            "DALTON_GOOGLE_OAUTH_CLIENT_SECRET",
+            "DALTON_FEISHU_APP_ID",
+            "DALTON_FEISHU_APP_SECRET",
+            "DALTON_FEISHU_ENCRYPT_KEY",
+            "DALTON_FEISHU_VERIFICATION_TOKEN",
+            "PUBLIC_APP_URL",
+            "DALTON_FRONTEND_URL",
+            "FRONTEND_URL",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("DALTON_ENABLED", "1")
+        monkeypatch.setattr(setup_env, "_at_start", None)
+        key_specs.cache_clear()
+        reset_active_snapshot_for_test()
+        yield
+        reset_active_snapshot_for_test()
+        key_specs.cache_clear()
+
+    def test_google_oauth_env_pair_half_pair_and_redirect_uri_gate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.deployment_credentials import (
+            CredentialGroupResult,
+            get_credential_group,
+            google_oauth_ready,
+        )
+        from src.dalton.deployment_credentials.snapshot import build_snapshot, set_active_snapshot
+        from src.server.services.setup_settings import environment as setup_env
+
+        # Full env pair wins over saved rows
+        monkeypatch.setenv("DALTON_GOOGLE_OAUTH_CLIENT_ID", "env-cid")
+        monkeypatch.setenv("DALTON_GOOGLE_OAUTH_CLIENT_SECRET", "test-secret-not-real-env-01")
+        monkeypatch.setattr(setup_env, "_at_start", None)
+        set_active_snapshot(
+            build_snapshot(
+                4,
+                {
+                    "DALTON_GOOGLE_OAUTH_CLIENT_ID": "saved-cid",
+                    "DALTON_GOOGLE_OAUTH_CLIENT_SECRET": "test-secret-not-real-saved-02",
+                },
+            )
+        )
+        res = get_credential_group("google_oauth")
+        assert isinstance(res, CredentialGroupResult)
+        assert res.group == "google_oauth"
+        assert res.source == "env"
+        assert res.revision == 4
+        assert res.ready is True
+        assert dict(res.values) == {
+            "DALTON_GOOGLE_OAUTH_CLIENT_ID": "env-cid",
+            "DALTON_GOOGLE_OAUTH_CLIENT_SECRET": "test-secret-not-real-env-01",
+        }
+
+        # Redirect URI eligibility gates google_oauth_ready()
+        monkeypatch.setenv("PUBLIC_APP_URL", "https://192.168.1.10")
+        assert google_oauth_ready() is False
+        monkeypatch.setenv("PUBLIC_APP_URL", "https://dalton.internal")
+        assert google_oauth_ready() is False
+        monkeypatch.setenv("PUBLIC_APP_URL", "http://research.example.com")
+        assert google_oauth_ready() is False
+        monkeypatch.setenv("PUBLIC_APP_URL", "https://research.example.com")
+        assert google_oauth_ready() is True
+        monkeypatch.setenv("PUBLIC_APP_URL", "http://localhost:8088")
+        assert google_oauth_ready() is True
+
+        # Single-sided env locks to env with ready=False and empty values (never falls back to saved)
+        monkeypatch.delenv("DALTON_GOOGLE_OAUTH_CLIENT_SECRET", raising=False)
+        monkeypatch.setattr(setup_env, "_at_start", None)
+        half = get_credential_group("google_oauth")
+        assert half.source == "env"
+        assert half.ready is False
+        assert dict(half.values) == {}
+        assert google_oauth_ready() is False
+
+    @pytest.mark.asyncio
+    async def test_feishu_app_precedence_half_saved_locks_and_vault_fallback_or_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.deployment_credentials import (
+            feishu_app_ready,
+            get_credential_group,
+            get_feishu_event_credentials,
+            resolve_credential_group,
+        )
+        from src.dalton.deployment_credentials import snapshot as snap_mod
+        from src.dalton.deployment_credentials.snapshot import build_snapshot, set_active_snapshot
+
+        # Single-sided saved + full Vault pair -> locks to saved, ready=False, never falls back to Vault
+        set_active_snapshot(
+            build_snapshot(
+                2,
+                {"DALTON_FEISHU_APP_ID": "saved-app-only"},
+                feishu_vault_pair={
+                    "DALTON_FEISHU_APP_ID": "vault-app-id",
+                    "DALTON_FEISHU_APP_SECRET": "test-secret-not-real-vault-03",
+                },
+            )
+        )
+        locked = get_credential_group("feishu_app")
+        assert locked.source == "saved"
+        assert locked.ready is False
+        assert dict(locked.values) == {}
+        assert feishu_app_ready() is False
+
+        resolved_locked = await resolve_credential_group("feishu_app")
+        assert resolved_locked.source == "saved"
+        assert resolved_locked.ready is False
+
+        # Neither env nor saved -> Vault fallback (sync reads slot, async resolves live & updates slot)
+        set_active_snapshot(
+            build_snapshot(
+                3,
+                {"DALTON_FEISHU_VERIFICATION_TOKEN": "test-secret-not-real-evt-04"},
+                feishu_vault_pair={
+                    "DALTON_FEISHU_APP_ID": "vault-old-id",
+                    "DALTON_FEISHU_APP_SECRET": "test-secret-not-real-old-05",
+                },
+            )
+        )
+        sync_v = get_credential_group("feishu_app")
+        assert sync_v.source == "vault_readonly"
+        assert sync_v.ready is True
+        assert sync_v.values["DALTON_FEISHU_APP_ID"] == "vault-old-id"
+        assert feishu_app_ready() is True
+
+        # feishu_event is independent and ready with single key
+        evt = get_feishu_event_credentials()
+        assert evt.group == "feishu_event"
+        assert evt.source == "saved"
+        assert evt.ready is True
+        assert dict(evt.values) == {
+            "DALTON_FEISHU_VERIFICATION_TOKEN": "test-secret-not-real-evt-04",
+        }
+
+        # Async resolve_credential_group("feishu_app") queries Vault live and updates active snapshot
+        orig_query_vault = snap_mod.query_feishu_vault_pair_strict
+        monkeypatch.setattr(
+            snap_mod,
+            "query_feishu_vault_pair_strict",
+            create_autospec(
+                orig_query_vault,
+                return_value=(
+                    {
+                        "DALTON_FEISHU_APP_ID": "vault-new-id",
+                        "DALTON_FEISHU_APP_SECRET": "test-secret-not-real-new-06",
+                    },
+                    False,
+                    None,
+                ),
+            ),
+        )
+        live_v = await resolve_credential_group("feishu_app")
+        assert live_v.source == "vault_readonly"
+        assert live_v.ready is True
+        assert live_v.values["DALTON_FEISHU_APP_ID"] == "vault-new-id"
+        assert get_credential_group("feishu_app").values["DALTON_FEISHU_APP_ID"] == "vault-new-id"
+
+        # Vault error maps to source="vault_error", ready=False, empty values
+        monkeypatch.setattr(
+            snap_mod,
+            "query_feishu_vault_pair_strict",
+            create_autospec(
+                orig_query_vault,
+                return_value=(None, True, None),
+            ),
+        )
+        err_v = await resolve_credential_group("feishu_app")
+        assert err_v.source == "vault_error"
+        assert err_v.ready is False
+        assert dict(err_v.values) == {}
+        assert feishu_app_ready() is False
+
+    def test_tristate_explicit_false_overrides_everflow_default_and_legacy_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _clean_cap_env(monkeypatch, app_env="dalton")
+        monkeypatch.setenv("CHANNEL_GATEWAY_URL", "http://127.0.0.1:8962")
+        assert has_capability(CapabilityId.CHANNEL_GATEWAY) is True
+
+        # Explicit "false" persisted by tri-state switch overrides legacy env & Everflow default
+        monkeypatch.setenv("DALTON_CAP_CHANNEL_GATEWAY", "false")
+        assert has_capability(CapabilityId.CHANNEL_GATEWAY) is False
+        assert has_capability(CapabilityId.CHANNEL_FEISHU) is False

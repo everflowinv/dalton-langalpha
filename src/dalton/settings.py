@@ -1256,27 +1256,49 @@ def get_dalton_transcription_ticket_hmac_key() -> bytes | None:
     ).digest()
 
 
-def managed_secret_token_values() -> tuple[str, ...]:
-    """Non-empty values of the management tokens that must never reach a sandbox.
+_DEPLOYMENT_CREDENTIAL_SECRET_ENV_NAMES: tuple[str, ...] = (
+    "DALTON_GOOGLE_OAUTH_CLIENT_SECRET",
+    "DALTON_FEISHU_APP_SECRET",
+    "DALTON_FEISHU_ENCRYPT_KEY",
+    "DALTON_FEISHU_VERIFICATION_TOKEN",
+)
 
-    ``DALTON_BRIDGE_ADMIN_TOKEN`` (the host bridge's admin credential),
-    ``INTERNAL_SERVICE_TOKEN`` (the backend's service-to-service credential),
-    ``DALTON_TRANSCRIPTION_TICKET_SECRET`` (the transcription ticket signing secret),
-    and ``DALTON_TRANSCRIPTION_TOKEN`` (the standalone transcription service token).
-    Any may be unset; only the non-empty ones are checked, so one missing
-    never disables the others' scrub.
+
+def managed_secret_token_values() -> tuple[str, ...]:
+    """Non-empty values of the management tokens and deployment secrets that must never leak.
+
+    Includes ``DALTON_BRIDGE_ADMIN_TOKEN``, ``INTERNAL_SERVICE_TOKEN``,
+    ``DALTON_TRANSCRIPTION_TICKET_SECRET``, ``DALTON_TRANSCRIPTION_TOKEN``,
+    ``DALTON_RESEARCH_ADMIN_TOKEN``, and the Batch 1 deployment credential secrets
+    (Google OAuth client secret, Feishu app secret, Feishu event encrypt key and
+    verification token). Any may be unset; only non-empty values are returned.
     """
-    return tuple(
-        t
-        for t in (
-            get_dalton_bridge_admin_token(),
-            get_internal_service_token(),
-            get_dalton_transcription_ticket_secret(),
-            get_dalton_transcription_token(),
-            get_dalton_research_admin_token(),
-        )
-        if t
-    )
+    values: list[str] = []
+    seen: set[str] = set()
+    for token in (
+        get_dalton_bridge_admin_token(),
+        get_internal_service_token(),
+        get_dalton_transcription_ticket_secret(),
+        get_dalton_transcription_token(),
+        get_dalton_research_admin_token(),
+        *(os.getenv(name, "").strip() for name in _DEPLOYMENT_CREDENTIAL_SECRET_ENV_NAMES),
+    ):
+        if token and token not in seen:
+            seen.add(token)
+            values.append(token)
+    # Also include active snapshot values so hot-rotated secrets are scrubbed immediately.
+    try:
+        from src.dalton.deployment_credentials.snapshot import get_active_snapshot
+
+        snap_values = get_active_snapshot().values
+        for name in _DEPLOYMENT_CREDENTIAL_SECRET_ENV_NAMES:
+            raw = snap_values.get(name, "").strip()
+            if raw and raw not in seen:
+                seen.add(raw)
+                values.append(raw)
+    except Exception:
+        pass
+    return tuple(values)
 
 
 def redact_managed_tokens(text: Any) -> Any:

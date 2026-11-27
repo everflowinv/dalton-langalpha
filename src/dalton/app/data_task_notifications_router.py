@@ -19,10 +19,15 @@ from src.dalton.database.data_task_notifications import (
     authorize_data_task_notification_plan,
     load_authorized_data_task_artifact,
 )
-from src.dalton.services.channel_vault_credentials import (
-    ChannelVaultCredentialError,
-    load_dedicated_feishu_vault_credentials,
+from src.dalton.deployment_credentials import resolve_feishu_app_credentials
+from src.dalton.deployment_credentials.snapshot import (
+    consume_last_feishu_vault_error,
+    inspect_feishu_app_incomplete,
 )
+from src.dalton.services.channel_vault_credentials import (
+    DEDICATED_FEISHU_VAULT_KEYS,
+)
+from src.dalton.settings import get_dalton_settings
 
 _NO_STORE_HEADERS: dict[str, str] = {
     "Cache-Control": "no-store",
@@ -84,22 +89,69 @@ async def internal_dedicated_feishu_vault_credentials_endpoint(
             headers=_NO_STORE_HEADERS,
         )
 
-    try:
-        credentials = await load_dedicated_feishu_vault_credentials()
-    except ChannelVaultCredentialError as exc:
+    if not get_dalton_settings().enabled:
         return JSONResponse(
-            status_code=exc.status_code,
+            status_code=503,
             content={
-                "code": exc.code,
-                "message": exc.message,
-                "missing": list(exc.missing),
+                "code": "dalton_disabled",
+                "message": "Dalton mode is disabled.",
+                "missing": [],
+            },
+            headers=_NO_STORE_HEADERS,
+        )
+
+    result = await resolve_feishu_app_credentials()
+    if not result.ready:
+        if result.source in ("env", "saved"):
+            code, message, missing = inspect_feishu_app_incomplete(result.source)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "code": code,
+                    "message": message,
+                    "missing": missing,
+                },
+                headers=_NO_STORE_HEADERS,
+            )
+        vault_err = consume_last_feishu_vault_error()
+        if vault_err is not None:
+            return JSONResponse(
+                status_code=vault_err.status_code,
+                content={
+                    "code": vault_err.code,
+                    "message": vault_err.message,
+                    "missing": list(vault_err.missing),
+                },
+                headers=_NO_STORE_HEADERS,
+            )
+        if result.source == "vault_error":
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "code": "vault_unavailable",
+                    "message": "Dedicated Feishu Vault lookup failed.",
+                    "missing": [],
+                },
+                headers=_NO_STORE_HEADERS,
+            )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "code": "vault_credentials_missing",
+                "message": "Dedicated Feishu Vault credentials missing or empty.",
+                "missing": list(DEDICATED_FEISHU_VAULT_KEYS),
             },
             headers=_NO_STORE_HEADERS,
         )
 
     return JSONResponse(
         status_code=200,
-        content={"credentials": credentials},
+        content={
+            "credentials": {
+                "DALTON_FEISHU_APP_ID": result.values["DALTON_FEISHU_APP_ID"],
+                "DALTON_FEISHU_APP_SECRET": result.values["DALTON_FEISHU_APP_SECRET"],
+            }
+        },
         headers=_NO_STORE_HEADERS,
     )
 

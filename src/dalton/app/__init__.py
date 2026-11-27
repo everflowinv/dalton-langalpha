@@ -13,6 +13,9 @@ from src.dalton.app.router import router as _dalton_api_router
 from src.dalton.app.transcriptions import router as _transcriptions_router
 from src.dalton.app.watchlist import router as _watchlist_router
 from src.dalton.auth.local_router import register_local_auth_routers
+from src.dalton.deployment_credentials.router import (
+    router as _deployment_credentials_router,
+)
 # DALTON-HOOK(monitors): mount monitor panel endpoints under /api/v1/dalton/monitors
 from src.dalton.monitors.router import router as _monitors_router
 from src.dalton.profile import is_core_profile
@@ -30,6 +33,7 @@ if is_core_profile():
 dalton_router.include_router(_chat_uploads_router)
 # DALTON-HOOK(monitors): include monitor panel router on dalton_router
 dalton_router.include_router(_monitors_router)
+dalton_router.include_router(_deployment_credentials_router)
 register_local_auth_routers(dalton_router)
 
 __all__ = ["dalton_router"]

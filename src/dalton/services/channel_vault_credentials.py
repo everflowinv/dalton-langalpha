@@ -43,6 +43,7 @@ class ChannelVaultCredentialError(Exception):
 async def load_dedicated_feishu_vault_credentials(
     *,
     get_secrets_fn: Callable[[str, Collection[str] | None], Awaitable[dict[str, str]]] | None = None,
+    strict_admin_lookup: bool = False,
 ) -> dict[str, str]:
     """Load the two dedicated Feishu credentials from the primary Dalton administrator's Vault."""
     if not get_dalton_settings().enabled:
@@ -52,9 +53,27 @@ async def load_dedicated_feishu_vault_credentials(
             status_code=503,
         )
 
-    from src.dalton.access_tiers import get_primary_admin_user_id
+    from src.dalton.access_tiers import (
+        get_primary_admin_user_id,
+        get_primary_admin_user_id_strict,
+    )
 
-    owner_user_id = str((await get_primary_admin_user_id()) or "").strip()
+    if strict_admin_lookup:
+        try:
+            raw_owner = await get_primary_admin_user_id_strict()
+        except Exception as exc:
+            logger.error(
+                "Primary Dalton administrator lookup failed (%s)",
+                type(exc).__name__,
+            )
+            raise ChannelVaultCredentialError(
+                "Primary Dalton administrator lookup failed.",
+                code="vault_unavailable",
+                status_code=503,
+            ) from None
+        owner_user_id = str(raw_owner or "").strip()
+    else:
+        owner_user_id = str((await get_primary_admin_user_id()) or "").strip()
     if not owner_user_id or any(ch.isspace() or ch == "\x00" for ch in owner_user_id):
         raise ChannelVaultCredentialError(
             "Primary Dalton administrator is not configured.",

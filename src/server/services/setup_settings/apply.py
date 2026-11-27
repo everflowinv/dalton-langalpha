@@ -88,11 +88,17 @@ async def _mint_namespaces(rows: Mapping[str, str]) -> bool:
     return minted
 
 
-async def _read_rows() -> dict[str, str]:
+async def _read_rows() -> tuple[dict[str, str], object | None]:
+    # DALTON-HOOK(deployment-credentials): use single REPEATABLE READ snapshot + Feishu Vault preload in Dalton mode
+    from src.dalton.deployment_credentials.hooks import read_dalton_snapshot_state
+
+    dalton_state = await read_dalton_snapshot_state()
+    if dalton_state is not None:
+        return dalton_state.rows, dalton_state
     rows = await read_deployment_settings()
     if await _mint_namespaces(rows):
         rows = await read_deployment_settings()
-    return rows
+    return rows, None
 
 
 async def _reset_market_data() -> None:
@@ -136,7 +142,10 @@ async def _rebuild_config(config, rows: Mapping[str, str], changed: set[str]) ->
     config_data = load_agent_config()
     in_reach = await in_reach_of(rows)
 
-    sandbox = create_sandbox_config(config_data, autodetect=True, in_reach=in_reach)
+    # DALTON-HOOK(deployment-credentials): preserve Dalton autodetect=False sandbox policy on rebuild
+    from src.server.services.setup_settings import autodetect_sandbox
+
+    sandbox = create_sandbox_config(config_data, autodetect=autodetect_sandbox(), in_reach=in_reach)
     search_api = default_search_api(config_data)
     mcp = config_mcp_before = config.mcp
     if changed and config_data.get("mcp"):
@@ -163,14 +172,25 @@ async def refresh() -> dict[str, str]:
     """Read the table and apply it to this worker. Returns the rows."""
     global _unapplied
     async with _lock:
-        rows = await _read_rows()
+        rows, dalton_state = await _read_rows()
         changed = export(rows) | _unapplied
+        # DALTON-HOOK(deployment-credentials): atomically swap process CredentialSnapshot after export(rows)
+        if dalton_state is not None:
+            from src.dalton.deployment_credentials.hooks import (
+                commit_dalton_snapshot,
+                on_deployment_settings_refreshed,
+            )
+
+            commit_dalton_snapshot(dalton_state)
         _unapplied = changed
         if FMP_KEY in changed:
             await _reset_market_data()
         config = _current_config()
         if config is not None:
             await _rebuild_config(config, rows, changed)
+        # DALTON-HOOK(deployment-credentials): run Dalton post-refresh hook before clearing _unapplied
+        if dalton_state is not None:
+            await on_deployment_settings_refreshed(changed, rows, dalton_state.revision)
         _unapplied = set()
         return rows
 
@@ -180,19 +200,33 @@ async def load_at_boot() -> ConfigReading:
     and the owner's choice reaches the loader. Never fatal: a deployment still
     boots on its ``.env``."""
     take_snapshot()
+    # DALTON-HOOK(deployment-credentials): preserve Dalton autodetect=False on normal and fallback returns
+    from src.server.services.setup_settings import autodetect_sandbox
+
+    autodetect = autodetect_sandbox()
     try:
         async with _lock:
-            rows = await _read_rows()
-            if export(rows):
+            rows, dalton_state = await _read_rows()
+            exported = export(rows)
+            # DALTON-HOOK(deployment-credentials): commit boot snapshot and invoke boot-loaded hook
+            if dalton_state is not None:
+                from src.dalton.deployment_credentials.hooks import (
+                    commit_dalton_snapshot,
+                    on_deployment_settings_boot_loaded,
+                )
+
+                commit_dalton_snapshot(dalton_state)
+                on_deployment_settings_boot_loaded(exported, rows, dalton_state.revision)
+            if exported:
                 from ptc_agent.config.file_utils import clear_config_cache
 
                 # Reading the rows loaded the config, expanding ``${VAR}``
                 # before these were in the environment.
                 clear_config_cache()
-            return ConfigReading(autodetect=True, in_reach=await in_reach_of(rows))
+            return ConfigReading(autodetect=autodetect, in_reach=await in_reach_of(rows))
     except Exception as exc:  # noqa: BLE001
         logger.warning("Saved deployment settings not loaded: %s", type(exc).__name__)
-        return ConfigReading(autodetect=True)
+        return ConfigReading(autodetect=autodetect)
 
 
 async def save(values: Mapping[str, str | None]) -> dict[str, str]:
