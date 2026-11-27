@@ -108,6 +108,8 @@ export interface CapabilitiesApiResponse {
   };
   ticker_logos?: boolean;
   market_enabled?: boolean;
+  /** Whether file and chart comments are on (`dalton.artifact_publishing`). */
+  artifact_comments?: boolean;
 }
 
 export async function fetchDaltonCapabilities(): Promise<CapabilitiesApiResponse> {
@@ -125,6 +127,8 @@ export interface UseCapabilitiesResult {
   tickerLogosEnabled: boolean;
   /** Whether the market / watchlist surface (`/market`) is enabled for this deployment. */
   marketEnabled?: boolean;
+  /** Whether file and chart comments are on for this deployment (`dalton.artifact_publishing`). */
+  artifactCommentsEnabled: boolean;
   /**
    * True only during initial load of a Core profile build so Core UI can render
    * a lightweight placeholder while avoiding any flash of proprietary cards.
@@ -180,6 +184,10 @@ export function useCapabilities(options: { enabled?: boolean } = {}): UseCapabil
     ? query.data.ticker_logos === true
     : !isCoreProfileBuild;
   const marketEnabled = isLoaded ? query.data.market_enabled !== false : true;
+  // Off until the deployment says so in a Core build; Everflow ships it on.
+  const artifactCommentsEnabled = isLoaded
+    ? query.data.artifact_comments !== false
+    : !isCoreProfileBuild;
 
   const hasCapability = useMemo(
     () => (required: CapabilityRequirement) => hasRequiredCapability(capabilities, required),
@@ -194,6 +202,7 @@ export function useCapabilities(options: { enabled?: boolean } = {}): UseCapabil
     fingerprint: query.data?.fingerprint ?? null,
     tickerLogosEnabled,
     marketEnabled,
+    artifactCommentsEnabled,
     isLoading,
     isLoaded,
     isCoreBuild: isCoreProfileBuild,

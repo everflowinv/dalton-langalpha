@@ -6,6 +6,7 @@
 import { useEffect, useMemo, type ReactNode, type RefObject } from 'react';
 import type { IChartApi, ISeriesApi } from 'lightweight-charts';
 import { useTranslation } from 'react-i18next';
+import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(artifact-publishing-off)
 import { ChartComments, type ChartCommentsHost } from '@/pages/ChatAgent/components/viewers/comments/chart/ChartComments';
 import { CommentTools } from '@/pages/ChatAgent/components/viewers/html/comments/CommentTools';
 import type { ChartLayerDrawing } from './useChartLayerIntegration';
@@ -29,11 +30,15 @@ export interface ChartCommentsWiring {
 }
 
 export function useChartComments(
-  comments: ChartCommentsHost | null,
+  host: ChartCommentsHost | null,
   isCustom: boolean,
   { workspaceId, chartId }: { workspaceId: string | null | undefined; chartId: string | null },
 ): ChartCommentsWiring {
   const { t } = useTranslation();
+  // DALTON-HOOK(artifact-publishing-off): chart comments ride the deployment's
+  // file-comments switch; off, a chart shows no comment controls at all.
+  const { artifactCommentsEnabled } = useCapabilities();
+  const comments = artifactCommentsEnabled ? host : null;
   const mode = isCustom && !!comments && comments.ui.modeTab === comments.tabId;
   const { setMode } = comments?.ui ?? {};
   const tab = comments?.tabId;

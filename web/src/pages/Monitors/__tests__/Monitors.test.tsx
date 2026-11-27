@@ -118,6 +118,7 @@ vi.mock('@/hooks/useCapabilities', async (importOriginal) => {
         hasCapability: (req) => actual.hasRequiredCapability(caps, req),
         brandName: capabilitiesMock.enabled ? 'Everflow' : 'Dalton',
         fingerprint: null,
+        artifactCommentsEnabled: true,
         tickerLogosEnabled: capabilitiesMock.enabled,
         isLoading: false,
         isLoaded: true,

@@ -515,7 +515,7 @@ def capabilities_fingerprint(
 def get_capabilities_payload() -> dict[str, Any]:
     """Build the read-only ``GET /api/v1/dalton/capabilities`` response payload."""
     from src.config.env import GINLIX_DATA_ENABLED
-    from src.dalton.settings import get_brand_name
+    from src.dalton.settings import get_brand_name, is_artifact_publishing_enabled
 
     profile = resolve_profile()
     caps = effective_capabilities(profile=profile)
@@ -530,6 +530,8 @@ def get_capabilities_payload() -> dict[str, Any]:
         },
         "ticker_logos": bool(GINLIX_DATA_ENABLED),
         "market_enabled": True,
+        # File and chart comments share the publishing switch; the UI hides them when off.
+        "artifact_comments": bool(is_artifact_publishing_enabled()),
     }
 
 
