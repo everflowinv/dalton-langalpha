@@ -96,6 +96,9 @@ NO_USER_CREDENTIAL = {
     # Authenticated in its handler, by ``authenticate_websocket``, which
     # refuses a suspended account (mounted only with market data on).
     ("WS", "/ws/v1/market-data/aggregates/{market}"),
+    # Large workspace-file download: authenticated by a short-lived HMAC ticket
+    # in its handler, which then calls ``admit_caller`` for the ticket's user.
+    ("GET", "/api/v1/dalton/workspace-files/download"),
     # Share links: the owner's public_links policy governs them.
     ("GET", "/api/v1/public/shared/{share_token}/files"),
     ("POST", "/api/v1/public/shared/{share_token}/files/resolve"),

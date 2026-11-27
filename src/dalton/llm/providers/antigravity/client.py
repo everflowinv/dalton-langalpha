@@ -75,7 +75,7 @@ _THOUGHT_SIGNATURES_KEY = "antigravity_thought_signatures"
 _CALL_SIGNATURES_KEY = "antigravity_call_signatures"
 # Model family that minted the thought signatures on this message (e.g.
 # "gemini", "claude"). Antigravity routes multiple model families behind one
-# provider_route ("antigravity-oauth"), so replay must check signature family
+# provider route (antigravity OAuth), so replay must check signature family
 # directly instead of relying on provider_route alone.
 _SIGNATURE_FAMILY_KEY = "antigravity_signature_family"
 # Gemini's documented stand-in for a call it did not sign (a Claude call, a
