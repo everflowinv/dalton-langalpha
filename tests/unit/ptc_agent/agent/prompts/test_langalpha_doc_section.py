@@ -117,8 +117,19 @@ def test_a_case_the_build_lacks_is_left_out(page):
 
 
 def test_the_save_command_is_named_only_where_bash_runs_it():
-    assert "`la skills save <name>`" in _section(_prompt(langalpha_doc_enabled=True))
-    assert "la skills save" not in _prompt(langalpha_doc_enabled=True, bash_enabled=False)
+    # DALTON-HOOK(computer-cli-tokens-off): `la skills save` requires both bash and computer_cli_tokens
+    assert "`la skills save <name>`" in _section(
+        _prompt(langalpha_doc_enabled=True, computer_cli_tokens_enabled=True)
+    )
+    assert "la skills save" not in _prompt(
+        langalpha_doc_enabled=True, bash_enabled=False, computer_cli_tokens_enabled=True
+    )
+    assert "la skills save" not in _prompt(langalpha_doc_enabled=True)
+    # DALTON-HOOK(hide-trading): brokerage connection wording omitted when trading is disabled
+    assert "brokerage connection" not in _section(_prompt(langalpha_doc_enabled=True))
+    assert "brokerage connection" in _section(
+        _prompt(langalpha_doc_enabled=True, trading_enabled=True)
+    )
 
 
 def test_a_subagent_keeps_the_pages_its_own_sections_name():

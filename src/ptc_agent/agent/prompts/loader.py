@@ -98,10 +98,23 @@ class PromptLoader:
         from src.dalton.access_tiers import is_internal_tier
         from src.dalton.capabilities import CapabilityId, effective_capabilities
         from src.dalton.profile import DeploymentProfile, resolve_profile
-        from src.dalton.settings import get_brand_name, get_dalton_settings, is_dalton_enabled
+        from src.dalton.settings import (
+            get_brand_name,
+            get_dalton_settings,
+            is_computer_cli_tokens_enabled,  # DALTON-HOOK(computer-cli-tokens-off)
+            is_dalton_enabled,
+        )
 
         active_caps = effective_capabilities()
+        dalton_on = is_dalton_enabled()
         context.setdefault("brand_name", get_brand_name())
+        # DALTON-HOOK(computer-cli-tokens-off): gate `la` CLI prompt hints on computer_cli_tokens.enabled
+        context.setdefault(
+            "computer_cli_tokens_enabled",
+            (not dalton_on) or is_computer_cli_tokens_enabled(),
+        )
+        # DALTON-HOOK(hide-trading): omit brokerage/trading prompt wording when Dalton hides trading
+        context.setdefault("trading_enabled", not dalton_on)
         # DALTON-HOOK(cos-settings-tools): gate managed automation tool guidance on autonomy.enabled
         context.setdefault(
             "autonomy_enabled",

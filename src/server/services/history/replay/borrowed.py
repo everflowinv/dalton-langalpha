@@ -46,6 +46,8 @@ class PagePart:
     thread_id: str
     owner_id: str
     lines: list[Line] = field(default_factory=list)
+    # DALTON-HOOK(share-redaction): carry snapshot ThreadRows for per-source public share redaction
+    rows: ThreadRows | None = None
 
 
 @dataclass
@@ -102,7 +104,7 @@ async def read_thread_page(
             persist=persist,  # DALTON-HOOK(team-sharing)
         )
         return ThreadPage(
-            parts=[PagePart(rows.thread_id, rows.owner_id, page.lines)],
+            parts=[PagePart(rows.thread_id, rows.owner_id, page.lines, rows=rows)],  # DALTON-HOOK(share-redaction)
             first_turn_index=page.first_turn_index,
             has_more=page.has_more,
             source=resolved,
@@ -170,7 +172,7 @@ class _BorrowedRead:
         budget: PageBudget | None,
     ) -> ThreadPage:
         rows, turn_base = self.rows, self.turn_base
-        own = PagePart(rows.thread_id, rows.owner_id)
+        own = PagePart(rows.thread_id, rows.owner_id, rows=rows)  # DALTON-HOOK(share-redaction)
         reads_own = before_turn is None or before_turn > turn_base
         has_own = any(q.get("turn_index") is not None for q in rows.queries)
         own_page: ReplayPage | None = None
@@ -228,7 +230,10 @@ class _BorrowedRead:
             )
             self.stubbed = self.stubbed or resolved == "stub"
             if page.turns:
-                borrowed.insert(0, PagePart(seg_rows.thread_id, seg_rows.owner_id, page.lines))
+                borrowed.insert(
+                    0,
+                    PagePart(seg_rows.thread_id, seg_rows.owner_id, page.lines, rows=seg_rows),  # DALTON-HOOK(share-redaction)
+                )
                 first_turn_index = page.first_turn_index
             if page.has_more:
                 has_more = True

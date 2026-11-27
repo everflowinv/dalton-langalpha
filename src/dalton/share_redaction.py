@@ -41,6 +41,7 @@ FAILED_TURN_NOTICE = "*（本轮运行失败，当前分享仅展示正常结束
 CANCELLED_TURN_NOTICE = "*（本轮已中止，当前分享仅展示正常结束回合的最终回答）*"
 IN_PROGRESS_TURN_NOTICE = "*（本轮尚未结束，当前分享仅展示正常结束回合的最终回答）*"
 TOOLS_ONLY_TURN_NOTICE = "*（本轮仅包含工具操作或文件修改，当前分享已省略执行过程）*"
+FORK_SOURCE_UNAVAILABLE_NOTICE = "原对话已删除或不可见，继承的历史消息未在此分享中显示。"
 
 RENDERABLE_FENCE_LANGUAGES: frozenset[str] = frozenset(
     {
@@ -2529,8 +2530,11 @@ async def _load_threads_for_redaction(
                     SELECT t.conversation_thread_id::text AS conversation_thread_id,
                            t.workspace_id::text AS workspace_id,
                            t.user_id,
+                           t.is_shared,
                            t.share_permissions,
+                           t.metadata->'fork' AS fork,
                            w.user_id AS owner_user_id,
+                           w.status AS workspace_status,
                            w.config AS workspace_config,
                            w.previous_root_dirs AS previous_root_dirs,
                            c.root_dir AS computer_root_dir
@@ -4160,6 +4164,306 @@ async def post_update_thread_share_hook(
         return None
 
 
+async def _resolve_borrowed_source_permissions(
+    src_trow: Mapping[str, Any] | None,
+) -> EffectiveSharePermissions:
+    """Resolve effective share permissions for a borrowed ancestor thread (fail-closed)."""
+    if not isinstance(src_trow, Mapping):
+        return EffectiveSharePermissions(allow_files=False, allow_download=False)
+    if src_trow.get("is_shared") is False:
+        return EffectiveSharePermissions(allow_files=False, allow_download=False)
+    ws = (
+        {"user_id": src_trow.get("owner_user_id")}
+        if src_trow.get("owner_user_id")
+        else None
+    )
+    return await resolve_effective_share_permissions(src_trow, ws)
+
+
+def _prepare_public_fork_divider(
+    divider_data: Mapping[str, Any],
+    *,
+    thread_id: str,
+    dropped_sources: Mapping[str, str],
+) -> dict[str, Any]:
+    """Anonymize a ``fork_divider`` frame for public replay and attach neutral unavailable notice."""
+    from src.server.services.share_redaction import (
+        _OWNER_ID_KEYS,
+        _anonymous_divider,
+        without_keys,
+    )
+
+    adjusted: dict[str, Any] = dict(divider_data)
+    if dropped_sources:
+        raw_segments = adjusted.get("segments")
+        if isinstance(raw_segments, list):
+            kept_segments = [
+                seg
+                for seg in raw_segments
+                if not (
+                    isinstance(seg, Mapping)
+                    and str(seg.get("thread_id") or "") in dropped_sources
+                )
+            ]
+            adjusted["segments"] = kept_segments
+            adjusted["shown_through"] = (
+                kept_segments[-1].get("through_turn")
+                if kept_segments and isinstance(kept_segments[-1], Mapping)
+                else None
+            )
+        src_id = str(adjusted.get("source_thread_id") or "")
+        if src_id in dropped_sources:
+            adjusted["state"] = dropped_sources[src_id]
+        elif adjusted.get("state") == "shown":
+            adjusted["state"] = "changed"
+
+    anonymized = _anonymous_divider(without_keys(adjusted, _OWNER_ID_KEYS))
+    anonymized["thread_id"] = thread_id
+    if anonymized.get("state") in ("deleted", "unavailable"):
+        anonymized["notice"] = FORK_SOURCE_UNAVAILABLE_NOTICE
+    return anonymized
+
+
+def _redact_rich_part_items(
+    items: list[dict[str, Any]],
+    *,
+    thread_id: str,
+    shared_user_message_fn: Any,
+    share_redaction_cls: Any,
+) -> list[dict[str, Any]]:
+    """Run ``ShareRedaction`` on one thread part and rewrite ``thread_id`` to the shared fork's id."""
+    redaction = share_redaction_cls(items)
+    out: list[dict[str, Any]] = []
+    for item in items:
+        event_type, data = item["event"], item["data"]
+        if event_type == "user_message":
+            replay_data = shared_user_message_fn(redaction, data)
+        else:
+            replay_data = redaction.event(event_type, data)
+            if replay_data is None:
+                continue
+        replay_data["thread_id"] = thread_id
+        out.append({"event": event_type, "data": replay_data})
+    return out
+
+
+async def _build_borrowed_fork_public_replay(
+    *,
+    share_token: str,
+    thread: Mapping[str, Any],
+    thread_id: str,
+    rows: Any,
+    lineage: Any,
+    eff: EffectiveSharePermissions,
+    before_turn: int | None,
+    budget: Any,
+    observe_replay_stream_fn: Any,
+    shared_user_message_fn: Any,
+    share_redaction_cls: Any,
+) -> Any:
+    """Public replay orchestrator for a snapshot fork that borrows earlier turns from ancestors."""
+    from fastapi.responses import StreamingResponse
+
+    from src.dalton.share_media import (
+        resolve_thread_media_bindings,
+        rewrite_items_for_public_media,
+    )
+    from src.server.services.history.replay import finish_lines
+    from src.server.services.history.replay.borrowed import read_thread_page
+
+    viewer = lineage.by if getattr(lineage, "by", None) else rows.owner_id
+    thread_page = await read_thread_page(
+        rows,
+        viewer,
+        before_turn=before_turn,
+        limit=PUBLIC_SHARE_MAX_TURNS,
+        budget=budget,
+        persist=eff.allow_files,
+    )
+
+    borrowed_tids = [
+        str(part.thread_id)
+        for part in thread_page.parts
+        if str(part.thread_id) != thread_id and part.lines
+    ]
+    source_threads_map: dict[str, dict[str, Any]] = {}
+    source_meta_failed = False
+    if borrowed_tids:
+        try:
+            source_threads_map = await _load_threads_for_redaction(borrowed_tids)
+        except Exception:
+            logger.warning(
+                "Failed loading borrowed ancestor threads for public share %s; failing closed",
+                thread_id,
+                exc_info=True,
+            )
+            source_meta_failed = True
+
+    emitted_events: list[dict[str, Any]] = []
+    dropped_sources: dict[str, str] = {}
+
+    for part in thread_page.parts:
+        if not part.lines:
+            continue
+        part_tid = str(part.thread_id)
+        is_borrowed = part_tid != thread_id
+        part_rows = part.rows if getattr(part, "rows", None) is not None else (rows if not is_borrowed else None)
+
+        if is_borrowed:
+            if source_meta_failed:
+                dropped_sources[part_tid] = "unavailable"
+                continue
+            src_trow = source_threads_map.get(part_tid)
+            if src_trow is None or src_trow.get("workspace_status") == "deleted":
+                dropped_sources[part_tid] = "deleted"
+                continue
+            src_eff = await _resolve_borrowed_source_permissions(src_trow)
+            part_allow_files = eff.allow_files and src_eff.allow_files
+            part_thread_meta: Mapping[str, Any] = src_trow
+        else:
+            part_allow_files = eff.allow_files
+            part_thread_meta = thread
+
+        if not part_allow_files:
+            strict = StrictNoFilesShareRedactor(
+                thread_id=thread_id,
+                responses_by_turn=(
+                    part_rows.responses_by_turn if part_rows is not None else {}
+                ),
+                open_runs=part_rows.open_runs if part_rows is not None else {},
+                roots=extract_thread_roots(part_thread_meta),
+                protected_urls=(
+                    collect_thread_protected_urls(
+                        part_rows.queries,
+                        part_rows.responses_by_turn,
+                        part_rows.run_facts,
+                    )
+                    if part_rows is not None
+                    else ()
+                ),
+            )
+            emitted_events.extend(strict.iter_redacted_events(part.lines))
+            continue
+
+        # Rich mode (part_allow_files=True): stamp task status/widgets against the owning thread,
+        # resolve & rewrite media bindings against that thread, then redact per-source.
+        await finish_lines(part_tid, part.lines, status_only=True)
+        part_items = [line.item() for line in part.lines]
+        thread_for_media = dict(part_thread_meta)
+        thread_for_media.setdefault("conversation_thread_id", part_tid)
+        part_owner = (
+            getattr(part_rows, "owner_id", None)
+            or getattr(part, "owner_id", None)
+            or part_thread_meta.get("owner_user_id")
+        )
+        if part_owner and not thread_for_media.get("user_id"):
+            thread_for_media["user_id"] = str(part_owner)
+        if not thread_for_media.get("workspace_id") and part_rows is not None:
+            ws_from_rows = (part_rows.thread or {}).get("workspace_id")
+            if ws_from_rows:
+                thread_for_media["workspace_id"] = str(ws_from_rows)
+
+        bindings = await resolve_thread_media_bindings(
+            thread_for_media,
+            part_rows.queries if part_rows is not None else (),
+            part_items,
+        )
+        part_items = rewrite_items_for_public_media(
+            part_items,
+            thread_id=thread_id,
+            share_token=share_token,
+            bindings=bindings,
+            source_thread_id=part_tid if is_borrowed else None,
+        )
+        emitted_events.extend(
+            _redact_rich_part_items(
+                part_items,
+                thread_id=thread_id,
+                shared_user_message_fn=shared_user_message_fn,
+                share_redaction_cls=share_redaction_cls,
+            )
+        )
+
+    divider_payload: dict[str, Any] | None = None
+    if thread_page.divider is not None:
+        raw_div = thread_page.divider.item().get("data")
+        if isinstance(raw_div, Mapping):
+            divider_payload = _prepare_public_fork_divider(
+                raw_div,
+                thread_id=thread_id,
+                dropped_sources=dropped_sources,
+            )
+    elif dropped_sources and not emitted_events:
+        # Paginating entirely into a deleted/unavailable ancestor range still yields a neutral placeholder.
+        last_src = lineage.borrow.ancestors[-1].thread_id
+        state = dropped_sources.get(str(last_src), next(iter(dropped_sources.values())))
+        divider_payload = _prepare_public_fork_divider(
+            {
+                "source_thread_id": str(last_src),
+                "turn_base": lineage.borrow.turn_base,
+                "state": state,
+                "shown_through": None,
+                "segments": [],
+            },
+            thread_id=thread_id,
+            dropped_sources=dropped_sources,
+        )
+
+    first_turn_index = thread_page.first_turn_index
+    if dropped_sources:
+        emitted_turns = [
+            ev["data"]["turn_index"]
+            for ev in emitted_events
+            if isinstance(ev.get("data"), Mapping)
+            and isinstance(ev["data"].get("turn_index"), int)
+            and not isinstance(ev["data"].get("turn_index"), bool)
+        ]
+        first_turn_index = min(emitted_turns) if emitted_turns else None
+
+    emit_history_page = bool(thread_page.has_more or before_turn is not None)
+    headers = (
+        {"Cache-Control": "no-store", "Clear-Site-Data": '"cache"'}
+        if not eff.allow_files
+        else {"Cache-Control": "no-store"}
+    )
+
+    async def borrowed_event_generator():
+        seq = 0
+        if emit_history_page:
+            seq += 1
+            hp = {
+                "first_turn_index": first_turn_index,
+                "has_more": thread_page.has_more,
+            }
+            yield (
+                f"id: {seq}\n"
+                f"event: history_page\n"
+                f"data: {json.dumps(hp, default=str)}\n\n"
+            )
+        if divider_payload is not None:
+            seq += 1
+            yield (
+                f"id: {seq}\n"
+                f"event: fork_divider\n"
+                f"data: {json.dumps(divider_payload, ensure_ascii=False, default=str)}\n\n"
+            )
+        for item in emitted_events:
+            seq += 1
+            yield (
+                f"id: {seq}\n"
+                f"event: {item['event']}\n"
+                f"data: {json.dumps(item['data'], ensure_ascii=False, default=str)}\n\n"
+            )
+        seq += 1
+        yield f"id: {seq}\nevent: replay_done\ndata: {json.dumps({'thread_id': thread_id}, default=str)}\n\n"
+
+    return StreamingResponse(
+        observe_replay_stream_fn(borrowed_event_generator(), source="public"),
+        media_type="text/event-stream",
+        headers=headers,
+    )
+
+
 async def build_public_replay_response(
     share_token: str,
     *,
@@ -4180,6 +4484,7 @@ async def build_public_replay_response(
     )
     from src.server.app import public as public_app
     from src.server.database.pool import DATABASE_UNAVAILABLE
+    from src.server.services.forks.model import ForkLineage
     from src.server.services.history.replay import finish_lines, read_replay_page
     from src.server.utils.api import database_unavailable
 
@@ -4215,6 +4520,24 @@ async def build_public_replay_response(
                 headers=no_store_headers,
             )
         budget = get_public_share_page_budget()
+        rows_thread = getattr(rows, "thread", None)
+        lineage = ForkLineage.parse(
+            rows_thread.get("fork") if isinstance(rows_thread, Mapping) else None
+        )
+        if lineage is not None and lineage.borrow is not None and lineage.borrow.ancestors:
+            return await _build_borrowed_fork_public_replay(
+                share_token=share_token,
+                thread=thread,
+                thread_id=thread_id,
+                rows=rows,
+                lineage=lineage,
+                eff=eff,
+                before_turn=before_turn,
+                budget=budget,
+                observe_replay_stream_fn=observe_replay_stream_fn,
+                shared_user_message_fn=shared_user_message_fn,
+                share_redaction_cls=share_redaction_cls,
+            )
         if not eff.allow_files:
             page, _ = await read_strict_public_replay_page(
                 rows,

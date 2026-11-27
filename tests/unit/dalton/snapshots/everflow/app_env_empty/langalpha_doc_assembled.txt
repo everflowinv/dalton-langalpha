@@ -1,0 +1,626 @@
+===== SKILL: langalpha-doc =====
+--- FILE: langalpha-doc/SKILL.md ---
+---
+name: langalpha-doc
+description: "How the platform under you works: the computer and its workspaces, files and what survives a restart, conversation transcripts, saved tool results, memory, chat apps, and adding skills, MCP servers or plugins. Read it when the user points back at an earlier conversation, when something is missing or behaves unexpectedly, before adding any of those, and when the user asks how the platform works and you don't know."
+---
+
+# How LangAlpha Works
+
+You run on a **computer**: one sandbox machine that belongs to the user. Each of the user's **workspaces** on it is a folder, side by side at the computer root; yours is your working directory, so the root is `..`. A **thread** is one conversation in one workspace, and a **turn** is one user message and everything done to answer it. Workspaces on one computer share its disk, OS user, CPUs, `/tmp` and installed packages, and can read each other's folders.
+
+## Reference files
+
+- **Earlier work**: The user points back at an earlier conversation or at work done in another thread or workspace; a compaction summary; a background task's steps; a tool result saved to a file: `.agents/skills/langalpha-doc/references/history.md`.
+- **Files**: Where things live, how a path resolves, why Grep or Glob missed a file, memory and memo storage, what the user sees in the file panel: `.agents/skills/langalpha-doc/references/files.md`.
+- **The Drive**, the user's files kept across every workspace and computer: whether it is turned on, putting a file in it, files that are not text, a save that did not land, history and trash: `.agents/skills/langalpha-doc/references/drive.md`.
+- **The computer**: Processes, output and timeouts, CPUs and disk, installed packages, what survives a stop or a rebuild, data-server tools from code, secrets: `.agents/skills/langalpha-doc/references/computer.md`.
+- **Skills**: Installing a skill, an `npx skills add` command included, or writing, changing or saving one, here or for every workspace: `.agents/skills/langalpha-doc/references/skills.md`.
+- **Data sources and plugins**: The user wants a new data source, MCP server or plugin, a server needs a key, or a server you expected is missing: `.agents/skills/langalpha-doc/references/plugins.md`.
+<!-- DALTON-HOOK(prompt-audit-text): link settings-map.md and update Dalton chat app list -->
+- **Chat apps**: Talking with the user in a chat app, or sending a message or file to Feishu, Discord or personal WeChat: `.agents/skills/langalpha-doc/references/chat.md`.
+- **Settings**: Where a setting is edited in the web UI, whether the Chief of Staff (研究总监) can change it on the user's behalf, plus Team Memory locations, background model defaults, and onboarding model candidates: `.agents/skills/langalpha-doc/references/settings-map.md`.
+
+## Traps
+
+- Every ExecuteCode and Bash call is a fresh process started in your workspace folder: Python variables, `cd` and `export` do not carry to the next call.
+- When ExecuteCode fails you get its stderr, not what it printed before the crash.
+- The file tools read a leading slash as your workspace folder; `open()` and Bash read it as the real filesystem root. Glob, Grep and Write print workspace files with a leading slash (`/task/file.md`), so drop it before pasting a path into code.
+- Grep skips hidden and git-ignored files and folders, `.agents/` included (`.agents/memory/` aside), unless `path` points inside one.
+- Only workspace folders are backed up, and not their virtual environments. Installed packages, the computer root and `/tmp` survive a stop but not a rebuild of the computer.
+- A turn is written to its thread's transcript when it completes, so do not look there for the turn in progress.
+- Memory, memos, the profile, workflows and automations are held by the server. Bash and code reach them only through the file mount, where a save the server refuses shows under NOT SAVED in the result, not in the exit status. Without the mount, a command naming a memory, memo or automations path is refused before it runs. The chat-app settings in `.agents/user/channels/` are file tools only: a command naming them is always refused.
+- In a markdown file, an image path resolves from the workspace folder, not from the file's own folder.
+- `plt.show()` output goes nowhere. Save charts with `savefig` into `<task>/charts/` and link the file.
+
+## Facts
+
+How the platform behaves, for answering the user. Your work doesn't need these pages, so don't read them ahead of time. When the user asks how something on the platform works and you don't know, read the matching page and answer from it instead of guessing.
+
+<!-- DALTON-HOOK(prompt-audit-text): list Dalton supported chat platforms -->
+- Channels (Feishu, Discord, personal WeChat): which conversation or workspace a message the user sends there reaches, why an answer came from another conversation, how `/new`, `/workspace` and replies pick one, and where your own sends land and whether replies to them come back: `.agents/skills/langalpha-doc/facts/channel-routing.md`.
+
+--- FILE: langalpha-doc/facts/channel-routing.md ---
+# Channel Routing
+
+Which conversation a message the user sends on a channel (Slack, Discord, Telegram, iMessage or Feishu) reaches, and why an answer can come from a different conversation than the one they expected.
+
+## The rules every app shares
+
+- A conversation is one thread, and it runs in one place: All workspaces, where the Chief of Staff answers from Home, or one workspace, where its Analyst answers. It keeps that place for as long as it lasts.
+- A message that isn't a reply goes to the chat's current conversation, or starts a new one; each app below says which.
+- A reply goes to the conversation of the message it answers, not to the chat's current one. In Slack, Discord and Feishu a reply is a message in a thread or topic; in Telegram it is a message in a topic, or, in a chat without topics, a reply to one message; in iMessage it is an inline reply.
+- A message that starts with `/new` starts a new conversation and runs the rest of the message there, on every app, even where the app runs no `/new` command, as in a Slack thread. It never changes the place. In a Slack or Discord thread that isn't the user's it gets a lock, except that `/new <text>` typed in a thread nobody owns continues that thread's conversation.
+- A new conversation starts in the place the user set for that chat with `/workspace`; in a group, each person has their own. A chat without one uses the account's default, and with no default it runs in All workspaces. `.agents/user/channels/channels.json` holds this user's settings (`default`, and each app's `chats`): read it before telling the user where a chat runs now.
+- Changing a chat's place doesn't move a conversation already started; each app below says when the next message starts a new one.
+- On Slack, Discord, Telegram and Feishu, a message the user sends in a conversation while its answer is running joins that answer. A `/new` with text, or the first message after a bare `/new` or after a `/workspace` that starts the conversation over, waits instead and runs as a new conversation when the answer ends; anything sent after it waits behind it. In a Telegram chat with topics, `/new` opens a new topic and runs there at once. On Telegram and Feishu a message with files also waits, and runs on its own. On iMessage it waits for any answer running in that chat, a group's included, then runs; if the answer it waited for was to the same person and asked them a question, it answers it.
+- A result you handed to an Analyst comes back in the thread, topic or chat the request came from.
+- Someone who hasn't connected their account gets a prompt to connect it, not an answer.
+
+## Why one chat shows two conversations
+
+One chat can show answers from more than one conversation. In a group, each person has their own. In a Telegram chat without topics, each person has one in All workspaces and one in a workspace. And a chat shows whatever you sent there from another conversation or an automation. In Slack, a Discord server, Feishu and a Telegram chat with topics, those sends go in your conversation's own thread or topic there, opening one if it has none, and the user's messages there come back to you. In iMessage, a Telegram chat without topics and a Discord DM, they sit among the chat's own messages, so two answers in one chat can come from two conversations with different histories. There, the user's reply to your message comes back to you, except in a Discord DM; a message that isn't a reply goes to the chat's current conversation, and anyone else's reply goes to their own. Tell the user which message their reply answered and which conversation that belongs to.
+
+## Slack
+
+- In the user's one-to-one DM with the app every message is answered. In a channel or group DM, the user mentions the app to start. Inside its thread no mention is needed, and only the person who started the thread can continue it; anyone else gets a lock and no answer.
+- A message at the top of a DM or channel starts a new conversation, and the answer goes in a thread under it. Reply in that thread to continue. In Slack's assistant panel each chat is one conversation; start a new chat for a new one.
+- `/new <text>` sent as a message starts a new conversation with the text, inside a thread too. As a command, it posts the text in the chat and answers it in a thread under it. `/new` alone makes the user's next message in that chat within 24 hours start one, even a reply in a thread already under way; typed alone in a thread, it starts only that thread over.
+- After `/workspace`, a thread already under way stays where it was; new messages at the top, new assistant chats and `/new` use the new place.
+- There is no command to stop an answer.
+- A message you send goes in your conversation's thread in that chat, or at the top, starting one. The user's replies there come back to you. `new_thread` starts another thread; the old one still reaches the same conversation.
+
+## Discord
+
+- In a server channel, the user mentions the app to start; the answer opens a thread from that message. Inside the thread no mention is needed, and only the person who started it can continue it; anyone else gets a lock and no answer. A thread or forum post someone else started gets no answer unless the app has been added to it.
+- Each mention in a channel starts a new conversation in a new thread. A DM is one conversation until `/new`, `/workspace` (even re-picking the same place) or a change to the DM in channels.json, after which the next message starts a new one if it comes within 24 hours; otherwise the old one goes on, in its old place. Changing the account default doesn't restart it.
+- `/new <text>` runs the text in a new conversation: from a channel, in a new thread; in a DM, or in a thread that is the user's, in place. `/new` alone makes the user's next message there within 24 hours start one.
+- `/workspace` in a server needs the server-wide Manage Channels permission and sets the place for that person in that channel; inside a thread it sets the thread's channel. After `/workspace` in a thread, the next message there within 24 hours starts a new conversation.
+- There is no command to stop an answer.
+- A message you send to a server channel goes in your conversation's thread there, or opens one from your first message; the user's replies there come back to you. Where the app can't start a thread, your message stays in the channel and replies to it don't come back; your next send there tries the thread again. A DM has no threads: the user's next message there, even a Discord reply to yours, goes to the DM's own conversation.
+
+## Telegram
+
+- In a private chat every message is answered. In a group, the user mentions the bot, replies to one of your messages, or uses a command. In a topic the bot opened, every message is answered except replies to other people.
+- Without topics, each person has two conversations in the chat, one in All workspaces and one in a workspace, and each starts over at the next message once 4 hours have passed since their last message in it that wasn't a reply to one of your messages or an answer to a question. With topics, each person has their own conversation in each topic, General included, with no 4-hour restart. Where the bot runs private chats with topics, a private chat works the same way.
+- `/new` (or `/reset`) starts a new conversation and runs any text after it. In a chat with topics it opens a new topic, named from the text or else "New thread"; if no topic can be opened, the current topic starts over.
+- `/workspace` to the place the user is already in changes nothing. Without topics, `/workspace` into a workspace starts a new conversation there, even one they used before; a change in channels.json or the account default starts one only if the old one began in another workspace. A move to All workspaces goes back to their All workspaces conversation, which starts over only by the 4-hour rule. With topics, after a move each of their topic conversations starts over with their next message there; after an account-default change, only those that began elsewhere.
+- `/stop` (or `/cancel`) stops the user's running answer in this chat or topic, and their running answers to replies. In a private chat, the Stop button on an answer stops that answer.
+- In a chat without topics, a reply to one of your messages from the last 30 days continues the conversation that posted it, if that conversation is the user's. The answer replies to their message, and the chat's own conversation is left as it was. A reply to a notice that ended a turn, to a command's answer, to an older message, or by someone else is an ordinary message. Every reply carries the quoted words and any photo or file on the quoted message. A message with files, or a reply to one, never answers a question: it runs as its own message, and the question its conversation was waiting on closes.
+- A message you send: without topics, the user's reply to it comes back to your conversation. With topics, it goes in your conversation's own topic, and the user's messages there come back to you; if the bot can't open topics in that group, it goes to the main chat and replies don't come back. `new_thread` opens a new topic where the chat has topics; without them it changes nothing and says so. A topic you opened keeps its conversation through a move.
+
+## iMessage
+
+- Every message is answered. Commands work with or without the slash when the word stands alone: `new` (or `reset`), `workspace`, `back`, `stop` (or `unsubscribe`), `start` (or `resume`), `help`.
+- Each person has one conversation in the chat, with no time limit.
+- `/new <text>` runs the text in a new conversation. `new` alone makes the next message within 24 hours start one.
+- `/workspace` shows a numbered list, All workspaces first: `/workspace 2` picks the second entry of a list shown in the last 15 minutes (an older list is shown again), `/workspace <name>` picks by name, and a number on its own is read as a question. `back` returns to where the user was before their last switch. Any change of place, by `/workspace`, `back`, channels.json or the account default, All workspaces included, makes the next message start a new conversation; re-picking the current place changes nothing.
+- `stop` turns off everything you'd send to that chat unasked, hand-off and automation results included, and `start` turns it back on. Answers to the user's own messages still come. Nothing stops an answer that is running, but a hand-off result not yet posted when `stop` arrives isn't posted.
+- An inline reply to one of your messages from the last 30 days continues the conversation that posted it, if that conversation is the user's. The answer goes in that reply thread, and so does what follows a question it asks. When the message came from a conversation other than the chat's own, so do its hand-off results. The chat's own conversation is left as it was. A reply to a notice that ended a turn, to a command's answer, to an older message, or by someone else is an ordinary message. Only a reply's own words and files reach you, never the message it quotes.
+- You can message the user's one-to-one chat, or a group they're still in, have texted you in and picked for you, if they also have a one-to-one chat with you. You can't message a chat where they sent `stop`, except while answering their message there. Sends from outside the conversation are limited to 20 a day across iMessage. The user's inline reply comes back to your conversation; a message that isn't a reply goes to the chat's own.
+
+## Feishu
+
+- In a DM every message is answered. In a group, the user mentions the app, or writes in a topic where it was mentioned in the last 30 days. On a company's own Feishu app every group message needs a mention, unless the company gave the app all group messages; even then, whoever connected it can require a mention again.
+- Each topic is a conversation, one per person, in a DM too. A message at the top starts a new one, and replies in its topic continue it.
+- `/new` alone makes the topic it was typed in start over with the user's next message there within 24 hours.
+- After the place changes, by `/workspace`, channels.json or the account default, each of the user's conversations in that chat starts over with their next message there. A move to All workspaces does this only within 24 hours of a `/workspace` or channels.json change, and never for the account default.
+- There is no command to stop an answer.
+- You can message the user's DM, or a group they picked for you and talked to you in within the last 90 days; a group they haven't opens up once they mention the app there. A message you send goes in your conversation's topic in that chat, or at the top, opening one. The user's replies in that topic come back to you, in a group without a mention. `new_thread` starts another topic; the old one still reaches the same conversation. A hand-off's result comes back as a reply in its topic.
+
+--- FILE: langalpha-doc/references/chat.md ---
+# Chat Apps
+
+<!-- DALTON-HOOK(prompt-audit-text): align chat reference to Dalton supported platforms (Feishu, Discord, personal WeChat) -->
+This page applies when you have `send_message` and `list_message_targets`: the user has connected chat apps — Feishu, Discord, or personal WeChat (`weixin:@me`, direct messages only) — and you can message them there. Group chat addresses come from `.agents/user/channels/available.json` or `list_message_targets`.
+
+## Which rules apply
+
+- A turn that comes from a chat app carries that app's delivery rules. Where they differ from this page, follow the turn's rules: they are current.
+- A turn that starts anywhere else (the web, an automation, a hand-off's report-back) and sends to a chat gets no chat rules. Write for the app you send to, using this page.
+
+## Talking with the user over chat
+
+In a chat the user sees what you send, not your updates between tool calls.
+
+- Reply first. When the work takes more than a moment, send one line on what you are about to do, then start. A quick answer is a single message.
+- Keep them posted. Before a long step, or a hand-off whose result comes later, say so and that you will follow up. When the result comes back, send it where the request came from.
+- Write like a colleague answering a message: short and plain, the answer first. Put detail in an attached file, not a long message.
+- If a send is refused, don't send it somewhere else instead. Tell the user it couldn't go there and how to allow it.
+- A request made on the web to send something to a chat ("send me the summary on Feishu" or "on Discord") is an ordinary task: send what was asked, where it was asked.
+
+## How sending works
+
+- Leave `target` out to post in the conversation the turn came from. A turn that did not come from a chat app has no such conversation, so each send needs a target.
+- On a turn from a chat app, your final answer is posted there only if you sent no text to that conversation during the turn, as a fallback. Never repeat in it what you already sent.
+- Attach workspace files by passing their paths in `files`, with the `workspace_id` they are in when the tool asks for one. Files arrive as their own messages after the text, without a caption, so say in the text what they are.
+- One send holds up to 20,000 characters of text, and its files hold 50 MB in all.
+- `list_message_targets` shows the other places you can send to.
+- Target channels and chats, never threads: messages to a channel are grouped into a thread automatically.
+
+## What each app shows
+
+<!-- DALTON-HOOK(prompt-audit-text): focus formatting table on Dalton supported apps (Feishu, Discord, personal WeChat) -->
+| What you write | Feishu | Discord | Personal WeChat (`weixin:@me`) |
+|---|---|---|---|
+| Headings | Shown | `#`, `##` and `###` only | Plain text |
+| Bold, italic, strikethrough | Shown | Shown, plus underline and spoilers | Plain text |
+| Lists | Shown | Shown | Plain text |
+| Code blocks | Shown, with the language | Shown, with the language | Plain text |
+| Tables | Shown; at most 5 in one card | Turned into a code block, hard to read on a phone | Plain text; attach a file for wide tables |
+| `[text](url)` links | Shown | Shown | Write URLs plainly |
+| Math | Not rendered | Not rendered | As written |
+| One message holds | About 28 KB a card (some 9,000 Chinese characters), then it is split; tables split it sooner | 2,000 characters, then it is split | Prefer concise text messages |
+| Files | Images (PNG, JPEG, GIF, WebP, BMP, TIFF) up to 10 MB show as images; other files go as files, up to 20 MB | 10 together, 20 MB each or the server's lower limit | Supported as attachments via direct message |
+| `reply: true` | No effect | Works in server channels | No effect (no quoted reply) |
+
+- **Feishu**: each message is a card. An image written in Markdown with a public web address shows as a picture in it.
+- **Discord**: underline is `__text__` and a spoiler is `||text||`. Mentions you write don't notify anyone.
+- **Personal WeChat**: direct messages only (`weixin:@me`); group chats are not supported.
+- **Every app**: a workspace path written as a link does not open in a chat. Attach the file.
+
+--- FILE: langalpha-doc/references/computer.md ---
+# The Computer
+
+## Processes
+
+- **ExecuteCode** starts a fresh `python3` process each call, in your workspace folder.
+- To import your own modules, run the script from Bash (`python <task>/run.py`) or put its folder on `sys.path`.
+- A missing package is not reliably installed for you: `pip install` it in Bash, then run again.
+- **Bash** starts a fresh shell each call, in your workspace folder. `cd` and `export` do not carry over, and stderr comes back merged with stdout.
+- ExecuteCode calls wait for a free CPU slot, one per CPU of the computer, shared with other threads, subagents and sibling workspaces, so parallel ExecuteCode calls queue. Bash does not. A run moved to the background gives its slot up.
+- `os.cpu_count()` and `nproc` report the host machine, not your share. `OMP_NUM_THREADS` holds your CPU count; size worker pools from it.
+- One disk serves every workspace on the computer, and `df -h /` shows it. The low-disk warning comes late, so check before writing large data.
+
+## What survives
+
+| Event | Kept | Lost |
+|---|---|---|
+| Stop, then start | the whole disk: files, installed packages, `/tmp` | running processes, background commands included |
+| Archive, then restore (after about a week stopped) | the whole disk, after a wait of up to five minutes | the same as a stop |
+| Rebuild (the sandbox is lost, the resource tier changes, or it was deleted after long dormancy) | backed-up workspace folders | installed packages, the computer root, `/tmp`, everything under `.agents/threads/` |
+
+- The computer stops on its own about 50 to 60 minutes after the last turn started, unless the user keeps it always on. A turn, background subagent or background command still running holds it up.
+- Each workspace folder is backed up after every completed turn, and on a best-effort basis before a stop. Files written after a turn ends wait for the next completed turn.
+- The backup skips dependency and cache folders (`.venv`, `venv`, `node_modules`, `vendor`, `.git`, `.cache`, `__pycache__` and similar), compiled files (`.pyc`, `.so`, `.dylib`, `.o`), `.agents/threads/`, `.agents/tools/`, and single files over the size limit (at least 100 MB). A cloned repository comes back without its history, and a virtual environment does not come back usable under any name, so keep a `requirements.txt` or a setup script in the workspace and reinstall when an import fails after a rebuild.
+- After a rebuild your workspace folder is restored before your turn starts; saved tool results follow during the turn. A sibling workspace is restored when it is next opened, so `../<sibling>/` can be missing until then.
+
+## Preinstalled
+
+Python with pandas, numpy, scipy, scikit-learn, statsmodels, matplotlib, seaborn, plotly, openpyxl, python-docx, python-pptx, pypdf, pdfplumber, reportlab, beautifulsoup4, lxml, playwright and yfinance; `rg`, `jq`, `git`, `gh`, `pandoc`, poppler, `qpdf`, LibreOffice (Writer, Calc, Impress, Draw), `uv` and Node. Check before installing.
+
+## Data-server tools from code
+
+- Import with `from tools.<server> import <function>`, from ExecuteCode or from a script Bash runs. A character that is not valid in a Python name becomes `_`, and a parameter named like a Python keyword (including `type` and `match`) gets a trailing `_`.
+- A folder or module named `tools` next to your script hides the wrappers.
+- Only servers enabled for this workspace have wrappers and docs under `.agents/tools/`; importing any other raises `ModuleNotFoundError`. `../.agents/tools/docs/` covers every server any workspace on the computer enabled, so a doc there does not mean you can call it here.
+- A built-in data server reports a failure as a value, `{"error": ..., "detail": ...}`, not an exception, so check for it; other servers return their own error text. A protocol or connection failure raises `RuntimeError`.
+- Calls to a local (stdio) server run one at a time across the whole computer; remote servers take calls in parallel. A local server idle for 15 minutes restarts on its next call, which can take half a minute.
+- Never edit the wrappers under `.agents/tools/`: they are regenerated, and sibling workspaces share them.
+
+## Secrets
+
+`vault` reads one file for the whole computer, holding every secret the user saved under Plugins, Secrets, so code sees the same secrets from any folder, `/tmp` and the computer root included. If it says the workspace still names its own vault, that clears once the workspace starts again.
+
+--- FILE: langalpha-doc/references/drive.md ---
+# The Drive
+
+<!-- DALTON-HOOK(drive-guidance): name the active overlay config files, startup guard, and gate: none since Settings has no Experiments page -->
+To turn the Drive on, an administrator edits the overlay file for the deployment's `APP_ENV` (`config.dalton.yaml` when `APP_ENV=dalton`, `config.core.yaml` when `APP_ENV=core`):
+
+1. Set `features.drive.enabled: true` and `features.drive.gate: none` in that overlay file to open the Drive for everyone. Because this deployment's Settings omits the Experiments page, `gate: none` activates the Drive directly once the backend picks up the file: on `APP_ENV=dalton` restart the backend; on `APP_ENV=core` the file is baked into the image, so rebuild the backend image (or mount the edited file) and recreate the container.
+2. Keep colleague access (`colleague_sharing` / `colleague_dispatch`) and computer CLI tokens (`computer_cli_tokens`) off before restarting; when either is on, startup turns the Drive off.
+
+The Drive is active for you when your prompt includes a `<drive_system>` section. Outside that case, or in a shared workspace, a call targeting `.agents/drive` reports unavailable; share the administrator steps above and keep the file in the workspace until the Drive is active.
+
+## What it is
+
+`.agents/drive/personal/` holds the user's own files, kept by the server: the same tree from every workspace and every computer, through every restart and rebuild. A workspace's backup leaves it out, since the server already has it.
+
+## Reaching it
+
+| | Read, Write, Edit, Glob, Grep | Bash, ExecuteCode |
+|---|---|---|
+| A cloud computer | yes | yes, as ordinary files at the same path |
+| A machine the user brought | yes | refused |
+
+## Putting a file in
+
+- Text you are writing: Write to a path under `.agents/drive/personal/`. Folders above it are made for you.
+- A file already in the workspace, of any type, where Bash reaches the Drive: `mkdir -p .agents/drive/personal/models && cp task/model.xlsx .agents/drive/personal/models/model.xlsx`; `mv` works the same way and removes the workspace copy.
+
+Write and Edit save at most 50 MB at a time by default; write a larger file in the workspace and copy it in. Otherwise a file may be as large as the room left in the Drive, unless the deployment sets a lower limit. A large save from Bash or code needs free disk on the computer while it is sent; when there is too little, NOT SAVED says how much more it needs.
+
+When a save is refused because the Drive is full, tell the user: they can delete files, or clear a file's earlier versions from the Drive page. Only the user clears earlier versions.
+
+## Reading
+
+Read shows text, PDFs and images. For anything else (a spreadsheet, a parquet file), open it with code at the same path where Bash reaches the Drive. Code reads it in place, fetching only the parts it touches, so query a large dataset where it sits (DuckDB or Polars on a Parquet or CSV file) rather than copying it first.
+
+## Search
+
+- Grep searches the Drive's text files only when `path` is inside it. Glob needs such a `path` or a pattern that names it: `.agents/drive/personal/**/*.md`.
+- Grep may skip data files (`.csv`, `.parquet`, `.jsonl`, `.xlsx`, `.db`, archives and the like); its result names the ones it skipped. Query them with code.
+- In Bash, `rg` is the fast way to search the whole Drive: it skips files that are not text, though it reads every CSV and JSON Lines file whole, so leave large datasets out with `-g '!*.{csv,tsv,jsonl,ndjson}'`. `grep -r` reads every file, which fetches each PDF and dataset from the server; use `rg`.
+
+## Saves and versions
+
+- Your saves to one file in one turn make one version. The user sees who made each version, with a link to this thread, and can restore an earlier one while it is kept, so save without asking first.
+- By default a text file keeps every version, another file under 100 MB keeps its earlier versions 30 days and at most 10, and a larger one keeps none, so saving over it replaces it for good. Unless the user asked to replace a large file, save the new one beside it under another name.
+- Write and Edit are refused when the file changed since you read it. Read it again and make the change on what it holds now.
+- A save from Bash or code reaches the server a moment after the write. One the server refuses does not fail the command: the tool result lists it under NOT SAVED, so check there before relying on the write. `NOT SAVED YET` means the computer is still sending the file, and a later result says `Saved now` or that it was not.
+
+## Renaming, moving, deleting
+
+Use `mv` and `rm` where Bash reaches the Drive. A file keeps its history under a new name. A delete goes to the trash for up to 14 days (the oldest go sooner when the trash grows past the Drive's allowance). The trash does not count against the Drive's allowance, so deleting is what frees room. Only the user empties the trash.
+
+## What the user sees
+
+The Drive page in the app's sidebar: every file, its history, and the trash. Link a Drive file as `[name](.agents/drive/personal/notes/thesis.md)`; the link opens that page at the file.
+
+--- FILE: langalpha-doc/references/files.md ---
+# Files and Paths
+
+## Layout
+
+The computer root, `..` from your workspace:
+
+```
+<workspace folder>/       one per workspace, named after it with any character a path
+                          cannot hold replaced; a rename moves it between turns, never during one
+.agents/threads.jsonl     every thread on this computer (see history.md)
+.agents/skills/           skills shared across workspaces
+.agents/tools/docs/       docs for every data server any workspace has enabled
+.agents/user/             memory, memos, profile and automations shared by all workspaces
+.agents/workflows/        saved workflows
+```
+
+The root also holds harness folders: `.system/`, `mcp_servers/`, and a reserved runtime folder the tools refuse to touch. Leave them alone. To find a sibling workspace, run `ls ..` in Bash or read the index for its exact folder rather than spelling it from the workspace's name.
+
+Your workspace folder:
+
+```
+agent.md, data/, <task>/            yours
+.agents/memory/                     this workspace's memory
+.agents/skills/<name>               this workspace's skills, and links to shared ones
+.agents/tools/                      wrappers and docs for the data servers enabled here;
+                                    generated, never edit
+.agents/threads/<thread>/           code/ (a copy of every ExecuteCode and Bash script)
+.agents/transcripts/<thread>/       every conversation's transcript, read only
+.agents/large_tool_results/<thread>/  tool results too large for your context
+.agents/scratchpad/<thread>/        a thread's temporary files and checkpoint notes; deleted when the thread is archived
+.file_sync_marker                   never delete: without it the workspace is restored again
+```
+
+The harness writes `.agents/threads/`, `.agents/transcripts/`, `.agents/large_tool_results/` and `.agents/tools/`. Read them; do not write them.
+
+## How paths resolve
+
+| Path | Read, Write, Edit, Glob, Grep | ExecuteCode, Bash |
+|---|---|---|
+| `data/x.csv` | your workspace | your workspace |
+| `/data/x.csv` | your workspace | the real filesystem root, where it does not exist |
+| `/etc/hosts` | `<workspace>/etc/hosts`, not found | the system file |
+| `../<sibling>/x` | the sibling's file | the sibling's file |
+| `/tmp/x` | `/tmp/x` | `/tmp/x` |
+
+Use Bash for anything outside the workspaces and `/tmp`. Tool output prints your own files with a leading slash, a sibling's as an absolute path, and memory files as `/.agents/...`.
+
+## Search
+
+- **Glob**: a pattern with no `/` searches every depth, and results come newest first, at most 1000. Dependency and cache folders (`node_modules`, `.venv`, `venv`, `vendor`, `.git`, `.cache`, `__pycache__` and similar) are skipped at any depth, and so are the history folders under `.agents/` (`threads/`, `transcripts/`, `large_tool_results/`, `scratchpad/`) unless the pattern or `path` spells them out. Braces do not expand: `*.{csv,json}` matches nothing, so run one pattern per extension.
+- **Grep**: skips hidden and git-ignored files and folders unless `path` points inside one. `.agents/memory/` is the exception and is searched by default. Its `glob` matches each path as Grep prints it, from your workspace, not from `path`, and takes rg's syntax: `!*.json` excludes and `*.{md,json}` expands. Content mode cuts a line over 500 characters to windows around its first matches. A sibling's files print as absolute paths, so start a filter for them with `**/`, as in `**/<sibling>/*.md`.
+- Data-server docs and shared skills are links, which Grep and a pattern starting `**/` do not follow. Spell the folder in the pattern, for example Glob `.agents/tools/docs/**/*.md`, or Read the file directly.
+
+## Memory, memos, profile, workflows and automations live on the server
+
+`.agents/memory/` (this workspace), `.agents/user/memory/` (every workspace), `.agents/user/memo/` (the user's uploaded documents, read only), `.agents/user/profile/` (`user.json`, `portfolio.json`, `watchlist.json`, `preference.json`, checked on write), `.agents/user/automations/` (one JSON file per automation, checked on write) and `.agents/workflows/` are held by the server, not on disk, so they survive every restart and rebuild. The file tools always reach them; Bash and code reach them through the computer's file mount.
+
+- With the mount up they are ordinary files at the same paths. A save the server refuses (invalid JSON, a file changed since you read it) does not fail the command: the tool result lists it under NOT SAVED, so check there before relying on the write. In the profile and automations folders, save in place: `sed -i` and write-then-rename helpers write a temporary file first, which the profile folder refuses, as does the automations folder for a name without `.json`, like sed's. A temporary `.json` file there is saved as an automation of its own, and moving it onto the original is refused, so `rm` it.
+- Without the mount, ExecuteCode and Bash refuse a call whose text names a memory, memo or automations path, even in a comment. Read the file first and put what you need into the code.
+- Glob finds them by their path from the workspace, such as `.agents/user/profile/*`. Like the links above, `.agents/user` and `.agents/workflows` are not followed by a pattern starting `**/`, so `**/*.json` skips them. Grep searches `.agents/memory/` by default; set `path` to `.agents/user` or `.agents/workflows` for the rest.
+- `.agents/user/channels/` (the user's chat-app settings, present when a messaging service is connected) is reached only by the file tools: it is never on the mount, and ExecuteCode and Bash refuse a call whose text names it, mounted or not. Read its README before editing.
+- A file holds at most 256 KB. Each part of a name uses only ASCII letters, digits and `- _ . @ + ~`, so no spaces; subfolders are fine.
+- The file tools cannot delete a memory file; `rm` through the mount can. To retire one without it, remove its line from `memory.md` and overwrite the file with what is still true.
+- Your context holds a copy of `memory.md` (its first 32,768 characters) taken when the thread starts. A change, by you or another thread, reaches it as a diff at the next turn. Read always returns the current file.
+- Read a memo by its relative path, `.agents/user/memo/<file>`. Memo names are lowercase, and a PDF memo is stored as text with `--- Page N ---` markers, skipping pages that had no text.
+
+## What the user sees
+
+- The file panel shows your workspace folder only: not siblings, the computer root or `/tmp`. `.agents/` is behind a system-files toggle, and dependency and cache folders never appear.
+- A new file shows up in the panel by the end of the turn at the latest.
+- Link a file as `[name](task/file.md)` and an image as `![title](task/charts/x.png)`, relative to the workspace. Anchors work: `#L42`, `#L40-L55`, `#heading-slug`, `#page=3`. A path in backticks is not a link.
+- Inside a markdown file, links resolve from the file's own folder first, but image paths always resolve from the workspace folder: in `task/report.md`, write `![](task/charts/x.png)`, not `![](charts/x.png)`.
+- md, pdf, xlsx, csv, html, images and text preview in the panel; docx, pptx and parquet download only. Markdown and HTML files already offer save-as-PDF, so skip a PDF copy unless the user asks for one.
+- An HTML file can `fetch` any file in its workspace and nothing else. Write each path as a plain string, such as `fetch('../../data/prices.json')`, so a published copy includes the file. Images, scripts and styles may be files beside it or `data:` URIs, and scripts may also load from cdnjs, jsdelivr, unpkg and esm.sh.
+- Chart output from `plt.show()` is discarded. Save with `savefig` into `<task>/charts/` and link the file; give a changed chart a new filename, since images are cached.
+
+--- FILE: langalpha-doc/references/history.md ---
+# Conversation History
+
+Every conversation on this computer is saved as a transcript, so when the user points back at earlier work, another conversation or something said before, look it up instead of guessing or asking. The server keeps them and the computer's file mount shows them as files. A computer without the mount, such as a machine the user brings over SSH, shows them to Read, Grep and Glob only: Bash and code find no `.agents/transcripts` there and the `jq` and `rg` commands below have no file to open, so do the same with Grep and Read. If Read cannot open `../.agents/threads.jsonl`, this computer is not showing them, so ask the user instead.
+
+## Where it lives
+
+Each thread's transcript sits in the workspace the thread belongs to:
+
+```
+.agents/transcripts/<thread>/
+  manifest.json        segments: one entry per turn file, with file, turn, at (when it opened), model, events
+  turn-0001.jsonl      one JSON event per line
+  tasks/<task_id>/
+    meta.json          task_id, description, subagent_type, created_at, and the latest
+                       run's status and launch_call_id; segments lists the runs, with their model
+    run-0001.jsonl     one file per run of that background task
+```
+
+`<thread>` is the first 8 characters of the thread id. A task id is 6 characters and can start with `-`, which a command reads as an option even when quoted, so use the task's full path, never the bare id.
+
+`../.agents/threads.jsonl` lists every thread on this computer, sibling workspaces included, newest first. Each line has `thread_id`, `title`, `workspace` (its display name, not its folder), `workspace_id`, `created_at`, `updated_at` and `transcript`, the thread's transcript folder as an absolute path, or `null` when none is saved yet (a thread whose first turn has not completed), so there is nothing to search.
+
+## Event lines
+
+Every line carries `seq`, `turn` (`run` in a task file), `type` and `id`.
+
+| `type` | Fields |
+|---|---|
+| `user` | `text`. The first line of a turn has `at` and `model`, the model that answered; a message sent while you were working has `steering: true` and text starting `[Steering from User]`; attachments show as `[image]` or `[file: name]` |
+| `assistant` | `text`, the visible reply only; `model` where the model that answered changes |
+| `tool_call` | `call_id`, `tool`, `args` in full, never truncated; `model` as on `assistant` |
+| `tool_result` | `call_id`, `tool`, `status`, `text` in full; `evicted` names the file a large result was saved to |
+
+Reasoning, compaction summaries and the context rows the harness injects are not kept. A turn file starts at each new user message, and a background task reporting back arrives as one too. An `AskUserQuestion` answer is that call's `tool_result` ("User answered: ..."), and a message sent mid-turn stays in the same turn, so transcript turn numbers can differ from the count the user sees.
+
+## How fresh it is
+
+- A turn is saved when it completes, and a compaction saves everything so far. A turn that ended interrupted, cancelled or failed is saved later, at the thread's next completed turn at the latest.
+- The index is built each time it is read, so it lists every thread that exists, this one included, with its current title.
+
+## Finding things
+
+Grep skips `.agents/` (`.agents/memory/` aside) and Glob skips the history folders unless `path` points inside them.
+
+- Pick candidates from the index before searching everything:
+  `jq -r '[.updated_at[:10], .workspace, .title, (.transcript // "-")] | @tsv' ../.agents/threads.jsonl`
+- This workspace: `Grep(pattern, path=".agents/transcripts")`, files first, then content.
+- A sibling workspace: pass its transcript folder from the index as `path`.
+- Every workspace at once:
+  `jq -r '.transcript // empty' ../.agents/threads.jsonl | xargs -r rg -l 'pattern'`. Without the mount, Grep each transcript folder the index lists.
+- One line can be a whole pasted document or a large tool result. Grep content mode cuts long lines to windows around the matches, and Read of a turn or run file cuts each field over 1,000 characters, naming the `offset` that shows its line whole with `limit=1`. Where Bash sees the files, `jq` pulls single events: `jq -c 'select(.type=="user") | .text[:300]' turn-0003.jsonl`.
+- A tool result or a pasted document is one JSON string, its lines joined by `\n`, so `^` and `$` match only at the ends of the whole event: search for the text itself.
+- Count across threads with Grep `output_mode="count"` or `rg -c`.
+- Each file is fetched from the server when first read, so a search over every thread is slower than one over workspace files. Narrow to likely threads with the index first.
+
+Transcripts are read only; a write to one fails.
+
+## Your own thread
+
+Until compaction you do not need this thread's transcript: the whole conversation is in your context. After compaction the summary names its folder, and so does any saved-result pointer in this conversation. Otherwise the newest script copy names the thread that last ran code, normally this one: `ls -t .agents/threads/*/code/* | head -1`.
+
+## Compaction and older tool calls
+
+When the context grows past a threshold, older messages are replaced by a `[Context Summary]` message and only the last few messages stay verbatim. The summary names the transcript folder that still holds everything before it; when an exact figure, path or the user's own wording matters, Grep that folder rather than trust the summary. Only the user can compact on demand.
+
+When a turn starts more than 90 minutes after your last reply, older tool calls are also trimmed, then and never in the middle of a turn, and never in the newest messages. A string over 2,000 characters passed to Write, Edit or ExecuteCode is cut to a pointer naming the transcript file of its turn and the call's `call_id`, with how to print the full arguments. Older Read results of files under `.agents/threads/`, `.agents/transcripts/`, `.agents/large_tool_results/`, `.agents/scratchpad/` and `.agents/tmp/` are cleared, as is a Read superseded by a later Read of the same file and range, so write down what you need from those files in your own reply when you read them.
+
+## Tool results saved to a file
+
+A tool result over about 160,000 characters is saved to `.agents/large_tool_results/<thread>/<call_id>.json` when it starts with `{` or `[`, otherwise `.md`, up to 50 MiB. You get a pointer plus its first and last 5 lines, each cut to 1,000 characters. Read, Write and Edit results are never saved this way, nor results that carry an image or PDF.
+
+- Many lines: Read it in slices with `offset` and `limit`.
+- A preview with a single line and no `[N lines truncated]` marker means the whole result is one line, as JSON usually is. Read cannot page it; use `jq`, Python, `head -c` or Grep content mode.
+- These files are backed up with the workspace. After a rebuild they come back a little after the turn starts, so a missing one may just be late.
+
+## Background tasks
+
+- `TaskOutput` returns a task's final message. Its steps, every tool call and result, are in `.agents/transcripts/<thread>/tasks/<task_id>/run-NNNN.jsonl`. A run file can be partial until the run finishes, so check `status` in `meta.json` before relying on it.
+- `launch_call_id` in `meta.json` is the `call_id` of the call that started the latest run. `rg -l -- <launch_call_id> .agents/transcripts/<thread>/turn-*.jsonl` finds the turn that made it, and that `tool_call` line holds the full prompt the task was given.
+- A completed task has stopped, not necessarily succeeded; read the result before building on it.
+- Subagents share your computer, workspace folder and memory. They are not given `agent.md` or the memory index, though they can Read both, and their large results are saved under your thread in `.agents/large_tool_results/`.
+
+--- FILE: langalpha-doc/references/plugins.md ---
+# MCP Servers, Secrets and Plugins
+
+You cannot add, switch on or connect any of these yourself: none of your tools reaches those settings. The user does it in two places, so name the one you mean:
+
+- **The Plugins page**, for the whole account. Its tabs are Packages, Connectors, Skills and Secrets, and its **Add** menu holds "Add MCP server", "Import servers", "Install plugin" and "Upload skill".
+- **Workspace Settings**, for this workspace, opened by the gear at the top of the file panel. Its MCP tab switches the account's servers on or off here, and its Skills tab matters too; its own Packages tab is unrelated to plugins.
+
+Your part is telling them exactly where to go and preparing what they paste or upload. Changes apply without a restart and usually reach you at your next turn, as an update to your context. A server change can take about 30 seconds to land, and the turn in progress keeps what it started with.
+
+## MCP servers
+
+`<mcp-servers>` in your context lists a server only when it is on for this workspace and its tools were found. One that is off, switched off for this workspace, still being checked, failing, missing a secret or on legacy SSE is simply absent. When the user expects one you cannot see, ask them to check its switch and status in Workspace Settings, MCP tab, and on the Plugins page its switch, its workspace scope and the switch of any plugin that owns it.
+
+**How the user adds one**
+Every server belongs to the account; a workspace only switches it on or off.
+- From the Plugins page: Add, "Add MCP server". It is saved switched off. Once the user switches it on under Connectors it is on in every workspace, new ones included; its scope menu can leave some out and set whether new workspaces start with it.
+- From this workspace: Workspace Settings, MCP tab, "Add server". It is added to the account switched on here only; other workspaces, new ones included, start with it off until the user switches it on there. An edit made on the MCP tab changes the server for every workspace.
+- The form takes one field: a URL, a command such as `npx -y <package>`, or an `{"mcpServers": {...}}` config, from which it takes the first server only. A key pasted into the form stays in the config unless the user presses "Save to vault", which saves it as an account secret.
+- To add several servers, or have keys moved into secrets, the user imports the config instead: "Import servers" on the Plugins page or "Import JSON" on the MCP tab. Both save keys as account secrets, under generated names such as `FX_FX_API_KEY`; "Import servers" leaves the servers switched off, and "Import JSON" switches them on in this workspace only. Write a placeholder such as `<your-api-key>` where a key goes, and the import asks the user for it.
+
+**Preparing the config for them**
+- A server's name is a letter or `_`, then letters, digits and `_`, at most 64 characters; it becomes `tools.<name>` in your code. It cannot be `mcp_client`, a Python keyword such as `class`, or start with `__`; an import or a plugin install renames such a name.
+- A remote server needs a public `https` address: no `http://`, `localhost` or private network address. Legacy SSE servers are accepted but cannot be called; use the server's streamable HTTP address.
+- A local server runs on this computer. Pin its version and run it isolated: `uvx --from '<package>==<version>' <command>` or `npx -y <package>@<version>`. A bare `python`, `python3`, `node` or `uv` command is saved with a warning and breaks when the shared environment changes.
+- A key goes in as a reference to a secret, `${vault:NAME}`, in an environment variable, an argument or a header value (`Bearer ${vault:NAME}` works). A plain `${NAME}` is rejected, and a key in the URL's query string is never moved to secrets, so put it in a header or variable.
+- A server that signs in with OAuth: the user presses Connect on its row under Connectors on the Plugins page, even for one added from a workspace, signs in, and switches it on.
+
+**Where its tools appear**
+- A server's tools are Python functions you call from ExecuteCode (computer.md), not tool calls.
+- The user can set each tool of a remote server to Direct or Both, in its detail view under Connectors; Direct tools are tool calls. A server that signs in with a header needs a successful connection check first. Local and SSE servers are never Direct.
+
+**When a call fails**
+- `Missing vault secret(s) for server '<name>': <NAMES>`: the user adds those secrets on the Plugins page, Secrets. "Set up <NAME>" on the MCP tab opens it with the name filled in.
+- The user sees each server's status in Workspace Settings, MCP tab: Connected, Pending, Error with its text, or Needs secret. Built-in servers always show Connected, and the Connectors tab shows only the switch, the OAuth connection and connection-check warnings.
+- A built-in server answering that it is not configured lacks a key in the deployment's own environment, not in the user's secrets. Say so instead of asking the user for a key.
+- Do not stand a server up yourself from code as a stand-in unless the user asks for exactly that: the platform gives it none of their secrets or tool settings.
+
+## Built-in servers
+
+The built-in servers are on by default in every workspace, and the user can switch any of them off for the account or for one workspace. Only `x_api` needs something from the user: an X bearer token saved as the secret `X_BEARER_TOKEN`; the `x-api` skill has the rest.
+
+## Secrets
+
+- Plugins page, Secrets: the user's only secrets. Every server, every workspace and your code read the same set.
+- No secret belongs to one workspace, and switching a server off in a workspace does not hide its key from code there.
+- Ask the user to add a key there, or leave a placeholder for the import to ask about, rather than paste it into the chat: you have nowhere safe to keep it, and every message is saved in the conversation's transcript.
+- Your code reads secrets with `vault` (computer.md).
+
+## Plugins
+
+A plugin bundles MCP servers and skills. Installing one adds them for the whole account: its servers switched on, its skills in every workspace, and a step asking for any secrets it declares, which the user can skip and fill in later under Secrets. The user can exclude workspaces per server or skill on the Connectors and Skills tabs, switch the plugin off on its card under Packages, or uninstall it, which removes its servers and skills, except ones they customized, and keeps the secrets. An installed plugin is changed by updating it, not by installing it again.
+
+**How the user installs one**: Plugins page, Add, "Install plugin", from a `.zip` upload, a public `https` git URL on GitHub, GitLab, Codeberg or Bitbucket, or a direct `https` link to an archive. For a repository listing several plugins, the user picks one. Claude, Codex and Cursor plugin repositories install as they are; their commands, agents and hooks are ignored. A repository with no plugin manifest is not a plugin: add its server as above, or its skills as in skills.md.
+
+**Building one for the user**
+
+```
+<name>/
+  plugin.json
+  mcp.json                 optional
+  skills/<skill>/SKILL.md  optional, one folder per skill (rules in skills.md)
+```
+
+Everything else in the folder is ignored.
+
+`plugin.json`:
+```json
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "fx-rates",
+  "version": "1.0.0",
+  "description": "FX rates for research notes"
+}
+```
+`name` is required: lowercase letters, digits, `.` and `-`, starting and ending with a letter or digit, no `--` or `..`, at most 64 characters. `alternative-data`, `langalpha-deliverables`, `langalpha-market-data`, `langalpha-research`, `langalpha-service` and `yfinance` are taken.
+
+`mcp.json`:
+```json
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "fx_rates": {"type": "stdio", "command": "uvx", "args": ["--from", "fx-rates-mcp==1.2.0", "fx-rates-mcp"]},
+    "fx_news": {"type": "streamable-http", "url": "https://fx.example.com/mcp"}
+  }
+}
+```
+- Every entry needs `type`, exactly `"stdio"` or `"streamable-http"` (`"http"` skips the entry), and takes only the keys shown plus `env` (local) or `headers` (remote). An unknown key skips that entry; one at the top level drops every server. Server names follow the rules above.
+- No code ships with a plugin. An entry using `${PLUGIN_ROOT}` or `${PLUGIN_DATA}` is skipped; leave `cwd` out. Make a local server a published package run by `uvx` or `npx` with a pinned version, and give a remote one a public `https` address, which is checked at install.
+
+A key the user supplies at install, in `plugin.json`:
+```json
+"extensions": {"ai.langalpha": {
+  "secrets": [{"name": "FX_API_KEY", "label": "FX API key", "bind": [{"server": "fx_rates", "env": "FX_API_KEY"}]}],
+  "servers": {"fx_rates": {"description": "Spot and forward FX rates", "instruction": "Call get_rate before get_history."}}
+}}
+```
+- `bind` sets a local server's `env` variable or a remote server's `header` to the secret; leave that key out of `mcp.json`. A header gets exactly the secret's value, so for `Authorization` tell the user to save `Bearer <token>` as the secret.
+- One wrong key anywhere in this block drops the whole block, secrets included, while the install still succeeds, so use only the keys shown.
+
+Zip it with `shutil.make_archive` (the folder's contents at the zip root, or the folder itself), save it under the task folder and link it; the user downloads it from the file panel and installs it. At most 64 MB.
+
+--- FILE: langalpha-doc/references/settings-map.md ---
+# 设置位置与代改范围
+
+用户询问某项设置在哪里修改，或需确认研究总监（Chief of Staff，简称 CoS）能否代改时，按本表回答。
+
+## 一、系统、模型与账户设置
+
+| 设置项 | 在哪里改（页面路径） | CoS 能否代改（用哪个工具） |
+|---|---|---|
+| 姓名、语言、时区、引导完成状态 | 设置 → 个人资料（姓名）；设置 → 通用与外观（语言、时区） | **能。** 编辑 `.agents/user/profile/user.json` |
+| 投资画像、风险偏好、研究深度、输出格式、主动性、长期指示 | 设置 → 投资画像；设置 → 对话与助手 | **能。** 编辑 `.agents/user/profile/preference.json` |
+| 自选股与持仓 | 侧栏「仪表盘」→「自选股」/「投资组合」卡片 | **能。** 编辑 `.agents/user/profile/` 下 `watchlist.json`、`portfolio.json` |
+| 重置全部偏好（整组清空） | 设置 → 投资画像 → 重置偏好 | **不能整组重置。** 仅能清空资料文件开放的字段，整组重置请用户到上述页面操作 |
+| 账户默认模型、更改默认模型时的适用范围、后台模型 | 设置 → 模型（默认模型、更改默认模型时） | **否。** 由用户在页面修改 |
+| 收藏的模型（快捷列表）、账户默认值与按模型调参（思考强度、提示词详细程度、快速模式、压缩预设、闲置压缩） | 设置 → 模型（收藏的模型）；开启「高级模型设置」→ 展开「高级：后台任务使用的模型」内的「账户默认值」与「按模型设置」 | **否。** 由用户在页面修改 |
+| 模型路由（网页抓取、上下文压缩、备用模型）与后台任务专用模型（数据核验、文字审校、核验备用、单次核验超时、轻量后台任务、独立复核候选、研究记忆整理） | 设置 → 模型 → 开启「高级模型设置」→「路由」与展开「高级：后台任务使用的模型」 | **否。** 由用户在页面修改 |
+| 主助理搜索服务、搜索深度、子智能体（子 Agent）默认开关 | 设置 → 对话与助手（网络搜索引擎、搜索深度、子 Agent） | **否。** 账户级开关在页面修改；单个子智能体配置可编辑 `.agents/user/agents/<name>.md` |
+| 自动批准派发分析、自动批准新建工作区 | 设置 → 对话与助手（交给分析师前不再询问、创建工作区前不再询问） | **否。** 授权开关由用户在页面修改 |
+| 当前对话模型；单对话思考强度、快速模式、子智能体许可 | 当前对话模型、单对话思考强度、快速模式与子智能体（子 Agent）开关均可在对话输入区修改；账户默认模型在「设置 → 模型」修改 | **模型能，其余否。** 用户本轮明确要求切换当前对话模型时调用 `switch_thread_model`，从用户下一条消息起生效 |
+| 交易权限（长期授权） | 当前版本不提供交易权限设置入口 | **否。** 当前版本不开放交易权限设置页 |
+| 预算（每日总上限、单任务默认上限、日切重置时区、按工作区覆盖单任务上限） | 设置 → 用量与预算 → 个人每日美元预算（搜索名：每日预算与花费上限） | **否。** `dalton_coverage_board` 仅只读查看今日预算，修改请用户在页面操作 |
+
+## 二、工作区、插件与工具设置
+
+| 设置项 | 在哪里改（页面路径） | CoS 能否代改（用哪个工具） |
+|---|---|---|
+| 工作区迁移（更换计算机） | 在目标工作区菜单选择「迁移到其他计算机…」，并指定目标计算机 | **否。** 迁移须由所有者在页面操作 |
+| 工作区自动入库（`dalton_auto_ingest`） | 在对应工作区的对话列表顶部切换「自动入库：开启 / 关闭」 | **否。** 开关随工作区生效，由用户在页面切换 |
+| Discord 自动入库频道与发送者策略 | 对应自动化任务的任务指令（`instruction`）中配置频道 ID 与发送者策略；工作区是否启用自动入库在工作区对话列表顶部切换 | **部分能。** 个人自动化任务可在 `.agents/user/automations/*.json` 修改任务指令；公司公共任务与工作区自动入库开关由有权限的成员在页面修改 |
+| 账户插件与连接器（MCP，模型上下文协议服务）管理 | 侧栏「插件」页（插件、连接器、技能、密钥、子 Agent） | **否。** 账户级安装与启停在插件页管理 |
+| 单个工作区的技能与 MCP 启停 | 对应工作区设置打开的 `Sandbox Settings` 面板（`MCP` / `Skills` 标签页） | **否。** 在该工作区的 `Sandbox Settings` 面板操作 |
+
+## 三、自动化任务设置
+
+| 设置项 | 在哪里改（页面路径） | CoS 能否代改（用哪个工具） |
+|---|---|---|
+| 个人自动化任务的新建、编辑、暂停、恢复 | 侧栏「自动化」→「我的任务」 | **能。** 读写 `.agents/user/automations/*.json` |
+| 受覆盖单元管理的财报任务、标准覆盖跟踪、公司公共数据任务 | 侧栏「自动化」→「研究跟踪」或「公司公共任务」；只读状态见「设置 → 团队管理 → 团队渠道与运维 → 自动巡检与团队公共任务」 | **部分能。** 财报排期用 `dalton_schedule_automation`，标准覆盖跟踪用 `dalton_coverage_tracking`，公司公共数据任务用 `dalton_system_jobs`（传 `data:<job_key>`）；运维任务只读；受覆盖单元管理的任务禁止直接修改自动化文件 |
+| 自动化任务删除、回收站恢复、版本回退与立即运行 | 恢复：侧栏「自动化」中「我的任务」「研究跟踪」「公司公共任务」每个分组底部各有独立「回收站」（普通任务删除超过 30 天会被清理）；版本回退：任务详情中的「修改历史」；立即运行：任务详情的立即运行按钮 | **个人自动化任务可删除（移入回收站），恢复、回退与立即运行不能。** 个人自动化任务通过文件设 `status: "deleted"` 或删除文件移入回收站并保留运行历史；受覆盖单元管理的任务不能经文件删除，可通过专用工具暂停 |
+| 已有公司公共智能任务的编辑与管理 | 侧栏「自动化」→「公司公共任务」 | **否。** 个人自动化任务不能通过修改字段转为公司公共任务；已有公司公共智能任务由有权限的成员在页面按版本编辑 |
+| 普通结果投递、完成通知、定时报告投递 | 见本表第四节「自动推送总开关」及任务详情 | **能。** 普通结果填个人自动化文件的 `delivery`（先读 `.agents/user/channels/available.json`，传 `[]` 关闭）；完成通知用 `dalton_notify_settings`；定时报告（调用 `automation_report`）的卡片、文字与失败提醒用 `dalton_report_delivery`（群目标先请用户确认）；个人任务完成通知与定时报告投递均受任务所属用户的「自动推送总开关」限制 |
+| 覆盖单元归属与个人覆盖名单 | 覆盖结构见「设置 → 覆盖结构」 | **能。** 团队覆盖单元用 `dalton_coverage_unit`，个人覆盖名单、分组和层级用 `dalton_coverage` |
+
+## 四、通知、渠道、共享与团队记忆
+
+| 设置项 | 在哪里改（页面路径） | CoS 能否代改（用哪个工具） |
+|---|---|---|
+| 自动推送总开关、默认个人收件人 | 设置 → 消息与渠道 → 自动推送与接收账号（搜索名：消息推送与接收账号，开启「自动推送总开关」） | **部分能。** `dalton_notify_settings(action="add_personal_target")` 可经确认添加个人飞书/Discord 目标；总开关及列表管理在页面操作 |
+| 个人渠道绑定与解绑（飞书、Discord、个人微信） | 设置 → 消息与渠道（飞书与 Discord 账号绑定、我的微信绑定） | **否。** 绑定码验证与解绑在页面完成；已绑定渠道的默认工作区、首选聊天与默认投递可通过 `.agents/user/channels/channels.json` 修改（Dalton 支持飞书、Discord 和个人微信，个人微信仅支持普通私聊 `weixin:@me`） |
+| 团队微信机器人、Discord 频道、飞书文档访问范围 | 团队微信机器人 / Discord 频道：设置 → 团队管理 → 团队渠道与运维；飞书文档访问范围：设置 → 团队管理 → 成员与权限 | **否（管理员专用）。** 仅管理员可在页面维护；CoS 仅可为有权限的任务选择已授权目标 |
+| 飞书团队群绑定 | 设置 → 团队管理 → 团队渠道与运维 → 飞书团队群 | **否（内部成员及以上可见）。** 内部成员及以上可在页面查看群列表与测试发送；CoS 仅可为有权限的任务选择已授权群目标 |
+| 工作区访问级别、账户协同共享开关、组织共享成员与角色 | 工作区访问级别：对应工作区对话列表顶部的「共享设置」弹窗；账户协同共享开关：设置 → 对话与助手 → 工作区协同共享；组织共享成员与角色：工作区的成员弹窗 | **否。** 共享授权由工作区所有者或管理者在页面操作 |
+| 团队记忆（Home 与工作区） | Home 的团队记忆：设置 → 对话与助手 → 共享团队历史研究记录；工作区的团队记忆：对应工作区对话列表顶部的「共享设置」→ 团队记忆 | **否。** 开关由用户在页面切换；当前轮次是否可用以本轮运行时状态为准 |
+| 共享工作区内的对话私有 / 共享状态 | 尚未共享的对话：对话输入区的隐私切换标签；已共享的对话：聊天顶部的隐私栏（有权改回私有的发起人可操作） | **否。** 由用户在页面切换 |
+| 对话分享链接与工作区文件分享链接（受众、附件浏览与下载权限） | 对话右上角「分享对话」面板（受众「谁可以打开」与「允许浏览文件 / 允许下载文件」）；文件链接在工作区文件菜单管理 | **否。** 分享链接与附件权限由用户在页面管理 |
+
+## 五、后台模型与入门模型说明
+
+- **后台模型与默认思考强度**：生成标题等后台任务通常使用后台模型。使用默认后台模型且未指定思考强度（`reasoning_effort`）时，多档模型默认使用低档（`low`）；用户设置和单次调用显式指定的值优先。数据核验与文字审校使用各自独立配置（路径见第一节「高级：后台任务使用的模型」），不与通用后台模型混用。
+- **入门模型候选与资料访谈**：入门模型页与资料访谈是两个独立步骤。入门模型页按顺序显示账户当前可用的推荐模型：`Gemini 4 Neon`、`Gemini 4 Carbon`、`Claude Opus 5.5`、`GPT-6.2 Astra`、`GPT-6.2 Sol`；其中 `Claude Opus 5.5` 首选档位不可用时，回退显示 `medium`（中档思考强度）版本。若列表无可用推荐模型，请用户联系管理员检查模型访问权限后点击重试。
+
+--- FILE: langalpha-doc/references/skills.md ---
+# Skills
+
+A skill is a folder holding a `SKILL.md` with YAML frontmatter (`name`, `description`) and any files it points to. The skills block in your context lists each available skill with its description; read its `SKILL.md` to use it. A skill is instructions and files only: it cannot add a tool. Ship scripts for yourself to run, and bring a real tool in as an MCP server (plugins.md).
+
+## Where skills live
+
+- `.agents/skills/` in your workspace holds this workspace's own skills as real folders, and links to the skills shared across workspaces: the platform's, and those the user added for their whole account, directly or through a plugin. A skill the user switched off for this workspace has no link.
+- The shared skills sit once in `../.agents/skills/`, behind every workspace's links. The whole set there is uploaded again whenever any shared skill changes, so an edit to one reaches every workspace until then and is lost after. Never edit a shared skill or write into `../.agents/skills/`.
+- To adapt a shared skill, copy it with the links resolved to a name no skill has yet, `cp -rL .agents/skills/<skill> .agents/skills/<new-name>`, set `name:` to the new folder name, and replace every `.agents/skills/<skill>/` path inside its files with the new name, or its instructions keep running the shared copy's scripts. A plain `cp -r` copies the link, and your edits land on the shared skill.
+
+## Adding a skill to this workspace
+
+Put the skill folder at `.agents/skills/<name>/`. The folder comes one of three ways:
+
+- **Published for the `skills` CLI**, which reaches you as an `npx skills add` command or a skills.sh page. Run that command from the working directory with `-a universal -y` added and without `-g`. `-a universal` keeps the install to `.agents/skills/`; without it the CLI also writes folders for other agents into the workspace. `-g` installs outside the workspace, where no save reads it. A command that names no skill installs every skill in the repository: `npx skills add <owner/repo> -l` lists them and `-s <skill>` installs one. The CLI replaces whatever is at `.agents/skills/<skill>`, a link to a shared skill included, so when a skill you already have has the name, add `--rename <new-name>`, which names the folder and sets `name:` to match. Its own record is `skills-lock.json` in the working directory, which `npx skills update -y` and `npx skills remove <skill> -y` read.
+- **In a repository**: clone it into `/tmp` and copy the skill folder over with `cp -rL`, leaving out `.git`.
+- **Written by you**: create the folder and its `SKILL.md`.
+
+However it came, a folder is saved only when it meets these:
+
+1. `SKILL.md`, spelled exactly so, sits directly inside the folder. A symbolic or hard link anywhere inside keeps the folder from being saved, and a skill folder that is itself a link is removed by the next save.
+2. Give it a name no other skill has. `name` must equal the folder name: lowercase letters, digits and single hyphens, not starting or ending with one, at most 64 characters. Names of platform skills and commands are taken, including `x-api`, `dashboard`, `compact`, `summarize`, `offload` and `subagent`; a folder with one of those names is never saved, and one named after a platform skill hides that skill in this workspace until you delete or rename it.
+3. `description` is required, at most 1024 characters, and decides whether a skill gets read, so say what it does and when to use it. Write `name:` and `description:` at the top level with each value on the same line as its key; quote a description containing `: `. No other `name:` or `description:` line may follow, not even an indented one, and no `#` comment may follow the name. A value on the next line or a name that differs from the folder makes the skill be skipped without a message.
+4. Every saved skill answers to `/<name>`. An optional `command: <alias>`, bare with the same rules as a name, replaces that with `/<alias>`; it is read on the first save only, and dropped without a message if it is taken.
+5. Stay within 64 files counting `SKILL.md`, 1 MB per file, 8 MB in total, and 64 KB for `SKILL.md`. Only `LICENSE.txt` and `__pycache__` are left out; `node_modules`, `.git` and `.DS_Store` count. An account holds at most 200 skills.
+
+## Saving a skill
+
+- A saved skill is this workspace's skill: the user sees and manages it in the workspace's settings, and from the next turn it is listed in your context. Until then it is not listed, but you can read it yourself.
+- Saves run automatically when a turn completes, when the computer next starts, and when the user changes this workspace's skills. Such a save refuses a folder without a message, so check the rules above before finishing.
+- A skill the user uploaded to this workspace is yours to edit and save the same way. When you and the user both changed one, your copy replaces theirs if it passes validation.
+- Never edit `.agents/skills/skills-lock.json`, the record the saves keep.
+- To remove a skill of this workspace, delete its folder; the saved copy goes at the next save, unless the user changed it in the meantime, in which case it comes back. A skill the user switched off for this workspace loses its folder at the next save, and recreating the folder does not switch it back on. Deleting a link to a shared skill does nothing lasting: only the user can switch a shared skill off, for this workspace or for the account.
+
+## Making a skill available in every workspace
+
+You cannot add a skill for the whole account. Tell the user one of these:
+
+- **Move a workspace skill**: once it is saved, Plugins page, Skills tab, the skill under "Workspace: <workspace name>", its scope control, "Move to all workspaces". Once moved, this workspace's folder stops saving and hides the shared copy; delete it so the link comes back.
+- **Upload a skill**: Plugins page, Add, "Upload skill", with a `.zip` of at most 2 MB holding `SKILL.md` at its root or inside one top-level folder named like the skill. Build it in the workspace, for example `python -c "import shutil; shutil.make_archive('<task>/<name>', 'zip', '.agents/skills', '<name>')"`, and link the zip; the user downloads it from the file panel.
+- **Install a plugin** that carries it (plugins.md). A repository holding only skill folders, with no plugin manifest, cannot be installed as a plugin, even with a marketplace listing; upload its skills one by one or copy them in here.
+

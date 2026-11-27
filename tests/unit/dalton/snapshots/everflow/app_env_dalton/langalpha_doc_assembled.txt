@@ -2,7 +2,7 @@
 --- FILE: langalpha-doc/SKILL.md ---
 ---
 name: langalpha-doc
-description: "How the platform under you works: the computer and its workspaces, files and what survives a restart, conversation transcripts, saved tool results, memory, chat apps, and adding skills, MCP servers, brokerages or plugins. Read it when the user points back at an earlier conversation, when something is missing or behaves unexpectedly, before adding any of those, and when the user asks how the platform works and you don't know."
+description: "How the platform under you works: the computer and its workspaces, files and what survives a restart, conversation transcripts, saved tool results, memory, chat apps, and adding skills, MCP servers or plugins. Read it when the user points back at an earlier conversation, when something is missing or behaves unexpectedly, before adding any of those, and when the user asks how the platform works and you don't know."
 ---
 
 # How LangAlpha Works
@@ -13,10 +13,9 @@ You run on a **computer**: one sandbox machine that belongs to the user. Each of
 
 - **Earlier work**: The user points back at an earlier conversation or at work done in another thread or workspace; a compaction summary; a background task's steps; a tool result saved to a file: `.agents/skills/langalpha-doc/references/history.md`.
 - **Files**: Where things live, how a path resolves, why Grep or Glob missed a file, memory and memo storage, what the user sees in the file panel: `.agents/skills/langalpha-doc/references/files.md`.
-- **The Drive**, the user's files kept across every workspace and computer: whether it is turned on, putting a file in it, files that are not text, a save that did not land, history and trash: `.agents/skills/langalpha-doc/references/drive.md`.
 - **The computer**: Processes, output and timeouts, CPUs and disk, installed packages, what survives a stop or a rebuild, data-server tools from code, secrets: `.agents/skills/langalpha-doc/references/computer.md`.
 - **Skills**: Installing a skill, an `npx skills add` command included, or writing, changing or saving one, here or for every workspace: `.agents/skills/langalpha-doc/references/skills.md`.
-- **Data sources and plugins**: The user wants a new data source, MCP server, brokerage connection or plugin, a server needs a key, or a server you expected is missing: `.agents/skills/langalpha-doc/references/plugins.md`.
+- **Data sources and plugins**: The user wants a new data source, MCP server or plugin, a server needs a key, or a server you expected is missing: `.agents/skills/langalpha-doc/references/plugins.md`.
 <!-- DALTON-HOOK(prompt-audit-text): link settings-map.md and update Dalton chat app list -->
 - **Chat apps**: Talking with the user in a chat app, or sending a message or file to Feishu, Discord or personal WeChat: `.agents/skills/langalpha-doc/references/chat.md`.
 - **Settings**: Where a setting is edited in the web UI, whether the Chief of Staff (研究总监) can change it on the user's behalf, plus Team Memory locations, background model defaults, and onboarding model candidates: `.agents/skills/langalpha-doc/references/settings-map.md`.
@@ -213,53 +212,6 @@ To turn the Drive on, an administrator edits the overlay file for the deployment
 
 The Drive is active for you when your prompt includes a `<drive_system>` section. Outside that case, or in a shared workspace, a call targeting `.agents/drive` reports unavailable; share the administrator steps above and keep the file in the workspace until the Drive is active.
 
-## What it is
-
-`.agents/drive/personal/` holds the user's own files, kept by the server: the same tree from every workspace and every computer, through every restart and rebuild. A workspace's backup leaves it out, since the server already has it.
-
-## Reaching it
-
-| | Read, Write, Edit, Glob, Grep | Bash, ExecuteCode |
-|---|---|---|
-| A cloud computer | yes | yes, as ordinary files at the same path |
-| A machine the user brought | yes | refused; use `la drive` |
-
-## Putting a file in
-
-- Text you are writing: Write to a path under `.agents/drive/personal/`. Folders above it are made for you.
-- A file already in the workspace, of any type, where Bash reaches the Drive: `mkdir -p .agents/drive/personal/models && cp task/model.xlsx .agents/drive/personal/models/model.xlsx`; `mv` works the same way and removes the workspace copy.
-- The same on any computer: `la drive put task/model.xlsx models/model.xlsx`, or a folder: `la drive put task/data datasets/q3` sends every file under it. `la drive` takes paths as they sit inside `personal/`. Add `--note "why"` to record the reason in the file's history. If `put` is interrupted, run the same command again; it continues from what the Drive already holds.
-
-Write and Edit save at most 50 MB at a time by default; write a larger file in the workspace and copy it in. Otherwise a file may be as large as the room left in the Drive, unless the deployment sets a lower limit. A large save from Bash or code needs free disk on the computer while it is sent; when there is too little, NOT SAVED says how much more it needs.
-
-When a save is refused because the Drive is full, tell the user: they can delete files, or clear a file's earlier versions from the Drive page. `la drive usage` shows what the Drive counts against its allowance. Only the user clears earlier versions: `la drive history clear` is refused from a computer.
-
-## Reading
-
-Read shows text, PDFs and images. For anything else (a spreadsheet, a parquet file), open it with code at the same path where Bash reaches the Drive. Code reads it in place, fetching only the parts it touches, so query a large dataset where it sits (DuckDB or Polars on a Parquet or CSV file) rather than copying it first. Where Bash does not reach the Drive, copy it out with `la drive get models/model.xlsx -o task/model.xlsx`; run it again to continue an interrupted download.
-
-## Search
-
-- Grep searches the Drive's text files only when `path` is inside it. Glob needs such a `path` or a pattern that names it: `.agents/drive/personal/**/*.md`.
-- Grep may skip data files (`.csv`, `.parquet`, `.jsonl`, `.xlsx`, `.db`, archives and the like); its result names the ones it skipped. Query them with code.
-- In Bash, `rg` is the fast way to search the whole Drive: it skips files that are not text, though it reads every CSV and JSON Lines file whole, so leave large datasets out with `-g '!*.{csv,tsv,jsonl,ndjson}'`. `grep -r` reads every file, which fetches each PDF and dataset from the server; use `rg`.
-
-## Saves and versions
-
-- Your saves to one file in one turn make one version. The user sees who made each version, with a link to this thread, and can restore an earlier one while it is kept, so save without asking first.
-- By default a text file keeps every version, another file under 100 MB keeps its earlier versions 30 days and at most 10, and a larger one keeps none, so saving over it replaces it for good. `la drive history <path>` says what a file keeps. Unless the user asked to replace a large file, save the new one beside it under another name.
-- Write and Edit are refused when the file changed since you read it. Read it again and make the change on what it holds now.
-- A save from Bash or code reaches the server a moment after the write. One the server refuses does not fail the command: the tool result lists it under NOT SAVED, so check there before relying on the write. `NOT SAVED YET` means the computer is still sending the file, and a later result says `Saved now` or that it was not.
-- `la drive history <path>` lists a file's versions; `la drive restore <path> --rev N` makes an older one current, as a new version.
-
-## Renaming, moving, deleting
-
-Use `mv` and `rm` where Bash reaches the Drive, else `la drive mv <from> <to>` and `la drive rm <path>`. A file keeps its history under a new name. A delete goes to the trash for up to 14 days (the oldest go sooner when the trash grows past the Drive's allowance): `la drive trash` lists it and `la drive trash restore <id>` puts an item back. The trash does not count against the Drive's allowance, so deleting is what frees room. Only the user empties the trash.
-
-## What the user sees
-
-The Drive page in the app's sidebar: every file, its history, and the trash. Link a Drive file as `[name](.agents/drive/personal/notes/thesis.md)`; the link opens that page at the file.
-
 --- FILE: langalpha-doc/references/files.md ---
 # Files and Paths
 
@@ -290,7 +242,6 @@ agent.md, data/, <task>/            yours
 .agents/threads/<thread>/           code/ (a copy of every ExecuteCode and Bash script)
 .agents/transcripts/<thread>/       every conversation's transcript, read only
 .agents/large_tool_results/<thread>/  tool results too large for your context
-.agents/scratchpad/<thread>/        a thread's temporary files and checkpoint notes; deleted when the thread is archived
 .file_sync_marker                   never delete: without it the workspace is restored again
 ```
 
@@ -310,7 +261,7 @@ Use Bash for anything outside the workspaces and `/tmp`. Tool output prints your
 
 ## Search
 
-- **Glob**: a pattern with no `/` searches every depth, and results come newest first, at most 1000. Dependency and cache folders (`node_modules`, `.venv`, `venv`, `vendor`, `.git`, `.cache`, `__pycache__` and similar) are skipped at any depth, and so are the history folders under `.agents/` (`threads/`, `transcripts/`, `large_tool_results/`, `scratchpad/`) unless the pattern or `path` spells them out. Braces do not expand: `*.{csv,json}` matches nothing, so run one pattern per extension.
+- **Glob**: a pattern with no `/` searches every depth, and results come newest first, at most 1000. Dependency and cache folders (`node_modules`, `.venv`, `venv`, `vendor`, `.git`, `.cache`, `__pycache__` and similar) are skipped at any depth, and so are the history folders under `.agents/` (`threads/`, `transcripts/`, `large_tool_results/`) unless the pattern or `path` spells them out. Braces do not expand: `*.{csv,json}` matches nothing, so run one pattern per extension.
 - **Grep**: skips hidden and git-ignored files and folders unless `path` points inside one. `.agents/memory/` is the exception and is searched by default. Its `glob` matches each path as Grep prints it, from your workspace, not from `path`, and takes rg's syntax: `!*.json` excludes and `*.{md,json}` expands. Content mode cuts a line over 500 characters to windows around its first matches. A sibling's files print as absolute paths, so start a filter for them with `**/`, as in `**/<sibling>/*.md`.
 - Data-server docs and shared skills are links, which Grep and a pattern starting `**/` do not follow. Spell the folder in the pattern, for example Glob `.agents/tools/docs/**/*.md`, or Read the file directly.
 
@@ -403,7 +354,7 @@ Until compaction you do not need this thread's transcript: the whole conversatio
 
 When the context grows past a threshold, older messages are replaced by a `[Context Summary]` message and only the last few messages stay verbatim. The summary names the transcript folder that still holds everything before it; when an exact figure, path or the user's own wording matters, Grep that folder rather than trust the summary. Only the user can compact on demand.
 
-When a turn starts more than 90 minutes after your last reply, older tool calls are also trimmed, then and never in the middle of a turn, and never in the newest messages. A string over 2,000 characters passed to Write, Edit or ExecuteCode is cut to a pointer naming the transcript file of its turn and the call's `call_id`, with how to print the full arguments. Older Read results of files under `.agents/threads/`, `.agents/transcripts/`, `.agents/large_tool_results/`, `.agents/scratchpad/` and `.agents/tmp/` are cleared, as is a Read superseded by a later Read of the same file and range, so write down what you need from those files in your own reply when you read them.
+When a turn starts more than 90 minutes after your last reply, older tool calls are also trimmed, then and never in the middle of a turn, and never in the newest messages. A string over 2,000 characters passed to Write, Edit or ExecuteCode is cut to a pointer naming the transcript file of its turn and the call's `call_id`, with how to print the full arguments. Older Read results of files under `.agents/threads/`, `.agents/transcripts/`, `.agents/large_tool_results/` and `.agents/tmp/` are cleared, as is a Read superseded by a later Read of the same file and range, so write down what you need from those files in your own reply when you read them.
 
 ## Tool results saved to a file
 
@@ -421,11 +372,11 @@ A tool result over about 160,000 characters is saved to `.agents/large_tool_resu
 - Subagents share your computer, workspace folder and memory. They are not given `agent.md` or the memory index, though they can Read both, and their large results are saved under your thread in `.agents/large_tool_results/`.
 
 --- FILE: langalpha-doc/references/plugins.md ---
-# MCP Servers, Brokerages, Secrets and Plugins
+# MCP Servers, Secrets and Plugins
 
 You cannot add, switch on or connect any of these yourself: none of your tools reaches those settings. The user does it in two places, so name the one you mean:
 
-- **The Plugins page**, for the whole account. Its tabs are Packages, Brokerages, Connectors, Skills and Secrets, and its **Add** menu holds "Add MCP server", "Import servers", "Install plugin" and "Upload skill".
+- **The Plugins page**, for the whole account. Its tabs are Packages, Connectors, Skills and Secrets, and its **Add** menu holds "Add MCP server", "Import servers", "Install plugin" and "Upload skill".
 - **Workspace Settings**, for this workspace, opened by the gear at the top of the file panel. Its MCP tab switches the account's servers on or off here, and its Skills tab matters too; its own Packages tab is unrelated to plugins.
 
 Your part is telling them exactly where to go and preparing what they paste or upload. Changes apply without a restart and usually reach you at your next turn, as an update to your context. A server change can take about 30 seconds to land, and the turn in progress keeps what it started with.
@@ -456,17 +407,11 @@ Every server belongs to the account; a workspace only switches it on or off.
 - `Missing vault secret(s) for server '<name>': <NAMES>`: the user adds those secrets on the Plugins page, Secrets. "Set up <NAME>" on the MCP tab opens it with the name filled in.
 - The user sees each server's status in Workspace Settings, MCP tab: Connected, Pending, Error with its text, or Needs secret. Built-in servers always show Connected, and the Connectors tab shows only the switch, the OAuth connection and connection-check warnings.
 - A built-in server answering that it is not configured lacks a key in the deployment's own environment, not in the user's secrets. Say so instead of asking the user for a key.
-- Do not stand a server up yourself from code as a stand-in unless the user asks for exactly that: the platform gives it none of their secrets, tool settings or order approvals.
+- Do not stand a server up yourself from code as a stand-in unless the user asks for exactly that: the platform gives it none of their secrets or tool settings.
 
 ## Built-in servers
 
 The built-in servers are on by default in every workspace, and the user can switch any of them off for the account or for one workspace. Only `x_api` needs something from the user: an X bearer token saved as the secret `X_BEARER_TOKEN`; the `x-api` skill has the rest.
-
-## Brokerages
-
-- Plugins page, Brokerages: the user presses Connect and signs in, which also switches the broker on. The consent step picks which groups of tools you may use, such as market data, account and positions, order preview or trading; a group left off is refused, not hidden. To change it they reconnect.
-- The brokers offered are listed there. Robinhood connects only from the LangAlpha desktop app. Connecting Robinhood or Interactive Brokers ends any other AI-platform connection on that brokerage account, so say so first.
-- Orders go through direct tool calls, never through code. Live and staged orders ask the user first unless they turned that off on the broker's page; paper-trading orders do not ask.
 
 ## Secrets
 
@@ -602,7 +547,7 @@ A skill is a folder holding a `SKILL.md` with YAML frontmatter (`name`, `descrip
 
 ## Adding a skill to this workspace
 
-Two steps add a skill: put its folder at `.agents/skills/<name>/`, then run `la skills save <name>`. The folder comes one of three ways:
+Put the skill folder at `.agents/skills/<name>/`. The folder comes one of three ways:
 
 - **Published for the `skills` CLI**, which reaches you as an `npx skills add` command or a skills.sh page. Run that command from the working directory with `-a universal -y` added and without `-g`. `-a universal` keeps the install to `.agents/skills/`; without it the CLI also writes folders for other agents into the workspace. `-g` installs outside the workspace, where no save reads it. A command that names no skill installs every skill in the repository: `npx skills add <owner/repo> -l` lists them and `-s <skill>` installs one. The CLI replaces whatever is at `.agents/skills/<skill>`, a link to a shared skill included, so when a skill you already have has the name, add `--rename <new-name>`, which names the folder and sets `name:` to match. Its own record is `skills-lock.json` in the working directory, which `npx skills update -y` and `npx skills remove <skill> -y` read.
 - **In a repository**: clone it into `/tmp` and copy the skill folder over with `cp -rL`, leaving out `.git`.
@@ -610,7 +555,7 @@ Two steps add a skill: put its folder at `.agents/skills/<name>/`, then run `la 
 
 However it came, a folder is saved only when it meets these:
 
-1. `SKILL.md`, spelled exactly so, sits directly inside the folder. A symbolic or hard link anywhere inside keeps the folder from being saved, and a skill folder that is itself a link is removed by the next save, the command's included.
+1. `SKILL.md`, spelled exactly so, sits directly inside the folder. A symbolic or hard link anywhere inside keeps the folder from being saved, and a skill folder that is itself a link is removed by the next save.
 2. Give it a name no other skill has. `name` must equal the folder name: lowercase letters, digits and single hyphens, not starting or ending with one, at most 64 characters. Names of platform skills and commands are taken, including `x-api`, `dashboard`, `compact`, `summarize`, `offload` and `subagent`; a folder with one of those names is never saved, and one named after a platform skill hides that skill in this workspace until you delete or rename it.
 3. `description` is required, at most 1024 characters, and decides whether a skill gets read, so say what it does and when to use it. Write `name:` and `description:` at the top level with each value on the same line as its key; quote a description containing `: `. No other `name:` or `description:` line may follow, not even an indented one, and no `#` comment may follow the name. A value on the next line or a name that differs from the folder makes the skill be skipped without a message.
 4. Every saved skill answers to `/<name>`. An optional `command: <alias>`, bare with the same rules as a name, replaces that with `/<alias>`; it is read on the first save only, and dropped without a message if it is taken.
@@ -618,9 +563,8 @@ However it came, a folder is saved only when it meets these:
 
 ## Saving a skill
 
-- Run `la skills save <name>` after you add a skill and after every change to one, `npx skills update` included, once for each skill. It prints `Saved <name>`, `<name> is already saved as it stands`, or `Not saved: <reason>` with a non-zero exit; fix what the reason names and run it again.
 - A saved skill is this workspace's skill: the user sees and manages it in the workspace's settings, and from the next turn it is listed in your context. Until then it is not listed, but you can read it yourself.
-- Saves also run without the command: when a turn completes, when the computer next starts, and when the user changes this workspace's skills. Such a save refuses a folder without a message, so the command is how you know a skill was saved.
+- Saves run automatically when a turn completes, when the computer next starts, and when the user changes this workspace's skills. Such a save refuses a folder without a message, so check the rules above before finishing.
 - A skill the user uploaded to this workspace is yours to edit and save the same way. When you and the user both changed one, your copy replaces theirs if it passes validation.
 - Never edit `.agents/skills/skills-lock.json`, the record the saves keep.
 - To remove a skill of this workspace, delete its folder; the saved copy goes at the next save, unless the user changed it in the meantime, in which case it comes back. A skill the user switched off for this workspace loses its folder at the next save, and recreating the folder does not switch it back on. Deleting a link to a shared skill does nothing lasting: only the user can switch a shared skill off, for this workspace or for the account.

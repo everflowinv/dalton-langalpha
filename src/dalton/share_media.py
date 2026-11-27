@@ -1264,15 +1264,18 @@ def mint_public_media_ref(
     thread_id: str,
     backend: str,
     ref_id: str,
+    source_thread_id: str | None = None,
 ) -> str:
     """Mint a thread-bound opaque ``media_ref`` for ``allow_files=True`` shared media routes."""
-    payload = {
+    payload: dict[str, Any] = {
         "v": 1,
         "typ": "dalton_pub_media",
         "tid": str(thread_id),
         "b": str(backend),
         "ref": str(ref_id),
     }
+    if source_thread_id and str(source_thread_id) != str(thread_id):
+        payload["stid"] = str(source_thread_id)
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     p_b64 = _b64u_encode(raw)
     sig = hmac.new(_media_hmac_key(), p_b64.encode("ascii"), hashlib.sha256).digest()
@@ -2490,6 +2493,7 @@ def rewrite_items_for_public_media(
     thread_id: str,
     share_token: str,
     bindings: Mapping[str, tuple[str, str]] | None,
+    source_thread_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Rewrite stored URLs and ``upload_id``-only attachments to ``/api/v1/public/shared/{token}/media/{ref}``.
 
@@ -2502,7 +2506,12 @@ def rewrite_items_for_public_media(
     url_map: dict[str, str] = {}
     upload_id_map: dict[str, str] = {}
     for key, (backend, ref_id) in bindings.items():
-        ref = mint_public_media_ref(thread_id=thread_id, backend=backend, ref_id=ref_id)
+        ref = mint_public_media_ref(
+            thread_id=thread_id,
+            backend=backend,
+            ref_id=ref_id,
+            source_thread_id=source_thread_id,
+        )
         controlled = f"/api/v1/public/shared/{share_token}/media/{ref}"
         if key.startswith("upload_id:"):
             upload_id_map[key[len("upload_id:") :]] = controlled
@@ -2739,6 +2748,75 @@ async def serve_owner_thread_media(
     )
 
 
+async def _resolve_borrowed_public_media_target(
+    thread: Mapping[str, Any],
+    *,
+    thread_id: str,
+    source_thread_id: str,
+) -> tuple[str, str, str]:
+    """Verify a borrowed ancestor media ref against live lineage, visibility, and source share settings."""
+    from src.dalton.share_redaction import (
+        _load_threads_for_redaction,
+        _resolve_borrowed_source_permissions,
+    )
+    from src.server.services.forks.model import ForkLineage
+    from src.server.services.forks.segments import read_segment
+    from src.server.services.shared_workspaces.access import thread_access
+
+    no_store = {"Cache-Control": "no-store"}
+    deny_headers = {"Cache-Control": "no-store", "Clear-Site-Data": '"cache"'}
+
+    try:
+        loaded = await _load_threads_for_redaction([thread_id, source_thread_id])
+    except Exception:
+        raise HTTPException(status_code=404, detail="Media not found", headers=no_store) from None
+
+    fork_row = loaded.get(thread_id)
+    raw_fork = (
+        (fork_row or {}).get("fork")
+        or thread.get("fork")
+        or (thread.get("metadata") or {}).get("fork")
+    )
+    lineage = ForkLineage.parse(raw_fork)
+    if lineage is None or lineage.borrow is None:
+        raise HTTPException(status_code=404, detail="Media not found", headers=no_store)
+
+    matching_seg = next(
+        (seg for seg in lineage.borrow.ancestors if str(seg.thread_id) == source_thread_id),
+        None,
+    )
+    if matching_seg is None:
+        raise HTTPException(status_code=404, detail="Media not found", headers=no_store)
+
+    src_trow = loaded.get(source_thread_id)
+    if src_trow is None or src_trow.get("workspace_status") == "deleted":
+        raise HTTPException(status_code=404, detail="Media not found", headers=no_store)
+
+    viewer = lineage.by or str(thread.get("user_id") or thread.get("owner_id") or "")
+    try:
+        await thread_access(source_thread_id, viewer)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail="Media not found", headers=no_store) from None
+
+    seg_state, _ = await read_segment(matching_seg, readable=True, with_rows=False)
+    if seg_state.shown_through is None:
+        raise HTTPException(status_code=404, detail="Media not found", headers=no_store)
+
+    src_eff = await _resolve_borrowed_source_permissions(src_trow)
+    if not src_eff.allow_files:
+        raise HTTPException(
+            status_code=403,
+            detail="Permission 'allow_files' not granted for this shared thread",
+            headers=deny_headers,
+        )
+
+    return (
+        source_thread_id,
+        str(src_trow.get("workspace_id") or ""),
+        str(src_trow.get("user_id") or src_trow.get("owner_user_id") or ""),
+    )
+
+
 @public_media_router.get("/shared/{share_token}/media/{media_ref}")
 async def serve_shared_thread_media(
     share_token: str,
@@ -2767,10 +2845,20 @@ async def serve_shared_thread_media(
         )
     thread_id = str(thread["conversation_thread_id"])
     claims = verify_public_media_ref(media_ref, expected_thread_id=thread_id)
+    target_tid = thread_id
+    target_ws = str(thread.get("workspace_id") or "")
+    target_owner = str(thread.get("user_id") or thread.get("owner_id") or "")
+    source_tid = str(claims.get("stid") or "").strip()
+    if source_tid and source_tid != thread_id:
+        target_tid, target_ws, target_owner = await _resolve_borrowed_public_media_target(
+            thread,
+            thread_id=thread_id,
+            source_thread_id=source_tid,
+        )
     return await _serve_media_payload(
-        thread_id=thread_id,
-        workspace_id=str(thread.get("workspace_id") or ""),
-        thread_owner_id=str(thread.get("user_id") or thread.get("owner_id") or ""),
+        thread_id=target_tid,
+        workspace_id=target_ws,
+        thread_owner_id=target_owner,
         backend=str(claims.get("b") or ""),
         ref_id=str(claims.get("ref") or ""),
         cache_control="no-store",
