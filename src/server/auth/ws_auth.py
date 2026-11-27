@@ -14,7 +14,6 @@ import logging
 from fastapi import WebSocket, WebSocketException, status
 
 from src.config.settings import HOST_MODE, LOCAL_DEV_USER_ID
-from src.server.auth import owner_requests
 from src.server.auth.jwt_bearer import _decode_token
 from src.server.services.account import ACCOUNT_SUSPENDED, AccountSuspended, admit
 
@@ -48,15 +47,13 @@ async def authenticate_websocket(websocket: WebSocket) -> str:
         return ws_uid
     if HOST_MODE == "oss":
         # DALTON-HOOK(standalone-core): dispatch local/invalid Dalton auth modes before upstream OSS owner check
-        from src.dalton.auth.dispatch import dispatch_oss_websocket
+        # DALTON-HOOK(share-redaction): enforce trusted loopback/owner gate on OSS WebSocket handshakes
+        from src.dalton.auth.dispatch import dispatch_oss_websocket, verify_oss_websocket_owner
         from src.dalton.settings import get_dalton_auth_mode
 
         if get_dalton_auth_mode() != "oss":
             return await dispatch_oss_websocket(websocket, local_dev_user_id=LOCAL_DEV_USER_ID)
-        if not owner_requests.is_owner(websocket.scope):
-            reason = owner_requests.REFUSAL
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=reason)
-            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION, reason=reason)
+        await verify_oss_websocket_owner(websocket)
         if is_company_system_user(LOCAL_DEV_USER_ID):
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid or expired token")
             raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid or expired token")

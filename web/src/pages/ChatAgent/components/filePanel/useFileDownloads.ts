@@ -2,6 +2,7 @@ import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/components/ui/use-toast';
 import { isWeChatBrowser } from '../viewers/html/useHtmlActions'; // DALTON-HOOK(mobile-web)
+import { isShareDownloadHandled } from '@/lib/dalton/shareFileGuard'; // DALTON-HOOK(share-redaction)
 import { categorizeFileError, type FileError } from './fileErrors';
 
 interface DownloadArgs {
@@ -32,6 +33,7 @@ export function useFileDownloads({ workspaceId, triggerDownloadFn, workspaceStat
   const download = useCallback((path: string) => {
     if (blockInWeChat()) return;
     triggerDownloadFn(workspaceId, path).catch((err: unknown) => {
+      if (isShareDownloadHandled(err)) return; // DALTON-HOOK(share-redaction)
       console.error('[FilePanel] Download failed:', err);
       setFailed({ path, error: categorizeFileError(err, workspaceStatus) });
     });
@@ -45,6 +47,7 @@ export function useFileDownloads({ workspaceId, triggerDownloadFn, workspaceStat
   const downloadQuietly = useCallback((path: string) => {
     if (blockInWeChat()) return;
     void triggerDownloadFn(workspaceId, path).catch((err: unknown) => {
+      if (isShareDownloadHandled(err)) return; // DALTON-HOOK(share-redaction)
       console.error('[FilePanel] Download failed:', err);
       toast({ description: t('filePanel:downloadFailed'), variant: 'destructive' });
     });
@@ -58,6 +61,7 @@ export function useFileDownloads({ workspaceId, triggerDownloadFn, workspaceStat
       try {
         await triggerDownloadFn(workspaceId, path);
       } catch (err) {
+        if (isShareDownloadHandled(err)) return; // DALTON-HOOK(share-redaction)
         console.error('[FilePanel] Download failed:', err);
         toast({ description: t('filePanel:downloadFailed'), variant: 'destructive' });
         return;

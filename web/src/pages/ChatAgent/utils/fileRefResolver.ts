@@ -105,7 +105,9 @@ export async function downloadTarget(
     const result = await resolve([path], [...recentWrites]);
     if (result.status === 'resolved' && result.path) return { path: result.path, placed: true };
     return { path, placed: result.status === 'unavailable' || result.status === 'resolved' };
-  } catch {
+  } catch (err: unknown) {
+    // DALTON-HOOK(share-redaction): propagate AbortError so revoked/unmounted lookups abort the download
+    if ((err as { name?: string })?.name === 'AbortError') throw err;
     return { path, placed: true };
   }
 }

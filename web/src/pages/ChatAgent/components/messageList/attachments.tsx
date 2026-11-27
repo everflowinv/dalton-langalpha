@@ -10,6 +10,8 @@ import { useObjectUrl } from '@/hooks/useObjectUrl';
 import { formatBytes } from '@/lib/format';
 import ImageLightbox from '../ImageLightbox';
 import { isImageFile } from '../../utils/fileUpload';
+// DALTON-HOOK(share-redaction): resolve controlled media URLs via credentialed blob fetch
+import { useControlledMediaSrc } from '@/components/dalton/RedactedSharePlaceholders';
 
 // --- AttachmentCard ---
 
@@ -147,7 +149,9 @@ export function AttachmentCard({ attachment }: AttachmentCardProps): React.React
   const att = attachment;
   const isImage = isImageFile(att);
   const fileUrl = useObjectUrl(isImage ? att.file : null);
-  const src = fileUrl || att.dataUrl || att.url;
+  // DALTON-HOOK(share-redaction): fetch controlled media attachment bytes and render via object URL
+  const controlled = useControlledMediaSrc(isImage && !fileUrl && !att.dataUrl ? att.url : undefined);
+  const src = fileUrl || att.dataUrl || (controlled.isControlled ? controlled.objectUrl ?? undefined : att.url);
   const ext = att.name?.split('.').pop() || '';
 
   // A file the turn never received has no bytes to show or open.

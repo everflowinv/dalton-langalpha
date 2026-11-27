@@ -43,7 +43,8 @@ async def test_public_stream_is_the_shared_page_through_redaction(client):
     thread = {
         "conversation_thread_id": _THREAD_ID,
         "workspace_id": "ws-1",
-        "share_permissions": {},
+        # DALTON-HOOK(share-redaction): exercise rich-share allow_files=True replay assembly
+        "share_permissions": {"allow_files": True},
         "owner_id": "owner-1",
     }
     row = {"conversation_thread_id": _THREAD_ID, "latest_checkpoint_id": None}
@@ -129,7 +130,8 @@ async def _shared(client, row: dict, responses: list[dict], read_page=None) -> s
     thread = {
         "conversation_thread_id": _THREAD_ID,
         "workspace_id": "ws-1",
-        "share_permissions": {},
+        # DALTON-HOOK(share-redaction): exercise rich-share allow_files=True replay assembly
+        "share_permissions": {"allow_files": True},
         "owner_id": "owner-1",
     }
     patches = [
@@ -257,7 +259,8 @@ async def test_a_shared_task_card_gets_its_status_and_never_the_failure(client):
     thread = {
         "conversation_thread_id": _THREAD_ID,
         "workspace_id": "ws-1",
-        "share_permissions": {},
+        # DALTON-HOOK(share-redaction): exercise rich-share allow_files=True replay assembly
+        "share_permissions": {"allow_files": True},
         "owner_id": "owner-1",
     }
     row = {"conversation_thread_id": _THREAD_ID, "latest_checkpoint_id": None}

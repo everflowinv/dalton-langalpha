@@ -74,8 +74,7 @@ def test_text_phase_rides_the_replayed_chunk():
 
 
 def test_disagreeing_text_phases_omit_the_key():
-    # The blocks are joined into one chunk, so a single phase would misdescribe
-    # half of it. Splitting the run per phase is a later change.
+    # DALTON-HOOK(share-redaction): mixed-phase AIMessage blocks split into ordered per-phase chunks.
     msg = AIMessage(
         content=[
             {"type": "text", "text": "hold on ", "phase": "commentary"},
@@ -84,11 +83,14 @@ def test_disagreeing_text_phases_omit_the_key():
         id="ai-1",
     )
     items = _sse([msg])
-    assert items[0]["data"]["content"] == "hold on the answer"
-    assert "phase" not in items[0]["data"]
+    assert [(i["data"]["content"], i["data"].get("phase")) for i in items] == [
+        ("hold on ", "commentary"),
+        ("the answer", "final_answer"),
+    ]
 
 
 def test_a_phaseless_block_beside_a_phased_one_omits_the_key():
+    # DALTON-HOOK(share-redaction): mixed-phase AIMessage blocks split into ordered per-phase chunks.
     msg = AIMessage(
         content=[
             {"type": "text", "text": "hold on ", "phase": "commentary"},
@@ -97,7 +99,10 @@ def test_a_phaseless_block_beside_a_phased_one_omits_the_key():
         id="ai-1",
     )
     items = _sse([msg])
-    assert "phase" not in items[0]["data"]
+    assert [(i["data"]["content"], i["data"].get("phase")) for i in items] == [
+        ("hold on ", "commentary"),
+        ("the answer", None),
+    ]
 
 
 def test_phaseless_text_omits_the_key():

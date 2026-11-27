@@ -1,5 +1,6 @@
 import { useRef } from 'react';
 import { useTranslation } from 'react-i18next';
+import i18n from '@/i18n'; // DALTON-HOOK(share-redaction)
 import { toast } from '@/components/ui/use-toast';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { desktop } from '@/lib/desktop';
@@ -142,8 +143,13 @@ export async function exportServedPdf({
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), PDF_FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch(pdfUrl, { signal: controller.signal });
+    // DALTON-HOOK(share-redaction): bypass HTTP cache on PDF export and do not fall back to print on 401/403
+    const res = await fetch(pdfUrl, { signal: controller.signal, cache: 'no-store' });
     if (!res.ok) {
+      if (res.status === 401 || res.status === 403) {
+        toast({ description: i18n.t('filePanel:downloadFailed'), variant: 'destructive' });
+        return;
+      }
       printFallback();
       return;
     }

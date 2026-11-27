@@ -1032,6 +1032,10 @@ export function handleHistoryHtmlWidget({ assistantMessageId, artifactType, arti
       if (payload.data) {
         widgetEntry.data = payload.data;
       }
+      // DALTON-HOOK(share-redaction): preserve redacted placeholder flag from strict shared replays
+      if (payload.redacted === true) {
+        widgetEntry.redacted = true;
+      }
       htmlWidgetProcesses[segmentId] = widgetEntry;
 
       return {

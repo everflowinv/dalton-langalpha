@@ -453,6 +453,50 @@ describe('useHtmlActions — file mode', () => {
     expect(open).toHaveBeenCalledWith('http://localhost:3000/s/tok-1', '_blank');
     expect(print).toHaveBeenCalled();
   });
+
+  // DALTON-HOOK(share-redaction): PDF export sends cache:'no-store' and refuses print fallback on 401/403
+  it('sends cache: no-store and skips print fallback on 403 or 401, while keeping print fallback on 500', async () => {
+    const print = vi.fn<() => void>();
+    open.mockReturnValue({ print });
+
+    fetchMock.mockResolvedValueOnce(pdfResponse(false, 403));
+    await exportServedPdf({
+      filePath: 'results/report.html',
+      servedUrl: '/api/v1/public/shared/tok-1/files/serve/results/report.html',
+      openUrl: 'http://localhost:3000/s/tok-1',
+      printHint: 'hint',
+      generatingHint: 'generating',
+    });
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      '/api/v1/public/shared/tok-1/files/serve/results/report.html?format=pdf',
+      expect.objectContaining({ signal: expect.any(AbortSignal), cache: 'no-store' }),
+    );
+    expect(open).not.toHaveBeenCalled();
+    expect(toastMock).toHaveBeenCalledWith(expect.objectContaining({ variant: 'destructive' }));
+
+    toastMock.mockClear();
+    fetchMock.mockResolvedValueOnce(pdfResponse(false, 401));
+    await exportServedPdf({
+      filePath: 'results/report.html',
+      servedUrl: SERVED,
+      openUrl: OPEN,
+      printHint: 'hint',
+      generatingHint: 'generating',
+    });
+    expect(open).not.toHaveBeenCalled();
+    expect(toastMock).toHaveBeenCalledWith(expect.objectContaining({ variant: 'destructive' }));
+
+    fetchMock.mockResolvedValueOnce(pdfResponse(false, 500));
+    await exportServedPdf({
+      filePath: 'results/report.html',
+      servedUrl: SERVED,
+      openUrl: OPEN,
+      printHint: 'hint',
+      generatingHint: 'generating',
+    });
+    expect(open).toHaveBeenCalledWith(OPEN, '_blank');
+    expect(print).toHaveBeenCalledTimes(1);
+  });
 });
 
 // The shell answers every `window.open` by handing the URL to the OS browser,

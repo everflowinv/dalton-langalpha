@@ -219,23 +219,16 @@ async def resolve_shared_files(
     thread = await get_shared_thread(share_token)
     perms = get_permissions(thread)
 
-    if require_files:
-        require_permission(perms, "allow_files")
-    if require_download:
-        require_permission(perms, "allow_download")
+    # DALTON-HOOK(share-redaction): enforce effective allow_files/allow_download before file access
+    from src.dalton.share_redaction import enforce_shared_file_permissions
+
+    await enforce_shared_file_permissions(thread, require_files=require_files, require_download=require_download)
 
     workspace_id = str(thread["workspace_id"])
     workspace, work_dir = await _serving_workspace(workspace_id)
 
-    # DALTON-HOOK(monitors): refuse historical or non-admin shared-thread workspace
-    # file access while keeping public conversation replay accessible.
-    if (require_files or require_download) and not await shared_thread_allows_files(
-        thread, workspace
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="仅管理员开启的公开对话分享允许访问工作区文件",
-        )
+    # DALTON-HOOK(share-redaction): re-verify effective permissions with resolved workspace owner
+    await enforce_shared_file_permissions(thread, workspace, require_files=require_files, require_download=require_download)
 
     raw_root = perms.get(SHARE_ROOT_PATH_KEY) or ""
     if not raw_root:

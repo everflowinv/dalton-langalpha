@@ -561,6 +561,9 @@ ALLOWED_HOOKS=(
   # BY4: sandbox-side runtime staged-file flock claim/release in wsfiles_transfer_runtime.py
   # (standalone script copied into sandboxes; cannot import src.dalton).
   "by4-relay-guard"
+  # AU1 Public share redaction: strict allow_files=false redaction, controlled media,
+  # org-library/activity title & summary scrubbing, and unkeyed OSS loopback gate.
+  "share-redaction"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

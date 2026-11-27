@@ -1234,6 +1234,24 @@ def get_dalton_transcription_ticket_secret() -> str:
     return os.getenv("DALTON_TRANSCRIPTION_TICKET_SECRET", "").strip()
 
 
+def is_dalton_transcription_ticket_using_dev_fallback() -> bool:
+    """Return True when transcription tickets are signed by the predictable local dev seed.
+
+    Decoupled from ``LANGALPHA_OWNER_SECRET``: whenever ``DALTON_TRANSCRIPTION_TICKET_SECRET``,
+    ``INTERNAL_SERVICE_TOKEN``, and ``DALTON_BRIDGE_ADMIN_TOKEN`` are all unset in ``oss``
+    auth mode, tickets use the predictable dev seed and MUST be restricted to direct
+    loopback non-proxied requests.
+    """
+    if is_dalton_local_auth_enabled():
+        return False
+    explicit_seed = (
+        get_dalton_transcription_ticket_secret()
+        or get_internal_service_token()
+        or get_dalton_bridge_admin_token()
+    )
+    return not explicit_seed and get_dalton_auth_mode() == "oss"
+
+
 def get_dalton_transcription_ticket_hmac_key() -> bytes | None:
     """Derive the HMAC-SHA256 signing key for per-job transcription tickets.
 

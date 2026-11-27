@@ -25,22 +25,20 @@ Endpoints:
 - GET /api/v1/public/shared/{share_token}/files/download — Download raw file (requires allow_download)
 """
 
-import json
 import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Response
-from fastapi.responses import StreamingResponse
 
-from src.observability import observe_replay_stream
+from src.dalton.share_media import NoStorePublicAPIRoute  # DALTON-HOOK(share-redaction)
+from src.observability import observe_replay_stream  # noqa: F401
 
 from src.server.app.share_access import (  # DALTON-HOOK(monitors): enforce admin file access on shared threads
     LINK_NOT_FOUND,
     LinkAccess,
     get_permissions,
-    get_shared_thread,
+    get_shared_thread,  # noqa: F401
     resolve_link,
-    shared_thread_allows_files,
 )
 from src.server.database.conversation import get_thread_by_share_token
 from src.server.services import member_grants
@@ -56,8 +54,7 @@ from src.server.app.share_files import share_files_router
 from src.server.app.workspace_sandbox import owner_preview, with_preview_path
 from src.server.database import artifacts as artifacts_db
 from src.server.database.artifacts import Artifact, Version
-from src.server.database.conversation.replay_rows import get_replay_thread_data
-from src.server.database.pool import DATABASE_UNAVAILABLE
+from src.server.database.conversation.replay_rows import get_replay_thread_data  # noqa: F401
 from src.server.database.share_links import KIND_APP
 from src.server.services.artifacts import grants as artifact_grants
 from src.server.services.file_grants import grant_prefix, mint_file_grant, seconds_left
@@ -69,16 +66,25 @@ from src.server.services.artifacts.snapshot import (
 )
 from src.server.services.preview_base import artifact_base
 from src.server.services.preview_links import signed_url_expires_at
-from src.server.utils.api import PageViewer, Viewer, database_unavailable
+from src.server.utils.api import PageViewer, Viewer
 from src.server.utils.error_sanitization import single_line
 from src.server.services.share_redaction import ShareRedaction
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/v1/public", tags=["Public Sharing"])
+# DALTON-HOOK(share-redaction): enforce Cache-Control: no-store across all public share responses and errors
+router = APIRouter(
+    prefix="/api/v1/public",
+    tags=["Public Sharing"],
+    route_class=NoStorePublicAPIRoute,
+)
 # The file routes live next door and mount here, so the token prefix and the
 # tag stay in one place.
 router.include_router(share_files_router)
+# DALTON-HOOK(share-redaction): mount controlled public shared media route
+from src.dalton.share_media import public_media_router as _dalton_public_media_router
+
+router.include_router(_dalton_public_media_router)
 
 # =============================================================================
 # METADATA
@@ -249,12 +255,10 @@ async def get_shared_thread_metadata(
     if access is not None:
         return await _link_metadata(access, viewer.user_id, path)
 
-    perms = get_permissions(thread)
-    # DALTON-HOOK(monitors): mask workspace file permissions on non-admin historical shares
-    allow_files = bool(perms.get("allow_files", False)) and await shared_thread_allows_files(
-        thread
-    )
-    allow_download = allow_files and bool(perms.get("allow_download", False))
+    # DALTON-HOOK(share-redaction): compute authoritative effective permissions & safe metadata fields
+    from src.dalton.share_redaction import prepare_public_thread_metadata
+
+    meta_fields = await prepare_public_thread_metadata(thread, response)
     members = (
         {
             "audience": ORGANIZATION,
@@ -270,11 +274,11 @@ async def get_shared_thread_metadata(
         **members,
         "kind": "thread",
         "thread_id": str(thread["conversation_thread_id"]),
-        "title": thread.get("title"),
+        "title": meta_fields["title"],
         "msg_type": thread.get("msg_type"),
         "created_at": thread.get("created_at"),
         "updated_at": thread.get("updated_at"),
-        "workspace_name": thread.get("workspace_name"),
+        "workspace_name": meta_fields["workspace_name"],
         # The transcript's absolute paths are spelled with these, so the viewer
         # reads them as workspace paths the way the owner does. A turn from
         # before a move spells them under a root the workspace has left, which
@@ -282,15 +286,13 @@ async def get_shared_thread_metadata(
         # roots go only with the files. Former folder names stay out: they are
         # old workspace names the share never showed, and the file routes
         # still fold them.
-        "root_dir": thread.get("root_dir"),
-        "previous_root_dirs": (
-            list(thread.get("previous_root_dirs") or ()) if allow_files else []
-        ),
-        "dir_name": thread.get("dir_name"),
+        "root_dir": meta_fields["root_dir"],
+        "previous_root_dirs": meta_fields["previous_root_dirs"],
+        "dir_name": meta_fields["dir_name"],
         # DALTON-HOOK(monitors): masked allow_files / allow_download for non-admin historical shares
         "permissions": {
-            "allow_files": allow_files,
-            "allow_download": allow_download,
+            "allow_files": meta_fields["allow_files"],
+            "allow_download": meta_fields["allow_download"],
         },
     }
 
@@ -325,59 +327,15 @@ async def _shared_thread_for(
 
 
 @router.get("/shared/{share_token}/replay")
-async def replay_shared_thread(share_token: str):
-    """Replay a shared thread as SSE. No auth required.
+async def replay_shared_thread(
+    share_token: str,
+    before_turn: int | None = Query(None, ge=0),
+):
+    """Replay a shared thread as SSE. No auth required."""
+    # DALTON-HOOK(share-redaction): delegate public replay SSE pipeline to Dalton orchestrator
+    from src.dalton.share_redaction import build_public_replay_response
 
-    The same assembly as the owner's replay, so a viewer sees the turns the
-    owner sees; the thread resolves through the share token and every event
-    passes ``ShareRedaction`` on the way out.
-    """
-    from src.server.services.history.replay import finish_lines, read_replay_page
-
-    try:
-        thread = await get_shared_thread(share_token)
-        thread_id = str(thread["conversation_thread_id"])
-        rows = await get_replay_thread_data(thread_id)
-        if rows is None:
-            raise HTTPException(status_code=404, detail="Shared thread not found")
-        page, _ = await read_replay_page(rows)
-        # Public replay has no /status reconciliation at all, so without the
-        # stamp its task cards would be stuck "running" forever (see
-        # history/task_status.py). Only the whitelisted status value is added,
-        # which redaction leaves as it is.
-        await finish_lines(thread_id, page.lines, status_only=True)
-    except DATABASE_UNAVAILABLE as e:
-        # As the owner's replay answers it.
-        raise database_unavailable("replaying a shared thread", logger, e)
-    items = [line.item() for line in page.lines]
-    redaction = ShareRedaction(items)
-
-    async def event_generator():
-        seq = 0
-        for item in items:
-            event_type, data = item["event"], item["data"]
-            if event_type == "user_message":
-                replay_data = _shared_user_message(redaction, data)
-            else:
-                replay_data = redaction.event(event_type, data)
-                if replay_data is None:
-                    continue
-                replay_data.setdefault("thread_id", thread_id)
-            seq += 1
-            yield (
-                f"id: {seq}\n"
-                f"event: {event_type}\n"
-                f"data: {json.dumps(replay_data, ensure_ascii=False, default=str)}\n\n"
-            )
-
-        seq += 1
-        yield f"id: {seq}\nevent: replay_done\ndata: {json.dumps({'thread_id': thread_id}, default=str)}\n\n"
-
-    return StreamingResponse(
-        observe_replay_stream(event_generator(), source="public"),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache"},
-    )
+    return await build_public_replay_response(share_token, before_turn=before_turn)
 
 
 def _shared_user_message(redaction: ShareRedaction, data: dict[str, Any]) -> dict[str, Any]:

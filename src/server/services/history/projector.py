@@ -48,8 +48,6 @@ from src.server.utils.content_normalizer import normalize_text_content
 from src.server.utils.error_sanitization import (
     sanitize_error_text as _sanitize_error_text,
 )
-# DALTON-HOOK(thinking-leak): replay shows the same filtered assistant text as the live stream.
-from src.server.utils.thinking_leak import visible_assistant_text
 from src.server.utils.text_phase import agreed_phase, block_phase
 
 if TYPE_CHECKING:
@@ -319,35 +317,11 @@ def _project_ai_message(
     # A compaction before this call: live, its signal fires before the call
     # streams, so the notice sits between the calls it fell between.
     events.extend(_stamped_summary(message, agent))
-    text, reasoning, phase = split_content_blocks(message.content)
-    if is_close_out_reply(message):
-        # Live the plan's close-out is never streamed, and its reasoning is
-        # kept only for the provider: its plan calls alone are shown.
-        text = reasoning = None
+    # DALTON-HOOK(share-redaction): delegate phase-split & depth-aware thinking strip to Dalton pure helper
+    from src.dalton.history_phase import build_ai_phase_events
+
     tool_calls = _filter_tool_calls(message.tool_calls or [])
-    # DALTON-HOOK(thinking-leak): the checkpoint message is left as stored.
-    if text:
-        text = visible_assistant_text(text, followed_by_tool_call=bool(tool_calls)) or None
-
-    if reasoning:
-        events.append(
-            HistoryEvent("reasoning-signal", agent, message_id, {"signal": "start"})
-        )
-        events.append(
-            HistoryEvent("reasoning", agent, message_id, {"content": reasoning})
-        )
-        events.append(
-            HistoryEvent("reasoning-signal", agent, message_id, {"signal": "complete"})
-        )
-
-    if text:
-        text_data: dict[str, Any] = {
-            "content": text,
-            "finish_reason": None if tool_calls else "stop",
-        }
-        if phase:
-            text_data["phase"] = phase
-        events.append(HistoryEvent("text", agent, message_id, text_data))
+    events.extend(build_ai_phase_events(message.content, agent=agent, message_id=message_id, is_close_out=is_close_out_reply(message), has_tool_calls=bool(tool_calls), event_cls=HistoryEvent))
 
     if tool_calls:
         for tool_call in tool_calls:

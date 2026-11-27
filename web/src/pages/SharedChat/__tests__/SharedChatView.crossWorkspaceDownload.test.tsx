@@ -107,8 +107,20 @@ describe('SharedChatView deliverable download', () => {
     // the same path, no qualifier, and the save goes through.
     const { onDownloadFile } = await actions();
     act(() => { onDownloadFile!('results/report.md'); });
-    await waitFor(() => expect(downloadSharedFile).toHaveBeenCalledWith('tok', 'results/report.md'));
-    expect(resolveSharedFile).toHaveBeenCalledWith('tok', ['results/report.md'], []);
+    // DALTON-HOOK(share-redaction): shared resolve/download calls forward the file-epoch AbortSignal
+    await waitFor(() =>
+      expect(downloadSharedFile).toHaveBeenCalledWith(
+        'tok',
+        'results/report.md',
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      ),
+    );
+    expect(resolveSharedFile).toHaveBeenCalledWith(
+      'tok',
+      ['results/report.md'],
+      [],
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
     expect(screen.queryByTestId('file-panel')).not.toBeInTheDocument();
   });
 });

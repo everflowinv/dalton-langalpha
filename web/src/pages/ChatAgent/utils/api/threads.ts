@@ -322,9 +322,15 @@ export function updateThreadTitle(threadId: string, title: string | null) {
  * @param {string} threadId
  * @returns {Promise<Object>} { is_shared, share_token, share_url, permissions }
  */
-export async function getThreadShareStatus(threadId: string) {
+// DALTON-HOOK(share-redaction): optional includeSummary flag for on-demand share panel summary
+export async function getThreadShareStatus(
+  threadId: string,
+  { includeSummary = false }: { includeSummary?: boolean } = {},
+) {
   if (!threadId) throw new Error('Thread ID is required');
-  const { data } = await api.get(`/api/v1/threads/${threadId}/share`);
+  const { data } = await api.get(`/api/v1/threads/${threadId}/share`, {
+    params: includeSummary ? { include_summary: true } : undefined,
+  });
   return data;
 }
 
