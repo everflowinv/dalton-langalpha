@@ -68,6 +68,16 @@ export function isCreatedThreadTransition(
 }
 
 /**
+ * The id of a thread this view's first send just created (moving off the
+ * `__default__` placeholder), or null for any other thread-id change.
+ */
+export function createdThreadIdFromSend(prevThreadId: string, nextThreadId: string): string | null {
+  if (!isDaltonBuild) return null;
+  if (prevThreadId && prevThreadId !== '__default__') return null;
+  return nextThreadId && nextThreadId !== '__default__' ? nextThreadId : null;
+}
+
+/**
  * Binds any pending null-origin `clearLocal` handles to the newly created
  * thread id so they follow ONLY that thread and ignore any subsequent switch
  * to another thread.

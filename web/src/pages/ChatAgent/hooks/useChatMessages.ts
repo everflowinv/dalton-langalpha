@@ -19,6 +19,8 @@ import {
   markHitlBubbleUnadmitted,
   type ActiveTurnModel,
 } from '@/lib/dalton/turnAdmission';
+// DALTON-HOOK(antigravity-series): created-thread detection for first-send model/tuning carry-over
+import { createdThreadIdFromSend } from '@/lib/dalton/threadTuningDalton';
 import { queryKeys } from '@/lib/queryKeys';
 import { randomUUID } from '@/lib/randomUUID'; // DALTON-HOOK(fork-message-identifiers)
 import { holdReload } from '@/lib/reloadHolds';
@@ -257,11 +259,9 @@ export function useChatMessages(
   renderedThreadIdRef.current = threadId;
   const turnModelTrackerRef = useRef(createTurnModelTracker());
   const setThreadIdFromSend: React.Dispatch<React.SetStateAction<string>> = useCallback((next) => {
-    const prev = renderedThreadIdRef.current;
-    const resolved = typeof next === 'function' ? next(prev) : next;
-    if (isDaltonBuild && (!prev || prev === '__default__') && resolved && resolved !== '__default__') {
-      setCreatedThreadId(resolved);
-    }
+    const resolved = typeof next === 'function' ? next(renderedThreadIdRef.current) : next;
+    const created = createdThreadIdFromSend(renderedThreadIdRef.current, resolved); // DALTON-HOOK(antigravity-series)
+    if (created) setCreatedThreadId(created);
     setThreadId(resolved);
   }, []);
   useEffect(() => {

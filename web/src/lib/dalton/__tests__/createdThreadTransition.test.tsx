@@ -10,6 +10,7 @@ import { createTestQueryClient, renderHookWithProviders } from '@/test/utils';
 import { queryKeys } from '@/lib/queryKeys';
 import { buildSeriesCatalog, type AntigravitySeriesCatalog } from '@/lib/antigravitySeries';
 import type { Thread } from '@/types/api';
+import type { toast as toastFn } from '@/components/ui/use-toast';
 import type {
   createThreadWithTitle as createThreadWithTitleApi,
   getThread as getThreadApi,
@@ -52,7 +53,7 @@ const mocks = vi.hoisted(() => ({
   sendChatMessageStream: vi.fn<typeof sendChatMessageStreamApi>(),
   getThread: vi.fn<typeof getThreadApi>(),
   updateThread: vi.fn<typeof updateThreadApi>(),
-  toast: vi.fn(),
+  toast: vi.fn<typeof toastFn>(),
   getStoredThreadId: vi.fn<typeof getStoredThreadIdFn>().mockReturnValue('__default__'),
   setStoredThreadId: vi.fn<typeof setStoredThreadIdFn>(),
   removeStoredThreadId: vi.fn<typeof removeStoredThreadIdFn>(),
