@@ -3902,6 +3902,66 @@ _pg_backup_job_running() {
   printf '%s\n' "$out" | grep -Eq '^[[:space:]]*(state = running|pid = [0-9]+)'
 }
 
+# Find the terminal dalton-pg-backup.log line matching a waited-on backup ID (set=<id>),
+# or (for legacy/mock logs without set=<id>) the latest terminal line strictly after $3.
+_find_completed_backup_for_wait() {
+  local log_file="$1" wait_id="$2" before_line="$3"
+  [ -f "$log_file" ] || return 1
+  local found=""
+  if [ -n "$wait_id" ]; then
+    found=$(grep -E "(^|[[:space:]])set=${wait_id}([[:space:]]|$)" "$log_file" 2>/dev/null | tail -1 || true)
+    if [ -n "$found" ] && _is_terminal_pg_backup_line "$found"; then
+      printf '%s\n' "$found"
+      return 0
+    fi
+  fi
+  local candidate=""
+  if [ -n "$before_line" ]; then
+    local last_before_ln=""
+    last_before_ln=$(grep -n -F -x -- "$before_line" "$log_file" 2>/dev/null | tail -1 | cut -d: -f1 || true)
+    if [ -n "$last_before_ln" ]; then
+      candidate=$(tail -n "+$((last_before_ln + 1))" "$log_file" 2>/dev/null | grep -v '^\[backup\]' | tail -1 || true)
+    else
+      candidate=$(grep -v '^\[backup\]' "$log_file" 2>/dev/null | tail -1 || true)
+    fi
+  else
+    candidate=$(grep -v '^\[backup\]' "$log_file" 2>/dev/null | tail -1 || true)
+  fi
+  [ -n "$candidate" ] || return 1
+  if [ "$candidate" = "$before_line" ]; then
+    return 1
+  fi
+  if ! _is_terminal_pg_backup_line "$candidate"; then
+    return 1
+  fi
+  # If we are waiting for a specific backup ID and the candidate explicitly names a DIFFERENT set=<other>,
+  # do not treat that unrelated backup as ours.
+  if [ -n "$wait_id" ]; then
+    case "$candidate" in
+      *" set="*)
+        case "$candidate" in
+          *" set=${wait_id}"|*" set=${wait_id} "*) ;;
+          *) return 1 ;;
+        esac
+        ;;
+    esac
+  fi
+  printf '%s\n' "$candidate"
+  return 0
+}
+
+_write_deploy_backup_wait_state() {
+  local state_file="$1" wait_id="$2" wait_head="$3" wait_target="$4" wait_before="$5"
+  mkdir -p "$(dirname "$state_file")" 2>/dev/null || true
+  local tmp_file="${state_file}.tmp.$$"
+  {
+    printf 'WAIT_BACKUP_ID=%s\n' "$wait_id"
+    printf 'WAIT_PRE_FF=%s\n' "$wait_head"
+    printf 'WAIT_TARGET=%s\n' "$wait_target"
+    printf 'WAIT_BEFORE_LINE=%s\n' "$wait_before"
+  } > "$tmp_file" && mv -f "$tmp_file" "$state_file"
+}
+
 # Prefer repo .venv/bin/python; fall back to python3 on PATH when absent.
 # Require Python >= 3.11.
 _resolve_deploy_python() {
@@ -4707,17 +4767,71 @@ run_deploy_main() {
     target_heads=$(target_migration_heads "$TARGET") || { echo "ERROR: failed to resolve unique migration heads for target ${TARGET}, abort" >&2; release_deploy_lock || true; exit 1; }
     echo "target migration heads: ${target_heads}"
     LOG="${DALTON_PG_BACKUP_LOG:-$HOME/Library/Logs/dalton-pg-backup.log}"; before=$(tail -1 "$LOG" 2>/dev/null)
+    local cur_head_for_backup=""
+    cur_head_for_backup=$(git rev-parse HEAD 2>/dev/null || true)
+    local backup_wait_state_file="${DALTON_DEPLOY_BACKUP_WAIT_STATE_FILE:-$HOME/Library/Logs/.dalton-deploy-backup-wait.state}"
+    local backup_next_id_file="${DALTON_PG_BACKUP_NEXT_ID_FILE:-$HOME/Library/Logs/.dalton-pg-backup.next-set-id}"
+    local backup_active_id_file="${DALTON_PG_BACKUP_ACTIVE_ID_FILE:-$HOME/Library/Logs/.dalton-pg-backup.active-set-id}"
+    local tracked_wait_id="" tracked_wait_head="" tracked_wait_target="" tracked_wait_before=""
+    local resumed_completed_backup="" resuming_active_wait=0
+    if [ -f "$backup_wait_state_file" ] && [ ! -L "$backup_wait_state_file" ]; then
+      while IFS= read -r _wline; do
+        case "$_wline" in
+          WAIT_BACKUP_ID=*) tracked_wait_id="${_wline#WAIT_BACKUP_ID=}" ;;
+          WAIT_PRE_FF=*) tracked_wait_head="${_wline#WAIT_PRE_FF=}" ;;
+          WAIT_TARGET=*) tracked_wait_target="${_wline#WAIT_TARGET=}" ;;
+          WAIT_BEFORE_LINE=*) tracked_wait_before="${_wline#WAIT_BEFORE_LINE=}" ;;
+        esac
+      done < "$backup_wait_state_file"
+      if [ -n "$tracked_wait_head" ] && [ "$tracked_wait_head" = "$cur_head_for_backup" ]; then
+        local tracked_done_line=""
+        if tracked_done_line=$(_find_completed_backup_for_wait "$LOG" "$tracked_wait_id" "$tracked_wait_before"); then
+          case "$tracked_done_line" in
+            *" ok "*)
+              resumed_completed_backup="$tracked_done_line"
+              ;;
+            *)
+              rm -f "$backup_wait_state_file" 2>/dev/null || true
+              tracked_wait_id=""
+              tracked_wait_before=""
+              ;;
+          esac
+        elif _pg_backup_job_running; then
+          resuming_active_wait=1
+        else
+          rm -f "$backup_wait_state_file" 2>/dev/null || true
+          tracked_wait_id=""
+          tracked_wait_before=""
+        fi
+      else
+        rm -f "$backup_wait_state_file" 2>/dev/null || true
+        tracked_wait_id=""
+        tracked_wait_before=""
+      fi
+    fi
+
     reused=""
-    if [ -n "$REUSE_BACKUP_MIN" ] && no_pending_migrations "$TARGET"; then
+    if [ -z "$resumed_completed_backup" ] && [ "$resuming_active_wait" -eq 0 ] && [ -n "$REUSE_BACKUP_MIN" ] && no_pending_migrations "$TARGET"; then
       reused=$(recent_ok_backup "$LOG" "$REUSE_BACKUP_MIN" "$(date +%s)") || reused=""
     fi
-    if [ -n "$reused" ]; then
+    if [ -n "$resumed_completed_backup" ]; then
+      DEPLOY_BACKUP_STATUS="fresh"
+      rm -f "$backup_wait_state_file" 2>/dev/null || true
+      echo "backup: resuming completed deploy backup (id=${tracked_wait_id:-tracked}): $resumed_completed_backup"
+    elif [ -n "$reused" ]; then
       DEPLOY_BACKUP_STATUS="reused"
       echo "backup: reusing (no migrations to deploy, dump within ${REUSE_BACKUP_MIN} min): $reused"
     else
       [ -n "$REUSE_BACKUP_MIN" ] && echo "backup: cannot reuse (migrations to deploy or no ok dump within ${REUSE_BACKUP_MIN} min); taking a fresh one"
       local backup_tag_file="${DALTON_PG_BACKUP_TAG_FILE:-$HOME/Library/Logs/.dalton-pg-backup.next-tag}"
-      local backup_wait_s="${DALTON_DEPLOY_BACKUP_WAIT_S:-14400}"
+      # Default wait covers lock phase (2h) + mirror phase (4h) + reconcile/publish margin (1h) = 7h (25200s).
+      local _lock_wait_t="${DALTON_BACKUP_LOCK_TIMEOUT_S:-7200}"
+      local _mirror_wait_t="${DALTON_BACKUP_MIRROR_TIMEOUT_S:-14400}"
+      local _default_backup_wait_s=25200
+      if [[ "$_lock_wait_t" =~ ^[0-9]+$ ]] && [[ "$_mirror_wait_t" =~ ^[0-9]+$ ]]; then
+        _default_backup_wait_s=$(( _lock_wait_t + _mirror_wait_t + 3600 ))
+      fi
+      local backup_wait_s="${DALTON_DEPLOY_BACKUP_WAIT_S:-${_default_backup_wait_s}}"
       local backup_poll_s="${DALTON_DEPLOY_BACKUP_POLL_S:-5}"
       local backup_polls=1
       if [ "$backup_poll_s" -gt 0 ] 2>/dev/null; then
@@ -4725,28 +4839,42 @@ run_deploy_main() {
       fi
       [ "$backup_polls" -lt 1 ] && backup_polls=1
 
-      if _pg_backup_job_running; then
-        echo "backup: com.dalton.pg-backup is already running; waiting for it instead of triggering a duplicate run"
+      local wait_backup_id=""
+      local wait_before_line="$before"
+      if [ "$resuming_active_wait" -eq 1 ]; then
+        wait_backup_id="$tracked_wait_id"
+        wait_before_line="$tracked_wait_before"
+        echo "backup: com.dalton.pg-backup is already running (resuming tracked wait id=${wait_backup_id:-unknown}); waiting without re-triggering"
+      elif _pg_backup_job_running; then
+        if [ -f "$backup_active_id_file" ] && [ ! -L "$backup_active_id_file" ]; then
+          wait_backup_id="$(tr -d '[:space:]' < "$backup_active_id_file" 2>/dev/null || true)"
+        fi
+        _write_deploy_backup_wait_state "$backup_wait_state_file" "$wait_backup_id" "$cur_head_for_backup" "$TARGET" "$wait_before_line"
+        echo "backup: com.dalton.pg-backup is already running (id=${wait_backup_id:-active}); waiting for it instead of triggering a duplicate run"
       else
-        mkdir -p "$(dirname "$backup_tag_file")" 2>/dev/null || true
+        wait_backup_id="$(date +%Y%m%d-%H%M%S)-deploy-$$"
+        mkdir -p "$(dirname "$backup_tag_file")" "$(dirname "$backup_next_id_file")" 2>/dev/null || true
         printf 'deploy\n' > "$backup_tag_file" 2>/dev/null || true
+        printf '%s\n' "$wait_backup_id" > "$backup_next_id_file" 2>/dev/null || true
+        _write_deploy_backup_wait_state "$backup_wait_state_file" "$wait_backup_id" "$cur_head_for_backup" "$TARGET" "$wait_before_line"
         launchctl kickstart "gui/$(id -u)/com.dalton.pg-backup"
       fi
 
       local backup_done=0
+      local matched_bak_line=""
       for i in $(seq 1 "$backup_polls"); do
-        cur_bak_line="$(tail -1 "$LOG" 2>/dev/null)"
-        if [ "$cur_bak_line" != "$before" ] && _is_terminal_pg_backup_line "$cur_bak_line"; then
+        if matched_bak_line=$(_find_completed_backup_for_wait "$LOG" "$wait_backup_id" "$wait_before_line"); then
           backup_done=1
           break
         fi
         sleep "$backup_poll_s"
-      done  # default 4h: covers pg_dump + full-bucket object mirror sync
-      after=$(tail -1 "$LOG" 2>/dev/null); echo "backup: $after"
+      done  # default 7h (25200s): covers 2h lock phase + 4h object mirror + 1h reconcile/publish
+      after="${matched_bak_line:-$(tail -1 "$LOG" 2>/dev/null)}"; echo "backup: $after"
       if [ "$backup_done" -eq 1 ]; then
+        rm -f "$backup_wait_state_file" 2>/dev/null || true
         case "$after" in
           *" ok "*)
-            if [ "$after" = "$before" ]; then
+            if [ "$after" = "$wait_before_line" ]; then
               echo "no fresh backup, abort"; release_deploy_lock || true; exit 1
             fi
             ;;
@@ -4756,14 +4884,22 @@ run_deploy_main() {
         esac
         DEPLOY_BACKUP_STATUS="fresh"
       elif _pg_backup_job_running; then
-        echo "backup: still running after ${backup_wait_s}s wait (not failed; leaving running job intact and deferring deploy without re-triggering)"
+        # Refresh tracked active ID if backup.sh published one after kickstart, and KEEP state file for retry.
+        if [ -z "$wait_backup_id" ] && [ -f "$backup_active_id_file" ] && [ ! -L "$backup_active_id_file" ]; then
+          wait_backup_id="$(tr -d '[:space:]' < "$backup_active_id_file" 2>/dev/null || true)"
+          _write_deploy_backup_wait_state "$backup_wait_state_file" "$wait_backup_id" "$cur_head_for_backup" "$TARGET" "$wait_before_line"
+        fi
+        echo "backup: still running after ${backup_wait_s}s wait (id=${wait_backup_id:-active}; not failed; leaving running job intact and deferring deploy without re-triggering)"
         release_deploy_lock || true
         exit 75
       else
-        rm -f "$backup_tag_file" 2>/dev/null || true
+        rm -f "$backup_tag_file" "$backup_next_id_file" "$backup_wait_state_file" 2>/dev/null || true
+        if matched_bak_line=$(_find_completed_backup_for_wait "$LOG" "$wait_backup_id" "$wait_before_line"); then
+          after="$matched_bak_line"
+        fi
         case "$after" in
           *" ok "*)
-            if [ "$after" = "$before" ]; then
+            if [ "$after" = "$wait_before_line" ]; then
               echo "no fresh backup, abort"; release_deploy_lock || true; exit 1
             fi
             DEPLOY_BACKUP_STATUS="fresh"

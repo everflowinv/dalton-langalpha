@@ -897,6 +897,15 @@ class AsrJobManager:
         async with self._job_lock(job_id):
             existing = self.read_state(job_id)
             if existing is not None:
+                if (
+                    existing.get("restored_no_resume") is True
+                    or existing.get("error_category") == "restored_inflight"
+                ):
+                    return 409, {
+                        "ok": False,
+                        "error_code": "restored_no_resume",
+                        "error": "Restored transcription job cannot be submitted directly; use /resubmit instead",
+                    }
                 ex_caller = existing.get("caller") or {}
                 if (
                     ex_caller.get("user_id") != user_id
@@ -1050,6 +1059,16 @@ class AsrJobManager:
                     "error": "Transcription job not found",
                 }
             cur_status = str(state.get("status") or "")
+            if (
+                state.get("restored_no_resume") is True
+                or state.get("error_category") == "restored_inflight"
+            ):
+                return 409, {
+                    "ok": False,
+                    "error_code": "restored_no_resume",
+                    "status": cur_status,
+                    "error": "Restored transcription job cannot be retried in place; use /resubmit instead",
+                }
             if cur_status in ACTIVE_JOB_STATUSES and int(state.get("attempt") or 1) > 1:
                 self._ensure_worker_running(job_id)
                 return 200, {"ok": True, "job": state, "deduplicated": True}

@@ -3371,9 +3371,11 @@ class TestSandboxNetworkAndInitScript:
         sc = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(sc)
 
-        # Item 1 & Item 2: backup.sh uses `pg_restore -f - --data-only` and no `printf/echo ... | grep -q`
+        # Item 1 & Item 2: backup.sh delegates full-consumer reconciliation to consistent_backup.py
+        # (removing the legacy duplicate verify-backup-refs check) and has no `printf/echo ... | grep -q`
         backup_text = (REPO_ROOT / "scripts/standalone/backup.sh").read_text(encoding="utf-8")
-        assert "pg_restore -f - --data-only --schema=public --table=dalton_chat_file_uploads" in backup_text
+        assert "scripts/standalone/consistent_backup.py compose-backup" in backup_text
+        assert "verify-backup-refs" not in backup_text
         for script_name in ("backup.sh", "restore.sh", "upgrade.sh"):
             src_text = (REPO_ROOT / "scripts/standalone" / script_name).read_text(encoding="utf-8")
             assert not _re.search(r"\b(?:printf|echo)\b[^\n|]*\|\s*grep\s+-[^\s]*q", src_text), (

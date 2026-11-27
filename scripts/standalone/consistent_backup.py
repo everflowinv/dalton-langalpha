@@ -19,11 +19,12 @@ import json
 import os
 import shutil
 import sys
+import tarfile
 import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote_plus, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote_plus, unquote_plus, urlsplit, urlunsplit
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -109,13 +110,17 @@ def resolve_standalone_pg_dsn(
 
     Priority:
     1. Explicit ``--pg-dsn``
-    2. ``DATABASE_URL`` environment variable
-    3. ``DB_HOST`` / ``DB_PORT`` / ``DB_NAME`` / ``DB_USER`` / ``DB_PASSWORD`` / ``DB_SSLMODE``
+    2. ``DALTON_BACKUP_PG_DSN`` environment override (passed by ``backup.sh``)
+    3. ``DATABASE_URL`` environment variable
+    4. ``DB_HOST`` / ``DB_PORT`` / ``DB_NAME`` / ``DB_USER`` / ``DB_PASSWORD`` / ``DB_SSLMODE``
     """
     explicit = (pg_dsn or "").strip()
     if explicit:
         return explicit
     em = os.environ if env is None else env
+    override_url = (em.get("DALTON_BACKUP_PG_DSN") or "").strip()
+    if override_url:
+        return override_url
     env_url = (em.get("DATABASE_URL") or "").strip()
     if env_url:
         return env_url
@@ -129,6 +134,58 @@ def resolve_standalone_pg_dsn(
         f"postgresql://{quote_plus(db_user)}:{quote_plus(db_password)}"
         f"@{db_host}:{db_port}/{db_name}?sslmode={quote_plus(db_sslmode)}"
     )
+
+
+def resolve_standalone_pg_config(
+    pg_dsn: str = "",
+    env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Resolve unified PostgreSQL connection fields from the single DSN resolver.
+
+    Returns ``dsn`` (for control session) AND ``container_dsn`` (with ``postgres`` host
+    rewritten to ``127.0.0.1`` for ``docker compose exec postgres pg_dump``), plus parsed
+    ``host``, ``port``, ``dbname``, ``user``, ``password``, ``sslmode``, and ``source``.
+    """
+    em = os.environ if env is None else env
+    if (pg_dsn or "").strip():
+        source = "pg_dsn"
+    elif (em.get("DALTON_BACKUP_PG_DSN") or "").strip():
+        source = "backup_pg_dsn"
+    elif (em.get("DATABASE_URL") or "").strip():
+        source = "database_url"
+    else:
+        source = "db_vars"
+
+    dsn = resolve_standalone_pg_dsn(pg_dsn, em)
+    parsed = urlsplit(dsn)
+    host = parsed.hostname or (em.get("DB_HOST") or "localhost").strip()
+    port = str(parsed.port or (em.get("DB_PORT") or "5432").strip())
+    dbname = unquote_plus((parsed.path or "").lstrip("/")) or (em.get("DB_NAME") or "postgres").strip()
+    user = unquote_plus(parsed.username) if parsed.username is not None else (em.get("DB_USER") or "postgres").strip()
+    password = unquote_plus(parsed.password) if parsed.password is not None else (em.get("DB_PASSWORD") or "")
+    qs = parse_qs(parsed.query)
+    sslmode = (qs.get("sslmode", [None])[0] or (em.get("DB_SSLMODE") or "prefer")).strip() or "prefer"
+
+    # Build a DSN suitable for running `pg_dump` inside the `postgres` container itself.
+    container_dsn = dsn
+    if parsed.scheme in ("postgres", "postgresql") and host.lower() == "postgres":
+        auth = quote_plus(user)
+        if parsed.password is not None:
+            auth = f"{auth}:{quote_plus(password)}"
+        netloc = f"{auth}@127.0.0.1:{port}"
+        container_dsn = urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+    return {
+        "dsn": dsn,
+        "container_dsn": container_dsn,
+        "host": host,
+        "port": port,
+        "dbname": dbname,
+        "user": user,
+        "password": password,
+        "sslmode": sslmode,
+        "source": source,
+    }
 
 
 async def open_standalone_session_connection(dsn: str) -> Any:
@@ -323,9 +380,19 @@ def _cmd_compose_backup(
     dsn = resolve_standalone_pg_dsn(args.pg_dsn, os.environ)
     specs = bucket_resolver(os.environ)
     stage_dir = Path(tempfile.mkdtemp(prefix="dalton-core-cb-"))
-    tar_path = Path(args.out_tar) if (args.out_tar and args.out_tar != "-") else (stage_dir / "minio-objects.tar.gz")
+    stream_bundle = bool(getattr(args, "stream_bundle", False))
+    tar_path = (
+        Path(args.out_tar)
+        if (args.out_tar and args.out_tar != "-" and not stream_bundle)
+        else (stage_dir / "minio-objects.tar.gz")
+    )
     asr_dir = Path(args.asr_jobs_dir) if args.asr_jobs_dir else None
-    asr_tar = (stage_dir / "asr-jobs.tar.gz") if (asr_dir and asr_dir.is_dir()) else None
+    out_asr_tar_arg = str(getattr(args, "out_asr_tar", "") or "").strip()
+    asr_tar = (
+        Path(out_asr_tar_arg)
+        if out_asr_tar_arg
+        else ((stage_dir / "asr-jobs.tar.gz") if (asr_dir and asr_dir.is_dir()) else None)
+    )
 
     def _emit_ctl(msg: str) -> None:
         sys.stderr.write(f"{CTL_PREFIX}{msg}\n")
@@ -368,7 +435,17 @@ def _cmd_compose_backup(
                 await conn.close()
 
         res = asyncio.run(_execute())
-        if not args.out_tar or args.out_tar == "-":
+        if stream_bundle:
+            with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as bundle_tf:
+                bundle_tf.add(tar_path, arcname="minio-objects.tar.gz", recursive=False)
+                if res.asr_archive is not None and res.asr_archive.archive_path.is_file():
+                    bundle_tf.add(
+                        res.asr_archive.archive_path,
+                        arcname="asr-jobs.tar.gz",
+                        recursive=False,
+                    )
+            sys.stdout.buffer.flush()
+        elif not args.out_tar or args.out_tar == "-":
             with tar_path.open("rb") as fh:
                 shutil.copyfileobj(fh, sys.stdout.buffer, length=1024 * 1024)
             sys.stdout.buffer.flush()
@@ -376,6 +453,10 @@ def _cmd_compose_backup(
         summary_payload = {
             "snapshot_id": res.snapshot_id,
             "object_count": len(res.manifest_objects),
+            "asr_job_count": len(res.asr_archive.included_job_ids) if res.asr_archive else 0,
+            "asr_archive_included": bool(
+                res.asr_archive is not None and res.asr_archive.archive_path.is_file()
+            ),
             "warnings": list(res.warnings),
             "reconcile_ok": res.reconcile_report.ok,
             "checked_refs": res.reconcile_report.checked_refs,
@@ -384,6 +465,23 @@ def _cmd_compose_backup(
         return 0
     finally:
         shutil.rmtree(stage_dir, ignore_errors=True)
+
+
+def _cmd_resolve_pg_config(args: argparse.Namespace) -> int:
+    from scripts.standalone import storage_config as sc
+
+    merged_env: dict[str, str] = {}
+    if args.env_file:
+        merged_env.update(sc.parse_env_file(Path(args.env_file)))
+    if args.compose_config_json:
+        svc_env = sc.parse_compose_service_env(
+            Path(args.compose_config_json),
+            service_name=args.service or "backend",
+        )
+        merged_env.update(svc_env)
+    cfg = resolve_standalone_pg_config(args.pg_dsn, merged_env if (args.env_file or args.compose_config_json) else os.environ)
+    print(json.dumps(cfg, ensure_ascii=False))
+    return 0
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -405,12 +503,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_cb = sub.add_parser("compose-backup")
     p_cb.add_argument("--pg-dsn", default="")
     p_cb.add_argument("--out-tar", default="-")
+    p_cb.add_argument("--out-asr-tar", default="")
+    p_cb.add_argument(
+        "--stream-bundle",
+        action="store_true",
+        help="Stream an uncompressed tar bundle (minio-objects.tar.gz + optional asr-jobs.tar.gz) to stdout.",
+    )
     p_cb.add_argument("--asr-jobs-dir", default="")
     p_cb.add_argument("--lock-timeout-s", type=float, default=None)
     p_cb.add_argument("--pg-dump-timeout-s", type=float, default=None)
     p_cb.add_argument("--mirror-timeout-s", type=float, default=None)
     p_cb.add_argument("--snapshot-import-timeout-s", type=float, default=None)
     p_cb.set_defaults(func=_cmd_compose_backup)
+
+    p_pg = sub.add_parser("resolve-pg-config")
+    p_pg.add_argument("--env-file", default="")
+    p_pg.add_argument("--compose-config-json", default="")
+    p_pg.add_argument("--service", default="backend")
+    p_pg.add_argument("--pg-dsn", default="")
+    p_pg.set_defaults(func=_cmd_resolve_pg_config)
 
     p_rec = sub.add_parser("reconcile-restored-inflight-states")
     p_rec.add_argument("--skip-object-check", action="store_true")

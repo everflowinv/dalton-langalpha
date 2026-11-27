@@ -2891,6 +2891,55 @@ async def enumerate_snapshot_refs(
                 if cnt:
                     inv.skipped_pending["drive_uploads"] = cnt
 
+            # 5b. workspace_file_uploads: `pulling` rows depend on an assembled object in main storage;
+            #     `uploading`/`completing` rows are pending multipart uploads skipped during backup
+            #     and converged by post-restore reconciliation.
+            if await _table_exists(cur, "public.workspace_file_uploads"):
+                await cur.execute(
+                    "SELECT upload_id, object_key, size, sha256, state "
+                    "FROM workspace_file_uploads "
+                    "WHERE cleaned_at IS NULL AND state IN ('uploading', 'completing', 'pulling')"
+                )
+                ws_upload_pending = 0
+                for row in await cur.fetchall():
+                    uid, okey, sz, sha, st = _extract_tuple(row, 5)
+                    st_clean = str(st or "").strip().lower()
+                    if st_clean in ("uploading", "completing"):
+                        ws_upload_pending += 1
+                        continue
+                    if st_clean != "pulling":
+                        continue
+                    clean_key = str(okey or "").strip().lstrip("/")
+                    if not clean_key:
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="workspace_file_uploads",
+                                bucket_role="main",
+                                object_key="",
+                                row_id=str(uid),
+                                check_mode="invalid",
+                                invalid_reason="pulling workspace_file_uploads row has empty object_key",
+                            )
+                        )
+                        continue
+                    inv.references.append(
+                        ObjectReference(
+                            consumer="workspace_file_uploads",
+                            bucket_role="main",
+                            object_key=clean_key,
+                            row_id=str(uid),
+                            expected_size=int(sz) if sz is not None else None,
+                            expected_sha256=(
+                                str(sha).strip().lower() if sha and str(sha).strip() else None
+                            ),
+                            check_mode="strict",
+                        )
+                    )
+                if ws_upload_pending:
+                    inv.skipped_pending["workspace_file_uploads"] = ws_upload_pending
+            else:
+                inv.skipped_missing_tables.append("public.workspace_file_uploads")
+
             # 6. provenance_result_bodies (mutable key: check exists, warn on size mismatch)
             if await _table_exists(cur, "public.provenance_result_bodies"):
                 await cur.execute(

@@ -496,8 +496,9 @@ while true; do
     break
 done
 
-# 5. Publish remote weekly/<YYYY-MM-DD>/LATEST.json ONLY after all immutable artifacts are verified & promoted,
-#    and THEN atomically publish the local weekly baseline pointer for daily delta runs.
+# 5. Publish an IMMUTABLE per-baseline checksum manifest (`baseline-<baseline_id>.json`)
+#    so same-day weekly reruns NEVER clobber the verification manifest referenced by earlier
+#    daily incrementals, THEN flip `weekly/<YYYY-MM-DD>/LATEST.json` and the local pointer.
 WEEKLY_LATEST_LOCAL="${RUN_TMP_DIR}/LATEST.json"
 "${PY_BIN}" "${OFFSITE_SYNC_PY}" build-weekly-latest-json \
     --run-id "${RUN_ID}" \
@@ -508,6 +509,31 @@ WEEKLY_LATEST_LOCAL="${RUN_TMP_DIR}/LATEST.json"
     --redis-name "${REDIS_FINAL_NAME}" --redis-meta "${REDIS_META}" \
     --var-name "${VAR_FINAL_NAME}" --var-meta "${VAR_META}" \
     --out "${WEEKLY_LATEST_LOCAL}"
+
+BASELINE_MANIFEST_REMOTE_NAME="baseline-${BASELINE_ID}.json"
+RAND_BL_MANIFEST="$(openssl rand -hex 6)"
+STAGED_BASELINE_MANIFEST_REMOTE="${REMOTE_WEEK_DEST}/${BASELINE_MANIFEST_REMOTE_NAME}.partial-${RAND_BL_MANIFEST}"
+FINAL_BASELINE_MANIFEST_REMOTE="${REMOTE_WEEK_DEST}/${BASELINE_MANIFEST_REMOTE_NAME}"
+CURRENT_PARTIAL_OBJ="${STAGED_BASELINE_MANIFEST_REMOTE}"
+if ! rclone_noproxy rcat "${STAGED_BASELINE_MANIFEST_REMOTE}" \
+    --cache-dir "${RCLONE_CACHE_DIR}" \
+    --temp-dir "${RUN_TMP_DIR}" \
+    --log-file "${RCLONE_LOG_FILE}" \
+    --log-level INFO < "${WEEKLY_LATEST_LOCAL}" 2>"${RUN_TMP_DIR}/rcat-weekly-baseline-manifest.err"; then
+    delete_partial_remote "${STAGED_BASELINE_MANIFEST_REMOTE}"
+    CURRENT_PARTIAL_OBJ=""
+    fail_with_alert "WEEKLY_MANIFEST_UPLOAD_FAILED" "Failed uploading immutable weekly manifest ${BASELINE_MANIFEST_REMOTE_NAME}"
+fi
+if ! rclone_noproxy moveto "${STAGED_BASELINE_MANIFEST_REMOTE}" "${FINAL_BASELINE_MANIFEST_REMOTE}" \
+    --cache-dir "${RCLONE_CACHE_DIR}" \
+    --temp-dir "${RUN_TMP_DIR}" \
+    --log-file "${RCLONE_LOG_FILE}" \
+    --log-level INFO 2>"${RUN_TMP_DIR}/moveto-weekly-baseline-manifest.err"; then
+    delete_partial_remote "${STAGED_BASELINE_MANIFEST_REMOTE}"
+    CURRENT_PARTIAL_OBJ=""
+    fail_with_alert "WEEKLY_MANIFEST_MOVETO_FAILED" "Failed promoting immutable weekly manifest ${BASELINE_MANIFEST_REMOTE_NAME}"
+fi
+CURRENT_PARTIAL_OBJ=""
 
 RAND_LATEST="$(openssl rand -hex 6)"
 STAGED_WEEKLY_LATEST="${REMOTE_WEEK_DEST}/LATEST.json.partial-${RAND_LATEST}"

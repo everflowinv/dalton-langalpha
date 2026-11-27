@@ -1512,6 +1512,67 @@ info "Running migrations against '${CFG_DB_NAME}'..."
 compose_cmd run --rm migrate
 ok "Database '${CFG_DB_NAME}' migrated to current heads."
 
+# Clear & restore terminal `asr-jobs` volume BEFORE post-restore convergence and BEFORE
+# starting backend or transcription services, so pre-restore directories can never be
+# auto-resumed by `recover_incomplete_jobs`.
+RESTORE_HAS_TRANSCRIPTION=0
+RESTORE_ASR_VOLUME="${COMPOSE_PROJECT}_dalton-asr-jobs"
+if compose_cmd --profile transcription config --services 2>/dev/null | grep -qx "transcription"; then
+  RESTORE_HAS_TRANSCRIPTION=1
+  RESTORE_ASR_CFG_JSON="$(compose_cmd --profile transcription config --format json 2>/dev/null || true)"
+  if [[ -n "$RESTORE_ASR_CFG_JSON" ]]; then
+    RESOLVED_RESTORE_ASR_VOL="$(printf '%s' "$RESTORE_ASR_CFG_JSON" | python3 -c '
+import json, sys
+cfg = json.load(sys.stdin)
+vol = (cfg.get("volumes") or {}).get("dalton-asr-jobs") or {}
+print(str(vol.get("name") or ""))
+' 2>/dev/null || true)"
+    if [[ -n "$RESOLVED_RESTORE_ASR_VOL" ]]; then
+      RESTORE_ASR_VOLUME="$RESOLVED_RESTORE_ASR_VOL"
+    fi
+  fi
+  if [[ -f "${BACKUP_DIR}/asr-jobs.tar.gz" ]]; then
+    info "Restoring terminal ASR jobs archive into /var/lib/dalton/asr_jobs..."
+    if ! compose_cmd --profile transcription run --rm -T --no-deps --entrypoint /bin/sh transcription \
+        -c 'mkdir -p /var/lib/dalton/asr_jobs && rm -rf /var/lib/dalton/asr_jobs/* /var/lib/dalton/asr_jobs/.[!.]* /var/lib/dalton/asr_jobs/..?* 2>/dev/null || true; tar -xzf - -C /var/lib/dalton/asr_jobs' \
+        < "${BACKUP_DIR}/asr-jobs.tar.gz"; then
+      err "Failed to clear and extract terminal ASR jobs from ${BACKUP_DIR}/asr-jobs.tar.gz; refusing to start services."
+      exit 1
+    fi
+    ok "Terminal ASR jobs archive restored into /var/lib/dalton/asr_jobs."
+  else
+    info "Clearing /var/lib/dalton/asr_jobs volume (no asr-jobs.tar.gz in backup)..."
+    if ! compose_cmd --profile transcription run --rm -T --no-deps --entrypoint /bin/sh transcription \
+        -c 'mkdir -p /var/lib/dalton/asr_jobs && rm -rf /var/lib/dalton/asr_jobs/* /var/lib/dalton/asr_jobs/.[!.]* /var/lib/dalton/asr_jobs/..?* 2>/dev/null || true'; then
+      err "Failed to clear /var/lib/dalton/asr_jobs volume before service start; refusing to start services."
+      exit 1
+    fi
+    ok "Cleared /var/lib/dalton/asr_jobs volume."
+  fi
+elif [[ -f "${BACKUP_DIR}/asr-jobs.tar.gz" ]]; then
+  err "Backup includes asr-jobs.tar.gz, but transcription service is not defined in Compose; refusing to start services."
+  exit 1
+fi
+
+# Converge restored inflight uploads and non-terminal transcription jobs BEFORE verification
+# and BEFORE starting services (`compose up -d`). Failure aborts restore immediately.
+info "Running post-restore inflight state convergence (reconcile-restored-inflight-states)..."
+RECONCILE_RUN_ARGS=(run --rm -T --no-deps)
+RECONCILE_CLI_ARGS=(reconcile-restored-inflight-states)
+if [[ "$RESTORE_HAS_TRANSCRIPTION" -eq 1 ]]; then
+  RECONCILE_RUN_ARGS+=(-v "${RESTORE_ASR_VOLUME}:/var/lib/dalton/asr_jobs")
+  RECONCILE_CLI_ARGS+=(--asr-jobs-dir /var/lib/dalton/asr_jobs)
+fi
+if [[ "$SKIP_MINIO" -eq 1 || "$STORAGE_ANY_CONFIGURED" -eq 0 ]]; then
+  RECONCILE_CLI_ARGS+=(--skip-object-check)
+fi
+if ! compose_cmd "${RECONCILE_RUN_ARGS[@]}" backend \
+    uv run --no-sync python scripts/standalone/consistent_backup.py "${RECONCILE_CLI_ARGS[@]}"; then
+  err "Post-restore inflight state convergence failed; refusing to run compose up -d."
+  exit 1
+fi
+ok "Post-restore inflight states converged."
+
 # Verify every completed DB-referenced object exists in object storage; skip in-progress
 # 'uploading' records (incomplete at backup time) and report how many were skipped.
 if [[ "$SKIP_MINIO" -eq 0 && "$STORAGE_ANY_CONFIGURED" -eq 1 ]]; then

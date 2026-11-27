@@ -124,11 +124,30 @@ if [[ "${SKIP_MOUNT_CHECK}" != "1" ]]; then
 fi
 
 mkdir -p "$(dirname "${DETAIL_LOG}")" 2>/dev/null || true
+
+# Consume optional one-shot backup set ID hint written by deploy_main.sh and publish
+# active set ID while running so deploy_main.sh can track and resume after completion.
+NEXT_ID_FILE="${DALTON_PG_BACKUP_NEXT_ID_FILE:-${HOME}/Library/Logs/.dalton-pg-backup.next-set-id}"
+ACTIVE_ID_FILE="${DALTON_PG_BACKUP_ACTIVE_ID_FILE:-${HOME}/Library/Logs/.dalton-pg-backup.active-set-id}"
+SET_ID_HINT=""
+if [[ -f "${NEXT_ID_FILE}" ]] && [[ ! -L "${NEXT_ID_FILE}" ]]; then
+    SET_ID_HINT="$(tr -d '[:space:]' < "${NEXT_ID_FILE}" 2>/dev/null || true)"
+    rm -f "${NEXT_ID_FILE}" 2>/dev/null || true
+fi
+if [[ -n "${SET_ID_HINT}" ]] && [[ "${SET_ID_HINT}" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
+    RUN_SET_ID="${SET_ID_HINT}"
+else
+    RUN_SET_ID="$(date +%Y%m%d-%H%M%S)"
+fi
+mkdir -p "$(dirname "${ACTIVE_ID_FILE}")" 2>/dev/null || true
+printf '%s\n' "${RUN_SET_ID}" > "${ACTIVE_ID_FILE}" 2>/dev/null || true
+
 RUN_ARGS=(
     run
     --mount-root "${EXT_MOUNT_ROOT}"
     --backups-root "${BACKUP_ROOT}"
     --tag "${TAG}"
+    --set-id "${RUN_SET_ID}"
     --compose-files "${COMPOSE_FILES}"
 )
 if [[ -d "${ASR_JOBS_DIR}" ]]; then
@@ -139,7 +158,7 @@ if [[ "${SKIP_MOUNT_CHECK}" == "1" ]]; then
 fi
 
 ERR_TMP="$(mktemp "${BACKUP_ROOT}/.tmp/backup-sh-err.XXXXXX" 2>/dev/null || mktemp "/tmp/backup-sh-err.XXXXXX")"
-trap 'rm -f "${ERR_TMP}" 2>/dev/null || true' EXIT
+trap 'rm -f "${ERR_TMP}" "${ACTIVE_ID_FILE}" 2>/dev/null || true' EXIT
 
 set +e
 JSON_OUT="$("${PY_BIN}" "${LOCAL_BACKUP_SET_PY}" "${RUN_ARGS[@]}" 2>"${ERR_TMP}")"
@@ -152,7 +171,7 @@ fi
 
 if [[ "${RC}" -ne 0 ]] || [[ -z "${JSON_OUT}" ]]; then
     ERR_LINE="$(tail -n 1 "${ERR_TMP}" 2>/dev/null | tr '\n' ' ' || true)"
-    echo "$(date '+%F %T') fail rc=${RC} ${ERR_LINE}"
+    echo "$(date '+%F %T') fail rc=${RC} set=${RUN_SET_ID} ${ERR_LINE}"
     exit "${RC:-1}"
 fi
 

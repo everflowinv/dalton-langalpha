@@ -590,10 +590,10 @@ def verify_backup_chat_upload_refs(
         state = _strip(row.get("state"))
         obj_key = _strip(row.get("object_key"))
         upload_id = _strip(row.get("upload_id")) or "<unknown>"
-        if state == "uploading":
+        if state in ("uploading", "completing"):
             skipped_uploading += 1
             continue
-        if state not in ("ready", "completing") or not obj_key:
+        if state != "ready" or not obj_key:
             continue
         full_key = obj_key.lstrip("/")
         if key_prefix and not full_key.startswith(f"{key_prefix}/"):

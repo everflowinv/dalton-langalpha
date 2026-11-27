@@ -1474,12 +1474,14 @@ release_publish_lock() {
 
 CONSISTENT_BACKEND_PID=""
 PG_DUMP_PID=""
+BUNDLE_TAR_PID=""
 CTL_IN_FIFO=""
 CTL_ERR_FIFO=""
+BUNDLE_OUT_FIFO=""
 
 stop_consistent_backup_children() {
   local pid=""
-  for pid in "${PG_DUMP_PID:-}" "${CONSISTENT_BACKEND_PID:-}"; do
+  for pid in "${PG_DUMP_PID:-}" "${CONSISTENT_BACKEND_PID:-}" "${BUNDLE_TAR_PID:-}"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill -TERM "$pid" 2>/dev/null || true
       sleep 0.2
@@ -1489,6 +1491,7 @@ stop_consistent_backup_children() {
   done
   PG_DUMP_PID=""
   CONSISTENT_BACKEND_PID=""
+  BUNDLE_TAR_PID=""
   if [[ -n "${CTL_IN_FIFO:-}" ]]; then
     rm -f "$CTL_IN_FIFO" 2>/dev/null || true
     CTL_IN_FIFO=""
@@ -1496,6 +1499,10 @@ stop_consistent_backup_children() {
   if [[ -n "${CTL_ERR_FIFO:-}" ]]; then
     rm -f "$CTL_ERR_FIFO" 2>/dev/null || true
     CTL_ERR_FIFO=""
+  fi
+  if [[ -n "${BUNDLE_OUT_FIFO:-}" ]]; then
+    rm -f "$BUNDLE_OUT_FIFO" 2>/dev/null || true
+    BUNDLE_OUT_FIFO=""
   fi
 }
 
@@ -1520,45 +1527,98 @@ trap cleanup EXIT
 
 info "Starting zero-downtime consistent backup into ${FINAL_DIR}..."
 
-# 1 & 2. Consistent PostgreSQL + MinIO backup via shared consistent_backup protocol (§3.1):
-#   - backend container runs scripts/standalone/consistent_backup.py compose-backup
-#     (acquires both GC advisory locks, exports REPEATABLE READ snapshot, enumerates all
-#     17 consumers' DB references, waits for postgres pg_dump --snapshot to import snapshot,
-#     commits export txn immediately, selects pinned object versions, reconciles all refs).
-#   - host runs compose_cmd exec -T postgres pg_dump --snapshot=<snapshot_id> with hard timeout.
-info "1-2/5 Running consistent PostgreSQL + MinIO snapshot backup (database '${DB_NAME}')..."
+# 1 & 2. Consistent PostgreSQL + MinIO + terminal ASR-jobs backup via shared consistent_backup protocol (§3.1):
+#   - Resolve ONE unified PostgreSQL connection config (honoring DATABASE_URL > DB_* across
+#     Compose `backend` config + .env) and pass it to BOTH compose-backup control session and pg_dump.
+#   - Mount the `dalton-asr-jobs` volume read-only into the one-shot backup container and pass
+#     `--asr-jobs-dir /var/lib/dalton/asr_jobs` so terminal ASR jobs enter the same reconciliation.
+#   - Wait for SNAPSHOT_READY using LOCK_TIMEOUT_S (default 7200s); SNAP_IMPORT_TIMEOUT_S (default 120s)
+#     is used ONLY for waiting on pg_dump to import the snapshot after SNAPSHOT_READY.
+COMPOSE_CFG_TMP="${STAGE_DIR}/.compose-config.json"
+COMPOSE_PG_ARGS=(--env-file "$ENV_FILE")
+if compose_cmd --profile transcription config --format json > "$COMPOSE_CFG_TMP" 2>/dev/null && [[ -s "$COMPOSE_CFG_TMP" ]]; then
+  COMPOSE_PG_ARGS+=(--compose-config-json "$COMPOSE_CFG_TMP" --service backend)
+else
+  rm -f "$COMPOSE_CFG_TMP" 2>/dev/null || true
+  COMPOSE_CFG_TMP=""
+fi
+
+PG_CFG_JSON="$(python3 "${SCRIPT_DIR}/consistent_backup.py" resolve-pg-config "${COMPOSE_PG_ARGS[@]}")"
+PG_CFG_LINES="$(printf '%s' "$PG_CFG_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for k in ("host", "dbname", "user", "dsn", "container_dsn"):
+    print(d.get(k, ""))
+')"
+PG_TARGET_HOST="$(printf '%s\n' "$PG_CFG_LINES" | sed -n '1p')"
+PG_TARGET_DB="$(printf '%s\n' "$PG_CFG_LINES" | sed -n '2p')"
+PG_TARGET_USER="$(printf '%s\n' "$PG_CFG_LINES" | sed -n '3p')"
+PG_TARGET_DSN="$(printf '%s\n' "$PG_CFG_LINES" | sed -n '4p')"
+PG_DUMP_CONTAINER_DSN="$(printf '%s\n' "$PG_CFG_LINES" | sed -n '5p')"
+
+if [[ "$PG_TARGET_HOST" != "postgres" && "$PG_TARGET_HOST" != "127.0.0.1" && "$PG_TARGET_HOST" != "localhost" ]]; then
+  err "External PostgreSQL detected in effective database config (host='${PG_TARGET_HOST}'; expected Compose-managed 'postgres')."
+  exit 1
+fi
+DB_NAME="${PG_TARGET_DB:-$DB_NAME}"
+DB_USER="${PG_TARGET_USER:-$DB_USER}"
+
+ASR_JOBS_VOLUME="${PROJECT_NAME}_dalton-asr-jobs"
+if [[ -n "$COMPOSE_CFG_TMP" && -s "$COMPOSE_CFG_TMP" ]]; then
+  RESOLVED_ASR_VOL="$(python3 - "$COMPOSE_CFG_TMP" "$ASR_JOBS_VOLUME" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+vol = (cfg.get("volumes") or {}).get("dalton-asr-jobs") or {}
+print(str(vol.get("name") or sys.argv[2]))
+PY
+  )"
+  if [[ -n "$RESOLVED_ASR_VOL" ]]; then
+    ASR_JOBS_VOLUME="$RESOLVED_ASR_VOL"
+  fi
+fi
+rm -f "$COMPOSE_CFG_TMP" 2>/dev/null || true
+
+info "1-2/5 Running consistent PostgreSQL + MinIO + ASR-jobs snapshot backup (database '${DB_NAME}')..."
+LOCK_TIMEOUT_S="${DALTON_BACKUP_LOCK_TIMEOUT_S:-7200}"
 SNAP_IMPORT_TIMEOUT_S="${DALTON_BACKUP_SNAPSHOT_IMPORT_TIMEOUT_S:-120}"
 PG_DUMP_TIMEOUT_S="${DALTON_BACKUP_PG_DUMP_TIMEOUT_S:-7200}"
 CTL_IN_FIFO="${STAGE_DIR}/.consistent-ctl.in"
 CTL_ERR_FIFO="${STAGE_DIR}/.consistent-ctl.err"
-mkfifo "$CTL_IN_FIFO" "$CTL_ERR_FIFO"
+BUNDLE_OUT_FIFO="${STAGE_DIR}/.consistent-bundle.out"
+mkfifo "$CTL_IN_FIFO" "$CTL_ERR_FIFO" "$BUNDLE_OUT_FIFO"
 
 # Hold write-end of CTL_IN_FIFO open on fd 5 so backend waits for explicit handshake tokens.
 exec 5<>"$CTL_IN_FIFO"
 exec 6<>"$CTL_ERR_FIFO"
 
+# Extract streamed tar bundle (minio-objects.tar.gz + optional asr-jobs.tar.gz) directly into STAGE_DIR.
+tar -xf "$BUNDLE_OUT_FIFO" -C "${STAGE_DIR}" &
+BUNDLE_TAR_PID=$!
+
 CONSISTENT_BACKEND_ARGS=(
-  exec -T backend uv run --no-sync python scripts/standalone/consistent_backup.py compose-backup
-  --out-tar -
+  run --rm -T --no-deps
+  -e DALTON_BACKUP_PG_DSN
+  -v "${ASR_JOBS_VOLUME}:/var/lib/dalton/asr_jobs:ro"
+  backend uv run --no-sync python scripts/standalone/consistent_backup.py compose-backup
+  --stream-bundle
+  --asr-jobs-dir /var/lib/dalton/asr_jobs
+  --lock-timeout-s "$LOCK_TIMEOUT_S"
   --snapshot-import-timeout-s "$SNAP_IMPORT_TIMEOUT_S"
   --pg-dump-timeout-s "$PG_DUMP_TIMEOUT_S"
 )
-if [[ -n "${DALTON_BACKUP_LOCK_TIMEOUT_S:-}" ]]; then
-  CONSISTENT_BACKEND_ARGS+=(--lock-timeout-s "${DALTON_BACKUP_LOCK_TIMEOUT_S}")
-fi
 if [[ -n "${DALTON_BACKUP_MIRROR_TIMEOUT_S:-}" ]]; then
   CONSISTENT_BACKEND_ARGS+=(--mirror-timeout-s "${DALTON_BACKUP_MIRROR_TIMEOUT_S}")
 fi
 
-compose_cmd "${CONSISTENT_BACKEND_ARGS[@]}" <"$CTL_IN_FIFO" >"${STAGE_DIR}/minio-objects.tar.gz" 2>"$CTL_ERR_FIFO" &
+DALTON_BACKUP_PG_DSN="$PG_TARGET_DSN" compose_cmd "${CONSISTENT_BACKEND_ARGS[@]}" <"$CTL_IN_FIFO" >"$BUNDLE_OUT_FIFO" 2>"$CTL_ERR_FIFO" &
 CONSISTENT_BACKEND_PID=$!
 
 SNAPSHOT_ID=""
-SNAP_DEADLINE=$(( $(date +%s) + SNAP_IMPORT_TIMEOUT_S ))
+SNAP_READY_DEADLINE=$(( $(date +%s) + LOCK_TIMEOUT_S ))
 while true; do
   NOW_TS="$(date +%s)"
-  if (( NOW_TS >= SNAP_DEADLINE )); then
-    err "Timed out waiting for consistent_backup snapshot export (${SNAP_IMPORT_TIMEOUT_S}s)."
+  if (( NOW_TS >= SNAP_READY_DEADLINE )); then
+    err "Timed out waiting for consistent_backup snapshot export (${LOCK_TIMEOUT_S}s)."
     printf 'PG_DUMP_FAILED\n' >&5 || true
     exec 5>&- 6<&- || true
     stop_consistent_backup_children
@@ -1588,21 +1648,19 @@ if [[ -z "$SNAPSHOT_ID" ]]; then
   exec 5>&- 6<&- || true
   wait "$CONSISTENT_BACKEND_PID" 2>/dev/null || true
   CONSISTENT_BACKEND_PID=""
+  stop_consistent_backup_children
   err "consistent_backup failed before exporting PostgreSQL snapshot."
   exit 1
 fi
 
 info "Exported PostgreSQL snapshot '${SNAPSHOT_ID}'; launching pg_dump --snapshot..."
-compose_cmd exec -T postgres pg_dump \
-  -U "$DB_USER" \
-  -d "$DB_NAME" \
-  -Fc \
-  --no-owner \
-  --no-acl \
-  "--snapshot=${SNAPSHOT_ID}" > "${STAGE_DIR}/postgres.dump" &
+DALTON_PG_DUMP_DSN="$PG_DUMP_CONTAINER_DSN" compose_cmd exec -T -e DALTON_PG_DUMP_DSN postgres \
+  sh -c 'exec pg_dump "$DALTON_PG_DUMP_DSN" -Fc --no-owner --no-acl "$1"' _ "--snapshot=${SNAPSHOT_ID}" \
+  > "${STAGE_DIR}/postgres.dump" &
 PG_DUMP_PID=$!
 
 # Wait until pg_dump emits custom-format bytes (confirming snapshot import) or exits early.
+# SNAP_IMPORT_TIMEOUT_S (default 120s) applies ONLY to snapshot import after SNAPSHOT_READY.
 IMPORT_DEADLINE=$(( $(date +%s) + SNAP_IMPORT_TIMEOUT_S ))
 DUMP_IMPORTED=0
 while true; do
@@ -1706,14 +1764,22 @@ exec 6<&-
 set +e
 wait "$CONSISTENT_BACKEND_PID"
 cb_rc=$?
+wait "$BUNDLE_TAR_PID"
+bundle_tar_rc=$?
 set -e
 CONSISTENT_BACKEND_PID=""
-rm -f "$CTL_IN_FIFO" "$CTL_ERR_FIFO"
+BUNDLE_TAR_PID=""
+rm -f "$CTL_IN_FIFO" "$CTL_ERR_FIFO" "$BUNDLE_OUT_FIFO"
 CTL_IN_FIFO=""
 CTL_ERR_FIFO=""
+BUNDLE_OUT_FIFO=""
 
 if [[ "$cb_rc" -ne 0 ]]; then
   err "Consistent object backup / reconciliation failed (rc=${cb_rc})."
+  exit 1
+fi
+if [[ "$bundle_tar_rc" -ne 0 ]] || [[ ! -s "${STAGE_DIR}/minio-objects.tar.gz" ]]; then
+  err "Failed extracting consistent backup archive bundle (tar_rc=${bundle_tar_rc})."
   exit 1
 fi
 
@@ -1723,8 +1789,8 @@ if [[ ! -s "${STAGE_DIR}/postgres.dump" ]]; then
 fi
 
 PG_DUMP_BYTES="$(wc -c < "${STAGE_DIR}/postgres.dump" | tr -d ' ')"
-ALEMBIC_UPSTREAM="$(compose_cmd exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -Atqc "SELECT version_num FROM alembic_version;" 2>/dev/null | tr -d '\r\n' || true)"
-ALEMBIC_DALTON="$(compose_cmd exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -Atqc "SELECT version_num FROM alembic_version_dalton;" 2>/dev/null | tr -d '\r\n' || true)"
+ALEMBIC_UPSTREAM="$(DALTON_PG_DUMP_DSN="$PG_DUMP_CONTAINER_DSN" compose_cmd exec -T -e DALTON_PG_DUMP_DSN postgres sh -c 'psql "$DALTON_PG_DUMP_DSN" -Atqc "SELECT version_num FROM alembic_version;"' 2>/dev/null | tr -d '\r\n' || true)"
+ALEMBIC_DALTON="$(DALTON_PG_DUMP_DSN="$PG_DUMP_CONTAINER_DSN" compose_cmd exec -T -e DALTON_PG_DUMP_DSN postgres sh -c 'psql "$DALTON_PG_DUMP_DSN" -Atqc "SELECT version_num FROM alembic_version_dalton;"' 2>/dev/null | tr -d '\r\n' || true)"
 
 PG_TOC_FILE="${STAGE_DIR}/.pg-toc.tmp"
 PG_TOC_ENTRIES=0
@@ -1742,6 +1808,7 @@ if [[ "$VERIFY" -eq 1 ]]; then
 else
   ok "PostgreSQL dump written (${PG_DUMP_BYTES} bytes; verification skipped)."
 fi
+rm -f "$PG_TOC_FILE"
 
 MINIO_MANIFEST_FILE="${STAGE_DIR}/.minio-manifest.tmp.json"
 tar -xOzf "${STAGE_DIR}/minio-objects.tar.gz" _minio_manifest.json > "$MINIO_MANIFEST_FILE"
@@ -1760,28 +1827,17 @@ else
   ok "MinIO objects archived (${MINIO_BUCKET_COUNT} bucket(s), ${MINIO_OBJECT_COUNT} object(s); verification skipped)."
 fi
 
-# Immediately verify every completed (non-'uploading') chat upload in the PostgreSQL snapshot
-# exists in the MinIO archive just enumerated; fail the backup if any object is missing.
-if [[ ! -s "$PG_TOC_FILE" ]]; then
-  compose_cmd exec -T postgres pg_restore --list < "${STAGE_DIR}/postgres.dump" > "$PG_TOC_FILE"
-fi
-if grep -Eq '^[[:space:]]*[0-9]+;[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+TABLE DATA[[:space:]]+public[[:space:]]+dalton_chat_file_uploads([[:space:]]|$)' "$PG_TOC_FILE"; then
-  info "Verifying completed chat upload references in PostgreSQL snapshot against MinIO archive..."
-  CHAT_UPLOADS_COPY_TMP="${STAGE_DIR}/.chat-uploads-copy.sql"
-  if ! compose_cmd exec -T postgres pg_restore -f - --data-only --schema=public --table=dalton_chat_file_uploads \
-      < "${STAGE_DIR}/postgres.dump" > "$CHAT_UPLOADS_COPY_TMP"; then
-    err "Failed to extract dalton_chat_file_uploads data from PostgreSQL snapshot for object verification."
-    exit 1
+ASR_BACKUP_INCLUDED=0
+ASR_FILE_COUNT=0
+if [[ -f "${STAGE_DIR}/asr-jobs.tar.gz" ]]; then
+  ASR_BACKUP_INCLUDED=1
+  if [[ "$VERIFY" -eq 1 ]]; then
+    ASR_FILE_COUNT="$(tar -tzf "${STAGE_DIR}/asr-jobs.tar.gz" | awk '!/\/$/ && $0 != "." && $0 != "./" { c++ } END { print c+0 }')"
+    ok "Terminal ASR jobs archive verified (${ASR_FILE_COUNT} file(s))."
+  else
+    ok "Terminal ASR jobs archived (verification skipped)."
   fi
-  if ! python3 "${SCRIPT_DIR}/storage_config.py" verify-backup-refs \
-      --copy-sql "$CHAT_UPLOADS_COPY_TMP" \
-      --minio-manifest "$MINIO_MANIFEST_FILE" \
-      --caller backup; then
-    exit 1
-  fi
-  rm -f "$CHAT_UPLOADS_COPY_TMP"
 fi
-rm -f "$PG_TOC_FILE"
 
 # 3. Caddy certificate & PKI data backup (/data on edge)
 info "3/5 Backing up Caddy certificate & PKI data..."
@@ -2034,7 +2090,9 @@ python3 - "${STAGE_DIR}/manifest.json" \
   "$ENV_CIPHER" \
   "$ENV_KDF" \
   "$ENV_KDF_DIGEST" \
-  "$ENV_KDF_ITER" <<'PY'
+  "$ENV_KDF_ITER" \
+  "$ASR_BACKUP_INCLUDED" \
+  "$ASR_FILE_COUNT" <<'PY'
 import json, sys
 
 (
@@ -2059,6 +2117,8 @@ import json, sys
     env_kdf,
     env_digest,
     env_iter,
+    asr_included,
+    asr_files,
 ) = sys.argv[1:]
 
 with open(minio_manifest_path, encoding="utf-8") as mfh:
@@ -2087,6 +2147,14 @@ manifest = {
         "object_count": int(minio_objects),
         "total_bytes": int(minio_bytes),
     },
+    "asr_jobs": (
+        {
+            "file": "asr-jobs.tar.gz",
+            "file_count": int(asr_files),
+        }
+        if int(asr_included) == 1
+        else None
+    ),
     "caddy": {
         "file": "caddy-data.tar.gz",
         "file_count": int(caddy_files),
@@ -2124,7 +2192,7 @@ chmod 600 "${STAGE_DIR}/manifest.json"
 (
   cd "$STAGE_DIR"
   : > SHA256SUMS
-  for f in postgres.dump minio-objects.tar.gz caddy-data.tar.gz wiki-data.tar.gz manifest.json env.enc; do
+  for f in postgres.dump minio-objects.tar.gz asr-jobs.tar.gz caddy-data.tar.gz wiki-data.tar.gz manifest.json env.enc; do
     if [[ -f "$f" ]]; then
       printf '%s  %s\n' "$(sha256_file "$f")" "$f" >> SHA256SUMS
     fi

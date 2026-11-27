@@ -1884,6 +1884,23 @@ async def complete_transcription_upload(
     }
 
 
+def _is_restored_no_resume_job(job: dict[str, Any]) -> bool:
+    """Return True when ``job`` carries the persisted post-restore no-resume marker.
+
+    Restored in-flight/indeterminate jobs must never be started via normal submit or
+    in-place ``/retry``; callers must use ``/resubmit`` which creates a single canonical
+    replacement attempt.
+    """
+    if job.get("restored_no_resume") is True:
+        return True
+    if str(job.get("error_category") or "").strip().lower() == "restored_inflight":
+        return True
+    usage = job.get("usage")
+    if isinstance(usage, dict) and usage.get("restored_no_resume") is True:
+        return True
+    return False
+
+
 async def submit_transcription_job(
     *,
     caller_user_id: str,
@@ -1970,6 +1987,11 @@ async def submit_transcription_job(
     if str(job.get("status") or "") == TranscriptionJobStatus.CANCELLED.value:
         raise HTTPException(
             status_code=409, detail="Cancelled transcription job cannot be submitted"
+        )
+    if _is_restored_no_resume_job(job):
+        raise HTTPException(
+            status_code=409,
+            detail="Restored transcription job cannot be submitted directly; use /resubmit instead",
         )
 
     # Item 1: Before submitting to the bridge, verify object storage is enabled and
@@ -2202,6 +2224,11 @@ async def retry_transcription_job(
     await authorize_job_access(job, clean_caller, need="read")
 
     cur_status = str(job.get("status") or "")
+    if _is_restored_no_resume_job(job):
+        raise HTTPException(
+            status_code=409,
+            detail="Restored transcription job cannot be retried in place; use /resubmit instead",
+        )
     if cur_status not in RETRYABLE_TRANSCRIPTION_STATUSES:
         raise HTTPException(
             status_code=409,

@@ -1083,34 +1083,46 @@ def verify_backup_mount_layout(
     return checked
 
 
-_COLIMA_DISK_NAMES = frozenset({"diffdisk", "basedisk", "datadisk"})
+_COLIMA_DISK_NAMES = frozenset({"diffdisk", "basedisk", "datadisk", "disk"})
 _COLIMA_DISK_SUFFIXES = (".img", ".qcow2", ".raw")
+
+
+def _is_colima_disk_file_name(name: str) -> bool:
+    low = name.lower()
+    return low in _COLIMA_DISK_NAMES or low.endswith(_COLIMA_DISK_SUFFIXES)
 
 
 def _discover_colima_disk_paths(
     colima_dir: Path,
     *,
     profile: str = "default",
-) -> list[Path]:
-    """Return paths to inspect for the active Colima profile's virtual disk(s) and Lima dir."""
+) -> tuple[list[Path], list[Path]]:
+    """Return ``(all_paths, disk_files)`` for the active Colima profile's Lima dir and virtual disks."""
     prof = (profile or "default").strip() or "default"
     instance_name = "colima" if prof == "default" else f"colima-{prof}"
     lima_root = colima_dir / "_lima"
     instance_dir = lima_root / instance_name
     candidates: list[Path] = []
+    disk_files: list[Path] = []
+
+    def _record_disk(p: Path) -> None:
+        if p.exists() or p.is_symlink():
+            candidates.append(p)
+            # Treat existing regular files (or symlinks resolving to files, or dangling disk symlinks
+            # which verify_external_mount will catch) as located virtual disk targets.
+            if p.is_file() or (p.is_symlink() and not p.is_dir()):
+                disk_files.append(p)
 
     if lima_root.exists() or lima_root.is_symlink():
         candidates.append(lima_root)
     if instance_dir.exists() or instance_dir.is_symlink():
         candidates.append(instance_dir)
         for name in sorted(_COLIMA_DISK_NAMES):
-            p = instance_dir / name
-            if p.exists() or p.is_symlink():
-                candidates.append(p)
+            _record_disk(instance_dir / name)
         try:
             for child in sorted(instance_dir.iterdir()):
-                if child.name.lower().endswith(_COLIMA_DISK_SUFFIXES) and child not in candidates:
-                    candidates.append(child)
+                if _is_colima_disk_file_name(child.name) and child not in candidates:
+                    _record_disk(child)
         except OSError:
             pass
 
@@ -1120,26 +1132,110 @@ def _discover_colima_disk_paths(
             if disk_dir.is_dir() or disk_dir.is_symlink():
                 candidates.append(disk_dir)
                 for name in sorted(_COLIMA_DISK_NAMES):
-                    dp = disk_dir / name
-                    if dp.exists() or dp.is_symlink():
-                        candidates.append(dp)
+                    _record_disk(disk_dir / name)
+                try:
+                    for child in sorted(disk_dir.iterdir()):
+                        if _is_colima_disk_file_name(child.name) and child not in candidates:
+                            _record_disk(child)
+                except OSError:
+                    pass
 
     profile_dir = colima_dir / prof
     if profile_dir.exists() or profile_dir.is_symlink():
         candidates.append(profile_dir)
-        for child_name in ("disk", "diffdisk", "datadisk"):
-            cp = profile_dir / child_name
-            if cp.exists() or cp.is_symlink():
-                candidates.append(cp)
+        for child_name in ("disk", "diffdisk", "basedisk", "datadisk"):
+            _record_disk(profile_dir / child_name)
+        try:
+            for child in sorted(profile_dir.iterdir()):
+                if _is_colima_disk_file_name(child.name) and child not in candidates:
+                    _record_disk(child)
+        except OSError:
+            pass
 
-    # Deduplicate preserving order
-    seen: set[Path] = set()
-    unique: list[Path] = []
-    for p in candidates:
-        if p not in seen:
-            seen.add(p)
-            unique.append(p)
-    return unique
+    def _dedup(items: list[Path]) -> list[Path]:
+        seen: set[Path] = set()
+        unique: list[Path] = []
+        for p in items:
+            if p not in seen:
+                seen.add(p)
+                unique.append(p)
+        return unique
+
+    return _dedup(candidates), _dedup(disk_files)
+
+
+def resolve_active_colima_config(
+    *,
+    colima_dir: Path | None = None,
+    colima_profile: str | None = None,
+    env: Mapping[str, str] | None = None,
+    run_fn: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    timeout_s: float = 10.0,
+) -> tuple[Path, str]:
+    """Resolve the active Colima home directory and running profile (honoring ``COLIMA_HOME``).
+
+    Priority:
+    - Home directory: explicit ``colima_dir`` > ``COLIMA_HOME`` env > ``~/.colima``.
+    - Profile: explicit ``colima_profile`` > ``COLIMA_PROFILE`` env > active running profile
+      reported by ``colima list --json`` (matching ``DOCKER_HOST`` socket if present, else
+      ``default`` if running, else first running profile) > ``"default"``.
+    """
+    em = os.environ if env is None else env
+    if colima_dir is not None:
+        home_path = colima_dir
+    else:
+        raw_home = (em.get("COLIMA_HOME") or "").strip()
+        home_path = Path(raw_home).expanduser() if raw_home else (Path.home() / ".colima")
+
+    if colima_profile is not None and str(colima_profile).strip():
+        return home_path, str(colima_profile).strip()
+    env_prof = (em.get("COLIMA_PROFILE") or "").strip()
+    if env_prof:
+        return home_path, env_prof
+
+    runner = run_fn if run_fn is not None else subprocess.run
+    sub_env = dict(os.environ)
+    for k, v in em.items():
+        sub_env[str(k)] = str(v)
+    sub_env["COLIMA_HOME"] = str(home_path)
+
+    running_profiles: list[str] = []
+    try:
+        proc = runner(
+            ["colima", "list", "--json"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_s,
+            env=sub_env,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            for line in proc.stdout.splitlines():
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and str(entry.get("status") or "").strip().lower() == "running":
+                    name = str(entry.get("name") or "").strip()
+                    if name:
+                        running_profiles.append(name)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    if running_profiles:
+        docker_host = (em.get("DOCKER_HOST") or "").strip()
+        if docker_host:
+            for prof in running_profiles:
+                if f"/{prof}/docker.sock" in docker_host:
+                    return home_path, prof
+        if "default" in running_profiles:
+            return home_path, "default"
+        return home_path, running_profiles[0]
+
+    return home_path, "default"
 
 
 def parse_df_available_bytes(df_stdout: str) -> int | None:
@@ -1160,17 +1256,26 @@ def parse_df_available_bytes(df_stdout: str) -> int | None:
 
 def _probe_colima_docker_free_bytes(
     *,
+    colima_home: Path | None = None,
+    profile: str = "default",
+    env: Mapping[str, str] | None = None,
     run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     timeout_s: float = 15.0,
 ) -> int | None:
-    """Query free space inside Colima's ``/var/lib/docker`` with a bounded timeout."""
+    """Query free space inside the active Colima profile's ``/var/lib/docker`` with a bounded timeout."""
+    prof = (profile or "default").strip() or "default"
+    cmd = ["colima", "ssh", "--profile", prof, "--", "df", "-Pk", "/var/lib/docker"]
+    sub_env = dict(os.environ if env is None else env)
+    if colima_home is not None:
+        sub_env["COLIMA_HOME"] = str(colima_home)
     try:
         proc = run_fn(
-            ["colima", "ssh", "--", "df", "-Pk", "/var/lib/docker"],
+            cmd,
             capture_output=True,
             text=True,
             check=False,
             timeout=timeout_s,
+            env=sub_env,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -1185,6 +1290,7 @@ def preflight_disk_space(
     internal_root: Path = Path("/"),
     colima_dir: Path | None = None,
     colima_profile: str | None = None,
+    env: Mapping[str, str] | None = None,
     min_external_gb: int = PREFLIGHT_EXT_SSD_MIN_GB,
     min_internal_gb: int = PREFLIGHT_INTERNAL_ROOT_MIN_GB,
     min_colima_docker_gb: int = PREFLIGHT_COLIMA_DOCKER_MIN_GB,
@@ -1193,34 +1299,36 @@ def preflight_disk_space(
     realpath_fn: Callable[[str], str] = os.path.realpath,
     stat_fn: Callable[[Path], Any] = os.stat,
     colima_docker_free_bytes_fn: Callable[[], int | None] | None = None,
+    colima_run_fn: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> PreflightDiskReport:
     """Run §2.1 Step 0 preflight gates before any write/migration starts.
 
     Gates:
-    1. ``realpath ~/.colima`` AND the active Colima profile's virtual disk file(s) must reside
-       on the mounted external volume with matching device ID (``st_dev``).
+    1. Active Colima home (respecting ``COLIMA_HOME``) AND the active Colima profile's
+       actual virtual disk file(s) must exist and reside on the mounted external volume
+       with matching device ID (``st_dev``). Fails closed if no virtual disk file is found.
     2. External volume free space >= ``min_external_gb`` (default 150 GB).
     3. Host internal root ``/`` free space >= ``min_internal_gb`` (default 10 GB).
-    4. Colima ``/var/lib/docker`` free space >= ``min_colima_docker_gb`` (default 55 GB).
+    4. Active Colima profile's ``/var/lib/docker`` free space >= ``min_colima_docker_gb`` (default 55 GB).
     """
-    colima_target = colima_dir if colima_dir is not None else (Path.home() / ".colima")
-    active_profile = (
-        colima_profile
-        if colima_profile is not None
-        else (os.getenv("COLIMA_PROFILE") or "default")
+    colima_target, active_profile = resolve_active_colima_config(
+        colima_dir=colima_dir,
+        colima_profile=colima_profile,
+        env=env,
+        run_fn=colima_run_fn,
     )
     resolved_colima = Path(realpath_fn(str(colima_target)))
     checks: list[PreflightDiskCheckItem] = []
 
-    # Gate 0: Colima root AND active profile virtual disk file(s) must be on the external mount's st_dev
+    # Gate 0: Colima root AND active profile virtual disk file(s) must exist on external mount's st_dev
     if not colima_target.exists() and not colima_target.is_symlink():
         checks.append(
             PreflightDiskCheckItem(
                 name="colima_location",
                 ok=False,
                 detail=(
-                    f"Colima path {colima_target} does not exist; verify Colima is installed "
-                    f"and located on external volume {external_mount_root}"
+                    f"Colima path {colima_target} (profile={active_profile}) does not exist; "
+                    f"verify Colima is installed and located on external volume {external_mount_root}"
                 ),
             )
         )
@@ -1232,8 +1340,10 @@ def preflight_disk_space(
                 is_mount_fn=is_mount_fn,
                 stat_fn=stat_fn,
             )
-            disk_paths = _discover_colima_disk_paths(resolved_colima, profile=active_profile)
-            verified_disks: list[str] = []
+            disk_paths, disk_files = _discover_colima_disk_paths(
+                resolved_colima, profile=active_profile
+            )
+            verified_paths: list[str] = []
             for dp in disk_paths:
                 resolved_dp = Path(realpath_fn(str(dp)))
                 verify_external_mount(
@@ -1242,27 +1352,40 @@ def preflight_disk_space(
                     is_mount_fn=is_mount_fn,
                     stat_fn=stat_fn,
                 )
-                verified_disks.append(str(resolved_dp))
-            disk_note = f"; checked {len(verified_disks)} disk/lima path(s)" if verified_disks else ""
-            checks.append(
-                PreflightDiskCheckItem(
-                    name="colima_location",
-                    ok=True,
-                    detail=(
-                        f"{colima_target} -> {resolved_colima} is on external volume "
-                        f"{external_mount_root}{disk_note}"
-                    ),
+                verified_paths.append(str(resolved_dp))
+            if not disk_files:
+                checks.append(
+                    PreflightDiskCheckItem(
+                        name="colima_location",
+                        ok=False,
+                        detail=(
+                            f"No Colima virtual disk file (diffdisk/basedisk/datadisk/*.img/*.qcow2/*.raw) "
+                            f"found under {resolved_colima} for active profile {active_profile!r}; "
+                            "cannot verify virtual disk placement on external volume"
+                        ),
+                    )
                 )
-            )
+            else:
+                checks.append(
+                    PreflightDiskCheckItem(
+                        name="colima_location",
+                        ok=True,
+                        detail=(
+                            f"{colima_target} -> {resolved_colima} (profile={active_profile}) is on "
+                            f"external volume {external_mount_root}; verified {len(disk_files)} "
+                            f"disk file(s) across {len(verified_paths)} path(s)"
+                        ),
+                    )
+                )
         except MountCheckError as exc:
             checks.append(
                 PreflightDiskCheckItem(
                     name="colima_location",
                     ok=False,
                     detail=(
-                        f"Colima virtual disk ({colima_target} -> {resolved_colima}) is not on "
-                        f"external volume {external_mount_root} (likely on internal disk '/'): {exc}. "
-                        "Move ~/.colima and its active disk files to the external SSD before proceeding."
+                        f"Colima virtual disk ({colima_target} -> {resolved_colima}, profile={active_profile}) "
+                        f"is not on external volume {external_mount_root} (likely on internal disk '/'): {exc}. "
+                        "Move Colima home and its active disk files to the external SSD before proceeding."
                     ),
                 )
             )
@@ -1327,10 +1450,17 @@ def preflight_disk_space(
             )
         )
 
-    # Gate 3: Colima /var/lib/docker >= 55 GB
+    # Gate 3: Active Colima profile's /var/lib/docker >= 55 GB (using the SAME resolved Colima config)
     req_colima = int(min_colima_docker_gb) * _BYTES_PER_GB
-    probe_fn = colima_docker_free_bytes_fn or _probe_colima_docker_free_bytes
-    colima_free = probe_fn()
+    if colima_docker_free_bytes_fn is not None:
+        colima_free = colima_docker_free_bytes_fn()
+    else:
+        colima_free = _probe_colima_docker_free_bytes(
+            colima_home=colima_target,
+            profile=active_profile,
+            env=env,
+            run_fn=colima_run_fn if colima_run_fn is not None else subprocess.run,
+        )
     if colima_free is None:
         checks.append(
             PreflightDiskCheckItem(
@@ -1957,6 +2087,7 @@ def _cmd_preflight_disk_space(args: argparse.Namespace) -> int:
         external_mount_root=Path(args.mount_root),
         internal_root=Path(args.internal_root),
         colima_dir=Path(args.colima_dir) if args.colima_dir else None,
+        colima_profile=args.colima_profile or None,
         min_external_gb=int(args.min_external_gb),
         min_internal_gb=int(args.min_internal_gb),
         min_colima_docker_gb=int(args.min_colima_gb),
@@ -2236,6 +2367,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_preflight.add_argument("--mount-root", default="/Volumes/EveSSD")
     p_preflight.add_argument("--internal-root", default="/")
     p_preflight.add_argument("--colima-dir", default="")
+    p_preflight.add_argument("--colima-profile", default="")
     p_preflight.add_argument("--min-external-gb", type=int, default=PREFLIGHT_EXT_SSD_MIN_GB)
     p_preflight.add_argument("--min-internal-gb", type=int, default=PREFLIGHT_INTERNAL_ROOT_MIN_GB)
     p_preflight.add_argument("--min-colima-gb", type=int, default=PREFLIGHT_COLIMA_DOCKER_MIN_GB)

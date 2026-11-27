@@ -200,6 +200,20 @@ def _baseline_date_dir(baseline_id: str) -> str:
     return m.group(1) if m else str(baseline_id or "").strip().rstrip("/")
 
 
+def weekly_baseline_manifest_filename(baseline_id: str) -> str:
+    """Return the immutable per-baseline remote checksum manifest filename."""
+    clean = str(baseline_id or "").strip().rstrip("/")
+    return f"baseline-{clean}.json" if clean else ""
+
+
+def weekly_baseline_manifest_relpath(baseline_id: str) -> str:
+    """Return the immutable remote path ``weekly/<YYYY-MM-DD>/baseline-<baseline_id>.json``."""
+    clean = str(baseline_id or "").strip().rstrip("/")
+    if not clean:
+        return ""
+    return f"weekly/{_baseline_date_dir(clean)}/{weekly_baseline_manifest_filename(clean)}"
+
+
 def select_weekly_baselines_to_prune(
     weekly_dirs: Iterable[str],
     *,
@@ -233,6 +247,8 @@ def build_daily_latest_json(
         "backup_set_id": backup_set_id,
         "baseline_id": baseline_id,
         "baseline_dir": _baseline_date_dir(baseline_id) if baseline_id else "",
+        "baseline_manifest": weekly_baseline_manifest_filename(baseline_id),
+        "baseline_manifest_path": weekly_baseline_manifest_relpath(baseline_id),
         "artifacts": {k: dict(v) for k, v in artifacts.items()},
     }
 
@@ -245,12 +261,14 @@ def build_weekly_latest_json(
     minio_mode: str,
     artifacts: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Build the authoritative ``weekly/<YYYY-MM-DD>/LATEST.json`` manifest published after full verification."""
+    """Build the authoritative weekly checksum manifest published per ``baseline_id`` and as ``LATEST.json``."""
     return {
         "version": 2,
         "run_id": run_id,
         "date": date_stamp,
         "baseline_id": baseline_id,
+        "baseline_manifest": weekly_baseline_manifest_filename(baseline_id),
+        "baseline_manifest_path": weekly_baseline_manifest_relpath(baseline_id),
         "minio_mode": minio_mode,
         "artifacts": {k: dict(v) for k, v in artifacts.items()},
     }
@@ -282,6 +300,8 @@ def publish_weekly_baseline_pointer(
         "version": 2,
         "baseline_id": baseline_id,
         "baseline_dir": _baseline_date_dir(baseline_id),
+        "baseline_manifest": weekly_baseline_manifest_filename(baseline_id),
+        "baseline_manifest_path": weekly_baseline_manifest_relpath(baseline_id),
         "manifest_path": str(final_manifest),
         "object_count": len(data["objects"]),
         "published_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),

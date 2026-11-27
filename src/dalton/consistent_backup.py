@@ -27,6 +27,7 @@ import asyncio
 import dataclasses
 import datetime as dt
 import hashlib
+import inspect
 import io
 import json
 import logging
@@ -34,8 +35,10 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import tarfile
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
@@ -563,10 +566,17 @@ async def wait_pg_dump_imported(
     """Wait until ``pg_dump -Fc --snapshot=...`` starts emitting output (snapshot imported) or finishes."""
     deadline = time.monotonic() + max(0.05, float(timeout_s))
     while True:
+        if proc.closed:
+            raise BackupTimeoutError(f"{proc.cmd_label} was terminated while waiting to import snapshot")
         rc = proc.popen.poll()
         if rc is not None:
             if rc != 0:
-                err_bytes = proc.popen.stderr.read() if proc.popen.stderr is not None else b""
+                err_bytes = b""
+                if proc.popen.stderr is not None:
+                    try:
+                        err_bytes = proc.popen.stderr.read()
+                    except (OSError, ValueError):
+                        err_bytes = b""
                 terminate_pg_dump_process(proc)
                 err = err_bytes.decode("utf-8", errors="replace").strip()
                 raise ConsistentBackupError(
@@ -595,9 +605,16 @@ async def wait_pg_dump_finished(
     """Wait for ``pg_dump`` to finish within ``timeout_s``; terminate and raise on timeout or failure."""
     deadline = time.monotonic() + max(0.05, float(timeout_s))
     while True:
+        if proc.closed:
+            raise BackupTimeoutError(f"{proc.cmd_label} was terminated before completing dump")
         rc = proc.popen.poll()
         if rc is not None:
-            err_bytes = proc.popen.stderr.read() if proc.popen.stderr is not None else b""
+            err_bytes = b""
+            if proc.popen.stderr is not None:
+                try:
+                    err_bytes = proc.popen.stderr.read()
+                except (OSError, ValueError):
+                    err_bytes = b""
             try:
                 proc.out_fh.flush()
             except Exception:
@@ -704,16 +721,17 @@ def _parse_last_modified(val: Any) -> float:
 
 
 def detect_bucket_versioning(s3_client: Any, bucket: str) -> bool:
-    """Return True when S3 ``get_bucket_versioning`` reports ``Status == 'Enabled'``."""
+    """Return True when S3 ``get_bucket_versioning`` reports ``Status == 'Enabled'``.
+
+    Fails closed on any S3/network error rather than misclassifying a versioned bucket
+    as unversioned.
+    """
     try:
         resp = s3_client.get_bucket_versioning(Bucket=bucket)
     except Exception as exc:
-        logger.warning(
-            "get_bucket_versioning failed for bucket %s (%s); treating as unversioned",
-            bucket,
-            type(exc).__name__,
-        )
-        return False
+        raise ConsistentBackupError(
+            f"Failed probing bucket versioning for {bucket!r} ({type(exc).__name__}): {exc}"
+        ) from exc
     status = str((resp or {}).get("Status") or "").strip()
     return status == "Enabled"
 
@@ -961,6 +979,8 @@ def archive_terminal_asr_jobs(
     asr_jobs_dir: Path,
     terminal_job_ids: Sequence[str],
     output_path: Path,
+    *,
+    deadline: float | None = None,
 ) -> AsrArchiveSummary:
     """Package ONLY terminal snapshot ASR job directories + top-level ``asr_usage.jsonl``.
 
@@ -975,12 +995,16 @@ def archive_terminal_asr_jobs(
 
     try:
         with tarfile.open(tmp_path, "w:gz") as tf:
+            if deadline is not None:
+                _remaining_or_raise(deadline, "archive_terminal_asr_jobs")
             usage_file = asr_jobs_dir / "asr_usage.jsonl"
             if usage_file.is_file() and not usage_file.is_symlink():
                 tf.add(usage_file, arcname="asr_usage.jsonl", recursive=False)
                 included_usage = True
 
             for raw_id in sorted(set(terminal_job_ids)):
+                if deadline is not None:
+                    _remaining_or_raise(deadline, "archive_terminal_asr_jobs")
                 job_id = str(raw_id or "").strip()
                 if not _SAFE_JOB_ID_RE.fullmatch(job_id):
                     continue
@@ -1022,6 +1046,8 @@ def archive_terminal_asr_jobs(
                     )
                     root_path = Path(root)
                     for fname in sorted(files):
+                        if deadline is not None:
+                            _remaining_or_raise(deadline, "archive_terminal_asr_jobs")
                         if _is_excluded_asr_file(fname):
                             continue
                         fpath = root_path / fname
@@ -1034,6 +1060,8 @@ def archive_terminal_asr_jobs(
         total_size = 0
         with tmp_path.open("rb") as fh:
             while True:
+                if deadline is not None:
+                    _remaining_or_raise(deadline, "archive_terminal_asr_jobs_hash")
                 chunk = fh.read(STREAM_CHUNK_BYTES)
                 if not chunk:
                     break
@@ -1050,6 +1078,160 @@ def archive_terminal_asr_jobs(
     finally:
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@dataclasses.dataclass
+class AsrArchiveProcess:
+    """Managed subprocess running ``archive-asr-jobs`` in its own process group."""
+
+    popen: subprocess.Popen[bytes]
+    ids_path: Path
+    output_path: Path
+    closed: bool = False
+
+
+def _build_asr_archive_cmd(
+    asr_jobs_dir: Path,
+    ids_path: Path,
+    output_path: Path,
+) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "src.dalton.consistent_backup",
+        "archive-asr-jobs",
+        "--asr-jobs-dir",
+        str(asr_jobs_dir),
+        "--job-ids-json",
+        str(ids_path),
+        "--output",
+        str(output_path),
+    ]
+
+
+def start_asr_archive_process(
+    asr_jobs_dir: Path,
+    terminal_job_ids: Sequence[str],
+    output_path: Path,
+) -> AsrArchiveProcess:
+    """Spawn ``archive-asr-jobs`` in its own session/process group so watchdog can kill it on timeout."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, ids_name = tempfile.mkstemp(prefix=".asr-job-ids-", suffix=".json", dir=str(output_path.parent))
+    ids_path = Path(ids_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"terminal_asr_job_ids": list(terminal_job_ids)}, fh)
+        sub_env = dict(os.environ)
+        existing_pp = sub_env.get("PYTHONPATH") or ""
+        root_str = str(_REPO_ROOT)
+        if root_str not in existing_pp.split(os.pathsep):
+            sub_env["PYTHONPATH"] = f"{root_str}{os.pathsep}{existing_pp}" if existing_pp else root_str
+        cmd = _build_asr_archive_cmd(asr_jobs_dir, ids_path, output_path)
+        popen = subprocess.Popen(
+            cmd,
+            cwd=root_str,
+            env=sub_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except Exception:
+        ids_path.unlink(missing_ok=True)
+        raise
+    return AsrArchiveProcess(popen=popen, ids_path=ids_path, output_path=output_path)
+
+
+def terminate_asr_archive_process(proc: AsrArchiveProcess) -> None:
+    """Terminate the ASR archive subprocess (and its process group) and clean up temp files."""
+    if proc.closed:
+        return
+    try:
+        if proc.popen.poll() is None:
+            try:
+                os.killpg(proc.popen.pid, signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                try:
+                    proc.popen.terminate()
+                except OSError:
+                    pass
+            try:
+                proc.popen.wait(timeout=1.5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.popen.pid, signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    try:
+                        proc.popen.kill()
+                    except OSError:
+                        pass
+                try:
+                    proc.popen.wait(timeout=1.5)
+                except subprocess.TimeoutExpired:
+                    pass
+    finally:
+        for pipe in (proc.popen.stdout, proc.popen.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+        proc.ids_path.unlink(missing_ok=True)
+        proc.closed = True
+
+
+async def wait_asr_archive_finished(
+    proc: AsrArchiveProcess,
+    *,
+    deadline: float,
+    poll_interval_s: float = 0.05,
+) -> AsrArchiveSummary:
+    """Wait for the ASR archive subprocess within ``deadline`` and return its parsed summary."""
+    while True:
+        if proc.closed:
+            raise BackupTimeoutError("archive-asr-jobs was terminated by lock-phase watchdog")
+        rc = proc.popen.poll()
+        if rc is not None:
+            if proc.closed or time.monotonic() >= deadline:
+                terminate_asr_archive_process(proc)
+                raise BackupTimeoutError("archive-asr-jobs exceeded lock-phase hard deadline")
+            out_bytes = b""
+            err_bytes = b""
+            if proc.popen.stdout is not None:
+                try:
+                    out_bytes = proc.popen.stdout.read()
+                except (OSError, ValueError):
+                    out_bytes = b""
+            if proc.popen.stderr is not None:
+                try:
+                    err_bytes = proc.popen.stderr.read()
+                except (OSError, ValueError):
+                    err_bytes = b""
+            terminate_asr_archive_process(proc)
+            if rc != 0:
+                err = err_bytes.decode("utf-8", errors="replace").strip()
+                raise ConsistentBackupError(
+                    f"archive-asr-jobs subprocess failed (rc={rc}): {err}"
+                )
+            try:
+                payload = json.loads(out_bytes.decode("utf-8"))
+            except Exception as exc:
+                raise ConsistentBackupError(
+                    f"archive-asr-jobs returned invalid JSON summary: {exc}"
+                ) from exc
+            return AsrArchiveSummary(
+                archive_path=Path(payload["archive_path"]),
+                size_bytes=int(payload["size_bytes"]),
+                sha256=str(payload["sha256"]),
+                included_job_ids=tuple(str(x) for x in (payload.get("included_job_ids") or ())),
+                included_usage_ledger=bool(payload.get("included_usage_ledger")),
+            )
+        if time.monotonic() >= deadline:
+            terminate_asr_archive_process(proc)
+            raise BackupTimeoutError("archive-asr-jobs exceeded lock-phase hard deadline")
+        await asyncio.sleep(poll_interval_s)
 
 
 # ---------------------------------------------------------------------------
@@ -1090,10 +1272,18 @@ class MirrorPoolSink:
         self,
         s3_client: Any,
         item: SelectedObjectVersion,
+        *,
+        deadline: float | None = None,
+        on_stream_open: Callable[[Any], None] | None = None,
+        on_stream_close: Callable[[Any], None] | None = None,
     ) -> ArchivedObjectRecord:
+        if deadline is not None:
+            _remaining_or_raise(deadline, f"get_object({item.bucket}/{item.key})")
         body, content_type = _fetch_s3_object_stream(
             s3_client, item.bucket, item.key, item.version_id
         )
+        if on_stream_open is not None:
+            on_stream_open(body)
         hasher = hashlib.sha256()
         total = 0
         fd, tmp_name = tempfile.mkstemp(prefix="obj-", dir=str(self.tmp_dir))
@@ -1102,16 +1292,24 @@ class MirrorPoolSink:
             with os.fdopen(fd, "wb") as out_fh:
                 try:
                     while True:
+                        if deadline is not None:
+                            _remaining_or_raise(deadline, f"read_object({item.bucket}/{item.key})")
                         chunk = body.read(STREAM_CHUNK_BYTES)
+                        if deadline is not None:
+                            _remaining_or_raise(deadline, f"read_object({item.bucket}/{item.key})")
                         if not chunk:
                             break
                         total += len(chunk)
                         hasher.update(chunk)
                         out_fh.write(chunk)
                 finally:
+                    if on_stream_close is not None:
+                        on_stream_close(body)
                     close_fn = getattr(body, "close", None)
                     if callable(close_fn):
                         close_fn()
+            if deadline is not None:
+                _remaining_or_raise(deadline, f"install_object({item.bucket}/{item.key})")
             digest = hasher.hexdigest()
             dst = self.object_path(digest)
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1162,10 +1360,18 @@ class TarGzObjectSink:
         self,
         s3_client: Any,
         item: SelectedObjectVersion,
+        *,
+        deadline: float | None = None,
+        on_stream_open: Callable[[Any], None] | None = None,
+        on_stream_close: Callable[[Any], None] | None = None,
     ) -> ArchivedObjectRecord:
+        if deadline is not None:
+            _remaining_or_raise(deadline, f"get_object({item.bucket}/{item.key})")
         body, content_type = _fetch_s3_object_stream(
             s3_client, item.bucket, item.key, item.version_id
         )
+        if on_stream_open is not None:
+            on_stream_open(body)
         hasher = hashlib.sha256()
         total = 0
         tmp_obj = self._stage_dir / f"obj-{len(self.records)}.bin"
@@ -1173,16 +1379,24 @@ class TarGzObjectSink:
             with tmp_obj.open("wb") as out_fh:
                 try:
                     while True:
+                        if deadline is not None:
+                            _remaining_or_raise(deadline, f"read_object({item.bucket}/{item.key})")
                         chunk = body.read(STREAM_CHUNK_BYTES)
+                        if deadline is not None:
+                            _remaining_or_raise(deadline, f"read_object({item.bucket}/{item.key})")
                         if not chunk:
                             break
                         total += len(chunk)
                         hasher.update(chunk)
                         out_fh.write(chunk)
                 finally:
+                    if on_stream_close is not None:
+                        on_stream_close(body)
                     close_fn = getattr(body, "close", None)
                     if callable(close_fn):
                         close_fn()
+            if deadline is not None:
+                _remaining_or_raise(deadline, f"tar_add({item.bucket}/{item.key})")
             digest = hasher.hexdigest()
             arcname = f"objects/{item.bucket}/{item.key.lstrip('/')}"
             info = tarfile.TarInfo(name=arcname)
@@ -1263,8 +1477,201 @@ class TarGzObjectSink:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end Step 1-4 orchestrator
+# End-to-end Step 1-4 orchestrator & independent lock-phase watchdog
 # ---------------------------------------------------------------------------
+
+
+def _run_in_daemon_thread(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> asyncio.Future[Any]:
+    """Run blocking ``fn`` in a daemon thread so watchdog cancellation never stalls ``asyncio.run`` teardown."""
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[Any] = loop.create_future()
+
+    def _worker() -> None:
+        try:
+            res = fn(*args, **kwargs)
+        except BaseException as exc:
+            if not fut.done() and not loop.is_closed():
+                loop.call_soon_threadsafe(lambda e=exc: None if fut.done() else fut.set_exception(e))
+        else:
+            if not fut.done() and not loop.is_closed():
+                loop.call_soon_threadsafe(lambda r=res: None if fut.done() else fut.set_result(r))
+
+    threading.Thread(
+        target=_worker,
+        name=f"consistent-backup-io-{getattr(fn, '__name__', 'call')}",
+        daemon=True,
+    ).start()
+    return fut
+
+
+def _force_close_db_connection(conn: Any, loop: asyncio.AbstractEventLoop | None) -> None:
+    """Best-effort immediate closure of the DB control session from the watchdog thread.
+
+    Drops both GC session advisory locks and aborts any open snapshot transaction at
+    PostgreSQL immediately, even if the main or worker thread is stalled in I/O.
+    """
+    pgconn = getattr(conn, "pgconn", None)
+    if pgconn is not None:
+        cancel_fn = getattr(pgconn, "cancel", None)
+        if callable(cancel_fn):
+            try:
+                cancel_fn()
+            except Exception:
+                pass
+        finish_fn = getattr(pgconn, "finish", None)
+        if callable(finish_fn):
+            try:
+                finish_fn()
+            except Exception:
+                pass
+
+    force_close = getattr(conn, "force_close", None)
+    if callable(force_close):
+        try:
+            force_close()
+        except Exception:
+            pass
+
+    close_fn = getattr(conn, "close", None)
+    if not callable(close_fn):
+        return
+    if inspect.iscoroutinefunction(close_fn):
+        if loop is not None and loop.is_running():
+            try:
+                fut = asyncio.run_coroutine_threadsafe(close_fn(), loop)
+                fut.result(timeout=2.0)
+            except Exception:
+                pass
+    else:
+        try:
+            res = close_fn()
+            if asyncio.iscoroutine(res):
+                if loop is not None and loop.is_running():
+                    try:
+                        fut = asyncio.run_coroutine_threadsafe(res, loop)
+                        fut.result(timeout=2.0)
+                    except Exception:
+                        pass
+                else:
+                    res.close()
+        except Exception:
+            pass
+
+
+class _LockPhaseWatchdog:
+    """Independent daemon thread enforcing the hard GC lock-phase deadline.
+
+    On timeout, immediately:
+    1. Terminates active ``pg_dump`` and ASR archive process groups.
+    2. Closes any active S3 response streams so stalled reads unblock.
+    3. Closes the PostgreSQL control session (dropping both GC advisory locks).
+    4. Cancels the asyncio lock-phase task so ``run_consistent_backup`` raises
+       :class:`BackupTimeoutError` promptly without waiting for blocked I/O.
+    """
+
+    def __init__(
+        self,
+        *,
+        deadline: float,
+        conn: Any,
+        loop: asyncio.AbstractEventLoop,
+        task: asyncio.Task[Any],
+    ) -> None:
+        self._deadline = deadline
+        self._conn = conn
+        self._loop = loop
+        self._task = task
+        self._mu = threading.Lock()
+        self._stop_event = threading.Event()
+        self._disarmed = False
+        self._phase = "lock_phase"
+        self._dump_terminator: Callable[[], None] | None = None
+        self._asr_terminator: Callable[[], None] | None = None
+        self._active_streams: list[Any] = []
+        self.timed_out = False
+        self.timeout_phase = "lock_phase"
+        self.db_closed_by_watchdog = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="consistent-backup-lock-watchdog",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def set_phase(self, phase: str) -> None:
+        with self._mu:
+            self._phase = phase
+
+    def set_dump_terminator(self, fn: Callable[[], None] | None) -> None:
+        with self._mu:
+            self._dump_terminator = fn
+
+    def set_asr_terminator(self, fn: Callable[[], None] | None) -> None:
+        with self._mu:
+            self._asr_terminator = fn
+
+    def register_stream(self, body: Any) -> None:
+        with self._mu:
+            self._active_streams.append(body)
+
+    def unregister_stream(self, body: Any) -> None:
+        with self._mu:
+            try:
+                self._active_streams.remove(body)
+            except ValueError:
+                pass
+
+    def disarm(self) -> None:
+        with self._mu:
+            self._disarmed = True
+        self._stop_event.set()
+        if self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        rem = self._deadline - time.monotonic()
+        if rem > 0:
+            self._stop_event.wait(timeout=rem)
+        with self._mu:
+            if self._disarmed:
+                return
+            self.timed_out = True
+            self.timeout_phase = self._phase
+            dump_term = self._dump_terminator
+            asr_term = self._asr_terminator
+            streams = list(self._active_streams)
+            task = self._task
+
+        logger.error(
+            "Consistent backup lock-phase watchdog expired during %s; closing DB session and killing child process groups",
+            self.timeout_phase,
+        )
+        if dump_term is not None:
+            try:
+                dump_term()
+            except Exception as exc:
+                logger.warning("Watchdog failed terminating pg_dump: %s", exc)
+        if asr_term is not None:
+            try:
+                asr_term()
+            except Exception as exc:
+                logger.warning("Watchdog failed terminating ASR archiver: %s", exc)
+        for body in streams:
+            close_fn = getattr(body, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+        _force_close_db_connection(self._conn, self._loop)
+        self.db_closed_by_watchdog = True
+        if self._loop.is_running():
+            try:
+                self._loop.call_soon_threadsafe(task.cancel)
+            except Exception:
+                pass
 
 
 async def run_consistent_backup(
@@ -1289,17 +1696,19 @@ async def run_consistent_backup(
 ) -> ConsistentBackupResult:
     """Execute the full §3.1 Steps 1-4 consistent backup protocol with hard deadlines.
 
-    - Enforces configurable hard deadlines on the entire GC lock-holding phase (default 2h),
-      ``pg_dump`` (default 2h), snapshot import (default 120s), and full-bucket mirroring
-      (separate default 4h).
+    - Enforces configurable hard deadlines on the entire GC lock-holding phase (default 2h)
+      via an independent watchdog thread that closes the DB control session and terminates
+      ``pg_dump`` and ASR archive process groups on expiry.
+    - Also enforces hard deadlines on ``pg_dump`` (default 2h), snapshot import (default 120s),
+      and full-bucket mirroring (separate default 4h).
     - Commits the ``REPEATABLE READ`` snapshot export transaction immediately after
       ``pg_dump`` imports the snapshot and ``enumerate_snapshot_refs`` finishes.
     - Enumerates ALL DB references independently of ``bucket_specs`` and fails loudly if
       the DB contains references for a bucket role without configured storage.
     - Releases both GC advisory locks before full-bucket versioned mirroring (or keeps
       them through unversioned bucket downloads, still capped by ``lock_phase_timeout_s``).
-    - On timeout or error: terminates ``pg_dump``, rolls back any open snapshot txn,
-      releases both GC advisory locks, and propagates the exception.
+    - On timeout or error: terminates ``pg_dump`` & ASR archiver, rolls back any open snapshot
+      txn, releases both GC advisory locks (or closes the control session), and propagates.
     """
     eff_lock_timeout = (
         float(lock_phase_timeout_s)
@@ -1327,10 +1736,15 @@ async def run_consistent_backup(
     warnings: list[str] = []
     dump_handle: Any = None
     dump_finished = False
+    asr_proc: AsrArchiveProcess | None = None
+    watchdog: _LockPhaseWatchdog | None = None
 
     async def _release_locks_now() -> None:
         nonlocal locks_held
         if not locks_held:
+            return
+        if watchdog is not None and watchdog.db_closed_by_watchdog:
+            locks_held = False
             return
         try:
             await asyncio.wait_for(release_gc_advisory_locks(conn), timeout=10.0)
@@ -1350,13 +1764,40 @@ async def run_consistent_backup(
             except Exception as exc:
                 logger.warning("Failed terminating pg_dump handle: %s", exc)
 
-    try:
+    def _terminate_asr_if_running() -> None:
+        if asr_proc is not None and not asr_proc.closed:
+            terminate_asr_archive_process(asr_proc)
+
+    async def _run_lock_phase() -> tuple[
+        str,
+        SnapshotRefInventory,
+        dict[str, tuple[str, str]],
+        list[tuple[BucketArchiveSpec, VersionSelectionResult]],
+        AsrArchiveSummary | None,
+    ]:
+        nonlocal locks_held, snapshot_open, dump_handle, dump_finished, asr_proc, watchdog
+
+        loop = asyncio.get_running_loop()
+        current_task = asyncio.current_task()
+        assert current_task is not None
+
         # Step 1: hold both GC session advisory locks (bounded lock_timeout)
         await acquire_gc_advisory_locks(conn, lock_timeout=lock_timeout)
         locks_held = True
         lock_deadline = time.monotonic() + max(0.05, eff_lock_timeout)
 
+        watchdog = _LockPhaseWatchdog(
+            deadline=lock_deadline,
+            conn=conn,
+            loop=loop,
+            task=current_task,
+        )
+        watchdog.set_dump_terminator(_terminate_dump_if_running)
+        watchdog.set_asr_terminator(_terminate_asr_if_running)
+        watchdog.start()
+
         # Step 2: REPEATABLE READ READ ONLY + pg_export_snapshot()
+        watchdog.set_phase("begin_exported_snapshot")
         snapshot_id = await asyncio.wait_for(
             begin_exported_snapshot(conn),
             timeout=_remaining_or_raise(lock_deadline, "begin_exported_snapshot"),
@@ -1364,6 +1805,7 @@ async def run_consistent_backup(
         snapshot_open = True
 
         # Enumerate ALL live DB references unconditionally (independent of bucket_specs)
+        watchdog.set_phase("enumerate_snapshot_refs")
         inventory = await asyncio.wait_for(
             enumerate_snapshot_refs(
                 conn,
@@ -1384,6 +1826,7 @@ async def run_consistent_backup(
                 raise MissingBucketConfigError(role, count)
 
         # Start pg_dump --snapshot=<snapshot_id> while the snapshot txn is still open
+        watchdog.set_phase("pg_dump_start")
         dump_deadline = time.monotonic() + max(0.05, eff_dump_timeout)
         dump_res = pg_dump_fn(snapshot_id, pg_dump_path)
         if asyncio.iscoroutine(dump_res):
@@ -1399,6 +1842,7 @@ async def run_consistent_backup(
             dump_handle = dump_res
 
         # Wait ONLY until pg_dump has imported the snapshot, then immediately COMMIT export txn
+        watchdog.set_phase("wait_pg_dump_imported")
         if wait_pg_dump_imported_fn is not None:
             rem = min(
                 eff_import_timeout,
@@ -1423,6 +1867,7 @@ async def run_consistent_backup(
             dump_finished = True
 
         # Snapshot imported & refs enumerated -> COMMIT snapshot txn immediately (locks stay held)
+        watchdog.set_phase("commit_exported_snapshot")
         await asyncio.wait_for(
             commit_exported_snapshot(conn),
             timeout=_remaining_or_raise(lock_deadline, "commit_exported_snapshot"),
@@ -1430,6 +1875,7 @@ async def run_consistent_backup(
         snapshot_open = False
 
         if after_snapshot_commit_hook is not None:
+            watchdog.set_phase("after_snapshot_commit_hook")
             hook_res = after_snapshot_commit_hook(snapshot_id, inventory)
             if asyncio.iscoroutine(hook_res):
                 await asyncio.wait_for(
@@ -1438,6 +1884,7 @@ async def run_consistent_backup(
                 )
 
         # Step 3a: list_object_versions per bucket & select versions under the two rules
+        # Run blocking S3 calls in worker threads so the asyncio loop stays responsive to the watchdog.
         keys_by_role = inventory.keys_by_bucket_role()
         bucket_targets: dict[str, tuple[str, str]] = {}
         selections: list[tuple[BucketArchiveSpec, VersionSelectionResult]] = []
@@ -1450,20 +1897,27 @@ async def run_consistent_backup(
                 for logical_key in keys_by_role.get(role, ()):
                     snap_keys_for_bucket.add(_apply_bucket_prefix(logical_key, spec.key_prefix))
 
-            ver_enabled = (
-                spec.versioning_enabled
-                if spec.versioning_enabled is not None
-                else detect_bucket_versioning(spec.s3_client, spec.bucket)
-            )
+            if spec.versioning_enabled is not None:
+                ver_enabled = spec.versioning_enabled
+            else:
+                watchdog.set_phase(f"detect_bucket_versioning({spec.bucket})")
+                ver_enabled = await _run_in_daemon_thread(
+                    detect_bucket_versioning, spec.s3_client, spec.bucket
+                )
+
             if ver_enabled:
-                vers, dms = list_all_object_versions(
+                watchdog.set_phase(f"list_object_versions({spec.bucket})")
+                vers, dms = await _run_in_daemon_thread(
+                    list_all_object_versions,
                     spec.s3_client,
                     spec.bucket,
                     prefix=spec.key_prefix,
                     deadline=lock_deadline,
                 )
             else:
-                vers = list_all_current_objects(
+                watchdog.set_phase(f"list_objects_v2({spec.bucket})")
+                vers = await _run_in_daemon_thread(
+                    list_all_current_objects,
                     spec.s3_client,
                     spec.bucket,
                     prefix=spec.key_prefix,
@@ -1482,17 +1936,20 @@ async def run_consistent_backup(
                 warnings.append(sel.warning)
             selections.append((spec, sel))
 
-        # Step 3b: pack terminal ASR jobs only + asr_usage.jsonl
+        # Step 3b: pack terminal ASR jobs only + asr_usage.jsonl in its own process group
         asr_summary: AsrArchiveSummary | None = None
         if asr_jobs_dir is not None and asr_archive_path is not None:
+            watchdog.set_phase("archive_terminal_asr_jobs")
             _remaining_or_raise(lock_deadline, "archive_terminal_asr_jobs")
-            asr_summary = archive_terminal_asr_jobs(
+            asr_proc = start_asr_archive_process(
                 asr_jobs_dir,
                 inventory.terminal_asr_job_ids,
                 asr_archive_path,
             )
+            asr_summary = await wait_asr_archive_finished(asr_proc, deadline=lock_deadline)
 
         # Step 4a: wait for pg_dump to finish within hard deadline
+        watchdog.set_phase("wait_pg_dump_finished")
         if wait_pg_dump_finished_fn is not None:
             rem = min(
                 _remaining_or_raise(lock_deadline, "wait_pg_dump_finished"),
@@ -1513,38 +1970,72 @@ async def run_consistent_backup(
             await wait_pg_dump_finished(dump_handle, timeout_s=rem)
             dump_finished = True
 
-        # Step 4b: fetch pinned objects.
-        # Unversioned buckets must download while GC locks are still held (bounded by lock_deadline);
-        # versioned buckets have pinned VersionIds (retained by NoncurrentVersionExpiration), so
-        # release both GC locks BEFORE full-bucket mirroring under its own separate mirror_deadline.
+        # Step 4b (unversioned only): unversioned buckets must download while GC locks are held,
+        # bounded strictly by lock_deadline (checked inside every chunk read AND enforced by watchdog).
         unversioned_selections = [(sp, sel) for sp, sel in selections if not sel.versioning_enabled]
-        versioned_selections = [(sp, sel) for sp, sel in selections if sel.versioning_enabled]
-
         for spec, sel in unversioned_selections:
             for obj in sel.selected:
+                watchdog.set_phase(f"mirror_unversioned({spec.bucket}/{obj.key})")
                 _remaining_or_raise(lock_deadline, f"mirror_unversioned({spec.bucket}/{obj.key})")
-                object_sink.archive_object(spec.s3_client, obj)
+                await _run_in_daemon_thread(
+                    object_sink.archive_object,
+                    spec.s3_client,
+                    obj,
+                    deadline=lock_deadline,
+                    on_stream_open=watchdog.register_stream,
+                    on_stream_close=watchdog.unregister_stream,
+                )
 
-        # Release both GC session advisory locks before potentially multi-hour versioned mirroring
+        # Release both GC session advisory locks & disarm watchdog before multi-hour versioned mirroring
         await _release_locks_now()
+        watchdog.disarm()
+        return snapshot_id, inventory, bucket_targets, selections, asr_summary
 
+    try:
+        lock_task = asyncio.create_task(_run_lock_phase())
+        try:
+            snapshot_id, inventory, bucket_targets, selections, asr_summary = await lock_task
+        except asyncio.CancelledError as exc:
+            if watchdog is not None and watchdog.timed_out:
+                raise BackupTimeoutError(
+                    f"Consistent backup exceeded hard lock-phase deadline during {watchdog.timeout_phase}"
+                ) from exc
+            raise
+
+        # Step 4b (versioned): locks already released; mirror pinned VersionIds under mirror_deadline
+        versioned_selections = [(sp, sel) for sp, sel in selections if sel.versioning_enabled]
         mirror_deadline = time.monotonic() + max(0.05, eff_mirror_timeout)
         for spec, sel in versioned_selections:
             for obj in sel.selected:
                 _remaining_or_raise(mirror_deadline, f"mirror_versioned({spec.bucket}/{obj.key})")
-                object_sink.archive_object(spec.s3_client, obj)
+                await asyncio.to_thread(
+                    object_sink.archive_object,
+                    spec.s3_client,
+                    obj,
+                    deadline=mirror_deadline,
+                )
 
         manifest_records = object_sink.finalize()
-    except Exception:
+    except Exception as exc:
+        if watchdog is not None:
+            watchdog.disarm()
         _terminate_dump_if_running()
+        _terminate_asr_if_running()
         if isinstance(object_sink, TarGzObjectSink):
             object_sink.abort()
-        if snapshot_open:
+        if snapshot_open and not (watchdog is not None and watchdog.db_closed_by_watchdog):
             await rollback_exported_snapshot(conn)
             snapshot_open = False
+        if watchdog is not None and watchdog.timed_out and not isinstance(exc, BackupTimeoutError):
+            raise BackupTimeoutError(
+                f"Consistent backup exceeded hard lock-phase deadline during {watchdog.timeout_phase}"
+            ) from exc
         raise
     finally:
+        if watchdog is not None:
+            watchdog.disarm()
         _terminate_dump_if_running()
+        _terminate_asr_if_running()
         await _release_locks_now()
 
     # Step 4 (end): release locks DONE -> run full-consumer reconciliation
@@ -1711,6 +2202,8 @@ class InflightReconcileSummary:
     chat_attachments_aborted: int = 0
     chat_uploads_promoted_ready: int = 0
     chat_uploads_aborted: int = 0
+    workspace_uploads_requeued: int = 0
+    workspace_uploads_aborted: int = 0
     transcriptions_cancelled: int = 0
     transcriptions_failed: int = 0
     asr_dirs_failed: int = 0
@@ -1767,6 +2260,7 @@ async def reconcile_restored_inflight_states(
     conn: Any,
     *,
     inspect_chat_upload_object_fn: Callable[[str], tuple[int, str] | None] | None = None,
+    inspect_workspace_upload_object_fn: Callable[[str], tuple[int, str] | None] | None = None,
     asr_jobs_dir: Path | None = None,
     restored_before: dt.datetime | None = None,
 ) -> InflightReconcileSummary:
@@ -1776,7 +2270,8 @@ async def reconcile_restored_inflight_states(
     transcription services to accept new submissions.
 
     Follows the unified concurrency pattern:
-    - Reads ``completing`` ``dalton_chat_file_uploads`` rows first without holding a DB lock;
+    - Reads ``completing`` ``dalton_chat_file_uploads`` and ``pulling`` ``workspace_file_uploads``
+      rows first without holding a DB lock;
     - Performs object-storage size + SHA-256 verification OUTSIDE any DB transaction/lock;
     - Re-locks rows ``FOR UPDATE`` inside a DB transaction, re-checks state, and commits.
     """
@@ -1784,13 +2279,17 @@ async def reconcile_restored_inflight_states(
     att_aborted = 0
     chat_promoted = 0
     chat_aborted = 0
+    ws_requeued = 0
+    ws_aborted = 0
     asr_cancelled = 0
     asr_failed = 0
     asr_dirs_failed = converge_restored_asr_jobs_dir(asr_jobs_dir) if asr_jobs_dir is not None else 0
 
-    # Phase 1: discover `completing` chat uploads without holding a long DB transaction
+    # Phase 1: discover `completing` chat uploads & `pulling` workspace uploads without holding a long DB transaction
     completing_candidates: list[tuple[str, str, int, str | None, str | None]] = []
+    pulling_ws_candidates: list[tuple[str, str, int, str | None]] = []
     has_chat_uploads = False
+    has_workspace_uploads = False
     async with conn.transaction():
         async with conn.cursor() as cur:
             has_chat_uploads = await _table_exists(cur, "public.dalton_chat_file_uploads")
@@ -1809,6 +2308,23 @@ async def reconcile_restored_inflight_states(
                             int(sz),
                             str(exp_sha).strip().lower() if exp_sha else None,
                             str(act_sha).strip().lower() if act_sha else None,
+                        )
+                    )
+            has_workspace_uploads = await _table_exists(cur, "public.workspace_file_uploads")
+            if has_workspace_uploads:
+                await cur.execute(
+                    "SELECT upload_id, object_key, size, sha256 "
+                    "FROM workspace_file_uploads "
+                    "WHERE cleaned_at IS NULL AND state = 'pulling'"
+                )
+                for row in await cur.fetchall():
+                    uid, okey, sz, sha = _extract_tuple(row, 4)
+                    pulling_ws_candidates.append(
+                        (
+                            str(uid),
+                            str(okey or "").strip(),
+                            int(sz),
+                            str(sha).strip().lower() if sha else None,
                         )
                     )
 
@@ -1830,6 +2346,23 @@ async def reconcile_restored_inflight_states(
             if want_sha and obj_sha != want_sha:
                 continue
             verified_ready_sha[uid] = obj_sha
+
+    verified_pulling_ws_ids: list[str] = []
+    if pulling_ws_candidates and inspect_workspace_upload_object_fn is not None:
+        for uid, okey, expected_size, expected_sha in pulling_ws_candidates:
+            if not okey:
+                continue
+            res = inspect_workspace_upload_object_fn(okey)
+            if asyncio.iscoroutine(res):
+                res = await res
+            if res is None:
+                continue
+            obj_size, obj_sha = int(res[0]), str(res[1]).strip().lower()
+            if obj_size != expected_size:
+                continue
+            if expected_sha and obj_sha != expected_sha:
+                continue
+            verified_pulling_ws_ids.append(uid)
 
     # Phase 3: re-lock & re-verify inside a clean transaction and commit
     async with conn.transaction():
@@ -1911,7 +2444,72 @@ async def reconcile_restored_inflight_states(
                 )
                 chat_aborted = max(0, int(cur.rowcount or 0))
 
-            # 4. dalton_transcription_jobs (includes `indeterminate` -> failed, resubmit only)
+            # 3b. workspace_file_uploads: re-queue verified `pulling` rows for clean sweep retry
+            #     (clearing pre-restore lease & placing_inode); explicitly abort all remaining
+            #     open rows (`uploading`, `completing`, and unverified/missing `pulling`).
+            if has_workspace_uploads:
+                requeued_ids: list[str] = []
+                for uid in verified_pulling_ws_ids:
+                    await cur.execute(
+                        """
+                        SELECT upload_id FROM workspace_file_uploads
+                         WHERE upload_id = %s
+                           AND cleaned_at IS NULL
+                           AND state = 'pulling'
+                           FOR UPDATE
+                        """,
+                        (uid,),
+                    )
+                    if await cur.fetchone() is not None:
+                        await cur.execute(
+                            """
+                            UPDATE workspace_file_uploads
+                               SET lease_until = NULL,
+                                   placing_inode = NULL,
+                                   error = NULL,
+                                   updated_at = NOW()
+                             WHERE upload_id = %s
+                               AND cleaned_at IS NULL
+                               AND state = 'pulling'
+                            """,
+                            (uid,),
+                        )
+                        if int(cur.rowcount or 0) > 0:
+                            ws_requeued += int(cur.rowcount or 0)
+                            requeued_ids.append(uid)
+
+                if requeued_ids:
+                    await cur.execute(
+                        """
+                        UPDATE workspace_file_uploads
+                           SET state = 'aborted',
+                               lease_until = NULL,
+                               placing_inode = NULL,
+                               error = COALESCE(error, 'aborted_after_restore'),
+                               updated_at = NOW()
+                         WHERE cleaned_at IS NULL
+                           AND state IN ('uploading', 'completing', 'pulling')
+                           AND NOT (upload_id::text = ANY(%s))
+                        """,
+                        (requeued_ids,),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        UPDATE workspace_file_uploads
+                           SET state = 'aborted',
+                               lease_until = NULL,
+                               placing_inode = NULL,
+                               error = COALESCE(error, 'aborted_after_restore'),
+                               updated_at = NOW()
+                         WHERE cleaned_at IS NULL
+                           AND state IN ('uploading', 'completing', 'pulling')
+                        """
+                    )
+                ws_aborted = max(0, int(cur.rowcount or 0))
+
+            # 4. dalton_transcription_jobs (includes `indeterminate` -> failed, resubmit only;
+            #    persists usage.restored_no_resume = true so normal submit & /retry are rejected)
             if await _table_exists(cur, "public.dalton_transcription_jobs"):
                 if restored_before is not None:
                     await cur.execute(
@@ -1919,6 +2517,7 @@ async def reconcile_restored_inflight_states(
                         UPDATE dalton_transcription_jobs
                            SET status = 'cancelled',
                                stage = 'cancelled',
+                               usage = COALESCE(usage, '{}'::jsonb) || '{"restored_no_resume": true}'::jsonb,
                                completed_at = COALESCE(completed_at, NOW()),
                                updated_at = NOW(),
                                version = version + 1
@@ -1934,6 +2533,7 @@ async def reconcile_restored_inflight_states(
                         UPDATE dalton_transcription_jobs
                            SET status = 'cancelled',
                                stage = 'cancelled',
+                               usage = COALESCE(usage, '{}'::jsonb) || '{"restored_no_resume": true}'::jsonb,
                                completed_at = COALESCE(completed_at, NOW()),
                                updated_at = NOW(),
                                version = version + 1
@@ -1951,6 +2551,7 @@ async def reconcile_restored_inflight_states(
                                stage = 'failed',
                                error_category = COALESCE(error_category, 'restored_inflight'),
                                error_message = %s,
+                               usage = COALESCE(usage, '{}'::jsonb) || '{"restored_no_resume": true}'::jsonb,
                                completed_at = COALESCE(completed_at, NOW()),
                                updated_at = NOW(),
                                version = version + 1
@@ -1971,6 +2572,7 @@ async def reconcile_restored_inflight_states(
                                stage = 'failed',
                                error_category = COALESCE(error_category, 'restored_inflight'),
                                error_message = %s,
+                               usage = COALESCE(usage, '{}'::jsonb) || '{"restored_no_resume": true}'::jsonb,
                                completed_at = COALESCE(completed_at, NOW()),
                                updated_at = NOW(),
                                version = version + 1
@@ -1985,6 +2587,8 @@ async def reconcile_restored_inflight_states(
         chat_attachments_aborted=att_aborted,
         chat_uploads_promoted_ready=chat_promoted,
         chat_uploads_aborted=chat_aborted,
+        workspace_uploads_requeued=ws_requeued,
+        workspace_uploads_aborted=ws_aborted,
         transcriptions_cancelled=asr_cancelled,
         transcriptions_failed=asr_failed,
         asr_dirs_failed=asr_dirs_failed,
@@ -2005,6 +2609,35 @@ def _default_chat_upload_inspector(object_key: str) -> tuple[int, str] | None:
     if not clean_sha:
         return None
     return int(size), clean_sha
+
+
+def _default_workspace_upload_inspector(object_key: str) -> tuple[int, str] | None:
+    """Inspect a ``workspace_file_uploads`` object in main storage, returning ``(size, sha256)`` or ``None``."""
+    specs = resolve_runtime_bucket_specs(os.environ)
+    main_spec = next((sp for sp in specs if "main" in sp.roles), None)
+    if main_spec is None:
+        return None
+    full_key = _apply_bucket_prefix(object_key, main_spec.key_prefix)
+    try:
+        body, _ct = _fetch_s3_object_stream(main_spec.s3_client, main_spec.bucket, full_key, None)
+    except Exception:
+        return None
+    hasher = hashlib.sha256()
+    total = 0
+    try:
+        while True:
+            chunk = body.read(STREAM_CHUNK_BYTES)
+            if not chunk:
+                break
+            total += len(chunk)
+            hasher.update(chunk)
+    except Exception:
+        return None
+    finally:
+        close_fn = getattr(body, "close", None)
+        if callable(close_fn):
+            close_fn()
+    return total, hasher.hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -2060,6 +2693,7 @@ def main(argv: list[str] | None = None) -> int:
         from src.server.database.pool import open_session_connection
 
         inspector = None if args.skip_object_check else _default_chat_upload_inspector
+        ws_inspector = None if args.skip_object_check else _default_workspace_upload_inspector
         asr_dir = Path(args.asr_jobs_dir) if args.asr_jobs_dir else None
         restored_before: dt.datetime | None = None
         if args.restored_before:
@@ -2072,6 +2706,7 @@ def main(argv: list[str] | None = None) -> int:
                 return await reconcile_restored_inflight_states(
                     conn,
                     inspect_chat_upload_object_fn=inspector,
+                    inspect_workspace_upload_object_fn=ws_inspector,
                     asr_jobs_dir=asr_dir,
                     restored_before=restored_before,
                 )
