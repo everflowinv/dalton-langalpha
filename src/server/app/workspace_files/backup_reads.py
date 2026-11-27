@@ -220,6 +220,12 @@ async def download_from_backup(
     ):
         raise HTTPException(status_code=404, detail="File not found")
 
+    # DALTON-HOOK(workspace-file-streaming): stream (100 MiB, 256 MiB] backup files
+    if byte_range is None:
+        from src.dalton.workspace_file_stream import backup_large_download
+        if (streamed := await backup_large_download(workspace_id, workspace, normalized_path, disposition, is_non_owner_reader=is_non_owner_reader)) is not None:
+            return streamed
+
     if byte_range is None:
         # Parallel: fetch vault secrets + file content in one round-trip window
         vault_secrets, file_record = await asyncio.gather(

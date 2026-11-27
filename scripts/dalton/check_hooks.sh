@@ -560,6 +560,10 @@ ALLOWED_HOOKS=(
   # BY4: sandbox-side runtime staged-file flock claim/release in wsfiles_transfer_runtime.py
   # (standalone script copied into sandboxes; cannot import src.dalton).
   "by4-relay-guard"
+  # workspace-file-storage (Batch 1)
+  "company-system-blob-key"
+  "backfill-readback-verify"
+  "workspace-file-streaming"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -191,7 +191,9 @@ def test_blob_keys_module_stays_import_clean():
 
     tree = ast.parse(Path(blob_keys.__file__).read_text())
     imported = {
-        node.module.split(".")[0]
+        node.module  # DALTON-HOOK(company-system-blob-key): allow import-free src.dalton.storage_keys only
+        if node.module == "src.dalton.storage_keys"
+        else node.module.split(".")[0]
         for node in ast.walk(tree)
         if isinstance(node, ast.ImportFrom) and node.module
     } | {
@@ -200,7 +202,7 @@ def test_blob_keys_module_stays_import_clean():
         if isinstance(node, ast.Import)
         for alias in node.names
     }
-    assert imported <= {"re", "__future__"}
+    assert imported <= {"re", "__future__", "src.dalton.storage_keys"}  # DALTON-HOOK(company-system-blob-key)
 
 
 @pytest.mark.asyncio
