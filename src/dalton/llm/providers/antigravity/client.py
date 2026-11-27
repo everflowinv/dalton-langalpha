@@ -899,6 +899,9 @@ class ChatAntigravity(BaseChatModel):
 
     @staticmethod
     def _error_from_status(status: int, body: str) -> AntigravityApiError:
+        from src.server.utils.error_sanitization import sanitize_error_text
+
+        body = sanitize_error_text(body or "")  # upstream errors may echo the Bearer header
         detail = ""
         effective_status = status or 500
         try:

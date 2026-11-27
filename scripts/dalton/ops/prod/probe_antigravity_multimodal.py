@@ -121,8 +121,9 @@ def _format_safe_error(exc: BaseException, *, secrets: Sequence[str] = ()) -> st
     for pattern, repl in _EXTRA_SECRET_PATTERNS:
         sanitized = pattern.sub(repl, sanitized)
     sanitized = single_line(sanitized).strip()[:200]
-    prefix = f"{type(exc).__name__}(status={status})" if status is not None else type(exc).__name__
-    return f"{prefix}: {sanitized}" if sanitized else prefix
+    # Only the exception type and HTTP status leave the probe: upstream messages may echo headers.
+    del sanitized
+    return f"{type(exc).__name__}(status={status})" if status is not None else type(exc).__name__
 
 
 def make_number_png(digits: str, *, scale: int = 12, padding: int = 24) -> bytes:
