@@ -145,7 +145,7 @@ def test_d056_single_head_and_fresh_upgrade_schema() -> None:
         heads_out = _run_alembic(["heads"], env=env, dalton=True)
         head_lines = [ln.strip() for ln in heads_out.splitlines() if ln.strip()]
         assert len(head_lines) == 1, f"Expected single Dalton head, got: {head_lines}"
-        assert head_lines[0].startswith("d057"), f"Expected head d057, got: {head_lines}"
+        assert head_lines[0].startswith("d058"), f"Expected head d058, got: {head_lines}"
 
         _run_alembic(["upgrade", "head"], env=env, dalton=False)
         _run_alembic(["upgrade", "head"], env=env, dalton=True)

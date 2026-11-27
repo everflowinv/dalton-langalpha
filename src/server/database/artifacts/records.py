@@ -505,6 +505,13 @@ async def unshare_artifact_and_downgrade_public_monitor(
                         """,
                         (mon["monitor_id"],),
                     )
+                elif mon is None:
+                    # DALTON-HOOK(monitors): also downgrade any public shared document row when unsharing
+                    from src.dalton.monitors.shared_documents import (
+                        downgrade_public_shared_document_in_cur,
+                    )
+
+                    await downgrade_public_shared_document_in_cur(cur, artifact_id)
                 return await unshare_in_cur(
                     cur, user_id=user_id, artifact_id=artifact_id
                 )

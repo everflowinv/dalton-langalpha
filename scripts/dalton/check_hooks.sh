@@ -677,6 +677,8 @@ AUDIT_EXEMPT_FILES = {
     "web/src/locales/memoPanel/zh-CN.json",
     "web/src/locales/plugins/en-US.json",
     "web/src/locales/plugins/zh-CN.json",
+    "web/src/locales/publish/en-US.json",
+    "web/src/locales/publish/zh-CN.json",
     "web/src/locales/settings/en-US.json",
     "web/src/locales/settings/zh-CN.json",
     "web/src/locales/setup/en-US.json",

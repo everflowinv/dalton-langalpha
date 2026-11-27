@@ -301,6 +301,10 @@ async def resolve_link(token: str, *, user_id: str | None = None) -> LinkAccess 
     if link is None:
         return None
     if user_id is None and not link.shared:
+        # DALTON-HOOK(monitors): prompt sign-in for colleague/team shared non-HTML documents
+        from src.dalton.monitors.shared_documents import authorize_unshared_link_via_dalton_document
+
+        await authorize_unshared_link_via_dalton_document(link.artifact_id, None, path=link.path)
         # No viewer whose ownership could open it, so no workspace read.
         raise HTTPException(status_code=404, detail=LINK_NOT_FOUND)
     workspace = await _link_workspace(link.workspace_id)
@@ -309,6 +313,11 @@ async def resolve_link(token: str, *, user_id: str | None = None) -> LinkAccess 
     if owner:
         return LinkAccess(link, workspace, owner)
     if not link.shared:
+        # DALTON-HOOK(monitors): admit signed-in viewers authorized by Dalton shared-document ACL
+        from src.dalton.monitors.shared_documents import authorize_unshared_link_via_dalton_document
+
+        if await authorize_unshared_link_via_dalton_document(link.artifact_id, user_id, path=link.path):
+            return LinkAccess(link, workspace, owner, member=True)
         raise HTTPException(status_code=404, detail=LINK_NOT_FOUND)
     if link_audience(link.artifact.audience if link.artifact else None) == ORGANIZATION:
         if user_id is None:

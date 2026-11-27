@@ -2,18 +2,21 @@ import React, { useMemo } from 'react';
 import { Link } from 'react-router';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, RefreshCw } from 'lucide-react';
+import { AlertTriangle, ExternalLink, FileText, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ListEmpty, ListError, ListSkeleton, MetaText, SectionHeader, TagBadge } from '@/components/mcp/McpPrimitives';
 import { useCapabilities } from '@/hooks/useCapabilities';
 import { useLocale } from '@/hooks/useLocale';
 import { formatTimestamp } from '@/lib/format';
 import { queryKeys } from '@/lib/queryKeys';
+import { isHtmlFile } from '@/pages/ChatAgent/utils/filePaths';
 import {
   listMonitors,
+  listSharedDocuments,
   MONITOR_CATEGORIES,
   type MonitorCategory,
   type MonitorSummary,
+  type SharedDocumentSummary,
 } from './api';
 
 export function MonitorsList(): React.ReactElement {
@@ -26,12 +29,18 @@ export function MonitorsList(): React.ReactElement {
     queryFn: listMonitors,
     staleTime: 30_000,
   });
+  const sharedDocsQuery = useQuery<SharedDocumentSummary[]>({
+    queryKey: queryKeys.daltonMonitors.sharedDocuments(),
+    queryFn: listSharedDocuments,
+    staleTime: 30_000,
+  });
 
   const grouped = useMemo(() => {
     const map = new Map<MonitorCategory, MonitorSummary[]>();
     for (const cat of MONITOR_CATEGORIES) map.set(cat, []);
     for (const item of data ?? []) {
       if (!dataJobsEnabled && item.source_kind === 'data_job') continue;
+      if (item.source_kind === 'workspace' && item.entry_path && !isHtmlFile(item.entry_path)) continue;
       const cat = MONITOR_CATEGORIES.includes(item.category) ? item.category : 'other';
       map.get(cat)!.push(item);
     }
@@ -39,6 +48,20 @@ export function MonitorsList(): React.ReactElement {
       .map((cat) => ({ category: cat, items: map.get(cat) ?? [] }))
       .filter((group) => group.items.length > 0);
   }, [data, dataJobsEnabled]);
+
+  const sharedDocs = useMemo(
+    () =>
+      (sharedDocsQuery.data ?? []).filter(
+        (doc) => doc.visibility !== 'own' && (!doc.entry_path || !isHtmlFile(doc.entry_path)) && Boolean(doc.url),
+      ),
+    [sharedDocsQuery.data],
+  );
+
+  const refreshing = isFetching || sharedDocsQuery.isFetching;
+  const handleRefresh = () => {
+    void refetch();
+    void sharedDocsQuery.refetch();
+  };
 
   return (
     <div className="monitors-page">
@@ -58,10 +81,10 @@ export function MonitorsList(): React.ReactElement {
               variant="outline"
               size="sm"
               className="tap-target h-8 gap-1.5 text-xs shrink-0"
-              onClick={() => void refetch()}
-              disabled={isFetching}
+              onClick={handleRefresh}
+              disabled={refreshing}
             >
-              <RefreshCw className={`h-3.5 w-3.5${isFetching ? ' animate-spin' : ''}`} />
+              <RefreshCw className={`h-3.5 w-3.5${refreshing ? ' animate-spin' : ''}`} />
               {t('common.retry', { defaultValue: 'Refresh' })}
             </Button>
           </div>
@@ -69,7 +92,7 @@ export function MonitorsList(): React.ReactElement {
           {isLoading || capsLoading ? (
             <ListSkeleton rows={4} />
           ) : isError ? (
-            <ListError onRetry={() => void refetch()}>
+            <ListError onRetry={handleRefresh}>
               {t('monitors:loadFailed')}
             </ListError>
           ) : grouped.length === 0 ? (
@@ -138,6 +161,79 @@ export function MonitorsList(): React.ReactElement {
                 </section>
               ))}
             </div>
+          )}
+
+          {sharedDocs.length > 0 && (
+            <section
+              aria-label={t('monitors:sharedDocuments.title')}
+              data-testid="shared-documents-section"
+              className="pt-2"
+            >
+              <SectionHeader>
+                {t('monitors:sharedDocuments.title')} ({sharedDocs.length})
+              </SectionHeader>
+              <ul
+                className="shell-box mt-2.5 divide-y rounded-lg"
+                style={{
+                  backgroundColor: 'var(--color-shell-fill, var(--color-bg-card))',
+                  borderColor: 'var(--color-shell-edge, var(--color-border-muted))',
+                }}
+              >
+                {sharedDocs.map((doc) => {
+                  const ownerLabel = doc.owner_name || doc.owner_email || doc.owner_user_id;
+                  const updatedTime = formatTimestamp(doc.updated_at, locale);
+                  return (
+                    <li
+                      key={doc.artifact_id}
+                      className="flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
+                      style={{ borderColor: 'var(--color-border-subtle)' }}
+                    >
+                      <div className="flex min-w-0 flex-1 items-start gap-2.5">
+                        <FileText
+                          className="mt-0.5 h-4 w-4 shrink-0"
+                          style={{ color: 'var(--color-text-tertiary)' }}
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span
+                              className="truncate text-sm font-medium"
+                              style={{ color: 'var(--color-text-primary)' }}
+                              title={doc.entry_path}
+                            >
+                              {doc.file_name}
+                            </span>
+                            <TagBadge soft>
+                              {t(`monitors:visibility.${doc.visibility}`)}
+                            </TagBadge>
+                          </div>
+                          <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-0.5">
+                            <MetaText>
+                              {t('monitors:sharedDocuments.sharedBy', { owner: ownerLabel })}
+                            </MetaText>
+                            <MetaText>
+                              {t('monitors:sharedDocuments.updatedAt', { time: updatedTime })}
+                            </MetaText>
+                          </div>
+                        </div>
+                      </div>
+                      <a
+                        href={doc.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="tap-target inline-flex h-8 shrink-0 items-center gap-1.5 self-start rounded-md border px-2.5 text-xs font-medium transition-colors hover:bg-(--color-bg-hover) sm:self-center"
+                        style={{
+                          borderColor: 'var(--color-border-muted)',
+                          color: 'var(--color-text-primary)',
+                        }}
+                      >
+                        <ExternalLink className="h-3.5 w-3.5" />
+                        {t('monitors:sharedDocuments.openLink')}
+                      </a>
+                    </li>
+                  );
+                })}
+              </ul>
+            </section>
           )}
         </div>
       </div>

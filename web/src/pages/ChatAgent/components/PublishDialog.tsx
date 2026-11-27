@@ -38,20 +38,26 @@ import {
   useOwnedArtifact,
   sharedSeq,
 } from '@/hooks/useArtifact';
-// DALTON-HOOK(monitors): ConfirmDialog and Monitor API helpers for 4-tier publish
+// DALTON-HOOK(monitors): ConfirmDialog, Monitor & shared-document API helpers for 4-tier publish
 import ConfirmDialog from '@/pages/Dashboard/components/ConfirmDialog';
 import {
   getMonitorByArtifact,
+  getSharedDocumentByArtifact,
   listCompanyMembers,
   MONITOR_CATEGORIES,
   monitorShareUrl,
   publishMonitor,
+  shareDocument,
   updateMonitor,
+  updateSharedDocument,
   type CompanyMemberOption,
   type MonitorCategory,
   type MonitorSummary,
   type MonitorVisibility,
+  type SharedDocumentSummary,
 } from '@/pages/Monitors/api';
+import { resolvePublishStatus } from '@/lib/dalton/publishStatus';
+import { isHtmlFile } from '../utils/filePaths';
 import { pageLoadsOf } from '@/lib/pageLoads';
 import { usePageScout } from './viewers/html/usePageScout';
 import type {
@@ -499,17 +505,28 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
   const { setterName, orgT } = useAccount();
   const { copy, copiedCode } = useCopyShareLink();
 
-  // DALTON-HOOK(monitors): load existing monitor config for this artifact in both normal and unshareOnly modes
+  // DALTON-HOOK(monitors): load existing monitor (HTML) or shared-document (non-HTML) config
+  const isHtmlPage = isHtmlFile(artifact?.path ?? path);
   const existingMonitorQuery = useQuery<MonitorSummary | null>({
     queryKey: queryKeys.daltonMonitors.byArtifact(artifact?.artifact_id ?? ''),
     queryFn: () => getMonitorByArtifact(artifact!.artifact_id),
-    enabled: Boolean(artifact?.artifact_id),
+    enabled: Boolean(artifact?.artifact_id) && isHtmlPage,
     staleTime: 10_000,
     retry: false,
   });
-  const existingMonitor = existingMonitorQuery.data ?? null;
-  const existingMonitorPending = Boolean(artifact?.artifact_id) && existingMonitorQuery.isPending;
-  const existingMonitorFailed = Boolean(artifact?.artifact_id) && existingMonitorQuery.isError;
+  const existingSharedDocQuery = useQuery<SharedDocumentSummary | null>({
+    queryKey: queryKeys.daltonMonitors.sharedDocumentByArtifact(artifact?.artifact_id ?? ''),
+    queryFn: () => getSharedDocumentByArtifact(artifact!.artifact_id),
+    enabled: Boolean(artifact?.artifact_id) && !isHtmlPage,
+    staleTime: 10_000,
+    retry: false,
+  });
+  const existingMonitor = isHtmlPage ? (existingMonitorQuery.data ?? null) : null;
+  const existingSharedDoc = !isHtmlPage ? (existingSharedDocQuery.data ?? null) : null;
+  const activeShare = existingMonitor ?? existingSharedDoc;
+  const existingShareQuery = isHtmlPage ? existingMonitorQuery : existingSharedDocQuery;
+  const existingMonitorPending = Boolean(artifact?.artifact_id) && existingShareQuery.isPending;
+  const existingMonitorFailed = Boolean(artifact?.artifact_id) && existingShareQuery.isError;
   const monitorStateReady = !artifact?.artifact_id || (!existingMonitorPending && !existingMonitorFailed);
 
   const [label, setLabel] = useState('');
@@ -535,7 +552,7 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
     prevReadyTierRef.current = identity.tier;
     if (prevTier === 'admin' && identity.tier === 'internal') {
       setPublicConfirmOpen(false);
-      if (visibilityDraft === 'public' || existingMonitor?.visibility === 'public') {
+      if (visibilityDraft === 'public' || activeShare?.visibility === 'public') {
         setVisibilityDraft(null);
         setPublicReselectRequired(true);
       }
@@ -549,7 +566,7 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
     } else if (identity.tier === 'admin') {
       setPublicReselectRequired(false);
     }
-  }, [identity.status, identity.tier, visibilityDraft, existingMonitor?.visibility]);
+  }, [identity.status, identity.tier, visibilityDraft, activeShare?.visibility]);
   // DALTON-HOOK(colleague-access): read workspace auto-publish pause state & CAS token only when colleague sharing is enabled
   const trackWorkspacePause =
     !unshareOnly && colleagueSharingCapable && colleagueSharingKnown && colleagueSharingEnabled;
@@ -621,9 +638,9 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
     busyRef.current = busy;
   }, [busy, busyRef]);
 
-  // DALTON-HOOK(monitors): track whether this artifact already has a public share or monitor record
+  // DALTON-HOOK(monitors): track whether this artifact already has a public share, monitor, or shared-doc record
   const shared = !!artifact?.shared;
-  const monitorPublished = !!existingMonitor;
+  const monitorPublished = !!activeShare;
   const status = statusQuery.data;
   scout.follow(status?.page_sha256);
   const statusRefusal = refusalIn(statusQuery.error);
@@ -662,13 +679,13 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
   const name = artifact?.name ?? basename(path);
   const effectiveTitle = titleDraft ?? existingMonitor?.title ?? name.replace(/\.html?$/i, '');
   const effectiveCategory: MonitorCategory = categoryDraft ?? existingMonitor?.category ?? 'other';
-  // DALTON-HOOK(external-share-guard): enforce tier-aware visibility selection and block external republish on non-own monitors
+  // DALTON-HOOK(external-share-guard): enforce tier-aware visibility selection and block external republish on non-own shares
   const externalNeedsDowngrade =
-    !unshareOnly && isExternal && Boolean(existingMonitor && existingMonitor.visibility !== 'own');
+    !unshareOnly && isExternal && Boolean(activeShare && activeShare.visibility !== 'own');
   const rawVisibility: MonitorVisibility | null =
     publicReselectRequired && visibilityDraft === null
       ? null
-      : (visibilityDraft ?? existingMonitor?.visibility ?? 'own');
+      : (visibilityDraft ?? activeShare?.visibility ?? 'own');
   const effectiveVisibility: MonitorVisibility | null = isExternal
     ? 'own'
     : rawVisibility === null
@@ -676,10 +693,10 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
       : !isAdmin && rawVisibility === 'public'
         ? null
         : rawVisibility;
-  const effectiveMembers = membersDraft ?? existingMonitor?.member_user_ids ?? [];
+  const effectiveMembers = membersDraft ?? activeShare?.member_user_ids ?? [];
   const keepOn = isExternal
     ? false
-    : (keepDraft ?? existingMonitor?.keep_updated ?? !!artifact?.keep_updated);
+    : (keepDraft ?? activeShare?.keep_updated ?? !!artifact?.keep_updated);
 
   const companyMembersQuery = useQuery<CompanyMemberOption[]>({
     queryKey: queryKeys.daltonMonitors.companyMembers(),
@@ -751,14 +768,14 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
     toast({ description, variant: 'destructive' });
   };
 
-  // DALTON-HOOK(monitors): submit through /api/v1/dalton/monitors instead of bare /artifacts/{id}/publish
+  // DALTON-HOOK(monitors): submit HTML pages to /api/v1/dalton/monitors and non-HTML files to /shared-documents
   const executeMonitorPublish = async () => {
     const latest = identity.getLatestIdentity();
     if (latest.isConfirming || latest.status !== 'ready') return;
-    if (existingMonitorQuery.isPending || existingMonitorQuery.isError) return;
+    if (existingShareQuery.isPending || existingShareQuery.isError) return;
     if (!artifact || !canPublish || effectiveVisibility === null) return;
     if (latest.isExternal) {
-      if (existingMonitor && existingMonitor.visibility !== 'own') return;
+      if (activeShare && activeShare.visibility !== 'own') return;
       if (effectiveVisibility !== 'own') return;
     } else if (!latest.canActAsOwner) {
       return;
@@ -771,11 +788,10 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
     setPublishingMonitor(true);
     try {
       // DALTON-HOOK(colleague-access): include CAS confirm_pause_token and surface server pause notice
-      const result = await publishMonitor({
+      const commonPayload = {
         workspace_id: workspaceId,
         path: artifact.path,
         title: effectiveTitle.trim() || name,
-        category: effectiveCategory,
         visibility: effectiveVisibility,
         member_user_ids: effectiveVisibility === 'members' ? effectiveMembers : [],
         keep_updated: latest.isExternal || !latest.canActAsOwner ? false : keepOn,
@@ -787,9 +803,30 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
         ...(trackPublishResponsePause && autoPublishPauseToken
           ? { confirm_pause_token: autoPublishPauseToken }
           : {}),
-      });
+      };
+      let result: {
+        cut?: boolean;
+        publishedSeq: number;
+        auto_publish_paused?: boolean;
+        auto_publish_pause_token?: string | null;
+        auto_publish_pause_notice?: string | null;
+      };
+      if (isHtmlPage) {
+        const monitorRes = await publishMonitor({
+          ...commonPayload,
+          category: effectiveCategory,
+        });
+        qc.setQueryData(queryKeys.daltonMonitors.byArtifact(artifact.artifact_id), monitorRes.monitor);
+        result = { ...monitorRes, publishedSeq: monitorRes.monitor.published_seq };
+      } else {
+        const docRes = await shareDocument(commonPayload);
+        qc.setQueryData(
+          queryKeys.daltonMonitors.sharedDocumentByArtifact(artifact.artifact_id),
+          docRes.document,
+        );
+        result = { ...docRes, publishedSeq: docRes.document.published_seq };
+      }
       setLabel('');
-      qc.setQueryData(queryKeys.daltonMonitors.byArtifact(artifact.artifact_id), result.monitor);
       void qc.invalidateQueries({ queryKey: queryKeys.daltonMonitors.all });
       void qc.invalidateQueries({ queryKey: queryKeys.artifacts.pathsIn(workspaceId) });
       if (trackPublishResponsePauseRef.current) {
@@ -841,9 +878,13 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
         }
       }
       if (result.cut === false) {
-        setOutcome({ kind: 'unchanged', seq: result.monitor.published_seq });
+        setOutcome({ kind: 'unchanged', seq: result.publishedSeq });
       } else {
-        toast({ description: t('monitors:dialog.publishedToast') });
+        toast({
+          description: isHtmlPage
+            ? t('monitors:dialog.publishedToast')
+            : t('monitors:dialog.sharedDocumentToast'),
+        });
       }
     } catch (err) {
       const changed = filesChangedIn(err);
@@ -872,10 +913,10 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
   const send = () => {
     const latest = identity.getLatestIdentity();
     if (latest.isConfirming || latest.status !== 'ready') return;
-    if (existingMonitorQuery.isPending || existingMonitorQuery.isError) return;
+    if (existingShareQuery.isPending || existingShareQuery.isError) return;
     if (!artifact || !canPublish || effectiveVisibility === null) return;
     if (latest.isExternal) {
-      if (existingMonitor && existingMonitor.visibility !== 'own') return;
+      if (activeShare && activeShare.visibility !== 'own') return;
       if (effectiveVisibility !== 'own') return;
     } else if (!latest.canActAsOwner) {
       return;
@@ -891,13 +932,18 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
   const downgradeToOwn = async () => {
     const latest = identity.getLatestIdentity();
     if (latest.isConfirming || latest.status !== 'ready') return;
-    if (!artifact || !existingMonitor || busy) return;
+    if (!artifact || !activeShare || busy) return;
     setDowngradingToOwn(true);
     try {
-      const res = await updateMonitor(existingMonitor.slug, { visibility: 'own', member_user_ids: [] });
+      if (existingMonitor) {
+        const res = await updateMonitor(existingMonitor.slug, { visibility: 'own', member_user_ids: [] });
+        qc.setQueryData(queryKeys.daltonMonitors.byArtifact(artifact.artifact_id), res.monitor);
+      } else if (existingSharedDoc) {
+        const res = await updateSharedDocument(artifact.artifact_id, { visibility: 'own', member_user_ids: [] });
+        qc.setQueryData(queryKeys.daltonMonitors.sharedDocumentByArtifact(artifact.artifact_id), res.document);
+      }
       setVisibilityDraft('own');
       setMembersDraft([]);
-      qc.setQueryData(queryKeys.daltonMonitors.byArtifact(artifact.artifact_id), res.monitor);
       void qc.invalidateQueries({ queryKey: queryKeys.daltonMonitors.all });
       void qc.invalidateQueries({ queryKey: queryKeys.artifacts.pathsIn(workspaceId) });
       void qc.invalidateQueries({ queryKey: queryKeys.shareLinks.byWorkspace(workspaceId) });
@@ -940,6 +986,13 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
       void updateMonitor(existingMonitor.slug, { keep_updated: next })
         .then((res) => {
           qc.setQueryData(queryKeys.daltonMonitors.byArtifact(artifact.artifact_id), res.monitor);
+          void qc.invalidateQueries({ queryKey: queryKeys.daltonMonitors.all });
+        })
+        .catch((err) => failed(err, t('publish:changeFailed')));
+    } else if (existingSharedDoc) {
+      void updateSharedDocument(artifact.artifact_id, { keep_updated: next })
+        .then((res) => {
+          qc.setQueryData(queryKeys.daltonMonitors.sharedDocumentByArtifact(artifact.artifact_id), res.document);
           void qc.invalidateQueries({ queryKey: queryKeys.daltonMonitors.all });
         })
         .catch((err) => failed(err, t('publish:changeFailed')));
@@ -993,22 +1046,26 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
     );
   };
 
-  // DALTON-HOOK(monitors): summarize monitor publication state or legacy artifact state
+  // DALTON-HOOK(monitors): resolve status row copy from actual visibility scope
   const legacyRefused = shared && !!artifact?.legacy_refused;
-  let stateHint: string;
-  if (standing.state === 'paused') {
-    stateHint = t('organization.share.pausedShort', { whoMid: setterName(RULE.publicLinks).mid });
-  } else if (existingMonitor) {
-    stateHint = t('publish:publishedAt', { seq: existingMonitor.published_seq || latestSeq });
-  } else if (!shared) {
-    stateHint = latestSeq > 0 ? t('publish:privateWithVersions') : t('publish:privateHint');
-  } else if (legacyRefused) {
-    stateHint = t('publish:legacyRefused');
-  } else if (visitorsAt === 0 || status?.changed == null) {
-    stateHint = membersOnly ? orgT('organization.share.fileMembersHint') : t('publish:sharedHint');
-  } else {
-    stateHint = t('publish:changedSince', { seq: visitorsAt });
-  }
+  const publishStatus = resolvePublishStatus({
+    unshareOnly,
+    standingPaused: standing.state === 'paused',
+    effectiveVisibility,
+    activeShare,
+    shared,
+    legacyRefused,
+    membersOnly,
+    latestSeq,
+    visitorsAt,
+    statusChanged: status?.changed,
+    hasVisibilityDraft: visibilityDraft !== null,
+  });
+  const stateHint = publishStatus.hintKind === 'paused'
+    ? t('organization.share.pausedShort', { whoMid: setterName(RULE.publicLinks).mid })
+    : publishStatus.hintKind === 'orgMembers'
+      ? orgT('organization.share.fileMembersHint')
+      : t(publishStatus.hintKey ?? 'publish:privateHint', publishStatus.hintParams);
 
   const listHeading = !monitorPublished && !shared
     ? t('publish:filesPublish', { count: files.length })
@@ -1080,8 +1137,8 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
               variant="outline"
               size="sm"
               className="h-6 px-2 text-xs"
-              onClick={() => void existingMonitorQuery.refetch()}
-              disabled={existingMonitorQuery.isFetching}
+              onClick={() => void existingShareQuery.refetch()}
+              disabled={existingShareQuery.isFetching}
             >
               {t('common.retry')}
             </Button>
@@ -1120,9 +1177,10 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
         </div>
         )}
 
-        {/* DALTON-HOOK(monitors): monitor title, category, and 4-tier visibility controls */}
+        {/* DALTON-HOOK(monitors): monitor title/category (HTML only) and 4-tier visibility controls */}
         {!unshareOnly && (
           <div className="flex flex-col gap-3 rounded-lg border p-3" style={{ borderColor: 'var(--color-border-muted)', backgroundColor: 'var(--color-bg-card)' }}>
+            {isHtmlPage && (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <label className="flex flex-col gap-1">
                 <span className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
@@ -1155,6 +1213,7 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
                 </Select>
               </label>
             </div>
+            )}
 
             <div className="flex flex-col gap-1.5">
               <span className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
@@ -1241,7 +1300,7 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
                   {t('monitors:dialog.adminDowngradedReselectHint')}
                 </p>
               )}
-              {identity.isInternal && !isAdmin && !publicReselectRequired && existingMonitor?.visibility === 'public' && effectiveVisibility === null && (
+              {identity.isInternal && !isAdmin && !publicReselectRequired && activeShare?.visibility === 'public' && effectiveVisibility === null && (
                 <p className="text-[0.6875rem]" role="note" style={{ color: 'var(--color-warning)' }}>
                   {t('monitors:dialog.nonAdminPublicDowngradeHint')}
                 </p>
@@ -1305,24 +1364,28 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
           style={{ borderColor: 'var(--color-border-muted)', backgroundColor: 'var(--color-bg-card)' }}
         >
           <div className="flex items-center justify-between gap-3 px-3 py-2.5">
-            {/* DALTON-HOOK(monitors): show monitor visibility badge or unshare control for legacy public links */}
+            {/* DALTON-HOOK(monitors): show actual visibility scope and who can open the link */}
             <div className="flex items-center gap-2 min-w-0">
-              {shared || monitorPublished
+              {publishStatus.showLinkIcon
                 ? <Link2 className="h-4 w-4 shrink-0" style={{ color: 'var(--color-accent-primary)' }} />
                 : <Lock className="h-4 w-4 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />}
               <div className="flex flex-col min-w-0">
                 <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                  {monitorPublished
-                    ? t(`monitors:visibility.${existingMonitor.visibility}`)
-                    : !shared
-                      ? t('publish:private')
-                      : visitorsAt > 0 ? t('publish:publishedAt', { seq: visitorsAt }) : t('publish:published')}
+                  {t(publishStatus.titleKey, publishStatus.titleParams)}
                 </span>
-                <span className="text-xs" style={{ color: legacyRefused ? 'var(--color-warning)' : 'var(--color-text-tertiary)' }}>{stateHint}</span>
+                <span className="text-xs" style={{ color: legacyRefused ? 'var(--color-warning)' : 'var(--color-text-tertiary)' }}>
+                  <span>{stateHint}</span>
+                  {publishStatus.publishedVersionSeq !== null && (
+                    <>
+                      <span> · </span>
+                      <span>{t('publish:publishedAt', { seq: publishStatus.publishedVersionSeq })}</span>
+                    </>
+                  )}
+                </span>
               </div>
             </div>
             {/* DALTON-HOOK(external-share-guard): stop button stays available for active shares and historical public monitors even while confirming */}
-            {(shared || existingMonitor?.visibility === 'public') && (
+            {(shared || activeShare?.visibility === 'public') && (
               <Button
                 variant="outline"
                 size="sm"
@@ -1480,10 +1543,10 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
 
         {/* Footer */}
         <div className="flex items-center justify-between gap-3 pt-1">
-          {/* DALTON-HOOK(external-share-guard): hide external monitor link in unshareOnly and for external/unconfirmed/confirming callers */}
-          {!unshareOnly && existingMonitor && identity.status === 'ready' && !identity.isConfirming && identity.canActAsOwner && !isExternal ? (
+          {/* DALTON-HOOK(external-share-guard): hide external share link in unshareOnly and for external/unconfirmed/confirming callers */}
+          {!unshareOnly && activeShare && href && identity.status === 'ready' && !identity.isConfirming && identity.canActAsOwner && !isExternal ? (
             <a
-              href={monitorShareUrl(existingMonitor.slug, existingMonitor.visibility)}
+              href={href}
               target="_blank"
               rel="noopener noreferrer"
               onClick={(e) => {

@@ -12,12 +12,15 @@ from fastapi.responses import JSONResponse
 from src.config import env
 from src.dalton.auth import is_dalton_service_request
 from src.dalton.monitors import service as monitor_service
+from src.dalton.monitors import shared_documents as shared_doc_service
 from src.dalton.monitors.models import (
     DataJobMonitorPublishRequest,
     MonitorDataPutRequest,
     PublishMonitorRequest,
     RepublishMonitorRequest,
+    ShareDocumentRequest,
     UpdateMonitorRequest,
+    UpdateSharedDocumentRequest,
 )
 from src.dalton.settings import get_dalton_settings
 from src.server.preview_proxy.artifacts import ArtifactFileUnavailable
@@ -82,6 +85,24 @@ async def get_monitor_by_artifact_endpoint(
     return {"monitor": monitor}
 
 
+@router.get("/shared-documents")
+@handle_api_exceptions("list shared non-HTML documents", logger)
+async def list_shared_documents_endpoint(user_id: CurrentUserId) -> dict[str, Any]:
+    items = await shared_doc_service.list_shared_documents_for_user(user_id)
+    return {"documents": items}
+
+
+@router.get("/shared-documents/by-artifact/{artifact_id}")
+@handle_api_exceptions("get shared document by artifact id", logger)
+async def get_shared_document_by_artifact_endpoint(
+    artifact_id: str, user_id: CurrentUserId
+) -> dict[str, Any]:
+    doc = await shared_doc_service.get_shared_document_by_artifact(
+        artifact_id, viewer_id=user_id
+    )
+    return {"document": doc}
+
+
 from src.dalton.colleague_outbound_guard import (
     NON_SESSION_CLEAR_FORBIDDEN_DETAIL,
     is_interactive_owner_session,
@@ -115,6 +136,38 @@ async def publish_monitor_endpoint(
         )
     return await monitor_service.publish_workspace_monitor(
         body, caller_id=user_id, allow_clear_pause=can_clear_pause
+    )
+
+
+@router.post("/shared-documents")
+@handle_api_exceptions("share workspace non-HTML document", logger)
+async def share_document_endpoint(
+    body: ShareDocumentRequest,
+    user_id: CurrentUserId,
+    interactive_session: bool = Depends(_interactive_session_for_clear),
+) -> dict[str, Any]:
+    from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+    sharing_auth_enabled = is_dalton_sharing_auth_enabled()
+    can_clear_pause = sharing_auth_enabled and interactive_session is True
+    if sharing_auth_enabled and body.confirm_pause_token and not can_clear_pause:
+        raise HTTPException(
+            status_code=403, detail=NON_SESSION_CLEAR_FORBIDDEN_DETAIL
+        )
+    return await shared_doc_service.share_workspace_document(
+        body, caller_id=user_id, allow_clear_pause=can_clear_pause
+    )
+
+
+@router.patch("/shared-documents/by-artifact/{artifact_id}")
+@handle_api_exceptions("update shared document settings", logger)
+async def update_shared_document_endpoint(
+    artifact_id: str,
+    body: UpdateSharedDocumentRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    return await shared_doc_service.update_shared_document_settings(
+        artifact_id, body, caller_id=user_id
     )
 
 

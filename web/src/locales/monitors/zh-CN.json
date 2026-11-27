@@ -59,7 +59,14 @@
     "publicConfirmTitle": "确认公开发布？",
     "publicConfirmMessage": "设为“任何人（公开链接）”后，互联网上任何持有链接的人都可以查看此监控面板及其实时数据。确认继续发布？",
     "publicConfirmButton": "确认公开",
-    "publishedToast": "已发布到监控面板"
+    "publishedToast": "已发布到监控面板",
+    "sharedDocumentToast": "已更新文档分享设置"
+  },
+  "sharedDocuments": {
+    "title": "分享的其他文档",
+    "sharedBy": "分享人：{{owner}}",
+    "updatedAt": "更新时间：{{time}}",
+    "openLink": "打开"
   },
   "demo": {
     "title": "实时数据监控示例",

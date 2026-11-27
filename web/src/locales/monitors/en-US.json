@@ -59,7 +59,14 @@
     "publicConfirmTitle": "Confirm public access?",
     "publicConfirmMessage": "Anyone with the link on the internet can view this monitor and its realtime data. Continue?",
     "publicConfirmButton": "Publish publicly",
-    "publishedToast": "Published to Monitors"
+    "publishedToast": "Published to Monitors",
+    "sharedDocumentToast": "Document sharing updated"
+  },
+  "sharedDocuments": {
+    "title": "Other shared documents",
+    "sharedBy": "Shared by {{owner}}",
+    "updatedAt": "Updated: {{time}}",
+    "openLink": "Open"
   },
   "demo": {
     "title": "Realtime Monitor Demo",

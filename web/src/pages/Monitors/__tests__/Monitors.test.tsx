@@ -67,13 +67,21 @@ vi.mock('../api', async (importOriginal) => {
   return {
     ...actual,
     listMonitors: vi.fn<typeof actual.listMonitors>(),
+    listSharedDocuments: vi.fn<typeof actual.listSharedDocuments>(async () => []),
     getMonitorDetail: vi.fn<typeof actual.getMonitorDetail>(),
     getPublicMonitorDetail: vi.fn<typeof actual.getPublicMonitorDetail>(),
     mintMonitorGrant: vi.fn<typeof actual.mintMonitorGrant>(),
   };
 });
 
-import { getMonitorDetail, getPublicMonitorDetail, listMonitors, mintMonitorGrant } from '../api';
+import {
+  getMonitorDetail,
+  getPublicMonitorDetail,
+  listMonitors,
+  listSharedDocuments,
+  mintMonitorGrant,
+  type SharedDocumentSummary,
+} from '../api';
 import {
   CORE_DEFAULT_CAPABILITY_SET,
   EVERFLOW_DEFAULT_CAPABILITY_SET,
@@ -111,6 +119,7 @@ vi.mock('@/hooks/useCapabilities', async (importOriginal) => {
 });
 
 const mockListMonitors = vi.mocked(listMonitors);
+const mockListSharedDocuments = vi.mocked(listSharedDocuments);
 const mockGetMonitorDetail = vi.mocked(getMonitorDetail);
 const mockGetPublicMonitorDetail = vi.mocked(getPublicMonitorDetail);
 const mockMintMonitorGrant = vi.mocked(mintMonitorGrant);
@@ -187,6 +196,7 @@ function LocationProbe() {
 describe('Monitors page (Checklist 8)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockListSharedDocuments.mockResolvedValue([]);
     capabilitiesMock.enabled = true;
     bridgeCallbacks.onNavigate = null;
     bridgeCallbacks.lastPosted = [];
@@ -468,5 +478,75 @@ describe('Monitors page (Checklist 8)', () => {
     expect(errBanner.className).toContain('whitespace-normal');
     expect(errBanner.className).toContain('break-words');
     expect(errBanner.querySelector('.truncate')).toBeNull();
+  });
+
+  it('excludes non-HTML entries from monitor cards, renders Other shared documents section when present, and hides it when empty', async () => {
+    mockListMonitors.mockResolvedValue([
+      makeSummary({
+        monitor_id: 'm-html',
+        slug: 'html-dashboard',
+        title: 'HTML Dashboard',
+        entry_path: 'dashboard.html',
+        category: 'overview',
+      }),
+      makeSummary({
+        monitor_id: 'm-legacy-md',
+        slug: 'legacy-notes',
+        title: 'Legacy Markdown Entry',
+        entry_path: 'notes/memo.md',
+        category: 'other',
+      }),
+    ]);
+
+    const sharedDoc: SharedDocumentSummary = {
+      doc_id: 'd-1',
+      artifact_id: 'a-md-1',
+      artifact_code: 'doccode12345',
+      workspace_id: 'ws-1',
+      entry_path: 'notes/q4-memo.md',
+      file_name: 'q4-memo.md',
+      title: 'Q4 Memo',
+      owner_user_id: 'u-2',
+      owner_name: 'Bob',
+      owner_email: 'bob@company.com',
+      visibility: 'members',
+      member_user_ids: ['u-1'],
+      published_seq: 2,
+      keep_updated: false,
+      acl_revision: 1,
+      url: '/a/doccode12345',
+      created_at: '2026-11-26T10:00:00Z',
+      updated_at: '2026-11-27T08:30:00Z',
+      can_manage: false,
+    };
+    mockListSharedDocuments.mockResolvedValue([sharedDoc]);
+
+    const { unmount } = renderWithProviders(
+      <Routes>
+        <Route path="/monitors" element={<Monitors />} />
+      </Routes>,
+      { route: '/monitors' },
+    );
+
+    expect(await screen.findByText('HTML Dashboard')).toBeInTheDocument();
+    expect(screen.queryByText('Legacy Markdown Entry')).not.toBeInTheDocument();
+
+    const docsSection = await screen.findByTestId('shared-documents-section');
+    expect(within(docsSection).getByText('q4-memo.md')).toBeInTheDocument();
+    expect(within(docsSection).getByText(/Bob/)).toBeInTheDocument();
+    expect(within(docsSection).getByText(/Updated:/i)).toBeInTheDocument();
+    expect(within(docsSection).getByRole('link', { name: /Open/i })).toHaveAttribute('href', '/a/doccode12345');
+    unmount();
+
+    // When there are no authorized shared documents, the section stays hidden.
+    mockListSharedDocuments.mockResolvedValue([]);
+    renderWithProviders(
+      <Routes>
+        <Route path="/monitors" element={<Monitors />} />
+      </Routes>,
+      { route: '/monitors' },
+    );
+    expect(await screen.findByText('HTML Dashboard')).toBeInTheDocument();
+    expect(screen.queryByTestId('shared-documents-section')).toBeNull();
   });
 });

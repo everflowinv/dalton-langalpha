@@ -199,11 +199,14 @@ vi.mock('@/pages/Monitors/api', async (importOriginal) => {
   return {
     ...actual,
     getMonitorByArtifact: vi.fn<typeof actual.getMonitorByArtifact>(async () => null),
+    getSharedDocumentByArtifact: vi.fn<typeof actual.getSharedDocumentByArtifact>(async () => null),
     listCompanyMembers: vi.fn<typeof actual.listCompanyMembers>(async () => [
       { user_id: 'u-colleague-1', email: 'bob@company.com', name: 'Bob', tier: 'internal' },
     ]),
     publishMonitor: vi.fn<typeof actual.publishMonitor>(),
+    shareDocument: vi.fn<typeof actual.shareDocument>(),
     updateMonitor: vi.fn<typeof actual.updateMonitor>(),
+    updateSharedDocument: vi.fn<typeof actual.updateSharedDocument>(),
   };
 });
 
@@ -216,7 +219,13 @@ import {
   unshareArtifact,
 } from '@/pages/ChatAgent/utils/api/artifacts';
 import { toast } from '@/components/ui/use-toast';
-import { getMonitorByArtifact, publishMonitor, updateMonitor } from '@/pages/Monitors/api';
+import {
+  getMonitorByArtifact,
+  getSharedDocumentByArtifact,
+  publishMonitor,
+  shareDocument,
+  updateMonitor,
+} from '@/pages/Monitors/api';
 import FilePanel from '../FilePanel';
 import { usePanelFiles } from '../chatView/usePanelFiles';
 import { fileTarget } from '../filePanel/types';
@@ -229,7 +238,9 @@ const mockStatus = vi.mocked(getArtifactStatus);
 const mockSetLeftOut = vi.mocked(setArtifactFileLeftOut);
 const mockUnshare = vi.mocked(unshareArtifact);
 const mockGetMonitor = vi.mocked(getMonitorByArtifact);
+const mockGetSharedDoc = vi.mocked(getSharedDocumentByArtifact);
 const mockPublishMonitor = vi.mocked(publishMonitor);
+const mockShareDocument = vi.mocked(shareDocument);
 
 const ARTIFACT: Artifact = {
   artifact_id: '6f1c2a7e-3b4d-4e5f-8a9b-0c1d2e3f4a5b',
@@ -283,6 +294,7 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
     mockFind.mockResolvedValue(ARTIFACT);
     mockStatus.mockResolvedValue(STATUS);
     mockGetMonitor.mockResolvedValue(null);
+    mockGetSharedDoc.mockResolvedValue(null);
     mockPublishMonitor.mockResolvedValue({
       monitor: {
         monitor_id: 'm-1',
@@ -1286,5 +1298,86 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
     expect(mockPublishMonitor).not.toHaveBeenCalled();
     // Dialog remains open rather than dismissing on a blocked confirm click.
     expect(screen.getByRole('button', { name: /Publish publicly|确认公开/i })).toBeInTheDocument();
+  });
+
+  it('updates bottom status copy across all 4 visibility levels and shares md files via shareDocument instead of publishMonitor', async () => {
+    tierState.callerTier = 'admin';
+    const mdArtifact: Artifact = {
+      ...ARTIFACT,
+      path: 'notes/memo.md',
+      name: 'memo.md',
+    };
+    mockEnsure.mockResolvedValue(mdArtifact);
+    mockFind.mockResolvedValue(mdArtifact);
+    mockStatus.mockResolvedValue({
+      ...STATUS,
+      files: [{ path: 'notes/memo.md', size: 256, reason: 'entry', optional: false }],
+      total_size: 256,
+    });
+    mockShareDocument.mockResolvedValue({
+      document: {
+        doc_id: 'd-md-1',
+        artifact_id: mdArtifact.artifact_id,
+        artifact_code: mdArtifact.code,
+        workspace_id: 'ws-1',
+        entry_path: 'notes/memo.md',
+        file_name: 'memo.md',
+        title: 'memo.md',
+        owner_user_id: 'u-1',
+        owner_name: 'Alice',
+        owner_email: 'alice@company.com',
+        visibility: 'members',
+        member_user_ids: ['u-colleague-1'],
+        published_seq: 1,
+        keep_updated: false,
+        acl_revision: 1,
+        url: `/a/${mdArtifact.code}`,
+        created_at: '2026-11-27T08:00:00Z',
+        updated_at: '2026-11-27T08:00:00Z',
+        can_manage: true,
+      },
+      cut: true,
+    });
+
+    renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="notes/memo.md" onClose={() => {}} />,
+    );
+
+    // Monitor-only title & category inputs are hidden for non-HTML files
+    expect(await screen.findByText('Only you can open this link.')).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('Enter monitor title')).toBeNull();
+
+    // Switching to Selected colleagues immediately replaces Private copy
+    await userEvent.click(screen.getByRole('button', { name: 'Selected colleagues' }));
+    expect(screen.getByText('Colleagues you select can open this link.')).toBeInTheDocument();
+    expect(screen.queryByText('Private')).toBeNull();
+    expect(screen.queryByText('Only you can open this link.')).toBeNull();
+
+    // Switching to Company shows team copy
+    await userEvent.click(screen.getByRole('button', { name: 'Company' }));
+    expect(screen.getByText('Team members can open this link.')).toBeInTheDocument();
+    expect(screen.queryByText('Private')).toBeNull();
+
+    // Switching to Anyone (Public link) shows public copy
+    await userEvent.click(screen.getByRole('button', { name: /Anyone \(Public link\)/i }));
+    expect(screen.getByText('Anyone with the link can open it.')).toBeInTheDocument();
+    expect(screen.queryByText('Private')).toBeNull();
+
+    // Share md to Selected colleagues -> calls shareDocument, NEVER publishMonitor
+    await userEvent.click(screen.getByRole('button', { name: 'Selected colleagues' }));
+    const bobBtn = await screen.findByRole('button', { name: /Bob/i });
+    await userEvent.click(bobBtn);
+    const publishBtn = screen.getByRole('button', { name: 'Publish' });
+    await waitFor(() => expect(publishBtn).toBeEnabled());
+    await userEvent.click(publishBtn);
+
+    await waitFor(() => expect(mockShareDocument).toHaveBeenCalledTimes(1));
+    expect(mockPublishMonitor).not.toHaveBeenCalled();
+    expect(mockShareDocument.mock.calls[0][0]).toMatchObject({
+      workspace_id: 'ws-1',
+      path: 'notes/memo.md',
+      visibility: 'members',
+      member_user_ids: ['u-colleague-1'],
+    });
   });
 });

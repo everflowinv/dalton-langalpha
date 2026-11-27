@@ -37,6 +37,7 @@ from src.dalton.monitors.grants import (
     MonitorGrantError,
     data_prefix,
     frame_prefix,
+    is_shared_document_grant,
     mint_monitor_grant,
     verify_monitor_grant,
 )
@@ -47,6 +48,8 @@ from src.dalton.monitors.models import (
     PublishMonitorRequest,
     RepublishMonitorRequest,
     UpdateMonitorRequest,
+    is_html_entry_path,
+    is_monitor_panel_entry,
     is_valid_data_key,
     is_valid_slug,
 )
@@ -123,6 +126,8 @@ def _normalize_workspace_entry_path(workspace: dict[str, Any], raw_path: str) ->
             return candidate
     if not may_be_artifact(relative):
         raise HTTPException(status_code=400, detail="该文件不能发布为监控面板")
+    if not is_html_entry_path(relative):
+        raise HTTPException(status_code=400, detail="监控面板仅支持发布 HTML 网页文件")
     return relative
 
 
@@ -376,6 +381,8 @@ async def list_monitors_for_user(user_id: str) -> list[dict[str, Any]]:
     rows = await monitor_db.list_all_monitors()
     visible: list[dict[str, Any]] = []
     for m in rows:
+        if not is_monitor_panel_entry(m):
+            continue
         if await can_view_monitor(m, user_id):
             visible.append(serialize_monitor(m, can_manage=_can_manage_monitor(m, user_id, tier)))
     return visible
@@ -1502,6 +1509,16 @@ async def serve_monitor_file(
     head: bool = False,
 ) -> ServedArtifactFile:
     """Serve a published monitor version file under ``CSP: sandbox`` (opaque origin)."""
+    if is_shared_document_grant(grant_token):
+        from src.dalton.monitors import shared_documents
+
+        return await shared_documents.serve_shared_document_file(
+            grant_token,
+            seq,
+            path,
+            if_none_match=if_none_match,
+            head=head,
+        )
     monitor, _viewer_id = await _authorize_grant(grant_token)
 
     if not seq.isdigit() or int(seq) < 1 or not _valid_path(path):
