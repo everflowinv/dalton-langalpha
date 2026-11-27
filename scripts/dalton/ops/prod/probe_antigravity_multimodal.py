@@ -81,6 +81,49 @@ _DUMMY_READ_TOOL = {
 
 _ANTIGRAVITY_PROVIDER = "antigravity-oauth"
 
+_EXTRA_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"(?i)\b(refresh[-_]?token|id[-_]?token|cookie|set-cookie|x-goog-api-key)"
+            r"(\s*[=:]\s*)([\"']?)[^\s\"',;)}\]]+"
+        ),
+        r"\1\2\3[REDACTED]",
+    ),
+    (re.compile(r"\bya29\.[A-Za-z0-9._~+/=-]+"), "[REDACTED]"),
+    (re.compile(r"(?i)\bheaders\s*[=:]\s*\{[^}]*\}"), "headers=[REDACTED]"),
+)
+
+
+def _client_secret_values(client: Any) -> tuple[str, ...]:
+    """Extract raw token values from ``client`` solely for exact-match redaction."""
+    raw = getattr(client, "api_key", None)
+    if raw is None:
+        return ()
+    getter = getattr(raw, "get_secret_value", None)
+    val = getter() if callable(getter) else (raw if isinstance(raw, str) else "")
+    return (val,) if isinstance(val, str) and val else ()
+
+
+def _format_safe_error(exc: BaseException, *, secrets: Sequence[str] = ()) -> str:
+    """Return a concise, single-line error summary free of headers and tokens."""
+    from src.server.utils.error_sanitization import sanitize_error_text, single_line
+
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
+
+    raw = str(exc) or type(exc).__name__
+    for secret in secrets:
+        if secret:
+            raw = raw.replace(secret, "[REDACTED]")
+    sanitized = sanitize_error_text(raw)
+    for pattern, repl in _EXTRA_SECRET_PATTERNS:
+        sanitized = pattern.sub(repl, sanitized)
+    sanitized = single_line(sanitized).strip()[:200]
+    prefix = f"{type(exc).__name__}(status={status})" if status is not None else type(exc).__name__
+    return f"{prefix}: {sanitized}" if sanitized else prefix
+
 
 def make_number_png(digits: str, *, scale: int = 12, padding: int = 24) -> bytes:
     """Generate a high-contrast PNG displaying ``digits`` with zero external font dependency."""
@@ -320,13 +363,16 @@ async def run_probes(model_name: str, user_id: str | None = None) -> int:
     load_dotenv(REPO_ROOT / ".env", override=False)
 
     from src.server.database.pool import get_or_create_pool
-    from src.server.utils.error_sanitization import sanitize_error_text
 
     pool = get_or_create_pool()
-    await pool.open()
+    pool_opened = False
+    known_secrets: tuple[str, ...] = ()
     try:
+        await pool.open()
+        pool_opened = True
         resolved_uid = await _resolve_user_id(user_id)
         client = await _build_readonly_client(model_name, resolved_uid)
+        known_secrets = _client_secret_values(client)
         tool_client = client.bind_tools([_DUMMY_READ_TOOL])
 
         img_b64 = base64.b64encode(make_number_png("7391")).decode("ascii")
@@ -350,11 +396,14 @@ async def run_probes(model_name: str, user_id: str | None = None) -> int:
                 print(f"[{status}] {label}: expected={expected_str} answer={snippet!r}")
             except Exception as exc:
                 all_ok = False
-                safe_err = sanitize_error_text(str(exc))[:200]
-                print(f"[FAIL] {label}: {type(exc).__name__}: {safe_err}")
+                print(f"[FAIL] {label}: {_format_safe_error(exc, secrets=known_secrets)}")
         return 0 if all_ok else 1
+    except Exception as exc:
+        print(f"[FAIL] setup: {_format_safe_error(exc, secrets=known_secrets)}")
+        return 1
     finally:
-        await pool.close()
+        if pool_opened:
+            await pool.close()
 
 
 def main(argv: list[str] | None = None) -> int:

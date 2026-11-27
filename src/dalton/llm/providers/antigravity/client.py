@@ -51,6 +51,7 @@ from langchain_core.messages import (
 from langchain_core.messages.ai import InputTokenDetails, OutputTokenDetails, UsageMetadata
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.tools import BaseTool
+from pydantic import Field, SecretStr
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,12 @@ _SKIP_SIGNATURE = "skip_thought_signature_validator"
 
 
 def _signature_family_for_model(model: Any) -> str | None:
-    """Infer model family for Antigravity thoughtSignature compatibility."""
+    """Infer model family for Antigravity thoughtSignature compatibility.
+
+    Only recognized model families are returned; opaque identifiers return
+    ``None`` so fallback metadata fields (such as ``catalog_model``) are still
+    checked and unknown-origin signatures are never replayed.
+    """
     if not isinstance(model, str):
         return None
     norm = model.strip().lower()
@@ -96,16 +102,15 @@ def _signature_family_for_model(model: Any) -> str | None:
         return "claude"
     if "gpt" in norm or "openai" in norm:
         return "gpt"
-    prefix = re.split(r"[-_./:\s]+", norm, maxsplit=1)[0]
-    return prefix or None
+    return None
 
 
 def _signature_source_family(message: AIMessage) -> str | None:
     """Resolve the model family that produced ``message``'s thought signatures."""
     extra = message.additional_kwargs or {}
-    stamped = extra.get(_SIGNATURE_FAMILY_KEY)
-    if isinstance(stamped, str) and stamped.strip():
-        return stamped.strip().lower()
+    stamped = _signature_family_for_model(extra.get(_SIGNATURE_FAMILY_KEY))
+    if stamped is not None:
+        return stamped
     meta = message.response_metadata or {}
     for key in ("model_version", "model_name", "model", "catalog_model"):
         fam = _signature_family_for_model(meta.get(key))
@@ -538,16 +543,16 @@ def _messages_to_gemini(
                 if block_id and block_id not in last_call_order:
                     last_call_order[block_id] = len(last_call_order)
             # The endpoint validates that functionCall parts carry their
-            # thought_signature (it 400s without one). A mapped message
-            # replays each call's own signature only within the same model
-            # family; cross-family messages drop foreign signatures while
-            # keeping tool call IDs, so Gemini gets the stand-in.
+            # thought_signature (it 400s without one). Replay signatures only
+            # when the message is confirmed to come from the same model family;
+            # cross-family or unknown-source messages drop signatures while
+            # keeping tool call IDs, falling through to the missing-signature path.
             extra = message.additional_kwargs or {}
             source_family = _signature_source_family(message)
             signatures_compatible = (
-                source_family is None
-                or target_family is None
-                or source_family == target_family
+                source_family is not None
+                and target_family is not None
+                and source_family == target_family
             )
             if signatures_compatible:
                 by_call = extra.get(_CALL_SIGNATURES_KEY)
@@ -774,7 +779,11 @@ class ChatAntigravity(BaseChatModel):
     """Chat model for Google Antigravity subscriptions (OAuth Bearer)."""
 
     model: str = "gemini-4-argon-medium"
-    api_key: str = ""  # OAuth access token (Bearer)
+    api_key: SecretStr | None = Field(
+        default=SecretStr(""),
+        repr=False,
+        exclude=True,
+    )  # OAuth access token (Bearer)
     base_url: str = ANTIGRAVITY_DEFAULT_BASE_URL
     project: str = ANTIGRAVITY_DEFAULT_PROJECT
     user_agent: str = ANTIGRAVITY_USER_AGENT
@@ -785,6 +794,15 @@ class ChatAntigravity(BaseChatModel):
     timeout: float = 600.0
     default_headers: dict[str, str] = {}
     tools: list[dict] = []  # bound Gemini functionDeclarations
+
+    @property
+    def lc_secrets(self) -> dict[str, str]:
+        return {"api_key": "ANTIGRAVITY_API_KEY"}
+
+    def _api_key_value(self) -> str:
+        if self.api_key is None:
+            return ""
+        return self.api_key.get_secret_value()
 
 
     @property
@@ -869,7 +887,7 @@ class ChatAntigravity(BaseChatModel):
     def _request_headers(self) -> dict[str, str]:
         return {
             **self.default_headers,
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {self._api_key_value()}",
             "Content-Type": "application/json",
             "User-Agent": self.user_agent,
         }

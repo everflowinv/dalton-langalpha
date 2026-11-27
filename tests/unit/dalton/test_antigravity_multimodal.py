@@ -15,9 +15,11 @@ import pypdf
 import pytest
 from langchain.agents.middleware.types import ModelRequest, ModelResponse
 from langchain_core.language_models import BaseChatModel
+from langchain_core.load import dumpd, dumps
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.config import get_config
 from PIL import Image
+from pydantic import SecretStr
 
 from ptc_agent.agent.middleware.file_operations.multimodal import build_content_blocks
 from ptc_agent.agent.middleware.model_resilience import ModelResilienceMiddleware
@@ -29,10 +31,12 @@ from ptc_agent.agent.middleware.tool.empty_call_retry import (
 )
 from scripts.dalton.ops.prod import probe_antigravity_multimodal as probe_mod
 from scripts.dalton.ops.prod.probe_antigravity_multimodal import (
+    _DUMMY_READ_TOOL,
     _answer_matches,
     _answer_matches_all,
     _build_probe_messages,
     _build_readonly_client,
+    _format_safe_error,
     make_number_pdf,
     make_number_png,
 )
@@ -43,6 +47,7 @@ from src.dalton.llm.providers.antigravity.client import (
     _THOUGHT_SIGNATURES_KEY,
     ChatAntigravity,
     _messages_to_gemini,
+    _signature_source_family,
 )
 from src.dalton.middleware.refusal_fallback import (
     REFUSAL_NOTICE_CHANNEL,
@@ -446,6 +451,148 @@ class TestAntigravityCrossFamilySignatures:
         claude_client = ChatAntigravity(model="claude-sonnet-5-5-high", api_key="fake")
         payload_c = claude_client._build_payload([HumanMessage(content="go"), claude_msg])
         assert payload_c["request"]["contents"][1]["parts"][0]["thoughtSignature"] == "claude-sig-call"
+
+    @pytest.mark.parametrize(
+        "response_metadata",
+        [
+            {},
+            {"model_version": "opaque-build-202611"},
+        ],
+        ids=["no_metadata", "unrecognized_model_version_only"],
+    )
+    def test_unknown_source_family_never_replays_signatures_and_keeps_tool_ids(
+        self, response_metadata: dict[str, str]
+    ) -> None:
+        unknown_msg = AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "Read", "args": {"file_path": "/a"}, "id": "call_u1"},
+                {"name": "Read", "args": {"file_path": "/b"}, "id": "call_u2"},
+            ],
+            additional_kwargs={
+                _THOUGHT_SIGNATURES_KEY: ["unknown-sig-text", "unknown-sig-1"],
+                _CALL_SIGNATURES_KEY: {"call_u1": "unknown-sig-1"},
+            },
+            response_metadata=response_metadata,
+        )
+        assert _signature_source_family(unknown_msg) is None
+
+        history = [
+            HumanMessage(content="go"),
+            unknown_msg,
+            ToolMessage(content="ok1", tool_call_id="call_u1", name="Read"),
+            ToolMessage(content="ok2", tool_call_id="call_u2", name="Read"),
+        ]
+
+        # Gemini target: preserve call IDs, drop unknown signatures, use existing stand-in path.
+        gemini_client = ChatAntigravity(model="gemini-4-argon-high", api_key="fake")
+        gemini_payload = gemini_client._build_payload(history)
+        gemini_parts = gemini_payload["request"]["contents"][1]["parts"]
+        assert len(gemini_parts) == 2
+        assert [p["functionCall"]["id"] for p in gemini_parts] == ["call_u1", "call_u2"]
+        assert [p["thoughtSignature"] for p in gemini_parts] == [_SKIP_SIGNATURE, _SKIP_SIGNATURE]
+        assert "unknown-sig" not in json.dumps(gemini_payload)
+
+        # Claude target: preserve call IDs, omit thoughtSignature completely.
+        claude_client = ChatAntigravity(model="claude-sonnet-5-5-medium", api_key="fake")
+        claude_payload = claude_client._build_payload(history)
+        claude_parts = claude_payload["request"]["contents"][1]["parts"]
+        assert len(claude_parts) == 2
+        assert [p["functionCall"]["id"] for p in claude_parts] == ["call_u1", "call_u2"]
+        assert all("thoughtSignature" not in p for p in claude_parts)
+        assert "unknown-sig" not in json.dumps(claude_payload)
+
+    def test_valid_catalog_model_wins_over_unrecognized_model_version(self) -> None:
+        legacy_gemini_msg = AIMessage(
+            content="",
+            tool_calls=[{"name": "Read", "args": {"file_path": "/a"}, "id": "call_g1"}],
+            additional_kwargs={
+                _THOUGHT_SIGNATURES_KEY: ["gemini-legacy-sig"],
+                _CALL_SIGNATURES_KEY: {"call_g1": "gemini-legacy-sig"},
+            },
+            response_metadata={
+                "model_version": "opaque-release-202611",
+                "catalog_model": "gemini-4-argon-high-oauth",
+            },
+        )
+        assert _signature_source_family(legacy_gemini_msg) == "gemini"
+
+        gemini_client = ChatAntigravity(model="gemini-4-carbon-high", api_key="fake")
+        gemini_payload = gemini_client._build_payload([HumanMessage(content="go"), legacy_gemini_msg])
+        gemini_fc = gemini_payload["request"]["contents"][1]["parts"][0]
+        assert gemini_fc["functionCall"]["id"] == "call_g1"
+        assert gemini_fc["thoughtSignature"] == "gemini-legacy-sig"
+
+        claude_client = ChatAntigravity(model="claude-sonnet-5-5-medium", api_key="fake")
+        cross_payload = claude_client._build_payload([HumanMessage(content="go"), legacy_gemini_msg])
+        cross_fc = cross_payload["request"]["contents"][1]["parts"][0]
+        assert cross_fc["functionCall"]["id"] == "call_g1"
+        assert "thoughtSignature" not in cross_fc
+        assert "gemini-legacy-sig" not in json.dumps(cross_payload)
+
+        legacy_claude_msg = AIMessage(
+            content="",
+            tool_calls=[{"name": "Read", "args": {"file_path": "/b"}, "id": "call_c1"}],
+            additional_kwargs={
+                _THOUGHT_SIGNATURES_KEY: ["claude-legacy-sig"],
+                _CALL_SIGNATURES_KEY: {"call_c1": "claude-legacy-sig"},
+            },
+            response_metadata={
+                "model_version": "v1internal-build-99",
+                "catalog_model": "claude-sonnet-5-5-medium-oauth",
+            },
+        )
+        assert _signature_source_family(legacy_claude_msg) == "claude"
+        same_claude_payload = claude_client._build_payload([HumanMessage(content="go"), legacy_claude_msg])
+        assert same_claude_payload["request"]["contents"][1]["parts"][0]["thoughtSignature"] == "claude-legacy-sig"
+
+
+# ---------------------------------------------------------------------------
+# Token redaction from client serialization, tracing, and probe errors
+# ---------------------------------------------------------------------------
+
+
+class TestAntigravitySecretRedaction:
+    def test_api_key_excluded_from_repr_model_dump_and_langchain_dumpd(self) -> None:
+        secret = "ya29.a0HF2_SUPER_SECRET_OAUTH_TOKEN_987654321"
+        client = ChatAntigravity(model="gemini-4-argon-medium", api_key=secret)
+        bound = client.bind_tools([_DUMMY_READ_TOOL])
+
+        for inst in (client, bound):
+            assert secret not in repr(inst)
+            assert secret not in str(inst)
+            dumped = inst.model_dump()
+            assert "api_key" not in dumped
+            assert secret not in json.dumps(inst.model_dump(mode="json"))
+            assert secret not in inst.model_dump_json()
+            lc_dumped = dumpd(inst)
+            assert secret not in json.dumps(lc_dumped)
+            assert secret not in dumps(inst)
+            assert inst.lc_secrets.get("api_key") == "ANTIGRAVITY_API_KEY"
+            assert inst._request_headers()["Authorization"] == f"Bearer {secret}"
+
+        secret_str_client = ChatAntigravity(model="gemini-4-argon-medium", api_key=SecretStr(secret))
+        assert secret_str_client._request_headers()["Authorization"] == f"Bearer {secret}"
+        assert secret not in repr(secret_str_client)
+        assert secret not in json.dumps(dumpd(secret_str_client))
+
+        empty_client = ChatAntigravity(model="gemini-4-argon-medium", api_key=None)
+        assert empty_client._request_headers()["Authorization"] == "Bearer "
+
+    def test_probe_format_safe_error_strips_headers_and_tokens(self) -> None:
+        secret = "ya29.a0HF2_PROBE_LIVE_TOKEN_1234567890"
+        raw_err = RuntimeError(
+            "upstream failed\n"
+            f"headers={{'Authorization': 'Bearer {secret}', 'Cookie': 'sid=abc123'}}\n"
+            f"refresh_token=1//0gREFRESH_SECRET_XYZ raw={secret}"
+        )
+        summary = _format_safe_error(raw_err, secrets=(secret,))
+        assert "\n" not in summary
+        assert secret not in summary
+        assert "1//0gREFRESH_SECRET_XYZ" not in summary
+        assert "sid=abc123" not in summary
+        assert "Authorization" not in summary
+        assert "RuntimeError" in summary
 
 
 # ---------------------------------------------------------------------------
