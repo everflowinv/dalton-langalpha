@@ -11,35 +11,10 @@ import { pdfjsData } from './scripts/vite-plugins/pdfjsData.ts'
 import { sentrySourcemaps } from './scripts/vite-plugins/sentrySourcemaps.ts'
 import { skipEntryPreload } from './scripts/vite-plugins/skipEntryPreload.ts'
 import { versionManifest } from './scripts/vite-plugins/versionManifest.ts'
+// DALTON-HOOK(brand-name): build-time HTML branding & Caddy OG template placeholder for link unfurlers
+import { brandIndexHtmlPlugin } from './src/lib/dalton/brandIndexHtml.ts'
 
 // https://vitejs.dev/config/
-
-// DALTON-HOOK(brand-name): the static index.html is what link unfurlers (Feishu,
-// Discord, Slack) read, before any script swaps the title or favicon, so the
-// brand has to be written into the HTML at build time.
-/**
- * @param {Record<string, string>} env
- * @returns {import('vite').Plugin | null}
- */
-function brandIndexHtml(env) {
-  const name = (env.VITE_BRAND_NAME || '').trim()
-  if (!name) return null
-  const everflow = (env.VITE_BRAND_MARK || '').trim() === 'everflow'
-  const esc = (/** @type {string} */ v) => v.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')
-  return {
-    name: 'dalton-brand-index-html',
-    transformIndexHtml(/** @type {string} */ html) {
-      let out = html.replace(/<title>[^<]*<\/title>/, `<title>${esc(name)}</title>`)
-      if (everflow) out = out.replace('href="/logo-favicon.svg"', 'href="/everflow/favicon.svg"')
-      const meta = [
-        `<meta property="og:site_name" content="${esc(name)}" />`,
-        `<meta property="og:title" content="${esc(name)}" />`,
-        `<meta name="application-name" content="${esc(name)}" />`,
-      ].join('\n    ')
-      return out.replace('</head>', `    ${meta}\n  </head>`)
-    },
-  }
-}
 
 export default defineConfig(({ command, mode }) => {
   // Load VITE_-prefixed vars from .env files (.env, .env.local, …) so they can
@@ -75,7 +50,7 @@ export default defineConfig(({ command, mode }) => {
       // names the origin the app's API frames really load from.
       framePolicy(env.VITE_API_BASE_URL),
       // DALTON-HOOK(brand-name): brand the static HTML link previews read.
-      brandIndexHtml(env),
+      brandIndexHtmlPlugin(env),
       authPreconnect(env.VITE_HOST_MODE, env.VITE_SUPABASE_URL),
       // Read with the SENTRY_ prefix, which never reaches the client the way
       // VITE_ does: the token stays in the build.
