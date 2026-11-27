@@ -142,6 +142,7 @@ class _FakeConn:
     def __init__(self, cursor: _FakeCursor | None = None):
         self._cursor = cursor or _FakeCursor()
         self.executed: list[tuple[str, object]] = []
+        self.closed = False
 
     def cursor(self, **_kw):
         return self._cursor
@@ -153,6 +154,9 @@ class _FakeConn:
     async def execute(self, sql: str, params=None):
         self.executed.append((sql, params))
         return self._cursor
+
+    async def close(self):
+        self.closed = True
 
 
 # ---------------------------------------------------------------------------
@@ -1165,6 +1169,11 @@ async def test_cancel_and_drain_calls_real_cancel_apis_and_checks_task_namespace
 
     with (
         patch.object(purge_mod, "get_db_connection", _get_conn),
+        patch.object(
+            purge_mod.db_pool,
+            "open_session_connection",
+            create_autospec(purge_mod.db_pool.open_session_connection, return_value=fake_conn),
+        ),
         patch.object(run_lifecycle, "request_run_cancel", req_run_cancel),
         patch.object(subagent_runs, "request_task_run_cancel", req_task_cancel),
         patch.object(purge_mod, "publish_cancel_nudge", nudge),
@@ -1176,6 +1185,7 @@ async def test_cancel_and_drain_calls_real_cancel_apis_and_checks_task_namespace
     req_task_cancel.assert_awaited_once_with(trid, thread_id=tid)
     held_ns.assert_awaited_once_with(tid, ["task-1"])
     assert nudge.await_count == 2
+    assert fake_conn.closed is True
 
     # When held_task_namespaces remains non-empty, drain times out and raises TimeoutError
     held_busy = create_autospec(writer_guard.held_task_namespaces, return_value={"task-1"})
@@ -1194,6 +1204,11 @@ async def test_cancel_and_drain_calls_real_cancel_apis_and_checks_task_namespace
 
     with (
         patch.object(purge_mod, "get_db_connection", _get_conn2),
+        patch.object(
+            purge_mod.db_pool,
+            "open_session_connection",
+            create_autospec(purge_mod.db_pool.open_session_connection, return_value=fake_conn2),
+        ),
         patch.object(run_lifecycle, "request_run_cancel", create_autospec(run_lifecycle.request_run_cancel, return_value={"state": "requested"})),
         patch.object(subagent_runs, "request_task_run_cancel", create_autospec(subagent_runs.request_task_run_cancel, return_value={"state": "requested"})),
         patch.object(purge_mod, "publish_cancel_nudge", create_autospec(purge_mod.publish_cancel_nudge, return_value=None)),
@@ -1212,6 +1227,11 @@ async def test_cancel_and_drain_calls_real_cancel_apis_and_checks_task_namespace
 
     with (
         patch.object(purge_mod, "get_db_connection", _get_idle_busy),
+        patch.object(
+            purge_mod.db_pool,
+            "open_session_connection",
+            create_autospec(purge_mod.db_pool.open_session_connection, return_value=fake_idle_busy),
+        ),
         patch.object(writer_guard, "held_task_namespaces", create_autospec(writer_guard.held_task_namespaces, return_value=set())),
     ):
         with pytest.raises(TimeoutError):
@@ -1227,6 +1247,11 @@ async def test_cancel_and_drain_calls_real_cancel_apis_and_checks_task_namespace
     held_empty = create_autospec(writer_guard.held_task_namespaces, return_value=set())
     with (
         patch.object(purge_mod, "get_db_connection", _get_idle_free),
+        patch.object(
+            purge_mod.db_pool,
+            "open_session_connection",
+            create_autospec(purge_mod.db_pool.open_session_connection, return_value=fake_idle_free),
+        ),
         patch.object(writer_guard, "held_task_namespaces", held_empty),
     ):
         await purge_mod._cancel_and_drain_thread(tid, min_turn=1, max_turn=2, timeout_s=1.0)
@@ -1247,6 +1272,11 @@ async def test_cancel_and_drain_calls_real_cancel_apis_and_checks_task_namespace
 
     with (
         patch.object(purge_mod, "get_db_connection", _get_done_task),
+        patch.object(
+            purge_mod.db_pool,
+            "open_session_connection",
+            create_autospec(purge_mod.db_pool.open_session_connection, return_value=fake_done_task),
+        ),
         patch.object(subagent_runs, "request_task_run_cancel", req_task_never),
         patch.object(writer_guard, "held_task_namespaces", held_still_locked),
     ):
@@ -1456,6 +1486,11 @@ async def test_purge_mutex_incomplete_layers_all_services_guard_and_resume_loop(
         patch.object(session_lock, "try_own_session_lock", autospec=True, side_effect=_lock_ok),
         patch.object(db, "get_purge_ledger", create_autospec(db.get_purge_ledger, return_value=running_ledger)),
         patch.object(purge_mod, "get_db_connection", _cp_missing_get_conn),
+        patch.object(
+            purge_mod.db_pool,
+            "open_session_connection",
+            create_autospec(purge_mod.db_pool.open_session_connection, return_value=cp_missing_conn),
+        ),
         patch.object(writer_guard, "held_task_namespaces", create_autospec(writer_guard.held_task_namespaces, return_value=set())),
         patch.object(purge_mod, "get_checkpointer", autospec=True, return_value=None),
     ):
@@ -1762,6 +1797,11 @@ async def test_partial_failures_decode_and_same_db_missing_checkpoints():
         patch.object(purge_mod, "acquire_purge_thread_lock", autospec=True, side_effect=_thread_lock_ok),
         patch.object(db, "get_purge_ledger", create_autospec(db.get_purge_ledger, return_value=running_ledger)),
         patch.object(purge_mod, "get_db_connection", _get_no_cp_conn),
+        patch.object(
+            purge_mod.db_pool,
+            "open_session_connection",
+            create_autospec(purge_mod.db_pool.open_session_connection, return_value=no_cp_conn),
+        ),
         patch.object(writer_guard, "held_task_namespaces", create_autospec(writer_guard.held_task_namespaces, return_value=set())),
         patch.object(purge_mod, "get_checkpointer", autospec=True, return_value=SimpleNamespace(conn=None, serde=serde)),
     ):
@@ -1941,3 +1981,350 @@ def test_restore_script_fails_before_any_mutation_when_reset_sql_missing(tmp_pat
             proj_lock.rmdir()
         elif proj_lock.exists():
             proj_lock.unlink()
+
+
+# ---------------------------------------------------------------------------
+# 11. r4 narrow fixes: decode error chain hygiene, Redis startup recovery, 1-slot pool drain
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_decode_failure_strips_exception_chain_and_never_logs_payload(
+    caplog: pytest.LogCaptureFixture,
+):
+    """Decoding a legacy JSON checkpoint write or blob that fails inside JsonPlusSerializer
+    must still fail closed (ledger stays running) while stripping __cause__/__context__ so
+    wait-to-purge payload text never reaches logs or tracebacks.
+    """
+    import dataclasses
+    import traceback
+
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+    from src.dalton.services import user_integrations_lifecycle as lifecycle_mod
+
+    serde = JsonPlusSerializer()
+    secret_write = "SECRET_GMAIL_98765"
+    secret_blob = "SECRET_CAL_54321"
+
+    legacy_write_payload = json.dumps(
+        {
+            "lc": 1,
+            "type": "constructor",
+            "id": ["langchain_core", "messages", "human", "HumanMessage"],
+            "kwargs": {"content": {"secret_email": secret_write}},
+        }
+    ).encode("utf-8")
+    legacy_blob_payload = json.dumps(
+        {
+            "lc": 1,
+            "type": "constructor",
+            "id": ["langchain_core", "messages", "human", "HumanMessage"],
+            "kwargs": {"content": {"secret_event": secret_blob}},
+        }
+    ).encode("utf-8")
+
+    # Sanity check: raw JsonPlusSerializer error genuinely embeds the secret payload
+    with pytest.raises(Exception) as raw_write_exc:
+        serde.loads_typed(("json", legacy_write_payload))
+    assert secret_write in str(raw_write_exc.value)
+    with pytest.raises(Exception) as raw_blob_exc:
+        serde.loads_typed(("json", legacy_blob_payload))
+    assert secret_blob in str(raw_blob_exc.value)
+
+    tid = str(uuid.uuid4())
+    r0 = str(uuid.uuid4())
+    all_cps = [
+        {
+            "checkpoint_ns": "",
+            "checkpoint_id": "cp-legacy-0",
+            "parent_checkpoint_id": None,
+            "checkpoint": {"channel_versions": {"messages": "v-legacy-0"}},
+            "metadata": {"turn_index": 0, "run_id": r0},
+        }
+    ]
+
+    # (1) Write decode failure: location metadata preserved, exception chain stripped
+    write_cur = _FakeCursor(
+        fetchall_seq=[
+            all_cps,
+            [
+                {
+                    "checkpoint_ns": "",
+                    "checkpoint_id": "cp-legacy-0",
+                    "task_id": "t0",
+                    "idx": 0,
+                    "channel": "messages",
+                    "type": "json",
+                    "blob": legacy_write_payload,
+                }
+            ],
+            [],
+        ]
+    )
+    with pytest.raises(RuntimeError) as write_err:
+        await purge_mod._purge_thread_checkpoints(
+            _FakeConn(write_cur),
+            serde,
+            thread_id=tid,
+            min_turn=0,
+            max_turn=0,
+            run_turn_map={r0: 0},
+            suffix_run_ids={r0},
+            suffix_task_ids=set(),
+        )
+    assert write_err.value.__cause__ is None
+    assert write_err.value.__context__ is None
+    write_tb = "".join(
+        traceback.format_exception(
+            type(write_err.value), write_err.value, write_err.value.__traceback__
+        )
+    )
+    assert tid in str(write_err.value)
+    assert "cp-legacy-0" in str(write_err.value)
+    assert "messages" in str(write_err.value)
+    assert secret_write not in write_tb
+
+    # (2) Blob decode failure through run_personal_purge_resume_once with exc_info=True logging
+    pid = str(uuid.uuid4())
+    running_ledger = dataclasses.replace(
+        _sample_ledger(purge_id=pid),
+        local_purge_status=LocalPurgeStatus.RUNNING,
+        purged_max_turn_by_thread={tid: {"min_turn": 0, "max_turn": 0}},
+    )
+    blob_cur = _FakeCursor(
+        fetchall_seq=[
+            all_cps,
+            [],
+            [
+                {
+                    "checkpoint_ns": "",
+                    "checkpoint_id": "cp-legacy-0",
+                    "channel": "messages",
+                    "version": "v-legacy-0",
+                    "type": "json",
+                    "blob": legacy_blob_payload,
+                }
+            ],
+        ]
+    )
+
+    async def _failing_finish(purge_id: str, *, revoker=None):
+        assert purge_id == pid
+        await purge_mod._purge_thread_checkpoints(
+            _FakeConn(blob_cur),
+            serde,
+            thread_id=tid,
+            min_turn=0,
+            max_turn=0,
+            run_turn_map={r0: 0},
+            suffix_run_ids={r0},
+            suffix_task_ids=set(),
+        )
+
+    caplog.clear()
+    with (
+        caplog.at_level(logging.WARNING, logger=purge_mod.logger.name),
+        patch.object(
+            db,
+            "list_running_local_purges",
+            create_autospec(db.list_running_local_purges, return_value=[running_ledger]),
+        ),
+        patch.object(
+            lifecycle_mod,
+            "finish_disconnect_locked",
+            create_autospec(lifecycle_mod.finish_disconnect_locked, side_effect=_failing_finish),
+        ),
+    ):
+        resumed = await purge_mod.run_personal_purge_resume_once()
+
+    assert resumed == []
+    assert any(pid in rec.getMessage() for rec in caplog.records)
+    formatted_logs = "\n".join(
+        logging.Formatter().format(rec) for rec in caplog.records
+    )
+    assert "cp-legacy-0" in formatted_logs
+    assert tid in formatted_logs
+    assert secret_blob not in formatted_logs
+    assert secret_blob not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_redis_startup_failure_recovers_on_same_worker_and_deletes_keys(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """When Redis is temporarily down at startup (leaving real RedisCacheClient.enabled=False),
+    subsequent purge retries on the same worker must fail while unavailable and recover
+    to delete keys once Redis becomes reachable again.
+    """
+    from src.utils.cache import redis_cache as redis_cache_mod
+
+    class _ToggleRedis:
+        def __init__(self) -> None:
+            self.available = False
+            self.deleted_calls: list[tuple[str, ...]] = []
+
+        async def ping(self) -> bool:
+            if not self.available:
+                raise ConnectionError("redis temporarily down")
+            return True
+
+        async def delete(self, *keys: str) -> int:
+            if not self.available:
+                raise ConnectionError("redis temporarily down")
+            self.deleted_calls.append(tuple(keys))
+            return len(keys)
+
+        async def aclose(self) -> None:
+            return None
+
+    class _DummyPool:
+        async def disconnect(self) -> None:
+            return None
+
+    fake_redis = _ToggleRedis()
+    monkeypatch.setenv("REDIS_CACHE_ENABLED", "true")
+
+    with (
+        patch("src.config.settings.is_redis_cache_enabled", autospec=True, return_value=True),
+        patch.object(
+            redis_cache_mod, "is_redis_cache_enabled", autospec=True, return_value=True
+        ),
+        patch.object(
+            redis_cache_mod.BlockingConnectionPool,
+            "from_url",
+            autospec=True,
+            return_value=_DummyPool(),
+        ),
+        patch.object(
+            redis_cache_mod.redis,
+            "Redis",
+            autospec=True,
+            return_value=fake_redis,
+        ),
+    ):
+        real_cache = redis_cache_mod.RedisCacheClient(url="redis://localhost:6379/0")
+        with pytest.raises(ConnectionError):
+            await real_cache.connect()
+        assert real_cache.enabled is False  # matches setup.py startup degradation
+
+        with patch.object(
+            redis_cache_mod, "get_cache_client", autospec=True, return_value=real_cache
+        ):
+            # Retry 1 while Redis is still down: fails closed, 0 delete calls
+            with pytest.raises(RuntimeError, match="unavailable"):
+                await purge_mod._delete_redis_keys(["stream:t1:r1", "meta:t1:r1"])
+            assert fake_redis.deleted_calls == []
+            assert real_cache.enabled is False
+
+            # Redis comes back on the same worker
+            fake_redis.available = True
+            deleted = await purge_mod._delete_redis_keys(["stream:t1:r1", "meta:t1:r1"])
+            assert deleted == 2
+            assert fake_redis.deleted_calls == [("stream:t1:r1", "meta:t1:r1")]
+            assert real_cache.enabled is True
+
+        # Also cover startup failure before client creation (client=None, enabled=False)
+        real_cache_no_client = redis_cache_mod.RedisCacheClient(url="redis://localhost:6379/0")
+        real_cache_no_client.enabled = False
+        real_cache_no_client.client = None
+        fake_redis.available = False
+        fake_redis.deleted_calls.clear()
+
+        with patch.object(
+            redis_cache_mod,
+            "get_cache_client",
+            autospec=True,
+            return_value=real_cache_no_client,
+        ):
+            with pytest.raises(RuntimeError, match="unavailable"):
+                await purge_mod._delete_redis_keys(["stream:t2:r2"])
+            assert real_cache_no_client.enabled is False
+            assert fake_redis.deleted_calls == []
+
+            fake_redis.available = True
+            deleted2 = await purge_mod._delete_redis_keys(["stream:t2:r2"])
+            assert deleted2 == 1
+            assert fake_redis.deleted_calls == [("stream:t2:r2",)]
+            assert real_cache_no_client.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_cancel_and_drain_succeeds_under_single_slot_pool_for_settled_subagent():
+    """With POSTGRES_CONVERSATION_POOL_MAX=1, _cancel_and_drain_thread holds T(thread) on an
+    out-of-pool session so real writer_guard.held_task_namespaces() can still borrow the single
+    pooled slot without timing out — while still blocking if a completed task's lock is held.
+    """
+    from psycopg_pool import PoolTimeout
+
+    from src.server.database import pool as pool_mod
+    from src.server.services import writer_guard
+
+    tid = str(uuid.uuid4())
+    trid = str(uuid.uuid4())
+    task_id = "task-settled-1"
+
+    class _SingleSlotPoolDouble:
+        def __init__(self, pg_locks_rows: list[tuple[int, int]]) -> None:
+            self._checked_out = False
+            self._pg_locks_rows = pg_locks_rows
+
+        @asynccontextmanager
+        async def get_db_connection(self, conn=None):
+            if conn is not None:
+                yield conn
+                return
+            if self._checked_out:
+                raise PoolTimeout("single-slot pool exhausted")
+            self._checked_out = True
+            try:
+                cur = _FakeCursor(
+                    fetchall_seq=[
+                        [],  # live_runs = []
+                        [{"task_id": task_id, "task_run_id": trid, "status": "completed"}],
+                    ]
+                )
+
+                class _SlotCursor(_FakeCursor):
+                    async def fetchall(self_inner):
+                        last_sql = self_inner.executed[-1][0] if self_inner.executed else ""
+                        if "FROM pg_locks" in last_sql:
+                            return list(self._pg_locks_rows)
+                        return await super().fetchall()
+
+                yield _FakeConn(_SlotCursor(fetchall_seq=cur._fetchall_seq))
+            finally:
+                self._checked_out = False
+
+    # Case 1: Settled completed subagent (no lock in pg_locks) drains cleanly on 1-slot pool
+    pool_free = _SingleSlotPoolDouble(pg_locks_rows=[])
+    session_conn_free = _FakeConn(_FakeCursor(fetchone_seq=[(True,)]))
+    with (
+        patch.object(purge_mod, "get_db_connection", pool_free.get_db_connection),
+        patch.object(pool_mod, "get_db_connection", pool_free.get_db_connection),
+        patch.object(
+            purge_mod.db_pool,
+            "open_session_connection",
+            create_autospec(purge_mod.db_pool.open_session_connection, return_value=session_conn_free),
+        ),
+    ):
+        await purge_mod._cancel_and_drain_thread(tid, min_turn=0, max_turn=2, timeout_s=0.5)
+    assert session_conn_free.closed is True
+
+    # Case 2: Completed subagent STILL holding N(thread, task:...) in pg_locks -> still times out
+    unsigned = writer_guard.namespace_key(tid, f"task:{task_id}") & 0xFFFFFFFFFFFFFFFF
+    held_pair = (unsigned >> 32, unsigned & 0xFFFFFFFF)
+    pool_held = _SingleSlotPoolDouble(pg_locks_rows=[held_pair])
+    session_conn_held = _FakeConn(_FakeCursor(fetchone_seq=[(True,), (True,), (True,)]))
+    with (
+        patch.object(purge_mod, "get_db_connection", pool_held.get_db_connection),
+        patch.object(pool_mod, "get_db_connection", pool_held.get_db_connection),
+        patch.object(
+            purge_mod.db_pool,
+            "open_session_connection",
+            create_autospec(purge_mod.db_pool.open_session_connection, return_value=session_conn_held),
+        ),
+        pytest.raises(TimeoutError),
+    ):
+        await purge_mod._cancel_and_drain_thread(tid, min_turn=0, max_turn=2, timeout_s=0.05)
+    assert session_conn_held.closed is True

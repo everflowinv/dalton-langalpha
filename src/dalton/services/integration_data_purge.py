@@ -16,7 +16,6 @@ import os
 import time
 from typing import TYPE_CHECKING, Any
 
-import anyio
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.serde.types import _DeltaSnapshot
 from psycopg.rows import dict_row
@@ -838,10 +837,14 @@ async def _cancel_and_drain_thread(
                 )
     suffix_task_ids = sorted(set(suffix_task_ids))
 
-    # Wait until exclusive T(thread) can be acquired AND no suffix task namespace is held
+    # Wait until exclusive T(thread) can be acquired AND no suffix task namespace is held.
+    # Hold T(thread) on a dedicated out-of-pool session so held_task_namespaces() can still
+    # borrow a pooled connection under POSTGRES_CONVERSATION_POOL_MAX=1 and closing the
+    # session on exit guarantees T(thread) is released even under repeated cancellation.
     tkey = writer_guard.thread_key(thread_id)
     deadline = time.monotonic() + max(0.0, float(timeout_s))
-    async with get_db_connection() as lock_conn:
+    lock_conn = await db_pool.open_session_connection()
+    try:
         while True:
             cur = await lock_conn.execute("SELECT pg_try_advisory_lock(%s)", (tkey,))
             row = await cur.fetchone()
@@ -851,14 +854,15 @@ async def _cancel_and_drain_thread(
                         thread_id, suffix_task_ids
                     )
                 finally:
-                    with anyio.CancelScope(shield=True):
-                        await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (tkey,))
+                    await session_lock.release_session_lock(lock_conn, tkey)
                 if held is not None and len(held) == 0:
                     return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             await asyncio.sleep(min(0.1, remaining))
+    finally:
+        await session_lock.await_settled(asyncio.ensure_future(lock_conn.close()))
     raise TimeoutError(
         f"Timed out waiting for writer drain on thread={thread_id} after {timeout_s:.1f}s"
     )
@@ -905,6 +909,33 @@ def _resolve_checkpoint_turns(
             cur_id = str(parent) if parent else None
         resolved[cid] = found
     return resolved
+
+
+def _decode_checkpoint_payload(
+    serde: Any,
+    payload_type: str,
+    payload_blob: Any,
+    *,
+    kind: str,
+    thread_id: str,
+    checkpoint_id: str,
+    channel: str,
+) -> Any:
+    """Decode a checkpoint write/blob, stripping the raw exception chain on failure.
+
+    Raising outside the ``except`` block guarantees neither ``__cause__`` nor
+    ``__context__`` retains the underlying serializer exception (which may embed
+    raw payload text slated for purge) when callers log with ``exc_info=True``.
+    """
+    err_type: str | None = None
+    try:
+        return serde.loads_typed((payload_type, bytes(payload_blob)))
+    except Exception as exc:
+        err_type = type(exc).__name__
+    raise RuntimeError(
+        f"Failed to decode checkpoint {kind} for thread_id={thread_id} "
+        f"checkpoint_id={checkpoint_id} channel={channel} error_type={err_type}"
+    )
 
 
 async def _purge_thread_checkpoints(
@@ -1099,13 +1130,15 @@ async def _purge_thread_checkpoints(
         for w in writes:
             if not w["type"] or w["type"] == "empty":
                 continue
-            try:
-                val = serde.loads_typed((w["type"], bytes(w["blob"])))
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Failed to decode checkpoint write for thread_id={thread_id} "
-                    f"checkpoint_id={w['checkpoint_id']} channel={w['channel']}"
-                ) from exc
+            val = _decode_checkpoint_payload(
+                serde,
+                w["type"],
+                w["blob"],
+                kind="write",
+                thread_id=thread_id,
+                checkpoint_id=str(w["checkpoint_id"]),
+                channel=str(w["channel"]),
+            )
             decoded_writes.append((w, val))
             ns = str(w["checkpoint_ns"])
             cid = str(w["checkpoint_id"])
@@ -1135,14 +1168,16 @@ async def _purge_thread_checkpoints(
             if not b["type"] or b["type"] == "empty":
                 continue
             key = (str(b["checkpoint_ns"]), str(b["channel"]), str(b["version"]))
-            try:
-                val = serde.loads_typed((b["type"], bytes(b["blob"])))
-            except Exception as exc:
-                ref_cid = blob_version_to_cp_id.get(key, str(b["version"]))
-                raise RuntimeError(
-                    f"Failed to decode checkpoint blob for thread_id={thread_id} "
-                    f"checkpoint_id={ref_cid} channel={b['channel']}"
-                ) from exc
+            ref_cid = blob_version_to_cp_id.get(key, str(b["version"]))
+            val = _decode_checkpoint_payload(
+                serde,
+                b["type"],
+                b["blob"],
+                kind="blob",
+                thread_id=thread_id,
+                checkpoint_id=ref_cid,
+                channel=str(b["channel"]),
+            )
             decoded_blobs.append((b, val))
             if b["channel"] == "messages":
                 if key in suffix_blob_versions:
@@ -1401,19 +1436,58 @@ def is_redis_configured_for_purge() -> bool:
     return bool(is_redis_cache_enabled() and cache_enabled_env)
 
 
+async def _resolve_redis_client_for_purge() -> Any:
+    """Return a live Redis client when Redis is configured enabled for purge.
+
+    If startup ``init_cache()`` failed during a transient outage,
+    ``RedisCacheClient.connect()`` leaves ``cache.enabled = False`` on the
+    singleton. Probe the existing client (or retry ``connect()`` if no client
+    was created yet) so the same worker recovers and deletes keys once Redis
+    is reachable again.
+    """
+    from src.utils.cache.redis_cache import get_cache_client
+
+    cache = get_cache_client()
+    if cache.enabled and cache.client is not None:
+        return cache.client
+
+    client = getattr(cache, "client", None)
+    ping_fn = getattr(client, "ping", None)
+    if client is not None and callable(ping_fn):
+        try:
+            await ping_fn()
+        except Exception as exc:
+            raise RuntimeError(
+                "Redis cache is configured enabled but client is unavailable for purge key deletion"
+            ) from exc
+        cache.enabled = True
+        return client
+
+    connect_fn = getattr(cache, "connect", None)
+    if callable(connect_fn):
+        cache.enabled = True
+        try:
+            await connect_fn()
+        except Exception as exc:
+            cache.enabled = False
+            raise RuntimeError(
+                "Redis cache is configured enabled but client is unavailable for purge key deletion"
+            ) from exc
+        if cache.enabled and getattr(cache, "client", None) is not None:
+            return cache.client
+
+    raise RuntimeError(
+        "Redis cache is configured enabled but client is unavailable for purge key deletion"
+    )
+
+
 async def _delete_redis_keys(keys: list[str]) -> int:
     if not keys:
         return 0
     if not is_redis_configured_for_purge():
         return 0
-    from src.utils.cache.redis_cache import get_cache_client
-
-    cache = get_cache_client()
-    if not cache.enabled or not cache.client:
-        raise RuntimeError(
-            "Redis cache is configured enabled but client is unavailable for purge key deletion"
-        )
-    deleted = await cache.client.delete(*keys)
+    client = await _resolve_redis_client_for_purge()
+    deleted = await client.delete(*keys)
     return int(deleted or 0)
 
 

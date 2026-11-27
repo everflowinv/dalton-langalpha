@@ -20,6 +20,7 @@ from contextlib import ExitStack, asynccontextmanager
 from datetime import UTC, datetime, timedelta
 import hashlib
 import importlib
+import json
 from pathlib import Path
 import pkgutil
 import sys
@@ -1697,7 +1698,16 @@ async def test_incomplete_layers_keep_running_and_blocked_until_repaired_and_res
             await finish_disconnect(purge_id)
     await _assert_still_running_and_blocked()
 
-    # (c) Corrupt checkpoint blob decode failure (serde.loads_typed raises RuntimeError)
+    # (c) Corrupt/legacy checkpoint blob decode failure (fails closed, strips exception chain & secret)
+    secret_cp_marker = "SECRET_CP_99999"
+    legacy_bad_blob = json.dumps(
+        {
+            "lc": 1,
+            "type": "constructor",
+            "id": ["langchain_core", "messages", "human", "HumanMessage"],
+            "kwargs": {"content": {"secret_email": secret_cp_marker}},
+        }
+    ).encode("utf-8")
     async with gws_live_pool.connection() as conn:
         await conn.execute(
             """
@@ -1711,10 +1721,13 @@ async def test_incomplete_layers_keep_running_and_blocked_until_repaired_and_res
             INSERT INTO checkpoint_blobs (thread_id, checkpoint_ns, channel, version, type, blob)
             VALUES (%s, '', 'messages', 'v-bad', 'json', %s)
             """,
-            (tid, b"NOT_VALID_JSON_BLOB"),
+            (tid, legacy_bad_blob),
         )
-    with pytest.raises(RuntimeError, match="cp-bad-0"):
+    with pytest.raises(RuntimeError, match="cp-bad-0") as cp_err:
         await finish_disconnect(purge_id)
+    assert cp_err.value.__cause__ is None
+    assert cp_err.value.__context__ is None
+    assert secret_cp_marker not in str(cp_err.value)
     await _assert_still_running_and_blocked()
     async with gws_live_pool.connection() as conn:
         await conn.execute("DELETE FROM checkpoint_blobs WHERE thread_id = %s", (tid,))
@@ -1737,17 +1750,60 @@ async def test_incomplete_layers_keep_running_and_blocked_until_repaired_and_res
             await conn.execute("ALTER TABLE public._checkpoints_hidden_for_test RENAME TO checkpoints")
     await _assert_still_running_and_blocked()
 
-    # (e) Redis configured enabled but unavailable (cache.enabled=False after startup failure) & delete error
-    class _BrokenRedis:
-        async def delete(self, *keys):
-            raise ConnectionError("redis failure")
+    # (e) Redis configured enabled: startup failure leaves real RedisCacheClient.enabled=False,
+    # delete failure keeps running, and same-worker recovery deletes keys & completes with Redis enabled.
+    class _RecoverableRedis:
+        def __init__(self) -> None:
+            self.available = False
+            self.fail_delete = False
+            self.deleted_keys: list[str] = []
+
+        async def ping(self) -> bool:
+            if not self.available:
+                raise ConnectionError("redis startup/retry unavailable")
+            return True
+
+        async def delete(self, *keys: str) -> int:
+            if not self.available or self.fail_delete:
+                raise ConnectionError("redis failure")
+            self.deleted_keys.extend(keys)
+            return len(keys)
+
+        async def aclose(self) -> None:
+            return None
+
+    class _DummyRedisPool:
+        async def disconnect(self) -> None:
+            return None
 
     from src.dalton.conversations import render as render_mod
 
+    recoverable_redis = _RecoverableRedis()
     monkeypatch.setenv("REDIS_CACHE_ENABLED", "true")
     with (
         patch("src.config.settings.is_redis_cache_enabled", autospec=True, return_value=True),
-        patch.object(redis_cache_mod, "get_cache_client", autospec=True, return_value=SimpleNamespace(enabled=False, client=None)),
+        patch.object(redis_cache_mod, "is_redis_cache_enabled", autospec=True, return_value=True),
+        patch.object(
+            redis_cache_mod.BlockingConnectionPool,
+            "from_url",
+            autospec=True,
+            return_value=_DummyRedisPool(),
+        ),
+        patch.object(
+            redis_cache_mod.redis,
+            "Redis",
+            autospec=True,
+            return_value=recoverable_redis,
+        ),
+    ):
+        real_cache = redis_cache_mod.RedisCacheClient(url="redis://localhost:6379/0")
+        with pytest.raises(ConnectionError):
+            await real_cache.connect()
+    assert real_cache.enabled is False
+
+    with (
+        patch("src.config.settings.is_redis_cache_enabled", autospec=True, return_value=True),
+        patch.object(redis_cache_mod, "get_cache_client", autospec=True, return_value=real_cache),
         patch.object(
             render_mod,
             "render_and_write_conversation_digests",
@@ -1756,61 +1812,53 @@ async def test_incomplete_layers_keep_running_and_blocked_until_repaired_and_res
     ):
         with pytest.raises(RuntimeError, match="unavailable"):
             await finish_disconnect(purge_id)
-    await _assert_still_running_and_blocked()
+        assert recoverable_redis.deleted_keys == []
+        await _assert_still_running_and_blocked()
 
-    with (
-        patch("src.config.settings.is_redis_cache_enabled", autospec=True, return_value=True),
-        patch.object(redis_cache_mod, "get_cache_client", autospec=True, return_value=SimpleNamespace(enabled=True, client=_BrokenRedis())),
-        patch.object(
-            render_mod,
-            "render_and_write_conversation_digests",
-            create_autospec(render_mod.render_and_write_conversation_digests, return_value=None),
-        ),
-    ):
+        recoverable_redis.available = True
+        recoverable_redis.fail_delete = True
         with pytest.raises(ConnectionError):
             await finish_disconnect(purge_id)
-    await _assert_still_running_and_blocked()
-    monkeypatch.setenv("REDIS_CACHE_ENABLED", "false")
+        assert recoverable_redis.deleted_keys == []
+        await _assert_still_running_and_blocked()
 
-    # Re-insert card if step (e) committed Layer 5a before Layer 2c failed
-    await _seed_conversation_card(
-        gws_live_pool,
-        card_id="card-inc-2",
-        thread_id=tid,
-        workspace_id=wid,
-        claim="secret2",
-    )
+        # Re-insert card since step (e) committed Layer 5a before Layer 2c failed
+        await _seed_conversation_card(
+            gws_live_pool,
+            card_id="card-inc-2",
+            thread_id=tid,
+            workspace_id=wid,
+            claim="secret2",
+        )
 
-    # (f) Conversation digest re-render failure rolls back card deletion & keeps ledger running
-    with patch.object(
-        render_mod,
-        "render_and_write_conversation_digests",
-        create_autospec(
-            render_mod.render_and_write_conversation_digests,
-            side_effect=RuntimeError("digest render failed"),
-        ),
-    ):
-        with pytest.raises(RuntimeError, match="digest render failed"):
-            await finish_disconnect(purge_id)
-    await _assert_still_running_and_blocked()
-    async with gws_live_pool.connection() as conn:
-        card_cnt = (
-            await (
-                await conn.execute(
-                    "SELECT COUNT(*) FROM dalton_conversation_cards WHERE card_id = 'card-inc-2'"
-                )
-            ).fetchone()
-        )[0]
-    assert card_cnt == 1  # rolled back cleanly!
+        # (f) Conversation digest re-render failure rolls back card deletion & keeps ledger running
+        recoverable_redis.fail_delete = False
+        with patch.object(
+            render_mod,
+            "render_and_write_conversation_digests",
+            create_autospec(
+                render_mod.render_and_write_conversation_digests,
+                side_effect=RuntimeError("digest render failed"),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="digest render failed"):
+                await finish_disconnect(purge_id)
+        await _assert_still_running_and_blocked()
+        async with gws_live_pool.connection() as conn:
+            card_cnt = (
+                await (
+                    await conn.execute(
+                        "SELECT COUNT(*) FROM dalton_conversation_cards WHERE card_id = 'card-inc-2'"
+                    )
+                ).fetchone()
+            )[0]
+        assert card_cnt == 1  # rolled back cleanly!
 
-    # Repair & run resume scan -> completes, deletes card, unblocks thread
-    with patch.object(
-        render_mod,
-        "render_and_write_conversation_digests",
-        create_autospec(render_mod.render_and_write_conversation_digests, return_value=None),
-    ):
+        # Repair digest render & run resume scan on SAME worker with REDIS_CACHE_ENABLED=true
         resumed = await run_personal_purge_resume_once()
     assert purge_id in resumed
+    assert real_cache.enabled is True
+    assert len(recoverable_redis.deleted_keys) > 0
     led_done = await ui_db.get_purge_ledger(purge_id)
     assert led_done is not None and led_done.local_purge_status == LocalPurgeStatus.COMPLETED
     async with gws_live_pool.connection() as conn:
