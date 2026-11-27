@@ -4,10 +4,12 @@ import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-rou
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type React from 'react';
 import { queryKeys } from '@/lib/queryKeys';
+import type { QuoteRow, useQuotes as useQuotesFn } from '@/lib/quotes';
 import {
   BATCH1_WATCHLIST_COLUMNS,
   buildPersonalWatchlistContextText,
   flattenWatchlistCompanies,
+  type WatchlistMetricsResponse,
 } from '@/lib/dalton/watchlist';
 import { WatchlistAddModal } from '../components/watchlist/WatchlistAddModal';
 import { WatchlistFullTable } from '../components/watchlist/WatchlistFullTable';
@@ -121,6 +123,15 @@ const mocks = vi.hoisted(() => ({
   isColleague: false,
   previewMutateMock: vi.fn(),
   mutateWatchlistMock: vi.fn(),
+  metricsOverride: null as {
+    data: WatchlistMetricsResponse | undefined;
+    isLoading: boolean;
+    isError: boolean;
+    isSuccess: boolean;
+  } | null,
+  liveQuotes: {} as Record<string, QuoteRow | undefined>,
+  liveQuotesLoading: false,
+  useQuotesMock: vi.fn<typeof useQuotesFn>(),
 }));
 
 vi.mock('@/config/brand', () => ({
@@ -162,12 +173,30 @@ vi.mock('@/lib/dalton/watchlist', async (importActual) => {
       isSuccess: true,
       refetch: vi.fn(),
     }),
-    usePersonalWatchlistMetrics: () => ({
-      data: mocks.watchlistMetrics,
-      isLoading: false,
-      isError: false,
-      isSuccess: true,
-    }),
+    usePersonalWatchlistMetrics: () =>
+      mocks.metricsOverride ?? {
+        data: mocks.watchlistMetrics,
+        isLoading: false,
+        isError: false,
+        isSuccess: true,
+      },
+  };
+});
+
+vi.mock('@/lib/quotes', async (importActual) => {
+  const actual = await importActual<typeof import('@/lib/quotes')>();
+  return {
+    ...actual,
+    useQuotes: (...args: Parameters<typeof actual.useQuotes>) => {
+      mocks.useQuotesMock(...args);
+      return {
+        quotes: mocks.liveQuotes,
+        pending: {},
+        isLoading: mocks.liveQuotesLoading,
+        isFetching: mocks.liveQuotesLoading,
+        refetch: vi.fn<() => void>(),
+      };
+    },
   };
 });
 
@@ -295,6 +324,10 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
     mocks.capturedChatProps = [];
     mocks.isColleague = false;
     mocks.activeWorkspaceObj = { workspace_id: 'home-ws', name: 'Home', is_home: true, is_shared: false };
+    mocks.metricsOverride = null;
+    mocks.liveQuotes = {};
+    mocks.liveQuotesLoading = false;
+    mocks.useQuotesMock.mockClear();
     localStorage.clear();
     sessionStorage.clear();
   });
@@ -577,5 +610,72 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
     ]);
     // HKD row displays HK$ currency symbol rather than bare number or USD
     expect(screen.getByTestId('watchlist-row-0700.HK').textContent).toContain('HK$');
+  });
+
+  it('shows price and 1D change from shared useQuotes before /metrics returns, then prefers /metrics timestamp when both exist', async () => {
+    // 1. /metrics has not returned yet, while shared useQuotes cache is already warm (e.g. from Dashboard)
+    mocks.metricsOverride = {
+      data: undefined,
+      isLoading: true,
+      isError: false,
+      isSuccess: false,
+    };
+    mocks.liveQuotes = {
+      NVDA: { symbol: 'NVDA', price: 142.5, change_percent: 3.15, currency: 'USD' },
+      AVGO: { symbol: 'AVGO', price: 185.2, change_percent: -0.85, currency: 'USD' },
+    };
+
+    const view = renderAt(['/market']);
+    const nvdaRow = await screen.findByTestId('watchlist-row-NVDA');
+    const avgoRow = screen.getByTestId('watchlist-row-AVGO');
+    const oaiRow = screen.getByTestId('watchlist-row-OPENAI');
+
+    // useQuotes subscribes to the listed symbols with the same cache options as Dashboard
+    expect(mocks.useQuotesMock).toHaveBeenCalledWith(['NVDA', 'AVGO', 'NET'], {
+      staleTime: 30_000,
+      refetchInterval: 60_000,
+      enabled: true,
+    });
+
+    // Price and 1D% columns already render from useQuotes before /metrics resolves
+    expect(nvdaRow.textContent).toContain('$142.50');
+    expect(nvdaRow.textContent).toContain('+3.15%');
+    expect(avgoRow.textContent).toContain('$185.20');
+    expect(avgoRow.textContent).toContain('-0.85%');
+    // Private company stays unlisted even if quotes exist
+    expect(oaiRow.textContent).not.toContain('$142.50');
+
+    // 2. /metrics returns AND useQuotes ticks to a newer price -> /metrics timestamp wins to avoid flicker
+    mocks.metricsOverride = {
+      data: mocks.watchlistMetrics,
+      isLoading: false,
+      isError: false,
+      isSuccess: true,
+    };
+    mocks.liveQuotes = {
+      NVDA: { symbol: 'NVDA', price: 149.99, change_percent: 6.5, currency: 'USD' },
+      AVGO: { symbol: 'AVGO', price: 185.2, change_percent: -0.85, currency: 'USD' },
+    };
+
+    view.rerender(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MemoryRouter initialEntries={['/market']}>
+          <LocationProbe />
+          <Routes>
+            <Route path="/market" element={<MarketView />} />
+            <Route path="/chat/*" element={<div data-testid="chat-route" />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const nvdaAfter = await screen.findByTestId('watchlist-row-NVDA');
+    // Uses /metrics snapshot price ($138.40) and 1D% (+2.45%) + indicator (64.2), NOT the newer quote ($149.99)
+    expect(nvdaAfter.textContent).toContain('$138.40');
+    expect(nvdaAfter.textContent).toContain('+2.45%');
+    expect(nvdaAfter.textContent).toContain('64.2');
+    expect(nvdaAfter.textContent).not.toContain('$149.99');
+    // AVGO has no /metrics row yet -> continues displaying useQuotes price
+    expect(screen.getByTestId('watchlist-row-AVGO').textContent).toContain('$185.20');
   });
 });

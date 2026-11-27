@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/api/client';
 import { queryKeys } from '@/lib/queryKeys';
 import { isDaltonBuild } from '@/config/brand';
+import { quoteKey, roundQuote2, type QuoteRow } from '@/lib/quotes';
 
 export type WatchlistTier = 'core' | 'watch' | 'radar';
 
@@ -397,6 +398,105 @@ export function mergeWatchlistMetricsResponse(
     summary: recomputeSummaryFromItems(prev.summary ?? subset.summary, mergedItems),
     as_of: subset.as_of || prev.as_of,
   };
+}
+
+/**
+ * Merge live per-symbol quotes from the shared `useQuotes` cache with `/metrics` rows.
+ *
+ * - Real-time quote columns (`price`, `chg_1d`, `currency`) hydrate immediately from
+ *   `useQuotes` (already warm when navigating from the Dashboard watchlist widget) before
+ *   `/api/v1/dalton/watchlist/metrics` finishes computing daily-bar indicators & market cap.
+ * - Once `/metrics` has a timestamped price for a symbol (`metric.price != null`),
+ *   `/metrics` stays authoritative for `price` and `chg_1d` so every column on the row
+ *   reflects the same `/metrics` snapshot timestamp without flickering between polls.
+ * - Private/unlisted companies never inherit quote prices.
+ */
+export function mergeQuotesIntoWatchlistMetrics(
+  companies: readonly PersonalWatchlistCompany[],
+  metrics: Record<string, WatchlistMetricRow>,
+  quotes: Record<string, QuoteRow | undefined>,
+): Record<string, WatchlistMetricRow> {
+  const out: Record<string, WatchlistMetricRow> = { ...metrics };
+  for (const company of companies) {
+    const ticker = company.ticker;
+    const metric = metrics[ticker];
+    if (company.is_private || metric?.is_private) continue;
+
+    const quote = quotes[quoteKey(ticker)];
+    if (!quote) continue;
+
+    const rawPrice =
+      typeof quote.price === 'number' && Number.isFinite(quote.price) ? quote.price : null;
+    const prevClose =
+      typeof quote.previous_close === 'number' &&
+      Number.isFinite(quote.previous_close) &&
+      quote.previous_close > 0
+        ? quote.previous_close
+        : null;
+    const unprinted = rawPrice == null && prevClose != null;
+    const quotePrice = unprinted ? prevClose : rawPrice;
+
+    let quoteChg1d: number | null = null;
+    if (unprinted) {
+      quoteChg1d = 0;
+    } else if (typeof quote.change_percent === 'number' && Number.isFinite(quote.change_percent)) {
+      quoteChg1d = quote.change_percent;
+    } else if (quotePrice != null && prevClose != null) {
+      quoteChg1d = roundQuote2(((quotePrice - prevClose) / prevClose) * 100);
+    }
+    const quoteCurrencyCode = quote.currency ?? null;
+
+    if (!metric) {
+      if (quotePrice == null && quoteChg1d == null && quoteCurrencyCode == null) continue;
+      out[ticker] = {
+        ticker,
+        is_private: false,
+        status: quotePrice != null ? 'ok' : 'warming',
+        price: quotePrice,
+        currency: quoteCurrencyCode,
+        chg_1d: quoteChg1d,
+        chg_1w: null,
+        chg_1m: null,
+        chg_3m: null,
+        chg_ytd: null,
+        chg_1y: null,
+        high_52w: null,
+        low_52w: null,
+        position_52w: null,
+        rsi_14d: null,
+        rsi_30d: null,
+        vol_ratio_5_20: null,
+        market_cap: null,
+        market_cap_currency: quoteCurrencyCode,
+        next_earnings: null,
+      };
+      continue;
+    }
+
+    // Both `/metrics` and `useQuotes` exist: prefer `/metrics` timestamped quote values.
+    if (metric.price != null) {
+      if (metric.currency == null && quoteCurrencyCode != null) {
+        out[ticker] = {
+          ...metric,
+          currency: quoteCurrencyCode,
+          market_cap_currency: metric.market_cap_currency ?? quoteCurrencyCode,
+        };
+      }
+      continue;
+    }
+
+    if (quotePrice != null || quoteChg1d != null || quoteCurrencyCode != null) {
+      out[ticker] = {
+        ...metric,
+        status: quotePrice != null ? 'ok' : metric.status,
+        price: quotePrice ?? metric.price,
+        currency: metric.currency ?? quoteCurrencyCode,
+        chg_1d: metric.chg_1d ?? quoteChg1d,
+        market_cap_currency: metric.market_cap_currency ?? quoteCurrencyCode,
+      };
+    }
+  }
+  return out;
 }
 
 export function usePersonalWatchlistMetrics(

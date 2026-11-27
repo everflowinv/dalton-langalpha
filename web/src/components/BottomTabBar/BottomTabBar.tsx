@@ -16,8 +16,8 @@ import { useNavItems } from '../nav/useNavItems';
 import './BottomTabBar.css';
 
 // DALTON-HOOK(mobile-web): cap bottom bar to 4 core tabs + "More" overflow so every button clears >= 44px on 390px phones
-const PRIMARY_WITH_DASHBOARD = new Set(['/dashboard', '/chat', '/automations', '/monitors']);
-const PRIMARY_DALTON_MODE = new Set(['/chat', '/automations', '/monitors', '/settings']);
+const PRIMARY_WITH_DASHBOARD = new Set(['/dashboard', '/chat', '/market', '/monitors']);
+const PRIMARY_DALTON_MODE = new Set(['/chat', '/market', '/monitors', '/settings']);
 
 export default function BottomTabBar() {
   const { t } = useTranslation();
@@ -32,7 +32,9 @@ export default function BottomTabBar() {
   const navItems = useNavItems();
   const menuItems = [...navItems, SETTINGS_ITEM];
   const hasDashboard = menuItems.some((item) => item.key === '/dashboard');
-  const primaryKeys = hasDashboard ? PRIMARY_WITH_DASHBOARD : PRIMARY_DALTON_MODE;
+  const hasMarket = menuItems.some((item) => item.key === '/market');
+  const basePrimaryKeys = hasDashboard ? PRIMARY_WITH_DASHBOARD : PRIMARY_DALTON_MODE;
+  const primaryKeys = hasMarket ? basePrimaryKeys : new Set([...basePrimaryKeys, '/automations']);
   const primaryItems: NavItem[] = [];
   const overflowItems: NavItem[] = [];
   for (const item of menuItems) {

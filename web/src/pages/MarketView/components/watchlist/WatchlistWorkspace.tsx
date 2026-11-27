@@ -11,11 +11,13 @@ import { useWorkspace } from '@/hooks/useWorkspace';
 import { portfolioHoldingsQuery } from '@/hooks/membershipQueries';
 import { queryKeys } from '@/lib/queryKeys';
 import { apiErrorDetailMessage, apiErrorStatus } from '@/api/errors';
+import { useQuotes } from '@/lib/quotes';
 import {
   BATCH1_WATCHLIST_COLUMNS,
   DEFAULT_WATCHLIST_COLUMNS,
   buildPersonalWatchlistContextText,
   flattenWatchlistCompanies,
+  mergeQuotesIntoWatchlistMetrics,
   mutateWatchlist,
   previewWatchlistMutation,
   reconcileWatchlist,
@@ -233,11 +235,20 @@ export function WatchlistWorkspace({
     return out;
   }, [filteredCompanies, allCompanies]);
 
+  const { quotes: liveQuotes, isLoading: quotesLoading } = useQuotes(listedSymbols, {
+    staleTime: 1000 * 30,
+    refetchInterval: 60_000,
+    enabled: listedSymbols.length > 0,
+  });
+
   const { data: metricsData, isLoading: metricsLoading } = usePersonalWatchlistMetrics(
     listedSymbols,
     listedSymbols.length > 0,
   );
-  const metricsMap = useMemo(() => metricsData?.items ?? {}, [metricsData]);
+  const metricsMap = useMemo(
+    () => mergeQuotesIntoWatchlistMetrics(allCompanies, metricsData?.items ?? {}, liveQuotes),
+    [allCompanies, metricsData?.items, liveQuotes],
+  );
 
   // Privacy boundary: ONLY inject personal watchlist context in private sessions
   // (Chief of Staff Home scope === 'all', or the user's own non-shared workspace).
@@ -561,7 +572,7 @@ export function WatchlistWorkspace({
           <WatchlistFullTable
             companies={filteredCompanies}
             metrics={metricsMap}
-            metricsLoading={metricsLoading}
+            metricsLoading={metricsLoading || quotesLoading}
             visibleColumns={visibleColumns}
             groupedByTier={groupedByTier}
             holdingSymbols={holdingSymbols}

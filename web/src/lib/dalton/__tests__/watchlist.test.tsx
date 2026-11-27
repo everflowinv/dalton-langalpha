@@ -4,8 +4,10 @@ import { act, renderHook } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { api } from '@/api/client';
 import {
+  mergeQuotesIntoWatchlistMetrics,
   mergeWatchlistMetricsResponse,
   usePersonalWatchlistMetrics,
+  type PersonalWatchlistCompany,
   type WatchlistMetricRow,
   type WatchlistMetricsResponse,
 } from '../watchlist';
@@ -175,5 +177,59 @@ describe('watchlist pending-only subset polling', () => {
     expect(merged.pending_symbols).toEqual(['0700.HK']);
     expect(merged.summary?.total_count).toBe(3);
     expect(merged.summary?.lowest_rsi_14d[0]).toEqual({ ticker: 'TSM', rsi_14d: 25 });
+  });
+
+  it('mergeQuotesIntoWatchlistMetrics hydrates price/chg_1d before /metrics returns and defers to /metrics when both exist', () => {
+    const companies: PersonalWatchlistCompany[] = [
+      { ticker: 'NVDA', name: 'NVIDIA', tier: 'core', is_private: false },
+      { ticker: '0700.HK', name: 'Tencent', tier: 'watch', is_private: false },
+      { ticker: 'AAPL', name: 'Apple', tier: 'core', is_private: false },
+      { ticker: 'OPENAI', name: 'OpenAI', tier: 'core', is_private: true },
+    ];
+
+    // Before /metrics returns: useQuotes populates price, chg_1d, currency immediately
+    const beforeMetrics = mergeQuotesIntoWatchlistMetrics(companies, {}, {
+      NVDA: { symbol: 'NVDA', price: 142.5, change_percent: 3.15, currency: 'USD' },
+      '0700.HK': { symbol: '0700.HK', price: null, previous_close: 400, currency: 'HKD' },
+      AAPL: { symbol: 'AAPL', price: 210, previous_close: 200, currency: 'USD' },
+      OPENAI: { symbol: 'OPENAI', price: 999, change_percent: 10, currency: 'USD' },
+    });
+
+    expect(beforeMetrics.NVDA?.price).toBe(142.5);
+    expect(beforeMetrics.NVDA?.chg_1d).toBe(3.15);
+    expect(beforeMetrics.NVDA?.currency).toBe('USD');
+    expect(beforeMetrics.NVDA?.rsi_14d).toBeNull();
+    expect(beforeMetrics['0700.HK']?.price).toBe(400);
+    expect(beforeMetrics['0700.HK']?.chg_1d).toBe(0);
+    expect(beforeMetrics.AAPL?.price).toBe(210);
+    expect(beforeMetrics.AAPL?.chg_1d).toBe(5);
+    expect(beforeMetrics.OPENAI).toBeUndefined();
+
+    // Once /metrics returns for NVDA, /metrics values win over useQuotes to avoid number jumps;
+    // warming row with price: null still falls back to useQuotes
+    const afterMetrics = mergeQuotesIntoWatchlistMetrics(
+      companies,
+      {
+        NVDA: makeRow('NVDA', { price: 138.4, chg_1d: 2.45, rsi_14d: 64.2 }),
+        '0700.HK': makeRow('0700.HK', {
+          status: 'warming',
+          price: null,
+          chg_1d: null,
+          currency: null,
+          rsi_14d: null,
+        }),
+      },
+      {
+        NVDA: { symbol: 'NVDA', price: 149.99, change_percent: 6.5, currency: 'USD' },
+        '0700.HK': { symbol: '0700.HK', price: 412, change_percent: 1.8, currency: 'HKD' },
+      },
+    );
+
+    expect(afterMetrics.NVDA?.price).toBe(138.4);
+    expect(afterMetrics.NVDA?.chg_1d).toBe(2.45);
+    expect(afterMetrics.NVDA?.rsi_14d).toBe(64.2);
+    expect(afterMetrics['0700.HK']?.price).toBe(412);
+    expect(afterMetrics['0700.HK']?.chg_1d).toBe(1.8);
+    expect(afterMetrics['0700.HK']?.currency).toBe('HKD');
   });
 });
