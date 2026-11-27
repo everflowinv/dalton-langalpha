@@ -10,7 +10,7 @@ Creates two Dalton-owned tables without touching upstream table schemas:
   object keys to migrated ``private-media/`` keys per storage backend.
 
 Revision ID: d059
-Revises: d055
+Revises: d058
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "d059"
-down_revision: str | None = "d055"
+down_revision: str | None = "d058"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

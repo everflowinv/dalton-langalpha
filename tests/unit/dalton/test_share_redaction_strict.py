@@ -651,7 +651,7 @@ def test_resolve_active_storage_targets_dedup_topologies(monkeypatch: pytest.Mon
 
 def test_d059_migration_contract() -> None:
     assert d059.revision == "d059"
-    assert d059.down_revision == "d055"
+    assert d059.down_revision == "d058"
     executed: list[str] = []
     fake_op = create_autospec(d059.op, instance=False)
     fake_op.execute.side_effect = lambda sql: executed.append(str(sql))
