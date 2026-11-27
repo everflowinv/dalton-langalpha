@@ -7,16 +7,21 @@ import { useHtmlActions } from './html/useHtmlActions';
 import HtmlActionBar from './html/HtmlActionBar';
 import HtmlFullscreenModal from './html/HtmlFullscreenModal';
 import type { WidgetExports } from '../messageList/MessageActionsContext'; // DALTON-HOOK(shared-widgets)
+// DALTON-HOOK(share-redaction): static redacted placeholder card when widget is redacted in text-only shares
+import { RedactedWidgetCard, useSharedRedaction } from '@/components/dalton/RedactedSharePlaceholders';
 import './InlineWidget.css';
 
 interface InlineWidgetProps {
-  html: string;
+  html?: string;
   title?: string;
   onSendPrompt?: (text: string) => void;
   /** Inline data file contents — injected directly as __WIDGET_DATA__. */
   data?: Record<string, string>;
   /** DALTON-HOOK(shared-widgets): export actions offered; all by default. */
   exports?: WidgetExports;
+  /** DALTON-HOOK(share-redaction): static placeholder mode for redacted shared widgets. */
+  redacted?: boolean;
+  payload?: { redacted?: boolean };
 }
 
 /**
@@ -43,8 +48,17 @@ function widgetHeightKey(html: string, data?: Record<string, string>): string {
   return `${h}|${html.length}|${dataSig}`;
 }
 
+// DALTON-HOOK(share-redaction): short-circuit to static placeholder card without mounting any iframe when redacted
+export default function InlineWidget(props: InlineWidgetProps) {
+  const shareRedaction = useSharedRedaction();
+  if (props.redacted === true || props.payload?.redacted === true || (shareRedaction.active && !shareRedaction.allowFiles)) {
+    return <RedactedWidgetCard />;
+  }
+  return <InlineWidgetFrame {...props} html={props.html ?? ''} />;
+}
+
 // DALTON-HOOK(shared-widgets): `exports` narrows the export actions on a shared view.
-export default function InlineWidget({ html, title, onSendPrompt, data, exports = 'all' }: InlineWidgetProps) {
+function InlineWidgetFrame({ html, title, onSendPrompt, data, exports = 'all' }: InlineWidgetProps & { html: string }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [fullscreen, setFullscreen] = useState(false);
 

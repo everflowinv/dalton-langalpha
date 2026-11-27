@@ -791,3 +791,129 @@ async def test_create_doc_and_grant_access_propagate_bound_open_id(
     assert err_payload["error"] == "no_grant_email"
     assert "open_id" in err_payload["message"] and "邮箱" in err_payload["message"]
     assert bridge_calls == []
+
+
+@pytest.mark.asyncio
+async def test_feishu_create_doc_strips_numeric_inline_code_and_preserves_code(
+    monkeypatch: pytest.MonkeyPatch, tools
+) -> None:
+    ts, bridge_calls, _, _ = tools
+    _set_tier(monkeypatch, "admin")
+    feishu_create_doc = ts[2]
+
+    raw_md = (
+        "# AI 应用周报\n\n"
+        "`ANT` 在 `2026Q3` 营收 `16,956.0`（`+46.7%`），区间 `15%~18%`，金额 `$150.0`。\n"
+        "路径 `state/ai_app_db/metrics.jsonl`，字段 `revenue_yoy_pct`。\n"
+        "```python\n"
+        "val = '`16,956.0` `ANT`'\n"
+        "```\n"
+    )
+    payload = _parse(
+        await feishu_create_doc.ainvoke(
+            {"title": "AI 应用周报", "markdown": raw_md},
+            config=_config(ADMIN_USER_ID),
+        )
+    )
+    assert payload["ok"] is True
+    create_body = next(b for route, b in bridge_calls if route == "doc/create")
+    assert create_body["markdown"] == (
+        "# AI 应用周报\n\n"
+        "ANT 在 2026Q3 营收 16,956.0（+46.7%），区间 15%至18%，金额 `$150.0`。\n"
+        "路径 `state/ai_app_db/metrics.jsonl`，字段 `revenue_yoy_pct`。\n"
+        "```python\n"
+        "val = '`16,956.0` `ANT`'\n"
+        "```\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_feishu_append_doc_strips_numeric_inline_code_and_preserves_code(
+    monkeypatch: pytest.MonkeyPatch, tools
+) -> None:
+    ts, bridge_calls, _, _ = tools
+    _set_tier(monkeypatch, "admin")
+    feishu_append = ts[3]
+
+    raw_md = (
+        "追加：港股 `0700.HK` 目标区间 `15%～18%`，估值 `3.2x`，"
+        "命令 `pytest -q`，路径 `src/dalton/tools/feishu_tools.py`。\n"
+        "```bash\n"
+        "echo `0700.HK` `3.2x`\n"
+        "```\n"
+    )
+    payload = _parse(
+        await feishu_append.ainvoke(
+            {"token": "doccn1", "markdown": raw_md},
+            config=_config(ADMIN_USER_ID),
+        )
+    )
+    assert payload["ok"] is True
+    append_body = next(b for route, b in bridge_calls if route == "doc/append")
+    assert append_body["markdown"] == (
+        "追加：港股 0700.HK 目标区间 15%至18%，估值 3.2x，"
+        "命令 `pytest -q`，路径 `src/dalton/tools/feishu_tools.py`。\n"
+        "```bash\n"
+        "echo `0700.HK` `3.2x`\n"
+        "```\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_feishu_create_doc_preserves_indented_code_blocks(
+    monkeypatch: pytest.MonkeyPatch, tools
+) -> None:
+    ts, bridge_calls, _, _ = tools
+    _set_tier(monkeypatch, "admin")
+    feishu_create_doc = ts[2]
+
+    raw_md = (
+        "# 代码样例 `2026Q3`\n\n"
+        "正文标的 `ANT`，增速 `15%~18%`。\n\n"
+        "    const ticker = `ANT`;\n"
+        "    const band = `15%~18%`;\n\n"
+        "\tconst tabTicker = `0700.HK`;\n"
+    )
+    payload = _parse(
+        await feishu_create_doc.ainvoke(
+            {"title": "代码样例", "markdown": raw_md},
+            config=_config(ADMIN_USER_ID),
+        )
+    )
+    assert payload["ok"] is True
+    create_body = next(b for route, b in bridge_calls if route == "doc/create")
+    assert create_body["markdown"] == (
+        "# 代码样例 2026Q3\n\n"
+        "正文标的 ANT，增速 15%至18%。\n\n"
+        "    const ticker = `ANT`;\n"
+        "    const band = `15%~18%`;\n\n"
+        "\tconst tabTicker = `0700.HK`;\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_feishu_append_doc_preserves_indented_code_blocks(
+    monkeypatch: pytest.MonkeyPatch, tools
+) -> None:
+    ts, bridge_calls, _, _ = tools
+    _set_tier(monkeypatch, "admin")
+    feishu_append = ts[3]
+
+    raw_md = (
+        "追加正文：`NVDA` 估值 `3.2x`，区间 `15%～18%`。\n\n"
+        "    const ticker = `ANT`;\n"
+        "\tconst ratio = `3.2x`;\n"
+    )
+    payload = _parse(
+        await feishu_append.ainvoke(
+            {"token": "doccn1", "markdown": raw_md},
+            config=_config(ADMIN_USER_ID),
+        )
+    )
+    assert payload["ok"] is True
+    append_body = next(b for route, b in bridge_calls if route == "doc/append")
+    assert append_body["markdown"] == (
+        "追加正文：NVDA 估值 3.2x，区间 15%至18%。\n\n"
+        "    const ticker = `ANT`;\n"
+        "\tconst ratio = `3.2x`;\n"
+    )

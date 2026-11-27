@@ -1010,6 +1010,14 @@ export interface ThreadSharePermissions {
   audience?: ShareAudience;
 }
 
+// DALTON-HOOK(share-redaction): DB-only counts of items hidden when allow_files=false
+export interface ShareRedactionSummary {
+  widgets: number;
+  tool_calls: number;
+  images: number;
+  attachments: number;
+}
+
 export interface ThreadShareStatus {
   is_shared: boolean;
   share_token: string;
@@ -1017,7 +1025,11 @@ export interface ThreadShareStatus {
   permissions: ThreadSharePermissions;
   /** The audiences the owner may choose now. Absent from an older server. */
   audiences?: ShareAudience[];
+  // DALTON-HOOK(share-redaction): populated on share panel open (?include_summary=true) and POST /share
+  redaction_summary?: ShareRedactionSummary | null;
 }
+
+export type ThreadShareResponse = ThreadShareStatus;
 
 // --- Share links (files and apps) ---
 

@@ -80,6 +80,11 @@ EXCLUDED: dict[str, tuple[frozenset[str], str]] = {
         frozenset({"get_bytes"}),
         "Offloaded widget data, inlined at read time.",
     ),
+    # DALTON-HOOK(share-redaction): runtime widget data reader inlined at read time (finish_lines)
+    "src/dalton/share_media.py": (
+        frozenset({"read_controlled_object_bytes"}),
+        "Offloaded widget data, inlined at read time across private-media/ and legacy keys.",
+    ),
     "src/server/services/history/replay/errors.py": (
         ANY,
         "Error types: why a read gives up, never what a line holds.",

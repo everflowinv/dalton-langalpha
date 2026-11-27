@@ -42,7 +42,8 @@ async def _closes(client, metadata: dict) -> list[dict]:
     thread = {
         "conversation_thread_id": _THREAD_ID,
         "workspace_id": "ws-1",
-        "share_permissions": {},
+        # DALTON-HOOK(share-redaction): exercise rich-share allow_files=True stopped close
+        "share_permissions": {"allow_files": True},
         "owner_id": "owner-1",
     }
     queries = [{"turn_index": 0, "content": "long-end yields?", "metadata": {}}]

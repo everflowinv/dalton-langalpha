@@ -354,6 +354,9 @@ class FMPDataSource:
             "as_of": _print_time_ms(q.get("timestamp")),
             "regular_only": True,
         }
+        # DALTON-HOOK(watchlist): the regular print time, so merges compare by trade time
+        if snap["as_of"] is not None:
+            snap["regular_as_of"] = snap["as_of"]
         return scale_snapshot_prices(snap, minor_unit_places(symbol))
 
     async def close(self) -> None:

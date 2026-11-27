@@ -1,6 +1,8 @@
 import { useState, useCallback, type ElementType } from 'react';
-import { Copy, Check, Link2, Lock, FileText } from 'lucide-react';
+import { Copy, Check, ExternalLink, Link2, Lock, FileText } from 'lucide-react'; // DALTON-HOOK(share-redaction)
 import { useTranslation } from 'react-i18next';
+// DALTON-HOOK(share-redaction): publishing boundary & hidden item count summary
+import { ShareBoundaryNotice } from '@/components/dalton/RedactedSharePlaceholders';
 import { apiErrorDetail, formatApiErrorDetail, isForbiddenError } from '@/api/errors'; // DALTON-HOOK(external-share-guard)
 import { Loader } from '@/components/ui/loader'; // DALTON-HOOK(external-share-guard)
 import { toast } from '@/components/ui/use-toast';
@@ -170,7 +172,11 @@ export function ThreadSharePanel({
   const identity = useCallerIdentity({ revalidateOnOpen: true, open });
   const isExternal = identity.isExternal;
   const isIdentityBlocked = identity.status !== 'ready' || identity.isConfirming;
-  const { data: shareState, isPending, isError, refetch } = useThreadShareStatus(threadId, { refetchOnMount: 'always' });
+  // DALTON-HOOK(share-redaction): fetch redaction_summary only while panel is open
+  const { data: shareState, isPending, isError, refetch } = useThreadShareStatus(threadId, {
+    refetchOnMount: 'always',
+    includeSummary: open,
+  });
 
   const isShared = shareState?.is_shared === true;
   const permissions = shareState?.permissions || {};
@@ -390,6 +396,8 @@ export function ThreadSharePanel({
           <>
             <LinkRuleNote note={standing.note} />
             {audiencePicker}
+            {/* DALTON-HOOK(share-redaction): show publishing boundary & hidden item counts before enabling share */}
+            <ShareBoundaryNotice allowFiles={permissions.allow_files === true} summary={shareState?.redaction_summary} />
           </>
         )
       )}
@@ -428,6 +436,25 @@ export function ThreadSharePanel({
             </button>
           </div>
           )}
+          {/* DALTON-HOOK(share-redaction): audience-specific preview link (visitor view for public, member view for organization) */}
+          {canShowShareUrl && !paused && shareState.share_url && (() => {
+            const isOrgAudience = permissions.audience === 'organization' || membersOnly;
+            const previewUrl = isOrgAudience
+              ? shareState.share_url
+              : `${shareState.share_url}${shareState.share_url.includes('?') ? '&' : '?'}as=visitor`;
+            return (
+              <a
+                href={previewUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 text-xs hover:underline"
+                style={{ color: 'var(--color-accent-primary)' }}
+              >
+                <ExternalLink className="h-3.5 w-3.5 shrink-0" />
+                <span>{isOrgAudience ? t('share.previewMemberView') : t('share.previewVisitorView')}</span>
+              </a>
+            );
+          })()}
 
           {paused && <LinkRuleNote note={standing.note} />}
           {audiencePicker}
@@ -465,6 +492,8 @@ export function ThreadSharePanel({
                 </span>
               </label>
             )}
+            {/* DALTON-HOOK(share-redaction): fixed publishing boundary and DB-only hidden item counts */}
+            <ShareBoundaryNotice allowFiles={permissions.allow_files === true} summary={shareState.redaction_summary} />
           </div>
 
           {/* Info: under "no one" the workspace's line says who opens it. */}

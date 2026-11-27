@@ -561,6 +561,19 @@ ALLOWED_HOOKS=(
   # BY4: sandbox-side runtime staged-file flock claim/release in wsfiles_transfer_runtime.py
   # (standalone script copied into sandboxes; cannot import src.dalton).
   "by4-relay-guard"
+  # AU1 Public share redaction: strict allow_files=false redaction, controlled media,
+  # org-library/activity title & summary scrubbing, and unkeyed OSS loopback gate.
+  "share-redaction"
+  # HF2: surface-aware safety-refusal exhaustion notice delegated to
+  # src/dalton/middleware/refusal_fallback.py (empty_call_retry.py).
+  "refusal-handling"
+  # workspace-file-storage (Batch 1)
+  "company-system-blob-key"
+  "backfill-readback-verify"
+  "workspace-file-streaming"
+  "workspace-file-write-mode"
+  "workspace-file-exclusions"
+  "workspace-file-download-ticket"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
@@ -678,6 +691,8 @@ AUDIT_EXEMPT_FILES = {
     "web/src/locales/memoPanel/zh-CN.json",
     "web/src/locales/plugins/en-US.json",
     "web/src/locales/plugins/zh-CN.json",
+    "web/src/locales/publish/en-US.json",
+    "web/src/locales/publish/zh-CN.json",
     "web/src/locales/settings/en-US.json",
     "web/src/locales/settings/zh-CN.json",
     "web/src/locales/setup/en-US.json",

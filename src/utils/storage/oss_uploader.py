@@ -128,14 +128,11 @@ def upload_file(key: str, file_path: str, content_type: str | None = None) -> bo
 
     try:
         client = get_oss_client()
+        # DALTON-HOOK(share-redaction): attach object-level private ACL on OSS upload via Dalton helper
+        from src.dalton.share_media import oss_put_object_with_private_acl
 
         with path_obj.open("rb") as f:
-            result = client.put_object(oss.PutObjectRequest(
-                bucket=OSSConfig.BUCKET_NAME,
-                key=full_key(key),
-                body=f,
-                content_type=content_type,
-            ))
+            result = oss_put_object_with_private_acl(client, oss.PutObjectRequest, bucket=OSSConfig.BUCKET_NAME, full_object_key=full_key(key), logical_key=key, body=f, content_type=content_type)
 
         logger.debug(f"Uploaded {path_obj} to OSS as {key} (ContentType: {content_type}), status: {result.status_code}")
         return True
@@ -221,13 +218,10 @@ def upload_bytes(
 
     try:
         client = get_oss_client()
+        # DALTON-HOOK(share-redaction): attach object-level private ACL on OSS upload via Dalton helper
+        from src.dalton.share_media import oss_put_object_with_private_acl
 
-        result = client.put_object(oss.PutObjectRequest(
-            bucket=OSSConfig.BUCKET_NAME,
-            key=full_key(key),
-            body=data,
-            content_type=content_type,
-        ))
+        result = oss_put_object_with_private_acl(client, oss.PutObjectRequest, bucket=OSSConfig.BUCKET_NAME, full_object_key=full_key(key), logical_key=key, body=data, content_type=content_type)
 
         logger.debug(f"Uploaded bytes to OSS as {key} (ContentType: {content_type}), status: {result.status_code}")
         return True

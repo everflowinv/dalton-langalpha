@@ -79,6 +79,8 @@ def blob_key(user_id: str, sha256: str) -> str:
     held by two users are two objects. Both segments are validated, since
     the key is built from them and nothing else.
     """
+    from src.dalton.storage_keys import storage_user_id  # DALTON-HOOK(company-system-blob-key)
+    user_id = storage_user_id(user_id)
     if not user_id or not _USER_ID_RE.match(user_id):
         msg = f"Refusing to build a blob key for a malformed user id: {user_id!r}"
         raise BlobError(msg)
@@ -95,6 +97,8 @@ def upload_key(user_id: str, upload_id: str) -> str:
     can only ever name its own user's objects. ``upload_id`` is the server's
     own UUID, checked anyway because the key is built from it.
     """
+    from src.dalton.storage_keys import storage_user_id  # DALTON-HOOK(company-system-blob-key)
+    user_id = storage_user_id(user_id)
     if not user_id or not _USER_ID_RE.match(user_id):
         msg = f"Refusing to build an upload key for a malformed user id: {user_id!r}"
         raise BlobError(msg)
@@ -117,7 +121,8 @@ def attachment_key(attachment_id: str, name: str) -> str:
         raise BlobError(msg)
     lines = name.splitlines()
     segment = (lines[0].strip()[:120] if lines else "").replace("/", "_") or "file"
-    return f"{ATTACHMENT_KEY_PREFIX}{attachment_id}/{segment}"
+    # DALTON-HOOK(share-redaction): write new staged chat attachments under private-media/ prefix
+    return f"private-media/{ATTACHMENT_KEY_PREFIX}{attachment_id}/{segment}"
 
 
 # --- registry SQL -------------------------------------------------------------

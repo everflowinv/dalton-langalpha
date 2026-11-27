@@ -271,7 +271,8 @@ async def _resolve_data_files(
 
 def widget_data_storage_key(thread_id: str, sha_hex: str) -> str:
     """Content-addressed storage key for resolved widget data."""
-    prefix = f"widgets/{thread_id}" if thread_id else "widgets"
+    # DALTON-HOOK(share-redaction): write new widget data blobs under private-media/ prefix
+    prefix = f"private-media/widgets/{thread_id}" if thread_id else "private-media/widgets"
     return f"{prefix}/{sha_hex}.json"
 
 

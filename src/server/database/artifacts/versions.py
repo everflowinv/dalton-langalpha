@@ -282,6 +282,13 @@ async def turn_version(
             ):
                 return PublishResult(locked, locked.latest_seq, False, False)
         read.check(locked)
+        to_visitors = visitors_follow_turn(locked, (f.path for f in files), left_out)
+        # DALTON-HOOK(monitors): shared documents exclusively control public /a/ turn-end advances once taken over
+        from src.dalton.monitors.shared_documents import is_artifact_managed_by_shared_document_in_cur
+        if to_visitors and await is_artifact_managed_by_shared_document_in_cur(cur, locked.artifact_id, entry_path=locked.path):
+            if not locked.kept:
+                return PublishResult(locked, locked.latest_seq, False, False)
+            to_visitors = False
         return await _cut(
             cur,
             locked,
@@ -289,9 +296,7 @@ async def turn_version(
             user_id=user_id,
             origin="keep_updated",
             title=title,
-            to_visitors=visitors_follow_turn(
-                locked, (f.path for f in files), left_out
-            ),
+            to_visitors=to_visitors,
         )
 
 

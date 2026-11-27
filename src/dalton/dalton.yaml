@@ -182,3 +182,11 @@ channels:
   interactive_actions_enabled: true
   interrupt_ledger_enabled: true
   bt2_link_recovery_enabled: true
+
+# 工作区文件对象存储写入回退与排除规则（§1.1 第 3 点、§4）。
+# 注意：非空的排除配置会让已镜像的匹配行在下次同步时被删除，首批保持为空。
+workspace_files:
+  write_inline_only: false
+  exclude_dir_names: []
+  exclude_rel_dirs: []
+  exclude_rel_globs: []

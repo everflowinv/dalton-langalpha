@@ -28,6 +28,7 @@ import { cn } from '@/lib/utils';
 import { fileExtension, isHtmlFile } from '../utils/filePaths';
 import { useDownloadState, workspaceDownloadKey } from '../utils/downloadNotice';
 import { exportServedPdf, isWeChatBrowser } from './viewers/html/useHtmlActions'; // DALTON-HOOK(mobile-web)
+import { isShareDownloadHandled } from '@/lib/dalton/shareFileGuard'; // DALTON-HOOK(share-redaction)
 import { useServedHtml } from './viewers/html/useServedHtml';
 // DALTON-HOOK(mobile-web): sharedSeq, useArtifactComments for mobile HTML More menu
 import { artifactPathKey, sharedSeq, useArtifactBinding, useArtifactByPath, useArtifactComments } from '@/hooks/useArtifact';
@@ -380,6 +381,7 @@ function FileHeaderActions({
       return;
     }
     triggerDownloadFn(workspaceId, selectedFile).catch((err: unknown) => {
+      if (isShareDownloadHandled(err)) return; // DALTON-HOOK(share-redaction)
       console.error('[FileHeaderActions] Download failed:', err);
       // A save is the whole interaction: nothing opens, nothing navigates, and the
       // browser shows no file. Without this the menu item is indistinguishable

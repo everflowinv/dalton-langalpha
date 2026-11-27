@@ -157,10 +157,16 @@ def _reset_clients_for_test() -> None:
 
 
 def open_multipart_upload(key: str, *, content_type: str) -> str | None:
-    """Start a multipart upload under ``key``; its upload id, or ``None`` if refused."""
+    """Start a multipart upload under ``key`` with private ACL; returns upload id or ``None``."""
+    from src.dalton.share_media import s3_create_multipart_with_private_acl
+
     try:
-        created = _get_client().create_multipart_upload(
-            Bucket=_bucket_name(), Key=resolve_full_key(key), ContentType=content_type
+        created = s3_create_multipart_with_private_acl(
+            _get_client(),
+            bucket=_bucket_name(),
+            key=resolve_full_key(key),
+            content_type=content_type,
+            endpoint_url=_endpoint_url(),
         )
         return created["UploadId"]
     except Exception as e:

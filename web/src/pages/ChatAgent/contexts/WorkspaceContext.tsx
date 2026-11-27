@@ -9,20 +9,23 @@ interface WorkspaceContextValue {
   folders: ComputerFolders | null;
   /** Whose images these are on a page with no workspace, where the same path is another image under another link or version. */
   imageScope: string | null;
+  // DALTON-HOOK(monitors): resolve document-relative image paths into canonical cache keys for shared subdocuments
+  resolveImagePath: ((path: string) => string | null) | null;
 }
 
-const WorkspaceContext = createContext<WorkspaceContextValue>({ workspaceId: null, downloadFile: null, folders: null, imageScope: null });
+const WorkspaceContext = createContext<WorkspaceContextValue>({ workspaceId: null, downloadFile: null, folders: null, imageScope: null, resolveImagePath: null });
 
 interface WorkspaceProviderProps {
   workspaceId: string | null;
   downloadFile: ((path: string) => void) | null;
   folders?: ComputerFolders | null;
   imageScope?: string | null;
+  resolveImagePath?: ((path: string) => string | null) | null; // DALTON-HOOK(monitors)
   children: ReactNode;
 }
 
-export const WorkspaceProvider = ({ workspaceId, downloadFile, folders = null, imageScope = null, children }: WorkspaceProviderProps) => {
-  const value = useMemo(() => ({ workspaceId, downloadFile, folders, imageScope }), [workspaceId, downloadFile, folders, imageScope]);
+export const WorkspaceProvider = ({ workspaceId, downloadFile, folders = null, imageScope = null, resolveImagePath = null, children }: WorkspaceProviderProps) => {
+  const value = useMemo(() => ({ workspaceId, downloadFile, folders, imageScope, resolveImagePath }), [workspaceId, downloadFile, folders, imageScope, resolveImagePath]);
   return <WorkspaceContext value={value}>{children}</WorkspaceContext>;
 };
 
@@ -30,3 +33,4 @@ export const useWorkspaceId = () => useContext(WorkspaceContext).workspaceId;
 export const useWorkspaceDownloadFile = () => useContext(WorkspaceContext).downloadFile;
 export const useWorkspaceFolders = () => useContext(WorkspaceContext).folders;
 export const useWorkspaceImageScope = () => useContext(WorkspaceContext).imageScope;
+export const useWorkspaceResolveImagePath = () => useContext(WorkspaceContext).resolveImagePath; // DALTON-HOOK(monitors)

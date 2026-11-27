@@ -194,7 +194,8 @@ async def test_oss_no_token_background_dispatch_returns_ack(monkeypatch):
     _unset_token(monkeypatch)
     app = _app()
     with _stub_workflow():
-        resp = await _post(app, headers={"X-Dispatch": "background"})
+        # DALTON-HOOK(share-redaction): unkeyed oss self-dispatch requires trusted loopback Host
+        resp = await _post(app, headers={"X-Dispatch": "background", "Host": "127.0.0.1:8000"})
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "dispatched"
 
@@ -219,7 +220,8 @@ async def test_oss_configured_token_still_enforced(monkeypatch):
     monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", TOKEN)
     app = _app()
     with _stub_workflow():
-        resp = await _post(app, headers={"X-Dispatch": "background"})
+        # DALTON-HOOK(share-redaction): unkeyed oss self-dispatch requires trusted loopback Host
+        resp = await _post(app, headers={"X-Dispatch": "background", "Host": "127.0.0.1:8000"})
     assert resp.status_code == 403
 
 

@@ -568,8 +568,9 @@ class SharePermissions(BaseModel):
 
     @model_validator(mode="after")
     def download_requires_files(self):
-        if self.allow_download and not self.allow_files:
-            self.allow_files = True
+        # DALTON-HOOK(share-redaction): collapse allow_download only when allow_files=false is explicitly set; partial patches normalize after DB merge
+        if "allow_files" in self.model_fields_set and not self.allow_files and self.allow_download:
+            self.allow_download = False
         return self
 
 
@@ -579,6 +580,15 @@ class ThreadShareRequest(BaseModel):
     permissions: Optional[SharePermissions] = Field(
         None, description="Share permissions (only provided fields are updated)"
     )
+
+
+class ShareRedactionSummary(BaseModel):
+    """DB-only counts of items hidden when ``allow_files=false`` (DALTON-HOOK(share-redaction))."""
+
+    widgets: int = 0
+    tool_calls: int = 0
+    images: int = 0
+    attachments: int = 0
 
 
 class ThreadShareResponse(BaseModel):
@@ -593,6 +603,8 @@ class ThreadShareResponse(BaseModel):
         default_factory=lambda: ["public"],
         description="The audiences the owner may choose for the link now",
     )
+    # DALTON-HOOK(share-redaction): optional DB-only redaction summary populated on share panel open & update
+    redaction_summary: Optional[ShareRedactionSummary] = None
 
 
 # ==================== Feedback Models ====================

@@ -356,7 +356,8 @@ async def test_metadata_without_files_leaves_out_the_roots_a_move_left():
             resp = await client.get("/api/v1/public/shared/share_abc123")
     body = resp.json()
     assert body["previous_root_dirs"] == []
-    assert body["root_dir"] == "/home/dev/langalpha"
+    # DALTON-HOOK(share-redaction): hide root_dir too when allow_files=False
+    assert body["root_dir"] is None
 
 
 async def test_metadata_shared_file_is_its_latest_version_to_anyone():

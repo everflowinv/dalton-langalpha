@@ -950,12 +950,14 @@ async def keep_updated_after_turn(*, workspace_id: str, user_id: str) -> None:
     # vault are all owner-scoped, so the cut runs as the owner, the way the
     # legacy first read already does.
     try:
-        # DALTON-HOOK(monitors): refresh workspace monitors with keep_updated=TRUE
+        # DALTON-HOOK(monitors): refresh workspace monitors and shared documents with keep_updated=TRUE
         # regardless of share_links.shared_at / kept_at.
         try:
             from src.dalton.monitors.service import republish_workspace_monitors_after_turn
+            from src.dalton.monitors.shared_documents import republish_workspace_shared_documents_after_turn
 
             await republish_workspace_monitors_after_turn(workspace_id=workspace_id)
+            await republish_workspace_shared_documents_after_turn(workspace_id=workspace_id)
         except Exception:
             logger.warning(
                 "Keeping monitors updated in workspace %s failed",

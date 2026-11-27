@@ -72,6 +72,7 @@ async def publish_target(
     the content. A link that is off is refused (409 ``link_off``).
     """
     await share_out.refuse_publish(access)
+    thread: dict[str, Any] | None = None
     if kind == "thread":
         thread = await get_thread_by_id(target_id)
         if not thread:
@@ -81,26 +82,41 @@ async def publish_target(
         link_on, workspace_id = artifact.shared, artifact.workspace_id
     if not link_on:
         raise _link_off()
+    # DALTON-HOOK(share-redaction): sanitize thread title/summary and persist per-item custom_title metadata
+    from src.dalton.share_redaction import (
+        prepare_org_library_publish_fields,
+        upsert_org_library_title_meta,
+    )
+
+    eff_title, eff_summary, is_custom_title = await prepare_org_library_publish_fields(
+        kind=kind, thread=thread, title=title, summary=summary
+    )
     published = await library_db.publish(
         org_id=org_id,
         publisher_id=user_id,
         owner_id=access.owner_id,
         kind=kind,
         target_id=target_id,
-        title=title,
-        summary=summary,
+        title=eff_title,
+        summary=eff_summary,
     )
     if published is None:
         raise _link_off()
     item_id, created = published
+    if kind == "thread":
+        await upsert_org_library_title_meta(item_id, is_custom_title)
     row = await _item(item_id, user_id)
+    # DALTON-HOOK(share-redaction): record per-row custom_title flag in activity detail
+    detail: dict[str, Any] = {"kind": kind, "title": row["title"][:256]}
+    if kind == "thread":
+        detail["custom_title"] = bool(is_custom_title)
     activity.record(
         user_id,
         Action.LIBRARY_PUBLISHED if created else Action.LIBRARY_UPDATED,
         resource=("library_item", item_id),
         workspace_id=workspace_id,
         thread_id=target_id if kind == "thread" else None,
-        detail={"kind": kind, "title": row["title"][:256]},
+        detail=detail,
     )
     return row
 
@@ -221,16 +237,30 @@ async def edit_item(
     if row is None or row["org_id"] != org_id or row["publisher_id"] != user_id:
         raise not_found()
     title, summary = cleaned(title, summary)
+    # DALTON-HOOK(share-redaction): sanitize thread title/summary, update custom_title meta, record per-row flag
+    from src.dalton.share_redaction import (
+        prepare_org_library_edit_fields,
+        upsert_org_library_title_meta,
+    )
+
+    eff_title, eff_summary, is_custom_title, act_title = await prepare_org_library_edit_fields(
+        row=row, title=title, summary=summary
+    )
     if not await library_db.edit(
-        item_id, publisher_id=user_id, title=title, summary=summary
+        item_id, publisher_id=user_id, title=eff_title, summary=eff_summary
     ):
         raise not_found()
+    if row["kind"] == "thread":
+        await upsert_org_library_title_meta(item_id, is_custom_title)
+    detail: dict[str, Any] = {"kind": row["kind"], "title": act_title}
+    if row["kind"] == "thread":
+        detail["custom_title"] = bool(is_custom_title)
     activity.record(
         user_id,
         Action.LIBRARY_UPDATED,
         resource=("library_item", item_id),
         thread_id=row.get("thread_id"),
-        detail={"kind": row["kind"], "title": (title or row["title"])[:256]},
+        detail=detail,
     )
     return await _item(item_id, user_id)
 
@@ -245,7 +275,10 @@ async def remove_item(
     if removed is None:
         raise not_found()
     await _drop_snapshot(removed.get("archive_key"))
-    detail = {"kind": removed["kind"], "title": removed["title"][:256]}
+    # DALTON-HOOK(share-redaction): compute per-row custom_title activity detail & delete title meta
+    from src.dalton.share_redaction import resolve_org_library_remove_meta
+
+    detail = await resolve_org_library_remove_meta(item_id, removed)
     if publisher_id is None:
         detail |= {"publisher_id": removed["publisher_id"], "from_console": True}
     activity.record(

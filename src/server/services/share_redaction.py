@@ -293,12 +293,10 @@ class ShareRedaction:
             # turn's query metadata does; a share keeps neither.
             data = without_keys(data, {"report_source"})
             if isinstance(data.get("messages"), list):
-                data["messages"] = [
-                    {**m, "wakeup": without_keys(m["wakeup"], _WAKEUP_ORDER_KEYS)}
-                    if isinstance(m, dict) and "wakeup" in m
-                    else m
-                    for m in data["messages"]
-                ]
+                # DALTON-HOOK(share-redaction): replace order/wakeup steer prompt prose with fixed notice even on allow_files=true
+                from src.dalton.share_redaction import redact_rich_steering_wakeup_messages
+
+                data["messages"] = redact_rich_steering_wakeup_messages(data["messages"], _WAKEUP_ORDER_KEYS)
         if event_type in _ERROR_TEXT_EVENTS:
             data.pop("error", None)
         if event_type == "tool_calls":

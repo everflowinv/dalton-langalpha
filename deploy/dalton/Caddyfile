@@ -8,6 +8,9 @@
 :8088 {
 	root * /srv-releases/current
 	encode zstd gzip
+	# Disable response compression on share pages so site-level encode cannot
+	# open an empty gzip stream before handle_errors falls back to static index.html.
+	request_header @share_pages -Accept-Encoding
 
 	# Redact ?token=<jwt> in access logs (e.g. /ws/v1/market-data/aggregates/* handshake)
 	# while preserving non-sensitive query parameters for troubleshooting.
@@ -18,6 +21,7 @@
 			fields {
 				request>uri query {
 					replace token REDACTED
+					replace dl_token REDACTED
 				}
 			}
 		}
@@ -71,6 +75,30 @@
 			header_up -X-Service-Token
 			header_up -X-User-Id
 			flush_interval -1
+		}
+	}
+
+	# 0b. Public OpenGraph meta fragment (/api/v1/public/og-meta):
+	#     always anonymous — strip visitor credentials and compression negotiation before
+	#     proxying so Caddy's httpInclude never forwards cookies/auth headers or receives
+	#     compressed bytes, and bound upstream wait so handle_errors falls back promptly.
+	@public_og_meta path /api/v1/public/og-meta
+	handle @public_og_meta {
+		request_header -X-Service-Token
+		request_header -X-User-Id
+		request_header -Authorization
+		request_header -Cookie
+		request_header -Accept-Encoding
+		reverse_proxy backend:8000 {
+			header_up -X-Service-Token
+			header_up -X-User-Id
+			header_up -Authorization
+			header_up -Cookie
+			header_up -Accept-Encoding
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 3s
+			}
 		}
 	}
 
@@ -151,6 +179,38 @@
 		handle @help_404 {
 			header Cache-Control "no-cache, no-store, must-revalidate"
 			rewrite * /help/404.html
+			file_server
+		}
+		@share_og_fallback {
+			expression {err.status_code} >= 500
+			vars og_share_fallback 1
+		}
+		handle @share_og_fallback {
+			header Cache-Control "no-cache, no-store, must-revalidate"
+			rewrite * /index.html
+			file_server {
+				status 200
+			}
+		}
+	}
+
+	# 5b. Public share pages (/s/<token>, /a/<token>): render index.html through Caddy
+	#     templates with custom <!--@ @--> delimiters so httpInclude injects per-link
+	#     OpenGraph <meta> tags from /api/v1/public/og-meta. If the backend is unavailable,
+	#     handle_errors (@share_og_fallback) falls back to static index.html (brand name) with 200.
+	@share_pages {
+		method GET HEAD
+		path_regexp share_pages ^/(?:s|a)/[^/]+/?$
+	}
+	handle @share_pages {
+		route {
+			vars og_share_fallback 1
+			rewrite * /index.html
+			header Cache-Control "no-cache, no-store, must-revalidate"
+			templates {
+				between <!--@ @-->
+				mime text/html
+			}
 			file_server
 		}
 	}

@@ -55,29 +55,31 @@ export function getExtendedHoursInfo(
   const earlyPct = data?.earlyTradingChangePercent ?? data?.early_trading_change_percent ?? null;
   const latePct = data?.lateTradingChangePercent ?? data?.late_trading_change_percent ?? null;
 
-  const extPct =
-    isPreMarket && earlyPct != null
-      ? earlyPct
-      : !isRegularOpen && latePct != null
-        ? latePct
-        : null;
+  const extPct = isPreMarket
+    ? earlyPct
+    : !isRegularOpen && latePct != null
+      ? latePct
+      : null;
 
-  const extLabel =
-    isPreMarket && earlyPct != null
+  const extLabel = isPreMarket
+    ? earlyPct != null
       ? shortLabels
         ? 'PM'
         : 'Pre-Market'
-      : !isRegularOpen && latePct != null
-        ? shortLabels
-          ? 'AH'
-          : 'After-Hours'
-        : null;
+      : null
+    : !isRegularOpen && latePct != null
+      ? shortLabels
+        ? 'AH'
+        : 'After-Hours'
+      : null;
 
-  const extType: 'pre' | 'post' | null = extLabel
-    ? isPreMarket && earlyPct != null
+  const extType: 'pre' | 'post' | null = isPreMarket
+    ? earlyPct != null
       ? 'pre'
-      : 'post'
-    : null;
+      : null
+    : !isRegularOpen && latePct != null
+      ? 'post'
+      : null;
 
   // Only use the snapshot/row's own previousClose (never fallbackPreviousClose) when synthesizing regularClose.
   const prevClose = data?.previousClose ?? data?.previous_close ?? null;

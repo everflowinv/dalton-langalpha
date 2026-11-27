@@ -444,7 +444,8 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
 
         if (block.type === 'html_widget') {
           const widgetSeg = (block as HtmlWidgetRenderBlock).segment;
-          const widgetData = (htmlWidgetProcesses as Record<string, { html: string; title: string; data?: Record<string, string> }> | undefined)?.[widgetSeg.widgetId!];
+          // DALTON-HOOK(share-redaction): preserve redacted flag on widgetData so redacted placeholders never mount an iframe
+          const widgetData = (htmlWidgetProcesses as Record<string, { html: string; title: string; data?: Record<string, string>; redacted?: boolean }> | undefined)?.[widgetSeg.widgetId!];
           if (!widgetData) return null;
           // DALTON-HOOK(channel-deep-links): strip internal 'widget-' segment prefix so data-widget-id matches ShowWidget's persistent artifact_id
           const deepLinkWidgetId = widgetSeg.widgetId?.startsWith('widget-')
@@ -462,6 +463,7 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
                 onSendPrompt={onWidgetSendPrompt}
                 exports={widgetExports} // DALTON-HOOK(shared-widgets)
                 data={widgetData.data}
+                redacted={widgetData.redacted} // DALTON-HOOK(share-redaction)
               />
             </div>
           );

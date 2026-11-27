@@ -1808,6 +1808,16 @@ class TestAnalystOutboundGuardAndKeepUpdated:
             create_autospec(dalton_settings_mod.is_artifact_publishing_enabled, return_value=True),
         )
 
+        from src.dalton.monitors import shared_documents as shared_doc_mod
+
+        monkeypatch.setattr(
+            shared_doc_mod,
+            "list_workspace_auto_update_shared_documents",
+            create_autospec(
+                shared_doc_mod.list_workspace_auto_update_shared_documents,
+                return_value=[],
+            ),
+        )
         await snapshot_mod.keep_updated_after_turn(workspace_id="ws-1", user_id="u-b")
         keep_one_spy.assert_not_called()
 
@@ -2178,10 +2188,20 @@ class TestAnalystOutboundGuardAndKeepUpdated:
             "is_artifact_publishing_enabled",
             create_autospec(dalton_settings_mod.is_artifact_publishing_enabled, return_value=True),
         )
+        from src.dalton.monitors import shared_documents as shared_doc_mod
+
         monkeypatch.setattr(
             monitor_service_mod,
             "republish_workspace_monitors_after_turn",
             create_autospec(monitor_service_mod.republish_workspace_monitors_after_turn, return_value=None),
+        )
+        monkeypatch.setattr(
+            shared_doc_mod,
+            "republish_workspace_shared_documents_after_turn",
+            create_autospec(
+                shared_doc_mod.republish_workspace_shared_documents_after_turn,
+                return_value=None,
+            ),
         )
         monkeypatch.setattr(
             artifacts_db_mod,
@@ -4289,6 +4309,16 @@ class TestR6SharingAuthGating:
             "is_dalton_multiuser_auth_enabled",
             create_autospec(
                 dalton_settings_mod.is_dalton_multiuser_auth_enabled, return_value=False
+            ),
+        )
+        from src.dalton.monitors import shared_documents as shared_doc_mod
+
+        monkeypatch.setattr(
+            shared_doc_mod,
+            "list_workspace_auto_update_shared_documents",
+            create_autospec(
+                shared_doc_mod.list_workspace_auto_update_shared_documents,
+                return_value=[],
             ),
         )
         await snapshot_mod.keep_updated_after_turn(workspace_id="ws-1", user_id="u-b")

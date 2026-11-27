@@ -158,7 +158,8 @@ describe('SharePage', () => {
     const { queryClient } = renderAt();
     await screen.findByTestId('chat-view');
 
-    mockMetadata.mockRejectedValue(notFound());
+    // DALTON-HOOK(share-redaction): 404 now unmounts thread shares on revocation; keep transient non-revocation failure coverage here
+    mockMetadata.mockRejectedValue(Object.assign(new Error('Too Many Requests'), { response: { status: 429 } }));
     await act(() => queryClient.refetchQueries({ queryKey: queryKeys.share.all }));
 
     expect(mockMetadata).toHaveBeenCalledTimes(2);

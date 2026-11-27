@@ -75,10 +75,19 @@ TEST_SESSION_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
 
 def _make_request(headers: dict[str, str] | None = None) -> Request:
+    hdr_dict = {"host": "127.0.0.1:8000", **(headers or {})}
     req = create_autospec(Request, instance=True)
     req.__len__.return_value = 1
-    req.headers = Headers(headers or {})
-    req.scope = {"state": {}}
+    req.headers = Headers(hdr_dict)
+    req.scope = {
+        "type": "http",
+        "client": ("127.0.0.1", 50000),
+        "headers": [
+            (k.lower().encode("latin-1"), v.encode("latin-1"))
+            for k, v in hdr_dict.items()
+        ],
+        "state": {},
+    }
     return req
 
 
@@ -86,14 +95,16 @@ def _make_websocket(
     headers: dict[str, str] | None = None,
     query: dict[str, str] | None = None,
 ) -> WebSocket:
+    hdr_dict = {"host": "127.0.0.1:8000", **(headers or {})}
     ws = create_autospec(WebSocket, instance=True)
-    ws.headers = Headers(headers or {})
+    ws.headers = Headers(hdr_dict)
     ws.query_params = QueryParams(query or {})
     ws.scope = {
         "type": "websocket",
+        "client": ("127.0.0.1", 50000),
         "headers": [
             (k.lower().encode("latin-1"), v.encode("latin-1"))
-            for k, v in (headers or {}).items()
+            for k, v in hdr_dict.items()
         ],
     }
     ws.state = SimpleNamespace()
@@ -348,6 +359,16 @@ class TestAuthModeStartupValidationAndTranscriptionSecret:
         )
         monkeypatch.setattr(
             bootstrap_mod, "seed_bootstrap_token_from_env_if_needed", mock_seed
+        )
+        from src.dalton import storage_refs as storage_refs_mod
+
+        monkeypatch.setattr(
+            storage_refs_mod,
+            "warn_main_bucket_references_on_startup",
+            create_autospec(
+                storage_refs_mod.warn_main_bucket_references_on_startup,
+                return_value=[],
+            ),
         )
         mock_logger = create_autospec(logging.Logger, instance=True)
 

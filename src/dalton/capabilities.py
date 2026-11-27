@@ -1050,6 +1050,8 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
     tuple[str, str], CapabilityId | tuple[CapabilityId, ...] | None
 ] = MappingProxyType(
     {
+        # --- public_og.py --- (share-preview OpenGraph fragment; brand-only fallback, no credentials)
+        ("public_og.py", "get_public_og_meta"): CORE_CAPABILITY,
         # --- router.py ---
         ("router.py", "get_capabilities_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_openclaw_health_endpoint"): CORE_CAPABILITY,
@@ -1283,6 +1285,7 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("chat_uploads.py", "upload_chat_part_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "complete_chat_upload_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "download_sandbox_chat_upload_endpoint"): CORE_CAPABILITY,
+        ("workspace_file_download.py", "download_workspace_file_with_ticket"): CORE_CAPABILITY,  # one-time ticket from download-url
         ("chat_uploads.py", "get_chat_upload_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "cancel_chat_upload_endpoint"): CORE_CAPABILITY,
         # --- watchlist.py (Personal Watchlist three-tier & outbox reconciler) ---

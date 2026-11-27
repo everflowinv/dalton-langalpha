@@ -76,21 +76,24 @@ function coerceOrder(raw: unknown): WakeupOrder | null {
  *  it names no wakeup. */
 export function coerceWakeNotice(raw: unknown): WakeNotice | null {
   if (!isRecord(raw)) return null;
-  const wakeupId = asString(raw.wakeup_id);
   const kind = KINDS.find((k) => k === raw.kind);
-  if (!wakeupId || !kind) return null;
+  if (!kind) return null;
   const seq = asNumber(raw.seq) ?? 1;
+  const notice: WakeNotice['notice'] = raw.notice === 'lapse' ? 'lapse' : 'fire';
+  const firedAt = asString(raw.fired_at) ?? '';
+  // DALTON-HOOK(share-redaction): redacted shared wakeup notices omit wakeup_id; derive a stable local key
+  const wakeupId = asString(raw.wakeup_id) ?? `redacted:${kind}:${notice}:${seq}:${firedAt}`;
   return {
     wakeup_id: wakeupId,
     short_id: asString(raw.short_id) ?? '',
     label: asString(raw.label),
     kind,
-    notice: raw.notice === 'lapse' ? 'lapse' : 'fire',
+    notice,
     seq,
     total: asNumber(raw.total) ?? 1,
     last: raw.last === true,
     skipped: asNumber(raw.skipped) ?? 0,
-    fired_at: asString(raw.fired_at) ?? '',
+    fired_at: firedAt,
     timezone: asString(raw.timezone),
     cron: asString(raw.cron),
     price: coercePrice(raw.price),

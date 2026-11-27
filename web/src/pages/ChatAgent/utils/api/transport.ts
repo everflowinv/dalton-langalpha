@@ -17,6 +17,18 @@ import { isStreamRunAdmissionEvent } from '@/lib/dalton/turnAdmission';
 
 export const baseURL = api.defaults.baseURL;
 
+// DALTON-HOOK(share-redaction): attach credentials:'include' on trusted-origin owner /messages/replay so cross-port OSS receives dalton_oss_media_session cookie
+function isTrustedOwnerReplayOrigin(fullUrl: string): boolean {
+  try {
+    const pageOrigin = typeof window !== 'undefined' && window.location?.origin && window.location.origin !== 'null'
+      ? window.location.origin : 'http://localhost';
+    const target = new URL(fullUrl, pageOrigin).origin;
+    return target === pageOrigin || (!!baseURL && target === new URL(baseURL, pageOrigin).origin);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Bearer headers for this package's raw fetch() calls (SSE streams).
  *
@@ -94,18 +106,29 @@ export async function streamFetch(
   const initialToken = bearerTokenOf(new Headers(opts.headers).get('Authorization'));
   const sentAs = initialToken ? authGeneration() : undefined;
   let res: Response;
+  const fullUrl = `${baseURL}${url}`;
+  // DALTON-HOOK(share-redaction): include credentials and cache:'no-store' on trusted-origin owner replay streams
+  const isTrustedOwnerReplay =
+    /\/api\/v1\/threads\/[^/]+\/messages\/replay(?:[?#]|$)/.test(url) && isTrustedOwnerReplayOrigin(fullUrl);
+  const fetchOpts: RequestInit = isTrustedOwnerReplay
+    ? {
+        ...opts,
+        ...(opts.credentials === undefined ? { credentials: 'include' } : {}),
+        ...(opts.cache === undefined ? { cache: 'no-store' } : {}),
+      }
+    : opts;
   try {
-    res = await fetch(`${baseURL}${url}`, opts);
+    res = await fetch(fullUrl, fetchOpts);
     // DALTON-HOOK(standalone-core): refresh once via cookie and retry SSE request on 401 in local auth mode
     if (isDaltonLocalAuth && res.status === 401) {
       const sameAccount = () => sameSession() && (sentAs === undefined || sentAs === authGeneration());
       if (sameAccount()) {
-        const hdrs = new Headers(opts.headers);
+        const hdrs = new Headers(fetchOpts.headers);
         const refused = bearerTokenOf(hdrs.get('Authorization'));
         const refreshed = await refreshAccessToken(refused);
         if (refreshed && sameAccount()) {
           hdrs.set('Authorization', `Bearer ${refreshed}`);
-          res = await fetch(`${baseURL}${url}`, { ...opts, headers: hdrs });
+          res = await fetch(fullUrl, { ...fetchOpts, headers: hdrs });
         }
       }
     }

@@ -2979,3 +2979,68 @@ async def test_sync_terminal_undelivered_execution_queries_valid_d014_columns_an
         rec.levelno == logging.WARNING and "RuntimeError" in rec.getMessage()
         for rec in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_completion_notify_card_strips_numeric_and_ticker_inline_code_but_keeps_snake_case() -> None:
+    from src.dalton.notify.dispatch import resolve_dalton_notify_routes
+
+    enabled_fn = create_autospec(resolve_dalton_notify_enabled, return_value=True)
+    overrides_fn = create_autospec(resolve_dalton_notify_overrides, return_value={})
+    targets_fn = create_autospec(
+        resolve_dalton_notify_targets, return_value=["feishu:user:ou_analyst_inline"]
+    )
+    routes_fn = create_autospec(resolve_dalton_notify_routes, return_value={})
+    verdict_fn = create_autospec(get_verdict_for_execution, return_value=None)
+    claim_fn = create_autospec(claim_target_delivery, return_value=True)
+    mark_fn = create_autospec(mark_target_delivery, return_value=None)
+    post_fn = create_autospec(
+        post_bridge_notify,
+        return_value={
+            "ok": True,
+            "results": [{"target": "feishu:user:ou_analyst_inline", "ok": True}],
+        },
+    )
+
+    pushed = await on_automation_settled(
+        automation={"name": "dalton-ant-earn-2026q3-t0", "user_id": "u-inline"},
+        execution_id="exec-inline-1",
+        thread_id="th-inline-1",
+        final_text=(
+            "## 结论\n"
+            "`ANT` 季度收入同比 `+46.7%`，指标字段 `revenue_yoy_pct` 维持高位。\n"
+            "## 要点\n"
+            "- 核心收入 `16,956.0`，指引区间 `15%~18%`，口径见 `revenue_yoy_pct`。"
+        ),
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=overrides_fn,
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=routes_fn,
+        get_verdict_fn=verdict_fn,
+        claim_target_fn=claim_fn,
+        mark_target_fn=mark_fn,
+        post_notify_fn=post_fn,
+        frontend_url_fn=lambda: "https://dalton.example.com",
+    )
+    assert pushed is True
+    claim_payload = claim_fn.await_args.kwargs["payload"]
+    card = claim_payload["card"]
+    markdown_texts = [
+        el["content"]
+        for el in card["body"]["elements"]
+        if el.get("tag") == "markdown" and isinstance(el.get("content"), str)
+    ]
+    joined = "\n".join(markdown_texts)
+    assert "`+46.7%`" not in joined
+    assert "`ANT`" not in joined
+    assert "+46.7%" in joined
+    assert "ANT" in joined
+    assert "15%至18%" in joined
+    assert "`revenue_yoy_pct`" in joined
+    # Bridge send receives the exact normalized card as well.
+    sent_card = (
+        post_fn.await_args.kwargs["card"]
+        if "card" in post_fn.await_args.kwargs
+        else post_fn.await_args.args[2]
+    )
+    assert sent_card == card

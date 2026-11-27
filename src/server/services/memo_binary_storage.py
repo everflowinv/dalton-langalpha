@@ -83,6 +83,8 @@ def _build_storage_key(user_id: str, content_type: str) -> str:
 
     UUID-based so concurrent uploads to the same slug don't collide on bytes.
     """
+    from src.dalton.storage_keys import storage_user_id  # DALTON-HOOK(company-system-blob-key)
+    user_id = storage_user_id(user_id)
     _validate_user_id(user_id)
     ext = _MIME_EXTENSION.get(content_type, "")
     return f"memo/{user_id}/{uuid.uuid4().hex}{ext}"
