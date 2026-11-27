@@ -100,3 +100,46 @@ bash scripts/dalton/ops/dalton_data_backup.sh
 - `com.dalton.colima.plist.template`：登录后前台保活运行 `prod/colima_launch.sh`。
 - `com.dalton.pg-backup.plist.template`：每天 03:00 执行 `prod/backup.sh`。
 - `com.dalton.portwatch.plist.template`：每 300 秒执行 `prod/portwatch.sh`，记录临时端口（49152–65535）占用和占用最多的进程，写入 `~/Library/Logs/dalton-portwatch/portwatch.jsonl`；占用超过 60% 时另存一份完整快照，便于事后找出泄漏连接的进程（起因是 2026-09-07 端口耗尽事故）。
+
+## 7. 关闭主桶前必跑引用核验（`storage_refs`）
+
+后端启动时的主桶引用检查仅记录 `WARNING`、不会拒绝启动。由于 `check --strict` 按表与主键分批只读扫描，**严禁在主桶仍在接收写入时边写边扫**（否则已扫过的表或主键范围仍可能新增主桶引用，导致命令退出 `0` 后关桶丢失访问）。关闭主桶必须按以下顺序操作，且**从步骤 1 暂停写入起一直保持到步骤 3 配置切换完成**：
+
+### 步骤 1：暂停并排空所有主桶写入（切勿先停 PostgreSQL）
+
+1. **排空在途任务并暂停所有写入主桶的入口**：
+   - 等待正在进行的对话轮次与子代理任务结束：
+     ```bash
+     bash scripts/dalton/ops/prod/wait_backend_idle.sh
+     ```
+   - 先卸载后端看门狗，否则它每 60 秒探测一次 `/health`，连续 3 次失败就会把刚停下的后端拉起来（Everflow 生产）：
+     ```bash
+     launchctl bootout gui/$(id -u)/com.dalton.backend-watchdog
+     ```
+     配置切换完成、`/health` 恢复正常后再装回：`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dalton.backend-watchdog.plist`。
+   - 暂停会向主桶写入数据的定时/后台任务与外部写流量，并停止后端写入进程（例如 `docker compose stop backend`，或停止运行中的 `server.py` 进程；**保持 PostgreSQL 运行**供只读核验连接）。
+2. **关于 `DALTON_WSFILES_WRITE_INLINE_ONLY=1` 的作用边界**：
+   - 若只想提前将新的普通工作区文件（非 Git、且 `<= 100 MiB`）改写回数据库内联而不停服，可在环境变量中设置 `DALTON_WSFILES_WRITE_INLINE_ONLY=1`（或在 `src/dalton/dalton.yaml` 中设置 `workspace_files.write_inline_only: true`）并重启/重建后端。
+   - **该开关不能替代停写排空**：`> 100 MiB` 工作区文件、Git 仓库文件，以及头像、聊天附件、回复图片、组件数据、技能归档、备忘录二进制等其他主桶消费者在主桶仍开启时仍会写入主桶；因此执行步骤 2 核验前仍必须按第 1 步暂停后端写入并确认排空。
+
+### 步骤 2：在保持暂停写入状态下执行只读全量核验
+
+确认后端写入已暂停且在途任务已排空后，执行只读全量核验并检查退出码：
+
+```bash
+python -m src.dalton.storage_refs check --strict
+```
+
+- **退出码 `0`**：全库 17 类主桶消费者（含检查点 `captured_images` 与旧 `image_capture` 记录）均未检出确认引用，方可进入步骤 3（若日志中出现头像 `avatar_url` 本站形状疑似告警，请人工复核确认无主桶头像后再切换）。
+- **退出码 `1`**：已确认存在主桶对象引用（命中即停）；此时**禁止关闭主桶**，保持 `STORAGE_PROVIDER=s3` 并按需恢复服务（如仅需让新普通工作区文件改写内联，可开启 `DALTON_WSFILES_WRITE_INLINE_ONLY=1`）。
+- **退出码 `2`**：检查本身失败或被中断（连接、查询、反序列化异常或 `Ctrl+C`）；保持暂停状态排障并重跑，直到退出码为 `0`（或放弃本次停桶并恢复 `STORAGE_PROVIDER=s3`）。
+- **核验范围与已知局限**：`check --strict` 覆盖全库 17 类主桶消费者（精确指针表、附件与回放记录、检查点组件与图片引用、用户头像对象键与本站形状疑似告警）；缺本站或主桶地址配置时按路径形状判断回复图片，HTML 图片按 `src` 属性提取。执行时保留原存储地址环境变量，对结果有疑问时保持主桶开启。
+
+### 步骤 3：仅在退出码 `0` 后切换配置，切换完成前保持暂停
+
+1. 在**继续保持暂停写入**的状态下修改配置：将 `STORAGE_PROVIDER` 设为 `none`（或清空 `STORAGE_BUCKET_NAME`），并用以下命令核对最终配置中 `is_storage_enabled` 为 `false`：
+   ```bash
+   python -m src.dalton.storage_config show
+   ```
+2. 重建/启动后端容器（例如 `docker compose up -d backend`），确认 `/health` 正常且启动日志中 `storage_refs` 无命中告警后，再恢复外部流量与定时任务。
+3. **禁止在核验返回 `0` 后先恢复写入再修改配置**，否则恢复期间产生的新引用会在关桶后无法读取。

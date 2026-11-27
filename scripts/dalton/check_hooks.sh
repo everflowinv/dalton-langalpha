@@ -567,6 +567,13 @@ ALLOWED_HOOKS=(
   # HF2: surface-aware safety-refusal exhaustion notice delegated to
   # src/dalton/middleware/refusal_fallback.py (empty_call_retry.py).
   "refusal-handling"
+  # workspace-file-storage (Batch 1)
+  "company-system-blob-key"
+  "backfill-readback-verify"
+  "workspace-file-streaming"
+  "workspace-file-write-mode"
+  "workspace-file-exclusions"
+  "workspace-file-download-ticket"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

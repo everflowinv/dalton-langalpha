@@ -53,6 +53,8 @@ def is_configured() -> bool:
 
 def build_storage_key(user_id: str, content_hash: str) -> str:
     """Build the content-addressed ``user-skills/{user_id}/{hash}.zip`` key."""
+    from src.dalton.storage_keys import storage_user_id  # DALTON-HOOK(company-system-blob-key)
+    user_id = storage_user_id(user_id)
     if not _USER_ID_RE.match(user_id):
         msg = f"Refusing to build storage key for unsafe user_id: {user_id!r}"
         raise SkillArchiveStorageError(msg)

@@ -360,6 +360,16 @@ class TestAuthModeStartupValidationAndTranscriptionSecret:
         monkeypatch.setattr(
             bootstrap_mod, "seed_bootstrap_token_from_env_if_needed", mock_seed
         )
+        from src.dalton import storage_refs as storage_refs_mod
+
+        monkeypatch.setattr(
+            storage_refs_mod,
+            "warn_main_bucket_references_on_startup",
+            create_autospec(
+                storage_refs_mod.warn_main_bucket_references_on_startup,
+                return_value=[],
+            ),
+        )
         mock_logger = create_autospec(logging.Logger, instance=True)
 
         # In local mode: validates, seeds bootstrap token, returns False (do NOT create local-dev-user)

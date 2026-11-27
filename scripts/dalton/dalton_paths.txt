@@ -665,3 +665,5 @@ web/src/pages/SharedChat/__tests__/SharePage.redaction.test.tsx
 web/src/pages/SharedChat/__tests__/SharedChatView.redaction.test.tsx
 web/src/pages/SharedChat/__tests__/SharedChatView.filePanelDownload.redaction.test.tsx
 web/src/pages/ChatAgent/components/__tests__/ThreadSharePanel.redaction.test.tsx
+# workspace-file-storage (Batch 1 Step 2): frontend download-ticket unit test.
+web/src/pages/ChatAgent/utils/api/__tests__/files.dlToken.test.ts

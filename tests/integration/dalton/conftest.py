@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
+# Disable `.env` loading (both python-dotenv and src.dalton.config_env.load_shared_dotenv)
+# before any application module is imported during pytest collection.
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+
+from pathlib import Path
+from unittest.mock import create_autospec, patch
+
+import dotenv
+import dotenv.main
 import pytest
 import pytest_asyncio
 from alembic import command
@@ -85,7 +93,26 @@ def pytest_collection_modifyitems(
 
 
 @pytest.fixture(scope="session", autouse=True)
-def dalton_schema(test_db_pool, test_db_uri: str):
+def disable_dotenv_loading():
+    """Disable ``dotenv.load_dotenv`` for the whole Dalton integration session.
+
+    Both ``migrations/env.py`` (invoked by ``test_db_pool``) and
+    ``src/dalton/migrations/env.py`` (invoked by ``dalton_schema``) call
+    ``dotenv.load_dotenv(...)`` against the repo ``.env``. Patching it at
+    session start guarantees neither Alembic chain ever reads ``.env``.
+    """
+    noop_load_dotenv = create_autospec(
+        dotenv.load_dotenv, spec_set=True, return_value=False
+    )
+    with (
+        patch.object(dotenv, "load_dotenv", noop_load_dotenv),
+        patch.object(dotenv.main, "load_dotenv", noop_load_dotenv),
+    ):
+        yield noop_load_dotenv
+
+
+@pytest.fixture(scope="session", autouse=True)
+def dalton_schema(disable_dotenv_loading, test_db_pool, test_db_uri: str):
     """Upgrade Dalton Alembic chain (`src/dalton/alembic.ini`) to head on the test database."""
     _ensure_safe_test_db_name()
     extract_effective_test_db_name(test_db_uri, source="test_db_uri")

@@ -137,16 +137,21 @@ async def close_ws_ticket_redis_client() -> None:
             pass
 
 _SENSITIVE_QUERY_PARAM_RE = re.compile(
-    r"([?&](?:ticket|token)=)[^&\s\"'<>#]+",
+    r"([?&](?:ticket|token|dl_token)=)[^&\s\"'<>#]+",
     re.IGNORECASE,
 )
 
 
 def redact_sensitive_query_params(value: Any) -> Any:
-    """Redact ``ticket=`` and ``token=`` query values from log strings."""
+    """Drop download-ticket route queries and redact ``ticket=`` / ``token=`` / ``dl_token=`` values."""
     if not isinstance(value, str) or "?" not in value:
         return value
-    return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1REDACTED", value)
+    from src.dalton.download_ticket import redact_dl_token_in_text
+
+    cleaned = redact_dl_token_in_text(value)
+    if "?" not in cleaned:
+        return cleaned
+    return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1REDACTED", cleaned)
 
 
 class SensitiveQueryLogFilter(logging.Filter):
