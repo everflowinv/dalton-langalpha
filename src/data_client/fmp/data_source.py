@@ -352,10 +352,11 @@ class FMPDataSource:
             # The regular session's print: extended hours have their own
             # endpoints, so after the close this stamp stays at the close.
             "as_of": _print_time_ms(q.get("timestamp")),
-            # DALTON-HOOK(watchlist): the regular print time, so merges compare by trade time
-            "regular_as_of": _print_time_ms(q.get("timestamp")),
             "regular_only": True,
         }
+        # DALTON-HOOK(watchlist): the regular print time, so merges compare by trade time
+        if snap["as_of"] is not None:
+            snap["regular_as_of"] = snap["as_of"]
         return scale_snapshot_prices(snap, minor_unit_places(symbol))
 
     async def close(self) -> None:
