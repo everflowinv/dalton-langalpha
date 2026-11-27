@@ -136,12 +136,26 @@ def _normalize_metric_key(name: str, segment: str | None = None) -> str:
     low = " ".join(raw.lower().split())
 
     if segment and str(segment).strip():
-        seg_clean = _SEG_FILLER_RE.sub(" ", str(segment).strip().lower())
+        seg_raw = str(segment).strip().lower()
+        seg_clean = _SEG_FILLER_RE.sub(" ", seg_raw)
         seg_slug = _slugify_key(seg_clean)
+        seg_tokens = set(seg_clean.split())
+        if not seg_slug or seg_slug in _GROUP_PREFIX_WORDS or (seg_tokens and seg_tokens <= _GROUP_PREFIX_WORDS):
+            return _normalize_metric_key(low)
         base_m = _normalize_metric_key(low)
+        if "::" in base_m:
+            existing_seg, existing_metric = base_m.split("::", 1)
+            if existing_seg == seg_slug:
+                return base_m
+            if existing_seg.startswith(seg_slug + "_") or seg_slug.startswith(existing_seg + "_"):
+                return f"{seg_slug}::{existing_metric}"
+        if base_m.startswith(seg_slug + "_"):
+            stripped = base_m[len(seg_slug) + 1 :]
+            if stripped:
+                base_m = _normalize_metric_key(stripped.replace("_", " "))
         if base_m == "total_revenue":
             base_m = "revenue"
-        return f"{seg_slug}::{base_m}" if seg_slug else base_m
+        return f"{seg_slug}::{base_m}"
 
     # 1. Exact group-level metric match
     for canon, aliases in _GROUP_METRIC_EXACT.items():
@@ -526,13 +540,14 @@ def write_consensus_snapshot(
                 ws = wb[target_sh]
                 detected = _detect_consensus_table_layouts(ws)
                 if detected:
-                    # Prefer the last isolated reference block if one already exists, else the first valid table
+                    # Prefer the last isolated reference block as append target, while indexing ALL detected tables
                     layout = detected[-1]
                     layout_mode = "existing_table"
                 else:
                     # Unrecognizable or formula-colliding layout -> create brand-new isolated zone below!
                     layout_mode = "isolated_block"
                     layout = _open_isolated_block()
+                    detected = [layout]
 
             def _layout_cols(lay: dict[str, Any]) -> tuple[int, int, int | None, int, int | None, int | None, int | None, int | None]:
                 return (
@@ -573,16 +588,20 @@ def write_consensus_snapshot(
                         return True
                 return False
 
-            p_col, m_col, h_col, c_col, d_col, s_col, dt_col, rat_col = _layout_cols(layout)
+            all_layouts = detected if layout_mode == "existing_table" else [layout]
 
-            # Build existing (period, metric_key) -> row index lookup strictly within detected table
-            row_lookup: dict[tuple[str, str], int] = {}
+            # Build existing (period, metric_key) -> (layout, row_index) lookup across ALL detected tables
+            # so repeated snapshot writes update existing rows in place even after an isolated block was opened.
+            row_lookup: dict[tuple[str, str], tuple[dict[str, Any], int]] = {}
             next_row = int(layout["data_end_row"]) + 1
-            for r in range(int(layout["data_start_row"]), int(layout["data_end_row"]) + 1):
-                p_val = str(ws.cell(r, p_col).value or "").strip()
-                m_val = str(ws.cell(r, m_col).value or "").strip()
-                if p_val and m_val:
-                    row_lookup[(p_val.upper(), _normalize_metric_key(m_val))] = r
+            for lay in all_layouts:
+                lp_col = int(lay["period_col"])
+                lm_col = int(lay["metric_col"])
+                for r in range(int(lay["data_start_row"]), int(lay["data_end_row"]) + 1):
+                    p_val = str(ws.cell(r, lp_col).value or "").strip()
+                    m_val = str(ws.cell(r, lm_col).value or "").strip()
+                    if p_val and m_val:
+                        row_lookup[(p_val.upper(), _normalize_metric_key(m_val))] = (lay, r)
 
             # Pre-validate append rows: if any prospective append row collides with existing formulas/content
             # (e.g. a summary row right below the table carrying House/Diff formulas), open an isolated zone!
@@ -611,11 +630,12 @@ def write_consensus_snapshot(
                     else metric_label
                 )
                 mkey = _normalize_metric_key(metric_label, segment=segment_label)
-                row_idx = row_lookup.get((period.upper(), mkey))
-                active_lay = layout
+                found_entry = row_lookup.get((period.upper(), mkey))
+                active_lay = found_entry[0] if found_entry is not None else layout
+                row_idx: int | None = found_entry[1] if found_entry is not None else None
                 use_isolated = False
 
-                if row_idx is not None and _existing_row_has_formula_conflict(row_idx, layout, item):
+                if row_idx is not None and _existing_row_has_formula_conflict(row_idx, active_lay, item):
                     use_isolated = True
                     row_idx = None
                 elif row_idx is None:
@@ -664,7 +684,7 @@ def write_consensus_snapshot(
                     if use_isolated:
                         isolated_lookup[(period.upper(), mkey)] = row_idx
                     else:
-                        row_lookup[(period.upper(), mkey)] = row_idx
+                        row_lookup[(period.upper(), mkey)] = (active_lay, row_idx)
 
                 cons_coord = f"{get_column_letter(ac_col)}{row_idx}"
                 snap_cell = ws.cell(row_idx, ac_col, float(cons_val))
@@ -971,6 +991,34 @@ def compute_consensus_diff(
     diff_rows: list[dict[str, Any]] = []
     exceeds_count = 0
     missing_rationale_count = 0
+    unaligned_count = 0
+
+    def _item_basis_warnings(item_obj: dict[str, Any]) -> list[str]:
+        item_b = dict(c_basis)
+        if isinstance(item_obj.get("basis"), dict):
+            item_b.update(item_obj["basis"])
+        for dim_k in (
+            "fiscal_year_end_month",
+            "currency",
+            "accounting_basis",
+            "share_basis",
+            "reflects_latest_earnings",
+        ):
+            if item_obj.get(dim_k) is not None:
+                item_b[dim_k] = item_obj[dim_k]
+        warns: list[str] = []
+        for dim, m_v in (
+            ("fiscal_year_end_month", model_basis.get("fiscal_year_end_month")),
+            ("currency", model_basis.get("currency")),
+            ("accounting_basis", model_basis.get("accounting_basis")),
+            ("share_basis", model_basis.get("share_basis")),
+        ):
+            c_v = item_b.get(dim)
+            if c_v is not None and m_v is not None and str(c_v).upper() != str(m_v).upper():
+                warns.append(f"{dim} mismatch: model={m_v!r} vs consensus={c_v!r}")
+        if item_b.get("reflects_latest_earnings") is False:
+            warns.append("consensus snapshot does not yet reflect the latest earnings release")
+        return warns
 
     for item in raw_items:
         period = str(item.get("period") or "").strip()
@@ -997,6 +1045,38 @@ def compute_consensus_diff(
         if cons_margin is None and h_entry and h_entry.get("revenue") and mkey in ("operating_income", "net_income"):
             cons_margin = cons_f / h_entry["revenue"]
 
+        item_warns = _item_basis_warnings(item)
+        item_aligned = len(item_warns) == 0
+
+        # Codex R3 #5: when reporting/currency basis is unaligned, record missing_evidence and do NOT
+        # feed unaligned raw numbers into threshold / missing-rationale judgment!
+        if not item_aligned:
+            unaligned_count += 1
+            diff_rows.append(
+                {
+                    "period": period,
+                    "metric": metric_lbl,
+                    "metric_key": mkey,
+                    "category": cat,
+                    "status": "missing_evidence",
+                    "basis_aligned": False,
+                    "basis_warnings": item_warns,
+                    "house": house_val,
+                    "house_cell": house_cell,
+                    "consensus": cons_f,
+                    "diff_abs": None,
+                    "diff_pct": None,
+                    "diff_bp": None,
+                    "comparison_mode": "unaligned",
+                    "threshold": "basis_unaligned (missing_evidence)",
+                    "exceeds_threshold": False,
+                    "rationale": str(item.get("rationale") or "").strip(),
+                    "missing_rationale": False,
+                    "source_type": str(item.get("source_type") or data.get("source_type") or "Market Consensus"),
+                }
+            )
+            continue
+
         diff_abs = (house_val - cons_f) if house_val is not None else None
         diff_pct = (
             (house_val - cons_f) / abs(cons_f)
@@ -1004,7 +1084,7 @@ def compute_consensus_diff(
             else None
         )
 
-        # Threshold evaluation (§5.2 & §8.7)
+        # Threshold evaluation (§5.2 & §8.7) — only after basis alignment!
         exceeds = False
         threshold_desc = ""
         metric_mode = "pct"
@@ -1066,6 +1146,9 @@ def compute_consensus_diff(
                 "metric": metric_lbl,
                 "metric_key": mkey,
                 "category": cat,
+                "status": "ok",
+                "basis_aligned": True,
+                "basis_warnings": [],
                 "house": house_val,
                 "house_cell": house_cell,
                 "consensus": cons_f,
@@ -1081,9 +1164,10 @@ def compute_consensus_diff(
             }
         )
 
+    all_unaligned = bool(diff_rows) and (unaligned_count == len(diff_rows))
     report = {
         "schema_version": 1,
-        "status": "ok",
+        "status": "missing_evidence" if all_unaligned else "ok",
         "ticker": ticker.strip().upper(),
         "model_path": str(mpath),
         "model_sha256": model_sha,
@@ -1091,14 +1175,16 @@ def compute_consensus_diff(
         "as_of_date": data.get("as_of_date") or data.get("fetched_at"),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "basis_alignment": {
-            "aligned": len(basis_warnings) == 0,
+            "aligned": len(basis_warnings) == 0 and unaligned_count == 0,
             "checks": checks,
             "warnings": basis_warnings,
+            "unaligned_count": unaligned_count,
         },
         "thresholds": eff_thresholds,
         "items": diff_rows,
         "exceeds_count": exceeds_count,
         "missing_rationale_count": missing_rationale_count,
+        "unaligned_count": unaligned_count,
     }
 
     json_out.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -1108,8 +1194,8 @@ def compute_consensus_diff(
         f"# House vs Consensus Diff ({ticker.strip().upper()})",
         "",
         f"- **Model**: `{mpath.name}` (`sha256: {model_sha}`)",
-        f"- **Basis alignment**: {'ALIGNED' if not basis_warnings else 'WARNINGS: ' + '; '.join(basis_warnings)}",
-        f"- **Exceeds threshold**: {exceeds_count} | **Missing rationale**: {missing_rationale_count}",
+        f"- **Basis alignment**: {'ALIGNED' if not basis_warnings and unaligned_count == 0 else 'UNALIGNED (missing_evidence): ' + '; '.join(basis_warnings or ['item-level basis mismatch'])}",
+        f"- **Exceeds threshold**: {exceeds_count} | **Missing rationale**: {missing_rationale_count} | **Unaligned (missing_evidence)**: {unaligned_count}",
         "",
         "| Period | Metric | House | Consensus | Diff | Threshold | Flag | Rationale |",
         "|---|---|---:|---:|---:|---|---|---|",
@@ -1117,13 +1203,18 @@ def compute_consensus_diff(
     for row in diff_rows:
         h_s = f"{row['house']:,.2f}" if row["house"] is not None else "N/A"
         c_s = f"{row['consensus']:,.2f}"
-        if row["comparison_mode"] == "bp" and row["diff_bp"] is not None:
+        if not row.get("basis_aligned", True):
+            d_s = "N/A"
+            flag = "MISSING_EVIDENCE (UNALIGNED)"
+        elif row["comparison_mode"] == "bp" and row["diff_bp"] is not None:
             d_s = f"{row['diff_bp']:+.0f}bp"
+            flag = "EXCEEDS" if row["exceeds_threshold"] else "OK"
         elif row["diff_pct"] is not None:
             d_s = f"{row['diff_pct'] * 100:+.1f}%"
+            flag = "EXCEEDS" if row["exceeds_threshold"] else "OK"
         else:
             d_s = "N/A"
-        flag = "EXCEEDS" if row["exceeds_threshold"] else "OK"
+            flag = "EXCEEDS" if row["exceeds_threshold"] else "OK"
         rat_s = row["rationale"] or ("*(missing rationale)*" if row["missing_rationale"] else "-")
         lines.append(
             f"| {row['period']} | {row['metric']} | {h_s} | {c_s} | {d_s} | {row['threshold']} | {flag} | {rat_s} |"

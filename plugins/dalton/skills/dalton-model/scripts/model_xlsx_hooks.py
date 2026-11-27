@@ -147,40 +147,87 @@ _SST_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relations
 _SST_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"
 
 
-def _read_shared_strings(payload: dict[str, bytes]) -> list[str]:
+def _normalize_sml_tree(el: Any) -> Any:
+    """Clone an OOXML subtree with canonical default SpreadsheetML namespace to ignore prefix aliases."""
+    nsmap = {None: _SML} if str(el.tag).startswith(f"{{{_SML}}}") else el.nsmap
+    cloned = etree.Element(el.tag, attrib=dict(el.attrib), nsmap=nsmap)
+    cloned.text = el.text
+    cloned.tail = el.tail
+    for child in el:
+        cloned.append(_normalize_sml_tree(child))
+    return cloned
+
+
+def _canonical_xml(el: Any) -> bytes:
+    """Deterministic canonical XML bytes for exact ``<si>`` / ``<is>`` rich-text comparison."""
+    return etree.tostring(_normalize_sml_tree(el), method="c14n")
+
+
+def _is_plain_si(si_el: Any) -> bool:
+    """Return True iff ``<si>`` contains a single plain ``<t>`` with no rich-text runs or phonetics."""
+    children = list(si_el)
+    return len(children) == 1 and children[0].tag == f"{{{_SML}}}t"
+
+
+def _read_shared_string_elements(payload: dict[str, bytes]) -> list[Any]:
     raw = payload.get("xl/sharedStrings.xml")
     if not raw:
         return []
     root = etree.fromstring(raw, _XML)
-    return ["".join(t.text or "" for t in si.iter(f"{{{_SML}}}t")) for si in root.findall(f"{{{_SML}}}si")]
+    return list(root.findall(f"{{{_SML}}}si"))
+
+
+def _read_shared_strings(payload: dict[str, bytes]) -> list[str]:
+    return [
+        "".join(t.text or "" for t in si.iter(f"{{{_SML}}}t"))
+        for si in _read_shared_string_elements(payload)
+    ]
 
 
 class _SharedStringsMutator:
-    """Maintain or create ``xl/sharedStrings.xml`` while preserving existing indices."""
+    """Maintain or create ``xl/sharedStrings.xml`` while preserving donor SST indices & rich-text ``<si>``."""
 
-    def __init__(self, infos: list[zipfile.ZipInfo], payload: dict[str, bytes]) -> None:
+    def __init__(
+        self,
+        infos: list[zipfile.ZipInfo],
+        payload: dict[str, bytes],
+        *,
+        seed_raw: bytes | None = None,
+    ) -> None:
         self._infos = infos
         self._payload = payload
+        self._seed_raw = seed_raw
+        self._appended = False
         self.dirty = False
-        raw = payload.get("xl/sharedStrings.xml")
+        self.donor_count = 0
+
+        raw = seed_raw if seed_raw is not None else payload.get("xl/sharedStrings.xml")
         if raw:
             self._root: Any = etree.fromstring(raw, _XML)
+            si_els = list(self._root.findall(f"{{{_SML}}}si"))
             self.strings: list[str] = [
-                "".join(t.text or "" for t in si.iter(f"{{{_SML}}}t"))
-                for si in self._root.findall(f"{{{_SML}}}si")
+                "".join(t.text or "" for t in si.iter(f"{{{_SML}}}t")) for si in si_els
             ]
+            if seed_raw is not None:
+                self.donor_count = len(si_els)
+                if payload.get("xl/sharedStrings.xml") != seed_raw:
+                    self.dirty = True
         else:
             self._root = None
+            si_els = []
             self.strings = []
-        self._index: dict[str, int] = {}
-        for idx, s in enumerate(self.strings):
-            self._index.setdefault(s, idx)
 
-    def _ensure_part(self) -> None:
-        if self._root is not None:
-            return
-        self._root = etree.Element(f"{{{_SML}}}sst", count="0", uniqueCount="0")
-        if "xl/sharedStrings.xml" not in self._payload:
+        self._c14n_index: dict[bytes, int] = {}
+        self._plain_index: dict[str, int] = {}
+        for idx, (si, text) in enumerate(zip(si_els, self.strings)):
+            self._c14n_index.setdefault(_canonical_xml(si), idx)
+            if _is_plain_si(si):
+                self._plain_index.setdefault(text, idx)
+
+    def _ensure_registration(self) -> None:
+        if "xl/sharedStrings.xml" not in self._payload and not any(
+            i.filename == "xl/sharedStrings.xml" for i in self._infos
+        ):
             zi = zipfile.ZipInfo("xl/sharedStrings.xml")
             zi.compress_type = zipfile.ZIP_DEFLATED
             self._infos.append(zi)
@@ -225,10 +272,39 @@ class _SharedStringsMutator:
                 self._payload["xl/_rels/workbook.xml.rels"] = etree.tostring(
                     rels_root, xml_declaration=True, encoding="UTF-8", standalone=True
                 )
+
+    def _ensure_part(self) -> None:
+        if self._root is not None:
+            self._ensure_registration()
+            return
+        self._root = etree.Element(f"{{{_SML}}}sst", count="0", uniqueCount="0")
+        self._ensure_registration()
         self.dirty = True
 
+    def intern_si(self, si_el: Any) -> int:
+        """Intern a complete ``<si>`` element (preserving rich-text runs ``<r>``) without mutating donor indices."""
+        c14n = _canonical_xml(si_el)
+        existing = self._c14n_index.get(c14n)
+        if existing is not None:
+            return existing
+        self._ensure_part()
+        idx = len(self.strings)
+        cloned = etree.fromstring(etree.tostring(si_el, encoding="UTF-8"), _XML)
+        self._root.append(cloned)
+        text = "".join(t.text or "" for t in cloned.iter(f"{{{_SML}}}t"))
+        self.strings.append(text)
+        self._c14n_index[c14n] = idx
+        if _is_plain_si(cloned):
+            self._plain_index.setdefault(text, idx)
+        self._root.set("uniqueCount", str(len(self.strings)))
+        cur_cnt = int(self._root.get("count") or len(self.strings))
+        self._root.set("count", str(max(cur_cnt, len(self.strings))))
+        self._appended = True
+        self.dirty = True
+        return idx
+
     def intern(self, text: str) -> int:
-        existing = self._index.get(text)
+        existing = self._plain_index.get(text)
         if existing is not None:
             return existing
         self._ensure_part()
@@ -239,28 +315,39 @@ class _SharedStringsMutator:
             t_el.set(_XML_SPACE, "preserve")
         t_el.text = text
         self.strings.append(text)
-        self._index[text] = idx
+        self._c14n_index.setdefault(_canonical_xml(si), idx)
+        self._plain_index[text] = idx
         self._root.set("uniqueCount", str(len(self.strings)))
         cur_cnt = int(self._root.get("count") or len(self.strings))
         self._root.set("count", str(max(cur_cnt, len(self.strings))))
+        self._appended = True
         self.dirty = True
         return idx
 
     def flush(self) -> None:
         if self.dirty and self._root is not None:
-            self._payload["xl/sharedStrings.xml"] = etree.tostring(
-                self._root, xml_declaration=True, encoding="UTF-8", standalone=True
-            )
+            self._ensure_registration()
+            if self._seed_raw is not None and not self._appended:
+                self._payload["xl/sharedStrings.xml"] = self._seed_raw
+            else:
+                self._payload["xl/sharedStrings.xml"] = etree.tostring(
+                    self._root, xml_declaration=True, encoding="UTF-8", standalone=True
+                )
 
 
-def _extract_donor_cells(
-    donor_path: Path,
+def extract_raw_xml_cell_states(
+    xlsx_path: str | Path,
+    sheet_names: set[str] | None = None,
 ) -> dict[str, dict[str, dict[str, Any]]]:
-    """Read full cell cache & formula metadata ``{sheet: {COORD: {...}}}`` from donor OOXML."""
-    _, payload = _read_package(donor_path)
-    sst = _read_shared_strings(payload)
+    """Read raw OOXML cell state (``t``, ``<v>``, SST index & canonical ``<si>``, ``<is>``, formula) per sheet."""
+    _, payload = _read_package(Path(xlsx_path).expanduser().resolve())
+    sst_els = _read_shared_string_elements(payload)
+    sst_texts = ["".join(t.text or "" for t in si.iter(f"{{{_SML}}}t")) for si in sst_els]
+    sst_c14n = [_canonical_xml(si) for si in sst_els]
     out: dict[str, dict[str, dict[str, Any]]] = {}
     for name, part in _sheet_parts(payload).items():
+        if sheet_names is not None and name not in sheet_names:
+            continue
         if part not in payload:
             continue
         root = etree.fromstring(payload[part], _XML)
@@ -277,9 +364,19 @@ def _extract_donor_cells(
             v_text: str | None = None
             v_is_empty = False
             resolved_str: str | None = None
+            sst_index: int | None = None
+            si_xml: bytes | None = None
+            si_c14n: bytes | None = None
+            is_xml: bytes | None = None
+            is_c14n: bytes | None = None
             if t == "inlineStr":
                 is_el = c.find(f"{{{_SML}}}is")
-                resolved_str = "".join(x.text or "" for x in is_el.iter(f"{{{_SML}}}t")) if is_el is not None else ""
+                if is_el is not None:
+                    resolved_str = "".join(x.text or "" for x in is_el.iter(f"{{{_SML}}}t"))
+                    is_xml = etree.tostring(is_el, encoding="UTF-8")
+                    is_c14n = _canonical_xml(is_el)
+                else:
+                    resolved_str = ""
                 v_text = resolved_str
             elif v is not None:
                 if v.text is None or v.text == "":
@@ -289,7 +386,13 @@ def _extract_donor_cells(
                     v_text = v.text
                 if t == "s" and v_text is not None and v_text.isdigit():
                     idx = int(v_text)
-                    resolved_str = sst[idx] if 0 <= idx < len(sst) else ""
+                    sst_index = idx
+                    if 0 <= idx < len(sst_els):
+                        resolved_str = sst_texts[idx]
+                        si_xml = etree.tostring(sst_els[idx], encoding="UTF-8")
+                        si_c14n = sst_c14n[idx]
+                    else:
+                        resolved_str = ""
             cells[ref.upper()] = {
                 "t": t,
                 "v": v_text,
@@ -298,10 +401,22 @@ def _extract_donor_cells(
                 "has_formula": has_formula,
                 "formula": f_text,
                 "resolved_str": resolved_str,
+                "sst_index": sst_index,
+                "si_xml": si_xml,
+                "si_c14n": si_c14n,
+                "is_xml": is_xml,
+                "is_c14n": is_c14n,
                 "xml_bytes": etree.tostring(c, encoding="UTF-8"),
             }
         out[name] = cells
     return out
+
+
+def _extract_donor_cells(
+    donor_path: Path,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Read full cell cache & formula metadata ``{sheet: {COORD: {...}}}`` from donor OOXML."""
+    return extract_raw_xml_cell_states(donor_path)
 
 
 def _extract_donor_cache(
@@ -356,30 +471,56 @@ def _apply_exact_donor_cache(
     d_meta: dict[str, Any],
     sst_mut: _SharedStringsMutator,
 ) -> bool:
-    """Restore exact donor ``<v>`` presence/emptiness/value and ``t`` attribute (preserving ``t="s"`` via SST)."""
+    """Restore exact donor ``<v>`` presence/emptiness/value, ``t`` attr, SST index & full ``<si>``/``<is>`` XML."""
     d_t = d_meta.get("t")
     d_v = d_meta.get("v")
     d_has_v = bool(d_meta.get("has_v"))
     d_v_empty = bool(d_meta.get("v_is_empty"))
 
-    # Preserve shared-string cells as t="s" (never degrade to inlineStr!)
-    if not d_meta.get("has_formula") and d_t == "s" and d_meta.get("resolved_str") is not None:
-        want_str = str(d_meta["resolved_str"])
-        cur_t = cell_el.get("t")
-        cur_v_el = cell_el.find(f"{{{_SML}}}v")
-        if (
-            cur_t == "s"
-            and cur_v_el is not None
-            and (cur_v_el.text or "").isdigit()
-            and 0 <= int(cur_v_el.text) < len(sst_mut.strings)
-            and sst_mut.strings[int(cur_v_el.text)] == want_str
-        ):
-            return False
-        idx = sst_mut.intern(want_str)
-        _apply_cached_value(cell_el, "s", str(idx))
-        return True
+    # Preserve shared-string cells with exact donor SST index & complete <si> (incl. rich-text <r> runs!)
+    if not d_meta.get("has_formula") and d_t == "s":
+        d_sst_idx = d_meta.get("sst_index")
+        if d_sst_idx is not None and 0 <= int(d_sst_idx) < sst_mut.donor_count:
+            want_idx_str = str(int(d_sst_idx))
+            cur_v_el = cell_el.find(f"{{{_SML}}}v")
+            if (
+                cell_el.get("t") == "s"
+                and cur_v_el is not None
+                and cur_v_el.text == want_idx_str
+                and cell_el.find(f"{{{_SML}}}is") is None
+            ):
+                return False
+            _apply_cached_value(cell_el, "s", want_idx_str)
+            return True
+        if d_meta.get("si_xml"):
+            idx = sst_mut.intern_si(etree.fromstring(d_meta["si_xml"], _XML))
+            _apply_cached_value(cell_el, "s", str(idx))
+            return True
+        if d_meta.get("resolved_str") is not None:
+            idx = sst_mut.intern(str(d_meta["resolved_str"]))
+            _apply_cached_value(cell_el, "s", str(idx))
+            return True
 
+    # Preserve inlineStr cells with complete <is> XML (incl. rich-text <r> runs!)
     if not d_meta.get("has_formula") and d_t == "inlineStr":
+        if d_meta.get("is_xml"):
+            want_is = etree.fromstring(d_meta["is_xml"], _XML)
+            cur_is = cell_el.find(f"{{{_SML}}}is")
+            cur_v = cell_el.find(f"{{{_SML}}}v")
+            if (
+                cell_el.get("t") == "inlineStr"
+                and cur_v is None
+                and cur_is is not None
+                and _canonical_xml(cur_is) == _canonical_xml(want_is)
+            ):
+                return False
+            if cur_v is not None:
+                cell_el.remove(cur_v)
+            if cur_is is not None:
+                cell_el.remove(cur_is)
+            cell_el.append(want_is)
+            cell_el.set("t", "inlineStr")
+            return True
         _apply_cached_value(cell_el, "inlineStr", str(d_meta.get("resolved_str") or ""))
         return True
 
@@ -489,10 +630,17 @@ def _reinsert_missing_donor_cell(
     # Strip style index from donor since openpyxl may reindex cellXfs
     if "s" in new_c.attrib:
         del new_c.attrib["s"]
-    # Intern donor shared-string text into target SST so t="s" is preserved with valid index
-    if not donor_meta["has_formula"] and donor_meta["t"] == "s" and donor_meta.get("resolved_str") is not None:
-        idx = sst_mut.intern(str(donor_meta["resolved_str"]))
-        _apply_cached_value(new_c, "s", str(idx))
+    # Preserve exact donor SST index when SST is seeded from donor; otherwise intern full <si>
+    if not donor_meta["has_formula"] and donor_meta["t"] == "s":
+        d_sst_idx = donor_meta.get("sst_index")
+        if d_sst_idx is not None and 0 <= int(d_sst_idx) < sst_mut.donor_count:
+            _apply_cached_value(new_c, "s", str(int(d_sst_idx)))
+        elif donor_meta.get("si_xml"):
+            idx = sst_mut.intern_si(etree.fromstring(donor_meta["si_xml"], _XML))
+            _apply_cached_value(new_c, "s", str(idx))
+        elif donor_meta.get("resolved_str") is not None:
+            idx = sst_mut.intern(str(donor_meta["resolved_str"]))
+            _apply_cached_value(new_c, "s", str(idx))
 
     # Insert <c> in column order inside <row>
     c_insert_before = None
@@ -559,17 +707,33 @@ def restore_donor_cache(
         for sh, coords in (spec.get("touched_cells") or {}).items()
     }
 
+    _, donor_payload = _read_package(donor)
+    donor_sst_raw = donor_payload.get("xl/sharedStrings.xml")
     donor_cells = _extract_donor_cells(donor)
     infos, payload = _read_package(target)
-    sst_mut = _SharedStringsMutator(infos, payload)
+    old_target_sis = _read_shared_string_elements(payload)
+    sst_mut = _SharedStringsMutator(infos, payload, seed_raw=donor_sst_raw)
     kept_cache_count = 0
+
+    def _remap_target_sst_cell(c_el: Any) -> bool:
+        """Remap a target-workbook ``t="s"`` cell from openpyxl's SST into the donor-seeded SST."""
+        if donor_sst_raw is None or c_el.get("t") != "s":
+            return False
+        v_el = c_el.find(f"{{{_SML}}}v")
+        if v_el is None or not (v_el.text or "").isdigit():
+            return False
+        old_idx = int(v_el.text)
+        if 0 <= old_idx < len(old_target_sis):
+            new_idx = sst_mut.intern_si(old_target_sis[old_idx])
+            if str(new_idx) != v_el.text:
+                v_el.text = str(new_idx)
+                return True
+        return False
 
     for name, part in _sheet_parts(payload).items():
         if part not in payload:
             continue
-        donor_sheet = donor_cells.get(name)
-        if not donor_sheet:
-            continue
+        donor_sheet = donor_cells.get(name) or {}
         root = etree.fromstring(payload[part], _XML)
         is_skip_sheet = name in skip_sheets
         sheet_skip_cells = skip_cells.get(name, set())
@@ -586,6 +750,8 @@ def restore_donor_cache(
             seen_refs.add(ref)
             d_meta = donor_sheet.get(ref)
             if d_meta is None:
+                if _remap_target_sst_cell(c):
+                    changed = True
                 continue
 
             f_el = c.find(f"{{{_SML}}}f")
@@ -603,13 +769,23 @@ def restore_donor_cache(
             # Target sheet rules:
             if not has_formula:
                 # Never overwrite a cell edited to a constant (including former exempt coords!)
-                if ref not in sheet_touched_all and d_t != "s" and not d_meta["has_formula"]:
+                if ref not in sheet_touched_all and not d_meta["has_formula"]:
+                    if d_t in ("s", "inlineStr"):
+                        if _apply_exact_donor_cache(c, d_meta, sst_mut):
+                            kept_cache_count += 1
+                            changed = True
+                        continue
                     # Preserve explicit t="n" on untouched numeric constants if donor had it
                     if d_meta["has_v"] and d_meta.get("v") is not None:
                         if d_t is not None and c.get("t") != d_t and _cell_has_nonempty_cache(c):
                             _apply_cached_value(c, d_t, str(d_meta["v"]))
                             kept_cache_count += 1
                             changed = True
+                    if _remap_target_sst_cell(c):
+                        changed = True
+                else:
+                    if _remap_target_sst_cell(c):
+                        changed = True
                 continue
 
             # Formula cell on target sheet:

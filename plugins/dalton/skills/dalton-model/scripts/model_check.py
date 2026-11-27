@@ -34,6 +34,7 @@ import model_edit  # noqa: E402
 import model_fingerprint  # noqa: E402
 import model_readable  # noqa: E402
 import model_style  # noqa: E402
+import model_xlsx_hooks  # noqa: E402
 
 _EXCEL_ERRORS = (
     "#DIV/0!", "#REF!", "#NAME?", "#VALUE!", "#N/A",
@@ -577,6 +578,7 @@ def run_checks(
     coord_map: dict[str, Any] | None = None,
     consensus_diff: dict[str, Any] | None = None,
     mode: str = "update",
+    failed_stages: list[str] | None = None,
 ) -> dict[str, Any]:
     """Execute deterministic C01-C14 checks and return structured 4-class findings."""
     cand = Path(candidate_path).expanduser().resolve()
@@ -1022,19 +1024,30 @@ def run_checks(
         if dsh in target_sheets:
             dynamic_ref_list.append({"sheet": dsh, "cell": dcoord, "formula": df})
 
-    # Consensus diff rationale & source check (Prompt R3 #4: hash mismatch -> stage failure ONLY, never actionable!)
+    # Consensus diff rationale & source check (Prompt R3 #4: hash mismatch -> stage failure ONLY, never actionable!
+    # Codex R3 #5: unaligned basis/currency -> missing_evidence, NEVER actionable!)
     if consensus_diff is not None:
-        if consensus_diff.get("status") == "missing_evidence":
-            _add_finding(findings, "C04", "missing_evidence", "No consensus data available for diff comparison")
-        elif str(consensus_diff.get("model_sha256") or "").lower() != str(cand_sha or "").lower():
+        if str(consensus_diff.get("model_sha256") or "").lower() != str(cand_sha or "").lower():
             optional_notices.append(
                 f"Stale consensus-diff.json hash ({consensus_diff.get('model_sha256')}) != candidate ({cand_sha}); recorded as stage failure only"
             )
-        elif int(consensus_diff.get("missing_rationale_count") or 0) > 0:
-            _add_finding(
-                findings, "C04", "actionable",
-                f"{consensus_diff['missing_rationale_count']} above-threshold consensus diff item(s) lack rationale",
-            )
+        else:
+            b_align = consensus_diff.get("basis_alignment") or {}
+            b_warns = list(b_align.get("warnings") or [])
+            unaligned_n = int(consensus_diff.get("unaligned_count") or b_align.get("unaligned_count") or 0)
+            if consensus_diff.get("status") == "missing_evidence" or b_align.get("aligned") is False or unaligned_n > 0:
+                reason_txt = "; ".join(b_warns) if b_warns else "No aligned consensus data available for diff comparison"
+                _add_finding(
+                    findings,
+                    "C04",
+                    "missing_evidence",
+                    f"Consensus comparison missing evidence / unaligned basis: {reason_txt}",
+                )
+            if int(consensus_diff.get("missing_rationale_count") or 0) > 0:
+                _add_finding(
+                    findings, "C04", "actionable",
+                    f"{consensus_diff['missing_rationale_count']} above-threshold aligned consensus diff item(s) lack rationale",
+                )
 
     # C05 Normalized style consistency & rightmost source notes + zero new comments
     for sh_name in target_sheets:
@@ -1434,16 +1447,60 @@ def run_checks(
     # C09 Balance Sheet balance & cash bridge; C10 Annual=Quarterly; C11 Group=Segments; C12 Cash/Share rollforward
     # Prompt R3 #3 / Codex #5 / Grok #2: compare EVERY discrepancy item-by-item against the shifted baseline;
     # pre-existing discrepancies of equal or smaller magnitude stay baseline_legacy even when another cell in the column was edited!
+    # Codex R3 #4: when recalc failed (timeout / no artifact), numerical balance checks touching any affected
+    # unrecalculated formula cell are classified as missing_evidence (NOT actionable), while formula/structure checks stay actionable!
+    recalc_st = str(((cm.get("recalc_result") or {}).get("status") or "")).strip().lower()
+    recalc_failed = (recalc_st == "recalc_failed") or (
+        "recalc" in {s.strip().lower() for s in (failed_stages or ())}
+    )
+    touched_nodes_recalc: set[tuple[str, str]] = {
+        (sh, crd.upper()) for sh, crds in touched_cells.items() for crd in crds
+    }
+    for sh_tf, crds_tf in (cm.get("touched_formula_cells") or {}).items():
+        for crd_tf in (crds_tf or ()):
+            touched_nodes_recalc.add((str(sh_tf), str(crd_tf).upper()))
+    added_cols_recalc: dict[str, set[str]] = {
+        str(sh_ac): {str(c).upper() for c in (cols_ac or ())}
+        for sh_ac, cols_ac in (cm.get("added_period_cols") or {}).items()
+    }
+    touched_idx_recalc = _index_target_coords(touched_nodes_recalc) if recalc_failed else {}
+    _stale_formula_cache: dict[tuple[str, str], bool] = {}
+
+    def _is_stale_unrecalculated_formula(sh: str, coord: str) -> bool:
+        if not recalc_failed:
+            return False
+        cu = coord.upper()
+        node = (sh, cu)
+        cached = _stale_formula_cache.get(node)
+        if cached is not None:
+            return cached
+        c_meta = ((cand_fp.get("sheets") or {}).get(sh, {}).get("cells") or {}).get(cu)
+        if not c_meta or c_meta.get("category") != "formula":
+            _stale_formula_cache[node] = False
+            return False
+        col_s, _ = coordinate_from_string(cu)
+        is_aff = (
+            (node in touched_nodes_recalc)
+            or (col_s.upper() in added_cols_recalc.get(sh, set()))
+            or (_reaches_any(node, touched_nodes_recalc, dep_graph, rect_graph, touched_idx_recalc) is not None)
+        )
+        _stale_formula_cache[node] = is_aff
+        return is_aff
+
     def _classify_discrepancy(
         cand_diff: float,
         base_diff: float | None,
         tol: float,
         base_tol: float | None = None,
+        participating_cells: list[tuple[str, str]] | None = None,
     ) -> str:
         if base_diff is not None:
             bt = base_tol if base_tol is not None else tol
             if abs(base_diff) > bt and abs(cand_diff) <= abs(base_diff) + max(1e-6, 1e-6 * abs(base_diff)):
                 return "baseline_legacy"
+        if recalc_failed and participating_cells:
+            if any(_is_stale_unrecalculated_formula(sh, crd) for sh, crd in participating_cells):
+                return "missing_evidence"
         return "actionable"
 
     for sh_name in target_sheets:
@@ -1493,10 +1550,14 @@ def run_checks(
                     continue
                 ta = _val(col_l, ta_r)
                 tle = _val(col_l, tle_r)
+                bs_parts: list[tuple[str, str]] = [(sh_name, f"{col_l}{ta_r}")]
+                if tle is not None and tle_r is not None:
+                    bs_parts.append((sh_name, f"{col_l}{tle_r}"))
                 if tle is None and tl_r is not None and te_r is not None:
                     tl, te = _val(col_l, tl_r), _val(col_l, te_r)
                     if tl is not None and te is not None:
                         tle = tl + te
+                        bs_parts.extend([(sh_name, f"{col_l}{tl_r}"), (sh_name, f"{col_l}{te_r}")])
                 if ta is not None and tle is not None:
                     tol = _unit_tolerance(unit_scale, ta)
                     cand_diff = ta - tle
@@ -1509,10 +1570,11 @@ def run_checks(
                                 b_tle = btl + bte
                         base_diff = (b_ta - b_tle) if (b_ta is not None and b_tle is not None) else None
                         b_tol = _unit_tolerance(unit_scale, b_ta) if b_ta is not None else tol
-                        sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol)
+                        sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol, participating_cells=bs_parts)
+                        suffix = " (recalc failed; cached formula value is stale)" if sev == "missing_evidence" else ""
                         _add_finding(
                             findings, "C09", sev,
-                            f"Balance sheet out of balance at {sh_name}!{col_l}: Assets={ta:.2f} vs L+E={tle:.2f} (diff={cand_diff:+.2f})",
+                            f"Balance sheet out of balance at {sh_name}!{col_l}: Assets={ta:.2f} vs L+E={tle:.2f} (diff={cand_diff:+.2f}){suffix}",
                             sheet=sh_name, cell=f"{col_l}{ta_r}",
                         )
         # Cash bridge (CF ending cash vs BS cash) — honor restricted cash/deposit bridge rows or notes
@@ -1551,10 +1613,14 @@ def run_checks(
                         b_ec, b_bsc = _b_val(col_l, ec_r), _b_val(col_l, bsc_r)
                         base_diff = (b_ec - b_bsc) if (b_ec is not None and b_bsc is not None) else None
                         b_tol = _unit_tolerance(unit_scale, max(abs(b_ec), abs(b_bsc))) if (b_ec is not None and b_bsc is not None) else tol
-                        sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol)
+                        cb_parts = [(sh_name, f"{col_l}{ec_r}"), (sh_name, f"{col_l}{bsc_r}")] + [
+                            (sh_name, f"{col_l}{br}") for br in bridge_rows
+                        ]
+                        sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol, participating_cells=cb_parts)
+                        suffix = " (recalc failed; cached formula value is stale)" if sev == "missing_evidence" else ""
                         _add_finding(
                             findings, "C09", sev,
-                            f"Cash bridge mismatch at {sh_name}!{col_l}: CF Ending Cash={ec:.2f} vs BS Cash={bsc:.2f}",
+                            f"Cash bridge mismatch at {sh_name}!{col_l}: CF Ending Cash={ec:.2f} vs BS Cash={bsc:.2f}{suffix}",
                             sheet=sh_name, cell=f"{col_l}{bsc_r}",
                         )
 
@@ -1624,6 +1690,7 @@ def run_checks(
                 b_q_vals = [_b_val(q, r_idx) for q in q_cols]
                 has_base_q = b_ann_val is not None and all(v is not None for v in b_q_vals)
                 b_q_floats = [float(v) for v in b_q_vals if v is not None] if has_base_q else []
+                c10_parts = [(sh_name, f"{ann_col}{r_idx}")] + [(sh_name, f"{q}{r_idx}") for q in q_cols]
 
                 if rtype == "flow":
                     q_sum = sum(q_floats)
@@ -1632,10 +1699,11 @@ def run_checks(
                     if abs(cand_diff) > tol:
                         base_diff = (b_ann_val - sum(b_q_floats)) if has_base_q and b_ann_val is not None else None
                         b_tol = _unit_tolerance(unit_scale, sum(b_q_floats)) if has_base_q else tol
-                        sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol)
+                        sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol, participating_cells=c10_parts)
+                        suffix = " (recalc failed; cached formula value is stale)" if sev == "missing_evidence" else ""
                         _add_finding(
                             findings, "C10", sev,
-                            f"Flow annual sum mismatch at {sh_name}!{ann_col}{r_idx} ({rmeta.get('label')}): annual={ann_val:.2f} vs sum({q_cols})={q_sum:.2f}",
+                            f"Flow annual sum mismatch at {sh_name}!{ann_col}{r_idx} ({rmeta.get('label')}): annual={ann_val:.2f} vs sum({q_cols})={q_sum:.2f}{suffix}",
                             sheet=sh_name, cell=f"{ann_col}{r_idx}",
                         )
                 elif rtype == "ending_balance":
@@ -1645,10 +1713,11 @@ def run_checks(
                     if abs(cand_diff) > tol:
                         base_diff = (b_ann_val - b_q_floats[-1]) if has_base_q and b_ann_val is not None else None
                         b_tol = _unit_tolerance(unit_scale, b_q_floats[-1]) if has_base_q else tol
-                        sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol)
+                        sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol, participating_cells=c10_parts)
+                        suffix = " (recalc failed; cached formula value is stale)" if sev == "missing_evidence" else ""
                         _add_finding(
                             findings, "C10", sev,
-                            f"Ending balance annual mismatch at {sh_name}!{ann_col}{r_idx} ({rmeta.get('label')}): annual={ann_val:.2f} vs Q4({q_cols[-1]})={q4_val:.2f}",
+                            f"Ending balance annual mismatch at {sh_name}!{ann_col}{r_idx} ({rmeta.get('label')}): annual={ann_val:.2f} vs Q4({q_cols[-1]})={q4_val:.2f}{suffix}",
                             sheet=sh_name, cell=f"{ann_col}{r_idx}",
                         )
                 elif rtype == "average":
@@ -1659,10 +1728,11 @@ def run_checks(
                         b_avg = sum(b_q_floats) / 4.0 if has_base_q else 0.0
                         base_diff = (b_ann_val - b_avg) if has_base_q and b_ann_val is not None else None
                         b_tol = _unit_tolerance(unit_scale, b_avg) if has_base_q else tol
-                        sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol)
+                        sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol, participating_cells=c10_parts)
+                        suffix = " (recalc failed; cached formula value is stale)" if sev == "missing_evidence" else ""
                         _add_finding(
                             findings, "C10", sev,
-                            f"Average KPI annual mismatch at {sh_name}!{ann_col}{r_idx}: annual={ann_val:.2f} vs avg={q_avg:.2f}",
+                            f"Average KPI annual mismatch at {sh_name}!{ann_col}{r_idx}: annual={ann_val:.2f} vs avg={q_avg:.2f}{suffix}",
                             sheet=sh_name, cell=f"{ann_col}{r_idx}",
                         )
 
@@ -1705,10 +1775,14 @@ def run_checks(
                             else:
                                 base_diff = None
                                 b_tol = tol
-                            sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol)
+                            op_parts = [(sh_name, f"{col_l}{grp_op_r}")] + [(sh_name, f"{col_l}{sr}") for sr in seg_op_rows]
+                            if seg_unalloc_r is not None:
+                                op_parts.append((sh_name, f"{col_l}{seg_unalloc_r}"))
+                            sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol, participating_cells=op_parts)
+                            suffix = " (recalc failed; cached formula value is stale)" if sev == "missing_evidence" else ""
                             _add_finding(
                                 findings, "C11", sev,
-                                f"Group vs Segment Operating Profit disconnect at {sh_name}!{col_l}{grp_op_r}: Group={g_op:.2f} vs Segments+Unalloc={seg_sum:.2f} (diff={cand_diff:+.2f})",
+                                f"Group vs Segment Operating Profit disconnect at {sh_name}!{col_l}{grp_op_r}: Group={g_op:.2f} vs Segments+Unalloc={seg_sum:.2f} (diff={cand_diff:+.2f}){suffix}",
                                 sheet=sh_name, cell=f"{col_l}{grp_op_r}",
                             )
             if seg_rev_rows and grp_rev_r is not None:
@@ -1736,10 +1810,14 @@ def run_checks(
                         else:
                             base_diff = None
                             b_tol = tol
-                        sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol)
+                        rev_parts = [(sh_name, f"{col_l}{grp_rev_r}")] + [(sh_name, f"{col_l}{sr}") for sr in seg_rev_rows]
+                        if seg_rev_elim_r is not None:
+                            rev_parts.append((sh_name, f"{col_l}{seg_rev_elim_r}"))
+                        sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol, participating_cells=rev_parts)
+                        suffix = " (recalc failed; cached formula value is stale)" if sev == "missing_evidence" else ""
                         _add_finding(
                             findings, "C11", sev,
-                            f"Group vs Segment Revenue disconnect at {sh_name}!{col_l}{grp_rev_r}: Group={g_rev:.2f} vs Segments+Elim={seg_rev_sum:.2f} (diff={cand_diff:+.2f})",
+                            f"Group vs Segment Revenue disconnect at {sh_name}!{col_l}{grp_rev_r}: Group={g_rev:.2f} vs Segments+Elim={seg_rev_sum:.2f} (diff={cand_diff:+.2f}){suffix}",
                             sheet=sh_name, cell=f"{col_l}{grp_rev_r}",
                         )
 
@@ -1761,10 +1839,12 @@ def run_checks(
                         b_bc, b_nc, b_ec = _b_val(col_l, bc_r), _b_val(col_l, nc_r), _b_val(col_l, ec_r)
                         base_diff = ((b_bc + b_nc) - b_ec) if (b_bc is not None and b_nc is not None and b_ec is not None) else None
                         b_tol = _unit_tolerance(unit_scale, b_ec) if b_ec is not None else tol
-                        sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol)
+                        cr_parts = [(sh_name, f"{col_l}{bc_r}"), (sh_name, f"{col_l}{nc_r}"), (sh_name, f"{col_l}{ec_r}")]
+                        sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol, participating_cells=cr_parts)
+                        suffix = " (recalc failed; cached formula value is stale)" if sev == "missing_evidence" else ""
                         _add_finding(
                             findings, "C12", sev,
-                            f"Cash rollforward broken at {sh_name}!{col_l}{ec_r}: Beg({bc:.2f}) + Chg({nc_v:.2f}) != End({ec:.2f})",
+                            f"Cash rollforward broken at {sh_name}!{col_l}{ec_r}: Beg({bc:.2f}) + Chg({nc_v:.2f}) != End({ec:.2f}){suffix}",
                             sheet=sh_name, cell=f"{col_l}{ec_r}",
                         )
                 if idx_q > 0:
@@ -1778,10 +1858,12 @@ def run_checks(
                             b_prev_ec = _b_val(prev_col_l, ec_r)
                             base_diff = (b_bc - b_prev_ec) if (b_bc is not None and b_prev_ec is not None) else None
                             b_tol = _unit_tolerance(unit_scale, b_prev_ec) if b_prev_ec is not None else tol
-                            sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol)
+                            bc_parts = [(sh_name, f"{col_l}{bc_r}"), (sh_name, f"{prev_col_l}{ec_r}")]
+                            sev = _classify_discrepancy(cand_diff, base_diff, tol, b_tol, participating_cells=bc_parts)
+                            suffix = " (recalc failed; cached formula value is stale)" if sev == "missing_evidence" else ""
                             _add_finding(
                                 findings, "C12", sev,
-                                f"Beginning cash discontinuity at {sh_name}!{col_l}{bc_r}: Beg({bc:.2f}) != Prior End({prev_ec:.2f})",
+                                f"Beginning cash discontinuity at {sh_name}!{col_l}{bc_r}: Beg({bc:.2f}) != Prior End({prev_ec:.2f}){suffix}",
                                 sheet=sh_name, cell=f"{col_l}{bc_r}",
                             )
 
@@ -1802,10 +1884,12 @@ def run_checks(
                             b_bs_v, b_prev_es = _b_val(col_l, bs_r), _b_val(prev_col_l, es_r)
                             base_diff = (b_bs_v - b_prev_es) if (b_bs_v is not None and b_prev_es is not None) else None
                             b_tol = max(1e-4 * abs(b_prev_es), 1e-6) if b_prev_es is not None else s_tol
-                            sev = _classify_discrepancy(cand_diff, base_diff, s_tol, b_tol)
+                            bs_parts = [(sh_name, f"{col_l}{bs_r}"), (sh_name, f"{prev_col_l}{es_r}")]
+                            sev = _classify_discrepancy(cand_diff, base_diff, s_tol, b_tol, participating_cells=bs_parts)
+                            suffix = " (recalc failed; cached formula value is stale)" if sev == "missing_evidence" else ""
                             _add_finding(
                                 findings, "C12", sev,
-                                f"Beginning shares discontinuity at {sh_name}!{col_l}{bs_r}: Beg({bs_v:.2f}) != Prior End({prev_es:.2f})",
+                                f"Beginning shares discontinuity at {sh_name}!{col_l}{bs_r}: Beg({bs_v:.2f}) != Prior End({prev_es:.2f}){suffix}",
                                 sheet=sh_name, cell=f"{col_l}{bs_r}",
                             )
                 if sc_rows and bs_v is not None and es_v is not None:
@@ -1823,10 +1907,14 @@ def run_checks(
                             else:
                                 base_diff = None
                                 b_tol = s_tol
-                            sev = _classify_discrepancy(cand_diff, base_diff, s_tol, b_tol)
+                            sr_parts = [(sh_name, f"{col_l}{bs_r}"), (sh_name, f"{col_l}{es_r}")] + [
+                                (sh_name, f"{col_l}{r_sc}") for r_sc in sc_rows
+                            ]
+                            sev = _classify_discrepancy(cand_diff, base_diff, s_tol, b_tol, participating_cells=sr_parts)
+                            suffix = " (recalc failed; cached formula value is stale)" if sev == "missing_evidence" else ""
                             _add_finding(
                                 findings, "C12", sev,
-                                f"Share rollforward broken at {sh_name}!{col_l}{es_r}: Beg({bs_v:.2f}) + Chg({chg_sum:+.2f}) != End({es_v:.2f})",
+                                f"Share rollforward broken at {sh_name}!{col_l}{es_r}: Beg({bs_v:.2f}) + Chg({chg_sum:+.2f}) != End({es_v:.2f}){suffix}",
                                 sheet=sh_name, cell=f"{col_l}{es_r}",
                             )
 
@@ -2026,53 +2114,104 @@ def run_checks(
             else:
                 target_ops.append(op)
 
+        # Raw OOXML cell-state comparison on non-target sheets (Codex R3 #2 / Lead #2):
+        # verify exact t attr, <v> presence/emptiness, SST index & canonical <si> rich-text XML, and <is> XML!
+        true_base_p: Path | None = None
+        if baseline_path is not None and Path(baseline_path).is_file():
+            true_base_p = Path(baseline_path).expanduser().resolve()
+        elif base_fp.get("source_path") and Path(str(base_fp["source_path"])).is_file():
+            true_base_p = Path(str(base_fp["source_path"])).expanduser().resolve()
+        base_raw_nt = (
+            model_xlsx_hooks.extract_raw_xml_cell_states(true_base_p, non_target_set)
+            if true_base_p is not None
+            else {}
+        )
+        cand_raw_nt = (
+            model_xlsx_hooks.extract_raw_xml_cell_states(cand, non_target_set)
+            if true_base_p is not None
+            else {}
+        )
+
         for nt_sh in non_target_sheets:
             orig_cells = (base_fp.get("sheets") or {}).get(nt_sh, {}).get("cells") or {}
             act_cells = (cand_fp.get("sheets") or {}).get(nt_sh, {}).get("cells") or {}
+            orig_raw = base_raw_nt.get(nt_sh) or {}
+            act_raw = cand_raw_nt.get(nt_sh) or {}
 
-            all_coords = sorted(set(orig_cells) | set(act_cells))
+            all_coords = sorted(set(orig_cells) | set(act_cells) | set(orig_raw) | set(act_raw))
             for coord in all_coords:
                 oc = orig_cells.get(coord)
                 ac = act_cells.get(coord)
-                if oc is None or ac is None:
-                    _add_finding(
-                        findings, "C14", "actionable",
-                        f"Non-target sheet cell added/removed at {nt_sh}!{coord}",
-                        sheet=nt_sh, cell=coord,
-                    )
-                    continue
-                if oc.get("category") != ac.get("category"):
-                    _add_finding(
-                        findings, "C14", "actionable",
-                        f"Non-target sheet cell category changed at {nt_sh}!{coord}",
-                        sheet=nt_sh, cell=coord,
-                    )
-                    continue
-                if oc.get("category") == "formula":
-                    orig_f = _norm_formula(oc.get("formula"))
-                    expected_f = (
-                        _norm_formula(_replay_formula_through_ops(orig_f, nt_sh, all_base_sheets, target_ops))
-                        if target_ops
-                        else orig_f
-                    )
-                    act_f = _norm_formula(ac.get("formula"))
-                    if act_f != expected_f:
+                cell_flagged = False
+                if oc is not None or ac is not None:
+                    if oc is None or ac is None:
                         _add_finding(
                             findings, "C14", "actionable",
-                            f"Non-target sheet formula modified at {nt_sh}!{coord}: expected {expected_f!r}, got {act_f!r}",
+                            f"Non-target sheet cell added/removed at {nt_sh}!{coord}",
                             sheet=nt_sh, cell=coord,
                         )
-                    if not _num_close(oc.get("cached_value"), ac.get("cached_value"), rel_tol=1e-9):
+                        continue
+                    if oc.get("category") != ac.get("category"):
                         _add_finding(
                             findings, "C14", "actionable",
-                            f"Non-target sheet cached <v> changed/lost at {nt_sh}!{coord}: expected {oc.get('cached_value')!r}, got {ac.get('cached_value')!r}",
+                            f"Non-target sheet cell category changed at {nt_sh}!{coord}",
                             sheet=nt_sh, cell=coord,
                         )
-                else:
-                    if not _num_close(oc.get("cached_value"), ac.get("cached_value"), rel_tol=1e-9):
+                        continue
+                    if oc.get("category") == "formula":
+                        orig_f = _norm_formula(oc.get("formula"))
+                        expected_f = (
+                            _norm_formula(_replay_formula_through_ops(orig_f, nt_sh, all_base_sheets, target_ops))
+                            if target_ops
+                            else orig_f
+                        )
+                        act_f = _norm_formula(ac.get("formula"))
+                        if act_f != expected_f:
+                            _add_finding(
+                                findings, "C14", "actionable",
+                                f"Non-target sheet formula modified at {nt_sh}!{coord}: expected {expected_f!r}, got {act_f!r}",
+                                sheet=nt_sh, cell=coord,
+                            )
+                            cell_flagged = True
+                        if not _num_close(oc.get("cached_value"), ac.get("cached_value"), rel_tol=1e-9):
+                            _add_finding(
+                                findings, "C14", "actionable",
+                                f"Non-target sheet cached <v> changed/lost at {nt_sh}!{coord}: expected {oc.get('cached_value')!r}, got {ac.get('cached_value')!r}",
+                                sheet=nt_sh, cell=coord,
+                            )
+                            cell_flagged = True
+                    else:
+                        if not _num_close(oc.get("cached_value"), ac.get("cached_value"), rel_tol=1e-9):
+                            _add_finding(
+                                findings, "C14", "actionable",
+                                f"Non-target sheet constant modified at {nt_sh}!{coord}: expected {oc.get('cached_value')!r}, got {ac.get('cached_value')!r}",
+                                sheet=nt_sh, cell=coord,
+                            )
+                            cell_flagged = True
+
+                # Raw OOXML state verification (SST index, rich-text <si>/<is>, explicit t attr, missing vs empty <v>)
+                oraw = orig_raw.get(coord)
+                araw = act_raw.get(coord)
+                if not cell_flagged and oraw is not None and araw is not None:
+                    xml_diffs: list[str] = []
+                    if oraw.get("t") != araw.get("t"):
+                        xml_diffs.append(f"t={oraw.get('t')!r}->{araw.get('t')!r}")
+                    if oraw.get("has_v") != araw.get("has_v") or oraw.get("v_is_empty") != araw.get("v_is_empty"):
+                        xml_diffs.append(
+                            f"v_state=(has={oraw.get('has_v')},empty={oraw.get('v_is_empty')})->(has={araw.get('has_v')},empty={araw.get('v_is_empty')})"
+                        )
+                    if oraw.get("t") == "s" and araw.get("t") == "s":
+                        if oraw.get("v") != araw.get("v"):
+                            xml_diffs.append(f"sst_index={oraw.get('v')!r}->{araw.get('v')!r}")
+                        if oraw.get("si_c14n") != araw.get("si_c14n"):
+                            xml_diffs.append("shared_string <si> rich-text XML changed")
+                    elif oraw.get("t") == "inlineStr" and araw.get("t") == "inlineStr":
+                        if oraw.get("is_c14n") != araw.get("is_c14n"):
+                            xml_diffs.append("inlineStr <is> rich-text XML changed")
+                    if xml_diffs:
                         _add_finding(
                             findings, "C14", "actionable",
-                            f"Non-target sheet constant modified at {nt_sh}!{coord}: expected {oc.get('cached_value')!r}, got {ac.get('cached_value')!r}",
+                            f"Non-target sheet raw OOXML cell state changed at {nt_sh}!{coord}: {', '.join(xml_diffs)}",
                             sheet=nt_sh, cell=coord,
                         )
 
@@ -2335,6 +2474,7 @@ def write_check_and_ledger(
         coord_map=cm,
         consensus_diff=cons_diff,
         mode=mode,
+        failed_stages=failed_stages,
     )
 
     f_stages = [s.strip() for s in (failed_stages or []) if s.strip()]

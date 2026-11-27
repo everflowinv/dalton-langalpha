@@ -21,9 +21,10 @@
 
 set -euo pipefail
 umask 077
+export PATH="/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:${PATH}"
 
 PROD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${PROD_DIR}/../../../.." && pwd)"
+REPO_ROOT="${DALTON_REPO_ROOT:-$(cd "${PROD_DIR}/../../../.." && pwd)}"
 HELPER_PY="${PROD_DIR}/recover_baseline_model_lib.py"
 
 if [[ -n "${DALTON_REPO_PYTHON:-}" ]] && [[ -x "${DALTON_REPO_PYTHON}" ]]; then
@@ -42,6 +43,8 @@ BACKUP_KEY_FILE="${DALTON_BACKUP_KEY_FILE:-${HOME}/.config/dalton/backup.key}"
 DB_URL="${DATABASE_URL:-}"
 MINIO_MC_ALIAS="${DALTON_MINIO_MC_ALIAS:-}"
 MINIO_BUCKET="${DALTON_CHAT_UPLOAD_STORAGE_BUCKET:-${DALTON_MINIO_BUCKET:-}}"
+PG_RESTORE_COMPOSE_SERVICE="${DALTON_PG_RESTORE_COMPOSE_SERVICE:-postgres}"
+PG_RESTORE_DOCKER_IMAGE="${DALTON_PG_RESTORE_DOCKER_IMAGE:-}"
 
 HAS_DB_FLAG=0
 HAS_RCLONE_REMOTE_FLAG=0
@@ -49,6 +52,9 @@ HAS_RCLONE_DIR_FLAG=0
 HAS_KEY_FLAG=0
 HAS_MC_ALIAS_FLAG=0
 HAS_BUCKET_FLAG=0
+HAS_COMPOSE_SVC_FLAG=0
+HAS_COMPOSE_CWD_FLAG=0
+HAS_DOCKER_IMG_FLAG=0
 
 for arg in "$@"; do
     case "$arg" in
@@ -58,6 +64,9 @@ for arg in "$@"; do
         --backup-key-file|--backup-key-file=*) HAS_KEY_FLAG=1 ;;
         --minio-mc-alias|--minio-mc-alias=*) HAS_MC_ALIAS_FLAG=1 ;;
         --minio-bucket|--minio-bucket=*) HAS_BUCKET_FLAG=1 ;;
+        --pg-restore-compose-service|--pg-restore-compose-service=*) HAS_COMPOSE_SVC_FLAG=1 ;;
+        --pg-restore-compose-cwd|--pg-restore-compose-cwd=*) HAS_COMPOSE_CWD_FLAG=1 ;;
+        --pg-restore-docker-image|--pg-restore-docker-image=*) HAS_DOCKER_IMG_FLAG=1 ;;
     esac
 done
 
@@ -79,6 +88,15 @@ if [[ "${HAS_MC_ALIAS_FLAG}" -eq 0 ]] && [[ -n "${MINIO_MC_ALIAS}" ]]; then
 fi
 if [[ "${HAS_BUCKET_FLAG}" -eq 0 ]] && [[ -n "${MINIO_BUCKET}" ]]; then
     EXTRA_ARGS+=(--minio-bucket "${MINIO_BUCKET}")
+fi
+if [[ "${HAS_COMPOSE_SVC_FLAG}" -eq 0 ]] && [[ -n "${PG_RESTORE_COMPOSE_SERVICE}" ]]; then
+    EXTRA_ARGS+=(--pg-restore-compose-service "${PG_RESTORE_COMPOSE_SERVICE}")
+fi
+if [[ "${HAS_COMPOSE_CWD_FLAG}" -eq 0 ]] && [[ -n "${REPO_ROOT}" ]]; then
+    EXTRA_ARGS+=(--pg-restore-compose-cwd "${REPO_ROOT}")
+fi
+if [[ "${HAS_DOCKER_IMG_FLAG}" -eq 0 ]] && [[ -n "${PG_RESTORE_DOCKER_IMAGE}" ]]; then
+    EXTRA_ARGS+=(--pg-restore-docker-image "${PG_RESTORE_DOCKER_IMAGE}")
 fi
 
 # Strip proxy env vars when invoking rclone (consistent with dalton_data_backup.sh / _common.sh).

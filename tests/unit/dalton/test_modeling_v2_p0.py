@@ -35,7 +35,6 @@ import io
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import sqlite3
 import subprocess
@@ -193,7 +192,7 @@ def test_extract_default_template_and_settings_dual_profile(
 
 
 def _inject_external_link_part(xlsx_path: Path) -> None:
-    """Attach a minimal valid OOXML ``xl/externalLinks/externalLink1.xml`` part to ``xlsx_path``."""
+    """Attach a real OOXML ``xl/externalLinks/externalLink1.xml`` part with Content_Types & workbook rels."""
     ext_xml = (
         b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         b'<externalLink xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
@@ -201,14 +200,47 @@ def _inject_external_link_part(xlsx_path: Path) -> None:
         b'<sheetNames><sheetName val="FX"/></sheetNames>'
         b'</externalBook></externalLink>'
     )
-    with zipfile.ZipFile(xlsx_path, "r") as zf:
-        infos = zf.infolist()
-        payload = {i.filename: zf.read(i.filename) for i in infos}
+    ext_rel_type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLink"
+    ext_ct = "application/vnd.openxmlformats-officedocument.spreadsheetml.externalLink+xml"
+    infos, payload = mhooks._read_package(xlsx_path)
+    if "xl/externalLinks/externalLink1.xml" not in payload:
+        zi = zipfile.ZipInfo("xl/externalLinks/externalLink1.xml")
+        zi.compress_type = zipfile.ZIP_DEFLATED
+        infos.append(zi)
+    payload["xl/externalLinks/externalLink1.xml"] = ext_xml
+
+    ct_raw = payload.get("[Content_Types].xml")
+    if ct_raw:
+        ct_root = etree.fromstring(ct_raw, mhooks._XML)
+        if not any(ov.get("PartName") == "/xl/externalLinks/externalLink1.xml" for ov in ct_root.findall(f"{{{mhooks._CT_NS}}}Override")):
+            etree.SubElement(
+                ct_root,
+                f"{{{mhooks._CT_NS}}}Override",
+                PartName="/xl/externalLinks/externalLink1.xml",
+                ContentType=ext_ct,
+            )
+            payload["[Content_Types].xml"] = etree.tostring(ct_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+    rels_raw = payload.get("xl/_rels/workbook.xml.rels")
+    if rels_raw:
+        rels_root = etree.fromstring(rels_raw, mhooks._XML)
+        if not any(r.get("Type") == ext_rel_type for r in rels_root.findall(f"{{{mhooks._PKG_REL_NS}}}Relationship")):
+            used_ids = {r.get("Id") or "" for r in rels_root.findall(f"{{{mhooks._PKG_REL_NS}}}Relationship")}
+            n = 1
+            while f"rId{n}" in used_ids:
+                n += 1
+            etree.SubElement(
+                rels_root,
+                f"{{{mhooks._PKG_REL_NS}}}Relationship",
+                Id=f"rId{n}",
+                Type=ext_rel_type,
+                Target="externalLinks/externalLink1.xml",
+            )
+            payload["xl/_rels/workbook.xml.rels"] = etree.tostring(rels_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
     with zipfile.ZipFile(xlsx_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
         for info in infos:
             zout.writestr(info, payload[info.filename])
-        if "xl/externalLinks/externalLink1.xml" not in payload:
-            zout.writestr("xl/externalLinks/externalLink1.xml", ext_xml)
 
 
 def test_unchanged_baseline_has_zero_actionable_and_single_engine_note(tmp_path: Path) -> None:
@@ -851,6 +883,48 @@ def test_fault_detection_c03_c04_c06_c11_c13_and_c10_semantic_conflict(tmp_path:
         f["check_id"] == "C10" and f["severity_class"] == "actionable" and f.get("cell") == "D29"
         for f in chk["findings"]
     )
+
+    # 8. Also verify C11 Group vs Segment profit disconnect on a NEWLY ADDED forecast column (Scenario 5)
+    res_new_fc = medit.apply_edit_plan(
+        baseline_path=base,
+        ticker="JD",
+        plan={
+            "ops": [{"op": "insert_columns", "sheet": "Model - JD", "at": "W", "count": 1, "copy_style_from": "V"}],
+            "added_period_cols": {"Model - JD": ["W"]},
+            "cell_edits": [
+                {"sheet": "Model - JD", "cell": "W1", "value": "1Q28E"},
+                {"sheet": "Model - JD", "cell": "W12", "value": "=W9-W11"},
+                {"sheet": "Model - JD", "cell": "W19", "value": "=W12*0.9"},
+                {"sheet": "Model - JD", "cell": "W20", "value": "=W12*0.2"},
+                {"sheet": "Model - JD", "cell": "W21", "value": "=-10"},
+            ],
+            "changelog_entry": {"version": "v03", "date": "2026-11-27", "baseline": base.name, "summary": "New forecast col C11"},
+        },
+        workspace_dir=ws,
+        skip_recalc=True,
+    )
+    cand_new_fc = Path(res_new_fc["candidate_path"])
+    _inject_xml_v_values(
+        cand_new_fc,
+        {
+            "Model - JD": {
+                "W12": (None, "850.0"),
+                "W19": (None, "200.0"),
+                "W20": (None, "50.0"),
+                "W21": (None, "-10.0"),
+            }
+        },
+    )
+    chk_new_fc = mchk.run_checks(
+        candidate_path=cand_new_fc,
+        ticker="JD",
+        baseline_path=base,
+        coord_map=res_new_fc["coord_map"],
+    )
+    assert any(
+        f["check_id"] == "C11" and f["severity_class"] == "actionable" and f.get("cell") == "W12"
+        for f in chk_new_fc["findings"]
+    ), chk_new_fc["findings"]
 
 
 def test_c04_structured_table_ref_large_range_and_period_metric_scoping(tmp_path: Path) -> None:
@@ -1541,27 +1615,21 @@ def test_recover_baseline_postgres_sql_casts_and_datetime_binding() -> None:
 
 
 def _extract_pg_dbname(dsn: str) -> str:
-    """Extract database name from a PostgreSQL URI or libpq conninfo string."""
+    """Extract effective database name using ``psycopg.conninfo.conninfo_to_dict`` (URI + query params & keyword DSN)."""
     raw = str(dsn or "").strip()
     if not raw:
         return ""
-    if "://" in raw:
-        from urllib.parse import urlparse
-
-        parsed = urlparse(raw)
-        return parsed.path.lstrip("/").strip()
     try:
         from psycopg.conninfo import conninfo_to_dict
 
         info = conninfo_to_dict(raw)
         return str(info.get("dbname") or "").strip()
     except Exception:
-        m = re.search(r"\bdbname\s*=\s*([^\s']+)", raw)
-        return m.group(1).strip() if m else ""
+        return ""
 
 
 def _resolve_safe_test_pg_dsn() -> str | None:
-    """Return explicit ``DALTON_TEST_PG_DSN`` ONLY if its database name ends with ``_test``."""
+    """Return explicit ``DALTON_TEST_PG_DSN`` ONLY if psycopg-resolved ``dbname`` ends with ``_test``."""
     dsn = os.environ.get("DALTON_TEST_PG_DSN", "").strip()
     if not dsn:
         return None
@@ -1571,12 +1639,35 @@ def _resolve_safe_test_pg_dsn() -> str | None:
     return dsn
 
 
+def _build_test_pg_dsn_with_search_path(dsn: str, schema: str) -> str:
+    """Construct a valid psycopg conninfo string with ``search_path`` for both URI and keyword DSNs."""
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    info = conninfo_to_dict(dsn)
+    existing_opts = str(info.get("options") or "").strip()
+    merged_opts = f"{existing_opts} -csearch_path={schema}".strip()
+    return make_conninfo(dsn, options=merged_opts)
+
+
+def _assert_live_pg_is_test_db(conn: Any) -> str:
+    """Double-check connected DB via ``SELECT current_database()`` BEFORE any DDL/write; abort unless ``*_test``."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT current_database()")
+        row = cur.fetchone()
+    actual_db = str(row[0] if row else "").strip()
+    if not actual_db.endswith("_test"):
+        raise RuntimeError(
+            f"Refusing to run PostgreSQL test DDL/writes against non-*_test database: {actual_db!r}"
+        )
+    return actual_db
+
+
 @pytest.mark.skipif(
     _resolve_safe_test_pg_dsn() is None,
-    reason="Requires explicit DALTON_TEST_PG_DSN whose database name ends with '_test' (never falls back to DATABASE_URL)",
+    reason="Requires explicit DALTON_TEST_PG_DSN whose psycopg-resolved dbname ends with '_test' (never falls back to DATABASE_URL)",
 )
 def test_recover_baseline_real_postgres_integration(tmp_path: Path) -> None:
-    """Principle #5 & R3 #1: execute real PostgreSQL SQL queries ONLY against explicit *_test DB."""
+    """Principle #5, R3 #1 & R4 #1: execute real PostgreSQL SQL queries ONLY against verified *_test DB."""
     import psycopg
 
     dsn = _resolve_safe_test_pg_dsn()
@@ -1589,9 +1680,13 @@ def test_recover_baseline_real_postgres_integration(tmp_path: Path) -> None:
     att_out_id = str(uuid.uuid4())
 
     setup_conn = psycopg.connect(dsn, autocommit=True)
+    schema_created = False
     try:
+        # R4 #1: MUST verify live current_database() ends with _test BEFORE any DDL or writes!
+        _assert_live_pg_is_test_db(setup_conn)
         with setup_conn.cursor() as cur:
             cur.execute(f"CREATE SCHEMA {schema};")
+            schema_created = True
             cur.execute(f"SET search_path TO {schema};")
             cur.execute(
                 """
@@ -1627,8 +1722,7 @@ def test_recover_baseline_real_postgres_integration(tmp_path: Path) -> None:
                 (att_ok_id, len(baseline_bytes), baseline_bytes, att_out_id, len(baseline_bytes), baseline_bytes),
             )
 
-        sep = "&" if "?" in dsn else "?"
-        pg_dsn = f"{dsn}{sep}options=-csearch_path%3D{schema}"
+        pg_dsn = _build_test_pg_dsn_with_search_path(dsn, schema)
         adapter = recover_lib.PostgresReadOnlyAdapter(pg_dsn)
         try:
             out_p = tmp_path / "pg_recovered.xlsx"
@@ -1647,8 +1741,9 @@ def test_recover_baseline_real_postgres_integration(tmp_path: Path) -> None:
         finally:
             adapter.close()
     finally:
-        with setup_conn.cursor() as cur:
-            cur.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
+        if schema_created:
+            with setup_conn.cursor() as cur:
+                cur.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
         setup_conn.close()
 
 
@@ -1832,7 +1927,14 @@ def test_consensus_snapshot_isolation_and_diff_thresholds(tmp_path: Path) -> Non
 
 
 def test_pg_test_dsn_guard_never_falls_back_to_database_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    """R3 #1 / Codex #10: PG integration test MUST only accept explicit DALTON_TEST_PG_DSN ending in _test."""
+    """R3 #1, R4 #1 & Codex R3 #1:
+    - PG integration test only accepts explicit DALTON_TEST_PG_DSN whose psycopg-resolved dbname ends with _test.
+    - URI path ending in _test with query param ?dbname=prod MUST be rejected.
+    - Keyword DSN & URI DSN both build search_path via psycopg.conninfo.make_conninfo (never ?options=).
+    - Live SELECT current_database() guard aborts immediately if connected DB does not end with _test."""
+    import psycopg
+    from psycopg.conninfo import conninfo_to_dict
+
     monkeypatch.delenv("DALTON_TEST_PG_DSN", raising=False)
     monkeypatch.setenv("DATABASE_URL", "postgresql://prod:secret@prod.db/dalton_test")
     assert _resolve_safe_test_pg_dsn() is None
@@ -1840,11 +1942,52 @@ def test_pg_test_dsn_guard_never_falls_back_to_database_url(monkeypatch: pytest.
     monkeypatch.setenv("DALTON_TEST_PG_DSN", "postgresql://u:p@localhost:5432/dalton_prod")
     assert _resolve_safe_test_pg_dsn() is None
 
-    monkeypatch.setenv("DALTON_TEST_PG_DSN", "postgresql://u:p@localhost:5432/dalton_test")
-    assert _resolve_safe_test_pg_dsn() == "postgresql://u:p@localhost:5432/dalton_test"
+    # R4 #1 / Codex R3 #1: path ends with _test, but query parameter dbname= points to another DB -> REJECT!
+    monkeypatch.setenv("DALTON_TEST_PG_DSN", "postgresql://u:p@localhost:5432/dalton_test?dbname=prod")
+    assert _resolve_safe_test_pg_dsn() is None
 
-    monkeypatch.setenv("DALTON_TEST_PG_DSN", "host=localhost port=5432 dbname=pg_unit_test user=postgres")
-    assert _resolve_safe_test_pg_dsn() == "host=localhost port=5432 dbname=pg_unit_test user=postgres"
+    monkeypatch.setenv("DALTON_TEST_PG_DSN", "host=localhost port=5432 dbname=dalton_prod user=postgres")
+    assert _resolve_safe_test_pg_dsn() is None
+
+    monkeypatch.setenv("DALTON_TEST_PG_DSN", "postgresql://u:p@localhost:5432/dalton_test?sslmode=disable")
+    assert _resolve_safe_test_pg_dsn() == "postgresql://u:p@localhost:5432/dalton_test?sslmode=disable"
+
+    kw_dsn = "host=localhost port=5432 dbname=pg_unit_test user=postgres options=-cTimeZone=UTC"
+    monkeypatch.setenv("DALTON_TEST_PG_DSN", kw_dsn)
+    assert _resolve_safe_test_pg_dsn() == kw_dsn
+
+    # Build search_path cleanly via psycopg make_conninfo for BOTH URI and keyword DSNs (no '?options='!)
+    built_uri = _build_test_pg_dsn_with_search_path("postgresql://u:p@localhost:5432/dalton_test", "sch_a")
+    assert "?options=" not in built_uri
+    parsed_uri = conninfo_to_dict(built_uri)
+    assert parsed_uri["dbname"] == "dalton_test"
+    assert "-csearch_path=sch_a" in parsed_uri["options"]
+
+    built_kw = _build_test_pg_dsn_with_search_path(kw_dsn, "sch_b")
+    assert "?options=" not in built_kw
+    parsed_kw = conninfo_to_dict(built_kw)
+    assert parsed_kw["dbname"] == "pg_unit_test"
+    assert "-cTimeZone=UTC" in parsed_kw["options"]
+    assert "-csearch_path=sch_b" in parsed_kw["options"]
+
+    # Live SELECT current_database() guard (using create_autospec)
+    cur_bad = create_autospec(psycopg.Cursor, instance=True)
+    cur_bad.__enter__.return_value = cur_bad
+    cur_bad.__exit__.return_value = False
+    cur_bad.fetchone.return_value = ("dalton_prod",)
+    conn_bad = create_autospec(psycopg.Connection, instance=True)
+    conn_bad.cursor.return_value = cur_bad
+    with pytest.raises(RuntimeError, match="non-\\*_test"):
+        _assert_live_pg_is_test_db(conn_bad)
+    cur_bad.execute.assert_called_once_with("SELECT current_database()")
+
+    cur_ok = create_autospec(psycopg.Cursor, instance=True)
+    cur_ok.__enter__.return_value = cur_ok
+    cur_ok.__exit__.return_value = False
+    cur_ok.fetchone.return_value = ("dalton_test",)
+    conn_ok = create_autospec(psycopg.Connection, instance=True)
+    conn_ok.cursor.return_value = cur_ok
+    assert _assert_live_pg_is_test_db(conn_ok) == "dalton_test"
 
 
 def _xml_full_cell_states(xlsx_path: Path, sheet_name: str) -> dict[str, dict[str, Any]]:
@@ -2213,7 +2356,8 @@ def test_c09_c10_c11_c12_baseline_relative_discrepancy_comparison(tmp_path: Path
     C09/C11/C12 discrepancies MUST keep them baseline_legacy (actionable == 0); only worsening or new
     discrepancies become actionable."""
     ws, _, base = _copy_fixture_to_ws(tmp_path)
-    # Inject pre-existing legacy discrepancies on col Q (3Q26E) into BASELINE:
+    # Inject pre-existing legacy discrepancies on col Q (3Q26E) & col G (2026E) into BASELINE:
+    # - C10 Annual vs Quarters flow mismatch: G4=15000 vs sum(O4:R4) (~11000)
     # - C11 Segment OP disconnect: Q12=300 vs segments 150+30-10=170 (diff=+130)
     # - C09 Cash bridge mismatch: Q34=2500 vs Q37=2300 (diff=+200)
     # - C09 Balance Sheet imbalance: Q39=10500 vs Q42=10000 (diff=+500)
@@ -2222,6 +2366,7 @@ def test_c09_c10_c11_c12_baseline_relative_discrepancy_comparison(tmp_path: Path
         base,
         {
             "Model - JD": {
+                "G4": (None, "15000.0"),
                 "Q12": (None, "300.0"),
                 "Q19": (None, "150.0"),
                 "Q20": (None, "30.0"),
@@ -2255,7 +2400,7 @@ def test_c09_c10_c11_c12_baseline_relative_discrepancy_comparison(tmp_path: Path
     )
     assert chk_clean["counts"]["actionable"] == 0, [f for f in chk_clean["findings"] if f["severity_class"] == "actionable"]
     leg_ids = {f["check_id"] for f in chk_clean["findings"] if f["severity_class"] == "baseline_legacy"}
-    assert {"C09", "C11", "C12"} <= leg_ids, chk_clean["findings"]
+    assert {"C09", "C10", "C11", "C12"} <= leg_ids, chk_clean["findings"]
 
     # 2. Now WORSEN the C11 discrepancy at Q12 (300 -> 450, diff grows from +130 to +280) -> MUST be actionable!
     cand_worse = Path(res_clean["candidate_path"])
@@ -2572,7 +2717,7 @@ sys.stdout.write(open({str(sql_fixture_file)!r}, encoding="utf-8").read())
     assert res_pgdmp.found is True and res_pgdmp.channel == "rclone_encrypted_db_backup"
     assert out_pgdmp.read_bytes() == baseline_bytes
 
-    # Missing pg_restore on PGDMP MUST report diagnostic (never silently scan binary as SQL)
+    # Missing pg_restore & disabled docker compose on PGDMP MUST report diagnostic (never silently scan binary as SQL)
     res_pgdmp_miss = recover_lib.recover_baseline(
         workspace_id=ws_id,
         output_path=tmp_path / "missing_pgdmp.xlsx",
@@ -2583,10 +2728,84 @@ sys.stdout.write(open({str(sql_fixture_file)!r}, encoding="utf-8").read())
         rclone_bin=str(rc_pgdmp),
         backup_key_file=key_file,
         pg_restore_bin="/nonexistent/pg_restore_bin",
+        pg_restore_compose_service=None,
         pg_restore_docker_image=None,
     )
     assert res_pgdmp_miss.found is False
     assert any("PGDMP" in d and "pg_restore" in d for d in res_pgdmp_miss.diagnostics), res_pgdmp_miss.diagnostics
+
+    # 3b. Container pg_restore fallback (`docker compose exec -T postgres pg_restore -f - --data-only -t chat_attachments`)
+    # aligned with scripts/dalton/ops/prod/backup.sh when host pg_restore is absent!
+    fake_docker = tmp_path / "fake_docker.py"
+    docker_log = tmp_path / "fake_docker_args.json"
+    fake_docker.write_text(
+        f"""#!{sys.executable}
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+data = sys.stdin.buffer.read()
+Path({str(docker_log)!r}).write_text(json.dumps({{"args": args, "cwd": os.getcwd(), "is_pgdmp": data.startswith(b"PGDMP")}}), encoding="utf-8")
+assert args == ["compose", "exec", "-T", "postgres", "pg_restore", "-f", "-", "--data-only", "-t", "chat_attachments"], args
+assert data.startswith(b"PGDMP")
+sys.stdout.write(open({str(sql_fixture_file)!r}, encoding="utf-8").read())
+""",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    out_comp = tmp_path / "recovered_pgdmp_compose.xlsx"
+    res_comp = recover_lib.recover_baseline(
+        workspace_id=ws_id,
+        output_path=out_comp,
+        before_first_edit_ts="2026-10-01T10:00:00+00:00",
+        expected_sha256=baseline_sha,
+        rclone_remote="fakegdrive",
+        rclone_drive_dir="DaltonBackup",
+        rclone_bin=str(rc_pgdmp),
+        backup_key_file=key_file,
+        pg_restore_bin="/nonexistent/pg_restore_bin",
+        pg_restore_compose_service="postgres",
+        pg_restore_compose_cwd=tmp_path,
+        docker_bin=str(fake_docker),
+    )
+    assert res_comp.found is True and res_comp.channel == "rclone_encrypted_db_backup"
+    assert out_comp.read_bytes() == baseline_bytes
+    logged_dk = json.loads(docker_log.read_text(encoding="utf-8"))
+    assert logged_dk["is_pgdmp"] is True
+    assert Path(logged_dk["cwd"]).resolve() == tmp_path.resolve()
+
+    # Also verify recover_baseline_model.sh shell wrapper forwards compose defaults cleanly!
+    out_sh_comp = tmp_path / "recovered_sh_pgdmp_compose.xlsx"
+    sh_proc = subprocess.run(
+        [
+            "bash",
+            str(PROD_OPS_DIR / "recover_baseline_model.sh"),
+            "--workspace-id",
+            ws_id,
+            "--output",
+            str(out_sh_comp),
+            "--before-ts",
+            "2026-10-01T10:00:00+00:00",
+            "--expected-sha256",
+            baseline_sha,
+            "--rclone-remote",
+            "fakegdrive",
+            "--rclone-drive-dir",
+            "DaltonBackup",
+            "--rclone-bin",
+            str(rc_pgdmp),
+            "--backup-key-file",
+            str(key_file),
+            "--pg-restore-bin",
+            "/nonexistent/pg_restore_bin",
+            "--docker-bin",
+            str(fake_docker),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert sh_proc.returncode == 0, sh_proc.stderr + sh_proc.stdout
+    assert out_sh_comp.read_bytes() == baseline_bytes
 
     # 4. Direct time-window exclusion assertion (Scenario 7 strictness)
     db_win = tmp_path / "win_only.sqlite3"
@@ -2620,3 +2839,557 @@ sys.stdout.write(open({str(sql_fixture_file)!r}, encoding="utf-8").read())
         assert cands == [], f"outside-window candidate should be excluded: {cands}"
     finally:
         adp_w.close()
+
+
+# ---------------------------------------------------------------------------
+# 11. Round-4 targeted tests (Codex & Grok R3 review items + Lead #1-#4)
+# ---------------------------------------------------------------------------
+
+
+def test_non_target_rich_text_sst_and_inline_str_preserved_and_checked_by_c14(tmp_path: Path) -> None:
+    """R4 #2 & Codex R3 #2:
+    - Non-target sheet keeps exact post-insert baseline SST index (<v>17</v>) and full rich-text <si> (partial bold).
+    - Non-target sheet keeps full rich-text inlineStr <is><r><rPr><b/></rPr>...</is>.
+    - C14 asserts raw OOXML cell state on non-target sheets (detects SST renumbering & rich-text loss even when display text matches)."""
+    ws, _, base = _copy_fixture_to_ws(tmp_path)
+
+    # Craft raw OOXML on base:
+    # - xl/sharedStrings.xml with 18 entries (0..16 padding + index 17 rich-text partial-bold 'BABA Revenue')
+    # - Model - BABA!D4 -> t="s" <v>17</v>
+    # - Model - BABA!D5 -> t="inlineStr" <is><r><rPr><b/></rPr><t>BABA</t></r><r><t xml:space="preserve"> Cloud</t></r></is>
+    infos, payload = mhooks._read_package(base)
+    parts = mhooks._sheet_parts(payload)
+    sst_mut = mhooks._SharedStringsMutator(infos, payload)
+    for idx in range(17):
+        sst_mut.intern(f"Dummy SST Padding {idx}")
+    rich_si = etree.fromstring(
+        f'<si xmlns="{mhooks._SML}">'
+        '<r><rPr><b/></rPr><t>BABA</t></r>'
+        '<r><t xml:space="preserve"> Revenue</t></r>'
+        '</si>',
+        mhooks._XML,
+    )
+    idx17 = sst_mut.intern_si(rich_si)
+    assert idx17 == 17
+
+    rich_is_xml = (
+        f'<is xmlns="{mhooks._SML}">'
+        '<r><rPr><b/></rPr><t>BABA</t></r>'
+        '<r><t xml:space="preserve"> Cloud</t></r>'
+        '</is>'
+    )
+    baba_root = etree.fromstring(payload[parts["Model - BABA"]], mhooks._XML)
+    for c in baba_root.iter(f"{{{mhooks._SML}}}c"):
+        ref = (c.get("r") or "").upper()
+        if ref == "D4":
+            mhooks._apply_cached_value(c, "s", "17")
+        elif ref == "D5":
+            for child in list(c):
+                c.remove(child)
+            c.set("t", "inlineStr")
+            c.append(etree.fromstring(rich_is_xml, mhooks._XML))
+    payload[parts["Model - BABA"]] = etree.tostring(baba_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    sst_mut.flush()
+    with zipfile.ZipFile(base, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for info in infos:
+            zout.writestr(info, payload[info.filename])
+
+    base_raw_baba = mhooks.extract_raw_xml_cell_states(base, {"Model - BABA"})["Model - BABA"]
+    assert base_raw_baba["D4"]["t"] == "s" and base_raw_baba["D4"]["v"] == "17"
+    assert b"<b" in (base_raw_baba["D4"]["si_c14n"] or b"")
+    assert base_raw_baba["D5"]["t"] == "inlineStr"
+    assert b"<b" in (base_raw_baba["D5"]["is_c14n"] or b"")
+
+    # Apply a normal target-sheet edit (+ column insert + changelog string) via model_edit.apply_edit_plan
+    res = medit.apply_edit_plan(
+        baseline_path=base,
+        ticker="JD",
+        plan={
+            "ops": [{"op": "insert_columns", "sheet": "Model - JD", "at": "P", "count": 1, "copy_style_from": "O"}],
+            "added_period_cols": {"Model - JD": ["P"]},
+            "cell_edits": [
+                {"sheet": "Model - JD", "cell": "P1", "value": "2Q26E_NEW"},
+                {"sheet": "Model - JD", "cell": "Q25", "value": 0.115},
+            ],
+            "changelog_entry": {"version": "v02", "date": "2026-11-27", "baseline": base.name, "summary": "Rich text SST test"},
+        },
+        workspace_dir=ws,
+        skip_recalc=True,
+    )
+    cand = Path(res["candidate_path"])
+    cand_raw_baba = mhooks.extract_raw_xml_cell_states(cand, {"Model - BABA"})["Model - BABA"]
+
+    # 1. Exact SST index <v>17</v> AND complete rich-text <si> (partial bold) preserved!
+    assert cand_raw_baba["D4"]["t"] == "s"
+    assert cand_raw_baba["D4"]["v"] == "17"
+    assert cand_raw_baba["D4"]["si_c14n"] == base_raw_baba["D4"]["si_c14n"]
+    # 2. Exact rich-text inlineStr <is> preserved!
+    assert cand_raw_baba["D5"]["t"] == "inlineStr"
+    assert cand_raw_baba["D5"]["is_c14n"] == base_raw_baba["D5"]["is_c14n"]
+    # 3. Newly written changelog string on target sheet is still valid & readable
+    wb_chk = openpyxl.load_workbook(cand, data_only=False)
+    try:
+        assert any(
+            str(wb_chk["README & Changelog"].cell(r, 4).value or "") == "Rich text SST test"
+            for r in range(1, wb_chk["README & Changelog"].max_row + 1)
+        )
+    finally:
+        wb_chk.close()
+
+    # 4. C14 passes with ZERO findings on properly restored candidate!
+    chk_ok = mchk.run_checks(candidate_path=cand, ticker="JD", baseline_path=base, coord_map=res["coord_map"])
+    c14_ok = [f for f in chk_ok["findings"] if f["check_id"] == "C14" and f["severity_class"] == "actionable"]
+    assert c14_ok == [], c14_ok
+
+    # 5. Tamper D4 to plain-text rebuilt <si> at index 0 (same display value!) & D5 to plain-text <is> -> C14 MUST flag BOTH!
+    tampered = ws / "model" / "China_Ecommerce_rich_loss_v03.xlsx"
+    shutil.copyfile(cand, tampered)
+    t_infos, t_payload = mhooks._read_package(tampered)
+    t_parts = mhooks._sheet_parts(t_payload)
+    sst_root = etree.fromstring(t_payload["xl/sharedStrings.xml"], mhooks._XML)
+    sis = sst_root.findall(f"{{{mhooks._SML}}}si")
+    # Replace si[17] with plain text (same display string "BABA Revenue", lost partial bold!)
+    sis[17].clear()
+    etree.SubElement(sis[17], f"{{{mhooks._SML}}}t").text = "BABA Revenue"
+    t_payload["xl/sharedStrings.xml"] = etree.tostring(sst_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    # Replace D5 <is> with plain text (same display string "BABA Cloud", lost partial bold!)
+    tb_root = etree.fromstring(t_payload[t_parts["Model - BABA"]], mhooks._XML)
+    for c in tb_root.iter(f"{{{mhooks._SML}}}c"):
+        if (c.get("r") or "").upper() == "D5":
+            mhooks._apply_cached_value(c, "inlineStr", "BABA Cloud")
+    t_payload[t_parts["Model - BABA"]] = etree.tostring(tb_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    with zipfile.ZipFile(tampered, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for info in t_infos:
+            zout.writestr(info, t_payload[info.filename])
+
+    chk_bad = mchk.run_checks(candidate_path=tampered, ticker="JD", baseline_path=base, coord_map=res["coord_map"])
+    c14_bad_cells = {f.get("cell") for f in chk_bad["findings"] if f["check_id"] == "C14" and f["severity_class"] == "actionable"}
+    assert "D4" in c14_bad_cells, chk_bad["findings"]
+    assert "D5" in c14_bad_cells, chk_bad["findings"]
+
+
+def test_recalc_failed_marks_affected_balance_checks_missing_evidence_and_verifies_done(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex R3 #4: when LibreOffice times out (recalc_failed) after a legal quarter rollover write to P4,
+    C10 marks stale formula G4=SUM(O4:R4) as missing_evidence (NOT actionable), delivers cleanly through
+    verify_done, while structural/formula faults (e.g. subtotal constant P6) remain actionable."""
+    ws, rdir, base = _copy_fixture_to_ws(tmp_path)
+
+    def _timeout_soffice(src: Path, out_dir: Path, timeout: int) -> Path:
+        raise subprocess.TimeoutExpired(cmd=["soffice"], timeout=timeout)
+
+    monkeypatch.setattr(recalc_mod, "soffice_calculate", create_autospec(_REAL_SOFFICE_CALC, side_effect=_timeout_soffice))
+    monkeypatch.setattr(recalc_mod.shutil, "which", create_autospec(_REAL_SHUTIL_WHICH, return_value="/usr/bin/soffice"))
+
+    # Legal rollover actuals into detail rows P4 & P5; G4=SUM(O4:R4) keeps donor cache because LO timed out!
+    cm_path = rdir / "model_dump" / "coord_map.json"
+    cm_path.parent.mkdir(parents=True, exist_ok=True)
+    res = medit.apply_edit_plan(
+        baseline_path=base,
+        ticker="JD",
+        plan={
+            "rollover_actual_cols": {"Model - JD": ["P"]},
+            "cell_edits": [
+                {"sheet": "Model - JD", "cell": "P1", "value": "2Q26A"},
+                {"sheet": "Model - JD", "cell": "P4", "value": 2900.0, "style_role": "historical_actual"},
+                {"sheet": "Model - JD", "cell": "P5", "value": 1100.0, "style_role": "historical_actual"},
+            ],
+            "changelog_entry": {"version": "v02", "date": "2026-11-27", "baseline": base.name, "summary": "2Q26A rollover under LO timeout"},
+        },
+        workspace_dir=ws,
+        coord_map_out=cm_path,
+        recalc_mod_override=recalc_mod,
+    )
+    assert res["recalc_status"] == "recalc_failed"
+    cand = Path(res["candidate_path"])
+
+    # Generate aligned consensus-diff bound to cand so only recalc is in failed_stages
+    mcons.compute_consensus_diff(
+        model_path=cand,
+        ticker="JD",
+        research_dir=rdir,
+        consensus_data={
+            "source_type": "Market Consensus",
+            "as_of_date": "2026-11-27",
+            "items": [{"period": "2026E", "metric": "Total Revenue", "consensus": 12000.0, "rationale": "Inline"}],
+        },
+    )
+
+    chk = mchk.write_check_and_ledger(
+        workspace_dir=ws,
+        ticker="JD",
+        research_dir=rdir,
+        candidate_path=cand,
+        baseline_path=base,
+        coord_map_path=cm_path,
+        run_id="run-recalc-timeout-01",
+    )
+    assert chk["counts"]["actionable"] == 0, [f for f in chk["findings"] if f["severity_class"] == "actionable"]
+    assert any(
+        f["check_id"] == "C10" and f["severity_class"] == "missing_evidence" and f.get("cell") == "G4"
+        for f in chk["findings"]
+    ), chk["findings"]
+    assert "recalc" in chk["failed_stages"]
+    assert chk["final_status"] == "delivered_with_open_issues"
+
+    vd = mchk.verify_done(workspace_dir=ws, ticker="JD", research_dir=rdir, expected_run_id="run-recalc-timeout-01")
+    assert vd["ok"] is True, vd
+    assert vd["final_status"] == "delivered_with_open_issues"
+
+    # Formula/structural faults (e.g. overwriting subtotal P6 with constant) STILL stay actionable under recalc_failed!
+    res_bad = medit.apply_edit_plan(
+        baseline_path=base,
+        ticker="JD",
+        plan={
+            "rollover_actual_cols": {"Model - JD": ["P"]},
+            "cell_edits": [
+                {"sheet": "Model - JD", "cell": "P1", "value": "2Q26A"},
+                {"sheet": "Model - JD", "cell": "P6", "value": 4000.0},
+            ],
+            "changelog_entry": {"version": "v03", "date": "2026-11-27", "baseline": base.name, "summary": "Subtotal constant under LO timeout"},
+        },
+        workspace_dir=ws,
+        recalc_mod_override=recalc_mod,
+    )
+    assert res_bad["recalc_status"] == "recalc_failed"
+    chk_bad = mchk.run_checks(
+        candidate_path=res_bad["candidate_path"],
+        ticker="JD",
+        baseline_path=base,
+        coord_map=res_bad["coord_map"],
+    )
+    assert any(
+        f["check_id"] == "C03" and f["severity_class"] == "actionable" and f.get("cell") == "P6"
+        for f in chk_bad["findings"]
+    ), chk_bad["findings"]
+
+
+def test_consensus_unaligned_currency_basis_is_missing_evidence_not_actionable(tmp_path: Path) -> None:
+    """Codex R3 #5: when consensus currency/basis mismatches model basis (e.g. USD vs RMB),
+    diff skips threshold judgment and marks items missing_evidence; unchanged baseline stays actionable == 0."""
+    ws, rdir, base = _copy_fixture_to_ws(tmp_path)
+
+    diff_res = mcons.compute_consensus_diff(
+        model_path=base,
+        ticker="JD",
+        research_dir=rdir,
+        consensus_data={
+            "source_type": "Street USD Consensus",
+            "as_of_date": "2026-11-27",
+            "basis": {
+                "fiscal_year_end_month": 12,
+                "currency": "USD",  # Model - JD is RMB MM!
+                "accounting_basis": "GAAP",
+                "share_basis": "ordinary",
+                "reflects_latest_earnings": True,
+            },
+            "items": [
+                {"period": "2026E", "metric": "Total Revenue", "consensus": 1650.0},  # Raw USD vs RMB 12000, NO rationale
+            ],
+        },
+    )
+    assert diff_res["basis_alignment"]["aligned"] is False
+    assert diff_res["unaligned_count"] == 1
+    assert diff_res["exceeds_count"] == 0
+    assert diff_res["missing_rationale_count"] == 0
+    assert diff_res["status"] == "missing_evidence"
+    assert diff_res["items"][0]["status"] == "missing_evidence"
+    assert diff_res["items"][0]["exceeds_threshold"] is False
+    assert diff_res["items"][0]["missing_rationale"] is False
+
+    # Same-hash unchanged baseline with this unaligned consensus-diff.json -> actionable == 0, C04 missing_evidence!
+    chk = mchk.write_check_and_ledger(
+        workspace_dir=ws,
+        ticker="JD",
+        research_dir=rdir,
+        candidate_path=base,
+        baseline_path=base,
+        run_id="run-unaligned-cons-01",
+    )
+    assert chk["counts"]["actionable"] == 0, chk["findings"]
+    assert any(
+        f["check_id"] == "C04" and f["severity_class"] == "missing_evidence"
+        for f in chk["findings"]
+    ), chk["findings"]
+    assert chk["final_status"] == "pass"
+
+
+def test_consensus_segment_metric_normalization_idempotent_double_write_and_diff_match(tmp_path: Path) -> None:
+    """Codex R3 #6: metric='Cloud Revenue', segment='Cloud' normalizes identically to 'Cloud Revenue'
+    and ('Revenue', segment='Cloud'); consecutive snapshot writes update in place (no duplicate rows)
+    and diff matches model segment rows."""
+    ws, rdir, base = _copy_fixture_to_ws(tmp_path)
+    cand = ws / "model" / "China_Ecommerce_seg_r4_v02.xlsx"
+    shutil.copyfile(base, cand)
+
+    # 1. Unified normalization across both prefixed and explicit-segment inputs
+    assert mcons._normalize_metric_key("Cloud Revenue", segment="Cloud") == "cloud::revenue"
+    assert mcons._normalize_metric_key("Revenue", segment="Cloud") == "cloud::revenue"
+    assert mcons._normalize_metric_key("Cloud Revenue") == "cloud::revenue"
+    assert mcons._normalize_metric_key("Retail Revenue", segment="Retail") == "retail::revenue"
+    assert mcons._normalize_metric_key("Cloud Segment Operating Income", segment="Cloud") == "cloud::operating_income"
+    assert mcons._normalize_metric_key("Total Revenue", segment="Group") == "total_revenue"
+
+    # 2. Write same segment snapshot TWICE consecutively (both prefixed+segment AND segment-only!) -> zero duplicate rows
+    payload1 = {
+        "source_type": "Market Consensus",
+        "as_of_date": "2026-11-27",
+        "items": [
+            {"period": "2026E", "metric": "Cloud Revenue", "segment": "Cloud", "consensus": 2100.0},
+            {"period": "2026E", "metric": "Retail Revenue", "segment": "Retail", "consensus": 9900.0},
+        ],
+    }
+    snap1 = mcons.write_consensus_snapshot(model_path=cand, consensus_data=payload1, sheet_name="vs Consensus")
+    wb1 = openpyxl.load_workbook(cand, data_only=False)
+    max_row_1 = wb1["vs Consensus"].max_row
+    wb1.close()
+
+    payload2 = {
+        "source_type": "Market Consensus",
+        "as_of_date": "2026-11-28",
+        "items": [
+            {"period": "2026E", "metric": "Cloud Revenue", "segment": "Cloud", "consensus": 2150.0},
+            {"period": "2026E", "metric": "Revenue", "segment": "Retail", "consensus": 10050.0},
+        ],
+    }
+    snap2 = mcons.write_consensus_snapshot(model_path=cand, consensus_data=payload2, sheet_name="vs Consensus")
+    wb2 = openpyxl.load_workbook(cand, data_only=False)
+    max_row_2 = wb2["vs Consensus"].max_row
+    wb2.close()
+
+    assert snap1["consensus_snapshot_cells"]["vs Consensus"] == snap2["consensus_snapshot_cells"]["vs Consensus"]
+    assert max_row_2 == max_row_1, f"Duplicate rows appended on second write: {max_row_1} -> {max_row_2}"
+
+    # 3. Consensus diff matches Model - JD's Retail Revenue row (G4) when passing metric="Retail Revenue", segment="Retail"
+    diff_res = mcons.compute_consensus_diff(
+        model_path=cand,
+        ticker="JD",
+        research_dir=rdir,
+        consensus_data={
+            "source_type": "Market Consensus",
+            "as_of_date": "2026-11-28",
+            "items": [
+                {"period": "2026E", "metric": "Retail Revenue", "segment": "Retail", "consensus": 10050.0, "rationale": "GMV mix"},
+            ],
+        },
+    )
+    assert len(diff_res["items"]) == 1
+    row0 = diff_res["items"][0]
+    assert row0["metric_key"] == "retail::revenue"
+    assert row0["house"] is not None
+    assert row0["house_cell"] == "Model - JD!G4"
+
+
+def test_recover_baseline_minio_inline_bitrot_and_custom_ecbsize_parts(tmp_path: Path) -> None:
+    """R4 #3, Codex R3 #3 & Grok 疑似:
+    - MinIO XL2 v1.3 nested msgpack inline xl.meta with 32B HighwayHash256 bitrot header is stripped before SHA-256 check.
+    - MinIO part.1 with non-default EcBSize declared inside sibling xl.meta nested V2Obj strips every block's 32B header."""
+    import struct as _st
+
+    baseline_bytes = FIXTURE_XLSX.read_bytes()
+    baseline_sha = hashlib.sha256(baseline_bytes).hexdigest()
+    key_file = tmp_path / "backup.key"
+    key_file.write_text("r4-minio-bitrot-key\n", encoding="utf-8")
+    ws_id = "22222222-3333-4444-5555-666666666666"
+
+    def _mp_bin(b: bytes) -> bytes:
+        if len(b) < 256:
+            return b"\xc4" + bytes([len(b)]) + b
+        if len(b) < 65536:
+            return b"\xc5" + _st.pack(">H", len(b)) + b
+        return b"\xc6" + _st.pack(">I", len(b)) + b
+
+    def _mp_str(s: str) -> bytes:
+        enc = s.encode("utf-8")
+        assert len(enc) < 32
+        return bytes([0xA0 | len(enc)]) + enc
+
+    def _encrypt_tar(tar_bytes: bytes, out_path: Path) -> None:
+        subprocess.run(
+            ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-salt", "-pass", f"file:{key_file}", "-out", str(out_path)],
+            input=tar_bytes,
+            check=True,
+        )
+
+    def _fake_rclone(script: Path, day: str, fname: str, enc_p: Path) -> None:
+        script.write_text(
+            f"""#!/usr/bin/env bash
+if [[ "$1" == "lsf" && "$2" == "--dirs-only" && "$3" == *"/weekly/" ]]; then
+  echo "{day}/"
+elif [[ "$1" == "lsf" && "$2" == "--files-only" && "$3" == *"/weekly/{day}/" ]]; then
+  echo "{fname}"
+elif [[ "$1" == "cat" ]]; then
+  cat "{enc_p}"
+fi
+""",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+
+    # 1. XL2 v1.3 nested msgpack: outer bin(xlMetaV2{Versions:[{V2Obj: bin({EcBSize:1048576, CSumAlgo:1})}]})
+    #    + trailing bin(inlineData{"data-dir-uuid": [32B HighwayHash256 bitrot header + baseline_bytes]})
+    inner_v2obj = b"\x82" + _mp_str("EcBSize") + b"\xce" + _st.pack(">I", 1048576) + _mp_str("CSumAlgo") + b"\x01"
+    outer_meta = b"\x81" + _mp_str("Versions") + b"\x91" + b"\x81" + _mp_str("V2Obj") + _mp_bin(inner_v2obj)
+    bitrot_inline = (b"\x5a" * 32) + baseline_bytes
+    inline_map = b"\x81" + _mp_str("data-dir-uuid") + _mp_bin(bitrot_inline)
+    xl_meta_v13 = b"XL2 " + _st.pack("<HH", 1, 3) + _mp_bin(outer_meta) + _mp_bin(inline_map)
+
+    tar1 = io.BytesIO()
+    with tarfile.open(fileobj=tar1, mode="w:gz") as tf:
+        ti = tarfile.TarInfo(name="dalton-uploads/attachments/att-inline/China_Ecommerce_Model.xlsx/xl.meta")
+        ti.size = len(xl_meta_v13)
+        tf.addfile(ti, io.BytesIO(xl_meta_v13))
+    enc1 = tmp_path / "minio-v13-inline.tar.gz.enc"
+    _encrypt_tar(tar1.getvalue(), enc1)
+    rc1 = tmp_path / "rc_v13.sh"
+    _fake_rclone(rc1, "2026-09-25", enc1.name, enc1)
+
+    out1 = tmp_path / "rec_v13_inline.xlsx"
+    res1 = recover_lib.recover_baseline(
+        workspace_id=ws_id,
+        output_path=out1,
+        before_first_edit_ts="2026-10-01T10:00:00+00:00",
+        expected_sha256=baseline_sha,
+        expected_filename="China_Ecommerce_Model.xlsx",
+        rclone_remote="fakegdrive",
+        rclone_drive_dir="DaltonBackup",
+        rclone_bin=str(rc1),
+        backup_key_file=key_file,
+    )
+    assert res1.found is True and "minio-xl-inline:" in (res1.source_ref or "")
+    assert out1.read_bytes() == baseline_bytes
+
+    # 2. Multi-block part.1 with non-default EcBSize=4096 declared inside sibling xl.meta V2Obj
+    custom_bsize = 4096
+    inner_v2_custom = b"\x82" + _mp_str("EcBSize") + b"\xcd" + _st.pack(">H", custom_bsize) + _mp_str("CSumAlgo") + b"\x01"
+    outer_custom = b"\x81" + _mp_str("Versions") + b"\x91" + b"\x81" + _mp_str("V2Obj") + _mp_bin(inner_v2_custom)
+    xl_meta_custom = b"XL2 " + _st.pack("<HH", 1, 3) + _mp_bin(outer_custom)
+    chunked_part1 = bytearray()
+    for off in range(0, len(baseline_bytes), custom_bsize):
+        chunked_part1.extend(b"\x99" * 32)
+        chunked_part1.extend(baseline_bytes[off : off + custom_bsize])
+
+    tar2 = io.BytesIO()
+    with tarfile.open(fileobj=tar2, mode="w:gz") as tf:
+        ti_m = tarfile.TarInfo(name="dalton-uploads/uploads/up-custom/China_Ecommerce_Model.xlsx/xl.meta")
+        ti_m.size = len(xl_meta_custom)
+        tf.addfile(ti_m, io.BytesIO(xl_meta_custom))
+        ti_p = tarfile.TarInfo(name="dalton-uploads/uploads/up-custom/China_Ecommerce_Model.xlsx/dir-uuid/part.1")
+        ti_p.size = len(chunked_part1)
+        tf.addfile(ti_p, io.BytesIO(bytes(chunked_part1)))
+    enc2 = tmp_path / "minio-custom-bsize.tar.gz.enc"
+    _encrypt_tar(tar2.getvalue(), enc2)
+    rc2 = tmp_path / "rc_custom.sh"
+    _fake_rclone(rc2, "2026-09-25", enc2.name, enc2)
+
+    out2 = tmp_path / "rec_custom_part.xlsx"
+    res2 = recover_lib.recover_baseline(
+        workspace_id=ws_id,
+        output_path=out2,
+        before_first_edit_ts="2026-10-01T10:00:00+00:00",
+        expected_sha256=baseline_sha,
+        expected_filename="China_Ecommerce_Model.xlsx",
+        rclone_remote="fakegdrive",
+        rclone_drive_dir="DaltonBackup",
+        rclone_bin=str(rc2),
+        backup_key_file=key_file,
+    )
+    assert res2.found is True and "minio-part:" in (res2.source_ref or "")
+    assert out2.read_bytes() == baseline_bytes
+
+
+MINIO_REAL_FIXTURE_TAR = REPO_ROOT / "tests" / "fixtures" / "dalton" / "minio_single_drive_fixture.tar.gz"
+MINIO_REAL_FIXTURE_MANIFEST = REPO_ROOT / "tests" / "fixtures" / "dalton" / "minio_single_drive_fixture.json"
+
+
+@pytest.mark.skipif(
+    not (MINIO_REAL_FIXTURE_TAR.is_file() and MINIO_REAL_FIXTURE_MANIFEST.is_file()),
+    reason="Real MinIO single-drive fixture not generated yet (run scripts/dalton/ops/prod/generate_minio_inline_fixture.sh outside sandbox)",
+)
+def test_recover_baseline_real_minio_single_drive_fixture(tmp_path: Path) -> None:
+    """R4 #3: verify recovery against a real single-drive MinIO tar.gz generated with production MinIO image."""
+    manifest = json.loads(MINIO_REAL_FIXTURE_MANIFEST.read_text(encoding="utf-8"))
+    tar_bytes = MINIO_REAL_FIXTURE_TAR.read_bytes()
+
+    # 1. Small inline object inside real xl.meta (with real MinIO bitrot header)
+    inline_sha = manifest["inline_object"]["sha256"]
+    got_inline, ref_inline = recover_lib._recover_from_minio_tar_bytes(
+        tar_bytes,
+        expected_sha256=inline_sha,
+        target_filename="China_Ecommerce_Model.xlsx",
+    )
+    assert got_inline is not None and "minio-xl-inline:" in (ref_inline or "")
+    assert hashlib.sha256(got_inline).hexdigest() == inline_sha
+
+    # 2. Larger >128KiB object in real <dataDir>/part.1 (with real MinIO HighwayHash256 bitrot header)
+    part_sha = manifest["part_object"]["sha256"]
+    got_part, ref_part = recover_lib._recover_from_minio_tar_bytes(
+        tar_bytes,
+        expected_sha256=part_sha,
+        target_filename="China_Ecommerce_Large.xlsx",
+    )
+    assert got_part is not None and "minio-part:" in (ref_part or "")
+    assert hashlib.sha256(got_part).hexdigest() == part_sha
+
+
+@pytest.mark.skipif(
+    _resolve_safe_test_pg_dsn() is None or shutil.which("pg_dump") is None or shutil.which("pg_restore") is None,
+    reason="Requires DALTON_TEST_PG_DSN (*_test) plus host pg_dump and pg_restore binaries",
+)
+def test_recover_baseline_real_pg_dump_fc_roundtrip(tmp_path: Path) -> None:
+    """Grok R3 #1 & R4 #4: real pg_dump -Fc -> encrypted stream -> pg_restore recovery round-trip on *_test DB."""
+    import psycopg
+
+    dsn = _resolve_safe_test_pg_dsn()
+    assert dsn is not None
+    schema = f"dalton_p0a_pgdmp_{uuid.uuid4().hex[:10]}"
+    baseline_bytes = FIXTURE_XLSX.read_bytes()
+    baseline_sha = hashlib.sha256(baseline_bytes).hexdigest()
+    att_id = str(uuid.uuid4())
+
+    conn = psycopg.connect(dsn, autocommit=True)
+    schema_created = False
+    try:
+        _assert_live_pg_is_test_db(conn)
+        with conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA {schema};")
+            schema_created = True
+            cur.execute(
+                f"""
+                CREATE TABLE {schema}.chat_attachments (
+                    attachment_id uuid PRIMARY KEY, user_id text, name text, size bigint, content bytea
+                );
+                INSERT INTO {schema}.chat_attachments VALUES (%s::uuid, 'sender-u3', 'China_Ecommerce_Model.xlsx', %s, %s);
+                """,
+                (att_id, len(baseline_bytes), baseline_bytes),
+            )
+
+        dump_res = subprocess.run(
+            ["pg_dump", "-Fc", "-t", f"{schema}.chat_attachments", dsn],
+            capture_output=True,
+            check=True,
+        )
+        assert dump_res.stdout.startswith(b"PGDMP")
+
+        key_file = tmp_path / "backup.key"
+        key_file.write_text("pgdmp-roundtrip-key\n", encoding="utf-8")
+        enc_path = tmp_path / "dalton-pg-roundtrip.dump.enc"
+        subprocess.run(
+            ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-salt", "-pass", f"file:{key_file}", "-out", str(enc_path)],
+            input=dump_res.stdout,
+            check=True,
+        )
+        blob, member = recover_lib.recover_from_encrypted_db_backup_stream(
+            ["cat", str(enc_path)],
+            key_file,
+            expected_sha256=baseline_sha,
+            pg_restore_compose_service=None,
+        )
+        assert blob == baseline_bytes and member is not None
+    finally:
+        if schema_created:
+            with conn.cursor() as cur:
+                cur.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
+        conn.close()
