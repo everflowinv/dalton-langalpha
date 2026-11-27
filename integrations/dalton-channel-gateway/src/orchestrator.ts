@@ -9168,6 +9168,23 @@ export class ChannelGatewayOrchestrator {
     return true;
   }
 
+  private isWatchBusyError(err: unknown): boolean {
+    if (!(err instanceof BackendHttpError) || err.status !== 409) {
+      return false;
+    }
+    const bodyObj = err.body as {
+      code?: unknown;
+      detail?: { code?: unknown } | null;
+    } | null;
+    const errCode =
+      typeof bodyObj?.code === "string"
+        ? bodyObj.code
+        : typeof bodyObj?.detail?.code === "string"
+          ? bodyObj.detail.code
+          : "";
+    return errCode === "watch_busy";
+  }
+
   private async syncWatchReconnectState(
     handle: ActiveWatchHandle,
   ): Promise<boolean> {
@@ -9176,10 +9193,19 @@ export class ChannelGatewayOrchestrator {
     }
     handle.syncingReconnect = true;
     try {
-      const rec = await this.backend.recoverState({
-        mode: "watch_reconnect",
-        thread_id: handle.threadId,
-      });
+      let rec: I7RecoverResponse;
+      try {
+        rec = await this.backend.recoverState({
+          mode: "watch_reconnect",
+          thread_id: handle.threadId,
+        });
+      } catch (err) {
+        if (this.isWatchBusyError(err)) {
+          handle.needsReconnectSync = true;
+          return false;
+        }
+        throw err;
+      }
 
       let allSettled = true;
       if (
@@ -9298,10 +9324,22 @@ export class ChannelGatewayOrchestrator {
    * Reconnect `/watch` after 45s keepalive timeout or 30m periodic rotation (§1.3.4).
    */
   async reconnectThreadWatch(threadId: string): Promise<void> {
-    const rec = await this.backend.recoverState({
-      mode: "watch_reconnect",
-      thread_id: threadId,
-    });
+    let rec: I7RecoverResponse;
+    try {
+      rec = await this.backend.recoverState({
+        mode: "watch_reconnect",
+        thread_id: threadId,
+      });
+    } catch (err) {
+      if (this.isWatchBusyError(err)) {
+        const existing = this.activeWatches.get(threadId);
+        if (existing) {
+          existing.needsReconnectSync = true;
+        }
+        return;
+      }
+      throw err;
+    }
 
     for (const bg of rec.background_runs ?? []) {
       await this.recoverSingleBackgroundRun(bg, rec.thread_watches);

@@ -17289,6 +17289,69 @@ async def _recover_channel_state_once(
                                 )
                         if await cur.fetchone() is not None:
                             raise wx_db.WeixinLockSetChanged()
+                    locked_watch_tids = {
+                        str(w["thread_id"]) for w in watches if w.get("thread_id")
+                    }
+                    # If the target watch row(s) exist on an enabled platform but were skipped
+                    # because another transaction holds a row lock (`FOR UPDATE SKIP LOCKED`),
+                    # fail fast with a retryable 409 (`watch_busy`) rather than returning 200 OK
+                    # with an empty watch list (which the gateway would mistake for a settled
+                    # reconnect and prematurely close the watch with `watch_active=false`).
+                    if norm_tid:
+                        if not watches:
+                            await cur.execute(
+                                """
+                                SELECT thread_id::text AS thread_id, platform
+                                FROM dalton_channel_thread_watches
+                                WHERE thread_id = %s
+                                LIMIT 1
+                                """,
+                                (norm_tid,),
+                            )
+                            existing_watch = await cur.fetchone()
+                            if existing_watch is not None and _platform_enabled_for_recovery(
+                                existing_watch.get("platform")
+                            ):
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail={
+                                        "code": "watch_busy",
+                                        "message": (
+                                            "Thread watch is currently locked by another "
+                                            "transaction; retry watch_reconnect."
+                                        ),
+                                        "thread_id": norm_tid,
+                                    },
+                                )
+                    else:
+                        await cur.execute(
+                            """
+                            SELECT thread_id::text AS thread_id, platform
+                            FROM dalton_channel_thread_watches
+                            WHERE watch_active = TRUE
+                            """
+                        )
+                        skipped_watch_tids = sorted(
+                            {
+                                str(r["thread_id"])
+                                for r in await cur.fetchall()
+                                if r.get("thread_id")
+                                and _platform_enabled_for_recovery(r.get("platform"))
+                                and str(r["thread_id"]) not in locked_watch_tids
+                            }
+                        )
+                        if skipped_watch_tids:
+                            raise HTTPException(
+                                status_code=409,
+                                detail={
+                                    "code": "watch_busy",
+                                    "message": (
+                                        "One or more active thread watches are currently "
+                                        "locked by another transaction; retry watch_reconnect."
+                                    ),
+                                    "thread_ids": skipped_watch_tids,
+                                },
+                            )
                     await _backfill_watch_notification_runs_in_tx(cur, watches)
 
                     if norm_tid:
@@ -17313,9 +17376,6 @@ async def _recover_channel_state_once(
                         for r in await cur.fetchall()
                         if _platform_enabled_for_recovery(r.get("platform"))
                     ]
-                    locked_watch_tids = {
-                        str(w["thread_id"]) for w in watches if w.get("thread_id")
-                    }
                     if locked_watch_tids:
                         await cur.execute(
                             """

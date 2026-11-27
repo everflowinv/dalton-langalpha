@@ -82,6 +82,7 @@ class _InMemoryBatch3DB:
         self.inbounds: dict[tuple[str, str], dict[str, Any]] = {}
         self.background_runs: dict[str, dict[str, Any]] = {}
         self.thread_watches: dict[str, dict[str, Any]] = {}
+        self.locked_watch_tids: set[str] = set()
         self.session_generations: dict[tuple[str, str, str], dict[str, Any]] = {}
         self.identities: dict[tuple[str, str], dict[str, Any]] = {}
         self.user_settings: dict[str, dict[str, Any]] = {}
@@ -418,18 +419,25 @@ class _FakeCursorState:
 
         # --- thread watches ---
         if "FROM DALTON_CHANNEL_THREAD_WATCHES" in norm:
+            skip_locked = "FOR UPDATE SKIP LOCKED" in norm
             if "SELECT 1 FROM DALTON_CHANNEL_THREAD_WATCHES" in norm:
                 self._one = None
                 self._all = []
             elif "WHERE THREAD_ID = %S" in norm:
-                row = self.db.thread_watches.get(str(p[0]))
-                if row:
+                tid_key = str(p[0])
+                row = self.db.thread_watches.get(tid_key)
+                if row and not (skip_locked and tid_key in self.db.locked_watch_tids):
                     d = dict(row)
                     d["weixin_account_id_text"] = d.get("weixin_account_id")
                     self._one = d
                     self._all = [d]
             else:
-                self._all = [dict(v) for v in self.db.thread_watches.values() if v.get("watch_active")]
+                self._all = [
+                    dict(v)
+                    for k, v in self.db.thread_watches.items()
+                    if v.get("watch_active")
+                    and not (skip_locked and k in self.db.locked_watch_tids)
+                ]
             return
         if "UPDATE DALTON_CHANNEL_THREAD_WATCHES" in norm:
             if "PENDING_INTERRUPT = NULL" in norm:
@@ -5078,3 +5086,85 @@ async def test_r4_item5_watch_reconnect_uses_skip_locked(
         if "FROM DALTON_CHANNEL_THREAD_WATCHES" in s and "FOR UPDATE" in s
     ]
     assert watch_lock_sqls_all and all("FOR UPDATE SKIP LOCKED" in s for s in watch_lock_sqls_all)
+
+
+@pytest.mark.asyncio
+async def test_r5_item1_watch_reconnect_skipped_target_returns_409_watch_busy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r5 Item 1: when a target watch exists on an enabled platform but is skipped by
+    ``FOR UPDATE SKIP LOCKED``, ``recover_channel_state(mode='watch_reconnect')`` MUST raise
+    HTTP 409 ``watch_busy`` instead of returning 200 OK with empty ``thread_watches``; once
+    unlocked it succeeds, and truly absent watches still return 200 OK."""
+    from fastapi import HTTPException
+
+    db = _InMemoryBatch3DB()
+    tid = str(uuid4())
+    absent_tid = str(uuid4())
+    uid = "u-alice"
+    _install_db(monkeypatch, db)
+    db.thread_watches[tid] = {
+        "thread_id": tid,
+        "dalton_user_id": uid,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "scope_key": "dm:ou_alice",
+        "generation": 1,
+        "watch_active": True,
+        "last_seen_turn_index": 0,
+        "weixin_account_id": None,
+    }
+    db.background_runs["bg-existing"] = {
+        "run_id": "bg-existing",
+        "thread_id": tid,
+        "dalton_user_id": uid,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "fallback_pending": True,
+    }
+
+    # Simulate another transaction holding FOR UPDATE on `tid`
+    db.locked_watch_tids.add(tid)
+
+    with pytest.raises(HTTPException) as exc_single:
+        await cg_db.recover_channel_state(
+            mode="watch_reconnect",
+            thread_id=tid,
+            gateway_epoch=1,
+            require_gateway_epoch=True,
+        )
+    assert exc_single.value.status_code == 409
+    assert exc_single.value.detail["code"] == "watch_busy"
+    assert exc_single.value.detail["thread_id"] == tid
+
+    with pytest.raises(HTTPException) as exc_all:
+        await cg_db.recover_channel_state(
+            mode="watch_reconnect",
+            thread_id=None,
+            gateway_epoch=1,
+            require_gateway_epoch=True,
+        )
+    assert exc_all.value.status_code == 409
+    assert exc_all.value.detail["code"] == "watch_busy"
+    assert exc_all.value.detail["thread_ids"] == [tid]
+
+    # A thread_id with no watch row at all is NOT busy -> 200 OK with empty thread_watches
+    res_absent = await cg_db.recover_channel_state(
+        mode="watch_reconnect",
+        thread_id=absent_tid,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert res_absent["mode"] == "watch_reconnect"
+    assert res_absent["thread_watches"] == []
+
+    # Unlocking allows watch_reconnect to succeed and return the watch
+    db.locked_watch_tids.clear()
+    res_unlocked = await cg_db.recover_channel_state(
+        mode="watch_reconnect",
+        thread_id=tid,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert res_unlocked["mode"] == "watch_reconnect"
+    assert any(str(w["thread_id"]) == tid for w in res_unlocked["thread_watches"])

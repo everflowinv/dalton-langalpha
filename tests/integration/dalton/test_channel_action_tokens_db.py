@@ -412,6 +412,7 @@ async def _seed_session_and_inbound(
     weixin_account_id: str | None = None,
     weixin_bot_gen: int | None = None,
     status: str = "pending",
+    session_generation: int | None = None,
 ) -> None:
     pi = {
         "interrupt_id": interrupt_id,
@@ -420,6 +421,9 @@ async def _seed_session_and_inbound(
         "kind": "ask_user_question",
         "action_requests": [{"type": "ask_user_question", "question": "Proceed?"}],
     }
+    raw_payload: dict[str, Any] = {"platform_user_id": f"p_{uid}"}
+    if session_generation is not None:
+        raw_payload["generation"] = session_generation
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -439,9 +443,10 @@ async def _seed_session_and_inbound(
                 INSERT INTO dalton_channel_inbound_events (
                     platform, message_id, request_key, dalton_user_id,
                     chat_type, chat_address, thread_scope_key, thread_id, run_id,
-                    status, raw_payload, weixin_account_id, weixin_context_bot_generation
+                    status, raw_payload, session_generation,
+                    weixin_account_id, weixin_context_bot_generation
                 )
-                VALUES (%s, %s, %s::uuid, %s, 'dm', %s, %s, %s::uuid, %s, %s, %s, %s::uuid, %s)
+                VALUES (%s, %s, %s::uuid, %s, 'dm', %s, %s, %s::uuid, %s, %s, %s, %s, %s::uuid, %s)
                 ON CONFLICT (platform, message_id) DO NOTHING
                 """,
                 (
@@ -454,7 +459,8 @@ async def _seed_session_and_inbound(
                     tid,
                     run_id,
                     status,
-                    Jsonb({"platform_user_id": f"p_{uid}"}),
+                    Jsonb(raw_payload),
+                    session_generation,
                     weixin_account_id,
                     weixin_bot_gen,
                 ),
@@ -2365,6 +2371,7 @@ async def test_pg_r4_item1_drain_zero_then_legacy_replay_terminal_parent_keeps_z
         tid=tid,
         run_id=run_id,
         interrupt_id=f"int-r4-i1-{pfx}",
+        session_generation=1,
     )
 
     # 1) Create pre-drain legacy parent and settle it as failed / not_allowed (like Feishu 403)
@@ -2382,8 +2389,12 @@ async def test_pg_r4_item1_drain_zero_then_legacy_replay_terminal_parent_keeps_z
         gateway_epoch=epoch,
         require_gateway_epoch=True,
     )
-    assert first_claim["claim_status"] == "claimed"
-    assert first_claim["delivery_attempt"] == 1
+    assert first_claim["claim_status"] == "claimed", (
+        f"Expected initial legacy claim_status='claimed', got full result: {first_claim!r}"
+    )
+    assert first_claim["delivery_attempt"] == 1, (
+        f"Expected initial delivery_attempt=1, got full result: {first_claim!r}"
+    )
 
     await cg_db.update_delivery_progress(
         delivery_key=parent_key,
@@ -2444,17 +2455,17 @@ async def test_pg_r4_item1_drain_zero_then_legacy_replay_terminal_parent_keeps_z
         async with conn.cursor() as cur:
             await cur.execute(
                 """
-                SELECT status, error_code, delivery_attempt, bt2_enrolled, updated_at
+                SELECT *
                 FROM dalton_channel_deliveries
                 WHERE delivery_key = %s
                 """,
                 (parent_key,),
             )
             before_row = dict(await cur.fetchone())
-            assert before_row["status"] == "failed"
-            assert before_row["error_code"] == "not_allowed"
-            assert before_row["delivery_attempt"] == 1
-            assert before_row["bt2_enrolled"] is False
+            assert before_row["status"] == "failed", f"Unexpected before_row: {before_row!r}"
+            assert before_row["error_code"] == "not_allowed", f"Unexpected before_row: {before_row!r}"
+            assert before_row["delivery_attempt"] == 1, f"Unexpected before_row: {before_row!r}"
+            assert before_row["bt2_enrolled"] is False, f"Unexpected before_row: {before_row!r}"
 
     # 3) Replay the SAME parent key in legacy format -> MUST NOT re-open or mutate!
     replay_res = await cg_db.authorize_and_claim_delivery(
@@ -2471,16 +2482,24 @@ async def test_pg_r4_item1_drain_zero_then_legacy_replay_terminal_parent_keeps_z
         gateway_epoch=epoch,
         require_gateway_epoch=True,
     )
-    assert replay_res["claim_status"] == "already_completed"
-    assert replay_res["status"] == "failed"
-    assert replay_res["error_code"] == "not_allowed"
-    assert replay_res["delivery_attempt"] == 1
+    assert replay_res["claim_status"] == "already_completed", (
+        f"Expected replay claim_status='already_completed', got full result: {replay_res!r}"
+    )
+    assert replay_res["status"] == "failed", (
+        f"Expected replay status='failed', got full result: {replay_res!r}"
+    )
+    assert replay_res["error_code"] == "not_allowed", (
+        f"Expected replay error_code='not_allowed', got full result: {replay_res!r}"
+    )
+    assert replay_res["delivery_attempt"] == 1, (
+        f"Expected replay delivery_attempt=1, got full result: {replay_res!r}"
+    )
 
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
                 """
-                SELECT status, error_code, delivery_attempt, bt2_enrolled, updated_at
+                SELECT *
                 FROM dalton_channel_deliveries
                 WHERE delivery_key = %s
                 """,
@@ -2495,10 +2514,13 @@ async def test_pg_r4_item1_drain_zero_then_legacy_replay_terminal_parent_keeps_z
 async def test_pg_r4_item5_watch_reconnect_skips_locked_watch_without_waiting(
     pg_b3_env,
 ) -> None:
-    """r4 Item 5 (real PG): while another transaction holds ``FOR UPDATE`` on a
+    """r4 Item 5 / r5 Item 1 (real PG): while another transaction holds ``FOR UPDATE`` on a
     ``dalton_channel_thread_watches`` row, ``recover_channel_state(mode='watch_reconnect')``
-    MUST return immediately without blocking (``FOR UPDATE SKIP LOCKED``), skipping that
-    watch; once the lock is released, a follow-up reconnect locks and backfills it."""
+    MUST return immediately without blocking (``FOR UPDATE SKIP LOCKED``) and raise retryable
+    HTTP 409 ``watch_busy`` instead of returning 200 OK with empty ``thread_watches`` (which
+    would let the gateway close the watch with ``watch_active=false``). The watch remains
+    active and un-backfilled while locked; once the lock is released, retrying
+    ``watch_reconnect`` locks the watch and backfills the wakeup run."""
     pool, uid, tid, epoch = pg_b3_env["pool"], pg_b3_env["uid"], pg_b3_env["tid"], pg_b3_env["epoch"]
     scope = f"dm:{pg_b3_env['feishu_puid']}"
     bg_rid = str(uuid4())
@@ -2544,22 +2566,40 @@ async def test_pg_r4_item5_watch_reconnect_skips_locked_watch_without_waiting(
                 )
                 assert await lock_cur.fetchone() is not None
 
-                # watch_reconnect MUST NOT block on the locked watch row!
-                rec_while_locked = await asyncio.wait_for(
-                    cg_db.recover_channel_state(
-                        mode="watch_reconnect",
-                        thread_id=tid,
-                        gateway_epoch=epoch,
-                        require_gateway_epoch=True,
-                    ),
-                    timeout=3.0,
+                # watch_reconnect MUST NOT block on the locked watch row, AND MUST return
+                # retryable 409 `watch_busy` (never 200 OK with empty thread_watches)!
+                with pytest.raises(HTTPException) as busy_exc_info:
+                    await asyncio.wait_for(
+                        cg_db.recover_channel_state(
+                            mode="watch_reconnect",
+                            thread_id=tid,
+                            gateway_epoch=epoch,
+                            require_gateway_epoch=True,
+                        ),
+                        timeout=3.0,
+                    )
+                assert busy_exc_info.value.status_code == 409, (
+                    f"Expected 409 watch_busy, got {busy_exc_info.value!r}"
                 )
-                assert rec_while_locked["mode"] == "watch_reconnect"
-                assert rec_while_locked["thread_watches"] == []
+                assert isinstance(busy_exc_info.value.detail, dict)
+                assert busy_exc_info.value.detail.get("code") == "watch_busy", (
+                    f"Expected code='watch_busy', got {busy_exc_info.value.detail!r}"
+                )
 
-                # Verify the locked watch was NOT backfilled while held
+                # Verify the locked watch was NOT closed (watch_active remains TRUE)
+                # and was NOT backfilled while held
                 async with pool.connection() as check_conn:
                     async with check_conn.cursor() as check_cur:
+                        await check_cur.execute(
+                            """
+                            SELECT watch_active
+                            FROM dalton_channel_thread_watches
+                            WHERE thread_id = %s::uuid
+                            """,
+                            (tid,),
+                        )
+                        w_row = await check_cur.fetchone()
+                        assert w_row is not None and w_row["watch_active"] is True
                         await check_cur.execute(
                             """
                             SELECT COUNT(*) AS cnt
@@ -2582,7 +2622,13 @@ async def test_pg_r4_item5_watch_reconnect_skips_locked_watch_without_waiting(
         timeout=3.0,
     )
     assert rec_after_unlock["mode"] == "watch_reconnect"
-    assert any(str(w["thread_id"]) == tid for w in rec_after_unlock["thread_watches"])
+    assert any(
+        str(w["thread_id"]) == tid and w.get("watch_active") is True
+        for w in rec_after_unlock["thread_watches"]
+    ), f"Expected unlocked active watch in response, got {rec_after_unlock!r}"
+    assert any(
+        str(b.get("run_id")) == bg_rid for b in rec_after_unlock["background_runs"]
+    ), f"Expected backfilled wakeup run_id={bg_rid} in response, got {rec_after_unlock!r}"
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
