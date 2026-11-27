@@ -175,13 +175,8 @@ async def refresh() -> dict[str, str]:
         rows, dalton_state = await _read_rows()
         changed = export(rows) | _unapplied
         # DALTON-HOOK(deployment-credentials): atomically swap process CredentialSnapshot after export(rows)
-        if dalton_state is not None:
-            from src.dalton.deployment_credentials.hooks import (
-                commit_dalton_snapshot,
-                on_deployment_settings_refreshed,
-            )
-
-            commit_dalton_snapshot(dalton_state)
+        from src.dalton.deployment_credentials import hooks as dalton_hooks
+        dalton_hooks.commit_dalton_snapshot(dalton_state)
         _unapplied = changed
         if FMP_KEY in changed:
             await _reset_market_data()
@@ -189,8 +184,7 @@ async def refresh() -> dict[str, str]:
         if config is not None:
             await _rebuild_config(config, rows, changed)
         # DALTON-HOOK(deployment-credentials): run Dalton post-refresh hook before clearing _unapplied
-        if dalton_state is not None:
-            await on_deployment_settings_refreshed(changed, rows, dalton_state.revision)
+        await dalton_hooks.notify_dalton_refreshed(dalton_state, changed, rows)
         _unapplied = set()
         return rows
 
@@ -202,21 +196,14 @@ async def load_at_boot() -> ConfigReading:
     take_snapshot()
     # DALTON-HOOK(deployment-credentials): preserve Dalton autodetect=False on normal and fallback returns
     from src.server.services.setup_settings import autodetect_sandbox
-
     autodetect = autodetect_sandbox()
     try:
         async with _lock:
             rows, dalton_state = await _read_rows()
             exported = export(rows)
             # DALTON-HOOK(deployment-credentials): commit boot snapshot and invoke boot-loaded hook
-            if dalton_state is not None:
-                from src.dalton.deployment_credentials.hooks import (
-                    commit_dalton_snapshot,
-                    on_deployment_settings_boot_loaded,
-                )
-
-                commit_dalton_snapshot(dalton_state)
-                on_deployment_settings_boot_loaded(exported, rows, dalton_state.revision)
+            from src.dalton.deployment_credentials.hooks import commit_and_notify_boot_loaded
+            commit_and_notify_boot_loaded(dalton_state, exported, rows)
             if exported:
                 from ptc_agent.config.file_utils import clear_config_cache
 

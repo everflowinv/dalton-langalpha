@@ -1256,22 +1256,14 @@ def get_dalton_transcription_ticket_hmac_key() -> bytes | None:
     ).digest()
 
 
-_DEPLOYMENT_CREDENTIAL_SECRET_ENV_NAMES: tuple[str, ...] = (
-    "DALTON_GOOGLE_OAUTH_CLIENT_SECRET",
-    "DALTON_FEISHU_APP_SECRET",
-    "DALTON_FEISHU_ENCRYPT_KEY",
-    "DALTON_FEISHU_VERIFICATION_TOKEN",
-)
-
-
 def managed_secret_token_values() -> tuple[str, ...]:
     """Non-empty values of the management tokens and deployment secrets that must never leak.
 
     Includes ``DALTON_BRIDGE_ADMIN_TOKEN``, ``INTERNAL_SERVICE_TOKEN``,
     ``DALTON_TRANSCRIPTION_TICKET_SECRET``, ``DALTON_TRANSCRIPTION_TOKEN``,
-    ``DALTON_RESEARCH_ADMIN_TOKEN``, and the Batch 1 deployment credential secrets
-    (Google OAuth client secret, Feishu app secret, Feishu event encrypt key and
-    verification token). Any may be unset; only non-empty values are returned.
+    ``DALTON_RESEARCH_ADMIN_TOKEN``, and active Batch 1 deployment credential secrets
+    (environment, saved snapshot, and Vault fallback via ``active_deployment_secret_values``).
+    Any may be unset; only non-empty values are returned.
     """
     values: list[str] = []
     seen: set[str] = set()
@@ -1281,18 +1273,14 @@ def managed_secret_token_values() -> tuple[str, ...]:
         get_dalton_transcription_ticket_secret(),
         get_dalton_transcription_token(),
         get_dalton_research_admin_token(),
-        *(os.getenv(name, "").strip() for name in _DEPLOYMENT_CREDENTIAL_SECRET_ENV_NAMES),
     ):
         if token and token not in seen:
             seen.add(token)
             values.append(token)
-    # Also include active snapshot values so hot-rotated secrets are scrubbed immediately.
     try:
-        from src.dalton.deployment_credentials.snapshot import get_active_snapshot
+        from src.dalton.deployment_credentials.snapshot import active_deployment_secret_values
 
-        snap_values = get_active_snapshot().values
-        for name in _DEPLOYMENT_CREDENTIAL_SECRET_ENV_NAMES:
-            raw = snap_values.get(name, "").strip()
+        for _name, raw in active_deployment_secret_values():
             if raw and raw not in seen:
                 seen.add(raw)
                 values.append(raw)

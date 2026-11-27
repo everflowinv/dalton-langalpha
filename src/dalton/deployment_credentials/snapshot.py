@@ -115,9 +115,16 @@ def update_active_snapshot_vault(
     feishu_vault_pair: Mapping[str, str] | None,
     *,
     feishu_vault_error: bool,
-) -> CredentialSnapshot:
-    """Atomically update only the Vault slot of ``_active_snapshot`` preserving revision and saved rows."""
+    expected: CredentialSnapshot,
+) -> CredentialSnapshot | None:
+    """Atomically update the Vault slot of ``_active_snapshot`` when it still matches ``expected``.
+
+    Preserves revision and saved rows. Returns ``None`` without replacing ``_active_snapshot``
+    if a concurrent refresh has already installed a newer snapshot.
+    """
     current = _active_snapshot
+    if current is not expected:
+        return None
     frozen_vault = (
         MappingProxyType(dict(feishu_vault_pair))
         if feishu_vault_pair is not None
@@ -182,10 +189,8 @@ def _evaluate_group_from_mapping(
         else:
             resolved[key] = cleaned
 
-    if invalid:
-        return False, _EMPTY_MAPPING
     if pair_required:
-        if missing:
+        if invalid or missing:
             return False, _EMPTY_MAPPING
         return True, MappingProxyType(resolved)
     if not resolved:
@@ -273,7 +278,7 @@ async def preload_feishu_vault_pair(
     return pair, vault_error
 
 
-def get_credential_group(group: str) -> CredentialGroupResult:
+def get_credential_group(group_name: str) -> CredentialGroupResult:
     """Synchronously read one credential group from the active worker snapshot.
 
     Enforces single-source precedence per group:
@@ -281,9 +286,9 @@ def get_credential_group(group: str) -> CredentialGroupResult:
     Half-configured ``env`` or ``saved`` groups lock to that source with ``ready=False``
     and empty ``values`` rather than falling back to lower-priority sources.
     """
-    spec = get_credential_group_spec(group)
+    spec = get_credential_group_spec(group_name)
     if spec is None:
-        raise ValueError(f"Unknown credential group: {group!r}")
+        raise ValueError(f"Unknown credential group: {group_name!r}")
 
     snap = get_active_snapshot()
     at_start = setup_env._snapshot()
@@ -294,7 +299,7 @@ def get_credential_group(group: str) -> CredentialGroupResult:
             spec.keys, at_start, pair_required=spec.pair_required
         )
         return CredentialGroupResult(
-            group=group,
+            group=group_name,
             source="env",
             revision=snap.revision,
             ready=ready,
@@ -307,7 +312,7 @@ def get_credential_group(group: str) -> CredentialGroupResult:
             spec.keys, snap.values, pair_required=spec.pair_required
         )
         return CredentialGroupResult(
-            group=group,
+            group=group_name,
             source="saved",
             revision=snap.revision,
             ready=ready,
@@ -318,7 +323,7 @@ def get_credential_group(group: str) -> CredentialGroupResult:
     if spec.vault_fallback:
         if snap.feishu_vault_error:
             return CredentialGroupResult(
-                group=group,
+                group=group_name,
                 source="vault_error",
                 revision=snap.revision,
                 ready=False,
@@ -329,7 +334,7 @@ def get_credential_group(group: str) -> CredentialGroupResult:
                 spec.keys, snap.feishu_vault_pair, pair_required=spec.pair_required
             )
             return CredentialGroupResult(
-                group=group,
+                group=group_name,
                 source="vault_readonly",
                 revision=snap.revision,
                 ready=ready,
@@ -338,7 +343,7 @@ def get_credential_group(group: str) -> CredentialGroupResult:
 
     # 4. Unset.
     return CredentialGroupResult(
-        group=group,
+        group=group_name,
         source="unset",
         revision=snap.revision,
         ready=False,
@@ -346,16 +351,17 @@ def get_credential_group(group: str) -> CredentialGroupResult:
     )
 
 
-async def resolve_credential_group(group: str) -> CredentialGroupResult:
+async def resolve_credential_group(group_name: str) -> CredentialGroupResult:
     """Asynchronously resolve one credential group using the same single-source precedence.
 
-    When ``group == "feishu_app"`` and neither startup ``env`` nor ``saved`` rows hold
+    When ``group_name == "feishu_app"`` and neither startup ``env`` nor ``saved`` rows hold
     any ``feishu_app`` key, queries the primary administrator's Vault live and atomically
-    updates this worker's ``_active_snapshot`` Vault slot before returning.
+    updates this worker's ``_active_snapshot`` Vault slot when the snapshot has not changed
+    during the await.
     """
-    spec = get_credential_group_spec(group)
+    spec = get_credential_group_spec(group_name)
     if spec is None:
-        raise ValueError(f"Unknown credential group: {group!r}")
+        raise ValueError(f"Unknown credential group: {group_name!r}")
 
     snap = get_active_snapshot()
     at_start = setup_env._snapshot()
@@ -366,7 +372,7 @@ async def resolve_credential_group(group: str) -> CredentialGroupResult:
             spec.keys, at_start, pair_required=spec.pair_required
         )
         return CredentialGroupResult(
-            group=group,
+            group=group_name,
             source="env",
             revision=snap.revision,
             ready=ready,
@@ -379,7 +385,7 @@ async def resolve_credential_group(group: str) -> CredentialGroupResult:
             spec.keys, snap.values, pair_required=spec.pair_required
         )
         return CredentialGroupResult(
-            group=group,
+            group=group_name,
             source="saved",
             revision=snap.revision,
             ready=ready,
@@ -390,12 +396,21 @@ async def resolve_credential_group(group: str) -> CredentialGroupResult:
     if spec.vault_fallback:
         _last_feishu_vault_error.set(None)
         pair, vault_error, err = await query_feishu_vault_pair_strict()
+        # Re-evaluate against the latest snapshot if a concurrent refresh swapped it during await.
+        if get_active_snapshot() is not snap:
+            return get_credential_group(group_name)
         if err is not None:
             _last_feishu_vault_error.set(err)
-        updated = update_active_snapshot_vault(pair, feishu_vault_error=vault_error)
+        updated = update_active_snapshot_vault(
+            pair,
+            feishu_vault_error=vault_error,
+            expected=snap,
+        )
+        if updated is None:
+            return get_credential_group(group_name)
         if vault_error:
             return CredentialGroupResult(
-                group=group,
+                group=group_name,
                 source="vault_error",
                 revision=updated.revision,
                 ready=False,
@@ -406,14 +421,14 @@ async def resolve_credential_group(group: str) -> CredentialGroupResult:
                 spec.keys, pair, pair_required=spec.pair_required
             )
             return CredentialGroupResult(
-                group=group,
+                group=group_name,
                 source="vault_readonly",
                 revision=updated.revision,
                 ready=ready,
                 values=values,
             )
         return CredentialGroupResult(
-            group=group,
+            group=group_name,
             source="unset",
             revision=updated.revision,
             ready=False,
@@ -422,7 +437,7 @@ async def resolve_credential_group(group: str) -> CredentialGroupResult:
 
     # 4. Unset.
     return CredentialGroupResult(
-        group=group,
+        group=group_name,
         source="unset",
         revision=snap.revision,
         ready=False,
@@ -440,12 +455,11 @@ def get_feishu_event_credentials() -> CredentialGroupResult:
     return get_credential_group("feishu_event")
 
 
-def google_oauth_ready(*, public_app_url: str | None = None) -> bool:
+def google_oauth_ready() -> bool:
     """Return True when ``google_oauth`` credentials are complete and the redirect URI is eligible."""
     if not get_credential_group("google_oauth").ready:
         return False
-    url = get_dalton_public_app_url() if public_app_url is None else public_app_url
-    eligible, _reason = google_redirect_uri_eligible(url)
+    eligible, _reason = google_redirect_uri_eligible(get_dalton_public_app_url())
     return eligible
 
 
@@ -455,18 +469,46 @@ def feishu_app_ready() -> bool:
 
 
 def active_deployment_secret_values() -> tuple[tuple[str, str], ...]:
-    """Return ``(env_name, value)`` pairs for active deployment secrets (for redaction)."""
-    from src.dalton.deployment_credentials.catalog import DEPLOYMENT_SECRET_ENV_NAMES
+    """Return ``(env_name, value)`` pairs for active deployment secrets (for redaction).
+
+    Includes process environment, active saved snapshot rows, and the active Feishu
+    Vault slot (``DALTON_FEISHU_APP_SECRET``) so secrets from every active source are
+    scrubbed consistently.
+    """
     import os
 
-    snap_values = get_active_snapshot().values
-    seen: dict[str, str] = {}
+    from src.dalton.deployment_credentials.catalog import DEPLOYMENT_SECRET_ENV_NAMES
+
+    snap = get_active_snapshot()
+    vault_pair = snap.feishu_vault_pair or _EMPTY_MAPPING
+    pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
     for name in DEPLOYMENT_SECRET_ENV_NAMES:
-        for raw in (os.environ.get(name), snap_values.get(name)):
-            if isinstance(raw, str) and raw:
-                seen[name] = raw
-                break
-    return tuple(seen.items())
+        sources = (
+            os.environ.get(name),
+            snap.values.get(name),
+            vault_pair.get(name) if name == FEISHU_APP_SECRET_KEY else None,
+        )
+        for raw in sources:
+            if not isinstance(raw, str):
+                continue
+            cleaned = raw.strip()
+            if cleaned and (name, cleaned) not in seen:
+                seen.add((name, cleaned))
+                pairs.append((name, cleaned))
+    return tuple(pairs)
+
+
+def redact_deployment_secrets(text: str) -> str:
+    """Replace active deployment secrets meeting ``MIN_REDACT_SECRET_LEN`` with ``[REDACTED:NAME]``."""
+    from src.server.utils.secret_redactor import MIN_REDACT_SECRET_LEN
+
+    for name, value in sorted(
+        active_deployment_secret_values(), key=lambda kv: len(kv[1]), reverse=True
+    ):
+        if value and len(value) >= MIN_REDACT_SECRET_LEN and value in text:
+            text = text.replace(value, f"[REDACTED:{name}]")
+    return text
 
 
 __all__ = [
@@ -485,6 +527,7 @@ __all__ = [
     "inspect_feishu_app_incomplete",
     "preload_feishu_vault_pair",
     "query_feishu_vault_pair_strict",
+    "redact_deployment_secrets",
     "reset_active_snapshot_for_test",
     "resolve_credential_group",
     "resolve_feishu_app_credentials",

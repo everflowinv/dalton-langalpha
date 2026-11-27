@@ -60,18 +60,31 @@ def _require_dalton_enabled() -> None:
         raise HTTPException(status_code=404, detail={"code": "dalton_disabled"})
 
 
+_REQUEST_MODEL_FIELDS: frozenset[str] = frozenset({"expected_revision", "values"})
+
+
 def _sanitize_request_validation_error(exc: RequestValidationError) -> list[dict[str, str]]:
-    """Convert Pydantic/FastAPI validation errors to enum reasons with zero raw input values."""
+    """Convert Pydantic/FastAPI validation errors to enum reasons with allowlisted field names only."""
+    allowed_names = (
+        {spec.name for spec in get_field_specs(profile=resolve_profile())}
+        | _REQUEST_MODEL_FIELDS
+    )
     sanitized: list[dict[str, str]] = []
     for err in exc.errors():
         loc = err.get("loc") or ()
         err_type = str(err.get("type") or "")
-        if len(loc) >= 3 and str(loc[1]) == "values":
-            setting_name = str(loc[2])
-        elif loc:
-            setting_name = str(loc[-1])
-        else:
+        if not loc or loc == ("body",):
             setting_name = "_body"
+        else:
+            last = loc[-1]
+            if isinstance(last, int) and not isinstance(last, bool):
+                setting_name = "_body"
+            else:
+                if len(loc) >= 3 and str(loc[1]) == "values":
+                    candidate = str(loc[2])
+                else:
+                    candidate = str(last)
+                setting_name = candidate if candidate in allowed_names else "_unknown"
 
         if err_type == "extra_forbidden":
             reason = "unknown_setting"
@@ -276,10 +289,10 @@ async def get_deployment_settings_endpoint(
             "encryption_configured": encryption_configured(),
             "fields": fields,
             "redirect_uris": {
-                "google": build_integration_redirect_uri("google", base_url=public_url),
-                "feishu": build_integration_redirect_uri("feishu", base_url=public_url),
+                "google": build_integration_redirect_uri("google"),
+                "feishu": build_integration_redirect_uri("feishu"),
             },
-            "feishu_events_url": build_feishu_integration_events_url(base_url=public_url),
+            "feishu_events_url": build_feishu_integration_events_url(),
             "google_redirect_uri_eligible": google_eligible,
             "google_redirect_uri_reason": google_reason,
         },

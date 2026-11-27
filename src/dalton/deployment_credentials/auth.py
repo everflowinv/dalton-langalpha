@@ -56,7 +56,7 @@ async def require_deployment_admin_session(
     credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
 ) -> str:
     """FastAPI dependency enforcing an authenticated interactive web administrator session."""
-    if request.headers.get("X-Service-Token"):
+    if "x-service-token" in request.headers:
         raise _forbid(
             "session_auth_required",
             "Interactive web session authentication is required.",

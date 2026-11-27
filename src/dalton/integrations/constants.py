@@ -18,25 +18,21 @@ _PROVIDER_CALLBACK_PATHS: dict[str, str] = {
 }
 
 
-def build_integration_redirect_uri(provider: str, *, base_url: str | None = None) -> str:
+def build_integration_redirect_uri(provider: str) -> str:
     """Build the full OAuth callback URL for ``provider`` (``google`` or ``feishu``)."""
     normalized = str(provider or "").strip().lower()
     path = _PROVIDER_CALLBACK_PATHS.get(normalized)
     if path is None:
         raise ValueError(f"Unsupported integration provider: {provider!r}")
-    origin = (
-        get_dalton_public_app_url() if base_url is None else str(base_url)
-    ).strip().rstrip("/")
+    origin = get_dalton_public_app_url().strip().rstrip("/")
     if not origin:
         return ""
     return f"{origin}{path}"
 
 
-def build_feishu_integration_events_url(*, base_url: str | None = None) -> str:
+def build_feishu_integration_events_url() -> str:
     """Build the full Feishu personal-integration event subscription callback URL."""
-    origin = (
-        get_dalton_public_app_url() if base_url is None else str(base_url)
-    ).strip().rstrip("/")
+    origin = get_dalton_public_app_url().strip().rstrip("/")
     if not origin:
         return ""
     return f"{origin}{FEISHU_INTEGRATION_EVENTS_PATH}"

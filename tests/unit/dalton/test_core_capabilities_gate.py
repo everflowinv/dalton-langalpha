@@ -3003,3 +3003,165 @@ class TestDeploymentCredentialsReadContract:
         monkeypatch.setenv("DALTON_CAP_CHANNEL_GATEWAY", "false")
         assert has_capability(CapabilityId.CHANNEL_GATEWAY) is False
         assert has_capability(CapabilityId.CHANNEL_FEISHU) is False
+
+    @pytest.mark.asyncio
+    async def test_deployment_credentials_and_integration_url_public_contract_signatures(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.deployment_credentials import (
+            feishu_app_ready,
+            get_credential_group,
+            google_oauth_ready,
+            resolve_credential_group,
+        )
+        from src.dalton.deployment_credentials import snapshot as snap_mod
+        from src.dalton.integrations.constants import (
+            FEISHU_INTEGRATION_EVENTS_PATH,
+            GOOGLE_OAUTH_CALLBACK_PATH,
+            build_feishu_integration_events_url,
+            build_integration_redirect_uri,
+        )
+
+        # Verify exact parameter lists matching design §2.3 and lane 82 §4.3
+        def _param_names(fn: Any) -> list[str]:
+            return list(inspect.signature(fn).parameters.keys())
+
+        assert _param_names(get_credential_group) == ["group_name"]
+        assert _param_names(resolve_credential_group) == ["group_name"]
+        assert _param_names(google_oauth_ready) == []
+        assert _param_names(feishu_app_ready) == []
+        assert _param_names(build_integration_redirect_uri) == ["provider"]
+        assert _param_names(build_feishu_integration_events_url) == []
+
+        monkeypatch.setenv("PUBLIC_APP_URL", "https://research.example.com")
+        monkeypatch.setattr(
+            snap_mod,
+            "query_feishu_vault_pair_strict",
+            create_autospec(
+                snap_mod.query_feishu_vault_pair_strict,
+                return_value=(None, False, None),
+            ),
+        )
+
+        g_res = get_credential_group(group_name="google_oauth")
+        assert g_res.group == "google_oauth"
+        assert g_res.source == "unset"
+
+        f_res = await resolve_credential_group(group_name="feishu_app")
+        assert f_res.group == "feishu_app"
+        assert f_res.source == "unset"
+
+        assert google_oauth_ready() is False
+        assert feishu_app_ready() is False
+        assert (
+            build_integration_redirect_uri("google")
+            == f"https://research.example.com{GOOGLE_OAUTH_CALLBACK_PATH}"
+        )
+        assert (
+            build_feishu_integration_events_url()
+            == f"https://research.example.com{FEISHU_INTEGRATION_EVENTS_PATH}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolve_credential_group_reevaluates_when_snapshot_changes_during_vault_await(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.deployment_credentials import resolve_credential_group
+        from src.dalton.deployment_credentials import snapshot as snap_mod
+        from src.dalton.deployment_credentials.snapshot import (
+            build_snapshot,
+            get_active_snapshot,
+            set_active_snapshot,
+            update_active_snapshot_vault,
+        )
+
+        initial_snap = build_snapshot(3, {}, feishu_vault_pair=None, feishu_vault_error=False)
+        set_active_snapshot(initial_snap)
+
+        async def _swap_snapshot_during_vault_query():
+            # Simulate a concurrent refresh saving feishu_app (revision + 1) while awaiting Vault.
+            set_active_snapshot(
+                build_snapshot(
+                    4,
+                    {
+                        "DALTON_FEISHU_APP_ID": "saved-fresh-app-id",
+                        "DALTON_FEISHU_APP_SECRET": "test-secret-not-real-fresh-07",
+                    },
+                    feishu_vault_pair=None,
+                    feishu_vault_error=False,
+                )
+            )
+            return (
+                {
+                    "DALTON_FEISHU_APP_ID": "vault-stale-app-id",
+                    "DALTON_FEISHU_APP_SECRET": "test-secret-not-real-stale-08",
+                },
+                False,
+                None,
+            )
+
+        monkeypatch.setattr(
+            snap_mod,
+            "query_feishu_vault_pair_strict",
+            create_autospec(
+                snap_mod.query_feishu_vault_pair_strict,
+                side_effect=_swap_snapshot_during_vault_query,
+            ),
+        )
+
+        res = await resolve_credential_group(group_name="feishu_app")
+        assert res.source == "saved"
+        assert res.revision == 4
+        assert res.ready is True
+        assert res.values["DALTON_FEISHU_APP_ID"] == "saved-fresh-app-id"
+        # New snapshot's Vault slot must remain untouched.
+        current = get_active_snapshot()
+        assert current.revision == 4
+        assert current.feishu_vault_pair is None
+        assert current.feishu_vault_error is False
+        assert (
+            update_active_snapshot_vault(
+                {"DALTON_FEISHU_APP_ID": "late", "DALTON_FEISHU_APP_SECRET": "late-secret"},
+                feishu_vault_error=False,
+                expected=initial_snap,
+            )
+            is None
+        )
+        assert get_active_snapshot() is current
+
+    def test_feishu_event_group_ready_with_at_least_one_valid_key_when_sibling_invalid(
+        self,
+    ) -> None:
+        from src.dalton.deployment_credentials import get_credential_group
+        from src.dalton.deployment_credentials.snapshot import build_snapshot, set_active_snapshot
+
+        set_active_snapshot(
+            build_snapshot(
+                5,
+                {
+                    "DALTON_FEISHU_ENCRYPT_KEY": "bad key with space",
+                    "DALTON_FEISHU_VERIFICATION_TOKEN": "test-secret-not-real-evt-valid-09",
+                },
+            )
+        )
+        evt = get_credential_group(group_name="feishu_event")
+        assert evt.source == "saved"
+        assert evt.ready is True
+        assert dict(evt.values) == {
+            "DALTON_FEISHU_VERIFICATION_TOKEN": "test-secret-not-real-evt-valid-09",
+        }
+
+        # pair_required=True group still rejects the whole group if one key contains internal whitespace
+        set_active_snapshot(
+            build_snapshot(
+                6,
+                {
+                    "DALTON_FEISHU_APP_ID": "cli_valid_id",
+                    "DALTON_FEISHU_APP_SECRET": "abc def",
+                },
+            )
+        )
+        app_res = get_credential_group(group_name="feishu_app")
+        assert app_res.source == "saved"
+        assert app_res.ready is False
+        assert dict(app_res.values) == {}

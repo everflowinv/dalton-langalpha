@@ -30,7 +30,10 @@ from src.dalton.deployment_credentials.catalog import (
     group_keys,
     writable_field_names,
 )
-from src.dalton.deployment_credentials.snapshot import query_feishu_vault_pair_strict
+from src.dalton.deployment_credentials.snapshot import (
+    _validate_credential_value,
+    query_feishu_vault_pair_strict,
+)
 from src.dalton.profile import DeploymentProfile, resolve_profile
 from src.server.database.encryption import encryption_configured, get_encryption_key
 from src.server.database.pool import get_db_connection
@@ -249,6 +252,12 @@ def _normalize_single_value(
     if len(stripped) > _MAX_VALUE_LENGTH:
         return None, "value_too_long"
 
+    if spec.credential_group:
+        cleaned, is_invalid = _validate_credential_value(stripped)
+        if is_invalid or cleaned is None:
+            return None, "non_printable"
+        return cleaned, None
+
     if spec.input_kind == "textarea":
         if "\x00" in stripped or any(
             (not ch.isprintable() and ch not in ("\n", "\r", "\t")) for ch in stripped
@@ -266,18 +275,18 @@ def _validate_and_normalize_changes(
     *,
     profile: DeploymentProfile,
 ) -> dict[str, str | None]:
-    """Validate allowlist and field values without ever including raw values in errors."""
+    """Validate allowlist and field values without ever including raw values or unknown keys in errors."""
     allowed = writable_field_names(profile=profile)
     errors: list[dict[str, str]] = []
     normalized: dict[str, str | None] = {}
 
     for name, raw in changes.items():
         if name not in allowed:
-            errors.append({"setting_name": str(name), "reason": "unknown_setting"})
+            errors.append({"setting_name": "_unknown", "reason": "unknown_setting"})
             continue
         spec = get_field_spec(name, profile=profile)
         if spec is None:
-            errors.append({"setting_name": str(name), "reason": "unknown_setting"})
+            errors.append({"setting_name": "_unknown", "reason": "unknown_setting"})
             continue
         value, reason = _normalize_single_value(name, raw, spec)
         if reason is not None:

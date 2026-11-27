@@ -52,8 +52,10 @@ async def read_dalton_snapshot_state() -> DaltonReadState | None:
     )
 
 
-def commit_dalton_snapshot(state: DaltonReadState) -> None:
+def commit_dalton_snapshot(state: DaltonReadState | None) -> None:
     """Atomically install ``state`` as this worker's immutable ``CredentialSnapshot``."""
+    if state is None:
+        return
     set_active_snapshot(
         build_snapshot(
             state.revision,
@@ -73,6 +75,18 @@ def on_deployment_settings_boot_loaded(
     _ = (exported, rows, revision)
 
 
+def commit_and_notify_boot_loaded(
+    state: DaltonReadState | None,
+    exported: set[str],
+    rows: Mapping[str, str],
+) -> None:
+    """Commit the boot snapshot and run the post-boot hook when Dalton mode is active."""
+    if state is None:
+        return
+    commit_dalton_snapshot(state)
+    on_deployment_settings_boot_loaded(exported, rows, state.revision)
+
+
 async def on_deployment_settings_refreshed(
     changed: set[str],
     rows: Mapping[str, str],
@@ -80,6 +94,17 @@ async def on_deployment_settings_refreshed(
 ) -> None:
     """Post-refresh hook invoked before ``_unapplied`` is cleared in ``apply.refresh()``."""
     _ = (changed, rows, revision)
+
+
+async def notify_dalton_refreshed(
+    state: DaltonReadState | None,
+    changed: set[str],
+    rows: Mapping[str, str],
+) -> None:
+    """Invoke the post-refresh hook before ``_unapplied`` is cleared when Dalton mode is active."""
+    if state is None:
+        return
+    await on_deployment_settings_refreshed(changed, rows, state.revision)
 
 
 async def on_vault_secrets_changed(secret_names: Iterable[str]) -> None:

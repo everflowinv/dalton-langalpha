@@ -218,6 +218,15 @@ class TestAuthMatrix:
         assert res_svc.status_code == 403
         assert res_svc.json()["detail"]["code"] == "session_auth_required"
 
+        # 2b. Admin JWT + empty X-Service-Token header -> 403 session_auth_required
+        _patch_local_admin(monkeypatch, user_id="local-admin-empty-svc", is_admin=True)
+        res_empty_svc = client.get(
+            ENDPOINT,
+            headers={"Authorization": "Bearer local-jwt", "X-Service-Token": ""},
+        )
+        assert res_empty_svc.status_code == 403
+        assert res_empty_svc.json()["detail"]["code"] == "session_auth_required"
+
         # 3. Computer CLI token (lac1_* / lac1.) -> 403 session_auth_required
         for cli_tok in ("lac1_abc1234567890", "lac1.abc1234567890"):
             res_cli = client.get(ENDPOINT, headers={"Authorization": f"Bearer {cli_tok}"})
@@ -393,7 +402,7 @@ class TestReadWriteValidationAndConflicts:
         client = _make_client()
 
         with caplog.at_level(logging.DEBUG):
-            # 1. Unknown setting -> 422 unknown_setting without echoing value
+            # 1. Unknown setting -> 422 unknown_setting masked as _unknown without echoing key or value
             r_unknown = client.put(
                 ENDPOINT,
                 headers={"Authorization": "Bearer local-jwt"},
@@ -402,9 +411,49 @@ class TestReadWriteValidationAndConflicts:
             assert r_unknown.status_code == 422
             assert r_unknown.json() == {
                 "code": "validation_error",
-                "errors": [{"setting_name": "OPENAI_API_KEY", "reason": "unknown_setting"}],
+                "errors": [{"setting_name": "_unknown", "reason": "unknown_setting"}],
             }
+            assert "OPENAI_API_KEY" not in r_unknown.text
             _assert_no_secrets_leaked(r_unknown.text)
+
+            # 1b. Secret-like unknown key in values and at top level -> masked as _unknown
+            secret_like_key = "test-secret-not-real-0009"
+            r_unknown_val_key = client.put(
+                ENDPOINT,
+                headers={"Authorization": "Bearer local-jwt"},
+                json={"expected_revision": 0, "values": {secret_like_key: "placeholder"}},
+            )
+            assert r_unknown_val_key.status_code == 422
+            assert secret_like_key not in r_unknown_val_key.text
+            assert r_unknown_val_key.json() == {
+                "code": "validation_error",
+                "errors": [{"setting_name": "_unknown", "reason": "unknown_setting"}],
+            }
+
+            r_unknown_top_key = client.put(
+                ENDPOINT,
+                headers={"Authorization": "Bearer local-jwt"},
+                json={"expected_revision": 0, "values": {}, secret_like_key: "placeholder"},
+            )
+            assert r_unknown_top_key.status_code == 422
+            assert secret_like_key not in r_unknown_top_key.text
+            assert r_unknown_top_key.json() == {
+                "code": "validation_error",
+                "errors": [{"setting_name": "_unknown", "reason": "unknown_setting"}],
+            }
+
+            # 1c. Malformed JSON -> 422 with _body
+            r_malformed = client.put(
+                ENDPOINT,
+                headers={
+                    "Authorization": "Bearer local-jwt",
+                    "Content-Type": "application/json",
+                },
+                content="{not-json",
+            )
+            assert r_malformed.status_code == 422
+            assert r_malformed.json()["code"] == "validation_error"
+            assert all(e["setting_name"] == "_body" for e in r_malformed.json()["errors"])
 
             # 2. Half pair for pair_required=True google_oauth -> 422 incomplete_credential_group
             r_half = client.put(
@@ -447,7 +496,7 @@ class TestReadWriteValidationAndConflicts:
             }
             _assert_no_secrets_leaked(r_bad.text)
 
-            # 4. Extra top-level Pydantic field -> sanitized 422 with zero raw input
+            # 4. Extra top-level Pydantic field -> sanitized 422 with _unknown and zero raw input
             r_extra = client.put(
                 ENDPOINT,
                 headers={"Authorization": "Bearer local-jwt"},
@@ -458,9 +507,33 @@ class TestReadWriteValidationAndConflicts:
                 },
             )
             assert r_extra.status_code == 422
-            assert r_extra.json()["code"] == "validation_error"
+            assert r_extra.json() == {
+                "code": "validation_error",
+                "errors": [{"setting_name": "_unknown", "reason": "unknown_setting"}],
+            }
+            assert "unexpected_secret_field" not in r_extra.text
             assert "input" not in r_extra.text
             _assert_no_secrets_leaked(r_extra.text)
+
+            # 5. Internal whitespace in credential-group value -> 422 non_printable, revision unchanged
+            r_ws = client.put(
+                ENDPOINT,
+                headers={"Authorization": "Bearer local-jwt"},
+                json={
+                    "expected_revision": 0,
+                    "values": {
+                        "DALTON_FEISHU_APP_ID": "cli_feishu_ws_1",
+                        "DALTON_FEISHU_APP_SECRET": "abc def",
+                    },
+                },
+            )
+            assert r_ws.status_code == 422
+            assert r_ws.json() == {
+                "code": "validation_error",
+                "errors": [{"setting_name": "DALTON_FEISHU_APP_SECRET", "reason": "non_printable"}],
+            }
+            assert "abc def" not in r_ws.text
+            assert fake_db.revision == 0
 
         _assert_no_secrets_leaked(caplog.text)
 
@@ -771,6 +844,28 @@ class TestRedirectUriRedactionAndVaultHooks:
         assert "[REDACTED:DALTON_FEISHU_APP_SECRET]" in redacted_text
         assert "[REDACTED:DALTON_FEISHU_ENCRYPT_KEY]" in redacted_text
         assert "[REDACTED:DALTON_FEISHU_VERIFICATION_TOKEN]" in redacted_text
+
+        # Vault-only Feishu App Secret (Everflow prod fallback) is scrubbed by both redactors
+        vault_only_secret = "test-secret-not-real-vault-only-0010"
+        dc_snapshot.set_active_snapshot(
+            dc_snapshot.build_snapshot(
+                2,
+                {},
+                feishu_vault_pair={
+                    "DALTON_FEISHU_APP_ID": "cli_vault_only_id",
+                    "DALTON_FEISHU_APP_SECRET": vault_only_secret,
+                },
+            )
+        )
+        vault_payload = f"app=cli_vault_only_id sec={vault_only_secret}"
+        redacted_vault_tokens = dalton_settings.redact_managed_tokens(vault_payload)
+        assert vault_only_secret not in redacted_vault_tokens
+        assert "cli_vault_only_id" in redacted_vault_tokens
+
+        redacted_vault_text = redactor.redact(vault_payload)
+        assert vault_only_secret not in redacted_vault_text
+        assert "[REDACTED:DALTON_FEISHU_APP_SECRET]" in redacted_vault_text
+        assert "cli_vault_only_id" in redacted_vault_text
 
     @pytest.mark.asyncio
     async def test_vault_invalidation_hook_refreshes_on_feishu_keys_and_ignores_errors(

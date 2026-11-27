@@ -86,13 +86,8 @@ class SecretRedactor:
                 if value and len(value) >= MIN_REDACT_SECRET_LEN and value in text:  # DALTON-HOOK(workspace-sharing-settings)
                     text = text.replace(value, f"[REDACTED:{name}]")
         # DALTON-HOOK(deployment-credentials): scrub active deployment credential secrets dynamically
-        from src.dalton.deployment_credentials.snapshot import active_deployment_secret_values
-
-        for name, value in sorted(
-            active_deployment_secret_values(), key=lambda kv: len(kv[1]), reverse=True
-        ):
-            if value and len(value) >= MIN_REDACT_SECRET_LEN and value in text:
-                text = text.replace(value, f"[REDACTED:{name}]")
+        from src.dalton.deployment_credentials.snapshot import redact_deployment_secrets
+        text = redact_deployment_secrets(text)
         text = _SANDBOX_TOKEN_RE.sub("[REDACTED:SANDBOX_TOKEN]", text)
         text = _SETUP_TOKEN_RE.sub("[REDACTED:CLAUDE_SETUP_TOKEN]", text)
         return text
