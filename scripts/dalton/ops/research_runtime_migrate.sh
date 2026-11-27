@@ -1032,6 +1032,7 @@ PY
         echo "[switch] detected loaded com.dalton.* host service(s); running host_services_switch.sh --apply --rerender-only"
         if ! (
             DALTON_REPO_ROOT="${REPO_ROOT}" \
+            DALTON_REPO_ENV_FILE="${repo_env_file}" \
             DALTON_GUIDEPOINT_OWNERSHIP_FILE="${ownership_file}" \
             DALTON_BRIDGE_ENV_FILE="${BRIDGE_ENV_FILE}" \
             DALTON_RESEARCH_CODE="${CODE_ROOT}" \

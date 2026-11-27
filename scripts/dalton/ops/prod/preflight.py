@@ -21,8 +21,10 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+import ctypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import fcntl
 import hashlib
 import importlib
@@ -32,6 +34,8 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import secrets
+import shutil
 import stat
 import subprocess
 import sys
@@ -181,14 +185,15 @@ def _abs_no_deref(path: Path | str) -> Path:
 
 
 def _has_unexpanded_path_syntax(value: str) -> str | None:
+    """Return ONLY the error category (never raw value) if unexpanded path/template syntax is present."""
     if _PLACEHOLDER_RE.search(value):
-        return f"unreplaced placeholder in {value!r}"
+        return "unreplaced_placeholder"
     if "$HOME" in value or "${" in value:
-        return f"unexpanded shell variable in {value!r}"
+        return "unexpanded_shell_variable"
     # Check tilde at start or after ':' (e.g. PYTHONPATH)
     for part in value.split(":"):
         if part == "~" or part.startswith("~/"):
-            return f"unexpanded tilde path in {value!r}"
+            return "unexpanded_tilde_path"
     return None
 
 
@@ -196,6 +201,22 @@ def _is_literal_abs_path(value: str) -> bool:
     if not value or not value.startswith("/"):
         return False
     return _has_unexpanded_path_syntax(value) is None
+
+
+def _strip_dotenv_value(raw_val: str, *, strict_hash_comment: bool = False) -> str:
+    """Strip quotes or trailing `#` comments matching `deploy_main.sh` `.env` parsing."""
+    val = raw_val.strip()
+    if not val:
+        return ""
+    if val[0] == '"':
+        end = val.find('"', 1)
+        return val[1:end] if end > 0 else val[1:]
+    if val[0] == "'":
+        end = val.find("'", 1)
+        return val[1:end] if end > 0 else val[1:]
+    if strict_hash_comment:
+        return re.sub(r"[ \t]*#.*$", "", val).strip()
+    return re.sub(r"[ \t]+#.*$", "", val).strip()
 
 
 def _parse_simple_env_file(path: Path) -> dict[str, str]:
@@ -215,11 +236,9 @@ def _parse_simple_env_file(path: Path) -> dict[str, str]:
             line = line[len("export ") :].strip()
         key, val = line.split("=", 1)
         key = key.strip()
-        val = val.strip()
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
-            val = val[1:-1]
         if key:
-            result[key] = val
+            strict_hash = key in ("COMPOSE_FILE", "COMPOSE_PROJECT_NAME", "COMPOSE_PATH_SEPARATOR")
+            result[key] = _strip_dotenv_value(val, strict_hash_comment=strict_hash)
     return result
 
 
@@ -251,22 +270,38 @@ def _sanitize_diag_value(key: str, value: Any) -> str:
     return sval
 
 
+_GENERIC_URI_RE = re.compile(r"""[A-Za-z][A-Za-z0-9+.-]*://[^\s"'<>)\],;]+""")
+
+
 def _sanitize_error_text(text: str) -> str:
-    # Redact any embedded Bearer tokens or URL userinfo in exception/error messages
-    cleaned = re.sub(r"(?i)(Bearer\s+)[^\s;\"']+", r"\1<redacted>", text)
-    cleaned = re.sub(r"(https?://)([^/@\s]+)@", r"\1***@", cleaned)
+    """Redact credentials, URL userinfo, URL queries, URL fragments, and bearer/header tokens."""
+    cleaned = _GENERIC_URI_RE.sub(lambda m: _sanitize_url_for_diag(m.group(0)), text)
+    cleaned = re.sub(r"(?i)\b((?:Bearer|Basic|Token)\s+)[^\s;\"']+", r"\1<redacted>", cleaned)
+    cleaned = re.sub(
+        r"(?i)\b(Authorization|X-Service-Token)\s*:\s*[^\r\n;,]+",
+        r"\1: <redacted>",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"(?i)\b(password|passwd|secret|token|api_key|client_secret)\s*([:=])\s*[^\s,;\"']+",
+        r"\1\2<redacted>",
+        cleaned,
+    )
     return cleaned
 
 
-def _fsync_dir(path: Path) -> None:
+def _fsync_dir(path: Path, *, strict: bool = True) -> None:
     try:
         dfd = os.open(str(path), os.O_RDONLY)
     except OSError:
+        if strict:
+            raise
         return
     try:
         os.fsync(dfd)
     except OSError:
-        pass
+        if strict:
+            raise
     finally:
         os.close(dfd)
 
@@ -287,7 +322,7 @@ def _atomic_write_text(path: Path, content: str, *, mode: int = 0o600) -> None:
             os.fsync(fh.fileno())
         os.chmod(tmp_path, mode)
         os.replace(tmp_path, path)
-        _fsync_dir(path.parent)
+        _fsync_dir(path.parent, strict=True)
     except Exception:
         try:
             if tmp_path.exists():
@@ -397,12 +432,14 @@ def _run_cmd(
     argv: Sequence[str],
     *,
     env: Mapping[str, str] | None = None,
+    cwd: Path | str | None = None,
     timeout_s: float = 15.0,
 ) -> tuple[int, str, str]:
     try:
         proc = subprocess.run(
             list(argv),
             env=dict(env) if env is not None else None,
+            cwd=str(cwd) if cwd is not None else None,
             capture_output=True,
             text=True,
             timeout=timeout_s,
@@ -427,10 +464,32 @@ def _load_module_from_path(module_name: str, file_path: Path) -> Any:
     return mod
 
 
+def _is_running_from_recovery_bin() -> bool:
+    here = Path(__file__).resolve()
+    parent_name = here.parent.name
+    grandparent_name = here.parents[1].name if len(here.parents) >= 2 else ""
+    return (
+        parent_name == "recovery-bin"
+        or parent_name.startswith(".recovery-bin.rel.")
+        or grandparent_name == "cutover-snapshots"
+    )
+
+
 def _import_guidepoint_lock(repo_root: Path | None = None) -> Any:
-    """Load `guidepoint_lock.py`, pinning to the same-batch sibling copy when in recovery-bin."""
+    """Load `guidepoint_lock.py`.
+
+    When executing from `recovery-bin/` (or a staged sibling release), fail closed if the
+    same-batch sibling `guidepoint_lock.py` is missing — NEVER fall back to the worktree copy.
+    """
     sys.dont_write_bytecode = True
     sibling = Path(__file__).resolve().parent / "guidepoint_lock.py"
+    if _is_running_from_recovery_bin():
+        if not sibling.is_file() or sibling.is_symlink():
+            raise ImportError(
+                f"same-batch recovery-bin guidepoint_lock.py missing: {sibling} (refusing worktree fallback)"
+            )
+        return _load_module_from_path("_dalton_recovery_guidepoint_lock", sibling)
+
     if sibling.is_file():
         return _load_module_from_path("_dalton_recovery_guidepoint_lock", sibling)
 
@@ -442,6 +501,19 @@ def _import_guidepoint_lock(repo_root: Path | None = None) -> Any:
         if cand.is_file():
             return _load_module_from_path("_dalton_worktree_guidepoint_lock", cand)
     raise ImportError("guidepoint_lock.py not found in recovery-bin or repo research_runtime")
+
+
+def _import_bridge_subprocess_env(repo_root: Path | None = None) -> Any:
+    """Load shared `bridge_subprocess_env.py` so preflight & renderer use one parser/resolver."""
+    sys.dont_write_bytecode = True
+    candidates: list[Path] = []
+    if repo_root is not None:
+        candidates.append(repo_root / "scripts" / "dalton" / "bridge_subprocess_env.py")
+    candidates.append(_default_repo_root() / "scripts" / "dalton" / "bridge_subprocess_env.py")
+    for cand in candidates:
+        if cand.is_file():
+            return _load_module_from_path("_dalton_shared_bridge_subprocess_env", cand)
+    raise ImportError("bridge_subprocess_env.py not found")
 
 
 def _import_capabilities(repo_root: Path) -> tuple[Any, Any]:
@@ -678,6 +750,8 @@ class PreflightConfig:
     budgets_file: Path
     expect_admission: str = "any"
     proxy_listen_port: int = 8943
+    research_host_plist: Path | None = None
+    archived_plist_dir: Path | None = None
     launchctl_bin: str = "launchctl"
     lsof_bin: str = "lsof"
     ps_bin: str = "ps"
@@ -701,6 +775,10 @@ class PreflightConfig:
         return (self.repo_root / DEFAULT_OWNERSHIP_REL_PATH).resolve()
 
     @property
+    def snapshots_root(self) -> Path:
+        return (self.repo_root / "var" / "dalton" / "cutover-snapshots").resolve()
+
+    @property
     def venv_python(self) -> Path:
         return self.repo_root / ".venv" / "bin" / "python"
 
@@ -708,19 +786,112 @@ class PreflightConfig:
     def effective_uid(self) -> str:
         return self.uid or str(os.getuid())
 
+    def resolve_research_host_plist(self, mode: str) -> tuple[Path | None, str | None]:
+        """Resolve `com.dalton.research-host.plist` for the given stage layout (§6.4b).
+
+        - `stage-a`: reads from `--research-host-plist` or `--plist-dir`.
+        - `switch` (Stage B): Stage A moves `com.dalton.research-host.plist` OUT of
+          `~/Library/LaunchAgents/` into `archived-launchagents/`; default lookup reads the
+          archived plist (`--research-host-plist` > `--archived-plist-dir` >
+          `<journal.snapshot_dir>/archived-launchagents/` >
+          `cutover-snapshots/research-host/archived-launchagents/` >
+          latest `cutover-snapshots/stage-a/*/archived-launchagents/`). When post-cutover
+          (`target_owner == "research_host_8951"`), the active LaunchAgents copy is also checked.
+        """
+        fname = "com.dalton.research-host.plist"
+        if self.research_host_plist is not None:
+            p = self.research_host_plist.expanduser().resolve()
+            if not p.is_file():
+                return None, f"missing research-host plist: {p}"
+            return p, None
+
+        if mode == "stage-a":
+            p = self.plist_dir / fname
+            if not p.is_file():
+                return None, f"missing plist: {p}"
+            return p, None
+
+        if self.archived_plist_dir is not None:
+            p = self.archived_plist_dir.expanduser().resolve() / fname
+            if not p.is_file():
+                return None, f"missing archived research-host plist: {p}"
+            return p, None
+
+        checked: list[str] = []
+        journal, j_err = _read_journal_strict(self.ownership_file)
+        if j_err is not None:
+            return None, j_err
+
+        target_owner = str((journal or {}).get("target_owner") or "").strip()
+        snap_raw = str((journal or {}).get("snapshot_dir") or "").strip()
+        if snap_raw:
+            snap_dir = Path(snap_raw).expanduser().resolve()
+            try:
+                snap_dir.relative_to(self.snapshots_root)
+            except ValueError:
+                return None, f"untrusted snapshot_dir outside cutover-snapshots: {snap_dir}"
+            cand = snap_dir / "archived-launchagents" / fname
+            checked.append(str(cand))
+            if cand.is_file():
+                return cand, None
+
+        canonical_archived = self.snapshots_root / "research-host" / "archived-launchagents" / fname
+        checked.append(str(canonical_archived))
+        if canonical_archived.is_file():
+            return canonical_archived, None
+
+        stage_a_root = self.snapshots_root / "stage-a"
+        if stage_a_root.is_dir():
+            for snap in sorted(stage_a_root.iterdir(), key=lambda p: p.name, reverse=True):
+                if not snap.is_dir():
+                    continue
+                cand = snap / "archived-launchagents" / fname
+                checked.append(str(cand))
+                if cand.is_file():
+                    return cand, None
+
+        if target_owner == "research_host_8951":
+            active_p = self.plist_dir / fname
+            checked.append(str(active_p))
+            if active_p.is_file():
+                return active_p, None
+
+        return None, (
+            f"missing archived {fname} (Stage A must archive it out of LaunchAgents; "
+            f"checked: {', '.join(checked) if checked else str(canonical_archived)})"
+        )
+
 
 def _result(check: str, status: str, detail: str) -> dict[str, str]:
     return {"check": check, "status": status, "detail": detail}
 
 
-def _extract_flag_value(prog_args: Sequence[Any], flag: str) -> str | None:
-    for idx, arg in enumerate(prog_args):
-        s = str(arg)
-        if s == flag and idx + 1 < len(prog_args):
-            return str(prog_args[idx + 1])
+def _extract_flag_values(prog_args: Sequence[Any], flag: str) -> tuple[list[str], list[str]]:
+    """Extract all occurrences of `flag` from `ProgramArguments`, failing on duplicates/missing values."""
+    values: list[str] = []
+    errors: list[str] = []
+    idx = 0
+    n = len(prog_args)
+    while idx < n:
+        s = str(prog_args[idx])
+        if s == "--":
+            break
+        if s == flag:
+            if idx + 1 >= n:
+                errors.append(f"{flag}: missing_value")
+                idx += 1
+            else:
+                values.append(str(prog_args[idx + 1]))
+                idx += 2
+            continue
         if s.startswith(flag + "="):
-            return s[len(flag) + 1 :]
-    return None
+            values.append(s[len(flag) + 1 :])
+            idx += 1
+            continue
+        idx += 1
+    if len(values) > 1:
+        errors.append(f"{flag}: duplicate_argument ({len(values)} occurrences)")
+    return values, errors
 
 
 def _inspect_plist_file(
@@ -740,16 +911,14 @@ def _inspect_plist_file(
         raw_bytes = plist_path.read_bytes()
         data = plistlib.loads(raw_bytes)
     except Exception as exc:
-        return None, [f"invalid plist {plist_path}: {exc}"]
+        return None, [f"invalid plist {plist_path.name}: {type(exc).__name__}"]
     if not isinstance(data, dict):
-        return None, [f"plist root is not dict: {plist_path}"]
+        return None, [f"plist root is not dict: {plist_path.name}"]
 
     if str(data.get("Label") or "") != expected_label:
-        errors.append(
-            f"{plist_path.name}: Label={data.get('Label')!r}, expected {expected_label!r}"
-        )
+        errors.append(f"{plist_path.name}: Label: mismatch (expected {expected_label})")
 
-    # Scan all string fields for unexpanded syntax ($HOME, ~, ${, __X__)
+    # Scan all string fields for unexpanded syntax ($HOME, ~, ${, __X__) — emit ONLY field location + error class
     def _walk_strings(obj: Any, loc: str) -> None:
         if isinstance(obj, str):
             bad = _has_unexpanded_path_syntax(obj)
@@ -764,32 +933,35 @@ def _inspect_plist_file(
 
     _walk_strings(data, "root")
 
-    # Validate literal absolute paths for standard plist path keys
+    # Validate literal absolute paths for standard plist path keys (never echo raw values)
     for pkey in ("WorkingDirectory", "StandardOutPath", "StandardErrorPath"):
         val = data.get(pkey)
         if val is not None and not _is_literal_abs_path(str(val)):
-            errors.append(f"{plist_path.name}: {pkey} must be a literal absolute path (got {val!r})")
+            errors.append(f"{plist_path.name}: {pkey}: not_literal_abs_path")
 
     prog_args = data.get("ProgramArguments")
     if not isinstance(prog_args, list) or not prog_args:
-        errors.append(f"{plist_path.name}: missing ProgramArguments")
+        errors.append(f"{plist_path.name}: ProgramArguments: missing")
         prog_args = []
     else:
         if not _is_literal_abs_path(str(prog_args[0])):
-            errors.append(
-                f"{plist_path.name}: ProgramArguments[0] must be a literal absolute path (got {prog_args[0]!r})"
-            )
-        # Validate path-valued CLI flags like --env-file / --repo-env-file
+            errors.append(f"{plist_path.name}: ProgramArguments[0]: not_literal_abs_path")
+        # Validate path-valued & critical CLI flags; reject duplicates explicitly
         for flag in ("--env-file", "--repo-env-file"):
-            nxt = _extract_flag_value(prog_args, flag)
-            if nxt is not None and not _is_literal_abs_path(nxt):
-                errors.append(
-                    f"{plist_path.name}: {flag} value must be a literal absolute path (got {nxt!r})"
-                )
+            vals, ferrs = _extract_flag_values(prog_args, flag)
+            for fe in ferrs:
+                errors.append(f"{plist_path.name}: {fe}")
+            for v in vals:
+                if not _is_literal_abs_path(v):
+                    errors.append(f"{plist_path.name}: {flag}: not_literal_abs_path")
+        for flag in ("--host", "--port"):
+            _, ferrs = _extract_flag_values(prog_args, flag)
+            for fe in ferrs:
+                errors.append(f"{plist_path.name}: {fe}")
 
     env_vars = data.get("EnvironmentVariables")
     if not isinstance(env_vars, dict):
-        errors.append(f"{plist_path.name}: missing EnvironmentVariables dict")
+        errors.append(f"{plist_path.name}: EnvironmentVariables: missing_or_not_dict")
         env_vars = {}
 
     for k, v in env_vars.items():
@@ -797,19 +969,13 @@ def _inspect_plist_file(
         if k == "DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH":
             parts = [part.strip() for part in re.split(r"[:,]", sv) if part.strip()]
             if not parts or any(not _is_literal_abs_path(part) for part in parts):
-                errors.append(
-                    f"{plist_path.name}: EnvironmentVariables.{k} entries must be literal absolute paths (got {sv!r})"
-                )
+                errors.append(f"{plist_path.name}: EnvironmentVariables.{k}: not_literal_abs_path")
         elif k in _PLIST_PATH_ENV_KEYS and not _is_literal_abs_path(sv):
-            errors.append(
-                f"{plist_path.name}: EnvironmentVariables.{k} must be a literal absolute path (got {sv!r})"
-            )
+            errors.append(f"{plist_path.name}: EnvironmentVariables.{k}: not_literal_abs_path")
         elif k == "PYTHONPATH":
             parts = [part for part in sv.split(":") if part]
             if not parts or any(not _is_literal_abs_path(part) for part in parts):
-                errors.append(
-                    f"{plist_path.name}: PYTHONPATH entries must be literal absolute paths (got {sv!r})"
-                )
+                errors.append(f"{plist_path.name}: EnvironmentVariables.PYTHONPATH: not_literal_abs_path")
 
     repo_abs = cfg.repo_root.resolve()
     expected_py = str(repo_abs / ".venv" / "bin" / "python")
@@ -819,80 +985,67 @@ def _inspect_plist_file(
     if require_venv_python:
         actual_py = str(prog_args[0]) if prog_args else ""
         if actual_py != expected_py:
-            errors.append(
-                f"{plist_path.name}: ProgramArguments[0]={actual_py!r}, expected {expected_py!r}"
-            )
+            errors.append(f"{plist_path.name}: ProgramArguments[0]: expected {expected_py}")
         actual_pp = str(env_vars.get("PYTHONPATH") or "")
         if actual_pp != expected_pythonpath:
-            errors.append(
-                f"{plist_path.name}: PYTHONPATH={actual_pp!r}, expected {expected_pythonpath!r}"
-            )
+            errors.append(f"{plist_path.name}: EnvironmentVariables.PYTHONPATH: expected {expected_pythonpath}")
         actual_repo_env = str(env_vars.get("DALTON_REPO_ENV_FILE") or "")
         if actual_repo_env != expected_repo_env:
-            errors.append(
-                f"{plist_path.name}: DALTON_REPO_ENV_FILE={actual_repo_env!r}, "
-                f"expected {expected_repo_env!r}"
-            )
+            errors.append(f"{plist_path.name}: EnvironmentVariables.DALTON_REPO_ENV_FILE: expected {expected_repo_env}")
 
     if require_bridge_env_match:
         raw_bridge_env = str(env_vars.get("DALTON_BRIDGE_ENV_FILE") or "").strip()
         expected_bridge_env = cfg.bridge_env_file.expanduser().resolve()
         if not raw_bridge_env:
-            errors.append(f"{plist_path.name}: missing DALTON_BRIDGE_ENV_FILE")
-        else:
+            errors.append(f"{plist_path.name}: EnvironmentVariables.DALTON_BRIDGE_ENV_FILE: missing")
+        elif _is_literal_abs_path(raw_bridge_env):
             resolved_bridge_env = Path(raw_bridge_env).expanduser().resolve()
             if resolved_bridge_env != expected_bridge_env:
                 errors.append(
-                    f"{plist_path.name}: DALTON_BRIDGE_ENV_FILE resolves to {resolved_bridge_env}, "
-                    f"expected {expected_bridge_env}"
+                    f"{plist_path.name}: EnvironmentVariables.DALTON_BRIDGE_ENV_FILE: expected {expected_bridge_env}"
                 )
 
     if require_ownership_match:
         raw_own = str(env_vars.get("DALTON_GUIDEPOINT_OWNERSHIP_FILE") or "").strip()
         expected_own = cfg.ownership_file
         if not raw_own:
-            errors.append(f"{plist_path.name}: missing DALTON_GUIDEPOINT_OWNERSHIP_FILE")
-        else:
+            errors.append(f"{plist_path.name}: EnvironmentVariables.DALTON_GUIDEPOINT_OWNERSHIP_FILE: missing")
+        elif _is_literal_abs_path(raw_own):
             resolved_own = Path(raw_own).expanduser().resolve()
             if resolved_own != expected_own:
                 errors.append(
-                    f"{plist_path.name}: DALTON_GUIDEPOINT_OWNERSHIP_FILE resolves to {resolved_own}, "
-                    f"expected {expected_own}"
+                    f"{plist_path.name}: EnvironmentVariables.DALTON_GUIDEPOINT_OWNERSHIP_FILE: expected {expected_own}"
                 )
 
     if require_research_host_startup:
         expected_host_env = cfg.research_host_env_file.expanduser().resolve()
         expected_repo_env_resolved = cfg.repo_env_file.expanduser().resolve()
-        arg_env_file = _extract_flag_value(prog_args, "--env-file")
-        arg_repo_env = _extract_flag_value(prog_args, "--repo-env-file")
+        env_vals, _ = _extract_flag_values(prog_args, "--env-file")
+        repo_vals, _ = _extract_flag_values(prog_args, "--repo-env-file")
+        arg_env_file = env_vals[-1] if env_vals else None
+        arg_repo_env = repo_vals[-1] if repo_vals else None
         ev_host_env = str(env_vars.get("DALTON_RESEARCH_HOST_ENV_FILE") or "").strip()
         ev_repo_env = str(env_vars.get("DALTON_REPO_ENV_FILE") or "").strip()
 
         if not arg_env_file:
-            errors.append(f"{plist_path.name}: ProgramArguments missing --env-file")
-        elif Path(arg_env_file).expanduser().resolve() != expected_host_env:
-            errors.append(
-                f"{plist_path.name}: --env-file resolves to {Path(arg_env_file).expanduser().resolve()}, "
-                f"expected {expected_host_env}"
-            )
+            errors.append(f"{plist_path.name}: ProgramArguments.--env-file: missing")
+        elif _is_literal_abs_path(arg_env_file) and Path(arg_env_file).expanduser().resolve() != expected_host_env:
+            errors.append(f"{plist_path.name}: ProgramArguments.--env-file: expected {expected_host_env}")
         if not ev_host_env:
-            errors.append(f"{plist_path.name}: missing DALTON_RESEARCH_HOST_ENV_FILE")
-        elif Path(ev_host_env).expanduser().resolve() != expected_host_env:
+            errors.append(f"{plist_path.name}: EnvironmentVariables.DALTON_RESEARCH_HOST_ENV_FILE: missing")
+        elif _is_literal_abs_path(ev_host_env) and Path(ev_host_env).expanduser().resolve() != expected_host_env:
             errors.append(
-                f"{plist_path.name}: DALTON_RESEARCH_HOST_ENV_FILE resolves to {Path(ev_host_env).expanduser().resolve()}, "
-                f"expected {expected_host_env}"
+                f"{plist_path.name}: EnvironmentVariables.DALTON_RESEARCH_HOST_ENV_FILE: expected {expected_host_env}"
             )
         if not arg_repo_env:
-            errors.append(f"{plist_path.name}: ProgramArguments missing --repo-env-file")
-        elif Path(arg_repo_env).expanduser().resolve() != expected_repo_env_resolved:
+            errors.append(f"{plist_path.name}: ProgramArguments.--repo-env-file: missing")
+        elif _is_literal_abs_path(arg_repo_env) and Path(arg_repo_env).expanduser().resolve() != expected_repo_env_resolved:
             errors.append(
-                f"{plist_path.name}: --repo-env-file resolves to {Path(arg_repo_env).expanduser().resolve()}, "
-                f"expected {expected_repo_env_resolved}"
+                f"{plist_path.name}: ProgramArguments.--repo-env-file: expected {expected_repo_env_resolved}"
             )
-        if ev_repo_env and Path(ev_repo_env).expanduser().resolve() != expected_repo_env_resolved:
+        if ev_repo_env and _is_literal_abs_path(ev_repo_env) and Path(ev_repo_env).expanduser().resolve() != expected_repo_env_resolved:
             errors.append(
-                f"{plist_path.name}: DALTON_REPO_ENV_FILE resolves to {Path(ev_repo_env).expanduser().resolve()}, "
-                f"expected {expected_repo_env_resolved}"
+                f"{plist_path.name}: EnvironmentVariables.DALTON_REPO_ENV_FILE: expected {expected_repo_env_resolved}"
             )
 
         extra_mods = [
@@ -902,11 +1055,11 @@ def _inspect_plist_file(
         ]
         if not extra_mods or "host_connectors" not in extra_mods:
             errors.append(
-                f"{plist_path.name}: DALTON_RESEARCH_HOST_EXTRA_MODULES must include 'host_connectors'"
+                f"{plist_path.name}: EnvironmentVariables.DALTON_RESEARCH_HOST_EXTRA_MODULES: missing 'host_connectors'"
             )
         extra_pp = str(env_vars.get("DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH") or "").strip()
         if not extra_pp:
-            errors.append(f"{plist_path.name}: missing DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH")
+            errors.append(f"{plist_path.name}: EnvironmentVariables.DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH: missing")
 
     return data, errors
 
@@ -1207,57 +1360,57 @@ def _load_plist_env_vars_strict(plist_path: Path) -> tuple[dict[str, str] | None
 
 
 def _resolve_legacy_proxy_effective_env(cfg: PreflightConfig) -> tuple[dict[str, str], Path, list[str]]:
-    """Resolve `com.dalton.guidepoint-mcp-proxy` env in real launcher order (plist -> `source ENV_FILE`)."""
-    errors: list[str] = []
-    env_map: dict[str, str] = {"HOME": str(cfg.home_dir)}
+    """Resolve `com.dalton.guidepoint-mcp-proxy` env via shared `bridge_subprocess_env` parser/resolver."""
+    default_gp_env = (
+        cfg.home_dir
+        / "Library"
+        / "Application Support"
+        / "Everflow"
+        / "research"
+        / "config"
+        / "guidepoint_mcp.env"
+    ).resolve()
+    try:
+        bse_mod = _import_bridge_subprocess_env(cfg.repo_root)
+    except Exception as exc:
+        return {"HOME": str(cfg.home_dir)}, default_gp_env, [f"cannot import bridge_subprocess_env: {exc}"]
 
     proxy_plist = cfg.plist_dir / "com.dalton.guidepoint-mcp-proxy.plist"
-    if proxy_plist.is_file():
-        plist_ev, perr = _load_plist_env_vars_strict(proxy_plist)
-        if perr:
-            errors.append(perr)
-        elif plist_ev:
-            env_map.update(plist_ev)
-
     bridge_vals = _parse_simple_env_file(cfg.bridge_env_file)
-    raw_rh = (
-        str(env_map.get("DALTON_RESEARCH_HOME") or "").strip()
-        or str(env_map.get("DALTON_OCW_ROOT") or "").strip()
-        or str(bridge_vals.get("DALTON_RESEARCH_HOME") or "").strip()
-    )
-    if raw_rh:
-        research_home = Path(raw_rh).expanduser().resolve()
-    else:
-        research_home = (
-            cfg.home_dir / "Library" / "Application Support" / "Everflow" / "research"
-        ).resolve()
+    try:
+        resolved = bse_mod.resolve_legacy_proxy_effective_paths(
+            repo_root=cfg.repo_root,
+            home_dir=cfg.home_dir,
+            existing_proxy_plist_path=proxy_plist,
+            bridge_env_vals=bridge_vals,
+        )
+    except Exception as exc:
+        return (
+            {"HOME": str(cfg.home_dir)},
+            default_gp_env,
+            [f"legacy proxy env resolution failed ({type(exc).__name__}: {_sanitize_error_text(str(exc))})"],
+        )
 
-    raw_gp_env = str(env_map.get("GUIDEPOINT_ENV_FILE") or "").strip()
-    gp_env_file = (
-        Path(raw_gp_env).expanduser().resolve()
-        if raw_gp_env
-        else (research_home / "config" / "guidepoint_mcp.env")
-    )
-
-    # `guidepoint_mcp_proxy_run.sh` does `set -a; source "$ENV_FILE"; set +a` AFTER inheriting plist env!
-    if gp_env_file.is_file():
-        env_map.update(_parse_simple_env_file(gp_env_file))
-
-    if not env_map.get("DALTON_RESEARCH_HOME") and not env_map.get("DALTON_OCW_ROOT"):
-        env_map["DALTON_RESEARCH_HOME"] = str(research_home)
-
-    return env_map, gp_env_file, errors
+    eff_env = dict(resolved.get("effective_env") or {"HOME": str(cfg.home_dir)})
+    gp_env_file = Path(str(resolved.get("guidepoint_env_file") or default_gp_env)).expanduser().resolve()
+    return eff_env, gp_env_file, []
 
 
-def _resolve_research_host_effective_env(cfg: PreflightConfig) -> tuple[dict[str, str], Path, Path, list[str]]:
+def _resolve_research_host_effective_env(
+    cfg: PreflightConfig,
+    *,
+    mode: str = "stage-a",
+) -> tuple[dict[str, str], Path, Path, list[str]]:
     """Resolve `com.dalton.research-host` env in real startup order (host.env < repo.env < plist)."""
     errors: list[str] = []
-    host_plist = cfg.plist_dir / "com.dalton.research-host.plist"
+    host_plist, hp_err = cfg.resolve_research_host_plist(mode)
     plist_ev: dict[str, str] = {}
     host_env_path = cfg.research_host_env_file
     repo_env_path = cfg.repo_env_file
 
-    if host_plist.is_file():
+    if hp_err is not None or host_plist is None:
+        errors.append(hp_err or "missing com.dalton.research-host.plist")
+    else:
         pdata, perr = _load_plist_full_strict(host_plist)
         if perr or pdata is None:
             errors.append(perr or f"unreadable {host_plist.name}")
@@ -1269,14 +1422,19 @@ def _resolve_research_host_effective_env(cfg: PreflightConfig) -> tuple[dict[str
                 errors.append(f"{host_plist.name}: EnvironmentVariables is not a dict")
             prog_args = pdata.get("ProgramArguments")
             if isinstance(prog_args, list):
-                arg_env = _extract_flag_value(prog_args, "--env-file")
+                env_vals, env_errs = _extract_flag_values(prog_args, "--env-file")
+                errors.extend(f"{host_plist.name}: {e}" for e in env_errs)
+                arg_env = env_vals[-1] if env_vals else None
                 if arg_env and _is_literal_abs_path(arg_env):
                     host_env_path = Path(arg_env).expanduser().resolve()
                 elif plist_ev.get("DALTON_RESEARCH_HOST_ENV_FILE") and _is_literal_abs_path(
                     plist_ev["DALTON_RESEARCH_HOST_ENV_FILE"]
                 ):
                     host_env_path = Path(plist_ev["DALTON_RESEARCH_HOST_ENV_FILE"]).expanduser().resolve()
-                arg_repo = _extract_flag_value(prog_args, "--repo-env-file")
+
+                repo_vals, repo_errs = _extract_flag_values(prog_args, "--repo-env-file")
+                errors.extend(f"{host_plist.name}: {e}" for e in repo_errs)
+                arg_repo = repo_vals[-1] if repo_vals else None
                 if arg_repo and _is_literal_abs_path(arg_repo):
                     repo_env_path = Path(arg_repo).expanduser().resolve()
                 elif plist_ev.get("DALTON_REPO_ENV_FILE") and _is_literal_abs_path(
@@ -1298,14 +1456,14 @@ def _resolve_research_host_effective_env(cfg: PreflightConfig) -> tuple[dict[str
     return env_map, host_env_path, repo_env_path, errors
 
 
-def _check_guidepoint_tokens_json(cfg: PreflightConfig) -> dict[str, str]:
+def _check_guidepoint_tokens_json(cfg: PreflightConfig, *, mode: str = "stage-a") -> dict[str, str]:
     try:
         gl = _import_guidepoint_lock(cfg.repo_root)
     except Exception as exc:
         return _result("guidepoint_tokens_json", "fail", f"cannot import guidepoint_lock: {exc}")
 
     proxy_env, _gp_env, proxy_errs = _resolve_legacy_proxy_effective_env(cfg)
-    host_env, _host_env_p, _repo_env_p, host_errs = _resolve_research_host_effective_env(cfg)
+    host_env, _host_env_p, _repo_env_p, host_errs = _resolve_research_host_effective_env(cfg, mode=mode)
     if proxy_errs or host_errs:
         return _result("guidepoint_tokens_json", "fail", "; ".join(proxy_errs + host_errs))
 
@@ -1347,13 +1505,15 @@ def _check_guidepoint_tokens_json(cfg: PreflightConfig) -> dict[str, str]:
     return _result("guidepoint_tokens_json", "ok", f"{tokens_path} valid JSON with required fields")
 
 
-def _check_venv_python_imports(cfg: PreflightConfig) -> dict[str, str]:
+def _check_venv_python_imports(cfg: PreflightConfig, *, mode: str = "stage-a") -> dict[str, str]:
     venv_py = cfg.venv_python
     if not (venv_py.is_file() and os.access(venv_py, os.X_OK)):
         return _result("venv_python_imports", "fail", f"missing executable venv python: {venv_py}")
 
-    # Strictly use ONLY paths declared in the plists (no synthetic repo fallbacks)
-    host_plist_path = cfg.plist_dir / "com.dalton.research-host.plist"
+    # Strictly use ONLY paths declared in the plists (no synthetic repo fallbacks and isolated cwd)
+    host_plist_path, hp_err = cfg.resolve_research_host_plist(mode)
+    if hp_err or host_plist_path is None:
+        return _result("venv_python_imports", "fail", hp_err or "missing com.dalton.research-host.plist")
     host_ev, host_err = _load_plist_env_vars_strict(host_plist_path)
     if host_err or host_ev is None:
         return _result("venv_python_imports", "fail", host_err or f"unreadable {host_plist_path}")
@@ -1375,13 +1535,6 @@ def _check_venv_python_imports(cfg: PreflightConfig) -> dict[str, str]:
             f"{host_plist_path.name} missing required import env key(s): {', '.join(missing_keys)}",
         )
 
-    rh_pp_parts: list[str] = []
-    for raw_block in (rh_pp_raw, rh_extra_pp_raw):
-        for entry in re.split(r"[:,]", raw_block):
-            e = entry.strip()
-            if e and e not in rh_pp_parts:
-                rh_pp_parts.append(e)
-
     extra_mods = [m.strip() for m in rh_extra_mods_raw.split(",") if m.strip()]
     for mod in extra_mods:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", mod):
@@ -1391,33 +1544,42 @@ def _check_venv_python_imports(cfg: PreflightConfig) -> dict[str, str]:
                 f"invalid module name in DALTON_RESEARCH_HOST_EXTRA_MODULES: {mod!r}",
             )
 
-    host_modules = [
-        "guidepoint_lock",
-        "fastapi",
-        "uvicorn",
-        "httpx",
-        "src.dalton.capabilities",
-        *extra_mods,
-    ]
-    host_import_code = "import " + ", ".join(dict.fromkeys(host_modules))
+    extra_pp_entries = [e.strip() for e in re.split(r"[:,]", rh_extra_pp_raw) if e.strip()]
+    host_modules = list(
+        dict.fromkeys(
+            [
+                "guidepoint_lock",
+                "fastapi",
+                "uvicorn",
+                "httpx",
+                "src.dalton.capabilities",
+                *extra_mods,
+            ]
+        )
+    )
+    # Reproduce real startup sys.path order:
+    # 1) PYTHONPATH from plist (with cwd stripped via PYTHONSAFEPATH=1 + explicit sys.path filter)
+    # 2) `src.dalton.research_host.__main__` inserts DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH entries
+    #    at front of sys.path before importing extra modules.
+    host_probe_code = (
+        "import importlib, os, sys\n"
+        "cwd = os.path.realpath(os.getcwd())\n"
+        "sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != cwd]\n"
+        f"extra_paths = {extra_pp_entries!r}\n"
+        "importlib.import_module('src.dalton.capabilities')\n"
+        "for _p in extra_paths:\n"
+        "    if _p and _p not in sys.path:\n"
+        "        sys.path.insert(0, _p)\n"
+        f"for _m in {host_modules!r}:\n"
+        "    importlib.import_module(_m)\n"
+    )
     sub_env_host = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(cfg.home_dir),
-        "PYTHONPATH": ":".join(rh_pp_parts),
+        "PYTHONPATH": rh_pp_raw,
         "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONSAFEPATH": "1",
     }
-    rc, _out, err = _run_cmd(
-        [str(venv_py), "-B", "-c", host_import_code],
-        env=sub_env_host,
-        timeout_s=20.0,
-    )
-    if rc != 0:
-        last_line = err.strip().splitlines()[-1] if err.strip() else "unknown"
-        return _result(
-            "venv_python_imports",
-            "fail",
-            f"research-host import probe failed (rc={rc}): {_sanitize_error_text(last_line)}",
-        )
 
     bridge_plist_path = cfg.plist_dir / "com.dalton.researchdata-bridge.plist"
     bridge_ev, bridge_err = _load_plist_env_vars_strict(bridge_plist_path)
@@ -1430,29 +1592,53 @@ def _check_venv_python_imports(cfg: PreflightConfig) -> dict[str, str]:
             "fail",
             f"{bridge_plist_path.name} missing required PYTHONPATH",
         )
+    bridge_probe_code = (
+        "import importlib, os, sys; "
+        "cwd = os.path.realpath(os.getcwd()); "
+        "sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != cwd]; "
+        "importlib.import_module('src.dalton.capabilities')"
+    )
     sub_env_bridge = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(cfg.home_dir),
         "PYTHONPATH": bridge_pp_raw,
         "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONSAFEPATH": "1",
     }
-    rc_b, _out_b, err_b = _run_cmd(
-        [str(venv_py), "-B", "-c", "import src.dalton.capabilities"],
-        env=sub_env_bridge,
-        timeout_s=20.0,
-    )
-    if rc_b != 0:
-        last_line = err_b.strip().splitlines()[-1] if err_b.strip() else "unknown"
-        return _result(
-            "venv_python_imports",
-            "fail",
-            f"bridge import probe failed (rc={rc_b}): {_sanitize_error_text(last_line)}",
+
+    with tempfile.TemporaryDirectory(prefix="dalton-import-probe-") as neutral_cwd:
+        rc, _out, err = _run_cmd(
+            [str(venv_py), "-B", "-c", host_probe_code],
+            env=sub_env_host,
+            cwd=neutral_cwd,
+            timeout_s=20.0,
         )
+        if rc != 0:
+            last_line = err.strip().splitlines()[-1] if err.strip() else "unknown"
+            return _result(
+                "venv_python_imports",
+                "fail",
+                f"research-host import probe failed (rc={rc}): {_sanitize_error_text(last_line)}",
+            )
+
+        rc_b, _out_b, err_b = _run_cmd(
+            [str(venv_py), "-B", "-c", bridge_probe_code],
+            env=sub_env_bridge,
+            cwd=neutral_cwd,
+            timeout_s=20.0,
+        )
+        if rc_b != 0:
+            last_line = err_b.strip().splitlines()[-1] if err_b.strip() else "unknown"
+            return _result(
+                "venv_python_imports",
+                "fail",
+                f"bridge import probe failed (rc={rc_b}): {_sanitize_error_text(last_line)}",
+            )
 
     return _result(
         "venv_python_imports",
         "ok",
-        f"plist-scoped imports ok ({', '.join(dict.fromkeys(host_modules))})",
+        f"plist-scoped imports ok ({', '.join(host_modules)})",
     )
 
 
@@ -1579,7 +1765,7 @@ def _check_live_services_health_and_drain(cfg: PreflightConfig) -> dict[str, str
 
 def _check_bridge_plist_and_budgets(cfg: PreflightConfig) -> dict[str, str]:
     errors: list[str] = []
-    _, plist_errors = _inspect_plist_file(
+    _, bridge_errors = _inspect_plist_file(
         cfg.plist_dir / "com.dalton.researchdata-bridge.plist",
         expected_label="com.dalton.researchdata-bridge",
         cfg=cfg,
@@ -1587,14 +1773,59 @@ def _check_bridge_plist_and_budgets(cfg: PreflightConfig) -> dict[str, str]:
         require_bridge_env_match=True,
         require_ownership_match=False,
     )
-    errors.extend(plist_errors)
+    errors.extend(bridge_errors)
+
+    _, proxy_errors = _inspect_plist_file(
+        cfg.plist_dir / "com.dalton.guidepoint-mcp-proxy.plist",
+        expected_label="com.dalton.guidepoint-mcp-proxy",
+        cfg=cfg,
+        require_venv_python=False,
+        require_bridge_env_match=False,
+        require_ownership_match=True,
+    )
+    errors.extend(proxy_errors)
+
+    journal, j_err = _read_journal_strict(cfg.ownership_file)
+    if j_err is not None:
+        errors.append(j_err)
+    target_owner = str((journal or {}).get("target_owner") or "legacy_proxy_8943").strip()
+
+    # Stage A terminal invariant: com.dalton.research-host.plist must be archived out of LaunchAgents
+    if (
+        target_owner != "research_host_8951"
+        and cfg.research_host_plist is None
+        and (cfg.plist_dir / "com.dalton.research-host.plist").exists()
+    ):
+        errors.append(
+            "com.dalton.research-host.plist is still present in LaunchAgents; "
+            "Stage A must archive it out of the auto-load directory"
+        )
+
+    host_plist_path, hp_err = cfg.resolve_research_host_plist("switch")
+    if hp_err or host_plist_path is None:
+        errors.append(hp_err or "missing archived com.dalton.research-host.plist")
+    else:
+        _, host_errors = _inspect_plist_file(
+            host_plist_path,
+            expected_label="com.dalton.research-host",
+            cfg=cfg,
+            require_venv_python=True,
+            require_bridge_env_match=False,
+            require_ownership_match=True,
+            require_research_host_startup=True,
+        )
+        errors.extend(host_errors)
 
     budget_errors = validate_timing_budgets_env(cfg.budgets_file)
     errors.extend(budget_errors)
 
     if errors:
         return _result("bridge_plist_and_budgets", "fail", "; ".join(errors))
-    return _result("bridge_plist_and_budgets", "ok", "bridge plist and timing-budgets.env valid")
+    return _result(
+        "bridge_plist_and_budgets",
+        "ok",
+        f"installed bridge/proxy plists, archived research-host plist ({host_plist_path}), and timing-budgets.env valid",
+    )
 
 
 def _check_extra_plugins(cfg: PreflightConfig) -> dict[str, str]:
@@ -1613,14 +1844,14 @@ def _check_extra_plugins(cfg: PreflightConfig) -> dict[str, str]:
     return _result("extra_plugins", "ok", f"all {len(EXTRA_PLUGIN_NAMES)} extra plugins present")
 
 
-def _check_two_sided_guidepoint_paths(cfg: PreflightConfig) -> dict[str, str]:
+def _check_two_sided_guidepoint_paths(cfg: PreflightConfig, *, mode: str = "switch") -> dict[str, str]:
     try:
         gl = _import_guidepoint_lock(cfg.repo_root)
     except Exception as exc:
         return _result("two_sided_guidepoint_paths", "fail", f"cannot import guidepoint_lock: {exc}")
 
     proxy_env, _gp_env, proxy_errs = _resolve_legacy_proxy_effective_env(cfg)
-    host_env, _host_env_p, _repo_env_p, host_errs = _resolve_research_host_effective_env(cfg)
+    host_env, _host_env_p, _repo_env_p, host_errs = _resolve_research_host_effective_env(cfg, mode=mode)
     if proxy_errs or host_errs:
         return _result("two_sided_guidepoint_paths", "fail", "; ".join(proxy_errs + host_errs))
 
@@ -1652,22 +1883,72 @@ def _check_two_sided_guidepoint_paths(cfg: PreflightConfig) -> dict[str, str]:
     )
 
 
-def _resolve_compose_file_chain(cfg: PreflightConfig) -> tuple[list[Path], str | None]:
-    """Mirror `deploy_main.sh`'s `compose_files_list` / `_edge_compose_files_list` chain."""
-    repo_vals = _parse_simple_env_file(cfg.repo_env_file)
+_COMPOSE_PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def resolve_compose_project_name(
+    repo_root: Path,
+    *,
+    repo_env_file: Path | None = None,
+    docker_bin: str = "docker",
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve Docker Compose project name matching `deploy_main.sh`'s `_edge_compose_project_name`."""
+    env = os.environ if environ is None else environ
+    env_file = repo_env_file if repo_env_file is not None else (repo_root / ".env")
+
+    rc, out, _ = _run_cmd(
+        [
+            docker_bin,
+            "inspect",
+            "-f",
+            '{{index .Config.Labels "com.docker.compose.project"}}',
+            "dalton-langalpha-edge-1",
+        ],
+        timeout_s=5.0,
+    )
+    if rc == 0:
+        proj = out.strip().rstrip("\r")
+        if proj and proj != "<no value>" and _COMPOSE_PROJECT_RE.fullmatch(proj):
+            return proj
+
+    raw_env_proj = str(env.get("COMPOSE_PROJECT_NAME") or "").strip()
+    if raw_env_proj and _COMPOSE_PROJECT_RE.fullmatch(raw_env_proj):
+        return raw_env_proj
+
+    if env_file.is_file():
+        repo_vals = _parse_simple_env_file(env_file)
+        file_proj = str(repo_vals.get("COMPOSE_PROJECT_NAME") or "").strip()
+        if file_proj and _COMPOSE_PROJECT_RE.fullmatch(file_proj):
+            return file_proj
+
+    return ""
+
+
+def resolve_compose_file_chain(
+    repo_root: Path,
+    *,
+    repo_env_file: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[list[Path], str | None]:
+    """Shared Compose file-chain resolver matching `deploy_main.sh`'s `compose_files_list` / `_edge_compose_files_list`."""
+    env = os.environ if environ is None else environ
+    env_file = repo_env_file if repo_env_file is not None else (repo_root / ".env")
+    repo_vals = _parse_simple_env_file(env_file)
+
     sep = (
-        str(os.environ.get("COMPOSE_PATH_SEPARATOR") or "").strip()
+        str(env.get("COMPOSE_PATH_SEPARATOR") or "").strip()
         or str(repo_vals.get("COMPOSE_PATH_SEPARATOR") or "").strip()
         or ":"
     )
     cf = (
-        str(os.environ.get("COMPOSE_FILE") or "").strip()
+        str(env.get("COMPOSE_FILE") or "").strip()
         or str(repo_vals.get("COMPOSE_FILE") or "").strip()
     )
 
     def _resolve_one(raw: str) -> Path:
         p = Path(raw)
-        return p if p.is_absolute() else (cfg.repo_root / p)
+        return p if p.is_absolute() else (repo_root / p)
 
     files: list[Path] = []
     if cf:
@@ -1681,7 +1962,7 @@ def _resolve_compose_file_chain(cfg: PreflightConfig) -> tuple[list[Path], str |
             files.append(resolved)
     else:
         for base_name in ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"):
-            base_path = cfg.repo_root / base_name
+            base_path = repo_root / base_name
             if base_path.is_file():
                 files.append(base_path)
                 for ovr_name in (
@@ -1690,18 +1971,58 @@ def _resolve_compose_file_chain(cfg: PreflightConfig) -> tuple[list[Path], str |
                     "docker-compose.override.yaml",
                     "docker-compose.override.yml",
                 ):
-                    ovr_path = cfg.repo_root / ovr_name
+                    ovr_path = repo_root / ovr_name
                     if ovr_path.is_file():
                         files.append(ovr_path)
                         break
                 break
 
     has_dalton = any(p.name == "docker-compose.dalton.yml" for p in files)
-    dalton_compose = cfg.repo_root / "docker-compose.dalton.yml"
+    dalton_compose = repo_root / "docker-compose.dalton.yml"
     if not has_dalton and dalton_compose.is_file():
         files.append(dalton_compose)
 
     return files, None
+
+
+def resolve_compose_args(
+    repo_root: Path,
+    *,
+    repo_env_file: Path | None = None,
+    docker_bin: str = "docker",
+    environ: Mapping[str, str] | None = None,
+) -> tuple[list[str], list[Path], str | None]:
+    """Build shared `docker compose` CLI args (`-p`, `--project-directory`, `--env-file`, `-f ...`)."""
+    env_file = repo_env_file if repo_env_file is not None else (repo_root / ".env")
+    compose_files, chain_err = resolve_compose_file_chain(
+        repo_root,
+        repo_env_file=env_file,
+        environ=environ,
+    )
+    if chain_err is not None:
+        return [], [], chain_err
+    if not compose_files:
+        return [], [], None
+
+    args: list[str] = []
+    proj = resolve_compose_project_name(
+        repo_root,
+        repo_env_file=env_file,
+        docker_bin=docker_bin,
+        environ=environ,
+    )
+    if proj:
+        args.extend(["-p", proj])
+    args.extend(["--project-directory", str(repo_root)])
+    if env_file.is_file():
+        args.extend(["--env-file", str(env_file)])
+    for cf in compose_files:
+        args.extend(["-f", str(cf)])
+    return args, compose_files, None
+
+
+def _resolve_compose_file_chain(cfg: PreflightConfig) -> tuple[list[Path], str | None]:
+    return resolve_compose_file_chain(cfg.repo_root, repo_env_file=cfg.repo_env_file)
 
 
 def _read_compose_backend_env(cfg: PreflightConfig) -> tuple[dict[str, str] | None, str, str | None]:
@@ -1712,23 +2033,17 @@ def _read_compose_backend_env(cfg: PreflightConfig) -> tuple[dict[str, str] | No
     - When compose files exist (or COMPOSE_FILE is set), any command failure, invalid JSON,
       or missing `services.backend.environment` returns an error string (fail closed).
     """
-    compose_files, chain_err = _resolve_compose_file_chain(cfg)
+    compose_args, compose_files, chain_err = resolve_compose_args(
+        cfg.repo_root,
+        repo_env_file=cfg.repo_env_file,
+        docker_bin=cfg.docker_bin,
+    )
     if chain_err is not None:
         return None, "compose_file_missing", chain_err
     if not compose_files:
         return None, "compose_files_absent", None
 
-    cmd: list[str] = [
-        cfg.docker_bin,
-        "compose",
-        "--project-directory",
-        str(cfg.repo_root),
-    ]
-    if cfg.repo_env_file.is_file():
-        cmd.extend(["--env-file", str(cfg.repo_env_file)])
-    for cf in compose_files:
-        cmd.extend(["-f", str(cf)])
-    cmd.extend(["config", "--format", "json"])
+    cmd: list[str] = [cfg.docker_bin, "compose", *compose_args, "config", "--format", "json"]
 
     sub_env = dict(os.environ)
     sub_env["HOME"] = str(cfg.home_dir)
@@ -1737,12 +2052,12 @@ def _read_compose_backend_env(cfg: PreflightConfig) -> tuple[dict[str, str] | No
         return (
             None,
             "compose_config_failed",
-            f"docker compose config failed (rc={rc}: {_sanitize_error_text(err.strip()[:160])})",
+            f"docker compose config failed (rc={rc}: {_sanitize_error_text(err.strip()[:240])})",
         )
     try:
         parsed = json.loads(out)
     except Exception as exc:
-        return None, "compose_json_error", f"docker compose config emitted invalid JSON: {exc}"
+        return None, "compose_json_error", f"docker compose config emitted invalid JSON: {type(exc).__name__}"
     if not isinstance(parsed, dict):
         return None, "compose_json_error", "docker compose config JSON root is not an object"
     services = parsed.get("services")
@@ -1793,16 +2108,20 @@ def _check_three_way_capability_parity(cfg: PreflightConfig) -> dict[str, str]:
         environ=compose_env if compose_env is not None else {},
     )
 
-    host_plist_path = cfg.plist_dir / "com.dalton.research-host.plist"
+    host_plist_path, hp_err = cfg.resolve_research_host_plist("switch")
     bridge_plist_path = cfg.plist_dir / "com.dalton.researchdata-bridge.plist"
+    if hp_err or host_plist_path is None:
+        return _result("three_way_capability_parity", "fail", hp_err or "missing archived com.dalton.research-host.plist")
     host_plist_ev, host_plist_err = _load_plist_env_vars_strict(host_plist_path)
     bridge_plist_ev, bridge_plist_err = _load_plist_env_vars_strict(bridge_plist_path)
     if host_plist_err or bridge_plist_err:
         errs = [e for e in (host_plist_err, bridge_plist_err) if e]
         return _result("three_way_capability_parity", "fail", "; ".join(errs))
 
-    # Honor actual research-host startup --env-file / --repo-env-file if declared in plist
-    _, eff_host_env_path, eff_host_repo_env_path, rh_errs = _resolve_research_host_effective_env(cfg)
+    # Honor actual research-host startup --env-file / --repo-env-file if declared in archived plist
+    _, eff_host_env_path, eff_host_repo_env_path, rh_errs = _resolve_research_host_effective_env(
+        cfg, mode="switch"
+    )
     if rh_errs:
         return _result("three_way_capability_parity", "fail", "; ".join(rh_errs))
 
@@ -1924,24 +2243,37 @@ def _get_service_pid_readonly(cfg: PreflightConfig, label: str) -> tuple[int | N
     return pid2, "running", None
 
 
-def _expected_stage_guidepoint_urls(cfg: PreflightConfig, bridge_env_gp_url: str) -> set[str]:
-    """Return expected `DALTON_GUIDEPOINT_MCP_URL` values for the current cutover stage."""
-    journal, _ = _read_journal_strict(cfg.ownership_file)
-    target_owner = str((journal or {}).get("target_owner") or "").strip()
-    if target_owner == "research_host_8951" or (
-        bridge_env_gp_url and (":8951" in bridge_env_gp_url or bridge_env_gp_url.rstrip("/").endswith("/mcp/guidepoint"))
-    ):
+def _expected_stage_guidepoint_urls(
+    cfg: PreflightConfig,
+    *,
+    mode: str = "switch",
+) -> tuple[set[str], str, str | None]:
+    """Determine expected `DALTON_GUIDEPOINT_MCP_URL` values SOLELY from explicit stage + persisted ownership."""
+    journal, j_err = _read_journal_strict(cfg.ownership_file)
+    if j_err is not None:
+        return set(), "", j_err
+    target_owner = str((journal or {}).get("target_owner") or "legacy_proxy_8943").strip()
+    if target_owner not in ("legacy_proxy_8943", "research_host_8951"):
+        return set(), target_owner, f"invalid target_owner in handoff-journal.json: {target_owner!r}"
+    if mode == "stage-a":
+        if target_owner != "legacy_proxy_8943":
+            return set(), target_owner, f"stage-a expects target_owner='legacy_proxy_8943', got {target_owner!r}"
+        return {
+            f"{cfg.proxy_url.rstrip('/')}/mcp",
+            "http://127.0.0.1:8943/mcp",
+        }, target_owner, None
+    if target_owner == "research_host_8951":
         return {
             f"{cfg.research_host_url.rstrip('/')}/mcp/guidepoint",
             "http://127.0.0.1:8951/mcp/guidepoint",
-        }
+        }, target_owner, None
     return {
         f"{cfg.proxy_url.rstrip('/')}/mcp",
         "http://127.0.0.1:8943/mcp",
-    }
+    }, target_owner, None
 
 
-def _check_env_override_scan(cfg: PreflightConfig) -> dict[str, str]:
+def _check_env_override_scan(cfg: PreflightConfig, *, mode: str = "switch") -> dict[str, str]:
     try:
         caps_mod, _ = _import_capabilities(cfg.repo_root)
     except Exception as exc:
@@ -1950,7 +2282,25 @@ def _check_env_override_scan(cfg: PreflightConfig) -> dict[str, str]:
     repo_vals = _parse_simple_env_file(cfg.repo_env_file)
     bridge_vals = _parse_simple_env_file(cfg.bridge_env_file)
     bridge_env_gp_url = str(bridge_vals.get("DALTON_GUIDEPOINT_MCP_URL") or "").strip()
-    expected_gp_urls = _expected_stage_guidepoint_urls(cfg, bridge_env_gp_url)
+    expected_gp_urls, target_owner, stage_err = _expected_stage_guidepoint_urls(cfg, mode=mode)
+    if stage_err is not None:
+        return _result("env_override_scan", "fail", stage_err)
+
+    normalized_expected_urls = {u.rstrip("/") for u in expected_gp_urls}
+    direct_errors: list[str] = []
+
+    # Independently validate researchdata-bridge.env effective DALTON_GUIDEPOINT_MCP_URL against stage + owner
+    if bridge_env_gp_url:
+        if bridge_env_gp_url.rstrip("/") not in normalized_expected_urls:
+            direct_errors.append(
+                f"researchdata-bridge.env DALTON_GUIDEPOINT_MCP_URL={_sanitize_diag_value('DALTON_GUIDEPOINT_MCP_URL', bridge_env_gp_url)} "
+                f"(does not match expected target for stage={mode} owner={target_owner})"
+            )
+    elif target_owner == "research_host_8951":
+        direct_errors.append(
+            f"researchdata-bridge.env missing DALTON_GUIDEPOINT_MCP_URL for owner={target_owner} "
+            "(default falls back to legacy :8943)"
+        )
 
     scan_keys: set[str] = set(_CONTROL_SCAN_BASE_KEYS)
     for k in repo_vals:
@@ -1981,15 +2331,25 @@ def _check_env_override_scan(cfg: PreflightConfig) -> dict[str, str]:
     if lc_env:
         extra_sources["launchctl_getenv"] = lc_env
 
-    # 2. All com.dalton.*.plist in --plist-dir (distinguish read failure from no override)
+    # 2. All com.dalton.*.plist in --plist-dir + archived com.dalton.research-host.plist
+    seen_plists: set[Path] = set()
     if cfg.plist_dir.is_dir():
         for pp in sorted(cfg.plist_dir.glob("com.dalton.*.plist")):
+            seen_plists.add(pp.resolve())
             ev, perr = _load_plist_env_vars_strict(pp)
             if perr is not None:
                 warnings.append(f"could not read plist {pp.name}: {perr}")
                 continue
             if ev:
                 extra_sources[f"plist:{pp.name}"] = ev
+
+    archived_host_plist, _ = cfg.resolve_research_host_plist(mode)
+    if archived_host_plist is not None and archived_host_plist.resolve() not in seen_plists:
+        ev, perr = _load_plist_env_vars_strict(archived_host_plist)
+        if perr is not None:
+            warnings.append(f"could not read archived plist {archived_host_plist.name}: {perr}")
+        elif ev:
+            extra_sources[f"archived_plist:{archived_host_plist.name}"] = ev
 
     # 3. Running process environments for bridge and research-host
     for label in ("com.dalton.researchdata-bridge", "com.dalton.research-host"):
@@ -2010,9 +2370,11 @@ def _check_env_override_scan(cfg: PreflightConfig) -> dict[str, str]:
         proc_vars = _extract_proc_env_vars(out, scan_keys)
         if label == "com.dalton.researchdata-bridge" and "DALTON_GUIDEPOINT_MCP_URL" in proc_vars:
             proc_gp_url = proc_vars["DALTON_GUIDEPOINT_MCP_URL"].strip()
-            # Bridge loads DALTON_GUIDEPOINT_MCP_URL from researchdata-bridge.env into its own os.environ.
-            # Only flag a conflict if it differs from the env file AND is not the expected URL for this stage.
-            if (bridge_env_gp_url and proc_gp_url == bridge_env_gp_url) or (proc_gp_url in expected_gp_urls):
+            # Allow bridge process DALTON_GUIDEPOINT_MCP_URL ONLY when it matches the expected target
+            # for the explicit stage/owner AND (bridge.env omits it or matches it).
+            if proc_gp_url.rstrip("/") in normalized_expected_urls and (
+                not bridge_env_gp_url or proc_gp_url.rstrip("/") == bridge_env_gp_url.rstrip("/")
+            ):
                 proc_vars = {k: v for k, v in proc_vars.items() if k != "DALTON_GUIDEPOINT_MCP_URL"}
         if proc_vars:
             extra_sources[f"proc:{label}(pid={pid})"] = proc_vars
@@ -2025,12 +2387,13 @@ def _check_env_override_scan(cfg: PreflightConfig) -> dict[str, str]:
         extra_sources=extra_sources,
         expected_bridge_env_file=expected_bridge_env,
     )
-    if conflicts:
-        details = [
-            f"{c.get('source')} {c.get('key')}={_sanitize_diag_value(str(c.get('key') or ''), c.get('value'))} ({c.get('reason')})"
-            for c in conflicts
-        ]
-        return _result("env_override_scan", "fail", "; ".join(details))
+    conflict_details = [
+        f"{c.get('source')} {c.get('key')}={_sanitize_diag_value(str(c.get('key') or ''), c.get('value'))} ({c.get('reason')})"
+        for c in conflicts
+    ]
+    all_fail_details = direct_errors + conflict_details
+    if all_fail_details:
+        return _result("env_override_scan", "fail", "; ".join(all_fail_details))
 
     if warnings:
         return _result("env_override_scan", "warn", "; ".join(warnings))
@@ -2045,8 +2408,8 @@ def run_preflight(mode: str, cfg: PreflightConfig, *, report_json: bool = False)
             ("guidepoint_proxy_pid_match", _check_guidepoint_proxy_pid_match),
             ("stage_a_plists", _check_stage_a_plists),
             ("research_host_env", lambda c: _check_research_host_env(c, require_distinct_tokens=False)),
-            ("guidepoint_tokens_json", _check_guidepoint_tokens_json),
-            ("venv_python_imports", _check_venv_python_imports),
+            ("guidepoint_tokens_json", lambda c: _check_guidepoint_tokens_json(c, mode="stage-a")),
+            ("venv_python_imports", lambda c: _check_venv_python_imports(c, mode="stage-a")),
             ("web_releases_current", _check_web_releases_current),
         ]
     elif mode == "switch":
@@ -2055,11 +2418,11 @@ def run_preflight(mode: str, cfg: PreflightConfig, *, report_json: bool = False)
             ("bridge_plist_and_budgets", _check_bridge_plist_and_budgets),
             ("research_host_env", lambda c: _check_research_host_env(c, require_distinct_tokens=True)),
             ("extra_plugins", _check_extra_plugins),
-            ("venv_python_imports", _check_venv_python_imports),
+            ("venv_python_imports", lambda c: _check_venv_python_imports(c, mode="switch")),
             ("web_releases_current", _check_web_releases_current),
-            ("two_sided_guidepoint_paths", _check_two_sided_guidepoint_paths),
+            ("two_sided_guidepoint_paths", lambda c: _check_two_sided_guidepoint_paths(c, mode="switch")),
             ("three_way_capability_parity", _check_three_way_capability_parity),
-            ("env_override_scan", _check_env_override_scan),
+            ("env_override_scan", lambda c: _check_env_override_scan(c, mode="switch")),
         ]
     else:
         raise ValueError(f"Unsupported preflight mode: {mode!r}")
@@ -2224,8 +2587,66 @@ def _read_journal_strict(path: Path) -> tuple[dict[str, Any] | None, str | None]
     return parsed, None
 
 
+def _canonical_ops_paths(repo_root: Path) -> tuple[Path, Path, Path, Path]:
+    """Derive canonical production lock, journal, admission, and budgets paths strictly from `repo_root`."""
+    root = repo_root.expanduser().resolve()
+    cutover_dir = root / "var" / "dalton" / "cutover-snapshots" / "research-host"
+    return (
+        cutover_dir / ".ops.lock",
+        cutover_dir / "handoff-journal.json",
+        root / "var" / "dalton" / "maintenance-admission.json",
+        cutover_dir / "timing-budgets.env",
+    )
+
+
+def _check_admission_and_incomplete_journal(
+    adm_path: Path,
+    j_path: Path,
+    *,
+    existing_journal: dict[str, Any] | None = None,
+    journal_already_read: bool = False,
+) -> list[str]:
+    """Return missing guard conditions for full admission pause + incomplete handoff-journal."""
+    missing_reasons: list[str] = []
+
+    if not adm_path.is_file():
+        missing_reasons.append(f"maintenance-admission.json missing ({adm_path})")
+    else:
+        try:
+            adm = json.loads(adm_path.read_text(encoding="utf-8"))
+            if not isinstance(adm, dict):
+                raise ValueError("not a JSON object")
+            paused = adm.get("paused") is True
+            allow_ids = adm.get("allow_workspace_ids")
+            empty_allow = isinstance(allow_ids, list) and len(allow_ids) == 0
+            if not paused:
+                missing_reasons.append("maintenance-admission.json paused != true")
+            if not empty_allow:
+                missing_reasons.append(
+                    f"maintenance-admission.json allow_workspace_ids != [] (got {allow_ids!r})"
+                )
+        except Exception as exc:
+            missing_reasons.append(f"maintenance-admission.json unreadable ({exc})")
+
+    if journal_already_read:
+        j_data, j_err = existing_journal, None
+    else:
+        j_data, j_err = _read_journal_strict(j_path)
+    if j_err is not None:
+        missing_reasons.append(j_err)
+    elif j_data is None:
+        missing_reasons.append(f"handoff-journal.json missing ({j_path})")
+    elif j_data.get("completed") is not False:
+        missing_reasons.append(
+            f"handoff-journal.json completed != false (got {j_data.get('completed')!r})"
+        )
+
+    return missing_reasons
+
+
 def cmd_lock_verify(args: argparse.Namespace) -> int:
-    lock_file = Path(args.lock_file).expanduser().resolve()
+    repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
+    lock_file, _, _, _ = _canonical_ops_paths(repo_root)
     ok, reason = _verify_inherited_ops_lock(lock_file, lock_fd=int(args.lock_fd))
     if not ok:
         print(f"ERROR: {reason}", file=sys.stderr)
@@ -2246,15 +2667,11 @@ def _coerce_journal_value(raw: str) -> Any:
 def cmd_journal_set(args: argparse.Namespace) -> int:
     repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
     gl = _import_guidepoint_lock(repo_root)
-    ownership_path = Path(args.ownership_file).expanduser().resolve()
-    lock_file = (
-        Path(args.lock_file).expanduser().resolve()
-        if getattr(args, "lock_file", None)
-        else (ownership_path.parent / ".ops.lock")
-    )
+    lock_file, ownership_path, adm_path, _ = _canonical_ops_paths(repo_root)
     lock_fd = int(args.lock_fd) if getattr(args, "lock_fd", None) is not None else None
 
     updates: list[tuple[str, Any]] = []
+    updates_map: dict[str, Any] = {}
     for item in args.pairs:
         if "=" not in item:
             print(f"ERROR: expected key=value pair, got {item!r}", file=sys.stderr)
@@ -2264,7 +2681,26 @@ def cmd_journal_set(args: argparse.Namespace) -> int:
         if not k:
             print(f"ERROR: empty key in {item!r}", file=sys.stderr)
             return 2
-        updates.append((k, _coerce_journal_value(v)))
+        coerced = _coerce_journal_value(v)
+        updates.append((k, coerced))
+        updates_map[k] = coerced
+
+    writes_owner = "target_owner" in updates_map
+    if writes_owner:
+        owner_val = str(updates_map["target_owner"] or "").strip()
+        if owner_val not in gl.VALID_TARGET_OWNERS:
+            print(
+                f"ERROR: invalid target_owner {updates_map['target_owner']!r}; "
+                f"expected one of {sorted(gl.VALID_TARGET_OWNERS)}",
+                file=sys.stderr,
+            )
+            return 2
+        if updates_map.get("completed") is True:
+            print(
+                "ERROR: refusing to write target_owner and completed=true in the same operation",
+                file=sys.stderr,
+            )
+            return 1
 
     try:
         with _hold_or_verify_ops_lock(lock_file, lock_fd=lock_fd, caller_tag="preflight:journal-set"):
@@ -2275,6 +2711,19 @@ def cmd_journal_set(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
+            if writes_owner:
+                guard_reasons = _check_admission_and_incomplete_journal(
+                    adm_path,
+                    ownership_path,
+                    existing_journal=existing,
+                    journal_already_read=True,
+                )
+                if guard_reasons:
+                    print(
+                        "ERROR: change guard denied target_owner write: " + "; ".join(guard_reasons),
+                        file=sys.stderr,
+                    )
+                    return 1
             current: dict[str, Any] = dict(existing) if existing is not None else {}
             for k, v in updates:
                 current[k] = v
@@ -2290,7 +2739,8 @@ def cmd_journal_set(args: argparse.Namespace) -> int:
 
 
 def cmd_journal_read(args: argparse.Namespace) -> int:
-    ownership_path = Path(args.ownership_file).expanduser().resolve()
+    repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
+    _, ownership_path, _, _ = _canonical_ops_paths(repo_root)
     data, j_err = _read_journal_strict(ownership_path)
     if j_err is not None:
         print(f"ERROR: {j_err}", file=sys.stderr)
@@ -2319,37 +2769,65 @@ def _sha256_file(path: Path) -> str:
 
 
 def _fsync_file(path: Path) -> None:
-    try:
-        fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
-        return
+    """Strictly fsync a regular file; any OSError aborts immediately."""
+    fd = os.open(str(path), os.O_RDONLY)
     try:
         os.fsync(fd)
-    except OSError:
-        pass
     finally:
         os.close(fd)
 
 
-def cmd_manifest_write(args: argparse.Namespace) -> int:
-    rec_dir = Path(args.recovery_dir).expanduser().resolve()
-    if not rec_dir.is_dir():
-        print(f"ERROR: recovery dir not found: {rec_dir}", file=sys.stderr)
-        return 1
-    requested = list(args.files)
-    if set(requested) != set(RECOVERY_REQUIRED_FILES) or len(requested) != len(RECOVERY_REQUIRED_FILES):
-        print(
-            f"ERROR: recovery manifest must cover the exact required 5-file set "
-            f"{list(RECOVERY_REQUIRED_FILES)}, got {requested}",
-            file=sys.stderr,
-        )
-        return 1
+def _atomic_swap_paths(src: Path, dst: Path) -> None:
+    """Atomically exchange two filesystem entries (e.g. symlink and real directory) in one syscall.
+
+    Uses `renamex_np(..., RENAME_SWAP)` on macOS and `renameat2(..., RENAME_EXCHANGE)` on Linux.
+    If the atomic swap fails or is unsupported, neither entry is modified and `OSError` is raised.
+    """
+    src_b = os.fsencode(str(src))
+    dst_b = os.fsencode(str(dst))
+    if sys.platform == "darwin":
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        libc.renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        libc.renamex_np.restype = ctypes.c_int
+        RENAME_SWAP = 0x00000002
+        rc = libc.renamex_np(src_b, dst_b, RENAME_SWAP)
+        if rc != 0:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err), str(src), None, str(dst))
+        return
+    if sys.platform.startswith("linux"):
+        libc = ctypes.CDLL(None, use_errno=True)
+        if hasattr(libc, "renameat2"):
+            libc.renameat2.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            libc.renameat2.restype = ctypes.c_int
+            AT_FDCWD = -100
+            RENAME_EXCHANGE = 2
+            rc = libc.renameat2(AT_FDCWD, src_b, AT_FDCWD, dst_b, RENAME_EXCHANGE)
+            if rc != 0:
+                err = ctypes.get_errno()
+                raise OSError(err, os.strerror(err), str(src), None, str(dst))
+            return
+    raise OSError(
+        errno.ENOTSUP,
+        f"atomic directory-to-symlink swap unsupported on platform {sys.platform}",
+        str(src),
+        None,
+        str(dst),
+    )
+
+
+def _write_recovery_manifest_dir(rec_dir: Path, source_commit: str) -> None:
     files_meta: dict[str, dict[str, Any]] = {}
     for name in RECOVERY_REQUIRED_FILES:
         fp = rec_dir / name
         if fp.is_symlink() or not fp.is_file():
-            print(f"ERROR: missing or non-regular file for manifest: {fp}", file=sys.stderr)
-            return 1
+            raise FileNotFoundError(f"missing or non-regular file for manifest: {fp}")
         _fsync_file(fp)
         files_meta[name] = {
             "sha256": _sha256_file(fp),
@@ -2357,7 +2835,7 @@ def cmd_manifest_write(args: argparse.Namespace) -> int:
         }
     manifest = {
         "version": 1,
-        "source_commit": str(args.source_commit or "unknown"),
+        "source_commit": str(source_commit or "unknown"),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "files": files_meta,
     }
@@ -2367,28 +2845,22 @@ def cmd_manifest_write(args: argparse.Namespace) -> int:
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         mode=0o600,
     )
-    _fsync_dir(rec_dir)
-    return 0
+    _fsync_dir(rec_dir, strict=True)
 
 
-def cmd_manifest_verify(args: argparse.Namespace) -> int:
-    rec_dir = Path(args.recovery_dir).expanduser().resolve()
+def _verify_recovery_manifest_dir(rec_dir: Path) -> list[str]:
     manifest_path = rec_dir / "recovery-manifest.json"
     if not manifest_path.is_file():
-        print(f"ERROR: missing recovery-manifest.json in {rec_dir}", file=sys.stderr)
-        return 1
+        return [f"missing recovery-manifest.json in {rec_dir}"]
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception as exc:
-        print(f"ERROR: invalid recovery-manifest.json: {exc}", file=sys.stderr)
-        return 1
+        return [f"invalid recovery-manifest.json: {exc}"]
     if not isinstance(manifest, dict) or manifest.get("version") != 1:
-        print("ERROR: recovery-manifest.json must be a version 1 JSON object", file=sys.stderr)
-        return 1
+        return ["recovery-manifest.json must be a version 1 JSON object"]
     files_meta = manifest.get("files")
     if not isinstance(files_meta, dict) or not files_meta:
-        print("ERROR: recovery-manifest.json has no files entries", file=sys.stderr)
-        return 1
+        return ["recovery-manifest.json has no files entries"]
 
     errors: list[str] = []
     required_set = set(RECOVERY_REQUIRED_FILES)
@@ -2421,7 +2893,144 @@ def cmd_manifest_verify(args: argparse.Namespace) -> int:
         actual = _sha256_file(fp)
         if actual != expected:
             errors.append(f"sha256 mismatch for {name}: expected={expected[:12]} actual={actual[:12]}")
+    return errors
 
+
+def publish_recovery_bin_atomic(
+    *,
+    repo_root: Path,
+    src_dir: Path,
+    gp_lock_src: Path,
+    source_commit: str,
+) -> Path:
+    """Atomically stage, fsync, verify, and publish `<repo>/var/dalton/cutover-snapshots/recovery-bin`.
+
+    - Any copy, fsync, verification, or swap failure aborts immediately and leaves any
+      existing `recovery-bin` entry (symlink or legacy real directory) completely intact.
+    - When `recovery-bin` is absent or already a symlink: single `os.replace` swap.
+    - When `recovery-bin` is an existing real directory: single atomic `_atomic_swap_paths`
+      (`renamex_np(..., RENAME_SWAP)` / `renameat2(..., RENAME_EXCHANGE)`) so the fixed
+      entrypoint is NEVER missing for even an instant.
+    """
+    repo_abs = repo_root.expanduser().resolve()
+    snapshots_root = repo_abs / "var" / "dalton" / "cutover-snapshots"
+    snapshots_root.mkdir(parents=True, exist_ok=True)
+    os.chmod(snapshots_root, 0o700)
+
+    src_map: dict[str, tuple[Path, int]] = {
+        "switch_research_host.sh": (src_dir / "switch_research_host.sh", 0o700),
+        "_research_host_handoff_lib.sh": (src_dir / "_research_host_handoff_lib.sh", 0o600),
+        "wait_backend_idle.sh": (src_dir / "wait_backend_idle.sh", 0o700),
+        "preflight.py": (src_dir / "preflight.py", 0o700),
+        "guidepoint_lock.py": (gp_lock_src, 0o600),
+    }
+    for name, (sp, _mode) in src_map.items():
+        if not sp.is_file():
+            raise FileNotFoundError(f"missing required recovery file ({name}): {sp}")
+
+    new_rel_dir = Path(tempfile.mkdtemp(prefix=".recovery-bin.rel.", dir=str(snapshots_root)))
+    tmp_link = snapshots_root / f".recovery-bin.link.{os.getpid()}.{secrets.token_hex(4)}"
+    published = False
+    try:
+        os.chmod(new_rel_dir, 0o700)
+        for name, (sp, mode) in src_map.items():
+            dst = new_rel_dir / name
+            raw_bytes = sp.read_bytes()
+            fd = os.open(str(dst), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+            closed = False
+            try:
+                os.fchmod(fd, mode)
+                view = memoryview(raw_bytes)
+                written = 0
+                while written < len(view):
+                    written += os.write(fd, view[written:])
+                os.fsync(fd)
+                os.close(fd)
+                closed = True
+            except BaseException:
+                if not closed:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                raise
+            os.chmod(dst, mode)
+
+        _write_recovery_manifest_dir(new_rel_dir, source_commit)
+        verify_errors = _verify_recovery_manifest_dir(new_rel_dir)
+        if verify_errors:
+            raise RuntimeError("staged recovery-bin failed manifest verification: " + "; ".join(verify_errors))
+
+        os.symlink(new_rel_dir.name, tmp_link)
+        rec_entry = snapshots_root / "recovery-bin"
+
+        if rec_entry.is_symlink() or not rec_entry.exists():
+            prev_target = os.readlink(rec_entry) if rec_entry.is_symlink() else ""
+            os.replace(tmp_link, rec_entry)
+            published = True
+            _fsync_dir(snapshots_root, strict=True)
+            if prev_target and prev_target != new_rel_dir.name and prev_target.startswith(".recovery-bin.rel."):
+                shutil.rmtree(snapshots_root / prev_target, ignore_errors=True)
+        else:
+            # Atomic single-syscall migration from existing real directory to symlink!
+            _atomic_swap_paths(tmp_link, rec_entry)
+            published = True
+            _fsync_dir(snapshots_root, strict=True)
+            # tmp_link now points to the displaced old real directory; remove it cleanly.
+            shutil.rmtree(tmp_link, ignore_errors=True)
+        return rec_entry
+    except BaseException:
+        if not published:
+            try:
+                if tmp_link.is_symlink() or tmp_link.is_file():
+                    tmp_link.unlink()
+            except OSError:
+                pass
+            shutil.rmtree(new_rel_dir, ignore_errors=True)
+        raise
+
+
+def cmd_recovery_publish(args: argparse.Namespace) -> int:
+    repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
+    src_dir = Path(args.src_dir).expanduser().resolve()
+    gp_lock_src = Path(args.gp_lock_src).expanduser().resolve()
+    try:
+        publish_recovery_bin_atomic(
+            repo_root=repo_root,
+            src_dir=src_dir,
+            gp_lock_src=gp_lock_src,
+            source_commit=str(args.source_commit or "unknown"),
+        )
+    except Exception as exc:
+        print(f"ERROR: atomic recovery-bin publish failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_manifest_write(args: argparse.Namespace) -> int:
+    rec_dir = Path(args.recovery_dir).expanduser().resolve()
+    if not rec_dir.is_dir():
+        print(f"ERROR: recovery dir not found: {rec_dir}", file=sys.stderr)
+        return 1
+    requested = list(args.files)
+    if set(requested) != set(RECOVERY_REQUIRED_FILES) or len(requested) != len(RECOVERY_REQUIRED_FILES):
+        print(
+            f"ERROR: recovery manifest must cover the exact required 5-file set "
+            f"{list(RECOVERY_REQUIRED_FILES)}, got {requested}",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        _write_recovery_manifest_dir(rec_dir, str(args.source_commit or "unknown"))
+    except Exception as exc:
+        print(f"ERROR: failed writing recovery manifest: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_manifest_verify(args: argparse.Namespace) -> int:
+    rec_dir = Path(args.recovery_dir).expanduser().resolve()
+    errors = _verify_recovery_manifest_dir(rec_dir)
     if errors:
         for e in errors:
             print(f"ERROR: {e}", file=sys.stderr)
@@ -2430,16 +3039,12 @@ def cmd_manifest_verify(args: argparse.Namespace) -> int:
 
 
 def cmd_approve_budgets(args: argparse.Namespace) -> int:
-    budgets_path = Path(args.budgets_file).expanduser().resolve()
-    journal_path = (
-        Path(args.journal_file).expanduser().resolve()
-        if getattr(args, "journal_file", None)
-        else (budgets_path.parent / "handoff-journal.json")
-    )
-    lock_file = (
-        Path(args.lock_file).expanduser().resolve()
-        if getattr(args, "lock_file", None)
-        else (budgets_path.parent / ".ops.lock")
+    repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
+    lock_file, journal_path, _, canonical_budgets_path = _canonical_ops_paths(repo_root)
+    budgets_path = (
+        Path(args.budgets_file).expanduser().resolve()
+        if getattr(args, "budgets_file", None)
+        else canonical_budgets_path
     )
     lock_fd = int(args.lock_fd) if getattr(args, "lock_fd", None) is not None else None
 
@@ -2562,15 +3167,11 @@ def cmd_guard_check(args: argparse.Namespace) -> int:
         print(f"ERROR: unknown change guard action: {action!r}", file=sys.stderr)
         return 2
 
+    repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
+    lock_file, j_path, adm_path, _ = _canonical_ops_paths(repo_root)
     missing_reasons: list[str] = []
 
-    # Condition 1: current process ACTUALLY holds kernel flock on .ops.lock (never trust --lock-held alone)
-    j_path = Path(args.journal_file).expanduser().resolve()
-    lock_file = (
-        Path(args.lock_file).expanduser().resolve()
-        if getattr(args, "lock_file", None)
-        else (j_path.parent / ".ops.lock")
-    )
+    # Condition 1: current process ACTUALLY holds kernel flock on canonical .ops.lock
     lock_fd = int(args.lock_fd) if getattr(args, "lock_fd", None) is not None else 8
     if str(args.lock_held) != "1":
         missing_reasons.append("current process does not hold .ops.lock")
@@ -2579,37 +3180,8 @@ def cmd_guard_check(args: argparse.Namespace) -> int:
         if not lock_ok:
             missing_reasons.append(f"current process does not hold .ops.lock ({lock_reason})")
 
-    # Condition 2: maintenance-admission.json fully paused (paused == true and allow_workspace_ids == [])
-    adm_path = Path(args.admission_file).expanduser().resolve()
-    if not adm_path.is_file():
-        missing_reasons.append(f"maintenance-admission.json missing ({adm_path})")
-    else:
-        try:
-            adm = json.loads(adm_path.read_text(encoding="utf-8"))
-            if not isinstance(adm, dict):
-                raise ValueError("not a JSON object")
-            paused = adm.get("paused") is True
-            allow_ids = adm.get("allow_workspace_ids")
-            empty_allow = isinstance(allow_ids, list) and len(allow_ids) == 0
-            if not paused:
-                missing_reasons.append("maintenance-admission.json paused != true")
-            if not empty_allow:
-                missing_reasons.append(
-                    f"maintenance-admission.json allow_workspace_ids != [] (got {allow_ids!r})"
-                )
-        except Exception as exc:
-            missing_reasons.append(f"maintenance-admission.json unreadable ({exc})")
-
-    # Condition 3: handoff-journal.json completed == false
-    j_data, j_err = _read_journal_strict(j_path)
-    if j_err is not None:
-        missing_reasons.append(j_err)
-    elif j_data is None:
-        missing_reasons.append(f"handoff-journal.json missing ({j_path})")
-    elif j_data.get("completed") is not False:
-        missing_reasons.append(
-            f"handoff-journal.json completed != false (got {j_data.get('completed')!r})"
-        )
+    # Conditions 2 & 3: full admission pause + incomplete handoff-journal.json
+    missing_reasons.extend(_check_admission_and_incomplete_journal(adm_path, j_path))
 
     if missing_reasons:
         print(
@@ -2620,10 +3192,90 @@ def cmd_guard_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_compose_args(args: argparse.Namespace) -> int:
+    repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
+    docker_bin = os.environ.get("DOCKER_BIN", "docker")
+    c_args, _, err = resolve_compose_args(repo_root, docker_bin=docker_bin)
+    if err is not None:
+        print(f"ERROR: {err}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(c_args, ensure_ascii=False))
+    else:
+        for item in c_args:
+            print(item)
+    return 0
+
+
+def _collect_status_summary_dict(
+    j_path: Path,
+    a_path: Path,
+    b_path: Path | None,
+    *,
+    include_dry_run_plan: bool = False,
+    test_workspace_id: str = "",
+    keep_admission_paused: bool = False,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    if j_path.is_file():
+        try:
+            j = json.loads(j_path.read_text(encoding="utf-8"))
+            summary["handoff_journal"] = {"exists": True, "data": j}
+        except Exception as exc:
+            summary["handoff_journal"] = {"exists": True, "error": type(exc).__name__}
+    else:
+        summary["handoff_journal"] = {"exists": False, "path": str(j_path)}
+
+    if a_path.is_file():
+        try:
+            a = json.loads(a_path.read_text(encoding="utf-8"))
+            summary["maintenance_admission"] = {"exists": True, "data": a}
+        except Exception as exc:
+            summary["maintenance_admission"] = {"exists": True, "error": type(exc).__name__}
+    else:
+        summary["maintenance_admission"] = {"exists": False, "path": str(a_path)}
+
+    if include_dry_run_plan:
+        summary["dry_run_plan"] = [
+            "1. Record switch_pausing_admission intent, lock maintenance admission (allow_workspace_ids=[]), verify idle & preflight, snapshot + baseline-snapshot.json",
+            "2. Bootstrap com.dalton.research-host (:8951) in standby and run read-only probes",
+            "3. Start handoff clock (T_trigger), drain :8943, archive plist & bootout to release .guidepoint.owner.lock",
+            "4. Set target_owner=research_host_8951, call :8951/admin/guidepoint/acquire-lock & run bounded search probe",
+            "5. Drain & kickstart :8960 with :8951 Guidepoint URL and run parallel 3-way real probes",
+            "6. Build frontend (--out-dir), close migrated :8960 routes first, force-recreate backend+edge & stop old sandboxes",
+            "7. Verify optional --test-workspace-id (new OK + legacy route_migrated), resume admission, mark completed=true",
+        ]
+        if test_workspace_id:
+            summary["test_workspace_id"] = test_workspace_id
+        if keep_admission_paused:
+            summary["keep_admission_paused"] = True
+        if b_path is None or not b_path.is_file():
+            summary["timing_budgets"] = {"exists": False, "path": str(b_path) if b_path else ""}
+        else:
+            parsed, errs = parse_timing_budgets_env(b_path)
+            if errs:
+                summary["timing_budgets"] = {"exists": True, "errors": errs}
+            else:
+                summary["timing_budgets"] = {"exists": True, "values": parsed}
+    return summary
+
+
 def cmd_status_summary(args: argparse.Namespace) -> int:
-    j_path = Path(args.journal_file).expanduser().resolve()
-    a_path = Path(args.admission_file).expanduser().resolve()
-    b_path = Path(args.budgets_file).expanduser().resolve() if args.budgets_file else None
+    repo_root = Path(args.repo).expanduser().resolve() if getattr(args, "repo", None) else _default_repo_root()
+    _, j_path, a_path, default_b_path = _canonical_ops_paths(repo_root)
+    b_path = Path(args.budgets_file).expanduser().resolve() if args.budgets_file else default_b_path
+
+    if getattr(args, "json", False):
+        payload = _collect_status_summary_dict(
+            j_path,
+            a_path,
+            b_path,
+            include_dry_run_plan=bool(args.include_dry_run_plan),
+            test_workspace_id=str(getattr(args, "test_workspace_id", "") or ""),
+            keep_admission_paused=bool(getattr(args, "keep_admission_paused", False)),
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
 
     print("=== Current Cutover State Summary (read-only) ===")
     if j_path.is_file():
@@ -2705,13 +3357,35 @@ def _build_preflight_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--repo", default=None, help="Repository root path")
     p.add_argument("--home", default=None, help="Home directory path")
-    p.add_argument("--plist-dir", default=None, help="LaunchAgents plist directory")
+    p.add_argument("--plist-dir", default=None, help="Installed LaunchAgents plist directory")
+    p.add_argument(
+        "--research-host-plist",
+        default=None,
+        help="Explicit path to archived/staged com.dalton.research-host.plist",
+    )
+    p.add_argument(
+        "--archived-plist-dir",
+        default=None,
+        help="Directory holding archived com.dalton.research-host.plist for Stage B",
+    )
     p.add_argument("--backend-url", default="http://127.0.0.1:8000")
     p.add_argument("--proxy-url", default="http://127.0.0.1:8943")
     p.add_argument("--bridge-url", default="http://127.0.0.1:8960")
     p.add_argument("--research-host-url", default="http://127.0.0.1:8951")
     p.add_argument("--proxy-listen-port", type=int, default=8943)
     p.add_argument("--budgets-file", default=None)
+    p.add_argument(
+        "--include-summary",
+        action="store_true",
+        help="Include read-only cutover state summary in JSON output",
+    )
+    p.add_argument(
+        "--include-dry-run-plan",
+        action="store_true",
+        help="Include Stage B 7-step dry-run plan in JSON summary output",
+    )
+    p.add_argument("--test-workspace-id", default="")
+    p.add_argument("--keep-admission-paused", action="store_true")
     return p
 
 
@@ -2720,21 +3394,24 @@ def _build_subcommand_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="subcommand", required=True)
 
     p_lv = sub.add_parser("lock-verify")
-    p_lv.add_argument("--lock-file", required=True)
+    p_lv.add_argument("--repo", required=True)
     p_lv.add_argument("--lock-fd", type=int, default=8)
 
     p_js = sub.add_parser("journal-set")
-    p_js.add_argument("--ownership-file", required=True)
-    p_js.add_argument("--repo", default=None)
-    p_js.add_argument("--lock-file", default=None)
+    p_js.add_argument("--repo", required=True)
     p_js.add_argument("--lock-fd", type=int, default=None)
     p_js.add_argument("--print-json", action="store_true")
     p_js.add_argument("pairs", nargs="+")
 
     p_jr = sub.add_parser("journal-read")
-    p_jr.add_argument("--ownership-file", required=True)
-    p_jr.add_argument("--repo", default=None)
+    p_jr.add_argument("--repo", required=True)
     p_jr.add_argument("--key", default=None)
+
+    p_rp = sub.add_parser("recovery-publish")
+    p_rp.add_argument("--repo", required=True)
+    p_rp.add_argument("--src-dir", required=True)
+    p_rp.add_argument("--gp-lock-src", required=True)
+    p_rp.add_argument("--source-commit", required=True)
 
     p_mw = sub.add_parser("manifest-write")
     p_mw.add_argument("--recovery-dir", required=True)
@@ -2745,26 +3422,29 @@ def _build_subcommand_parser() -> argparse.ArgumentParser:
     p_mv.add_argument("--recovery-dir", required=True)
 
     p_ab = sub.add_parser("approve-budgets")
-    p_ab.add_argument("--budgets-file", required=True)
-    p_ab.add_argument("--journal-file", default=None)
-    p_ab.add_argument("--lock-file", default=None)
+    p_ab.add_argument("--repo", required=True)
+    p_ab.add_argument("--budgets-file", default=None)
     p_ab.add_argument("--lock-fd", type=int, default=None)
     p_ab.add_argument("--handoff-deadline-s", default=None)
     p_ab.add_argument("--stage-b-window-m", default=None)
 
     p_gc = sub.add_parser("guard-check")
+    p_gc.add_argument("--repo", required=True)
     p_gc.add_argument("--action", required=True)
-    p_gc.add_argument("--admission-file", required=True)
-    p_gc.add_argument("--journal-file", required=True)
-    p_gc.add_argument("--lock-file", default=None)
     p_gc.add_argument("--lock-fd", type=int, default=8)
     p_gc.add_argument("--lock-held", required=True)
 
+    p_ca = sub.add_parser("compose-args")
+    p_ca.add_argument("--repo", required=True)
+    p_ca.add_argument("--json", action="store_true")
+
     p_ss = sub.add_parser("status-summary")
-    p_ss.add_argument("--journal-file", required=True)
-    p_ss.add_argument("--admission-file", required=True)
+    p_ss.add_argument("--repo", required=True)
     p_ss.add_argument("--budgets-file", default=None)
     p_ss.add_argument("--include-dry-run-plan", action="store_true")
+    p_ss.add_argument("--test-workspace-id", default="")
+    p_ss.add_argument("--keep-admission-paused", action="store_true")
+    p_ss.add_argument("--json", action="store_true")
 
     return p
 
@@ -2774,10 +3454,12 @@ _SUBCOMMANDS = frozenset(
         "lock-verify",
         "journal-set",
         "journal-read",
+        "recovery-publish",
         "manifest-write",
         "manifest-verify",
         "approve-budgets",
         "guard-check",
+        "compose-args",
         "status-summary",
     }
 )
@@ -2793,6 +3475,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_journal_set(ns)
         if ns.subcommand == "journal-read":
             return cmd_journal_read(ns)
+        if ns.subcommand == "recovery-publish":
+            return cmd_recovery_publish(ns)
         if ns.subcommand == "manifest-write":
             return cmd_manifest_write(ns)
         if ns.subcommand == "manifest-verify":
@@ -2801,6 +3485,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_approve_budgets(ns)
         if ns.subcommand == "guard-check":
             return cmd_guard_check(ns)
+        if ns.subcommand == "compose-args":
+            return cmd_compose_args(ns)
         if ns.subcommand == "status-summary":
             return cmd_status_summary(ns)
         return 2
@@ -2818,6 +3504,16 @@ def main(argv: list[str] | None = None) -> int:
         if ns.budgets_file
         else (repo_root / DEFAULT_BUDGETS_REL_PATH)
     )
+    rh_plist = (
+        Path(ns.research_host_plist).expanduser().resolve()
+        if ns.research_host_plist
+        else None
+    )
+    archived_dir = (
+        Path(ns.archived_plist_dir).expanduser().resolve()
+        if ns.archived_plist_dir
+        else None
+    )
 
     cfg = PreflightConfig(
         repo_root=repo_root,
@@ -2830,6 +3526,8 @@ def main(argv: list[str] | None = None) -> int:
         budgets_file=budgets_file,
         expect_admission=ns.expect_admission,
         proxy_listen_port=int(ns.proxy_listen_port),
+        research_host_plist=rh_plist,
+        archived_plist_dir=archived_dir,
         launchctl_bin=os.environ.get("LAUNCHCTL_BIN", "launchctl"),
         lsof_bin=os.environ.get("LSOF_BIN", "lsof"),
         ps_bin=os.environ.get("PS_BIN", "ps"),
@@ -2840,17 +3538,22 @@ def main(argv: list[str] | None = None) -> int:
     mode = "stage-a" if ns.stage_a else "switch"
     rc, results = run_preflight(mode, cfg, report_json=ns.report_json)
     if ns.report_json:
-        print(
-            json.dumps(
-                {
-                    "mode": mode,
-                    "ok": rc == 0,
-                    "checks": results,
-                },
-                ensure_ascii=False,
-                indent=2,
+        out_obj: dict[str, Any] = {
+            "mode": mode,
+            "ok": rc == 0,
+            "checks": results,
+        }
+        if ns.include_summary:
+            _, j_path, a_path, _ = _canonical_ops_paths(repo_root)
+            out_obj["summary"] = _collect_status_summary_dict(
+                j_path,
+                a_path,
+                budgets_file,
+                include_dry_run_plan=bool(ns.include_dry_run_plan),
+                test_workspace_id=str(ns.test_workspace_id or ""),
+                keep_admission_paused=bool(ns.keep_admission_paused),
             )
-        )
+        print(json.dumps(out_obj, ensure_ascii=False, indent=2))
     else:
         for r in results:
             tag = r["status"].upper()

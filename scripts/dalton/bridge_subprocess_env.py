@@ -18,6 +18,7 @@ from pathlib import Path
 import plistlib
 import re
 import secrets
+import shutil
 import stat
 import sys
 import tempfile
@@ -2196,15 +2197,18 @@ def validate_safe_regular_file_target(
         raise EnvFileValidationError(path=path, reason="target path is not a regular file")
 
 
-def _fsync_directory(dir_path: Path) -> None:
+def _fsync_directory(dir_path: Path, *, strict: bool = False) -> None:
     try:
         fd = os.open(str(dir_path), os.O_RDONLY)
     except OSError:
+        if strict:
+            raise
         return
     try:
         os.fsync(fd)
     except OSError:
-        pass
+        if strict:
+            raise
     finally:
         os.close(fd)
 
@@ -2645,29 +2649,337 @@ def _resolve_abs_without_symlink_deref(path: Path) -> Path:
     return Path(os.path.abspath(str(path.expanduser())))
 
 
-def _parse_simple_dotenv_lenient(path: Path) -> dict[str, str]:
-    """Read KEY=VALUE pairs from a sourced shell env file (e.g. guidepoint_mcp.env)."""
-    result: dict[str, str] = {}
-    if not path.is_file():
-        return result
+_SHELL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SHELL_ASSIGN_LINE_RE = re.compile(r"^(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_SHELL_UNQUOTED_META_CHARS: frozenset[str] = frozenset({";", "|", "&", "<", ">", "(", ")", "`"})
+
+
+def _expand_shell_dollar(
+    raw: str,
+    idx: int,
+    env: Mapping[str, str],
+    *,
+    path: Path,
+    lineno: int,
+    key: str,
+) -> tuple[str, int]:
+    """Expand `$VAR`, `${VAR}`, `${VAR:-default}`, or `${VAR-default}` at `raw[idx] == '$'`.
+
+    Rejects command substitution `$(...)`, arithmetic `$((...))`, unsupported parameter
+    operators, and special shell parameters so unparseable shell syntax fails closed.
+    """
+    n = len(raw)
+    if idx + 1 >= n:
+        return "$", idx + 1
+    nxt = raw[idx + 1]
+    if nxt == "(":
+        raise EnvFileValidationError(
+            path=path,
+            key=key,
+            reason=f"line {lineno}: command/arithmetic substitution '$(' is not reliably parseable",
+        )
+    if nxt == "{":
+        # Find matching '}' respecting nested single/double quotes and nested ${...}
+        depth = 1
+        pos = idx + 2
+        in_sq = False
+        in_dq = False
+        while pos < n and depth > 0:
+            ch = raw[pos]
+            if in_sq:
+                if ch == "'":
+                    in_sq = False
+                pos += 1
+                continue
+            if in_dq:
+                if ch == "\\" and pos + 1 < n:
+                    pos += 2
+                    continue
+                if ch == '"':
+                    in_dq = False
+                pos += 1
+                continue
+            if ch == "\\" and pos + 1 < n:
+                pos += 2
+                continue
+            if ch == "'":
+                in_sq = True
+                pos += 1
+                continue
+            if ch == '"':
+                in_dq = True
+                pos += 1
+                continue
+            if ch == "$" and pos + 1 < n and raw[pos + 1] == "{":
+                depth += 1
+                pos += 2
+                continue
+            if ch == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+                pos += 1
+                continue
+            pos += 1
+        if depth != 0:
+            raise EnvFileValidationError(
+                path=path,
+                key=key,
+                reason=f"line {lineno}: unclosed '${{...}}' parameter expansion",
+            )
+        inner = raw[idx + 2 : pos]
+        if not inner:
+            raise EnvFileValidationError(
+                path=path,
+                key=key,
+                reason=f"line {lineno}: empty '${{}}' parameter expansion",
+            )
+        if _SHELL_IDENT_RE.fullmatch(inner):
+            return str(env.get(inner, "")), pos + 1
+        m_def = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)(:-|-)([\s\S]*)$", inner)
+        if not m_def:
+            raise EnvFileValidationError(
+                path=path,
+                key=key,
+                reason=f"line {lineno}: unsupported parameter expansion syntax in '${{...}}'",
+            )
+        var_name, op, default_expr = m_def.group(1), m_def.group(2), m_def.group(3)
+        if op == ":-":
+            if var_name in env and env[var_name] != "":
+                return str(env[var_name]), pos + 1
+        else:
+            if var_name in env:
+                return str(env[var_name]), pos + 1
+        expanded_default = _parse_shell_rhs_value(
+            default_expr,
+            env,
+            path=path,
+            lineno=lineno,
+            key=key,
+            allow_inline_comment=False,
+        )
+        return expanded_default, pos + 1
+
+    if nxt.isalpha() or nxt == "_":
+        end = idx + 2
+        while end < n and (raw[end].isalnum() or raw[end] == "_"):
+            end += 1
+        var_name = raw[idx + 1 : end]
+        return str(env.get(var_name, "")), end
+
+    if nxt in ("'", '"', " ", "\t"):
+        return "$", idx + 1
+
+    raise EnvFileValidationError(
+        path=path,
+        key=key,
+        reason=f"line {lineno}: unsupported shell parameter expansion '${nxt}'",
+    )
+
+
+def _parse_shell_rhs_value(
+    rhs: str,
+    env: Mapping[str, str],
+    *,
+    path: Path,
+    lineno: int,
+    key: str,
+    allow_inline_comment: bool = True,
+) -> str:
+    """Parse a single bash `source` assignment RHS with quotes, `$VAR`/`${VAR}`, and inline `#` comments."""
+    out: list[str] = []
+    n = len(rhs)
+    i = 0
+
+    # Leading unquoted tilde expansion (`~` or `~/...`)
+    if rhs == "~" or rhs.startswith("~/"):
+        home_val = str(env.get("HOME") or "")
+        if not home_val:
+            raise EnvFileValidationError(
+                path=path,
+                key=key,
+                reason=f"line {lineno}: cannot expand '~' without HOME",
+            )
+        out.append(home_val)
+        i = 1
+    elif rhs.startswith("~"):
+        raise EnvFileValidationError(
+            path=path,
+            key=key,
+            reason=f"line {lineno}: unsupported user-specific tilde expansion",
+        )
+
+    while i < n:
+        ch = rhs[i]
+        if ch == "'":
+            end = rhs.find("'", i + 1)
+            if end < 0:
+                raise EnvFileValidationError(
+                    path=path,
+                    key=key,
+                    reason=f"line {lineno}: unclosed single quote",
+                )
+            out.append(rhs[i + 1 : end])
+            i = end + 1
+            continue
+
+        if ch == '"':
+            i += 1
+            closed = False
+            while i < n:
+                c = rhs[i]
+                if c == '"':
+                    closed = True
+                    i += 1
+                    break
+                if c == "\\":
+                    if i + 1 >= n:
+                        raise EnvFileValidationError(
+                            path=path,
+                            key=key,
+                            reason=f"line {lineno}: trailing backslash inside double quote",
+                        )
+                    nxt = rhs[i + 1]
+                    if nxt in ('"', "\\", "$", "`"):
+                        out.append(nxt)
+                    else:
+                        out.append("\\" + nxt)
+                    i += 2
+                    continue
+                if c == "`":
+                    raise EnvFileValidationError(
+                        path=path,
+                        key=key,
+                        reason=f"line {lineno}: backtick command substitution is not reliably parseable",
+                    )
+                if c == "$":
+                    val, i = _expand_shell_dollar(rhs, i, env, path=path, lineno=lineno, key=key)
+                    out.append(val)
+                    continue
+                out.append(c)
+                i += 1
+            if not closed:
+                raise EnvFileValidationError(
+                    path=path,
+                    key=key,
+                    reason=f"line {lineno}: unclosed double quote",
+                )
+            continue
+
+        if ch in (" ", "\t"):
+            rest = rhs[i:].lstrip(" \t")
+            if not rest:
+                break
+            if allow_inline_comment and rest.startswith("#"):
+                break
+            raise EnvFileValidationError(
+                path=path,
+                key=key,
+                reason=f"line {lineno}: unquoted whitespace / trailing tokens in sourced shell assignment",
+            )
+
+        if ch == "\\":
+            if i + 1 >= n:
+                raise EnvFileValidationError(
+                    path=path,
+                    key=key,
+                    reason=f"line {lineno}: multiline line continuation is not reliably parseable",
+                )
+            out.append(rhs[i + 1])
+            i += 2
+            continue
+
+        if ch in _SHELL_UNQUOTED_META_CHARS:
+            raise EnvFileValidationError(
+                path=path,
+                key=key,
+                reason=f"line {lineno}: unsupported shell metacharacter '{ch}' in sourced env file",
+            )
+
+        if ch == "$":
+            val, i = _expand_shell_dollar(rhs, i, env, path=path, lineno=lineno, key=key)
+            out.append(val)
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def parse_sourced_shell_env_strict(
+    path: Path,
+    *,
+    base_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Strictly parse a bash-sourced env file (e.g. `guidepoint_mcp.env`) in real `source` order.
+
+    Supports `KEY=VALUE` / `export KEY=VALUE`, single/double quotes, `$VAR` / `${VAR}` /
+    `${VAR:-default}` / `${VAR-default}` expansion using inherited + previously assigned
+    variables, `~/` expansion, and inline `#` comments preceded by unquoted whitespace.
+    Rejects any shell construct that cannot be reliably evaluated statically (command
+    substitution, conditionals, `source`, multiline continuations, unclosed quotes, etc.).
+    """
+    validate_safe_regular_file_target(path, allow_missing=False)
     try:
         raw_text = path.read_text(encoding="utf-8")
-    except OSError:
-        return result
-    for raw in raw_text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
+    except (OSError, UnicodeDecodeError) as exc:
+        raise EnvFileValidationError(
+            path=path,
+            reason=f"failed reading sourced shell env file ({type(exc).__name__})",
+        ) from exc
+
+    env: dict[str, str] = {str(k): str(v) for k, v in (base_env or {}).items()}
+    assigned: dict[str, str] = {}
+
+    for lineno, raw_line in enumerate(raw_text.splitlines(), start=1):
+        line = raw_line.rstrip("\r")
+        stripped = line.lstrip(" \t")
+        if not stripped or stripped.startswith("#"):
             continue
-        if line.startswith("export "):
-            line = line[len("export ") :].strip()
-        key, val = line.split("=", 1)
-        key = key.strip()
-        val = val.strip()
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
-            val = val[1:-1]
-        if key:
-            result[key] = val
-    return result
+        m = _SHELL_ASSIGN_LINE_RE.match(stripped)
+        if not m:
+            raise EnvFileValidationError(
+                path=path,
+                reason=f"line {lineno}: unsupported non-assignment shell syntax in sourced env file",
+            )
+        key, rhs = m.group(1), m.group(2)
+        val = _parse_shell_rhs_value(
+            rhs,
+            env,
+            path=path,
+            lineno=lineno,
+            key=key,
+            allow_inline_comment=True,
+        )
+        env[key] = val
+        assigned[key] = val
+
+    return assigned
+
+
+def _read_plist_env_vars_strict(plist_path: Path) -> dict[str, str]:
+    """Strictly read `EnvironmentVariables` from an existing launchd plist (fail closed on corruption)."""
+    validate_safe_regular_file_target(plist_path, allow_missing=False)
+    try:
+        parsed = plistlib.loads(plist_path.read_bytes())
+    except Exception as exc:
+        raise EnvFileValidationError(
+            path=plist_path,
+            reason=f"failed parsing plist ({type(exc).__name__})",
+        ) from exc
+    if not isinstance(parsed, Mapping):
+        raise EnvFileValidationError(path=plist_path, reason="plist root is not a dict")
+    env_map = parsed.get("EnvironmentVariables")
+    if env_map is None:
+        return {}
+    if not isinstance(env_map, Mapping):
+        raise EnvFileValidationError(
+            path=plist_path,
+            key="EnvironmentVariables",
+            reason="EnvironmentVariables is not a dict",
+        )
+    return {str(k): str(v) for k, v in env_map.items() if isinstance(k, str) and v is not None}
 
 
 def resolve_legacy_proxy_effective_paths(
@@ -2680,11 +2992,16 @@ def resolve_legacy_proxy_effective_paths(
 ) -> dict[str, Any]:
     """Resolve legacy `com.dalton.guidepoint-mcp-proxy` effective paths in real runtime order.
 
-    Actual launcher order (`guidepoint_mcp_proxy_run.sh`):
+    Single source of truth shared by Stage A rendering and `preflight.py`.
+    Actual launcher order (`guidepoint_mcp_proxy_run.sh` + `guidepoint_lock.py`):
       1. Inherit `EnvironmentVariables` from `com.dalton.guidepoint-mcp-proxy.plist`.
       2. Resolve `RESEARCH_HOME` (`DALTON_RESEARCH_HOME` > `DALTON_OCW_ROOT` > default)
-         and `GUIDEPOINT_ENV_FILE` (`$RESEARCH_HOME/config/guidepoint_mcp.env`).
-      3. `source "$ENV_FILE"` (overrides any keys inherited from the plist).
+         and `ENV_FILE` (`GUIDEPOINT_ENV_FILE` > `$RESEARCH_HOME/config/guidepoint_mcp.env`).
+      3. `source "$ENV_FILE"` (overrides any keys inherited from the plist, with variable
+         expansion against plist + `HOME` + `RESEARCH_HOME` and inline `#` comments).
+      4. Resolve paths via `guidepoint_lock.py` priority:
+         - tokens: `GUIDEPOINT_TOKENS_FILE` > `DALTON_GUIDEPOINT_TOKENS_FILE` > `$RESEARCH_HOME/config/guidepoint_mcp_tokens.json`
+         - ownership: `DALTON_GUIDEPOINT_OWNERSHIP_FILE` > `DALTON_HOST_OWNERSHIP_FILE` > canonical repo journal.
     """
     repo_abs = repo_root.expanduser().resolve()
     home_abs = home_dir.expanduser().resolve()
@@ -2694,23 +3011,33 @@ def resolve_legacy_proxy_effective_paths(
     existing_plist_found = False
     if existing_proxy_plist_path is not None:
         p = existing_proxy_plist_path.expanduser()
-        if p.is_file():
+        if p.exists() or p.is_symlink():
             existing_plist_found = True
-            plist_env = _read_plist_env_vars(p)
+            plist_env = _read_plist_env_vars_strict(p)
 
     eff_env: dict[str, str] = {"HOME": str(home_abs)}
     eff_env.update(plist_env)
 
-    raw_rh = (
-        str(eff_env.get("DALTON_RESEARCH_HOME") or "").strip()
-        or str(eff_env.get("DALTON_OCW_ROOT") or "").strip()
-        or str(bvals.get("DALTON_RESEARCH_HOME") or "").strip()
-    )
+    # Match `guidepoint_mcp_proxy_run.sh`: when an existing plist is present, launcher only reads
+    # plist env (`DALTON_RESEARCH_HOME` > `DALTON_OCW_ROOT` > default); bridge_env_vals is only a
+    # fallback default when rendering fresh without an existing plist.
+    if existing_plist_found:
+        raw_rh = (
+            str(eff_env.get("DALTON_RESEARCH_HOME") or "").strip()
+            or str(eff_env.get("DALTON_OCW_ROOT") or "").strip()
+        )
+    else:
+        raw_rh = (
+            str(eff_env.get("DALTON_RESEARCH_HOME") or "").strip()
+            or str(eff_env.get("DALTON_OCW_ROOT") or "").strip()
+            or str(bvals.get("DALTON_RESEARCH_HOME") or "").strip()
+        )
     research_home_abs = (
         _resolve_abs_without_symlink_deref(Path(raw_rh))
         if raw_rh
         else (home_abs / "Library" / "Application Support" / "Everflow" / "research")
     )
+    eff_env["RESEARCH_HOME"] = str(research_home_abs)
 
     if guidepoint_env_path is not None:
         gp_env_abs = _resolve_abs_without_symlink_deref(guidepoint_env_path)
@@ -2719,19 +3046,18 @@ def resolve_legacy_proxy_effective_paths(
     else:
         gp_env_abs = research_home_abs / "config" / "guidepoint_mcp.env"
 
-    sourced_vals = _parse_simple_dotenv_lenient(gp_env_abs) if gp_env_abs.is_file() else {}
-    # `source "$ENV_FILE"` overwrites plist variables!
-    eff_env.update(sourced_vals)
+    sourced_vals: dict[str, str] = {}
+    if gp_env_abs.exists() or gp_env_abs.is_symlink():
+        sourced_vals = parse_sourced_shell_env_strict(gp_env_abs, base_env=eff_env)
+        # `source "$ENV_FILE"` overwrites same-named plist variables!
+        eff_env.update(sourced_vals)
 
-    sourced_tokens_raw = (
-        str(sourced_vals.get("GUIDEPOINT_TOKENS_FILE") or "").strip()
-        or str(sourced_vals.get("DALTON_GUIDEPOINT_TOKENS_FILE") or "").strip()
-    )
-    sourced_ownership_raw = (
-        str(sourced_vals.get("DALTON_GUIDEPOINT_OWNERSHIP_FILE") or "").strip()
-        or str(sourced_vals.get("DALTON_HOST_OWNERSHIP_FILE") or "").strip()
-    )
+    if not eff_env.get("DALTON_RESEARCH_HOME") and not eff_env.get("DALTON_OCW_ROOT"):
+        eff_env["DALTON_RESEARCH_HOME"] = str(research_home_abs)
 
+    # Effective tokens path follows exact `guidepoint_lock.resolve_guidepoint_tokens_file()` priority:
+    # primary `GUIDEPOINT_TOKENS_FILE` ALWAYS beats alias `DALTON_GUIDEPOINT_TOKENS_FILE`, even if
+    # primary came from plist and alias came from sourced `guidepoint_mcp.env`.
     final_tokens_raw = (
         str(eff_env.get("GUIDEPOINT_TOKENS_FILE") or "").strip()
         or str(eff_env.get("DALTON_GUIDEPOINT_TOKENS_FILE") or "").strip()
@@ -2760,6 +3086,13 @@ def resolve_legacy_proxy_effective_paths(
         else (repo_abs / _DEFAULT_OWNERSHIP_REL_PATH)
     )
 
+    sourced_primary_tokens = str(sourced_vals.get("GUIDEPOINT_TOKENS_FILE") or "").strip()
+    sourced_alias_tokens = str(sourced_vals.get("DALTON_GUIDEPOINT_TOKENS_FILE") or "").strip()
+    sourced_primary_own = str(sourced_vals.get("DALTON_GUIDEPOINT_OWNERSHIP_FILE") or "").strip()
+    sourced_alias_own = str(sourced_vals.get("DALTON_HOST_OWNERSHIP_FILE") or "").strip()
+    sourced_tokens_raw = sourced_primary_tokens or sourced_alias_tokens
+    sourced_ownership_raw = sourced_primary_own or sourced_alias_own
+
     return {
         "existing_plist_found": existing_plist_found,
         "env_file_exists": gp_env_abs.is_file(),
@@ -2767,6 +3100,13 @@ def resolve_legacy_proxy_effective_paths(
         "guidepoint_env_file": str(gp_env_abs),
         "tokens_file": str(tokens_abs),
         "ownership_file": str(ownership_abs),
+        "effective_env": eff_env,
+        "sourced_vals": sourced_vals,
+        "env_file_primary_tokens_override": (
+            str(_resolve_abs_without_symlink_deref(Path(sourced_primary_tokens)))
+            if sourced_primary_tokens
+            else ""
+        ),
         "env_file_tokens_override": (
             str(_resolve_abs_without_symlink_deref(Path(sourced_tokens_raw)))
             if sourced_tokens_raw
@@ -3284,14 +3624,29 @@ def render_stage_a_plists_atomic(
                 ),
             )
 
-    if live_proxy["env_file_tokens_override"]:
-        eff_tokens_abs = _resolve_abs_without_symlink_deref(Path(live_proxy["env_file_tokens_override"]))
-    elif live_proxy["existing_plist_found"] or live_proxy["env_file_exists"]:
+    # Choose effective tokens path using the EXACT live runtime resolution (`live_proxy["tokens_file"]`)
+    # so primary `GUIDEPOINT_TOKENS_FILE` in the existing plist is NEVER silently superseded by a
+    # secondary alias `DALTON_GUIDEPOINT_TOKENS_FILE` in `guidepoint_mcp.env`.
+    if live_proxy_has_explicit:
         eff_tokens_abs = live_proxy_tokens
     elif host_explicit_tokens is not None:
         eff_tokens_abs = host_explicit_tokens
     else:
         eff_tokens_abs = live_proxy_tokens
+
+    # If `guidepoint_mcp.env` sets primary `GUIDEPOINT_TOKENS_FILE`, verify it won't override
+    # our chosen `eff_tokens_abs` on restart (when live_proxy_has_explicit is True they already match).
+    if live_proxy["env_file_primary_tokens_override"]:
+        env_primary_tok = Path(live_proxy["env_file_primary_tokens_override"]).resolve()
+        if env_primary_tok != eff_tokens_abs.resolve():
+            raise EnvFileValidationError(
+                path=Path(live_proxy["guidepoint_env_file"]),
+                key="GUIDEPOINT_TOKENS_FILE",
+                reason=(
+                    f"sourced guidepoint env overrides GUIDEPOINT_TOKENS_FILE to {env_primary_tok}, "
+                    f"conflicting with {eff_tokens_abs}"
+                ),
+            )
 
     bridge_dest = out_abs / "com.dalton.researchdata-bridge.plist"
     host_dest = out_abs / "com.dalton.research-host.plist"
@@ -3334,6 +3689,7 @@ def render_stage_a_plists_atomic(
 
     # Phase 2: Write all three staged files inside output_dir, fsync, and re-parse from disk.
     stage_dir = Path(tempfile.mkdtemp(prefix=".stage-a-plists.", dir=str(out_abs)))
+    backup_dir = stage_dir / "backup"
     staged_pairs: list[tuple[Path, Path]] = [
         (stage_dir / bridge_dest.name, bridge_dest),
         (stage_dir / host_dest.name, host_dest),
@@ -3364,23 +3720,92 @@ def render_stage_a_plists_atomic(
             os.chmod(staged_path, 0o644)
             # Re-verify written bytes on disk via plistlib before committing any file
             plistlib.loads(staged_path.read_bytes())
-        _fsync_directory(stage_dir)
 
-        # Phase 3: Commit all three validated files into output_dir
+        # Post-render runtime check: verify newly rendered proxy plist -> `source guidepoint_mcp.env`
+        # resolves to the exact expected `eff_tokens_abs` and `target_ownership_abs`.
+        staged_proxy_path = stage_dir / proxy_dest.name
+        post_proxy = resolve_legacy_proxy_effective_paths(
+            repo_root=repo_abs,
+            home_dir=home_abs,
+            existing_proxy_plist_path=staged_proxy_path,
+            bridge_env_vals=bridge_vals,
+            guidepoint_env_path=Path(live_proxy["guidepoint_env_file"]),
+        )
+        if Path(post_proxy["tokens_file"]).resolve() != eff_tokens_abs.resolve():
+            raise EnvFileValidationError(
+                path=Path(live_proxy["guidepoint_env_file"]),
+                key="GUIDEPOINT_TOKENS_FILE",
+                reason=(
+                    f"post-render proxy runtime tokens path {post_proxy['tokens_file']} "
+                    f"diverges from rendered {eff_tokens_abs}"
+                ),
+            )
+        if Path(post_proxy["ownership_file"]).resolve() != target_ownership_abs.resolve():
+            raise EnvFileValidationError(
+                path=Path(live_proxy["guidepoint_env_file"]),
+                key="DALTON_GUIDEPOINT_OWNERSHIP_FILE",
+                reason=(
+                    f"post-render proxy runtime ownership path {post_proxy['ownership_file']} "
+                    f"diverges from canonical {target_ownership_abs}"
+                ),
+            )
+
+        # Snapshot pre-existing destination files into stage_dir/backup before committing any file
+        # so a mid-commit failure cleanly rolls back all previously replaced destinations.
+        backup_dir.mkdir(mode=0o700)
+        commit_plan: list[tuple[Path, Path, bool, Path | None]] = []
         for staged_path, dest_path in staged_pairs:
             validate_safe_regular_file_target(dest_path, allow_missing=True)
-            os.replace(staged_path, dest_path)
-        _fsync_directory(out_abs)
-    finally:
-        for staged_path, _ in staged_pairs:
-            try:
-                staged_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            if dest_path.exists():
+                bkp_path = backup_dir / dest_path.name
+                old_mode = stat.S_IMODE(dest_path.stat().st_mode)
+                old_bytes = dest_path.read_bytes()
+                bfd = os.open(str(bkp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, old_mode)
+                bclosed = False
+                try:
+                    os.fchmod(bfd, old_mode)
+                    bview = memoryview(old_bytes)
+                    bwritten = 0
+                    while bwritten < len(bview):
+                        bwritten += os.write(bfd, bview[bwritten:])
+                    os.fsync(bfd)
+                    os.close(bfd)
+                    bclosed = True
+                except BaseException:
+                    if not bclosed:
+                        try:
+                            os.close(bfd)
+                        except OSError:
+                            pass
+                    raise
+                os.chmod(bkp_path, old_mode)
+                commit_plan.append((staged_path, dest_path, True, bkp_path))
+            else:
+                commit_plan.append((staged_path, dest_path, False, None))
+
+        _fsync_directory(backup_dir, strict=True)
+        _fsync_directory(stage_dir, strict=True)
+
+        # Phase 3: Commit all three validated files; roll back all committed files on ANY failure.
+        committed: list[tuple[Path, bool, Path | None]] = []
         try:
-            stage_dir.rmdir()
-        except OSError:
-            pass
+            for staged_path, dest_path, existed, bkp_path in commit_plan:
+                os.replace(staged_path, dest_path)
+                committed.append((dest_path, existed, bkp_path))
+            _fsync_directory(out_abs, strict=True)
+        except BaseException:
+            for dest_path, existed, bkp_path in reversed(committed):
+                try:
+                    if existed and bkp_path is not None and bkp_path.exists():
+                        os.replace(bkp_path, dest_path)
+                    elif not existed:
+                        dest_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            _fsync_directory(out_abs, strict=False)
+            raise
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
 
     return {
         "com.dalton.guidepoint-mcp-proxy": str(proxy_dest),

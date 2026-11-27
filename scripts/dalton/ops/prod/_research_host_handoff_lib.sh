@@ -58,9 +58,9 @@ rh_paths() {
 rh_acquire_ops_lock() {
   rh_paths
   if [[ "${RH_OPS_LOCK_HELD:-0}" -eq 1 && "${DALTON_OPS_LOCK_OWNER_PID:-}" == "$$" ]]; then
-    # Verify FD 8 actually holds the kernel flock on RH_OPS_LOCK_FILE (never trust flags alone)
+    # Verify FD 8 actually holds the kernel flock on canonical .ops.lock (never trust flags alone)
     if PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" lock-verify \
-        --lock-file "${RH_OPS_LOCK_FILE}" --lock-fd 8 >/dev/null 2>&1; then
+        --repo "${RH_REPO_ROOT}" --lock-fd 8 >/dev/null 2>&1; then
       return 0
     fi
     RH_OPS_LOCK_HELD=0
@@ -146,148 +146,17 @@ rh_persist_recovery_bin() {
     gp_lock_src="${RH_LIB_DIR}/guidepoint_lock.py"
   fi
 
-  local f
-  for f in switch_research_host.sh _research_host_handoff_lib.sh wait_backend_idle.sh preflight.py; do
-    if [[ ! -f "${src_dir}/${f}" ]]; then
-      echo "ERROR: missing required recovery file: ${src_dir}/${f}" >&2
-      return 1
-    fi
-  done
-  if [[ ! -f "${gp_lock_src}" ]]; then
-    echo "ERROR: missing required recovery file: ${gp_lock_src}" >&2
-    return 1
-  fi
-
-  if ! mkdir -p "${RH_SNAPSHOTS_ROOT}" 2>/dev/null; then
-    echo "ERROR: failed to create snapshots directory ${RH_SNAPSHOTS_ROOT}" >&2
-    return 1
-  fi
-  chmod 0700 "${RH_SNAPSHOTS_ROOT}" 2>/dev/null || true
-
-  # Build the new immutable release directory as a sibling inside RH_SNAPSHOTS_ROOT
-  local new_rel_dir=""
-  new_rel_dir="$(mktemp -d "${RH_SNAPSHOTS_ROOT}/.recovery-bin.rel.XXXXXX")" || return 1
-  chmod 0700 "${new_rel_dir}"
-
-  local rc=0
-  cp "${src_dir}/switch_research_host.sh" "${new_rel_dir}/switch_research_host.sh" && \
-  cp "${src_dir}/_research_host_handoff_lib.sh" "${new_rel_dir}/_research_host_handoff_lib.sh" && \
-  cp "${src_dir}/wait_backend_idle.sh" "${new_rel_dir}/wait_backend_idle.sh" && \
-  cp "${src_dir}/preflight.py" "${new_rel_dir}/preflight.py" && \
-  cp "${gp_lock_src}" "${new_rel_dir}/guidepoint_lock.py" || rc=$?
-
-  if [[ "${rc}" -ne 0 ]]; then
-    rm -rf "${new_rel_dir}" 2>/dev/null || true
-    echo "ERROR: failed copying files into staging recovery-bin release directory" >&2
-    return 1
-  fi
-
-  chmod 0700 "${new_rel_dir}/switch_research_host.sh" "${new_rel_dir}/wait_backend_idle.sh" "${new_rel_dir}/preflight.py"
-  chmod 0600 "${new_rel_dir}/_research_host_handoff_lib.sh" "${new_rel_dir}/guidepoint_lock.py"
-
   local src_commit="${src_commit_override}"
   if [[ -z "${src_commit}" ]]; then
     src_commit="$(git -C "${src_dir}" rev-parse HEAD 2>/dev/null || git -C "${RH_REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo "unknown")"
   fi
 
-  # Use trusted RH_PREFLIGHT_PY to write & fsync the 5-file manifest, then verify before publishing
-  if ! PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" manifest-write \
-      --recovery-dir "${new_rel_dir}" \
-      --source-commit "${src_commit}" \
-      --file switch_research_host.sh \
-      --file _research_host_handoff_lib.sh \
-      --file wait_backend_idle.sh \
-      --file preflight.py \
-      --file guidepoint_lock.py; then
-    rm -rf "${new_rel_dir}" 2>/dev/null || true
-    return 1
-  fi
-
-  if ! PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" manifest-verify \
-      --recovery-dir "${new_rel_dir}"; then
-    rm -rf "${new_rel_dir}" 2>/dev/null || true
-    echo "ERROR: staged recovery-bin release failed manifest verification" >&2
-    return 1
-  fi
-
-  local new_rel_base
-  new_rel_base="$(basename "${new_rel_dir}")"
-  local tmp_link="${RH_SNAPSHOTS_ROOT}/.recovery-bin.link.$$.${RANDOM:-0}"
-  rm -f "${tmp_link}" 2>/dev/null || true
-  if ! ln -s "${new_rel_base}" "${tmp_link}"; then
-    rm -rf "${new_rel_dir}" 2>/dev/null || true
-    echo "ERROR: failed creating sibling symlink for recovery-bin" >&2
-    return 1
-  fi
-
-  # Atomic sibling symlink swap (single POSIX rename(2) when target is absent or already a symlink)
-  if [[ -L "${RH_RECOVERY_BIN_DIR}" || ! -e "${RH_RECOVERY_BIN_DIR}" ]]; then
-    local prev_target=""
-    if [[ -L "${RH_RECOVERY_BIN_DIR}" ]]; then
-      prev_target="$(readlink "${RH_RECOVERY_BIN_DIR}" 2>/dev/null || true)"
-    fi
-    if ! PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B - "${tmp_link}" "${RH_RECOVERY_BIN_DIR}" "${RH_SNAPSHOTS_ROOT}" <<'PY'
-import os
-import sys
-
-src_link, dst_link, parent_dir = sys.argv[1:4]
-os.replace(src_link, dst_link)
-try:
-    dfd = os.open(parent_dir, os.O_RDONLY)
-    try:
-        os.fsync(dfd)
-    finally:
-        os.close(dfd)
-except OSError:
-    pass
-PY
-    then
-      rm -f "${tmp_link}" 2>/dev/null || true
-      rm -rf "${new_rel_dir}" 2>/dev/null || true
-      echo "ERROR: atomic symlink swap for recovery-bin failed; previous entrypoint preserved" >&2
-      return 1
-    fi
-    # Clean up retired sibling release directory after successful swap
-    if [[ -n "${prev_target}" && "${prev_target}" != "${new_rel_base}" ]]; then
-      case "${prev_target}" in
-        .recovery-bin.rel.*)
-          rm -rf "${RH_SNAPSHOTS_ROOT}/${prev_target}" 2>/dev/null || true
-          ;;
-      esac
-    fi
-    return 0
-  fi
-
-  # Legacy upgrade path: RH_RECOVERY_BIN_DIR exists as a real non-symlink directory.
-  # Never ignore rmdir/mv failures; abort and preserve previous entrypoint on any failure.
-  local legacy_slot=""
-  legacy_slot="$(mktemp -d "${RH_SNAPSHOTS_ROOT}/.recovery-bin.legacy.XXXXXX")" || {
-    rm -f "${tmp_link}" 2>/dev/null || true
-    rm -rf "${new_rel_dir}" 2>/dev/null || true
-    echo "ERROR: failed creating legacy backup slot for recovery-bin migration" >&2
-    return 1
-  }
-  local legacy_backup="${legacy_slot}/old"
-  if ! mv "${RH_RECOVERY_BIN_DIR}" "${legacy_backup}"; then
-    rm -f "${tmp_link}" 2>/dev/null || true
-    rm -rf "${new_rel_dir}" 2>/dev/null || true
-    rmdir "${legacy_slot}" 2>/dev/null || true
-    echo "ERROR: failed moving legacy recovery-bin directory; previous entrypoint preserved" >&2
-    return 1
-  fi
-  if ! mv "${tmp_link}" "${RH_RECOVERY_BIN_DIR}"; then
-    echo "ERROR: failed promoting recovery-bin symlink; attempting to restore legacy directory" >&2
-    if ! mv "${legacy_backup}" "${RH_RECOVERY_BIN_DIR}"; then
-      echo "ERROR: CRITICAL: failed restoring legacy recovery-bin from ${legacy_backup}" >&2
-    else
-      rmdir "${legacy_slot}" 2>/dev/null || true
-    fi
-    rm -f "${tmp_link}" 2>/dev/null || true
-    rm -rf "${new_rel_dir}" 2>/dev/null || true
-    return 1
-  fi
-  rm -rf "${legacy_slot}" 2>/dev/null || true
-  return 0
+  # Single shared atomic Python implementation (strict fsync + single-syscall os.replace / RENAME_SWAP)
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" recovery-publish \
+    --repo "${RH_REPO_ROOT}" \
+    --src-dir "${src_dir}" \
+    --gp-lock-src "${gp_lock_src}" \
+    --source-commit "${src_commit}"
 }
 
 rh_verify_recovery_manifest() {
@@ -298,6 +167,13 @@ rh_verify_recovery_manifest() {
     --recovery-dir "${target_dir}"
 }
 
+rh_compose_args() {
+  rh_paths
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" compose-args \
+    --repo "${RH_REPO_ROOT}" \
+    "$@"
+}
+
 rh_journal_set() {
   rh_paths
   if [[ "$#" -lt 1 ]]; then
@@ -306,8 +182,6 @@ rh_journal_set() {
   fi
   PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" journal-set \
     --repo "${RH_REPO_ROOT}" \
-    --ownership-file "${RH_JOURNAL_FILE}" \
-    --lock-file "${RH_OPS_LOCK_FILE}" \
     --lock-fd 8 \
     "$@"
 }
@@ -324,10 +198,8 @@ rh_require_change_allowed() {
     lock_held=1
   fi
   PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" guard-check \
+    --repo "${RH_REPO_ROOT}" \
     --action "${action}" \
-    --admission-file "${RH_ADMISSION_FILE}" \
-    --journal-file "${RH_JOURNAL_FILE}" \
-    --lock-file "${RH_OPS_LOCK_FILE}" \
     --lock-fd 8 \
     --lock-held "${lock_held}"
 }
@@ -341,7 +213,6 @@ rh_require_no_incomplete_journal() {
   local rc=0
   completed="$(PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" journal-read \
     --repo "${RH_REPO_ROOT}" \
-    --ownership-file "${RH_JOURNAL_FILE}" \
     --key completed 2>&1)" || rc=$?
   if [[ "${rc}" -ne 0 ]]; then
     echo "ERROR: handoff-journal.json is invalid or unreadable; refusing mutating operation (${completed})" >&2
@@ -351,7 +222,6 @@ rh_require_no_incomplete_journal() {
     local op=""
     op="$(PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" journal-read \
       --repo "${RH_REPO_ROOT}" \
-      --ownership-file "${RH_JOURNAL_FILE}" \
       --key operation 2>/dev/null || true)"
     if [[ "${op}" == "deploy" ]]; then
       echo "ERROR: incomplete handoff-journal.json (operation=deploy, completed=false). Run deploy_main.sh --recover-deploy first." >&2

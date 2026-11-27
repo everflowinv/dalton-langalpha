@@ -31,6 +31,8 @@ STAGE_B_WINDOW_M=""
 REPORT_JSON=0
 
 PLIST_DIR="${DALTON_LAUNCH_AGENTS_DIR:-}"
+RESEARCH_HOST_PLIST="${DALTON_RESEARCH_HOST_PLIST:-}"
+ARCHIVED_PLIST_DIR="${DALTON_ARCHIVED_PLIST_DIR:-}"
 BACKEND_URL="${DALTON_BACKEND_URL:-http://127.0.0.1:8000}"
 PROXY_URL="${DALTON_PROXY_URL:-http://127.0.0.1:8943}"
 BRIDGE_URL="${DALTON_BRIDGE_LOCAL_URL:-http://127.0.0.1:8960}"
@@ -60,6 +62,8 @@ Actions:
 
 Optional read-only / test overrides:
   --plist-dir DIR
+  --research-host-plist FILE
+  --archived-plist-dir DIR
   --backend-url URL
   --proxy-url URL
   --bridge-url URL
@@ -119,6 +123,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --plist-dir)
       PLIST_DIR="${2:?missing --plist-dir value}"
+      shift 2
+      ;;
+    --research-host-plist)
+      RESEARCH_HOST_PLIST="${2:?missing --research-host-plist value}"
+      shift 2
+      ;;
+    --archived-plist-dir)
+      ARCHIVED_PLIST_DIR="${2:?missing --archived-plist-dir value}"
       shift 2
       ;;
     --backend-url)
@@ -212,6 +224,7 @@ EFF_BUDGETS_FILE="${BUDGETS_FILE_OVERRIDE:-${RH_TIMING_BUDGETS_FILE}}"
 EFF_PLIST_DIR="${PLIST_DIR:-${RH_HOME}/Library/LaunchAgents}"
 
 run_preflight_switch() {
+  local include_dry_run_plan="${1:-0}"
   local -a cmd=(
     "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" --switch
     --repo "${RH_REPO_ROOT}"
@@ -223,8 +236,23 @@ run_preflight_switch() {
     --research-host-url "${RESEARCH_HOST_URL}"
     --budgets-file "${EFF_BUDGETS_FILE}"
   )
+  if [[ -n "${RESEARCH_HOST_PLIST}" ]]; then
+    cmd+=(--research-host-plist "${RESEARCH_HOST_PLIST}")
+  fi
+  if [[ -n "${ARCHIVED_PLIST_DIR}" ]]; then
+    cmd+=(--archived-plist-dir "${ARCHIVED_PLIST_DIR}")
+  fi
   if [[ "${REPORT_JSON}" -eq 1 ]]; then
-    cmd+=(--report-json)
+    cmd+=(--report-json --include-summary)
+    if [[ "${include_dry_run_plan}" -eq 1 ]]; then
+      cmd+=(--include-dry-run-plan)
+      if [[ -n "${TEST_WORKSPACE_ID}" ]]; then
+        cmd+=(--test-workspace-id "${TEST_WORKSPACE_ID}")
+      fi
+      if [[ "${KEEP_ADMISSION_PAUSED}" -eq 1 ]]; then
+        cmd+=(--keep-admission-paused)
+      fi
+    fi
   fi
   PYTHONDONTWRITEBYTECODE=1 "${cmd[@]}"
 }
@@ -232,20 +260,26 @@ run_preflight_switch() {
 case "${ACTION}" in
   --check)
     # Strictly read-only: no lock, no journal write, exempt from completed==false guard.
+    if [[ "${REPORT_JSON}" -eq 1 ]]; then
+      run_preflight_switch 0
+      exit $?
+    fi
     PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" status-summary \
-      --journal-file "${RH_JOURNAL_FILE}" \
-      --admission-file "${RH_ADMISSION_FILE}" \
+      --repo "${RH_REPO_ROOT}" \
       --budgets-file "${EFF_BUDGETS_FILE}"
     echo ""
-    run_preflight_switch
+    run_preflight_switch 0
     exit $?
     ;;
 
   --switch)
     # DRY_RUN == 1 guaranteed here. Strictly read-only & exempt from completed==false guard.
+    if [[ "${REPORT_JSON}" -eq 1 ]]; then
+      run_preflight_switch 1
+      exit $?
+    fi
     PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" status-summary \
-      --journal-file "${RH_JOURNAL_FILE}" \
-      --admission-file "${RH_ADMISSION_FILE}" \
+      --repo "${RH_REPO_ROOT}" \
       --budgets-file "${EFF_BUDGETS_FILE}" \
       --include-dry-run-plan
     if [[ -n "${TEST_WORKSPACE_ID}" ]]; then
@@ -255,7 +289,7 @@ case "${ACTION}" in
       echo "  keep_admission_paused:                true"
     fi
     echo ""
-    run_preflight_switch
+    run_preflight_switch 1
     exit $?
     ;;
 
@@ -267,9 +301,8 @@ case "${ACTION}" in
     rh_require_completed_journal_for_approval || exit 1
     cmd=(
       "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" approve-budgets
+      --repo "${RH_REPO_ROOT}"
       --budgets-file "${EFF_BUDGETS_FILE}"
-      --journal-file "${RH_JOURNAL_FILE}"
-      --lock-file "${RH_OPS_LOCK_FILE}"
       --lock-fd 8
     )
     if [[ -n "${HANDOFF_DEADLINE_S}" ]]; then
