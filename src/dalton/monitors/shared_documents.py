@@ -258,18 +258,32 @@ async def _deactivate_legacy_non_html_monitor_in_cur(
         "DELETE FROM dalton_monitor_members WHERE monitor_id = %s::uuid",
         (mon_id,),
     )
-    if mon.get("visibility") != "own" or bool(mon.get("keep_updated")):
-        await cur.execute(
-            """
-            UPDATE dalton_monitors
-               SET visibility = 'own',
-                   keep_updated = FALSE,
-                   acl_revision = acl_revision + 1,
-                   updated_at = NOW()
-             WHERE monitor_id = %s::uuid
-            """,
-            (mon_id,),
-        )
+    await cur.execute(
+        """
+        UPDATE dalton_monitors
+           SET visibility = 'own',
+               keep_updated = FALSE,
+               acl_revision = acl_revision + 1,
+               updated_at = NOW()
+         WHERE monitor_id = %s::uuid
+        """,
+        (mon_id,),
+    )
+
+
+async def _disable_legacy_share_link_auto_update_in_cur(
+    cur: Any, locked: Any, *, workspace_owner_id: str
+) -> Any:
+    """Turn off legacy ``share_links.keep_updated`` in-tx so only shared-document turns publish."""
+    if not getattr(locked, "keep_updated", False):
+        return locked
+    return await artifacts_records_db.set_record_in_cur(
+        cur,
+        user_id=workspace_owner_id,
+        artifact_id=locked.artifact_id,
+        assignments="keep_updated = FALSE",
+        params={},
+    )
 
 
 async def downgrade_dalton_share_on_unshare_in_cur(
@@ -652,6 +666,9 @@ async def commit_shared_document_publish_tx(
                         [(doc_id, mid) for mid in clean_members],
                     )
 
+                locked = await _disable_legacy_share_link_auto_update_in_cur(
+                    cur, locked, workspace_owner_id=workspace_owner_id
+                )
                 if not share_public and locked.shared:
                     locked = await artifacts_records_db.unshare_in_cur(
                         cur, user_id=workspace_owner_id, artifact_id=artifact_id
@@ -708,6 +725,9 @@ async def update_shared_document_settings_tx(
                 )
                 await _deactivate_legacy_non_html_monitor_in_cur(
                     cur, artifact_id, entry_path=locked.path
+                )
+                locked = await _disable_legacy_share_link_auto_update_in_cur(
+                    cur, locked, workspace_owner_id=owner_user_id
                 )
                 await cur.execute(
                     """
@@ -1285,6 +1305,9 @@ async def commit_shared_document_version_tx(
                 if read_basis is not None:
                     read_basis.check(locked)
 
+                locked = await _disable_legacy_share_link_auto_update_in_cur(
+                    cur, locked, workspace_owner_id=workspace_owner_id
+                )
                 if not share_public and locked.shared:
                     locked = await artifacts_records_db.unshare_in_cur(
                         cur, user_id=workspace_owner_id, artifact_id=artifact_id

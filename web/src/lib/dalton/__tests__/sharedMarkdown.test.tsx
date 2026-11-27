@@ -87,6 +87,33 @@ describe('sharedMarkdown helpers', () => {
     expect(resolveSharedImageCandidates('reports/memo.md', '../../../etc/passwd.png')).toEqual([]);
     expect(resolveSharedRelativePath('reports/memo.md', '../../../etc/passwd.md')).toBeNull();
   });
+
+  it('preserves parent traversals for anonymous /m/ entries so backend resolves them against the withheld entry directory', () => {
+    expect(
+      resolveSharedRelativePath('legacy-public-md.md', '../shared/logo.png', {
+        rootRelative: true,
+        anonymousEntry: true,
+      }),
+    ).toBe('../shared/logo.png');
+    expect(
+      resolveSharedRelativePath('../shared/overview.md', 'logo.png', {
+        rootRelative: false,
+        anonymousEntry: true,
+      }),
+    ).toBe('../shared/logo.png');
+    expect(
+      resolveSharedRelativePath('../shared/overview.md', '../q4/charts/rev.png', {
+        rootRelative: false,
+        anonymousEntry: true,
+      }),
+    ).toBe('../q4/charts/rev.png');
+    expect(
+      resolveSharedRelativePath('legacy-public-md.md', '..', {
+        rootRelative: true,
+        anonymousEntry: true,
+      }),
+    ).toBeNull();
+  });
 });
 
 describe('SharedPageView Markdown rendering & security', () => {

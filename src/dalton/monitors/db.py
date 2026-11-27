@@ -28,6 +28,7 @@ from src.dalton.monitors.models import (
     MonitorRecord,
     MonitorSourceKind,
     MonitorVisibility,
+    is_html_entry_path,
     is_valid_slug,
     slugify_candidate,
 )
@@ -208,11 +209,38 @@ async def list_workspace_auto_update_monitors(workspace_id: str) -> list[Monitor
                 WHERE m.source_kind = 'workspace'
                   AND m.keep_updated = TRUE
                   AND l.workspace_id = %s::uuid
+                  AND NOT EXISTS (
+                      SELECT 1
+                        FROM dalton_shared_documents d
+                       WHERE d.artifact_id = m.artifact_id
+                  )
                 ORDER BY m.slug
                 """,
                 (workspace_id,),
             )
             return [r for row in await cur.fetchall() if (r := _row_to_record(row))]
+
+
+async def _reject_if_superseded_by_shared_document_in_cur(
+    cur: Any, artifact_id: str, *, entry_path: str | None = None
+) -> None:
+    """Reject mutations on a legacy non-HTML monitor already taken over by ``dalton_shared_documents``."""
+    if not entry_path or is_html_entry_path(entry_path):
+        return
+    await cur.execute(
+        """
+        SELECT 1
+          FROM dalton_shared_documents
+         WHERE artifact_id = %s::uuid
+           FOR SHARE
+        """,
+        (artifact_id,),
+    )
+    if await cur.fetchone() is not None:
+        raise HTTPException(
+            status_code=403,
+            detail="该文档已由分享文档接管，旧监控入口仅保留历史只读记录",
+        )
 
 
 async def pick_available_slug(base_raw: str) -> str:
@@ -547,7 +575,7 @@ async def update_monitor_settings_tx(
     async with get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
-                await artifacts_records_db.lock_owned(
+                locked = await artifacts_records_db.lock_owned(
                     cur, user_id=owner_user_id, artifact_id=artifact_id
                 )
                 await cur.execute(
@@ -563,6 +591,10 @@ async def update_monitor_settings_tx(
                 row = await cur.fetchone()
                 if row is None:
                     raise LookupError(f"Monitor {monitor_id} not found")
+                if row["source_kind"] == "workspace":
+                    await _reject_if_superseded_by_shared_document_in_cur(
+                        cur, artifact_id, entry_path=getattr(locked, "path", None)
+                    )
 
                 cur_visibility: MonitorVisibility = row["visibility"]
                 was_public = cur_visibility == "public"
@@ -907,6 +939,10 @@ async def commit_monitor_publish_tx(
                     (artifact_id,),
                 )
                 existing = await cur.fetchone()
+                if source_kind == "workspace":
+                    await _reject_if_superseded_by_shared_document_in_cur(
+                        cur, artifact_id, entry_path=getattr(locked, "path", None)
+                    )
                 if is_company_system_user(monitor_owner_id) or source_kind == "data_job":
                     if share_public and verify_public_authority is not None:
                         await _call_with_optional_conn(
@@ -1323,6 +1359,10 @@ async def commit_monitor_version_tx(
                 row = await cur.fetchone()
                 if row is None:
                     raise LookupError(f"Monitor {monitor_id} not found")
+                if row.get("source_kind", "workspace") == "workspace":
+                    await _reject_if_superseded_by_shared_document_in_cur(
+                        cur, artifact_id, entry_path=getattr(locked, "path", None)
+                    )
 
                 if check_pending_outbound_confirm or reject_if_pending_outbound_confirm:
                     from src.dalton.settings import is_dalton_sharing_auth_enabled
@@ -1555,7 +1595,7 @@ async def delete_monitor_tx(
                 )
                 await cur.execute(
                     """
-                    SELECT visibility, owner_user_id
+                    SELECT visibility, owner_user_id, source_kind
                       FROM dalton_monitors
                      WHERE monitor_id = %s::uuid
                        FOR UPDATE
@@ -1565,6 +1605,10 @@ async def delete_monitor_tx(
                 row = await cur.fetchone()
                 if row is None:
                     return False
+                if row.get("source_kind", "workspace") == "workspace":
+                    await _reject_if_superseded_by_shared_document_in_cur(
+                        cur, artifact_id, entry_path=getattr(locked, "path", None)
+                    )
                 from src.dalton.settings import is_dalton_local_auth_enabled
 
                 if (

@@ -32,6 +32,29 @@ function resolveAgainstDir(baseDir: string, relPath: string): string | null {
   return stack.length > 0 ? stack.join('/') : null;
 }
 
+function resolveAnonymousAgainstDir(baseDir: string, relPath: string): string | null {
+  let upCount = 0;
+  const stack: string[] = [];
+  const apply = (segments: string[]) => {
+    for (const seg of segments) {
+      if (!seg || seg === '.') continue;
+      if (seg === '..') {
+        if (stack.length > 0) {
+          stack.pop();
+        } else {
+          upCount += 1;
+        }
+        continue;
+      }
+      stack.push(seg);
+    }
+  };
+  if (baseDir) apply(baseDir.split('/'));
+  apply(relPath.split('/'));
+  if (stack.length === 0) return null;
+  return [...Array<string>(upCount).fill('..'), ...stack].join('/');
+}
+
 /** Split an href into its path portion and optional fragment (without `#`). */
 export function splitSharedHref(href: string): { path: string; fragment: string | null } {
   const trimmed = (href || '').trim();
@@ -46,6 +69,8 @@ export function splitSharedHref(href: string): { path: string; fragment: string 
 export interface ResolveSharedPathOptions {
   /** Resolve relative paths against root (`""`) when the document's own directory is hidden (anonymous `/m/`). */
   rootRelative?: boolean;
+  /** Preserve leading `..` segments so the backend resolves them against the withheld entry directory (anonymous `/m/`). */
+  anonymousEntry?: boolean;
   /** Decode percent-encoded path segments once (for raw Markdown link `href`s). */
   decode?: boolean;
 }
@@ -84,11 +109,28 @@ export function resolveSharedRelativePath(
   }
 
   if (target.startsWith('/')) {
-    return resolveAgainstDir('', target);
+    const resolved = resolveAgainstDir('', target);
+    if (!resolved) return null;
+    return options?.anonymousEntry ? `/${resolved}` : resolved;
   }
 
   const baseDir = options?.rootRelative ? '' : parentDir(docPath);
+  if (options?.anonymousEntry) {
+    return resolveAnonymousAgainstDir(baseDir, target);
+  }
   return resolveAgainstDir(baseDir, target);
+}
+
+/** Build the fetch URL for a target path under `frameBase` (using `?rel=` when `anonymousEntry` hides the entry path). */
+export function buildSharedTargetUrl(
+  frameBase: string,
+  targetPath: string,
+  anonymousEntry = false,
+): string {
+  if (anonymousEntry) {
+    return `${frameBase.replace(/\/+$/, '')}/?rel=${encodeURIComponent(targetPath)}`;
+  }
+  return buildServeUrl(frameBase, targetPath);
 }
 
 /**
@@ -124,6 +166,15 @@ export async function fetchSharedImageObjectUrl(
   if (candidates.length === 0) {
     throw new Error('Image path outside shared scope');
   }
+  if (options?.anonymousEntry) {
+    const res = await fetch(buildSharedTargetUrl(frameBase, candidates[0], true));
+    if (!res.ok) {
+      throw Object.assign(new Error(`Failed to load shared image (${res.status})`), {
+        response: { status: res.status },
+      });
+    }
+    return URL.createObjectURL(await res.blob());
+  }
   return fetchUrl(frameBase, candidates[0]);
 }
 
@@ -135,8 +186,9 @@ export async function fetchSharedImageObjectUrl(
 export async function probeSharedFileAccess(
   frameBase: string,
   targetPath: string,
+  options?: { anonymousEntry?: boolean },
 ): Promise<boolean> {
-  const url = buildServeUrl(frameBase, targetPath);
+  const url = buildSharedTargetUrl(frameBase, targetPath, Boolean(options?.anonymousEntry));
   try {
     let res = await fetch(url, { method: 'HEAD' });
     if (res.status === 405) {
@@ -152,18 +204,19 @@ export async function probeSharedFileAccess(
  * Build `BodyReaders` for a shared viewer. When `entryUrl` is given (anonymous
  * `/m/` page whose real `entry_path` is withheld), reads for the entry file use
  * `entryUrl` directly while other paths under the same version read via
- * `frameBase`.
+ * `?rel=` on `frameBase` when `anonymousEntry` is true.
  */
 export function createSharedEntryReaders(
   frameBase: string,
   entryPath: string,
   entryUrl?: string,
+  anonymousEntry = false,
 ): BodyReaders {
   const base = servedReaders(frameBase);
-  if (!entryUrl) return base;
+  if (!entryUrl && !anonymousEntry) return base;
 
-  const readEntryText = async () => {
-    const res = await fetch(entryUrl);
+  const readTextFromUrl = async (url: string) => {
+    const res = await fetch(url);
     if (!res.ok) {
       throw Object.assign(new Error(`Failed to load shared file (${res.status})`), {
         response: { status: res.status },
@@ -173,11 +226,29 @@ export function createSharedEntryReaders(
     return { content: await res.text(), from: LIVE, ...(mime ? { mime } : {}) };
   };
 
+  const readBufferFromUrl = async (url: string) => {
+    const res = await fetch(url);
+    if (!res.ok) {
+      throw Object.assign(new Error(`Failed to load shared file (${res.status})`), {
+        response: { status: res.status },
+      });
+    }
+    return { buffer: await res.arrayBuffer(), from: LIVE };
+  };
+
+  const readText = (wsId: string, reqPath: string) => {
+    if (entryUrl && reqPath === entryPath) return readTextFromUrl(entryUrl);
+    if (anonymousEntry) return readTextFromUrl(buildSharedTargetUrl(frameBase, reqPath, true));
+    return base.readFile(wsId, reqPath);
+  };
+
   return {
-    readFile: (wsId, reqPath) =>
-      reqPath === entryPath ? readEntryText() : base.readFile(wsId, reqPath),
-    readFileFull: (wsId, reqPath) =>
-      reqPath === entryPath ? readEntryText() : base.readFileFull(wsId, reqPath),
-    downloadFileAsArrayBuffer: base.downloadFileAsArrayBuffer,
+    readFile: readText,
+    readFileFull: readText,
+    downloadFileAsArrayBuffer: (wsId, reqPath) => {
+      if (entryUrl && reqPath === entryPath) return readBufferFromUrl(entryUrl);
+      if (anonymousEntry) return readBufferFromUrl(buildSharedTargetUrl(frameBase, reqPath, true));
+      return base.downloadFileAsArrayBuffer(wsId, reqPath);
+    },
   };
 }

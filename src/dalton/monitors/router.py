@@ -232,6 +232,7 @@ async def serve_public_monitor_entry_endpoint(
     slug: str,
     seq: str,
     request: Request,
+    rel: str | None = None,
     if_none_match: Annotated[str | None, Header()] = None,
 ) -> Response:
     try:
@@ -239,6 +240,7 @@ async def serve_public_monitor_entry_endpoint(
             slug,
             seq,
             "",
+            rel=rel,
             if_none_match=if_none_match,
             head=request.method == "HEAD",
         )

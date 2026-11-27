@@ -812,4 +812,141 @@ describe('Monitors page (Checklist 8)', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('resolves ../ relative image and link on anonymous /m/ entry in a subdirectory without root fallback', async () => {
+    const user = userEvent.setup();
+    const entryDir = ['reports', 'q4'];
+    const versionFiles: Record<string, { body: string; contentType: string }> = {
+      'reports/q4/memo.md': {
+        body: [
+          '# Q4 Subdir Memo',
+          '',
+          '![Shared Logo](../shared/logo.png)',
+          '![Root Decoy](shared/logo.png)',
+          '',
+          'See [Shared Overview](../shared/overview.md), [Root Decoy Doc](shared/overview.md), and [Outside](../../../etc/passwd.md).',
+        ].join('\n'),
+        contentType: 'text/markdown; charset=utf-8',
+      },
+      'reports/shared/logo.png': { body: 'parent-shared-logo', contentType: 'image/png' },
+      'reports/shared/overview.md': {
+        body: '# Shared Overview\n\nOpened via **parent relative link**.',
+        contentType: 'text/markdown; charset=utf-8',
+      },
+      // Workspace-root decoys with the same suffix must never be returned for entry-relative paths.
+      'shared/logo.png': { body: 'wrong-root-logo', contentType: 'image/png' },
+      'shared/overview.md': { body: '# Wrong Root Overview', contentType: 'text/markdown; charset=utf-8' },
+    };
+
+    const resolveEntryRel = (rel: string): string | null => {
+      const stack = [...entryDir];
+      for (const seg of rel.split('/')) {
+        if (!seg || seg === '.') continue;
+        if (seg === '..') {
+          if (stack.length === 0) return null;
+          stack.pop();
+          continue;
+        }
+        stack.push(seg);
+      }
+      return stack.length > 0 ? stack.join('/') : null;
+    };
+
+    const createObjectURLMock = vi.fn<typeof URL.createObjectURL>(() => 'blob:parent-shared-logo');
+    const revokeObjectURLMock = vi.fn<typeof URL.revokeObjectURL>();
+    URL.createObjectURL = createObjectURLMock;
+    URL.revokeObjectURL = revokeObjectURLMock;
+
+    const publicDetailPayload: MonitorDetail = {
+      monitor: {
+        monitor_id: 'm-pub-subdir-md',
+        slug: 'public-q4-memo',
+        owner_name: 'Alice',
+        owner_email: null,
+        title: 'Q4 Subdir Memo',
+        category: 'other',
+        sort_order: 0,
+        visibility: 'public',
+        member_user_ids: [],
+        published_seq: 2,
+        keep_updated: false,
+        source_kind: 'workspace',
+        source_ref: null,
+        acl_revision: 1,
+        last_publish_error: null,
+        last_publish_failed_at: null,
+        data_as_of: null,
+        created_at: '2026-11-27T08:00:00Z',
+        updated_at: '2026-11-27T08:00:00Z',
+        can_manage: false,
+        entry_file_type: 'markdown',
+      },
+      versions: [],
+      monitor_grant: '',
+      frame_base: '/api/v1/dalton/monitors/public/public-q4-memo/',
+      data_base: '/api/v1/dalton/monitors/public/public-q4-memo/data',
+      expires_in: 0,
+    };
+
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const urlStr = String(input);
+      const parsed = new URL(urlStr, 'http://localhost');
+      if (parsed.pathname === '/api/v1/dalton/monitors/public/public-q4-memo/v/2/') {
+        const rel = parsed.searchParams.get('rel');
+        const target = rel === null ? 'reports/q4/memo.md' : resolveEntryRel(rel);
+        const hit = target ? versionFiles[target] : undefined;
+        if (hit) {
+          return {
+            ok: true,
+            status: 200,
+            headers: new Headers({ 'content-type': hit.contentType }),
+            text: async () => hit.body,
+            blob: async () => new Blob([hit.body], { type: hit.contentType }),
+          } as Response;
+        }
+      }
+      return { ok: false, status: 404, headers: new Headers() } as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    mockGetPublicMonitorDetail.mockResolvedValue(publicDetailPayload);
+
+    try {
+      renderWithProviders(
+        <Routes>
+          <Route path="/m/:slug" element={<PublicMonitorPage />} />
+        </Routes>,
+        { route: '/m/public-q4-memo' },
+      );
+
+      expect(await screen.findByRole('heading', { level: 1, name: 'Q4 Subdir Memo' })).toBeInTheDocument();
+
+      // ../shared/logo.png loads via ?rel=..%2Fshared%2Flogo.png (resolved to reports/shared/logo.png)
+      const logoImg = await screen.findByAltText('Shared Logo');
+      await waitFor(() => expect(logoImg).toHaveAttribute('src', 'blob:parent-shared-logo'));
+
+      // Root decoy image (shared/logo.png -> reports/q4/shared/logo.png) does NOT resolve to workspace root
+      expect(await screen.findByText(/logo\.png/i)).toBeInTheDocument();
+
+      // ../shared/overview.md probes OK and opens inside the viewer
+      const overviewLink = await screen.findByRole('link', { name: 'Shared Overview' });
+      expect(overviewLink).toHaveAttribute(
+        'href',
+        '/api/v1/dalton/monitors/public/public-q4-memo/v/2/?rel=..%2Fshared%2Foverview.md',
+      );
+
+      // Root decoy link and escaping ../../../etc/passwd.md stay placeholders
+      const placeholders = await screen.findAllByTestId('shared-link-placeholder');
+      const placeholderText = placeholders.map((el) => el.textContent).join(' ');
+      expect(placeholderText).toContain('Root Decoy Doc');
+      expect(placeholderText).toContain('Outside');
+      expect(screen.queryByRole('link', { name: 'Root Decoy Doc' })).toBeNull();
+      expect(screen.queryByRole('link', { name: 'Outside' })).toBeNull();
+
+      await user.click(overviewLink);
+      expect(await screen.findByRole('heading', { level: 1, name: 'Shared Overview' })).toBeInTheDocument();
+      expect(screen.getByText('parent relative link').tagName).toBe('STRONG');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });

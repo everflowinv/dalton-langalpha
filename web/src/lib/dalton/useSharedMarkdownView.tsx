@@ -2,10 +2,10 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeft } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { bodyMode } from '@/pages/ChatAgent/components/filePanel/fileBody';
-import { buildServeUrl } from '@/pages/ChatAgent/components/viewers/html/wsfilesUrl';
 import { isHtmlFile } from '@/pages/ChatAgent/utils/filePaths';
 import { servedObjectUrl } from '@/pages/SharedChat/api';
 import {
+  buildSharedTargetUrl,
   createSharedEntryReaders,
   fetchSharedImageObjectUrl,
   probeSharedFileAccess,
@@ -24,6 +24,7 @@ interface SharedMarkdownRelativeLinkProps {
   frameBase: string;
   docPath: string;
   rootRelative: boolean;
+  anonymousEntry: boolean;
   href: string;
   probe: ProbeFn;
   onOpen: (targetPath: string, fragment: string | null) => void;
@@ -34,6 +35,7 @@ function SharedMarkdownRelativeLink({
   frameBase,
   docPath,
   rootRelative,
+  anonymousEntry,
   href,
   probe,
   onOpen,
@@ -42,10 +44,10 @@ function SharedMarkdownRelativeLink({
   const { t } = useTranslation();
   const { fragment } = useMemo(() => splitSharedHref(href), [href]);
   const target = useMemo(
-    () => resolveSharedRelativePath(docPath, href, { rootRelative, decode: true }),
-    [docPath, href, rootRelative],
+    () => resolveSharedRelativePath(docPath, href, { rootRelative, anonymousEntry, decode: true }),
+    [docPath, href, rootRelative, anonymousEntry],
   );
-  const probeKey = target ? `${frameBase}\0${target}` : '';
+  const probeKey = target ? `${frameBase}\0${anonymousEntry ? 'anon' : 'direct'}\0${target}` : '';
   const [result, setResult] = useState<{ key: string; allowed: boolean } | null>(null);
 
   useEffect(() => {
@@ -68,7 +70,7 @@ function SharedMarkdownRelativeLink({
       : 'checking';
 
   if (status === 'allowed' && target) {
-    const targetUrl = buildServeUrl(frameBase, target);
+    const targetUrl = buildSharedTargetUrl(frameBase, target, anonymousEntry);
     return (
       <a
         href={targetUrl}
@@ -131,34 +133,36 @@ export function useSharedMarkdownView({
   const isRootRelative = Boolean(anonymousEntry && !activeSubPath);
 
   const probeCacheRef = useRef<{ base: string; map: Map<string, Promise<boolean>> }>({
-    base: frameBase,
+    base: `${frameBase}\0${anonymousEntry ? 'anon' : 'direct'}`,
     map: new Map(),
   });
   const probe = useCallback<ProbeFn>(
     (targetPath: string) => {
-      if (probeCacheRef.current.base !== frameBase) {
-        probeCacheRef.current = { base: frameBase, map: new Map() };
+      const cacheBase = `${frameBase}\0${anonymousEntry ? 'anon' : 'direct'}`;
+      if (probeCacheRef.current.base !== cacheBase) {
+        probeCacheRef.current = { base: cacheBase, map: new Map() };
       }
       const existing = probeCacheRef.current.map.get(targetPath);
       if (existing) return existing;
-      const req = probeSharedFileAccess(frameBase, targetPath);
+      const req = probeSharedFileAccess(frameBase, targetPath, { anonymousEntry });
       probeCacheRef.current.map.set(targetPath, req);
       return req;
     },
-    [frameBase],
+    [frameBase, anonymousEntry],
   );
 
   const readers = useMemo(
-    () => createSharedEntryReaders(frameBase, path, entryUrl),
-    [frameBase, path, entryUrl],
+    () => createSharedEntryReaders(frameBase, path, entryUrl, anonymousEntry),
+    [frameBase, path, entryUrl, anonymousEntry],
   );
 
   const imageDownloader = useCallback(
     (imagePath: string) =>
       fetchSharedImageObjectUrl(frameBase, activePath, imagePath, servedObjectUrl, {
         rootRelative: isRootRelative,
+        anonymousEntry,
       }),
-    [frameBase, activePath, isRootRelative],
+    [frameBase, activePath, isRootRelative, anonymousEntry],
   );
 
   const handleOpenTarget = useCallback(
@@ -168,12 +172,12 @@ export function useSharedMarkdownView({
         return;
       }
       if (isHtmlFile(targetPath) || bodyMode(targetPath) === 'none') {
-        window.open(buildServeUrl(frameBase, targetPath), '_blank', 'noopener,noreferrer');
+        window.open(buildSharedTargetUrl(frameBase, targetPath, anonymousEntry), '_blank', 'noopener,noreferrer');
         return;
       }
       setNavState({ baseKey, subPath: targetPath === path ? null : targetPath });
     },
-    [activePath, baseKey, frameBase, onAnchorLink, path],
+    [activePath, anonymousEntry, baseKey, frameBase, onAnchorLink, path],
   );
 
   const renderFileLink = useCallback(
@@ -182,6 +186,7 @@ export function useSharedMarkdownView({
         frameBase={frameBase}
         docPath={activePath}
         rootRelative={isRootRelative}
+        anonymousEntry={anonymousEntry}
         href={href}
         probe={probe}
         onOpen={handleOpenTarget}
@@ -189,7 +194,7 @@ export function useSharedMarkdownView({
         {children}
       </SharedMarkdownRelativeLink>
     ),
-    [frameBase, activePath, isRootRelative, probe, handleOpenTarget],
+    [frameBase, activePath, isRootRelative, anonymousEntry, probe, handleOpenTarget],
   );
 
   const entryDisplayName = path.split('/').pop() || path;
