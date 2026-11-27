@@ -26,6 +26,8 @@ import pkgutil
 import sys
 from types import SimpleNamespace
 from unittest.mock import create_autospec, patch
+
+from src.server.services.runs.cancel import publish_cancel_nudge as _real_publish_cancel_nudge
 import uuid
 
 from alembic import command
@@ -1678,7 +1680,7 @@ async def test_incomplete_layers_keep_running_and_blocked_until_repaired_and_res
     async with gws_live_pool.connection() as blocker_conn:
         await blocker_conn.execute("SELECT pg_advisory_lock(%s)", (tkey,))
         try:
-            with patch.object(purge_mod, "publish_cancel_nudge", create_autospec(purge_mod.publish_cancel_nudge, return_value=None)):
+            with patch.object(purge_mod, "publish_cancel_nudge", create_autospec(_real_publish_cancel_nudge, return_value=None)):
                 with pytest.raises(TimeoutError):
                     await finish_disconnect(purge_id, cancel_drain_timeout_s=0.05)
         finally:
