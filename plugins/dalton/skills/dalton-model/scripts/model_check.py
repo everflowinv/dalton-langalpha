@@ -23,13 +23,13 @@ import re
 import sys
 from typing import Any
 
-from openpyxl.formula.tokenizer import Token, Tokenizer
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string, get_column_letter
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+import model_consensus  # noqa: E402
 import model_edit  # noqa: E402
 import model_fingerprint  # noqa: E402
 import model_readable  # noqa: E402
@@ -154,66 +154,28 @@ def _expand_defined_names_and_refs(
     expr: str,
     current_sheet: str,
     defined_names: list[dict[str, str]],
-) -> tuple[set[tuple[str, str]], bool]:
-    """Return ``(direct_refs, has_dynamic_ref)`` after recursively expanding defined names."""
-    has_dyn = model_fingerprint._has_dynamic_ref(expr)
-    wb_names: dict[str, str] = {}
-    sheet_names: dict[tuple[str, str], str] = {}
-    for dn in defined_names:
-        n_low = str(dn.get("name") or "").strip().lower()
-        scope = str(dn.get("scope") or "workbook")
-        d_expr = str(dn.get("expression") or "")
-        if not n_low or not d_expr:
-            continue
-        if scope == "workbook":
-            wb_names[n_low] = d_expr
-        else:
-            sheet_names[(scope, n_low)] = d_expr
-
-    refs: set[tuple[str, str]] = set()
-    visited_names: set[tuple[str, str]] = set()
-
-    def _walk(cur_expr: str, cur_sh: str) -> None:
-        nonlocal has_dyn
-        if model_fingerprint._has_dynamic_ref(cur_expr):
-            has_dyn = True
-        for rsh, rcoord in model_fingerprint.extract_formula_refs(cur_expr, cur_sh):
-            refs.add((rsh, rcoord.upper()))
-        # Identify defined name tokens via openpyxl Tokenizer + fallback regex
-        tokens_to_check: list[str] = []
-        try:
-            for tok in Tokenizer(cur_expr if cur_expr.startswith("=") else "=" + cur_expr).items:
-                if tok.type == Token.OPERAND and tok.subtype == Token.RANGE:
-                    val = tok.value.strip()
-                    if "!" not in val and ":" not in val:
-                        tokens_to_check.append(val)
-        except Exception:
-            pass
-        cleaned = model_fingerprint._EXCEL_STR_RE.sub('""', cur_expr)
-        for m in _NAME_TOKEN_RE.finditer(cleaned):
-            tok_s = m.group(1)
-            if tok_s.upper() not in _EXCEL_BUILTIN_FUNCS:
-                tokens_to_check.append(tok_s)
-
-        for tok_s in tokens_to_check:
-            key_low = tok_s.lower()
-            target_expr = sheet_names.get((cur_sh, key_low)) or wb_names.get(key_low)
-            if target_expr is not None:
-                vkey = (cur_sh, key_low)
-                if vkey not in visited_names:
-                    visited_names.add(vkey)
-                    _walk(target_expr, cur_sh)
-
-    _walk(expr, current_sheet)
-    return refs, has_dyn
+    *,
+    tables: dict[str, dict[str, Any]] | None = None,
+) -> tuple[set[tuple[str, str]], list[tuple[str, int, int, int, int]], bool]:
+    """Return ``(direct_refs, range_rects, has_dynamic_ref)`` after expanding defined names & tables."""
+    refs, rects, _, has_dyn = model_fingerprint.expand_defined_names_in_expr(
+        expr, current_sheet, defined_names, tables=tables
+    )
+    return refs, rects, has_dyn
 
 
 def _build_full_dependency_graph(
     cand_fp: dict[str, Any],
-) -> tuple[dict[tuple[str, str], set[tuple[str, str]]], dict[tuple[str, str], str]]:
-    """Build workbook-wide cell dependency graph (with defined_names expanded) & dynamic-ref map."""
+) -> tuple[
+    dict[tuple[str, str], set[tuple[str, str]]],
+    dict[tuple[str, str], list[tuple[str, int, int, int, int]]],
+    dict[tuple[str, str], str],
+]:
+    """Build workbook-wide cell & range dependency graph (expanding defined_names + tables) & dynamic-ref map."""
     defined_names = cand_fp.get("defined_names") or []
+    tables = cand_fp.get("tables") or {}
     graph: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    rect_graph: dict[tuple[str, str], list[tuple[str, int, int, int, int]]] = {}
     dynamic_cells: dict[tuple[str, str], str] = {}
 
     for sh_name, sh_data in (cand_fp.get("sheets") or {}).items():
@@ -221,20 +183,57 @@ def _build_full_dependency_graph(
             if cmeta.get("category") != "formula":
                 continue
             f_txt = cmeta.get("formula") or ""
-            refs, has_dyn = _expand_defined_names_and_refs(f_txt, sh_name, defined_names)
+            refs, rects, has_dyn = _expand_defined_names_and_refs(
+                f_txt, sh_name, defined_names, tables=tables
+            )
             node = (sh_name, coord.upper())
             graph[node] = refs
+            if rects:
+                rect_graph[node] = rects
             if has_dyn:
                 dynamic_cells[node] = f_txt
-    return graph, dynamic_cells
+    return graph, rect_graph, dynamic_cells
+
+
+def _rect_hits_targets(
+    rects: list[tuple[str, int, int, int, int]],
+    target_coords_by_sheet: dict[str, list[tuple[int, int, str]]],
+) -> tuple[str, str] | None:
+    for rsh, r1, c1, r2, c2 in rects:
+        for tr, tc, tcoord in target_coords_by_sheet.get(rsh, ()):
+            if r1 <= tr <= r2 and c1 <= tc <= c2:
+                return (rsh, tcoord)
+    return None
+
+
+def _index_target_coords(targets: set[tuple[str, str]]) -> dict[str, list[tuple[int, int, str]]]:
+    idx: dict[str, list[tuple[int, int, str]]] = defaultdict(list)
+    for sh, coord in targets:
+        try:
+            col_s, row_i = coordinate_from_string(coord.upper())
+            col_i = column_index_from_string(col_s)
+            idx[sh].append((row_i, col_i, coord.upper()))
+        except Exception:
+            continue
+    return idx
 
 
 def _reaches_any(
     start: tuple[str, str],
     targets: set[tuple[str, str]],
     graph: dict[tuple[str, str], set[tuple[str, str]]],
+    rect_graph: dict[tuple[str, str], list[tuple[str, int, int, int, int]]] | None = None,
+    target_index: dict[str, list[tuple[int, int, str]]] | None = None,
 ) -> tuple[str, str] | None:
-    """BFS through formula dependencies to check if ``start`` reaches any node in ``targets``."""
+    """BFS through formula cell & range dependencies to check if ``start`` reaches any node in ``targets``."""
+    if not targets:
+        return None
+    t_idx = target_index if target_index is not None else (_index_target_coords(targets) if rect_graph else None)
+    if rect_graph and t_idx and start in rect_graph:
+        hit = _rect_hits_targets(rect_graph[start], t_idx)
+        if hit is not None:
+            return hit
+
     seen: set[tuple[str, str]] = {start}
     queue = list(graph.get(start, ()))
     while queue:
@@ -244,6 +243,10 @@ def _reaches_any(
         if cur in seen:
             continue
         seen.add(cur)
+        if rect_graph and t_idx and cur in rect_graph:
+            hit = _rect_hits_targets(rect_graph[cur], t_idx)
+            if hit is not None:
+                return hit
         for nxt in graph.get(cur, ()):
             if nxt not in seen:
                 queue.append(nxt)
@@ -268,6 +271,170 @@ def _non_target_company_sheets(fp: dict[str, Any], ticker: str) -> list[str]:
         if tag is not None and str(tag).upper() != tk:
             out.append(entry["name"])
     return out
+
+
+def _check_period_sequence(cols: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Analyze forecast annual & quarterly span and continuity for C02."""
+    has_any_q = any(m.get("kind") == "quarter" for m in cols.values())
+    fc_ann_years = sorted({
+        int(m["year"]) for m in cols.values()
+        if m.get("kind") == "annual" and m.get("is_forecast") and m.get("year")
+    })
+    fc_q = sorted({
+        (int(m["year"]), int(m["quarter"])) for m in cols.values()
+        if m.get("kind") == "quarter" and m.get("is_forecast") and m.get("year") and m.get("quarter")
+    })
+    non_consec_ann = [
+        (fc_ann_years[i], fc_ann_years[i + 1])
+        for i in range(len(fc_ann_years) - 1)
+        if fc_ann_years[i + 1] != fc_ann_years[i] + 1
+    ]
+    skipped_q: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    for i in range(len(fc_q) - 1):
+        y1, q1 = fc_q[i]
+        exp_y, exp_q = (y1 + 1, 1) if q1 == 4 else (y1, q1 + 1)
+        if fc_q[i + 1] != (exp_y, exp_q):
+            skipped_q.append((fc_q[i], fc_q[i + 1]))
+    q_span_short = bool(fc_q and (fc_q[0][0] + 1, 4) not in fc_q)
+    return {
+        "has_any_q": has_any_q,
+        "fc_ann_years": fc_ann_years,
+        "fc_q": fc_q,
+        "zero_fc_q": has_any_q and len(fc_q) == 0,
+        "ann_span_short": len(fc_ann_years) < 3,
+        "non_consec_ann": non_consec_ann,
+        "skipped_q": skipped_q,
+        "q_span_short": q_span_short,
+    }
+
+
+def _fmt_category(num_fmt: str | None) -> str:
+    s = str(num_fmt or "General").strip()
+    if not s or s.lower() == "general" or s == "@":
+        return "general"
+    if "%" in s:
+        return "percent"
+    if re.search(r'(?:"\s*x"|\\x|\bx\b)', s, re.IGNORECASE):
+        return "multiple"
+    if any(ch in s for ch in ("0", "#")):
+        return "number"
+    return "other"
+
+
+def _extract_snapshot_entries(
+    cand_fp: dict[str, Any],
+    base_fp: dict[str, Any],
+    cm: dict[str, Any],
+) -> tuple[set[tuple[str, str]], list[dict[str, Any]]]:
+    """Build snapshot node set and structured ``(period_norm, metric_key, value)`` metadata."""
+    snapshot_nodes: set[tuple[str, str]] = set()
+    snapshot_entries: list[dict[str, Any]] = []
+
+    for sh_name, sh_data in (cand_fp.get("sheets") or {}).items():
+        snap_coords = set((sh_data.get("semantic_anchors") or {}).get("consensus_snapshot_cells") or ())
+        snap_coords.update(c.upper() for c in (cm["consensus_snapshot_cells"].get(sh_name) or ()))
+        b_sh = (base_fp.get("sheets") or {}).get(sh_name)
+        if b_sh:
+            for old_sc in (b_sh.get("semantic_anchors") or {}).get("consensus_snapshot_cells") or ():
+                nc = model_edit.map_coord_str(cm, sh_name, old_sc)
+                if nc:
+                    snap_coords.add(nc.upper())
+        if not snap_coords:
+            continue
+
+        cells = sh_data.get("cells") or {}
+        # Detect period / metric / source / date columns per header row on this sheet
+        row_hdrs: dict[int, dict[str, int]] = {}
+        max_r = max((coordinate_from_string(c)[1] for c in cells), default=1)
+        for r in range(1, max_r + 1):
+            hdr_cols: dict[str, int] = {}
+            for coord, cmeta in cells.items():
+                cs, ri = coordinate_from_string(coord)
+                if ri != r:
+                    continue
+                v = cmeta.get("cached_value")
+                if not isinstance(v, str) or not v.strip():
+                    continue
+                vl = " ".join(v.strip().lower().split())
+                ci = column_index_from_string(cs)
+                if "period_col" not in hdr_cols and any(k in vl for k in ("period", "期间", "fiscal", "quarter")):
+                    hdr_cols["period_col"] = ci
+                elif "metric_col" not in hdr_cols and any(k in vl for k in ("metric", "line item", "item", "指标", "科目", "项目")):
+                    hdr_cols["metric_col"] = ci
+                elif "source_col" not in hdr_cols and any(k in vl for k in ("source", "来源")):
+                    hdr_cols["source_col"] = ci
+                elif "date_col" not in hdr_cols and any(k in vl for k in ("as-of", "as of", "date", "日期")):
+                    hdr_cols["date_col"] = ci
+            if "period_col" in hdr_cols and "metric_col" in hdr_cols:
+                row_hdrs[r] = hdr_cols
+        sorted_hdr_rows = sorted(row_hdrs)
+
+        for sc in sorted(snap_coords):
+            scu = sc.upper()
+            node = (sh_name, scu)
+            snapshot_nodes.add(node)
+            cmeta = cells.get(scu) or {}
+            cv = cmeta.get("cached_value")
+            if not (isinstance(cv, (int, float)) and not isinstance(cv, bool)):
+                continue
+            _, row_i = coordinate_from_string(scu)
+            # Find nearest preceding header row
+            active_hdr = None
+            for hr in sorted_hdr_rows:
+                if hr < row_i:
+                    active_hdr = row_hdrs[hr]
+            p_norm: str | None = None
+            m_key: str | None = None
+            has_src_date = True
+            if active_hdr:
+                p_raw = cells.get(f"{get_column_letter(active_hdr['period_col'])}{row_i}", {}).get("cached_value")
+                m_raw = cells.get(f"{get_column_letter(active_hdr['metric_col'])}{row_i}", {}).get("cached_value")
+                if p_raw:
+                    parsed_p = model_fingerprint.parse_period_header(p_raw)
+                    p_norm = (parsed_p["normalized"] if parsed_p else str(p_raw).strip()).upper()
+                if m_raw:
+                    m_key = model_consensus._normalize_metric_key(str(m_raw))
+                if "source_col" in active_hdr and "date_col" in active_hdr:
+                    sv = str(cells.get(f"{get_column_letter(active_hdr['source_col'])}{row_i}", {}).get("cached_value") or "").strip()
+                    dv = str(cells.get(f"{get_column_letter(active_hdr['date_col'])}{row_i}", {}).get("cached_value") or "").strip()
+                    has_src_date = bool(sv and dv)
+            snapshot_entries.append(
+                {
+                    "node": node,
+                    "value": float(cv),
+                    "period_norm": p_norm,
+                    "metric_key": m_key,
+                    "has_src_date": has_src_date,
+                }
+            )
+    return snapshot_nodes, snapshot_entries
+
+
+def _has_reconcile_note(text: str) -> bool:
+    if not text:
+        return False
+    return bool(
+        re.search(
+            r"(?:restricted|time\s+deposit|short[\-\s]?term\s+inv|reconcil|bridge|offset|buyback|repurchase|sbc|dilut|受限|定期|调节|桥接|抵销|回购|增发|激励)",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _cell_is_error(c_cell: dict[str, Any] | None) -> bool:
+    if not c_cell:
+        return False
+    if c_cell.get("cached_t") == "e":
+        return True
+    cv = c_cell.get("cached_value")
+    return isinstance(cv, str) and bool(cv in _EXCEL_ERRORS or _ERROR_SHAPE.match(cv))
+
+
+def _formula_has_ref_literal(f_txt: str | None) -> bool:
+    if not f_txt:
+        return False
+    return "#REF!" in model_fingerprint._EXCEL_STR_RE.sub('""', str(f_txt)).upper()
 
 
 def _detect_scope_changes(
@@ -423,7 +590,7 @@ def run_checks(
                     sheet=rm_sh,
                 )
 
-    # C02 Period coverage & historical column preservation
+    # C02 Period coverage, historical actual preservation & forecast sequence continuity
     for sh_name in target_sheets:
         b_sh = (base_fp.get("sheets") or {}).get(sh_name)
         c_sh = (cand_fp.get("sheets") or {}).get(sh_name)
@@ -431,28 +598,58 @@ def run_checks(
             continue
         c_axis = c_sh.get("period_axis") or {}
         c_cols = c_axis.get("columns") or {}
+        c_hdr_r = c_axis.get("header_row") or 1
+        period_headers_changed = False
+
         if b_sh:
-            b_cols = (b_sh.get("period_axis") or {}).get("columns") or {}
-            cand_raw_periods = {
+            b_axis = b_sh.get("period_axis") or {}
+            b_cols = b_axis.get("columns") or {}
+            b_hdr_r = b_axis.get("header_row") or 1
+            cand_actual_periods = {
                 str(m.get("normalized") or m.get("raw") or "").upper()
                 for m in c_cols.values()
-                if m.get("kind") in ("annual", "quarter")
+                if m.get("kind") in ("annual", "quarter") and not m.get("is_forecast")
             }
             for col_l, meta in b_cols.items():
-                if meta.get("kind") in ("annual", "quarter") and not meta.get("is_forecast"):
+                if meta.get("kind") not in ("annual", "quarter"):
+                    continue
+                old_ci = int(meta.get("col_index") or column_index_from_string(col_l))
+                mapped_pos = model_edit.map_coord(cm, sh_name, b_hdr_r, old_ci)
+                mapped_col_l = get_column_letter(mapped_pos[1]) if mapped_pos is not None else None
+                mapped_c_meta = c_cols.get(mapped_col_l) if mapped_col_l else None
+                if not meta.get("is_forecast"):
                     norm_p = str(meta.get("normalized") or meta.get("raw") or "").upper()
-                    if norm_p and norm_p not in cand_raw_periods:
+                    if mapped_c_meta and mapped_c_meta.get("is_forecast"):
                         _add_finding(
                             findings,
                             "C02",
                             "actionable",
-                            f"Historical period column {meta.get('raw')!r} ({col_l}) was removed",
+                            f"Historical actual period {meta.get('raw')!r} ({col_l}->{mapped_col_l}) was changed to forecast {mapped_c_meta.get('raw')!r}",
                             sheet=sh_name,
-                            cell=f"{col_l}{c_axis.get('header_row') or 1}",
+                            cell=f"{mapped_col_l}{c_hdr_r}",
                         )
+                    elif norm_p and norm_p not in cand_actual_periods:
+                        _add_finding(
+                            findings,
+                            "C02",
+                            "actionable",
+                            f"Historical period column {meta.get('raw')!r} ({col_l}) was removed or lost actual status",
+                            sheet=sh_name,
+                            cell=f"{mapped_col_l or col_l}{c_hdr_r}",
+                        )
+                if mapped_c_meta is None or str(mapped_c_meta.get("raw") or "") != str(meta.get("raw") or ""):
+                    period_headers_changed = True
+            if len(c_cols) != len(b_cols):
+                period_headers_changed = True
+
         # Non-Dec FY label check
         if c_axis.get("fiscal_year_end_month", 12) != 12 and not c_axis.get("fiscal_year_end_explicit"):
-            sev = "actionable" if mode == "build" else "baseline_legacy"
+            b_non_dec_unlabeled = bool(
+                b_sh
+                and (b_sh.get("period_axis") or {}).get("fiscal_year_end_month", 12) != 12
+                and not (b_sh.get("period_axis") or {}).get("fiscal_year_end_explicit")
+            )
+            sev = "baseline_legacy" if (b_non_dec_unlabeled and mode != "build") else "actionable"
             _add_finding(
                 findings,
                 "C02",
@@ -460,34 +657,50 @@ def run_checks(
                 f"Non-December fiscal year (ends month {c_axis.get('fiscal_year_end_month')}) not explicitly noted in header/A2",
                 sheet=sh_name,
             )
-        # Forecast span check on build or period-expansion rounds
-        if sh_name.lower().startswith("model") and (mode == "build" or cm["added_period_cols"].get(sh_name)):
-            fc_ann_years = sorted({
-                int(m["year"]) for m in c_cols.values()
-                if m.get("kind") == "annual" and m.get("is_forecast") and m.get("year")
-            })
-            fc_q = sorted({
-                (int(m["year"]), int(m["quarter"])) for m in c_cols.values()
-                if m.get("kind") == "quarter" and m.get("is_forecast") and m.get("year") and m.get("quarter")
-            })
-            if len(fc_ann_years) < 3:
+
+        # Forecast span & continuity check (compare vs baseline so untouched legacy gaps stay baseline_legacy)
+        if sh_name.lower().startswith("model") and (
+            mode == "build" or cm["added_period_cols"].get(sh_name) or period_headers_changed
+        ):
+            c_seq = _check_period_sequence(c_cols)
+            b_seq = _check_period_sequence(((b_sh.get("period_axis") or {}).get("columns") or {}) if b_sh else {})
+
+            if c_seq["ann_span_short"]:
+                sev = "baseline_legacy" if (b_sh and b_seq["ann_span_short"] and mode != "build") else "actionable"
                 _add_finding(
-                    findings,
-                    "C02",
-                    "actionable",
-                    f"Annual forecast span covers only {len(fc_ann_years)} years ({fc_ann_years}); require >= 3 full forecast years",
+                    findings, "C02", sev,
+                    f"Annual forecast span covers only {len(c_seq['fc_ann_years'])} years ({c_seq['fc_ann_years']}); require >= 3 full forecast years",
                     sheet=sh_name,
                 )
-            if fc_q:
-                first_fc_yr = fc_q[0][0]
-                if (first_fc_yr + 1, 4) not in fc_q:
-                    _add_finding(
-                        findings,
-                        "C02",
-                        "actionable",
-                        f"Quarterly forecast does not reach next fiscal year Q4 ({first_fc_yr + 1}Q4E)",
-                        sheet=sh_name,
-                    )
+            if c_seq["non_consec_ann"]:
+                sev = "baseline_legacy" if (b_sh and b_seq["non_consec_ann"] == c_seq["non_consec_ann"] and mode != "build") else "actionable"
+                _add_finding(
+                    findings, "C02", sev,
+                    f"Non-consecutive annual forecast years detected: {c_seq['fc_ann_years']}",
+                    sheet=sh_name,
+                )
+            if c_seq["zero_fc_q"]:
+                sev = "baseline_legacy" if (b_sh and b_seq["zero_fc_q"] and mode != "build") else "actionable"
+                _add_finding(
+                    findings, "C02", sev,
+                    "Model sheet has quarterly columns but zero forecast quarters",
+                    sheet=sh_name,
+                )
+            if c_seq["skipped_q"]:
+                sev = "baseline_legacy" if (b_sh and b_seq["skipped_q"] == c_seq["skipped_q"] and mode != "build") else "actionable"
+                _add_finding(
+                    findings, "C02", sev,
+                    f"Skipped quarter(s) in quarterly forecast sequence: {c_seq['skipped_q']}",
+                    sheet=sh_name,
+                )
+            if c_seq["q_span_short"]:
+                first_fc_yr = c_seq["fc_q"][0][0]
+                sev = "baseline_legacy" if (b_sh and b_seq["q_span_short"] and mode != "build") else "actionable"
+                _add_finding(
+                    findings, "C02", sev,
+                    f"Quarterly forecast does not reach next fiscal year Q4 ({first_fc_yr + 1}Q4E)",
+                    sheet=sh_name,
+                )
 
     # C03 Round-scoped formula protection & rollover actual auto-exemption
     for sh_name in target_sheets:
@@ -607,36 +820,40 @@ def run_checks(
                     )
 
     # C04 Consensus snapshot isolation & diff rationale
-    dep_graph, dynamic_cells = _build_full_dependency_graph(cand_fp)
-    snapshot_nodes: set[tuple[str, str]] = set()
-    snapshot_values: list[tuple[tuple[str, str], float]] = []
+    dep_graph, rect_graph, dynamic_cells = _build_full_dependency_graph(cand_fp)
+    base_dep_graph, base_rect_graph, _ = _build_full_dependency_graph(base_fp)
+    snapshot_nodes, snapshot_entries = _extract_snapshot_entries(cand_fp, base_fp, cm)
+    snap_target_idx = _index_target_coords(snapshot_nodes)
 
-    for sh_name, sh_data in (cand_fp.get("sheets") or {}).items():
-        snap_coords = set((sh_data.get("semantic_anchors") or {}).get("consensus_snapshot_cells") or ())
-        snap_coords.update(c.upper() for c in (cm["consensus_snapshot_cells"].get(sh_name) or ()))
-        b_sh = (base_fp.get("sheets") or {}).get(sh_name)
-        if b_sh:
-            for old_sc in (b_sh.get("semantic_anchors") or {}).get("consensus_snapshot_cells") or ():
-                nc = model_edit.map_coord_str(cm, sh_name, old_sc)
-                if nc:
-                    snap_coords.add(nc.upper())
-        for sc in snap_coords:
-            node = (sh_name, sc.upper())
-            snapshot_nodes.add(node)
-            cv = (sh_data.get("cells") or {}).get(sc.upper(), {}).get("cached_value")
-            if isinstance(cv, (int, float)) and not isinstance(cv, bool):
-                snapshot_values.append((node, float(cv)))
+    base_snapshot_nodes: set[tuple[str, str]] = set()
+    for bsh_name, bsh_data in (base_fp.get("sheets") or {}).items():
+        for sc in (bsh_data.get("semantic_anchors") or {}).get("consensus_snapshot_cells") or ():
+            base_snapshot_nodes.add((bsh_name, sc.upper()))
+    base_snap_idx = _index_target_coords(base_snapshot_nodes)
+
+    # Check snapshot metadata (source & as-of date) on touched snapshot cells
+    for entry in snapshot_entries:
+        s_sh, s_crd = entry["node"]
+        if not entry.get("has_src_date"):
+            in_scope_s = s_crd in touched_cells.get(s_sh, set())
+            _add_finding(
+                findings, "C04", "actionable" if in_scope_s else "baseline_legacy",
+                f"Consensus snapshot cell {s_sh}!{s_crd} is missing source_type or as_of_date",
+                sheet=s_sh, cell=s_crd,
+            )
 
     # Check House forecast/result cells on non-consensus sheets
     for sh_name in target_sheets:
         if any(k in sh_name.lower() for k in ("consensus", "readme", "changelog")):
             continue
         sh_data = (cand_fp.get("sheets") or {}).get(sh_name)
+        b_sh = (base_fp.get("sheets") or {}).get(sh_name)
         if not sh_data:
             continue
         cols = (sh_data.get("period_axis") or {}).get("columns") or {}
         hdr_r = (sh_data.get("period_axis") or {}).get("header_row") or 1
         anchors = sh_data.get("semantic_anchors") or {}
+        lim = sh_data.get("line_item_map") or {}
         result_rows = {
             r for r in (
                 anchors.get("total_revenue_row"),
@@ -647,6 +864,14 @@ def run_checks(
             )
             if r is not None
         }
+        sh_touched = touched_cells.get(sh_name, set())
+        b_mapped_c04: dict[str, tuple[str, dict[str, Any]]] = {}
+        if b_sh:
+            for old_c, bc in (b_sh.get("cells") or {}).items():
+                nc = model_edit.map_coord_str(cm, sh_name, old_c)
+                if nc:
+                    b_mapped_c04[nc.upper()] = (old_c.upper(), bc)
+
         for coord, c_cell in (sh_data.get("cells") or {}).items():
             cu = coord.upper()
             col_s, row_i = coordinate_from_string(cu)
@@ -654,30 +879,65 @@ def run_checks(
                 continue
             col_meta = cols.get(col_s)
             is_fc = bool(col_meta and col_meta.get("is_forecast"))
-            if not is_fc and cu not in touched_cells.get(sh_name, set()):
+            is_touched = cu in sh_touched
+            if not is_fc and not is_touched:
                 continue
 
+            b_pair = b_mapped_c04.get(cu)
+            b_old_coord, b_cell = (b_pair[0], b_pair[1]) if b_pair else (None, None)
+
             if c_cell.get("category") == "formula":
-                hit = _reaches_any((sh_name, cu), snapshot_nodes, dep_graph)
+                hit = _reaches_any((sh_name, cu), snapshot_nodes, dep_graph, rect_graph, snap_target_idx)
                 if hit is not None:
+                    was_legacy_dep = bool(
+                        not is_touched
+                        and b_old_coord is not None
+                        and b_cell is not None
+                        and b_cell.get("category") == "formula"
+                        and _reaches_any(
+                            (sh_name, b_old_coord), base_snapshot_nodes, base_dep_graph, base_rect_graph, base_snap_idx
+                        ) is not None
+                    )
                     _add_finding(
-                        findings, "C04", "actionable",
-                        f"House forecast/driver formula {sh_name}!{cu} depends on consensus snapshot cell {hit[0]}!{hit[1]} (directly or via defined_names)",
+                        findings, "C04", "baseline_legacy" if was_legacy_dep else "actionable",
+                        f"House forecast/driver formula {sh_name}!{cu} depends on consensus snapshot cell {hit[0]}!{hit[1]} (directly, via range/table, or via defined_names)",
                         sheet=sh_name, cell=cu,
                         details={"snapshot_ref": f"{hit[0]}!{hit[1]}", "formula": c_cell.get("formula")},
                     )
             elif c_cell.get("category") == "input" and (row_i in result_rows or c_cell.get("is_subtotal_or_ratio_row")):
                 cv = c_cell.get("cached_value")
                 if isinstance(cv, (int, float)) and not isinstance(cv, bool):
-                    for snap_node, snap_val in snapshot_values:
-                        if _num_close(cv, snap_val, rel_tol=1e-6, abs_tol=1e-6):
-                            _add_finding(
-                                findings, "C04", "actionable",
-                                f"House result cell {sh_name}!{cu} is a hard-coded constant ({cv}) equal to consensus snapshot {snap_node[0]}!{snap_node[1]}",
-                                sheet=sh_name, cell=cu,
-                                details={"snapshot_ref": f"{snap_node[0]}!{snap_node[1]}", "value": cv},
-                            )
-                            break
+                    cell_period = str((col_meta or {}).get("normalized") or (col_meta or {}).get("raw") or "").upper()
+                    row_lbl = str((lim.get(str(row_i)) or {}).get("label") or "")
+                    cell_mkey = model_consensus._normalize_metric_key(row_lbl) if row_lbl else None
+                    # Check whether baseline already had this exact constant (unchanged in this round)
+                    was_legacy_const = bool(
+                        not is_touched
+                        and b_cell is not None
+                        and b_cell.get("category") == "input"
+                        and _num_close(cv, b_cell.get("cached_value"), rel_tol=1e-6, abs_tol=1e-6)
+                    )
+                    for entry in snapshot_entries:
+                        snap_node = entry["node"]
+                        snap_val = entry["value"]
+                        if not _num_close(cv, snap_val, rel_tol=1e-6, abs_tol=1e-6):
+                            continue
+                        # Match by (period, metric_key) when snapshot carries period/metric metadata
+                        sp = entry.get("period_norm")
+                        sm = entry.get("metric_key")
+                        if sp and cell_period and sp != cell_period:
+                            continue
+                        if sm and cell_mkey and sm != cell_mkey:
+                            continue
+                        if (not sp or not sm) and not is_touched:
+                            continue
+                        _add_finding(
+                            findings, "C04", "baseline_legacy" if was_legacy_const else "actionable",
+                            f"House result cell {sh_name}!{cu} is a hard-coded constant ({cv}) equal to consensus snapshot {snap_node[0]}!{snap_node[1]}",
+                            sheet=sh_name, cell=cu,
+                            details={"snapshot_ref": f"{snap_node[0]}!{snap_node[1]}", "value": cv},
+                        )
+                        break
 
     # Dynamic refs recorded as review notes (not actionable in P0; handed to P1 review pack)
     dynamic_ref_list: list[dict[str, str]] = []
@@ -708,14 +968,28 @@ def run_checks(
             continue
         c_cells = c_sh.get("cells") or {}
         b_cells = (b_sh.get("cells") or {}) if b_sh else {}
-        note_col = (c_sh.get("period_axis") or {}).get("source_note_col")
+        c_axis = c_sh.get("period_axis") or {}
+        c_cols = c_axis.get("columns") or {}
+        hdr_r = c_axis.get("header_row") or 1
+        note_col = c_axis.get("source_note_col")
         b_comment_coords: set[str] = set()
+        b_mapped_c05: dict[str, dict[str, Any]] = {}
         for old_c, bc in b_cells.items():
-            if bc.get("has_comment"):
-                nc = model_edit.map_coord_str(cm, sh_name, old_c)
-                if nc:
+            nc = model_edit.map_coord_str(cm, sh_name, old_c)
+            if nc:
+                b_mapped_c05[nc.upper()] = bc
+                if bc.get("has_comment"):
                     b_comment_coords.add(nc.upper())
-        for cu in sorted(touched_cells.get(sh_name, set())):
+
+        is_data_sheet = not any(k in sh_name.lower() for k in ("readme", "changelog", "consensus"))
+        added_cols_set = {str(c).upper() for c in (cm["added_period_cols"].get(sh_name) or ())}
+        check_coords_c05 = set(touched_cells.get(sh_name, set()))
+        for crd in c_cells:
+            cs, ri = coordinate_from_string(crd)
+            if cs.upper() in added_cols_set and ri > hdr_r:
+                check_coords_c05.add(crd.upper())
+
+        for cu in sorted(check_coords_c05):
             cc = c_cells.get(cu)
             if not cc:
                 continue
@@ -736,7 +1010,71 @@ def run_checks(
                         sheet=sh_name, cell=cu,
                     )
 
-    # C06 Shifted freeze panes, column widths & outline groups
+            # Normalized style consistency check on touched/added period cells
+            if not is_data_sheet:
+                continue
+            col_s, row_i = coordinate_from_string(cu)
+            col_meta = c_cols.get(col_s)
+            if row_i <= hdr_r or not col_meta or col_meta.get("kind") not in ("annual", "quarter"):
+                continue
+            rn = cc.get("role_norm") or {}
+            bc = b_mapped_c05.get(cu)
+            if bc and bc.get("category") == cc.get("category") and bc.get("role_norm") == rn and col_s not in added_cols_set:
+                continue
+
+            # Gather same-row peer cells of matching kind/role (excluding touched cells)
+            peer_norms: list[dict[str, Any]] = []
+            for oc, om in c_cols.items():
+                if oc == col_s or om.get("kind") not in ("annual", "quarter"):
+                    continue
+                if bool(om.get("is_forecast")) != bool(col_meta.get("is_forecast")):
+                    continue
+                pc = c_cells.get(f"{oc}{row_i}")
+                if pc and pc.get("category") == cc.get("category"):
+                    peer_norms.append(pc.get("role_norm") or {})
+            if not peer_norms:
+                continue
+
+            # 1. Number format category consistency (e.g. % vs number)
+            peer_fmts = {_fmt_category(pn.get("num_fmt")) for pn in peer_norms if _fmt_category(pn.get("num_fmt")) != "general"}
+            cur_fmt_cat = _fmt_category(rn.get("num_fmt"))
+            if len(peer_fmts) == 1 and cur_fmt_cat != "general" and cur_fmt_cat not in peer_fmts:
+                _add_finding(
+                    findings, "C05", "actionable",
+                    f"Style number format mismatch at {sh_name}!{cu}: got {rn.get('num_fmt')!r} ({cur_fmt_cat}), peers use {sorted(peer_fmts)[0]}",
+                    sheet=sh_name, cell=cu,
+                )
+
+            # 2. Role color / fill consistency
+            if cc.get("category") == "input":
+                if col_meta.get("is_forecast"):
+                    # Forecast driver input row whose peers use yellow fill FFFFC8 + blue font
+                    peers_yellow = all(pn.get("fill_rgb") == model_style.ASSUMP_FILL for pn in peer_norms)
+                    if peers_yellow and (rn.get("fill_rgb") != model_style.ASSUMP_FILL or rn.get("font_rgb") != model_style.ASSUMP_FONT):
+                        _add_finding(
+                            findings, "C05", "actionable",
+                            f"Forecast driver cell {sh_name}!{cu} style drifted (font={rn.get('font_rgb')}, fill={rn.get('fill_rgb')}); peers use blue/{model_style.ASSUMP_FILL}",
+                            sheet=sh_name, cell=cu,
+                        )
+                else:
+                    # Historical actual input whose peers use blue font
+                    peers_blue = all(pn.get("font_rgb") == model_style.ACTUAL_FONT for pn in peer_norms)
+                    if peers_blue and rn.get("font_rgb") != model_style.ACTUAL_FONT:
+                        _add_finding(
+                            findings, "C05", "actionable",
+                            f"Historical actual cell {sh_name}!{cu} font color {rn.get('font_rgb')} mismatches peer actual color {model_style.ACTUAL_FONT}",
+                            sheet=sh_name, cell=cu,
+                        )
+            elif cc.get("category") == "formula" and (col_meta.get("is_forecast") or col_s in added_cols_set):
+                peers_black = all(pn.get("font_rgb") == model_style.FORMULA_FONT for pn in peer_norms)
+                if peers_black and rn.get("font_rgb") == model_style.ACTUAL_FONT:
+                    _add_finding(
+                        findings, "C05", "actionable",
+                        f"Forecast/added formula cell {sh_name}!{cu} uses blue input font ({rn.get('font_rgb')}) instead of formula color {model_style.FORMULA_FONT}",
+                        sheet=sh_name, cell=cu,
+                    )
+
+    # C06 Shifted freeze panes, column widths (added & existing) & row/col outline groups
     for sh_name in target_sheets:
         b_sh = (base_fp.get("sheets") or {}).get(sh_name)
         c_sh = (cand_fp.get("sheets") or {}).get(sh_name)
@@ -755,9 +1093,58 @@ def run_checks(
                 sheet=sh_name,
             )
 
-        # Added period column width consistency (±0.5 per §8.7)
+        b_layout = b_sh.get("column_layout") or {}
         c_layout = c_sh.get("column_layout") or {}
         c_cols = (c_sh.get("period_axis") or {}).get("columns") or {}
+        added_cols_c06 = {str(c).upper() for c in (cm["added_period_cols"].get(sh_name) or ())}
+
+        # 1. Existing column widths & column outline groups preserved after shift
+        for old_col_l, b_cinfo in b_layout.items():
+            old_ci = column_index_from_string(old_col_l)
+            mapped = model_edit.map_coord(cm, sh_name, 1, old_ci)
+            if mapped is None:
+                continue
+            new_col_l = get_column_letter(mapped[1])
+            if new_col_l in added_cols_c06:
+                continue
+            c_cinfo = c_layout.get(new_col_l) or {}
+            bw = b_cinfo.get("width")
+            cw = c_cinfo.get("width")
+            if bw is not None and cw is not None and abs(float(cw) - float(bw)) > 0.5:
+                _add_finding(
+                    findings, "C06", "actionable",
+                    f"Existing column width drifted at {sh_name}!{new_col_l} (was {old_col_l}): expected {float(bw):.2f}, got {float(cw):.2f}",
+                    sheet=sh_name, cell=f"{new_col_l}1",
+                )
+            b_ol = int(b_cinfo.get("outline_level") or 0)
+            c_ol = int(c_cinfo.get("outline_level") or 0)
+            if b_ol > 0 and c_ol != b_ol:
+                _add_finding(
+                    findings, "C06", "actionable",
+                    f"Column outline group lost/changed at {sh_name}!{new_col_l} (was {old_col_l}): expected outlineLevel={b_ol}, got {c_ol}",
+                    sheet=sh_name, cell=f"{new_col_l}1",
+                )
+
+        # 2. Row outline groups preserved after shift
+        b_rgroups = b_sh.get("row_groups") or {}
+        c_rgroups = c_sh.get("row_groups") or {}
+        for old_r_s, b_rinfo in b_rgroups.items():
+            b_ol = int(b_rinfo.get("outline_level") or 0)
+            if b_ol <= 0:
+                continue
+            mapped_r = model_edit.map_coord(cm, sh_name, int(old_r_s), 1)
+            if mapped_r is None:
+                continue
+            new_r = mapped_r[0]
+            c_ol = int((c_rgroups.get(str(new_r)) or {}).get("outline_level") or 0)
+            if c_ol != b_ol:
+                _add_finding(
+                    findings, "C06", "actionable",
+                    f"Row outline group lost/changed at {sh_name}!row {new_r} (was row {old_r_s}): expected outlineLevel={b_ol}, got {c_ol}",
+                    sheet=sh_name, cell=f"A{new_r}",
+                )
+
+        # 3. Added period column width consistency (±0.5 per §8.7)
         for added_c in cm["added_period_cols"].get(sh_name) or ():
             ac_u = str(added_c).upper()
             w_new = (c_layout.get(ac_u) or {}).get("width")
@@ -778,16 +1165,37 @@ def run_checks(
                         sheet=sh_name, cell=f"{ac_u}1",
                     )
 
-    # C07 Unit label, summary sheet formulas & valuation sheet sync
+    # C07 Unit label, summary sheet formulas & valuation sheet FY reference sync
     val_sheets = [s for s in target_sheets if any(k in s.lower() for k in ("valuation", "sotp"))]
     if not val_sheets:
         _add_finding(findings, "C07", "not_applicable", "No Valuation / SOTP sheet present")
+
+    # Index target Model sheet period columns for Valuation FY reference verification
+    model_col_periods: dict[str, dict[str, str]] = {}
+    base_model_col_periods: dict[str, dict[str, str]] = {}
+    for m_sh in target_sheets:
+        if m_sh.lower().startswith("model"):
+            m_cols = ((cand_fp.get("sheets") or {}).get(m_sh, {}).get("period_axis") or {}).get("columns") or {}
+            model_col_periods[m_sh] = {
+                cl.upper(): str(cm_i.get("normalized") or cm_i.get("raw") or "").upper()
+                for cl, cm_i in m_cols.items()
+                if cm_i.get("kind") in ("annual", "quarter")
+            }
+            bm_cols = ((base_fp.get("sheets") or {}).get(m_sh, {}).get("period_axis") or {}).get("columns") or {}
+            base_model_col_periods[m_sh] = {
+                cl.upper(): str(bm_i.get("normalized") or bm_i.get("raw") or "").upper()
+                for cl, bm_i in bm_cols.items()
+                if bm_i.get("kind") in ("annual", "quarter")
+            }
+
     for sh_name in target_sheets:
         c_sh = (cand_fp.get("sheets") or {}).get(sh_name)
+        b_sh = (base_fp.get("sheets") or {}).get(sh_name)
         if not c_sh:
             continue
         if sh_name.lower().startswith("model") and not (c_sh.get("period_axis") or {}).get("unit_text"):
-            sev = "actionable" if (mode == "build" or touched_cells.get(sh_name)) else "baseline_legacy"
+            b_missing_unit = bool(b_sh and not (b_sh.get("period_axis") or {}).get("unit_text"))
+            sev = "baseline_legacy" if (b_missing_unit and mode != "build") else "actionable"
             _add_finding(findings, "C07", sev, f"Missing unit header (A1) on {sh_name!r}", sheet=sh_name, cell="A1")
         if any(k in sh_name.lower() for k in ("key metrics", "valuation", "sotp")):
             for cu in sorted(touched_cells.get(sh_name, set())):
@@ -799,8 +1207,56 @@ def run_checks(
                         f"Summary/Valuation cell {sh_name}!{cu} is a constant instead of a cross-sheet formula",
                         sheet=sh_name, cell=cu,
                     )
+            # Verify Valuation/SOTP period columns reference matching fiscal years on Model sheets
+            if any(k in sh_name.lower() for k in ("valuation", "sotp")):
+                v_axis = c_sh.get("period_axis") or {}
+                v_cols = v_axis.get("columns") or {}
+                v_hdr_r = v_axis.get("header_row") or 1
+                bv_cells = (b_sh.get("cells") or {}) if b_sh else {}
+                bv_cols = ((b_sh.get("period_axis") or {}).get("columns") or {}) if b_sh else {}
+                b_mapped_v: dict[str, tuple[str, dict[str, Any]]] = {}
+                for old_vc, bvc in bv_cells.items():
+                    nvc = model_edit.map_coord_str(cm, sh_name, old_vc)
+                    if nvc:
+                        b_mapped_v[nvc.upper()] = (old_vc.upper(), bvc)
 
-    # C08 Newly disclosed period required items & forecast blank discipline
+                for coord, cc in (c_sh.get("cells") or {}).items():
+                    cu = coord.upper()
+                    v_col_s, v_row_i = coordinate_from_string(cu)
+                    if v_row_i <= v_hdr_r or cc.get("category") != "formula":
+                        continue
+                    v_cm = v_cols.get(v_col_s)
+                    if not v_cm or v_cm.get("kind") not in ("annual", "quarter"):
+                        continue
+                    v_norm = str(v_cm.get("normalized") or v_cm.get("raw") or "").upper()
+                    refs = model_fingerprint.extract_formula_refs(cc.get("formula") or "", sh_name)
+                    for rsh, rcrd in refs:
+                        if rsh not in model_col_periods:
+                            continue
+                        rcol_s, _ = coordinate_from_string(rcrd.upper())
+                        m_norm = model_col_periods[rsh].get(rcol_s.upper())
+                        if m_norm and v_norm and m_norm != v_norm:
+                            # Check if baseline already had the exact same FY mismatch
+                            was_legacy_fy = False
+                            bp = b_mapped_v.get(cu)
+                            if bp and cu not in touched_cells.get(sh_name, set()):
+                                b_old_c, b_vc = bp
+                                b_col_s, _ = coordinate_from_string(b_old_c)
+                                b_vnorm = str((bv_cols.get(b_col_s) or {}).get("normalized") or "").upper()
+                                b_refs = model_fingerprint.extract_formula_refs(b_vc.get("formula") or "", sh_name)
+                                for brsh, brcrd in b_refs:
+                                    if brsh in base_model_col_periods:
+                                        bm_norm = base_model_col_periods[brsh].get(coordinate_from_string(brcrd.upper())[0].upper())
+                                        if bm_norm and b_vnorm and bm_norm != b_vnorm:
+                                            was_legacy_fy = True
+                            _add_finding(
+                                findings, "C07", "baseline_legacy" if was_legacy_fy else "actionable",
+                                f"Valuation cell {sh_name}!{cu} ({v_norm}) references {rsh}!{rcrd} ({m_norm}) — fiscal period mismatch",
+                                sheet=sh_name, cell=cu,
+                            )
+                            break
+
+    # C08 Newly disclosed period required items, historical preservation & forecast blank discipline
     for sh_name in target_sheets:
         b_sh = (base_fp.get("sheets") or {}).get(sh_name)
         c_sh = (cand_fp.get("sheets") or {}).get(sh_name)
@@ -827,6 +1283,57 @@ def run_checks(
                                 findings, "C08", "actionable",
                                 f"Historical value at {sh_name}!{nc} (was {old_coord}) was cleared",
                                 sheet=sh_name, cell=nc,
+                            )
+
+        # Newly disclosed period (rollover_actual_cols) required items check
+        roll_cols_c08 = [str(c).upper() for c in (cm["rollover_actual_cols"].get(sh_name) or ())]
+        if roll_cols_c08 and sh_name.lower().startswith("model"):
+            anchors_c08 = c_sh.get("semantic_anchors") or {}
+            core_rows = {
+                int(r) for r in (
+                    anchors_c08.get("total_revenue_row"),
+                    anchors_c08.get("gross_profit_row"),
+                    anchors_c08.get("operating_income_row"),
+                    anchors_c08.get("net_income_row"),
+                    anchors_c08.get("eps_row"),
+                    anchors_c08.get("total_assets_row"),
+                    anchors_c08.get("ending_cash_row"),
+                )
+                if r is not None
+            }
+            q_cols_sorted = sorted(
+                [(int(m["col_index"]), cl) for cl, m in c_cols.items() if m.get("kind") == "quarter"],
+                key=lambda x: x[0],
+            )
+            q_col_pos = {cl: idx for idx, (_, cl) in enumerate(q_cols_sorted)}
+            lim_c08 = c_sh.get("line_item_map") or {}
+            for rc in roll_cols_c08:
+                pos = q_col_pos.get(rc)
+                prev_q = q_cols_sorted[pos - 1][1] if (pos is not None and pos > 0) else None
+                for row_s, rmeta in lim_c08.items():
+                    r_idx = int(row_s)
+                    if r_idx <= hdr_r:
+                        continue
+                    # Only require rows that were populated in the immediately prior quarter
+                    if prev_q and f"{prev_q}{r_idx}" not in c_cells:
+                        continue
+                    cur_c = c_cells.get(f"{rc}{r_idx}")
+                    if cur_c is None or (cur_c.get("formula") is None and cur_c.get("cached_value") is None):
+                        has_note = False
+                        if note_col:
+                            nv = str(c_cells.get(f"{get_column_letter(int(note_col))}{r_idx}", {}).get("cached_value") or "").strip()
+                            has_note = bool(nv)
+                        if r_idx in core_rows:
+                            _add_finding(
+                                findings, "C08", "actionable",
+                                f"Core newly disclosed line item {rmeta.get('label')!r} is blank at {sh_name}!{rc}{r_idx}",
+                                sheet=sh_name, cell=f"{rc}{r_idx}",
+                            )
+                        elif not rmeta.get("is_subtotal_or_ratio") and not has_note:
+                            _add_finding(
+                                findings, "C08", "missing_evidence",
+                                f"Disclosed detail item {rmeta.get('label')!r} is blank in rollover column {sh_name}!{rc}{r_idx} without note",
+                                sheet=sh_name, cell=f"{rc}{r_idx}",
                             )
 
         for cu in sorted(touched_cells.get(sh_name, set())):
@@ -896,8 +1403,19 @@ def run_checks(
                             f"Balance sheet out of balance at {sh_name}!{col_l}: Assets={ta:.2f} vs L+E={tle:.2f} (diff={ta - tle:+.2f})",
                             sheet=sh_name, cell=f"{col_l}{ta_r}",
                         )
-        # Cash bridge (CF ending cash vs BS cash)
+        # Cash bridge (CF ending cash vs BS cash) — honor restricted cash/deposit bridge rows or notes
         ec_r, bsc_r = anchors.get("ending_cash_row"), anchors.get("bs_cash_row")
+        note_col_m = c_axis.get("source_note_col")
+        bridge_rows = [
+            int(rs) for rs, rm in lim.items()
+            if re.search(r"(?:restricted\s+cash|time\s+deposit|short[\-\s]?term\s+inv|cash\s+bridge|受限现金|定期存款|桥接)", str(rm.get("label") or ""), re.IGNORECASE)
+        ]
+
+        def _row_note(row_idx: int | None) -> str:
+            if row_idx is None or note_col_m is None:
+                return ""
+            return str(c_cells.get(f"{get_column_letter(int(note_col_m))}{row_idx}", {}).get("cached_value") or "").strip()
+
         if ec_r is not None and bsc_r is not None:
             for col_l in sh_tcols:
                 if col_l not in c_cols:
@@ -906,14 +1424,33 @@ def run_checks(
                 if ec is not None and bsc is not None:
                     tol = _unit_tolerance(unit_scale, max(abs(ec), abs(bsc)))
                     if abs(ec - bsc) > tol:
+                        # Check if a bridge row reconciles the difference
+                        bridge_vals = [_val(col_l, br) for br in bridge_rows]
+                        bridge_sum = sum(v for v in bridge_vals if v is not None)
+                        reconciled_by_row = bool(
+                            bridge_rows
+                            and any(v is not None for v in bridge_vals)
+                            and (abs(ec - (bsc + bridge_sum)) <= tol or abs(ec - (bsc - bridge_sum)) <= tol)
+                        )
+                        reconciled_by_note = _has_reconcile_note(_row_note(ec_r)) or _has_reconcile_note(_row_note(bsc_r))
+                        if reconciled_by_row or reconciled_by_note:
+                            continue
                         _add_finding(
                             findings, "C09", "actionable",
                             f"Cash bridge mismatch at {sh_name}!{col_l}: CF Ending Cash={ec:.2f} vs BS Cash={bsc:.2f}",
                             sheet=sh_name, cell=f"{col_l}{bsc_r}",
                         )
 
-        # --- C10 Semantic line-item Annual == Quarterly aggregation ---
+        # --- C10 Semantic line-item Annual == Quarterly aggregation (incl. ratio & EPS formulas) ---
         ann_q_map = c_axis.get("annual_sum_quarters") or {}
+        b_sh_m = (base_fp.get("sheets") or {}).get(sh_name)
+        b_cells_m: dict[str, dict[str, Any]] = {}
+        if b_sh_m:
+            for old_c, bc in (b_sh_m.get("cells") or {}).items():
+                nc = model_edit.map_coord_str(cm, sh_name, old_c)
+                if nc:
+                    b_cells_m[nc.upper()] = bc
+
         for row_s, rmeta in sorted(lim.items(), key=lambda kv: int(kv[0])):
             r_idx = int(row_s)
             rtype = rmeta.get("row_type")
@@ -930,6 +1467,45 @@ def run_checks(
                 # Only check annual columns in round scope (annual col or any constituent quarter touched)
                 if ann_col not in sh_tcols and not any(q in sh_tcols for q in q_cols):
                     continue
+                if rtype in ("ratio", "eps"):
+                    ann_coord = f"{ann_col}{r_idx}"
+                    ann_cell = c_cells.get(ann_coord)
+                    if not ann_cell:
+                        continue
+                    b_ann = b_cells_m.get(ann_coord)
+                    ann_f = str(ann_cell.get("formula") or "")
+                    if ann_cell.get("category") != "formula":
+                        is_fc_ann = bool((c_cols.get(ann_col) or {}).get("is_forecast"))
+                        if is_fc_ann or (ann_coord in touched_cells.get(sh_name, set())):
+                            was_legacy_c = bool(b_ann and b_ann.get("category") != "formula" and ann_coord not in touched_cells.get(sh_name, set()))
+                            _add_finding(
+                                findings, "C10", "baseline_legacy" if was_legacy_c else "actionable",
+                                f"Annual {rtype} cell {sh_name}!{ann_coord} ({rmeta.get('label')}) is not a formula",
+                                sheet=sh_name, cell=ann_coord,
+                            )
+                        continue
+                    # Reject annual ratio/EPS summing or averaging quarterly cells instead of annual numerator/denominator
+                    up_f = ann_f.upper().replace("$", "").replace(" ", "")
+                    q1, q4 = q_cols[0].upper(), q_cols[-1].upper()
+                    bad_q_agg = (
+                        f"SUM({q1}{r_idx}:{q4}{r_idx})" in up_f
+                        or f"AVERAGE({q1}{r_idx}:{q4}{r_idx})" in up_f
+                        or f"AVG({q1}{r_idx}:{q4}{r_idx})" in up_f
+                        or (all(f"{q.upper()}{r_idx}" in up_f for q in q_cols) and "+" in up_f and "/" not in up_f)
+                    )
+                    if bad_q_agg:
+                        was_legacy_agg = bool(
+                            b_ann
+                            and _norm_formula(b_ann.get("formula")) == _norm_formula(ann_f)
+                            and ann_coord not in touched_cells.get(sh_name, set())
+                        )
+                        _add_finding(
+                            findings, "C10", "baseline_legacy" if was_legacy_agg else "actionable",
+                            f"Annual {rtype} cell {sh_name}!{ann_coord} ({rmeta.get('label')}) aggregates quarters ({ann_f}) instead of computing from annual column",
+                            sheet=sh_name, cell=ann_coord,
+                        )
+                    continue
+
                 ann_val = _val(ann_col, r_idx)
                 q_vals = [_val(q, r_idx) for q in q_cols]
                 if ann_val is None or any(v is None for v in q_vals):
@@ -963,43 +1539,72 @@ def run_checks(
                             sheet=sh_name, cell=f"{ann_col}{r_idx}",
                         )
 
-        # --- C11 Group == Segments + Unallocated & Eliminations ---
+        # --- C11 Group == Segments + Unallocated & Eliminations (Operating Profit & Segment Revenue) ---
         grp_op_r = anchors.get("operating_income_row")
         seg_op_rows = list(anchors.get("segment_op_rows") or [])
         seg_unalloc_r = anchors.get("segment_unalloc_row")
-        if not seg_op_rows:
+        grp_rev_r = anchors.get("total_revenue_row")
+        seg_rev_rows = list(anchors.get("segment_rev_rows") or [])
+        seg_rev_elim_r = anchors.get("segment_rev_elim_row")
+
+        if not seg_op_rows and not seg_rev_rows:
             _add_finding(findings, "C11", "not_applicable", f"No segment reporting rows on {sh_name!r}", sheet=sh_name)
-        elif grp_op_r is None:
-            _add_finding(findings, "C11", "missing_evidence", f"Missing Group Operating Income anchor on {sh_name!r}", sheet=sh_name)
         else:
-            for col_l, cinfo in c_cols.items():
-                if cinfo.get("kind") not in ("annual", "quarter"):
-                    continue
-                g_op = _val(col_l, grp_op_r)
-                s_vals = [_val(col_l, sr) for sr in seg_op_rows]
-                if g_op is None or any(v is None for v in s_vals):
-                    continue
-                unalloc = _val(col_l, seg_unalloc_r) if seg_unalloc_r is not None else 0.0
-                seg_sum = sum(float(v) for v in s_vals if v is not None) + float(unalloc or 0.0)
-                tol = _unit_tolerance(unit_scale, g_op)
-                if abs(g_op - seg_sum) > tol:
-                    in_scope_col = col_l in sh_tcols
-                    sev = "actionable" if in_scope_col else "baseline_legacy"
-                    _add_finding(
-                        findings, "C11", sev,
-                        f"Group vs Segment Operating Profit disconnect at {sh_name}!{col_l}{grp_op_r}: Group={g_op:.2f} vs Segments+Unalloc={seg_sum:.2f} (diff={g_op - seg_sum:+.2f})",
-                        sheet=sh_name, cell=f"{col_l}{grp_op_r}",
-                    )
+            if seg_op_rows:
+                if grp_op_r is None:
+                    _add_finding(findings, "C11", "missing_evidence", f"Missing Group Operating Income anchor on {sh_name!r}", sheet=sh_name)
+                else:
+                    for col_l, cinfo in c_cols.items():
+                        if cinfo.get("kind") not in ("annual", "quarter"):
+                            continue
+                        g_op = _val(col_l, grp_op_r)
+                        s_vals = [_val(col_l, sr) for sr in seg_op_rows]
+                        if g_op is None or any(v is None for v in s_vals):
+                            continue
+                        unalloc = _val(col_l, seg_unalloc_r) if seg_unalloc_r is not None else 0.0
+                        seg_sum = sum(float(v) for v in s_vals if v is not None) + float(unalloc or 0.0)
+                        tol = _unit_tolerance(unit_scale, g_op)
+                        if abs(g_op - seg_sum) > tol:
+                            if _has_reconcile_note(_row_note(grp_op_r)):
+                                continue
+                            in_scope_col = col_l in sh_tcols
+                            sev = "actionable" if in_scope_col else "baseline_legacy"
+                            _add_finding(
+                                findings, "C11", sev,
+                                f"Group vs Segment Operating Profit disconnect at {sh_name}!{col_l}{grp_op_r}: Group={g_op:.2f} vs Segments+Unalloc={seg_sum:.2f} (diff={g_op - seg_sum:+.2f})",
+                                sheet=sh_name, cell=f"{col_l}{grp_op_r}",
+                            )
+            if seg_rev_rows and grp_rev_r is not None:
+                for col_l, cinfo in c_cols.items():
+                    if cinfo.get("kind") not in ("annual", "quarter"):
+                        continue
+                    g_rev = _val(col_l, grp_rev_r)
+                    sr_vals = [_val(col_l, sr) for sr in seg_rev_rows]
+                    if g_rev is None or any(v is None for v in sr_vals):
+                        continue
+                    rev_elim = _val(col_l, seg_rev_elim_r) if seg_rev_elim_r is not None else 0.0
+                    seg_rev_sum = sum(float(v) for v in sr_vals if v is not None) + float(rev_elim or 0.0)
+                    tol = _unit_tolerance(unit_scale, g_rev)
+                    if abs(g_rev - seg_rev_sum) > tol:
+                        if _has_reconcile_note(_row_note(grp_rev_r)):
+                            continue
+                        in_scope_col = col_l in sh_tcols
+                        sev = "actionable" if in_scope_col else "baseline_legacy"
+                        _add_finding(
+                            findings, "C11", sev,
+                            f"Group vs Segment Revenue disconnect at {sh_name}!{col_l}{grp_rev_r}: Group={g_rev:.2f} vs Segments+Elim={seg_rev_sum:.2f} (diff={g_rev - seg_rev_sum:+.2f})",
+                            sheet=sh_name, cell=f"{col_l}{grp_rev_r}",
+                        )
 
         # --- C12 Cash & Share rollforward ---
         bc_r, nc_r = anchors.get("beginning_cash_row"), anchors.get("net_change_cash_row")
+        q_ordered = sorted(
+            [(m["col_index"], col_l, m) for col_l, m in c_cols.items() if m.get("kind") == "quarter"],
+            key=lambda x: x[0],
+        )
         if bc_r is None or nc_r is None or ec_r is None:
             _add_finding(findings, "C12", "missing_evidence", f"Missing cash rollforward anchors on {sh_name!r}", sheet=sh_name)
         else:
-            q_ordered = sorted(
-                [(m["col_index"], col_l, m) for col_l, m in c_cols.items() if m.get("kind") == "quarter"],
-                key=lambda x: x[0],
-            )
             for idx_q, (_, col_l, cinfo) in enumerate(q_ordered):
                 if col_l not in sh_tcols:
                     continue
@@ -1024,7 +1629,38 @@ def run_checks(
                                 sheet=sh_name, cell=f"{col_l}{bc_r}",
                             )
 
-    # C13 fullCalcOnLoad, exempt cells, formula errors & new circular references
+        # Share rollforward (explicit beg/change/end rows per §6.1 C12 & §8.7)
+        bs_r = anchors.get("beginning_shares_row")
+        es_r = anchors.get("ending_shares_row")
+        sc_rows = list(anchors.get("share_change_rows") or [])
+        if bs_r is not None and es_r is not None:
+            for idx_q, (_, col_l, cinfo) in enumerate(q_ordered):
+                if col_l not in sh_tcols:
+                    continue
+                bs_v, es_v = _val(col_l, bs_r), _val(col_l, es_r)
+                if idx_q > 0:
+                    prev_es = _val(q_ordered[idx_q - 1][1], es_r)
+                    if bs_v is not None and prev_es is not None:
+                        s_tol = max(1e-4 * abs(prev_es), 1e-6)
+                        if abs(bs_v - prev_es) > s_tol and not _has_reconcile_note(_row_note(bs_r)):
+                            _add_finding(
+                                findings, "C12", "actionable",
+                                f"Beginning shares discontinuity at {sh_name}!{col_l}{bs_r}: Beg({bs_v:.2f}) != Prior End({prev_es:.2f})",
+                                sheet=sh_name, cell=f"{col_l}{bs_r}",
+                            )
+                if sc_rows and bs_v is not None and es_v is not None:
+                    chg_vals = [_val(col_l, r_sc) for r_sc in sc_rows]
+                    if all(v is not None for v in chg_vals):
+                        chg_sum = sum(float(v) for v in chg_vals if v is not None)
+                        s_tol = max(1e-4 * abs(bs_v), 1e-6)
+                        if abs((bs_v + chg_sum) - es_v) > s_tol and not _has_reconcile_note(_row_note(es_r)):
+                            _add_finding(
+                                findings, "C12", "actionable",
+                                f"Share rollforward broken at {sh_name}!{col_l}{es_r}: Beg({bs_v:.2f}) + Chg({chg_sum:+.2f}) != End({es_v:.2f})",
+                                sheet=sh_name, cell=f"{col_l}{es_r}",
+                            )
+
+    # C13 fullCalcOnLoad, exempt cells, baseline error comparison, downstream diffs & new circular references
     base_full_calc = bool((base_fp.get("calc_properties") or {}).get("full_calc_on_load"))
     cand_full_calc = bool((cand_fp.get("calc_properties") or {}).get("full_calc_on_load"))
     if not base_full_calc and cand_full_calc:
@@ -1033,7 +1669,7 @@ def run_checks(
             "Workbook <calcPr> has fullCalcOnLoad=1 enabled (was disabled in baseline)",
         )
 
-    # Build exempt cell set (external links, plugins, mapped baseline circular SCCs)
+    # Build exempt cell set (external links incl. defined_names, plugins, mapped baseline circular SCCs)
     exempt_nodes: set[tuple[str, str]] = set()
     for item in (base_fp.get("external_links_baseline") or {}).get("cells") or []:
         nc = model_edit.map_coord_str(cm, item["sheet"], item["cell"])
@@ -1057,6 +1693,23 @@ def run_checks(
                     exempt_nodes.add((sh_n, nc.upper()))
         if mapped_nodes:
             mapped_base_sccs.add(frozenset(mapped_nodes))
+    exempt_idx = _index_target_coords(exempt_nodes)
+
+    # Build shifted baseline error inventory (Principle #1: pre-existing baseline errors -> baseline_legacy!)
+    base_cached_err_nodes: dict[tuple[str, str], str] = {}
+    base_ref_formula_nodes: set[tuple[str, str]] = set()
+    for sh_name, b_sh in (base_fp.get("sheets") or {}).items():
+        for old_coord, b_cell in (b_sh.get("cells") or {}).items():
+            if b_cell.get("category") != "formula":
+                continue
+            nc = model_edit.map_coord_str(cm, sh_name, old_coord)
+            if not nc:
+                continue
+            node = (sh_name, nc.upper())
+            if _cell_is_error(b_cell):
+                base_cached_err_nodes[node] = str(b_cell.get("cached_value") or "#ERROR!")
+            if _formula_has_ref_literal(b_cell.get("formula")):
+                base_ref_formula_nodes.add(node)
 
     # Circular reference diff
     for scc in cand_fp.get("circular_baseline") or []:
@@ -1072,11 +1725,29 @@ def run_checks(
                 f"New circular reference introduced: {', '.join(scc[:5])}",
             )
 
+    # Downstream-of-exempt cache deviations (e.g. =IFERROR(F45, 0) where LO computed 0 while donor kept 38.5)
+    for ddiff in (cm.get("recalc_result") or {}).get("downstream_exempt_diffs") or []:
+        dsh = str(ddiff.get("sheet") or "")
+        dcrd = str(ddiff.get("cell") or "").upper()
+        _add_finding(
+            findings, "C13", "baseline_legacy",
+            f"Downstream-of-exempt cache deviation preserved donor value at {dsh}!{dcrd}: donor={ddiff.get('donor_value')!r} vs recalc={ddiff.get('recalc_value')!r}",
+            sheet=dsh, cell=dcrd,
+        )
+
     # Formula errors (cached or recalc_result) + #REF! inside IFERROR
     recalc_errors = (cm.get("recalc_result") or {}).get("errors") or []
     reported_err_nodes: set[tuple[str, str]] = set()
 
-    def _classify_error(sh: str, coord: str, err_code: str, formula_txt: str, *, exempt_hint: bool = False) -> None:
+    def _classify_error(
+        sh: str,
+        coord: str,
+        err_code: str,
+        formula_txt: str,
+        *,
+        exempt_hint: bool = False,
+        is_ref_in_formula: bool = False,
+    ) -> None:
         node = (sh, coord.upper())
         if node in reported_err_nodes:
             return
@@ -1085,7 +1756,7 @@ def run_checks(
             exempt_hint
             or (sh not in target_sheets)
             or (node in exempt_nodes)
-            or (_reaches_any(node, exempt_nodes, dep_graph) is not None)
+            or (_reaches_any(node, exempt_nodes, dep_graph, rect_graph, exempt_idx) is not None)
         )
         if is_exempt:
             _add_finding(
@@ -1093,12 +1764,23 @@ def run_checks(
                 f"Exempt/downstream-of-exempt formula error {err_code} at {sh}!{coord}",
                 sheet=sh, cell=coord,
             )
-        else:
+            return
+        is_preexisting = (
+            (is_ref_in_formula and node in base_ref_formula_nodes)
+            or (not is_ref_in_formula and node in base_cached_err_nodes)
+        )
+        if is_preexisting and coord.upper() not in touched_cells.get(sh, set()):
             _add_finding(
-                findings, "C13", "actionable",
-                f"Formula error {err_code} at {sh}!{coord} ({formula_txt[:60]})",
+                findings, "C13", "baseline_legacy",
+                f"Pre-existing baseline formula error {err_code} at {sh}!{coord}",
                 sheet=sh, cell=coord,
             )
+            return
+        _add_finding(
+            findings, "C13", "actionable",
+            f"New formula error {err_code} at {sh}!{coord} ({formula_txt[:60]})",
+            sheet=sh, cell=coord,
+        )
 
     for re_item in recalc_errors:
         _classify_error(
@@ -1117,11 +1799,10 @@ def run_checks(
                 continue
             f_txt = str(c_cell.get("formula") or "")
             cv = c_cell.get("cached_value")
-            ct = c_cell.get("cached_t")
-            if ct == "e" or (isinstance(cv, str) and (cv in _EXCEL_ERRORS or _ERROR_SHAPE.match(cv))):
+            if _cell_is_error(c_cell):
                 _classify_error(sh_name, coord, str(cv or "#ERROR!"), f_txt)
-            elif "#REF!" in model_fingerprint._EXCEL_STR_RE.sub('""', f_txt).upper():
-                _classify_error(sh_name, coord, "#REF! (in formula)", f_txt)
+            elif _formula_has_ref_literal(f_txt):
+                _classify_error(sh_name, coord, "#REF! (in formula)", f_txt, is_ref_in_formula=True)
 
     # C14 Multi-company non-target sheets preserved (expected formula = post-insert donor!)
     if not non_target_sheets:
@@ -1253,9 +1934,19 @@ def _render_check_md(
     result: dict[str, Any],
     ticker: str,
     failed_stages: list[str],
+    *,
+    run_id: str | None = None,
 ) -> str:
     counts = result["counts"]
+    meta_payload = {
+        "candidate_sha256": result.get("candidate_sha256"),
+        "baseline_sha256": result.get("baseline_sha256"),
+        "run_id": run_id,
+        "counts": counts,
+        "failed_stages": list(failed_stages),
+    }
     lines = [
+        f"<!-- model-check-meta: {json.dumps(meta_payload, ensure_ascii=False, sort_keys=True)} -->",
         f"# 模型格式与结构检查报告（{ticker.upper()}）",
         "",
         f"- **候选文件**：`{Path(result['candidate_path']).name}`（`sha256: {result['candidate_sha256']}`）",
@@ -1289,6 +1980,50 @@ def _render_check_md(
             lines.append(f"- {n}")
         lines.append("")
     return "\n".join(lines)
+
+
+def _parse_check_md_meta(check_md_path: Path) -> dict[str, Any] | None:
+    """Parse self-recorded ``candidate_sha256`` and 4-class ``counts`` from ``model-check.md``."""
+    if not check_md_path.is_file() or check_md_path.stat().st_size == 0:
+        return None
+    try:
+        text = check_md_path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    # 1. Machine-readable metadata comment written by _render_check_md
+    m_meta = re.search(r"<!--\s*model-check-meta:\s*(\{.*?\})\s*-->", text)
+    if m_meta:
+        try:
+            parsed = json.loads(m_meta.group(1))
+            if isinstance(parsed, dict) and parsed.get("candidate_sha256"):
+                sha = str(parsed["candidate_sha256"]).strip().lower()
+                counts = parsed.get("counts") if isinstance(parsed.get("counts"), dict) else None
+                return {
+                    "candidate_sha256": sha,
+                    "run_id": parsed.get("run_id"),
+                    "counts": counts,
+                }
+        except Exception:
+            pass
+
+    # 2. Fallback: parse visible markdown candidate sha256 + 4-class counts table
+    m_sha = re.search(r"候选文件[^`\n]*`[^`\n]+`[^`\n]*`sha256:\s*([0-9a-fA-F]{64})`", text)
+    if not m_sha:
+        m_sha = re.search(r"`sha256:\s*([0-9a-fA-F]{64})`", text)
+    if not m_sha:
+        return None
+    sha = m_sha.group(1).lower()
+    counts_out: dict[str, int] = {}
+    for cls in ("actionable", "baseline_legacy", "missing_evidence", "not_applicable"):
+        mc = re.search(rf"\|\s*`{cls}`[^|]*\|\s*(\d+)\s*\|", text)
+        if mc:
+            counts_out[cls] = int(mc.group(1))
+    return {
+        "candidate_sha256": sha,
+        "run_id": None,
+        "counts": counts_out if len(counts_out) == 4 else None,
+    }
 
 
 def _render_summary_10lines(
@@ -1385,7 +2120,13 @@ def write_check_and_ledger(
     fp = json.loads(Path(fingerprint_path).read_text(encoding="utf-8")) if fingerprint_path else None
     cm = json.loads(Path(coord_map_path).read_text(encoding="utf-8")) if coord_map_path else None
     cons_json_path = dump_dir / "consensus-diff.json"
-    cons_diff = json.loads(cons_json_path.read_text(encoding="utf-8")) if cons_json_path.is_file() else None
+    cons_md_path = dump_dir / "consensus-diff.md"
+    cons_diff = None
+    if cons_json_path.is_file():
+        try:
+            cons_diff = json.loads(cons_json_path.read_text(encoding="utf-8"))
+        except Exception:
+            cons_diff = None
 
     res = run_checks(
         candidate_path=cand,
@@ -1402,14 +2143,29 @@ def write_check_and_ledger(
     if recalc_st == "recalc_failed" and "recalc" not in f_stages:
         f_stages.append("recalc")
 
+    # Principle #4: if consensus-diff.{json,md} was not generated for the current candidate,
+    # record "consensus" in failed_stages so the run delivers cleanly as delivered_with_open_issues!
+    cons_valid = bool(
+        cons_diff is not None
+        and cons_md_path.is_file()
+        and cons_md_path.stat().st_size > 0
+        and res.get("candidate_sha256")
+        and str(cons_diff.get("model_sha256") or "").lower() == str(res["candidate_sha256"]).lower()
+    )
+    if not cons_valid and "consensus" not in f_stages:
+        f_stages.append("consensus")
+
     actionable_list = [f for f in res["findings"] if f["severity_class"] == "actionable"]
     check_md_path = dump_dir / "model-check.md"
     review_pack_path = dump_dir / "model-review-pack.md"
     rem_path = dump_dir / "remaining-issues.md"
     ledger_path = dump_dir / "model-verification.json"
 
-    check_md_path.write_text(_render_check_md(res, ticker, f_stages), encoding="utf-8")
-    summary_10 = _render_summary_10lines(res, ticker, cons_diff)
+    existing = _load_existing_ledger(ledger_path) if (append_revision or kind == "report_revision") else None
+    eff_run_id = run_id if run_id is not None else (existing or {}).get("run_id")
+
+    check_md_path.write_text(_render_check_md(res, ticker, f_stages, run_id=eff_run_id), encoding="utf-8")
+    summary_10 = _render_summary_10lines(res, ticker, cons_diff if cons_valid else None)
     review_pack_path.write_text(_render_review_pack_md(res, ticker, summary_10), encoding="utf-8")
 
     has_open = (len(actionable_list) > 0) or (len(f_stages) > 0)
@@ -1426,7 +2182,6 @@ def write_check_and_ledger(
         if rem_path.exists():
             rem_path.unlink()
 
-    existing = _load_existing_ledger(ledger_path) if (append_revision or kind == "report_revision") else None
     rounds = list((existing or {}).get("rounds") or [])
     prev_fix_rounds = int((existing or {}).get("fix_rounds") or 0)
     eff_fix_rounds = prev_fix_rounds if kind == "report_revision" else max(prev_fix_rounds, int(fix_round))
@@ -1438,10 +2193,10 @@ def write_check_and_ledger(
             "counts": res["counts"],
         }
     }
-    if cons_diff is not None:
+    if cons_valid and cons_diff is not None:
         evidence["consensus"] = {
             "path": _rel_or_str(cons_json_path, ws),
-            "md_path": _rel_or_str(dump_dir / "consensus-diff.md", ws),
+            "md_path": _rel_or_str(cons_md_path, ws),
             "evidence_model_sha256": cons_diff.get("model_sha256"),
             "status": cons_diff.get("status"),
             "exceeds_count": cons_diff.get("exceeds_count", 0),
@@ -1534,23 +2289,40 @@ def write_fallback_ledger(
 
     evidence: dict[str, Any] = {}
     cons_json = dump_dir / "consensus-diff.json"
-    if "consensus" not in f_stages and cons_json.is_file():
+    cons_md = dump_dir / "consensus-diff.md"
+    cons_matched = False
+    if "consensus" not in f_stages and cons_json.is_file() and cons_md.is_file() and cons_md.stat().st_size > 0:
         try:
             cd = json.loads(cons_json.read_text(encoding="utf-8"))
-            evidence["consensus"] = {
-                "path": _rel_or_str(cons_json, ws),
-                "md_path": _rel_or_str(dump_dir / "consensus-diff.md", ws),
-                "evidence_model_sha256": cd.get("model_sha256"),
-                "status": cd.get("status"),
-            }
+            if cand_sha and str(cd.get("model_sha256") or "").lower() == cand_sha.lower():
+                evidence["consensus"] = {
+                    "path": _rel_or_str(cons_json, ws),
+                    "md_path": _rel_or_str(cons_md, ws),
+                    "evidence_model_sha256": cd.get("model_sha256"),
+                    "status": cd.get("status"),
+                }
+                cons_matched = True
         except Exception:
             pass
+    if "consensus" not in f_stages and not cons_matched:
+        f_stages.append("consensus")
+
+    # Never blindly label a stale model-check.md with the new candidate's hash!
     check_md = dump_dir / "model-check.md"
+    check_matched = False
+    parsed_check_counts: dict[str, Any] | None = None
     if "check" not in f_stages and check_md.is_file() and check_md.stat().st_size > 0:
-        evidence["check"] = {
-            "path": _rel_or_str(check_md, ws),
-            "evidence_model_sha256": cand_sha,
-        }
+        parsed_meta = _parse_check_md_meta(check_md)
+        if parsed_meta and cand_sha and str(parsed_meta.get("candidate_sha256") or "").lower() == cand_sha.lower():
+            parsed_check_counts = parsed_meta.get("counts")
+            evidence["check"] = {
+                "path": _rel_or_str(check_md, ws),
+                "evidence_model_sha256": parsed_meta["candidate_sha256"],
+                "counts": parsed_check_counts,
+            }
+            check_matched = True
+    if "check" not in f_stages and not check_matched:
+        f_stages.append("check")
 
     round_entry = {
         "round_index": len(rounds) + 1,
@@ -1558,6 +2330,7 @@ def write_fallback_ledger(
         "candidate_path": _rel_or_str(cand, ws),
         "model_sha256": cand_sha,
         "failed_stages": f_stages,
+        **({"counts": parsed_check_counts} if parsed_check_counts is not None else {}),
         "evidence": evidence,
         "reason": reason or "stage timed out or returned empty before generating report",
         "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -1709,7 +2482,7 @@ def verify_done(
                 if final_model_sha and final_model_sha[:12] not in rem_text:
                     errors.append("candidate model SHA-256 not recorded in remaining-issues.md")
 
-        # Verify each completed enabled stage has real on-disk artifact + aligned hash
+        # Verify each completed enabled stage has real on-disk artifact + self-recorded hash & counts match!
         for st in enabled_stages:
             if st in round_failed or st in top_failed:
                 continue
@@ -1717,8 +2490,35 @@ def verify_done(
                 chk_p = dump_dir / "model-check.md"
                 if not chk_p.is_file() or chk_p.stat().st_size == 0:
                     errors.append(f"completed stage 'check' missing non-empty {chk_p}")
+                else:
+                    parsed_chk = _parse_check_md_meta(chk_p)
+                    if parsed_chk is None:
+                        errors.append(f"model-check.md is missing self-recorded candidate_sha256 metadata: {chk_p}")
+                    else:
+                        rpt_sha = str(parsed_chk.get("candidate_sha256") or "").lower()
+                        if final_model_sha and rpt_sha != final_model_sha:
+                            errors.append(
+                                f"stale model-check.md: report sha256 ({rpt_sha}) != final_model_sha256 ({final_model_sha})"
+                            )
+                        rpt_counts = parsed_chk.get("counts")
+                        ledger_counts = (evidence.get("check") or {}).get("counts") or last_round.get("counts")
+                        if rpt_counts is None:
+                            errors.append("model-check.md is missing 4-class counts metadata")
+                        else:
+                            if ledger_counts is not None:
+                                for k_cnt in ("actionable", "baseline_legacy", "missing_evidence", "not_applicable"):
+                                    if k_cnt in ledger_counts and int(rpt_counts.get(k_cnt, -1)) != int(ledger_counts[k_cnt]):
+                                        errors.append(
+                                            f"model-check.md count mismatch for {k_cnt}: report={rpt_counts.get(k_cnt)} vs ledger={ledger_counts[k_cnt]}"
+                                        )
+                            if final_status == "pass" and int(rpt_counts.get("actionable", 0)) != 0:
+                                errors.append(
+                                    f"final_status='pass' conflicts with model-check.md actionable={rpt_counts.get('actionable')}"
+                                )
                 ev_sha = (evidence.get("check") or {}).get("evidence_model_sha256")
-                if ev_sha and final_model_sha and str(ev_sha).lower() != final_model_sha:
+                if not ev_sha:
+                    errors.append("completed stage 'check' missing evidence_model_sha256 in ledger")
+                elif final_model_sha and str(ev_sha).lower() != final_model_sha:
                     errors.append(f"check evidence sha {ev_sha} != final_model_sha256 {final_model_sha}")
             elif st == "consensus":
                 cj_p = dump_dir / "consensus-diff.json"
@@ -1732,8 +2532,18 @@ def verify_done(
                             errors.append(
                                 f"consensus-diff.json model_sha256 ({cd.get('model_sha256')}) != final_model_sha256 ({final_model_sha})"
                             )
+                        cm_text = cm_p.read_text(encoding="utf-8")
+                        if final_model_sha and final_model_sha[:12] not in cm_text:
+                            errors.append(
+                                f"consensus-diff.md does not record final_model_sha256 ({final_model_sha[:12]})"
+                            )
                     except Exception as exc:
                         errors.append(f"corrupt consensus-diff.json: {exc}")
+                ev_c_sha = (evidence.get("consensus") or {}).get("evidence_model_sha256")
+                if not ev_c_sha:
+                    errors.append("completed stage 'consensus' missing evidence_model_sha256 in ledger")
+                elif final_model_sha and str(ev_c_sha).lower() != final_model_sha:
+                    errors.append(f"consensus evidence sha {ev_c_sha} != final_model_sha256 {final_model_sha}")
 
         # Deep-update note rules (§3.2 item 3)
         if str(ledger.get("workflow") or "") == "earnings-deep-update":

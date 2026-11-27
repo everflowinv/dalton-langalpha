@@ -25,12 +25,16 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
 from typing import Any
+import zipfile
 
+from lxml import etree
 import openpyxl
+from openpyxl.utils import get_column_letter
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
@@ -97,16 +101,240 @@ def _is_house_sheet(sheet_name: str) -> bool:
     return not any(k in low for k in ("vs consensus", "street vs house", "consensus"))
 
 
+def _detect_consensus_table_layouts(ws: Any) -> list[dict[str, Any]]:
+    """Detect all safe consensus comparison tables on ``ws`` by scanning header rows.
+
+    Returns a list of layout dicts ``{header_row, data_start_row, data_end_row, period_col,
+    metric_col, house_col, consensus_col, diff_col, source_col, date_col, rationale_col}``
+    that pass safety checks (distinct columns, no formulas in writable snapshot/metadata cols).
+    """
+    header_rows: list[dict[str, Any]] = []
+    for r in range(1, ws.max_row + 1):
+        cols: dict[str, int] = {}
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(r, c).value
+            if not isinstance(v, str) or not v.strip():
+                continue
+            vl = " ".join(v.strip().lower().split())
+            if "period_col" not in cols and any(k in vl for k in ("period", "期间", "fiscal", "quarter")):
+                cols["period_col"] = c
+            elif "metric_col" not in cols and any(k in vl for k in ("metric", "line item", "item", "指标", "科目", "项目")):
+                cols["metric_col"] = c
+            elif "diff_col" not in cols and any(k in vl for k in ("diff", "vs", "差异", "spread", "variance")):
+                if "isolated reference zone" not in vl:
+                    cols["diff_col"] = c
+            elif "house_col" not in cols and any(k in vl for k in ("house", "our est", "model", "本方", "我们")):
+                cols["house_col"] = c
+            elif "consensus_col" not in cols and any(k in vl for k in ("consensus", "street", "外部预期", "一致预期")):
+                if not any(ex in vl for ex in ("vs", "diff", "差异", "house", "我们", "rationale", "理由", "isolated reference zone")):
+                    cols["consensus_col"] = c
+            elif "source_col" not in cols and any(k in vl for k in ("source", "来源")):
+                cols["source_col"] = c
+            elif "date_col" not in cols and any(k in vl for k in ("as-of", "as of", "date", "日期")):
+                cols["date_col"] = c
+            elif "rationale_col" not in cols and any(k in vl for k in ("rationale", "reason", "note", "理由", "说明")):
+                cols["rationale_col"] = c
+        if {"period_col", "metric_col", "consensus_col"} <= set(cols):
+            header_rows.append({"header_row": r, **cols})
+
+    layouts: list[dict[str, Any]] = []
+    for idx, hdr in enumerate(header_rows):
+        h_row = int(hdr["header_row"])
+        next_h = int(header_rows[idx + 1]["header_row"]) if idx + 1 < len(header_rows) else ws.max_row + 1
+        # Determine contiguous end of this table block
+        data_end = h_row
+        for r in range(h_row + 1, next_h):
+            p_v = ws.cell(r, hdr["period_col"]).value
+            m_v = ws.cell(r, hdr["metric_col"]).value
+            c_v = ws.cell(r, hdr["consensus_col"]).value
+            if p_v is None and m_v is None and c_v is None:
+                break
+            data_end = r
+
+        # Safety guard: consensus_col MUST NOT contain formulas (would indicate House/diff formula col!)
+        cons_col = int(hdr["consensus_col"])
+        has_formula_in_cons = False
+        for r in range(h_row + 1, data_end + 1):
+            val = ws.cell(r, cons_col).value
+            if isinstance(val, str) and val.strip().startswith("="):
+                has_formula_in_cons = True
+                break
+        if has_formula_in_cons:
+            continue
+
+        # Also validate optional writable metadata cols don't contain formulas or collide with house/diff
+        protected_cols = {hdr.get("house_col"), hdr.get("diff_col")} - {None}
+        safe_layout = dict(hdr)
+        for opt_k in ("source_col", "date_col", "rationale_col"):
+            oc = safe_layout.get(opt_k)
+            if oc is None:
+                continue
+            if oc in protected_cols:
+                safe_layout.pop(opt_k, None)
+                continue
+            for r in range(h_row + 1, data_end + 1):
+                ov = ws.cell(r, int(oc)).value
+                if isinstance(ov, str) and ov.strip().startswith("="):
+                    safe_layout.pop(opt_k, None)
+                    break
+
+        safe_layout["data_start_row"] = h_row + 1
+        safe_layout["data_end_row"] = data_end
+        layouts.append(safe_layout)
+    return layouts
+
+
+def _eval_simple_diff_formula(
+    expr: str,
+    house_coord: str,
+    cons_coord: str,
+    house_val: float | None,
+    cons_val: float,
+) -> float | None:
+    """Evaluate standard House-vs-Consensus diff formulas directly without LibreOffice."""
+    if not expr or not expr.startswith("=") or house_val is None:
+        return None
+    norm = "".join(expr[1:].upper().replace("$", "").split())
+    h = house_coord.upper()
+    c = cons_coord.upper()
+    # Unwrap IF(OR(C="",C=0),"",<inner>) or IFERROR(<inner>,...)
+    m_if = re.match(r'^IF\(OR\([^)]+\),"",(.+)\)$', norm)
+    if m_if:
+        norm = m_if.group(1)
+    m_ife = re.match(r'^IFERROR\((.+),[^,]+\)$', norm)
+    if m_ife:
+        norm = m_ife.group(1)
+
+    if norm in (f"({h}-{c})/ABS({c})", f"({h}-{c})/{c}"):
+        denom = abs(cons_val) if "ABS(" in norm else cons_val
+        return (house_val - cons_val) / denom if abs(denom) > 1e-12 else None
+    if norm in (f"({h}/{c})-1", f"{h}/{c}-1"):
+        return (house_val / cons_val) - 1.0 if abs(cons_val) > 1e-12 else None
+    if norm in (f"{h}-{c}", f"({h}-{c})"):
+        return house_val - cons_val
+    if norm in (f"{c}-{h}", f"({c}-{h})"):
+        return cons_val - house_val
+    return None
+
+
+def _refresh_consensus_diff_caches(
+    xlsx_path: Path,
+    sheet_name: str,
+    donor_path: Path,
+    diff_targets: list[dict[str, Any]],
+) -> list[str]:
+    """Recompute or clear stale ``<v>`` caches on diff formula cells affected by snapshot updates."""
+    if not diff_targets:
+        return []
+    donor_cells = model_xlsx_hooks._extract_donor_cells(donor_path)
+    infos, payload = model_xlsx_hooks._read_package(xlsx_path)
+    parts = model_xlsx_hooks._sheet_parts(payload)
+    part = parts.get(sheet_name)
+    if not part or part not in payload:
+        return []
+
+    root = etree.fromstring(payload[part], model_xlsx_hooks._XML)
+    sml = model_xlsx_hooks._SML
+    by_ref = {(c.get("r") or "").upper(): c for c in root.iter(f"{{{sml}}}c") if c.get("r")}
+    refreshed: list[str] = []
+    changed = False
+
+    def _resolve_house_val(house_ref: str) -> float | None:
+        # First check current sheet cell <v> (already restored from donor for house_col)
+        hc_el = by_ref.get(house_ref)
+        if hc_el is not None:
+            v_el = hc_el.find(f"{{{sml}}}v")
+            if v_el is not None and v_el.text is not None:
+                try:
+                    return float(v_el.text)
+                except ValueError:
+                    pass
+            # If house cell is a simple cross-sheet link (e.g. ='Model - JD'!G6), read referenced donor <v>
+            f_el = hc_el.find(f"{{{sml}}}f")
+            if f_el is not None and f_el.text:
+                refs = model_fingerprint.extract_formula_refs("=" + f_el.text.lstrip("="), sheet_name)
+                if len(refs) == 1:
+                    rsh, rcrd = refs[0]
+                    dm = (donor_cells.get(rsh) or {}).get(rcrd.upper())
+                    if dm and dm.get("v") is not None:
+                        try:
+                            return float(dm["v"])
+                        except ValueError:
+                            pass
+        # Fallback to donor's cache on this consensus sheet
+        dm_self = (donor_cells.get(sheet_name) or {}).get(house_ref)
+        if dm_self and dm_self.get("v") is not None:
+            try:
+                return float(dm_self["v"])
+            except ValueError:
+                pass
+        return None
+
+    for tgt in diff_targets:
+        diff_ref = str(tgt["diff_coord"]).upper()
+        c_el = by_ref.get(diff_ref)
+        if c_el is None:
+            continue
+        f_el = c_el.find(f"{{{sml}}}f")
+        if f_el is None or not f_el.text:
+            continue
+        expr = "=" + f_el.text.lstrip("=")
+        h_coord = tgt.get("house_coord")
+        c_coord = tgt["cons_coord"]
+        c_val = float(tgt["cons_val"])
+        h_val = _resolve_house_val(str(h_coord).upper()) if h_coord else None
+
+        # Also refresh house_col cache if it was newly written and missing <v>
+        if h_coord and h_val is not None:
+            hc_el = by_ref.get(str(h_coord).upper())
+            if hc_el is not None and hc_el.find(f"{{{sml}}}f") is not None and not model_xlsx_hooks._cell_has_nonempty_cache(hc_el):
+                model_xlsx_hooks._apply_cached_value(hc_el, None, repr(h_val))
+                changed = True
+
+        new_diff = (
+            _eval_simple_diff_formula(expr, str(h_coord), str(c_coord), h_val, c_val)
+            if h_coord
+            else None
+        )
+        if new_diff is not None:
+            model_xlsx_hooks._apply_cached_value(c_el, None, repr(new_diff))
+            refreshed.append(diff_ref)
+            changed = True
+        else:
+            # Never leave a stale pre-update diff cached value behind!
+            v_el = c_el.find(f"{{{sml}}}v")
+            if v_el is not None:
+                c_el.remove(v_el)
+                if "t" in c_el.attrib:
+                    del c_el.attrib["t"]
+                refreshed.append(diff_ref)
+                changed = True
+
+    if changed:
+        payload[part] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+        tmp = xlsx_path.with_name(xlsx_path.name + ".consdiff.tmp")
+        with zipfile.ZipFile(tmp, "w") as zout:
+            for info in infos:
+                zout.writestr(info, payload[info.filename], compress_type=info.compress_type)
+        os.replace(tmp, xlsx_path)
+    return sorted(set(refreshed))
+
+
 def write_consensus_snapshot(
     *,
     model_path: str | Path,
     consensus_data: dict[str, Any],
     sheet_name: str = "vs Consensus",
+    coord_map_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Write external consensus reference figures ONLY into the isolated snapshot sheet/zone.
 
-    Never edits any cell on House model/valuation/summary sheets. Preserves all
-    pre-existing OOXML cached values ``<v>`` and ``<calcPr>``.
+    - Auto-detects actual column order on an existing consensus sheet and verifies writable columns
+      contain no formulas; if layout cannot be safely recognized, appends a new isolated reference
+      zone below existing content without overwriting any existing House formulas.
+    - Never edits any cell on House model/valuation/summary sheets.
+    - Preserves all pre-existing OOXML cached values ``<v>`` and ``<calcPr>``, while refreshing
+      cached values of diff formula cells affected by the updated snapshot.
     """
     mpath = Path(model_path).expanduser().resolve()
     if not mpath.is_file():
@@ -133,33 +361,98 @@ def write_consensus_snapshot(
 
         wb = openpyxl.load_workbook(editing_copy, data_only=False)
         written_coords: list[str] = []
+        touched_coords: list[str] = []
+        touched_formula_coords: list[str] = []
+        diff_targets: list[dict[str, Any]] = []
+        layout_mode = "existing_table"
         try:
             target_sh = _find_consensus_sheet(wb, sheet_name)
+            headers = [
+                "Period",
+                "Metric",
+                "House",
+                "Consensus Snapshot",
+                "Diff %",
+                "Source Type",
+                "As-Of Date",
+                "Rationale",
+            ]
             if target_sh is None:
                 ws = wb.create_sheet(sheet_name)
                 target_sh = sheet_name
-                headers = [
-                    "Period",
-                    "Metric",
-                    "House",
-                    "Consensus Snapshot",
-                    "Diff %",
-                    "Source Type",
-                    "As-Of Date",
-                    "Rationale",
-                ]
+                layout_mode = "new_sheet"
                 for idx, h in enumerate(headers, start=1):
                     c = ws.cell(1, idx, h)
-                    model_style.apply_cell_style(c, "header", is_left_aligned=(idx in (1, 2, 6, 7, 8)))
+                    model_style.apply_cell_style(c, "header")
+                    c.alignment = openpyxl.styles.Alignment(
+                        horizontal="left" if idx in (1, 2, 6, 7, 8) else "right", vertical="center"
+                    )
+                    touched_coords.append(f"{get_column_letter(idx)}1")
                 ws.freeze_panes = "C2"
+                layout = {
+                    "header_row": 1,
+                    "data_start_row": 2,
+                    "data_end_row": 1,
+                    "period_col": 1,
+                    "metric_col": 2,
+                    "house_col": 3,
+                    "consensus_col": 4,
+                    "diff_col": 5,
+                    "source_col": 6,
+                    "date_col": 7,
+                    "rationale_col": 8,
+                }
             else:
                 ws = wb[target_sh]
+                detected = _detect_consensus_table_layouts(ws)
+                if detected:
+                    # Prefer the last isolated reference block if one already exists, else the first valid table
+                    layout = detected[-1]
+                    layout_mode = "existing_table"
+                else:
+                    # Unrecognizable or formula-colliding layout -> create brand-new isolated zone below!
+                    layout_mode = "isolated_block"
+                    banner_r = max(ws.max_row, 1) + 2
+                    hdr_r = banner_r + 1
+                    banner_c = ws.cell(banner_r, 1, "Consensus Snapshot (Isolated Reference Zone)")
+                    model_style.apply_cell_style(banner_c, "section_report")
+                    touched_coords.append(f"A{banner_r}")
+                    for idx, h in enumerate(headers, start=1):
+                        c = ws.cell(hdr_r, idx, h)
+                        model_style.apply_cell_style(c, "header")
+                        c.alignment = openpyxl.styles.Alignment(
+                            horizontal="left" if idx in (1, 2, 6, 7, 8) else "right", vertical="center"
+                        )
+                        touched_coords.append(f"{get_column_letter(idx)}{hdr_r}")
+                    layout = {
+                        "header_row": hdr_r,
+                        "data_start_row": hdr_r + 1,
+                        "data_end_row": hdr_r,
+                        "period_col": 1,
+                        "metric_col": 2,
+                        "house_col": 3,
+                        "consensus_col": 4,
+                        "diff_col": 5,
+                        "source_col": 6,
+                        "date_col": 7,
+                        "rationale_col": 8,
+                    }
 
-            # Build existing (period, metric_key) -> row index lookup
+            p_col = int(layout["period_col"])
+            m_col = int(layout["metric_col"])
+            h_col = layout.get("house_col")
+            c_col = int(layout["consensus_col"])
+            d_col = layout.get("diff_col")
+            s_col = layout.get("source_col")
+            dt_col = layout.get("date_col")
+            rat_col = layout.get("rationale_col")
+
+            # Build existing (period, metric_key) -> row index lookup strictly within detected table
             row_lookup: dict[tuple[str, str], int] = {}
-            for r in range(2, ws.max_row + 1):
-                p_val = str(ws.cell(r, 1).value or "").strip()
-                m_val = str(ws.cell(r, 2).value or "").strip()
+            next_row = int(layout["data_end_row"]) + 1
+            for r in range(int(layout["data_start_row"]), int(layout["data_end_row"]) + 1):
+                p_val = str(ws.cell(r, p_col).value or "").strip()
+                m_val = str(ws.cell(r, m_col).value or "").strip()
                 if p_val and m_val:
                     row_lookup[(p_val.upper(), _normalize_metric_key(m_val))] = r
 
@@ -171,53 +464,115 @@ def write_consensus_snapshot(
                     continue
                 mkey = _normalize_metric_key(metric_label)
                 row_idx = row_lookup.get((period.upper(), mkey))
+                is_new_row = False
                 if row_idx is None:
-                    row_idx = ws.max_row + 1
-                    ws.cell(row_idx, 1, period)
-                    ws.cell(row_idx, 2, metric_label)
-                    if item.get("house_formula"):
-                        hc = ws.cell(row_idx, 3, str(item["house_formula"]))
+                    is_new_row = True
+                    row_idx = next_row
+                    next_row += 1
+                    ws.cell(row_idx, p_col, period)
+                    ws.cell(row_idx, m_col, metric_label)
+                    touched_coords.append(f"{get_column_letter(p_col)}{row_idx}")
+                    touched_coords.append(f"{get_column_letter(m_col)}{row_idx}")
+                    if h_col is not None and item.get("house_formula"):
+                        hc = ws.cell(row_idx, int(h_col), str(item["house_formula"]))
                         model_style.apply_cell_style(hc, "formula", is_link=True)
-                    dc = ws.cell(
-                        row_idx,
-                        5,
-                        f'=IF(OR(D{row_idx}="",D{row_idx}=0),"",(C{row_idx}-D{row_idx})/ABS(D{row_idx}))',
-                    )
-                    model_style.apply_cell_style(dc, "formula", is_ratio=True, is_percent=True)
+                        hc_ref = f"{get_column_letter(int(h_col))}{row_idx}"
+                        touched_coords.append(hc_ref)
+                        touched_formula_coords.append(hc_ref)
+                    if d_col is not None and h_col is not None:
+                        c_let = get_column_letter(c_col)
+                        h_let = get_column_letter(int(h_col))
+                        d_let = get_column_letter(int(d_col))
+                        dc = ws.cell(
+                            row_idx,
+                            int(d_col),
+                            f'=IF(OR({c_let}{row_idx}="",{c_let}{row_idx}=0),"",({h_let}{row_idx}-{c_let}{row_idx})/ABS({c_let}{row_idx}))',
+                        )
+                        model_style.apply_cell_style(dc, "formula", is_ratio=True, is_percent=True)
+                        dc_ref = f"{d_let}{row_idx}"
+                        touched_coords.append(dc_ref)
+                        touched_formula_coords.append(dc_ref)
                     row_lookup[(period.upper(), mkey)] = row_idx
 
-                snap_cell = ws.cell(row_idx, 4, float(cons_val))
+                cons_coord = f"{get_column_letter(c_col)}{row_idx}"
+                snap_cell = ws.cell(row_idx, c_col, float(cons_val))
                 model_style.apply_cell_style(snap_cell, "external_input")
-                written_coords.append(f"D{row_idx}")
+                written_coords.append(cons_coord)
+                touched_coords.append(cons_coord)
 
-                src_cell = ws.cell(row_idx, 6, str(item.get("source_type") or source_type))
-                model_style.apply_cell_style(src_cell, "source_note")
-                dt_cell = ws.cell(row_idx, 7, str(item.get("as_of_date") or as_of_date))
-                model_style.apply_cell_style(dt_cell, "source_note")
-                if item.get("rationale") is not None:
-                    ws.cell(row_idx, 8, str(item["rationale"]))
+                if s_col is not None:
+                    src_cell = ws.cell(row_idx, int(s_col), str(item.get("source_type") or source_type))
+                    model_style.apply_cell_style(src_cell, "source_note")
+                    touched_coords.append(f"{get_column_letter(int(s_col))}{row_idx}")
+                if dt_col is not None:
+                    dt_cell = ws.cell(row_idx, int(dt_col), str(item.get("as_of_date") or as_of_date))
+                    model_style.apply_cell_style(dt_cell, "source_note")
+                    touched_coords.append(f"{get_column_letter(int(dt_col))}{row_idx}")
+                if rat_col is not None and item.get("rationale") is not None:
+                    ws.cell(row_idx, int(rat_col), str(item["rationale"]))
+                    touched_coords.append(f"{get_column_letter(int(rat_col))}{row_idx}")
+
+                # Track any diff formula cell on this row so its cached value is refreshed, not left stale!
+                if d_col is not None:
+                    d_coord = f"{get_column_letter(int(d_col))}{row_idx}"
+                    d_val = ws.cell(row_idx, int(d_col)).value
+                    if isinstance(d_val, str) and d_val.strip().startswith("="):
+                        touched_formula_coords.append(d_coord)
+                        diff_targets.append(
+                            {
+                                "diff_coord": d_coord,
+                                "house_coord": f"{get_column_letter(int(h_col))}{row_idx}" if h_col is not None else None,
+                                "cons_coord": cons_coord,
+                                "cons_val": float(cons_val),
+                                "is_new_row": is_new_row,
+                            }
+                        )
 
             wb.save(editing_copy)
+            sheet_names = list(wb.sheetnames)
         finally:
             wb.close()
 
         model_edit._preserve_calcpr_from_donor(editing_copy, donor_copy)
-        # Restore ALL donor caches on every sheet (snapshot cells are numeric inputs, not formulas)
+        # Restore donor caches on ALL untouched sheets and untouched formulas, excluding updated diff formulas
         spec = {
             "cache_donor_path": str(donor_copy),
-            "skip_sheets": [s for s in wb.sheetnames if s != target_sh],
+            "skip_sheets": [s for s in sheet_names if s != target_sh],
             "skip_cells": {},
-            "touched_formula_cells": {},
+            "touched_cells": {target_sh: sorted(set(touched_coords))},
+            "touched_formula_cells": {target_sh: sorted(set(touched_formula_coords))},
         }
         model_xlsx_hooks.restore_donor_cache(editing_copy, spec)
+        refreshed_diffs = _refresh_consensus_diff_caches(
+            editing_copy, target_sh, donor_copy, diff_targets
+        )
         os.replace(editing_copy, mpath)
+
+    new_sha = model_fingerprint.file_sha256(mpath)
+    touched_sorted = sorted(set(touched_coords))
+    snap_sorted = sorted(set(written_coords))
+    if coord_map_path is not None:
+        cp = Path(coord_map_path).expanduser().resolve()
+        if cp.is_file():
+            cm = json.loads(cp.read_text(encoding="utf-8"))
+            cm_touched = set(cm.setdefault("touched_cells", {}).get(target_sh) or ())
+            cm_touched.update(touched_sorted)
+            cm["touched_cells"][target_sh] = sorted(cm_touched)
+            cm_snap = set(cm.setdefault("consensus_snapshot_cells", {}).get(target_sh) or ())
+            cm_snap.update(snap_sorted)
+            cm["consensus_snapshot_cells"][target_sh] = sorted(cm_snap)
+            cm["candidate_sha256"] = new_sha
+            cp.write_text(json.dumps(cm, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     return {
         "status": "ok",
         "model_path": str(mpath),
-        "model_sha256": model_fingerprint.file_sha256(mpath),
+        "model_sha256": new_sha,
         "sheet": target_sh,
-        "consensus_snapshot_cells": {target_sh: sorted(set(written_coords))},
+        "layout_mode": layout_mode,
+        "consensus_snapshot_cells": {target_sh: snap_sorted},
+        "touched_cells": {target_sh: touched_sorted},
+        "refreshed_diff_cells": refreshed_diffs,
         "written_count": len(written_coords),
     }
 
@@ -313,19 +668,32 @@ def _extract_house_values_from_model(
                     house_map[(raw_p, mkey)] = entry
                     house_map[(norm_p, mkey)] = entry
 
-    # Also read rationales already recorded in vs Consensus sheet
+    # Also read rationales already recorded in vs Consensus sheet (auto-detected layouts)
     rationales: dict[tuple[str, str], str] = {}
     wb = openpyxl.load_workbook(model_path, data_only=True)
     try:
         con_sh = _find_consensus_sheet(wb)
         if con_sh:
             ws = wb[con_sh]
-            for r in range(2, ws.max_row + 1):
-                p = str(ws.cell(r, 1).value or "").strip().upper()
-                m = _normalize_metric_key(str(ws.cell(r, 2).value or ""))
-                rat = str(ws.cell(r, 8).value or "").strip()
-                if p and m and rat:
-                    rationales[(p, m)] = rat
+            layouts = _detect_consensus_table_layouts(ws)
+            if layouts:
+                for lay in layouts:
+                    rat_c = lay.get("rationale_col")
+                    if rat_c is None:
+                        continue
+                    for r in range(int(lay["data_start_row"]), int(lay["data_end_row"]) + 1):
+                        p = str(ws.cell(r, int(lay["period_col"])).value or "").strip().upper()
+                        m = _normalize_metric_key(str(ws.cell(r, int(lay["metric_col"])).value or ""))
+                        rat = str(ws.cell(r, int(rat_c)).value or "").strip()
+                        if p and m and rat:
+                            rationales[(p, m)] = rat
+            else:
+                for r in range(2, ws.max_row + 1):
+                    p = str(ws.cell(r, 1).value or "").strip().upper()
+                    m = _normalize_metric_key(str(ws.cell(r, 2).value or ""))
+                    rat = str(ws.cell(r, 8).value or "").strip()
+                    if p and m and rat:
+                        rationales[(p, m)] = rat
     finally:
         wb.close()
 
@@ -591,6 +959,7 @@ def main(argv: list[str] | None = None) -> int:
     p_snap.add_argument("--model", required=True)
     p_snap.add_argument("--consensus", required=True)
     p_snap.add_argument("--sheet", default="vs Consensus")
+    p_snap.add_argument("--coord-map", default=None, help="Optional coord_map.json to register written cells")
 
     p_diff = sub.add_parser("diff", help="Generate <R>/model_dump/consensus-diff.{json,md}")
     p_diff.add_argument("--model", required=True)
@@ -602,7 +971,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.cmd == "write-snapshot":
         cdata = json.loads(Path(args.consensus).read_text(encoding="utf-8"))
-        res = write_consensus_snapshot(model_path=args.model, consensus_data=cdata, sheet_name=args.sheet)
+        res = write_consensus_snapshot(
+            model_path=args.model,
+            consensus_data=cdata,
+            sheet_name=args.sheet,
+            coord_map_path=args.coord_map,
+        )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0
 

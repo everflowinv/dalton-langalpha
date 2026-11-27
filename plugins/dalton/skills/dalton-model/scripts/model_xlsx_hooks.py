@@ -133,35 +133,98 @@ def _read_package(path: Path) -> tuple[list[zipfile.ZipInfo], dict[str, bytes]]:
         return infos, {i.filename: zf.read(i.filename) for i in infos}
 
 
-def _extract_donor_cache(
+def _norm_formula_xml(text: str | None) -> str:
+    if not text:
+        return ""
+    s = "".join(str(text).strip().split())
+    return s[1:] if s.startswith("=") else s
+
+
+def _read_shared_strings(payload: dict[str, bytes]) -> list[str]:
+    raw = payload.get("xl/sharedStrings.xml")
+    if not raw:
+        return []
+    root = etree.fromstring(raw, _XML)
+    return ["".join(t.text or "" for t in si.iter(f"{{{_SML}}}t")) for si in root.findall(f"{{{_SML}}}si")]
+
+
+def _extract_donor_cells(
     donor_path: Path,
-) -> dict[str, dict[str, tuple[str | None, str | None]]]:
-    """Read ``{sheet: {COORD: (t_attr, v_text)}}`` for all cells with ``<v>`` in donor."""
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Read full cell cache & formula metadata ``{sheet: {COORD: {...}}}`` from donor OOXML."""
     _, payload = _read_package(donor_path)
-    out: dict[str, dict[str, tuple[str | None, str | None]]] = {}
+    sst = _read_shared_strings(payload)
+    out: dict[str, dict[str, dict[str, Any]]] = {}
     for name, part in _sheet_parts(payload).items():
         if part not in payload:
             continue
         root = etree.fromstring(payload[part], _XML)
-        cells: dict[str, tuple[str | None, str | None]] = {}
+        cells: dict[str, dict[str, Any]] = {}
         for c in root.iter(f"{{{_SML}}}c"):
             ref = c.get("r")
             if not ref:
                 continue
-            v = c.find(f"{{{_SML}}}v")
-            if v is None:
-                continue
             t = c.get("t")
-            text = "" if v.text is None and t == "str" else v.text
-            if text is None:
-                continue
-            cells[ref.upper()] = (t, text)
+            f_el = c.find(f"{{{_SML}}}f")
+            has_formula = f_el is not None
+            f_text = f_el.text if f_el is not None else None
+            v = c.find(f"{{{_SML}}}v")
+            v_text: str | None = None
+            resolved_str: str | None = None
+            if t == "inlineStr":
+                is_el = c.find(f"{{{_SML}}}is")
+                resolved_str = "".join(x.text or "" for x in is_el.iter(f"{{{_SML}}}t")) if is_el is not None else ""
+                v_text = resolved_str
+            elif v is not None:
+                v_text = "" if (v.text is None and t == "str") else v.text
+                if t == "s" and v_text is not None and v_text.isdigit():
+                    idx = int(v_text)
+                    resolved_str = sst[idx] if 0 <= idx < len(sst) else ""
+            cells[ref.upper()] = {
+                "t": t,
+                "v": v_text,
+                "has_v": v is not None,
+                "has_formula": has_formula,
+                "formula": f_text,
+                "resolved_str": resolved_str,
+                "xml_bytes": etree.tostring(c, encoding="UTF-8"),
+            }
         out[name] = cells
     return out
 
 
+def _extract_donor_cache(
+    donor_path: Path,
+) -> dict[str, dict[str, tuple[str | None, str | None]]]:
+    """Read ``{sheet: {COORD: (t_attr, v_text)}}`` for all cells with ``<v>`` in donor."""
+    full = _extract_donor_cells(donor_path)
+    out: dict[str, dict[str, tuple[str | None, str | None]]] = {}
+    for sh, cmap in full.items():
+        out[sh] = {
+            ref: (meta["t"], meta["v"])
+            for ref, meta in cmap.items()
+            if meta["has_v"] and meta["v"] is not None
+        }
+    return out
+
+
 def _apply_cached_value(cell_el: Any, t: str | None, text: str) -> None:
-    """Write ``<v>`` and ``t`` attribute onto an OOXML ``<c>`` element."""
+    """Write ``<v>`` and exact ``t`` attribute (including explicit ``t="n"``) onto an OOXML ``<c>`` element."""
+    is_el = cell_el.find(f"{{{_SML}}}is")
+    if is_el is not None and t != "inlineStr":
+        cell_el.remove(is_el)
+    if t == "inlineStr":
+        v_old = cell_el.find(f"{{{_SML}}}v")
+        if v_old is not None:
+            cell_el.remove(v_old)
+        if is_el is None:
+            is_el = etree.SubElement(cell_el, f"{{{_SML}}}is")
+        else:
+            is_el.clear()
+        t_el = etree.SubElement(is_el, f"{{{_SML}}}t")
+        t_el.text = text
+        cell_el.set("t", "inlineStr")
+        return
     v = cell_el.find(f"{{{_SML}}}v")
     if v is None:
         v = etree.Element(f"{{{_SML}}}v")
@@ -171,7 +234,7 @@ def _apply_cached_value(cell_el: Any, t: str | None, text: str) -> None:
         else:
             cell_el.append(v)
     v.text = text
-    if t in ("str", "e", "b", "s"):
+    if t is not None:
         cell_el.set("t", t)
     elif "t" in cell_el.attrib:
         del cell_el.attrib["t"]
@@ -185,6 +248,70 @@ def _cell_has_nonempty_cache(cell_el: Any) -> bool:
     if t == "str" and v.text is None:
         return True
     return v.text is not None and v.text != ""
+
+
+def _parse_coord_row_col(ref: str) -> tuple[int, int]:
+    i = 0
+    while i < len(ref) and ref[i].isalpha():
+        i += 1
+    col_s = ref[:i].upper()
+    row_i = int(ref[i:]) if i < len(ref) and ref[i:].isdigit() else 0
+    col_i = 0
+    for ch in col_s:
+        col_i = col_i * 26 + (ord(ch) - ord("A") + 1)
+    return row_i, col_i
+
+
+def _reinsert_missing_donor_cell(root: Any, ref: str, donor_meta: dict[str, Any]) -> bool:
+    """Re-insert a cell present in donor but dropped by openpyxl on an untouched non-target sheet."""
+    sheet_data = root.find(f"{{{_SML}}}sheetData")
+    if sheet_data is None:
+        return False
+    row_i, col_i = _parse_coord_row_col(ref)
+    if row_i <= 0:
+        return False
+
+    # Find or create <row r="row_i"> in sorted row order
+    target_row_el = None
+    insert_before = None
+    for r_el in sheet_data.findall(f"{{{_SML}}}row"):
+        r_attr = r_el.get("r")
+        if not r_attr or not r_attr.isdigit():
+            continue
+        ri = int(r_attr)
+        if ri == row_i:
+            target_row_el = r_el
+            break
+        if ri > row_i and insert_before is None:
+            insert_before = r_el
+            break
+    if target_row_el is None:
+        target_row_el = etree.Element(f"{{{_SML}}}row", r=str(row_i))
+        if insert_before is not None:
+            sheet_data.insert(sheet_data.index(insert_before), target_row_el)
+        else:
+            sheet_data.append(target_row_el)
+
+    new_c = etree.fromstring(donor_meta["xml_bytes"], _XML)
+    # Strip style index from donor since openpyxl may reindex cellXfs
+    if "s" in new_c.attrib:
+        del new_c.attrib["s"]
+    # Convert donor SST index into inlineStr so sharedStrings table remains valid
+    if not donor_meta["has_formula"] and donor_meta["t"] == "s":
+        _apply_cached_value(new_c, "inlineStr", str(donor_meta.get("resolved_str") or ""))
+
+    # Insert <c> in column order inside <row>
+    c_insert_before = None
+    for existing_c in target_row_el.findall(f"{{{_SML}}}c"):
+        _, ex_ci = _parse_coord_row_col((existing_c.get("r") or "").upper())
+        if ex_ci > col_i:
+            c_insert_before = existing_c
+            break
+    if c_insert_before is not None:
+        target_row_el.insert(target_row_el.index(c_insert_before), new_c)
+    else:
+        target_row_el.append(new_c)
+    return True
 
 
 def _is_error_value(recalc_mod: Any, t: str | None, text: str | None) -> bool:
@@ -202,13 +329,14 @@ def restore_donor_cache(
     *,
     recalc_mod: Any | None = None,
 ) -> dict[str, Any]:
-    """Atomically restore donor ``<v>`` and ``t`` cache entries in pure OOXML.
+    """Atomically restore donor ``<v>`` and exact ``t`` (including ``t="n"``) in pure OOXML.
 
     Runs with zero LibreOffice dependency. Restores cached values from
     ``spec["cache_donor_path"]`` for:
-    - all formula cells (and any cells missing ``<v>``) in ``skip_sheets``;
-    - all cells listed in ``skip_cells[sheet]``;
-    - all formula cells NOT listed in ``touched_formula_cells[sheet]``.
+    - all cells in ``skip_sheets`` (preserving exact ``<v>`` and ``t``, and restoring dropped cells);
+    - all cells listed in ``skip_cells[sheet]`` and ``exempt_downstream_cells[sheet]``, ONLY after
+      verifying the cell still carries its exempt donor formula (never overwriting a cell edited to a constant);
+    - all untouched formula cells NOT listed in ``touched_formula_cells[sheet]`` / ``touched_cells[sheet]``.
     """
     target = Path(target_path).expanduser().resolve()
     donor_raw = spec.get("cache_donor_path")
@@ -223,54 +351,121 @@ def restore_donor_cache(
         str(sh): {str(coord).upper() for coord in (coords or ())}
         for sh, coords in (spec.get("skip_cells") or {}).items()
     }
+    exempt_downstream = {
+        str(sh): {str(coord).upper() for coord in (coords or ())}
+        for sh, coords in (spec.get("exempt_downstream_cells") or {}).items()
+    }
     touched_formulas = {
         str(sh): {str(coord).upper() for coord in (coords or ())}
         for sh, coords in (spec.get("touched_formula_cells") or {}).items()
     }
+    touched_all = {
+        str(sh): {str(coord).upper() for coord in (coords or ())}
+        for sh, coords in (spec.get("touched_cells") or {}).items()
+    }
 
-    donor_cache = _extract_donor_cache(donor)
+    donor_cells = _extract_donor_cells(donor)
     infos, payload = _read_package(target)
+    target_sst = _read_shared_strings(payload)
     kept_cache_count = 0
 
     for name, part in _sheet_parts(payload).items():
         if part not in payload:
             continue
-        donor_sheet = donor_cache.get(name)
+        donor_sheet = donor_cells.get(name)
         if not donor_sheet:
             continue
         root = etree.fromstring(payload[part], _XML)
         is_skip_sheet = name in skip_sheets
         sheet_skip_cells = skip_cells.get(name, set())
-        sheet_touched = touched_formulas.get(name, set())
+        sheet_exempt_down = exempt_downstream.get(name, set())
+        sheet_touched_f = touched_formulas.get(name, set())
+        sheet_touched_all = touched_all.get(name, set())
         changed = False
+        seen_refs: set[str] = set()
 
         for c in root.iter(f"{{{_SML}}}c"):
             ref = (c.get("r") or "").upper()
-            if not ref or ref not in donor_sheet:
+            if not ref:
                 continue
-            has_formula = c.find(f"{{{_SML}}}f") is not None
-            should_restore = False
-            if is_skip_sheet:
-                if has_formula or not _cell_has_nonempty_cache(c):
-                    should_restore = True
-            elif ref in sheet_skip_cells:
-                should_restore = True
-            elif has_formula and ref not in sheet_touched:
-                should_restore = True
+            seen_refs.add(ref)
+            d_meta = donor_sheet.get(ref)
+            if d_meta is None:
+                continue
 
-            if not should_restore:
+            f_el = c.find(f"{{{_SML}}}f")
+            has_formula = f_el is not None
+            cur_f_norm = _norm_formula_xml(f_el.text if f_el is not None else None)
+            donor_f_norm = _norm_formula_xml(d_meta.get("formula"))
+            d_t = d_meta.get("t")
+            d_v = d_meta.get("v")
+
+            if is_skip_sheet:
+                if has_formula:
+                    if d_meta["has_v"] and d_v is not None:
+                        _apply_cached_value(c, d_t, d_v)
+                        kept_cache_count += 1
+                        changed = True
+                else:
+                    if d_t == "s":
+                        # Verify target cell's resolved string matches donor; do not blindly copy SST index
+                        cur_t = c.get("t")
+                        cur_v_el = c.find(f"{{{_SML}}}v")
+                        cur_str = None
+                        if cur_t == "s" and cur_v_el is not None and (cur_v_el.text or "").isdigit():
+                            idx = int(cur_v_el.text)
+                            if 0 <= idx < len(target_sst):
+                                cur_str = target_sst[idx]
+                        elif cur_t == "inlineStr":
+                            is_el = c.find(f"{{{_SML}}}is")
+                            cur_str = "".join(x.text or "" for x in is_el.iter(f"{{{_SML}}}t")) if is_el is not None else ""
+                        if cur_str != d_meta.get("resolved_str") and d_meta.get("resolved_str") is not None:
+                            _apply_cached_value(c, "inlineStr", str(d_meta["resolved_str"]))
+                            kept_cache_count += 1
+                            changed = True
+                    elif d_meta["has_v"] and d_v is not None:
+                        _apply_cached_value(c, d_t, d_v)
+                        kept_cache_count += 1
+                        changed = True
                 continue
-            d_t, d_text = donor_sheet[ref]
-            if d_text is None:
+
+            # Target sheet rules:
+            if not d_meta["has_v"] or d_v is None:
                 continue
-            # Do not overwrite shared-string index cells (t="s") across different
-            # SST tables when the cell is a plain text constant; formula cells
-            # never use t="s" in OOXML (they use t="str").
-            if not has_formula and d_t == "s":
+            if not has_formula:
+                # Never overwrite a cell edited to a constant (including former exempt coords!)
+                if ref not in sheet_touched_all and d_t != "s" and not d_meta["has_formula"]:
+                    # Preserve explicit t="n" on untouched numeric constants if donor had it
+                    if d_t is not None and c.get("t") != d_t and _cell_has_nonempty_cache(c):
+                        _apply_cached_value(c, d_t, d_v)
+                        kept_cache_count += 1
+                        changed = True
                 continue
-            _apply_cached_value(c, d_t, d_text)
-            kept_cache_count += 1
-            changed = True
+
+            # Formula cell on target sheet:
+            is_exempt_coord = (ref in sheet_skip_cells) or (ref in sheet_exempt_down)
+            if is_exempt_coord:
+                # Verify this cell is STILL the donor's exempt formula (not overwritten to a new formula!)
+                if d_meta["has_formula"] and (not donor_f_norm or cur_f_norm == donor_f_norm):
+                    _apply_cached_value(c, d_t, d_v)
+                    kept_cache_count += 1
+                    changed = True
+                continue
+
+            # Untouched formula cell: restore exact donor <v> and t
+            if ref not in sheet_touched_f and ref not in sheet_touched_all:
+                if d_meta["has_formula"] and (not donor_f_norm or cur_f_norm == donor_f_norm):
+                    _apply_cached_value(c, d_t, d_v)
+                    kept_cache_count += 1
+                    changed = True
+
+        # For non-target skip_sheets, also restore any cell that openpyxl dropped completely
+        if is_skip_sheet:
+            for d_ref, d_meta in donor_sheet.items():
+                if d_ref not in seen_refs and (d_meta["has_v"] or d_meta["has_formula"] or d_meta["resolved_str"] is not None):
+                    if _reinsert_missing_donor_cell(root, d_ref, d_meta):
+                        kept_cache_count += 1
+                        changed = True
 
         if changed:
             payload[part] = etree.tostring(
@@ -295,6 +490,18 @@ def restore_donor_cache(
     }
 
 
+def _values_differ(cur_t: str | None, cur_v: str | None, new_t: str | None, new_v: str | None) -> bool:
+    if cur_v is None and new_v is None:
+        return False
+    if cur_t == "e" or new_t == "e":
+        return str(cur_v) != str(new_v)
+    try:
+        a, b = float(cur_v or ""), float(new_v or "")
+        return abs(a - b) > max(1e-9, 1e-9 * max(abs(a), abs(b)))
+    except ValueError:
+        return str(cur_v) != str(new_v)
+
+
 def _transfer_values_selective(
     recalc_mod: Any,
     src: Path,
@@ -302,12 +509,25 @@ def _transfer_values_selective(
     values: dict[str, dict[str, tuple[str | None, str | None]]],
     formulas: dict[tuple[str, str], str],
     spec: dict[str, Any],
-) -> tuple[int, int, int, int, list[str], list[dict[str, Any]]]:
-    """Merge non-error recalculated values while preserving donor cache on skipped/errored cells."""
+) -> tuple[int, int, int, int, list[str], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Selectively merge LibreOffice values ONLY for round-affected formulas; keep donor caches intact."""
     skip_sheets = set(spec.get("skip_sheets") or ())
     skip_cells = {
         str(sh): {str(coord).upper() for coord in (coords or ())}
         for sh, coords in (spec.get("skip_cells") or {}).items()
+    }
+    exempt_downstream = {
+        str(sh): {str(coord).upper() for coord in (coords or ())}
+        for sh, coords in (spec.get("exempt_downstream_cells") or {}).items()
+    }
+    touched_formulas = {
+        str(sh): {str(coord).upper() for coord in (coords or ())}
+        for sh, coords in (spec.get("touched_formula_cells") or {}).items()
+    }
+    has_recalc_targets = "recalc_target_cells" in spec and spec["recalc_target_cells"] is not None
+    recalc_targets = {
+        str(sh): {str(coord).upper() for coord in (coords or ())}
+        for sh, coords in (spec.get("recalc_target_cells") or {}).items()
     }
     skip_error_writeback = bool(spec.get("skip_error_writeback", True))
 
@@ -316,6 +536,7 @@ def _transfer_values_selective(
     unmatched = 0
     kept_on_error = 0
     recalc_errors: list[dict[str, Any]] = []
+    downstream_exempt_diffs: list[dict[str, Any]] = []
 
     for name, part in recalc_mod.sheet_parts(payload).items():
         if part not in payload:
@@ -324,6 +545,9 @@ def _transfer_values_selective(
         sheet_values = values.get(name, {})
         is_skip_sheet = name in skip_sheets
         sheet_skip_cells = skip_cells.get(name, set())
+        sheet_exempt_down = exempt_downstream.get(name, set())
+        sheet_touched_f = touched_formulas.get(name, set())
+        sheet_targets = recalc_targets.get(name, set())
         changed = False
 
         for c in root.iter(f"{{{_SML}}}c"):
@@ -332,31 +556,104 @@ def _transfer_values_selective(
                 continue
             ref = c.get("r") or ""
             ref_u = ref.upper()
-            exempt = is_skip_sheet or (ref_u in sheet_skip_cells)
+            is_direct_exempt = is_skip_sheet or (ref_u in sheet_skip_cells)
+            is_down_exempt = (not is_direct_exempt) and (ref_u in sheet_exempt_down)
+            exempt = is_direct_exempt or is_down_exempt
             got = sheet_values.get(ref) or sheet_values.get(ref_u)
             if got is None or got[1] is None:
-                if not exempt:
+                if not exempt and (not has_recalc_targets or ref_u in sheet_targets or ref_u in sheet_touched_f):
                     unmatched += 1
                 continue
             t, text = got
             is_err = _is_error_value(recalc_mod, t, text)
-            if is_err:
-                has_donor = _cell_has_nonempty_cache(c)
-                recalc_errors.append(
-                    {
-                        "sheet": name,
-                        "cell": ref,
-                        "error": text or "#ERROR!",
-                        "formula": formulas.get((name, ref), ""),
-                        "exempt": exempt,
-                        "kept_donor_cache": exempt or (skip_error_writeback and has_donor),
-                    }
-                )
-            if exempt:
+            cur_v_el = c.find(f"{{{_SML}}}v")
+            cur_t = c.get("t")
+            cur_v = cur_v_el.text if cur_v_el is not None else None
+            has_donor = _cell_has_nonempty_cache(c)
+
+            if is_direct_exempt:
+                if is_err:
+                    recalc_errors.append(
+                        {
+                            "sheet": name,
+                            "cell": ref,
+                            "error": text or "#ERROR!",
+                            "formula": formulas.get((name, ref), ""),
+                            "exempt": True,
+                            "kept_donor_cache": True,
+                        }
+                    )
                 continue
-            if is_err and skip_error_writeback and _cell_has_nonempty_cache(c):
+
+            if is_down_exempt:
+                # Downstream of exempt cell (e.g. =F45 or =IFERROR(F45, 0)): NEVER overwrite donor <v>!
+                if is_err:
+                    recalc_errors.append(
+                        {
+                            "sheet": name,
+                            "cell": ref,
+                            "error": text or "#ERROR!",
+                            "formula": formulas.get((name, ref), ""),
+                            "exempt": True,
+                            "downstream_exempt": True,
+                            "kept_donor_cache": True,
+                        }
+                    )
+                elif has_donor and _values_differ(cur_t, cur_v, t, text):
+                    downstream_exempt_diffs.append(
+                        {
+                            "sheet": name,
+                            "cell": ref,
+                            "donor_value": cur_v,
+                            "recalc_value": text,
+                            "formula": formulas.get((name, ref), ""),
+                        }
+                    )
                 kept_on_error += 1
                 continue
+
+            # Non-exempt formula on target sheet: only write if affected this round or missing cache
+            is_touched_f = ref_u in sheet_touched_f
+            is_target = (
+                is_touched_f
+                or (ref_u in sheet_targets)
+                or (not has_donor)
+                or (not has_recalc_targets)
+            )
+            if not is_target:
+                continue
+
+            if is_err:
+                # For newly added / modified formulas (or missing donor cache), KEEP the error value
+                # so model_check.py C13 classifies it as actionable rather than hiding it behind 0/stale!
+                if is_touched_f or (not has_donor) or (not skip_error_writeback) or (ref_u in sheet_targets):
+                    recalc_errors.append(
+                        {
+                            "sheet": name,
+                            "cell": ref,
+                            "error": text or "#ERROR!",
+                            "formula": formulas.get((name, ref), ""),
+                            "exempt": False,
+                            "kept_donor_cache": False,
+                        }
+                    )
+                    _apply_cached_value(c, t, text)
+                    written += 1
+                    changed = True
+                else:
+                    recalc_errors.append(
+                        {
+                            "sheet": name,
+                            "cell": ref,
+                            "error": text or "#ERROR!",
+                            "formula": formulas.get((name, ref), ""),
+                            "exempt": False,
+                            "kept_donor_cache": True,
+                        }
+                    )
+                    kept_on_error += 1
+                continue
+
             _apply_cached_value(c, t, text)
             written += 1
             changed = True
@@ -372,7 +669,15 @@ def _transfer_values_selective(
         for info in infos:
             zout.writestr(info, payload[info.filename], compress_type=info.compress_type)
     os.replace(tmp, dst)
-    return written, unmatched, kept_on_error, charts_updated, chart_refs_skipped, recalc_errors
+    return (
+        written,
+        unmatched,
+        kept_on_error,
+        charts_updated,
+        chart_refs_skipped,
+        recalc_errors,
+        downstream_exempt_diffs,
+    )
 
 
 def recalculate_keep_cache(
@@ -497,6 +802,7 @@ def recalculate_keep_cache(
             charts_updated,
             chart_refs_skipped,
             recalc_errors,
+            downstream_exempt_diffs,
         ) = _transfer_values_selective(recalc_mod, src, patched, values, formulas, spec)
         kept_cache_count += kept_on_error
 
@@ -520,6 +826,7 @@ def recalculate_keep_cache(
         "non_exempt_errors": len(non_exempt_errors),
         "error_summary": summary,
         "errors": recalc_errors[: recalc_mod.MAX_LISTED],
+        "downstream_exempt_diffs": downstream_exempt_diffs[: recalc_mod.MAX_LISTED],
         "truncated": len(recalc_errors) > recalc_mod.MAX_LISTED,
         "values_written": written,
         "unmatched": unmatched,

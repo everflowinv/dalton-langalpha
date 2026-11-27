@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal
 import hashlib
 import json
 from pathlib import Path
@@ -49,6 +51,24 @@ _CELL_REF_RE = re.compile(
 _RANGE_REF_RE = re.compile(
     r"^(?:(?:'((?:[^']|'')+)'|([^'!\[\]]+))!)?\$?([A-Za-z]{1,3})\$?(\d+):\$?([A-Za-z]{1,3})\$?(\d+)$"
 )
+_COL_RANGE_RE = re.compile(
+    r"^(?:(?:'((?:[^']|'')+)'|([^'!\[\]]+))!)?\$?([A-Za-z]{1,3}):\$?([A-Za-z]{1,3})$"
+)
+_ROW_RANGE_RE = re.compile(
+    r"^(?:(?:'((?:[^']|'')+)'|([^'!\[\]]+))!)?\$?(\d+):\$?(\d+)$"
+)
+_STRUCT_REF_RE = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_.]*)\s*\[((?:[^\[\]]|\[[^\[\]]*\])*)\]"
+)
+_NAME_TOKEN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_.]{1,})\b")
+_EXCEL_BUILTIN_FUNCS = frozenset({
+    "SUM", "AVERAGE", "AVG", "MIN", "MAX", "IF", "IFERROR", "IFNA", "AND", "OR", "NOT",
+    "ABS", "ROUND", "ROUNDUP", "ROUNDDOWN", "INT", "MOD", "SQRT", "POWER", "LN", "LOG",
+    "EXP", "COUNT", "COUNTA", "COUNTIF", "SUMIF", "SUMIFS", "SUBTOTAL", "INDEX", "MATCH",
+    "VLOOKUP", "HLOOKUP", "XLOOKUP", "OFFSET", "INDIRECT", "CHOOSE", "NPV", "IRR", "XIRR",
+    "TRUE", "FALSE", "NA", "ISNA", "ISERROR", "ISBLANK", "ISNUMBER", "TEXT", "VALUE",
+    "LEFT", "RIGHT", "MID", "LEN", "CONCAT", "CONCATENATE", "TODAY", "NOW", "YEAR", "MONTH",
+})
 
 _CAGR_DELTA_RE = re.compile(
     r"(?:\bCAGR\b|\bYoY\b|\bQoQ\b|\bMoM\b|\bvs\.?\b|\bChg\b|\bDiff\b|Δ|同比|环比)",
@@ -99,6 +119,52 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: fh.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _json_safe_value(val: Any) -> Any:
+    """Normalize openpyxl/Python values (dates, datetimes, Decimals, RGB objects) to JSON-safe scalars."""
+    if val is None or isinstance(val, (bool, int, float, str)):
+        return val
+    if isinstance(val, datetime):
+        return val.isoformat()
+    if isinstance(val, date):
+        return val.isoformat()
+    if isinstance(val, time):
+        return val.isoformat()
+    if isinstance(val, timedelta):
+        return val.total_seconds()
+    if isinstance(val, Decimal):
+        return float(val)
+    return str(val)
+
+
+def _serialize_color(color: Any) -> str | None:
+    """Normalize an openpyxl ``Color`` object (RGB, theme, indexed) into a JSON-safe string."""
+    if color is None:
+        return None
+    ctype = getattr(color, "type", None)
+    if ctype == "rgb":
+        rgb = getattr(color, "rgb", None)
+        if isinstance(rgb, str) and rgb and rgb != "00000000":
+            return rgb
+        return None
+    if ctype == "theme":
+        theme = getattr(color, "theme", None)
+        if theme is not None:
+            tint = getattr(color, "tint", 0.0) or 0.0
+            if abs(float(tint)) > 1e-6:
+                return f"theme:{int(theme)}:{round(float(tint), 4)}"
+            return f"theme:{int(theme)}"
+        return None
+    if ctype == "indexed":
+        idx = getattr(color, "indexed", None)
+        if idx is not None:
+            return f"indexed:{int(idx)}"
+        return None
+    rgb = getattr(color, "rgb", None)
+    if isinstance(rgb, str) and rgb and rgb != "00000000":
+        return rgb
+    return None
 
 
 def _expand_year(raw: str) -> int:
@@ -208,21 +274,119 @@ def _has_dynamic_ref(expr: str) -> bool:
     return bool(_DYNAMIC_FUNC_RE.search(cleaned))
 
 
-def extract_formula_refs(expr: str, current_sheet: str) -> list[tuple[str, str]]:
-    """Return list of ``(sheet_name, COORD)`` cell references inside ``expr``."""
+def _extract_tables_index(wb: openpyxl.Workbook) -> dict[str, dict[str, Any]]:
+    """Collect Excel Table definitions across all worksheets for structured reference resolution."""
+    tables: dict[str, dict[str, Any]] = {}
+    for ws in wb.worksheets:
+        ws_tables = getattr(ws, "tables", None)
+        if not ws_tables:
+            continue
+        for tbl in ws_tables.values():
+            tname = str(getattr(tbl, "name", None) or getattr(tbl, "displayName", None) or "").strip()
+            ref = str(getattr(tbl, "ref", "") or "").strip()
+            if not tname or not ref or ":" not in ref:
+                continue
+            m = _RANGE_REF_RE.match(ref)
+            if not m:
+                continue
+            c1 = column_index_from_string(m.group(3).upper())
+            r1 = int(m.group(4))
+            c2 = column_index_from_string(m.group(5).upper())
+            r2 = int(m.group(6))
+            c1, c2 = min(c1, c2), max(c1, c2)
+            r1, r2 = min(r1, r2), max(r1, r2)
+            cols_map: dict[str, int] = {}
+            tbl_cols = list(getattr(tbl, "tableColumns", None) or ())
+            if tbl_cols:
+                for offset, tc in enumerate(tbl_cols):
+                    cname = str(getattr(tc, "name", "") or "").strip()
+                    if cname and (c1 + offset) <= c2:
+                        cols_map[cname.lower()] = c1 + offset
+            for ci in range(c1, c2 + 1):
+                hv = ws.cell(r1, ci).value
+                if isinstance(hv, str) and hv.strip():
+                    cols_map.setdefault(hv.strip().lower(), ci)
+            tables[tname.lower()] = {
+                "name": tname,
+                "sheet": ws.title,
+                "ref": ref,
+                "r1": r1,
+                "c1": c1,
+                "r2": r2,
+                "c2": c2,
+                "columns": cols_map,
+            }
+    return tables
+
+
+def _resolve_structured_refs(
+    expr: str,
+    tables: dict[str, dict[str, Any]] | None,
+) -> list[tuple[str, int, int, int, int]]:
+    """Resolve Excel structured table references like ``Tbl[Consensus]`` into ``(sheet, r1, c1, r2, c2)`` rects."""
+    if not expr or not tables or "[" not in expr:
+        return []
+    cleaned = _EXCEL_STR_RE.sub('""', expr)
+    rects: list[tuple[str, int, int, int, int]] = []
+    for m in _STRUCT_REF_RE.finditer(cleaned):
+        tname = m.group(1).strip().lower()
+        spec = m.group(2).strip()
+        tbl = tables.get(tname)
+        if not tbl:
+            continue
+        sh = tbl["sheet"]
+        r1, c1, r2, c2 = int(tbl["r1"]), int(tbl["c1"]), int(tbl["r2"]), int(tbl["c2"])
+        cols_map: dict[str, int] = tbl.get("columns") or {}
+        if not spec or spec.lower() in ("#all", "#data", "#headers", "#totals"):
+            rects.append((sh, r1, c1, r2, c2))
+            continue
+        # Extract bracketed or bare column names inside structured specifier
+        inner_tokens = re.findall(r"\[([^\[\]]+)\]", spec)
+        col_candidates = [
+            tok.lstrip("@").strip().lower()
+            for tok in (inner_tokens or [spec.lstrip("@").strip()])
+            if tok and not tok.strip().startswith("#")
+        ]
+        matched_cols = [cols_map[cn] for cn in col_candidates if cn in cols_map]
+        if matched_cols:
+            rects.append((sh, r1, min(matched_cols), r2, max(matched_cols)))
+        else:
+            # Conservative fallback: treat unknown column selector on the table as spanning the whole table
+            rects.append((sh, r1, c1, r2, c2))
+    return rects
+
+
+def extract_formula_targets(
+    expr: str,
+    current_sheet: str,
+    *,
+    tables: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[tuple[str, str]], list[tuple[str, int, int, int, int]]]:
+    """Return ``(cell_refs, range_rects)`` for ``expr``, including >256-cell ranges & structured table refs."""
     refs: list[tuple[str, str]] = []
+    rects: list[tuple[str, int, int, int, int]] = []
     if not expr:
-        return refs
+        return refs, rects
+
+    for rect in _resolve_structured_refs(expr, tables):
+        rects.append(rect)
+        sh, r1, c1, r2, c2 = rect
+        if (c2 - c1 + 1) * (r2 - r1 + 1) <= 256:
+            for rr in range(r1, r2 + 1):
+                for cc in range(c1, c2 + 1):
+                    refs.append((sh, f"{get_column_letter(cc)}{rr}"))
+
     try:
         tokens = Tokenizer(expr if expr.startswith("=") else "=" + expr).items
     except Exception:
-        return refs
+        return refs, rects
 
     for tok in tokens:
         if tok.type != Token.OPERAND or tok.subtype != Token.RANGE:
             continue
         raw = tok.value.strip()
         if "[" in raw:
+            # External link or structured reference (structured refs handled above)
             continue
         m_rng = _RANGE_REF_RE.match(raw)
         if m_rng:
@@ -237,10 +401,32 @@ def extract_formula_refs(expr: str, current_sheet: str) -> list[tuple[str, str]]
             r2 = int(m_rng.group(6))
             c1, c2 = min(c1, c2), max(c1, c2)
             r1, r2 = min(r1, r2), max(r1, r2)
+            rects.append((sh, r1, c1, r2, c2))
             if (c2 - c1 + 1) * (r2 - r1 + 1) <= 256:
                 for rr in range(r1, r2 + 1):
                     for cc in range(c1, c2 + 1):
                         refs.append((sh, f"{get_column_letter(cc)}{rr}"))
+            continue
+        m_col = _COL_RANGE_RE.match(raw)
+        if m_col:
+            sh = (
+                m_col.group(1).replace("''", "'")
+                if m_col.group(1)
+                else (m_col.group(2) or current_sheet)
+            )
+            c1 = column_index_from_string(m_col.group(3).upper())
+            c2 = column_index_from_string(m_col.group(4).upper())
+            rects.append((sh, 1, min(c1, c2), 1048576, max(c1, c2)))
+            continue
+        m_row = _ROW_RANGE_RE.match(raw)
+        if m_row:
+            sh = (
+                m_row.group(1).replace("''", "'")
+                if m_row.group(1)
+                else (m_row.group(2) or current_sheet)
+            )
+            r1, r2 = int(m_row.group(3)), int(m_row.group(4))
+            rects.append((sh, min(r1, r2), 1, max(r1, r2), 16384))
             continue
         m_cell = _CELL_REF_RE.match(raw)
         if m_cell:
@@ -249,8 +435,89 @@ def extract_formula_refs(expr: str, current_sheet: str) -> list[tuple[str, str]]
                 if m_cell.group(1)
                 else (m_cell.group(2) or current_sheet)
             )
-            refs.append((sh, f"{m_cell.group(3).upper()}{int(m_cell.group(4))}"))
+            col_u = m_cell.group(3).upper()
+            row_i = int(m_cell.group(4))
+            refs.append((sh, f"{col_u}{row_i}"))
+    return refs, rects
+
+
+def extract_formula_refs(expr: str, current_sheet: str) -> list[tuple[str, str]]:
+    """Return list of ``(sheet_name, COORD)`` cell references inside ``expr``."""
+    refs, _ = extract_formula_targets(expr, current_sheet)
     return refs
+
+
+def _extract_name_tokens(expr: str) -> list[str]:
+    """Return candidate defined-name identifiers referenced by ``expr``."""
+    tokens_to_check: list[str] = []
+    if not expr:
+        return tokens_to_check
+    try:
+        for tok in Tokenizer(expr if expr.startswith("=") else "=" + expr).items:
+            if tok.type == Token.OPERAND and tok.subtype == Token.RANGE:
+                val = tok.value.strip()
+                if "!" not in val and ":" not in val and "[" not in val:
+                    tokens_to_check.append(val)
+    except Exception:
+        pass
+    cleaned = _EXCEL_STR_RE.sub('""', expr)
+    for m in _NAME_TOKEN_RE.finditer(cleaned):
+        tok_s = m.group(1)
+        if tok_s.upper() not in _EXCEL_BUILTIN_FUNCS:
+            tokens_to_check.append(tok_s)
+    return tokens_to_check
+
+
+def expand_defined_names_in_expr(
+    expr: str,
+    current_sheet: str,
+    defined_names: list[dict[str, str]],
+    *,
+    tables: dict[str, dict[str, Any]] | None = None,
+) -> tuple[set[tuple[str, str]], list[tuple[str, int, int, int, int]], str | None, bool]:
+    """Expand defined names recursively; return ``(cell_refs, range_rects, ext_ref_or_none, has_dynamic)``."""
+    wb_names: dict[str, str] = {}
+    sheet_names: dict[tuple[str, str], str] = {}
+    for dn in defined_names:
+        n_low = str(dn.get("name") or "").strip().lower()
+        scope = str(dn.get("scope") or "workbook")
+        d_expr = str(dn.get("expression") or "")
+        if not n_low or not d_expr:
+            continue
+        if scope == "workbook":
+            wb_names[n_low] = d_expr
+        else:
+            sheet_names[(scope, n_low)] = d_expr
+
+    refs: set[tuple[str, str]] = set()
+    rects: list[tuple[str, int, int, int, int]] = []
+    visited: set[tuple[str, str]] = set()
+    ext_hit: str | None = None
+    has_dyn = _has_dynamic_ref(expr)
+
+    def _walk(cur_expr: str, cur_sh: str) -> None:
+        nonlocal ext_hit, has_dyn
+        if _has_dynamic_ref(cur_expr):
+            has_dyn = True
+        if ext_hit is None:
+            ext_op = _has_external_operand(cur_expr)
+            if ext_op:
+                ext_hit = ext_op
+        c_refs, c_rects = extract_formula_targets(cur_expr, cur_sh, tables=tables)
+        for rsh, rcoord in c_refs:
+            refs.add((rsh, rcoord.upper()))
+        rects.extend(c_rects)
+        for tok_s in _extract_name_tokens(cur_expr):
+            key_low = tok_s.lower()
+            target_expr = sheet_names.get((cur_sh, key_low)) or wb_names.get(key_low)
+            if target_expr is not None:
+                vkey = (cur_sh, key_low)
+                if vkey not in visited:
+                    visited.add(vkey)
+                    _walk(target_expr, cur_sh)
+
+    _walk(expr, current_sheet)
+    return refs, rects, ext_hit, has_dyn
 
 
 def _tarjan_scc(graph: dict[str, set[str]]) -> list[list[str]]:
@@ -339,7 +606,7 @@ def _detect_company_tags(wb: openpyxl.Workbook, requested_ticker: str | None) ->
         vis = getattr(ws, "sheet_state", "visible") or "visible"
         tab_c = None
         if ws.sheet_properties and ws.sheet_properties.tabColor:
-            tab_c = ws.sheet_properties.tabColor.rgb or str(ws.sheet_properties.tabColor.theme or "")
+            tab_c = _serialize_color(ws.sheet_properties.tabColor)
 
         tag: str | None = None
         if name.endswith(">>"):
@@ -480,7 +747,7 @@ def _read_xml_metadata(xlsx_path: Path) -> dict[str, Any]:
                             else:
                                 try:
                                     num = float(raw_t)
-                                    raw_cache[ref] = (None, int(num) if num.is_integer() and abs(num) < 1e15 else num)
+                                    raw_cache[ref] = (t, int(num) if num.is_integer() and abs(num) < 1e15 else num)
                                 except ValueError:
                                     raw_cache[ref] = (t, raw_t)
 
@@ -619,22 +886,37 @@ def _detect_consensus_snapshot_cells(ws: Any, sheet_name: str, cells_data: dict[
     snapshot_cells: list[str] = []
     low_name = sheet_name.lower()
     if any(k in low_name for k in _CONSENSUS_SHEET_KEYWORDS):
-        # Find header column matching "Consensus" / "外部预期" / "Street"
-        snap_cols: set[int] = set()
-        for r in range(1, min(6, ws.max_row + 1)):
+        # Scan all rows so both primary tables (rows 1..5) and appended isolated consensus blocks are detected
+        active_snap_cols: set[int] = set()
+        for r in range(1, ws.max_row + 1):
+            row_header_hits: set[int] = set()
+            row_has_any_header_word = False
+            row_has_data_or_formula = False
             for c in range(1, ws.max_column + 1):
                 v = ws.cell(r, c).value
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    row_has_data_or_formula = True
+                    continue
                 if isinstance(v, str):
-                    vl = v.strip().lower()
+                    vs = v.strip()
+                    if vs.startswith("="):
+                        row_has_data_or_formula = True
+                        continue
+                    vl = vs.lower()
+                    if any(k in vl for k in ("period", "metric", "house", "diff", "期间", "指标", "本方", "差异")):
+                        row_has_any_header_word = True
                     if any(k in vl for k in ("consensus", "外部预期", "一致预期", "street")):
-                        if not any(ex in vl for ex in ("vs", "diff", "差异", "house", "我们", "rationale", "理由")):
-                            snap_cols.add(c)
-        for r in range(2, ws.max_row + 1):
-            for c in snap_cols:
-                coord = f"{get_column_letter(c)}{r}"
-                val = ws.cell(r, c).value
-                if val is not None and not (isinstance(val, str) and val.startswith("=")):
-                    snapshot_cells.append(coord)
+                        if not any(ex in vl for ex in ("vs", "diff", "差异", "house", "我们", "rationale", "理由", "isolated reference zone")):
+                            row_header_hits.add(c)
+            if row_header_hits and not row_has_data_or_formula and (row_has_any_header_word or r <= 2):
+                active_snap_cols = row_header_hits
+                continue
+            if active_snap_cols:
+                for c in active_snap_cols:
+                    coord = f"{get_column_letter(c)}{r}"
+                    val = ws.cell(r, c).value
+                    if isinstance(val, (int, float)) and not isinstance(val, bool):
+                        snapshot_cells.append(coord)
         return sorted(set(snapshot_cells))
 
     # Also support an isolated consensus reference block below a summary/model table
@@ -682,20 +964,24 @@ def build_fingerprint(
             else "single_company"
         )
 
-        # Defined names (workbook-scoped + sheet-scoped)
+        # Defined names (workbook-scoped + sheet-scoped) and Excel tables
+        tables_index = _extract_tables_index(wb)
         defined_names: list[dict[str, str]] = []
         ext_names: list[dict[str, str]] = []
         for name, dn in wb.defined_names.items():
             expr = str(dn.attr_text or "")
             defined_names.append({"name": name, "scope": "workbook", "expression": expr})
-            if _has_external_operand(expr):
-                ext_names.append({"name": name, "scope": "workbook", "expression": expr})
         for ws in wb.worksheets:
             for name, dn in getattr(ws, "defined_names", {}).items():
                 expr = str(dn.attr_text or "")
                 defined_names.append({"name": name, "scope": ws.title, "expression": expr})
-                if _has_external_operand(expr):
-                    ext_names.append({"name": name, "scope": ws.title, "expression": expr})
+        for dn_item in defined_names:
+            scope_sh = "" if dn_item["scope"] == "workbook" else dn_item["scope"]
+            _, _, dn_ext, _ = expand_defined_names_in_expr(
+                dn_item["expression"], scope_sh, defined_names, tables=tables_index
+            )
+            if dn_ext:
+                ext_names.append(dn_item)
 
         ext_cells: list[dict[str, str]] = []
         dep_graph: dict[str, set[str]] = {}
@@ -766,11 +1052,15 @@ def build_fingerprint(
                 "operating_income_row": None,
                 "net_income_row": None,
                 "diluted_shares_row": None,
+                "beginning_shares_row": None,
+                "ending_shares_row": None,
+                "share_change_rows": [],
                 "eps_row": None,
                 "segment_op_rows": [],
                 "segment_unalloc_row": None,
                 "segment_total_op_row": None,
                 "segment_rev_rows": [],
+                "segment_rev_elim_row": None,
                 "beginning_cash_row": None,
                 "net_change_cash_row": None,
                 "ending_cash_row": None,
@@ -837,15 +1127,25 @@ def build_fingerprint(
                         anchors["net_income_row"] = r
                     if anchors["diluted_shares_row"] is None and re.search(r"(?:diluted\s+shares|稀释.*股数|加权平均稀释股数)", low_lbl):
                         anchors["diluted_shares_row"] = r
+                    if anchors["beginning_shares_row"] is None and re.search(r"(?:beginning\s+(?:diluted\s+)?shares|期初.*股[数本])", low_lbl):
+                        anchors["beginning_shares_row"] = r
+                    if anchors["ending_shares_row"] is None and re.search(r"(?:ending\s+(?:diluted\s+)?shares|期末.*股[数本])", low_lbl):
+                        anchors["ending_shares_row"] = r
+                    if re.search(r"(?:share\s+(?:issuance|repurchase|buyback)|net\s+change\s+in\s+shares|sbc\s+dilution|股[数本].*(?:变动|增发|回购|稀释))", low_lbl):
+                        anchors["share_change_rows"].append(r)
                     if anchors["eps_row"] is None and _EPS_LABEL_RE.search(low_lbl):
                         anchors["eps_row"] = r
                     if current_section == "segment_reporting":
                         if re.search(r"(?:total\s+segment\s+operating|分部营业利润合计|分部利润合计)", low_lbl):
                             anchors["segment_total_op_row"] = r
+                        elif re.search(r"(?:unallocated|eliminat|总部|抵销)", low_lbl) and re.search(r"(?:revenue|收入)", low_lbl):
+                            anchors["segment_rev_elim_row"] = r
                         elif re.search(r"(?:unallocated|eliminat|总部|抵销)", low_lbl):
                             anchors["segment_unalloc_row"] = r
                         elif re.search(r"(?:operating\s+(?:profit|income)|营业利润)", low_lbl):
                             anchors["segment_op_rows"].append(r)
+                        elif re.search(r"(?:revenue|收入)", low_lbl) and not re.search(r"(?:\btotal\b|合计|yoy|%|margin|growth)", low_lbl):
+                            anchors["segment_rev_rows"].append(r)
                     if current_section == "cash_flow":
                         if re.search(r"(?:beginning\s+cash|期初现金)", low_lbl):
                             anchors["beginning_cash_row"] = r
@@ -963,23 +1263,25 @@ def build_fingerprint(
                     f_txt = _extract_formula_text(val)
 
                     if f_txt is not None:
-                        ext_op = _has_external_operand(f_txt)
+                        exp_refs, _, ext_op, has_dyn = expand_defined_names_in_expr(
+                            f_txt, sname, defined_names, tables=tables_index
+                        )
                         if ext_op:
                             subcat = "external_link"
                             ext_cells.append({"sheet": sname, "cell": coord, "reference": ext_op})
                         elif _has_plugin_call(f_txt):
                             subcat = "plugin"
-                        elif _has_dynamic_ref(f_txt):
+                        elif has_dyn:
                             subcat = "dynamic_ref"
                         else:
-                            refs = extract_formula_refs(f_txt, sname)
-                            if any(rsh != sname for rsh, _ in refs):
+                            if any(rsh != sname for rsh, _ in exp_refs):
                                 subcat = "cross_sheet"
                                 link_colors.add(font_rgb)
                             else:
                                 subcat = "same_sheet"
+                        if exp_refs:
                             node_key = f"{sname}!{coord}"
-                            dep_graph[node_key] = {f"{rsh}!{rcoord}" for rsh, rcoord in refs}
+                            dep_graph[node_key] = {f"{rsh}!{rcoord}" for rsh, rcoord in exp_refs}
 
                         if col_info and col_info.get("kind") == "annual" and not col_info.get("is_forecast") and font_rgb == model_style.ACTUAL_FONT:
                             legacy_blue_annual_formulas += 1
@@ -990,7 +1292,7 @@ def build_fingerprint(
                             "category": "formula",
                             "subcategory": subcat,
                             "formula": f_txt,
-                            "cached_value": cached_val,
+                            "cached_value": _json_safe_value(cached_val),
                             "cached_t": cached_t,
                             "role_norm": role_norm,
                             "has_comment": cell.comment is not None,
@@ -1022,7 +1324,7 @@ def build_fingerprint(
                                                 "kind": "baseline_forecast_constant",
                                                 "sheet": sname,
                                                 "cell": coord,
-                                                "value": val,
+                                                "value": _json_safe_value(val),
                                             }
                                         )
                         else:
@@ -1032,8 +1334,8 @@ def build_fingerprint(
                             "category": "input",
                             "subcategory": in_sub,
                             "formula": None,
-                            "cached_value": val,
-                            "cached_t": None,
+                            "cached_value": _json_safe_value(val),
+                            "cached_t": cached_t,
                             "role_norm": role_norm,
                             "has_comment": cell.comment is not None,
                             "is_subtotal_or_ratio_row": subtotal_or_ratio,
@@ -1043,7 +1345,7 @@ def build_fingerprint(
                             "category": "label" if c <= 4 or r == header_row else "constant",
                             "subcategory": "consensus_snapshot" if coord in consensus_snap_set else "text",
                             "formula": None,
-                            "cached_value": val,
+                            "cached_value": _json_safe_value(val),
                             "cached_t": cached_t,
                             "role_norm": role_norm,
                             "has_comment": cell.comment is not None,
@@ -1102,6 +1404,7 @@ def build_fingerprint(
             "normalized_styles": normalized_styles,
             "sheet_order": sheet_order,
             "defined_names": defined_names,
+            "tables": tables_index,
             "external_links_baseline": {
                 "parts": xml_meta["external_link_parts"],
                 "cells": ext_cells,

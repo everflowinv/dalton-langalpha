@@ -315,6 +315,104 @@ def _clone_cell_style(src_cell: Any, dst_cell: Any) -> None:
         dst_cell.protection = copy.copy(src_cell.protection)
 
 
+def _build_post_edit_dep_graph(
+    workbook_path: Path,
+) -> tuple[
+    dict[tuple[str, str], set[tuple[str, str]]],
+    dict[tuple[str, str], list[tuple[str, int, int, int, int]]],
+]:
+    """Build lightweight post-edit formula dependency graph (with defined_names + tables expanded)."""
+    wb = openpyxl.load_workbook(workbook_path, data_only=False)
+    try:
+        tables = model_fingerprint._extract_tables_index(wb)
+        defined_names: list[dict[str, str]] = []
+        for name, dn in wb.defined_names.items():
+            defined_names.append({"name": name, "scope": "workbook", "expression": str(dn.attr_text or "")})
+        for ws in wb.worksheets:
+            for name, dn in getattr(ws, "defined_names", {}).items():
+                defined_names.append({"name": name, "scope": ws.title, "expression": str(dn.attr_text or "")})
+
+        cell_deps: dict[tuple[str, str], set[tuple[str, str]]] = {}
+        rect_deps: dict[tuple[str, str], list[tuple[str, int, int, int, int]]] = {}
+        for ws in wb.worksheets:
+            sname = ws.title
+            for r, c, cell in model_style._iter_stored_cells(ws):
+                f_txt = model_fingerprint._extract_formula_text(cell.value)
+                if f_txt is None:
+                    continue
+                coord = f"{get_column_letter(c)}{r}"
+                refs, rects, _, _ = model_fingerprint.expand_defined_names_in_expr(
+                    f_txt, sname, defined_names, tables=tables
+                )
+                node = (sname, coord)
+                cell_deps[node] = refs
+                if rects:
+                    rect_deps[node] = rects
+        return cell_deps, rect_deps
+    finally:
+        wb.close()
+
+
+def _node_in_rects(
+    node: tuple[str, str],
+    rects: list[tuple[str, int, int, int, int]],
+) -> bool:
+    sh, coord = node
+    col_s, row_i = coordinate_from_string(coord)
+    col_i = column_index_from_string(col_s)
+    for rsh, r1, c1, r2, c2 in rects:
+        if rsh == sh and r1 <= row_i <= r2 and c1 <= col_i <= c2:
+            return True
+    return False
+
+
+def _find_downstream_formulas(
+    seed_nodes: set[tuple[str, str]],
+    cell_deps: dict[tuple[str, str], set[tuple[str, str]]],
+    rect_deps: dict[tuple[str, str], list[tuple[str, int, int, int, int]]],
+) -> set[tuple[str, str]]:
+    """Return all formula nodes that transitively depend on any node in ``seed_nodes``."""
+    if not seed_nodes:
+        return set()
+    # Reverse adjacency for direct cell edges
+    rev: dict[tuple[str, str], set[tuple[str, str]]] = defaultdict(set)
+    for src, targets in cell_deps.items():
+        for tgt in targets:
+            rev[tgt].add(src)
+
+    # Pre-index rect dependencies by referenced sheet
+    rect_by_sheet: dict[str, list[tuple[tuple[str, str], int, int, int, int]]] = defaultdict(list)
+    for src, rects in rect_deps.items():
+        for rsh, r1, c1, r2, c2 in rects:
+            rect_by_sheet[rsh].append((src, r1, c1, r2, c2))
+
+    reached: set[tuple[str, str]] = set()
+    queue = list(seed_nodes)
+    visited = set(seed_nodes)
+    while queue:
+        cur = queue.pop(0)
+        # Direct cell dependents
+        for dep in rev.get(cur, ()):
+            if dep not in reached:
+                reached.add(dep)
+            if dep not in visited:
+                visited.add(dep)
+                queue.append(dep)
+        # Range-rect dependents
+        sh, coord = cur
+        if sh in rect_by_sheet:
+            col_s, row_i = coordinate_from_string(coord)
+            col_i = column_index_from_string(col_s)
+            for dep, r1, c1, r2, c2 in rect_by_sheet[sh]:
+                if r1 <= row_i <= r2 and c1 <= col_i <= c2:
+                    if dep not in reached:
+                        reached.add(dep)
+                    if dep not in visited:
+                        visited.add(dep)
+                        queue.append(dep)
+    return reached
+
+
 def _build_keep_cache_spec(
     fingerprint: dict[str, Any],
     coord_map: dict[str, Any],
@@ -322,6 +420,8 @@ def _build_keep_cache_spec(
     ticker: str,
     touched_formula_cells: dict[str, list[str]],
     *,
+    touched_cells: dict[str, list[str]] | None = None,
+    editing_path: Path | None = None,
     engine: str = "libreoffice",
 ) -> dict[str, Any]:
     tk = ticker.strip().upper()
@@ -330,44 +430,106 @@ def _build_keep_cache_spec(
         tag = sh_entry.get("company_tag")
         if tag is not None and str(tag).upper() != tk:
             skip_sheets.append(sh_entry["name"])
+    skip_sheets_set = set(skip_sheets)
+
+    touched_all_map: dict[str, set[str]] = {
+        sh: {str(c).upper() for c in coords}
+        for sh, coords in (touched_cells or {}).items()
+    }
+    touched_f_map: dict[str, set[str]] = {
+        sh: {str(c).upper() for c in coords}
+        for sh, coords in (touched_formula_cells or {}).items()
+    }
 
     skip_cells_map: dict[str, set[str]] = defaultdict(set)
-    # 1. External link baseline cells
+    # 1. External link baseline cells (includes cells referencing external defined_names)
     for item in (fingerprint.get("external_links_baseline") or {}).get("cells") or []:
         sh = item.get("sheet")
         cell = item.get("cell")
         if sh and cell:
             mapped = map_coord_str(coord_map, sh, cell)
             if mapped:
-                skip_cells_map[sh].add(mapped)
+                skip_cells_map[sh].add(mapped.upper())
 
-    # 2. Plugin cells (CIQ etc.)
+    # 2. Plugin & external_link cells
     for sh_name, sh_data in (fingerprint.get("sheets") or {}).items():
         for coord, cmeta in (sh_data.get("cells") or {}).items():
             if cmeta.get("category") == "formula" and cmeta.get("subcategory") in ("plugin", "external_link"):
                 mapped = map_coord_str(coord_map, sh_name, coord)
                 if mapped:
-                    skip_cells_map[sh_name].add(mapped)
+                    skip_cells_map[sh_name].add(mapped.upper())
 
-    # 3. Circular baseline SCC cells (mapped through coord_map)
+    # 3. Circular baseline SCC cells (mapped through coord_map; includes defined_names cycles)
     for scc in fingerprint.get("circular_baseline") or []:
         for node in scc:
             if "!" in node:
                 sh_name, coord = node.rsplit("!", 1)
                 mapped = map_coord_str(coord_map, sh_name, coord)
                 if mapped:
-                    skip_cells_map[sh_name].add(mapped)
+                    skip_cells_map[sh_name].add(mapped.upper())
+
+    # Remove any exempt coordinate that the user explicitly overwrote in this edit
+    for sh_name in list(skip_cells_map):
+        if sh_name in touched_all_map:
+            skip_cells_map[sh_name] -= touched_all_map[sh_name]
+        if not skip_cells_map[sh_name]:
+            del skip_cells_map[sh_name]
+
+    # Compute exempt_downstream_cells & recalc_target_cells from post-edit dependency graph
+    exempt_downstream_map: dict[str, set[str]] = defaultdict(set)
+    recalc_targets_map: dict[str, set[str]] = defaultdict(set)
+    if editing_path is not None and editing_path.is_file():
+        cell_deps, rect_deps = _build_post_edit_dep_graph(editing_path)
+        exempt_seeds: set[tuple[str, str]] = {
+            (sh, crd)
+            for sh, crds in skip_cells_map.items()
+            if sh not in skip_sheets_set
+            for crd in crds
+        }
+        down_exempt = _find_downstream_formulas(exempt_seeds, cell_deps, rect_deps)
+        for sh, crd in down_exempt:
+            if sh not in skip_sheets_set and crd not in skip_cells_map.get(sh, set()) and crd not in touched_f_map.get(sh, set()):
+                exempt_downstream_map[sh].add(crd)
+
+        touched_seeds: set[tuple[str, str]] = {
+            (sh, crd)
+            for sh, crds in touched_all_map.items()
+            if sh not in skip_sheets_set
+            for crd in crds
+        }
+        for sh, crds in touched_f_map.items():
+            if sh not in skip_sheets_set:
+                for crd in crds:
+                    recalc_targets_map[sh].add(crd)
+                    touched_seeds.add((sh, crd))
+        down_touched = _find_downstream_formulas(touched_seeds, cell_deps, rect_deps)
+        for sh, crd in down_touched:
+            if (
+                sh not in skip_sheets_set
+                and crd not in skip_cells_map.get(sh, set())
+                and crd not in exempt_downstream_map.get(sh, set())
+            ):
+                recalc_targets_map[sh].add(crd)
 
     return {
         "cache_donor_path": str(donor_path),
         "engine": engine,
         "allow_external_links": True,
         "skip_sheets": sorted(set(skip_sheets)),
-        "skip_cells": {sh: sorted(coords) for sh, coords in sorted(skip_cells_map.items())},
+        "skip_cells": {sh: sorted(coords) for sh, coords in sorted(skip_cells_map.items()) if coords},
+        "exempt_downstream_cells": {
+            sh: sorted(coords) for sh, coords in sorted(exempt_downstream_map.items()) if coords
+        },
+        "touched_cells": {
+            sh: sorted(coords) for sh, coords in sorted(touched_all_map.items()) if coords
+        },
         "touched_formula_cells": {
             sh: sorted(set(c.upper() for c in coords))
             for sh, coords in sorted(touched_formula_cells.items())
             if coords
+        },
+        "recalc_target_cells": {
+            sh: sorted(coords) for sh, coords in sorted(recalc_targets_map.items()) if coords
         },
         "skip_error_writeback": True,
     }
@@ -571,21 +733,33 @@ def apply_edit_plan(
 
             if edit.get("note") is not None:
                 note_col = edit.get("note_col")
-                if note_col is None:
-                    note_col = (
-                        fp.get("sheets", {})
-                        .get(sh, {})
-                        .get("period_axis", {})
-                        .get("source_note_col")
-                    )
+                nc_i: int | None = None
                 if note_col is not None:
                     nc_i = (
                         column_index_from_string(str(note_col))
                         if isinstance(note_col, str) and not str(note_col).isdigit()
                         else int(note_col)
                     )
+                else:
+                    base_note_col = (
+                        fp.get("sheets", {})
+                        .get(sh, {})
+                        .get("period_axis", {})
+                        .get("source_note_col")
+                    )
+                    if base_note_col is not None:
+                        base_nc_i = (
+                            column_index_from_string(str(base_note_col))
+                            if isinstance(base_note_col, str) and not str(base_note_col).isdigit()
+                            else int(base_note_col)
+                        )
+                        mapped_note = map_coord(coord_map, sh, 1, base_nc_i)
+                        if mapped_note is not None:
+                            nc_i = mapped_note[1]
+                if nc_i is not None:
                     ncell = ws.cell(row_i, nc_i, str(edit["note"]))
                     model_style.apply_cell_style(ncell, "source_note")
+                    touched_cells[sh].add(f"{get_column_letter(nc_i)}{row_i}")
 
         # Optional Changelog row append on README & Changelog / Change Log
         changelog = plan.get("changelog_entry")
@@ -632,6 +806,8 @@ def apply_edit_plan(
         donor_path,
         tk,
         coord_map["touched_formula_cells"],
+        touched_cells=coord_map["touched_cells"],
+        editing_path=editing_tmp,
         engine=str(plan.get("calc_engine") or "libreoffice"),
     )
     if spec_out is not None:

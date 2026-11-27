@@ -13,12 +13,14 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import gzip
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -27,6 +29,8 @@ from typing import Any, Callable
 
 # ---------------------------------------------------------------------------
 # Exact PostgreSQL read-only SQL queries specified in modeling-v2.md §8.5
+# (with explicit ::timestamptz / ::text[] casts so PostgreSQL never mis-infers
+#  untyped text parameters in INTERVAL arithmetic!)
 # ---------------------------------------------------------------------------
 
 SQL_PG_LARGE_UPLOADS = """
@@ -34,7 +38,7 @@ SELECT upload_id, workspace_id, filename, size_bytes, object_key,
        actual_sha256, state, created_at, used_at, cleaned_at
 FROM dalton_chat_file_uploads
 WHERE workspace_id = %(workspace_id)s::text
-  AND created_at <= %(before_first_edit_ts)s
+  AND created_at <= %(before_first_edit_ts)s::timestamptz
   AND filename ILIKE '%%.xlsx'
 ORDER BY created_at ASC;
 """
@@ -57,7 +61,7 @@ LEFT JOIN LATERAL (
 ) r ON TRUE
 CROSS JOIN LATERAL jsonb_array_elements(COALESCE(q.metadata->'attachments', '[]'::jsonb)) AS att
 WHERE t.workspace_id = %(workspace_id)s::uuid
-  AND q.created_at <= %(before_first_edit_ts)s
+  AND q.created_at <= %(before_first_edit_ts)s::timestamptz
   AND COALESCE(att->>'name', '') ILIKE '%%.xlsx'
 ORDER BY q.created_at ASC, q.turn_index ASC;
 """
@@ -67,13 +71,16 @@ SELECT attachment_id::text AS attachment_id, user_id, name, size,
        object_key, (content IS NOT NULL) AS has_inline_content,
        state, created_at, sent_at, cleaned_at
 FROM chat_attachments
-WHERE user_id = ANY(%(sender_user_ids)s)
+WHERE user_id = ANY(%(sender_user_ids)s::text[])
   AND name = %(att_name)s
   AND size = %(att_size)s::bigint
-  AND created_at <= LEAST(%(before_first_edit_ts)s, %(turn_created_at)s + INTERVAL '5 minutes')
-  AND (sent_at IS NULL OR sent_at BETWEEN %(turn_created_at)s - INTERVAL '10 minutes'
-                                      AND %(turn_created_at)s + INTERVAL '10 minutes')
-ORDER BY ABS(EXTRACT(EPOCH FROM (COALESCE(sent_at, created_at) - %(turn_created_at)s))) ASC;
+  AND created_at <= LEAST(
+        %(before_first_edit_ts)s::timestamptz,
+        %(turn_created_at)s::timestamptz + INTERVAL '5 minutes'
+      )
+  AND (sent_at IS NULL OR sent_at BETWEEN %(turn_created_at)s::timestamptz - INTERVAL '10 minutes'
+                                      AND %(turn_created_at)s::timestamptz + INTERVAL '10 minutes')
+ORDER BY ABS(EXTRACT(EPOCH FROM (COALESCE(sent_at, created_at) - %(turn_created_at)s::timestamptz))) ASC;
 """
 
 SQL_PG_INLINE_CONTENT = """
@@ -222,19 +229,21 @@ class PostgresReadOnlyAdapter(ReadOnlyDBAdapter):
     def close(self) -> None:
         self._conn.close()
 
-    def fetch_large_uploads(self, workspace_id: str, before_ts: str) -> list[dict[str, Any]]:
+    def fetch_large_uploads(self, workspace_id: str, before_ts: str | datetime) -> list[dict[str, Any]]:
+        before_dt = parse_iso_ts(before_ts)
         with self._conn.cursor() as cur:
             cur.execute(
                 SQL_PG_LARGE_UPLOADS,
-                {"workspace_id": workspace_id, "before_first_edit_ts": before_ts},
+                {"workspace_id": workspace_id, "before_first_edit_ts": before_dt},
             )
             return list(cur.fetchall())
 
-    def fetch_turn_attachments(self, workspace_id: str, before_ts: str) -> list[dict[str, Any]]:
+    def fetch_turn_attachments(self, workspace_id: str, before_ts: str | datetime) -> list[dict[str, Any]]:
+        before_dt = parse_iso_ts(before_ts)
         with self._conn.cursor() as cur:
             cur.execute(
                 SQL_PG_TURN_ATTACHMENTS,
-                {"workspace_id": workspace_id, "before_first_edit_ts": before_ts},
+                {"workspace_id": workspace_id, "before_first_edit_ts": before_dt},
             )
             return list(cur.fetchall())
 
@@ -243,20 +252,22 @@ class PostgresReadOnlyAdapter(ReadOnlyDBAdapter):
         sender_user_ids: list[str],
         att_name: str,
         att_size: int,
-        before_ts: str,
-        turn_created_at: str,
+        before_ts: str | datetime,
+        turn_created_at: str | datetime,
     ) -> list[dict[str, Any]]:
         if not sender_user_ids:
             return []
+        before_dt = parse_iso_ts(before_ts)
+        turn_dt = parse_iso_ts(turn_created_at)
         with self._conn.cursor() as cur:
             cur.execute(
                 SQL_PG_INLINE_CANDIDATES,
                 {
-                    "sender_user_ids": sender_user_ids,
+                    "sender_user_ids": list(sender_user_ids),
                     "att_name": att_name,
                     "att_size": int(att_size),
-                    "before_first_edit_ts": before_ts,
-                    "turn_created_at": turn_created_at,
+                    "before_first_edit_ts": before_dt,
+                    "turn_created_at": turn_dt,
                 },
             )
             return list(cur.fetchall())
@@ -518,6 +529,127 @@ def recover_from_encrypted_tar_stream(
     return None, None
 
 
+def _scan_pg_sql_for_attachment(
+    sql_bytes: bytes,
+    expected_sha256: str,
+) -> tuple[bytes | None, str | None]:
+    """Scan PostgreSQL dump SQL text (COPY or INSERT into chat_attachments) for matching inline BYTEA."""
+    want_sha = expected_sha256.lower()
+    text = sql_bytes.decode("utf-8", errors="ignore")
+    copy_re = re.compile(
+        r"^\s*COPY\s+(?:[A-Za-z0-9_\"']+\.)?\"?chat_attachments\"?\s*\(([^)]+)\)\s+FROM\s+stdin;",
+        re.IGNORECASE,
+    )
+    in_copy = False
+    content_col_idx: int | None = None
+    id_col_idx: int | None = None
+
+    for line in text.splitlines():
+        if not in_copy:
+            m = copy_re.match(line)
+            if m:
+                cols = [c.strip().strip('"').lower() for c in m.group(1).split(",")]
+                if "content" in cols:
+                    in_copy = True
+                    content_col_idx = cols.index("content")
+                    id_col_idx = cols.index("attachment_id") if "attachment_id" in cols else None
+                continue
+            # Also handle plain INSERT INTO chat_attachments ... '\\x<hex>'
+            if "chat_attachments" in line.lower() and "\\x" in line:
+                for hm in re.finditer(r"'(?:\\x|\\\\x)([0-9a-fA-F]{16,})'", line):
+                    hex_str = hm.group(1)
+                    if len(hex_str) % 2 != 0:
+                        continue
+                    try:
+                        blob = bytes.fromhex(hex_str)
+                    except ValueError:
+                        continue
+                    if sha256_bytes(blob) == want_sha:
+                        return blob, "chat_attachments:insert"
+        else:
+            if line == "\\.":
+                in_copy = False
+                content_col_idx = None
+                id_col_idx = None
+                continue
+            if content_col_idx is None:
+                continue
+            fields = line.split("\t")
+            if content_col_idx >= len(fields):
+                continue
+            raw_val = fields[content_col_idx]
+            if raw_val == "\\N" or not raw_val:
+                continue
+            # PostgreSQL COPY escapes backslash as \\x<hex>
+            hex_str: str | None = None
+            if raw_val.startswith("\\\\x"):
+                hex_str = raw_val[3:]
+            elif raw_val.startswith("\\x"):
+                hex_str = raw_val[2:]
+            if hex_str and len(hex_str) % 2 == 0:
+                try:
+                    blob = bytes.fromhex(hex_str)
+                except ValueError:
+                    continue
+                if sha256_bytes(blob) == want_sha:
+                    att_id = fields[id_col_idx] if (id_col_idx is not None and id_col_idx < len(fields)) else "row"
+                    return blob, f"chat_attachments:{att_id}"
+    return None, None
+
+
+def recover_from_encrypted_db_backup_stream(
+    enc_stream_cmd: list[str],
+    backup_key_file: Path,
+    *,
+    expected_sha256: str,
+) -> tuple[bytes | None, str | None]:
+    """Stream-decrypt a daily Postgres offsite backup (``db/<date>/*.enc``) and scan ``chat_attachments``."""
+    p1 = subprocess.Popen(enc_stream_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p2 = subprocess.Popen(
+        [
+            "openssl",
+            "enc",
+            "-d",
+            "-aes-256-cbc",
+            "-pbkdf2",
+            "-pass",
+            f"file:{backup_key_file}",
+        ],
+        stdin=p1.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if p1.stdout is not None:
+        p1.stdout.close()
+    decrypted, _ = p2.communicate()
+    p1.wait()
+    if p1.returncode != 0 or p2.returncode != 0 or not decrypted:
+        return None, None
+
+    # Decompress gzip if needed (.sql.gz.enc)
+    payload = decrypted
+    if payload[:2] == b"\x1f\x8b":
+        try:
+            payload = gzip.decompress(payload)
+        except Exception:
+            pass
+
+    # Handle PostgreSQL custom-format dump (PGDMP) via pg_restore if installed
+    if payload[:5] == b"PGDMP" and shutil.which("pg_restore") is not None:
+        pr = subprocess.run(
+            ["pg_restore", "-f", "-", "--data-only", "-t", "chat_attachments"],
+            input=payload,
+            capture_output=True,
+            check=False,
+        )
+        if pr.returncode == 0 and pr.stdout:
+            blob, ref = _scan_pg_sql_for_attachment(pr.stdout, expected_sha256)
+            if blob is not None:
+                return blob, ref
+
+    return _scan_pg_sql_for_attachment(payload, expected_sha256)
+
+
 def recover_baseline(
     *,
     workspace_id: str,
@@ -669,10 +801,12 @@ def recover_baseline(
                         if res is not None:
                             return res
 
-    # Channel 3: Encrypted rclone backup fallback (weekly MinIO/workspace archives before cutoff)
+    # Channel 3: Encrypted rclone backup fallback (weekly/ MinIO archives + db/ daily Postgres dumps before cutoff)
     if rclone_remote and rclone_drive_dir and backup_key_file and backup_key_file.is_file():
         cutoff_dt = parse_iso_ts(before_first_edit_ts)
         cutoff_date = cutoff_dt.strftime("%Y-%m-%d") if cutoff_dt else "9999-99-99"
+
+        # 3a. Weekly MinIO / workspace tarballs (weekly/<YYYY-MM-DD>/*.enc)
         weekly_base = f"{rclone_remote}:{rclone_drive_dir}/weekly"
         ls_proc = subprocess.run(
             [rclone_bin, "lsf", "--dirs-only", f"{weekly_base}/"],
@@ -711,6 +845,49 @@ def recover_baseline(
                         res = _accept(
                             blob,
                             "rclone_encrypted_backup",
+                            f"{remote_obj}!{member}",
+                        )
+                        if res is not None:
+                            return res
+
+        # 3b. Daily PostgreSQL offsite dumps (db/<YYYY-MM-DD>/*.enc) containing inline chat_attachments
+        db_base = f"{rclone_remote}:{rclone_drive_dir}/db"
+        ls_db = subprocess.run(
+            [rclone_bin, "lsf", "--dirs-only", f"{db_base}/"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if ls_db.returncode == 0:
+            day_dirs = sorted(
+                (d.strip().rstrip("/") for d in ls_db.stdout.splitlines() if d.strip()),
+                reverse=True,
+            )
+            for day in day_dirs:
+                if day > cutoff_date:
+                    continue
+                obj_proc = subprocess.run(
+                    [rclone_bin, "lsf", "--files-only", f"{db_base}/{day}/"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if obj_proc.returncode != 0:
+                    continue
+                for obj_name in sorted(obj_proc.stdout.splitlines()):
+                    obj_name = obj_name.strip()
+                    if not obj_name.endswith(".enc"):
+                        continue
+                    remote_obj = f"{db_base}/{day}/{obj_name}"
+                    blob, member = recover_from_encrypted_db_backup_stream(
+                        [rclone_bin, "cat", remote_obj],
+                        backup_key_file,
+                        expected_sha256=want_sha,
+                    )
+                    if blob is not None:
+                        res = _accept(
+                            blob,
+                            "rclone_encrypted_db_backup",
                             f"{remote_obj}!{member}",
                         )
                         if res is not None:
