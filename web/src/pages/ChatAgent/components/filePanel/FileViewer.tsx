@@ -66,6 +66,8 @@ export interface FileViewerProps {
   onPageCount?: (pages: number) => void;
   /** An HTML file's markup rather than its page, switched from the panel header. */
   htmlSource?: boolean;
+  // DALTON-HOOK(monitors): allow switching a shared Markdown file to raw text view
+  markdownSource?: boolean;
 
   isEditing?: boolean;
   editContent?: string | null;
@@ -252,14 +254,15 @@ export function FileViewer(props: FileViewerProps): React.ReactElement {
         <div className="markdown-print-content">
           <Markdown variant="panel" content={stripLineNumbers(body?.content ?? null) ?? ''} className="text-sm" />
         </div>
-      ) : viewer === 'markdown' ? (
+      // DALTON-HOOK(monitors): render Markdown by default, or raw source when markdownSource is toggled
+      ) : viewer === 'markdown' && !props.markdownSource ? (
         <MarkdownFile
           content={body?.content ?? ''}
           comments={comments}
           onOpenFile={props.onViewerLink}
           onAnchorLink={props.onAnchorLink}
         />
-      ) : (viewer === 'code' || viewer === 'html') && body?.content != null ? (
+      ) : (viewer === 'code' || viewer === 'html' || (viewer === 'markdown' && props.markdownSource)) && body?.content != null ? (
         <CodeFile content={body.content} language={EXT_TO_LANG[ext] || 'text'} lineRange={lineRange} comments={comments} />
       ) : (
         <p className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>{t('filePanel:emptyFile')}</p>

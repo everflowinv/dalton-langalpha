@@ -63,10 +63,29 @@
     "sharedDocumentToast": "Document sharing updated"
   },
   "sharedDocuments": {
-    "title": "Other shared documents",
+    "title": "Shared documents",
+    "sharedByMe": "Shared by me",
+    "sharedWithMe": "Shared with me",
     "sharedBy": "Shared by {{owner}}",
     "updatedAt": "Updated: {{time}}",
-    "openLink": "Open"
+    "openLink": "Open",
+    "stopSharing": "Stop sharing",
+    "stopSharingConfirmTitle": "Stop sharing this document?",
+    "stopSharingConfirmMessage": "“{{name}}” will switch back to private access for you only. Continue?",
+    "stopSharingConfirmButton": "Stop sharing",
+    "stopSharingSuccess": "Sharing stopped",
+    "stopSharingFailed": "Failed to stop sharing. Please try again.",
+    "visibility": {
+      "members": "Selected colleagues",
+      "company": "Team",
+      "public": "Public link"
+    }
+  },
+  "markdown": {
+    "viewRaw": "View raw",
+    "viewRendered": "View rendered",
+    "download": "Download",
+    "downloadFailed": "Failed to download file"
   },
   "demo": {
     "title": "Realtime Monitor Demo",

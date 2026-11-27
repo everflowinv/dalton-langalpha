@@ -88,8 +88,7 @@ async def get_monitor_by_artifact_endpoint(
 @router.get("/shared-documents")
 @handle_api_exceptions("list shared non-HTML documents", logger)
 async def list_shared_documents_endpoint(user_id: CurrentUserId) -> dict[str, Any]:
-    items = await shared_doc_service.list_shared_documents_for_user(user_id)
-    return {"documents": items}
+    return await shared_doc_service.list_grouped_shared_documents_for_user(user_id)
 
 
 @router.get("/shared-documents/by-artifact/{artifact_id}")

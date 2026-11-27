@@ -212,6 +212,8 @@
   "collapseFolder": "Collapse",
   "viewSource": "View source",
   "viewPreview": "View page",
+  "viewRaw": "View raw",
+  "viewRendered": "View rendered",
   "htmlPreviewFailed": "Couldn't load the preview.",
   "pdfPrintHint": "Press Cmd/Ctrl-P to save the page as a PDF.",
   "pdfGenerating": "Generating PDF…",

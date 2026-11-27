@@ -181,7 +181,11 @@ async def _select_doc_in_cur(cur: Any, doc_id: str) -> SharedDocumentRecord | No
 
 
 async def downgrade_public_shared_document_in_cur(cur: Any, artifact_id: str) -> None:
-    """Downgrade any public shared document row on *artifact_id* to ``own`` inside an open tx."""
+    """Downgrade any shared document row on *artifact_id* to ``own`` inside an open tx.
+
+    Clears explicit member grants and bumps ``acl_revision`` so any previously
+    minted ``d1.`` grants are immediately rejected on their next request.
+    """
     await cur.execute(
         """
         SELECT doc_id::text AS doc_id, visibility
@@ -192,7 +196,7 @@ async def downgrade_public_shared_document_in_cur(cur: Any, artifact_id: str) ->
         (artifact_id,),
     )
     row = await cur.fetchone()
-    if row is not None and row.get("visibility") == "public":
+    if row is not None and row.get("visibility") != "own":
         await cur.execute(
             """
             UPDATE dalton_shared_documents
@@ -203,6 +207,48 @@ async def downgrade_public_shared_document_in_cur(cur: Any, artifact_id: str) ->
             """,
             (row["doc_id"],),
         )
+        await cur.execute(
+            "DELETE FROM dalton_shared_document_members WHERE doc_id = %s::uuid",
+            (row["doc_id"],),
+        )
+
+
+async def downgrade_dalton_share_on_unshare_in_cur(
+    cur: Any, artifact_id: str, *, entry_path: str | None = None
+) -> None:
+    """Downgrade public monitors, legacy non-HTML monitors, and shared documents to ``own``."""
+    await cur.execute(
+        """
+        SELECT monitor_id::text AS monitor_id, visibility
+          FROM dalton_monitors
+         WHERE artifact_id = %s::uuid
+           FOR UPDATE
+        """,
+        (artifact_id,),
+    )
+    mon = await cur.fetchone()
+    mon_vis = mon.get("visibility") if mon is not None else None
+    if mon is not None and (
+        mon_vis == "public"
+        or (mon_vis != "own" and not is_html_entry_path(entry_path))
+    ):
+        await cur.execute(
+            """
+            UPDATE dalton_monitors
+               SET visibility = 'own',
+                   acl_revision = acl_revision + 1,
+                   updated_at = NOW()
+             WHERE monitor_id = %s::uuid
+            """,
+            (mon["monitor_id"],),
+        )
+        if mon_vis == "members":
+            await cur.execute(
+                "DELETE FROM dalton_monitor_members WHERE monitor_id = %s::uuid",
+                (mon["monitor_id"],),
+            )
+    elif mon is None:
+        await downgrade_public_shared_document_in_cur(cur, artifact_id)
 
 
 async def can_view_shared_document(
@@ -243,10 +289,14 @@ def _file_name_of(entry_path: str | None, fallback: str) -> str:
 
 
 def serialize_shared_document(
-    doc: SharedDocumentRecord, *, can_manage: bool = False
+    doc: SharedDocumentRecord,
+    *,
+    can_manage: bool = False,
+    viewer_id: str | None = None,
 ) -> dict[str, Any]:
     file_name = _file_name_of(doc.entry_path, doc.title)
     url = share_path(doc.artifact_code) if doc.artifact_code else ""
+    is_owner = bool(viewer_id) and str(viewer_id).strip() == doc.owner_user_id
     return {
         "doc_id": doc.doc_id,
         "artifact_id": doc.artifact_id,
@@ -267,6 +317,7 @@ def serialize_shared_document(
         "created_at": doc.created_at.isoformat(),
         "updated_at": doc.updated_at.isoformat(),
         "can_manage": can_manage,
+        "is_owner": is_owner,
     }
 
 
@@ -296,13 +347,15 @@ async def _find_record_or_legacy_monitor(
 
 
 async def list_shared_documents_for_user(user_id: str) -> list[dict[str, Any]]:
-    """List non-HTML documents shared with *user_id* (or team/public) that they may view.
+    """List non-HTML documents shared by or shared with *user_id* that they may view.
 
     Excludes ``visibility == 'own'`` (not shared with others) and any HTML entry.
     Includes existing legacy non-HTML rows from ``dalton_monitors`` without
-    mutating them, deduplicated by ``artifact_id``.
+    mutating them, deduplicated by ``artifact_id``. Owners always see their own
+    shared documents so they can stop sharing them even if their tier changed.
     """
-    tier = await get_user_tier(user_id)
+    uid = str(user_id or "").strip()
+    tier = await get_user_tier(uid)
     docs = await list_all_shared_documents()
     legacy_monitors = await monitor_db.list_all_monitors()
 
@@ -316,7 +369,7 @@ async def list_shared_documents_for_user(user_id: str) -> list[dict[str, Any]]:
             continue
         if not doc.artifact_code:
             continue
-        if await can_view_shared_document(doc, user_id):
+        if doc.owner_user_id == uid or await can_view_shared_document(doc, uid):
             visible_records.append(doc)
             seen_artifacts.add(doc.artifact_id)
 
@@ -329,17 +382,31 @@ async def list_shared_documents_for_user(user_id: str) -> list[dict[str, Any]]:
             continue
         if not mon.artifact_code:
             continue
-        if await can_view_monitor(mon, user_id):
+        if mon.owner_user_id == uid or await can_view_monitor(mon, uid):
             visible_records.append(_legacy_monitor_to_doc(mon))
             seen_artifacts.add(mon.artifact_id)
 
     visible_records.sort(key=lambda item: item.updated_at, reverse=True)
     return [
         serialize_shared_document(
-            item, can_manage=_can_manage_doc(item, user_id, tier)
+            item,
+            can_manage=_can_manage_doc(item, uid, tier),
+            viewer_id=uid,
         )
         for item in visible_records
     ]
+
+
+async def list_grouped_shared_documents_for_user(user_id: str) -> dict[str, list[dict[str, Any]]]:
+    """Return shared non-HTML documents split into ``shared_by_me`` and ``shared_with_me``."""
+    items = await list_shared_documents_for_user(user_id)
+    shared_by_me = [item for item in items if item.get("is_owner")]
+    shared_with_me = [item for item in items if not item.get("is_owner")]
+    return {
+        "documents": items,
+        "shared_by_me": shared_by_me,
+        "shared_with_me": shared_with_me,
+    }
 
 
 async def get_shared_document_by_artifact(

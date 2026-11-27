@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useEffectEvent, useMemo, useState } from 'react';
-import { Download } from 'lucide-react';
+import { Code, Download, Eye } from 'lucide-react'; // DALTON-HOOK(monitors)
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/components/ui/use-toast';
+import { fetchSharedImageObjectUrl, isMarkdownFile } from '@/lib/dalton/sharedMarkdown'; // DALTON-HOOK(monitors)
 import { cn } from '@/lib/utils';
 import { bodyMode } from '../ChatAgent/components/filePanel/fileBody';
 import { getFileExtension } from '../ChatAgent/components/filePanel/fileMeta';
@@ -19,7 +20,7 @@ interface SharedFileViewProps {
 }
 
 /** Every non-HTML file, read and rendered the way the owner's panel does. */
-export function FileBody({ scope, path, frameBase, onDownload, downloading, onGone }: {
+export function FileBody({ scope, path, frameBase, onDownload, downloading, onGone, rawSource = false }: {
   /** The body cache's scope: the same bytes, whatever prefix renews under it. */
   scope: string;
   path: string;
@@ -28,6 +29,8 @@ export function FileBody({ scope, path, frameBase, onDownload, downloading, onGo
   downloading: boolean;
   /** The file answered 404: under a version, most likely one an Update just ended. */
   onGone?: () => void;
+  // DALTON-HOOK(monitors): show raw Markdown source when toggled in shared viewer
+  rawSource?: boolean;
 }) {
   const readers = useMemo(() => servedReaders(frameBase), [frameBase]);
   const cache = useFileBodyCache({ scope, workspaceId: '', readers });
@@ -36,8 +39,11 @@ export function FileBody({ scope, path, frameBase, onDownload, downloading, onGo
   useEffect(() => {
     if (error?.category === 'not_found') tellGone();
   }, [error]);
-  // Markdown images are workspace paths, fetched under the same prefix as the file.
-  const imageDownloader = useCallback((imagePath: string) => servedObjectUrl(frameBase, imagePath), [frameBase]);
+  // DALTON-HOOK(monitors): resolve document-relative image paths under the shared prefix
+  const imageDownloader = useCallback(
+    (imagePath: string) => fetchSharedImageObjectUrl(frameBase, path, imagePath, servedObjectUrl),
+    [frameBase, path],
+  );
   // With an anchor handler and no file opener, a link to another workspace
   // file is plain text: a visitor can open only the files listed.
   const scrollToAnchor = useCallback((id: string) => {
@@ -64,6 +70,7 @@ export function FileBody({ scope, path, frameBase, onDownload, downloading, onGo
             downloadState={downloading ? 'preparing' : 'idle'}
             workspaceId=""
             onAnchorLink={scrollToAnchor}
+            markdownSource={rawSource} // DALTON-HOOK(monitors)
           />
         </WorkspaceProvider>
       </div>
@@ -80,6 +87,9 @@ export default function SharedFileView({ code, metadata }: SharedFileViewProps):
   const { t } = useTranslation();
   const { path, name, frame_base: frameBase } = metadata;
   const [busy, setBusy] = useState(false);
+  // DALTON-HOOK(monitors): toggle raw Markdown source on shared file page
+  const isMarkdown = isMarkdownFile(path);
+  const [rawSource, setRawSource] = useState(false);
 
   const download = async () => {
     setBusy(true);
@@ -97,12 +107,19 @@ export default function SharedFileView({ code, metadata }: SharedFileViewProps):
     <div className="share-page">
       <ShareTopBar
         name={name}
-        actions={<ShareTopBarAction icon={Download} label={t('filePanel:download')} onClick={() => void download()} disabled={busy} />}
+        actions={(
+          <>
+            {/* DALTON-HOOK(monitors): View raw / View rendered toggle for Markdown files */}
+            {isMarkdown && (
+              <ShareTopBarAction icon={rawSource ? Eye : Code} label={rawSource ? t('filePanel:viewRendered') : t('filePanel:viewRaw')} onClick={() => setRawSource((v) => !v)} />
+            )}
+            <ShareTopBarAction icon={Download} label={t('filePanel:download')} onClick={() => void download()} disabled={busy} />
+          </>
+        )}
       />
       <div className="share-content">
-        {/* Scoped by the code, not the prefix: an owner's grant renews under a
-            new prefix, and the bytes on screen are still the same file's. */}
-        <FileBody scope={`share:${code}`} path={path} frameBase={frameBase} onDownload={() => void download()} downloading={busy} />
+        {/* DALTON-HOOK(monitors): pass rawSource toggle to FileBody */}
+        <FileBody scope={`share:${code}`} path={path} frameBase={frameBase} onDownload={() => void download()} downloading={busy} rawSource={isMarkdown && rawSource} />
       </div>
     </div>
   );

@@ -144,6 +144,7 @@ export function viewerFor(path: string, mime: string | null): FocusViewer {
   if (ext === 'html' || ext === 'htm') return 'html';
   if (mime === 'image') return 'image';
   if (path.startsWith(LARGE_TOOL_RESULTS_PREFIX)) return 'other';
-  if (mime?.includes('markdown') || ext === 'md') return 'markdown';
+  // DALTON-HOOK(monitors): render both .md and .markdown files with Markdown viewer
+  if (mime?.includes('markdown') || ext === 'md' || ext === 'markdown') return 'markdown';
   return 'code';
 }

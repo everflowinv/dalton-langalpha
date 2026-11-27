@@ -483,35 +483,15 @@ async def unshare_artifact_and_downgrade_public_monitor(
     async with get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
-                await lock_owned(cur, user_id=user_id, artifact_id=artifact_id)
-                await cur.execute(
-                    """
-                    SELECT monitor_id::text AS monitor_id, visibility
-                      FROM dalton_monitors
-                     WHERE artifact_id = %s::uuid
-                       FOR UPDATE
-                    """,
-                    (artifact_id,),
+                locked = await lock_owned(cur, user_id=user_id, artifact_id=artifact_id)
+                # DALTON-HOOK(monitors): delegate monitor/shared-document downgrade to Dalton helper
+                from src.dalton.monitors.shared_documents import (
+                    downgrade_dalton_share_on_unshare_in_cur,
                 )
-                mon = await cur.fetchone()
-                if mon is not None and mon.get("visibility") == "public":
-                    await cur.execute(
-                        """
-                        UPDATE dalton_monitors
-                           SET visibility = 'own',
-                               acl_revision = acl_revision + 1,
-                               updated_at = NOW()
-                         WHERE monitor_id = %s::uuid
-                        """,
-                        (mon["monitor_id"],),
-                    )
-                elif mon is None:
-                    # DALTON-HOOK(monitors): also downgrade any public shared document row when unsharing
-                    from src.dalton.monitors.shared_documents import (
-                        downgrade_public_shared_document_in_cur,
-                    )
 
-                    await downgrade_public_shared_document_in_cur(cur, artifact_id)
+                await downgrade_dalton_share_on_unshare_in_cur(
+                    cur, artifact_id, entry_path=locked.path
+                )
                 return await unshare_in_cur(
                     cur, user_id=user_id, artifact_id=artifact_id
                 )

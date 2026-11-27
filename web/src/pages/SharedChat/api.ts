@@ -202,10 +202,12 @@ export async function servedObjectUrl(prefix: string, path: string): Promise<str
  * handed goes unused: the prefix is the credential.
  */
 export function servedReaders(prefix: string): BodyReaders {
-  const text = async (_workspaceId: string, path: string) => ({
-    content: await (await served(buildServeUrl(prefix, path))).text(),
-    from: LIVE,
-  });
+  // DALTON-HOOK(monitors): preserve response Content-Type so text/markdown files render as Markdown
+  const text = async (_workspaceId: string, path: string) => {
+    const res = await served(buildServeUrl(prefix, path));
+    const mime = res.headers?.get?.('content-type') || undefined;
+    return { content: await res.text(), from: LIVE, ...(mime ? { mime } : {}) };
+  };
   return {
     readFile: text,
     readFileFull: text,

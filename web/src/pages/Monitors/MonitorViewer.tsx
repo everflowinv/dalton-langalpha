@@ -1,8 +1,11 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, ArrowLeft, Check, Copy, ExternalLink, FileCode2 } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, Check, Code, Copy, Download, ExternalLink, Eye, FileCode2 } from 'lucide-react';
+import { withCopy } from '@/i18n';
+import { isMarkdownFile } from '@/lib/dalton/sharedMarkdown';
+import { downloadServedFile } from '@/pages/SharedChat/api';
 import { Button } from '@/components/ui/button';
 import { Loader } from '@/components/ui/loader';
 import { Select } from '@/components/ui/select';
@@ -39,6 +42,11 @@ interface MonitorViewerProps {
   publicMode?: boolean;
 }
 
+const SharedFileBody = React.lazy(withCopy(
+  () => import('@/pages/SharedChat/SharedFileView').then((m) => ({ default: m.FileBody })),
+  ['filePanel', 'pageViewer', 'toolArtifact'],
+));
+
 export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps): React.ReactElement {
   const { t } = useTranslation();
   const locale = useLocale();
@@ -74,9 +82,12 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     receivedAt: number;
   } | null>(null);
   const [copied, setCopied] = useState(false);
+  const [rawSource, setRawSource] = useState(false);
+  const [downloading, setDownloading] = useState(false);
 
   useEffect(() => {
     setSelectedSeq(null);
+    setRawSource(false);
   }, [slug]);
 
   // Periodically renew monitor_grant before its 12h expiry and push to iframe via postMessage.
@@ -130,8 +141,10 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     ? detail?.versions.find((v) => v.seq === effectiveSeq)
     : undefined;
   const effectiveEntryPath = selectedVersion?.entry_path || monitor?.entry_path;
+  const isMarkdownEntry = Boolean(effectiveEntryPath && isMarkdownFile(effectiveEntryPath));
+  const activeVersionPrefix = activeGrant ? versionPrefix(activeGrant.frameBase, effectiveSeq) : '';
   const frameSource = useMemo<FrameSource | null>(() => {
-    if (!monitor || !activeGrant) return null;
+    if (!monitor || !activeGrant || isMarkdownEntry) return null;
     const prefix = versionPrefix(activeGrant.frameBase, effectiveSeq);
     if (!effectiveEntryPath) {
       if (!publicMode) return null;
@@ -146,7 +159,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
       src: buildServeUrl(prefix, effectiveEntryPath),
       sandbox: SERVED_HTML_SANDBOX,
     };
-  }, [monitor, activeGrant, effectiveSeq, effectiveEntryPath, publicMode]);
+  }, [monitor, activeGrant, effectiveSeq, effectiveEntryPath, publicMode, isMarkdownEntry]);
 
   // DALTON-HOOK(monitors): guard bridge & unified HtmlFrameDocState by frameKey so monitor/version switches never bleed stale paths.
   const currentFrameKey = frameSource?.key ?? null;
@@ -210,6 +223,17 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     } catch {
       toast({ description: permalink });
     }
+  };
+
+  const handleDownloadMarkdown = () => {
+    if (!activeVersionPrefix || !effectiveEntryPath) return;
+    const fileName = effectiveEntryPath.split('/').pop() || `${monitor?.slug || 'document'}.md`;
+    setDownloading(true);
+    downloadServedFile(buildServeUrl(activeVersionPrefix, effectiveEntryPath), fileName)
+      .catch(() => {
+        toast({ description: t('monitors:markdown.downloadFailed'), variant: 'destructive' });
+      })
+      .finally(() => setDownloading(false));
   };
 
   if (detailQuery.isLoading || (!publicMode && capsLoading)) {
@@ -291,6 +315,36 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
             </Select>
           )}
 
+          {isMarkdownEntry && (
+            <>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="tap-target h-[30px] gap-1.5 px-2.5 text-xs"
+                aria-label={rawSource ? t('monitors:markdown.viewRendered') : t('monitors:markdown.viewRaw')}
+                onClick={() => setRawSource((v) => !v)}
+              >
+                {rawSource ? <Eye className="h-3.5 w-3.5" /> : <Code className="h-3.5 w-3.5" />}
+                <span className="hidden sm:inline">
+                  {rawSource ? t('monitors:markdown.viewRendered') : t('monitors:markdown.viewRaw')}
+                </span>
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="tap-target h-[30px] gap-1.5 px-2.5 text-xs"
+                aria-label={t('monitors:markdown.download')}
+                disabled={downloading}
+                onClick={handleDownloadMarkdown}
+              >
+                <Download className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">{t('monitors:markdown.download')}</span>
+              </Button>
+            </>
+          )}
+
           <Button
             type="button"
             variant="outline"
@@ -366,17 +420,33 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
 
       {/* DALTON-HOOK(monitors): expose docState on monitor host and wire BridgedFrame expectedDocKey & onDocStateChange */}
       <div className="monitors-frame-host" data-doc-state={docState.kind}>
-        <BridgedFrame
-          source={frameSource}
-          title={monitor.title}
-          groundKey={monitor.monitor_id}
-          expectedDocKey={effectiveEntryPath ? artifactPathKey(effectiveEntryPath) : null}
-          onBridge={handleBridge}
-          onDocStateChange={handleDocStateChange}
-          onUnbridged={() => {
-            void detailQuery.refetch();
-          }}
-        />
+        {isMarkdownEntry && effectiveEntryPath && activeVersionPrefix ? (
+          <Suspense fallback={null}>
+            <SharedFileBody
+              scope={`monitor:${monitor.monitor_id}:v${effectiveSeq}`}
+              path={effectiveEntryPath}
+              frameBase={activeVersionPrefix}
+              onDownload={handleDownloadMarkdown}
+              downloading={downloading}
+              onGone={() => {
+                void detailQuery.refetch();
+              }}
+              rawSource={rawSource}
+            />
+          </Suspense>
+        ) : (
+          <BridgedFrame
+            source={frameSource}
+            title={monitor.title}
+            groundKey={monitor.monitor_id}
+            expectedDocKey={effectiveEntryPath ? artifactPathKey(effectiveEntryPath) : null}
+            onBridge={handleBridge}
+            onDocStateChange={handleDocStateChange}
+            onUnbridged={() => {
+              void detailQuery.refetch();
+            }}
+          />
+        )}
       </div>
     </div>
   );

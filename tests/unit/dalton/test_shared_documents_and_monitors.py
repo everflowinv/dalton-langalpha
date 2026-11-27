@@ -432,9 +432,32 @@ async def test_shared_documents_endpoint_lists_only_authorized_non_html_files(
     async with AsyncClient(transport=ASGITransport(app=_build_app("colleague-a")), base_url="http://t") as client:
         resp_a = await client.get("/api/v1/dalton/monitors/shared-documents")
         assert resp_a.status_code == 200
-        names_a = [d["file_name"] for d in resp_a.json()["documents"]]
+        body_a = resp_a.json()
+        names_a = [d["file_name"] for d in body_a["documents"]]
         assert names_a == ["for-a.md", "valuation.xlsx", "public.pdf", "deck.pdf"]
-        assert resp_a.json()["documents"][0]["url"] == "/a/memcode12345"
+        assert body_a["documents"][0]["url"] == "/a/memcode12345"
+        assert body_a["shared_by_me"] == []
+        assert [d["file_name"] for d in body_a["shared_with_me"]] == [
+            "for-a.md",
+            "valuation.xlsx",
+            "public.pdf",
+            "deck.pdf",
+        ]
+        assert all(d["is_owner"] is False for d in body_a["shared_with_me"])
+
+    # Owner-1 sees their own shared non-HTML docs in shared_by_me (never own_doc or html_monitor)
+    async with AsyncClient(transport=ASGITransport(app=_build_app("owner-1")), base_url="http://t") as client:
+        resp_owner = await client.get("/api/v1/dalton/monitors/shared-documents")
+        assert resp_owner.status_code == 200
+        body_owner = resp_owner.json()
+        assert [d["file_name"] for d in body_owner["shared_by_me"]] == [
+            "for-a.md",
+            "valuation.xlsx",
+            "public.pdf",
+            "deck.pdf",
+        ]
+        assert all(d["is_owner"] is True for d in body_owner["shared_by_me"])
+        assert body_owner["shared_with_me"] == []
 
     # Colleague B (NOT listed in members_doc) does NOT see for-a.md
     async with AsyncClient(transport=ASGITransport(app=_build_app("colleague-b")), base_url="http://t") as client:
@@ -443,12 +466,15 @@ async def test_shared_documents_endpoint_lists_only_authorized_non_html_files(
         names_b = [d["file_name"] for d in resp_b.json()["documents"]]
         assert names_b == ["valuation.xlsx", "public.pdf", "deck.pdf"]
 
-    # External member only sees public.pdf (never members/company/own)
+    # External member only sees public.pdf in shared_with_me (never members/company/own)
     async with AsyncClient(transport=ASGITransport(app=_build_app("ext-1")), base_url="http://t") as client:
         resp_ext = await client.get("/api/v1/dalton/monitors/shared-documents")
         assert resp_ext.status_code == 200
-        names_ext = [d["file_name"] for d in resp_ext.json()["documents"]]
+        body_ext = resp_ext.json()
+        names_ext = [d["file_name"] for d in body_ext["documents"]]
         assert names_ext == ["public.pdf"]
+        assert body_ext["shared_by_me"] == []
+        assert [d["file_name"] for d in body_ext["shared_with_me"]] == ["public.pdf"]
 
 
 @pytest.mark.asyncio
@@ -523,6 +549,8 @@ async def test_shared_document_grant_serves_authorized_colleague_and_rejects_una
     served = await monitor_service.serve_monitor_file(token, "2", "notes/q4-memo.md")
     assert served.status == 200
     assert served.body == b"# Q4 Memo\nhello\n"
+    headers_map = {k.lower(): v for k, v in served.headers}
+    assert headers_map["content-type"] == "text/markdown; charset=utf-8"
 
     # Unauthorized colleague gets 404 from metadata and 403 from forged/revoked grant
     with pytest.raises(HTTPException) as exc_meta:
@@ -537,3 +565,162 @@ async def test_shared_document_grant_serves_authorized_colleague_and_rejects_una
     with pytest.raises(HTTPException) as exc_stale:
         await monitor_service.serve_monitor_file(stale_grant.token, "2", "notes/q4-memo.md")
     assert exc_stale.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_shared_documents_two_groups_mixed_ownership_and_unshare_revoke(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from psycopg import AsyncCursor
+
+    tiers = {"me-1": "internal", "colleague-x": "internal", "ext-owner": "external"}
+
+    async def _tier(uid: str | None) -> str:
+        return tiers.get(str(uid or ""), "external")
+
+    monkeypatch.setattr(
+        shared_doc_service,
+        "get_user_tier",
+        create_autospec(shared_doc_service.get_user_tier, side_effect=_tier),
+    )
+    monkeypatch.setattr(
+        monitor_perms,
+        "get_user_tier",
+        create_autospec(monitor_perms.get_user_tier, side_effect=_tier),
+    )
+
+    my_members_doc = _make_doc(
+        doc_id="70000000-0000-4000-8000-000000000401",
+        artifact_id="71000000-0000-4000-8000-000000000401",
+        artifact_code="mymem1234567",
+        owner_user_id="me-1",
+        owner_name="Me",
+        entry_path="notes/my-plan.md",
+        visibility="members",
+        member_user_ids=("colleague-x",),
+        updated_at=NOW + timedelta(minutes=5),
+    )
+    other_company_doc = _make_doc(
+        doc_id="70000000-0000-4000-8000-000000000402",
+        artifact_id="71000000-0000-4000-8000-000000000402",
+        artifact_code="othcom123456",
+        owner_user_id="colleague-x",
+        owner_name="Colleague X",
+        entry_path="notes/team-brief.md",
+        visibility="company",
+        updated_at=NOW + timedelta(minutes=4),
+    )
+    other_members_hidden = _make_doc(
+        doc_id="70000000-0000-4000-8000-000000000403",
+        artifact_id="71000000-0000-4000-8000-000000000403",
+        artifact_code="othhid123456",
+        owner_user_id="colleague-x",
+        owner_name="Colleague X",
+        entry_path="notes/secret.md",
+        visibility="members",
+        member_user_ids=("someone-else",),
+        updated_at=NOW + timedelta(minutes=3),
+    )
+    ext_own_shared_doc = _make_doc(
+        doc_id="70000000-0000-4000-8000-000000000404",
+        artifact_id="71000000-0000-4000-8000-000000000404",
+        artifact_code="extown123456",
+        owner_user_id="ext-owner",
+        owner_name="Ext Owner",
+        entry_path="notes/old-company-share.md",
+        visibility="company",
+        updated_at=NOW + timedelta(minutes=2),
+    )
+
+    monkeypatch.setattr(
+        shared_doc_service,
+        "list_all_shared_documents",
+        create_autospec(
+            shared_doc_service.list_all_shared_documents,
+            return_value=[my_members_doc, other_company_doc, other_members_hidden, ext_own_shared_doc],
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "list_all_monitors",
+        create_autospec(monitor_db.list_all_monitors, return_value=[]),
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=_build_app("me-1")), base_url="http://t") as client:
+        resp = await client.get("/api/v1/dalton/monitors/shared-documents")
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert [d["file_name"] for d in payload["shared_by_me"]] == ["my-plan.md"]
+        assert [d["file_name"] for d in payload["shared_with_me"]] == [
+            "team-brief.md",
+            "old-company-share.md",
+        ]
+
+    # Even if an owner was downgraded to external, their own previously shared doc stays in shared_by_me for revocation.
+    async with AsyncClient(transport=ASGITransport(app=_build_app("ext-owner")), base_url="http://t") as client:
+        resp_ext = await client.get("/api/v1/dalton/monitors/shared-documents")
+        assert resp_ext.status_code == 200
+        payload_ext = resp_ext.json()
+        assert [d["file_name"] for d in payload_ext["shared_by_me"]] == ["old-company-share.md"]
+        assert payload_ext["shared_with_me"] == []
+
+    # Unsharing a members/company shared document downgrades it to 'own' and deletes member rows.
+    executed: list[str] = []
+    cur = create_autospec(AsyncCursor, instance=True)
+
+    async def _exec_doc(sql: str, _params: Any = None) -> None:
+        executed.append(" ".join(sql.split()))
+        if "FROM dalton_monitors" in sql:
+            cur._row = None
+        elif "FROM dalton_shared_documents" in sql:
+            cur._row = {"doc_id": my_members_doc.doc_id, "visibility": "members"}
+        else:
+            cur._row = None
+
+    cur.execute.side_effect = _exec_doc
+    cur.fetchone.side_effect = lambda: getattr(cur, "_row", None)
+
+    await shared_doc_service.downgrade_dalton_share_on_unshare_in_cur(
+        cur, my_members_doc.artifact_id, entry_path="notes/my-plan.md"
+    )
+    assert any("UPDATE dalton_shared_documents SET visibility = 'own'" in s for s in executed)
+    assert any("DELETE FROM dalton_shared_document_members" in s for s in executed)
+
+    # Unsharing a legacy non-HTML monitor with visibility='members' also downgrades it to 'own' and clears members,
+    # while an HTML monitor with visibility='company' is left untouched.
+    executed_legacy: list[str] = []
+    cur_legacy = create_autospec(AsyncCursor, instance=True)
+
+    async def _exec_legacy(sql: str, _params: Any = None) -> None:
+        executed_legacy.append(" ".join(sql.split()))
+        if "FROM dalton_monitors" in sql:
+            cur_legacy._row = {"monitor_id": "m-legacy-1", "visibility": "members"}
+        else:
+            cur_legacy._row = None
+
+    cur_legacy.execute.side_effect = _exec_legacy
+    cur_legacy.fetchone.side_effect = lambda: getattr(cur_legacy, "_row", None)
+
+    await shared_doc_service.downgrade_dalton_share_on_unshare_in_cur(
+        cur_legacy, "71000000-0000-4000-8000-000000000499", entry_path="notes/legacy.md"
+    )
+    assert any("UPDATE dalton_monitors SET visibility = 'own'" in s for s in executed_legacy)
+    assert any("DELETE FROM dalton_monitor_members" in s for s in executed_legacy)
+
+    executed_html: list[str] = []
+    cur_html = create_autospec(AsyncCursor, instance=True)
+
+    async def _exec_html(sql: str, _params: Any = None) -> None:
+        executed_html.append(" ".join(sql.split()))
+        if "FROM dalton_monitors" in sql:
+            cur_html._row = {"monitor_id": "m-html-1", "visibility": "company"}
+        else:
+            cur_html._row = None
+
+    cur_html.execute.side_effect = _exec_html
+    cur_html.fetchone.side_effect = lambda: getattr(cur_html, "_row", None)
+
+    await shared_doc_service.downgrade_dalton_share_on_unshare_in_cur(
+        cur_html, "71000000-0000-4000-8000-000000000498", entry_path="dashboard.html"
+    )
+    assert not any("UPDATE dalton_monitors" in s for s in executed_html)

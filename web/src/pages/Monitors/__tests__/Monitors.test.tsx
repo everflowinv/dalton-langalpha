@@ -11,9 +11,18 @@ const bridgeCallbacks = vi.hoisted(() => ({
   lastPosted: [] as unknown[],
 }));
 
+vi.mock('@/contexts/ThemeContext', () => ({
+  useTheme: () => ({ theme: 'light', setTheme: () => {} }),
+}));
+
 vi.mock('@/components/ui/use-toast', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/components/ui/use-toast')>();
   return { ...actual, toast: vi.fn<typeof actual.toast>() };
+});
+
+vi.mock('@/pages/ChatAgent/utils/api/artifacts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/pages/ChatAgent/utils/api/artifacts')>();
+  return { ...actual, unshareArtifact: vi.fn<typeof actual.unshareArtifact>() };
 });
 
 vi.mock('@/pages/ChatAgent/components/viewers/html/BridgedFrame', () => ({
@@ -82,6 +91,7 @@ import {
   mintMonitorGrant,
   type SharedDocumentSummary,
 } from '../api';
+import { unshareArtifact } from '@/pages/ChatAgent/utils/api/artifacts';
 import {
   CORE_DEFAULT_CAPABILITY_SET,
   EVERFLOW_DEFAULT_CAPABILITY_SET,
@@ -123,6 +133,7 @@ const mockListSharedDocuments = vi.mocked(listSharedDocuments);
 const mockGetMonitorDetail = vi.mocked(getMonitorDetail);
 const mockGetPublicMonitorDetail = vi.mocked(getPublicMonitorDetail);
 const mockMintMonitorGrant = vi.mocked(mintMonitorGrant);
+const mockUnshareArtifact = vi.mocked(unshareArtifact);
 let mockClipboardWriteText = vi.fn<typeof navigator.clipboard.writeText>();
 
 function makeSummary(overrides: Partial<MonitorSummary> = {}): MonitorSummary {
@@ -201,8 +212,10 @@ describe('Monitors page (Checklist 8)', () => {
     bridgeCallbacks.onNavigate = null;
     bridgeCallbacks.lastPosted = [];
     mockClipboardWriteText = vi.fn<typeof navigator.clipboard.writeText>(async () => {});
-    Object.assign(navigator, {
-      clipboard: {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      writable: true,
+      value: {
         writeText: mockClipboardWriteText,
       },
     });
@@ -480,7 +493,8 @@ describe('Monitors page (Checklist 8)', () => {
     expect(errBanner.querySelector('.truncate')).toBeNull();
   });
 
-  it('excludes non-HTML entries from monitor cards, renders Other shared documents section when present, and hides it when empty', async () => {
+  it('excludes non-HTML entries from monitor cards, groups shared documents into Shared by me and Shared with me, revokes own doc after confirmation, and hides Stop sharing on others', async () => {
+    const user = userEvent.setup();
     mockListMonitors.mockResolvedValue([
       makeSummary({
         monitor_id: 'm-html',
@@ -498,11 +512,33 @@ describe('Monitors page (Checklist 8)', () => {
       }),
     ]);
 
-    const sharedDoc: SharedDocumentSummary = {
+    const myDoc: SharedDocumentSummary = {
+      doc_id: 'd-mine',
+      artifact_id: 'a-md-mine',
+      artifact_code: 'mycode123456',
+      workspace_id: 'ws-1',
+      entry_path: 'notes/my-outlook.md',
+      file_name: 'my-outlook.md',
+      title: 'My Outlook',
+      owner_user_id: 'local-user',
+      owner_name: 'Alice',
+      owner_email: 'alice@company.com',
+      visibility: 'company',
+      member_user_ids: [],
+      published_seq: 1,
+      keep_updated: false,
+      acl_revision: 1,
+      url: '/a/mycode123456',
+      created_at: '2026-11-26T10:00:00Z',
+      updated_at: '2026-11-27T09:00:00Z',
+      can_manage: true,
+      is_owner: true,
+    };
+    const otherMembersDoc: SharedDocumentSummary = {
       doc_id: 'd-1',
       artifact_id: 'a-md-1',
       artifact_code: 'doccode12345',
-      workspace_id: 'ws-1',
+      workspace_id: 'ws-2',
       entry_path: 'notes/q4-memo.md',
       file_name: 'q4-memo.md',
       title: 'Q4 Memo',
@@ -510,7 +546,7 @@ describe('Monitors page (Checklist 8)', () => {
       owner_name: 'Bob',
       owner_email: 'bob@company.com',
       visibility: 'members',
-      member_user_ids: ['u-1'],
+      member_user_ids: ['local-user'],
       published_seq: 2,
       keep_updated: false,
       acl_revision: 1,
@@ -518,8 +554,36 @@ describe('Monitors page (Checklist 8)', () => {
       created_at: '2026-11-26T10:00:00Z',
       updated_at: '2026-11-27T08:30:00Z',
       can_manage: false,
+      is_owner: false,
     };
-    mockListSharedDocuments.mockResolvedValue([sharedDoc]);
+    const otherPublicDoc: SharedDocumentSummary = {
+      ...otherMembersDoc,
+      doc_id: 'd-2',
+      artifact_id: 'a-pdf-2',
+      artifact_code: 'pubcode12345',
+      entry_path: 'briefs/public.pdf',
+      file_name: 'public.pdf',
+      title: 'Public Brief',
+      owner_user_id: 'u-3',
+      owner_name: 'Carol',
+      visibility: 'public',
+      url: '/a/pubcode12345',
+    };
+
+    mockListSharedDocuments.mockResolvedValue([myDoc, otherMembersDoc, otherPublicDoc]);
+    mockUnshareArtifact.mockResolvedValue({
+      artifact_id: myDoc.artifact_id,
+      code: myDoc.artifact_code!,
+      workspace_id: 'ws-1',
+      path: myDoc.entry_path,
+      name: myDoc.file_name,
+      url: myDoc.url,
+      shared: false,
+      keep_updated: false,
+      latest_seq: 1,
+      shared_seq: 0,
+      created_at: myDoc.created_at,
+    } as never);
 
     const { unmount } = renderWithProviders(
       <Routes>
@@ -531,14 +595,48 @@ describe('Monitors page (Checklist 8)', () => {
     expect(await screen.findByText('HTML Dashboard')).toBeInTheDocument();
     expect(screen.queryByText('Legacy Markdown Entry')).not.toBeInTheDocument();
 
-    const docsSection = await screen.findByTestId('shared-documents-section');
-    expect(within(docsSection).getByText('q4-memo.md')).toBeInTheDocument();
-    expect(within(docsSection).getByText(/Bob/)).toBeInTheDocument();
-    expect(within(docsSection).getByText(/Updated:/i)).toBeInTheDocument();
-    expect(within(docsSection).getByRole('link', { name: /Open/i })).toHaveAttribute('href', '/a/doccode12345');
+    const byMeGroup = await screen.findByTestId('shared-documents-by-me');
+    expect(within(byMeGroup).getByText('my-outlook.md')).toBeInTheDocument();
+    expect(within(byMeGroup).getByText('Team')).toBeInTheDocument();
+    expect(within(byMeGroup).getByText(/Alice/)).toBeInTheDocument();
+    expect(within(byMeGroup).getByText(/Updated:/i)).toBeInTheDocument();
+    expect(within(byMeGroup).getByRole('link', { name: /Open/i })).toHaveAttribute('href', '/a/mycode123456');
+    const stopBtn = within(byMeGroup).getByRole('button', { name: /Stop sharing/i });
+
+    const withMeGroup = await screen.findByTestId('shared-documents-with-me');
+    expect(within(withMeGroup).getByText('q4-memo.md')).toBeInTheDocument();
+    expect(within(withMeGroup).getByText('Selected colleagues')).toBeInTheDocument();
+    expect(within(withMeGroup).getByText(/Bob/)).toBeInTheDocument();
+    expect(within(withMeGroup).getByText('public.pdf')).toBeInTheDocument();
+    expect(within(withMeGroup).getByText('Public link')).toBeInTheDocument();
+    expect(within(withMeGroup).getByText(/Carol/)).toBeInTheDocument();
+    expect(within(withMeGroup).queryByRole('button', { name: /Stop sharing/i })).toBeNull();
+
+    // Clicking Stop sharing opens confirmation dialog; confirming calls unshareArtifact and removes the item.
+    mockListSharedDocuments.mockResolvedValue([otherMembersDoc, otherPublicDoc]);
+    await user.click(stopBtn);
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText(/my-outlook\.md/)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole('button', { name: /Stop sharing/i }));
+
+    await waitFor(() => expect(mockUnshareArtifact).toHaveBeenCalledWith('a-md-mine'));
+    await waitFor(() => expect(screen.queryByTestId('shared-documents-by-me')).toBeNull());
+    expect(screen.getByTestId('shared-documents-with-me')).toBeInTheDocument();
     unmount();
 
-    // When there are no authorized shared documents, the section stays hidden.
+    // When only Shared by me is present, Shared with me is hidden.
+    mockListSharedDocuments.mockResolvedValue([myDoc]);
+    const onlyMine = renderWithProviders(
+      <Routes>
+        <Route path="/monitors" element={<Monitors />} />
+      </Routes>,
+      { route: '/monitors' },
+    );
+    expect(await screen.findByTestId('shared-documents-by-me')).toBeInTheDocument();
+    expect(screen.queryByTestId('shared-documents-with-me')).toBeNull();
+    onlyMine.unmount();
+
+    // When both groups are empty, the entire shared-documents section stays hidden.
     mockListSharedDocuments.mockResolvedValue([]);
     renderWithProviders(
       <Routes>
@@ -548,5 +646,77 @@ describe('Monitors page (Checklist 8)', () => {
     );
     expect(await screen.findByText('HTML Dashboard')).toBeInTheDocument();
     expect(screen.queryByTestId('shared-documents-section')).toBeNull();
+  });
+
+  it('renders a legacy Markdown monitor using Markdown viewer with raw toggle instead of raw iframe', async () => {
+    const user = userEvent.setup();
+    const mdBody = [
+      '# Earnings Recap',
+      '',
+      'Summary with **strong growth**.',
+      '',
+      '| Metric | Value |',
+      '| --- | --- |',
+      '| Revenue | $10B |',
+      '',
+      '<script>window.__mdMonitorXss = true;</script>',
+    ].join('\n');
+
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'text/markdown; charset=utf-8' }),
+      text: async () => mdBody,
+      blob: async () => new Blob([mdBody], { type: 'text/markdown' }),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      mockGetMonitorDetail.mockResolvedValue(
+        makeDetail({
+          monitor: makeSummary({
+            slug: 'legacy-recap',
+            title: 'Earnings Recap',
+            entry_path: 'notes/recap.md',
+            published_seq: 1,
+          }),
+          versions: [
+            {
+              seq: 1,
+              entry_path: 'notes/recap.md',
+              origin: 'owner',
+              title: 'Earnings Recap',
+              label: null,
+              byte_len: mdBody.length,
+              published_at: '2026-11-27T08:00:00Z',
+            },
+          ],
+        }),
+      );
+
+      renderWithProviders(
+        <Routes>
+          <Route path="/monitors/:slug" element={<Monitors />} />
+        </Routes>,
+        { route: '/monitors/legacy-recap' },
+      );
+
+      const bold = await screen.findByText('strong growth', {}, { timeout: 5000 });
+      expect(bold.tagName).toBe('STRONG');
+      expect(screen.queryByTestId('bridged-frame')).toBeNull();
+      const host = document.querySelector('.monitors-frame-host') as HTMLElement;
+      expect(within(host).getByRole('heading', { level: 1, name: 'Earnings Recap' })).toBeInTheDocument();
+      expect(within(host).getByRole('table')).toBeInTheDocument();
+      expect(document.querySelector('script')).toBeNull();
+      expect((window as unknown as Record<string, unknown>).__mdMonitorXss).toBeUndefined();
+
+      // Switch to raw Markdown view and back.
+      await user.click(screen.getByRole('button', { name: /View raw/i }));
+      expect(await screen.findByText(/\*\*strong growth\*\*/)).toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: /View rendered/i }));
+      expect((await screen.findByText('strong growth')).tagName).toBe('STRONG');
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
