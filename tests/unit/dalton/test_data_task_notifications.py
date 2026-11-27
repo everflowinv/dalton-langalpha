@@ -5742,3 +5742,479 @@ def test_continuation_heading_fingerprint_parity_with_font_tags_and_bold_boundar
     )
 
 
+def test_feishu_credentials_endpoint_live_vault_rotation_and_env_saved_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/feishu-credentials resolves via resolve_feishu_app_credentials() across Vault, env, and saved sources."""
+    from src.dalton.deployment_credentials import get_credential_group
+    from src.dalton.deployment_credentials.snapshot import (
+        build_snapshot,
+        reset_active_snapshot_for_test,
+        set_active_snapshot,
+    )
+    from src.dalton.services import channel_vault_credentials as vault_creds_mod
+    from src.server.services.setup_settings import environment as setup_env
+    from src.server.services.setup_settings.catalog import key_specs
+
+    pm_uid = "pm-vault-rotation-test-001"
+    monkeypatch.setenv("DALTON_ENABLED", "1")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    monkeypatch.setenv("DALTON_PM_USER_IDS", pm_uid)
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", SERVICE_TOKEN)
+    monkeypatch.setenv("DALTON_CAP_CHANNEL_GATEWAY", "true")
+    monkeypatch.setenv("DALTON_CAP_CHANNEL_FEISHU", "true")
+    monkeypatch.delenv("DALTON_FEISHU_APP_ID", raising=False)
+    monkeypatch.delenv("DALTON_FEISHU_APP_SECRET", raising=False)
+    monkeypatch.setattr(setup_env, "_at_start", None)
+    key_specs.cache_clear()
+    reset_active_snapshot_for_test()
+
+    app = FastAPI()
+    app.include_router(dalton_router)
+    client = TestClient(app)
+    endpoint = "/api/v1/dalton/channels/internal/data-task-notifications/feishu-credentials"
+    headers = {"X-Service-Token": SERVICE_TOKEN}
+
+    try:
+        # 1. Vault source: stale secret cached in worker snapshot, Vault rotated to new secret ->
+        #    endpoint reads Vault live, returns new secret, and updates worker snapshot slot.
+        old_secret = "test-secret-not-real-vault-old-001"
+        new_secret = "test-secret-not-real-vault-new-002"
+        set_active_snapshot(
+            build_snapshot(
+                2,
+                {},
+                feishu_vault_pair={
+                    "DALTON_FEISHU_APP_ID": "cli_vault_old",
+                    "DALTON_FEISHU_APP_SECRET": old_secret,
+                },
+            )
+        )
+        monkeypatch.setattr(
+            vault_creds_mod,
+            "get_user_secrets_decrypted",
+            create_autospec(
+                vault_creds_mod.get_user_secrets_decrypted,
+                return_value={
+                    "DALTON_FEISHU_APP_ID": "cli_vault_new",
+                    "DALTON_FEISHU_APP_SECRET": new_secret,
+                },
+            ),
+        )
+        res_vault = client.post(endpoint, headers=headers, json={})
+        assert res_vault.status_code == 200
+        assert res_vault.headers.get("cache-control") == "no-store"
+        assert res_vault.json() == {
+            "credentials": {
+                "DALTON_FEISHU_APP_ID": "cli_vault_new",
+                "DALTON_FEISHU_APP_SECRET": new_secret,
+            }
+        }
+        # Worker snapshot Vault slot was updated atomically.
+        slot = get_credential_group("feishu_app")
+        assert slot.source == "vault_readonly"
+        assert slot.values["DALTON_FEISHU_APP_ID"] == "cli_vault_new"
+        assert slot.values["DALTON_FEISHU_APP_SECRET"] == new_secret
+
+        # 2. Saved source: complete pair returns 200; half pair returns 503 with missing list
+        saved_secret = "test-secret-not-real-saved-003"
+        set_active_snapshot(
+            build_snapshot(
+                3,
+                {
+                    "DALTON_FEISHU_APP_ID": "cli_saved_ok",
+                    "DALTON_FEISHU_APP_SECRET": saved_secret,
+                },
+            )
+        )
+        res_saved = client.post(endpoint, headers=headers, json={})
+        assert res_saved.status_code == 200
+        assert res_saved.headers.get("cache-control") == "no-store"
+        assert res_saved.json() == {
+            "credentials": {
+                "DALTON_FEISHU_APP_ID": "cli_saved_ok",
+                "DALTON_FEISHU_APP_SECRET": saved_secret,
+            }
+        }
+
+        set_active_snapshot(build_snapshot(4, {"DALTON_FEISHU_APP_ID": "cli_saved_half"}))
+        res_saved_half = client.post(endpoint, headers=headers, json={})
+        assert res_saved_half.status_code == 503
+        assert res_saved_half.headers.get("cache-control") == "no-store"
+        assert res_saved_half.json()["code"] == "saved_credentials_missing"
+        assert res_saved_half.json()["missing"] == ["DALTON_FEISHU_APP_SECRET"]
+        assert "cli_saved_half" not in res_saved_half.text
+
+        # 3. Env source: complete pair returns 200; invalid format returns 503 with missing/invalid key
+        env_secret = "test-secret-not-real-env-004"
+        monkeypatch.setenv("DALTON_FEISHU_APP_ID", "cli_env_ok")
+        monkeypatch.setenv("DALTON_FEISHU_APP_SECRET", env_secret)
+        monkeypatch.setattr(setup_env, "_at_start", None)
+        res_env = client.post(endpoint, headers=headers, json={})
+        assert res_env.status_code == 200
+        assert res_env.headers.get("cache-control") == "no-store"
+        assert res_env.json() == {
+            "credentials": {
+                "DALTON_FEISHU_APP_ID": "cli_env_ok",
+                "DALTON_FEISHU_APP_SECRET": env_secret,
+            }
+        }
+
+        monkeypatch.setenv("DALTON_FEISHU_APP_SECRET", "bad secret with space")
+        monkeypatch.setattr(setup_env, "_at_start", None)
+        res_env_bad = client.post(endpoint, headers=headers, json={})
+        assert res_env_bad.status_code == 503
+        assert res_env_bad.headers.get("cache-control") == "no-store"
+        assert res_env_bad.json()["code"] == "env_credentials_invalid"
+        assert res_env_bad.json()["missing"] == ["DALTON_FEISHU_APP_SECRET"]
+        assert "bad secret with space" not in res_env_bad.text
+    finally:
+        reset_active_snapshot_for_test()
+        key_specs.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_feishu_credentials_endpoint_concurrent_vault_rotation_and_error_code_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Concurrent /feishu-credentials reads return rotated Vault secrets and preserve exact error codes."""
+    import logging
+
+    from src.dalton.deployment_credentials import get_credential_group
+    from src.dalton.deployment_credentials.snapshot import (
+        build_snapshot,
+        reset_active_snapshot_for_test,
+        set_active_snapshot,
+    )
+    from src.dalton.services import channel_vault_credentials as vault_creds_mod
+    from src.server.services.setup_settings import environment as setup_env
+    from src.server.services.setup_settings.catalog import key_specs
+
+    pm_uid = "pm-vault-concurrent-r3-001"
+    monkeypatch.setenv("DALTON_ENABLED", "1")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    monkeypatch.setenv("DALTON_PM_USER_IDS", pm_uid)
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", SERVICE_TOKEN)
+    monkeypatch.setenv("DALTON_CAP_CHANNEL_GATEWAY", "true")
+    monkeypatch.setenv("DALTON_CAP_CHANNEL_FEISHU", "true")
+    monkeypatch.delenv("DALTON_FEISHU_APP_ID", raising=False)
+    monkeypatch.delenv("DALTON_FEISHU_APP_SECRET", raising=False)
+    monkeypatch.setattr(setup_env, "_at_start", None)
+    key_specs.cache_clear()
+    reset_active_snapshot_for_test()
+
+    app = FastAPI()
+    app.include_router(dalton_router)
+    endpoint = "/api/v1/dalton/channels/internal/data-task-notifications/feishu-credentials"
+    headers = {"X-Service-Token": SERVICE_TOKEN}
+
+    old_secret = "test-secret-not-real-concurrent-old-01"
+    new_secret = "test-secret-not-real-concurrent-new-02"
+    invalid_secret = "test-secret-not-real bad-space-03"
+    orig_get_secrets = vault_creds_mod.get_user_secrets_decrypted
+
+    try:
+        # 1. Two concurrent requests start from the same snapshot; Vault rotates before request 2 finishes.
+        set_active_snapshot(build_snapshot(1, {}))
+        first_entered = asyncio.Event()
+        both_started = asyncio.Event()
+        release_second = asyncio.Event()
+        rot_calls = 0
+
+        async def _get_secrets_rotation(
+            user_id: str, names: Any = None
+        ) -> dict[str, str]:
+            _ = (user_id, names)
+            nonlocal rot_calls
+            rot_calls += 1
+            idx = rot_calls
+            if idx == 1:
+                first_entered.set()
+                await both_started.wait()
+                return {
+                    "DALTON_FEISHU_APP_ID": "cli_old_conc",
+                    "DALTON_FEISHU_APP_SECRET": old_secret,
+                }
+            if idx == 2:
+                both_started.set()
+                await release_second.wait()
+                return {
+                    "DALTON_FEISHU_APP_ID": "cli_new_conc",
+                    "DALTON_FEISHU_APP_SECRET": new_secret,
+                }
+            return {
+                "DALTON_FEISHU_APP_ID": "cli_new_conc",
+                "DALTON_FEISHU_APP_SECRET": new_secret,
+            }
+
+        monkeypatch.setattr(
+            vault_creds_mod,
+            "get_user_secrets_decrypted",
+            create_autospec(
+                orig_get_secrets,
+                side_effect=_get_secrets_rotation,
+            ),
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as async_client:
+            req1 = asyncio.create_task(
+                async_client.post(endpoint, headers=headers, json={})
+            )
+            await first_entered.wait()
+            req2 = asyncio.create_task(
+                async_client.post(endpoint, headers=headers, json={})
+            )
+            res1 = await req1
+            assert res1.status_code == 200
+            assert res1.json()["credentials"]["DALTON_FEISHU_APP_SECRET"] == old_secret
+
+            release_second.set()
+            res2 = await req2
+            assert res2.status_code == 200
+            assert res2.json()["credentials"] == {
+                "DALTON_FEISHU_APP_ID": "cli_new_conc",
+                "DALTON_FEISHU_APP_SECRET": new_secret,
+            }
+            assert get_credential_group("feishu_app").values["DALTON_FEISHU_APP_SECRET"] == new_secret
+
+            # 2. Two concurrent requests hitting invalid Vault credentials both preserve
+            #    exact `vault_credentials_invalid` (never downgraded to `vault_unavailable`).
+            set_active_snapshot(build_snapshot(2, {}))
+            err_first_entered = asyncio.Event()
+            err_both_started = asyncio.Event()
+            err_release_second = asyncio.Event()
+            err_calls = 0
+
+            async def _get_secrets_invalid(
+                user_id: str, names: Any = None
+            ) -> dict[str, str]:
+                _ = (user_id, names)
+                nonlocal err_calls
+                err_calls += 1
+                idx = err_calls
+                if idx == 1:
+                    err_first_entered.set()
+                    await err_both_started.wait()
+                elif idx == 2:
+                    err_both_started.set()
+                    await err_release_second.wait()
+                return {
+                    "DALTON_FEISHU_APP_ID": "cli_invalid_conc",
+                    "DALTON_FEISHU_APP_SECRET": invalid_secret,
+                }
+
+            monkeypatch.setattr(
+                vault_creds_mod,
+                "get_user_secrets_decrypted",
+                create_autospec(
+                    orig_get_secrets,
+                    side_effect=_get_secrets_invalid,
+                ),
+            )
+
+            with caplog.at_level(logging.DEBUG):
+                err_req1 = asyncio.create_task(
+                    async_client.post(endpoint, headers=headers, json={})
+                )
+                await err_first_entered.wait()
+                err_req2 = asyncio.create_task(
+                    async_client.post(endpoint, headers=headers, json={})
+                )
+                err_res1 = await err_req1
+                err_release_second.set()
+                err_res2 = await err_req2
+
+            for resp in (err_res1, err_res2):
+                assert resp.status_code == 503
+                assert resp.headers.get("cache-control") == "no-store"
+                body = resp.json()
+                assert body["code"] == "vault_credentials_invalid"
+                assert body["missing"] == ["DALTON_FEISHU_APP_SECRET"]
+                assert invalid_secret not in resp.text
+
+            # 3. Even if a background refresh advances the snapshot during both awaits,
+            #    the request preserves its own `vault_credentials_invalid` error code.
+            set_active_snapshot(build_snapshot(3, {}))
+            bg_rev = 3
+
+            async def _get_secrets_invalid_with_bg_swap(
+                user_id: str, names: Any = None
+            ) -> dict[str, str]:
+                _ = (user_id, names)
+                nonlocal bg_rev
+                bg_rev += 1
+                set_active_snapshot(build_snapshot(bg_rev, {}, feishu_vault_error=True))
+                return {
+                    "DALTON_FEISHU_APP_ID": "cli_invalid_bg",
+                    "DALTON_FEISHU_APP_SECRET": invalid_secret,
+                }
+
+            monkeypatch.setattr(
+                vault_creds_mod,
+                "get_user_secrets_decrypted",
+                create_autospec(
+                    orig_get_secrets,
+                    side_effect=_get_secrets_invalid_with_bg_swap,
+                ),
+            )
+
+            with caplog.at_level(logging.DEBUG):
+                bg_resp = await async_client.post(endpoint, headers=headers, json={})
+            assert bg_resp.status_code == 503
+            assert bg_resp.json()["code"] == "vault_credentials_invalid"
+            assert bg_resp.json()["missing"] == ["DALTON_FEISHU_APP_SECRET"]
+            assert invalid_secret not in bg_resp.text
+            assert old_secret not in caplog.text
+            assert new_secret not in caplog.text
+            assert invalid_secret not in caplog.text
+    finally:
+        reset_active_snapshot_for_test()
+        key_specs.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_feishu_credentials_endpoint_second_query_rotation_returns_new_credentials_and_revision(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When Vault rotates again during the 2nd query, /feishu-credentials returns the new credentials and revision."""
+    import logging
+
+    from src.dalton.deployment_credentials import get_credential_group
+    from src.dalton.deployment_credentials.snapshot import (
+        build_snapshot,
+        reset_active_snapshot_for_test,
+        set_active_snapshot,
+    )
+    from src.dalton.services import channel_vault_credentials as vault_creds_mod
+    from src.server.services.setup_settings import environment as setup_env
+    from src.server.services.setup_settings.catalog import key_specs
+
+    pm_uid = "pm-vault-second-rot-r4-001"
+    monkeypatch.setenv("DALTON_ENABLED", "1")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    monkeypatch.setenv("DALTON_PM_USER_IDS", pm_uid)
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", SERVICE_TOKEN)
+    monkeypatch.setenv("DALTON_CAP_CHANNEL_GATEWAY", "true")
+    monkeypatch.setenv("DALTON_CAP_CHANNEL_FEISHU", "true")
+    monkeypatch.delenv("DALTON_FEISHU_APP_ID", raising=False)
+    monkeypatch.delenv("DALTON_FEISHU_APP_SECRET", raising=False)
+    monkeypatch.setattr(setup_env, "_at_start", None)
+    key_specs.cache_clear()
+    reset_active_snapshot_for_test()
+
+    app = FastAPI()
+    app.include_router(dalton_router)
+    endpoint = "/api/v1/dalton/channels/internal/data-task-notifications/feishu-credentials"
+    headers = {"X-Service-Token": SERVICE_TOKEN}
+
+    old_secret = "test-secret-not-real-2ndrot-old-01"
+    rotated_secret = "test-secret-not-real-2ndrot-rot-02"
+    newest_secret = "test-secret-not-real-2ndrot-new-03"
+    old_pair = {
+        "DALTON_FEISHU_APP_ID": "cli_2ndrot_old",
+        "DALTON_FEISHU_APP_SECRET": old_secret,
+    }
+    rotated_pair = {
+        "DALTON_FEISHU_APP_ID": "cli_2ndrot_rotated",
+        "DALTON_FEISHU_APP_SECRET": rotated_secret,
+    }
+    newest_pair = {
+        "DALTON_FEISHU_APP_ID": "cli_2ndrot_newest",
+        "DALTON_FEISHU_APP_SECRET": newest_secret,
+    }
+    orig_get_secrets = vault_creds_mod.get_user_secrets_decrypted
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as async_client:
+            # 1. Rotation happens during the 2nd Vault query; 3rd query adopts rotated credentials + rev 12.
+            set_active_snapshot(build_snapshot(10, {}))
+            calls_rot2 = 0
+
+            async def _get_secrets_rotates_on_second(
+                user_id: str, names: Any = None
+            ) -> dict[str, str]:
+                _ = (user_id, names)
+                nonlocal calls_rot2
+                calls_rot2 += 1
+                if calls_rot2 == 1:
+                    set_active_snapshot(build_snapshot(11, {}, feishu_vault_pair=old_pair))
+                    return dict(old_pair)
+                if calls_rot2 == 2:
+                    set_active_snapshot(build_snapshot(12, {}, feishu_vault_pair=rotated_pair))
+                    return dict(old_pair)
+                return dict(rotated_pair)
+
+            monkeypatch.setattr(
+                vault_creds_mod,
+                "get_user_secrets_decrypted",
+                create_autospec(
+                    orig_get_secrets,
+                    side_effect=_get_secrets_rotates_on_second,
+                ),
+            )
+
+            with caplog.at_level(logging.DEBUG):
+                res_rot2 = await async_client.post(endpoint, headers=headers, json={})
+
+            assert res_rot2.status_code == 200
+            assert res_rot2.headers.get("cache-control") == "no-store"
+            assert res_rot2.json()["credentials"] == rotated_pair
+            assert calls_rot2 == 3
+            snap_after_rot2 = get_credential_group("feishu_app")
+            assert snap_after_rot2.revision == 12
+            assert dict(snap_after_rot2.values) == rotated_pair
+
+            # 2. Rotation persists across all 3 queries (initial + 2 re-queries): slot write is rejected
+            #    and endpoint returns the current snapshot's newest credentials + rev 23 instead of stale values.
+            set_active_snapshot(build_snapshot(20, {}))
+            calls_cap = 0
+
+            async def _get_secrets_always_stale(
+                user_id: str, names: Any = None
+            ) -> dict[str, str]:
+                _ = (user_id, names)
+                nonlocal calls_cap
+                calls_cap += 1
+                if calls_cap == 1:
+                    set_active_snapshot(build_snapshot(21, {}, feishu_vault_pair=old_pair))
+                elif calls_cap == 2:
+                    set_active_snapshot(build_snapshot(22, {}, feishu_vault_pair=rotated_pair))
+                else:
+                    set_active_snapshot(build_snapshot(23, {}, feishu_vault_pair=newest_pair))
+                return dict(old_pair)
+
+            monkeypatch.setattr(
+                vault_creds_mod,
+                "get_user_secrets_decrypted",
+                create_autospec(
+                    orig_get_secrets,
+                    side_effect=_get_secrets_always_stale,
+                ),
+            )
+
+            with caplog.at_level(logging.DEBUG):
+                res_cap = await async_client.post(endpoint, headers=headers, json={})
+
+            assert res_cap.status_code == 200
+            assert res_cap.headers.get("cache-control") == "no-store"
+            assert res_cap.json()["credentials"] == newest_pair
+            assert calls_cap == 3
+            snap_after_cap = get_credential_group("feishu_app")
+            assert snap_after_cap.revision == 23
+            assert dict(snap_after_cap.values) == newest_pair
+
+            for secret in (old_secret, rotated_secret, newest_secret):
+                assert secret not in caplog.text
+    finally:
+        reset_active_snapshot_for_test()
+        key_specs.cache_clear()
+
+

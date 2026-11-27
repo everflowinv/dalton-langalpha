@@ -43,6 +43,14 @@ def _daemon(up: bool):
 
 
 class TestAllowlist:
+    # DALTON-HOOK(deployment-credentials): pin upstream non-Dalton allowlist contract
+    @pytest.fixture(autouse=True)
+    def _upstream_non_dalton(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DALTON_ENABLED", "0")
+        key_specs.cache_clear()
+        yield
+        key_specs.cache_clear()
+
     def test_holds_every_manifest_key_and_the_named_vendors(self):
         manifest = Path("src/tools/manifest/web_providers.json")
         web = {
@@ -304,6 +312,11 @@ class TestOfferedProviders:
 class TestRefresh:
     """A refresh builds the config anew and swaps it in whole."""
 
+    # DALTON-HOOK(deployment-credentials): pin upstream non-Dalton refresh contract
+    @pytest.fixture(autouse=True)
+    def _upstream_non_dalton(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DALTON_ENABLED", "0")
+
     @pytest.fixture(autouse=True)
     def no_daemon(self):
         with _daemon(False):
@@ -512,3 +525,303 @@ class TestWebDist:
 
         roots = {getattr(r, "path", "").strip("/").split("/", 1)[0] for r in app.routes}
         assert roots - {""} <= web_dist._BACKEND_ROOTS
+
+
+# DALTON-HOOK(deployment-credentials): Batch 1 Dalton setup_settings hooks & snapshot tests
+class TestDaltonDeploymentSettingsHooks:
+    @pytest.fixture(autouse=True)
+    def _dalton_mode(self, monkeypatch: pytest.MonkeyPatch):
+        from src.dalton.deployment_credentials.snapshot import reset_active_snapshot_for_test
+
+        monkeypatch.setenv("DALTON_ENABLED", "1")
+        monkeypatch.setattr(apply, "_unapplied", set())
+        key_specs.cache_clear()
+        reset_active_snapshot_for_test()
+        yield
+        reset_active_snapshot_for_test()
+        monkeypatch.setattr(apply, "_unapplied", set())
+        key_specs.cache_clear()
+
+    def test_setup_routes_stay_closed_while_loads_saved_settings_and_autodetect_false_hold(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.server.services import setup_settings
+
+        monkeypatch.setenv("HOST_MODE", "oss")
+        assert setup_settings.self_hosted() is False
+        assert setup_settings.loads_saved_settings() is True
+        assert setup_settings.autodetect_sandbox() is False
+
+    def test_key_specs_merge_dedup_and_precede_first_take_snapshot_without_reentry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.deployment_credentials import catalog as dc_catalog
+        from src.dalton.deployment_credentials.catalog import (
+            BATCH1_FIELD_SPECS,
+            DaltonDeploymentFieldSpec,
+            GOOGLE_OAUTH_CLIENT_ID_KEY,
+        )
+
+        # Register a duplicate FMP_API_KEY alongside Batch 1 specs to verify order-preserving dedup.
+        dup_spec = DaltonDeploymentFieldSpec(
+            name="FMP_API_KEY",
+            group="data",
+            provider="fmp_dup",
+            section="market_sec",
+            label_zh="FMP",
+            label_en="FMP",
+            secret=True,
+        )
+        monkeypatch.setattr(dc_catalog, "_ACTIVE_FIELD_SPECS", (*BATCH1_FIELD_SPECS, dup_spec))
+        key_specs.cache_clear()
+        monkeypatch.setenv(GOOGLE_OAUTH_CLIENT_ID_KEY, "env-google-client-id")
+        monkeypatch.setattr(environment, "_at_start", None)
+
+        # take_snapshot() calls key_specs() internally on first use without lru_cache re-entry.
+        environment.take_snapshot()
+        specs = key_specs()
+        names = [s.name for s in specs]
+        assert len(names) == len(set(names))
+        assert names.count("FMP_API_KEY") == 1
+        assert GOOGLE_OAUTH_CLIENT_ID_KEY in names
+        assert environment.set_outside_app(GOOGLE_OAUTH_CLIENT_ID_KEY) is True
+
+    @pytest.mark.asyncio
+    async def test_load_at_boot_handles_empty_valid_and_unregistered_rows_with_autodetect_false(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from unittest.mock import create_autospec
+
+        from src.dalton.deployment_credentials import get_credential_group, hooks, snapshot, store
+
+        monkeypatch.setattr(
+            snapshot,
+            "query_feishu_vault_pair_strict",
+            create_autospec(
+                snapshot.query_feishu_vault_pair_strict,
+                return_value=(None, False, None),
+            ),
+        )
+
+        # 1. Empty table
+        monkeypatch.setattr(
+            hooks,
+            "read_settings_snapshot",
+            create_autospec(store.read_settings_snapshot, return_value=(0, {})),
+        )
+        reading = await apply.load_at_boot()
+        assert reading.autodetect is False
+        assert get_credential_group("google_oauth").source == "unset"
+
+        # 2. Valid saved rows + unregistered residual key (unregistered key must stay out of os.environ)
+        saved_rows = {
+            "DALTON_GOOGLE_OAUTH_CLIENT_ID": "g-client-id-saved",
+            "DALTON_GOOGLE_OAUTH_CLIENT_SECRET": "test-secret-not-real-boot-0001",
+            "UNREGISTERED_RESIDUAL_KEY": "should-not-export",
+        }
+        monkeypatch.setattr(
+            hooks,
+            "read_settings_snapshot",
+            create_autospec(store.read_settings_snapshot, return_value=(3, saved_rows)),
+        )
+        reading2 = await apply.load_at_boot()
+        assert reading2.autodetect is False
+        assert os.environ.get("DALTON_GOOGLE_OAUTH_CLIENT_ID") == "g-client-id-saved"
+        assert "UNREGISTERED_RESIDUAL_KEY" not in os.environ
+        g_res = get_credential_group("google_oauth")
+        assert g_res.source == "saved"
+        assert g_res.revision == 3
+        assert g_res.ready is True
+
+        # 3. Boot failure fallback keeps autodetect=False
+        monkeypatch.setattr(
+            hooks,
+            "read_settings_snapshot",
+            create_autospec(store.read_settings_snapshot, side_effect=RuntimeError("db down")),
+        )
+        reading_err = await apply.load_at_boot()
+        assert reading_err.autodetect is False
+
+    @pytest.mark.asyncio
+    async def test_core_empty_db_owner_unconfigured_and_vault_missing_apply_immediately(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from unittest.mock import create_autospec
+
+        from src.dalton import access_tiers
+        from src.dalton.deployment_credentials import get_credential_group, hooks, store
+        from src.dalton.services import channel_vault_credentials as vault_creds_mod
+
+        monkeypatch.setenv("DALTON_PROFILE", "core")
+        monkeypatch.setenv("DALTON_AUTH_MODE", "local")
+
+        # Case A: no primary admin (owner_unconfigured) -> feishu_vault_error=False, source=unset
+        orig_strict_admin = access_tiers.get_primary_admin_user_id_strict
+        monkeypatch.setattr(
+            access_tiers,
+            "get_primary_admin_user_id_strict",
+            create_autospec(orig_strict_admin, return_value=None),
+        )
+        monkeypatch.setattr(
+            hooks,
+            "read_settings_snapshot",
+            create_autospec(
+                store.read_settings_snapshot,
+                return_value=(
+                    1,
+                    {
+                        "DALTON_GOOGLE_OAUTH_CLIENT_ID": "core-g-id",
+                        "DALTON_GOOGLE_OAUTH_CLIENT_SECRET": "test-secret-not-real-core-0001",
+                    },
+                ),
+            ),
+        )
+        monkeypatch.setattr(apply, "_current_config", lambda: None)
+        await apply.refresh()
+        assert get_credential_group("google_oauth").ready is True
+        assert get_credential_group("feishu_app").source == "unset"
+
+        # Case B: admin exists, Vault has no Feishu pair -> vault_credentials_missing -> source=unset
+        monkeypatch.setattr(
+            access_tiers,
+            "get_primary_admin_user_id_strict",
+            create_autospec(orig_strict_admin, return_value="admin-1"),
+        )
+        monkeypatch.setattr(
+            vault_creds_mod,
+            "get_user_secrets_decrypted",
+            create_autospec(vault_creds_mod.get_user_secrets_decrypted, return_value={}),
+        )
+        await apply.refresh()
+        assert get_credential_group("feishu_app").source == "unset"
+        assert get_credential_group("feishu_app").ready is False
+
+    @pytest.mark.asyncio
+    async def test_strict_admin_db_error_maps_to_vault_error_without_blocking_other_groups(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from unittest.mock import create_autospec
+
+        from src.dalton import access_tiers
+        from src.dalton.deployment_credentials import get_credential_group, hooks, store
+
+        monkeypatch.setenv("DALTON_AUTH_MODE", "local")
+        monkeypatch.setattr(
+            access_tiers,
+            "get_primary_admin_user_id_strict",
+            create_autospec(
+                access_tiers.get_primary_admin_user_id_strict,
+                side_effect=RuntimeError("pg role table unreachable"),
+            ),
+        )
+        monkeypatch.setattr(
+            hooks,
+            "read_settings_snapshot",
+            create_autospec(
+                store.read_settings_snapshot,
+                return_value=(
+                    5,
+                    {
+                        "DALTON_GOOGLE_OAUTH_CLIENT_ID": "g-ok-id",
+                        "DALTON_GOOGLE_OAUTH_CLIENT_SECRET": "test-secret-not-real-ok-0002",
+                        "DALTON_FEISHU_VERIFICATION_TOKEN": "test-secret-not-real-vt-0003",
+                    },
+                ),
+            ),
+        )
+        monkeypatch.setattr(apply, "_current_config", lambda: None)
+        await apply.refresh()
+
+        feishu_res = get_credential_group("feishu_app")
+        assert feishu_res.source == "vault_error"
+        assert feishu_res.ready is False
+        assert feishu_res.values == {}
+
+        # Other groups remain completely unaffected.
+        assert get_credential_group("google_oauth").ready is True
+        assert get_credential_group("feishu_event").ready is True
+        assert os.environ.get("DALTON_GOOGLE_OAUTH_CLIENT_ID") == "g-ok-id"
+
+    @pytest.mark.asyncio
+    async def test_refresh_hook_error_retains_unapplied_keys_for_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from unittest.mock import create_autospec
+
+        from src.dalton.deployment_credentials import hooks, snapshot, store
+
+        monkeypatch.setattr(
+            snapshot,
+            "query_feishu_vault_pair_strict",
+            create_autospec(
+                snapshot.query_feishu_vault_pair_strict,
+                return_value=(None, False, None),
+            ),
+        )
+        rows = {
+            "DALTON_GOOGLE_OAUTH_CLIENT_ID": "retry-g-id",
+            "DALTON_GOOGLE_OAUTH_CLIENT_SECRET": "test-secret-not-real-retry-0004",
+        }
+        monkeypatch.setattr(
+            hooks,
+            "read_settings_snapshot",
+            create_autospec(store.read_settings_snapshot, return_value=(7, rows)),
+        )
+        monkeypatch.setattr(apply, "_current_config", lambda: None)
+
+        seen_changed: list[set[str]] = []
+
+        async def _flaky_hook(changed: set[str], _rows, _rev: int) -> None:
+            seen_changed.append(set(changed))
+            if len(seen_changed) == 1:
+                raise RuntimeError("transient hook error")
+
+        monkeypatch.setattr(
+            hooks,
+            "on_deployment_settings_refreshed",
+            create_autospec(hooks.on_deployment_settings_refreshed, side_effect=_flaky_hook),
+        )
+
+        with pytest.raises(RuntimeError, match="transient hook error"):
+            await apply.refresh()
+        assert "DALTON_GOOGLE_OAUTH_CLIENT_ID" in apply._unapplied
+
+        # Next refresh passes retained _unapplied keys and clears _unapplied on success.
+        await apply.refresh()
+        assert "DALTON_GOOGLE_OAUTH_CLIENT_ID" in seen_changed[1]
+        assert apply._unapplied == set()
+
+    @pytest.mark.asyncio
+    async def test_rebuild_config_passes_autodetect_false_under_dalton(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from unittest.mock import create_autospec
+
+        from ptc_agent.config import utils as ptc_utils
+        from ptc_agent.config.core import MCPConfig, SandboxConfig
+
+        captured: list[bool] = []
+        orig_create = ptc_utils.create_sandbox_config
+
+        def _spy_create(config_data, *, autodetect=True, in_reach=None):
+            captured.append(autodetect)
+            return SandboxConfig(provider="docker")
+
+        monkeypatch.setattr(
+            ptc_utils,
+            "create_sandbox_config",
+            create_autospec(orig_create, side_effect=_spy_create),
+        )
+        monkeypatch.setattr(
+            "ptc_agent.config.file_utils.load_agent_config",
+            lambda: {"sandbox": {}, "search_api": "tavily"},
+        )
+        from types import SimpleNamespace
+
+        cfg = SimpleNamespace(
+            sandbox=SandboxConfig(provider="docker"),
+            mcp=MCPConfig(servers=[], tool_discovery_enabled=False),
+            search_api="tavily",
+        )
+        await apply._rebuild_config(cfg, {}, set())
+        assert captured == [False]

@@ -900,6 +900,10 @@ class SessionLifecycleMixin:
 
                 await session.sandbox.ensure_sandbox_ready()
                 mark("sandbox_ready")
+                # DALTON-HOOK(deployment-credentials): scrub legacy Feishu Vault keys once per (computer_id, provider_ref) on ready
+                from src.dalton.deployment_credentials.sandbox_scrub import scrub_sandbox_on_ready
+
+                await scrub_sandbox_on_ready(binding, session)
 
                 # Resync before MCP/assets so warm and always-on sandboxes receive secret
                 # rollouts within one cooldown; the session stamp makes unchanged sync free.

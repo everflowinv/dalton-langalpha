@@ -564,6 +564,9 @@ ALLOWED_HOOKS=(
   # FOR SHARE dual-generation writeback fences (replay, search, transcripts), closed-range
   # search guard & truncate/fork clipping, startup purge resume, and callback query redaction.
   "personal-integrations"
+  # Deployment credentials Batch 1: setup_settings thin hooks, vault invalidation sync,
+  # and deployment secret redaction.
+  "deployment-credentials"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
