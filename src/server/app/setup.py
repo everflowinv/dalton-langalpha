@@ -782,9 +782,12 @@ async def lifespan(app: FastAPI):
             logger.warning(f"Failed to start {name}: {e}")
 
     # DALTON-HOOK(redis-write-diag): start per-worker Redis diagnostics flush & PG leader sampler
-    from src.dalton.observability.redis_diagnostics import RedisDiagnosticsService
+    try:
+        from src.dalton.observability.redis_diagnostics import RedisDiagnosticsService
 
-    RedisDiagnosticsService.get_instance().start()
+        RedisDiagnosticsService.get_instance().start()
+    except Exception as e:  # diagnostics must never block startup
+        logger.warning(f"Failed to start RedisDiagnosticsService: {e}")
 
     # Start MarketDataFeed (shared upstream WS to ginlix-data)
     try:
@@ -1168,9 +1171,12 @@ async def lifespan(app: FastAPI):
             logger.warning(f"Error stopping {name}: {e}")
 
     # DALTON-HOOK(redis-write-diag): stop per-worker Redis diagnostics & release PG leader lock
-    from src.dalton.observability.redis_diagnostics import RedisDiagnosticsService
+    try:
+        from src.dalton.observability.redis_diagnostics import RedisDiagnosticsService
 
-    await RedisDiagnosticsService.get_instance().stop()
+        await RedisDiagnosticsService.get_instance().stop()
+    except Exception as e:
+        logger.warning(f"Error stopping RedisDiagnosticsService: {e}")
 
     # 0.1. Shutdown ProvenanceGCService
     try:
