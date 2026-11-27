@@ -43,17 +43,21 @@ const _MODEL_DISK_PROBE_SCHEMA = {
   required: ['path', 'exists', 'readable'],
 }
 
-// Non-replayable live disk probe for full-coverage required worksheets (carries `path`, no `files`/`file`).
+// Non-replayable live disk probe for full-coverage required worksheets (carries `candidate_path`, no `files`/`file`).
+// Matches `model_check.py check-sheets` stdout JSON 1:1 so a child can return the script output verbatim.
 const _MODEL_SHEET_GATE_SCHEMA = {
   type: 'object',
   properties: {
-    path: { type: ['string', 'null'] },
+    candidate_path: { type: ['string', 'null'] },
     status: { type: 'string', enum: ['complete', 'missing', 'unverified'] },
+    readable: { type: 'boolean' },
+    workflow: { type: ['string', 'null'] },
+    mode: { type: ['string', 'null'] },
     sheet_names: { type: 'array', items: { type: 'string' } },
     missing_required_sheets: { type: 'array', items: { type: 'string' } },
     summary: { type: 'string', minLength: 1 },
   },
-  required: ['path', 'status', 'missing_required_sheets', 'summary'],
+  required: ['candidate_path', 'status', 'sheet_names', 'missing_required_sheets', 'summary'],
 }
 
 // Non-replayable live state query (no files/file field; journal.py never replays {run_id}-only queries).
@@ -158,15 +162,58 @@ const _MODEL_REV_EDIT_SCHEMA = {
   required: ['files', 'summary', 'changed', 'model_path'],
 }
 
-const _MODEL_REV_SYNC_SCHEMA = {
+const _MODEL_REV_DIFF_SCHEMA = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+    summary: { type: 'string', minLength: 1 },
+    consensus_diff_generated: { type: 'boolean' },
+  },
+  required: ['files', 'summary', 'consensus_diff_generated'],
+}
+
+const _MODEL_REV_REPORT_SYNC_SCHEMA = {
   type: 'object',
   properties: {
     files: { type: 'array', items: { type: 'string', minLength: 1 } },
     summary: { type: 'string', minLength: 1 },
     report_sha256: { type: ['string', 'null'] },
-    consensus_diff_generated: { type: 'boolean' },
   },
-  required: ['files', 'summary', 'consensus_diff_generated'],
+  required: ['files', 'summary'],
+}
+
+// Non-replayable live disk probe for consensus-diff.{json,md} bound to a specific model_sha256.
+const _MODEL_CONSENSUS_PROBE_SCHEMA = {
+  type: 'object',
+  properties: {
+    path: { type: ['string', 'null'] },
+    json_ok: { type: 'boolean' },
+    md_ok: { type: 'boolean' },
+    matched: { type: 'boolean' },
+  },
+  required: ['path', 'json_ok', 'md_ok', 'matched'],
+}
+
+// Non-replayable live disk probe for report sync & real report SHA-256 measurement.
+const _MODEL_REPORT_SYNC_PROBE_SCHEMA = {
+  type: 'object',
+  properties: {
+    path: { type: ['string', 'null'] },
+    exists: { type: 'boolean' },
+    synced: { type: 'boolean' },
+    report_sha256: { type: ['string', 'null'] },
+  },
+  required: ['path', 'exists', 'synced'],
+}
+
+function _mValidModelOutPath(p, baselinePath, workspaceDir) {
+  const norm = _mNormPath(p, workspaceDir)
+  if (!norm) return null
+  if (norm.startsWith('/') || norm.split('/').includes('..')) return null
+  if (!/\.xlsx$/i.test(norm)) return null
+  const normBase = _mNormPath(baselinePath, workspaceDir)
+  if (normBase && norm === normBase) return null
+  return norm
 }
 
 function _mNormPath(p, workspaceDir) {
@@ -282,6 +329,106 @@ async function _mProbeCandidateOnDisk(candidatePath, W, phaseTitle, label) {
   }
 }
 
+async function _mProbeConsensusOnDisk(consensusJsonPath, consensusMdPath, expectedModelSha, W, phaseTitle, label) {
+  const jNorm = _mNormPath(consensusJsonPath, W)
+  const mNorm = _mNormPath(consensusMdPath, W)
+  const wantSha = _mValidSha(expectedModelSha)
+  if (!jNorm || !mNorm || !wantSha) {
+    return { json_ok: false, md_ok: false, matched: false }
+  }
+  const pyCode = [
+    `import json, pathlib, sys`,
+    `jp, mp, sha = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3].lower()`,
+    `j_ok = False`,
+    `if jp.is_file() and jp.stat().st_size > 0:`,
+    `    try: j_ok = str(json.loads(jp.read_text(encoding='utf-8')).get('model_sha256') or '').lower() == sha`,
+    `    except Exception: j_ok = False`,
+    `m_ok = mp.is_file() and mp.stat().st_size > 0 and (sha[:12] in mp.read_text(encoding='utf-8', errors='replace').lower())`,
+    `print(json.dumps({'path': sys.argv[1], 'json_ok': j_ok, 'md_ok': m_ok, 'matched': bool(j_ok and m_ok)}))`,
+  ].join('\n')
+  const prompt = [
+    `只读核验一致预期差异产物 ${jNorm} 与 ${mNorm} 是否已按模型哈希 ${wantSha} 落盘（不修改任何文件）。`,
+    `在 Bash 执行：\n\`\`\`bash\npython3 - "${jNorm}" "${mNorm}" "${wantSha}" <<'PY'\n${pyCode}\nPY\n\`\`\`\n将输出 JSON 的 path、json_ok、md_ok、matched 原样回传。`,
+  ].join('\n')
+  const res = await _mSafeAgent(prompt, {
+    agentType: 'dalton-evidence',
+    label: label || '核验差异表落盘',
+    phase: phaseTitle || '核验差异表落盘',
+    schema: _MODEL_CONSENSUS_PROBE_SCHEMA,
+    checkFiles: false,
+  })
+  if (!res || typeof res !== 'object') {
+    return { json_ok: false, md_ok: false, matched: false }
+  }
+  return {
+    json_ok: Boolean(res.json_ok),
+    md_ok: Boolean(res.md_ok),
+    matched: Boolean(res.matched) && Boolean(res.json_ok) && Boolean(res.md_ok),
+  }
+}
+
+async function _mProbeReportSyncOnDisk(reportPath, nextModelPath, nextModelSha, extraSyncPaths, W, phaseTitle, label) {
+  const rNorm = _mNormPath(reportPath, W)
+  const mNorm = _mNormPath(nextModelPath, W)
+  const mSha = _mValidSha(nextModelSha) || ''
+  if (!rNorm || !mNorm) {
+    return { exists: false, synced: false, report_sha256: null }
+  }
+  const extras = (Array.isArray(extraSyncPaths) ? extraSyncPaths : [])
+    .map((p) => _mNormPath(p, W))
+    .filter(Boolean)
+  const pyCode = [
+    `import hashlib, json, pathlib, re, sys`,
+    `rp, mp, msha = pathlib.Path(sys.argv[1]), sys.argv[2].lstrip('./'), sys.argv[3].lower()`,
+    `extras = json.loads(sys.argv[4])`,
+    `ex = rp.is_file() and rp.stat().st_size > 0`,
+    `rsha = hashlib.sha256(rp.read_bytes()).hexdigest() if ex else None`,
+    `synced = False`,
+    `if ex:`,
+    `    txt = rp.read_text(encoding='utf-8', errors='replace')`,
+    `    refs = [r.lstrip('./') for r in re.findall(r'model:([^\\s!#]+\\.xlsx)[!#]', txt, re.I)]`,
+    `    report_ok = all(r == mp for r in refs) and (bool(refs) or (mp in txt) or bool(extras))`,
+    `    extras_ok = True`,
+    `    for ep_s in extras:`,
+    `        ep = pathlib.Path(ep_s)`,
+    `        if not ep.is_file() or ep.stat().st_size == 0:`,
+    `            extras_ok = False; break`,
+    `        if ep_s.lower().endswith('.json'):`,
+    `            try:`,
+    `                d = json.loads(ep.read_text(encoding='utf-8'))`,
+    `                if str(d.get('path') or '').lstrip('./') != mp or (msha and str(d.get('sha256') or '').lower() != msha):`,
+    `                    extras_ok = False; break`,
+    `            except Exception:`,
+    `                extras_ok = False; break`,
+    `        else:`,
+    `            etxt = ep.read_text(encoding='utf-8', errors='replace')`,
+    `            erefs = [r.lstrip('./') for r in re.findall(r'model:([^\\s!#]+\\.xlsx)[!#]', etxt, re.I)]`,
+    `            if any(r != mp for r in erefs) or (not erefs and mp not in etxt):`,
+    `                extras_ok = False; break`,
+    `    synced = bool(report_ok and extras_ok)`,
+    `print(json.dumps({'path': sys.argv[1], 'exists': ex, 'synced': synced, 'report_sha256': rsha}))`,
+  ].join('\n')
+  const prompt = [
+    `只读核验报告 ${rNorm}（及元数据 ${extras.length ? extras.join('、') : '无'}）是否已同步指向 ${mNorm} 并实测报告 SHA-256（不修改任何文件）。`,
+    `在 Bash 执行：\n\`\`\`bash\npython3 - "${rNorm}" "${mNorm}" "${mSha}" '${JSON.stringify(extras)}' <<'PY'\n${pyCode}\nPY\n\`\`\`\n将输出 JSON 的 path、exists、synced、report_sha256 原样回传。`,
+  ].join('\n')
+  const res = await _mSafeAgent(prompt, {
+    agentType: 'dalton-evidence',
+    label: label || '核验报告同步落盘',
+    phase: phaseTitle || '核验报告同步落盘',
+    schema: _MODEL_REPORT_SYNC_PROBE_SCHEMA,
+    checkFiles: false,
+  })
+  if (!res || typeof res !== 'object') {
+    return { exists: false, synced: false, report_sha256: null }
+  }
+  return {
+    exists: Boolean(res.exists),
+    synced: Boolean(res.exists) && Boolean(res.synced),
+    report_sha256: _mValidSha(res.report_sha256),
+  }
+}
+
 const _FC_BUILD_REQUIRED_SHEETS_JS = [
   'Cover',
   'Facts',
@@ -345,7 +492,7 @@ async function verifyFullCoverageSheetsOnDisk(ctx) {
   const prompt = [
     `只读独立核验完整覆盖候选模型 ${candidatePath} 的必需工作表（不修改任何文件，不依赖前序检查子任务回传）。`,
     `在 Bash 执行：\`python3 .agents/skills/dalton-model/scripts/model_check.py check-sheets --candidate "${candidatePath}" --workflow full-coverage --mode "${effMode}"\`。`,
-    `严格按脚本 JSON 输出回传：path（"${candidatePath}"）、status（complete / missing / unverified）、sheet_names（实际工作表名数组）、missing_required_sheets（缺表数组）、summary。`,
+    `将脚本输出的 JSON 原样回传（含 candidate_path、status、sheet_names、missing_required_sheets、summary）。`,
   ].join('\n')
 
   const probe = await _mSafeAgent(prompt, {
@@ -372,23 +519,33 @@ async function verifyFullCoverageSheetsOnDisk(ctx) {
     : []
   const jsMissing = sheetNames.length > 0 ? _mComputeMissingFullCoverageSheets(sheetNames, effMode) : []
 
-  const mergedMissing = []
-  for (const s of [...probeMissing, ...jsMissing, ...priorMissing]) {
-    _mPushUnique(mergedMissing, s)
+  const diskMissing = []
+  for (const s of [...probeMissing, ...jsMissing]) {
+    _mPushUnique(diskMissing, s)
   }
 
-  if (mergedMissing.length > 0 || probe.status === 'missing') {
+  if (diskMissing.length > 0 || probe.status === 'missing') {
     return {
       status: 'missing',
-      missing_required_sheets: mergedMissing,
+      missing_required_sheets: diskMissing.length > 0 ? diskMissing : priorMissing,
       sheet_names: sheetNames,
     }
   }
 
   if (probe.status === 'complete' && sheetNames.length > 0) {
+    // 读盘结果为 complete 且表名核验无缺表时，不并入前序子任务回传的 missing_required_sheets
     return {
       status: 'complete',
       missing_required_sheets: [],
+      sheet_names: sheetNames,
+    }
+  }
+
+  // 探针返回 unverified 或无表名时，仅用 priorMissing 区分缺表与未核验
+  if (priorMissing.length > 0) {
+    return {
+      status: 'missing',
+      missing_required_sheets: priorMissing,
       sheet_names: sheetNames,
     }
   }
@@ -636,7 +793,7 @@ async function runModelingPipeline(ctx) {
   const baselineSha = _mValidSha(prep.baseline_sha256)
   const fingerprintPath = _mNormPath(prep.fingerprint_path || fpPath, W) || fpPath
   const consensusPath = _mNormPath(prep.consensus_path, W)
-  let plannedCandPath = _mNormPath(prep.planned_output_path, W)
+  let plannedCandPath = _mValidModelOutPath(prep.planned_output_path, baselinePath, W)
   const artifacts = []
   const failedStages = []
   if (deepNotes) {
@@ -652,11 +809,11 @@ async function runModelingPipeline(ctx) {
 
   // -------------------------------------------------------------------------
   // 阶段 2a：先绑定本轮输出路径，再受控原地建模并确认可读候选模型落盘
-  // （避免复算期间子任务超时导致已发布的可读候选被误判为 failed_unusable）
+  // （没有拿到合法 next_path 绝不派发编辑；避免省略 --out 后超时丢失已发布候选）
   // -------------------------------------------------------------------------
   const p2 = setPhase('建模与一致预期对照')
   if (!plannedCandPath) {
-    plannedCandPath = await _mResolveNextModelPath(
+    const resolvedCand = await _mResolveNextModelPath(
       W,
       T,
       baselinePath,
@@ -664,15 +821,25 @@ async function runModelingPipeline(ctx) {
       p2,
       '绑定输出路径'
     )
+    plannedCandPath = _mValidModelOutPath(resolvedCand, baselinePath, W)
+  }
+  if (!plannedCandPath) {
+    return failUnusable('本轮模型输出路径绑定失败（未获得合法 next_path），未派发模型构建与落盘', [...failedStages, 'model'], {
+      baseline_path: baselinePath,
+      baseline_sha256: baselineSha,
+      consensus_path: consensusPath,
+      artifacts,
+      run_id: runId,
+    })
   }
   const thresholdArg = consensusThresholds
     ? ` --thresholds '${typeof consensusThresholds === 'string' ? consensusThresholds : JSON.stringify(consensusThresholds)}'`
     : ''
   const editSourcePath = baselinePath || '.agents/skills/dalton-model/assets/default_model_template.xlsx'
-  const stage2aOutArg = plannedCandPath ? ` --out "${plannedCandPath}"` : ''
+  const stage2aOutArg = ` --out "${plannedCandPath}"`
   const stage2aPrompt = [
     `${extraCtx}先读 .agents/skills/dalton-model/SKILL.md、.agents/skills/dalton-model/references/forecast-rules.md、.agents/skills/dalton-model/references/rollforward.md 与 .agents/skills/dalton-model/references/format-spec.md${modelSpecPath ? `，以及 ${modelSpecPath}` : ''}。`,
-    `目标公司：${C}（${T}）；模式：${effMode}；起点模型：${editSourcePath}；基线指纹：${fingerprintPath}${plannedCandPath ? `；本轮绑定输出路径：${plannedCandPath}` : ''}。`,
+    `目标公司：${C}（${T}）；模式：${effMode}；起点模型：${editSourcePath}；基线指纹：${fingerprintPath}；本轮绑定输出路径：${plannedCandPath}。`,
     `执行独立建模与受控原地编辑（先落盘并确认可读候选模型，暂不写一致预期快照）：`,
     `- 完整遵守既有建模约定：预测期金额全部用公式算出、由季度汇总的年度列按行项类型写公式、季度预测覆盖至下一财年 Q4、年度预测覆盖至少 3 个完整财年（下一财年各季度加之后两个完整财年），原模型保持只读；多公司行业整本只改 ${T} 所属工作表与变更记录，保留其他公司工作表原状。`,
     `- 准备编辑计划 JSON，统一经由 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${editSourcePath}" --ticker "${T}" --plan "<edit_plan.json>"${stage2aOutArg} --workspace-dir "${W}" --fingerprint "${fingerprintPath}" --coord-map-out "${coordMapPath}" --mode "${effMode}"${expectedBaseSha ? ` --expected-baseline-sha256 "${expectedBaseSha}"` : ''}\` 执行受控原地编辑、落盘前母本缓存恢复、落盘后可读性确认与 LibreOffice 临时副本复算写回。`,
@@ -686,20 +853,30 @@ async function runModelingPipeline(ctx) {
     schema: _MODEL_STAGE2A_SCHEMA,
   })
   const stage2aCand = stage2a ? _mNormPath(stage2a.candidate_path, W) : null
+  const stage2aSha = stage2a ? _mValidSha(stage2a.model_sha256) : null
   let candidatePath = null
   let modelSha = null
-  if (stage2a && stage2aCand && _mHasPath(stage2a.files, stage2aCand, W)) {
-    candidatePath = stage2aCand
-    modelSha = _mValidSha(stage2a.model_sha256)
+  if (
+    stage2a &&
+    stage2aCand === plannedCandPath &&
+    stage2aSha &&
+    _mHasPath(stage2a.files, plannedCandPath, W)
+  ) {
+    candidatePath = plannedCandPath
+    modelSha = stage2aSha
     if (stage2a.recalc_status === 'recalc_failed') _mPushUnique(failedStages, 'recalc')
-  } else if (plannedCandPath) {
-    // 复算期间子任务超时或空返回时，独立探测已绑定的输出路径是否已发布且可读，避免误判 failed_unusable
+  } else {
+    // 子任务超时、回传旧/异常路径或未带哈希时，按预绑路径独立实测盘上可读性与哈希
     const diskProbe = await _mProbeCandidateOnDisk(plannedCandPath, W, p2, '核验候选落盘')
-    if (diskProbe.readable) {
+    if (diskProbe.readable && diskProbe.model_sha256) {
       candidatePath = plannedCandPath
       modelSha = diskProbe.model_sha256
-      _mPushUnique(failedStages, 'recalc')
-      log(`[modeling] 模型构建子任务未回传，但已绑定候选 ${candidatePath} 已落盘且可读，按 recalc 降级继续后续阶段`)
+      if (!stage2a || stage2a.recalc_status === 'recalc_failed') {
+        _mPushUnique(failedStages, 'recalc')
+      }
+      if (!stage2a) {
+        log(`[modeling] 模型构建子任务未回传，但已绑定候选 ${candidatePath} 已落盘且可读，按 recalc 降级继续后续阶段`)
+      }
     }
   }
   if (!candidatePath) {
@@ -908,6 +1085,7 @@ async function runModelingPipeline(ctx) {
           researchDir: R,
           progressPath,
           workflow: wfName,
+          mode: effMode,
           candidatePath,
           baselinePath,
           kind: 'modeling',
@@ -1039,6 +1217,7 @@ async function reviseModelForReport(ctx) {
   const R = ctx.researchDir
   const progressPath = ctx.progressPath || `${R}/.progress.json`
   const wfName = ctx.workflow || 'full-coverage'
+  const effMode = ctx.mode === 'build' ? 'build' : 'update'
   const currentModelPath = _mNormPath(ctx.currentModelPath, W)
   const currentModelSha = _mValidSha(ctx.currentModelSha256)
   const currentStatus = ctx.currentStatus || 'pass'
@@ -1079,28 +1258,102 @@ async function reviseModelForReport(ctx) {
     : ''
   const baseShaArg = currentModelSha ? ` --expected-baseline-sha256 "${currentModelSha}"` : ''
 
-  // -------------------------------------------------------------------------
-  // 派发 0：父流程事先算好下一版本路径并写入 --out（独立记录，续跑不重复递增版本）
-  // -------------------------------------------------------------------------
-  const revKey = String(currentModelPath || 'base').replace(/[^a-zA-Z0-9._-]/g, '_')
-  const revPlannedRecord = `${dumpDir}/rev-planned-${revKey}.json`
-  const plannedNextPath = currentModelPath
-    ? await _mResolveNextModelPath(W, T, currentModelPath, revPlannedRecord, phaseLabel, '计算联动新路径')
-    : null
-  const revOutArg = plannedNextPath ? ` --out "${plannedNextPath}"` : ''
+  const fallbackOnCurrent = async (failedStagesList, reasonText, openIssueMsg) => {
+    if (!currentModelPath) {
+      return {
+        ok: false,
+        changed: false,
+        modelPath: null,
+        modelSha256: null,
+        reportSha256: null,
+        status: 'failed_unusable',
+        openIssues: [openIssueMsg],
+        artifacts: currentArtifacts,
+        failedStages: failedStagesList,
+        remainingIssuesPath: null,
+        runId,
+      }
+    }
+    const fb = await writeFallbackLedger({
+      workspaceDir: W,
+      ticker: T,
+      researchDir: R,
+      progressPath,
+      workflow: wfName,
+      mode: effMode,
+      candidatePath: currentModelPath,
+      baselinePath: currentModelPath,
+      kind: 'report_revision',
+      failedStages: failedStagesList,
+      runId,
+      reason: reasonText,
+      phaseLabel,
+    })
+    const arts = currentArtifacts.slice()
+    for (const a of fb.artifacts) _mPushUnique(arts, a)
+    if (!fb.ok || fb.final_status === 'failed_unusable') {
+      return {
+        ok: false,
+        changed: false,
+        modelPath: currentModelPath,
+        modelSha256: fb.model_sha256 || currentModelSha,
+        reportSha256: null,
+        status: 'failed_unusable',
+        openIssues: [`${openIssueMsg}且降级账本未确认落盘`],
+        artifacts: arts,
+        failedStages: failedStagesList,
+        remainingIssuesPath: fb.remaining_issues_path,
+        runId: fb.run_id || runId,
+      }
+    }
+    return {
+      ok: true,
+      changed: false,
+      modelPath: currentModelPath,
+      modelSha256: fb.model_sha256 || currentModelSha,
+      reportSha256: null,
+      status: fb.final_status,
+      openIssues: [openIssueMsg],
+      artifacts: arts,
+      failedStages: failedStagesList,
+      remainingIssuesPath: fb.remaining_issues_path,
+      runId: fb.run_id || runId,
+    }
+  }
 
   // -------------------------------------------------------------------------
-  // 派发 1：仅重提指纹 + 改模落盘（确认新候选路径与哈希后，再单独派发差异刷新与报告同步）
+  // 派发 0：父流程先绑定合法下一版本路径并写入 --out（独立记录，续跑不重复递增版本）
+  // 没有拿到合法 next_path（非空 .xlsx 且不等于 currentModelPath）绝不派发改模！
+  // -------------------------------------------------------------------------
+  const failedStages = [...carriedNoteFailures]
+  const revKey = String(currentModelPath || 'base').replace(/[^a-zA-Z0-9._-]/g, '_')
+  const revPlannedRecord = `${dumpDir}/rev-planned-${revKey}.json`
+  const rawPlannedNext = currentModelPath
+    ? await _mResolveNextModelPath(W, T, currentModelPath, revPlannedRecord, phaseLabel, '计算联动新路径')
+    : null
+  const plannedNextPath = _mValidModelOutPath(rawPlannedNext, currentModelPath, W)
+  if (!plannedNextPath) {
+    _mPushUnique(failedStages, 'report_revision')
+    return await fallbackOnCurrent(
+      failedStages,
+      '报告联动改模下一版本输出路径绑定失败（未获得合法 next_path），未派发改模，保留当前可读模型并补写降级账本',
+      '报告联动改模下一版本输出路径绑定失败'
+    )
+  }
+  const revOutArg = ` --out "${plannedNextPath}"`
+
+  // -------------------------------------------------------------------------
+  // 派发 1：仅重提指纹 + 改模落盘（按预绑路径独立实测可读性与哈希后，再分别派发差异刷新与报告同步）
   // 子任务 label 固定使用「模型联动修订」，避免命中 check_done 的审稿收集正则（审稿|复审）
   // -------------------------------------------------------------------------
   const editPrompt = [
-    `评估报告审稿意见是否需要联动修改模型（目标公司 ${T}，当前模型 ${currentModelPath}${currentModelSha ? `，sha256：${currentModelSha}` : ''}${plannedNextPath ? `，预绑定下一版本路径 ${plannedNextPath}` : ''}，报告 ${reportPath}）。`,
+    `评估报告审稿意见是否需要联动修改模型（目标公司 ${T}，当前模型 ${currentModelPath}${currentModelSha ? `，sha256：${currentModelSha}` : ''}，预绑定下一版本路径 ${plannedNextPath}，报告 ${reportPath}）。`,
     `1) 若审稿意见仅涉及文字表达、无需改动模型数字或驱动假设：核对 ${currentModelPath} 哈希未变，不修改模型与报告文件，直接返回 changed=false、model_path="${currentModelPath}"、model_sha256。`,
-    `2) 若审稿意见要求调整模型数字、驱动假设或勾稽（本步只做重提指纹与改模落盘，暂不刷新差异表也不改写报告，确认新候选后再单独执行）：`,
+    `2) 若审稿意见要求调整模型数字、驱动假设或勾稽（本步只做重提指纹与改模落盘，暂不刷新差异表也不改写报告，确认新候选后再分别执行）：`,
     `   a) 先对当前候选模型重新提取指纹：\`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py "${currentModelPath}" --ticker "${T}" --out "${revFpPath}"\`；`,
     `   b) 按 .agents/skills/dalton-model/SKILL.md 与 .agents/skills/dalton-model/references/rollforward.md，保持原件只读，调用 \`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline "${currentModelPath}" --ticker "${T}" --plan "<report_rev_plan.json>"${revOutArg} --workspace-dir "${W}" --fingerprint "${revFpPath}"${baseShaArg} --coord-map-out "${coordMapPath}" --mode update\` 按原版本链规则另存下一版本并完成落盘前母本缓存恢复、落盘后可读性确认与复算写回。`,
     `审稿意见：\n${typeof reviewFeedback === 'string' ? reviewFeedback : JSON.stringify(reviewFeedback)}`,
-    `返回 JSON：files（含新模型路径与 ${coordMapPath}）、summary、changed、model_path、model_sha256（64 位）、recalc_status。`,
+    `返回 JSON：files（含新模型路径 ${plannedNextPath} 与 ${coordMapPath}）、summary、changed、model_path、model_sha256（64 位）、recalc_status。`,
   ].join('\n')
 
   const editRes = await _mSafeAgent(editPrompt, {
@@ -1110,85 +1363,7 @@ async function reviseModelForReport(ctx) {
     schema: _MODEL_REV_EDIT_SCHEMA,
   })
 
-  const failedStages = [...carriedNoteFailures]
-  let nextPath = null
-  let nextSha = null
-
-  if (!editRes) {
-    // 改模派发超时或空返回：先探测预绑定的下一版本路径是否已落盘且可读
-    if (plannedNextPath && plannedNextPath !== currentModelPath) {
-      const diskProbe = await _mProbeCandidateOnDisk(plannedNextPath, W, phaseLabel, '核验联动候选落盘')
-      if (diskProbe.readable) {
-        nextPath = plannedNextPath
-        nextSha = diskProbe.model_sha256
-        _mPushUnique(failedStages, 'recalc')
-        log(`[modeling] 报告联动改模派发未回传，但新候选 ${nextPath} 已落盘且可读，按已确认新候选继续`)
-      }
-    }
-    if (!nextPath) {
-      _mPushUnique(failedStages, 'report_revision')
-      if (!currentModelPath) {
-        return {
-          ok: false,
-          changed: false,
-          modelPath: null,
-          modelSha256: null,
-          reportSha256: null,
-          status: 'failed_unusable',
-          openIssues: ['报告联动改模子任务超时且无可读候选模型'],
-          artifacts: currentArtifacts,
-          failedStages,
-          remainingIssuesPath: null,
-          runId,
-        }
-      }
-      const fb = await writeFallbackLedger({
-        workspaceDir: W,
-        ticker: T,
-        researchDir: R,
-        progressPath,
-        workflow: wfName,
-        mode: 'update',
-        candidatePath: currentModelPath,
-        baselinePath: currentModelPath,
-        kind: 'report_revision',
-        failedStages,
-        runId,
-        reason: '报告联动改模落盘子任务超时或返回空且未见新候选落盘，已保留当前可读模型并补写降级账本',
-        phaseLabel,
-      })
-      const arts = currentArtifacts.slice()
-      for (const a of fb.artifacts) _mPushUnique(arts, a)
-      if (!fb.ok || fb.final_status === 'failed_unusable') {
-        return {
-          ok: false,
-          changed: false,
-          modelPath: currentModelPath,
-          modelSha256: fb.model_sha256 || currentModelSha,
-          reportSha256: null,
-          status: 'failed_unusable',
-          openIssues: ['报告联动改模超时且降级账本未确认落盘'],
-          artifacts: arts,
-          failedStages,
-          remainingIssuesPath: fb.remaining_issues_path,
-          runId: fb.run_id || runId,
-        }
-      }
-      return {
-        ok: true,
-        changed: false,
-        modelPath: currentModelPath,
-        modelSha256: fb.model_sha256 || currentModelSha,
-        reportSha256: null,
-        status: fb.final_status,
-        openIssues: ['报告联动改模落盘子任务超时或返回空'],
-        artifacts: arts,
-        failedStages,
-        remainingIssuesPath: fb.remaining_issues_path,
-        runId: fb.run_id || runId,
-      }
-    }
-  } else if (!editRes.changed) {
+  if (editRes && !editRes.changed) {
     return {
       ok: true,
       changed: false,
@@ -1202,82 +1377,106 @@ async function reviseModelForReport(ctx) {
       remainingIssuesPath: currentStatus === 'delivered_with_open_issues' ? remPath : null,
       runId,
     }
+  }
+
+  // 父流程始终按预绑路径 plannedNextPath 独立实测盘上可读性与 SHA-256，绝不信任子任务回传的旧路径或自报哈希
+  let nextPath = null
+  let nextSha = null
+  const diskProbe = await _mProbeCandidateOnDisk(plannedNextPath, W, phaseLabel, '核验联动候选落盘')
+  if (diskProbe.readable && diskProbe.model_sha256) {
+    nextPath = plannedNextPath
+    nextSha = diskProbe.model_sha256
+    if (!editRes || editRes.recalc_status === 'recalc_failed') {
+      _mPushUnique(failedStages, 'recalc')
+    }
+    if (!editRes) {
+      log(`[modeling] 报告联动改模派发未回传，但预绑新候选 ${nextPath} 已落盘且可读，按已确认新候选继续`)
+    }
+  } else if (!editRes) {
+    _mPushUnique(failedStages, 'report_revision')
+    return await fallbackOnCurrent(
+      failedStages,
+      '报告联动改模落盘子任务超时或返回空且预绑路径未见新候选落盘，已保留当前可读模型并补写降级账本',
+      '报告联动改模落盘子任务超时或返回空'
+    )
   } else {
-    const explicitNextPath = _mNormPath(editRes.model_path, W)
-    const nextPathConfirmed = Boolean(explicitNextPath && _mHasPath(editRes.files, explicitNextPath, W))
-    if (explicitNextPath && nextPathConfirmed) {
-      nextPath = explicitNextPath
-      nextSha = _mValidSha(editRes.model_sha256)
-      if (editRes.recalc_status === 'recalc_failed') _mPushUnique(failedStages, 'recalc')
-    } else if (plannedNextPath && plannedNextPath !== currentModelPath) {
-      const diskProbe = await _mProbeCandidateOnDisk(plannedNextPath, W, phaseLabel, '核验联动候选落盘')
-      if (diskProbe.readable) {
-        nextPath = plannedNextPath
-        nextSha = diskProbe.model_sha256
-        _mPushUnique(failedStages, 'recalc')
-      }
-    }
-    if (!nextPath) {
-      // No readable new candidate confirmed: never call write-ledger with --candidate "null".
-      return {
-        ok: false,
-        changed: true,
-        modelPath: null,
-        modelSha256: null,
-        reportSha256: null,
-        status: 'failed_unusable',
-        openIssues: ['报告联动改模未能产出并确认可读新候选模型'],
-        artifacts: currentArtifacts,
-        failedStages: [...carriedNoteFailures, 'report_revision'],
-        remainingIssuesPath: null,
-        runId,
-      }
-    }
-    if (!nextSha) {
-      const shaProbe = await _mProbeCandidateOnDisk(nextPath, W, phaseLabel, '核验联动候选落盘')
-      if (shaProbe.readable && shaProbe.model_sha256) {
-        nextSha = shaProbe.model_sha256
-      }
+    // editRes.changed === true，但预绑新路径盘上不可读或不存在（例如子任务回传了旧路径）：拒绝把旧路径当新候选
+    return {
+      ok: false,
+      changed: true,
+      modelPath: null,
+      modelSha256: null,
+      reportSha256: null,
+      status: 'failed_unusable',
+      openIssues: ['报告联动改模未在预绑输出路径产出可读新候选模型'],
+      artifacts: currentArtifacts,
+      failedStages: [...carriedNoteFailures, 'report_revision'],
+      remainingIssuesPath: null,
+      runId,
     }
   }
 
   // -------------------------------------------------------------------------
-  // 派发 2：新候选路径与哈希已确认，单独派发差异刷新与报告引用同步
+  // 派发 2a：单独派发一致预期差异刷新，并按盘上实测证据落账
   // -------------------------------------------------------------------------
-  const syncPrompt = [
-    `已确认报告联动改模产出的新候选模型 ${nextPath}${nextSha ? `（sha256：${nextSha}）` : ''}，请执行差异刷新与报告同步（不修改 .xlsx 模型文件）：`,
-    `1) 运行 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "${nextPath}" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 刷新一致预期差异表 ${consensusMdPath} 与 ${consensusJsonPath}；`,
-    `2) 同步更新 ${reportPath} 正文中的 model: 引用${syncClause}，使其指向新模型路径 ${nextPath} 与新哈希 ${nextSha || '<实测哈希>'}（JSON 元数据文件写入 {"path": "${nextPath}", "sha256": "${nextSha || '<实测哈希>'}"}），随后在 Bash 执行 \`sha256sum "${reportPath}"\` 并在返回 JSON 的 report_sha256 字段回传该 64 位实测哈希（未改写报告则回传 null）。`,
-    `返回 JSON：files（含 ${consensusMdPath}、${consensusJsonPath} 及已改写报告路径）、summary、report_sha256、consensus_diff_generated。`,
+  const diffPrompt = [
+    `已确认报告联动改模产出的新候选模型 ${nextPath}（sha256：${nextSha}），请仅执行一致预期差异刷新（不修改 .xlsx 模型文件与报告正文）：`,
+    `运行 \`python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model "${nextPath}" --ticker "${T}" --research-dir "${R}"${consensusPath ? ` --consensus "${consensusPath}"` : ''}${thresholdArg}\` 刷新一致预期差异表 ${consensusMdPath} 与 ${consensusJsonPath}。`,
+    `返回 JSON：files（含 ${consensusMdPath} 与 ${consensusJsonPath}）、summary、consensus_diff_generated。`,
   ].join('\n')
 
-  const syncRes = await _mSafeAgent(syncPrompt, {
+  await _mSafeAgent(diffPrompt, {
     agentType: 'general-purpose',
-    label: '模型联动差异与报告同步',
+    label: '模型联动差异刷新',
     phase: phaseLabel,
-    schema: _MODEL_REV_SYNC_SCHEMA,
+    schema: _MODEL_REV_DIFF_SCHEMA,
   })
-
-  let reportSha256 = null
-  let consMdOk = false
-  let consJsonOk = false
-  if (!syncRes) {
+  const consProbe = await _mProbeConsensusOnDisk(
+    consensusJsonPath,
+    consensusMdPath,
+    nextSha,
+    W,
+    phaseLabel,
+    '核验差异表落盘'
+  )
+  const consMdOk = consProbe.md_ok
+  const consJsonOk = consProbe.json_ok
+  if (!consProbe.matched) {
     _mPushUnique(failedStages, 'consensus')
-    _mPushUnique(failedStages, 'report_sync')
-  } else {
-    reportSha256 = _mValidSha(syncRes.report_sha256)
-    consMdOk = _mHasPath(syncRes.files, consensusMdPath, W)
-    consJsonOk = _mHasPath(syncRes.files, consensusJsonPath, W)
-    if (syncRes.consensus_diff_generated === false || !consMdOk || !consJsonOk) {
-      _mPushUnique(failedStages, 'consensus')
-    }
-    if (!reportSha256 && !_mHasPath(syncRes.files, reportPath, W)) {
-      _mPushUnique(failedStages, 'report_sync')
-    }
   }
 
   // -------------------------------------------------------------------------
-  // 派发 3：单遍本轮范围检查（append kind="report_revision"）；超时时按已确认新候选路径写降级账本
+  // 派发 2b：单独派发报告引用同步，并按盘上实测证据与实测报告哈希落账
+  // -------------------------------------------------------------------------
+  const reportSyncPrompt = [
+    `已确认报告联动改模产出的新候选模型 ${nextPath}（sha256：${nextSha}），请仅同步报告引用与元数据（不修改 .xlsx 模型文件）：`,
+    `同步更新 ${reportPath} 正文中的 model: 引用${syncClause}，使其指向新模型路径 ${nextPath} 与新哈希 ${nextSha}（JSON 元数据文件写入 {"path": "${nextPath}", "sha256": "${nextSha}"}），随后在 Bash 执行 \`sha256sum "${reportPath}"\` 并在返回 JSON 的 report_sha256 字段回传该 64 位实测哈希。`,
+    `返回 JSON：files（含已改写报告路径${extraSyncPaths.length ? `与 ${extraSyncPaths.join('、')}` : ''}）、summary、report_sha256。`,
+  ].join('\n')
+
+  await _mSafeAgent(reportSyncPrompt, {
+    agentType: 'general-purpose',
+    label: '模型联动报告同步',
+    phase: phaseLabel,
+    schema: _MODEL_REV_REPORT_SYNC_SCHEMA,
+  })
+  const reportProbe = await _mProbeReportSyncOnDisk(
+    reportPath,
+    nextPath,
+    nextSha,
+    extraSyncPaths,
+    W,
+    phaseLabel,
+    '核验报告同步落盘'
+  )
+  const reportSha256 = reportProbe.report_sha256
+  if (!reportProbe.synced || !reportSha256) {
+    _mPushUnique(failedStages, 'report_sync')
+  }
+
+  // -------------------------------------------------------------------------
+  // 派发 3：单遍本轮范围检查（append kind="report_revision"，透传本轮有效 mode）；
+  // 超时时按已确认新候选路径与本轮有效 mode 写降级账本
   // -------------------------------------------------------------------------
   const chkCmdParts = [
     `python3 .agents/skills/dalton-model/scripts/model_check.py check`,
@@ -1289,6 +1488,7 @@ async function reviseModelForReport(ctx) {
     `--fingerprint "${revFpPath}"`,
     `--coord-map "${coordMapPath}"`,
     `--workflow "${wfName}"`,
+    `--mode "${effMode}"`,
     `--kind report_revision`,
     `--append-revision`,
   ]
@@ -1296,7 +1496,7 @@ async function reviseModelForReport(ctx) {
   if (failedStages.length) chkCmdParts.push(`--failed-stages "${failedStages.join(',')}"`)
 
   const chkPrompt = [
-    `对报告联动改模已落盘的新候选 ${nextPath}${nextSha ? `（sha256：${nextSha}）` : ''} 执行单遍本轮范围检查（不修改模型文件）。`,
+    `对报告联动改模已落盘的新候选 ${nextPath}（sha256：${nextSha}）执行单遍本轮范围检查（不修改模型文件）。`,
     `在 Bash 运行：\`${chkCmdParts.join(' ')}\`（追加 kind="report_revision" 轮次记录，不计入 fix_rounds 两轮上限）。`,
     `核对生成的 ${checkMdPath}、${reviewPackPath}、${ledgerPath}（以及存在剩余问题时的 ${remPath}）。`,
     `按脚本 JSON 输出返回：files、summary、readable、final_status、model_sha256、actionable_count、actionable_issues、baseline_legacy_issues、missing_evidence_issues、not_applicable_issues、missing_required_sheets、remaining_issues_path、summary_10lines。`,
@@ -1326,6 +1526,7 @@ async function reviseModelForReport(ctx) {
       researchDir: R,
       progressPath,
       workflow: wfName,
+      mode: effMode,
       candidatePath: nextPath,
       baselinePath: currentModelPath,
       kind: 'report_revision',

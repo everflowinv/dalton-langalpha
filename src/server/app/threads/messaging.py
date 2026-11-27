@@ -394,6 +394,7 @@ _SERVER_ONLY_FIELDS = (
     "resume_of_run_id",
     "llm_model_system_only",  # DALTON-HOOK(cos-settings-tools)
     "restart_from_run_id",  # DALTON-HOOK(cos-settings-tools)
+    "approved_dispatch_payloads",  # DALTON-HOOK(cos-verbatim-forward)
 )
 
 

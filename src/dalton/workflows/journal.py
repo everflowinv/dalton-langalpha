@@ -401,22 +401,130 @@ class WorkflowJournal:
             )
         await self.write_progress("running")
 
+    @staticmethod
+    def _match_receipt_chain(
+        receipt: dict[str, Any],
+        unresolved: list[dict[str, Any]],
+        cm_path: str,
+        current: dict[str, str | None],
+    ) -> tuple[bool, str | None]:
+        """Verify ``unresolved`` artifacts against a chained candidate transition
+        receipt written before each legitimate publish (``write-snapshot`` and
+        subsequent ``--in-place`` rework / recalc publishes).
+
+        Returns ``(matched, migrated_model_sha256)``. External tampering whose
+        digest does not match any connected post-publish state is rejected."""
+        rec_model_name = str(receipt.get("model_name") or "").strip()
+        raw_transitions = receipt.get("transitions")
+        transitions: list[dict[str, Any]] = []
+        if isinstance(raw_transitions, list) and raw_transitions:
+            for item in raw_transitions:
+                if isinstance(item, dict):
+                    transitions.append(item)
+        else:
+            pre_m = receipt.get("pre_snapshot_model_sha256")
+            post_m = receipt.get("post_snapshot_model_sha256")
+            pre_cm = receipt.get("pre_snapshot_coord_map_sha256")
+            post_cm = receipt.get("post_snapshot_coord_map_sha256")
+            if pre_m and post_m:
+                transitions.append(
+                    {
+                        "op": "write_snapshot",
+                        "pre_model_sha256": pre_m,
+                        "post_model_sha256": post_m,
+                        "pre_coord_map_sha256": pre_cm,
+                        "post_coord_map_sha256": post_cm,
+                    }
+                )
+        if not transitions:
+            return False, None
+
+        def _reachable_states(
+            start_sha: str | None,
+            pre_key: str,
+            post_key: str,
+        ) -> set[tuple[int, str]]:
+            """Return ``{(step_idx, sha)}`` reachable from ``start_sha`` along
+            contiguous receipt transitions."""
+            if not isinstance(start_sha, str) or not start_sha:
+                return set()
+            reached: set[tuple[int, str]] = set()
+            frontier: set[str] = {start_sha}
+            for idx, tr in enumerate(transitions):
+                pre_v = tr.get(pre_key)
+                post_v = tr.get(post_key)
+                if isinstance(pre_v, str) and pre_v in frontier:
+                    # Allow half-commit state (pre_v still on disk for one file
+                    # while the paired file already swapped to post_v).
+                    reached.add((idx, pre_v))
+                    if isinstance(post_v, str) and post_v:
+                        reached.add((idx, post_v))
+                        frontier.add(post_v)
+            return reached
+
+        model_entry: dict[str, Any] | None = None
+        cm_entry: dict[str, Any] | None = None
+        for a in unresolved:
+            path = str(a.get("path") or "")
+            if path == cm_path:
+                cm_entry = a
+            elif path.lower().endswith(".xlsx"):
+                base_name = path.replace("\\", "/").rsplit("/", 1)[-1]
+                if rec_model_name and base_name != rec_model_name:
+                    return False, None
+                model_entry = a
+            else:
+                return False, None
+
+        matched_steps: set[int] | None = None
+        migrated_model_sha: str | None = None
+
+        if model_entry is not None:
+            old_m = model_entry.get("sha256")
+            cur_m = current.get(model_entry["path"])
+            m_states = _reachable_states(old_m, "pre_model_sha256", "post_model_sha256")
+            m_steps = {idx for idx, sha in m_states if sha == cur_m and cur_m != old_m}
+            if not m_steps:
+                return False, None
+            matched_steps = m_steps
+            migrated_model_sha = cur_m
+
+        if cm_entry is not None:
+            old_cm = cm_entry.get("sha256")
+            cur_cm = current.get(cm_entry["path"])
+            cm_states = _reachable_states(
+                old_cm, "pre_coord_map_sha256", "post_coord_map_sha256"
+            )
+            cm_steps = {idx for idx, sha in cm_states if sha == cur_cm}
+            if not cm_steps:
+                return False, None
+            if matched_steps is not None and not (matched_steps & cm_steps):
+                # Also permit coord_map reaching a step at or before the model step
+                # when model swapped atomically just before coord_map finished.
+                if not any(cs <= ms for cs in cm_steps for ms in matched_steps):
+                    return False, None
+
+        return True, migrated_model_sha
+
     async def _artifacts_match_or_superseded(
         self,
         entry: dict[str, Any],
         artifacts: list[dict[str, Any]],
         current: dict[str, str | None],
         index: dict[str, list[dict[str, Any]]],
-    ) -> bool:
+    ) -> tuple[bool, str | None]:
         """Verify each recorded artifact matches disk directly, OR was updated
         in-place by a later completed dispatch in the same source run, OR
         matches a verified ``consensus-snapshot-receipt.json`` pre->post
-        transition written by ``model_consensus.py write-snapshot``."""
+        transition chain written by ``model_consensus.py write-snapshot`` /
+        ``model_edit.py apply --in-place``.
+
+        Returns ``(matched, migrated_model_sha256)``."""
         mismatched = [a for a in artifacts if current.get(a["path"]) != a.get("sha256")]
         if not mismatched:
-            return True
+            return True, None
         if any(current.get(a["path"]) is None for a in mismatched):
-            return False
+            return False, None
 
         entry_seq = entry.get("seq")
         unresolved: list[dict[str, Any]] = []
@@ -447,11 +555,11 @@ class WorkflowJournal:
                 unresolved.append(a)
 
         if not unresolved:
-            return True
+            return True, None
 
-        # Check verified consensus-snapshot-receipt.json transition (handles interruption
-        # right after write-snapshot mutated the candidate .xlsx and coord_map.json, before
-        # the consensus stage finished and wrote an ok journal entry).
+        # Check verified consensus-snapshot-receipt.json transition chain (handles
+        # interruption after write-snapshot or subsequent in-place rework/recalc,
+        # before the consensus stage finished and wrote an ok journal entry).
         cm_path: str | None = None
         for a in artifacts:
             p = str(a.get("path") or "").replace("\\", "/")
@@ -459,7 +567,7 @@ class WorkflowJournal:
                 cm_path = a["path"]
                 break
         if cm_path is None:
-            return False
+            return False, None
         cm_norm = cm_path.replace("\\", "/")
         receipt_rel = (
             f"{cm_norm.rsplit('/', 1)[0]}/consensus-snapshot-receipt.json"
@@ -469,32 +577,11 @@ class WorkflowJournal:
         try:
             receipt = await _read_json(self.backend, receipt_rel)
         except Exception:
-            return False
+            return False, None
         if not isinstance(receipt, dict):
-            return False
+            return False, None
 
-        rec_pre_m = receipt.get("pre_snapshot_model_sha256")
-        rec_post_m = receipt.get("post_snapshot_model_sha256")
-        rec_pre_cm = receipt.get("pre_snapshot_coord_map_sha256")
-        rec_post_cm = receipt.get("post_snapshot_coord_map_sha256")
-        rec_model_name = str(receipt.get("model_name") or "").strip()
-
-        for a in unresolved:
-            path = a["path"]
-            old_sha = a.get("sha256")
-            cur_sha = current.get(path)
-            if path == cm_path:
-                if not (rec_pre_cm and rec_post_cm and old_sha == rec_pre_cm and cur_sha == rec_post_cm):
-                    return False
-            elif path.lower().endswith(".xlsx"):
-                base_name = path.replace("\\", "/").rsplit("/", 1)[-1]
-                if rec_model_name and base_name != rec_model_name:
-                    return False
-                if not (rec_pre_m and rec_post_m and old_sha == rec_pre_m and cur_sha == rec_post_m):
-                    return False
-            else:
-                return False
-        return True
+        return self._match_receipt_chain(receipt, unresolved, cm_path, current)
 
     async def find_replayable(
         self, label: str, prompt: str, *, subagent_type: str | None = None
@@ -545,13 +632,16 @@ class WorkflowJournal:
             ):
                 continue
             artifacts = entry.get("artifacts") or []
+            migrated_model_sha: str | None = None
+            current_digests: dict[str, str | None] | None = None
             if artifacts:
-                current = await digest_paths(
+                current_digests = await digest_paths(
                     self.backend, [a["path"] for a in artifacts]
                 )
-                if not await self._artifacts_match_or_superseded(
-                    entry, artifacts, current, index
-                ):
+                matched, migrated_model_sha = await self._artifacts_match_or_superseded(
+                    entry, artifacts, current_digests, index
+                )
+                if not matched:
                     continue
                 # A terminal model verification ledger is bound to a specific run_id:
                 # never replay a prior run's ledger entry on resume so the stage re-runs
@@ -581,8 +671,22 @@ class WorkflowJournal:
                 ).get(str(review_draft))
                 if not isinstance(recorded_sha, str) or current_sha != recorded_sha:
                     continue
-            if isinstance(result, dict) and "run_id" in result and result.get("run_id") not in (None, self.run_id):
-                return {**entry, "result": {**result, "run_id": self.run_id}}
+            updated_result = result
+            if isinstance(updated_result, dict):
+                if "run_id" in updated_result and updated_result.get("run_id") not in (None, self.run_id):
+                    updated_result = {**updated_result, "run_id": self.run_id}
+                if migrated_model_sha and "model_sha256" in updated_result:
+                    updated_result = {**updated_result, "model_sha256": migrated_model_sha}
+            if updated_result is not result or (migrated_model_sha and current_digests is not None):
+                updated_artifacts = (
+                    [
+                        {**a, "sha256": current_digests.get(a["path"]) or a.get("sha256")}
+                        for a in artifacts
+                    ]
+                    if migrated_model_sha and current_digests is not None
+                    else artifacts
+                )
+                return {**entry, "result": updated_result, "artifacts": updated_artifacts}
             return entry
         return None
 

@@ -310,26 +310,25 @@ const sheetGate = await verifyFullCoverageSheetsOnDisk({
 if (sheetGate.status === 'missing') {
   const missingRequiredSheets = sheetGate.missing_required_sheets
   const missList = missingRequiredSheets.join('、') || '必需工作表'
-  if (modelFailedStages.includes('check') || !remainingIssuesPath) {
-    const fb = await writeFallbackLedger({
-      workspaceDir: W,
-      ticker: T,
-      researchDir: R,
-      progressPath,
-      workflow: 'full-coverage',
-      mode: modelEffMode,
-      candidatePath: modelPath,
-      baselinePath: (modelResult && modelResult.baseline_path) || args.model_path || null,
-      kind: 'modeling',
-      failedStages: modelFailedStages.length ? modelFailedStages : ['sheet_gate'],
-      runId: modelRunId,
-      fixRounds: modelResult && typeof modelResult.fix_rounds === 'number' ? modelResult.fix_rounds : 0,
-      reason: `完整覆盖模型缺少必需工作表（${missList}），已写入未决清单并停在成稿之前`,
-      phaseLabel: '建模',
-    })
-    if (fb && fb.remaining_issues_path) remainingIssuesPath = fb.remaining_issues_path
-    if (fb && fb.model_sha256) modelSha = fb.model_sha256
-  }
+  // 缺表时一律重写未决清单，确保缺表名以 C01 写入 remaining-issues.md
+  const fb = await writeFallbackLedger({
+    workspaceDir: W,
+    ticker: T,
+    researchDir: R,
+    progressPath,
+    workflow: 'full-coverage',
+    mode: modelEffMode,
+    candidatePath: modelPath,
+    baselinePath: (modelResult && modelResult.baseline_path) || args.model_path || null,
+    kind: 'modeling',
+    failedStages: modelFailedStages.length ? modelFailedStages : ['sheet_gate'],
+    runId: modelRunId,
+    fixRounds: modelResult && typeof modelResult.fix_rounds === 'number' ? modelResult.fix_rounds : 0,
+    reason: `完整覆盖模型缺少必需工作表（${missList}），已写入未决清单并停在成稿之前`,
+    phaseLabel: '建模',
+  })
+  if (fb && fb.remaining_issues_path) remainingIssuesPath = fb.remaining_issues_path
+  if (fb && fb.model_sha256) modelSha = fb.model_sha256
   const remHint = remainingIssuesPath || `${R}/model_dump/remaining-issues.md`
   return {
     ...gateBlock(
@@ -499,6 +498,7 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 1) {
     researchDir: R,
     progressPath,
     workflow: 'full-coverage',
+    mode: modelEffMode,
     currentModelPath: modelPath,
     currentModelSha256: modelSha,
     currentStatus: modelStatus,

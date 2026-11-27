@@ -1354,17 +1354,25 @@ async def astream_ptc_workflow(
             is_dalton_sharing_auth_enabled as _is_colleague_sharing_auth_enabled,
         )
 
-        # DALTON-HOOK(cos-verbatim-forward): restore approval-bound dispatch payloads by tool_call_id on HITL resume
-        approved_dispatch_payloads: dict[str, Any] = {}
+        # DALTON-HOOK(cos-verbatim-forward): reuse approval-bound dispatch payloads read during HITL validation (fallback to checkpointer only when absent)
+        approved_dispatch_payloads: dict[str, Any] | None = None
         if request.hitl_response:
-            from src.dalton.cos_verbatim import load_approved_dispatch_payloads
-
-            approved_dispatch_payloads = await load_approved_dispatch_payloads(
-                getattr(ptc_graph, "checkpointer", None),
-                thread_id,
-                checkpoint_id=request.checkpoint_id or base_checkpoint_id,
-                hitl_response=request.hitl_response,
+            from src.dalton.cos_verbatim import (
+                COS_APPROVED_DISPATCH_PAYLOADS_CONFIG_KEY,
+                COS_HITL_RESUME_CONFIG_KEY,
+                load_approved_dispatch_payloads,
             )
+
+            preloaded_payloads = getattr(request, "approved_dispatch_payloads", None)
+            if preloaded_payloads is not None:
+                approved_dispatch_payloads = preloaded_payloads
+            else:
+                approved_dispatch_payloads = await load_approved_dispatch_payloads(
+                    getattr(ptc_graph, "checkpointer", None),
+                    thread_id,
+                    checkpoint_id=request.checkpoint_id or base_checkpoint_id,
+                    hitl_response=request.hitl_response,
+                )
 
         # DALTON-HOOK(colleague-dispatch): stamp turn_admitted_workspace_id and workspace_owner_id in configurable
         extra_configurable = {
@@ -1380,8 +1388,11 @@ async def astream_ptc_workflow(
             # DALTON-HOOK(cos-verbatim-forward): forward pre-injection raw user request (None when turn has no user text) and approved HITL dispatch payloads
             "cos_turn_verbatim_request": turn_verbatim_request,
             **(
-                {"cos_approved_dispatch_payloads": approved_dispatch_payloads}
-                if approved_dispatch_payloads
+                {
+                    COS_HITL_RESUME_CONFIG_KEY: True,
+                    COS_APPROVED_DISPATCH_PAYLOADS_CONFIG_KEY: approved_dispatch_payloads,
+                }
+                if request.hitl_response
                 else {}
             ),
             **(

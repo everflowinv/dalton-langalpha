@@ -218,6 +218,7 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
       researchDir: R,
       progressPath,
       workflow: 'earnings-deep-update',
+      mode: 'update',
       currentModelPath: modelPath,
       currentModelSha256: modelSha,
       currentStatus: modelStatus,

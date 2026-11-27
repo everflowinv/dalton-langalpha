@@ -731,12 +731,18 @@ def check_required_sheets(
             "mode": eff_mode,
             "sheet_names": [],
             "missing_required_sheets": [],
+            "summary": f"{cand.name}: unverified ({err or 'unreadable workbook'})",
             "error": err,
         }
     missing = (
         _missing_full_coverage_sheets(sheet_names, eff_mode)
         if str(workflow or "").strip() == "full-coverage"
         else []
+    )
+    summary = (
+        f"{cand.name}: missing {len(missing)} required sheet(s) ({', '.join(missing)})"
+        if missing
+        else f"{cand.name}: complete ({len(sheet_names)} sheets, mode={eff_mode})"
     )
     return {
         "ok": len(missing) == 0,
@@ -747,6 +753,7 @@ def check_required_sheets(
         "mode": eff_mode,
         "sheet_names": sheet_names,
         "missing_required_sheets": missing,
+        "summary": summary,
         "error": None,
     }
 
@@ -2952,6 +2959,25 @@ def write_check_and_ledger(
         except Exception:
             cons_diff = None
 
+    ledger_path = dump_dir / "model-verification.json"
+    existing = _load_existing_ledger(ledger_path) if (append_revision or kind == "report_revision") else None
+    existing_mode = str((existing or {}).get("mode") or "").strip().lower()
+    req_mode = str(mode or "").strip().lower()
+    if req_mode in ("build", "update"):
+        eff_mode = req_mode
+    elif existing_mode in ("build", "update"):
+        eff_mode = existing_mode
+    else:
+        eff_mode = "update"
+    # A full-coverage build run has no user baseline: report revisions must keep
+    # full build-mode required-sheet checks instead of silently downgrading to update.
+    if (
+        str(workflow or "").strip() == "full-coverage"
+        and kind == "report_revision"
+        and existing_mode == "build"
+    ):
+        eff_mode = "build"
+
     res = run_checks(
         candidate_path=cand,
         ticker=ticker,
@@ -2959,7 +2985,7 @@ def write_check_and_ledger(
         fingerprint=fp,
         coord_map=cm,
         consensus_diff=cons_diff,
-        mode=mode,
+        mode=eff_mode,
         failed_stages=failed_stages,
         workflow=workflow,
     )
@@ -2985,9 +3011,7 @@ def write_check_and_ledger(
     check_md_path = dump_dir / "model-check.md"
     review_pack_path = dump_dir / "model-review-pack.md"
     rem_path = dump_dir / "remaining-issues.md"
-    ledger_path = dump_dir / "model-verification.json"
 
-    existing = _load_existing_ledger(ledger_path) if (append_revision or kind == "report_revision") else None
     if existing is not None:
         f_stages = _carry_unrecovered_deep_note_failures(workflow, rdir, existing, f_stages)
     eff_run_id = run_id if run_id is not None else (existing or {}).get("run_id")
@@ -3060,7 +3084,7 @@ def write_check_and_ledger(
     ledger = {
         "schema_version": 2,
         "workflow": workflow,
-        "mode": str(mode or "update").strip().lower(),
+        "mode": eff_mode,
         "ticker": ticker.strip().upper(),
         "run_id": run_id if run_id is not None else (existing or {}).get("run_id"),
         "baseline_path": _rel_or_str(Path(res["baseline_path"]), ws) if res.get("baseline_path") else None,
@@ -3128,9 +3152,16 @@ def write_fallback_ledger(
     rem_path = dump_dir / "remaining-issues.md"
     existing = _load_existing_ledger(ledger_path)
     eff_workflow = workflow or (existing or {}).get("workflow") or "company-model"
-    eff_mode = str(mode or (existing or {}).get("mode") or "").strip().lower()
+    existing_mode = str((existing or {}).get("mode") or "").strip().lower()
+    eff_mode = str(mode or existing_mode or "").strip().lower()
     if eff_mode not in ("build", "update"):
         eff_mode = "build" if not (base_p or (existing or {}).get("baseline_path")) else "update"
+    if (
+        eff_workflow == "full-coverage"
+        and kind == "report_revision"
+        and existing_mode == "build"
+    ):
+        eff_mode = "build"
     f_stages = _carry_unrecovered_deep_note_failures(eff_workflow, rdir, existing, f_stages)
 
     missing_required_sheets: list[str] = []
@@ -3557,7 +3588,7 @@ def main(argv: list[str] | None = None) -> int:
     p_chk.add_argument("--coord-map", default=None)
     p_chk.add_argument("--run-id", default=None)
     p_chk.add_argument("--workflow", default="company-model")
-    p_chk.add_argument("--mode", default="update", choices=["build", "update", "auto"])
+    p_chk.add_argument("--mode", default=None, choices=["build", "update", "auto"])
     p_chk.add_argument("--fix-round", type=int, default=0)
     p_chk.add_argument("--kind", default="modeling", choices=["modeling", "report_revision"])
     p_chk.add_argument("--append-revision", action="store_true")

@@ -387,6 +387,14 @@ async def dispatch(
         if not approved:
             return decline_handoff_command(response, tool_call_id)
 
+        # DALTON-HOOK(cos-verbatim-forward): require approval-bound payload on HITL resume; stop with retryable error if missing.
+        from src.dalton.cos_verbatim import resolve_approved_dispatch_question
+        question, payload_err = resolve_approved_dispatch_question(
+            question, config=config, tool_call_id=tool_call_id
+        )
+        if payload_err is not None:
+            return error_command(payload_err, tool_call_id)
+
         # The card's report-back switch, when the user moved it. A resume
         # that names no overrides keeps what the call asked for.
         overrides = (response.get("decisions") or [{}])[0].get("overrides")

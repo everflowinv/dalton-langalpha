@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 
 COS_TURN_VERBATIM_CONFIG_KEY = "cos_turn_verbatim_request"
 COS_APPROVED_DISPATCH_PAYLOADS_CONFIG_KEY = "cos_approved_dispatch_payloads"
+COS_HITL_RESUME_CONFIG_KEY = "cos_is_hitl_resume"
+
+_MISSING_APPROVED_PAYLOAD_ERROR = (
+    "Approved hand-off payload is temporarily unavailable (missing approval-bound "
+    "question from checkpoint); nothing was dispatched. Please retry the approval."
+)
 
 _CLOSING_TAG_RE = re.compile(r"</\s*user_verbatim_request\s*>", re.IGNORECASE)
 _SYSTEM_REMINDER_RE = re.compile(
@@ -359,12 +365,16 @@ async def load_approved_dispatch_payloads(
     *,
     checkpoint_id: str | None = None,
     hitl_response: Any = None,
-) -> dict[str, dict[str, Any]]:
+) -> dict[str, dict[str, Any]] | None:
     """Load approval-bound ``ptc_agent`` dispatch payloads from ``checkpointer``
     so HITL resume reuses the exact card text (with verbatim block & attachments)
-    without regenerating."""
+    without regenerating.
+
+    Returns ``None`` (rather than ``{}``) when the checkpoint cannot be read so
+    callers distinguish a read failure from an empty interrupt map and never
+    silently fall back to raw tool arguments."""
     if checkpointer is None or not thread_id:
-        return {}
+        return None
     cfg: dict[str, Any] = {"configurable": {"thread_id": str(thread_id)}}
     if checkpoint_id:
         cfg["configurable"]["checkpoint_id"] = str(checkpoint_id)
@@ -377,12 +387,14 @@ async def load_approved_dispatch_payloads(
             get = getattr(checkpointer, "get_tuple", None)
             cp_tuple = get(cfg) if get is not None else None
     except Exception:
-        logger.debug(
+        logger.warning(
             "Failed to load approved dispatch payloads from checkpoint",
             extra={"thread_id": thread_id, "checkpoint_id": checkpoint_id},
             exc_info=True,
         )
-        return {}
+        return None
+    if cp_tuple is None:
+        return None
     return extract_approved_dispatch_payloads_from_checkpoint(
         cp_tuple, hitl_response=hitl_response
     )
@@ -406,3 +418,39 @@ def resolve_dispatch_question(
                 if isinstance(saved, dict) and isinstance(saved.get("question"), str):
                     return saved["question"]
     return append_verbatim_user_request(question, state, config=config)
+
+
+def resolve_approved_dispatch_question(
+    question: str,
+    *,
+    config: Any = None,
+    tool_call_id: str | None = None,
+) -> tuple[str, str | None]:
+    """Verify and return the approval-bound question for an approved HITL
+    ``ptc_agent`` hand-off.
+
+    When the turn is a HITL resume (``cos_is_hitl_resume`` or
+    ``cos_approved_dispatch_payloads`` present in ``config["configurable"]``),
+    missing or unreadable bound payload for ``tool_call_id`` returns a
+    retryable error message instead of silently falling back to the raw tool
+    argument."""
+    if not isinstance(config, dict):
+        return question, None
+    configurable = config.get("configurable")
+    if not isinstance(configurable, dict):
+        return question, None
+    is_hitl_resume = bool(configurable.get(COS_HITL_RESUME_CONFIG_KEY)) or (
+        COS_APPROVED_DISPATCH_PAYLOADS_CONFIG_KEY in configurable
+    )
+    if not is_hitl_resume:
+        return question, None
+    approved_map = configurable.get(COS_APPROVED_DISPATCH_PAYLOADS_CONFIG_KEY)
+    if (
+        isinstance(approved_map, dict)
+        and isinstance(tool_call_id, str)
+        and tool_call_id.strip()
+    ):
+        saved = approved_map.get(tool_call_id)
+        if isinstance(saved, dict) and isinstance(saved.get("question"), str) and saved["question"].strip():
+            return saved["question"], None
+    return question, _MISSING_APPROVED_PAYLOAD_ERROR

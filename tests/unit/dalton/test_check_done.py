@@ -7778,7 +7778,6 @@ async def test_p0b_r3_deep_update_args_json_missing_corrupt_or_unreadable_fails(
                 f"{r_rel}/reconcile.md": "对账说明" * 25,
                 f"{r_rel}/reconcile.json": json.dumps({"wrong": 0, "partial": 0}),
                 f"{r_rel}/knowledge-revision.json": json.dumps({"thesis": {"ops": []}, "pad": "x" * 40}),
-                "research/push/2026-10-28-earnings-deep-FY26Q3.md": "推送稿" * 40,
                 f"{run_dir}/status.json": json.dumps(
                     {"run_id": "run-deep-r3", "name": "earnings-deep-update", "status": "completed", "updated_at": 100.0}
                 ),
@@ -7877,3 +7876,110 @@ async def test_p0b_r3_deep_update_args_json_missing_corrupt_or_unreadable_fails(
     )
     assert res_no_tid_missing["done"] is False
     assert any("args.json" in m for m in res_no_tid_missing["missing"]), res_no_tid_missing["missing"]
+
+
+@pytest.mark.asyncio
+async def test_p0b_r4_deep_update_args_json_empty_missing_fields_type_or_mismatch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4 #1: earnings-deep-update launch args.json MUST validate required fields,
+    types, and consistency with closing params; `{}` or missing/mistyped/mismatched
+    fields MUST fail check_done instead of taking the no-model branch."""
+    _patch_knowledge(monkeypatch, ["thesis", "debate", "drivers", "management"])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
+    import src.dalton.tools.check_done_tools as _cdt_mod
+
+    monkeypatch.setattr(
+        _cdt_mod,
+        "_push_draft_since_epoch",
+        create_autospec(_cdt_mod._push_draft_since_epoch, return_value=10),
+    )
+
+    r_rel = "research/2026-10-28-deep-FY26Q3"
+    run_dir = ".agents/threads/short-de/workflows/run-deep-r4"
+    draft_path = "drafts/2026-10-28-deep-FY26Q3.md"
+    draft_text = "# META 深度点评\n" + ("正文内容" * 200)
+    params_no_model = {
+        "ticker": "META",
+        "quarter": "FY26Q3",
+        "workspace_dir": ".",
+        "release_date": "2026-10-28",
+    }
+
+    def _make_files(args_obj: dict[str, Any]) -> dict[str, str]:
+        return _with_full_language_sidecars(
+            {
+                draft_path: draft_text,
+                "drafts/2026-10-28-deep-FY26Q3.audit.md": _sidecar_for(draft_text),
+                f"{r_rel}/thesis-calibration.md": "校准结论" * 40,
+                f"{r_rel}/management-delta.md": "指引兑现" * 25,
+                f"{r_rel}/reconcile.md": "对账说明" * 25,
+                f"{r_rel}/reconcile.json": json.dumps({"wrong": 0, "partial": 0}),
+                f"{r_rel}/knowledge-revision.json": json.dumps({"thesis": {"ops": []}, "pad": "x" * 40}),
+                "research/push/2026-10-28-earnings-deep-FY26Q3.md": "推送稿" * 40,
+                f"{run_dir}/status.json": json.dumps(
+                    {
+                        "run_id": "run-deep-r4",
+                        "name": "earnings-deep-update",
+                        "status": "completed",
+                        "started_at": 10.0,
+                        "updated_at": 100.0,
+                    }
+                ),
+                f"{run_dir}/args.json": json.dumps(args_obj),
+                f"{run_dir}/journal/审稿.json": json.dumps(
+                    {
+                        "label": "审稿",
+                        "dispatches": [
+                            {
+                                "label": "审稿",
+                                "status": "ok",
+                                "seq": 1,
+                                "recorded_at": 50.0,
+                                "draft_sha256": _draft_hash(draft_text),
+                                "result": {"verdict": "pass", "summary": "ok", "items": _nine_items(), "must_fix": []},
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        )
+
+    async def _check(args_obj: dict[str, Any]) -> dict[str, Any]:
+        return await run_check_done(
+            workflow="earnings-deep-update",
+            params=params_no_model,
+            backend=_make_backend(_make_files(args_obj)),
+            workspace_id=WS,
+            run_id="run-deep-r4",
+            thread_id="short-deep-uuid",
+        )
+
+    # 1. Empty JSON object `{}` MUST fail (previously skipped model_verification & models doc!)
+    res_empty = await _check({})
+    assert res_empty["done"] is False
+    assert any("args.json" in m and "必填字段" in m for m in res_empty["missing"]), res_empty["missing"]
+
+    # 2. Missing a required field (`quarter`) MUST fail
+    res_missing_field = await _check({"ticker": "META", "workspace_dir": ".", "release_date": "2026-10-28"})
+    assert res_missing_field["done"] is False
+    assert any("quarter" in m for m in res_missing_field["missing"]), res_missing_field["missing"]
+
+    # 3. Wrong type on required field or optional `model_path` MUST fail
+    res_bad_req_type = await _check({**params_no_model, "ticker": 123})
+    assert res_bad_req_type["done"] is False
+    assert any("ticker" in m for m in res_bad_req_type["missing"]), res_bad_req_type["missing"]
+
+    res_bad_mp_type = await _check({**params_no_model, "model_path": 999})
+    assert res_bad_mp_type["done"] is False
+    assert any("model_path" in m and "类型异常" in m for m in res_bad_mp_type["missing"]), res_bad_mp_type["missing"]
+
+    # 4. Closing param mismatch with args.json MUST fail
+    res_mismatch = await _check({**params_no_model, "quarter": "FY26Q2"})
+    assert res_mismatch["done"] is False
+    assert any("quarter" in m and "不一致" in m for m in res_mismatch["missing"]), res_mismatch["missing"]
+
+    # 5. Complete, correctly typed, consistent args.json without model_path passes cleanly
+    res_valid = await _check(params_no_model)
+    assert res_valid["done"] is True, res_valid["missing"]

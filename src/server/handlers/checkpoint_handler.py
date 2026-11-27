@@ -610,7 +610,11 @@ async def settle_resume_request(
     if stale:
         raise HTTPException(status_code=409, detail=stale_fork_detail())
     # --- DALTON-HOOK(cos-settings-tools): begin ---
+    # DALTON-HOOK(cos-verbatim-forward): reuse newest checkpoint read here to carry approval-bound ptc_agent payloads into ptc_run
+    approved_dispatch_payloads: dict[str, dict[str, Any]] | None = None
     if request.hitl_response and newest is not None:
+        from src.dalton.cos_verbatim import extract_approved_dispatch_payloads_from_checkpoint
+
         pending_records = interrupt_records(getattr(newest, "pending_writes", None))
         pending_by_id = {
             str(rec["id"]): rec
@@ -637,15 +641,26 @@ async def settle_resume_request(
                 raw_request=raw_request,
                 thread_meta=thread_meta,
             )
+        approved_dispatch_payloads = extract_approved_dispatch_payloads_from_checkpoint(
+            newest,
+            hitl_response=rewritten_hitl if rewritten_hitl is not None else request.hitl_response,
+        )
         if rewritten_hitl is not None:
             return request.model_copy(
                 update={
                     "resume_run_horizon": branch.run_horizon,
                     "hitl_response": rewritten_hitl,
+                    "approved_dispatch_payloads": approved_dispatch_payloads,
                 }
             )
     # --- DALTON-HOOK(cos-settings-tools): end ---
-    return request.model_copy(update={"resume_run_horizon": branch.run_horizon})
+    return request.model_copy(
+        update={
+            "resume_run_horizon": branch.run_horizon,
+            # DALTON-HOOK(cos-verbatim-forward): stamp verified payloads (or None when newest was absent)
+            "approved_dispatch_payloads": approved_dispatch_payloads,
+        }
+    )
 
 
 async def resolve_checkpoint_resume_run_id(

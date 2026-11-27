@@ -2102,6 +2102,8 @@ def recalculate_keep_cache(
     timeout: int,
     flags: set[str],
     keep_cache_spec: dict[str, Any] | None,
+    *,
+    on_before_replace: Any = None,
 ) -> dict[str, Any]:
     """Run Step 1 (donor cache restore) then Step 2 (temp-copy LibreOffice selective merge)."""
     spec = dict(keep_cache_spec or {})
@@ -2227,6 +2229,8 @@ def recalculate_keep_cache(
         if written_back:
             staged = src.with_name(src.name + ".recalc.tmp")
             shutil.copyfile(patched, staged)
+            if callable(on_before_replace):
+                on_before_replace(staged)
             os.replace(staged, src)
 
     non_exempt_errors = [e for e in recalc_errors if not e.get("exempt")]

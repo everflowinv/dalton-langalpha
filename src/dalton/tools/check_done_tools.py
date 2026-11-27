@@ -1191,6 +1191,63 @@ async def _read_run_args_checked(
     return doc, None
 
 
+_DEEP_UPDATE_REQUIRED_ARGS: tuple[str, ...] = (
+    "ticker",
+    "quarter",
+    "workspace_dir",
+    "release_date",
+)
+
+
+def _validate_deep_run_args(
+    doc: dict[str, Any],
+    caller_params: dict[str, Any],
+    args_path: str,
+) -> str | None:
+    """Validate ``earnings-deep-update`` launch ``args.json`` required fields,
+    types, and consistency with closing ``caller_params``.
+
+    An empty object ``{}`` or a record missing/mistyping required fields or
+    disagreeing with closing parameters MUST fail verification rather than
+    letting the closing check take the no-model branch."""
+    missing_or_invalid: list[str] = []
+    for key in _DEEP_UPDATE_REQUIRED_ARGS:
+        val = doc.get(key)
+        if not isinstance(val, str) or not val.strip():
+            missing_or_invalid.append(key)
+    if missing_or_invalid:
+        fields = "、".join(missing_or_invalid)
+        return (
+            f"深度链启动记录（{args_path}）缺少或类型异常的必填字段：{fields}；"
+            "无法确认启动参数，完成核对不予放行。"
+        )
+    if "model_path" in doc and doc["model_path"] is not None:
+        if not isinstance(doc["model_path"], str):
+            return (
+                f"深度链启动记录（{args_path}）的 model_path 类型异常"
+                f"（期望字符串或 null，实际为 {type(doc['model_path']).__name__}），"
+                "完成核对不予放行。"
+            )
+    for key in _DEEP_UPDATE_REQUIRED_ARGS:
+        launched_s = doc[key].strip()
+        raw_caller = caller_params.get(key)
+        if not isinstance(raw_caller, str) or not raw_caller.strip():
+            continue
+        caller_s = raw_caller.strip()
+        if key == "ticker":
+            same = launched_s.upper() == caller_s.upper()
+        elif key == "workspace_dir":
+            same = posixpath.normpath(launched_s) == posixpath.normpath(caller_s)
+        else:
+            same = launched_s == caller_s
+        if not same:
+            return (
+                f"收尾参数 {key}（{caller_s!r}）与本次运行启动记录"
+                f"（{args_path} 中的 {launched_s!r}）不一致，完成核对不予放行。"
+            )
+    return None
+
+
 async def _run_args_doc(
     backend: Any, workflow: str, run_id: str | None, thread_id: str | None
 ) -> dict[str, Any] | None:
@@ -4109,17 +4166,31 @@ async def run_check_done(
                         inherited = raw_as_of.strip()
                 if inherited:
                     params = {**params, "as_of": inherited}
+            deep_args_valid = True
             if workflow == "earnings-deep-update":
                 if located_run_dir is not None and args_err is not None:
+                    deep_args_valid = False
                     missing.append(
                         f"已定位到深度链运行（{located_run_dir}），但启动记录无法读取（{args_err}）；"
                         "无法确认启动时是否传入 model_path，完成核对不予放行。"
                     )
                 elif located_run_dir is None and run_dir_err is not None:
+                    deep_args_valid = False
                     missing.append(
                         f"深度链运行目录核验失败（{run_dir_err}），无法读取启动记录（args.json），完成核对不予放行。"
                     )
-            if workflow in ("company-model", "earnings-deep-update") and isinstance(run_args, dict):
+                elif located_run_dir is not None and isinstance(run_args, dict):
+                    deep_args_err = _validate_deep_run_args(
+                        run_args, params, f"{located_run_dir}/args.json"
+                    )
+                    if deep_args_err is not None:
+                        deep_args_valid = False
+                        missing.append(deep_args_err)
+            if (
+                workflow in ("company-model", "earnings-deep-update")
+                and isinstance(run_args, dict)
+                and (workflow != "earnings-deep-update" or deep_args_valid)
+            ):
                 raw_launched_mp = run_args.get("model_path")
                 launched_mp = (
                     raw_launched_mp.strip()

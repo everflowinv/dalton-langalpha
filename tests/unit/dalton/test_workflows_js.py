@@ -1168,25 +1168,48 @@ class DiskHost(ScriptedHost):
                 "Checks",
             ]
             return {
-                "path": cand,
+                "candidate_path": cand,
                 "status": "complete",
+                "readable": True,
+                "workflow": "full-coverage",
+                "mode": "build",
                 "sheet_names": all_sheets,
                 "missing_required_sheets": [],
                 "summary": "all required sheets present",
             }
-        if label == "模型联动差异与报告同步" and label not in self.by_label:
+        if label == "模型联动差异刷新" and label not in self.by_label:
             m_cm = re.search(r"刷新一致预期差异表 (\S*consensus-diff\.md) 与 (\S*consensus-diff\.json)", prompt)
-            files = []
-            if m_cm:
-                files.extend([m_cm.group(1), m_cm.group(2)])
-            m_rpt = re.search(r"同步更新 (\S+?\.md) 正文", prompt)
-            if m_rpt:
-                files.append(m_rpt.group(1))
+            files = [m_cm.group(1), m_cm.group(2)] if m_cm else ["model_dump/consensus-diff.md", "model_dump/consensus-diff.json"]
             return {
-                "files": files or ["model_dump/consensus-diff.md", "model_dump/consensus-diff.json"],
-                "summary": "diff & report synced",
-                "report_sha256": None,
+                "files": files,
+                "summary": "diff refreshed",
                 "consensus_diff_generated": True,
+            }
+        if label == "核验差异表落盘" and label not in self.by_label:
+            return {
+                "path": "model_dump/consensus-diff.json",
+                "json_ok": True,
+                "md_ok": True,
+                "matched": True,
+            }
+        if label == "模型联动报告同步" and label not in self.by_label:
+            m_rpt = re.search(r"同步更新 (\S+?\.md) 正文", prompt)
+            files = [m_rpt.group(1)] if m_rpt else ["drafts/report.md"]
+            return {
+                "files": files,
+                "summary": "report synced",
+                "report_sha256": "d" * 64,
+            }
+        if label == "核验报告同步落盘" and label not in self.by_label:
+            m_rpt = re.search(r"核验报告 (\S+?\.md)", prompt)
+            rel = m_rpt.group(1) if m_rpt else "drafts/report.md"
+            p = self.workspace / rel
+            rsha = hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "d" * 64
+            return {
+                "path": rel,
+                "exists": True,
+                "synced": True,
+                "report_sha256": rsha,
             }
         if label == "模型构建与落盘" and label not in self.by_label:
             cand, sha = self._latest_disk_model()

@@ -747,55 +747,40 @@ def write_consensus_snapshot(
         refreshed_diffs = _refresh_consensus_diff_caches(
             editing_copy, target_sh, donor_copy, diff_targets
         )
+        new_sha = model_fingerprint.file_sha256(editing_copy)
+        touched_sorted = sorted(set(touched_coords))
+        snap_sorted = sorted(set(written_coords))
+        post_cm_sha: str | None = None
+        new_cm_text: str | None = None
+        receipt_path: Path | None = None
+        if cp_obj is not None:
+            if cp_obj.is_file():
+                cm = json.loads(cp_obj.read_text(encoding="utf-8"))
+                cm_touched = set(cm.setdefault("touched_cells", {}).get(target_sh) or ())
+                cm_touched.update(touched_sorted)
+                cm["touched_cells"][target_sh] = sorted(cm_touched)
+                cm_snap = set(cm.setdefault("consensus_snapshot_cells", {}).get(target_sh) or ())
+                cm_snap.update(snap_sorted)
+                cm["consensus_snapshot_cells"][target_sh] = sorted(cm_snap)
+                cm["candidate_sha256"] = new_sha
+                new_cm_text = json.dumps(cm, indent=2, ensure_ascii=False) + "\n"
+                post_cm_sha = model_edit._sha256_text(new_cm_text)
+            # Write chained transition receipt BEFORE replacing mpath / coord_map.json
+            # so there is zero crash window between file publish and receipt persistence.
+            receipt_path = model_edit.record_candidate_transition(
+                coord_map_path=cp_obj,
+                model_path=mpath,
+                op="write_snapshot",
+                pre_model_sha256=pre_model_sha,
+                post_model_sha256=new_sha,
+                pre_coord_map_sha256=pre_cm_sha,
+                post_coord_map_sha256=post_cm_sha,
+            )
         os.replace(editing_copy, mpath)
-
-    new_sha = model_fingerprint.file_sha256(mpath)
-    touched_sorted = sorted(set(touched_coords))
-    snap_sorted = sorted(set(written_coords))
-    post_cm_sha: str | None = None
-    receipt_path: Path | None = None
-    if cp_obj is not None:
-        if cp_obj.is_file():
-            cm = json.loads(cp_obj.read_text(encoding="utf-8"))
-            cm_touched = set(cm.setdefault("touched_cells", {}).get(target_sh) or ())
-            cm_touched.update(touched_sorted)
-            cm["touched_cells"][target_sh] = sorted(cm_touched)
-            cm_snap = set(cm.setdefault("consensus_snapshot_cells", {}).get(target_sh) or ())
-            cm_snap.update(snap_sorted)
-            cm["consensus_snapshot_cells"][target_sh] = sorted(cm_snap)
-            cm["candidate_sha256"] = new_sha
-            cp_obj.write_text(json.dumps(cm, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-            post_cm_sha = model_fingerprint.file_sha256(cp_obj)
-        # Write independent snapshot receipt so workflow resume can verify the exact
-        # pre->post hash transition of both the candidate workbook and coord_map.json.
-        receipt_path = cp_obj.parent / "consensus-snapshot-receipt.json"
-        orig_model_sha = pre_model_sha
-        orig_cm_sha = pre_cm_sha
-        if receipt_path.is_file():
-            try:
-                prev_rcpt = json.loads(receipt_path.read_text(encoding="utf-8"))
-                if (
-                    isinstance(prev_rcpt, dict)
-                    and prev_rcpt.get("post_snapshot_model_sha256") == pre_model_sha
-                    and prev_rcpt.get("post_snapshot_coord_map_sha256") == pre_cm_sha
-                ):
-                    orig_model_sha = prev_rcpt.get("pre_snapshot_model_sha256") or pre_model_sha
-                    orig_cm_sha = prev_rcpt.get("pre_snapshot_coord_map_sha256")
-            except Exception:
-                pass
-        receipt_doc = {
-            "model_path": str(mpath),
-            "model_name": mpath.name,
-            "pre_snapshot_model_sha256": orig_model_sha,
-            "post_snapshot_model_sha256": new_sha,
-            "coord_map_path": str(cp_obj),
-            "pre_snapshot_coord_map_sha256": orig_cm_sha,
-            "post_snapshot_coord_map_sha256": post_cm_sha,
-        }
-        receipt_path.write_text(
-            json.dumps(receipt_doc, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        if cp_obj is not None and new_cm_text is not None:
+            tmp_cm = cp_obj.with_name(f".{cp_obj.name}.{os.getpid()}.tmp")
+            tmp_cm.write_text(new_cm_text, encoding="utf-8")
+            os.replace(tmp_cm, cp_obj)
 
     return {
         "status": "ok",

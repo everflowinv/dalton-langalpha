@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -78,6 +79,91 @@ def _load_module(mod_name: str, path: Path) -> Any:
     sys.modules[mod_name] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def record_candidate_transition(
+    *,
+    coord_map_path: Path,
+    model_path: Path,
+    op: str,
+    pre_model_sha256: str,
+    post_model_sha256: str,
+    pre_coord_map_sha256: str | None,
+    post_coord_map_sha256: str | None,
+) -> Path:
+    """Atomically record a pre->post publish transition for ``model_path`` and
+    ``coord_map_path`` into ``<coord_map_dir>/consensus-snapshot-receipt.json``.
+
+    Called BEFORE ``os.replace`` swaps the target workbook/coord_map on disk so
+    there is no crash window between file publish and receipt persistence, and
+    chains across ``write-snapshot`` plus subsequent ``--in-place`` rework and
+    recalc publishes so workflow resume always recovers the reworked candidate
+    without rebuilding from baseline or bumping the model version."""
+    cp = Path(coord_map_path).expanduser().resolve()
+    mp = Path(model_path).expanduser().resolve()
+    cp.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path = cp.parent / "consensus-snapshot-receipt.json"
+
+    transitions: list[dict[str, Any]] = []
+    if receipt_path.is_file():
+        try:
+            prev = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except Exception:
+            prev = None
+        if isinstance(prev, dict) and str(prev.get("model_name") or "").strip() == mp.name:
+            prev_trs = prev.get("transitions")
+            if isinstance(prev_trs, list) and prev_trs:
+                valid_prev = [t for t in prev_trs if isinstance(t, dict)]
+            elif prev.get("pre_snapshot_model_sha256") and prev.get("post_snapshot_model_sha256"):
+                valid_prev = [
+                    {
+                        "op": "write_snapshot",
+                        "pre_model_sha256": prev.get("pre_snapshot_model_sha256"),
+                        "post_model_sha256": prev.get("post_snapshot_model_sha256"),
+                        "pre_coord_map_sha256": prev.get("pre_snapshot_coord_map_sha256"),
+                        "post_coord_map_sha256": prev.get("post_snapshot_coord_map_sha256"),
+                    }
+                ]
+            else:
+                valid_prev = []
+            if valid_prev:
+                known_posts = {
+                    str(t.get("post_model_sha256") or "") for t in valid_prev
+                } | {str(t.get("pre_model_sha256") or "") for t in valid_prev}
+                if pre_model_sha256 in known_posts:
+                    transitions = valid_prev
+
+    new_tr = {
+        "op": str(op or "publish"),
+        "pre_model_sha256": pre_model_sha256,
+        "post_model_sha256": post_model_sha256,
+        "pre_coord_map_sha256": pre_coord_map_sha256,
+        "post_coord_map_sha256": post_coord_map_sha256,
+    }
+    if not transitions or transitions[-1] != new_tr:
+        transitions.append(new_tr)
+
+    first = transitions[0]
+    last = transitions[-1]
+    receipt_doc = {
+        "schema_version": 2,
+        "model_path": str(mp),
+        "model_name": mp.name,
+        "pre_snapshot_model_sha256": first.get("pre_model_sha256"),
+        "post_snapshot_model_sha256": last.get("post_model_sha256"),
+        "coord_map_path": str(cp),
+        "pre_snapshot_coord_map_sha256": first.get("pre_coord_map_sha256"),
+        "post_snapshot_coord_map_sha256": last.get("post_coord_map_sha256"),
+        "transitions": transitions,
+    }
+    tmp_rcpt = receipt_path.with_name(f".{receipt_path.name}.{os.getpid()}.tmp")
+    tmp_rcpt.write_text(json.dumps(receipt_doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp_rcpt, receipt_path)
+    return receipt_path
 
 
 # ---------------------------------------------------------------------------
@@ -1056,31 +1142,75 @@ def apply_edit_plan(
     # is already readable and prompts Excel to recalculate on open.
     if is_template_build and not skip_recalc:
         model_xlsx_hooks.set_full_calc_on_load(editing_tmp, True)
+
+    ok_read_tmp, read_msg_tmp = model_readable.check_workbook_readable(editing_tmp)
+    if not ok_read_tmp:
+        raise ValueError(f"staged candidate workbook unreadable before publish: {read_msg_tmp} ({cand})")
+
+    pre_recalc_sha = model_fingerprint.file_sha256(editing_tmp)
+    coord_map["candidate_sha256"] = pre_recalc_sha
+    coord_map["donor_cache_restored"] = True
+    coord_map["kept_cache_count"] = donor_restore_res.get("kept_cache_count", 0)
+    coord_map["recalc_result"] = {"status": "pending"}
+
+    cp_resolved = Path(coord_map_out).expanduser().resolve() if coord_map_out is not None else None
+    pre_cm_sha = (
+        model_fingerprint.file_sha256(cp_resolved)
+        if (cp_resolved is not None and cp_resolved.is_file())
+        else None
+    )
+    pre_cm_text: str | None = None
+    pre_recalc_cm_sha: str | None = None
+    if cp_resolved is not None:
+        cp_resolved.parent.mkdir(parents=True, exist_ok=True)
+        pre_cm = _merge_coord_maps(prior_coord_map, coord_map) if prior_coord_map is not None else coord_map
+        pre_cm_text = json.dumps(pre_cm, indent=2, ensure_ascii=False) + "\n"
+        pre_recalc_cm_sha = _sha256_text(pre_cm_text)
+        # Write transition receipt BEFORE swapping cand/coord_map on disk so any
+        # interruption during or right after in-place publish stays resume-safe.
+        if in_place:
+            record_candidate_transition(
+                coord_map_path=cp_resolved,
+                model_path=cand,
+                op="in_place_publish",
+                pre_model_sha256=base_sha,
+                post_model_sha256=pre_recalc_sha,
+                pre_coord_map_sha256=pre_cm_sha,
+                post_coord_map_sha256=pre_recalc_cm_sha,
+            )
+
     os.replace(editing_tmp, cand)
 
     ok_read, read_msg = model_readable.check_workbook_readable(cand)
     if not ok_read:
         raise ValueError(f"published candidate workbook unreadable before recalc: {read_msg} ({cand})")
 
-    pre_recalc_sha = model_fingerprint.file_sha256(cand)
-    coord_map["candidate_sha256"] = pre_recalc_sha
-    coord_map["donor_cache_restored"] = True
-    coord_map["kept_cache_count"] = donor_restore_res.get("kept_cache_count", 0)
-    coord_map["recalc_result"] = {"status": "pending"}
-    if coord_map_out is not None:
-        cp = Path(coord_map_out).expanduser().resolve()
-        cp.parent.mkdir(parents=True, exist_ok=True)
-        pre_cm = _merge_coord_maps(prior_coord_map, coord_map) if prior_coord_map is not None else coord_map
-        tmp_cm = cp.with_name(f".{cp.name}.{os.getpid()}.tmp")
-        tmp_cm.write_text(json.dumps(pre_cm, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        os.replace(tmp_cm, cp)
+    if cp_resolved is not None and pre_cm_text is not None:
+        tmp_cm = cp_resolved.with_name(f".{cp_resolved.name}.{os.getpid()}.tmp")
+        tmp_cm.write_text(pre_cm_text, encoding="utf-8")
+        os.replace(tmp_cm, cp_resolved)
 
     # Step 4: Temp-copy LibreOffice recalculation & selective non-error merge
     full_calc_fallback = False
     if skip_recalc:
-        # Non-template --skip-recalc: enable fullCalcOnLoad=1 BEFORE hashing/reporting so Excel recalculates
-        # on open and generated reports match the actual workbook state.
-        model_xlsx_hooks.set_full_calc_on_load(cand, True)
+        # Non-template --skip-recalc: enable fullCalcOnLoad=1 on a staged copy first so
+        # we can record the transition receipt BEFORE replacing cand on disk.
+        staged_skip = cand.with_name(f".{cand.name}.{os.getpid()}.skiprecalc.tmp")
+        shutil.copyfile(cand, staged_skip)
+        model_xlsx_hooks.set_full_calc_on_load(staged_skip, True)
+        if in_place and cp_resolved is not None:
+            staged_skip_sha = model_fingerprint.file_sha256(staged_skip)
+            if staged_skip_sha != pre_recalc_sha:
+                record_candidate_transition(
+                    coord_map_path=cp_resolved,
+                    model_path=cand,
+                    op="in_place_skip_recalc",
+                    pre_model_sha256=pre_recalc_sha,
+                    post_model_sha256=staged_skip_sha,
+                    pre_coord_map_sha256=pre_recalc_cm_sha,
+                    post_coord_map_sha256=pre_recalc_cm_sha,
+                )
+        os.replace(staged_skip, cand)
         full_calc_fallback = True
         recalc_res: dict[str, Any] = {
             "status": "skipped",
@@ -1090,19 +1220,53 @@ def apply_edit_plan(
             "full_calc_on_load_enabled": True,
         }
     else:
+        def _record_before_recalc_swap(staged_path: Path) -> None:
+            if in_place and cp_resolved is not None:
+                staged_sha = model_fingerprint.file_sha256(staged_path)
+                if staged_sha != pre_recalc_sha:
+                    record_candidate_transition(
+                        coord_map_path=cp_resolved,
+                        model_path=cand,
+                        op="in_place_recalc",
+                        pre_model_sha256=pre_recalc_sha,
+                        post_model_sha256=staged_sha,
+                        pre_coord_map_sha256=pre_recalc_cm_sha,
+                        post_coord_map_sha256=pre_recalc_cm_sha,
+                    )
+
         recalc_res = model_xlsx_hooks.recalculate_keep_cache(
-            recalc_mod, cand, int(recalc_timeout), set(), keep_cache_spec
+            recalc_mod,
+            cand,
+            int(recalc_timeout),
+            set(),
+            keep_cache_spec,
+            on_before_replace=_record_before_recalc_swap if (in_place and cp_resolved is not None) else None,
         )
         # For default-template builds: if recalculation failed or left unmatched target formulas,
         # keep fullCalcOnLoad=1 so Excel recalculates immediately on open; if it succeeded cleanly,
         # restore the donor <calcPr>.
         if is_template_build:
+            staged_post = cand.with_name(f".{cand.name}.{os.getpid()}.postrecalc.tmp")
+            shutil.copyfile(cand, staged_post)
+            pre_post_sha = model_fingerprint.file_sha256(cand)
             if recalc_res.get("status") in ("recalc_failed", "incomplete"):
-                model_xlsx_hooks.set_full_calc_on_load(cand, True)
+                model_xlsx_hooks.set_full_calc_on_load(staged_post, True)
                 full_calc_fallback = True
                 recalc_res["full_calc_on_load_enabled"] = True
             else:
-                _preserve_calcpr_from_donor(cand, donor_path)
+                _preserve_calcpr_from_donor(staged_post, donor_path)
+            post_post_sha = model_fingerprint.file_sha256(staged_post)
+            if in_place and cp_resolved is not None and post_post_sha != pre_post_sha:
+                record_candidate_transition(
+                    coord_map_path=cp_resolved,
+                    model_path=cand,
+                    op="in_place_calcpr",
+                    pre_model_sha256=pre_post_sha,
+                    post_model_sha256=post_post_sha,
+                    pre_coord_map_sha256=pre_recalc_cm_sha,
+                    post_coord_map_sha256=pre_recalc_cm_sha,
+                )
+            os.replace(staged_post, cand)
 
     cand_sha = model_fingerprint.file_sha256(cand)
     coord_map["candidate_sha256"] = cand_sha
@@ -1117,12 +1281,23 @@ def apply_edit_plan(
     if prior_coord_map is not None:
         coord_map = _merge_coord_maps(prior_coord_map, coord_map)
 
-    if coord_map_out is not None:
-        cp = Path(coord_map_out).expanduser().resolve()
-        cp.parent.mkdir(parents=True, exist_ok=True)
-        tmp_cm = cp.with_name(f".{cp.name}.{os.getpid()}.tmp")
-        tmp_cm.write_text(json.dumps(coord_map, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        os.replace(tmp_cm, cp)
+    if cp_resolved is not None:
+        cp_resolved.parent.mkdir(parents=True, exist_ok=True)
+        final_cm_text = json.dumps(coord_map, indent=2, ensure_ascii=False) + "\n"
+        final_cm_sha = _sha256_text(final_cm_text)
+        if in_place:
+            record_candidate_transition(
+                coord_map_path=cp_resolved,
+                model_path=cand,
+                op="in_place_finalize",
+                pre_model_sha256=cand_sha,
+                post_model_sha256=cand_sha,
+                pre_coord_map_sha256=pre_recalc_cm_sha,
+                post_coord_map_sha256=final_cm_sha,
+            )
+        tmp_cm = cp_resolved.with_name(f".{cp_resolved.name}.{os.getpid()}.tmp")
+        tmp_cm.write_text(final_cm_text, encoding="utf-8")
+        os.replace(tmp_cm, cp_resolved)
 
     return {
         "status": "ok",
