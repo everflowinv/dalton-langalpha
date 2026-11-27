@@ -245,6 +245,10 @@ class _ConsensusSingleflightBusyError(RuntimeError):
     """Raised when another worker still holds the Redis singleflight lock past the wait timeout."""
 
 
+class _ConsensusSlotBusyError(RuntimeError):
+    """Raised when waiting for a local or cross-process upstream slot times out before sending any upstream request."""
+
+
 class _ConsensusEmptyCooldownError(RuntimeError):
     """Raised when upstream returned only rolled-past/unusable estimates and entered cooldown."""
 
@@ -1044,7 +1048,12 @@ async def _run_blocking_holding_slot(
 async def _acquire_upstream_slot() -> AsyncIterator[_UpstreamSlotLease]:
     """Acquire a cross-process Redis semaphore slot (8-way instance-wide, §6.2) with local fallback."""
     local_sem = _get_consensus_semaphore()
-    await asyncio.wait_for(local_sem.acquire(), timeout=_REDIS_SEM_WAIT_TIMEOUT_SECONDS)
+    try:
+        await asyncio.wait_for(local_sem.acquire(), timeout=_REDIS_SEM_WAIT_TIMEOUT_SECONDS)
+    except TimeoutError as exc:
+        raise _ConsensusSlotBusyError(
+            "Timed out waiting for local consensus concurrency slot"
+        ) from exc
 
     redis_client = await _get_redis_cache_client()
     acquire_lock = getattr(redis_client, "acquire_lock", None) if redis_client is not None else None
@@ -1077,7 +1086,9 @@ async def _acquire_upstream_slot() -> AsyncIterator[_UpstreamSlotLease]:
                 if acquired_slot_key is not None or redis_unavailable:
                     break
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("Timed out waiting for cross-process consensus semaphore slot")
+                    raise _ConsensusSlotBusyError(
+                        "Timed out waiting for cross-process consensus semaphore slot"
+                    )
                 await asyncio.sleep(_REDIS_SEM_POLL_SECONDS)
         except BaseException:
             local_sem.release()
@@ -1588,26 +1599,6 @@ def select_fmp_fy1_fy2_estimates(
     return fy1_row, fy2_row
 
 
-def _find_fmp_row_by_fy_end(
-    annual_estimates: list[Mapping[str, Any]],
-    target_fy_end: str | None,
-) -> Mapping[str, Any] | None:
-    """Find an FMP annual estimate row matching ``target_fy_end`` (within ±15 days)."""
-    if not target_fy_end:
-        return None
-    best: Mapping[str, Any] | None = None
-    for item in annual_estimates or []:
-        if not isinstance(item, Mapping):
-            continue
-        dt_parsed = _parse_iso_date(item.get("date"))
-        if dt_parsed is None:
-            continue
-        if _dates_match_fiscal_year(dt_parsed.isoformat(), target_fy_end):
-            if best is None or (_fmp_row_eps(best) is None and _fmp_row_eps(item) is not None):
-                best = item
-    return best
-
-
 def _merge_partial_consensus_record(
     primary: RawConsensusRecord,
     fallback: RawConsensusRecord,
@@ -1616,7 +1607,13 @@ def _merge_partial_consensus_record(
     today: date | None = None,
     last_reported_fy_end: str | None = None,
 ) -> RawConsensusRecord:
-    """Fill a single missing year (FY1 or FY2) in ``primary`` using eligible ``fallback`` rows only."""
+    """Merge eligible dated fiscal years from ``primary`` and ``fallback`` to determine FY1/FY2, then match EPS by date.
+
+    Determines FY1/FY2 strictly from the combined sorted eligible fiscal-year end dates across both
+    sources (handling ±15-day 52/53-week shifts), preferring ``primary`` EPS when available for a
+    fiscal year and filling missing years (including an earlier eligible FY1 when Yahoo ``0y``
+    lacked an endDate) from ``fallback``.
+    """
     p_ccy, _ = _normalize_currency(primary.estimate_currency)
     f_ccy, _ = _normalize_currency(fallback.estimate_currency)
     # Refuse to merge when fallback currency is unverified/missing or incompatible with primary
@@ -1630,125 +1627,126 @@ def _merge_partial_consensus_record(
         fallback.last_reported_fy_end,
     )
 
-    fy1_eps = primary.fy1_eps
-    fy1_end = primary.fy1_end
-    fy2_eps = primary.fy2_eps
-    fy2_end = primary.fy2_end
-    analyst_count = primary.analyst_count
-    filled_any = False
+    # Buckets: [end_date_iso, primary_eps, primary_analysts, fallback_eps, fallback_analysts]
+    buckets: list[list[Any]] = []
 
-    # Only search FMP rows that pass the unified FY eligibility filter (never resurrect excluded FYs!)
+    def _upsert_primary(end_raw: str | None, eps_val: float | None, analysts: int | None) -> None:
+        parsed = _parse_iso_date(end_raw)
+        if parsed is None:
+            return
+        iso = parsed.isoformat()
+        if not _is_eligible_fy_end(iso, today=ref_today, last_reported_fy_end=eff_reported):
+            return
+        for b in buckets:
+            if _dates_match_fiscal_year(b[0], iso):
+                if b[1] is None and eps_val is not None:
+                    b[1] = eps_val
+                    b[2] = analysts
+                return
+        buckets.append([iso, eps_val, analysts if eps_val is not None else None, None, None])
+
+    def _upsert_fallback(end_raw: str | None, eps_val: float | None, analysts: int | None) -> None:
+        parsed = _parse_iso_date(end_raw)
+        if parsed is None:
+            return
+        iso = parsed.isoformat()
+        if not _is_eligible_fy_end(iso, today=ref_today, last_reported_fy_end=eff_reported):
+            return
+        for b in buckets:
+            if _dates_match_fiscal_year(b[0], iso):
+                if b[3] is None and eps_val is not None:
+                    b[3] = eps_val
+                    b[4] = analysts
+                return
+        buckets.append([iso, None, None, eps_val, analysts if eps_val is not None else None])
+
+    # 1. Insert eligible dated fiscal years from primary (sorted chronologically)
+    primary_dated: list[tuple[str, float | None, int | None]] = []
+    for end_raw, eps_val in ((primary.fy1_end, primary.fy1_eps), (primary.fy2_end, primary.fy2_eps)):
+        parsed = _parse_iso_date(end_raw)
+        if parsed is not None:
+            primary_dated.append(
+                (parsed.isoformat(), eps_val, primary.analyst_count if eps_val is not None else None)
+            )
+    primary_dated.sort(key=lambda item: item[0])
+    for iso, eps_val, analysts in primary_dated:
+        _upsert_primary(iso, eps_val, analysts)
+
+    # 2. Insert eligible dated fiscal years from FMP annual rows + fallback record (never resurrect excluded FYs)
     eligible_rows = _filter_fmp_eligible_estimates(
         list(fallback_annual_rows or []),
         today=ref_today,
         last_reported_fy_end=eff_reported,
     )
+    for row in eligible_rows:
+        _upsert_fallback(row.get("date"), _fmp_row_eps(row), _fmp_row_analysts(row))
+    for end_raw, eps_val in (
+        (fallback.fy1_end, fallback.fy1_eps),
+        (fallback.fy2_end, fallback.fy2_eps),
+    ):
+        _upsert_fallback(end_raw, eps_val, fallback.analyst_count if eps_val is not None else None)
 
-    if fy1_eps is None:
-        fy1_target_ok = fy1_end is None or _is_eligible_fy_end(
-            fy1_end, today=ref_today, last_reported_fy_end=eff_reported
-        )
-        matched_row = (
-            _find_fmp_row_by_fy_end(eligible_rows, fy1_end)
-            if (fy1_end and fy1_target_ok)
-            else None
-        )
-        cand_eps: float | None = None
-        cand_end: str | None = None
-        cand_analysts: int | None = None
-        if matched_row is not None:
-            cand_eps = _fmp_row_eps(matched_row)
-            cand_end = str(matched_row.get("date"))[:10]
-            cand_analysts = _fmp_row_analysts(matched_row)
-        elif fy1_end is None:
-            # No target FY1 end from primary: accept eligible dated fallback FY1 strictly earlier than primary FY2
-            fb1_ok = fallback.fy1_end is not None and _is_eligible_fy_end(
-                fallback.fy1_end, today=ref_today, last_reported_fy_end=eff_reported
-            )
-            if (
-                fb1_ok
-                and fallback.fy1_eps is not None
-                and (
-                    fy2_end is None
-                    or (
-                        fallback.fy1_end < fy2_end
-                        and not _dates_match_fiscal_year(fallback.fy1_end, fy2_end)
-                    )
-                )
-            ):
-                cand_eps = fallback.fy1_eps
-                cand_end = fallback.fy1_end
-                cand_analysts = fallback.analyst_count
-        if cand_eps is not None:
-            fy1_eps = cand_eps
-            fy1_end = fy1_end or cand_end
-            analyst_count = analyst_count or cand_analysts
-            filled_any = True
-
-    if fy2_eps is None:
-        fy2_target_ok = fy2_end is None or _is_eligible_fy_end(
-            fy2_end, today=ref_today, last_reported_fy_end=eff_reported
-        )
-        matched_row = (
-            _find_fmp_row_by_fy_end(eligible_rows, fy2_end)
-            if (fy2_end and fy2_target_ok)
-            else None
-        )
-        cand_eps = None
-        cand_end = None
-        cand_analysts = None
-        if matched_row is not None:
-            cand_eps = _fmp_row_eps(matched_row)
-            cand_end = str(matched_row.get("date"))[:10]
-            cand_analysts = _fmp_row_analysts(matched_row)
-        elif fy2_end is None:
-            # No target FY2 end from primary: pick eligible dated fallback FY2 (or FY1) strictly after primary FY1
-            fb2_ok = fallback.fy2_end is not None and _is_eligible_fy_end(
-                fallback.fy2_end, today=ref_today, last_reported_fy_end=eff_reported
-            )
-            fb1_ok = fallback.fy1_end is not None and _is_eligible_fy_end(
-                fallback.fy1_end, today=ref_today, last_reported_fy_end=eff_reported
-            )
-            if (
-                fb2_ok
-                and fallback.fy2_eps is not None
-                and (
-                    fy1_end is None
-                    or (
-                        fallback.fy2_end is not None
-                        and fallback.fy2_end > fy1_end
-                        and not _dates_match_fiscal_year(fallback.fy2_end, fy1_end)
-                    )
-                )
-            ):
-                cand_eps = fallback.fy2_eps
-                cand_end = fallback.fy2_end
-                cand_analysts = fallback.analyst_count
-            elif (
-                fb1_ok
-                and fy1_end is not None
-                and fallback.fy1_eps is not None
-                and fallback.fy1_end is not None
-                and fallback.fy1_end > fy1_end
-                and not _dates_match_fiscal_year(fallback.fy1_end, fy1_end)
-            ):
-                cand_eps = fallback.fy1_eps
-                cand_end = fallback.fy1_end
-                cand_analysts = fallback.analyst_count
-        if cand_eps is not None:
-            fy2_eps = cand_eps
-            fy2_end = fy2_end or cand_end
-            analyst_count = analyst_count or cand_analysts
-            filled_any = True
-
-    if not filled_any:
+    if not buckets:
         return primary
 
-    combined_provider = (
-        f"{primary.provider}+{fallback.provider}"
-        if primary.provider and fallback.provider and primary.provider != fallback.provider
-        else (primary.provider or fallback.provider)
+    buckets.sort(key=lambda b: b[0])
+    selected = buckets[:2]
+
+    def _resolve_slot(bucket: list[Any] | None) -> tuple[str | None, float | None, int | None, bool, bool]:
+        if bucket is None:
+            return None, None, None, False, False
+        end_iso, p_eps, p_an, f_eps, f_an = bucket
+        if p_eps is not None:
+            return end_iso, p_eps, p_an, True, False
+        if f_eps is not None:
+            return end_iso, f_eps, f_an, False, True
+        return end_iso, None, None, False, False
+
+    fy1_end, fy1_eps, fy1_an, used_p1, used_f1 = _resolve_slot(
+        selected[0] if len(selected) >= 1 else None
     )
+    fy2_end, fy2_eps, fy2_an, used_p2, used_f2 = _resolve_slot(
+        selected[1] if len(selected) >= 2 else None
+    )
+
+    used_primary_eps = used_p1 or used_p2
+    used_fallback_eps = used_f1 or used_f2
+
+    if (
+        fy1_end == primary.fy1_end
+        and fy1_eps == primary.fy1_eps
+        and fy2_end == primary.fy2_end
+        and fy2_eps == primary.fy2_eps
+        and not used_fallback_eps
+    ):
+        return primary
+
+    has_any_eps = fy1_eps is not None or fy2_eps is not None
+    analyst_count = (
+        (
+            fy1_an
+            or fy2_an
+            or (primary.analyst_count if used_primary_eps else None)
+            or (fallback.analyst_count if used_fallback_eps else None)
+        )
+        if has_any_eps
+        else None
+    )
+
+    if used_primary_eps and used_fallback_eps:
+        combined_provider = (
+            f"{primary.provider}+{fallback.provider}"
+            if primary.provider and fallback.provider and primary.provider != fallback.provider
+            else (primary.provider or fallback.provider)
+        )
+        confirmed = primary.eps_per_quote_unit_confirmed and fallback.eps_per_quote_unit_confirmed
+    elif used_fallback_eps:
+        combined_provider = fallback.provider or primary.provider
+        confirmed = fallback.eps_per_quote_unit_confirmed
+    else:
+        combined_provider = primary.provider
+        confirmed = primary.eps_per_quote_unit_confirmed
+
     return RawConsensusRecord(
         symbol=_canonical_symbol(primary.symbol),
         fy1_eps=fy1_eps,
@@ -1762,7 +1760,7 @@ def _merge_partial_consensus_record(
         as_of=primary.as_of or fallback.as_of,
         quote_type=primary.quote_type,
         security_name=primary.security_name or fallback.security_name,
-        eps_per_quote_unit_confirmed=primary.eps_per_quote_unit_confirmed and fallback.eps_per_quote_unit_confirmed,
+        eps_per_quote_unit_confirmed=confirmed,
         is_adr=primary.is_adr if primary.is_adr is not None else fallback.is_adr,
         last_reported_fy_end=eff_reported,
     )
@@ -2065,20 +2063,34 @@ class WatchlistConsensusAdapter:
     def _today(self) -> date:
         return self._today_fn()
 
+    def _has_fmp_configured(self) -> bool:
+        return self._fmp_client is not None or bool(os.environ.get("FMP_API_KEY", "").strip())
+
     async def _fetch_from_yfinance(
         self,
         symbol: str,
         *,
         last_reported_fy_end: str | None = None,
+        timeout: float | None = None,
     ) -> tuple[RawConsensusRecord | None, bool]:
+        eff_timeout = (
+            CONSENSUS_FETCH_TIMEOUT_SECONDS
+            if timeout is None
+            else min(CONSENSUS_FETCH_TIMEOUT_SECONDS, max(0.0, timeout))
+        )
+        if eff_timeout <= 0.0:
+            raise TimeoutError(f"Consensus fetch deadline exceeded before yfinance call for {symbol}")
         if self._yfinance_fetcher is not None:
-            res = self._yfinance_fetcher(symbol)
-            rec = await res if asyncio.iscoroutine(res) else res
+            async def _run_injected() -> Any:
+                res = self._yfinance_fetcher(symbol)
+                return await res if asyncio.iscoroutine(res) else res
+
+            rec = await asyncio.wait_for(_run_injected(), timeout=eff_timeout)
             return rec, False
         return await _run_blocking_holding_slot(
             _fetch_yfinance_consensus_result_sync,
             symbol,
-            timeout=CONSENSUS_FETCH_TIMEOUT_SECONDS,
+            timeout=eff_timeout,
             today=self._today(),
             last_reported_fy_end=last_reported_fy_end,
         )
@@ -2088,6 +2100,7 @@ class WatchlistConsensusAdapter:
         symbol: str,
         *,
         last_reported_fy_end: str | None = None,
+        timeout: float | None = None,
     ) -> tuple[RawConsensusRecord | None, list[Mapping[str, Any]], bool]:
         """Fetch annual estimates from FMP using a lifecycle-managed client bounded below Redis lease.
 
@@ -2096,6 +2109,11 @@ class WatchlistConsensusAdapter:
         and NEVER falls back to ``profile.currency``.
         """
         sym = _canonical_symbol(symbol)
+        eff_timeout = (
+            CONSENSUS_FETCH_TIMEOUT_SECONDS
+            if timeout is None
+            else min(CONSENSUS_FETCH_TIMEOUT_SECONDS, max(0.0, timeout))
+        )
         injected_client = self._fmp_client
         owned_client: Any = None
         if injected_client is not None:
@@ -2104,6 +2122,8 @@ class WatchlistConsensusAdapter:
             api_key = os.environ.get("FMP_API_KEY", "").strip()
             if not api_key:
                 return None, [], False
+            if eff_timeout <= 0.0:
+                raise TimeoutError(f"Consensus fetch deadline exceeded before FMP call for {sym}")
             try:
                 from src.data_client.fmp.fmp_client import FMPClient
 
@@ -2111,6 +2131,8 @@ class WatchlistConsensusAdapter:
                 client = owned_client
             except Exception:
                 return None, [], False
+        if eff_timeout <= 0.0:
+            raise TimeoutError(f"Consensus fetch deadline exceeded before FMP call for {sym}")
 
         async def _run_fmp_calls() -> tuple[RawConsensusRecord | None, list[Mapping[str, Any]], bool]:
             try:
@@ -2208,7 +2230,7 @@ class WatchlistConsensusAdapter:
         try:
             return await asyncio.wait_for(
                 _run_fmp_calls(),
-                timeout=CONSENSUS_FETCH_TIMEOUT_SECONDS,
+                timeout=eff_timeout,
             )
         finally:
             if owned_client is not None:
@@ -2249,7 +2271,7 @@ class WatchlistConsensusAdapter:
                 if rate is not None:
                     return rate, False, False, False
                 return (cached, True, False, False) if cached is not None else (None, False, False, False)
-            except _ConsensusSingleflightBusyError:
+            except (_ConsensusSingleflightBusyError, _ConsensusSlotBusyError):
                 return (cached, True, False, False) if cached is not None else (None, False, False, True)
             except _ConsensusCooldownHitError as cd_exc:
                 fallback_fx = cd_exc.cached_fx if cd_exc.cached_fx is not None else cached
@@ -2347,7 +2369,11 @@ class WatchlistConsensusAdapter:
                         return pos
                     await _write_fx_cooldown(cache_key, "empty")
                     return None
-            except (_ConsensusSingleflightBusyError, _ConsensusCooldownHitError):
+            except (
+                _ConsensusSingleflightBusyError,
+                _ConsensusSlotBusyError,
+                _ConsensusCooldownHitError,
+            ):
                 raise
             except Exception as exc:
                 if _is_rate_limit_exception(exc):
@@ -2374,7 +2400,7 @@ class WatchlistConsensusAdapter:
             if rate is not None:
                 return rate, False, False, False
             return (cached, True, False, False) if cached is not None else (None, False, False, False)
-        except _ConsensusSingleflightBusyError:
+        except (_ConsensusSingleflightBusyError, _ConsensusSlotBusyError):
             return (cached, True, False, False) if cached is not None else (None, False, False, True)
         except _ConsensusCooldownHitError as cd_exc:
             fallback_fx = cd_exc.cached_fx if cd_exc.cached_fx is not None else cached
@@ -2414,7 +2440,7 @@ class WatchlistConsensusAdapter:
             try:
                 loaded = await existing
                 return RawConsensusRecord.from_dict(loaded), False, False, False
-            except _ConsensusSingleflightBusyError:
+            except (_ConsensusSingleflightBusyError, _ConsensusSlotBusyError):
                 if cached_dict is not None:
                     return RawConsensusRecord.from_dict(cached_dict), True, False, False
                 return None, False, False, True
@@ -2511,47 +2537,65 @@ class WatchlistConsensusAdapter:
                     raise _ConsensusCooldownHitError(cd_kind, cached_dict=r_cached)
 
                 async with _acquire_upstream_slot():
-                    async def _do_consensus_upstream() -> dict[str, Any]:
-                        rate_limited = False
-                        had_transient_error = False
-                        had_rolled_past_fy = False
-                        fmp_missing_currency = False
-                        rec: RawConsensusRecord | None = None
+                    slot_deadline = time.monotonic() + _UPSTREAM_SLOT_HARD_TIMEOUT_SECONDS
+                    rate_limited = False
+                    had_transient_error = False
+                    had_rolled_past_fy = False
+                    fmp_missing_currency = False
+                    rec: RawConsensusRecord | None = None
 
-                        # 1. Public primary: yfinance (filtered by unified FY eligibility rule)
-                        try:
-                            raw_rec, yf_sync_dropped = await self._fetch_from_yfinance(
-                                sym, last_reported_fy_end=last_reported_fy_end
+                    # 1. Public primary: yfinance (filtered by unified FY eligibility rule)
+                    try:
+                        yf_budget = max(0.0, slot_deadline - time.monotonic())
+                        raw_rec, yf_sync_dropped = await self._fetch_from_yfinance(
+                            sym,
+                            last_reported_fy_end=last_reported_fy_end,
+                            timeout=yf_budget,
+                        )
+                        if yf_sync_dropped:
+                            had_rolled_past_fy = True
+                        if raw_rec is not None:
+                            rec, rec_dropped = _filter_consensus_record_fiscal_years(
+                                raw_rec,
+                                today=ref_today,
+                                last_reported_fy_end=last_reported_fy_end,
                             )
-                            if yf_sync_dropped:
+                            if rec_dropped:
                                 had_rolled_past_fy = True
-                            if raw_rec is not None:
-                                rec, rec_dropped = _filter_consensus_record_fiscal_years(
-                                    raw_rec,
-                                    today=ref_today,
-                                    last_reported_fy_end=last_reported_fy_end,
-                                )
-                                if rec_dropped:
-                                    had_rolled_past_fy = True
-                        except Exception as exc:
-                            if _is_rate_limit_exception(exc):
-                                rate_limited = True
-                            else:
-                                had_transient_error = True
-                                logger.debug(
-                                    "[WATCHLIST_CONSENSUS] yfinance failed for %s: %s", sym, exc
-                                )
-
-                        # 2. Optional public fallback: FMP (when yfinance missed either or both years)
-                        if rec is None or rec.fy1_eps is None or rec.fy2_eps is None:
-                            eff_reported = _max_iso_date(
-                                last_reported_fy_end,
-                                rec.last_reported_fy_end if rec is not None else None,
+                    except Exception as exc:
+                        if _is_rate_limit_exception(exc):
+                            rate_limited = True
+                        else:
+                            had_transient_error = True
+                            logger.debug(
+                                "[WATCHLIST_CONSENSUS] yfinance failed for %s: %s", sym, exc
                             )
+
+                    # 2. Optional public fallback: FMP (when yfinance missed either or both years).
+                    # Budgeted against the remaining outer slot deadline so a deadline timeout during
+                    # single-year backfill raises TimeoutError instead of cancelling and discarding `rec`.
+                    if (
+                        (rec is None or rec.fy1_eps is None or rec.fy2_eps is None)
+                        and self._has_fmp_configured()
+                    ):
+                        eff_reported = _max_iso_date(
+                            last_reported_fy_end,
+                            rec.last_reported_fy_end if rec is not None else None,
+                        )
+                        fmp_budget = slot_deadline - time.monotonic()
+                        if fmp_budget <= 0.0:
+                            had_transient_error = True
+                            logger.debug(
+                                "[WATCHLIST_CONSENSUS] outer slot deadline exhausted before FMP backfill for %s",
+                                sym,
+                            )
+                        else:
                             try:
                                 fmp_rec, fmp_eligible_rows, fmp_rolled_only = (
                                     await self._fetch_from_fmp_with_rows(
-                                        sym, last_reported_fy_end=eff_reported
+                                        sym,
+                                        last_reported_fy_end=eff_reported,
+                                        timeout=fmp_budget,
                                     )
                                 )
                                 if fmp_rolled_only:
@@ -2586,75 +2630,70 @@ class WatchlistConsensusAdapter:
                                     exc,
                                 )
 
-                        has_usable_eps = rec is not None and (
-                            rec.fy1_eps is not None or rec.fy2_eps is not None
+                    has_usable_eps = rec is not None and (
+                        rec.fy1_eps is not None or rec.fy2_eps is not None
+                    )
+
+                    # Decide degradation strictly by whether usable EPS exists (fixes Yahoo empty record + FMP 429)
+                    if not has_usable_eps:
+                        if rate_limited:
+                            await _write_consensus_cooldown(sym, "rate_limited")
+                            raise ConsensusRateLimitError(
+                                f"Rate limited fetching consensus for {sym}"
+                            )
+                        if had_transient_error:
+                            await _write_consensus_cooldown(sym, "error")
+                            raise RuntimeError(f"Transient consensus fetch failure for {sym}")
+                        # Ordinary empty or rolled-past-only result -> short cooldown, NEVER 12h success cache!
+                        await _write_consensus_cooldown(sym, "empty")
+                        reason = (
+                            f"Only rolled-past fiscal years available for {sym}"
+                            if had_rolled_past_fy
+                            else f"No usable consensus EPS available for {sym}"
+                        )
+                        raise _ConsensusEmptyCooldownError(reason)
+
+                    assert rec is not None
+                    rec_dict = rec.to_dict()
+                    final_reported = _max_iso_date(
+                        last_reported_fy_end, rec.last_reported_fy_end
+                    )
+                    if _is_record_rolled_past_fy(
+                        rec_dict, today=ref_today, last_reported_fy_end=final_reported
+                    ):
+                        await _write_consensus_cooldown(sym, "empty")
+                        raise _ConsensusEmptyCooldownError(
+                            f"Refusing to cache rolled-past or undated FY record for {sym}"
                         )
 
-                        # Decide degradation strictly by whether usable EPS exists (fixes Yahoo empty record + FMP 429)
-                        if not has_usable_eps:
-                            if rate_limited:
-                                await _write_consensus_cooldown(sym, "rate_limited")
-                                raise ConsensusRateLimitError(
-                                    f"Rate limited fetching consensus for {sym}"
-                                )
-                            if had_transient_error:
-                                await _write_consensus_cooldown(sym, "error")
-                                raise RuntimeError(f"Transient consensus fetch failure for {sym}")
-                            # Ordinary empty or rolled-past-only result -> short cooldown, NEVER 12h success cache!
-                            await _write_consensus_cooldown(sym, "empty")
-                            reason = (
-                                f"Only rolled-past fiscal years available for {sym}"
-                                if had_rolled_past_fy
-                                else f"No usable consensus EPS available for {sym}"
-                            )
-                            raise _ConsensusEmptyCooldownError(reason)
-
-                        assert rec is not None
-                        rec_dict = rec.to_dict()
-                        final_reported = _max_iso_date(
-                            last_reported_fy_end, rec.last_reported_fy_end
+                    # Temporarily missing reporting currency -> short cooldown (no 12h cache), still display unit_unverified.
+                    est_ccy, _ = _normalize_currency(rec.estimate_currency)
+                    if est_ccy is None:
+                        await _write_consensus_cooldown(
+                            sym, "missing_currency", record_dict=rec_dict
                         )
-                        if _is_record_rolled_past_fy(
-                            rec_dict, today=ref_today, last_reported_fy_end=final_reported
-                        ):
-                            await _write_consensus_cooldown(sym, "empty")
-                            raise _ConsensusEmptyCooldownError(
-                                f"Refusing to cache rolled-past or undated FY record for {sym}"
-                            )
-
-                        # Temporarily missing reporting currency -> short cooldown (no 12h cache), still display unit_unverified.
-                        est_ccy, _ = _normalize_currency(rec.estimate_currency)
-                        if est_ccy is None:
-                            await _write_consensus_cooldown(
-                                sym, "missing_currency", record_dict=rec_dict
-                            )
-                            return rec_dict
-
-                        # Partial result where FMP single-year fill failed (429 / transient error / missing currency)
-                        # -> short cooldown (no 12h cache) while preserving the available year for display!
-                        is_partial = rec.fy1_eps is None or rec.fy2_eps is None
-                        if is_partial and (
-                            rate_limited or had_transient_error or fmp_missing_currency
-                        ):
-                            partial_kind = (
-                                "partial_rate_limited" if rate_limited else "partial_error"
-                            )
-                            await _write_consensus_cooldown(
-                                sym, partial_kind, record_dict=rec_dict
-                            )
-                            return rec_dict
-
-                        await _clear_consensus_cooldown(sym)
-                        await _write_consensus_cache(sym, rec_dict)
                         return rec_dict
 
-                    # Hard total deadline strictly shorter than the 15s Redis slot/inflight lease
-                    return await asyncio.wait_for(
-                        _do_consensus_upstream(),
-                        timeout=_UPSTREAM_SLOT_HARD_TIMEOUT_SECONDS,
-                    )
+                    # Partial result where FMP single-year fill failed (429 / transient error / outer deadline / missing currency)
+                    # -> short cooldown (no 12h cache) while preserving the available year for display!
+                    is_partial = rec.fy1_eps is None or rec.fy2_eps is None
+                    if is_partial and (
+                        rate_limited or had_transient_error or fmp_missing_currency
+                    ):
+                        partial_kind = (
+                            "partial_rate_limited" if rate_limited else "partial_error"
+                        )
+                        await _write_consensus_cooldown(
+                            sym, partial_kind, record_dict=rec_dict
+                        )
+                        return rec_dict
+
+                    await _clear_consensus_cooldown(sym)
+                    await _write_consensus_cache(sym, rec_dict)
+                    return rec_dict
             except (
                 _ConsensusSingleflightBusyError,
+                _ConsensusSlotBusyError,
                 _ConsensusCooldownHitError,
                 ConsensusRateLimitError,
                 _ConsensusEmptyCooldownError,
@@ -2683,7 +2722,7 @@ class WatchlistConsensusAdapter:
         try:
             loaded = await task
             return RawConsensusRecord.from_dict(loaded), False, False, False
-        except _ConsensusSingleflightBusyError:
+        except (_ConsensusSingleflightBusyError, _ConsensusSlotBusyError):
             if cached_dict is not None:
                 return RawConsensusRecord.from_dict(cached_dict), True, False, False
             return None, False, False, True
