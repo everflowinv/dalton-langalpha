@@ -247,7 +247,7 @@ class RedisCacheClient:
         # DALTON-HOOK(redis-write-diag): record cache error/timeout into worker diagnostics
         from src.dalton.observability.redis_diagnostics import record_redis_error
 
-        record_redis_error(context, err, pool=self.pool)
+        record_redis_error(context, err, pool=getattr(self, "pool", None))
         if is_pool_exhaustion(err):
             logger.error(
                 f"{context} — {type(err).__name__}: {err} "
@@ -350,7 +350,7 @@ class RedisCacheClient:
             from src.dalton.observability.redis_diagnostics import dumps_with_heavy_task, estimate_serialized_bytes, redis_op_span
 
             serialized = dumps_with_heavy_task(value, ensure_ascii=False, cls=DateTimeEncoder)
-            with redis_op_span("set", key, payload_bytes=estimate_serialized_bytes(serialized), pool=self.pool):
+            with redis_op_span("set", key, payload_bytes=estimate_serialized_bytes(serialized), pool=getattr(self, "pool", None)):
                 if ttl == PERSIST:
                     await self.client.set(key, serialized)
                 else:
@@ -760,7 +760,7 @@ class RedisCacheClient:
         # DALTON-HOOK(redis-write-diag): split acquire_ms vs pure wire_ms for xadd and tx pipeline
         from src.dalton.observability.redis_diagnostics import redis_event_buffer_span
         try:
-            with redis_event_buffer_span(stream_key, payload, fields.get(b"record"), reset_epoch, heal_retention, ttl, self.pool):
+            with redis_event_buffer_span(stream_key, payload, fields.get(b"record"), reset_epoch, heal_retention, ttl, getattr(self, "pool", None)):
                 if not (reset_epoch or heal_retention or ttl is not None):
                     await self.client.xadd(stream_key, fields, **append)
                 else:

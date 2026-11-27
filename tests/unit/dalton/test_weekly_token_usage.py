@@ -1453,6 +1453,13 @@ def test_s5_input_json_offline_uses_embedded_series_and_falls_back_for_legacy_sn
         "DALTON_SEC_USER_AGENT": "TestBot test@example.com",
         "DALTON_DATA_TASK_GS_PB_PYTHON": "/opt/test/gs-pb/bin/python",
     }
+    # The seed preflight reads only the target's single config/data_tasks.env.
+    _cfg = seeded_target / "config" / "data_tasks.env"
+    _cfg.parent.mkdir(parents=True, exist_ok=True)
+    _cfg.write_text(
+        "\n".join(f"{k}={v}" for k, v in seed_env.items() if k.startswith("DALTON_")) + "\n",
+        encoding="utf-8",
+    )
     seed_res = subprocess.run(
         ["bash", str(REPO_ROOT / "scripts/dalton/seed_openclaw_data.sh"), "--apply", "--target", str(seeded_target)],
         env=seed_env,

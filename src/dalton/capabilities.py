@@ -1040,6 +1040,8 @@ BACKGROUND_LOOP_REGISTRY: Mapping[str, CapabilityId | None] = MappingProxyType(
         "DriveTrashSweep": CORE_CAPABILITY,
         "WorkspaceFileGCService": CORE_CAPABILITY,
         "SetupSettings": CORE_CAPABILITY,
+        # Prod Audit 2 Batch 1: per-worker Redis diagnostics flush + PG leader sampler
+        "RedisDiagnosticsService": CORE_CAPABILITY,
     }
 )
 
@@ -1056,6 +1058,7 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("router.py", "get_capabilities_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_openclaw_health_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_browser_memory_diagnostics_endpoint"): CORE_CAPABILITY,
+        ("router.py", "get_admin_redis_diagnostics_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_native_models_status_endpoint"): CapabilityId.NATIVE_OAUTH_SYNC,
         ("router.py", "check_native_models_endpoint"): CapabilityId.NATIVE_OAUTH_SYNC,
         ("router.py", "sync_native_models_endpoint"): CapabilityId.NATIVE_OAUTH_SYNC,
