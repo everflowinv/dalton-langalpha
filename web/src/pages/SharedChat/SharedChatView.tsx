@@ -25,6 +25,7 @@ import { useTranslation } from 'react-i18next';
 import { toast } from '@/components/ui/use-toast';
 import {
   handleHistoryUserMessage,
+  handleHistorySteeringDelivered, // DALTON-HOOK(share-redaction): replay steering follow-ups and notices in shared chats
   handleHistoryReasoningSignal,
   handleHistoryReasoningContent,
   handleHistoryTextContent,
@@ -34,6 +35,10 @@ import {
   handleHistoryHtmlWidget, // DALTON-HOOK(shared-widgets): replay inline widgets in shared chats
 } from '../ChatAgent/hooks/utils/historyEventHandlers';
 import type { PairState } from '../ChatAgent/hooks/utils/historyEventHandlers';
+// DALTON-HOOK(share-redaction): permission-downgrade detection, shared image cache revocation, and redaction context
+import { apiErrorStatus } from '@/api/errors';
+import { SharedRedactionProvider } from '@/components/dalton/RedactedSharePlaceholders';
+import { buildSharedImageScope, revokeSharedImageScope } from '@/lib/dalton/sharedImageCache';
 import {
   replaySharedThread,
   getSharedFiles,
@@ -79,9 +84,238 @@ interface SharedChatViewProps {
   access?: string;
   /** Resolved by `SharePage`; the replay starts from it. */
   metadata: SharedThreadMetadata;
+  // DALTON-HOOK(share-redaction): metadata refresh stamp for allow_files=true serve URLs and 403 revalidation hook
+  refreshStamp?: number;
+  onPermissionForbidden?: () => void;
 }
 
-export default function SharedChatView({ shareToken, access = shareToken, metadata }: SharedChatViewProps) {
+// DALTON-HOOK(share-redaction): replay one shared history page (initial or beforeTurn) into an isolated message list
+async function replaySharedPage(
+  token: string,
+  opts: { beforeTurn?: number; signal?: AbortSignal } = {},
+): Promise<{ messages: MessageRecord[]; firstTurnIndex: number | null; hasMore: boolean }> {
+  let pageMessages: MessageRecord[] = [];
+  let firstTurnIndex: number | null = null;
+  let hasMore = false;
+  const assistantMessagesByPair = new Map<number, string>();
+  const pairStateByPair = new Map<number, PairState>();
+  const runSettledAtByPair = new Map<number, number>();
+  const sharedRefs = {
+    recentlySentTracker: { isRecentlySent: (_content: string) => false },
+    currentMessageRef: { current: null as string | null },
+    newMessagesStartIndexRef: { current: 0 },
+  };
+  const setPageMessages: SetMessages = (updater) => {
+    pageMessages = updater(pageMessages);
+  };
+  const stampSettledTurns = () => {
+    if (runSettledAtByPair.size === 0) return;
+    const settledAtByMessageId = new Map<string, number>();
+    for (const [pairIndex, settledAt] of runSettledAtByPair) {
+      const tailId = assistantMessagesByPair.get(pairIndex);
+      if (tailId) settledAtByMessageId.set(tailId, settledAt);
+    }
+    if (settledAtByMessageId.size === 0) return;
+    pageMessages = pageMessages.map((msg) => {
+      const settledAt = settledAtByMessageId.get(msg.id as string);
+      return msg.role === 'assistant' && settledAt !== undefined ? { ...msg, completedAt: settledAt } : msg;
+    });
+  };
+
+  await replaySharedThread(token, (event: SSEEvent) => {
+    if (opts.signal?.aborted) return;
+    const eventType = event.event as string | undefined;
+    const contentType = event.content_type as string | undefined;
+    const hasRole = event.role !== undefined;
+    const hasPairIndex = event.turn_index !== undefined;
+
+    // DALTON-HOOK(share-redaction): track history_page pagination cursor
+    if (eventType === 'history_page') {
+      if (typeof event.first_turn_index === 'number') firstTurnIndex = event.first_turn_index;
+      hasMore = event.has_more === true;
+      return;
+    }
+
+    if (eventType === 'replay_done') {
+      stampSettledTurns();
+      return;
+    }
+
+    if (isTaskAgentId(event.agent)) return;
+
+    if (eventType === 'user_message' && hasPairIndex) {
+      if (typeof event.run_completed_at === 'string') {
+        const settledAt = Date.parse(event.run_completed_at);
+        if (Number.isFinite(settledAt)) runSettledAtByPair.set(event.turn_index as number, settledAt);
+      }
+      handleHistoryUserMessage({
+        event,
+        pairIndex: event.turn_index as number,
+        assistantMessagesByPair,
+        pairStateByPair,
+        refs: sharedRefs,
+        setMessages: setPageMessages,
+      });
+      return;
+    }
+
+    // DALTON-HOOK(share-redaction): replay steering_delivered follow-ups and notices in shared view
+    if (eventType === 'steering_delivered' && hasPairIndex) {
+      handleHistorySteeringDelivered({
+        event,
+        pairIndex: event.turn_index as number,
+        assistantMessagesByPair,
+        pairStateByPair,
+        refs: sharedRefs,
+        setMessages: setPageMessages,
+      });
+      return;
+    }
+
+    if (eventType === 'message_chunk' && hasRole && event.role === 'assistant' && hasPairIndex) {
+      const pairIndex = event.turn_index as number;
+      const currentAssistantMessageId = assistantMessagesByPair.get(pairIndex);
+      const pairState = pairStateByPair.get(pairIndex);
+      if (!currentAssistantMessageId || !pairState) return;
+
+      if (contentType === 'reasoning_signal') {
+        handleHistoryReasoningSignal({
+          assistantMessageId: currentAssistantMessageId,
+          signalContent: (event.content as string) || '',
+          pairIndex,
+          pairState,
+          setMessages: setPageMessages,
+          elapsedMs: typeof event.elapsed_ms === 'number' ? event.elapsed_ms : undefined,
+        });
+        return;
+      }
+
+      if (contentType === 'reasoning' && event.content) {
+        handleHistoryReasoningContent({
+          assistantMessageId: currentAssistantMessageId,
+          content: event.content as string,
+          pairState,
+          setMessages: setPageMessages,
+        });
+        return;
+      }
+
+      if (contentType === 'text' && event.content) {
+        handleHistoryTextContent({
+          assistantMessageId: currentAssistantMessageId,
+          content: event.content as string,
+          finishReason: event.finish_reason as string | undefined,
+          pairState,
+          setMessages: setPageMessages,
+          phase: event.phase as TextSegment['phase'],
+        });
+        return;
+      }
+
+      if (event.finish_reason) {
+        handleHistoryTextContent({
+          assistantMessageId: currentAssistantMessageId,
+          content: '',
+          finishReason: event.finish_reason as string,
+          pairState,
+          setMessages: setPageMessages,
+        });
+        return;
+      }
+    }
+
+    if (eventType === 'tool_call_chunks') return;
+
+    const steps = eventType === 'artifact' ? readPlanSteps(event.artifact_type, event.payload) : null;
+    if (steps && hasPairIndex) {
+      const pairIndex = event.turn_index as number;
+      const currentAssistantMessageId = assistantMessagesByPair.get(pairIndex);
+      const pairState = pairStateByPair.get(pairIndex);
+      if (currentAssistantMessageId && pairState) {
+        applyPlanSnapshot(setPageMessages, currentAssistantMessageId, steps, eventOrder(event, () => ++pairState.contentOrderCounter));
+      }
+      return;
+    }
+
+    if (eventType === 'artifact' && event.artifact_type === 'task') {
+      const payload = (event.payload as Record<string, unknown>) || {};
+      handleHistoryTaskArtifactStatus({
+        toolCallId: event.tool_call_id as string | undefined,
+        taskId: payload.task_id as string | undefined,
+        status: payload.status,
+        setMessages: setPageMessages,
+      });
+      return;
+    }
+
+    // DALTON-HOOK(shared-widgets): replay inline html_widget artifacts (including redacted placeholders)
+    if (eventType === 'artifact' && event.artifact_type === 'html_widget' && hasPairIndex) {
+      const pairIndex = event.turn_index as number;
+      const currentAssistantMessageId = assistantMessagesByPair.get(pairIndex);
+      const pairState = pairStateByPair.get(pairIndex);
+      if (!currentAssistantMessageId || !pairState) return;
+      handleHistoryHtmlWidget({
+        assistantMessageId: currentAssistantMessageId,
+        artifactType: 'html_widget',
+        artifactId: event.artifact_id as string,
+        payload: (event.payload as HtmlWidgetData | null) ?? null,
+        pairState,
+        setMessages: setPageMessages,
+        eventId: null,
+      });
+      return;
+    }
+
+    if (eventType === 'tool_calls' && hasPairIndex) {
+      const pairIndex = event.turn_index as number;
+      const currentAssistantMessageId = assistantMessagesByPair.get(pairIndex);
+      const pairState = pairStateByPair.get(pairIndex);
+      if (!currentAssistantMessageId || !pairState) return;
+      handleHistoryToolCalls({
+        assistantMessageId: currentAssistantMessageId,
+        toolCalls: event.tool_calls as Array<Record<string, unknown>>,
+        pairState,
+        setMessages: setPageMessages,
+      });
+      return;
+    }
+
+    if (eventType === 'tool_call_result' && hasPairIndex) {
+      const pairIndex = event.turn_index as number;
+      const currentAssistantMessageId = assistantMessagesByPair.get(pairIndex);
+      const pairState = pairStateByPair.get(pairIndex);
+      if (!currentAssistantMessageId || !pairState) return;
+      handleHistoryToolCallResult({
+        assistantMessageId: currentAssistantMessageId,
+        toolCallId: event.tool_call_id as string,
+        result: {
+          content: event.content,
+          content_type: event.content_type as string,
+          tool_call_id: event.tool_call_id as string,
+          artifact: event.artifact,
+          status: event.status,
+        },
+        pairState,
+        setMessages: setPageMessages,
+      });
+    }
+  }, opts);
+
+  stampSettledTurns();
+  return {
+    messages: pageMessages.map((m) => ({ ...m, isStreaming: false })),
+    firstTurnIndex,
+    hasMore,
+  };
+}
+
+export default function SharedChatView({
+  shareToken,
+  access = shareToken,
+  metadata,
+  refreshStamp,
+  onPermissionForbidden,
+}: SharedChatViewProps) {
   const { t } = useTranslation();
   // The latest credential, read by the loads keyed on the share itself, so a
   // renewed grant serves the next request without replaying the thread.
@@ -129,265 +363,134 @@ export default function SharedChatView({ shareToken, access = shareToken, metada
   useEffect(() => () => dragCleanupRef.current?.(), []);
 
   const scrollAreaRef = useRef<HTMLDivElement>(null);
+  // DALTON-HOOK(share-redaction): pagination, downgrade revocation, and 403 fail-closed state
+  const [historyPage, setHistoryPage] = useState<{ firstTurnIndex: number | null; hasMore: boolean }>({
+    firstTurnIndex: null,
+    hasMore: false,
+  });
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [downgradedToken, setDowngradedToken] = useState<string | null>(null);
+  const shouldAutoScrollRef = useRef(true);
+  const replayAbortRef = useRef<AbortController | null>(null);
+  const olderAbortRef = useRef<AbortController | null>(null);
+  const filesAbortRef = useRef<AbortController | null>(null);
 
-  // Replay the conversation
+  // Permissions (fail-closed: anything other than explicit true is false)
+  const permissions = (metadata.permissions || {}) as Record<string, unknown>;
+  const canBrowseFiles = permissions.allow_files === true && downgradedToken !== shareToken;
+  const canDownload = canBrowseFiles && permissions.allow_download === true;
+  const sharedImageScope = useMemo(
+    () => buildSharedImageScope(shareToken, canBrowseFiles),
+    [shareToken, canBrowseFiles],
+  );
+
+  const handleForbiddenDowngrade = useCallback(() => {
+    setDowngradedToken((prev) => (prev === shareToken ? prev : shareToken));
+    onPermissionForbidden?.();
+  }, [shareToken, onPermissionForbidden]);
+
+  const guardForbidden = useCallback(
+    <T,>(promise: Promise<T>): Promise<T> =>
+      promise.catch((err: unknown) => {
+        const status = apiErrorStatus(err) ?? (err as { status?: number })?.status;
+        if (status === 403) handleForbiddenDowngrade();
+        throw err;
+      }),
+    [handleForbiddenDowngrade],
+  );
+
+  // DALTON-HOOK(share-redaction): on allow_files downgrade (true -> false), abort in-flight loads, revoke scoped image cache, and clear state before redacted replay
+  const prevPermRef = useRef<{ token: string; allowFiles: boolean }>({ token: shareToken, allowFiles: canBrowseFiles });
+  useEffect(() => {
+    const prev = prevPermRef.current;
+    prevPermRef.current = { token: shareToken, allowFiles: canBrowseFiles };
+    if (prev.token === shareToken && prev.allowFiles && !canBrowseFiles) {
+      replayAbortRef.current?.abort();
+      olderAbortRef.current?.abort();
+      filesAbortRef.current?.abort();
+      revokeSharedImageScope(shareToken);
+      if (accessRef.current !== shareToken) revokeSharedImageScope(accessRef.current);
+      setMessages([]);
+      setFiles([]);
+      setShowFilePanel(false);
+      setFilePanelTarget(null);
+      setHistoryPage({ firstTurnIndex: null, hasMore: false });
+      setLoadingOlder(false);
+      setLoading(true);
+      filesFetchRef.current = { token: undefined, state: 'idle' };
+    }
+  }, [shareToken, canBrowseFiles]);
+
+  // Replay the conversation (re-runs on shareToken change or allow_files downgrade)
+  // DALTON-HOOK(share-redaction): abortable paginated replay with history_page & steering_delivered support
   useEffect(() => {
     let cancelled = false;
-
-    const assistantMessagesByPair = new Map<number, string>();
-    const pairStateByPair = new Map<number, PairState>();
-    // The turn's end, paired with the user bubble's timestamp to give the fold
-    // row its duration. This view replays the public stream itself rather than
-    // going through `replayHistory`, so it has to do this pass on its own.
-    const runSettledAtByPair = new Map<number, number>();
-    let _currentActivePairIndex: number | null = null;
-    let _currentActivePairState: PairState | undefined = undefined;
-
-    // Persistent refs that survive across event callbacks (matching useChatMessages shape)
-    const sharedRefs = {
-      recentlySentTracker: { isRecentlySent: (_content: string) => false },
-      currentMessageRef: { current: null as string | null },
-      newMessagesStartIndexRef: { current: 0 },
-    };
-
-    // Cast setMessages to the narrower type expected by historyEventHandlers
-    const setMessagesCompat: SetMessages = setMessages;
-
-    const stampSettledTurns = () => {
-      if (runSettledAtByPair.size === 0) return;
-      const settledAtByMessageId = new Map<string, number>();
-      for (const [pairIndex, settledAt] of runSettledAtByPair) {
-        const tailId = assistantMessagesByPair.get(pairIndex);
-        if (tailId) settledAtByMessageId.set(tailId, settledAt);
-      }
-      if (settledAtByMessageId.size === 0) return;
-      setMessages(prev => prev.map(msg => {
-        const settledAt = settledAtByMessageId.get(msg.id as string);
-        return msg.role === 'assistant' && settledAt !== undefined ? { ...msg, completedAt: settledAt } : msg;
-      }));
-    };
+    const controller = new AbortController();
+    replayAbortRef.current?.abort();
+    replayAbortRef.current = controller;
+    setLoading(true);
+    setError(null);
 
     (async () => {
       try {
-        await replaySharedThread(accessRef.current, (event: SSEEvent) => {
-          if (cancelled) return;
-          const eventType = event.event as string | undefined;
-          const contentType = event.content_type as string | undefined;
-          const hasRole = event.role !== undefined;
-          const hasPairIndex = event.turn_index !== undefined;
-
-          if (hasPairIndex) {
-            _currentActivePairIndex = event.turn_index as number;
-            _currentActivePairState = pairStateByPair.get(event.turn_index as number);
-          }
-
-          if (eventType === 'replay_done') {
-            stampSettledTurns();
-            setLoading(false);
-            return;
-          }
-
-          // Skip subagent events in shared view
-          if (isTaskAgentId(event.agent)) {
-            return;
-          }
-
-          // user_message
-          if (eventType === 'user_message' && hasPairIndex) {
-            if (typeof event.run_completed_at === 'string') {
-              const settledAt = Date.parse(event.run_completed_at);
-              if (Number.isFinite(settledAt)) runSettledAtByPair.set(event.turn_index as number, settledAt);
-            }
-            handleHistoryUserMessage({
-              event,
-              pairIndex: event.turn_index as number,
-              assistantMessagesByPair,
-              pairStateByPair,
-              refs: sharedRefs,
-              setMessages: setMessagesCompat,
-            });
-            return;
-          }
-
-          // message_chunk (text, reasoning)
-          if (eventType === 'message_chunk' && hasRole && event.role === 'assistant' && hasPairIndex) {
-            const pairIndex = event.turn_index as number;
-            const currentAssistantMessageId = assistantMessagesByPair.get(pairIndex);
-            const pairState = pairStateByPair.get(pairIndex);
-            if (!currentAssistantMessageId || !pairState) return;
-
-            if (contentType === 'reasoning_signal') {
-              handleHistoryReasoningSignal({
-                assistantMessageId: currentAssistantMessageId,
-                signalContent: (event.content as string) || '',
-                pairIndex,
-                pairState,
-                setMessages: setMessagesCompat,
-                elapsedMs: typeof event.elapsed_ms === 'number' ? event.elapsed_ms : undefined,
-              });
-              return;
-            }
-
-            if (contentType === 'reasoning' && event.content) {
-              handleHistoryReasoningContent({
-                assistantMessageId: currentAssistantMessageId,
-                content: event.content as string,
-                pairState,
-                setMessages: setMessagesCompat,
-              });
-              return;
-            }
-
-            if (contentType === 'text' && event.content) {
-              handleHistoryTextContent({
-                assistantMessageId: currentAssistantMessageId,
-                content: event.content as string,
-                finishReason: event.finish_reason as string | undefined,
-                pairState,
-                setMessages: setMessagesCompat,
-                phase: event.phase as TextSegment['phase'],
-              });
-              return;
-            }
-
-            // A content-less close, a stopped turn's synthetic one included,
-            // goes through the text handler, which owns what a close stamps.
-            if (event.finish_reason) {
-              handleHistoryTextContent({
-                assistantMessageId: currentAssistantMessageId,
-                content: '',
-                finishReason: event.finish_reason as string,
-                pairState,
-                setMessages: setMessagesCompat,
-              });
-              return;
-            }
-          }
-
-          // tool_call_chunks — skip
-          if (eventType === 'tool_call_chunks') return;
-
-          // artifact (the plan)
-          const steps = eventType === 'artifact' ? readPlanSteps(event.artifact_type, event.payload) : null;
-          if (steps && hasPairIndex) {
-            const pairIndex = event.turn_index as number;
-            const currentAssistantMessageId = assistantMessagesByPair.get(pairIndex);
-            const pairState = pairStateByPair.get(pairIndex);
-            if (currentAssistantMessageId && pairState) {
-              applyPlanSnapshot(setMessagesCompat, currentAssistantMessageId, steps, eventOrder(event, () => ++pairState.contentOrderCounter));
-            }
-            return;
-          }
-
-          // artifact (task) — stamp the inline subagent card's real status.
-          // The task artifact has agent "main" (not "task:"), so it isn't
-          // filtered above. tool_calls replays first, so the card exists here.
-          if (eventType === 'artifact' && event.artifact_type === 'task') {
-            const payload = (event.payload as Record<string, unknown>) || {};
-            handleHistoryTaskArtifactStatus({
-              toolCallId: event.tool_call_id as string | undefined,
-              taskId: payload.task_id as string | undefined,
-              status: payload.status,
-              setMessages: setMessagesCompat,
-            });
-            return;
-          }
-
-          // DALTON-HOOK(shared-widgets): an inline widget (ShowWidget) replays as
-          // the owner's view shows it. The public replay already sends it, its
-          // data_ref resolved, and the widget renders in the same sandboxed frame.
-          if (eventType === 'artifact' && event.artifact_type === 'html_widget' && hasPairIndex) {
-            const pairIndex = event.turn_index as number;
-            const currentAssistantMessageId = assistantMessagesByPair.get(pairIndex);
-            const pairState = pairStateByPair.get(pairIndex);
-            if (!currentAssistantMessageId || !pairState) return;
-            handleHistoryHtmlWidget({
-              assistantMessageId: currentAssistantMessageId,
-              artifactType: 'html_widget',
-              artifactId: event.artifact_id as string,
-              payload: (event.payload as HtmlWidgetData | null) ?? null,
-              pairState,
-              setMessages: setMessagesCompat,
-              // The reply's other segments here sort on the pair's own counter,
-              // so the widget does too, keeping its place among them.
-              eventId: null,
-            });
-            return;
-          }
-
-          // tool_calls
-          if (eventType === 'tool_calls' && hasPairIndex) {
-            const pairIndex = event.turn_index as number;
-            const currentAssistantMessageId = assistantMessagesByPair.get(pairIndex);
-            const pairState = pairStateByPair.get(pairIndex);
-            if (!currentAssistantMessageId || !pairState) return;
-
-            handleHistoryToolCalls({
-              assistantMessageId: currentAssistantMessageId,
-              toolCalls: event.tool_calls as Array<Record<string, unknown>>,
-              pairState,
-              setMessages: setMessagesCompat,
-            });
-            return;
-          }
-
-          // tool_call_result
-          if (eventType === 'tool_call_result' && hasPairIndex) {
-            const pairIndex = event.turn_index as number;
-            const currentAssistantMessageId = assistantMessagesByPair.get(pairIndex);
-            const pairState = pairStateByPair.get(pairIndex);
-            if (!currentAssistantMessageId || !pairState) return;
-
-            handleHistoryToolCallResult({
-              assistantMessageId: currentAssistantMessageId,
-              toolCallId: event.tool_call_id as string,
-              result: {
-                content: event.content,
-                content_type: event.content_type as string,
-                tool_call_id: event.tool_call_id as string,
-                artifact: event.artifact,
-                status: event.status,
-              },
-              pairState,
-              setMessages: setMessagesCompat,
-            });
-            return;
-          }
-
-          // provenance — DELIBERATELY NOT replayed in public shared chats.
-          // Provenance records carry result snippets, checksums, and identifiers
-          // (incl. private file/memo/memory paths) of data the owner's agent
-          // accessed. Replaying them here would leak that into a public share.
-          // Sources are owner-only by design; do not add a `provenance` branch
-          // without a redaction story for the public surface.
-        });
-
-        // Mark all messages as done streaming
-        setMessages((prev) => prev.map((m) => ({ ...m, isStreaming: false })));
+        const result = await replaySharedPage(accessRef.current, { signal: controller.signal });
+        if (cancelled || controller.signal.aborted) return;
+        shouldAutoScrollRef.current = true;
+        setMessages(result.messages);
+        setHistoryPage({ firstTurnIndex: result.firstTurnIndex, hasMore: result.hasMore });
         setLoading(false);
       } catch (e: unknown) {
-        if (!cancelled) {
+        if (!cancelled && !controller.signal.aborted && (e as { name?: string })?.name !== 'AbortError') {
           setError((e as Error).message);
           setLoading(false);
         }
       }
     })();
 
-    return () => { cancelled = true; };
-  }, [shareToken]);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      olderAbortRef.current?.abort();
+    };
+  }, [shareToken, canBrowseFiles]);
 
-  // Auto-scroll on new messages
+  // DALTON-HOOK(share-redaction): load an earlier history page via beforeTurn and prepend it
+  const handleLoadOlder = useCallback(async () => {
+    if (loadingOlder || !historyPage.hasMore || historyPage.firstTurnIndex == null) return;
+    const controller = new AbortController();
+    olderAbortRef.current?.abort();
+    olderAbortRef.current = controller;
+    setLoadingOlder(true);
+    try {
+      const older = await replaySharedPage(accessRef.current, {
+        beforeTurn: historyPage.firstTurnIndex,
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) return;
+      shouldAutoScrollRef.current = false;
+      setMessages((prev) => {
+        const seen = new Set(prev.map((m) => m.id));
+        const freshOlder = older.messages.filter((m) => !seen.has(m.id));
+        return [...freshOlder, ...prev];
+      });
+      setHistoryPage({ firstTurnIndex: older.firstTurnIndex, hasMore: older.hasMore });
+    } catch (e: unknown) {
+      if (!controller.signal.aborted && (e as { name?: string })?.name !== 'AbortError') {
+        toast({ description: (e as Error).message, variant: 'destructive' });
+      }
+    } finally {
+      if (!controller.signal.aborted) setLoadingOlder(false);
+    }
+  }, [loadingOlder, historyPage]);
+
+  // Auto-scroll on initial load (skip when prepending older history)
   useEffect(() => {
+    if (!shouldAutoScrollRef.current) return;
     if (scrollAreaRef.current) {
       const el = scrollAreaRef.current.querySelector('[data-radix-scroll-area-viewport]');
       if (el) el.scrollTop = el.scrollHeight;
     }
   }, [messages]);
-
-  // Permissions
-  const permissions = (metadata.permissions || {}) as Record<string, unknown>;
-  const canBrowseFiles = permissions.allow_files === true;
-  const canDownload = permissions.allow_download === true;
 
   // The route keeps this view mounted from one share to the next, and the panel
   // and its listing belong to the share they were opened on.
@@ -405,28 +508,37 @@ export default function SharedChatView({ shareToken, access = shareToken, metada
     const fetchState = filesFetchRef.current;
     if (fetchState.token === shareToken && fetchState.state !== 'idle') return;
     let cancelled = false;
+    // DALTON-HOOK(share-redaction): abortable file listing fetch that downgrades on HTTP 403
+    const controller = new AbortController();
+    filesAbortRef.current?.abort();
+    filesAbortRef.current = controller;
     filesFetchRef.current = { token: shareToken, state: 'loading' };
     setFilesLoading(true);
     (async () => {
       try {
-        const result = await getSharedFiles(accessRef.current);
-        if (cancelled) return;
+        const result = await getSharedFiles(accessRef.current, '.', { signal: controller.signal });
+        if (cancelled || controller.signal.aborted) return;
         const listed = result.files || [];
         setFiles(listed);
         // An empty listing is asked again on the next open, as it was before
         // the load moved here: files can land after the share was made.
         filesFetchRef.current = { token: shareToken, state: listed.length ? 'loaded' : 'idle' };
-      } catch {
-        if (!cancelled) filesFetchRef.current = { token: shareToken, state: 'idle' };
+      } catch (err: unknown) {
+        if (!cancelled && !controller.signal.aborted) {
+          const status = apiErrorStatus(err) ?? (err as { status?: number })?.status;
+          if (status === 403) handleForbiddenDowngrade();
+          filesFetchRef.current = { token: shareToken, state: 'idle' };
+        }
       }
-      if (!cancelled) setFilesLoading(false);
+      if (!cancelled && !controller.signal.aborted) setFilesLoading(false);
     })();
     return () => {
       cancelled = true;
+      controller.abort();
       // Unmount mid-fetch: the result is dropped, so the state must not claim it.
       if (filesFetchRef.current.state === 'loading') filesFetchRef.current = { token: shareToken, state: 'idle' };
     };
-  }, [showFilePanel, canBrowseFiles, shareToken]);
+  }, [showFilePanel, canBrowseFiles, shareToken, handleForbiddenDowngrade]);
 
   // File panel handlers
   const handleToggleFilePanel = useCallback(() => {
@@ -436,23 +548,27 @@ export default function SharedChatView({ shareToken, access = shareToken, metada
 
   // The panel's adapter over the public endpoints. The serve prefix stands in
   // for the workspace, which a share never names.
+  // DALTON-HOOK(share-redaction): guard public file/preview reads for 403 downgrade and attach refresh stamp
   const servePrefix = sharedServePrefix(access);
   const fileApiAdapter = useMemo(() => ({
-    readFile: (path: string) => readSharedFile(access, path),
+    readFile: (path: string) => guardForbidden(readSharedFile(access, path)),
     // HTML files read their full source here; the public read endpoint caps at
     // its own line limit, and the preview renders via the served URL regardless.
-    readFileFull: (path: string) => readSharedFile(access, path),
+    readFileFull: (path: string) => guardForbidden(readSharedFile(access, path)),
     // Previews read under the serve prefix (allow_files), matching the rendered
     // report; only the explicit save uses the download endpoint (allow_download).
-    downloadFile: (path: string) => servedObjectUrl(servePrefix, path),
-    downloadFileAsArrayBuffer: (path: string) => servedBytes(servePrefix, path),
-    triggerDownload: (path: string) => downloadSharedFile(access, path),
+    downloadFile: (path: string) => guardForbidden(servedObjectUrl(servePrefix, path, { refreshStamp })),
+    downloadFileAsArrayBuffer: (path: string) => guardForbidden(servedBytes(servePrefix, path, { refreshStamp })),
+    triggerDownload: (path: string) => guardForbidden(downloadSharedFile(access, path)),
     servePrefix,
     resolveFile: (candidates: string[], recentWrites: string[]) =>
-      resolveSharedFile(access, candidates, recentWrites),
-  }), [access, servePrefix]);
+      guardForbidden(resolveSharedFile(access, candidates, recentWrites)),
+  }), [access, servePrefix, refreshStamp, guardForbidden]);
 
-  const imageDownloader = useCallback((path: string) => servedObjectUrl(servePrefix, path), [servePrefix]);
+  const imageDownloader = useCallback(
+    (path: string) => guardForbidden(servedObjectUrl(servePrefix, path, { refreshStamp })),
+    [servePrefix, refreshStamp, guardForbidden],
+  );
 
   // A share is a finished thread: nothing runs, and nothing will come back.
   const plans = useMemo(() => threadPlans(messages, false, false).underMessages, [messages]);
@@ -703,15 +819,46 @@ export default function SharedChatView({ shareToken, access = shareToken, metada
                         <span className="ml-2 text-sm" style={{ color: 'var(--color-text-tertiary)' }}>Loading conversation...</span>
                       </div>
                     ) : (
-                      <WorkspaceProvider workspaceId={null} downloadFile={imageDownloader} folders={folders}>
+                      <WorkspaceProvider
+                        workspaceId={null}
+                        downloadFile={canBrowseFiles ? imageDownloader : null}
+                        folders={folders}
+                        imageScope={sharedImageScope}
+                      >
                       <MessageActionsProvider actions={readOnlyActions}>
                       <DispatchStatusProvider>
+                      {/* DALTON-HOOK(share-redaction): propagate allowFiles/allowDiagramRender context and render older-history pagination trigger */}
+                      <SharedRedactionProvider
+                        allowFiles={canBrowseFiles}
+                        allowDiagramRender={canBrowseFiles}
+                        shareToken={shareToken}
+                        imageScope={sharedImageScope}
+                        onForbidden={handleForbiddenDowngrade}
+                      >
+                        {historyPage.hasMore && (
+                          <div className="flex justify-center pb-4">
+                            <button
+                              type="button"
+                              onClick={() => void handleLoadOlder()}
+                              disabled={loadingOlder}
+                              className="text-xs px-3 py-1.5 rounded-full border transition-colors hover:bg-(--color-border-muted) disabled:opacity-50"
+                              style={{
+                                borderColor: 'var(--color-border-muted)',
+                                color: 'var(--color-text-secondary)',
+                              }}
+                            >
+                              {loadingOlder ? t('chat.loadingOlderHistory') : t('share.loadEarlierMessages')}
+                            </button>
+                          </div>
+                        )}
                         <MessageList
                           messages={messages}
                           readOnly={true}
                           allowFiles={canBrowseFiles}
                           plans={plans}
                         />
+                      {/* DALTON-HOOK(share-redaction): end redaction context */}
+                      </SharedRedactionProvider>
                       </DispatchStatusProvider>
                       </MessageActionsProvider>
                       </WorkspaceProvider>

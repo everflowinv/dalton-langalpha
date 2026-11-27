@@ -8,6 +8,9 @@ import { onOtherComputer, parseAgentHref } from '../utils/agentPaths';
 import { normalizeFilePath, parseFolderHref, parseWsPath } from '../utils/filePaths';
 import ImageLightbox from './ImageLightbox';
 import { useCapturedImageUrl } from '../contexts/CapturedImagesContext';
+// DALTON-HOOK(share-redaction): controlled media fetcher, redacted placeholder, and epoch-guarded share image cache
+import { RedactedImage, useControlledMediaSrc, useSharedRedaction } from '@/components/dalton/RedactedSharePlaceholders';
+import { beginScopedImageRead, finishScopedImageRead, onSharedImageScopeRevoked, parseSharedImageScopeFromKey, shouldCommitScopedImageRead } from '@/lib/dalton/sharedImageCache';
 
 // key:path → blob URL of the copy last read. A path is not a version: the agent
 // rewrites a chart in place and shows it again, so the cache only paints at
@@ -33,15 +36,19 @@ function readInto(key: string, fetcher: () => Promise<string>): Promise<void> {
   if (running) return running;
   // A sign-out landing first makes the bytes the last account's.
   const current = authSessionCheck();
+  // DALTON-HOOK(share-redaction): guard shared-scope image commits with monotonic epoch
+  const sharedScope = parseSharedImageScopeFromKey(key);
+  const scopedRead = sharedScope ? beginScopedImageRead(sharedScope) : null;
   const read = fetcher()
     .then((url) => {
-      if (!current()) {
+      if (!current() || (sharedScope && scopedRead && !shouldCommitScopedImageRead(sharedScope, scopedRead.epoch))) {
         URL.revokeObjectURL(url);
         throw new Error('signed out');
       }
       publish(key, url);
     })
     .finally(() => {
+      if (sharedScope && scopedRead) finishScopedImageRead(sharedScope, scopedRead.signal);
       if (inFlight.get(key) === read) inFlight.delete(key);
     });
   inFlight.set(key, read);
@@ -55,6 +62,22 @@ registerAuthReset(() => {
   blobCache.clear();
   inFlight.clear();
   changes.emit();
+});
+// DALTON-HOOK(share-redaction): evict and revoke blobCache entries when a share scope is revoked
+onSharedImageScopeRevoked((shareToken) => {
+  const prefix = `share:${shareToken}:`;
+  let changed = false;
+  for (const [k, url] of blobCache.entries()) {
+    if (k.startsWith(prefix)) {
+      URL.revokeObjectURL(url);
+      blobCache.delete(k);
+      changed = true;
+    }
+  }
+  for (const k of inFlight.keys()) {
+    if (k.startsWith(prefix)) inFlight.delete(k);
+  }
+  if (changed) changes.emit();
 });
 
 function isExternalUrl(src: string): boolean {
@@ -88,6 +111,10 @@ function WorkspaceImage({ src: written, alt, ...props }: WorkspaceImageProps) {
   const contextWorkspaceId = useWorkspaceId();
   const downloadFileFn = useWorkspaceDownloadFile();
   const imageScope = useWorkspaceImageScope();
+  // DALTON-HOOK(share-redaction): resolve controlled media routes via credentialed blob fetch and block images in text-only shares
+  const shareRedaction = useSharedRedaction();
+  const controlled = useControlledMediaSrc(src);
+  const redacted = (shareRedaction.active && !shareRedaction.allowFiles) || controlled.redacted;
 
   // Support __wsref__/{workspaceId}/path for cross-workspace file references,
   // and another workspace's folder (`../NVDA/chart.png`), which names its
@@ -109,7 +136,7 @@ function WorkspaceImage({ src: written, alt, ...props }: WorkspaceImageProps) {
   // endpoint and get a 401.
   const effectiveDownloadFn = (wsRef || other) && contextWorkspaceId ? null : downloadFileFn;
 
-  const canFetch = !!(src && !elsewhere && !isExternalUrl(src) && (workspaceId || effectiveDownloadFn));
+  const canFetch = !redacted && !controlled.isControlled && !!(src && !elsewhere && !isExternalUrl(src) && (workspaceId || effectiveDownloadFn));
   // The one reading of the destination, the same one a file link gets, so
   // `/home/workspace/charts/x.png` fetches `charts/x.png`, and `../<own
   // folder>/x.png` fetches `x.png`, rather than a path no workspace holds. The
@@ -143,6 +170,23 @@ function WorkspaceImage({ src: written, alt, ...props }: WorkspaceImageProps) {
   const state: LoadState = failed?.key === cacheKey && failed.url === blobUrl
     ? 'error'
     : blobUrl ? 'loaded' : 'loading';
+
+  // DALTON-HOOK(share-redaction): render static placeholder when text-only share, or display controlled media object URL
+  if (redacted) return <RedactedImage alt={alt} />;
+  if (controlled.isControlled) {
+    if (controlled.loading) {
+      return <span className="rounded-lg my-2 animate-pulse" style={{ display: 'block', width: '100%', maxWidth: 480, height: 200, backgroundColor: 'var(--color-border-muted)' }} />;
+    }
+    if (controlled.error || !controlled.objectUrl) {
+      return <ImageLoadFailed name={alt || src?.split('/').pop()} />;
+    }
+    return (
+      <>
+        <img className="rounded-lg my-2 cursor-pointer" style={{ maxWidth: '100%', height: 'auto' }} src={controlled.objectUrl} alt={alt} onClick={() => setLightboxOpen(true)} {...props} />
+        <ImageLightbox src={controlled.objectUrl} alt={alt} open={lightboxOpen} onClose={() => setLightboxOpen(false)} />
+      </>
+    );
+  }
 
   if (elsewhere) return <span>{alt || src!.split('/').pop()}</span>;
 
