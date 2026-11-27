@@ -5,6 +5,7 @@ import type { ChatInputHandle } from '@/components/ui/chat-input';
 import type { MessageActions } from '../messageList/MessageActionsContext';
 import type { EditDraftStore } from '../../hooks/utils/editDrafts';
 import type { ModelOptions } from './types';
+import type { ArtifactCommentRef } from '../artifactComments/artifactCommentReply';
 
 type Action<K extends keyof MessageActions> = NonNullable<MessageActions[K]>;
 
@@ -12,6 +13,7 @@ type Action<K extends keyof MessageActions> = NonNullable<MessageActions[K]>;
 export interface MessageActionSources {
   reportThreadId?: string;
   feedbackLoading?: boolean;
+  onOpenThread: Action<'onOpenThread'>;
   onOpenFile: Action<'onOpenFile'>;
   onDownloadFile: Action<'onDownloadFile'>;
   onPublishFile: Action<'onPublishFile'>;
@@ -28,7 +30,8 @@ export interface MessageActionSources {
   onOpenSources: Action<'onOpenSources'>;
   onToolCallDetailClick: Action<'onToolCallDetailClick'>;
   onOpenChart: Action<'onOpenChart'>;
-  onOpenArtifactComment: Action<'onOpenArtifactComment'>;
+  /** Opens a comment of either kind, a file's in the panel and a chart's in its tab. */
+  onOpenArtifactComment: (comment: ArtifactCommentRef) => void;
   onOpenSubagentTask: Action<'onOpenSubagentTask'>;
   onOpenDispatcher: Action<'onOpenDispatcher'>;
   onAnswerQuestion: Action<'onAnswerQuestion'>;
@@ -88,8 +91,13 @@ export function useMessageActionBundles(src: MessageActionSources): {
   const stableToolCallDetail = useStableHandler(src.onToolCallDetailClick);
   const stableOpenChart = useStableHandler(src.onOpenChart);
   const stableOpenArtifactComment = useStableHandler(src.onOpenArtifactComment);
+  const openArtifactComment = useMemo(
+    () => ({ file: stableOpenArtifactComment, chart: stableOpenArtifactComment }),
+    [stableOpenArtifactComment],
+  );
   const stableOpenSubagentTask = useStableHandler(src.onOpenSubagentTask);
   const stableOpenDispatcher = useStableHandler(src.onOpenDispatcher);
+  const stableOpenThread = useStableHandler(src.onOpenThread);
   const stableAnswerQuestion = useStableHandler(src.onAnswerQuestion);
   const stableSkipQuestion = useStableHandler(src.onSkipQuestion);
   const stableApproveCreateWorkspace = useStableHandler(src.onApproveCreateWorkspace);
@@ -146,6 +154,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
           onOpenChart: stableOpenChart,
           onOpenSubagentTask: stableOpenSubagentTask,
           onOpenDispatcher: stableOpenDispatcher,
+          onOpenThread: stableOpenThread,
         }
       : {
           onOpenFile: stableOpenFile,
@@ -157,9 +166,10 @@ export function useMessageActionBundles(src: MessageActionSources): {
           onOpenSources: stableOpenSources,
           onToolCallDetailClick: stableToolCallDetail,
           onOpenChart: stableOpenChart,
-          onOpenArtifactComment: stableOpenArtifactComment,
+          onOpenArtifactComment: openArtifactComment,
           onOpenSubagentTask: stableOpenSubagentTask,
           onOpenDispatcher: stableOpenDispatcher,
+          onOpenThread: stableOpenThread,
           onAnswerQuestion: stableAnswerQuestion,
           onSkipQuestion: stableSkipQuestion,
           onApproveCreateWorkspace: stableApproveCreateWorkspace,
@@ -191,7 +201,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
   ), [
     readOnly,
     stableOpenFile, stableDownloadFile, stablePublishFile, stableDownloadKeyFor, stableRevealFiles, stableRevealMessage, stableOpenSources, stableToolCallDetail,
-    stableOpenChart, stableOpenArtifactComment, stableOpenSubagentTask, stableOpenDispatcher, stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
+    stableOpenChart, openArtifactComment, stableOpenSubagentTask, stableOpenDispatcher, stableOpenThread, stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
     stableRejectCreateWorkspace, stableApproveStartQuestion, stableRejectStartQuestion,
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
     stableRejectSecretaryAction, stableApproveWatchlistAction, stableRejectWatchlistAction,

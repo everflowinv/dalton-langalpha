@@ -584,6 +584,34 @@ export type MessageProvenance =
       chartLayers?: PublishedLayer[];
     };
 
+/** One OHLCV bar a chart pick gave the agent. Times are ISO8601. */
+export interface PreviewBar {
+  time: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+/**
+ * A region or price level a message picked on a chart carried, as its turn
+ * keeps it: the card's fields, the time bounds and the bars the agent was
+ * given, for the preview of what it read.
+ */
+export interface SelectionPreviewShape {
+  selectionType: 'region' | 'price_level';
+  symbol: string;
+  timeframe: string;
+  priceLow: number;
+  priceHigh: number;
+  comment?: string;
+  timeStart?: string;
+  timeEnd?: string;
+  bars?: PreviewBar[];
+  barsTruncated?: boolean;
+}
+
 /** The member who sent a turn in a shared workspace. */
 export interface MessageSender {
   userId: string;
@@ -610,13 +638,11 @@ export type UserMessage = {
    */
   widgetSnapshots?: import('@/pages/Dashboard/widgets/framework/contextSnapshot').WidgetContextSnapshot[];
   /**
-   * Chart selections (region / price level) the user attached to this message.
-   * Rendered as read-only pills below the user bubble (like widget snapshots)
-   * and forwarded to the backend via `additional_context`. A compact camelCase
-   * summary is persisted to the turn's query metadata, so history replay
-   * re-renders these cards (see serialize_chart_selections_for_metadata).
+   * Regions and price levels a message picked on a chart carried, read back
+   * from its turn's query metadata and drawn as read-only cards below the
+   * user bubble.
    */
-  chartSelections?: import('@/pages/MarketView/stores/chartSelectionStore').ChartSelectionSnapshot[];
+  chartSelections?: SelectionPreviewShape[];
   /** The file comments this message sent, drawn under its note. `content`
    *  is that note wherever the row came from: the server keeps the block the
    *  agent read as the query, and every way a row comes in (a replay, a
@@ -718,8 +744,9 @@ export type AssistantMessage = {
   unloaded?: boolean;
   /** Set when the turn was stopped (live finalize or history replay of a
    *  stopped turn): `true` when its user stopped it, which the "⏹ Stopped"
-   *  chip says, or `suspension` when the account's suspension ended it,
-   *  which its own chip says. */
+   *  chip says, `suspension` when the account's suspension ended it, or
+   *  `computer_lost` when its computer stopped answering and the turn was
+   *  not carried on, each of which its own chip says. */
   stopped?: TurnStop;
   /** The reply to a send the server refused before admitting it (see
    *  UserMessage.unadmitted). */
@@ -737,7 +764,7 @@ export type AssistantMessage = {
   completionObservedAt?: number;
 };
 
-export type TurnStop = true | 'suspension';
+export type TurnStop = true | 'suspension' | 'computer_lost';
 
 export type NotificationVariant = 'info' | 'success' | 'warning';
 

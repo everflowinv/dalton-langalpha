@@ -31,11 +31,13 @@ import { exportServedPdf, isWeChatBrowser } from './viewers/html/useHtmlActions'
 import { isShareDownloadHandled } from '@/lib/dalton/shareFileGuard'; // DALTON-HOOK(share-redaction)
 import { useServedHtml } from './viewers/html/useServedHtml';
 // DALTON-HOOK(mobile-web): sharedSeq, useArtifactComments for mobile HTML More menu
-import { artifactPathKey, sharedSeq, useArtifactBinding, useArtifactByPath, useArtifactComments } from '@/hooks/useArtifact';
+import { artifactPathKey, sharedSeq, useArtifactBinding, useArtifactComments, useArtifactRecord } from '@/hooks/useArtifact';
+import { targetFor as artifactTargetFor } from '@/lib/artifactTarget';
 // DALTON-HOOK(monitors): inspect bound monitor visibility so historical public monitors show stop-share entry
 import { queryKeys } from '@/lib/queryKeys';
 import { getMonitorByArtifact, type MonitorSummary } from '@/pages/Monitors/api';
 import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
+import { sameTarget, threadOf } from './artifactComments/destinations';
 import { openComments } from './artifactComments/commentModel'; // DALTON-HOOK(mobile-web)
 import { queuedBatches, refusalReason, sendBatches } from './artifactComments/commentSends'; // DALTON-HOOK(mobile-web)
 import { useArtifactCommentSender } from './artifactComments/sendContext';
@@ -261,10 +263,9 @@ function FileHeaderActions({
   const monitorQueryClient = contextClient ?? FALLBACK_MONITOR_QUERY_CLIENT;
   const root = useWorkspaceFolders()?.rootDir;
   const unsharePath = access.kind === 'owner' && artifactDoc ? artifactDoc : selectedFile;
-  const { data: unshareRecord } = useArtifactByPath(
+  const { data: unshareRecord } = useArtifactRecord(
     openUnshareOnly ? workspaceId : null,
-    openUnshareOnly ? unsharePath : null,
-    { root },
+    openUnshareOnly && unsharePath ? artifactTargetFor('file', unsharePath, root) : null,
   );
   // DALTON-HOOK(monitors): also surface stop-share entry when a historical public monitor is attached even if artifact.shared is false
   const { data: unshareMonitor } = useQuery<MonitorSummary | null>(
@@ -720,7 +721,8 @@ function useArtifactMenuState({
   const contextClient = useContext(QueryClientContext);
   const monitorQueryClient = contextClient ?? FALLBACK_MONITOR_QUERY_CLIENT;
   const root = useWorkspaceFolders()?.rootDir;
-  const { data: queriedArtifact } = useArtifactByPath(enabled ? workspaceId : null, enabled ? path : null, { root });
+  const target = artifactTargetFor('file', path, root);
+  const { data: queriedArtifact } = useArtifactRecord(enabled ? workspaceId : null, enabled ? target : null);
   const artifact = queriedArtifact ?? fallbackArtifact;
   const artifactId = artifact?.artifact_id ?? null;
   // DALTON-HOOK(monitors): read attached monitor so owner Manage label recognizes historical public monitors even when artifact.shared is false
@@ -735,20 +737,21 @@ function useArtifactMenuState({
   );
   const hasPublicMonitor = artifactMonitor?.visibility === 'public';
   const sender = useArtifactCommentSender();
-  const { besideThreadId } = sender;
+  const { beside } = sender;
+  const besideThreadId = threadOf(beside);
   const { choices, canBind, targetFor } = useCommentDestinations(
     enabled ? workspaceId : '',
-    artifactPathKey(path, root),
+    target,
   );
   const { bind, unbind } = useArtifactBinding();
 
   const goesTo = choices.find((c) => c.isDefault) ?? null;
   const goesLine = !goesTo
     ? null
-    : !('threadId' in goesTo.target)
-      ? t('artifact.commentsGoNew')
-      : goesTo.target.threadId === besideThreadId
-        ? t('artifact.commentsGoHere')
+    : sameTarget(beside, goesTo.target)
+      ? t('artifact.commentsGoHere')
+      : !('threadId' in goesTo.target)
+        ? t('artifact.commentsGoNew')
         : t('artifact.commentsGoTo', { thread: goesTo.label });
   const bound = artifact?.bound_thread_id ?? null;
   // DALTON-HOOK(mobile-web): shared bind/unbind visibility and mutation handlers for desktop & mobile HTML menus
@@ -758,7 +761,7 @@ function useArtifactMenuState({
   const onBind = () => {
     if (!besideThreadId) return;
     bind.mutate(
-      { workspaceId, path, threadId: besideThreadId },
+      { workspaceId, target, threadId: besideThreadId },
       { onError: () => toast({ description: t('pageViewer:comments.bindFailed'), variant: 'destructive' }) },
     );
   };
@@ -899,7 +902,6 @@ function MobileHtmlOverflowMenu({
   // DALTON-HOOK(mobile-web): reuse linkedDocPath resolved from unified HtmlFrameDocState
   const isLinkedDoc = Boolean(linkedDocPath);
   const commentDocPath = isLinkedDoc && linkedDocPath ? linkedDocPath : selectedFile;
-  const commentDocKey = artifactPathKey(commentDocPath, root);
 
   const versionView = !isLinkedDoc ? (mobileHtmlTools?.versionView ?? null) : null;
   const menu = useArtifactMenuState({
@@ -908,16 +910,16 @@ function MobileHtmlOverflowMenu({
     enabled: isOwner && !isLinkedDoc,
     fallbackArtifact: versionView?.record ?? null,
   });
-  const { data: linkedArtifact } = useArtifactByPath(
+  const commentDocTarget = artifactTargetFor('file', commentDocPath, root);
+  const { data: linkedArtifact } = useArtifactRecord(
     isOwner && isLinkedDoc ? workspaceId : null,
-    isLinkedDoc ? commentDocKey : null,
-    { root },
+    isLinkedDoc ? commentDocTarget : null,
   );
   const artifact = !isLinkedDoc ? menu.artifact : null;
   const commentArtifactId = isLinkedDoc ? (linkedArtifact?.artifact_id ?? null) : menu.artifactId;
   const { targetFor: commentTargetFor } = useCommentDestinations(
     isOwner && isLinkedDoc ? workspaceId : '',
-    commentDocKey,
+    commentDocTarget,
   );
   const commentsQuery = useArtifactComments(mobileHtmlTools ? commentArtifactId : null);
   const comments = commentsQuery.data ?? [];
@@ -1006,7 +1008,7 @@ function MobileHtmlOverflowMenu({
       reasonOf: (err) => refusalReason(t, err, true),
     }).then((outcomes) => {
       setSendingAll(false);
-      const summary = summarizeSendAllOutcome(t, locale, outcomes, menu.sender.besideThreadId);
+      const summary = summarizeSendAllOutcome(t, locale, outcomes, menu.sender);
       setSendAllNotice([summary.sent, summary.refused].filter(Boolean).join(' · '));
       refreshArtifactComments(queryClient, [{ artifactId: commentArtifactId, workspaceId }], ALL);
     });

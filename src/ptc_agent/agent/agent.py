@@ -64,6 +64,7 @@ from ptc_agent.agent.middleware.background_subagent.subagent import (
     run_on_by_type,
 )
 from ptc_agent.agent.transcript.classify import MARKET_ALERT_SENDER, WAKEUP_SENDER
+from ptc_agent.agent.transcript.store import BorrowedFiles
 from ptc_agent.agent.middleware.compaction.notes import (
     NotesDueMiddleware,
     NotesOffMiddleware,
@@ -80,6 +81,7 @@ from ptc_agent.agent.middleware.direct_mcp import (
 )
 from ptc_agent.agent.middleware.file_mount_notice import FileMountNoticeMiddleware
 from ptc_agent.agent.middleware.order_governance import OrderLedger, places_order
+from ptc_agent.agent.middleware.comment_guidance import CommentGuidanceMiddleware
 from ptc_agent.agent.middleware.subagent_switch import (
     SubagentSwitchMiddleware,
     SubagentSwitchReader,
@@ -250,6 +252,7 @@ class PTCAgent:
         # DALTON-HOOK(colleague-access): gate colleague sharing CoS prompt & analyst colleague_workspace prompt
         colleague_sharing_enabled: bool = False,
         colleague_workspace_enabled: bool = False,
+        langalpha_doc_enabled: bool = False,
     ) -> str:
         """Build the static system prompt (excludes time/profile for cacheability).
 
@@ -266,6 +269,9 @@ class PTCAgent:
         the user at a time. ``user_memory_enabled`` and ``user_data_enabled``
         are ``IdentityGates.prompt_vars``: a shared workspace's prompt points
         at no memory tier or data of one member's, since none is there.
+        ``langalpha_doc_enabled`` follows the user's switch for that skill,
+        as ``order_skill`` does: its section names files only a workspace
+        with the skill holds.
         """
         loader = get_loader()
         return loader.get_system_prompt(
@@ -308,6 +314,7 @@ class PTCAgent:
             # DALTON-HOOK(colleague-access): gate colleague sharing & analyst colleague_workspace prompts
             colleague_sharing_enabled=colleague_sharing_enabled,
             colleague_workspace_enabled=colleague_workspace_enabled,
+            langalpha_doc_enabled=langalpha_doc_enabled,
         )
 
     def _get_tool_summary(self, mcp_registry: MCPRegistry) -> str:
@@ -362,6 +369,7 @@ class PTCAgent:
         team_memory_enabled: bool = False,
         # DALTON-HOOK(research-writing): permanent Chinese research judgment and writing rules
         research_writing_enabled: bool = False,
+        transcript_borrowed: tuple[BorrowedFiles, ...] = (),
         member_context: MemberContext | None = None,
         # DALTON-HOOK(watchlist): withhold personal watchlist tool on individually shared threads
         thread_is_shared: bool = False,
@@ -434,6 +442,10 @@ class PTCAgent:
                 leaves this thread out (a thread kept private in a shared
                 workspace); the agent's transcripts are saved and pointed at
                 there. Its subagents share it, as they share the computer's.
+            transcript_borrowed: A snapshot fork's turns before its own, whose
+                files are in the transcripts of the chats it was forked from:
+                the server reads them with the thread, and every pointer the
+                main agent's compaction writes names them there.
             member_context: In a shared workspace whose member's organization
                 lets their own context reach it, the member this turn is for:
                 the main agent alone is given their answer preferences and
@@ -473,6 +485,7 @@ class PTCAgent:
             operation_callback=operation_callback,
             preview_owner=preview_owner,
             history=thread_history,
+            transcript_borrowed=transcript_borrowed,
         )
         # The one workspace root this build uses, read off the live computer
         # root plus the turn's folder rather than the config default.
@@ -886,6 +899,9 @@ class PTCAgent:
         # still does: a user who turned it off, or the plugin that ships it,
         # gets neither the tools nor the prompt line naming them.
         chart_annotation = "chart-annotation" in skill_registry
+        # Its prompt section names the skill's pages, which a build without
+        # skills, or a user who switched the skill off, has no copy of.
+        langalpha_doc = self.config.skills.enabled and "langalpha-doc" in skill_registry
         # Subagents never bind the annotation tools (see where they are
         # appended), so neither their manifest nor a preload may offer the
         # guide to them.
@@ -937,6 +953,11 @@ class PTCAgent:
             ),
         )
         main_only_middleware.append(steering)
+
+        # How to answer the comments a send carries, after the steering, whose
+        # message a send mid-turn arrives in.
+        comment_guidance = CommentGuidanceMiddleware(drawing=chart_annotation)
+        main_only_middleware.append(comment_guidance)
 
         # The user's cancels of wakeups the agent set, after the steers that
         # reached this call. Whether or not wakeups are on, so the row saying
@@ -1247,6 +1268,7 @@ class PTCAgent:
             dalton_report_delivery_enabled=dalton_report_delivery_enabled,  # DALTON-HOOK(report-delivery)
             colleague_sharing_enabled=colleague_sharing_enabled,  # DALTON-HOOK(colleague-access)
             colleague_workspace_enabled=colleague_workspace_enabled,  # DALTON-HOOK(colleague-access)
+            langalpha_doc_enabled=langalpha_doc,
         )
         # Read once: the baseline freezes this value per epoch, and the
         # prompt is sent with the frozen one (FrozenPromptMiddleware).
@@ -1816,6 +1838,7 @@ class PTCAgent:
                 entry=(skill_loader_middleware, context.turn, context.baseline, plan_state),
                 plan=AgentPlan(plan_close_out) if plan_on else None,
                 shared=not own_data,
+                comment_guidance=comment_guidance,
                 middleware=deepagent_middleware,
                 baseline=context.baseline.frozen_block,
                 steering=steering,

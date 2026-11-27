@@ -32,6 +32,7 @@ from src.server.services.shared_workspaces.member_context import (
 )
 from src.server.services.shared_workspaces.turn import TurnIdentity
 from src.server.services.forks.carry import ForkTurnStart
+from src.server.services.forks.start import ThreadStart
 from src.server.database.workspace import update_workspace_activity
 from src.server.services.commands.mirror import mirror_computer
 from src.server.services.computer_disk import TURN_MEASURE_MIN_INTERVAL_SECONDS
@@ -126,7 +127,7 @@ from src.server.services.runs.admission import (
     begin_run,
     dedup_retransmit_or_raise,
 )
-from src.server.services.artifacts.comments import CommentSendScope
+from src.server.services.artifacts.comments import CommentSendScope, stamp_send
 from src.server.services.turn_runtime import TurnRoute
 
 from .admission_gate import agent_steer_of, steer_allowed, wait_or_steer
@@ -1046,6 +1047,7 @@ async def astream_ptc_workflow(
             workspace_owner_id=workspace_owner_id,
             acting_for=workspace_id,
             member_context=member_context,
+            fork=prior_thread.fork,
         )
         project = inputs.project
         # One relay session per directly bound server, held for the run.
@@ -1148,7 +1150,9 @@ async def astream_ptc_workflow(
                 # A port, not a value: the switch can flip mid-turn from any
                 # worker, so the agent re-reads the row on every call.
                 subagent_switch=partial(read_thread_subagents_allowed, thread_id),
-                window_coverage=partial(runs_held, thread_id),
+                window_coverage=partial(
+                    runs_held, thread_id, start=ThreadStart.of(prior_thread.fork)
+                ),
                 cancel_notices=ThreadCancelNotices(thread_id, turn_context.tool_timezone),
                 reached_computers=reached_computers,
             )
@@ -1312,6 +1316,8 @@ async def astream_ptc_workflow(
 
         if inline_target is not None and written_by is not None:
             written_by.stamp(inline_target)
+        if inline_target is not None:
+            stamp_send(inline_target, request.artifact_comments)
 
         # =====================================================================
         # Save user request to system thread directory (non-critical)

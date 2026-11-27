@@ -65,6 +65,7 @@ import {
 import type { SharedThreadMetadata, SSEEvent } from './api';
 import ShareUnavailable from './ShareUnavailable';
 import type { TextSegment } from '@/types/chat';
+import type { ForkDividerEvent } from '@/types/api';
 import { isTaskAgentId } from '../ChatAgent/utils/agentId';
 import type { FileLocation } from '../ChatAgent/utils/fileLocation';
 import { computeAgentArtifactRouting } from '../ChatAgent/utils/agentArtifactRouting';
@@ -338,6 +339,8 @@ export default function SharedChatView({
   }, [access]);
 
   const [messages, setMessages] = useState<MessageRecord[]>([]);
+  // Where a fork's borrowed turns end, as the replay said.
+  const [forkDivider, setForkDivider] = useState<ForkDividerEvent | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -926,6 +929,7 @@ export default function SharedChatView({
                           readOnly={true}
                           allowFiles={canBrowseFiles}
                           plans={plans}
+                          forkDivider={forkDivider}
                         />
                       {/* DALTON-HOOK(share-redaction): end redaction context */}
                       </SharedRedactionProvider>

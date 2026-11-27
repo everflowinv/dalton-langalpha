@@ -200,6 +200,7 @@ vi.mock('@/pages/ChatAgent/hooks/useChatMessages', () => ({
   useChatMessages: (): ReturnType<typeof useChatMessagesType> => ({
     messages: mockMessages.current,
     liveMessages: STABLE_CHAT_HELPERS.liveMessages,
+    forkDivider: null,
     isLoading: false,
     turnStatus: { workspaceStarting: false, turnHeld: null, cliQueue: null },
     hasActiveSubagents: false,

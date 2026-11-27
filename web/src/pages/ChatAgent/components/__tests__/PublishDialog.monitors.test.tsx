@@ -243,6 +243,7 @@ const mockPublishMonitor = vi.mocked(publishMonitor);
 const mockShareDocument = vi.mocked(shareDocument);
 
 const ARTIFACT: Artifact = {
+  kind: 'file' as const,
   artifact_id: '6f1c2a7e-3b4d-4e5f-8a9b-0c1d2e3f4a5b',
   code: 'k7f2m9q1x4z8',
   url: '/a/k7f2m9q1x4z8',

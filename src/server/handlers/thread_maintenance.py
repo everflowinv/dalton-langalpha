@@ -235,6 +235,8 @@ async def _thread_agent(
         raise HTTPException(
             status_code=500, detail="Agent configuration not initialized"
         )
+    from src.server.database.conversation.threads_read import get_thread_metadata
+    from src.server.services.forks.model import ForkLineage
     from src.server.services.thread_agent import AgentInputs
 
     # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id to AgentInputs.read
@@ -254,9 +256,15 @@ async def _thread_agent(
             else {}
         ),
         acting_for=workspace_id,
+        fork=ForkLineage.of(await get_thread_metadata(thread_id)),
     )
     # A summary written here points at the transcript where the turns' agent finds it.
-    backend = layout and SandboxBackend(session.sandbox, layout.workspace, history=inputs.thread_history)
+    backend = layout and SandboxBackend(
+        session.sandbox,
+        layout.workspace,
+        history=inputs.thread_history,
+        transcript_borrowed=inputs.transcript_borrowed,
+    )
     graph = await build_ptc_graph_with_session(
         session=session,
         config=effective_config,

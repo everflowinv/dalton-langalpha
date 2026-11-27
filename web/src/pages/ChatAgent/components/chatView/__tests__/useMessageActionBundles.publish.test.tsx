@@ -15,6 +15,7 @@ const noop = () => {};
 function sources(overrides: Partial<MessageActionSources> = {}): MessageActionSources {
   return {
     onOpenFile: noop,
+    onOpenThread: noop,
     onDownloadFile: noop,
     onPublishFile: async () => {},
     downloadKeyFor: (p: string) => p,

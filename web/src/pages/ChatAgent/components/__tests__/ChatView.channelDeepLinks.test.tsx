@@ -11,7 +11,7 @@ import {
   clearShowRequest,
   getShowLayersRequest,
 } from '@/pages/MarketView/stores/layerViewStore';
-import { chartKeyFor } from '@/pages/MarketView/utils/chartInstanceKey';
+import { chartKeyFor } from '@/lib/bars/chartId';
 import {
   parseChartDeepLinkParam,
   useChannelDeepLinks,
