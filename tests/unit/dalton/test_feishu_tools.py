@@ -857,3 +857,63 @@ async def test_feishu_append_doc_strips_numeric_inline_code_and_preserves_code(
         "echo `0700.HK` `3.2x`\n"
         "```\n"
     )
+
+
+@pytest.mark.asyncio
+async def test_feishu_create_doc_preserves_indented_code_blocks(
+    monkeypatch: pytest.MonkeyPatch, tools
+) -> None:
+    ts, bridge_calls, _, _ = tools
+    _set_tier(monkeypatch, "admin")
+    feishu_create_doc = ts[2]
+
+    raw_md = (
+        "# 代码样例 `2026Q3`\n\n"
+        "正文标的 `ANT`，增速 `15%~18%`。\n\n"
+        "    const ticker = `ANT`;\n"
+        "    const band = `15%~18%`;\n\n"
+        "\tconst tabTicker = `0700.HK`;\n"
+    )
+    payload = _parse(
+        await feishu_create_doc.ainvoke(
+            {"title": "代码样例", "markdown": raw_md},
+            config=_config(ADMIN_USER_ID),
+        )
+    )
+    assert payload["ok"] is True
+    create_body = next(b for route, b in bridge_calls if route == "doc/create")
+    assert create_body["markdown"] == (
+        "# 代码样例 2026Q3\n\n"
+        "正文标的 ANT，增速 15%至18%。\n\n"
+        "    const ticker = `ANT`;\n"
+        "    const band = `15%~18%`;\n\n"
+        "\tconst tabTicker = `0700.HK`;\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_feishu_append_doc_preserves_indented_code_blocks(
+    monkeypatch: pytest.MonkeyPatch, tools
+) -> None:
+    ts, bridge_calls, _, _ = tools
+    _set_tier(monkeypatch, "admin")
+    feishu_append = ts[3]
+
+    raw_md = (
+        "追加正文：`NVDA` 估值 `3.2x`，区间 `15%～18%`。\n\n"
+        "    const ticker = `ANT`;\n"
+        "\tconst ratio = `3.2x`;\n"
+    )
+    payload = _parse(
+        await feishu_append.ainvoke(
+            {"token": "doccn1", "markdown": raw_md},
+            config=_config(ADMIN_USER_ID),
+        )
+    )
+    assert payload["ok"] is True
+    append_body = next(b for route, b in bridge_calls if route == "doc/append")
+    assert append_body["markdown"] == (
+        "追加正文：NVDA 估值 3.2x，区间 15%至18%。\n\n"
+        "    const ticker = `ANT`;\n"
+        "\tconst ratio = `3.2x`;\n"
+    )

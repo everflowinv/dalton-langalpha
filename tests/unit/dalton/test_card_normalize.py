@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 
+from src.dalton.notify import feishu_markdown_normalize as fmn
 from src.dalton.notify.card_normalize import (
     normalize_feishu_card,
     normalize_feishu_cards,
@@ -256,12 +258,58 @@ _INLINE_CODE_SAMPLES: list[tuple[str, str]] = [
         "~~~\n"
         "双反引号 `` `16,956.0` `` 与转义 \\`150.0\\` 保持原样，末尾 601100.SS 去反引号。",
     ),
+    # Indented code blocks (4 spaces / tab, after blank line / heading / blockquote / list) -> preserved;
+    # lazy paragraph continuation & list continuation -> stripped as prose inline code.
+    (
+        "正文 `ANT` 增速 `15%~18%`。\n\n"
+        "    const ticker = `ANT`;\n"
+        "    const range = `15%~18%`;\n\n"
+        "\tconst tabTicker = `0700.HK`;\n\n"
+        "# 标题 `2026Q3`\n"
+        "    const afterHeading = `3.2x`;\n\n"
+        ">     const quotedCode = `NVDA`;\n\n"
+        "- 列表项 `16,956.0`\n"
+        "    列表续行 `+46.7%`\n\n"
+        "      const listCode = `FY26E`;\n\n"
+        "段落首行\n"
+        "    段落续行 `150.0`",
+        "正文 ANT 增速 15%至18%。\n\n"
+        "    const ticker = `ANT`;\n"
+        "    const range = `15%~18%`;\n\n"
+        "\tconst tabTicker = `0700.HK`;\n\n"
+        "# 标题 2026Q3\n"
+        "    const afterHeading = `3.2x`;\n\n"
+        ">     const quotedCode = `NVDA`;\n\n"
+        "- 列表项 16,956.0\n"
+        "    列表续行 +46.7%\n\n"
+        "      const listCode = `FY26E`;\n\n"
+        "段落首行\n"
+        "    段落续行 150.0",
+    ),
 ]
 
 
 def test_strips_decorative_inline_code_backticks_and_preserves_code() -> None:
+    assert fmn._MD_PARSER is not None
     for raw, expected in _INLINE_CODE_SAMPLES:
         assert normalize_feishu_markdown_inline_code(raw) == expected
+        assert fmn._normalize_with_markdown_it(raw, fmn._MD_PARSER) == expected
+        assert fmn._normalize_stdlib(raw) == expected
+
+
+def test_feishu_markdown_normalize_skill_mirror_matches_canonical_source() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    canonical = repo_root / "src" / "dalton" / "notify" / "feishu_markdown_normalize.py"
+    skill_mirror = (
+        repo_root
+        / "plugins"
+        / "dalton"
+        / "skills"
+        / "dalton-richard-coverage-weekly"
+        / "scripts"
+        / "feishu_markdown_normalize.py"
+    )
+    assert skill_mirror.read_text(encoding="utf-8") == canonical.read_text(encoding="utf-8")
 
 
 def test_normalize_feishu_card_strips_markdown_inline_code_without_mutating_or_leaking_body() -> None:

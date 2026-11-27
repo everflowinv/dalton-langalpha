@@ -1277,3 +1277,187 @@ def test_transport_mcp_client_fallback_uses_call_mcp_tool_with_error_flag_f5(
     err_res = transport.call_bridge_jsonrpc("community", {"fail": True})
     assert err_res["ok"] is False and err_res["error"] == "bridge timeout"
     assert calls[0][0] == "researchdata" and calls[0][1] == "community"
+
+
+@pytest.mark.asyncio
+async def test_verify_append_matches_landed_normalized_write_after_uncertain_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When feishu_append lands normalized prose (`15%~18%` -> `15%至18%`) but returns
+    outcome='unknown', verify_doc_append normalizes the draft with the same function and
+    marks the segment completed instead of stalling with readback_partial_match."""
+    import os
+    import shutil
+    import subprocess
+
+    from src.dalton.feishu import FeishuBridgeError
+    from src.dalton.tools import feishu_tools as feishu_tools_mod
+
+    end_d = dt.date(2026, 12, 18)
+    part1_raw = "**窗口与基准**\n`SPY` 区间收益 `15%~18%`，核心标的 `ANT` 跟踪。"
+    part2_raw = (
+        "\n---\n"
+        "**Watch 异动汇总**\n"
+        "本周核心增速落在 `15%~18%`（指引区间 `15%～18%`），`2026Q3` 营收 `16,956.0`，"
+        "目标价 `$150.0`，字段 `revenue_yoy_pct`。\n\n"
+        "    const ticker = `ANT`;\n"
+    )
+    landed_chunks: list[str] = []
+
+    async def _fake_bridge(route: str, body: dict) -> dict:
+        if route == "doc/create":
+            landed_chunks.append(body["markdown"])
+            return {
+                "ok": True,
+                "document_id": "DoxNormUncertain1",
+                "url": "https://feishu.cn/docx/DoxNormUncertain1",
+            }
+        if route == "doc/append":
+            # Simulate write landing on Feishu before network timeout causes unknown outcome.
+            landed_chunks.append(body["markdown"])
+            raise FeishuBridgeError(
+                "content_insert_failed",
+                "追加请求结果未知，可能已经写入",
+                payload={
+                    "ok": False,
+                    "error": "content_insert_failed",
+                    "outcome": "unknown",
+                    "document_id": "DoxNormUncertain1",
+                    "url": "https://feishu.cn/docx/DoxNormUncertain1",
+                },
+            )
+        raise AssertionError(f"unexpected route: {route}")
+
+    monkeypatch.setattr(
+        feishu_tools_mod,
+        "post_bridge_feishu",
+        create_autospec(feishu_tools_mod.post_bridge_feishu, side_effect=_fake_bridge),
+    )
+    monkeypatch.setattr(
+        feishu_tools_mod,
+        "_caller_email",
+        create_autospec(feishu_tools_mod._caller_email, return_value=""),
+    )
+    monkeypatch.setattr(
+        feishu_tools_mod,
+        "_caller_feishu_open_id",
+        create_autospec(feishu_tools_mod._caller_feishu_open_id, return_value=""),
+    )
+
+    create_res = await feishu_tools_mod.create_feishu_doc_on_server(
+        user_id="u-richard",
+        title="Richard 覆盖周报",
+        markdown=part1_raw,
+    )
+    assert create_res["ok"] is True
+    saved = cli.save_doc_record(
+        tmp_path,
+        end_d,
+        json.dumps(create_res, ensure_ascii=False).encode("utf-8"),
+        total_parts=3,
+        attempt_id="att-norm-1",
+    )
+    assert saved["completed_parts"] == [1] and saved["pending_parts"] == [2, 3]
+
+    append_res = await feishu_tools_mod.append_feishu_doc_on_server(
+        token=create_res["url"],
+        markdown=part2_raw,
+    )
+    assert append_res["ok"] is False and append_res["outcome"] == "unknown"
+    assert "15%至18%" in landed_chunks[1]
+    assert "    const ticker = `ANT`;" in landed_chunks[1]
+
+    rec = cli.record_doc_append(
+        tmp_path,
+        end_d,
+        2,
+        json.dumps(append_res, ensure_ascii=False).encode("utf-8"),
+    )
+    assert rec["ok"] is False and rec["unverified"] is True and rec["unverified_parts"] == [2]
+
+    # Simulate feishu_read plain text derived from the exact normalized chunks that landed.
+    feishu_plain = "\n".join(
+        chunk.replace("**", "").replace("\n---\n", "\n") for chunk in landed_chunks
+    )
+    readback_json = {
+        "ok": True,
+        "title": "Richard 覆盖周报",
+        "content": feishu_plain,
+        "truncated": False,
+        "total_chars": len(feishu_plain),
+    }
+
+    verified = cli.verify_doc_append(
+        tmp_path,
+        end_d,
+        2,
+        readback_json,
+        part_text=part2_raw,
+        expected_after=part1_raw,
+    )
+    assert verified["ok"] is True
+    assert verified["present"] is True
+    assert verified["should_append"] is False
+    assert verified["indeterminate"] is False
+    assert verified["action"] == "marked_completed"
+    assert verified["completed_parts"] == [1, 2]
+    assert verified["unverified_parts"] == []
+    assert verified["pending_parts"] == [3]
+
+    # Verify standalone sandbox copy (without repo src/) produces identical verify-append result.
+    iso_dir = tmp_path / "sandbox_scripts"
+    shutil.copytree(SCRIPTS_DIR, iso_dir, ignore=shutil.ignore_patterns("__pycache__"))
+    iso_ws = tmp_path / "sandbox_ws"
+    iso_ws.mkdir()
+    cli.save_doc_record(
+        iso_ws,
+        end_d,
+        json.dumps(create_res, ensure_ascii=False).encode("utf-8"),
+        total_parts=3,
+        attempt_id="att-iso-1",
+    )
+    cli.record_doc_append(
+        iso_ws,
+        end_d,
+        2,
+        json.dumps(append_res, ensure_ascii=False).encode("utf-8"),
+    )
+    run_dir = iso_ws / cli.run_rel(end_d, "")
+    (run_dir / "part_1.md").write_text(part1_raw, encoding="utf-8")
+    (run_dir / "part_2.md").write_text(part2_raw, encoding="utf-8")
+    (run_dir / "feishu-read.json").write_text(
+        json.dumps(readback_json, ensure_ascii=False), encoding="utf-8"
+    )
+    clean_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(iso_dir / "richard_coverage_weekly_cli.py"),
+            "verify-append",
+            "--workspace-dir",
+            str(iso_ws),
+            "--end",
+            end_d.isoformat(),
+            "--part",
+            "2",
+            "--part-file",
+            cli.run_rel(end_d, "part_2.md"),
+            "--expected-after-file",
+            cli.run_rel(end_d, "part_1.md"),
+            "--doc-json-file",
+            cli.run_rel(end_d, "feishu-read.json"),
+        ],
+        env=clean_env,
+        cwd=str(iso_ws),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    iso_out = json.loads(proc.stdout)
+    assert iso_out["ok"] is True
+    assert iso_out["present"] is True
+    assert iso_out["action"] == "marked_completed"
+    assert iso_out["completed_parts"] == [1, 2]
+    assert iso_out["pending_parts"] == [3]

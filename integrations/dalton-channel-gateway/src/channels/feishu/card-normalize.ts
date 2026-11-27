@@ -44,9 +44,6 @@ const INLINE_CODE_PERIOD_RE = new RegExp(
   `^${PERIOD_ATOM}(?:${RANGE_SEP}${PERIOD_ATOM})?$`,
 );
 
-const FENCE_OPEN_RE = /^[ ]{0,3}(`{3,}|~{3,})(.*)$/;
-const FENCE_CLOSE_BACKTICK_RE = /^[ ]{0,3}(`{3,})[ \t]*$/;
-const FENCE_CLOSE_TILDE_RE = /^[ ]{0,3}(~{3,})[ \t]*$/;
 const RANGE_TILDE_RE = / ?[~～] ?/g;
 
 function shouldStripInlineCodeBackticks(inner: string): boolean {
@@ -60,111 +57,76 @@ function shouldStripInlineCodeBackticks(inner: string): boolean {
   );
 }
 
-function stripInlineCodeOnLine(line: string): string {
-  if (!line.includes("`")) {
-    return line;
-  }
-  let out = "";
-  let i = 0;
-  while (i < line.length) {
-    const tickPos = line.indexOf("`", i);
-    if (tickPos === -1) {
-      out += line.slice(i);
-      break;
-    }
-    out += line.slice(i, tickPos);
-
-    let runEnd = tickPos;
-    while (runEnd < line.length && line[runEnd] === "`") {
-      runEnd += 1;
-    }
-    const runLen = runEnd - tickPos;
-
-    let backslashes = 0;
-    let bsPos = tickPos - 1;
-    while (bsPos >= 0 && line[bsPos] === "\\") {
-      backslashes += 1;
-      bsPos -= 1;
-    }
-    if (backslashes % 2 === 1) {
-      out += line.slice(tickPos, runEnd);
-      i = runEnd;
-      continue;
-    }
-
-    let searchPos = runEnd;
-    let closeStart = -1;
-    while (searchPos < line.length) {
-      const nextTick = line.indexOf("`", searchPos);
-      if (nextTick === -1) {
-        break;
-      }
-      let nextEnd = nextTick;
-      while (nextEnd < line.length && line[nextEnd] === "`") {
-        nextEnd += 1;
-      }
-      if (nextEnd - nextTick === runLen) {
-        closeStart = nextTick;
-        break;
-      }
-      searchPos = nextEnd;
-    }
-
-    if (closeStart === -1) {
-      out += line.slice(tickPos, runEnd);
-      i = runEnd;
-      continue;
-    }
-
-    const closeEnd = closeStart + runLen;
-    const inner = line.slice(runEnd, closeStart);
-    if (runLen === 1 && shouldStripInlineCodeBackticks(inner)) {
-      out += inner.replace(RANGE_TILDE_RE, "至");
-    } else {
-      out += line.slice(tickPos, closeEnd);
-    }
-    i = closeEnd;
-  }
-  return out;
-}
-
 /**
  * Removes decorative single-backtick inline code wrapping around financial
  * numbers/amounts/percentages/multiples/ranges, stock tickers, and reporting
  * periods inside Feishu card markdown content so Feishu does not render them
- * as gray code badges. Leaves code blocks (fenced) and technical inline code
- * (paths, commands, snake_case identifiers, etc.) untouched.
+ * as gray code badges. Leaves Markdown code blocks (fenced and 4-space/tab
+ * indented), HTML blocks, multi-backtick spans, escaped backticks, and
+ * technical inline code (paths, commands, snake_case identifiers, etc.)
+ * untouched.
  */
 export function normalizeFeishuMarkdownInlineCode(content: string): string {
   if (!content.includes("`")) {
     return content;
   }
-  const parts = content.split(/(\r?\n)/);
-  let inFence: { char: "`" | "~"; len: number } | null = null;
-  for (let idx = 0; idx < parts.length; idx += 2) {
-    const line = parts[idx];
-    if (inFence !== null) {
-      const closeRe =
-        inFence.char === "`" ? FENCE_CLOSE_BACKTICK_RE : FENCE_CLOSE_TILDE_RE;
-      const closeMatch = closeRe.exec(line);
-      if (closeMatch && closeMatch[1].length >= inFence.len) {
-        inFence = null;
+  const tree = parseChannelMarkdown(content);
+  const edits: Array<{ start: number; end: number; replacement: string }> = [];
+  const walk = (node: MdastNode): void => {
+    if (node.type === "inlineCode") {
+      const start = node.position?.start?.offset;
+      const end = node.position?.end?.offset;
+      if (
+        typeof start === "number" &&
+        typeof end === "number" &&
+        start >= 0 &&
+        end > start + 1 &&
+        end <= content.length
+      ) {
+        const raw = content.slice(start, end);
+        if (
+          raw.startsWith("`") &&
+          !raw.startsWith("``") &&
+          raw.endsWith("`") &&
+          !raw.endsWith("``")
+        ) {
+          const inner = raw.slice(1, -1);
+          if (shouldStripInlineCodeBackticks(inner)) {
+            edits.push({
+              start,
+              end,
+              replacement: inner.replace(RANGE_TILDE_RE, "至"),
+            });
+          }
+        }
       }
+      return;
+    }
+    if (node.type === "code" || node.type === "html") {
+      return;
+    }
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) {
+        walk(child);
+      }
+    }
+  };
+  walk(tree);
+  if (edits.length === 0) {
+    return content;
+  }
+  edits.sort((a, b) => a.start - b.start);
+  let out = "";
+  let cursor = 0;
+  for (const edit of edits) {
+    if (edit.start < cursor) {
       continue;
     }
-    const openMatch = FENCE_OPEN_RE.exec(line);
-    if (openMatch) {
-      const marker = openMatch[1];
-      const info = openMatch[2];
-      const fenceChar = marker[0] as "`" | "~";
-      if (fenceChar === "~" || !info.includes("`")) {
-        inFence = { char: fenceChar, len: marker.length };
-        continue;
-      }
-    }
-    parts[idx] = stripInlineCodeOnLine(line);
+    out += content.slice(cursor, edit.start) + edit.replacement;
+    cursor = edit.end;
   }
-  return parts.join("");
+  out += content.slice(cursor);
+  return out;
 }
 
 export interface FeishuCardNormalizeResult {

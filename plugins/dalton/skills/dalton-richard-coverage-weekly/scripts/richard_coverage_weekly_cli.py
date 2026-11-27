@@ -56,6 +56,29 @@ resolve_researchdata_transport = _transport.resolve_researchdata_transport
 unwrap_bridge_response = _transport.unwrap_bridge_response
 screen_movers = _io.load_sibling("richard_cov_screen_movers", "screen_movers.py")
 
+
+def _load_feishu_markdown_normalizer() -> Callable[[str], str]:
+    loaded = sys.modules.get("src.dalton.notify.feishu_markdown_normalize")
+    if loaded is not None:
+        return loaded.normalize_feishu_markdown_inline_code
+    resolved = Path(__file__).resolve()
+    for parent in resolved.parents:
+        candidate = parent / "src" / "dalton" / "notify" / "feishu_markdown_normalize.py"
+        if candidate.is_file():
+            spec = importlib.util.spec_from_file_location(
+                "richard_cov_repo_feishu_markdown_normalize", candidate
+            )
+            if spec is not None and spec.loader is not None:
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules["richard_cov_repo_feishu_markdown_normalize"] = mod
+                spec.loader.exec_module(mod)
+                return mod.normalize_feishu_markdown_inline_code
+    fallback = _io.load_sibling("richard_cov_feishu_markdown_normalize", "feishu_markdown_normalize.py")
+    return fallback.normalize_feishu_markdown_inline_code
+
+
+normalize_feishu_markdown_inline_code = _load_feishu_markdown_normalizer()
+
 TEMPLATE_VERSION = "dalton-richard-coverage-weekly-v1.0"
 STATE_ROOT = "state/richard-coverage-weekly"
 DOC_FILE = "doc.json"
@@ -852,10 +875,16 @@ def _evaluate_segment_match(
     *,
     expected_after: str | None = None,
 ) -> tuple[str, str | None]:
-    stripped = _strip_separators(part_text)
+    # Apply the same Feishu markdown inline-code normalization used by feishu_create_doc /
+    # feishu_append before matching draft segments against feishu_read output.
+    stripped = _strip_separators(normalize_feishu_markdown_inline_code(part_text))
     if not stripped:
         return "error", "part_text contains no non-separator content"
-    stripped_after = _strip_separators(expected_after) if expected_after else None
+    stripped_after = (
+        _strip_separators(normalize_feishu_markdown_inline_code(expected_after))
+        if expected_after
+        else None
+    )
 
     out_of_order = False
     for norm_fn in (_norm_ws, _strip_md_ws):
