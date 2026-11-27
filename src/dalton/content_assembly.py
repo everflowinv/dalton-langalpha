@@ -712,6 +712,7 @@ def decide_topic_research_internal_memory(
 
 def _internal_memory_decision_mac(
     *,
+    workflow: str = "topic-research",
     short_thread_id: str,
     run_id: str,
     run: bool,
@@ -722,7 +723,7 @@ def _internal_memory_decision_mac(
 
     canonical = json.dumps(
         {
-            "workflow": "topic-research",
+            "workflow": str(workflow),
             "short_thread_id": short_thread_id,
             "run_id": run_id,
             "run": bool(run),
@@ -745,9 +746,20 @@ def sign_topic_research_internal_memory_decision(
     *,
     short_thread_id: str,
     run_id: str,
+    workflow_name: str = "topic-research",
 ) -> dict[str, Any]:
-    """Bind a server-computed `internal_memory_decision` to `(short_thread_id, run_id)` with an HMAC."""
+    """Bind a server-computed `internal_memory_decision` for `topic-research` to
+    `(workflow, short_thread_id, run_id)` with an HMAC.
+
+    For any non-`topic-research` workflow, strips `internal_memory_decision`
+    instead of signing it so caller-supplied fields can never receive a valid
+    `topic-research` signature.
+    """
     if not isinstance(params, dict):
+        return params
+    if workflow_name != "topic-research":
+        if "internal_memory_decision" in params:
+            return {k: v for k, v in params.items() if k != "internal_memory_decision"}
         return params
     decision = params.get("internal_memory_decision")
     if not isinstance(decision, dict) or not isinstance(decision.get("run"), bool):
@@ -759,6 +771,7 @@ def sign_topic_research_internal_memory_decision(
     mode = str(decision.get("mode") or "")
     discovery_status = str(decision.get("discovery_status") or "")
     sig = _internal_memory_decision_mac(
+        workflow="topic-research",
         short_thread_id=thread_key,
         run_id=run_key,
         run=decision["run"],
@@ -767,6 +780,7 @@ def sign_topic_research_internal_memory_decision(
     )
     signed = {
         **decision,
+        "workflow": "topic-research",
         "short_thread_id": thread_key,
         "run_id": run_key,
         "signature": sig,
@@ -779,13 +793,14 @@ def verify_topic_research_internal_memory_decision(
     *,
     short_thread_id: str | None,
     run_id: str | None,
+    workflow_name: str = "topic-research",
 ) -> dict[str, Any] | None:
-    """Verify a server-signed `internal_memory_decision` for `(short_thread_id, run_id)`.
+    """Verify a server-signed `internal_memory_decision` for `(workflow, short_thread_id, run_id)`.
 
     Returns the verified decision dict on success, or ``None`` if unsigned,
-    forged, tampered, or bound to a different thread/run.
+    forged, tampered, or bound to a different workflow/thread/run.
     """
-    if not isinstance(decision, dict):
+    if workflow_name != "topic-research" or not isinstance(decision, dict):
         return None
     run_val = decision.get("run")
     sig = decision.get("signature")
@@ -795,9 +810,14 @@ def verify_topic_research_internal_memory_decision(
     run_key = str(run_id or "").strip()
     if not thread_key or not run_key:
         return None
-    if decision.get("short_thread_id") != thread_key or decision.get("run_id") != run_key:
+    if (
+        decision.get("workflow") != "topic-research"
+        or decision.get("short_thread_id") != thread_key
+        or decision.get("run_id") != run_key
+    ):
         return None
     expected = _internal_memory_decision_mac(
+        workflow="topic-research",
         short_thread_id=thread_key,
         run_id=run_key,
         run=run_val,
@@ -819,13 +839,14 @@ async def resolve_launch_discovered_mcp_servers(
     """Attach server-discovered MCP tools and internal-memory decision for `topic-research`.
 
     Always strips any caller-supplied `discovered_mcp_servers`, `mcp_servers`, or
-    `internal_memory_decision` — even when legacy `researchdata_bridge` is enabled —
-    so callers can never smuggle or spoof a skip decision. When legacy
-    `researchdata_bridge` is disabled, attaches server-discovered minimal tools and
-    the server-computed decision.
+    `internal_memory_decision` across ALL workflows — including non-`topic-research`
+    workflows and when legacy `researchdata_bridge` is enabled — so callers can
+    never smuggle or spoof a skip decision. When `workflow_name == "topic-research"`
+    and legacy `researchdata_bridge` is disabled, attaches server-discovered minimal
+    tools and the server-computed decision.
     """
     _ = backend
-    if workflow_name != "topic-research" or not isinstance(params, dict):
+    if not isinstance(params, dict):
         return params
 
     cleaned = {
@@ -833,6 +854,8 @@ async def resolve_launch_discovered_mcp_servers(
         for k, v in params.items()
         if k not in ("discovered_mcp_servers", "mcp_servers", "internal_memory_decision")
     }
+    if workflow_name != "topic-research":
+        return cleaned
     active_caps = effective_capabilities()
     if CapabilityId.RESEARCHDATA_BRIDGE in active_caps:
         return cleaned

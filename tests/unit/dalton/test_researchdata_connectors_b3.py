@@ -4067,7 +4067,13 @@ async def test_r2_workflow_server_discovery_overwrites_caller_and_aligns_check_d
     )
     files_map: dict[str, str] = {
         ".agents/threads/th123456/workflows/wf-skip/args.json": json.dumps(signed_skip, ensure_ascii=False),
+        ".agents/threads/th123456/workflows/wf-skip/status.json": json.dumps(
+            {"run_id": "wf-skip", "name": "topic-research", "status": "completed", "updated_at": 1.0}
+        ),
         ".agents/threads/th123456/workflows/wf-run/args.json": json.dumps(signed_fed, ensure_ascii=False),
+        ".agents/threads/th123456/workflows/wf-run/status.json": json.dumps(
+            {"run_id": "wf-run", "name": "topic-research", "status": "completed", "updated_at": 2.0}
+        ),
         "research/2026-11-26-topic-ai/plan.md": "p" * 120,
         "research/2026-11-26-topic-ai/primary.md": "p" * 120,
         "research/2026-11-26-topic-ai/cluster-a.md": "c" * 120,
@@ -4613,7 +4619,14 @@ async def test_r3_internal_memory_decision_forged_and_snapshot_write_failure_ref
     saved_args = json.loads(written_ok[args_path])
     assert saved_args["internal_memory_decision"]["run"] is False
     assert saved_args["internal_memory_decision"]["signature"]
-    be_verified = _make_backend({args_path: written_ok[args_path]})
+    be_verified = _make_backend(
+        {
+            args_path: written_ok[args_path],
+            ".agents/threads/co123456/workflows/wf-snap-1/status.json": json.dumps(
+                {"run_id": "wf-snap-1", "name": "topic-research", "status": "completed", "updated_at": 1.0}
+            ),
+        }
+    )
     res_verified = await run_check_done(
         workflow="topic-research",
         params={"topic": "AI Capex", "slug": "ai", "workspace_dir": ".", "as_of": "2026-11-26"},
@@ -4883,3 +4896,346 @@ async def test_r3_sales_notes_layer_all_cross_layer_ranking_before_rrf(
     top = res_top1["results"][0]
     assert top["layer"] == "digest", f"High-similarity digest must outrank low-similarity raw: {top}"
     assert float(top["score"]) > 0.95, f"Expected ~0.99 digest similarity, got {top}"
+
+
+@pytest.mark.asyncio
+async def test_r4_non_topic_research_workflow_forged_decision_stripped_and_check_done_requires_internal_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4 item 1:
+    - Non-`topic-research` workflows strip caller-supplied `internal_memory_decision`,
+      `discovered_mcp_servers`, and `mcp_servers`, and NEVER receive a signed decision.
+    - `dalton_check_done` reading a snapshot by explicit `run_id` verifies workflow name
+      and run identity against the server-written `status.json` run record; any mismatch
+      (wrong workflow name, mismatched run_id, or missing status.json) falls back to
+      requiring `internal-memory.md`.
+    """
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.agent.middleware.background_subagent.dispatch import SubagentDispatcher
+    from ptc_agent.agent.middleware.background_subagent.middleware import (
+        BackgroundSubagentMiddleware,
+    )
+    from ptc_agent.agent.middleware.background_subagent.registry import (
+        BackgroundTask,
+        BackgroundTaskRegistry,
+    )
+    from ptc_agent.agent.middleware.background_subagent.workflow import tool as wf_tool_mod
+    from ptc_agent.core.mcp_registry import MCPRegistry
+    from src.config.models import WorkflowOrchestrationConfig
+    from src.dalton.content_assembly import (
+        resolve_launch_discovered_mcp_servers,
+        sign_topic_research_internal_memory_decision,
+    )
+    from src.dalton.tools.check_done_tools import run_check_done
+
+    _clean_profile_env(monkeypatch, profile="core")
+
+    forged_params = {
+        "note": "ok",
+        "internal_memory_decision": {"run": False, "mode": "skip", "discovery_status": "ok"},
+        "discovered_mcp_servers": {},
+        "mcp_servers": {},
+    }
+
+    # 1. Direct helper checks: non-topic-research strips fields and refuses signing
+    cleaned = await resolve_launch_discovered_mcp_servers(
+        None, "helper-wf", forged_params, mcp_registry=None
+    )
+    assert "internal_memory_decision" not in cleaned
+    assert "discovered_mcp_servers" not in cleaned
+    assert "mcp_servers" not in cleaned
+
+    unsigned = sign_topic_research_internal_memory_decision(
+        forged_params,
+        short_thread_id="co123456",
+        run_id="wf-helper-1",
+        workflow_name="helper-wf",
+    )
+    assert "internal_memory_decision" not in unsigned
+
+    # 2. End-to-end RunWorkflow launch of non-topic-research workflow with forged params
+    written: dict[str, str] = {}
+    be_launch = create_autospec(SandboxBackend, instance=True)
+    be_launch.workspace_dir = None
+
+    async def _awrite(path: str, content: str) -> bool:
+        written[path] = content
+        return True
+
+    be_launch.awrite_text.side_effect = _awrite
+
+    mw = create_autospec(BackgroundSubagentMiddleware, instance=True)
+    mw.workflow_config = WorkflowOrchestrationConfig()
+    mw.checkpointer = None
+    mw.admit_task_run.return_value = "admitted-row-helper"
+    mw._abort_admitted_run.return_value = None
+    mw._finalize_cancelled_before_spawn.return_value = None
+
+    task_reg = create_autospec(BackgroundTaskRegistry, instance=True)
+    task_reg.run_ledger = None
+    task_reg.get_all_tasks.return_value = []
+    task_reg.get_by_tool_call_id.return_value = None
+    run_task = BackgroundTask(
+        task_id="wf-helper-1",
+        description="helper",
+        prompt="p",
+        subagent_type="workflow",
+        tool_call_id="tc-helper-1",
+    )
+    task_reg.register.return_value = run_task
+    task_reg.discard_unstarted.return_value = None
+
+    dispatcher = create_autospec(SubagentDispatcher, instance=True)
+    dispatcher.middleware = mw
+    dispatcher.registry = task_reg
+
+    reg_empty = create_autospec(MCPRegistry, instance=True)
+    reg_empty.config = None
+    reg_empty.get_all_tools.return_value = {}
+
+    spawn_spy = create_autospec(wf_tool_mod.spawn_task_writer, return_value=None)
+    monkeypatch.setattr(wf_tool_mod, "spawn_task_writer", spawn_spy)
+
+    helper_script = (
+        "const meta = { name: 'helper-wf', description: 'helper' };\n"
+        "async function run() { return { ok: true }; }\n"
+    )
+    wf_tool = wf_tool_mod.create_run_workflow_tool(
+        dispatcher=dispatcher,
+        backend=be_launch,
+        thread_id="co123456-full",
+        short_thread_id="co123456",
+        mcp_registry=reg_empty,
+    )
+    reply = await wf_tool.ainvoke(
+        {
+            "name": "RunWorkflow",
+            "id": "tc-helper-1",
+            "type": "tool_call",
+            "args": {"script": helper_script, "params": forged_params},
+        }
+    )
+    assert "Workflow run started" in str(reply)
+    helper_args_path = ".agents/threads/co123456/workflows/wf-helper-1/args.json"
+    assert helper_args_path in written
+    saved_helper_args = json.loads(written[helper_args_path])
+    assert "internal_memory_decision" not in saved_helper_args
+    assert "discovered_mcp_servers" not in saved_helper_args
+    assert "mcp_servers" not in saved_helper_args
+
+    # 3. check_done on topic-research pointing at helper-wf run_id (and mismatched server run records)
+    #    MUST still require internal-memory.md even if args.json carries a signed skip payload!
+    base_files: dict[str, str] = {
+        "research/2026-11-26-topic-ai/plan.md": "p" * 120,
+        "research/2026-11-26-topic-ai/primary.md": "p" * 120,
+        "research/2026-11-26-topic-ai/cluster-a.md": "c" * 120,
+        "research/2026-11-26-topic-ai/cluster-b.md": "c" * 120,
+        "research/2026-11-26-topic-ai/cluster-c.md": "c" * 120,
+        "research/2026-11-26-topic-ai/cross-check.md": ("x" * 120) + "\n盲区检查完成\n",
+        "research/2026-11-26-topic-ai/number-audit.md": "n" * 80,
+        "research/2026-11-26-topic-ai/knowledge-revision.json": json.dumps({"ok": True, "pad": "x" * 50}),
+        "drafts/2026-11-26-topic-ai.md": "d" * 600,
+    }
+
+    def _make_check_backend(extra_files: dict[str, str]) -> Any:
+        files_map = {**base_files, **extra_files}
+        be = create_autospec(SandboxBackend, instance=True)
+        be.workspace_dir = None
+
+        async def _aread(path: str) -> str | None:
+            norm = path[2:] if path.startswith("./") else path.lstrip("/")
+            return files_map.get(norm)
+
+        async def _aglob(pattern: str, _root: str = ".") -> list[str]:
+            import fnmatch
+
+            return sorted(k for k in files_map if fnmatch.fnmatch(k, pattern))
+
+        be.aread_text.side_effect = _aread
+        be.aglob_paths.side_effect = _aglob
+        be.aexecute = None
+        return be
+
+    signed_wrong_wf = sign_topic_research_internal_memory_decision(
+        {"internal_memory_decision": {"run": False, "mode": "skip", "discovery_status": "ok"}},
+        short_thread_id="co123456",
+        run_id="wf-wrong-wf",
+    )
+    signed_wrong_runid = sign_topic_research_internal_memory_decision(
+        {"internal_memory_decision": {"run": False, "mode": "skip", "discovery_status": "ok"}},
+        short_thread_id="co123456",
+        run_id="wf-wrong-id",
+    )
+    signed_no_status = sign_topic_research_internal_memory_decision(
+        {"internal_memory_decision": {"run": False, "mode": "skip", "discovery_status": "ok"}},
+        short_thread_id="co123456",
+        run_id="wf-no-status",
+    )
+    signed_valid = sign_topic_research_internal_memory_decision(
+        {"internal_memory_decision": {"run": False, "mode": "skip", "discovery_status": "ok"}},
+        short_thread_id="co123456",
+        run_id="wf-valid-tr",
+    )
+
+    be_check = _make_check_backend(
+        {
+            helper_args_path: written[helper_args_path],
+            ".agents/threads/co123456/workflows/wf-helper-1/status.json": json.dumps(
+                {"run_id": "wf-helper-1", "name": "helper-wf", "status": "completed", "updated_at": 1.0}
+            ),
+            ".agents/threads/co123456/workflows/wf-wrong-wf/args.json": json.dumps(signed_wrong_wf),
+            ".agents/threads/co123456/workflows/wf-wrong-wf/status.json": json.dumps(
+                {"run_id": "wf-wrong-wf", "name": "helper-wf", "status": "completed", "updated_at": 2.0}
+            ),
+            ".agents/threads/co123456/workflows/wf-wrong-id/args.json": json.dumps(signed_wrong_runid),
+            ".agents/threads/co123456/workflows/wf-wrong-id/status.json": json.dumps(
+                {"run_id": "wf-different", "name": "topic-research", "status": "completed", "updated_at": 3.0}
+            ),
+            ".agents/threads/co123456/workflows/wf-no-status/args.json": json.dumps(signed_no_status),
+            ".agents/threads/co123456/workflows/wf-valid-tr/args.json": json.dumps(signed_valid),
+            ".agents/threads/co123456/workflows/wf-valid-tr/status.json": json.dumps(
+                {"run_id": "wf-valid-tr", "name": "topic-research", "status": "completed", "updated_at": 4.0}
+            ),
+        }
+    )
+
+    for bad_run_id in ("wf-helper-1", "wf-wrong-wf", "wf-wrong-id", "wf-no-status"):
+        res_bad = await run_check_done(
+            workflow="topic-research",
+            params={"topic": "AI Capex", "slug": "ai", "workspace_dir": ".", "as_of": "2026-11-26"},
+            backend=be_check,
+            workspace_id=None,
+            run_id=bad_run_id,
+            thread_id="co123456-full",
+        )
+        assert any("internal-memory.md" in m for m in res_bad["missing"]), (
+            f"Run {bad_run_id} must NOT bypass internal-memory.md check: {res_bad['missing']}"
+        )
+
+    # Positive control: matching server status.json + signed topic-research decision skips internal-memory.md
+    res_ok = await run_check_done(
+        workflow="topic-research",
+        params={"topic": "AI Capex", "slug": "ai", "workspace_dir": ".", "as_of": "2026-11-26"},
+        backend=be_check,
+        workspace_id=None,
+        run_id="wf-valid-tr",
+        thread_id="co123456-full",
+    )
+    assert not any("internal-memory.md" in m for m in res_ok["missing"]), res_ok["missing"]
+
+
+@pytest.mark.asyncio
+async def test_r4_workflow_snapshot_cancelled_after_admission_finalizes_and_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4 item 2:
+    When `asyncio.CancelledError` is raised during post-admission artifact snapshotting
+    (`workflow.js` or `args.json`), `RunWorkflow` runs terminal cancellation cleanup
+    (`_finalize_cancelled_before_spawn`, marks task cancelled, never spawns writer) and
+    re-raises `CancelledError`.
+    """
+    import asyncio
+
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.agent.middleware.background_subagent.dispatch import SubagentDispatcher
+    from ptc_agent.agent.middleware.background_subagent.middleware import (
+        BackgroundSubagentMiddleware,
+    )
+    from ptc_agent.agent.middleware.background_subagent.registry import (
+        BackgroundTask,
+        BackgroundTaskRegistry,
+    )
+    from ptc_agent.agent.middleware.background_subagent.workflow import tool as wf_tool_mod
+    from ptc_agent.core.mcp_registry import MCPRegistry
+    from src.config.models import WorkflowOrchestrationConfig
+
+    _clean_profile_env(monkeypatch, profile="core")
+
+    reg_empty = create_autospec(MCPRegistry, instance=True)
+    reg_empty.config = None
+    reg_empty.get_all_tools.return_value = {}
+    real_spawn_task_writer = wf_tool_mod.spawn_task_writer
+
+    for cancel_suffix, wf_name, params in (
+        (
+            "/args.json",
+            "topic-research",
+            {
+                "topic": "AI Capex",
+                "slug": "ai",
+                "subject_kind": "theme",
+                "workspace_dir": ".",
+                "as_of": "2026-11-26",
+            },
+        ),
+        (
+            "/workflow.js",
+            "helper-wf",
+            {"note": "x"},
+        ),
+    ):
+        be = create_autospec(SandboxBackend, instance=True)
+        be.workspace_dir = None
+
+        async def _awrite_cancel(path: str, _content: str, *, _suffix: str = cancel_suffix) -> bool:
+            if path.endswith(_suffix):
+                raise asyncio.CancelledError()
+            return True
+
+        be.awrite_text.side_effect = _awrite_cancel
+
+        mw = create_autospec(BackgroundSubagentMiddleware, instance=True)
+        mw.workflow_config = WorkflowOrchestrationConfig()
+        mw.checkpointer = None
+        mw.admit_task_run.return_value = f"admitted-{wf_name}"
+        mw._abort_admitted_run.return_value = None
+        mw._finalize_cancelled_before_spawn.return_value = None
+
+        task_reg = create_autospec(BackgroundTaskRegistry, instance=True)
+        task_reg.run_ledger = None
+        task_reg.get_all_tasks.return_value = []
+        task_reg.get_by_tool_call_id.return_value = None
+        run_task = BackgroundTask(
+            task_id=f"wf-cancel-{wf_name}",
+            description=wf_name,
+            prompt="p",
+            subagent_type="workflow",
+            tool_call_id=f"tc-cancel-{wf_name}",
+        )
+        task_reg.register.return_value = run_task
+        task_reg.discard_unstarted.return_value = None
+
+        dispatcher = create_autospec(SubagentDispatcher, instance=True)
+        dispatcher.middleware = mw
+        dispatcher.registry = task_reg
+
+        spawn_spy = create_autospec(real_spawn_task_writer, return_value=None)
+        monkeypatch.setattr(wf_tool_mod, "spawn_task_writer", spawn_spy)
+
+        script = (
+            f"const meta = {{ name: '{wf_name}', description: '{wf_name}' }};\n"
+            "async function run() { return { ok: true }; }\n"
+        )
+        wf_tool = wf_tool_mod.create_run_workflow_tool(
+            dispatcher=dispatcher,
+            backend=be,
+            thread_id="co123456-full",
+            short_thread_id="co123456",
+            mcp_registry=reg_empty,
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await wf_tool.ainvoke(
+                {
+                    "name": "RunWorkflow",
+                    "id": f"tc-cancel-{wf_name}",
+                    "type": "tool_call",
+                    "args": {"script": script, "params": params},
+                }
+            )
+
+        mw._finalize_cancelled_before_spawn.assert_awaited_once_with(run_task)
+        assert mw._abort_admitted_run.await_count == 0
+        assert task_reg.discard_unstarted.await_count == 0
+        assert spawn_spy.await_count == 0
+        assert run_task.completed is True
+        assert run_task.terminal_status == "cancelled"

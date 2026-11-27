@@ -1165,10 +1165,44 @@ def _parse_run_dir_identity(run_dir: str | None) -> tuple[str | None, str | None
     return None, None
 
 
+async def _verify_run_status_record(
+    backend: Any,
+    run_dir: str,
+    *,
+    workflow: str,
+    run_id: str | None = None,
+    thread_id: str | None = None,
+) -> bool:
+    """Verify via the server-written ``status.json`` run record that ``run_dir``
+    matches ``workflow`` and the resolved ``(short_thread_id, run_id)`` identity."""
+    dir_thread, dir_run = _parse_run_dir_identity(run_dir)
+    if not dir_thread or not dir_run:
+        return False
+    if run_id is not None and dir_run != str(run_id).strip():
+        return False
+    if thread_id is not None and dir_thread != str(thread_id)[:8]:
+        return False
+    status_text = await _read_text(backend, f"{run_dir}/status.json")
+    if not status_text:
+        return False
+    try:
+        status_doc = json.loads(status_text)
+    except ValueError:
+        return False
+    if not isinstance(status_doc, dict):
+        return False
+    if status_doc.get("name") != workflow:
+        return False
+    if status_doc.get("run_id") != dir_run:
+        return False
+    return True
+
+
 async def _load_run_args_with_dir(
     backend: Any, workflow: str, run_id: str | None, thread_id: str | None
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Read the server-written ``args.json`` snapshot and its resolved run dir."""
+    """Read the server-written ``args.json`` snapshot and its resolved run dir
+    after verifying workflow name and run identity against ``status.json``."""
     dirs: list[str]
     if run_id:
         if thread_id:
@@ -1184,7 +1218,16 @@ async def _load_run_args_with_dir(
         except _CannotVerify:
             return None, None
         dirs = [latest] if latest else []
+    verified_matches: list[tuple[dict[str, Any], str]] = []
     for run_dir in dirs:
+        if not await _verify_run_status_record(
+            backend,
+            run_dir,
+            workflow=workflow,
+            run_id=run_id,
+            thread_id=thread_id,
+        ):
+            continue
         text = await _read_text(backend, f"{run_dir}/args.json")
         if not text:
             continue
@@ -1193,8 +1236,10 @@ async def _load_run_args_with_dir(
         except ValueError:
             continue
         if isinstance(doc, dict):
-            return doc, run_dir
-    return None, None
+            verified_matches.append((doc, run_dir))
+    if len(verified_matches) != 1:
+        return None, None
+    return verified_matches[0]
 
 
 async def _load_run_args(
@@ -1249,12 +1294,17 @@ def _apply_run_internal_memory_decision(
         return contract
 
     dir_thread, dir_run = _parse_run_dir_identity(run_dir)
-    expected_thread = dir_thread or (str(thread_id)[:8] if thread_id else None)
-    expected_run = dir_run or (str(run_id) if run_id else None)
+    if not dir_thread or not dir_run:
+        return contract
+    if thread_id and dir_thread != str(thread_id)[:8]:
+        return contract
+    if run_id and dir_run != str(run_id).strip():
+        return contract
     verified = verify_topic_research_internal_memory_decision(
         run_args.get("internal_memory_decision"),
-        short_thread_id=expected_thread,
-        run_id=expected_run,
+        short_thread_id=dir_thread,
+        run_id=dir_run,
+        workflow_name=str(contract.get("name") or ""),
     )
     if verified is None or verified["run"] is not False:
         return contract
