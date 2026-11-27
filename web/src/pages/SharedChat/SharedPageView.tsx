@@ -1,7 +1,8 @@
 import React, { Suspense, useMemo, useState } from 'react';
-import { Download } from 'lucide-react';
+import { Code, Download, Eye } from 'lucide-react'; // DALTON-HOOK(monitors)
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/components/ui/use-toast';
+import { isMarkdownFile } from '@/lib/dalton/sharedMarkdown'; // DALTON-HOOK(monitors)
 import { bodyMode } from '../ChatAgent/components/filePanel/fileBody';
 import { BridgedFrame, type FrameSource } from '../ChatAgent/components/viewers/html/BridgedFrame';
 import { ISOLATED_PAGE_SANDBOX, SERVED_HTML_SANDBOX } from '../ChatAgent/components/viewers/html/sandbox';
@@ -67,8 +68,10 @@ export default function SharedPageView({ code, metadata, onStale }: SharedPageVi
   const { name, path, seq, frame_base: base } = metadata;
   const label = metadata.title || name;
   const isHtml = bodyMode(path) === 'html';
+  const isMarkdown = isMarkdownFile(path); // DALTON-HOOK(monitors)
   const prefix = versionPrefix(base, seq);
   const [busy, setBusy] = useState(false);
+  const [rawSource, setRawSource] = useState(false); // DALTON-HOOK(monitors)
 
   const download = () => {
     setBusy(true);
@@ -88,15 +91,23 @@ export default function SharedPageView({ code, metadata, onStale }: SharedPageVi
         name={label}
         actions={isHtml
           ? undefined
-          : <ShareTopBarAction icon={Download} label={t('filePanel:download')} onClick={download} disabled={busy} />}
+          : (
+            <>
+              {/* DALTON-HOOK(monitors): View raw / View rendered toggle for Markdown files */}
+              {isMarkdown && (
+                <ShareTopBarAction icon={rawSource ? Eye : Code} label={rawSource ? t('filePanel:viewRendered') : t('filePanel:viewRaw')} onClick={() => setRawSource((v) => !v)} />
+              )}
+              <ShareTopBarAction icon={Download} label={t('filePanel:download')} onClick={download} disabled={busy} />
+            </>
+          )}
       />
       <div className="share-content">
         {isHtml
           ? <VersionFrame metadata={metadata} title={label} onStale={onStale} />
           : (
             <Suspense fallback={null}>
-              {/* Scoped by the version too: an Update keeps the path and changes the bytes. */}
-              <FileBody scope={`share:${code}:v${seq}`} path={path} frameBase={prefix} onDownload={download} downloading={busy} onGone={onStale} />
+              {/* DALTON-HOOK(monitors): pass rawSource toggle to FileBody */}
+              <FileBody scope={`share:${code}:v${seq}`} path={path} frameBase={prefix} onDownload={download} downloading={busy} onGone={onStale} rawSource={isMarkdown && rawSource} />
             </Suspense>
           )}
       </div>

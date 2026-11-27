@@ -14,11 +14,13 @@ const SOURCE_LINES = (fileLine: (line: number) => number): RehypePlugins[number]
  * blocks and words (`comments`), which marks each block with its lines in
  * the file; anyone else's shows the file alone.
  */
-export function MarkdownFile({ content, comments, onOpenFile, onAnchorLink }: {
+export function MarkdownFile({ content, comments, onOpenFile, onAnchorLink, renderFileLink }: {
   content: string;
   comments: ViewerCommentsTarget | null;
   onOpenFile?: OpenFileHandler;
   onAnchorLink?: (fragment: string) => void;
+  // DALTON-HOOK(monitors): custom renderer for permission-checked relative links in shared Markdown views
+  renderFileLink?: (info: { href: string; children: React.ReactNode }) => React.ReactNode;
 }) {
   const { t } = useTranslation();
   const [root, setRoot] = useState<HTMLDivElement | null>(null);
@@ -37,6 +39,7 @@ export function MarkdownFile({ content, comments, onOpenFile, onAnchorLink }: {
           className="text-sm"
           onOpenFile={onOpenFile}
           onAnchorLink={onAnchorLink}
+          renderFileLink={renderFileLink} // DALTON-HOOK(monitors)
           rehypeForBlock={comments ? SOURCE_LINES : undefined}
         />
       </div>

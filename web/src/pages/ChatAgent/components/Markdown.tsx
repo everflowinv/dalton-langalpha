@@ -693,6 +693,8 @@ interface MarkdownProps {
   onOpenFile?: OpenFileHandler;
   /** Called with the fragment of a same-document link (`[Valuation](#valuation)`). */
   onAnchorLink?: (fragment: string) => void;
+  // DALTON-HOOK(monitors): custom renderer for permission-checked relative links in shared Markdown views
+  renderFileLink?: (info: { href: string; children: React.ReactNode }) => React.ReactNode;
   /** Force code blocks to use a specific syntax theme regardless of app theme */
   codeTheme?: 'light' | 'dark';
   /** The content is still arriving, so a fence open at its end is still being written. */
@@ -726,7 +728,7 @@ function embeddedImagesKey(source: string): string {
   return [...found].sort().join('\n');
 }
 
-function Markdown({ content, variant = 'panel', className = '', style, onOpenFile, onAnchorLink, codeTheme, streaming = false, rehypeAfter, rehypeForBlock, allowDiagramRender }: MarkdownProps): React.ReactElement {
+function Markdown({ content, variant = 'panel', className = '', style, onOpenFile, onAnchorLink, renderFileLink, codeTheme, streaming = false, rehypeAfter, rehypeForBlock, allowDiagramRender }: MarkdownProps): React.ReactElement {
   const config = VARIANTS[variant];
   // DALTON-HOOK(share-redaction): default to true (or inherit SharedRedactionContext inside SharedChatView)
   const shareRedaction = useSharedRedaction();
@@ -780,7 +782,7 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
       result = { ...result, 'redacted-image': RedactedImage };
     }
 
-    if (!onOpenFile && !onAnchorLink && variant !== 'chat') return result;
+    if (!onOpenFile && !onAnchorLink && !renderFileLink && variant !== 'chat') return result;
 
     // Fallback: detect __wsref__ links inside inline code spans that survived
     // normalizeFileRefs' backtick unwrapping (e.g., nested backticks, extra whitespace).
@@ -839,6 +841,8 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
         if (isImagePath(href) && !embedded.has(normalizeFilePath(href!, folders))) {
           return <WorkspaceImage src={href} alt={textOf(children)} />;
         }
+        // DALTON-HOOK(monitors): delegate shared-viewer relative links to permission-checked renderer
+        if (renderFileLink) return renderFileLink({ href: href!, children });
         if (onOpenFile) {
           const wsRef = parseWsPath(href);
           const { path, location } = splitFileLocation(href!);
@@ -871,7 +875,7 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
       return <DefaultA node={_node} href={href} {...props}>{children}</DefaultA>;
     };
     return { ...result, a: fileAwareA };
-  }, [onOpenFile, onAnchorLink, variant, config.components, codeTheme, folders, embeddedImages, effectiveAllowDiagramRender]);
+  }, [onOpenFile, onAnchorLink, renderFileLink, variant, config.components, codeTheme, folders, embeddedImages, effectiveAllowDiagramRender]);
 
   // Rendered markdown is always long-form reading content — every call site
   // (transcript, detail panels, memos) gets the content face here.

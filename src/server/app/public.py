@@ -159,6 +159,11 @@ async def _file_metadata(access: LinkAccess, viewer_id: str | None) -> dict[str,
             "expires_in": seconds_left(grant.expires_at),
         }
 
+    # DALTON-HOOK(monitors): serve colleague/team shared non-HTML documents via Dalton grant
+    if not link.shared and access.member and link.artifact_id and viewer_id:
+        from src.dalton.monitors.shared_documents import build_shared_document_file_metadata
+
+        return await build_shared_document_file_metadata(link.artifact_id, viewer_id)
     artifact, latest = await _latest_shared_version(link.artifact)
     seq = latest.seq
     if access.member:
