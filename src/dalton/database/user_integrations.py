@@ -920,22 +920,32 @@ async def list_running_local_purges(*, conn: Any = None) -> list[PurgeLedgerRow]
 
 
 async def list_due_remote_revokes(*, limit: int = 50, conn: Any = None) -> list[PurgeLedgerRow]:
-    """List purge ledger entries due for remote revocation retry (including initial pending rows)."""
+    """List purge ledger entries due for remote revocation retry once all local 2A purges for that (user, provider) finish."""
     async with get_db_connection(conn) as db_conn:
         async with db_conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
                 SELECT {_PURGE_LEDGER_META_COLS}
-                FROM dalton_integration_purge_ledger
-                WHERE (
-                    remote_revoke_status = 'failed_retryable'
-                    AND next_retry_at IS NOT NULL
-                    AND next_retry_at <= NOW()
-                ) OR (
-                    remote_revoke_status = 'pending'
-                    AND (next_retry_at IS NULL OR next_retry_at <= NOW())
-                )
-                ORDER BY COALESCE(next_retry_at, disconnected_at) ASC, disconnected_at ASC
+                FROM dalton_integration_purge_ledger l
+                WHERE l.local_purge_status IN ('completed', 'not_required')
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM dalton_integration_purge_ledger l2
+                      WHERE l2.user_id = l.user_id
+                        AND l2.provider = l.provider
+                        AND l2.local_purge_status = 'running'
+                  )
+                  AND (
+                      (
+                          l.remote_revoke_status = 'failed_retryable'
+                          AND l.next_retry_at IS NOT NULL
+                          AND l.next_retry_at <= NOW()
+                      ) OR (
+                          l.remote_revoke_status = 'pending'
+                          AND (l.next_retry_at IS NULL OR l.next_retry_at <= NOW())
+                      )
+                  )
+                ORDER BY COALESCE(l.next_retry_at, l.disconnected_at) ASC, l.disconnected_at ASC
                 LIMIT %s
                 """,
                 (int(limit),),
@@ -1173,6 +1183,125 @@ async def insert_oauth_state(
                     browser_binding_hash,
                     expires_at,
                 ),
+            )
+
+
+async def peek_oauth_state(
+    state_hash: str,
+    provider: str,
+    *,
+    conn: Any = None,
+) -> tuple[str, str] | None:
+    """Non-destructively read ``(user_id, oauth_client_id)`` for an unexpired OAuth state."""
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT user_id, oauth_client_id
+                FROM dalton_user_integration_oauth_states
+                WHERE state_hash = %s
+                  AND provider = %s
+                  AND expires_at > clock_timestamp()
+                """,
+                (state_hash, provider),
+            )
+            row = await cur.fetchone()
+    if row is None:
+        return None
+    return str(row[0]), str(row[1])
+
+
+async def get_active_google_oauth_state_expiry(
+    user_id: str,
+    google_project: str,
+    *,
+    conn: Any = None,
+) -> datetime | None:
+    """Return the furthest ``expires_at`` among unexpired Google OAuth states in ``(user_id, google_project)``."""
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT oauth_client_id, expires_at
+                FROM dalton_user_integration_oauth_states
+                WHERE user_id = %s
+                  AND provider = 'google'
+                  AND expires_at > clock_timestamp()
+                """,
+                (user_id,),
+            )
+            rows = await cur.fetchall()
+    max_exp: datetime | None = None
+    for r in rows:
+        if extract_google_project(str(r["oauth_client_id"])) == google_project:
+            exp = r["expires_at"]
+            if exp is not None and (max_exp is None or exp > max_exp):
+                max_exp = exp
+    return max_exp
+
+
+async def list_google_project_revoke_lock_subs(
+    user_id: str,
+    google_project: str,
+    *,
+    conn: Any = None,
+) -> list[str]:
+    """Return sorted distinct Google ``sub`` values needing ``revoke_lock`` coordination for ``(user_id, google_project)``.
+
+    Covers every ``sub`` with an active/retryable remote revoke ledger OR an existing
+    Google connection row in ``google_project``.
+    """
+    subs: set[str] = set()
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT oauth_client_id, provider_account_id
+                FROM dalton_integration_purge_ledger
+                WHERE user_id = %s
+                  AND provider = 'google'
+                  AND remote_revoke_status IN ('pending', 'failed_retryable')
+                """,
+                (user_id,),
+            )
+            for r in await cur.fetchall():
+                if extract_google_project(str(r["oauth_client_id"])) == google_project:
+                    sub = str(r["provider_account_id"] or "").strip()
+                    if sub:
+                        subs.add(sub)
+            await cur.execute(
+                """
+                SELECT oauth_client_id, provider_account_id
+                FROM dalton_user_integrations
+                WHERE user_id = %s
+                  AND provider = 'google'
+                """,
+                (user_id,),
+            )
+            for r in await cur.fetchall():
+                if extract_google_project(str(r["oauth_client_id"])) == google_project:
+                    sub = str(r["provider_account_id"] or "").strip()
+                    if sub:
+                        subs.add(sub)
+    return sorted(subs)
+
+
+async def delete_pending_confirmation_by_hash(
+    confirmation_hash: str,
+    user_id: str,
+    *,
+    conn: Any = None,
+) -> None:
+    """Delete a pending confirmation (or internal commit-guard row) owned by ``user_id``."""
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor() as cur:
+            await cur.execute(
+                """
+                DELETE FROM dalton_user_integration_pending_confirmations
+                WHERE confirmation_hash = %s
+                  AND user_id = %s
+                """,
+                (confirmation_hash, user_id),
             )
 
 
@@ -1614,22 +1743,48 @@ async def has_running_local_purge_for_service(
     provider: str,
     service: str,
     *,
+    oauth_client_id: str | None = None,
+    provider_account_id: str | None = None,
+    min_auth_epoch_upto: int | None = None,
     conn: Any = None,
 ) -> list[str]:
-    """Return ``purge_id`` values with ``local_purge_status = 'running'`` for ``(user_id, provider, service)``."""
+    """Return ``purge_id`` values with ``local_purge_status = 'running'`` for ``(user_id, provider, service)``.
+
+    When ``oauth_client_id``, ``provider_account_id``, or ``min_auth_epoch_upto`` are supplied,
+    only returns ledgers covering that specific app/account/epoch so an in-flight purge for an
+    older account never blocks revocation of a newly bound account on the same service.
+    """
+    clauses = [
+        "user_id = %(user_id)s",
+        "provider = %(provider)s",
+        "(service = %(service)s OR service IS NULL)",
+        "local_purge_status = 'running'",
+    ]
+    params: dict[str, Any] = {
+        "user_id": user_id,
+        "provider": provider,
+        "service": service,
+    }
+    if oauth_client_id is not None:
+        clauses.append("oauth_client_id = %(oauth_client_id)s")
+        params["oauth_client_id"] = oauth_client_id
+    if provider_account_id is not None:
+        clauses.append("provider_account_id = %(provider_account_id)s")
+        params["provider_account_id"] = provider_account_id
+    if min_auth_epoch_upto is not None:
+        clauses.append("auth_epoch_upto >= %(min_auth_epoch_upto)s")
+        params["min_auth_epoch_upto"] = int(min_auth_epoch_upto)
+
     async with get_db_connection(conn) as db_conn:
         async with db_conn.cursor() as cur:
             await cur.execute(
-                """
+                f"""
                 SELECT purge_id::text
                 FROM dalton_integration_purge_ledger
-                WHERE user_id = %s
-                  AND provider = %s
-                  AND (service = %s OR service IS NULL)
-                  AND local_purge_status = 'running'
+                WHERE {' AND '.join(clauses)}
                 ORDER BY disconnected_at ASC
                 """,
-                (user_id, provider, service),
+                params,
             )
             rows = await cur.fetchall()
     return [str(r[0]) for r in rows]
@@ -1839,6 +1994,9 @@ async def list_orphaned_revoked_purging_connections(
                       WHERE l.user_id = i.user_id
                         AND l.provider = i.provider
                         AND (l.service = i.service OR l.service IS NULL)
+                        AND l.oauth_client_id = i.oauth_client_id
+                        AND l.provider_account_id = i.provider_account_id
+                        AND l.auth_epoch_upto >= i.auth_epoch
                         AND l.local_purge_status = 'running'
                   )
                 ORDER BY i.updated_at ASC, i.user_id ASC, i.provider ASC, i.service ASC

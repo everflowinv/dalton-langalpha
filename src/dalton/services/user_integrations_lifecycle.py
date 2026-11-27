@@ -338,7 +338,13 @@ async def begin_disconnect(
 
                     if skip_if_running_ledger:
                         existing_running = await db.has_running_local_purge_for_service(
-                            user_id, provider, service, conn=tx_conn
+                            user_id,
+                            provider,
+                            service,
+                            oauth_client_id=str(target_row["oauth_client_id"]),
+                            provider_account_id=str(target_row["provider_account_id"]),
+                            min_auth_epoch_upto=int(target_row["auth_epoch"]),
+                            conn=tx_conn,
                         )
                         if existing_running:
                             return existing_running[0]
@@ -780,6 +786,9 @@ async def begin_feishu_webhook_revocation_batch(
                         str(r["user_id"]),
                         "feishu",
                         str(r["service"]),
+                        oauth_client_id=str(r["oauth_client_id"]),
+                        provider_account_id=str(r["provider_account_id"]),
+                        min_auth_epoch_upto=int(r["auth_epoch"]),
                         conn=tx_conn,
                     )
                     if running_ids:

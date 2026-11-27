@@ -93,6 +93,7 @@ from src.dalton.services.user_integrations_oauth import (
     PersonalIntegrationError,
     confirm_pending_integration,
     handle_oauth_callback,
+    sanitize_return_to,
     start_oauth_authorization,
     validate_callback_location,
 )
@@ -405,7 +406,7 @@ def _build_callback_redirect_url(
     query_updates: dict[str, str],
     fragment_params: dict[str, str] | None = None,
 ) -> str:
-    safe_target = return_to if validate_callback_location(return_to) else DEFAULT_INTEGRATIONS_RETURN_TO
+    safe_target = sanitize_return_to(return_to)
     parts = urlsplit(safe_target)
     existing_q = dict(parse_qsl(parts.query, keep_blank_values=True))
     existing_q.update(query_updates)

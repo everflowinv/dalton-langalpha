@@ -20,9 +20,13 @@ from src.dalton.services.integration_revoke import (
 
 
 async def run_personal_purge_resume_loop(*, poll_interval_s: float = 60.0) -> None:
-    """Resume incomplete local 2A purges with the concrete Google ``RemoteRevoker``."""
+    """Resume incomplete local 2A purges ONLY so remote HTTP revocations never delay local purge or thread unblocking.
+
+    Due remote Google revocations are executed independently by ``run_integration_revoke_retry_loop``
+    once all local 2A purges for the same ``(user_id, provider)`` batch have finished.
+    """
     await _run_personal_purge_resume_loop(
-        revoker=get_google_remote_revoker(),
+        revoker=None,
         poll_interval_s=poll_interval_s,
     )
 

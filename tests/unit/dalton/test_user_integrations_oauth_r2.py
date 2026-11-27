@@ -354,6 +354,32 @@ class TestOAuthStateAndSessionVerification:
             db, "consume_oauth_state", create_autospec(db.consume_oauth_state, side_effect=_atomic_consume)
         )
         monkeypatch.setattr(
+            db,
+            "peek_oauth_state",
+            create_autospec(
+                db.peek_oauth_state,
+                side_effect=lambda sh, prov, **k: (
+                    (states_store[(sh, prov)].user_id, states_store[(sh, prov)].oauth_client_id)
+                    if (sh, prov) in states_store and states_store[(sh, prov)].expires_at > datetime.now(UTC)
+                    else None
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            db, "list_google_project_revoke_lock_subs", create_autospec(db.list_google_project_revoke_lock_subs, return_value=[])
+        )
+        fake_conn_ctx, _ = _make_fake_lock_pool()
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_conn_ctx)
+        monkeypatch.setattr(
+            db, "supersede_active_revokes_for_google_project_sub_tx", create_autospec(db.supersede_active_revokes_for_google_project_sub_tx, return_value=0)
+        )
+        monkeypatch.setattr(
+            db, "insert_pending_confirmation", create_autospec(db.insert_pending_confirmation, return_value=None)
+        )
+        monkeypatch.setattr(
+            db, "delete_pending_confirmation_by_hash", create_autospec(db.delete_pending_confirmation_by_hash, return_value=None)
+        )
+        monkeypatch.setattr(
             db, "get_connection", create_autospec(db.get_connection, return_value=None)
         )
 
@@ -443,6 +469,8 @@ class TestOAuthStateAndSessionVerification:
             ),
         )
         monkeypatch.setattr(db, "consume_oauth_state", consume_mock)
+        monkeypatch.setattr(db, "peek_oauth_state", create_autospec(db.peek_oauth_state, return_value=None))
+        monkeypatch.setattr(db, "list_google_project_revoke_lock_subs", create_autospec(db.list_google_project_revoke_lock_subs, return_value=[]))
         verify_local_spy = create_autospec(
             oauth_mod.verify_local_session_active,
             side_effect=HTTPException(status_code=401, detail="Session has been revoked"),
@@ -602,6 +630,19 @@ class TestGoogleThreeCases:
             db.consume_oauth_state, return_value=_make_state_row(service="calendar")
         )
         monkeypatch.setattr(db, "consume_oauth_state", consume_mock)
+        monkeypatch.setattr(db, "peek_oauth_state", create_autospec(db.peek_oauth_state, return_value=None))
+        monkeypatch.setattr(db, "list_google_project_revoke_lock_subs", create_autospec(db.list_google_project_revoke_lock_subs, return_value=[]))
+        fake_conn_ctx, _ = _make_fake_lock_pool()
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_conn_ctx)
+        monkeypatch.setattr(
+            db, "supersede_active_revokes_for_google_project_sub_tx", create_autospec(db.supersede_active_revokes_for_google_project_sub_tx, return_value=0)
+        )
+        monkeypatch.setattr(
+            db, "insert_pending_confirmation", create_autospec(db.insert_pending_confirmation, return_value=None)
+        )
+        monkeypatch.setattr(
+            db, "delete_pending_confirmation_by_hash", create_autospec(db.delete_pending_confirmation_by_hash, return_value=None)
+        )
         g_client.exchange_code.return_value = OAuthTokenResponse(
             access_token="at-1",
             refresh_token="rt-1",
@@ -792,6 +833,12 @@ class TestGoogleThreeCases:
 
         monkeypatch.setattr(
             db, "consume_oauth_state", create_autospec(db.consume_oauth_state, return_value=_make_state_row())
+        )
+        monkeypatch.setattr(
+            db, "peek_oauth_state", create_autospec(db.peek_oauth_state, return_value=(LOCAL_DEV_USER_ID, "111222333-abc.apps.googleusercontent.com"))
+        )
+        monkeypatch.setattr(
+            db, "list_google_project_revoke_lock_subs", create_autospec(db.list_google_project_revoke_lock_subs, return_value=["sub-alice"])
         )
         current_conn = [old_row]
         monkeypatch.setattr(
@@ -2191,12 +2238,15 @@ class TestRound2ReviewFixes:
             browser_binding_hash=hashlib.sha256(cookie_val.encode()).hexdigest(),
         )
         monkeypatch.setattr(db, "consume_oauth_state", create_autospec(db.consume_oauth_state, return_value=state_row))
+        monkeypatch.setattr(db, "peek_oauth_state", create_autospec(db.peek_oauth_state, return_value=None))
+        monkeypatch.setattr(db, "list_google_project_revoke_lock_subs", create_autospec(db.list_google_project_revoke_lock_subs, return_value=[]))
         monkeypatch.setattr(oauth_mod, "verify_local_session_active", create_autospec(oauth_mod.verify_local_session_active, return_value=None))
         monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=None))
         fake_ctx, _ = _make_fake_lock_pool()
         monkeypatch.setattr(oauth_mod, "get_db_connection", fake_ctx)
         monkeypatch.setattr(db, "supersede_active_revokes_for_google_project_sub_tx", create_autospec(db.supersede_active_revokes_for_google_project_sub_tx, return_value=0))
         monkeypatch.setattr(db, "insert_pending_confirmation", create_autospec(db.insert_pending_confirmation, return_value=None))
+        monkeypatch.setattr(db, "delete_pending_confirmation_by_hash", create_autospec(db.delete_pending_confirmation_by_hash, return_value=None))
 
         g_client = create_autospec(GoogleOAuthClient, instance=True)
         g_client.exchange_code.return_value = OAuthTokenResponse(
@@ -2322,10 +2372,17 @@ class TestRound2ReviewFixes:
 
     @pytest.mark.asyncio
     async def test_r2_item12_feishu_open_id_check_only_when_app_id_matches_gateway(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Item 12: gateway open_id is checked ONLY when OAuth app_id matches gateway's Feishu app_id."""
-        from src.dalton.deployment_credentials.snapshot import build_snapshot, set_active_snapshot
+        """Item 12: gateway App ID uses the exact same production resolve_feishu_app_credentials source; unavailable logs warning & skips."""
+        from types import MappingProxyType
+
+        from src.dalton.deployment_credentials import snapshot as snap_mod
+        from src.dalton.deployment_credentials.snapshot import (
+            CredentialGroupResult,
+            build_snapshot,
+            set_active_snapshot,
+        )
         from src.dalton.integrations.oauth_clients import FeishuUserInfo
 
         now = datetime.now(UTC)
@@ -2340,61 +2397,176 @@ class TestRound2ReviewFixes:
         f_client.get_user_info.return_value = FeishuUserInfo(
             open_id="ou_oauth_app", union_id="on_union_1", email="u@example.com"
         )
-        monkeypatch.setattr(db, "get_channel_feishu_open_id", create_autospec(db.get_channel_feishu_open_id, return_value="ou_gateway_different"))
+        monkeypatch.setattr(
+            db,
+            "get_channel_feishu_open_id",
+            create_autospec(db.get_channel_feishu_open_id, return_value="ou_gateway_different"),
+        )
         monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=None))
-        saved_row = _make_integration_row(provider="feishu", oauth_client_id="cli_independent_oauth", provider_account_id="ou_oauth_app")
-        monkeypatch.setattr(oauth_mod, "_finalize_connection", create_autospec(oauth_mod._finalize_connection, return_value=(saved_row, None)))
+        saved_row = _make_integration_row(
+            provider="feishu", oauth_client_id="cli_saved_app", provider_account_id="ou_oauth_app"
+        )
+        monkeypatch.setattr(
+            oauth_mod,
+            "_finalize_connection",
+            create_autospec(oauth_mod._finalize_connection, return_value=(saved_row, None)),
+        )
 
-        # 1) Independent OAuth app != gateway Vault app -> succeeds without mismatch error!
+        # 1) Saved credentials (production gateway fetches via /feishu-credentials -> resolve_feishu_app_credentials -> saved):
+        #    both gateway endpoint and OAuth resolve the exact same App ID; different open_id MUST raise!
         set_active_snapshot(
             build_snapshot(
                 revision=1,
                 rows={
-                    FEISHU_APP_ID_KEY: "cli_independent_oauth",
-                    FEISHU_APP_SECRET_KEY: "sec-ind",
-                },
-                feishu_vault_pair={
-                    FEISHU_APP_ID_KEY: "cli_gateway_vault_app",
-                    FEISHU_APP_SECRET_KEY: "sec-gw",
+                    FEISHU_APP_ID_KEY: "cli_saved_app",
+                    FEISHU_APP_SECRET_KEY: "sec-saved",
                 },
             )
         )
+        monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "t" * 40)
+        gw_client = TestClient(_make_app())
+        gw_resp = gw_client.post(
+            "/api/v1/dalton/channels/internal/data-task-notifications/feishu-credentials",
+            headers={"X-Service-Token": "t" * 40},
+        )
+        assert gw_resp.status_code == 200
+        assert gw_resp.json()["credentials"][FEISHU_APP_ID_KEY] == "cli_saved_app"
+        assert await oauth_mod._resolve_channel_gateway_feishu_app_id() == "cli_saved_app"
+
         consume_state_mock = create_autospec(
             db.consume_oauth_state,
             return_value=_make_state_row(
                 provider="feishu",
                 service="calendar",
-                oauth_client_id="cli_independent_oauth",
+                oauth_client_id="cli_saved_app",
                 requested_scopes=" ".join(oauth_mod.FEISHU_CALENDAR_SCOPES),
             ),
         )
         monkeypatch.setattr(db, "consume_oauth_state", consume_state_mock)
-        res_ind = await handle_oauth_callback(
-            provider="feishu", code="c1", state="s1", feishu_client=f_client
-        )
-        assert res_ind.status == "connected"
+        with pytest.raises(oauth_mod.FeishuIdentityMismatchError):
+            await handle_oauth_callback(
+                provider="feishu", code="c1", state="s1", feishu_client=f_client
+            )
 
-        # 2) Same App ID as gateway Vault app + different open_id -> raises FeishuIdentityMismatchError!
+        # 1b) Env credentials (production gateway fetches via /feishu-credentials -> env):
+        #     same App ID + different open_id MUST raise FeishuIdentityMismatchError!
+        setup_env_mod.set_outside_app.side_effect = (
+            lambda k: k in (FEISHU_APP_ID_KEY, FEISHU_APP_SECRET_KEY)
+        )
+        setup_env_mod._snapshot.return_value = {
+            FEISHU_APP_ID_KEY: "cli_env_app",
+            FEISHU_APP_SECRET_KEY: "sec-env",
+        }
+        try:
+            gw_env_resp = gw_client.post(
+                "/api/v1/dalton/channels/internal/data-task-notifications/feishu-credentials",
+                headers={"X-Service-Token": "t" * 40},
+            )
+            assert gw_env_resp.status_code == 200
+            assert gw_env_resp.json()["credentials"][FEISHU_APP_ID_KEY] == "cli_env_app"
+            assert await oauth_mod._resolve_channel_gateway_feishu_app_id() == "cli_env_app"
+            consume_state_mock.return_value = _make_state_row(
+                provider="feishu",
+                service="calendar",
+                oauth_client_id="cli_env_app",
+                requested_scopes=" ".join(oauth_mod.FEISHU_CALENDAR_SCOPES),
+            )
+            with pytest.raises(oauth_mod.FeishuIdentityMismatchError):
+                await handle_oauth_callback(
+                    provider="feishu", code="c1b", state="s1b", feishu_client=f_client
+                )
+        finally:
+            setup_env_mod.set_outside_app.side_effect = None
+            setup_env_mod.set_outside_app.return_value = False
+            setup_env_mod._snapshot.return_value = {}
+
+        # 2) Vault readonly credentials via live Vault resolution (production gateway startup path):
+        #    same App ID + different open_id MUST raise FeishuIdentityMismatchError!
         set_active_snapshot(
             build_snapshot(
                 revision=2,
                 rows={},
                 feishu_vault_pair={
-                    FEISHU_APP_ID_KEY: "cli_gateway_vault_app",
-                    FEISHU_APP_SECRET_KEY: "sec-gw",
+                    FEISHU_APP_ID_KEY: "cli_vault_app",
+                    FEISHU_APP_SECRET_KEY: "sec-vault",
                 },
             )
+        )
+        monkeypatch.setattr(
+            snap_mod,
+            "query_feishu_vault_pair_strict",
+            create_autospec(
+                snap_mod.query_feishu_vault_pair_strict,
+                return_value=(
+                    MappingProxyType(
+                        {
+                            FEISHU_APP_ID_KEY: "cli_vault_app",
+                            FEISHU_APP_SECRET_KEY: "sec-vault",
+                        }
+                    ),
+                    False,
+                    None,
+                ),
+            ),
         )
         consume_state_mock.return_value = _make_state_row(
             provider="feishu",
             service="calendar",
-            oauth_client_id="cli_gateway_vault_app",
+            oauth_client_id="cli_vault_app",
             requested_scopes=" ".join(oauth_mod.FEISHU_CALENDAR_SCOPES),
         )
         with pytest.raises(oauth_mod.FeishuIdentityMismatchError):
             await handle_oauth_callback(
                 provider="feishu", code="c2", state="s2", feishu_client=f_client
             )
+
+        # 3) Gateway App ID unavailable (e.g. resolve_feishu_app_credentials not ready / error):
+        #    skips open_id comparison and logs a warning!
+        set_active_snapshot(
+            build_snapshot(
+                revision=3,
+                rows={
+                    FEISHU_APP_ID_KEY: "cli_saved_app",
+                    FEISHU_APP_SECRET_KEY: "sec-saved",
+                },
+            )
+        )
+        consume_state_mock.return_value = _make_state_row(
+            provider="feishu",
+            service="calendar",
+            oauth_client_id="cli_saved_app",
+            requested_scopes=" ".join(oauth_mod.FEISHU_CALENDAR_SCOPES),
+        )
+        with monkeypatch.context() as mp:
+            mp.setattr(
+                oauth_mod,
+                "resolve_feishu_app_credentials",
+                create_autospec(
+                    oauth_mod.resolve_feishu_app_credentials,
+                    return_value=CredentialGroupResult(
+                        group="feishu_app",
+                        source="vault_error",
+                        revision=3,
+                        ready=False,
+                        values=MappingProxyType({}),
+                    ),
+                ),
+            )
+            with caplog.at_level(logging.WARNING, logger=oauth_mod.logger.name):
+                res_unavail = await handle_oauth_callback(
+                    provider="feishu", code="c3", state="s3", feishu_client=f_client
+                )
+            assert res_unavail.status == "connected"
+            assert any("skipping open_id check" in rec.getMessage() for rec in caplog.records)
+
+        # 4) Standalone Core profile (CHANNEL_FEISHU disabled) -> skips open_id check cleanly
+        monkeypatch.setenv("APP_ENV", "core")
+        monkeypatch.setenv("DALTON_PROFILE", "core")
+        monkeypatch.setenv("DALTON_CAP_FEISHU_CALENDAR", "1")
+        res_core = await handle_oauth_callback(
+            provider="feishu", code="c4", state="s4", feishu_client=f_client
+        )
+        assert res_core.status == "connected"
 
     def test_r2_item13_return_to_known_routes_only_and_final_location_validation(self) -> None:
         """Item 13: control chars, protocol-relative, backslash, and unknown paths fall back to safe default; Location validated."""
@@ -2420,3 +2592,618 @@ class TestRound2ReviewFixes:
 
         assert oauth_mod._sanitize_return_to("/settings?tab=integrations") == "/settings?tab=integrations"
         assert oauth_mod._sanitize_return_to("/chat/t/abc-123") == "/chat/t/abc-123"
+
+
+
+# ---------------------------------------------------------------------------
+# 10. Round 3 Review Fixes (Codex High + Medium items)
+# ---------------------------------------------------------------------------
+
+
+class TestRound3ReviewFixes:
+    @pytest.mark.asyncio
+    async def test_r3_item1_google_callback_holds_revoke_lock_across_exchange_and_process_revoke_defers_active_oauth(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Task 7: Google callback holds (project, sub) revoke_lock across consume + exchange + supersede; process_revoke defers during active OAuth state."""
+        from src.dalton.services import integration_revoke as revoke_mod
+
+        _install_saved_credentials()
+        timeline: list[str] = []
+        target_key = db.revoke_lock_key(LOCAL_DEV_USER_ID, "111222333", "sub-alice")
+
+        class _TrackingConn:
+            async def execute(self, sql: str, params: Any = None) -> None:
+                if "pg_advisory_lock" in sql:
+                    timeline.append(f"lock:{params[0]}")
+                elif "pg_advisory_unlock" in sql:
+                    timeline.append(f"unlock:{params[0]}")
+
+            @asynccontextmanager
+            async def transaction(self) -> Any:
+                yield self
+
+        @asynccontextmanager
+        async def _tracking_conn_ctx(_conn: Any = None) -> Any:
+            yield _TrackingConn()
+
+        monkeypatch.setattr(oauth_mod, "get_db_connection", _tracking_conn_ctx)
+        monkeypatch.setattr(
+            db,
+            "peek_oauth_state",
+            create_autospec(
+                db.peek_oauth_state,
+                return_value=(LOCAL_DEV_USER_ID, "111222333-abc.apps.googleusercontent.com"),
+            ),
+        )
+        monkeypatch.setattr(
+            db,
+            "list_google_project_revoke_lock_subs",
+            create_autospec(db.list_google_project_revoke_lock_subs, return_value=["sub-alice"]),
+        )
+
+        async def _track_consume(*_a: Any, **_k: Any) -> OAuthStateRow:
+            timeline.append("consume_state")
+            return _make_state_row()
+
+        monkeypatch.setattr(db, "consume_oauth_state", create_autospec(db.consume_oauth_state, side_effect=_track_consume))
+        monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=None))
+
+        async def _track_supersede(*_a: Any, **_k: Any) -> int:
+            timeline.append("supersede")
+            return 1
+
+        async def _track_insert_guard(**_k: Any) -> None:
+            timeline.append("insert_guard")
+
+        async def _track_finalize(**_k: Any) -> tuple[IntegrationRow, None]:
+            timeline.append("finalize")
+            return _make_integration_row(), None
+
+        monkeypatch.setattr(
+            db, "supersede_active_revokes_for_google_project_sub_tx", create_autospec(db.supersede_active_revokes_for_google_project_sub_tx, side_effect=_track_supersede)
+        )
+        monkeypatch.setattr(db, "insert_pending_confirmation", create_autospec(db.insert_pending_confirmation, side_effect=_track_insert_guard))
+        monkeypatch.setattr(oauth_mod, "_finalize_connection", create_autospec(oauth_mod._finalize_connection, side_effect=_track_finalize))
+
+        g_client = create_autospec(GoogleOAuthClient, instance=True)
+
+        async def _track_exchange(**_k: Any) -> OAuthTokenResponse:
+            timeline.append("exchange_code")
+            return OAuthTokenResponse(
+                access_token="at-new",
+                refresh_token="rt-new",
+                expires_in=3600,
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                scope=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+                id_token="id.tok",
+            )
+
+        g_client.exchange_code.side_effect = _track_exchange
+        g_client.verify_id_token.return_value = GoogleIdTokenClaims(
+            sub="sub-alice",
+            email="alice@example.com",
+            email_verified=True,
+            aud="111222333-abc.apps.googleusercontent.com",
+            iss="https://accounts.google.com",
+            exp=int(time.time()) + 3600,
+        )
+
+        cb = await handle_oauth_callback(
+            provider="google", code="c1", state="s1", google_client=g_client
+        )
+        assert cb.status == "connected"
+        assert timeline == [
+            f"lock:{target_key}",
+            "consume_state",
+            "exchange_code",
+            "supersede",
+            "insert_guard",
+            f"unlock:{target_key}",
+            "finalize",
+        ]
+
+        # process_revoke defers when an active Google OAuth state exists for (user_id, project)
+        pid = str(uuid.uuid4())
+        ledger = PurgeLedgerRow(
+            purge_id=pid,
+            user_id=LOCAL_DEV_USER_ID,
+            provider="google",
+            service="calendar",
+            oauth_client_id="111222333-old.apps.googleusercontent.com",
+            provider_account_id="sub-alice",
+            auth_epoch_upto=1,
+            trigger_reason=TriggerReason.CLIENT_ROTATION,
+            local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
+            purged_max_turn_by_thread={},
+            tracker_reconcile_needed=False,
+            local_completed_at=datetime.now(UTC),
+            remote_revoke_status=RemoteRevokeStatus.FAILED_RETRYABLE,
+            has_revoke_token=True,
+            retry_count=1,
+            next_retry_at=datetime.now(UTC) - timedelta(seconds=5),
+            last_remote_error="pre_auth_rotation_revoke_retryable",
+            remote_completed_at=None,
+            disconnected_at=datetime.now(UTC),
+            completed_at=None,
+            revoke_token="rt-old-secret",
+        )
+        oauth_exp = datetime.now(UTC) + timedelta(minutes=8)
+        fake_rev_ctx, _ = _make_fake_lock_pool()
+        monkeypatch.setattr(revoke_mod, "get_db_connection", fake_rev_ctx)
+        monkeypatch.setattr(db, "get_purge_ledger", create_autospec(db.get_purge_ledger, return_value=ledger))
+        monkeypatch.setattr(revoke_mod, "_has_newer_active_google_connection", create_autospec(revoke_mod._has_newer_active_google_connection, return_value=False))
+        monkeypatch.setattr(db, "get_active_google_oauth_state_expiry", create_autospec(db.get_active_google_oauth_state_expiry, return_value=oauth_exp))
+        update_remote_spy = create_autospec(db.update_purge_ledger_remote_status, return_value=ledger)
+        monkeypatch.setattr(db, "update_purge_ledger_remote_status", update_remote_spy)
+        revoker = create_autospec(RemoteRevoker, instance=True)
+
+        st = await revoke_mod.process_revoke(pid, revoker)
+        assert st == RemoteRevokeStatus.FAILED_RETRYABLE
+        revoker.revoke.assert_not_awaited()
+        update_remote_spy.assert_awaited_once()
+        assert update_remote_spy.await_args.kwargs["clear_revoke_token"] is False
+        assert update_remote_spy.await_args.kwargs["increment_retry"] is False
+        assert update_remote_spy.await_args.kwargs["next_retry_at"] >= oauth_exp
+
+    @pytest.mark.asyncio
+    async def test_r3_item2_account_switch_ticket_reverified_in_normal_commit_branch_on_delete_or_overwrite(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Task 8: normal commit branch re-verifies expected_old_* inside FOR UPDATE tx; deleted row or concurrent same-target switch rejects with 409."""
+        _install_saved_credentials()
+        fake_ctx, _ = _make_fake_lock_pool()
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_ctx)
+        monkeypatch.setattr(
+            db, "has_running_local_purge_for_service", create_autospec(db.has_running_local_purge_for_service, return_value=[])
+        )
+        monkeypatch.setattr(
+            db, "supersede_active_revokes_for_google_project_sub_tx", create_autospec(db.supersede_active_revokes_for_google_project_sub_tx, return_value=0)
+        )
+        upsert_spy = create_autospec(db.upsert_connection)
+        monkeypatch.setattr(db, "upsert_connection", upsert_spy)
+
+        # Case A: old row concurrently disconnected/deleted before _finalize_connection -> normal branch MUST reject!
+        get_conn_mock = create_autospec(db.get_connection, return_value=None)
+        monkeypatch.setattr(db, "get_connection", get_conn_mock)
+        with pytest.raises(PendingConfirmationInvalidError) as exc_deleted:
+            await oauth_mod._finalize_connection(
+                user_id=LOCAL_DEV_USER_ID,
+                provider="google",
+                service="calendar",
+                oauth_client_id="111222333-abc.apps.googleusercontent.com",
+                provider_account_id="sub-b",
+                provider_union_id=None,
+                provider_email="b@example.com",
+                granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+                access_token="at-b",
+                refresh_token="rt-b",
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                preferences={},
+                allow_account_switch=True,
+                expected_old_oauth_client_id="111222333-abc.apps.googleusercontent.com",
+                expected_old_provider_account_id="sub-a",
+                expected_old_auth_epoch=3,
+            )
+        assert exc_deleted.value.code == "account_switch_state_changed"
+        assert exc_deleted.value.status_code == 409
+        upsert_spy.assert_not_awaited()
+
+        # Case B: another ticket already switched sub-a (epoch 3) -> sub-b (epoch 4) -> normal branch MUST reject!
+        already_b = _make_integration_row(provider_account_id="sub-b", auth_epoch=4)
+        get_conn_mock.return_value = already_b
+        with pytest.raises(PendingConfirmationInvalidError) as exc_overwritten:
+            await oauth_mod._finalize_connection(
+                user_id=LOCAL_DEV_USER_ID,
+                provider="google",
+                service="calendar",
+                oauth_client_id="111222333-abc.apps.googleusercontent.com",
+                provider_account_id="sub-b",
+                provider_union_id=None,
+                provider_email="b@example.com",
+                granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+                access_token="at-stale-b",
+                refresh_token="rt-stale-b",
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                preferences={},
+                allow_account_switch=True,
+                expected_old_oauth_client_id="111222333-abc.apps.googleusercontent.com",
+                expected_old_provider_account_id="sub-a",
+                expected_old_auth_epoch=3,
+            )
+        assert exc_overwritten.value.code == "account_switch_state_changed"
+        assert exc_overwritten.value.status_code == 409
+        upsert_spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_r3_item3_feishu_revocation_matches_running_ledger_by_account_and_epoch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Task 5: Feishu revocation & orphan repair pass (oauth_client_id, provider_account_id, min_auth_epoch_upto)."""
+        from src.dalton.services import user_integrations_lifecycle as lifecycle_mod
+
+        now = datetime.now(UTC)
+        new_row_dict = {
+            "user_id": "u-switch",
+            "provider": "feishu",
+            "service": "calendar",
+            "oauth_client_id": "cli_test_app_1",
+            "provider_account_id": "ou_new",
+            "auth_epoch": 9,
+            "authorized_at": now - timedelta(minutes=5),
+            "status": "connected",
+        }
+
+        class _BatchCur:
+            def __init__(self) -> None:
+                self._step = 0
+
+            async def __aenter__(self) -> _BatchCur:
+                return self
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+            async def execute(self, sql: str, params: Any = None) -> None:
+                self._last_sql = sql
+
+            async def fetchall(self) -> list[dict[str, Any]]:
+                if "FROM dalton_user_integrations" in self._last_sql:
+                    return [new_row_dict]
+                return []
+
+        class _BatchConn:
+            async def execute(self, *_a: Any, **_k: Any) -> None:
+                return None
+
+            def cursor(self, **_k: Any) -> _BatchCur:
+                return _BatchCur()
+
+            @asynccontextmanager
+            async def transaction(self) -> Any:
+                yield self
+
+        @asynccontextmanager
+        async def _batch_conn_ctx(_conn: Any = None) -> Any:
+            yield _BatchConn()
+
+        monkeypatch.setattr(lifecycle_mod, "get_db_connection", _batch_conn_ctx)
+        monkeypatch.setattr(db, "has_webhook_event", create_autospec(db.has_webhook_event, return_value=False))
+        monkeypatch.setattr(db, "record_webhook_event", create_autospec(db.record_webhook_event, return_value=True))
+        has_running_spy = create_autospec(db.has_running_local_purge_for_service, return_value=[])
+        monkeypatch.setattr(db, "has_running_local_purge_for_service", has_running_spy)
+        insert_ledger_spy = create_autospec(db.insert_purge_ledger, return_value=None)
+        monkeypatch.setattr(db, "insert_purge_ledger", insert_ledger_spy)
+
+        outcome, pids = await lifecycle_mod.begin_feishu_webhook_revocation_batch(
+            app_id="cli_test_app_1",
+            open_id="ou_new",
+            union_id=None,
+            event_id="evt-new-acct-1",
+            event_time=now,
+            candidate_user_ids=["u-switch"],
+        )
+        assert outcome == "purged"
+        assert len(pids) == 1
+        has_running_spy.assert_awaited_once()
+        kw = has_running_spy.await_args.kwargs
+        assert kw["oauth_client_id"] == "cli_test_app_1"
+        assert kw["provider_account_id"] == "ou_new"
+        assert kw["min_auth_epoch_upto"] == 9
+        insert_ledger_spy.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_r3_item5_production_resume_loop_local_only_and_batch_local_before_remote(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Task 10: production resume loop runs local-only; run_personal_purge_resume_once completes ALL local purges before any remote revoke."""
+        from src.dalton.services import integration_background as bg_mod
+        from src.dalton.services import integration_data_purge as purge_mod
+        from src.dalton.services import integration_revoke as revoke_mod
+        from src.dalton.services import user_integrations_lifecycle as lifecycle_mod
+
+        inner_loop_spy = create_autospec(bg_mod._run_personal_purge_resume_loop, return_value=None)
+        monkeypatch.setattr(bg_mod, "_run_personal_purge_resume_loop", inner_loop_spy)
+        await bg_mod.run_personal_purge_resume_loop(poll_interval_s=15.0)
+        inner_loop_spy.assert_awaited_once_with(revoker=None, poll_interval_s=15.0)
+
+        now = datetime.now(UTC)
+        l_cal = PurgeLedgerRow(
+            purge_id=str(uuid.uuid4()),
+            user_id="u-batch",
+            provider="google",
+            service="calendar",
+            oauth_client_id="111-a",
+            provider_account_id="sub-1",
+            auth_epoch_upto=1,
+            trigger_reason=TriggerReason.USER_DISCONNECT,
+            local_purge_status=LocalPurgeStatus.RUNNING,
+            purged_max_turn_by_thread={},
+            tracker_reconcile_needed=False,
+            local_completed_at=None,
+            remote_revoke_status=RemoteRevokeStatus.PENDING,
+            has_revoke_token=True,
+            retry_count=0,
+            next_retry_at=now,
+            last_remote_error=None,
+            remote_completed_at=None,
+            disconnected_at=now,
+            completed_at=None,
+        )
+        l_mail = PurgeLedgerRow(
+            purge_id=str(uuid.uuid4()),
+            user_id="u-batch",
+            provider="google",
+            service="mail",
+            oauth_client_id="111-a",
+            provider_account_id="sub-1",
+            auth_epoch_upto=2,
+            trigger_reason=TriggerReason.USER_DISCONNECT,
+            local_purge_status=LocalPurgeStatus.RUNNING,
+            purged_max_turn_by_thread={},
+            tracker_reconcile_needed=False,
+            local_completed_at=None,
+            remote_revoke_status=RemoteRevokeStatus.NOT_APPLICABLE,
+            has_revoke_token=False,
+            retry_count=0,
+            next_retry_at=None,
+            last_remote_error=None,
+            remote_completed_at=now,
+            disconnected_at=now,
+            completed_at=None,
+        )
+        call_order: list[str] = []
+        list_running_calls = [[l_cal, l_mail], []]
+        monkeypatch.setattr(
+            db,
+            "list_running_local_purges",
+            create_autospec(db.list_running_local_purges, side_effect=lambda **k: list_running_calls.pop(0)),
+        )
+
+        async def _fake_finish(pid: str, *, revoker: Any = None, **_k: Any) -> FinishDisconnectResult:
+            assert revoker is None
+            call_order.append(f"local:{pid}")
+            return FinishDisconnectResult(
+                purge_id=pid,
+                deleted_connections=1,
+                local_purge_status=LocalPurgeStatus.COMPLETED,
+                remote_revoke_status=(
+                    RemoteRevokeStatus.PENDING if pid == l_cal.purge_id else RemoteRevokeStatus.NOT_APPLICABLE
+                ),
+            )
+
+        async def _fake_revoke(pid: str, _rev: Any) -> RemoteRevokeStatus:
+            call_order.append(f"remote:{pid}")
+            return RemoteRevokeStatus.SUCCEEDED
+
+        monkeypatch.setattr(lifecycle_mod, "finish_disconnect_locked", create_autospec(lifecycle_mod.finish_disconnect_locked, side_effect=_fake_finish))
+        monkeypatch.setattr(revoke_mod, "process_revoke", create_autospec(revoke_mod.process_revoke, side_effect=_fake_revoke))
+        rev = create_autospec(RemoteRevoker, instance=True)
+
+        resumed = await purge_mod.run_personal_purge_resume_once(revoker=rev)
+        assert resumed == [l_cal.purge_id, l_mail.purge_id]
+        assert call_order == [
+            f"local:{l_cal.purge_id}",
+            f"local:{l_mail.purge_id}",
+            f"remote:{l_cal.purge_id}",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_r3_item6_feishu_crash_takeover_never_replays_refresh_token_and_converges_by_expiry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Feishu refresh crash recovery: takeover worker NEVER replays possibly-consumed refresh token."""
+        _install_saved_credentials()
+        fake_ctx, _ = _make_fake_lock_pool(try_lock_results=[True, True, True, True])
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_ctx)
+        status_updates: list[dict[str, Any]] = []
+
+        async def _capture_status(*args: Any, **kwargs: Any) -> bool:
+            status_updates.append({"args": args, **kwargs})
+            return True
+
+        monkeypatch.setattr(
+            db, "update_connection_status", create_autospec(db.update_connection_status, side_effect=_capture_status)
+        )
+        f_client = create_autospec(FeishuOAuthClient, instance=True)
+
+        # 1) Unexpired access token + leftover refresh_inflight_gen == token_generation (force_refresh=True / sweep):
+        #    marks REFRESH_AMBIGUOUS, keeps tokens, makes 0 upstream calls!
+        crashed_unexpired = _make_integration_row(
+            provider="feishu",
+            service="calendar",
+            oauth_client_id="cli_test_app_1",
+            provider_account_id="ou_crash_1",
+            token_generation=3,
+            refresh_inflight_gen=3,
+            access_token="still-valid-at-crash",
+            expires_at=datetime.now(UTC) + timedelta(minutes=15),
+        )
+        get_conn_mock = create_autospec(db.get_connection, return_value=crashed_unexpired)
+        monkeypatch.setattr(db, "get_connection", get_conn_mock)
+        with pytest.raises(oauth_mod.IntegrationTransientError) as sweep_exc:
+            await ensure_fresh_access_token(
+                LOCAL_DEV_USER_ID, "feishu", "calendar", force_refresh=True, feishu_client=f_client
+            )
+        assert sweep_exc.value.code == "refresh_ambiguous"
+        assert status_updates[-1]["status"] == IntegrationStatus.REFRESH_AMBIGUOUS
+        assert status_updates[-1]["clear_tokens"] is False
+        f_client.refresh_token.assert_not_awaited()
+
+        # 2) Same unexpired crashed row on normal tool call (min_remaining_seconds=3600 > 900s remaining):
+        #    marks REFRESH_AMBIGUOUS & returns still-valid access token with 0 upstream calls!
+        tok = await ensure_fresh_access_token(
+            LOCAL_DEV_USER_ID,
+            "feishu",
+            "calendar",
+            min_remaining_seconds=3600,
+            force_refresh=False,
+            feishu_client=f_client,
+        )
+        assert tok.access_token == "still-valid-at-crash"
+        f_client.refresh_token.assert_not_awaited()
+
+        # 3) Already REFRESH_AMBIGUOUS (no inflight marker) while access token is STILL unexpired:
+        #    does NOT replay refresh token before expiry!
+        already_amb_unexpired = _make_integration_row(
+            provider="feishu",
+            service="calendar",
+            oauth_client_id="cli_test_app_1",
+            provider_account_id="ou_crash_1",
+            token_generation=3,
+            refresh_inflight_gen=None,
+            status=IntegrationStatus.REFRESH_AMBIGUOUS,
+            access_token="still-valid-at-amb",
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+        get_conn_mock.return_value = already_amb_unexpired
+        tok_amb = await ensure_fresh_access_token(
+            LOCAL_DEV_USER_ID,
+            "feishu",
+            "calendar",
+            min_remaining_seconds=600,
+            force_refresh=False,
+            feishu_client=f_client,
+        )
+        assert tok_amb.access_token == "still-valid-at-amb"
+        f_client.refresh_token.assert_not_awaited()
+
+        # 4) Expired access token + leftover refresh_inflight_gen == token_generation:
+        #    converges directly to NEEDS_REAUTH (clear_tokens=True) with 0 upstream calls!
+        crashed_expired = _make_integration_row(
+            provider="feishu",
+            service="calendar",
+            oauth_client_id="cli_test_app_1",
+            provider_account_id="ou_crash_2",
+            token_generation=4,
+            refresh_inflight_gen=4,
+            access_token="expired-at",
+            expires_at=datetime.now(UTC) - timedelta(seconds=30),
+        )
+        get_conn_mock.return_value = crashed_expired
+        with pytest.raises(IntegrationNeedsReauthError) as exp_exc:
+            await ensure_fresh_access_token(
+                LOCAL_DEV_USER_ID, "feishu", "calendar", feishu_client=f_client
+            )
+        assert exp_exc.value.code == "previous_refresh_crashed"
+        assert status_updates[-1]["status"] == IntegrationStatus.NEEDS_REAUTH
+        assert status_updates[-1]["clear_tokens"] is True
+        f_client.refresh_token.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_r3_item7_google_sibling_updates_use_actual_granted_scopes_and_recompute_status(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Google actual granted scopes: sibling row gets ONLY new token's scopes (no union) and recomputes status/preferences."""
+        _install_saved_credentials()
+        cal_row = _make_integration_row(
+            service="calendar",
+            provider_account_id="sub-alice",
+            granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        )
+        mail_sib = _make_integration_row(
+            service="mail",
+            provider_account_id="sub-alice",
+            granted_scopes=f"{GOOGLE_SCOPE_GMAIL_READONLY} https://www.googleapis.com/auth/gmail.drafts.create",
+            preferences={"allow_create_draft": True},
+        )
+        captured_updates: list[dict[str, Any]] = []
+
+        class _CapCur:
+            async def __aenter__(self) -> _CapCur:
+                return self
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+            async def execute(self, sql: str, params: Any = None) -> None:
+                if "UPDATE dalton_user_integrations" in sql and isinstance(params, dict):
+                    captured_updates.append(dict(params))
+
+        class _CapConn:
+            async def execute(self, *_a: Any, **_k: Any) -> None:
+                return None
+
+            def cursor(self, **_k: Any) -> _CapCur:
+                return _CapCur()
+
+            @asynccontextmanager
+            async def transaction(self) -> Any:
+                yield self
+
+        @asynccontextmanager
+        async def _cap_conn_ctx(_conn: Any = None) -> Any:
+            yield _CapConn()
+
+        monkeypatch.setattr(oauth_mod, "get_db_connection", _cap_conn_ctx)
+        monkeypatch.setattr(db, "has_running_local_purge_for_service", create_autospec(db.has_running_local_purge_for_service, return_value=[]))
+        monkeypatch.setattr(db, "supersede_active_revokes_for_google_project_sub_tx", create_autospec(db.supersede_active_revokes_for_google_project_sub_tx, return_value=0))
+        monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=cal_row))
+        monkeypatch.setattr(db, "list_connections_by_account", create_autospec(db.list_connections_by_account, return_value=[cal_row, mail_sib]))
+        monkeypatch.setattr(db, "upsert_connection", create_autospec(db.upsert_connection, return_value=cal_row))
+
+        # Switch-account flow picked back original sub-alice, so Google only granted Calendar scopes (no Gmail!)
+        await oauth_mod._finalize_connection(
+            user_id=LOCAL_DEV_USER_ID,
+            provider="google",
+            service="calendar",
+            oauth_client_id=cal_row.oauth_client_id,
+            provider_account_id="sub-alice",
+            provider_union_id=None,
+            provider_email="alice@example.com",
+            granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+            access_token="at-cal-only",
+            refresh_token="rt-cal-only",
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            preferences={},
+            allow_account_switch=False,
+        )
+        assert len(captured_updates) == 1
+        sib_upd = captured_updates[0]
+        assert sib_upd["service"] == "mail"
+        assert GOOGLE_SCOPE_GMAIL_READONLY not in sib_upd["granted_scopes"]
+        assert sib_upd["status"] == IntegrationStatus.NEEDS_REAUTH.value
+        assert sib_upd["err_code"] == "missing_required_scopes"
+        assert sib_upd["preferences"].obj["allow_create_draft"] is False
+
+    def test_r3_item8_return_to_browser_normalization_rejects_percent_encoded_dot_segments_and_checks_location(
+        self,
+    ) -> None:
+        """Task 13: WHATWG browser path normalization resolves %2e/%2E dot segments before route allowlist check and validates final Location."""
+        for traversal in (
+            "/settings/%2e%2e/outside",
+            "/settings/.%2e/outside",
+            "/settings/%2e./outside",
+            "/settings/%2E%2E/outside",
+            "/chat/%2e%2e/login",
+            "/monitors/%2e%2e/admin",
+            "/settings/%2e%2e%2foutside",
+            "/settings/%2e%2e%5coutside",
+            "/%2e%2e//evil.com",
+            "/settings/%00/evil",
+            "/settings/%2e%2e/evil?x=1",
+        ):
+            assert oauth_mod.sanitize_return_to(traversal) == "/settings?tab=integrations"
+            assert oauth_mod.validate_callback_location(traversal) is False
+            loc = router_mod._build_callback_redirect_url(
+                traversal,
+                query_updates={"integration_status": "connected", "provider": "google", "service": "calendar"},
+                fragment_params={"confirmation_token": "tok"},
+            )
+            assert oauth_mod.validate_callback_location(loc) is True
+            # Simulate browser WHATWG URL resolution of Location against app origin
+            resolved_path = oauth_mod._normalize_browser_path(urlparse(loc).path)
+            assert resolved_path == "/settings"
+            assert "outside" not in loc
+            assert "evil.com" not in loc
+
+        # In-app dot segment that stays inside allowed prefix is normalized to canonical path
+        assert oauth_mod.sanitize_return_to("/settings/sub/%2e%2e/integrations") == "/settings/integrations"
+        assert oauth_mod.validate_callback_location("/settings/sub/%2e%2e/integrations") is False
+        loc_norm = router_mod._build_callback_redirect_url(
+            "/settings/sub/%2e%2e/integrations?tab=1",
+            query_updates={"integration_status": "connected"},
+        )
+        assert loc_norm.startswith("/settings/integrations?")
+        assert "%2e" not in loc_norm.lower()
+        assert oauth_mod.validate_callback_location(loc_norm) is True

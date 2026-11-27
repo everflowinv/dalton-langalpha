@@ -37,6 +37,7 @@ from src.dalton.database import user_integrations as db
 from src.dalton.database.user_integrations import (
     LocalPurgeStatus,
     PurgeLedgerRow,
+    RemoteRevokeStatus,
     purge_lock_key,
     purge_thread_lock_key,
 )
@@ -2288,11 +2289,18 @@ async def run_personal_purge_resume_once(
     revoker: RemoteRevoker | None = None,
 ) -> list[str]:
     """Scan ``dalton_integration_purge_ledger WHERE local_purge_status = 'running'``
-    and attempt mutex-protected ``finish_disconnect_locked`` on each incomplete purge.
+    and execute local 2A purge ONLY via mutex-protected ``finish_disconnect_locked(..., run_remote_revoke=False)``
+    so slow or failing upstream remote revocations never delay local purge or shared-thread unblocking.
+
+    When a caller explicitly injects ``revoker``, due remote revocations are run strictly AFTER
+    all local 2A purges in the scan have finished and only for ``(user_id, provider)`` batches
+    that have zero remaining ``running`` local purge ledgers.
     """
+    from src.dalton.services.integration_revoke import process_revoke
     from src.dalton.services.user_integrations_lifecycle import finish_disconnect_locked
 
     resumed: list[str] = []
+    pending_remote_rows: list[tuple[str, str, str]] = []
     try:
         pending = await db.list_running_local_purges()
     except Exception as exc:
@@ -2303,15 +2311,44 @@ async def run_personal_purge_resume_once(
 
     for row in pending:
         try:
-            result = await finish_disconnect_locked(row.purge_id, revoker=revoker)
+            result = await finish_disconnect_locked(
+                row.purge_id,
+                revoker=None,
+            )
             if result is not None:
                 resumed.append(row.purge_id)
+                if (
+                    revoker is not None
+                    and result.remote_revoke_status == RemoteRevokeStatus.PENDING
+                ):
+                    pending_remote_rows.append(
+                        (row.purge_id, row.user_id, row.provider)
+                    )
         except Exception:
             logger.warning(
                 "[purge-resume] failed to resume purge_id=%s",
                 row.purge_id,
                 exc_info=True,
             )
+
+    if revoker is not None and pending_remote_rows:
+        try:
+            still_running = await db.list_running_local_purges()
+            running_batches = {(r.user_id, r.provider) for r in still_running}
+        except Exception:
+            running_batches = {(u, p) for _, u, p in pending_remote_rows}
+        for pid, uid, prov in pending_remote_rows:
+            if (uid, prov) in running_batches:
+                continue
+            try:
+                await process_revoke(pid, revoker)
+            except Exception:
+                logger.warning(
+                    "[purge-resume] post-local remote revoke deferred for purge_id=%s",
+                    pid,
+                    exc_info=True,
+                )
+
     if resumed:
         logger.info(
             "[purge-resume] resumed %d incomplete personal integration purge(s)",

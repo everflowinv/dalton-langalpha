@@ -58,25 +58,16 @@ async def _has_newer_active_google_connection(
     auth_epoch_upto: int,
     exclude_client_id: str | None = None,
 ) -> bool:
-    """Return True if ``(user_id, google_project, sub)`` already holds a newer active or pending token."""
+    """Return True if ``(user_id, google_project, sub)`` holds any active or pending grant that would be destroyed by revoking."""
+    _ = auth_epoch_upto
+    _ = exclude_client_id
     async with get_db_connection() as conn:
-        if await db.has_active_or_pending_google_grant(
+        return await db.has_active_or_pending_google_grant(
             user_id,
             google_project,
             sub,
-            min_auth_epoch=auth_epoch_upto,
             conn=conn,
-        ):
-            return True
-        if exclude_client_id is not None:
-            return await db.has_active_or_pending_google_grant(
-                user_id,
-                google_project,
-                sub,
-                exclude_client_id=exclude_client_id,
-                conn=conn,
-            )
-    return False
+        )
 
 
 async def process_revoke(
@@ -137,6 +128,33 @@ async def process_revoke(
                     mark_remote_completed=True,
                 )
                 return RemoteRevokeStatus.SUPERSEDED
+
+            if row.provider == "google":
+                active_oauth_exp = await db.get_active_google_oauth_state_expiry(
+                    row.user_id,
+                    google_project,
+                    conn=lock_conn,
+                )
+                if active_oauth_exp is not None:
+                    exp_utc = (
+                        active_oauth_exp
+                        if active_oauth_exp.tzinfo is not None
+                        else active_oauth_exp.replace(tzinfo=UTC)
+                    )
+                    defer_until = max(
+                        datetime.now(UTC) + timedelta(seconds=5),
+                        exp_utc + timedelta(seconds=5),
+                    )
+                    await db.update_purge_ledger_remote_status(
+                        purge_id,
+                        remote_revoke_status=RemoteRevokeStatus.FAILED_RETRYABLE,
+                        clear_revoke_token=False,
+                        increment_retry=False,
+                        next_retry_at=defer_until,
+                        last_remote_error="deferred_for_active_oauth_flow",
+                        mark_remote_completed=False,
+                    )
+                    return RemoteRevokeStatus.FAILED_RETRYABLE
 
             token = row.revoke_token
             if not token:
