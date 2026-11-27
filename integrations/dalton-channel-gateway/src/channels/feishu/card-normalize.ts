@@ -24,6 +24,148 @@ const NESTED_ELEMENTS_CONTAINER_TAGS = new Set([
 const FALLBACK_EMPTY_TEXT = "（卡片内容无法以原格式展示）";
 const FALLBACK_TRUNCATED_SUFFIX = "\n\n...(内容过长已截断)";
 
+const QUANTITY_CURR_PREFIX =
+  "(?:US\\$|HK\\$|CN\\$|NT\\$|A\\$|C\\$|S\\$|[$€£¥￥]|(?:USD|HKD|CNY|RMB|EUR|GBP|JPY|TWD|KRW) )";
+const QUANTITY_PREFIX = `(?:[+\\-−]?${QUANTITY_CURR_PREFIX}|${QUANTITY_CURR_PREFIX}[+\\-−]|[+\\-−])?`;
+const QUANTITY_NUM = "(?:\\d{1,3}(?:,\\d{3})+|\\d+)(?:\\.\\d+)?";
+const QUANTITY_SUFFIX =
+  "(?:%|％| ?(?:bps|bp|ppts|ppt|pp)|[xX]|(?:[KkMmBbTt]|[mM][nN]|[bB][nN]|[tT][nN])(?: ?(?:USD|HKD|CNY|RMB|EUR|GBP|JPY|TWD|KRW))?| ?(?:USD|HKD|CNY|RMB|EUR|GBP|JPY|TWD|KRW)| ?(?:千|万|百万|千万|亿|十亿|百亿|千亿|万亿)?(?:美元|港元|港币|人民币|欧元|日元|英镑|美金|元|倍|个百分点|百分点)| ?(?:千|万|百万|千万|亿|十亿|百亿|千亿|万亿))?";
+const QUANTITY_ATOM = `${QUANTITY_PREFIX}${QUANTITY_NUM}${QUANTITY_SUFFIX}`;
+const RANGE_SEP = "(?: ?(?:[-–—~～]|至|到) ?| to )";
+
+const INLINE_CODE_QUANTITY_RE = new RegExp(
+  `^${QUANTITY_ATOM}(?:${RANGE_SEP}${QUANTITY_ATOM})?$`,
+);
+const INLINE_CODE_TICKER_RE =
+  /^(?:[A-Z]{1,6}|[A-Z]{1,5}\.[A-Z]|\d{3,6}\.(?:HK|SH|SS|SZ|BJ|TW|TWO|KS|KQ|T|JP|SI|KL|BK|AX|NS|BO|US)|[A-Z][A-Z0-9]{0,5}\.(?:HK|US|N|O|OQ|L|PA|DE|AS|SW|MI|MC|ST|CO|HE|OL|VI|BR|LS|TO|AX|NZ|SI|NS|BO|KL|BK|JK|SA|MX|KS|KQ|TW|TWO|T|JP))$/;
+const PERIOD_ATOM =
+  "(?:(?:19|20)\\d{2} ?(?:Q[1-4]|H[12]|M(?:0?[1-9]|1[0-2])|FY|CY|YTD)[EAPF]?|[1-4]Q(?:\\d{2}|(?:19|20)\\d{2})[EAPF]?|[12]H(?:\\d{2}|(?:19|20)\\d{2})[EAPF]?|(?:FY|CY)(?: ?(?:'?\\d{2}|(?:19|20)\\d{2})(?:Q[1-4]|H[12])?)[EAPF]?|Q[1-4](?: ?(?:'?\\d{2}|(?:19|20)\\d{2}))?[EAPF]?|H[12](?: ?(?:'?\\d{2}|(?:19|20)\\d{2}))?[EAPF]?|(?:19|20)\\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\\d|3[01]))";
+const INLINE_CODE_PERIOD_RE = new RegExp(
+  `^${PERIOD_ATOM}(?:${RANGE_SEP}${PERIOD_ATOM})?$`,
+);
+
+const FENCE_OPEN_RE = /^[ ]{0,3}(`{3,}|~{3,})(.*)$/;
+const FENCE_CLOSE_BACKTICK_RE = /^[ ]{0,3}(`{3,})[ \t]*$/;
+const FENCE_CLOSE_TILDE_RE = /^[ ]{0,3}(~{3,})[ \t]*$/;
+
+function shouldStripInlineCodeBackticks(inner: string): boolean {
+  if (!inner || inner !== inner.trim()) {
+    return false;
+  }
+  return (
+    INLINE_CODE_QUANTITY_RE.test(inner) ||
+    INLINE_CODE_TICKER_RE.test(inner) ||
+    INLINE_CODE_PERIOD_RE.test(inner)
+  );
+}
+
+function stripInlineCodeOnLine(line: string): string {
+  if (!line.includes("`")) {
+    return line;
+  }
+  let out = "";
+  let i = 0;
+  while (i < line.length) {
+    const tickPos = line.indexOf("`", i);
+    if (tickPos === -1) {
+      out += line.slice(i);
+      break;
+    }
+    out += line.slice(i, tickPos);
+
+    let runEnd = tickPos;
+    while (runEnd < line.length && line[runEnd] === "`") {
+      runEnd += 1;
+    }
+    const runLen = runEnd - tickPos;
+
+    let backslashes = 0;
+    let bsPos = tickPos - 1;
+    while (bsPos >= 0 && line[bsPos] === "\\") {
+      backslashes += 1;
+      bsPos -= 1;
+    }
+    if (backslashes % 2 === 1) {
+      out += line.slice(tickPos, runEnd);
+      i = runEnd;
+      continue;
+    }
+
+    let searchPos = runEnd;
+    let closeStart = -1;
+    while (searchPos < line.length) {
+      const nextTick = line.indexOf("`", searchPos);
+      if (nextTick === -1) {
+        break;
+      }
+      let nextEnd = nextTick;
+      while (nextEnd < line.length && line[nextEnd] === "`") {
+        nextEnd += 1;
+      }
+      if (nextEnd - nextTick === runLen) {
+        closeStart = nextTick;
+        break;
+      }
+      searchPos = nextEnd;
+    }
+
+    if (closeStart === -1) {
+      out += line.slice(tickPos, runEnd);
+      i = runEnd;
+      continue;
+    }
+
+    const closeEnd = closeStart + runLen;
+    const inner = line.slice(runEnd, closeStart);
+    if (runLen === 1 && shouldStripInlineCodeBackticks(inner)) {
+      out += inner;
+    } else {
+      out += line.slice(tickPos, closeEnd);
+    }
+    i = closeEnd;
+  }
+  return out;
+}
+
+/**
+ * Removes decorative single-backtick inline code wrapping around financial
+ * numbers/amounts/percentages/multiples/ranges, stock tickers, and reporting
+ * periods inside Feishu card markdown content so Feishu does not render them
+ * as gray code badges. Leaves code blocks (fenced) and technical inline code
+ * (paths, commands, snake_case identifiers, etc.) untouched.
+ */
+export function normalizeFeishuMarkdownInlineCode(content: string): string {
+  if (!content.includes("`")) {
+    return content;
+  }
+  const parts = content.split(/(\r?\n)/);
+  let inFence: { char: "`" | "~"; len: number } | null = null;
+  for (let idx = 0; idx < parts.length; idx += 2) {
+    const line = parts[idx];
+    if (inFence !== null) {
+      const closeRe =
+        inFence.char === "`" ? FENCE_CLOSE_BACKTICK_RE : FENCE_CLOSE_TILDE_RE;
+      const closeMatch = closeRe.exec(line);
+      if (closeMatch && closeMatch[1].length >= inFence.len) {
+        inFence = null;
+      }
+      continue;
+    }
+    const openMatch = FENCE_OPEN_RE.exec(line);
+    if (openMatch) {
+      const marker = openMatch[1];
+      const info = openMatch[2];
+      const fenceChar = marker[0] as "`" | "~";
+      if (fenceChar === "~" || !info.includes("`")) {
+        inFence = { char: fenceChar, len: marker.length };
+        continue;
+      }
+    }
+    parts[idx] = stripInlineCodeOnLine(line);
+  }
+  return parts.join("");
+}
+
 export interface FeishuCardNormalizeResult {
   card: Record<string, unknown>;
   normalizedPaths: string[];
@@ -110,12 +252,20 @@ function normalizeElementList(
       normalizedPaths.push(elPath);
       return {
         tag: "markdown",
-        content: extractTextElementContent(rawEl),
+        content: normalizeFeishuMarkdownInlineCode(
+          extractTextElementContent(rawEl),
+        ),
       };
     }
 
     const cloned: Record<string, unknown> = structuredClone(rawEl);
-    if (tagLower === "column_set" && Array.isArray(cloned.columns)) {
+    if (tagLower === "markdown" && typeof cloned.content === "string") {
+      const nextContent = normalizeFeishuMarkdownInlineCode(cloned.content);
+      if (nextContent !== cloned.content) {
+        cloned.content = nextContent;
+        normalizedPaths.push(`${elPath}.content`);
+      }
+    } else if (tagLower === "column_set" && Array.isArray(cloned.columns)) {
       cloned.columns = cloned.columns.map((col, colIdx) => {
         if (!isRecord(col) || !Array.isArray(col.elements)) {
           return col;
@@ -310,7 +460,9 @@ function collectFallbackBlocksFromElements(
     const tagLower = readTagLower(rawEl);
 
     if (tagLower === "markdown" || tagLower === "lark_md") {
-      const text = extractTextElementContent(rawEl).trim();
+      const text = normalizeFeishuMarkdownInlineCode(
+        extractTextElementContent(rawEl).trim(),
+      );
       if (text) {
         blocks.push(text);
       }

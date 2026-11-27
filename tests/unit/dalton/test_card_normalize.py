@@ -7,6 +7,7 @@ from copy import deepcopy
 from src.dalton.notify.card_normalize import (
     normalize_feishu_card,
     normalize_feishu_cards,
+    normalize_feishu_markdown_inline_code,
 )
 
 
@@ -191,3 +192,152 @@ def test_normalize_feishu_cards_prefixes_paths_per_card() -> None:
         "tag": "markdown",
         "content": "second",
     }
+
+
+# Shared sample matrix mirrored identically in
+# integrations/dalton-channel-gateway/test/feishu.test.ts
+_INLINE_CODE_SAMPLES: list[tuple[str, str]] = [
+    # Numbers / amounts / percentages / multiples / ranges -> stripped
+    (
+        "营收 `16,956.0`（`+46.7%` / `-11.9%`），估值 `3.2x`，目标价 `150.0`。",
+        "营收 16,956.0（+46.7% / -11.9%），估值 3.2x，目标价 150.0。",
+    ),
+    (
+        "金额 `$150.0`、`-$2.3B`、`USD 45.2B`、`452 亿美元`，利差 `+50bps`、`-2.5 ppt`。",
+        "金额 $150.0、-$2.3B、USD 45.2B、452 亿美元，利差 +50bps、-2.5 ppt。",
+    ),
+    (
+        "区间 `15%–18%`、`15% 至 18%`、`10-20`、`2.5x~3.5x`、`120亿至130亿美元`。",
+        "区间 15%–18%、15% 至 18%、10-20、2.5x~3.5x、120亿至130亿美元。",
+    ),
+    # Stock tickers -> stripped
+    (
+        "标的 `ANT`、`NVDA`、`V`、`GOOGL`、`0700.HK`、`601100.SS`、`600519.SH`、`300750.SZ`、`2330.TW`、`005930.KS`、`9984.T`、`ASML.AS`、`BRK.B`。",
+        "标的 ANT、NVDA、V、GOOGL、0700.HK、601100.SS、600519.SH、300750.SZ、2330.TW、005930.KS、9984.T、ASML.AS、BRK.B。",
+    ),
+    # Periods -> stripped
+    (
+        "期间 `2026Q3`、`2026M11`、`FY26E`、`4Q27E`、`2026H1`、`1H26`、`FY2025`、`2026FY`、`2025Q1–2026Q3`、`2026-11-27`。",
+        "期间 2026Q3、2026M11、FY26E、4Q27E、2026H1、1H26、FY2025、2026FY、2025Q1–2026Q3、2026-11-27。",
+    ),
+    # Paths, commands, snake_case & technical identifiers -> preserved
+    (
+        "路径 `state/ai_app_db/companies/NET/metrics.jsonl`、`src/dalton/notify/card_normalize.py`、`./scripts/run.py`、`SKILL.md`、`README.MD`。",
+        "路径 `state/ai_app_db/companies/NET/metrics.jsonl`、`src/dalton/notify/card_normalize.py`、`./scripts/run.py`、`SKILL.md`、`README.MD`。",
+    ),
+    (
+        "命令 `pytest -q`、`git diff --check`、`npx vitest run`、`python3 scripts/cli.py --json`。",
+        "命令 `pytest -q`、`git diff --check`、`npx vitest run`、`python3 scripts/cli.py --json`。",
+    ),
+    (
+        "字段 `revenue_yoy_pct`、`report_run_id`、`value_usd_mn`、`NO_REPLY`、`THESIS_STRENGTHENED`、`normalizeFeishuCard`。",
+        "字段 `revenue_yoy_pct`、`report_run_id`、`value_usd_mn`、`NO_REPLY`、`THESIS_STRENGTHENED`、`normalizeFeishuCard`。",
+    ),
+    (
+        "技术标识 `v1.2.3`、`127.0.0.1`、`0x1f`、`10-K`、`P1`、`D1`、`f:rev_q8`。",
+        "技术标识 `v1.2.3`、`127.0.0.1`、`0x1f`、`10-K`、`P1`、`D1`、`f:rev_q8`。",
+    ),
+    # Mixed prose + fenced code blocks + multi-backtick + escaped backticks
+    (
+        "摘要：`ANT` 在 `2026Q3` 营收 `16,956.0`（`+46.7%`），字段 `revenue_yoy_pct`。\n"
+        "```python\n"
+        "sample = '`16,956.0` `ANT` `+46.7%` `2026Q3`'\n"
+        "```\n"
+        "~~~text\n"
+        "`0700.HK` `FY26E`\n"
+        "~~~\n"
+        "双反引号 `` `16,956.0` `` 与转义 \\`150.0\\` 保持原样，末尾 `601100.SS` 去反引号。",
+        "摘要：ANT 在 2026Q3 营收 16,956.0（+46.7%），字段 `revenue_yoy_pct`。\n"
+        "```python\n"
+        "sample = '`16,956.0` `ANT` `+46.7%` `2026Q3`'\n"
+        "```\n"
+        "~~~text\n"
+        "`0700.HK` `FY26E`\n"
+        "~~~\n"
+        "双反引号 `` `16,956.0` `` 与转义 \\`150.0\\` 保持原样，末尾 601100.SS 去反引号。",
+    ),
+]
+
+
+def test_strips_decorative_inline_code_backticks_and_preserves_code() -> None:
+    for raw, expected in _INLINE_CODE_SAMPLES:
+        assert normalize_feishu_markdown_inline_code(raw) == expected
+
+
+def test_normalize_feishu_card_strips_markdown_inline_code_without_mutating_or_leaking_body() -> None:
+    card = {
+        "schema": "2.0",
+        "header": {
+            "title": {"tag": "plain_text", "content": "AI 应用周报 — 2026-11-27"},
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "**`ANT`** `2026Q3` 收入 `16,956.0`（`+46.7%`），"
+                        "字段 `revenue_yoy_pct`，路径 `state/ai_app_db/`。\n"
+                        "```bash\n"
+                        "echo `16,956.0` `ANT`\n"
+                        "```"
+                    ),
+                },
+                {
+                    "tag": "column_set",
+                    "columns": [
+                        {
+                            "tag": "column",
+                            "elements": [
+                                {
+                                    "tag": "markdown",
+                                    "content": "港股 `0700.HK` 估值 `3.2x`（`FY26E`）",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "tag": "text",
+                    "content": "A 股 `601100.SS` 同比 `-11.9%`（`4Q27E`），命令 `pytest -q`",
+                },
+                {
+                    "tag": "markdown",
+                    "content": "纯代码引用 `report_run_id` 与 `src/app.py` 无需改动",
+                },
+            ]
+        },
+    }
+    before = deepcopy(card)
+    norm, paths = normalize_feishu_card(card)
+
+    assert card == before
+    assert paths == [
+        "body.elements[0].content",
+        "body.elements[1].columns[0].elements[0].content",
+        "body.elements[2]",
+    ]
+    assert all("16,956.0" not in p and "ANT" not in p for p in paths)
+
+    elems = norm["body"]["elements"]
+    assert elems[0]["content"] == (
+        "**ANT** 2026Q3 收入 16,956.0（+46.7%），"
+        "字段 `revenue_yoy_pct`，路径 `state/ai_app_db/`。\n"
+        "```bash\n"
+        "echo `16,956.0` `ANT`\n"
+        "```"
+    )
+    assert elems[1]["columns"][0]["elements"][0]["content"] == (
+        "港股 0700.HK 估值 3.2x（FY26E）"
+    )
+    assert elems[2] == {
+        "tag": "markdown",
+        "content": "A 股 601100.SS 同比 -11.9%（4Q27E），命令 `pytest -q`",
+    }
+    assert elems[3]["content"] == (
+        "纯代码引用 `report_run_id` 与 `src/app.py` 无需改动"
+    )
+
+    # Idempotent on second pass
+    norm_2, paths_2 = normalize_feishu_card(norm)
+    assert norm_2 == norm
+    assert paths_2 == []

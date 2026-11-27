@@ -138,7 +138,7 @@ Reddit 当前没有对应数据工具。名单只作来源记录，不要用代�
 
 ## 8. 成稿、校验、发送
 
-按模板写 `temp/humanoid-robot-weekly/<report_date>.md`。标题用 `🤖 人形机器人行业周报 — <report_date>`。副标题写监控窗口，日期用「至」。没有内容的栏目仍留模板里的那句空栏说明。新稿的模型栏目标题用 `## 🧠 模型与控制`。不用 Markdown 表格。公司演示写「演示级证据」。订单写「订单，尚非部署」。部署写「已运行」。每个数字紧跟来源和日期。
+按模板写 `temp/humanoid-robot-weekly/<report_date>.md`。标题用 `🤖 人形机器人行业周报 — <report_date>`。副标题写监控窗口，日期用「至」。没有内容的栏目仍留模板里的那句空栏说明。新稿的模型栏目标题用 `## 🧠 模型与控制`。不用 Markdown 表格。公司演示写「演示级证据」。订单写「订单，尚非部署」。部署写「已运行」。每个数字紧跟来源和日期。数字、股票代码与期间格式见 `.agents/skills/dalton-conventions/references/writing.md` §5。
 
 `report_run_id` 用 `humanoid-robot-weekly-<report_date>`。
 

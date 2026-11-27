@@ -90,7 +90,7 @@ web_search(
 
 ## 5. 写周报并提交卡片
 
-先把正文写到 `temp/us-weekly-movers/<week_end>-delivery.md`。不用 Markdown 表格，不用 `#` 标题。金额写「美元」。区间写「至」。跌幅用 Unicode 减号 `−`。主题之间空一行。编号用 ①②③，不用 `1.`。每个主题一个加粗标题行（主题名、中位涨跌幅、只数和最多 4 个代码），下面两条 bullet，分别是「催化」和「判断」，各一句。
+先把正文写到 `temp/us-weekly-movers/<week_end>-delivery.md`。不用 Markdown 表格，不用 `#` 标题。金额写「美元」。区间写「至」。跌幅用 Unicode 减号 `−`。主题之间空一行。编号用 ①②③，不用 `1.`。每个主题一个加粗标题行（主题名、中位涨跌幅、只数和最多 4 个代码），下面两条 bullet，分别是「催化」和「判断」，各一句。数字、股票代码与期间格式见 `.agents/skills/dalton-conventions/references/writing.md` §5。
 
 ```
 📈 **美股周涨跌幅共性｜<week_start> 至 <week_end>**
