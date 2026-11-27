@@ -5,8 +5,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { api } from '@/api/client';
 import { queryKeys } from '@/lib/queryKeys';
 import { getQuoteBatcher } from '@/lib/quotes/quoteBatcher';
-import { deriveQuoteDisplay, snapshotToStockPrice, writeQuoteFromWs, type QuoteRow } from '@/lib/quotes';
-import { extractSelectedPriceTradeTsMs, mergeRestQuoteRow } from '@/lib/dalton/quotes/quoteMerge';
+import { deriveQuoteDisplay, snapshotToStockPrice, writeQuoteFromWs, type QuoteRow, type WsQuoteFields } from '@/lib/quotes';
+import { extractSelectedPriceTradeTsMs, mergeRestQuoteRow, mergeWsQuoteRow } from '@/lib/dalton/quotes/quoteMerge';
 import { getExtendedHoursInfo } from '@/lib/dalton/quotes/extendedHoursCore';
 import { resolveExtendedHoursDisplay } from '@/components/dalton/ExtendedHours';
 import {
@@ -1159,8 +1159,29 @@ describe('watchlist pending-only subset polling', () => {
     expect(mergeRestQuoteRow(prev, incoming).price).toBe(104);
 
     // Untimed regular-only fallback (yesterday's close, no regular_as_of) still never overwrites the WS print.
-    const untimed = { ...incoming, price: 100, regular_as_of: undefined } as unknown as QuoteRow;
+    const untimed = { ...incoming, price: 100, regular_as_of: undefined, as_of: undefined } as unknown as QuoteRow;
     expect(mergeRestQuoteRow(prev, untimed).price).toBe(102);
+  });
+
+  it('r7 lead: FMP regular_only snapshot timed only by as_of compares by trade time in both directions', () => {
+    const T_830 = 1_792_672_200_000;
+    const T_935 = 1_792_676_100_000;
+    const ws102 = { symbol: 'GOOG', source: 'ws', price: 102, as_of: T_830, live_tick_at: T_830, currency: 'USD' } as QuoteRow;
+    const fmp104 = { symbol: 'GOOG', source: 'fmp', price: 104, as_of: T_935, regular_only: true, currency: 'USD' } as unknown as QuoteRow;
+    // REST direction: newer FMP print replaces the older WS print.
+    expect(mergeRestQuoteRow(ws102, fmp104).price).toBe(104);
+    // WS direction: a late 08:30 frame does not overwrite the cached 09:35 FMP print.
+    const afterLateWs = mergeWsQuoteRow(fmp104, 'GOOG', { price: 102, timestamp: T_830 } as WsQuoteFields);
+    expect(afterLateWs.price).toBe(104);
+  });
+
+  it('r7 lead: a WS print taking over a regular_only row clears regular_only', () => {
+    const T_close = 1_792_612_800_000; // 16:00 ET
+    const T_ah = 1_792_620_000_000; // 18:00 ET
+    const yahoo100 = { symbol: 'GOOG', source: 'yahoo', price: 100, as_of: T_close, regular_as_of: T_close, regular_only: true, currency: 'USD' } as unknown as QuoteRow;
+    const merged = mergeWsQuoteRow(yahoo100, 'GOOG', { price: 105, timestamp: T_ah } as WsQuoteFields) as Record<string, unknown>;
+    expect(merged.price).toBe(105);
+    expect(merged.regular_only).toBeNull();
   });
 
   it('r7: REST regular_only Yahoo snapshot (8:31) and SnapshotData-serialized Yahoo PM row never overwrite 8:30 WS trade (102)', async () => {

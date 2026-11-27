@@ -186,12 +186,13 @@ export function mergeRestQuoteRow(
   const incomingRecord = incoming as Record<string, unknown>;
   const incomingIsRegularOnly = incomingRecord.regular_only === true;
   const prevHasLiveWs = prev.live_tick_at != null;
-  // Exempt only regular-only snapshots without a trusted regular trade time (e.g. a
-  // pre-market fallback carrying yesterday's close). Intraday regular-only snapshots
-  // with `regular_as_of` still compare by trade time like any other REST row.
+  // Exempt only regular-only snapshots with no trade time at all (neither
+  // `regular_as_of` nor `as_of`). Timed regular-only snapshots (Yahoo with
+  // `regular_as_of`, FMP with its regular print in `as_of`) compare by trade time.
   const incomingRegularUntimed =
     incomingIsRegularOnly &&
-    parsePriceTimestampMs(incoming.regular_as_of ?? incomingRecord.regular_as_of) == null;
+    parsePriceTimestampMs(incoming.regular_as_of ?? incomingRecord.regular_as_of) == null &&
+    parsePriceTimestampMs(incoming.as_of) == null;
 
   const existingCand = quotePriceCandidateForCache(prev);
   const incomingCand = quotePriceCandidateForCache(incoming);
@@ -269,7 +270,8 @@ export function mergeWsQuoteRow(
   const prevIsRegularOnly =
     prevRecordWs.regular_only === true &&
     prev.live_tick_at == null &&
-    parsePriceTimestampMs(prev.regular_as_of ?? prevRecordWs.regular_as_of) == null;
+    parsePriceTimestampMs(prev.regular_as_of ?? prevRecordWs.regular_as_of) == null &&
+    parsePriceTimestampMs(prev.as_of) == null;
   const existingCand = quotePriceCandidateForCache(prev);
   const incomingCand: PricedCandidate = {
     price: Number.isFinite(fields.price) ? fields.price : null,
@@ -285,7 +287,8 @@ export function mergeWsQuoteRow(
     ...prev,
     symbol: prev.symbol ?? key,
     ...(prev.source === 'daily' ? { source: 'ws' } : {}),
-    ...(prevIsRegularOnly ? { regular_only: null } : {}),
+    // Once a WS print owns the price the row is no longer a regular-only snapshot.
+    ...(prevRecordWs.regular_only === true ? { regular_only: null } : {}),
     price: fields.price,
     // A frame is a minute aggregate: its close is the row's last minute close,
     // which an extended-hours row prints as its session price.
