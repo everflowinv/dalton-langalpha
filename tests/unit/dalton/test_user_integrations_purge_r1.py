@@ -33,6 +33,7 @@ from src.dalton.database.user_integrations import (
     TriggerReason,
     extract_google_project,
     lifecycle_lock_key,
+    purge_lock_key,
     refresh_lock_key,
     revoke_lock_key,
 )
@@ -197,6 +198,8 @@ def test_lock_keys_and_google_project_extraction():
 
     assert lifecycle_lock_key("u1", "google") != lifecycle_lock_key("u1", "feishu")
     assert revoke_lock_key("u1", "123456789012", "sub-1") != revoke_lock_key("u1", "999999999999", "sub-1")
+    assert purge_lock_key("p1") != purge_lock_key("p2")
+    assert purge_lock_key("p1") == purge_lock_key("p1")
 
 
 def test_dataclasses_hide_secret_tokens_in_repr():
@@ -349,6 +352,7 @@ def test_2a_redaction_preserves_pre_touch_and_purges_suffix_and_tool_calls():
         ],
         additional_kwargs={
             "reasoning_content": "secret reasoning",
+            "reasoning_details": [{"type": "reasoning.encrypted", "data": "opaque-secret"}],
             "tool_calls": [
                 {
                     "id": "call_1",
@@ -377,7 +381,24 @@ def test_2a_redaction_preserves_pre_touch_and_purges_suffix_and_tool_calls():
     assert out_ai.invalid_tool_calls[0]["name"] == "dalton_calendar"
     assert out_ai.invalid_tool_calls[0]["args"] == PURGED_TOOL_ARGS_JSON
     assert out_ai.additional_kwargs["reasoning_content"] == PURGED_PLACEHOLDER
+    assert "reasoning_details" not in out_ai.additional_kwargs
     assert out_ai.additional_kwargs["tool_calls"][0]["function"]["arguments"] == PURGED_TOOL_ARGS_JSON
+
+    # Dict-shaped message fallback also deletes reasoning_details and replaces reasoning_content
+    dict_ai = {
+        "id": "m2-dict",
+        "content": "secret reply",
+        "additional_kwargs": {
+            "reasoning_content": "secret chain",
+            "reasoning_details": [{"type": "reasoning.summary", "summary": "secret"}],
+        },
+    }
+    out_dict, ch_dict = redact_message(
+        dict_ai, in_suffix=True, affected_summary_ids=set(), min_turn=1, max_turn=3
+    )
+    assert ch_dict
+    assert out_dict["additional_kwargs"]["reasoning_content"] == PURGED_PLACEHOLDER
+    assert "reasoning_details" not in out_dict["additional_kwargs"]
 
     suf_tool = ToolMessage(
         content="Event: Private Board Meeting",
@@ -875,7 +896,7 @@ async def test_tracker_reconcile_needed_without_handler_and_with_handler(monkeyp
         disconnected_at=now,
         completed_at=None,
     )
-    fake_conn = _FakeConn(_FakeCursor(fetchall_seq=[[]]))
+    fake_conn = _FakeConn(_FakeCursor(fetchone_seq=[(True,)], fetchall_seq=[[]]))
 
     @asynccontextmanager
     async def _get_conn(_conn=None):
@@ -899,7 +920,7 @@ async def test_tracker_reconcile_needed_without_handler_and_with_handler(monkeyp
 
     register_tracker_purge_handler(_custom_handler)
     try:
-        fake_conn2 = _FakeConn(_FakeCursor(fetchall_seq=[[]]))
+        fake_conn2 = _FakeConn(_FakeCursor(fetchone_seq=[(True,)], fetchall_seq=[[]]))
 
         @asynccontextmanager
         async def _get_conn2(_conn=None):
@@ -1041,6 +1062,305 @@ def test_restore_reset_sql_and_restore_script_wiring():
     reset_pos = restore_sh.index("personal_integrations_restore_reset.sql")
     up_pos = restore_sh.index("compose_cmd up -d\n")
     assert migrate_pos < reset_pos < up_pos
+    assert 'if [[ ! -f "$PERSONAL_INTEGRATIONS_RESET_SQL" ]]; then' in restore_sh
+    missing_branch = restore_sh[reset_pos : reset_pos + 320]
+    assert "err " in missing_branch and "exit 1" in missing_branch
+
+    pkg_sh = (REPO_ROOT / "scripts" / "standalone" / "package_release.sh").read_text(encoding="utf-8")
+    req_start = pkg_sh.index("ALLOWLIST_REQUIRED=(")
+    req_end = pkg_sh.index(")", req_start)
+    assert '"scripts/dalton/sql/personal_integrations_restore_reset.sql"' in pkg_sh[req_start:req_end]
+
+    standalone_doc = (REPO_ROOT / "docs" / "dalton" / "dev-guide" / "STANDALONE-DEPLOY.md").read_text(encoding="utf-8")
+    assert "psql -v ON_ERROR_STOP=1 -f scripts/dalton/sql/personal_integrations_restore_reset.sql" in standalone_doc
 
     ops_doc = (REPO_ROOT / "docs" / "dalton" / "OPERATIONS.md").read_text(encoding="utf-8")
     assert "scripts/dalton/sql/personal_integrations_restore_reset.sql" in ops_doc
+
+
+# ---------------------------------------------------------------------------
+# 9. r2 regressions: cancel & drain, shared UI & cumulative summaries, mutex, incomplete layers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_and_drain_calls_real_cancel_apis_and_checks_task_namespaces():
+    from src.server.database.runs import lifecycle as run_lifecycle
+    from src.server.database.runs import subagent_runs
+    from src.server.services import writer_guard
+
+    tid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    trid = str(uuid.uuid4())
+
+    req_run_cancel = create_autospec(
+        run_lifecycle.request_run_cancel,
+        return_value={"state": "requested", "run": None, "returned_steers": [], "held_steers": 0},
+    )
+    req_task_cancel = create_autospec(
+        subagent_runs.request_task_run_cancel,
+        return_value={"state": "requested", "run": None},
+    )
+    nudge = create_autospec(purge_mod.publish_cancel_nudge, return_value=None)
+    held_ns = create_autospec(writer_guard.held_task_namespaces, return_value=set())
+
+    cur = _FakeCursor(
+        fetchall_seq=[[{"run_id": rid}], [{"task_id": "task-1", "task_run_id": trid}]],
+        fetchone_seq=[(True,)],
+    )
+    fake_conn = _FakeConn(cur)
+
+    @asynccontextmanager
+    async def _get_conn(_conn=None):
+        yield fake_conn
+
+    with (
+        patch.object(purge_mod, "get_db_connection", _get_conn),
+        patch.object(run_lifecycle, "request_run_cancel", req_run_cancel),
+        patch.object(subagent_runs, "request_task_run_cancel", req_task_cancel),
+        patch.object(purge_mod, "publish_cancel_nudge", nudge),
+        patch.object(writer_guard, "held_task_namespaces", held_ns),
+    ):
+        await purge_mod._cancel_and_drain_thread(tid, min_turn=1, max_turn=2, timeout_s=1.0)
+
+    req_run_cancel.assert_awaited_once_with(rid, thread_id=tid, by="suspension")
+    req_task_cancel.assert_awaited_once_with(trid, thread_id=tid)
+    held_ns.assert_awaited_once_with(tid, ["task-1"])
+    assert nudge.await_count == 2
+
+    # When held_task_namespaces remains non-empty, drain times out and raises TimeoutError
+    held_busy = create_autospec(writer_guard.held_task_namespaces, return_value={"task-1"})
+    cur2 = _FakeCursor(
+        fetchall_seq=[[{"run_id": rid}], [{"task_id": "task-1", "task_run_id": trid}]],
+        fetchone_seq=[(True,), (True,), (True,)],
+    )
+    fake_conn2 = _FakeConn(cur2)
+
+    @asynccontextmanager
+    async def _get_conn2(_conn=None):
+        yield fake_conn2
+
+    with (
+        patch.object(purge_mod, "get_db_connection", _get_conn2),
+        patch.object(run_lifecycle, "request_run_cancel", create_autospec(run_lifecycle.request_run_cancel, return_value={"state": "requested"})),
+        patch.object(subagent_runs, "request_task_run_cancel", create_autospec(subagent_runs.request_task_run_cancel, return_value={"state": "requested"})),
+        patch.object(purge_mod, "publish_cancel_nudge", create_autospec(purge_mod.publish_cancel_nudge, return_value=None)),
+        patch.object(writer_guard, "held_task_namespaces", held_busy),
+    ):
+        with pytest.raises(TimeoutError):
+            await purge_mod._cancel_and_drain_thread(tid, min_turn=1, max_turn=2, timeout_s=0.05)
+
+
+@pytest.mark.asyncio
+async def test_shared_ui_version_and_cumulative_messages_preserve_pre_touch_summaries():
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+    from langgraph.checkpoint.serde.types import _DeltaSnapshot
+
+    serde = JsonPlusSerializer()
+    tid = str(uuid.uuid4())
+    r0 = str(uuid.uuid4())
+    r1 = str(uuid.uuid4())
+
+    sum_pre = HumanMessage(
+        content="Pre-touch summary of turn 0 research",
+        id="sum-pre",
+        additional_kwargs={
+            "lc_source": "summarization",
+            SUMMARIZED_KEY: {"span": [0, 0], "gap": None, "skills": []},
+        },
+    )
+    sum_cross = HumanMessage(
+        content="Cross-boundary summary leaking turn 1 calendar",
+        id="sum-cross",
+        additional_kwargs={
+            "lc_source": "summarization",
+            SUMMARIZED_KEY: {"span": [0, 1], "gap": None, "skills": []},
+        },
+    )
+    m0 = HumanMessage(content="NVDA Q0", id="m0")
+    m1 = HumanMessage(content="Private calendar Q1", id="m1")
+
+    v0_t, v0_b = serde.dumps_typed(_DeltaSnapshot([m0, sum_pre, sum_cross]))
+    v1_t, v1_b = serde.dumps_typed(_DeltaSnapshot([m0, sum_pre, sum_cross, m1]))
+    u0_t, u0_b = serde.dumps_typed(
+        [
+            {
+                "type": "ui",
+                "id": "ui-pre",
+                "name": "context_window",
+                "props": {"action": "summarize", "summary_text": "Pre-touch UI summary"},
+                "metadata": {
+                    "summary_message_id": "sum-pre",
+                    "replaced_summary": {
+                        "id": "sum-pre",
+                        "action": "summarize",
+                        "summary_text": "Pre-touch replaced summary",
+                    },
+                },
+            },
+            {
+                "type": "ui",
+                "id": "ui-cross",
+                "name": "context_window",
+                "props": {"action": "summarize", "summary_text": "Cross UI summary"},
+                "metadata": {
+                    "summary_message_id": "sum-cross",
+                    "replaced_summary": {
+                        "id": "sum-cross",
+                        "action": "summarize",
+                        "summary_text": "Cross replaced summary",
+                    },
+                },
+            },
+        ]
+    )
+
+    all_cps = [
+        {
+            "checkpoint_ns": "",
+            "checkpoint_id": "cp-0",
+            "parent_checkpoint_id": None,
+            "checkpoint": {"channel_versions": {"messages": "v0", "ui": "u0"}},
+            "metadata": {"turn_index": 0, "run_id": r0},
+        },
+        {
+            "checkpoint_ns": "",
+            "checkpoint_id": "cp-1",
+            "parent_checkpoint_id": "cp-0",
+            "checkpoint": {"channel_versions": {"messages": "v1", "ui": "u0"}},  # shared ui version u0!
+            "metadata": {"turn_index": 1, "run_id": r1},
+        },
+    ]
+    blobs = [
+        {"checkpoint_ns": "", "channel": "messages", "version": "v0", "type": v0_t, "blob": v0_b},
+        {"checkpoint_ns": "", "channel": "messages", "version": "v1", "type": v1_t, "blob": v1_b},
+        {"checkpoint_ns": "", "channel": "ui", "version": "u0", "type": u0_t, "blob": u0_b},
+    ]
+
+    cur = _FakeCursor(fetchall_seq=[all_cps, [], blobs])
+    cp_conn = _FakeConn(cur)
+
+    updated = await purge_mod._purge_thread_checkpoints(
+        cp_conn,
+        serde,
+        thread_id=tid,
+        min_turn=1,
+        max_turn=1,
+        run_turn_map={r0: 0, r1: 1},
+        suffix_run_ids={r1},
+        suffix_task_ids=set(),
+    )
+    assert updated == 3
+
+    updated_blobs: dict[tuple[str, str], object] = {}
+    for sql, params in cur.executed:
+        if "UPDATE checkpoint_blobs" in sql:
+            new_type, new_blob, _t, _ns, ch, ver = params  # type: ignore[misc]
+            updated_blobs[(ch, ver)] = serde.loads_typed((new_type, new_blob))
+
+    msgs_v0 = {m.id: m for m in updated_blobs[("messages", "v0")].value}
+    msgs_v1 = {m.id: m for m in updated_blobs[("messages", "v1")].value}
+    assert msgs_v0["sum-pre"].content == "Pre-touch summary of turn 0 research"
+    assert msgs_v1["sum-pre"].content == "Pre-touch summary of turn 0 research"
+    assert msgs_v0["sum-cross"].content == PURGED_PLACEHOLDER
+    assert msgs_v1["sum-cross"].content == PURGED_PLACEHOLDER
+    assert msgs_v1["m1"].content == PURGED_PLACEHOLDER
+
+    ui_u0 = {r["id"]: r for r in updated_blobs[("ui", "u0")]}
+    assert ui_u0["ui-pre"]["metadata"]["replaced_summary"]["summary_text"] == "Pre-touch replaced summary"
+    assert ui_u0["ui-pre"]["props"]["summary_text"] == "Pre-touch UI summary"
+    assert ui_u0["ui-cross"]["metadata"]["replaced_summary"]["summary_text"] == PURGED_PLACEHOLDER
+    assert ui_u0["ui-cross"]["props"]["summary_text"] == PURGED_PLACEHOLDER
+
+
+@pytest.mark.asyncio
+async def test_purge_mutex_incomplete_layers_all_services_guard_and_resume_loop():
+    from src.dalton.services import user_integrations_lifecycle as lifecycle_mod
+
+    # begin_disconnect rejects service=None and points to begin_disconnect_all_services
+    with pytest.raises(ValueError, match="begin_disconnect_all_services"):
+        await lifecycle_mod.begin_disconnect("u1", "google", None)  # type: ignore[arg-type]
+
+    # finish_disconnect_locked returns None immediately if advisory lock is already held
+    busy_conn = _FakeConn(_FakeCursor(fetchone_seq=[(False,)]))
+
+    @asynccontextmanager
+    async def _busy_get_conn(_conn=None):
+        yield busy_conn
+
+    with patch.object(lifecycle_mod, "get_db_connection", _busy_get_conn):
+        assert await lifecycle_mod.finish_disconnect_locked(str(uuid.uuid4())) is None
+
+    # Redis disabled -> returns 0; Redis delete failure -> propagates exception
+    disabled_cache = SimpleNamespace(enabled=False, client=None)
+    with patch("src.utils.cache.redis_cache.get_cache_client", return_value=disabled_cache):
+        assert await purge_mod._delete_redis_keys(["k1"]) == 0
+
+    class _FailingRedis:
+        async def delete(self, *keys):
+            raise ConnectionError("redis down")
+
+    failing_cache = SimpleNamespace(enabled=True, client=_FailingRedis())
+    with patch("src.utils.cache.redis_cache.get_cache_client", return_value=failing_cache):
+        with pytest.raises(ConnectionError):
+            await purge_mod._delete_redis_keys(["k1"])
+
+    # Missing checkpointer on a ledger with affected threads -> raises RuntimeError (never marks completed)
+    import dataclasses
+    from src.dalton.conversations import render as render_mod
+
+    tid = str(uuid.uuid4())
+    pid = str(uuid.uuid4())
+    running_ledger = dataclasses.replace(
+        _sample_ledger(purge_id=pid),
+        local_purge_status=LocalPurgeStatus.RUNNING,
+        purged_max_turn_by_thread={tid: {"min_turn": 0, "max_turn": 0}},
+    )
+    cp_missing_conn = _FakeConn(_FakeCursor(fetchone_seq=[(True,)], fetchall_seq=[[], [], []]))
+
+    @asynccontextmanager
+    async def _cp_missing_get_conn(_conn=None):
+        yield cp_missing_conn
+
+    with (
+        patch.object(db, "get_purge_ledger", create_autospec(db.get_purge_ledger, return_value=running_ledger)),
+        patch.object(purge_mod, "get_db_connection", _cp_missing_get_conn),
+        patch.object(purge_mod, "get_checkpointer", return_value=None),
+    ):
+        with pytest.raises(RuntimeError, match="Checkpointer"):
+            await purge_mod.run_local_purge(pid)
+
+    # Conversation digest re-render failure propagates instead of being swallowed
+    card_conn = _FakeConn(
+        _FakeCursor(
+            fetchone_seq=[{"tbl": "dalton_conversation_cards"}],
+            fetchall_seq=[
+                [{"card_id": "c1", "date_et": "2026-11-26", "rendered_locations": ["a.md"], "tickers": []}],
+                [],
+            ],
+        )
+    )
+    with patch.object(
+        render_mod,
+        "render_and_write_conversation_digests",
+        create_autospec(
+            render_mod.render_and_write_conversation_digests,
+            side_effect=RuntimeError("render boom"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="render boom"):
+            await purge_mod._purge_conversation_cards_for_thread(card_conn, tid, "u1")
+
+    # Background resume loop scans immediately on start and exits cleanly on cancel
+    scan_ran = asyncio.Event()
+
+    async def _fake_once(*, revoker=None):
+        scan_ran.set()
+        return []
+
+    with patch.object(purge_mod, "run_personal_purge_resume_once", side_effect=_fake_once):
+        task = asyncio.create_task(purge_mod.run_personal_purge_resume_loop(poll_interval_s=60.0))
+        await asyncio.wait_for(scan_ran.wait(), timeout=1.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task

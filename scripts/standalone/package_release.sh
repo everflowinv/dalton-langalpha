@@ -226,6 +226,7 @@ ALLOWLIST_REQUIRED=(
   "scripts/dalton/docker_entrypoint_dalton.sh"
   "scripts/dalton/configure_minio.sh"
   "scripts/dalton/log_redaction.py"
+  "scripts/dalton/sql/personal_integrations_restore_reset.sql"
   "web"
   "docs-site"
 )

@@ -117,12 +117,9 @@ async def fork_thread(req: ForkRequest) -> ForkResult:
                 # Again under the lock, which holds off a delete or compaction
                 # from here on: one may have landed since the plan was read.
                 await thread_fork.check_source(conn, **_source_check(snapshot))
-                # DALTON-HOOK(personal-integrations): lock source thread row and reject fork while personal data purge is active
+                # DALTON-HOOK(personal-integrations): reject fork while personal data purge is active
                 from src.dalton.services.purge_fence import assert_fork_source_not_purging_tx
-
-                await assert_fork_source_not_purging_tx(
-                    conn, req.source_thread_id, cut_turn_index=req.cut.turn_index
-                )
+                await assert_fork_source_not_purging_tx(conn, req.source_thread_id, cut_turn_index=req.cut.turn_index)
                 async with _checkpoint_connection(conn) as cp:
                     await _copy_chains(cp, req.source_thread_id, thread_id, snapshot, plan)
                 await _write_thread(conn, req, snapshot, plan, source, subagents_allowed, thread_id)
@@ -283,17 +280,9 @@ async def _write_thread(
         llm_model=source.get("llm_model"),
         shared_reader=created_by,
     )
-    # DALTON-HOOK(personal-integrations): inherit private flag, clipped purged turn ranges, and remapped touches on fork
+    # DALTON-HOOK(personal-integrations): inherit private flag, clipped purged ranges, and remapped touches on fork
     from src.dalton.services.purge_fence import copy_personal_integration_state_for_fork_tx
-
-    await copy_personal_integration_state_for_fork_tx(
-        conn,
-        source_thread_id=req.source_thread_id,
-        target_thread_id=thread_id,
-        cut=req.cut,
-        kept_turn_indexes=snapshot.turn_indexes,
-        run_map=plan.run_map,
-    )
+    await copy_personal_integration_state_for_fork_tx(conn, source_thread_id=req.source_thread_id, target_thread_id=thread_id, cut=req.cut, kept_turn_indexes=snapshot.turn_indexes, run_map=plan.run_map)
 
 
 async def _drop_unclaimed(thread_id: str) -> None:

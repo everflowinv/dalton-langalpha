@@ -42,6 +42,8 @@ class ThreadRows:
     workspace_owner_id: str | None = None
     # DALTON-HOOK(chat-large-upload): permanently failed main-thread steers for replay surfacing.
     failed_steers: list[dict[str, Any]] = field(default_factory=list)
+    # DALTON-HOOK(personal-integrations): purge generation captured before reading replay inputs.
+    expected_purge_gen: int | None = None
 
 
 async def get_branch_pointer(thread_id: str) -> tuple[str, list[Any]] | None:
@@ -82,9 +84,11 @@ async def get_replay_thread_data(thread_id: str) -> ThreadRows | None:
         async with conn.cursor(row_factory=dict_row) as cur:
             # 1. Owner check (join threads -> workspaces)
             # DALTON-HOOK(colleague-dispatch): return thread owner (A) as user_id and workspace owner (B) as workspace_owner_id.
+            # DALTON-HOOK(personal-integrations): capture personal_purge_generation before reading any replay rows.
             await cur.execute(
                 """SELECT COALESCE(t.user_id, w.user_id) AS user_id,
-                          w.user_id AS workspace_owner_id
+                          w.user_id AS workspace_owner_id,
+                          t.personal_purge_generation
                    FROM conversation_threads t
                    JOIN workspaces w ON w.workspace_id = t.workspace_id
                    WHERE t.conversation_thread_id = %s
@@ -98,6 +102,7 @@ async def get_replay_thread_data(thread_id: str) -> ThreadRows | None:
                 if owner_row
                 else None
             )
+            expected_purge_gen = int(owner_row["personal_purge_generation"]) if owner_row and owner_row.get("personal_purge_generation") is not None else None
 
             if owner_id is None:
                 return None
@@ -239,6 +244,8 @@ async def get_replay_thread_data(thread_id: str) -> ThreadRows | None:
         workspace_owner_id=workspace_owner_id,
         # DALTON-HOOK(chat-large-upload): pass failed_steers for replay surfacing.
         failed_steers=failed_steers,
+        # DALTON-HOOK(personal-integrations): pass purge generation captured before replay reads.
+        expected_purge_gen=expected_purge_gen,
     )
 
 

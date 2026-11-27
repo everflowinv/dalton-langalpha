@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 import logging
 import os
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anyio
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
@@ -37,14 +37,19 @@ from src.dalton.database import user_integrations as db
 from src.dalton.database.user_integrations import (
     LocalPurgeStatus,
     PurgeLedgerRow,
+    purge_lock_key,
 )
-from src.server.contracts.status import Stopper
+from src.llms.reasoning_payload import REASONING_KWARG_KEYS
 from src.server.database.pool import get_db_connection
 from src.server.database.runs import lifecycle as run_lifecycle
+from src.server.database.runs import subagent_runs
 from src.server.services import writer_guard
 from src.server.services.runs.cancel import publish_cancel_nudge
 from src.server.services.runs.stream_writer import stream_key, stream_meta_key
 from src.server.utils.checkpoint_helpers import get_checkpointer
+
+if TYPE_CHECKING:
+    from src.dalton.services.integration_revoke import RemoteRevoker
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +255,23 @@ def _redact_context_summary_dict(cs: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _redact_reasoning_kwargs(ak: dict[str, Any]) -> None:
+    """Redact suffix AIMessage reasoning fields using ``REASONING_KWARG_KEYS`` plus ``"thinking"``.
+
+    String fields are replaced with ``PURGED_PLACEHOLDER``; structured values such as
+    ``reasoning_details`` lists are deleted outright.
+    """
+    for rkey in (*REASONING_KWARG_KEYS, "thinking"):
+        if rkey not in ak:
+            continue
+        val = ak[rkey]
+        if isinstance(val, str):
+            if val:
+                ak[rkey] = PURGED_PLACEHOLDER
+        elif val is not None:
+            ak.pop(rkey, None)
+
+
 def redact_message(
     msg: Any,
     *,
@@ -343,9 +365,7 @@ def redact_message(
                     "name": ak["function_call"].get("name", ""),
                     "arguments": PURGED_TOOL_ARGS_JSON,
                 }
-            for rkey in ("reasoning_content", "reasoning", "thinking"):
-                if ak.get(rkey):
-                    ak[rkey] = PURGED_PLACEHOLDER
+            _redact_reasoning_kwargs(ak)
             if isinstance(rm.get(COMPACTION_SUMMARY_KEY), Mapping):
                 rm[COMPACTION_SUMMARY_KEY] = _redact_context_summary_dict(
                     rm[COMPACTION_SUMMARY_KEY]
@@ -386,9 +406,7 @@ def redact_message(
             ]
         if isinstance(ak.get("tool_calls"), list):
             ak["tool_calls"] = redact_additional_kwargs_tool_calls(ak["tool_calls"])
-        for rkey in ("reasoning_content", "reasoning", "thinking"):
-            if ak.get(rkey):
-                ak[rkey] = PURGED_PLACEHOLDER
+        _redact_reasoning_kwargs(ak)
         if summary_overlaps:
             ak.pop(SIDECAR_KEY, None)
         if isinstance(rm.get(COMPACTION_SUMMARY_KEY), Mapping):
@@ -402,14 +420,49 @@ def redact_message(
     return msg, False
 
 
+def _ui_record_id(record: Any) -> str | None:
+    if isinstance(record, Mapping):
+        raw = record.get("id")
+        return str(raw) if raw is not None and str(raw) else None
+    return None
+
+
+def _collect_ui_records_from_value(value: Any) -> list[Any]:
+    if isinstance(value, _DeltaSnapshot):
+        return _collect_ui_records_from_value(value.value)
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, Mapping):
+        return [value]
+    return []
+
+
+def _is_summary_id_affected(
+    summary_id: str,
+    *,
+    affected_summary_ids: set[str],
+    pre_touch_summary_ids: set[str] | None,
+    fallback_in_suffix: bool,
+) -> bool:
+    if summary_id:
+        if summary_id in affected_summary_ids:
+            return True
+        if pre_touch_summary_ids is not None:
+            return summary_id not in pre_touch_summary_ids
+        return fallback_in_suffix
+    return fallback_in_suffix
+
+
 def redact_ui_record(
     record: Any,
     *,
     in_suffix: bool,
     affected_summary_ids: set[str],
+    pre_touch_summary_ids: set[str] | None = None,
 ) -> tuple[Any, bool]:
-    """Redact copy 3 of compaction summaries in checkpoint ``ui`` records
-    (``metadata.replaced_summary.summary_text`` and ``props.summary_text``).
+    """Redact copy 3 of compaction summaries in checkpoint ``ui`` records per entry
+    (``metadata.replaced_summary.summary_text`` and ``props.summary_text``), plus
+    text fields on suffix-born UI records while keeping pre-touch UI records intact.
     """
     if not isinstance(record, Mapping):
         return record, False
@@ -419,14 +472,17 @@ def redact_ui_record(
     props_dict = dict(props) if isinstance(props, Mapping) else None
 
     changed = False
+    sum_id = str(meta_dict.get("summary_message_id") or "") if meta_dict else ""
+
     replaced = meta_dict.get("replaced_summary") if meta_dict else None
     if isinstance(replaced, Mapping):
         rep_id = str(replaced.get("id") or "")
-        sum_id = str(meta_dict.get("summary_message_id") or "") if meta_dict else ""
-        if (
-            in_suffix
-            or (rep_id and rep_id in affected_summary_ids)
-            or (sum_id and sum_id in affected_summary_ids)
+        target_id = rep_id or sum_id
+        if _is_summary_id_affected(
+            target_id,
+            affected_summary_ids=affected_summary_ids,
+            pre_touch_summary_ids=pre_touch_summary_ids,
+            fallback_in_suffix=in_suffix,
         ):
             new_rep = dict(replaced)
             if "summary_text" in new_rep or new_rep.get("action") == "summarize":
@@ -435,13 +491,23 @@ def redact_ui_record(
                 meta_dict["replaced_summary"] = new_rep  # type: ignore[index]
                 changed = True
 
-    if props_dict is not None and "summary_text" in props_dict:
-        sum_id = str(meta_dict.get("summary_message_id") or "") if meta_dict else ""
-        if in_suffix or (sum_id and sum_id in affected_summary_ids):
-            props_dict["summary_text"] = PURGED_PLACEHOLDER
-            if "summary_length" in props_dict:
-                props_dict["summary_length"] = len(PURGED_PLACEHOLDER)
-            changed = True
+    if props_dict is not None:
+        if "summary_text" in props_dict:
+            if _is_summary_id_affected(
+                sum_id,
+                affected_summary_ids=affected_summary_ids,
+                pre_touch_summary_ids=pre_touch_summary_ids,
+                fallback_in_suffix=in_suffix,
+            ):
+                props_dict["summary_text"] = PURGED_PLACEHOLDER
+                if "summary_length" in props_dict:
+                    props_dict["summary_length"] = len(PURGED_PLACEHOLDER)
+                changed = True
+        if in_suffix:
+            for tkey in ("text", "content", "message"):
+                if isinstance(props_dict.get(tkey), str) and props_dict[tkey] != PURGED_PLACEHOLDER:
+                    props_dict[tkey] = PURGED_PLACEHOLDER
+                    changed = True
 
     if not changed:
         return record, False
@@ -548,29 +614,50 @@ def _redact_messages_container(
 def _redact_ui_container(
     value: Any,
     *,
-    in_suffix: bool,
     affected_summary_ids: set[str],
+    pre_touch_ui_ids: set[str] | None = None,
+    pre_touch_summary_ids: set[str] | None = None,
+    in_suffix: bool = False,
+    force_suffix: bool = False,
 ) -> tuple[Any, bool]:
     if isinstance(value, _DeltaSnapshot):
         inner, changed = _redact_ui_container(
             value.value,
-            in_suffix=in_suffix,
             affected_summary_ids=affected_summary_ids,
+            pre_touch_ui_ids=pre_touch_ui_ids,
+            pre_touch_summary_ids=pre_touch_summary_ids,
+            in_suffix=in_suffix,
+            force_suffix=force_suffix,
         )
         return (_DeltaSnapshot(inner), True) if changed else (value, False)
+
+    def _rec_in_suffix(rec: Any) -> bool:
+        if force_suffix:
+            return True
+        if pre_touch_ui_ids is not None:
+            rid = _ui_record_id(rec)
+            return rid is None or rid not in pre_touch_ui_ids
+        return in_suffix
+
     if isinstance(value, list):
         any_changed = False
         out = []
         for rec in value:
             r2, ch = redact_ui_record(
-                rec, in_suffix=in_suffix, affected_summary_ids=affected_summary_ids
+                rec,
+                in_suffix=_rec_in_suffix(rec),
+                affected_summary_ids=affected_summary_ids,
+                pre_touch_summary_ids=pre_touch_summary_ids,
             )
             if ch:
                 any_changed = True
             out.append(r2)
         return (out, True) if any_changed else (value, False)
     return redact_ui_record(
-        value, in_suffix=in_suffix, affected_summary_ids=affected_summary_ids
+        value,
+        in_suffix=_rec_in_suffix(value),
+        affected_summary_ids=affected_summary_ids,
+        pre_touch_summary_ids=pre_touch_summary_ids,
     )
 
 
@@ -584,9 +671,13 @@ async def _cancel_and_drain_thread(
     *,
     min_turn: int,
     max_turn: int,
-    timeout_s: float = 15.0,
+    timeout_s: float = 120.0,
 ) -> None:
-    """Broadcast cancellation to live runs/subagents on ``thread_id`` and wait for WriterGuard drain."""
+    """Stamp durable cancellation on live runs/subagents on ``thread_id`` and wait for full WriterGuard drain.
+
+    Raises on cancellation failure or drain timeout so the ledger stays ``running``
+    and the thread stays blocked until the resume loop retries.
+    """
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -602,47 +693,66 @@ async def _cancel_and_drain_thread(
 
             await cur.execute(
                 """
-                SELECT task_id, task_run_id::text AS task_run_id
-                FROM subagent_runs
-                WHERE thread_id = %s::uuid
-                  AND status IN ('in_progress', 'running')
+                SELECT sr.task_id, sr.task_run_id::text AS task_run_id
+                FROM subagent_runs sr
+                LEFT JOIN conversation_responses r
+                  ON r.conversation_response_id = sr.parent_run_id
+                WHERE sr.thread_id = %s::uuid
+                  AND sr.status IN ('in_progress', 'running')
+                  AND (
+                      r.turn_index IS NULL
+                      OR r.turn_index BETWEEN %s AND %s
+                  )
                 """,
-                (thread_id,),
+                (thread_id, min_turn, max_turn),
             )
             live_tasks = [dict(r) for r in await cur.fetchall()]
 
     for rid in live_runs:
-        try:
-            await run_lifecycle.request_cancel(rid, thread_id=thread_id, by=Stopper.SYSTEM)
-        except Exception:
-            logger.debug("[purge] request_cancel failed for run=%s", rid, exc_info=True)
+        await run_lifecycle.request_run_cancel(
+            rid, thread_id=thread_id, by="suspension"
+        )
         await publish_cancel_nudge(thread_id, rid)
 
+    active_task_ids: list[str] = []
     for task in live_tasks:
         tid_task = str(task.get("task_id") or "")
-        trid = str(task.get("task_run_id") or "") or None
+        trid = str(task.get("task_run_id") or "")
+        if trid:
+            await subagent_runs.request_task_run_cancel(trid, thread_id=thread_id)
         if tid_task:
-            await publish_cancel_nudge(thread_id, None, task_id=tid_task, task_run_id=trid)
+            active_task_ids.append(tid_task)
+            await publish_cancel_nudge(
+                thread_id, None, task_id=tid_task, task_run_id=trid or None
+            )
+    active_task_ids = sorted(set(active_task_ids))
 
     if not live_runs and not live_tasks:
         return
 
-    # Drain active WriterGuard sessions by taking and immediately releasing exclusive T(thread)
+    # Wait until exclusive T(thread) can be acquired AND no active suffix task namespace is held
     tkey = writer_guard.thread_key(thread_id)
-    deadline = time.monotonic() + max(0.5, float(timeout_s))
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
     async with get_db_connection() as lock_conn:
-        while time.monotonic() < deadline:
+        while True:
             cur = await lock_conn.execute("SELECT pg_try_advisory_lock(%s)", (tkey,))
             row = await cur.fetchone()
             if row and row[0]:
-                with anyio.CancelScope(shield=True):
-                    await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (tkey,))
-                return
-            await asyncio.sleep(0.1)
-    logger.warning(
-        "[purge] timed out waiting for writer drain on thread=%s after %.1fs",
-        thread_id,
-        timeout_s,
+                try:
+                    held = await writer_guard.held_task_namespaces(
+                        thread_id, active_task_ids
+                    )
+                finally:
+                    with anyio.CancelScope(shield=True):
+                        await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (tkey,))
+                if held is not None and len(held) == 0:
+                    return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.1, remaining))
+    raise TimeoutError(
+        f"Timed out waiting for writer drain on thread={thread_id} after {timeout_s:.1f}s"
     )
 
 
@@ -738,28 +848,21 @@ async def _purge_thread_checkpoints(
                 else:
                     pre_touch_cp_ids.add(cid)
 
-        # Determine which checkpoint_blobs versions are referenced by pre-touch vs suffix checkpoints
+        # Determine which checkpoint_blobs versions are referenced by pre-touch checkpoints
         pre_blob_versions: set[tuple[str, str, str]] = set()
-        suffix_blob_versions: set[tuple[str, str, str]] = set()
-        all_referenced_versions: set[tuple[str, str, str]] = set()
         suffix_task_namespaces = {f"task:{tid}" for tid in suffix_task_ids}
 
         for c in all_cps:
             ns = str(c["checkpoint_ns"])
             cid = str(c["checkpoint_id"])
+            if ns != "" or cid not in pre_touch_cp_ids:
+                continue
             cp_obj = c.get("checkpoint") or {}
             ch_vers = cp_obj.get("channel_versions") if isinstance(cp_obj, Mapping) else {}
             if not isinstance(ch_vers, Mapping):
                 continue
-            is_suf = (ns == "" and cid in suffix_cp_ids) or (ns in suffix_task_namespaces)
-            is_pre = ns == "" and cid in pre_touch_cp_ids
             for ch, ver in ch_vers.items():
-                key = (ns, str(ch), str(ver))
-                all_referenced_versions.add(key)
-                if is_suf:
-                    suffix_blob_versions.add(key)
-                if is_pre:
-                    pre_blob_versions.add(key)
+                pre_blob_versions.add((ns, str(ch), str(ver)))
 
         # Load writes & blobs for this thread
         await cur.execute(
@@ -786,60 +889,132 @@ async def _purge_thread_checkpoints(
         )
         blobs = [dict(r) for r in await cur.fetchall()]
 
-        # Pass 1: discover pre_touch_msg_ids and affected_summary_ids
+        # Pass 1a: collect every message id, summary id, and ui record id present in any pre-touch checkpoint
+        # (including blob versions shared between pre-touch and suffix checkpoints)
         pre_touch_msg_ids: set[str] = set()
+        pre_touch_summary_ids: set[str] = set()
+        pre_touch_ui_ids: set[str] = set()
         affected_summary_ids: set[str] = set()
 
-        def _inspect_msgs(msgs: list[Any], *, is_pre: bool, is_suf: bool) -> None:
+        def _collect_pre_msgs(msgs: list[Any]) -> None:
+            for m in msgs:
+                mid = _msg_id(m)
+                if mid:
+                    pre_touch_msg_ids.add(mid)
+                    if _is_summary_msg(m):
+                        pre_touch_summary_ids.add(mid)
+                cs_id = _context_summary_id(m)
+                if cs_id:
+                    pre_touch_summary_ids.add(cs_id)
+
+        def _collect_pre_ui(recs: list[Any]) -> None:
+            for rec in recs:
+                rid = _ui_record_id(rec)
+                if rid:
+                    pre_touch_ui_ids.add(rid)
+                if isinstance(rec, Mapping):
+                    meta = rec.get("metadata")
+                    if isinstance(meta, Mapping):
+                        sid = str(meta.get("summary_message_id") or "")
+                        if sid:
+                            pre_touch_summary_ids.add(sid)
+                        rep = meta.get("replaced_summary")
+                        if isinstance(rep, Mapping):
+                            rep_id = str(rep.get("id") or "")
+                            if rep_id:
+                                pre_touch_summary_ids.add(rep_id)
+
+        def _collect_affected_msgs(msgs: list[Any], *, force_suffix: bool) -> None:
             for m in msgs:
                 mid = _msg_id(m)
                 if _is_summary_msg(m):
-                    if is_suf or _summary_span_overlaps(m, min_turn, max_turn):
+                    if (
+                        force_suffix
+                        or _summary_span_overlaps(m, min_turn, max_turn)
+                        or (mid is not None and mid not in pre_touch_summary_ids)
+                    ):
                         if mid:
                             affected_summary_ids.add(mid)
-                    elif is_pre and mid:
-                        pre_touch_msg_ids.add(mid)
-                else:
-                    if is_pre and not is_suf and mid:
-                        pre_touch_msg_ids.add(mid)
+                cs_id = _context_summary_id(m)
+                if cs_id and (force_suffix or cs_id not in pre_touch_summary_ids):
+                    affected_summary_ids.add(cs_id)
 
+        def _collect_affected_ui(recs: list[Any], *, force_suffix: bool) -> None:
+            for rec in recs:
+                if not isinstance(rec, Mapping):
+                    continue
+                meta = rec.get("metadata")
+                if not isinstance(meta, Mapping):
+                    continue
+                sid = str(meta.get("summary_message_id") or "")
+                if sid and (force_suffix or sid not in pre_touch_summary_ids):
+                    affected_summary_ids.add(sid)
+                rep = meta.get("replaced_summary")
+                if isinstance(rep, Mapping):
+                    rep_id = str(rep.get("id") or "")
+                    if rep_id and (force_suffix or rep_id not in pre_touch_summary_ids):
+                        affected_summary_ids.add(rep_id)
+
+        decoded_writes: list[tuple[dict[str, Any], Any]] = []
         for w in writes:
-            if w["channel"] != "messages" or not w["type"] or w["type"] == "empty":
+            if not w["type"] or w["type"] == "empty":
                 continue
-            ns = str(w["checkpoint_ns"])
-            cid = str(w["checkpoint_id"])
-            is_suf = (ns == "" and cid in suffix_cp_ids) or (ns in suffix_task_namespaces)
-            is_pre = ns == "" and cid in pre_touch_cp_ids
             try:
                 val = serde.loads_typed((w["type"], bytes(w["blob"])))
             except Exception:
                 continue
-            _inspect_msgs(_collect_messages_from_value(val), is_pre=is_pre, is_suf=is_suf)
-
-        for b in blobs:
-            if b["channel"] != "messages" or not b["type"] or b["type"] == "empty":
+            decoded_writes.append((w, val))
+            ns = str(w["checkpoint_ns"])
+            cid = str(w["checkpoint_id"])
+            is_pre = ns == "" and cid in pre_touch_cp_ids
+            if not is_pre:
                 continue
-            key = (str(b["checkpoint_ns"]), str(b["channel"]), str(b["version"]))
-            is_suf = key in suffix_blob_versions
-            is_pre = key in pre_blob_versions
+            if w["channel"] == "messages":
+                _collect_pre_msgs(_collect_messages_from_value(val))
+            elif w["channel"] == "ui":
+                _collect_pre_ui(_collect_ui_records_from_value(val))
+
+        decoded_blobs: list[tuple[dict[str, Any], Any]] = []
+        for b in blobs:
+            if not b["type"] or b["type"] == "empty":
+                continue
             try:
                 val = serde.loads_typed((b["type"], bytes(b["blob"])))
             except Exception:
                 continue
-            _inspect_msgs(_collect_messages_from_value(val), is_pre=is_pre, is_suf=is_suf)
+            decoded_blobs.append((b, val))
+            key = (str(b["checkpoint_ns"]), str(b["channel"]), str(b["version"]))
+            if key not in pre_blob_versions:
+                continue
+            if b["channel"] == "messages":
+                _collect_pre_msgs(_collect_messages_from_value(val))
+            elif b["channel"] == "ui":
+                _collect_pre_ui(_collect_ui_records_from_value(val))
+
+        # Pass 1b: determine affected summary ids (span overlaps [min_turn, max_turn] OR not in pre-touch)
+        for w, val in decoded_writes:
+            ns = str(w["checkpoint_ns"])
+            force_suf = ns in suffix_task_namespaces
+            if w["channel"] == "messages":
+                _collect_affected_msgs(_collect_messages_from_value(val), force_suffix=force_suf)
+            elif w["channel"] == "ui":
+                _collect_affected_ui(_collect_ui_records_from_value(val), force_suffix=force_suf)
+
+        for b, val in decoded_blobs:
+            ns = str(b["checkpoint_ns"])
+            force_suf = ns in suffix_task_namespaces
+            if b["channel"] == "messages":
+                _collect_affected_msgs(_collect_messages_from_value(val), force_suffix=force_suf)
+            elif b["channel"] == "ui":
+                _collect_affected_ui(_collect_ui_records_from_value(val), force_suffix=force_suf)
 
         # Pass 2: rewrite checkpoint_writes
-        for w in writes:
-            if not w["type"] or w["type"] == "empty":
-                continue
+        for w, val in decoded_writes:
             ns = str(w["checkpoint_ns"])
             cid = str(w["checkpoint_id"])
             ch = str(w["channel"])
             is_suf = (ns == "" and cid in suffix_cp_ids) or (ns in suffix_task_namespaces)
-            try:
-                val = serde.loads_typed((w["type"], bytes(w["blob"])))
-            except Exception:
-                continue
+            force_suf = ns in suffix_task_namespaces
 
             changed = False
             new_val = val
@@ -850,11 +1025,15 @@ async def _purge_thread_checkpoints(
                     affected_summary_ids=affected_summary_ids,
                     min_turn=min_turn,
                     max_turn=max_turn,
-                    force_suffix=(ns in suffix_task_namespaces),
+                    force_suffix=force_suf,
                 )
             elif ch == "ui":
                 new_val, changed = _redact_ui_container(
-                    val, in_suffix=is_suf, affected_summary_ids=affected_summary_ids
+                    val,
+                    affected_summary_ids=affected_summary_ids,
+                    pre_touch_ui_ids=pre_touch_ui_ids,
+                    pre_touch_summary_ids=pre_touch_summary_ids,
+                    force_suffix=force_suf,
                 )
             elif ch == "__interrupt__" and is_suf:
                 new_val = redact_interrupt_payload(val)
@@ -884,19 +1063,12 @@ async def _purge_thread_checkpoints(
                 )
                 updated_count += 1
 
-        # Pass 3: rewrite checkpoint_blobs
-        for b in blobs:
-            if not b["type"] or b["type"] == "empty":
-                continue
+        # Pass 3: rewrite checkpoint_blobs per entry (shared versions redact only affected entries)
+        for b, val in decoded_blobs:
             ns = str(b["checkpoint_ns"])
             ch = str(b["channel"])
             ver = str(b["version"])
-            key = (ns, ch, ver)
-            is_suf = key in suffix_blob_versions
-            try:
-                val = serde.loads_typed((b["type"], bytes(b["blob"])))
-            except Exception:
-                continue
+            force_suf = ns in suffix_task_namespaces
 
             changed = False
             new_val = val
@@ -907,11 +1079,15 @@ async def _purge_thread_checkpoints(
                     affected_summary_ids=affected_summary_ids,
                     min_turn=min_turn,
                     max_turn=max_turn,
-                    force_suffix=(ns in suffix_task_namespaces),
+                    force_suffix=force_suf,
                 )
             elif ch == "ui":
                 new_val, changed = _redact_ui_container(
-                    val, in_suffix=is_suf, affected_summary_ids=affected_summary_ids
+                    val,
+                    affected_summary_ids=affected_summary_ids,
+                    pre_touch_ui_ids=pre_touch_ui_ids,
+                    pre_touch_summary_ids=pre_touch_summary_ids,
+                    force_suffix=force_suf,
                 )
 
             if changed:
@@ -1014,17 +1190,15 @@ def collect_redis_keys_for_suffix(
 async def _delete_redis_keys(keys: list[str]) -> int:
     if not keys:
         return 0
-    try:
-        from src.utils.cache.redis_cache import get_cache_client
+    from src.utils.cache.redis_cache import get_cache_client
 
-        cache = get_cache_client()
-        if not cache.enabled or not cache.client:
-            return 0
-        deleted = await cache.client.delete(*keys)
-        return int(deleted or 0)
-    except Exception:
-        logger.warning("[purge] Redis stream key cleanup failed", exc_info=True)
+    cache = get_cache_client()
+    if not cache.enabled:
         return 0
+    if not cache.client:
+        raise RuntimeError("Redis cache is enabled but client is unavailable for purge key deletion")
+    deleted = await cache.client.delete(*keys)
+    return int(deleted or 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1098,24 +1272,16 @@ async def _purge_conversation_cards_for_thread(
         for r in matched
         if r.get("rendered_locations")
     ]
-    try:
-        from src.dalton.conversations.render import (
-            render_and_write_conversation_digests,
-        )
+    from src.dalton.conversations.render import (
+        render_and_write_conversation_digests,
+    )
 
-        await render_and_write_conversation_digests(
-            [*remaining, *retracted_stubs],
-            target_dates=affected_dates,
-            user_id=user_id,
-            conn=conn,
-        )
-    except Exception:
-        logger.warning(
-            "[purge] conversation digest re-render failed for thread=%s dates=%s",
-            thread_id,
-            affected_dates,
-            exc_info=True,
-        )
+    await render_and_write_conversation_digests(
+        [*remaining, *retracted_stubs],
+        target_dates=affected_dates,
+        user_id=user_id,
+        conn=conn,
+    )
     return deleted_count
 
 
@@ -1199,14 +1365,45 @@ async def _resolve_thread_ranges(
 async def run_local_purge(
     purge_id: str,
     *,
-    cancel_drain_timeout_s: float = 15.0,
+    cancel_drain_timeout_s: float = 120.0,
+    _lock_held: bool = False,
 ) -> LocalPurgeReport:
     """Execute the 6-layer Scheme 2A local online purge for ``purge_id`` (idempotent & re-entrant).
 
-    Commits thread unblocking (``personal_purge_in_progress = FALSE`` + second
-    ``personal_purge_generation`` bump + ``purged_at = NOW()`` +
-    ``local_purge_status = 'completed'``) atomically in one ``FOR UPDATE`` transaction.
+    Acquires per-ledger advisory lock ``advisory_key('dalton_integration_purge', purge_id)``
+    unless ``_lock_held=True`` (when called via ``finish_disconnect_locked``).
+    Raises if any required layer fails so the ledger remains ``running`` and the thread
+    remains blocked until retried.
+
+    Commits thread unblocking (``personal_purge_in_progress = FALSE`` only when no other
+    running ledger still covers the thread + second ``personal_purge_generation`` bump +
+    ``purged_at = NOW()`` + ``local_purge_status = 'completed'``) atomically in one
+    ``FOR UPDATE`` transaction.
     """
+    if not _lock_held:
+        lock_key = purge_lock_key(purge_id)
+        async with get_db_connection() as lock_conn:
+            cur = await lock_conn.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+            lock_row = await cur.fetchone()
+            if not (lock_row and lock_row[0]):
+                return LocalPurgeReport(purge_id=str(purge_id), skipped=True)
+            try:
+                return await _run_local_purge_body(
+                    purge_id, cancel_drain_timeout_s=cancel_drain_timeout_s
+                )
+            finally:
+                with anyio.CancelScope(shield=True):
+                    await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+    return await _run_local_purge_body(
+        purge_id, cancel_drain_timeout_s=cancel_drain_timeout_s
+    )
+
+
+async def _run_local_purge_body(
+    purge_id: str,
+    *,
+    cancel_drain_timeout_s: float = 120.0,
+) -> LocalPurgeReport:
     report = LocalPurgeReport(purge_id=str(purge_id))
     ledger = await db.get_purge_ledger(purge_id, decrypt_revoke_token=False)
     if ledger is None:
@@ -1232,13 +1429,16 @@ async def run_local_purge(
     blobs_to_release: list[tuple[str, str]] = []
     redis_keys_to_delete: list[str] = []
 
-    checkpointer = None
-    try:
+    cp_pool = None
+    cp_serde = None
+    if target_thread_ids:
         checkpointer = get_checkpointer()
-    except Exception:
-        checkpointer = None
-    cp_pool = getattr(checkpointer, "conn", None) if checkpointer is not None else None
-    cp_serde = getattr(checkpointer, "serde", None) if checkpointer is not None else None
+        cp_pool = getattr(checkpointer, "conn", None) if checkpointer is not None else None
+        cp_serde = getattr(checkpointer, "serde", None) if checkpointer is not None else None
+        if checkpointer is None or cp_serde is None:
+            raise RuntimeError(
+                f"Checkpointer or serializer unavailable while purging purge_id={purge_id}"
+            )
 
     for tid in target_thread_ids:
         min_turn, max_turn = thread_ranges[tid]
@@ -1657,13 +1857,19 @@ async def run_local_purge(
                 )
                 await cur.execute(
                     """
-                    UPDATE conversation_threads
-                    SET personal_purge_in_progress = FALSE,
+                    UPDATE conversation_threads t
+                    SET personal_purge_in_progress = EXISTS (
+                            SELECT 1
+                            FROM dalton_integration_purge_ledger l
+                            WHERE l.local_purge_status = 'running'
+                              AND l.purge_id <> %s::uuid
+                              AND l.purged_max_turn_by_thread ? t.conversation_thread_id::text
+                        ),
                         personal_purge_generation = personal_purge_generation + 1,
                         updated_at = NOW()
-                    WHERE conversation_thread_id = ANY(%s::uuid[])
+                    WHERE t.conversation_thread_id = ANY(%s::uuid[])
                     """,
-                    (target_thread_ids,),
+                    (str(purge_id), target_thread_ids),
                 )
 
                 service_filter = (
@@ -1722,38 +1928,72 @@ async def run_local_purge(
 
 
 # ---------------------------------------------------------------------------
-# Startup resume scan (called from Dalton startup hook in setup.py)
+# Background resume loop (called from Dalton startup hook in setup.py)
 # ---------------------------------------------------------------------------
 
 
-async def run_startup_personal_purge_resume() -> list[str]:
+async def run_personal_purge_resume_once(
+    *,
+    revoker: RemoteRevoker | None = None,
+) -> list[str]:
     """Scan ``dalton_integration_purge_ledger WHERE local_purge_status = 'running'``
-    and resume each incomplete local purge on backend startup.
+    and attempt mutex-protected ``finish_disconnect_locked`` on each incomplete purge.
     """
-    from src.dalton.services.user_integrations_lifecycle import finish_disconnect
+    from src.dalton.services.user_integrations_lifecycle import finish_disconnect_locked
 
     resumed: list[str] = []
     try:
         pending = await db.list_running_local_purges()
     except Exception as exc:
         logger.warning(
-            "[purge-startup] skipped startup purge resume scan: %s", exc
+            "[purge-resume] skipped personal purge resume scan: %s", exc
         )
         return resumed
 
     for row in pending:
         try:
-            await finish_disconnect(row.purge_id, revoker=None)
-            resumed.append(row.purge_id)
+            result = await finish_disconnect_locked(row.purge_id, revoker=revoker)
+            if result is not None:
+                resumed.append(row.purge_id)
         except Exception:
             logger.warning(
-                "[purge-startup] failed to resume purge_id=%s",
+                "[purge-resume] failed to resume purge_id=%s",
                 row.purge_id,
                 exc_info=True,
             )
     if resumed:
         logger.info(
-            "[purge-startup] resumed %d incomplete personal integration purge(s)",
+            "[purge-resume] resumed %d incomplete personal integration purge(s)",
             len(resumed),
         )
     return resumed
+
+
+async def run_personal_purge_resume_loop(
+    *,
+    revoker: RemoteRevoker | None = None,
+    poll_interval_s: float = 60.0,
+) -> None:
+    """Background loop that immediately scans once at startup and retries every ``poll_interval_s``."""
+    logger.info(
+        "[purge-resume] background loop started (poll_interval_s=%.1f)",
+        poll_interval_s,
+    )
+    while True:
+        try:
+            await run_personal_purge_resume_once(revoker=revoker)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "[purge-resume] resume loop iteration failed", exc_info=True
+            )
+        await asyncio.sleep(poll_interval_s)
+
+
+async def run_startup_personal_purge_resume(
+    *,
+    revoker: RemoteRevoker | None = None,
+) -> list[str]:
+    """Run one resume scan immediately (compat wrapper around ``run_personal_purge_resume_once``)."""
+    return await run_personal_purge_resume_once(revoker=revoker)

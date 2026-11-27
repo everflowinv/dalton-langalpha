@@ -549,10 +549,7 @@ async def truncate_thread_from_turn(
 
                 # DALTON-HOOK(personal-integrations): clip personal_purged_turn_ranges to <= from_turn_index - 1
                 from src.dalton.services.purge_fence import clip_purged_ranges_on_truncate_tx
-
-                await clip_purged_ranges_on_truncate_tx(
-                    conn, conversation_thread_id, from_turn_index
-                )
+                await clip_purged_ranges_on_truncate_tx(conn, conversation_thread_id, from_turn_index)
 
                 return deleted_queries + deleted_responses
 

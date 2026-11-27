@@ -181,12 +181,8 @@ async def turns_to_index(
 
 
 async def write_turns(
-    thread_id: str,
-    rows: Sequence[IndexedTurn],
-    *,
-    read_at: datetime | None,
-    # DALTON-HOOK(personal-integrations): optional FOR SHARE dual-generation writeback fence
-    expected_purge_gen: int | None = None,
+    thread_id: str, rows: Sequence[IndexedTurn], *, read_at: datetime | None,
+    expected_purge_gen: int | None = None,  # DALTON-HOOK(personal-integrations)
 ) -> int:
     """Write each turn's row from its response, read at ``read_at``, unless
     the response is no longer the turn's current one or the row holds a read
@@ -194,19 +190,12 @@ async def write_turns(
     thread_id = normalize_uuid(thread_id)
     if thread_id is None or not rows or read_at is None:
         return 0
-    async with pool.get_db_connection() as conn:
-        async with conn.transaction():
-            # DALTON-HOOK(personal-integrations): verify thread is not purging and generation matches
-            if expected_purge_gen is not None:
-                from src.dalton.services.purge_fence import verify_writeback_fence_tx
-
-                if not await verify_writeback_fence_tx(
-                    conn, thread_id, expected_purge_gen, label="search_write_turns"
-                ):
-                    return 0
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    f"""
+    async with pool.get_db_connection() as conn, conn.transaction():  # DALTON-HOOK(personal-integrations)
+        from src.dalton.services.purge_fence import check_writeback_fence_tx
+        if not await check_writeback_fence_tx(conn, thread_id, expected_purge_gen, label="search_write_turns"): return 0
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"""
                 INSERT INTO thread_search_turns AS s (
                     conversation_thread_id, turn_index,
                     conversation_response_id, attempt_no, user_text,
@@ -263,18 +252,18 @@ async def write_turns(
                            AND (NOT s.answer_read
                                 OR s.answer_text IS DISTINCT FROM EXCLUDED.answer_text)))
                 """,
-                    {
-                        "response_ids": [row.response_id for row in rows],
-                        "user_texts": [row.user_text for row in rows],
-                        "answer_texts": [row.answer_text for row in rows],
-                        "answer_reads": [row.answer_read for row in rows],
-                        "turn_ats": [row.turn_at for row in rows],
-                        "read_at": read_at,
-                        "thread_id": thread_id,
-                        **_retry_params(),
-                    },
-                )
-                return cur.rowcount
+                {
+                    "response_ids": [row.response_id for row in rows],
+                    "user_texts": [row.user_text for row in rows],
+                    "answer_texts": [row.answer_text for row in rows],
+                    "answer_reads": [row.answer_read for row in rows],
+                    "turn_ats": [row.turn_at for row in rows],
+                    "read_at": read_at,
+                    "thread_id": thread_id,
+                    **_retry_params(),
+                },
+            )
+            return cur.rowcount
 
 
 async def due_retries(*, limit: int) -> list[StaleThread]:

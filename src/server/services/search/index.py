@@ -61,15 +61,9 @@ async def index_turns(
     indexed with its message alone and counted ``unread``; its row keeps an
     answer read before."""
     from src.server.services.history.committed import read_committed_texts
-    # DALTON-HOOK(personal-integrations): read purge generation and closed purged ranges before reading checkpoints
-    from src.dalton.services.purge_fence import (
-        is_turn_in_purged_ranges,
-        read_thread_purge_state,
-    )
-
+    # DALTON-HOOK(personal-integrations): read purge state before checkpoints and guard purged ranges
+    from src.dalton.services.purge_fence import build_guarded_search_rows, read_thread_purge_state
     purge_state = await read_thread_purge_state(thread_id)
-    expected_purge_gen = purge_state[1] if purge_state is not None else None
-    purged_ranges = purge_state[2] if purge_state is not None else []
 
     sources, read_at = await db.turns_to_index(
         thread_id, turn_indexes=turn_indexes, newest=newest
@@ -83,37 +77,12 @@ async def index_turns(
         {s.response_id: s.turn_index for s in sources},
         schedule_claims_pass=False,
     )
-    # DALTON-HOOK(personal-integrations): force empty text for turns inside personal_purged_turn_ranges and pass expected_purge_gen
-    indexed_rows = [
-        db.IndexedTurn(
-            response_id=s.response_id,
-            user_text="",
-            answer_text="",
-            answer_read=True,
-            turn_at=s.turn_at,
-        )
-        if is_turn_in_purged_ranges(s.turn_index, purged_ranges)
-        else db.IndexedTurn(
-            response_id=s.response_id,
-            user_text=""
-            if s.query_type in NOTIFICATION_QUERY_TYPES
-            else _clean(s.user_text),
-            answer_text=_clean(read.texts.get(s.response_id)),
-            answer_read=s.response_id not in read.unread,
-            turn_at=s.turn_at,
-        )
-        for s in sources
-    ]
-    write_kwargs = (
-        {"expected_purge_gen": expected_purge_gen}
-        if expected_purge_gen is not None
-        else {}
-    )
+    rows, expected_purge_gen = build_guarded_search_rows(sources, read, purge_state, _clean, NOTIFICATION_QUERY_TYPES)
     written = await db.write_turns(
         thread_id,
-        indexed_rows,
+        rows,
         read_at=read_at,
-        **write_kwargs,
+        **({"expected_purge_gen": expected_purge_gen} if expected_purge_gen is not None else {}),
     )
     return Indexed(written, len(read.unread))
 

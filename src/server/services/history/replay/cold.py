@@ -71,13 +71,7 @@ class _Writes:
     updates: list[slices_db.TurnUpdate] = field(default_factory=list)
     runs: list[slices_db.RunRow] = field(default_factory=list)
 
-    async def store(
-        self,
-        thread_id: str,
-        *,
-        # DALTON-HOOK(personal-integrations): pass expected_purge_gen to fenced slice writers
-        expected_purge_gen: int | None = None,
-    ) -> None:
+    async def store(self, thread_id: str, *, expected_purge_gen: int | None = None) -> None:  # DALTON-HOOK(personal-integrations)
         """Best effort, kind by kind: a turn that fails to store is
         projected again on the next read."""
         for kind, write, rows in (
@@ -88,14 +82,8 @@ class _Writes:
             if not rows:
                 continue
             try:
-                if expected_purge_gen is not None:
-                    await write(
-                        rows,
-                        thread_id=thread_id,
-                        expected_purge_gen=expected_purge_gen,
-                    )
-                else:
-                    await write(rows)
+                # DALTON-HOOK(personal-integrations): pass expected_purge_gen to fenced slice writers
+                await write(rows, **({"thread_id": thread_id, "expected_purge_gen": expected_purge_gen} if expected_purge_gen is not None else {}))
             except Exception:
                 logger.warning(
                     "[REPLAY] %s store failed for %s (%d rows)",
@@ -111,14 +99,7 @@ class _Pending:
     before the request returns, so a later read in it never misses its own
     writes, and the post-turn refresh and backfill still finish theirs."""
 
-    def __init__(
-        self,
-        thread_id: str,
-        *,
-        persist: bool = True,
-        # DALTON-HOOK(personal-integrations): carry expected_purge_gen to writes.store
-        expected_purge_gen: int | None = None,
-    ) -> None:
+    def __init__(self, thread_id: str, *, persist: bool = True, expected_purge_gen: int | None = None) -> None:  # DALTON-HOOK(personal-integrations)
         self._thread_id = thread_id
         self._persist = persist
         self._expected_purge_gen = expected_purge_gen
@@ -129,14 +110,7 @@ class _Pending:
         if not self._persist:
             return
         if writes.turns or writes.updates or writes.runs:
-            self._tasks.append(
-                asyncio.create_task(
-                    writes.store(
-                        self._thread_id,
-                        expected_purge_gen=self._expected_purge_gen,
-                    )
-                )
-            )
+            self._tasks.append(asyncio.create_task(writes.store(self._thread_id, expected_purge_gen=self._expected_purge_gen)))  # DALTON-HOOK(personal-integrations)
 
     async def drain(self) -> None:
         tasks, self._tasks = self._tasks, []
@@ -176,11 +150,7 @@ class _ColdRead:
         self.lane = run_lane.RunLane(reader, inputs.thread_id, inputs.run_facts)
         # DALTON-HOOK(team-sharing): pass policy.persist to _Pending
         # DALTON-HOOK(personal-integrations): pass policy.expected_purge_gen to _Pending
-        self.pending = _Pending(
-            inputs.thread_id,
-            persist=policy.persist,
-            expected_purge_gen=policy.expected_purge_gen,
-        )
+        self.pending = _Pending(inputs.thread_id, persist=policy.persist, expected_purge_gen=policy.expected_purge_gen)
         # Stale turns projected or replayed as stubs.
         self._done: set[Any] = set()
         # Slices read for turns not yet done: a batch the claims pass

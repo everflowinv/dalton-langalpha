@@ -522,6 +522,140 @@ async def verify_writeback_fence_tx(
     return True
 
 
+async def check_writeback_fence_tx(
+    conn: Any,
+    thread_id: str | None,
+    expected_purge_gen: int | None,
+    *,
+    label: str = "writeback",
+) -> bool:
+    """Thin-hook wrapper: passes immediately when no fence is requested; otherwise runs ``verify_writeback_fence_tx``."""
+    if thread_id is None or expected_purge_gen is None:
+        return True
+    return await verify_writeback_fence_tx(
+        conn, thread_id, expected_purge_gen, label=label
+    )
+
+
+async def write_many_fenced(
+    sql: str,
+    params: list[tuple[Any, ...]],
+    what: str,
+    *,
+    thread_id: str,
+    expected_purge_gen: int,
+) -> None:
+    """Fenced ``_write_many`` implementation for ``turn_slices`` / ``task_run_slices``."""
+    from psycopg.errors import ForeignKeyViolation
+    from src.server.database import pool
+
+    async with pool.get_db_connection() as conn, conn.transaction():
+        if not await verify_writeback_fence_tx(
+            conn, thread_id, expected_purge_gen, label=what
+        ):
+            return
+        async with conn.cursor() as cur:
+            try:
+                async with conn.transaction():
+                    await cur.executemany(sql, params)
+                return
+            except ForeignKeyViolation:
+                if len(params) == 1:
+                    logger.debug("%s not stored, its parent row is gone", what)
+                    return
+            for row in params:
+                try:
+                    async with conn.transaction():
+                        await cur.execute(sql, row)
+                except ForeignKeyViolation:
+                    logger.debug("%s not stored, its parent row is gone", what)
+
+
+def build_guarded_search_rows(
+    sources: Sequence[Any],
+    read: Any,
+    purge_state: tuple[bool, int, list[list[int]]] | None,
+    clean_fn: Any,
+    notification_query_types: Any = None,
+) -> tuple[list[Any], int | None]:
+    """Build ``IndexedTurn`` rows for ``index_turns`` with closed-range empty-string guard.
+
+    Turns inside ``personal_purged_turn_ranges`` are forced to empty text (``answer_read=True``);
+    turns outside are indexed normally. Returns ``(rows, expected_purge_gen)``.
+    """
+    from src.server.contracts.turn_kinds import NOTIFICATION_QUERY_TYPES
+    from src.server.database.search import index as search_db
+
+    notif_types = (
+        NOTIFICATION_QUERY_TYPES
+        if notification_query_types is None
+        else notification_query_types
+    )
+    expected_purge_gen = purge_state[1] if purge_state is not None else None
+    purged_ranges = purge_state[2] if purge_state is not None else []
+    indexed_rows = [
+        search_db.IndexedTurn(
+            response_id=s.response_id,
+            user_text="",
+            answer_text="",
+            answer_read=True,
+            turn_at=s.turn_at,
+        )
+        if is_turn_in_purged_ranges(s.turn_index, purged_ranges)
+        else search_db.IndexedTurn(
+            response_id=s.response_id,
+            user_text=""
+            if s.query_type in notif_types
+            else clean_fn(s.user_text),
+            answer_text=clean_fn(read.texts.get(s.response_id)),
+            answer_read=s.response_id not in read.unread,
+            turn_at=s.turn_at,
+        )
+        for s in sources
+    ]
+    return indexed_rows, expected_purge_gen
+
+
+async def save_transcript_with_stale_retry(
+    target: Any,
+    job: Any,
+    rendered: Any,
+    render_job: Any,
+    concurrency: int,
+) -> bool:
+    """Fenced transcript save with ``StaleCopy`` full re-render retry (called from ``transcripts._save``)."""
+    from src.server.database.thread_transcripts import StaleCopy
+
+    agent = job.agent
+    try:
+        return await save_stored_transcript_fenced(
+            agent.thread_id,
+            agent.prefix,
+            target.user_id,
+            rendered.copy,
+            rendered.blobs,
+            expected_purge_gen=job.expected_purge_gen,
+            concurrency=concurrency,
+        )
+    except StaleCopy:
+        if job.previous is None:
+            raise
+        logger.info(
+            "Transcript %s moved under its render; rendering it in full",
+            agent.directory,
+        )
+    full = await render_job(job, inline=target.inline, full=True)
+    return await save_stored_transcript_fenced(
+        agent.thread_id,
+        agent.prefix,
+        target.user_id,
+        full.copy,
+        full.blobs,
+        expected_purge_gen=job.expected_purge_gen,
+        concurrency=concurrency,
+    )
+
+
 async def _upload_and_register_blobs_tracked(
     user_id: str,
     contents: dict[str, bytes],

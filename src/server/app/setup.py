@@ -981,13 +981,9 @@ async def lifespan(app: FastAPI):
             name="dalton-startup-watchlist-reconcile",
         )
 
-    # DALTON-HOOK(personal-integrations): one-shot startup scan to resume incomplete local 2A purges
-    if is_dalton_enabled():
-        from src.dalton.services.integration_data_purge import (
-            run_startup_personal_purge_resume,
-        )
-
-        await run_startup_personal_purge_resume()
+    # DALTON-HOOK(personal-integrations): start background loop to resume incomplete local 2A purges
+    from src.dalton.services.integration_data_purge import run_personal_purge_resume_loop
+    _dalton_personal_purge_resume_task = asyncio.create_task(run_personal_purge_resume_loop(), name="dalton-personal-purge-resume") if is_dalton_enabled() else None
 
     # DALTON-HOOK(transcriptions-reconcile): start 5-minute background reconciliation loop when Dalton & ASR reconciliation are enabled
     from src.dalton.services.transcriptions import (
@@ -1084,6 +1080,10 @@ async def lifespan(app: FastAPI):
         _dalton_watchlist_reconcile_startup_task.cancel()
         await asyncio.gather(_dalton_watchlist_reconcile_startup_task, return_exceptions=True)
         _dalton_watchlist_reconcile_startup_task = None
+    # DALTON-HOOK(personal-integrations): cancel personal purge resume loop on shutdown
+    if _dalton_personal_purge_resume_task is not None:
+        _dalton_personal_purge_resume_task.cancel()
+        await asyncio.gather(_dalton_personal_purge_resume_task, return_exceptions=True)
     # DALTON-HOOK(transcriptions-reconcile): cancel periodic ASR reconciliation task on shutdown
     if _dalton_transcription_reconcile_task is not None:
         _dalton_transcription_reconcile_task.cancel()

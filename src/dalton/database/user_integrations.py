@@ -138,6 +138,11 @@ def revoke_lock_key(user_id: str, google_project: str, sub: str) -> int:
     )
 
 
+def purge_lock_key(purge_id: str | UUID) -> int:
+    """Per-ledger execution advisory lock key (mutual exclusion across workers)."""
+    return advisory_key("dalton_integration_purge", str(purge_id))
+
+
 # ---------------------------------------------------------------------------
 # Safe row dataclasses (token fields excluded from repr)
 # ---------------------------------------------------------------------------
@@ -809,6 +814,7 @@ async def insert_purge_ledger(
         if local_completed_sql == "NOW()" and remote_completed_sql == "NOW()"
         else "NULL"
     )
+    next_retry_sql = "NOW()" if remote_val == RemoteRevokeStatus.PENDING else "NULL"
 
     async with get_db_connection(conn) as db_conn:
         async with db_conn.cursor(row_factory=dict_row) as cur:
@@ -829,7 +835,7 @@ async def insert_purge_ledger(
                     %(trigger_reason)s, %(local_purge_status)s, %(purged_max_turn_by_thread)s,
                     %(tracker_reconcile_needed)s, {local_completed_sql},
                     %(remote_revoke_status)s, {token_sql},
-                    0, NULL, NULL,
+                    0, {next_retry_sql}, NULL,
                     {remote_completed_sql}, NOW(), {completed_sql}
                 )
                 RETURNING {_PURGE_LEDGER_META_COLS}
@@ -895,7 +901,7 @@ async def list_running_local_purges(*, conn: Any = None) -> list[PurgeLedgerRow]
 
 
 async def list_due_remote_revokes(*, limit: int = 50, conn: Any = None) -> list[PurgeLedgerRow]:
-    """List purge ledger entries due for remote revocation retry (``next_retry_at <= NOW()``)."""
+    """List purge ledger entries due for remote revocation retry (including initial pending rows)."""
     async with get_db_connection(conn) as db_conn:
         async with db_conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -908,10 +914,9 @@ async def list_due_remote_revokes(*, limit: int = 50, conn: Any = None) -> list[
                     AND next_retry_at <= NOW()
                 ) OR (
                     remote_revoke_status = 'pending'
-                    AND next_retry_at IS NOT NULL
-                    AND next_retry_at <= NOW()
+                    AND (next_retry_at IS NULL OR next_retry_at <= NOW())
                 )
-                ORDER BY next_retry_at ASC, disconnected_at ASC
+                ORDER BY COALESCE(next_retry_at, disconnected_at) ASC, disconnected_at ASC
                 LIMIT %s
                 """,
                 (int(limit),),

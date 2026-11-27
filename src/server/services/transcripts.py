@@ -220,35 +220,26 @@ async def _save(target: _Target, job: _Job, rendered: _Rendered) -> bool:
     save has since moved is rendered again in full."""
     from src.server.database.thread_transcripts import StaleCopy, save_stored
     from src.server.database.workspace_file_blobs import store_unregistered_blobs
-    # DALTON-HOOK(personal-integrations): delegate fenced saves to save_stored_transcript_fenced (FOR SHARE -> upload -> same tx)
-    from src.dalton.services.purge_fence import save_stored_transcript_fenced
 
     agent = job.agent
-
-    async def _persist(item: _Rendered) -> bool:
-        if job.expected_purge_gen is not None:
-            return await save_stored_transcript_fenced(
-                agent.thread_id,
-                agent.prefix,
-                target.user_id,
-                item.copy,
-                item.blobs,
-                expected_purge_gen=job.expected_purge_gen,
-                concurrency=_BLOB_UPLOAD_CONCURRENCY,
-            )
-        await store_unregistered_blobs(
-            target.user_id, item.blobs, concurrency=_BLOB_UPLOAD_CONCURRENCY
-        )
-        return await save_stored(agent.thread_id, agent.prefix, target.user_id, item.copy)
-
+    # DALTON-HOOK(personal-integrations): delegate fenced saves to save_transcript_with_stale_retry
+    if job.expected_purge_gen is not None:
+        from src.dalton.services.purge_fence import save_transcript_with_stale_retry
+        return await save_transcript_with_stale_retry(target, job, rendered, _render_job, _BLOB_UPLOAD_CONCURRENCY)
     try:
-        return await _persist(rendered)
+        await store_unregistered_blobs(
+            target.user_id, rendered.blobs, concurrency=_BLOB_UPLOAD_CONCURRENCY
+        )
+        return await save_stored(agent.thread_id, agent.prefix, target.user_id, rendered.copy)
     except StaleCopy:
         if job.previous is None:
             raise
         logger.info(f"Transcript {agent.directory} moved under its render; rendering it in full")
     full = await _render_job(job, inline=target.inline, full=True)
-    return await _persist(full)
+    await store_unregistered_blobs(
+        target.user_id, full.blobs, concurrency=_BLOB_UPLOAD_CONCURRENCY
+    )
+    return await save_stored(agent.thread_id, agent.prefix, target.user_id, full.copy)
 
 
 @dataclass
