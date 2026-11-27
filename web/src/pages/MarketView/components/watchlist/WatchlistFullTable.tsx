@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, FolderOpen, Star, Trash2 } from 'lucide-react';
+import { ArrowDown, ArrowUp, FolderOpen, RefreshCw, Star, Trash2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useLocale } from '@/hooks/useLocale';
 import { compactNumber, DASH } from '@/lib/format';
@@ -7,6 +7,7 @@ import { formatMoney, quoteCurrency } from '@/lib/bars';
 import {
   WATCHLIST_TIERS,
   type PersonalWatchlistCompany,
+  type ValuationStatus,
   type WatchlistColumnKey,
   type WatchlistMetricRow,
   type WatchlistTier,
@@ -47,6 +48,9 @@ const COL_LABEL_KEY: Record<WatchlistColumnKey, string> = {
   chg_3m: 'marketView:watchlist.columns.chg_3m',
   chg_ytd: 'marketView:watchlist.columns.chg_ytd',
   chg_1y: 'marketView:watchlist.columns.chg_1y',
+  pe_fy1: 'marketView:watchlist.columns.pe_fy1',
+  pe_fy2: 'marketView:watchlist.columns.pe_fy2',
+  eps_growth_fy2: 'marketView:watchlist.columns.eps_growth_fy2',
   range_52w: 'marketView:watchlist.columns.range_52w',
   rsi_14d: 'marketView:watchlist.columns.rsi_14d',
   rsi_30d: 'marketView:watchlist.columns.rsi_30d',
@@ -141,6 +145,12 @@ export function WatchlistFullTable({
           return m?.chg_ytd ?? null;
         case 'chg_1y':
           return m?.chg_1y ?? null;
+        case 'pe_fy1':
+          return m?.pe_fy1 ?? null;
+        case 'pe_fy2':
+          return m?.pe_fy2 ?? null;
+        case 'eps_growth_fy2':
+          return m?.eps_growth_fy2 ?? null;
         case 'range_52w':
           return m?.position_52w ?? null;
         case 'rsi_14d':
@@ -249,6 +259,152 @@ export function WatchlistFullTable({
           style={{ color: signedPctColor(val) }}
         >
           {formatSignedPct(val)}
+        </td>
+      );
+    }
+
+    if (col === 'pe_fy1' || col === 'pe_fy2' || col === 'eps_growth_fy2') {
+      const valMeta = m?.valuation;
+      const cellStatus: ValuationStatus | undefined =
+        col === 'pe_fy1'
+          ? (valMeta?.pe_fy1_status ?? valMeta?.status)
+          : col === 'pe_fy2'
+            ? (valMeta?.pe_fy2_status ?? valMeta?.status)
+            : (valMeta?.eps_growth_fy2_status ?? valMeta?.status);
+      const numVal =
+        col === 'pe_fy1'
+          ? m?.pe_fy1
+          : col === 'pe_fy2'
+            ? m?.pe_fy2
+            : m?.eps_growth_fy2;
+
+      const fyEnd = col === 'pe_fy1' ? valMeta?.fy1_end : valMeta?.fy2_end;
+      const fyMonth = fyEnd ? fyEnd.slice(0, 7) : null;
+      const providerStr = valMeta?.provider ?? '';
+      const analystsStr =
+        valMeta?.analyst_count != null
+          ? t('marketView:watchlist.valuation.analysts', { count: valMeta.analyst_count })
+          : '';
+      const metaParts = [
+        fyMonth ? t('marketView:watchlist.valuation.fyEnd', { date: fyMonth }) : '',
+        providerStr ? t('marketView:watchlist.valuation.source', { provider: providerStr }) : '',
+        analystsStr,
+      ].filter(Boolean);
+
+      if (cellStatus === 'unlisted') {
+        return (
+          <td
+            key={col}
+            data-valuation-status="unlisted"
+            title={t('marketView:watchlist.unlisted')}
+            className="px-2.5 py-2 text-right text-xs tabular-nums whitespace-nowrap"
+            style={{ color: 'var(--color-text-tertiary)' }}
+          >
+            {DASH}
+          </td>
+        );
+      }
+
+      if (cellStatus === 'loss') {
+        return (
+          <td
+            key={col}
+            data-valuation-status="loss"
+            title={[t('marketView:watchlist.valuation.lossTooltip'), ...metaParts].join(' · ')}
+            className="px-2.5 py-2 text-right text-xs tabular-nums whitespace-nowrap italic"
+            style={{ color: 'var(--color-text-tertiary)' }}
+          >
+            NM
+          </td>
+        );
+      }
+
+      if (cellStatus === 'unit_unverified') {
+        return (
+          <td
+            key={col}
+            data-valuation-status="unit_unverified"
+            title={t('marketView:watchlist.valuation.unitUnverifiedTooltip')}
+            className="px-2.5 py-2 text-right text-xs tabular-nums whitespace-nowrap"
+            style={{ color: 'var(--color-text-tertiary)' }}
+          >
+            {DASH}
+          </td>
+        );
+      }
+
+      if (cellStatus === 'rate_limited') {
+        return (
+          <td
+            key={col}
+            data-valuation-status="rate_limited"
+            title={t('marketView:watchlist.valuation.rateLimitedTooltip')}
+            className="px-2.5 py-2 text-right text-xs tabular-nums whitespace-nowrap"
+            style={{ color: 'var(--color-warning)' }}
+          >
+            <span className="inline-flex items-center gap-1 justify-end">
+              <RefreshCw className="h-3 w-3 animate-spin" />
+              <span>{t('marketView:watchlist.valuation.rateLimitedLabel')}</span>
+            </span>
+          </td>
+        );
+      }
+
+      if (cellStatus === 'no_coverage' || numVal == null) {
+        return (
+          <td
+            key={col}
+            data-valuation-status={cellStatus ?? 'no_coverage'}
+            title={
+              !valMeta && metricsLoading
+                ? t('marketView:watchlist.loading')
+                : t('marketView:watchlist.valuation.noCoverageTooltip')
+            }
+            className="px-2.5 py-2 text-right text-xs tabular-nums whitespace-nowrap"
+            style={{ color: 'var(--color-text-tertiary)' }}
+          >
+            {!valMeta && metricsLoading ? '…' : DASH}
+          </td>
+        );
+      }
+
+      const isStale = cellStatus === 'stale';
+      const formatted =
+        col === 'eps_growth_fy2'
+          ? formatSignedPct(numVal)
+          : `${numVal.toFixed(1)}x`;
+      const tooltip = [
+        ...(isStale ? [t('marketView:watchlist.valuation.staleTooltip')] : []),
+        ...metaParts,
+      ].join(' · ');
+
+      return (
+        <td
+          key={col}
+          data-valuation-status={isStale ? 'stale' : 'ok'}
+          title={tooltip || undefined}
+          className="px-2.5 py-2 text-right text-xs tabular-nums whitespace-nowrap"
+          style={{
+            color:
+              col === 'eps_growth_fy2'
+                ? signedPctColor(numVal)
+                : 'var(--color-text-primary)',
+          }}
+        >
+          <span className="inline-flex items-center gap-1 justify-end">
+            <span>{formatted}</span>
+            {isStale && (
+              <span
+                className="text-[9px] px-1 rounded"
+                style={{
+                  backgroundColor: 'var(--color-bg-elevated)',
+                  color: 'var(--color-text-tertiary)',
+                }}
+              >
+                {t('marketView:watchlist.valuation.staleBadge')}
+              </span>
+            )}
+          </span>
         </td>
       );
     }

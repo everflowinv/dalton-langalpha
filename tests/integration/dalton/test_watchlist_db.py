@@ -1202,3 +1202,52 @@ async def test_r7_reconciler_fallback_query_savepoint_commits_pause_real_pg(
                     assert row is not None
                     assert row[0] == "paused"
                     assert row[1] is None
+
+
+@pytest.mark.asyncio
+async def test_tier_policy_upsert_reset_monotonic_version_and_scope_changed_real_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real-PG Batch-2 test: upsert/reset bumps policy_version monotonically (1->2->3) and rejects stale snapshots."""
+    async with _isolated_db() as iso_dsn:
+
+        @asynccontextmanager
+        async def _connect_iso(conn: Any = None) -> Any:
+            if conn is not None:
+                yield conn
+                return
+            async with await psycopg.AsyncConnection.connect(iso_dsn) as aconn:
+                yield aconn
+
+        monkeypatch.setattr(policies_mod, "get_db_connection", _connect_iso)
+        monkeypatch.setattr(coverage_db, "get_db_connection", _connect_iso)
+
+        uid = f"u-pol-{uuid.uuid4().hex[:8]}"
+        default_core = await policies_mod.get_user_tier_policy(uid, "core")
+        assert default_core.policy_version == 1
+        assert default_core.watch_cron == policies_mod.WATCH_CRON_CORE_DEFAULT
+
+        # First custom upsert bumps policy_version 1 -> 2
+        updated = await policies_mod.upsert_tier_policy(
+            uid,
+            "core",
+            policy={
+                **default_core.to_dict(),
+                "watch_cron": "0 6-20 * * 1-5",
+                "move_threshold_pct": 6.0,
+            },
+        )
+        assert updated.policy_version == 2
+        assert updated.watch_cron == "0 6-20 * * 1-5"
+        assert updated.move_threshold_pct == 6.0
+
+        # Reset writes default values while bumping policy_version 2 -> 3 (never regresses!)
+        reset_pol = await policies_mod.reset_tier_policy_row(uid, "core")
+        assert reset_pol.policy_version == 3
+        assert reset_pol.watch_cron == policies_mod.WATCH_CRON_CORE_DEFAULT
+        assert reset_pol.move_threshold_pct == 4.0
+
+        # Re-read from Postgres confirms persisted v3
+        reloaded = await policies_mod.get_user_tier_policy(uid, "core")
+        assert reloaded.policy_version == 3
+        assert reloaded.watch_cron == policies_mod.WATCH_CRON_CORE_DEFAULT

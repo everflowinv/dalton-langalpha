@@ -1972,6 +1972,8 @@
       },
       "affectedCompanies": "受影响公司（{{count}}）",
       "affectedWorkspaces": "受影响研究工作区与任务（{{count}}）",
+      "policyDiffTitle": "策略变更前后对比",
+      "policyOff": "关闭",
       "confirm": "确认执行",
       "submitting": "执行中…",
       "decline": "取消",

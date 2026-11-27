@@ -36,6 +36,33 @@ MIN_WATCH_INTERVAL_SECONDS = 30 * 60  # 30 minutes
 MIN_DELTA_INTERVAL_SECONDS = 23 * 3600  # 23 hours (DST spring-forward safe)
 CRON_VALIDATION_HORIZON_DAYS = 370  # covers full year + DST transitions
 
+# UI & tool preset choices aligned with §5.1 / §5.2
+WATCH_CRON_PRESETS: tuple[dict[str, str], ...] = (
+    {"id": "every_30m", "cron": "*/30 6-20 * * 1-5", "label_zh": "每 30 分钟（交易日 6:00–20:00）", "label_en": "Every 30 min (Mon–Fri 6:00–20:00)"},
+    {"id": "hourly", "cron": "0 6-20 * * 1-5", "label_zh": "每小时（交易日 6:00–20:00）", "label_en": "Hourly (Mon–Fri 6:00–20:00)"},
+    {"id": "every_2h", "cron": "0 6-20/2 * * 1-5", "label_zh": "每 2 小时（交易日 6:00–20:00）", "label_en": "Every 2 hours (Mon–Fri 6:00–20:00)"},
+    {"id": "premarket_daily", "cron": "30 7 * * 1-5", "label_zh": "每日盘前一次（交易日 07:30）", "label_en": "Once pre-market (Mon–Fri 07:30)"},
+)
+
+DELTA_CRON_PRESETS: tuple[dict[str, str], ...] = (
+    {"id": "daily_trading", "cron": "0 11 * * 2-6", "label_zh": "每交易日一次（周二至周六 11:00）", "label_en": "Daily after trading (Tue–Sat 11:00)"},
+    {"id": "twice_weekly", "cron": "0 11 * * 3,6", "label_zh": "每周两次（周三、周六 11:00）", "label_en": "Twice weekly (Wed & Sat 11:00)"},
+    {"id": "weekly", "cron": "0 11 * * 6", "label_zh": "每周一次（周六 11:00）", "label_en": "Weekly (Sat 11:00)"},
+)
+
+MOVE_THRESHOLD_PRESETS: tuple[float, ...] = (4.0, 6.0, 8.0)
+
+TIER_POLICY_MUTABLE_FIELDS: tuple[str, ...] = (
+    "watch_enabled",
+    "watch_cron",
+    "delta_enabled",
+    "delta_cron",
+    "delta_timezone",
+    "move_enabled",
+    "move_threshold_pct",
+    "earnings_stages",
+)
+
 
 @dataclass(frozen=True)
 class TierPolicy:
@@ -300,6 +327,101 @@ def validate_earnings_stages(stages: Any) -> tuple[str, ...]:
     return tuple(s for s in VALID_EARNINGS_STAGES if s in raw_set)
 
 
+def validate_tier_policy_update(
+    current: TierPolicy,
+    patch: Mapping[str, Any] | None,
+) -> TierPolicy:
+    """Merge a partial policy patch onto ``current`` and run full DST-aware & range validation."""
+    if patch is None:
+        raise ValueError("执行 set_tier_policy 时必须提供至少一项策略配置。")
+    if not isinstance(patch, Mapping):
+        raise ValueError("policy 必须为策略配置对象。")
+    unknown_keys = sorted(
+        str(k)
+        for k in patch.keys()
+        if str(k) not in TIER_POLICY_MUTABLE_FIELDS
+    )
+    if unknown_keys:
+        raise ValueError(f"不支持的策略字段：{', '.join(unknown_keys)}")
+
+    def _bool_field(key: str, default: bool) -> bool:
+        if key not in patch or patch[key] is None:
+            return default
+        val = patch[key]
+        if not isinstance(val, bool):
+            raise ValueError(f"{key} 必须为布尔值（true/false）。")
+        return val
+
+    watch_enabled = _bool_field("watch_enabled", current.watch_enabled)
+    delta_enabled = _bool_field("delta_enabled", current.delta_enabled)
+    move_enabled = _bool_field("move_enabled", current.move_enabled)
+
+    raw_watch_cron = patch.get("watch_cron") if patch.get("watch_cron") is not None else current.watch_cron
+    watch_cron = validate_watch_cron(str(raw_watch_cron))
+
+    raw_delta_cron = patch.get("delta_cron") if patch.get("delta_cron") is not None else current.delta_cron
+    raw_delta_tz = (
+        patch.get("delta_timezone")
+        if patch.get("delta_timezone") is not None
+        else current.delta_timezone
+    )
+    delta_cron, delta_timezone = validate_delta_cron(str(raw_delta_cron), str(raw_delta_tz))
+
+    raw_move_pct = (
+        patch.get("move_threshold_pct")
+        if patch.get("move_threshold_pct") is not None
+        else current.move_threshold_pct
+    )
+    move_threshold_pct = validate_move_threshold_pct(raw_move_pct)
+
+    raw_stages = (
+        patch.get("earnings_stages")
+        if "earnings_stages" in patch and patch["earnings_stages"] is not None
+        else list(current.earnings_stages)
+    )
+    earnings_stages = validate_earnings_stages(raw_stages)
+
+    return TierPolicy(
+        tier=current.tier,
+        watch_enabled=watch_enabled,
+        watch_cron=watch_cron,
+        delta_enabled=delta_enabled,
+        delta_cron=delta_cron,
+        delta_timezone=delta_timezone,
+        move_enabled=move_enabled,
+        move_threshold_pct=move_threshold_pct,
+        earnings_stages=earnings_stages,
+        policy_version=current.policy_version,
+    )
+
+
+def diff_tier_policies(before: TierPolicy, after: TierPolicy) -> dict[str, Any]:
+    """Return structured before/after comparison for tier policy confirmation cards and modals."""
+    before_d = before.to_dict()
+    after_d = after.to_dict()
+    changed_fields = [
+        field
+        for field in TIER_POLICY_MUTABLE_FIELDS
+        if before_d.get(field) != after_d.get(field)
+    ]
+    return {
+        "tier": before.tier,
+        "before": before_d,
+        "after": after_d,
+        "changed_fields": changed_fields,
+    }
+
+
+def get_tier_policy_presets() -> dict[str, Any]:
+    """Return canonical preset choices for Settings UI and API metadata."""
+    return {
+        "watch_cron": [dict(p) for p in WATCH_CRON_PRESETS],
+        "delta_cron": [dict(p) for p in DELTA_CRON_PRESETS],
+        "move_threshold_pct": list(MOVE_THRESHOLD_PRESETS),
+        "earnings_stages": list(VALID_EARNINGS_STAGES),
+    }
+
+
 def default_tier_policies_yaml_dict() -> dict[str, dict[str, Any]]:
     """Return canonical dict of the 3 default tier policies for YAML serialization."""
     return {
@@ -401,6 +523,96 @@ async def get_user_tier_policy(
         return _UNKNOWN_TIER_DISABLED_POLICY
     policies = await get_user_tier_policies(user_id, conn=conn)
     return policies.get(norm, get_default_tier_policy(norm))
+
+
+async def upsert_tier_policy(
+    user_id: str,
+    tier: str,
+    *,
+    policy: TierPolicy | Mapping[str, Any],
+    conn: Any = None,
+) -> TierPolicy:
+    """Persist ``policy`` for ``(user_id, tier)`` and monotonically bump ``policy_version``.
+
+    First custom write inserts ``policy_version = 2`` (strictly above default ``1``);
+    subsequent writes and resets increment ``policy_version = policy_version + 1`` so
+    outbox reconciler version checks never regress.
+    """
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise ValueError("user_id is required")
+    norm_tier = normalize_tier(tier)
+
+    if isinstance(policy, TierPolicy):
+        validated = validate_tier_policy_update(
+            get_default_tier_policy(norm_tier),
+            {k: policy.to_dict()[k] for k in TIER_POLICY_MUTABLE_FIELDS},
+        )
+    else:
+        validated = validate_tier_policy_update(get_default_tier_policy(norm_tier), policy)
+
+    stages_json = json.dumps(list(validated.earnings_stages), ensure_ascii=False)
+
+    async def _run(c: Any) -> TierPolicy:
+        async with c.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                INSERT INTO dalton_watchlist_tier_policies (
+                    user_id, tier, watch_enabled, watch_cron,
+                    delta_enabled, delta_cron, delta_timezone,
+                    move_enabled, move_threshold_pct, earnings_stages,
+                    policy_version, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, 2, NOW())
+                ON CONFLICT (user_id, tier) DO UPDATE
+                SET watch_enabled = EXCLUDED.watch_enabled,
+                    watch_cron = EXCLUDED.watch_cron,
+                    delta_enabled = EXCLUDED.delta_enabled,
+                    delta_cron = EXCLUDED.delta_cron,
+                    delta_timezone = EXCLUDED.delta_timezone,
+                    move_enabled = EXCLUDED.move_enabled,
+                    move_threshold_pct = EXCLUDED.move_threshold_pct,
+                    earnings_stages = EXCLUDED.earnings_stages,
+                    policy_version = dalton_watchlist_tier_policies.policy_version + 1,
+                    updated_at = NOW()
+                RETURNING
+                    user_id, tier, watch_enabled, watch_cron,
+                    delta_enabled, delta_cron, delta_timezone,
+                    move_enabled, move_threshold_pct, earnings_stages,
+                    policy_version, updated_at
+                """,
+                (
+                    uid,
+                    norm_tier,
+                    bool(validated.watch_enabled),
+                    validated.watch_cron,
+                    bool(validated.delta_enabled),
+                    validated.delta_cron,
+                    validated.delta_timezone,
+                    bool(validated.move_enabled),
+                    float(validated.move_threshold_pct),
+                    stages_json,
+                ),
+            )
+            row = await cur.fetchone()
+            return policy_from_mapping(norm_tier, row)
+
+    if conn is not None:
+        return await _run(conn)
+    async with get_db_connection() as c, c.transaction():
+        return await _run(c)
+
+
+async def reset_tier_policy_row(
+    user_id: str,
+    tier: str,
+    *,
+    conn: Any = None,
+) -> TierPolicy:
+    """Reset ``(user_id, tier)`` back to default settings while bumping ``policy_version``."""
+    norm_tier = normalize_tier(tier)
+    default_pol = get_default_tier_policy(norm_tier)
+    return await upsert_tier_policy(user_id, norm_tier, policy=default_pol, conn=conn)
 
 
 def _normalize_reconcile_job_row(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -1103,6 +1315,7 @@ __all__ = [
     "DEFAULT_OUTBOX_LEASE_SECONDS",
     "DEFAULT_TIER_POLICIES",
     "DELTA_CRON_CORE_DEFAULT",
+    "DELTA_CRON_PRESETS",
     "DELTA_CRON_RADAR_TEMPLATE",
     "DELTA_CRON_WATCH_DEFAULT",
     "DELTA_TIMEZONE_DEFAULT",
@@ -1110,8 +1323,11 @@ __all__ = [
     "MIN_WATCH_INTERVAL_SECONDS",
     "MOVE_THRESHOLD_MAX_PCT",
     "MOVE_THRESHOLD_MIN_PCT",
+    "MOVE_THRESHOLD_PRESETS",
+    "TIER_POLICY_MUTABLE_FIELDS",
     "TierPolicy",
     "WATCH_CRON_CORE_DEFAULT",
+    "WATCH_CRON_PRESETS",
     "WATCH_CRON_RADAR_TEMPLATE",
     "WATCH_CRON_WATCH_DEFAULT",
     "bump_user_roster_revision",
@@ -1119,9 +1335,11 @@ __all__ = [
     "claim_unfinished_reconcile_jobs_for_startup",
     "consume_confirm_snapshot",
     "default_tier_policies_yaml_dict",
+    "diff_tier_policies",
     "get_confirm_snapshot",
     "get_default_tier_policy",
     "get_reconcile_job",
+    "get_tier_policy_presets",
     "get_user_roster_state",
     "get_user_tier_policies",
     "get_user_tier_policy",
@@ -1132,10 +1350,13 @@ __all__ = [
     "policy_from_mapping",
     "record_yaml_synced_revision",
     "renew_reconcile_job_lease",
+    "reset_tier_policy_row",
     "resolve_effective_company_policy",
     "update_reconcile_job_progress",
+    "upsert_tier_policy",
     "validate_delta_cron",
     "validate_earnings_stages",
     "validate_move_threshold_pct",
+    "validate_tier_policy_update",
     "validate_watch_cron",
 ]

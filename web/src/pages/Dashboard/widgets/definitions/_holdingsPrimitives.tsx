@@ -16,6 +16,7 @@ import {
   ContextMenuTrigger,
   ContextMenuContent,
   ContextMenuItem,
+  ContextMenuSeparator, // DALTON-HOOK(watchlist)
 } from '@/components/ui/context-menu';
 import { TermChange, TermKV } from '@/pages/ChatAgent/components/charts/TermCard';
 import type { WatchlistRow } from '../../hooks/useWatchlistData';
@@ -87,9 +88,11 @@ interface WatchlistRowItemProps {
   onDelete?: (id: string) => void;
   /** The row's paperclip, set at the end of the symbol's cell. */
   attach?: ReactNode;
+  /** Optional extra context-menu items (DALTON-HOOK(watchlist)). */
+  extraMenuItems?: ReactNode;
 }
 
-export function WatchlistRowItem({ item, marketStatus, onDelete, attach }: WatchlistRowItemProps) {
+export function WatchlistRowItem({ item, marketStatus, onDelete, attach, extraMenuItems }: WatchlistRowItemProps) {
   const { t } = useTranslation();
   const locale = useLocale();
   const navigate = useNavigate();
@@ -148,15 +151,20 @@ export function WatchlistRowItem({ item, marketStatus, onDelete, attach }: Watch
     </motion.tr>
   );
 
-  if (hasId) {
+  // DALTON-HOOK(watchlist): allow extra context-menu items (e.g. one-click add to personal watchlist)
+  if (hasId || extraMenuItems) {
     return (
       <ContextMenu>
         <ContextMenuTrigger asChild>{row}</ContextMenuTrigger>
         <ContextMenuContent>
-          <ContextMenuItem variant="destructive" onSelect={() => onDelete?.(String(item.watchlist_item_id))}>
-            <Trash2 className="h-3.5 w-3.5" />
-            {t('dashboard:widgets.holdings.delete')}
-          </ContextMenuItem>
+          {extraMenuItems}
+          {extraMenuItems && hasId && <ContextMenuSeparator />}
+          {hasId && (
+            <ContextMenuItem variant="destructive" onSelect={() => onDelete?.(String(item.watchlist_item_id))}>
+              <Trash2 className="h-3.5 w-3.5" />
+              {t('dashboard:widgets.holdings.delete')}
+            </ContextMenuItem>
+          )}
         </ContextMenuContent>
       </ContextMenu>
     );
@@ -172,6 +180,8 @@ interface PortfolioRowItemProps {
   onDelete?: (id: string) => void;
   /** The row's paperclip, set at the end of the symbol's cell. */
   attach?: ReactNode;
+  /** Optional extra context-menu items (DALTON-HOOK(watchlist)). */
+  extraMenuItems?: ReactNode;
 }
 
 export function PortfolioRowItem({
@@ -181,6 +191,7 @@ export function PortfolioRowItem({
   onEdit,
   onDelete,
   attach,
+  extraMenuItems,
 }: PortfolioRowItemProps) {
   const { t } = useTranslation();
   const locale = useLocale();
@@ -251,19 +262,26 @@ export function PortfolioRowItem({
     </motion.tr>
   );
 
-  if (hasId) {
+  // DALTON-HOOK(watchlist): allow extra context-menu items on portfolio rows
+  if (hasId || extraMenuItems) {
     return (
       <ContextMenu>
         <ContextMenuTrigger asChild>{row}</ContextMenuTrigger>
         <ContextMenuContent>
-          <ContextMenuItem onSelect={() => onEdit?.(item)}>
-            <Pencil className="h-3.5 w-3.5" />
-            {t('dashboard:widgets.holdings.edit')}
-          </ContextMenuItem>
-          <ContextMenuItem variant="destructive" onSelect={() => onDelete?.(String(item.user_portfolio_id))}>
-            <Trash2 className="h-3.5 w-3.5" />
-            {t('dashboard:widgets.holdings.delete')}
-          </ContextMenuItem>
+          {extraMenuItems}
+          {extraMenuItems && hasId && <ContextMenuSeparator />}
+          {hasId && (
+            <>
+              <ContextMenuItem onSelect={() => onEdit?.(item)}>
+                <Pencil className="h-3.5 w-3.5" />
+                {t('dashboard:widgets.holdings.edit')}
+              </ContextMenuItem>
+              <ContextMenuItem variant="destructive" onSelect={() => onDelete?.(String(item.user_portfolio_id))}>
+                <Trash2 className="h-3.5 w-3.5" />
+                {t('dashboard:widgets.holdings.delete')}
+              </ContextMenuItem>
+            </>
+          )}
         </ContextMenuContent>
       </ContextMenu>
     );

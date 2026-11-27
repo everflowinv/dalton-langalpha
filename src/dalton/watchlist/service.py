@@ -31,9 +31,11 @@ from src.dalton.coverage.service import (
 from src.dalton.database import coverage as coverage_db
 from src.dalton.watchlist.pause_guards import is_earnings_task_allowed_for_stages
 from src.dalton.watchlist.policies import (
+    TIER_POLICY_MUTABLE_FIELDS,
     TierPolicy,
     bump_user_roster_revision,
     consume_confirm_snapshot,
+    diff_tier_policies,
     get_confirm_snapshot,
     get_default_tier_policy,
     get_user_roster_state,
@@ -41,6 +43,8 @@ from src.dalton.watchlist.policies import (
     insert_confirm_snapshot,
     insert_reconcile_job,
     resolve_effective_company_policy,
+    upsert_tier_policy,
+    validate_tier_policy_update,
 )
 from src.dalton.watchlist.reconciler import (
     STANDARD_TASK_SUFFIXES,
@@ -256,18 +260,43 @@ def _estimate_workspace_task_changes(
                 }
             )
         elif status_now == "active":
-            old_cron = existing.get("cron_expression")
-            new_cron = spec.get("cron_expression")
-            if old_cron != new_cron or old_tier != new_tier:
-                counts["update_count"] += 1
-                changes.append(
-                    {
-                        "name": s_name,
-                        "change": "update",
-                        "old_cron": old_cron,
-                        "new_cron": new_cron,
-                    }
-                )
+            is_price = str(spec.get("trigger_type") or "").strip().lower() == "price"
+            if is_price:
+                old_cfg = existing.get("trigger_config") if isinstance(existing.get("trigger_config"), Mapping) else {}
+                old_conds = old_cfg.get("conditions") if isinstance(old_cfg.get("conditions"), list) else []
+                old_val = old_conds[0].get("value") if old_conds and isinstance(old_conds[0], Mapping) else None
+                new_cfg = spec.get("trigger_config") if isinstance(spec.get("trigger_config"), Mapping) else {}
+                new_conds = new_cfg.get("conditions") if isinstance(new_cfg.get("conditions"), list) else []
+                new_val = new_conds[0].get("value") if new_conds and isinstance(new_conds[0], Mapping) else None
+                old_num = round(float(old_val), 2) if isinstance(old_val, (int, float)) else None
+                new_num = round(float(new_val), 2) if isinstance(new_val, (int, float)) else None
+                if old_num != new_num or old_tier != new_tier:
+                    counts["update_count"] += 1
+                    changes.append(
+                        {
+                            "name": s_name,
+                            "change": "update",
+                            "old_threshold_pct": abs(old_num) if old_num is not None else None,
+                            "new_threshold_pct": abs(new_num) if new_num is not None else None,
+                        }
+                    )
+            else:
+                old_cron = existing.get("cron_expression")
+                new_cron = spec.get("cron_expression")
+                old_tz = existing.get("timezone")
+                new_tz = spec.get("timezone")
+                if old_cron != new_cron or (new_tz and old_tz != new_tz) or old_tier != new_tier:
+                    counts["update_count"] += 1
+                    changes.append(
+                        {
+                            "name": s_name,
+                            "change": "update",
+                            "old_cron": old_cron,
+                            "new_cron": new_cron,
+                            "old_timezone": old_tz,
+                            "new_timezone": new_tz,
+                        }
+                    )
 
     # Preview future earnings stage pauses using the same shared rules as reconciler
     allowed_stages = set(new_policy.earnings_stages)
@@ -378,6 +407,7 @@ class WatchlistMutationService:
         action: str,
         tickers: Sequence[str] | str | None = None,
         tier: str | None = None,
+        policy: Mapping[str, Any] | None = None,
         label: str | None = None,
         criteria: Mapping[str, Any] | None = None,
         default_tier: str | None = None,
@@ -436,6 +466,10 @@ class WatchlistMutationService:
         resolved_group_id: str | None = None
         resolved_group_label: str | None = None
         resolved_criteria: dict[str, Any] = dict(criteria or {})
+        before_tier_policy: TierPolicy | None = None
+        proposed_tier_policy: TierPolicy | None = None
+        policy_diff: dict[str, Any] | None = None
+        policies_for_preview: dict[str, TierPolicy] = dict(policies)
 
         resolve_membership_delta: dict[str, list[str]] | None = None
         if act == "add":
@@ -566,6 +600,24 @@ class WatchlistMutationService:
                 if c.get("ticker")
             }
 
+        elif act in ("set_tier_policy", "reset_tier_policy"):
+            if not str(tier or "").strip():
+                raise ValueError(f"执行 {act} 时必须指定 tier（core / watch / radar）。")
+            target_tier = normalize_tier(tier)
+            before_tier_policy = policies.get(target_tier, get_default_tier_policy(target_tier))
+            if act == "set_tier_policy":
+                proposed_tier_policy = validate_tier_policy_update(before_tier_policy, policy)
+            else:
+                proposed_tier_policy = get_default_tier_policy(target_tier)
+            policy_diff = diff_tier_policies(before_tier_policy, proposed_tier_policy)
+            policies_for_preview[target_tier] = proposed_tier_policy
+            norm_tickers = sorted(
+                sym
+                for sym, row in existing_by_ticker.items()
+                if str(row.get("tier") or "").strip().lower() == target_tier
+            )
+            raw_tickers = list(norm_tickers)
+
         else:
             raise ValueError(f"Unsupported watchlist mutation action: {action!r}")
 
@@ -644,7 +696,9 @@ class WatchlistMutationService:
                     )
                 eff_pol = (
                     resolve_effective_company_policy(
-                        policies.get(eff_new_tier, get_default_tier_policy(eff_new_tier)),
+                        policies_for_preview.get(
+                            eff_new_tier, get_default_tier_policy(eff_new_tier)
+                        ),
                         row.get("task_overrides") if row is not None else None,
                     )
                     if eff_new_tier is not None
@@ -717,6 +771,9 @@ class WatchlistMutationService:
         elif act in ("remove", "remove_group"):
             confirm_action_type = "watchlist_remove"
             requires_confirmation = True
+        elif act in ("set_tier_policy", "reset_tier_policy"):
+            confirm_action_type = "watchlist_tier_policy"
+            requires_confirmation = True
 
         # Human-readable card copy
         if confirm_action_type == "watchlist_batch_add":
@@ -752,6 +809,21 @@ class WatchlistMutationService:
                     f"移除 {', '.join(norm_tickers[:5])}{' 等' if len(norm_tickers) > 5 else ''}；"
                     "研究工作区与历史文档完整保留，关联受管定时任务及待执行财报任务同步暂停。"
                 )
+        elif confirm_action_type == "watchlist_tier_policy":
+            tier_lbl = TIER_DISPLAY_ZH.get(target_tier or "watch", target_tier or "watch")
+            changed_n = len((policy_diff or {}).get("changed_fields") or [])
+            if act == "reset_tier_policy":
+                card_title = f"确认恢复 {tier_lbl} 默认监控策略"
+                card_description = (
+                    f"将 {tier_lbl} 监控策略恢复为默认值，"
+                    f"覆盖 {len(norm_tickers)} 家公司、影响 {len(affected_workspaces)} 个已有研究工作区的受管任务。"
+                )
+            else:
+                card_title = f"确认修改 {tier_lbl} 监控策略"
+                card_description = (
+                    f"更新 {tier_lbl} 监控策略（变更 {changed_n} 项配置），"
+                    f"覆盖 {len(norm_tickers)} 家公司、影响 {len(affected_workspaces)} 个已有研究工作区的受管任务。"
+                )
         else:
             card_title = ""
             card_description = ""
@@ -773,10 +845,17 @@ class WatchlistMutationService:
                 "override_user_pause": bool(override_user_pause),
                 "expected_roster_hash": expected_roster_hash,
                 "expected_policy_versions": dict(expected_policy_versions),
+                "expected_policy_version": (
+                    before_tier_policy.policy_version if before_tier_policy is not None else None
+                ),
                 "expected_pause_versions": dict(expected_pause_versions),
                 "roster_revision": roster_revision,
                 "prevalidated": prevalidated if act in ("add", "add_group") else None,
                 "resolve_membership_delta": resolve_membership_delta if act == "resolve_group" else None,
+                "proposed_policy": (
+                    proposed_tier_policy.to_dict() if proposed_tier_policy is not None else None
+                ),
+                "policy_diff": policy_diff,
             }
             snapshot_id = await insert_confirm_snapshot(uid, server_snapshot_payload)
 
@@ -794,6 +873,9 @@ class WatchlistMutationService:
             "target_tier": target_tier,
             "not_found": not_found,
             "expected_roster_hash": expected_roster_hash,
+            "expected_policy_version": (
+                before_tier_policy.policy_version if before_tier_policy is not None else None
+            ),
             "expected_policy_versions": expected_policy_versions,
             "expected_pause_versions": expected_pause_versions,
             "affected_tickers": affected_tickers,
@@ -806,6 +888,9 @@ class WatchlistMutationService:
             "auto_refresh": bool(auto_refresh) if act == "add_group" else None,
             "prevalidated": prevalidated if act in ("add", "add_group") else None,
             "resolve_membership_delta": resolve_membership_delta if act == "resolve_group" else None,
+            "before_policy": before_tier_policy.to_dict() if before_tier_policy is not None else None,
+            "after_policy": proposed_tier_policy.to_dict() if proposed_tier_policy is not None else None,
+            "policy_diff": policy_diff,
             "card_title": card_title,
             "card_description": card_description,
             "preserve_workspace_notice": (
@@ -823,6 +908,9 @@ class WatchlistMutationService:
         snapshot_id: str | None = None,
         tickers: Sequence[str] | str | None = None,
         tier: str | None = None,
+        policy: Mapping[str, Any] | None = None,
+        expected_policy_version: int | None = None,
+        expected_roster_hash: str | None = None,
         source: str = "chat",
         label: str | None = None,
         criteria: Mapping[str, Any] | None = None,
@@ -1071,7 +1159,15 @@ class WatchlistMutationService:
                 ),
             }
 
-        if act not in ("add", "add_group", "set_tier", "remove", "remove_group"):
+        if act not in (
+            "add",
+            "add_group",
+            "set_tier",
+            "remove",
+            "remove_group",
+            "set_tier_policy",
+            "reset_tier_policy",
+        ):
             raise ValueError(f"Unsupported watchlist mutation action: {action!r}")
 
         caller_raw_tickers = normalize_tickers_input(tickers)
@@ -1162,6 +1258,8 @@ class WatchlistMutationService:
             eff_auto_refresh: bool = True
             eff_override_pause: bool = False
             eff_valid_items: list[dict[str, Any]] = []
+            eff_proposed_policy: dict[str, Any] | None = None
+            eff_policy_diff: dict[str, Any] | None = None
 
             if clean_snapshot_id is not None:
                 snap_row = await get_confirm_snapshot(
@@ -1237,6 +1335,32 @@ class WatchlistMutationService:
                             raise WatchlistScopeChangedError()
                     if caller_label and caller_label.lower() != snap_glabel.lower():
                         raise WatchlistScopeChangedError()
+                if act in ("set_tier_policy", "reset_tier_policy"):
+                    if snap_tier not in VALID_TIERS:
+                        raise WatchlistScopeChangedError()
+                    snap_prop_pol = snap.get("proposed_policy")
+                    if not isinstance(snap_prop_pol, Mapping):
+                        raise WatchlistScopeChangedError()
+                    if expected_policy_version is not None:
+                        snap_exp_pv = snap.get("expected_policy_version")
+                        if snap_exp_pv is not None and int(expected_policy_version) != int(snap_exp_pv):
+                            raise WatchlistScopeChangedError()
+                    if expected_roster_hash is not None and str(expected_roster_hash).strip():
+                        if str(expected_roster_hash).strip() != str(snap.get("expected_roster_hash") or ""):
+                            raise WatchlistScopeChangedError()
+                    if policy is not None:
+                        if not isinstance(policy, Mapping):
+                            raise WatchlistScopeChangedError()
+                        for pk, pv in policy.items():
+                            if pk in TIER_POLICY_MUTABLE_FIELDS and pv is not None:
+                                if pk == "earnings_stages":
+                                    if list(pv) != list(snap_prop_pol.get(pk) or []):
+                                        raise WatchlistScopeChangedError()
+                                elif pk == "move_threshold_pct":
+                                    if round(float(pv), 2) != round(float(snap_prop_pol.get(pk) or 0), 2):
+                                        raise WatchlistScopeChangedError()
+                                elif pv != snap_prop_pol.get(pk):
+                                    raise WatchlistScopeChangedError()
 
                 # Check roster revision, policy versions, roster+owner hash, group deletion set, pause versions
                 if int(snap.get("roster_revision", 0)) != live_roster_rev:
@@ -1255,6 +1379,14 @@ class WatchlistMutationService:
                 exp_hash = snap.get("expected_roster_hash")
                 if not isinstance(exp_hash, str) or not exp_hash:
                     raise WatchlistScopeChangedError()
+                if act in ("set_tier_policy", "reset_tier_policy"):
+                    live_tier_tickers = sorted(
+                        sym
+                        for sym, row in live_by_ticker.items()
+                        if str(row.get("tier") or "").strip().lower() == snap_tier
+                    )
+                    if live_tier_tickers != sorted(snap_tickers):
+                        raise WatchlistScopeChangedError()
                 live_ws_map, live_ws_owners = await _resolve_ws_map_and_owners(
                     uid, snap_tickers, live_by_ticker, owned_ws=owned_ws, conn=conn
                 )
@@ -1319,6 +1451,16 @@ class WatchlistMutationService:
                 eff_criteria = snap_criteria
                 eff_auto_refresh = snap_auto_refresh
                 eff_override_pause = snap_override
+                eff_proposed_policy = (
+                    dict(snap["proposed_policy"])
+                    if isinstance(snap.get("proposed_policy"), Mapping)
+                    else None
+                )
+                eff_policy_diff = (
+                    dict(snap["policy_diff"])
+                    if isinstance(snap.get("policy_diff"), Mapping)
+                    else None
+                )
                 snap_preval = snap.get("prevalidated")
                 if isinstance(snap_preval, Mapping):
                     for sym in eff_norm_tickers:
@@ -1560,6 +1702,27 @@ class WatchlistMutationService:
                 res_payload = {
                     "ok": bool(del_res.get("deleted")),
                     **del_res,
+                }
+
+            elif act in ("set_tier_policy", "reset_tier_policy"):
+                assert eff_tier is not None and eff_proposed_policy is not None
+                before_pol = live_policies.get(eff_tier, get_default_tier_policy(eff_tier))
+                updated_pol = await upsert_tier_policy(
+                    uid,
+                    eff_tier,
+                    policy=eff_proposed_policy,
+                    conn=conn,
+                )
+                target_versions[eff_tier] = updated_pol.policy_version
+                pending_reconcile_tickers = list(eff_norm_tickers)
+                res_payload = {
+                    "ok": True,
+                    "action": act,
+                    "tier": eff_tier,
+                    "policy": updated_pol.to_dict(),
+                    "before_policy": before_pol.to_dict(),
+                    "policy_diff": eff_policy_diff or diff_tier_policies(before_pol, updated_pol),
+                    "affected_tickers": list(eff_norm_tickers),
                 }
 
             # Bump monotonic roster revision & insert outbox record in the SAME transaction

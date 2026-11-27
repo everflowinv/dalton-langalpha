@@ -96,7 +96,8 @@ export const SECTIONS = {
   server: { labelKey: 'settings:section.server', descKey: 'settings:definition.server', icon: ServerCog, selfHostedOnly: true },
   budget: { labelKey: 'settings:section.budget', descKey: 'settings:sectionDesc.budget', icon: Wallet },
   integrations: { labelKey: 'settings:section.integrations', descKey: 'settings:sectionDesc.integrations', icon: Plug },
-  coverage: { labelKey: 'settings:section.coverage', descKey: 'settings:sectionDesc.coverage', icon: Layers, coverageUnitsOnly: true },
+  // DALTON-HOOK(watchlist): Personal tier monitoring policies are always available in Coverage section (Everflow & Core)
+  coverage: { labelKey: 'settings:section.coverage', descKey: 'settings:sectionDesc.coverage', icon: Layers },
   // Team Management settings
   teamModels: { labelKey: 'settings:section.teamModels', descKey: 'settings:sectionDesc.teamModels', icon: ServerCog, minTier: 'admin' },
   teamMembers: { labelKey: 'settings:section.teamMembers', descKey: 'settings:sectionDesc.teamMembers', icon: Users, minTier: 'internal', daltonAuthOnly: true },
@@ -301,7 +302,9 @@ export const SETTINGS = {
   // DALTON-HOOK(settings-reorg): match runtime platform-only visibility in search & palette
   connectedApps: { section: 'integrations', anchor: 'connected-apps', labelKey: 'settings:integrations.connectedApps', descKey: 'settings:integrations.connectedAppsDesc', visibleWhen: () => isPlatformMode },
 
-  daltonCoverage: { section: 'coverage', anchor: 'dalton-coverage', labelKey: 'settings:dalton.coverageLabel', descKey: 'settings:dalton.coverageDesc', keywords: '覆盖结构 行业 独立公司 绑定工作区 未归类工作区 coverage sector company' },
+  // DALTON-HOOK(watchlist): Personal watchlist tier policies (#dalton-tier-policies) & colleague_sharing-gated team coverage units
+  daltonTierPolicies: { section: 'coverage', anchor: 'dalton-tier-policies', labelKey: 'settings:dalton.tierPoliciesLabel', descKey: 'settings:dalton.tierPoliciesDesc', keywords: '各档监控策略 关注列表 核心 跟踪 雷达 盘中盯盘 论点增量 涨跌异动 财报写稿 tier policy watchlist core watch radar cron' },
+  daltonCoverage: { section: 'coverage', anchor: 'dalton-coverage', labelKey: 'settings:dalton.coverageLabel', descKey: 'settings:dalton.coverageDesc', keywords: '覆盖结构 行业 独立公司 绑定工作区 未归类工作区 coverage sector company', capability: 'colleague_sharing', visibleWhen: (ctx) => ctx?.coverageUnitsEnabled === true },
 
   // DALTON-HOOK(team-model-catalog): register team model catalog card in Team Management -> Models & Providers
   daltonTeamModelCatalog: { section: 'teamModels', anchor: 'dalton-team-model-catalog', labelKey: 'settings:dalton.teamCatalogLabel', descKey: 'settings:dalton.teamCatalogDesc', keywords: '团队模型目录 新增模型 模型价格 评分 退役 回滚 供应商变体 team model catalog pricing ratings retire rollback provider variant' },

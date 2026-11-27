@@ -12,6 +12,10 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from src.dalton.database import coverage as coverage_db
+from src.dalton.watchlist.consensus import (
+    WatchlistConsensusAdapter,
+    _clear_consensus_cache_for_tests,
+)
 from src.dalton.watchlist.indicators import compute_symbol_metrics
 
 logger = logging.getLogger(__name__)
@@ -40,6 +44,7 @@ def _clear_metrics_cache_for_tests() -> None:
     _MARKET_CAP_CACHE.clear()
     _INFLIGHT_BARS.clear()
     _INFLIGHT_MCAP.clear()
+    _clear_consensus_cache_for_tests()
 
 
 def _bars_cache_key(
@@ -422,7 +427,10 @@ def _build_full_roster_summary(
 
 
 class WatchlistMetricsService:
-    """Compute Batch-1 metrics for a user's personal watchlist (works on Standalone Core)."""
+    """Compute metrics + consensus valuation for a user's personal watchlist (works on Standalone Core)."""
+
+    def __init__(self, consensus_adapter: WatchlistConsensusAdapter | None = None) -> None:
+        self._consensus = consensus_adapter or WatchlistConsensusAdapter()
 
     async def get_metrics_for_user(
         self,
@@ -430,6 +438,7 @@ class WatchlistMetricsService:
         *,
         symbols: Sequence[str] | None = None,
         wait_for_cold: bool = False,
+        include_valuation: bool = True,
     ) -> dict[str, Any]:
         uid = str(user_id or "").strip()
         if not uid:
@@ -457,6 +466,13 @@ class WatchlistMetricsService:
         for sym in requested:
             row = rows_by_ticker.get(sym)
             if row is not None and bool(row.get("is_private", False)):
+                unlisted_val = (
+                    await self._consensus.get_valuation(
+                        sym, latest_price=None, coverage_row=row, is_private=True
+                    )
+                    if include_valuation
+                    else None
+                )
                 items[sym] = {
                     "ticker": sym,
                     "is_private": True,
@@ -477,6 +493,10 @@ class WatchlistMetricsService:
                     "vol_ratio_5_20": None,
                     "market_cap": None,
                     "next_earnings": None,
+                    "pe_fy1": None,
+                    "pe_fy2": None,
+                    "eps_growth_fy2": None,
+                    "valuation": unlisted_val,
                 }
             else:
                 listed_symbols.append(sym)
@@ -491,6 +511,7 @@ class WatchlistMetricsService:
 
         snaps = await _fetch_snapshots_chunked(listed_symbols, user_id=uid, provider=provider)
         pending_symbols: list[str] = []
+        pending_valuation_symbols: list[str] = []
 
         async def _compute_one(sym: str) -> tuple[str, dict[str, Any]]:
             snap = snaps.get(sym) or {}
@@ -572,6 +593,35 @@ class WatchlistMetricsService:
                 next_earnings=next_earn,
                 quote_timestamp=quote_ts,
             )
+
+            valuation: dict[str, Any] | None = None
+            if include_valuation:
+                if wait_for_cold:
+                    try:
+                        valuation = await self._consensus.get_valuation(
+                            sym,
+                            latest_price=metric.get("price"),
+                            quote_currency=metric.get("currency"),
+                            coverage_row=row,
+                            is_private=False,
+                        )
+                    except Exception as exc:
+                        logger.debug("[WATCHLIST_METRICS] valuation failed for %s: %s", sym, exc)
+                else:
+                    valuation, needs_val_warmup = await self._consensus.get_cached_valuation(
+                        sym,
+                        latest_price=metric.get("price"),
+                        quote_currency=metric.get("currency"),
+                        coverage_row=row,
+                        is_private=False,
+                    )
+                    if needs_val_warmup:
+                        pending_valuation_symbols.append(sym)
+                        last_fy_end = (
+                            str(extra_earn.get("last_fiscal_year_end") or "").strip()[:10] or None
+                        )
+                        self._consensus.schedule_warmup(sym, last_reported_fy_end=last_fy_end)
+
             status = (
                 "ok"
                 if metric.get("price") is not None
@@ -582,6 +632,12 @@ class WatchlistMetricsService:
                 "is_private": False,
                 "status": status,
                 **metric,
+                "pe_fy1": valuation.get("pe_fy1") if isinstance(valuation, dict) else None,
+                "pe_fy2": valuation.get("pe_fy2") if isinstance(valuation, dict) else None,
+                "eps_growth_fy2": (
+                    valuation.get("eps_growth_fy2") if isinstance(valuation, dict) else None
+                ),
+                "valuation": valuation,
             }
 
         results = await asyncio.gather(*(_compute_one(sym) for sym in listed_symbols))
@@ -592,6 +648,7 @@ class WatchlistMetricsService:
             "ok": True,
             "items": items,
             "pending_symbols": pending_symbols,
+            "pending_valuation_symbols": pending_valuation_symbols,
             "summary": _build_full_roster_summary(items, rows_by_ticker),
             "as_of": datetime.now(timezone.utc).isoformat(),
         }

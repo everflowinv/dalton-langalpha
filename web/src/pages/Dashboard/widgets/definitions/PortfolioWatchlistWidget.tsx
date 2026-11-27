@@ -64,8 +64,9 @@ function PortfolioWatchlistWidget({
     dashboard,
   } = useDashboardContext();
 
-  // DALTON-HOOK(watchlist): normalize coverage context and filter rows by tier
+  // DALTON-HOOK(watchlist): normalize coverage context, filter rows by tier, and enable right-click quick-add
   const coverage = daltonCoverage.normalizeCoverageContext(rawCoverage);
+  const quickAddCoverage = daltonCoverage.useQuickAddToCoverage(coverage);
   const [coverageTier, setCoverageTier] = useState<WatchlistTier | 'all'>('all');
   const { rows: filteredCoverageRows, filteredTotalCount, quotesBridge } = daltonCoverage.useFilteredCoverageWatchlistRows(coverage, coverageTier);
   const savedDefaultTab = instance.config.defaultTab;
@@ -280,6 +281,7 @@ function PortfolioWatchlistWidget({
                         item={row}
                         marketStatus={dashboard.marketStatus}
                         onDelete={watchlistHandlers.onDelete}
+                        extraMenuItems={quickAddCoverage.renderMenuItems(row.symbol)} // DALTON-HOOK(watchlist)
                         attach={
                           <RowAttachButton
                             instanceId={instance.id}
@@ -315,6 +317,7 @@ function PortfolioWatchlistWidget({
                         valuesHidden={valuesHidden}
                         onEdit={portfolioHandlers.onEdit}
                         onDelete={portfolioHandlers.onDelete}
+                        extraMenuItems={quickAddCoverage.renderMenuItems(row.symbol)} // DALTON-HOOK(watchlist)
                         attach={
                           <RowAttachButton
                             instanceId={instance.id}
@@ -331,6 +334,7 @@ function PortfolioWatchlistWidget({
           )}
         </SwapCell>
       </div>
+      {quickAddCoverage.confirmModal /* DALTON-HOOK(watchlist) */}
     </div>
   );
 }

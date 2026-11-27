@@ -12,6 +12,7 @@ import pytest
 from pydantic import TypeAdapter
 
 from src.dalton.database import coverage as coverage_db
+from src.dalton.watchlist import consensus as consensus_mod
 from src.dalton.watchlist import indicators as ind_mod
 from src.dalton.watchlist import metrics as metrics_mod
 from src.dalton.watchlist import privacy as privacy_mod
@@ -121,6 +122,16 @@ async def test_metrics_service_skips_private_and_enriches_earnings(
 ) -> None:
     metrics_mod._clear_metrics_cache_for_tests()
     monkeypatch.setattr(
+        consensus_mod,
+        "_fetch_yfinance_consensus_sync",
+        create_autospec(
+            consensus_mod._fetch_yfinance_consensus_sync,
+            side_effect=lambda sym: consensus_mod.RawConsensusRecord(
+                symbol=sym, quote_currency="USD", provider="yfinance"
+            ),
+        ),
+    )
+    monkeypatch.setattr(
         coverage_db,
         "list_coverage_rows",
         create_autospec(
@@ -200,6 +211,16 @@ async def test_r4_metrics_no_empty_bar_cache_progressive_warmup_and_watchlist_co
     """r2 Codex P1/P2: empty bars are never cached; progressive non-blocking return warms bars in background;
     WatchlistContext validates in AdditionalContext and is stripped on shared workspaces AND shared threads."""
     metrics_mod._clear_metrics_cache_for_tests()
+    monkeypatch.setattr(
+        consensus_mod,
+        "_fetch_yfinance_consensus_sync",
+        create_autospec(
+            consensus_mod._fetch_yfinance_consensus_sync,
+            side_effect=lambda sym: consensus_mod.RawConsensusRecord(
+                symbol=sym, quote_currency="USD", provider="yfinance"
+            ),
+        ),
+    )
     monkeypatch.setattr(
         coverage_db,
         "list_coverage_rows",

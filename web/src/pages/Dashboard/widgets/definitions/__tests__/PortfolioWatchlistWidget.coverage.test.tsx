@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { renderHook } from '@testing-library/react';
@@ -13,6 +13,8 @@ import { PortfolioWatchlistConfigSchema } from '../../framework/configSchemas';
 
 const mocks = vi.hoisted(() => ({
   useQuotesCalls: [] as string[][],
+  mutateWatchlistMock: vi.fn(),
+  previewWatchlistMutationMock: vi.fn(),
   personalSummary: {
     ok: true,
     core: [] as Array<{ ticker: string; name: string; tier: 'core'; is_private?: boolean; is_pinned?: boolean }>,
@@ -39,6 +41,8 @@ vi.mock('@/lib/dalton/watchlist', async (importActual) => {
   const actual = await importActual<typeof import('@/lib/dalton/watchlist')>();
   return {
     ...actual,
+    mutateWatchlist: (...args: unknown[]) => mocks.mutateWatchlistMock(...args),
+    previewWatchlistMutation: (...args: unknown[]) => mocks.previewWatchlistMutationMock(...args),
     usePersonalWatchlist: () => ({
       data: mocks.personalSummary,
       isLoading: false,
@@ -264,5 +268,81 @@ describe('Dashboard PortfolioWatchlistWidget coverage tab & 50-quote cap', () =>
     const exp = mocks.exported['pw-1'].full() as { data: { totalCount: number; rows: unknown[] } };
     expect(exp.data.totalCount).toBe(5);
     expect(exp.data.rows.length).toBe(5);
+  });
+
+  it('b2: right-click on Watchlist and Portfolio rows adds ticker to personal watchlist (core/watch/radar) without mutating source tables', async () => {
+    mocks.mutateWatchlistMock.mockReset().mockResolvedValue({ ok: true, added_tickers: ['AAPL'] });
+    const onWatchlistDelete = vi.fn();
+    const onPortfolioDelete = vi.fn();
+    const onPortfolioEdit = vi.fn();
+
+    mocks.dashboardCtx = {
+      ...mocks.dashboardCtx,
+      watchlist: {
+        rows: [
+          {
+            watchlist_item_id: 'wl-1',
+            symbol: 'AAPL',
+            price: 220,
+            change: 2,
+            changePercent: 0.9,
+            currency: 'USD',
+            quoteAvailable: true,
+          },
+        ],
+        loading: false,
+        loaded: true,
+      },
+      watchlistHandlers: { onAdd: vi.fn(), onDelete: onWatchlistDelete },
+      portfolio: {
+        rows: [
+          {
+            user_portfolio_id: 'pf-1',
+            symbol: 'MSFT',
+            quantity: 10,
+            marketValue: 4200,
+            unrealizedPlPercent: 12.5,
+            currency: 'USD',
+            quoteAvailable: true,
+          },
+        ],
+        loading: false,
+        loaded: true,
+        hasRealHoldings: true,
+      },
+      portfolioHandlers: { onAdd: vi.fn(), onEdit: onPortfolioEdit, onDelete: onPortfolioDelete },
+    };
+
+    // 1. Watchlist ("自选股") tab -> right-click AAPL -> add to Core
+    renderWidget({ defaultTab: 'watchlist', valuesHidden: false });
+    const aaplCell = screen.getByText('AAPL');
+    fireEvent.contextMenu(aaplCell);
+    const addCoreItem = await screen.findByTestId('quick-add-coverage-AAPL-core');
+    fireEvent.click(addCoreItem);
+    await waitFor(() => {
+      expect(mocks.mutateWatchlistMock).toHaveBeenCalledWith({
+        action: 'add',
+        tickers: ['AAPL'],
+        tier: 'core',
+      });
+    });
+    expect(onWatchlistDelete).not.toHaveBeenCalled();
+    cleanup();
+
+    // 2. Portfolio ("持仓") tab -> right-click MSFT -> add to Radar
+    renderWidget({ defaultTab: 'portfolio', valuesHidden: false });
+    const msftCell = await screen.findByText('MSFT');
+    fireEvent.contextMenu(msftCell);
+    const addRadarItem = await screen.findByTestId('quick-add-coverage-MSFT-radar');
+    fireEvent.click(addRadarItem);
+    await waitFor(() => {
+      expect(mocks.mutateWatchlistMock).toHaveBeenCalledWith({
+        action: 'add',
+        tickers: ['MSFT'],
+        tier: 'radar',
+      });
+    });
+    expect(onPortfolioDelete).not.toHaveBeenCalled();
+    expect(onPortfolioEdit).not.toHaveBeenCalled();
   });
 });
