@@ -197,6 +197,7 @@ def compute_symbol_metrics(
     chg_1d_override: float | None = None,
     currency: str | None = None,
     market_cap: float | None = None,
+    market_cap_currency: str | None = None,
     next_earnings: str | None = None,
     quote_timestamp: Any = None,
     now_utc: datetime | None = None,
@@ -339,5 +340,6 @@ def compute_symbol_metrics(
         "rsi_30d": wilder_rsi(eff_closes, 30),
         "vol_ratio_5_20": vol_ratio_5_20,
         "market_cap": _to_float(market_cap),
+        "market_cap_currency": market_cap_currency or currency,
         "next_earnings": next_earnings,
     }

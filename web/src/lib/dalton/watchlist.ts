@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/api/client';
 import { queryKeys } from '@/lib/queryKeys';
@@ -89,6 +90,7 @@ export interface WatchlistMetricRow {
   rsi_30d: number | null;
   vol_ratio_5_20: number | null;
   market_cap: number | null;
+  market_cap_currency?: string | null;
   next_earnings: string | null;
 }
 
@@ -322,20 +324,143 @@ export function usePersonalWatchlist(enabled = true) {
   });
 }
 
+const PENDING_POLL_INTERVAL_MS = 3_000;
+
+function recomputeSummaryFromItems(
+  prevSummary: WatchlistMetricsSummary | undefined,
+  items: Record<string, WatchlistMetricRow>,
+): WatchlistMetricsSummary | undefined {
+  if (!prevSummary) return undefined;
+  const rsiEntries: Array<{ ticker: string; rsi_14d: number }> = [];
+  const chg1dEntries: Array<{ ticker: string; chg_1d: number }> = [];
+  const upcomingEarnings: Array<{ ticker: string; date: string }> = [];
+
+  for (const [sym, item] of Object.entries(items)) {
+    if (item.is_private) continue;
+    if (typeof item.rsi_14d === 'number' && Number.isFinite(item.rsi_14d)) {
+      rsiEntries.push({ ticker: sym, rsi_14d: item.rsi_14d });
+    }
+    if (typeof item.chg_1d === 'number' && Number.isFinite(item.chg_1d)) {
+      chg1dEntries.push({ ticker: sym, chg_1d: item.chg_1d });
+    }
+    if (typeof item.next_earnings === 'string' && item.next_earnings.length >= 10) {
+      upcomingEarnings.push({ ticker: sym, date: item.next_earnings.slice(0, 10) });
+    }
+  }
+
+  rsiEntries.sort((a, b) => a.rsi_14d - b.rsi_14d);
+  chg1dEntries.sort((a, b) => a.chg_1d - b.chg_1d);
+  upcomingEarnings.sort((a, b) => (a.date === b.date ? a.ticker.localeCompare(b.ticker) : a.date.localeCompare(b.date)));
+
+  return {
+    ...prevSummary,
+    lowest_rsi_14d: rsiEntries.slice(0, 5),
+    highest_rsi_14d: rsiEntries.slice(-5).reverse(),
+    top_gainers_1d: chg1dEntries.slice(-5).reverse(),
+    top_losers_1d: chg1dEntries.slice(0, 5),
+    upcoming_earnings: upcomingEarnings.slice(0, 10),
+  };
+}
+
+/** Merge a pending-only subset poll response into the full cached metrics response. */
+export function mergeWatchlistMetricsResponse(
+  prev: WatchlistMetricsResponse,
+  subset: WatchlistMetricsResponse,
+  polledSymbols: readonly string[],
+): WatchlistMetricsResponse {
+  const mergedItems: Record<string, WatchlistMetricRow> = {
+    ...prev.items,
+    ...subset.items,
+  };
+  const polledSet = new Set(polledSymbols.map((s) => s.toUpperCase()));
+  const nextPending: string[] = [];
+  const seen = new Set<string>();
+  for (const sym of prev.pending_symbols ?? []) {
+    const up = sym.toUpperCase();
+    if (!polledSet.has(up) && !seen.has(up)) {
+      seen.add(up);
+      nextPending.push(sym);
+    }
+  }
+  for (const sym of subset.pending_symbols ?? []) {
+    const up = sym.toUpperCase();
+    if (!seen.has(up)) {
+      seen.add(up);
+      nextPending.push(sym);
+    }
+  }
+  return {
+    ...prev,
+    ok: prev.ok && subset.ok,
+    items: mergedItems,
+    pending_symbols: nextPending,
+    summary: recomputeSummaryFromItems(prev.summary ?? subset.summary, mergedItems),
+    as_of: subset.as_of || prev.as_of,
+  };
+}
+
 export function usePersonalWatchlistMetrics(
   symbols: readonly string[],
   enabled = true,
 ) {
+  const queryClient = useQueryClient();
   const normalizedKey = symbols.length > 0 ? symbols.slice().sort().join(',') : 'all';
-  return useQuery({
+  const isEnabled = enabled && isDaltonBuild && symbols.length > 0;
+
+  const query = useQuery({
     queryKey: queryKeys.dalton.watchlistMetrics(normalizedKey),
     queryFn: () => fetchPersonalWatchlistMetrics(symbols.length > 0 ? symbols : undefined),
-    enabled: enabled && isDaltonBuild && symbols.length > 0,
+    enabled: isEnabled,
     staleTime: 30_000,
-    refetchInterval: (query) => ((query.state.data?.pending_symbols?.length ?? 0) > 0 ? 3_000 : 60_000),
+    refetchInterval: 60_000,
     refetchIntervalInBackground: false,
     retry: 1,
   });
+
+  const pendingKey = (query.data?.pending_symbols ?? []).join(',');
+
+  useEffect(() => {
+    if (!isEnabled || !pendingKey) return;
+    let cancelled = false;
+    let timerId: ReturnType<typeof setTimeout> | null = null;
+    let currentPending = pendingKey.split(',').filter(Boolean);
+    const key = queryKeys.dalton.watchlistMetrics(normalizedKey);
+
+    const scheduleNext = () => {
+      if (cancelled || currentPending.length === 0) return;
+      timerId = setTimeout(async () => {
+        if (cancelled) return;
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+          scheduleNext();
+          return;
+        }
+        const batch = currentPending;
+        try {
+          const subset = await fetchPersonalWatchlistMetrics(batch);
+          if (cancelled) return;
+          queryClient.setQueryData<WatchlistMetricsResponse>(key, (prev) =>
+            prev ? mergeWatchlistMetricsResponse(prev, subset, batch) : subset,
+          );
+          currentPending = subset.pending_symbols ?? [];
+          if (currentPending.length > 0 && currentPending.join(',') === pendingKey) {
+            scheduleNext();
+          }
+        } catch {
+          if (!cancelled) {
+            scheduleNext();
+          }
+        }
+      }, PENDING_POLL_INTERVAL_MS);
+    };
+
+    scheduleNext();
+    return () => {
+      cancelled = true;
+      if (timerId !== null) clearTimeout(timerId);
+    };
+  }, [isEnabled, normalizedKey, pendingKey, queryClient]);
+
+  return query;
 }
 
 export function useMutatePersonalWatchlist() {

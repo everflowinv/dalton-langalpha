@@ -16,16 +16,26 @@ from src.dalton.watchlist.indicators import compute_symbol_metrics
 
 logger = logging.getLogger(__name__)
 
-MAX_SNAPSHOT_CHUNK = 200
+MAX_SNAPSHOT_CHUNK = 30
+MAX_SNAPSHOT_CHUNK_CONCURRENCY = 6
+SNAPSHOT_CHUNK_TIMEOUT_SECONDS = 8.0
+SNAPSHOT_CACHE_TTL_SECONDS = 15.0
 MAX_BAR_CONCURRENCY = 8
+MAX_MCAP_CONCURRENCY = 4
 DAILY_BARS_CACHE_TTL_SECONDS = 4 * 3600  # 4 hours (§6.2)
 MARKET_CAP_CACHE_TTL_SECONDS = 24 * 3600  # 24 hours
+WARMUP_FAILURE_COOLDOWN_SECONDS = 60.0
+MAX_BARS_CONSECUTIVE_EMPTY = 2
 
 _BARS_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
-_MARKET_CAP_CACHE: dict[str, tuple[float, float]] = {}
+_MARKET_CAP_CACHE: dict[str, tuple[float, float, str | None]] = {}
+_SNAPSHOT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _INFLIGHT_BARS: dict[str, asyncio.Task[list[dict[str, Any]]]] = {}
-_INFLIGHT_MCAP: dict[str, asyncio.Task[float | None]] = {}
+_INFLIGHT_MCAP: dict[str, asyncio.Task[tuple[float | None, str | None]]] = {}
+_BARS_EMPTY_STREAK: dict[str, tuple[int, float]] = {}
+_MCAP_WARMUP_COOLDOWN: dict[str, float] = {}
 _BARS_SEMAPHORE: asyncio.Semaphore | None = None
+_MCAP_SEMAPHORE: asyncio.Semaphore | None = None
 
 
 def _get_bars_semaphore() -> asyncio.Semaphore:
@@ -35,11 +45,24 @@ def _get_bars_semaphore() -> asyncio.Semaphore:
     return _BARS_SEMAPHORE
 
 
+def _get_mcap_semaphore() -> asyncio.Semaphore:
+    global _MCAP_SEMAPHORE
+    if _MCAP_SEMAPHORE is None:
+        _MCAP_SEMAPHORE = asyncio.Semaphore(MAX_MCAP_CONCURRENCY)
+    return _MCAP_SEMAPHORE
+
+
 def _clear_metrics_cache_for_tests() -> None:
+    global _BARS_SEMAPHORE, _MCAP_SEMAPHORE
     _BARS_CACHE.clear()
     _MARKET_CAP_CACHE.clear()
+    _SNAPSHOT_CACHE.clear()
     _INFLIGHT_BARS.clear()
     _INFLIGHT_MCAP.clear()
+    _BARS_EMPTY_STREAK.clear()
+    _MCAP_WARMUP_COOLDOWN.clear()
+    _BARS_SEMAPHORE = None
+    _MCAP_SEMAPHORE = None
 
 
 def _bars_cache_key(
@@ -165,6 +188,12 @@ async def _resolve_provider_and_key() -> tuple[Any, str, bool]:
     return provider, prov_name, split_adj
 
 
+async def _resolve_financial_provider() -> Any:
+    from src.data_client import get_financial_data_provider
+
+    return await get_financial_data_provider()
+
+
 async def _fetch_daily_bars_singleflight(
     symbol: str,
     *,
@@ -224,8 +253,12 @@ def _schedule_bars_warmup(
     provider: Any = None,
     provider_name: str = "default",
     split_adjusted: bool = True,
-) -> None:
-    """Kick off bounded background bar warm-up without blocking the HTTP response."""
+) -> bool:
+    """Kick off bounded background bar warm-up without blocking the HTTP response.
+
+    Returns True if warm-up is running (already in flight or newly scheduled),
+    False if skipped due to consecutive-failure cooldown.
+    """
     cache_key = _bars_cache_key(
         symbol,
         provider_name=provider_name,
@@ -233,7 +266,15 @@ def _schedule_bars_warmup(
     )
     existing_task = _INFLIGHT_BARS.get(cache_key)
     if existing_task is not None and not existing_task.done():
-        return
+        return True
+
+    streak = _BARS_EMPTY_STREAK.get(cache_key)
+    if (
+        streak is not None
+        and streak[0] >= MAX_BARS_CONSECUTIVE_EMPTY
+        and (time.monotonic() - streak[1]) < WARMUP_FAILURE_COOLDOWN_SECONDS
+    ):
+        return False
 
     async def _bg() -> list[dict[str, Any]]:
         try:
@@ -254,9 +295,15 @@ def _schedule_bars_warmup(
                 cleaned = [dict(b) for b in (bars or []) if isinstance(b, dict)]
                 if cleaned:
                     await _write_bars_to_cache(cache_key, cleaned)
+                    _BARS_EMPTY_STREAK.pop(cache_key, None)
+                else:
+                    prev_count = _BARS_EMPTY_STREAK.get(cache_key, (0, 0.0))[0]
+                    _BARS_EMPTY_STREAK[cache_key] = (prev_count + 1, time.monotonic())
                 return cleaned
         except Exception as exc:
             logger.debug("[WATCHLIST_METRICS] background bars warmup failed for %s: %s", symbol, exc)
+            prev_count = _BARS_EMPTY_STREAK.get(cache_key, (0, 0.0))[0]
+            _BARS_EMPTY_STREAK[cache_key] = (prev_count + 1, time.monotonic())
             return []
 
     task = asyncio.create_task(_bg())
@@ -267,6 +314,7 @@ def _schedule_bars_warmup(
             _INFLIGHT_BARS.pop(cache_key, None)
 
     task.add_done_callback(_cleanup)
+    return True
 
 
 def _positive_float(val: Any) -> float | None:
@@ -279,53 +327,69 @@ def _positive_float(val: Any) -> float | None:
     return num if math.isfinite(num) and num > 0 else None
 
 
+def _normalize_currency(val: Any) -> str | None:
+    if not isinstance(val, str):
+        return None
+    code = val.strip().upper()
+    return code if len(code) == 3 and code.isalpha() else None
+
+
+def _extract_market_cap_and_currency(profile: Any) -> tuple[float | None, str | None]:
+    row = profile[0] if isinstance(profile, list) and profile else profile
+    if not isinstance(row, Mapping):
+        return None, None
+    raw_cap = row.get("marketCap")
+    if raw_cap is None:
+        raw_cap = row.get("mktCap")
+    if raw_cap is None:
+        raw_cap = row.get("market_cap")
+    val = _positive_float(raw_cap)
+    cur = _normalize_currency(row.get("currency"))
+    return val, cur
+
+
 async def _fetch_market_cap_cached(
     symbol: str,
     *,
-    provider: Any = None,
+    financial_provider: Any = None,
     user_id: str = "",
-) -> float | None:
-    """Best-effort cacheable market-cap lookup via provider profile (never caches errors)."""
+) -> tuple[float | None, str | None]:
+    """Best-effort cacheable market-cap + currency lookup via financial provider profile (never caches errors)."""
+    _ = user_id
     sym = str(symbol or "").strip().upper()
     if not sym:
-        return None
+        return None, None
     now = time.monotonic()
     cached = _MARKET_CAP_CACHE.get(sym)
     if cached is not None and (now - cached[0]) < MARKET_CAP_CACHE_TTL_SECONDS:
-        return cached[1]
+        return cached[1], cached[2]
 
     existing = _INFLIGHT_MCAP.get(sym)
     if existing is not None and not existing.done():
         return await existing
 
-    async def _load_mcap() -> float | None:
-        try:
-            eff_provider = provider
-            if eff_provider is None:
-                eff_provider, _, _ = await _resolve_provider_and_key()
-            val: float | None = None
-            for method_name in ("get_company_profile", "get_profile", "get_quote"):
-                fn = getattr(eff_provider, method_name, None)
-                if callable(fn):
-                    try:
-                        res = await fn(sym, user_id=user_id)
-                    except TypeError:
-                        res = await fn(sym)
-                    if isinstance(res, list) and res:
-                        res = res[0]
-                    if isinstance(res, Mapping):
-                        val = _positive_float(
-                            res.get("market_cap")
-                            or res.get("marketCap")
-                            or res.get("mktCap")
-                        )
-                        if val is not None:
-                            break
-            if val is not None:
-                _MARKET_CAP_CACHE[sym] = (time.monotonic(), val)
-            return val
-        except Exception:
-            return None
+    async def _load_mcap() -> tuple[float | None, str | None]:
+        sem = _get_mcap_semaphore()
+        async with sem:
+            try:
+                eff_provider = financial_provider
+                if eff_provider is None:
+                    eff_provider = await _resolve_financial_provider()
+                financial = getattr(eff_provider, "financial", None) if eff_provider is not None else None
+                if financial is None:
+                    return None, None
+                fn = getattr(financial, "get_company_profile", None)
+                if not callable(fn):
+                    return None, None
+                res = await fn(sym)
+                val, cur = _extract_market_cap_and_currency(res)
+                if val is not None:
+                    _MARKET_CAP_CACHE[sym] = (time.monotonic(), val, cur)
+                    _MCAP_WARMUP_COOLDOWN.pop(sym, None)
+                return val, cur
+            except Exception as exc:
+                logger.debug("[WATCHLIST_METRICS] market_cap lookup failed for %s: %s", sym, exc)
+                return None, None
 
     task = asyncio.create_task(_load_mcap())
     _INFLIGHT_MCAP[sym] = task
@@ -338,16 +402,109 @@ async def _fetch_market_cap_cached(
     return await task
 
 
+def _schedule_market_cap_warmup(
+    symbol: str,
+    *,
+    financial_provider: Any = None,
+    user_id: str = "",
+) -> bool:
+    """Kick off bounded, single-flight background market-cap warm-up.
+
+    Returns True if a lookup is in flight (already running or newly scheduled),
+    False if cached, unavailable, or within empty/error retry cooldown.
+    """
+    _ = user_id
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return False
+    now = time.monotonic()
+    cached = _MARKET_CAP_CACHE.get(sym)
+    if cached is not None and (now - cached[0]) < MARKET_CAP_CACHE_TTL_SECONDS:
+        return False
+    existing = _INFLIGHT_MCAP.get(sym)
+    if existing is not None and not existing.done():
+        return True
+    last_miss = _MCAP_WARMUP_COOLDOWN.get(sym)
+    if last_miss is not None and (now - last_miss) < WARMUP_FAILURE_COOLDOWN_SECONDS:
+        return False
+    if financial_provider is not None and getattr(financial_provider, "financial", None) is None:
+        return False
+
+    async def _bg() -> tuple[float | None, str | None]:
+        sem = _get_mcap_semaphore()
+        async with sem:
+            try:
+                eff_provider = financial_provider
+                if eff_provider is None:
+                    eff_provider = await _resolve_financial_provider()
+                financial = getattr(eff_provider, "financial", None) if eff_provider is not None else None
+                if financial is None:
+                    _MCAP_WARMUP_COOLDOWN[sym] = time.monotonic()
+                    return None, None
+                fn = getattr(financial, "get_company_profile", None)
+                if not callable(fn):
+                    _MCAP_WARMUP_COOLDOWN[sym] = time.monotonic()
+                    return None, None
+                res = await fn(sym)
+                val, cur = _extract_market_cap_and_currency(res)
+                if val is not None:
+                    _MARKET_CAP_CACHE[sym] = (time.monotonic(), val, cur)
+                    _MCAP_WARMUP_COOLDOWN.pop(sym, None)
+                else:
+                    _MCAP_WARMUP_COOLDOWN[sym] = time.monotonic()
+                return val, cur
+            except Exception as exc:
+                logger.debug("[WATCHLIST_METRICS] background market_cap warmup failed for %s: %s", sym, exc)
+                _MCAP_WARMUP_COOLDOWN[sym] = time.monotonic()
+                return None, None
+
+    task = asyncio.create_task(_bg())
+    _INFLIGHT_MCAP[sym] = task
+
+    def _cleanup(_t: asyncio.Task[Any]) -> None:
+        if _INFLIGHT_MCAP.get(sym) is task:
+            _INFLIGHT_MCAP.pop(sym, None)
+
+    task.add_done_callback(_cleanup)
+    return True
+
+
+def _symbol_market_bucket(symbol: str) -> str:
+    sym = str(symbol or "").strip().upper()
+    if sym.endswith(".HK"):
+        return "hk"
+    if sym.endswith((".SS", ".SH", ".SZ", ".BJ")):
+        return "cn"
+    if "." in sym and not sym.endswith(".US"):
+        return "other"
+    return "us"
+
+
 async def _fetch_snapshots_chunked(
     symbols: Sequence[str],
     *,
     user_id: str,
     provider: Any = None,
 ) -> dict[str, dict[str, Any]]:
-    """Fetch snapshots in chunks of <=200 using the public/configured market data provider."""
+    """Fetch snapshots concurrently in market-grouped chunks with per-chunk timeout and short TTL cache."""
     if not symbols:
         return {}
     out: dict[str, dict[str, Any]] = {}
+    deduped = list(dict.fromkeys(str(s).strip().upper() for s in symbols if str(s).strip()))
+    if not deduped:
+        return out
+
+    now = time.monotonic()
+    missing: list[str] = []
+    for sym in deduped:
+        cached = _SNAPSHOT_CACHE.get(sym)
+        if cached is not None and (now - cached[0]) < SNAPSHOT_CACHE_TTL_SECONDS:
+            out[sym] = cached[1]
+        else:
+            missing.append(sym)
+    if not missing:
+        return out
+
     eff_provider = provider
     if eff_provider is None:
         try:
@@ -356,20 +513,42 @@ async def _fetch_snapshots_chunked(
             logger.debug("[WATCHLIST_METRICS] provider unavailable: %s", exc)
             return out
 
-    deduped = list(dict.fromkeys(str(s).strip().upper() for s in symbols if str(s).strip()))
-    for i in range(0, len(deduped), MAX_SNAPSHOT_CHUNK):
-        chunk = deduped[i : i + MAX_SNAPSHOT_CHUNK]
-        try:
-            snaps = await eff_provider.get_snapshots(chunk, asset_type="stocks", user_id=user_id)
-        except Exception as exc:
-            logger.debug("[WATCHLIST_METRICS] snapshot chunk failed: %s", exc)
-            continue
-        for snap in snaps or []:
-            if not isinstance(snap, dict):
-                continue
+    buckets: dict[str, list[str]] = {}
+    for sym in missing:
+        buckets.setdefault(_symbol_market_bucket(sym), []).append(sym)
+
+    chunks: list[list[str]] = []
+    for bucket_syms in buckets.values():
+        for i in range(0, len(bucket_syms), MAX_SNAPSHOT_CHUNK):
+            chunks.append(bucket_syms[i : i + MAX_SNAPSHOT_CHUNK])
+
+    sem = asyncio.Semaphore(MAX_SNAPSHOT_CHUNK_CONCURRENCY)
+
+    async def _fetch_chunk(chunk: list[str]) -> list[dict[str, Any]]:
+        async with sem:
+            try:
+                snaps = await asyncio.wait_for(
+                    eff_provider.get_snapshots(chunk, asset_type="stocks", user_id=user_id),
+                    timeout=SNAPSHOT_CHUNK_TIMEOUT_SECONDS,
+                )
+                return [s for s in (snaps or []) if isinstance(s, dict)]
+            except asyncio.TimeoutError:
+                logger.debug("[WATCHLIST_METRICS] snapshot chunk timed out (%d symbols)", len(chunk))
+                return []
+            except Exception as exc:
+                logger.debug("[WATCHLIST_METRICS] snapshot chunk failed: %s", exc)
+                return []
+
+    chunk_results = await asyncio.gather(*(_fetch_chunk(chunk) for chunk in chunks))
+    fetched_at = time.monotonic()
+    for snaps in chunk_results:
+        for snap in snaps:
             sym = str(snap.get("symbol") or snap.get("ticker") or "").strip().upper()
-            if sym:
-                out[sym] = snap
+            if not sym:
+                continue
+            out[sym] = snap
+            if _positive_float(snap.get("price") or snap.get("last_price") or snap.get("close")) is not None:
+                _SNAPSHOT_CACHE[sym] = (fetched_at, snap)
     return out
 
 
@@ -435,7 +614,10 @@ class WatchlistMetricsService:
         if not uid:
             raise ValueError("user_id is required")
 
-        rows = await coverage_db.list_coverage_rows(uid)
+        rows, mirror_row = await asyncio.gather(
+            coverage_db.list_coverage_rows(uid),
+            coverage_db.get_earnings_calendar_mirror(uid),
+        )
         rows_by_ticker = {
             str(r["ticker"]).strip().upper(): r
             for r in rows
@@ -449,7 +631,6 @@ class WatchlistMetricsService:
         else:
             requested = list(rows_by_ticker.keys())
 
-        mirror_row = await coverage_db.get_earnings_calendar_mirror(uid)
         earnings_by_ticker = _extract_next_earnings_map(mirror_row)
 
         items: dict[str, dict[str, Any]] = {}
@@ -476,6 +657,7 @@ class WatchlistMetricsService:
                     "rsi_30d": None,
                     "vol_ratio_5_20": None,
                     "market_cap": None,
+                    "market_cap_currency": None,
                     "next_earnings": None,
                 }
             else:
@@ -484,13 +666,33 @@ class WatchlistMetricsService:
         provider: Any = None
         provider_name = "default"
         split_adjusted = True
-        try:
-            provider, provider_name, split_adjusted = await _resolve_provider_and_key()
-        except Exception as exc:
-            logger.debug("[WATCHLIST_METRICS] provider unavailable: %s", exc)
+        financial_provider: Any = None
+
+        async def _safe_market_provider() -> tuple[Any, str, bool]:
+            try:
+                return await _resolve_provider_and_key()
+            except Exception as exc:
+                logger.debug("[WATCHLIST_METRICS] provider unavailable: %s", exc)
+                return None, "default", True
+
+        async def _safe_financial_provider() -> Any:
+            try:
+                return await _resolve_financial_provider()
+            except Exception as exc:
+                logger.debug("[WATCHLIST_METRICS] financial provider unavailable: %s", exc)
+                return None
+
+        (provider, provider_name, split_adjusted), financial_provider = await asyncio.gather(
+            _safe_market_provider(),
+            _safe_financial_provider(),
+        )
+        has_financial = (
+            financial_provider is not None
+            and getattr(financial_provider, "financial", None) is not None
+        )
 
         snaps = await _fetch_snapshots_chunked(listed_symbols, user_id=uid, provider=provider)
-        pending_symbols: list[str] = []
+        pending_set: set[str] = set()
 
         async def _compute_one(sym: str) -> tuple[str, dict[str, Any]]:
             snap = snaps.get(sym) or {}
@@ -522,35 +724,53 @@ class WatchlistMetricsService:
                 except Exception as exc:
                     logger.debug("[WATCHLIST_METRICS] bars failed for %s: %s", sym, exc)
                     bars = []
-                    pending_symbols.append(sym)
+                    pending_set.add(sym)
             else:
                 # Non-blocking progressive response: return live quote immediately & warm bars in background
-                pending_symbols.append(sym)
                 if provider is not None:
-                    _schedule_bars_warmup(
+                    warming_bars = _schedule_bars_warmup(
                         sym,
                         user_id=uid,
                         provider=provider,
                         provider_name=provider_name,
                         split_adjusted=split_adjusted,
                     )
+                    if warming_bars:
+                        pending_set.add(sym)
+                else:
+                    pending_set.add(sym)
 
             mcap = (
                 _positive_float(snap.get("market_cap"))
                 or _positive_float(snap.get("marketCap"))
                 or _positive_float(extra_meta.get("market_cap"))
             )
-            if mcap is None and provider is not None:
+            mcap_currency: str | None = _normalize_currency(
+                snap.get("market_cap_currency") or extra_meta.get("market_cap_currency")
+            )
+            if mcap is None:
                 now_m = time.monotonic()
                 mcap_cached = _MARKET_CAP_CACHE.get(sym)
                 if mcap_cached is not None and (now_m - mcap_cached[0]) < MARKET_CAP_CACHE_TTL_SECONDS:
-                    mcap = mcap_cached[1]
-                elif wait_for_cold:
-                    mcap = await _fetch_market_cap_cached(sym, provider=provider, user_id=uid)
-                else:
-                    # Warm market_cap opportunistically without blocking response
-                    if sym not in _INFLIGHT_MCAP or _INFLIGHT_MCAP[sym].done():
-                        asyncio.create_task(_fetch_market_cap_cached(sym, provider=provider, user_id=uid))
+                    mcap, mcap_currency = mcap_cached[1], mcap_cached[2]
+                elif has_financial:
+                    if wait_for_cold:
+                        mcap, mcap_currency = await _fetch_market_cap_cached(
+                            sym,
+                            financial_provider=financial_provider,
+                            user_id=uid,
+                        )
+                    else:
+                        if _schedule_market_cap_warmup(
+                            sym,
+                            financial_provider=financial_provider,
+                            user_id=uid,
+                        ):
+                            pending_set.add(sym)
+
+            snap_currency = _normalize_currency(snap.get("currency"))
+            eff_currency = snap_currency or mcap_currency
+            eff_mcap_currency = mcap_currency or snap_currency
 
             quote_ts = (
                 snap.get("timestamp")
@@ -567,15 +787,16 @@ class WatchlistMetricsService:
                 day_low=snap.get("day_low") or snap.get("low"),
                 prev_close=snap.get("previous_close") or snap.get("prev_close"),
                 chg_1d_override=snap.get("change_percent") or snap.get("changesPercentage"),
-                currency=snap.get("currency"),
+                currency=eff_currency,
                 market_cap=mcap,
+                market_cap_currency=eff_mcap_currency,
                 next_earnings=next_earn,
                 quote_timestamp=quote_ts,
             )
             status = (
                 "ok"
                 if metric.get("price") is not None
-                else ("warming" if sym in pending_symbols else "unavailable")
+                else ("warming" if sym in pending_set else "unavailable")
             )
             return sym, {
                 "ticker": sym,
@@ -587,6 +808,8 @@ class WatchlistMetricsService:
         results = await asyncio.gather(*(_compute_one(sym) for sym in listed_symbols))
         for sym, payload in results:
             items[sym] = payload
+
+        pending_symbols = [sym for sym in listed_symbols if sym in pending_set]
 
         return {
             "ok": True,

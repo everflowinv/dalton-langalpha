@@ -10,6 +10,7 @@ import {
   flattenWatchlistCompanies,
 } from '@/lib/dalton/watchlist';
 import { WatchlistAddModal } from '../components/watchlist/WatchlistAddModal';
+import { WatchlistFullTable } from '../components/watchlist/WatchlistFullTable';
 
 const mocks = vi.hoisted(() => ({
   toast: vi.fn(),
@@ -481,5 +482,100 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
       action: 'add',
       snapshot_id: 'snap-uuid-123',
     });
+  });
+
+  it('uses the same Tailwind font-size class as row text for the tier badge at mobile width (non-select)', () => {
+    const prevInnerWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 375 });
+    try {
+      const companies = [
+        { ticker: 'NVDA', name: 'NVIDIA Corp', tier: 'core' as const, is_private: false },
+        { ticker: '0700.HK', name: 'Tencent', tier: 'watch' as const, is_private: false },
+      ];
+      render(
+        <WatchlistFullTable
+          companies={companies}
+          metrics={{
+            NVDA: {
+              ...mocks.watchlistMetrics.items.NVDA,
+              market_cap: 5_167_353_167_872,
+              currency: 'USD',
+              market_cap_currency: 'USD',
+            },
+            '0700.HK': {
+              ...mocks.watchlistMetrics.items.NVDA,
+              ticker: '0700.HK',
+              price: 410,
+              currency: 'HKD',
+              market_cap: 3_111_992_426_496,
+              market_cap_currency: 'HKD',
+            },
+          }}
+          metricsLoading={false}
+          visibleColumns={['tier', 'price', 'chg_1d', 'market_cap']}
+          groupedByTier={false}
+          holdingSymbols={new Set()}
+          onSelectSymbol={vi.fn<(symbol: string) => void>()}
+          onRequestTierChange={vi.fn()}
+          onRequestRemove={vi.fn()}
+        />,
+      );
+
+      const nvdaRow = screen.getByTestId('watchlist-row-NVDA');
+      const tierBadge = screen.getByTestId('watchlist-tier-badge-NVDA');
+      // Must NOT be a native <select> so tokens.css mobile `select { font-size: max(16px, 1rem) !important }` cannot inflate it
+      expect(tierBadge.tagName).toBe('BUTTON');
+      expect(nvdaRow.querySelector('select')).toBeNull();
+
+      // Shares the exact same Tailwind font-size class (`text-xs`) as sibling ticker and price text in the row
+      const tickerSpan = nvdaRow.querySelector('span.font-mono');
+      const priceCell = nvdaRow.querySelectorAll('td')[2];
+      expect(tierBadge.className.split(/\s+/)).toContain('text-xs');
+      expect(tickerSpan?.className.split(/\s+/)).toContain('text-xs');
+      expect(priceCell?.className.split(/\s+/)).toContain('text-xs');
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: prevInnerWidth });
+    }
+  });
+
+  it('formats market cap in quote currency and groups by currency (unknown last) when sorting', () => {
+    const companies = [
+      { ticker: 'MSFT', name: 'Microsoft', tier: 'core' as const, is_private: false },
+      { ticker: '0700.HK', name: 'Tencent', tier: 'core' as const, is_private: false },
+      { ticker: 'AAPL', name: 'Apple', tier: 'core' as const, is_private: false },
+      { ticker: 'PETR4.SA', name: 'Petrobras', tier: 'watch' as const, is_private: false },
+    ];
+    const baseMetric = mocks.watchlistMetrics.items.NVDA;
+    render(
+      <WatchlistFullTable
+        companies={companies}
+        metrics={{
+          MSFT: { ...baseMetric, ticker: 'MSFT', currency: 'USD', market_cap: 3_000_000_000_000, market_cap_currency: 'USD' },
+          '0700.HK': { ...baseMetric, ticker: '0700.HK', currency: 'HKD', market_cap: 3_111_992_426_496, market_cap_currency: 'HKD' },
+          AAPL: { ...baseMetric, ticker: 'AAPL', currency: 'USD', market_cap: 5_167_353_167_872, market_cap_currency: 'USD' },
+          'PETR4.SA': { ...baseMetric, ticker: 'PETR4.SA', currency: null, market_cap: 500_000_000_000, market_cap_currency: null },
+        }}
+        metricsLoading={false}
+        visibleColumns={['market_cap']}
+        groupedByTier={false}
+        holdingSymbols={new Set()}
+        sortField="market_cap"
+        sortDir="desc"
+        onSelectSymbol={vi.fn<(symbol: string) => void>()}
+        onRequestTierChange={vi.fn()}
+        onRequestRemove={vi.fn()}
+      />,
+    );
+
+    // Order: USD desc (AAPL 5.17T, MSFT 3.00T) -> HKD desc (0700.HK HK$3.11T) -> unknown currency last (PETR4.SA)
+    const rows = screen.getAllByTestId(/^watchlist-row-/);
+    expect(rows.map((r) => r.getAttribute('data-testid'))).toEqual([
+      'watchlist-row-AAPL',
+      'watchlist-row-MSFT',
+      'watchlist-row-0700.HK',
+      'watchlist-row-PETR4.SA',
+    ]);
+    // HKD row displays HK$ currency symbol rather than bare number or USD
+    expect(screen.getByTestId('watchlist-row-0700.HK').textContent).toContain('HK$');
   });
 });

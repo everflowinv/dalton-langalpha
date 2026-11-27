@@ -186,16 +186,6 @@ export function WatchlistWorkspace({
   const { data: watchlistData, isLoading, isError, refetch } = usePersonalWatchlist(true);
   const allCompanies = useMemo(() => flattenWatchlistCompanies(watchlistData), [watchlistData]);
 
-  const listedSymbols = useMemo(
-    () => allCompanies.filter((c) => !c.is_private).map((c) => c.ticker),
-    [allCompanies],
-  );
-  const { data: metricsData, isLoading: metricsLoading } = usePersonalWatchlistMetrics(
-    listedSymbols,
-    listedSymbols.length > 0,
-  );
-  const metricsMap = useMemo(() => metricsData?.items ?? {}, [metricsData]);
-
   const { data: holdingsData } = useQuery({
     ...portfolioHoldingsQuery,
     retry: false,
@@ -223,6 +213,31 @@ export function WatchlistWorkspace({
       return true;
     });
   }, [allCompanies, tierFilter, holdingsOnly, holdingSymbols, searchQuery]);
+
+  // Prioritize visible/filtered rows first so the backend warms their bars & market cap first
+  const listedSymbols = useMemo(() => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const c of filteredCompanies) {
+      if (!c.is_private && !seen.has(c.ticker)) {
+        seen.add(c.ticker);
+        out.push(c.ticker);
+      }
+    }
+    for (const c of allCompanies) {
+      if (!c.is_private && !seen.has(c.ticker)) {
+        seen.add(c.ticker);
+        out.push(c.ticker);
+      }
+    }
+    return out;
+  }, [filteredCompanies, allCompanies]);
+
+  const { data: metricsData, isLoading: metricsLoading } = usePersonalWatchlistMetrics(
+    listedSymbols,
+    listedSymbols.length > 0,
+  );
+  const metricsMap = useMemo(() => metricsData?.items ?? {}, [metricsData]);
 
   // Privacy boundary: ONLY inject personal watchlist context in private sessions
   // (Chief of Staff Home scope === 'all', or the user's own non-shared workspace).
