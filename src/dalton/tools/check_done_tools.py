@@ -1172,9 +1172,14 @@ async def _verify_run_status_record(
     workflow: str,
     run_id: str | None = None,
     thread_id: str | None = None,
+    allow_missing: bool = False,
 ) -> bool:
     """Verify via the server-written ``status.json`` run record that ``run_dir``
-    matches ``workflow`` and the resolved ``(short_thread_id, run_id)`` identity."""
+    matches ``workflow`` and the resolved ``(short_thread_id, run_id)`` identity.
+
+    ``allow_missing`` accepts a run dir whose ``status.json`` was never written
+    (the driver's write is best effort); a present but mismatching record is
+    still rejected."""
     dir_thread, dir_run = _parse_run_dir_identity(run_dir)
     if not dir_thread or not dir_run:
         return False
@@ -1184,7 +1189,7 @@ async def _verify_run_status_record(
         return False
     status_text = await _read_text(backend, f"{run_dir}/status.json")
     if not status_text:
-        return False
+        return allow_missing
     try:
         status_doc = json.loads(status_text)
     except ValueError:
@@ -1199,7 +1204,12 @@ async def _verify_run_status_record(
 
 
 async def _load_run_args_with_dir(
-    backend: Any, workflow: str, run_id: str | None, thread_id: str | None
+    backend: Any,
+    workflow: str,
+    run_id: str | None,
+    thread_id: str | None,
+    *,
+    allow_missing_status: bool = False,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Read the server-written ``args.json`` snapshot and its resolved run dir
     after verifying workflow name and run identity against ``status.json``."""
@@ -1226,6 +1236,7 @@ async def _load_run_args_with_dir(
             workflow=workflow,
             run_id=run_id,
             thread_id=thread_id,
+            allow_missing=allow_missing_status,
         ):
             continue
         text = await _read_text(backend, f"{run_dir}/args.json")
@@ -1245,8 +1256,14 @@ async def _load_run_args_with_dir(
 async def _load_run_args(
     backend: Any, workflow: str, run_id: str | None, thread_id: str | None
 ) -> dict[str, Any] | None:
-    """Read the server-written ``args.json`` snapshot for this run, or None when unavailable."""
-    doc, _ = await _load_run_args_with_dir(backend, workflow, run_id, thread_id)
+    """Read the server-written ``args.json`` snapshot for this run, or None when unavailable.
+
+    Used for argument inheritance (``as_of``), so a run whose ``status.json``
+    write failed still keeps its arguments; the internal-memory skip reads
+    through ``_load_run_args_with_dir`` with the strict status check."""
+    doc, _ = await _load_run_args_with_dir(
+        backend, workflow, run_id, thread_id, allow_missing_status=True
+    )
     return doc
 
 

@@ -758,7 +758,8 @@ def create_run_workflow_tool(
                 if isinstance(launch_error, asyncio.CancelledError):
                     if not run_task.completed:
                         run_task.mark_cancelled("Cancelled before spawn")
-                    await mw._finalize_cancelled_before_spawn(run_task)
+                    # A second cancel must not cut the ledger/namespace settle short.
+                    await asyncio.shield(mw._finalize_cancelled_before_spawn(run_task))
                 else:
                     if not run_task.completed:
                         run_task.mark_never_started(

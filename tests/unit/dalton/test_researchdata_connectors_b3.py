@@ -5239,3 +5239,40 @@ async def test_r4_workflow_snapshot_cancelled_after_admission_finalizes_and_prop
         assert spawn_spy.await_count == 0
         assert run_task.completed is True
         assert run_task.terminal_status == "cancelled"
+
+
+class _R5FilesBackend:
+    """Minimal read-only backend over an in-memory file map (aread_text only)."""
+
+    def __init__(self, files: dict[str, str]) -> None:
+        self._files = files
+
+    async def aread_text(self, path: str) -> str:
+        if path not in self._files:
+            raise FileNotFoundError(path)
+        return self._files[path]
+
+
+@pytest.mark.asyncio
+async def test_r5_as_of_inherited_when_status_json_missing_but_rejected_on_mismatch() -> None:
+    from src.dalton.tools import check_done_tools as cdt
+
+    thread_id = "abcdef12-0000-0000-0000-000000000000"
+    run_dir = ".agents/threads/abcdef12/workflows/wf-r5"
+    args = json.dumps({"as_of": "2026-11-20"})
+
+    # status.json never written: explicit run keeps its as_of.
+    backend = _R5FilesBackend({f"{run_dir}/args.json": args})
+    assert await cdt._run_args_as_of(backend, "topic-research", "wf-r5", thread_id) == "2026-11-20"
+    # The strict loader used for the internal-memory skip still refuses it.
+    doc, _ = await cdt._load_run_args_with_dir(backend, "topic-research", "wf-r5", thread_id)
+    assert doc is None
+
+    # A present status.json naming another workflow is still rejected.
+    backend = _R5FilesBackend(
+        {
+            f"{run_dir}/args.json": args,
+            f"{run_dir}/status.json": json.dumps({"name": "other-workflow", "run_id": "wf-r5"}),
+        }
+    )
+    assert await cdt._run_args_as_of(backend, "topic-research", "wf-r5", thread_id) is None
