@@ -51,6 +51,7 @@ from langchain_core.messages import (
 from langchain_core.messages.ai import InputTokenDetails, OutputTokenDetails, UsageMetadata
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.tools import BaseTool
+from pydantic import Field, SecretStr
 
 logger = logging.getLogger(__name__)
 
@@ -72,10 +73,50 @@ _THOUGHT_SIGNATURES_KEY = "antigravity_thought_signatures"
 # message whose signatures can be replayed exactly; one without it predates the
 # map, and its list cannot be matched to calls.
 _CALL_SIGNATURES_KEY = "antigravity_call_signatures"
+# Model family that minted the thought signatures on this message (e.g.
+# "gemini", "claude"). Antigravity routes multiple model families behind one
+# provider_route ("antigravity-oauth"), so replay must check signature family
+# directly instead of relying on provider_route alone.
+_SIGNATURE_FAMILY_KEY = "antigravity_signature_family"
 # Gemini's documented stand-in for a call it did not sign (a Claude call, a
 # call from before the map): it validates every functionCall of the current
 # turn and refuses one with no signature or with another call's.
 _SKIP_SIGNATURE = "skip_thought_signature_validator"
+
+
+def _signature_family_for_model(model: Any) -> str | None:
+    """Infer model family for Antigravity thoughtSignature compatibility.
+
+    Only recognized model families are returned; opaque identifiers return
+    ``None`` so fallback metadata fields (such as ``catalog_model``) are still
+    checked and unknown-origin signatures are never replayed.
+    """
+    if not isinstance(model, str):
+        return None
+    norm = model.strip().lower()
+    if not norm:
+        return None
+    if "gemini" in norm:
+        return "gemini"
+    if "claude" in norm or "anthropic" in norm:
+        return "claude"
+    if "gpt" in norm or "openai" in norm:
+        return "gpt"
+    return None
+
+
+def _signature_source_family(message: AIMessage) -> str | None:
+    """Resolve the model family that produced ``message``'s thought signatures."""
+    extra = message.additional_kwargs or {}
+    stamped = _signature_family_for_model(extra.get(_SIGNATURE_FAMILY_KEY))
+    if stamped is not None:
+        return stamped
+    meta = message.response_metadata or {}
+    for key in ("model_version", "model_name", "model", "catalog_model"):
+        fam = _signature_family_for_model(meta.get(key))
+        if fam is not None:
+            return fam
+    return None
 
 
 # DALTON-HOOK(antigravity-json-nan): coerce NaN/+Inf/-Inf in tool outputs and request payloads to JSON null
@@ -100,14 +141,21 @@ def _sanitize_json_non_finite(value: Any) -> Any:
 class _SignatureState:
     """The signatures of one response; never shared between calls."""
 
-    def __init__(self) -> None:
+    def __init__(self, family: str | None = None) -> None:
         self.ordered: list[str] = []
         self.by_call: dict[str, str] = {}
+        self.family: str | None = family
 
     def kwargs(self) -> dict[str, Any]:
         if not self.ordered:
             return {}
-        return {_THOUGHT_SIGNATURES_KEY: list(self.ordered), _CALL_SIGNATURES_KEY: dict(self.by_call)}
+        out: dict[str, Any] = {
+            _THOUGHT_SIGNATURES_KEY: list(self.ordered),
+            _CALL_SIGNATURES_KEY: dict(self.by_call),
+        }
+        if self.family:
+            out[_SIGNATURE_FAMILY_KEY] = self.family
+        return out
 
 
 class AntigravityApiError(RuntimeError):
@@ -211,38 +259,153 @@ def _content_blocks(message: BaseMessage) -> list[Any]:
     return [{"type": "text", "text": str(content)}]
 
 
+_SILENT_SKIP_BLOCK_TYPES = frozenset(
+    {"tool_result", "thinking", "redacted_thinking", "reasoning", "compaction"}
+)
+
+
+def _undelivered_placeholder(block: Any) -> str:
+    """User/model-visible placeholder when an attachment or block cannot be sent."""
+    label = ""
+    if isinstance(block, dict):
+        filename = block.get("filename")
+        if not filename and isinstance(block.get("file"), dict):
+            filename = block["file"].get("filename")
+        if isinstance(filename, str) and filename.strip():
+            label = filename.strip()
+        elif isinstance(block.get("type"), str) and block["type"].strip():
+            label = block["type"].strip()
+        else:
+            label = "dict"
+    else:
+        label = type(block).__name__
+    return f"[附件未能送达当前模型：{label}]"
+
+
+def _parse_data_url(url: Any, *, default_mime: str = "image/png") -> tuple[str, str] | None:
+    """Parse ``data:<mime>;base64,<data>`` into ``(mime_type, data)`` or ``None``."""
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return None
+    header, sep, data = url.partition(",")
+    if not sep or not data:
+        return None
+    mime = header[5:].split(";")[0].strip() or default_mime
+    return mime, data
+
+
+def _extract_file_inline_data(block: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract Gemini ``inlineData`` from a ``file`` or ``document`` block.
+
+    Internal annotations such as ``pages``, ``filename``, or ``unsaved`` are
+    intentionally omitted from the upstream payload.
+    """
+    b64 = block.get("base64")
+    mime = block.get("mime_type") or block.get("media_type")
+    if isinstance(b64, str) and b64 and isinstance(mime, str) and mime:
+        return {"inlineData": {"mimeType": mime, "data": b64}}
+
+    if block.get("source_type") == "base64":
+        data = block.get("data")
+        if isinstance(data, str) and data and isinstance(mime, str) and mime:
+            return {"inlineData": {"mimeType": mime, "data": data}}
+
+    source = block.get("source")
+    if isinstance(source, dict) and source.get("type") == "base64":
+        data = source.get("data")
+        src_mime = source.get("media_type") or source.get("mime_type") or mime
+        if isinstance(data, str) and data and isinstance(src_mime, str) and src_mime:
+            return {"inlineData": {"mimeType": src_mime, "data": data}}
+
+    nested = block.get("file")
+    if isinstance(nested, dict):
+        parsed = _parse_data_url(nested.get("file_data"), default_mime="application/pdf")
+        if parsed is not None:
+            return {"inlineData": {"mimeType": parsed[0], "data": parsed[1]}}
+
+    return None
+
+
+def _extract_image_inline_data(block: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract Gemini ``inlineData`` from an ``image`` block."""
+    b64 = block.get("base64")
+    mime = block.get("mime_type") or block.get("media_type") or "image/png"
+    if isinstance(b64, str) and b64:
+        return {"inlineData": {"mimeType": str(mime), "data": b64}}
+
+    if block.get("source_type") == "base64":
+        data = block.get("data")
+        if isinstance(data, str) and data:
+            return {"inlineData": {"mimeType": str(mime), "data": data}}
+
+    source = block.get("source")
+    if isinstance(source, dict) and source.get("type") == "base64":
+        data = source.get("data")
+        src_mime = source.get("media_type") or source.get("mime_type") or mime
+        if isinstance(data, str) and data:
+            return {"inlineData": {"mimeType": str(src_mime), "data": data}}
+
+    parsed = _parse_data_url(block.get("url"), default_mime="image/png")
+    if parsed is not None:
+        return {"inlineData": {"mimeType": parsed[0], "data": parsed[1]}}
+
+    return None
+
+
 def _part_from_block(block: Any) -> dict | None:
     """One content block → one Gemini part."""
     if isinstance(block, str):
         return {"text": block} if block else None
     if not isinstance(block, dict):
-        return None
+        logger.warning(
+            "[antigravity] Dropping unsupported non-dict content block type=%s",
+            type(block).__name__,
+        )
+        return {"text": _undelivered_placeholder(block)}
     btype = block.get("type")
     if btype in ("text", "input_text", "output_text"):
         text_val = block.get("text", "")
         return {"text": text_val} if text_val else None
     if btype == "image_url":
-        url = (block.get("image_url") or {}).get("url", "")
-        if not isinstance(url, str) or not url.startswith("data:"):
-            logger.warning("[antigravity] Non-data-URL image block dropped (endpoint takes inline data only)")
-            return None
-        header, _, data = url.partition(",")
-        mime = header[5:].split(";")[0] or "image/png"
-        return {"inlineData": {"mimeType": mime, "data": data}}
-    if btype in ("tool_use", "tool_result"):  # anthropic-style blocks from history
-        if btype == "tool_use":
-            fc: dict[str, Any] = {"name": block.get("name", ""), "args": block.get("input", {})}
-            if block.get("id"):
-                fc["id"] = block["id"]
-            return {"functionCall": fc}
-        return None  # handled via ToolMessage path
-    if btype == "thinking":
-        return None  # reasoning is not replayed (fresh thinking per turn)
-    return None
+        raw_img = block.get("image_url")
+        url = raw_img.get("url", "") if isinstance(raw_img, dict) else (raw_img if isinstance(raw_img, str) else "")
+        parsed = _parse_data_url(url, default_mime="image/png")
+        if parsed is None:
+            logger.warning(
+                "[antigravity] Non-data-URL image block cannot be delivered (endpoint takes inline data only)"
+            )
+            return {"text": _undelivered_placeholder(block)}
+        return {"inlineData": {"mimeType": parsed[0], "data": parsed[1]}}
+    if btype == "image":
+        part = _extract_image_inline_data(block)
+        if part is not None:
+            return part
+        logger.warning("[antigravity] Image block missing inline base64 data; replaced with placeholder")
+        return {"text": _undelivered_placeholder(block)}
+    if btype in ("file", "document"):
+        part = _extract_file_inline_data(block)
+        if part is not None:
+            return part
+        logger.warning(
+            "[antigravity] File block type=%r missing inline base64 data or mime_type; replaced with placeholder",
+            btype,
+        )
+        return {"text": _undelivered_placeholder(block)}
+    if btype == "tool_use":  # anthropic-style blocks from history
+        fc: dict[str, Any] = {"name": block.get("name", ""), "args": block.get("input", {})}
+        if block.get("id"):
+            fc["id"] = block["id"]
+        return {"functionCall": fc}
+    if btype in _SILENT_SKIP_BLOCK_TYPES:
+        return None
+    logger.warning("[antigravity] Unsupported content block type=%r; replaced with placeholder", btype)
+    return {"text": _undelivered_placeholder(block)}
 
 
 def _messages_to_gemini(
-    messages: Sequence[BaseMessage], *, gemini_target: bool = False
+    messages: Sequence[BaseMessage],
+    *,
+    gemini_target: bool = False,
+    target_model: str | None = None,
 ) -> tuple[dict | None, list[dict]]:
     """LangChain messages → (systemInstruction, contents).
 
@@ -256,6 +419,32 @@ def _messages_to_gemini(
     # R6-3: map tool_call_id -> tool name from preceding AIMessages so
     # ToolMessages without an explicit .name still send the declared function name.
     tool_call_names: dict[str, str] = {}
+    target_family = (
+        _signature_family_for_model(target_model)
+        if target_model
+        else ("gemini" if gemini_target else None)
+    )
+    last_call_order: dict[str, int] = {}
+    # Buffer consecutive ToolMessages from one parallel tool batch so all
+    # functionResponse parts go first (in call order), followed by all
+    # inlineData attachments (in matching call order), inside a single user turn.
+    pending_tools: list[tuple[int, int, dict[str, Any], list[dict[str, Any]]]] = []
+
+    def _flush_tool_batch() -> None:
+        if not pending_tools:
+            return
+        ordered = sorted(pending_tools, key=lambda item: (item[0], item[1]))
+        fn_parts = [item[2] for item in ordered]
+        extra_batch: list[dict[str, Any]] = []
+        for item in ordered:
+            extra_batch.extend(item[3])
+        contents.append(
+            {
+                "role": "user",  # tool results ride the user turn in Gemini
+                "parts": [*fn_parts, *extra_batch],
+            }
+        )
+        pending_tools.clear()
 
     for message in messages:
         if isinstance(message, SystemMessage):
@@ -267,8 +456,11 @@ def _messages_to_gemini(
 
         if isinstance(message, ToolMessage):
             # Gemini expects one functionResponse per tool call, named after
-            # the tool, with the payload as a JSON object.
+            # the tool, with the payload as a JSON object. Multimodal parts
+            # (inlineData images/PDFs) ride in the same user turn after all
+            # functionResponse parts of the batch.
             result: Any = message.content
+            extra_parts: list[dict[str, Any]] = []
             if isinstance(result, str):
                 try:
                     # DALTON-HOOK(antigravity-json-nan): coerce bare NaN/Infinity/-Infinity JSON constants to None
@@ -276,13 +468,31 @@ def _messages_to_gemini(
                 except json.JSONDecodeError:
                     result = {"result": result}
             elif isinstance(result, list):
-                result = {
-                    "result": "\n".join(
-                        block.get("text", "")
-                        for block in result
-                        if isinstance(block, dict)
-                    )
-                }
+                text_chunks: list[str] = []
+                for block in result:
+                    if isinstance(block, str):
+                        if block:
+                            text_chunks.append(block)
+                        continue
+                    if isinstance(block, dict) and block.get("type") in (
+                        "text",
+                        "input_text",
+                        "output_text",
+                    ):
+                        t = block.get("text", "")
+                        if t:
+                            text_chunks.append(t)
+                        continue
+                    part = _part_from_block(block)
+                    if part is None:
+                        continue
+                    if "inlineData" in part:
+                        extra_parts.append(part)
+                    elif "text" in part:
+                        text_chunks.append(part["text"])
+                    else:
+                        extra_parts.append(part)
+                result = {"result": "\n".join(text_chunks)}
             if not isinstance(result, dict):
                 result = {"result": result}
             result = _sanitize_json_non_finite(result)
@@ -298,18 +508,17 @@ def _messages_to_gemini(
             }
             if message.tool_call_id:
                 fn_resp["id"] = message.tool_call_id
-            contents.append(
-                {
-                    "role": "user",  # tool results ride the user turn in Gemini
-                    "parts": [
-                        {
-                            "functionResponse": fn_resp
-                        }
-                    ],
-                }
+            call_pos = (
+                last_call_order.get(str(message.tool_call_id), len(last_call_order))
+                if message.tool_call_id
+                else len(last_call_order)
+            )
+            pending_tools.append(
+                (call_pos, len(pending_tools), {"functionResponse": fn_resp}, extra_parts)
             )
             continue
 
+        _flush_tool_batch()
         role = "model" if isinstance(message, AIMessage) else "user"
         parts: list[dict] = []
         # An Anthropic-SDK message names each call twice, as a tool_use block
@@ -328,14 +537,29 @@ def _messages_to_gemini(
                     block_calls.append(part)
                 parts.append(part)
         if isinstance(message, AIMessage):
+            last_call_order = {}
+            for part_fc in block_calls:
+                block_id = str(part_fc["functionCall"].get("id") or "")
+                if block_id and block_id not in last_call_order:
+                    last_call_order[block_id] = len(last_call_order)
             # The endpoint validates that functionCall parts carry their
-            # thought_signature (it 400s without one). A mapped message
-            # replays each call's own signature; Gemini gets the stand-in for
-            # any call not in the map, and for every call of an unmapped one,
-            # whose list may hold a text part's signature first.
+            # thought_signature (it 400s without one). Replay signatures only
+            # when the message is confirmed to come from the same model family;
+            # cross-family or unknown-source messages drop signatures while
+            # keeping tool call IDs, falling through to the missing-signature path.
             extra = message.additional_kwargs or {}
-            by_call = extra.get(_CALL_SIGNATURES_KEY)
-            signatures = list(extra.get(_THOUGHT_SIGNATURES_KEY, []))
+            source_family = _signature_source_family(message)
+            signatures_compatible = (
+                source_family is not None
+                and target_family is not None
+                and source_family == target_family
+            )
+            if signatures_compatible:
+                by_call = extra.get(_CALL_SIGNATURES_KEY)
+                signatures = list(extra.get(_THOUGHT_SIGNATURES_KEY, []))
+            else:
+                by_call = None
+                signatures = []
             if isinstance(by_call, dict):
                 signatures = [sig for sig in signatures if sig not in by_call.values()]
             elif gemini_target:
@@ -345,6 +569,8 @@ def _messages_to_gemini(
                 call_name = call.get("name", "")
                 if call_id and call_name:
                     tool_call_names[str(call_id)] = str(call_name)
+                if call_id and str(call_id) not in last_call_order:
+                    last_call_order[str(call_id)] = len(last_call_order)
                 fc_payload: dict[str, Any] = {"name": call_name, "args": call.get("args", {})}
                 if call_id:
                     fc_payload["id"] = call_id
@@ -374,6 +600,7 @@ def _messages_to_gemini(
         if parts:
             contents.append({"role": role, "parts": parts})
 
+    _flush_tool_batch()
     system_instruction = {"parts": system_parts} if system_parts else None
     return system_instruction, contents
 
@@ -552,7 +779,11 @@ class ChatAntigravity(BaseChatModel):
     """Chat model for Google Antigravity subscriptions (OAuth Bearer)."""
 
     model: str = "gemini-4-argon-medium"
-    api_key: str = ""  # OAuth access token (Bearer)
+    api_key: SecretStr | None = Field(
+        default=SecretStr(""),
+        repr=False,
+        exclude=True,
+    )  # OAuth access token (Bearer)
     base_url: str = ANTIGRAVITY_DEFAULT_BASE_URL
     project: str = ANTIGRAVITY_DEFAULT_PROJECT
     user_agent: str = ANTIGRAVITY_USER_AGENT
@@ -563,6 +794,15 @@ class ChatAntigravity(BaseChatModel):
     timeout: float = 600.0
     default_headers: dict[str, str] = {}
     tools: list[dict] = []  # bound Gemini functionDeclarations
+
+    @property
+    def lc_secrets(self) -> dict[str, str]:
+        return {"api_key": "ANTIGRAVITY_API_KEY"}
+
+    def _api_key_value(self) -> str:
+        if self.api_key is None:
+            return ""
+        return self.api_key.get_secret_value()
 
 
     @property
@@ -605,7 +845,9 @@ class ChatAntigravity(BaseChatModel):
         thinking_level_override: Optional[str] = None,
     ) -> dict:
         system_instruction, contents = _messages_to_gemini(
-            messages, gemini_target="gemini" in (self.model or "").lower()
+            messages,
+            gemini_target="gemini" in (self.model or "").lower(),
+            target_model=self.model,
         )
 
         inner: dict[str, Any] = {"contents": contents}
@@ -645,7 +887,7 @@ class ChatAntigravity(BaseChatModel):
     def _request_headers(self) -> dict[str, str]:
         return {
             **self.default_headers,
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {self._api_key_value()}",
             "Content-Type": "application/json",
             "User-Agent": self.user_agent,
         }
@@ -657,6 +899,9 @@ class ChatAntigravity(BaseChatModel):
 
     @staticmethod
     def _error_from_status(status: int, body: str) -> AntigravityApiError:
+        from src.server.utils.error_sanitization import sanitize_error_text
+
+        body = sanitize_error_text(body or "")  # upstream errors may echo the Bearer header
         detail = ""
         effective_status = status or 500
         try:
@@ -740,7 +985,7 @@ class ChatAntigravity(BaseChatModel):
         """
         # Per call, not on the client: one cached client serves concurrent
         # turns, and a shared list mixed their signatures.
-        sigs = sigs if sigs is not None else _SignatureState()
+        sigs = sigs if sigs is not None else _SignatureState(_signature_family_for_model(self.model))
         response = envelope.get("response") or {}
         candidates = response.get("candidates") or []
         if not candidates:
@@ -827,6 +1072,8 @@ class ChatAntigravity(BaseChatModel):
             model_version = response.get("modelVersion")
             if model_version:
                 meta["model_version"] = model_version
+                if not sigs.family:
+                    sigs.family = _signature_family_for_model(model_version)
             response_id = response.get("responseId")
             if response_id:
                 meta["response_id"] = response_id
@@ -900,6 +1147,9 @@ class ChatAntigravity(BaseChatModel):
             if c.additional_kwargs.get(_THOUGHT_SIGNATURES_KEY):
                 additional_kwargs[_THOUGHT_SIGNATURES_KEY] = list(c.additional_kwargs[_THOUGHT_SIGNATURES_KEY])
                 additional_kwargs[_CALL_SIGNATURES_KEY] = dict(c.additional_kwargs.get(_CALL_SIGNATURES_KEY) or {})
+                sig_family = c.additional_kwargs.get(_SIGNATURE_FAMILY_KEY)
+                if sig_family:
+                    additional_kwargs[_SIGNATURE_FAMILY_KEY] = sig_family
 
         usage = None
         metadata: dict[str, Any] = {}
@@ -926,7 +1176,7 @@ class ChatAntigravity(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
-        sigs = _SignatureState()
+        sigs = _SignatureState(_signature_family_for_model(self.model))
         payload = self._build_payload(messages, stop=stop, thinking_level_override=kwargs.get("thinking_level"))
         for envelope in self._stream_raw(payload):
             for chunk in self._chunks_from_frame(envelope, sigs):
@@ -941,7 +1191,7 @@ class ChatAntigravity(BaseChatModel):
         run_manager: AsyncCallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
-        sigs = _SignatureState()
+        sigs = _SignatureState(_signature_family_for_model(self.model))
         payload = self._build_payload(messages, stop=stop, thinking_level_override=kwargs.get("thinking_level"))
         async for envelope in self._astream_raw(payload):
             for chunk in self._chunks_from_frame(envelope, sigs):

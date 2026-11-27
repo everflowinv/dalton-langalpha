@@ -564,6 +564,9 @@ ALLOWED_HOOKS=(
   # AU1 Public share redaction: strict allow_files=false redaction, controlled media,
   # org-library/activity title & summary scrubbing, and unkeyed OSS loopback gate.
   "share-redaction"
+  # HF2: surface-aware safety-refusal exhaustion notice delegated to
+  # src/dalton/middleware/refusal_fallback.py (empty_call_retry.py).
+  "refusal-handling"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
