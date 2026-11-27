@@ -2799,6 +2799,12 @@ async def test_r6_small_pool_size_2_saturated_concurrency_no_deadlock_db(
     fake_sandbox.working_dir = "/workspace"
     # autospec does not create attributes assigned only in __init__; SandboxBackend reads it.
     fake_sandbox._work_dir = "/workspace"
+    fake_sandbox.config = SimpleNamespace(
+        filesystem=SimpleNamespace(
+            working_directory="/workspace", allowed_directories=["/workspace"]
+        ),
+        sandbox=SimpleNamespace(provider="docker"),
+    )
 
     async def _slow_bash(**kwargs: Any) -> dict[str, Any]:
         assert held_advisory_locks() == ()
