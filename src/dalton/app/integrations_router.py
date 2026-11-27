@@ -31,6 +31,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
 
+from src.dalton.app.channels_router import require_channel_service_token
 from src.dalton.auth import resolve_dalton_create_user_email
 from src.dalton.auth.dispatch import _read_local_session_from_request
 from src.dalton.capabilities import (
@@ -44,6 +45,7 @@ from src.dalton.database import user_integrations as db
 from src.dalton.database.user_integrations import (
     IntegrationRow,
     PurgeLedgerRow,
+    RemoteRevokeStatus,
     TriggerReason,
 )
 from src.dalton.deployment_credentials.catalog import (
@@ -52,8 +54,10 @@ from src.dalton.deployment_credentials.catalog import (
 )
 from src.dalton.deployment_credentials.snapshot import get_credential_group
 from src.dalton.integrations.constants import (
+    DEFAULT_INTEGRATIONS_RETURN_TO,
     FEISHU_MAIL_SEND_SCOPE,
     GOOGLE_GMAIL_DRAFT_SCOPES,
+    OAUTH_STATE_TTL_SECONDS,
     PERSONAL_INTEGRATION_CONNECTOR_SPECS,
     build_feishu_integration_events_url,
     build_integration_redirect_uri,
@@ -68,10 +72,15 @@ from src.dalton.integrations.oauth_clients import (
 from src.dalton.services.feishu_integration_events import (
     FeishuEventAuthError,
     FeishuEventNotConfiguredError,
+    normalize_gateway_feishu_event,
     process_feishu_integration_event,
     verify_and_decode_feishu_event,
 )
-from src.dalton.services.integration_revoke import RemoteRevoker, process_revoke
+from src.dalton.services.integration_revoke import (
+    RemoteRevoker,
+    process_revoke,
+    schedule_background_remote_revokes,
+)
 from src.dalton.services.user_integrations_lifecycle import (
     IntegrationNotFoundError,
     MissingRefreshTokenOnAccountSwitchError,
@@ -80,12 +89,18 @@ from src.dalton.services.user_integrations_lifecycle import (
     finish_disconnect,
 )
 from src.dalton.services.user_integrations_oauth import (
+    OAUTH_BROWSER_BINDING_COOKIE_NAME,
     PersonalIntegrationError,
     confirm_pending_integration,
     handle_oauth_callback,
     start_oauth_authorization,
+    validate_callback_location,
 )
-from src.dalton.settings import get_dalton_auth_mode, is_dalton_enabled
+from src.dalton.settings import (
+    get_dalton_auth_mode,
+    get_dalton_public_app_url,
+    is_dalton_enabled,
+)
 from src.server.database.shared_workspaces import is_holder
 from src.server.utils.api import CurrentUserId, caller_of
 
@@ -390,13 +405,32 @@ def _build_callback_redirect_url(
     query_updates: dict[str, str],
     fragment_params: dict[str, str] | None = None,
 ) -> str:
-    parts = urlsplit(return_to)
+    safe_target = return_to if validate_callback_location(return_to) else DEFAULT_INTEGRATIONS_RETURN_TO
+    parts = urlsplit(safe_target)
     existing_q = dict(parse_qsl(parts.query, keep_blank_values=True))
     existing_q.update(query_updates)
     fragment = urlencode(fragment_params) if fragment_params else parts.fragment
-    return urlunsplit(
+    location = urlunsplit(
         ("", "", parts.path or "/", urlencode(existing_q), fragment)
     )
+    if not validate_callback_location(location):
+        fallback_parts = urlsplit(DEFAULT_INTEGRATIONS_RETURN_TO)
+        fallback_q = dict(parse_qsl(fallback_parts.query, keep_blank_values=True))
+        fallback_q.update(query_updates)
+        location = urlunsplit(
+            ("", "", fallback_parts.path, urlencode(fallback_q), fragment)
+        )
+    return location
+
+
+def _use_secure_cookie(request: Request) -> bool:
+    public_url = get_dalton_public_app_url().strip().lower()
+    if public_url.startswith("https://"):
+        return True
+    forwarded_proto = str(request.headers.get("x-forwarded-proto") or "").strip().lower()
+    if forwarded_proto == "https":
+        return True
+    return str(request.url.scheme).lower() == "https"
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +493,7 @@ async def list_personal_integrations_endpoint(
 async def authorize_personal_integration_endpoint(
     provider: str,
     service: str,
+    request: Request,
     session: CurrentIntegrationSession,
     body: AuthorizeIntegrationRequest | None = None,
 ) -> JSONResponse:
@@ -482,7 +517,7 @@ async def authorize_personal_integration_endpoint(
         return_to=req.return_to,
         revoker=get_router_remote_revoker() if norm_provider == "google" else None,
     )
-    return JSONResponse(
+    response = JSONResponse(
         status_code=200,
         content={
             "authorize_url": started.authorize_url,
@@ -493,11 +528,23 @@ async def authorize_personal_integration_endpoint(
         },
         headers=_NO_STORE_HEADERS,
     )
+    if started.browser_binding_cookie:
+        response.set_cookie(
+            key=OAUTH_BROWSER_BINDING_COOKIE_NAME,
+            value=started.browser_binding_cookie,
+            max_age=OAUTH_STATE_TTL_SECONDS,
+            path="/api/v1/dalton/integrations",
+            httponly=True,
+            samesite="lax",
+            secure=_use_secure_cookie(request),
+        )
+    return response
 
 
 @router.get("/{provider}/callback")
 async def oauth_callback_personal_integration_endpoint(
     provider: str,
+    request: Request,
     code: str | None = Query(default=None),
     state: str | None = Query(default=None),
     error: str | None = Query(default=None),
@@ -507,6 +554,7 @@ async def oauth_callback_personal_integration_endpoint(
     if not is_dalton_enabled():
         raise HTTPException(status_code=404, detail="Dalton mode disabled")
     norm_provider, _ = _validate_provider_service(provider)
+    browser_binding_token = request.cookies.get(OAUTH_BROWSER_BINDING_COOKIE_NAME)
 
     result = await handle_oauth_callback(
         provider=norm_provider,
@@ -514,6 +562,7 @@ async def oauth_callback_personal_integration_endpoint(
         state=state,
         error=error,
         error_description=error_description,
+        browser_binding_token=browser_binding_token,
         google_client=get_router_google_client() if norm_provider == "google" else None,
         feishu_client=get_router_feishu_client() if norm_provider == "feishu" else None,
         revoker=get_router_remote_revoker() if norm_provider == "google" else None,
@@ -538,11 +587,20 @@ async def oauth_callback_personal_integration_endpoint(
         query_updates=q_updates,
         fragment_params=frag,
     )
-    return RedirectResponse(
+    response = RedirectResponse(
         url=location,
         status_code=302,
         headers=_NO_STORE_HEADERS,
     )
+    if browser_binding_token is not None:
+        response.delete_cookie(
+            key=OAUTH_BROWSER_BINDING_COOKIE_NAME,
+            path="/api/v1/dalton/integrations",
+            httponly=True,
+            samesite="lax",
+            secure=_use_secure_cookie(request),
+        )
+    return response
 
 
 @router.post("/confirm")
@@ -725,20 +783,37 @@ async def disconnect_personal_integration_provider_endpoint(
         trigger_reason=TriggerReason.USER_DISCONNECT,
         remote_mode=effective_mode,
     )
-    revoker = get_router_remote_revoker() if norm_provider == "google" else None
+    # Complete ALL local 2A purges first so shared threads unblock immediately,
+    # then progress Google remote revocations independently in the background (§4.2(3)).
     results: list[dict[str, Any]] = []
+    pending_remote_pids: list[str] = []
     for pid in purge_ids:
-        finished = await finish_disconnect(pid, revoker=revoker)
+        finished = await finish_disconnect(
+            pid,
+            revoker=None,
+            run_remote_revoke=False,
+        )
+        remote_st = (
+            finished.remote_revoke_status
+            if finished is not None
+            else RemoteRevokeStatus.PENDING
+        )
+        if norm_provider == "google" and remote_st == RemoteRevokeStatus.PENDING:
+            pending_remote_pids.append(pid)
         results.append(
             {
                 "purge_id": pid,
                 "local_purge_status": (
                     finished.local_purge_status.value if finished is not None else "running"
                 ),
-                "remote_revoke_status": (
-                    finished.remote_revoke_status.value if finished is not None else "pending"
-                ),
+                "remote_revoke_status": remote_st.value,
             }
+        )
+
+    if pending_remote_pids and norm_provider == "google":
+        schedule_background_remote_revokes(
+            pending_remote_pids,
+            get_router_remote_revoker(),
         )
 
     payload: dict[str, Any] = {
@@ -806,6 +881,48 @@ async def feishu_integration_events_endpoint(
             content={"challenge": result.challenge or ""},
             headers=_NO_STORE_HEADERS,
         )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": result.status,
+            "event_id": result.event_id,
+            "reason": result.reason,
+            "purge_ids": list(result.purge_ids),
+        },
+        headers=_NO_STORE_HEADERS,
+    )
+
+
+@router.post(
+    "/internal/feishu/events",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def feishu_integration_internal_events_endpoint(
+    request: Request,
+) -> JSONResponse:
+    """Internal service-token endpoint receiving ``auth.user_access_token.revoked_v4`` forwarded from dalton-channel-gateway (§4.2(3), §4.5(3))."""
+    require_personal_integration_capability(
+        "feishu",
+        None,
+        mode="manage",
+        allow_feishu_event_configured=True,
+    )
+    try:
+        raw_payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "invalid_json", "message": "Invalid JSON body."},
+            headers=_NO_STORE_HEADERS,
+        )
+    if not isinstance(raw_payload, dict):
+        return JSONResponse(
+            status_code=400,
+            content={"code": "invalid_json", "message": "Event body must be a JSON object."},
+            headers=_NO_STORE_HEADERS,
+        )
+    normalized = normalize_gateway_feishu_event(raw_payload)
+    result = await process_feishu_integration_event(normalized, execute_purge=True)
     return JSONResponse(
         status_code=200,
         content={

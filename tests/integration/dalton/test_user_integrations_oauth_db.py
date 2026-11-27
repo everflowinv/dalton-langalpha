@@ -28,7 +28,12 @@ import pytest
 
 from src.config.settings import LOCAL_DEV_USER_ID
 from src.dalton.database import user_integrations as db
-from src.dalton.database.user_integrations import IntegrationStatus
+from src.dalton.database.user_integrations import (
+    IntegrationStatus,
+    LocalPurgeStatus,
+    RemoteRevokeStatus,
+    TriggerReason,
+)
 from src.dalton.deployment_credentials.catalog import (
     FEISHU_APP_ID_KEY,
     FEISHU_APP_SECRET_KEY,
@@ -43,8 +48,11 @@ from src.dalton.deployment_credentials.snapshot import (
     set_active_snapshot,
 )
 from src.dalton.integrations.constants import (
+    FEISHU_CALENDAR_SCOPES,
     FEISHU_REVOKED_EVENT_TYPE,
     GOOGLE_CALENDAR_MIN_SCOPES,
+    GOOGLE_GMAIL_MIN_SCOPES,
+    GOOGLE_SCOPE_CALENDAR_LIST_RO,
 )
 from src.dalton.integrations.oauth_clients import (
     FeishuOAuthClient,
@@ -53,10 +61,15 @@ from src.dalton.integrations.oauth_clients import (
     OAuthTokenResponse,
     OAuthUpstreamError,
 )
+from src.dalton.services import user_integrations_oauth as oauth_mod
 from src.dalton.services.feishu_integration_events import process_feishu_integration_event
 from src.dalton.services.integration_health_sweep import run_integration_health_sweep_once
 from src.dalton.services.integration_revoke import RemoteRevoker, RevokeOutcome
 from src.dalton.services.user_integrations_oauth import (
+    IntegrationNeedsReauthError,
+    IntegrationRevokedError,
+    IntegrationTransientError,
+    PendingConfirmationInvalidError,
     confirm_pending_integration,
     ensure_fresh_access_token,
     handle_oauth_callback,
@@ -216,7 +229,13 @@ async def test_google_first_connect_client_rotation_rebind_and_account_switch_co
             "VALUES (%s::uuid, %s::uuid, %s, 'completed', 'ptc', 1, 'Private Cal')",
             (thread_id, ws_id, uid),
         )
-        _, resp_id = await _seed_turn(conn, thread_id, 0, "Alice secret calendar note")
+    resp_id = await _seed_turn(
+        pool,
+        thread_id=thread_id,
+        turn_index=0,
+        user_text="Alice secret calendar note",
+    )
+    async with pool.connection() as conn:
         await db.record_touch(
             thread_id=thread_id,
             response_id=resp_id,
@@ -309,7 +328,7 @@ async def test_serialized_refresh_concurrent_two_workers_single_upstream_call_an
         service="calendar",
         oauth_client_id="cli_db_test_1",
         provider_account_id="ou_refresh_1",
-        granted_scopes="offline_access calendar:calendar:readonly",
+        granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
         access_token="expired-at",
         refresh_token="rt-once-1",
         expires_at=datetime.now(UTC) - timedelta(seconds=30),
@@ -365,7 +384,7 @@ async def test_feishu_webhook_revocation_atomic_dedup_and_authorized_at_db(
         service="calendar",
         oauth_client_id="cli_db_test_1",
         provider_account_id="ou_wh_1",
-        granted_scopes="offline_access calendar:calendar:readonly",
+        granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
         access_token="at-wh",
         refresh_token="rt-wh",
         expires_at=datetime.now(UTC) + timedelta(hours=2),
@@ -380,10 +399,11 @@ async def test_feishu_webhook_revocation_atomic_dedup_and_authorized_at_db(
                 "app_id": "cli_db_test_1",
                 "create_time": stale_ts_ms,
             },
-            "event": {"open_id": "ou_wh_1"},
+            "event": {"open_id": "ou_wh_1", "revoke_reason": "Revoked by user action."},
         }
     )
     assert stale_res.status == "ignored"
+    assert stale_res.reason == "stale_before_authorized_at"
     assert await db.get_connection(uid, "feishu", "calendar") is not None
 
     fresh_ts_ms = str(int((row.authorized_at + timedelta(seconds=5)).timestamp() * 1000))
@@ -394,19 +414,27 @@ async def test_feishu_webhook_revocation_atomic_dedup_and_authorized_at_db(
             "app_id": "cli_db_test_1",
             "create_time": fresh_ts_ms,
         },
-        "event": {"open_id": "ou_wh_1", "revoke_reason": "user_revoked"},
+        "event": {"open_id": "ou_wh_1", "revoke_reason": "Revoked by user action."},
     }
     ok_res = await process_feishu_integration_event(ev_payload)
     assert ok_res.status == "purged"
     assert len(ok_res.purge_ids) == 1
     assert await db.get_connection(uid, "feishu", "calendar") is None
 
+    # Replay of the exact same event_id returns duplicate
+    dup_res = await process_feishu_integration_event(ev_payload)
+    assert dup_res.status == "duplicate"
+    assert dup_res.reason == "duplicate_event_id"
+
 
 async def test_health_sweep_multiworker_mutex_and_unready_creds_skip_db(
     gws_live_pool: Any,
 ) -> None:
     """Real PG: 12h health sweep respects PG advisory lock, interval state, invalid_grant -> needs_reauth, and skips unready creds."""
-    _ = gws_live_pool
+    async with gws_live_pool.connection() as conn:
+        await conn.execute(
+            "UPDATE dalton_integration_health_sweep_state SET last_started_at = NULL, last_completed_at = NULL, last_worker_id = NULL"
+        )
     # Configure ONLY google_oauth (leave feishu_app unset!)
     _install_creds(feishu_app_id=None, feishu_app_secret=None)
     await db.upsert_connection(
@@ -426,7 +454,7 @@ async def test_health_sweep_multiworker_mutex_and_unready_creds_skip_db(
         service="calendar",
         oauth_client_id="cli_db_test_1",
         provider_account_id="ou-sw-2",
-        granted_scopes="offline_access calendar:calendar:readonly",
+        granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
         access_token="at-sw-2",
         refresh_token="rt-sw-2",
         expires_at=datetime.now(UTC) + timedelta(minutes=30),
@@ -452,3 +480,617 @@ async def test_health_sweep_multiworker_mutex_and_unready_creds_skip_db(
     rep2 = await run_integration_health_sweep_once(force=False, google_client=g_client)
     assert rep2.acquired is True
     assert rep2.skipped_reason == "interval_not_elapsed"
+
+
+async def test_refresh_error_and_narrowed_scope_commit_final_row_and_generation_db(
+    gws_live_pool: Any,
+) -> None:
+    """Real PG (Item 1): narrowed scope commits new tokens + generation + needs_reauth; ambiguous & transient commit cleanly."""
+    _ = gws_live_pool
+    _install_creds()
+    uid = "u-refresh-tx-commit"
+
+    # 1) Narrowed scope on refresh: commits newly issued tokens & token_generation=2 with status=needs_reauth
+    await db.upsert_connection(
+        user_id=uid,
+        provider="google",
+        service="calendar",
+        oauth_client_id="111222333-alpha.apps.googleusercontent.com",
+        provider_account_id="sub-narrow",
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="old-at",
+        refresh_token="old-rt",
+        expires_at=datetime.now(UTC) - timedelta(seconds=30),
+    )
+    g_client = create_autospec(GoogleOAuthClient, instance=True)
+    g_client.refresh_token.return_value = OAuthTokenResponse(
+        access_token="new-at-kept",
+        refresh_token="new-rt-kept",
+        expires_in=3600,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        scope=GOOGLE_SCOPE_CALENDAR_LIST_RO,  # missing calendar.events!
+    )
+    with pytest.raises(IntegrationNeedsReauthError) as narrow_exc:
+        await ensure_fresh_access_token(uid, "google", "calendar", google_client=g_client)
+    assert narrow_exc.value.code == "missing_required_scopes"
+    narrow_row = await db.get_connection(uid, "google", "calendar", decrypt_tokens=True)
+    assert narrow_row is not None
+    assert narrow_row.status == IntegrationStatus.NEEDS_REAUTH
+    assert narrow_row.token_generation == 2
+    assert narrow_row.access_token == "new-at-kept"
+    assert narrow_row.refresh_token == "new-rt-kept"
+    assert narrow_row.refresh_inflight_gen is None
+
+    # 2) Feishu ambiguous refresh (force_refresh=True, token not yet expired) commits refresh_ambiguous
+    await db.upsert_connection(
+        user_id=uid,
+        provider="feishu",
+        service="calendar",
+        oauth_client_id="cli_db_test_1",
+        provider_account_id="ou-amb",
+        granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
+        access_token="fs-valid-at",
+        refresh_token="fs-rt-1",
+        expires_at=datetime.now(UTC) + timedelta(minutes=20),
+    )
+    f_client = create_autospec(FeishuOAuthClient, instance=True)
+    f_client.refresh_token.side_effect = OAuthUpstreamError(
+        provider="feishu", kind="ambiguous", error_code="readtimeout"
+    )
+    with pytest.raises(IntegrationTransientError) as amb_exc:
+        await ensure_fresh_access_token(
+            uid, "feishu", "calendar", force_refresh=True, feishu_client=f_client
+        )
+    assert amb_exc.value.code == "refresh_ambiguous"
+    amb_row = await db.get_connection(uid, "feishu", "calendar")
+    assert amb_row is not None
+    assert amb_row.status == IntegrationStatus.REFRESH_AMBIGUOUS
+    assert amb_row.refresh_inflight_gen is None
+
+    # 3) Transient error clears refresh_inflight_gen and commits last_error_code while keeping connected
+    await db.upsert_connection(
+        user_id="u-transient-commit",
+        provider="google",
+        service="calendar",
+        oauth_client_id="111222333-alpha.apps.googleusercontent.com",
+        provider_account_id="sub-tr",
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-tr",
+        refresh_token="rt-tr",
+        expires_at=datetime.now(UTC) - timedelta(seconds=10),
+    )
+    g_client.refresh_token.side_effect = OAuthUpstreamError(
+        provider="google", kind="transient", error_code="http_503", status_code=503
+    )
+    with pytest.raises(IntegrationTransientError):
+        await ensure_fresh_access_token(
+            "u-transient-commit", "google", "calendar", google_client=g_client
+        )
+    tr_row = await db.get_connection("u-transient-commit", "google", "calendar")
+    assert tr_row is not None
+    assert tr_row.status == IntegrationStatus.CONNECTED
+    assert tr_row.refresh_inflight_gen is None
+    assert tr_row.last_error_code == "http_503"
+
+
+async def test_feishu_revoked_code_atomic_2a_registration_and_orphan_recovery_db(
+    gws_live_pool: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real PG (Item 2): confirmed revocation sets revoked_purging + ledger atomically; failure rolls back; orphans repaired."""
+    async with gws_live_pool.connection() as conn:
+        await conn.execute(
+            "UPDATE dalton_integration_health_sweep_state SET last_started_at = NULL, last_completed_at = NULL, last_worker_id = NULL"
+        )
+    _install_creds()
+    uid = "u-fs-atomic-rev"
+    await db.upsert_connection(
+        user_id=uid,
+        provider="feishu",
+        service="calendar",
+        oauth_client_id="cli_db_test_1",
+        provider_account_id="ou-rev-atomic",
+        granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
+        access_token="at-rev",
+        refresh_token="rt-rev",
+        expires_at=datetime.now(UTC) - timedelta(seconds=30),
+    )
+    f_client = create_autospec(FeishuOAuthClient, instance=True)
+    f_client.refresh_token.side_effect = OAuthUpstreamError(
+        provider="feishu", kind="revoked", error_code="feishu_confirmed_rev", feishu_code=99999
+    )
+
+    # 1) When Phase 1 registration fails, exception is NOT swallowed and row stays connected (not orphaned)
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            oauth_mod,
+            "begin_disconnect",
+            create_autospec(oauth_mod.begin_disconnect, side_effect=RuntimeError("phase1 db fail")),
+        )
+        with pytest.raises(RuntimeError, match="phase1 db fail"):
+            await ensure_fresh_access_token(uid, "feishu", "calendar", feishu_client=f_client)
+    still_conn = await db.get_connection(uid, "feishu", "calendar", decrypt_tokens=True)
+    assert still_conn is not None
+    assert still_conn.status == IntegrationStatus.CONNECTED
+    assert still_conn.refresh_token == "rt-rev"
+
+    # 2) Succeeding Phase 1 atomically commits revoked_purging + purge ledger and runs 2A purge
+    with pytest.raises(IntegrationRevokedError):
+        await ensure_fresh_access_token(uid, "feishu", "calendar", feishu_client=f_client)
+    assert await db.get_connection(uid, "feishu", "calendar") is None
+    ledgers = await db.list_user_purge_ledgers(uid, active_only=False)
+    assert any(
+        l.trigger_reason == TriggerReason.ERROR_CODE_REVOKED
+        and l.local_purge_status == LocalPurgeStatus.COMPLETED
+        for l in ledgers
+    )
+
+    # 3) Orphaned revoked_purging row with NO running ledger is repaired by health sweep AND by ensure_fresh_access_token
+    uid_orphan_sw = "u-orphan-sweep"
+    await db.upsert_connection(
+        user_id=uid_orphan_sw,
+        provider="feishu",
+        service="calendar",
+        oauth_client_id="cli_db_test_1",
+        provider_account_id="ou-orphan-1",
+        granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
+        access_token=None,
+        refresh_token=None,
+        status=IntegrationStatus.REVOKED_PURGING,
+    )
+    rep = await run_integration_health_sweep_once(force=True)
+    assert rep.triggered_revocation_purge >= 1
+    assert await db.get_connection(uid_orphan_sw, "feishu", "calendar") is None
+
+    uid_orphan_ref = "u-orphan-refresh"
+    await db.upsert_connection(
+        user_id=uid_orphan_ref,
+        provider="feishu",
+        service="calendar",
+        oauth_client_id="cli_db_test_1",
+        provider_account_id="ou-orphan-2",
+        granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
+        access_token=None,
+        refresh_token=None,
+        status=IntegrationStatus.REVOKED_PURGING,
+    )
+    with pytest.raises(IntegrationRevokedError):
+        await ensure_fresh_access_token(uid_orphan_ref, "feishu", "calendar", feishu_client=f_client)
+    assert await db.get_connection(uid_orphan_ref, "feishu", "calendar") is None
+
+
+async def test_feishu_event_race_with_reauth_and_multi_user_atomic_replay_db(
+    gws_live_pool: Any,
+) -> None:
+    """Real PG (Items 4 & 5): same-client reauth updates authorized_at/epoch; multi-user single-tx & partial replay."""
+    _ = gws_live_pool
+    _install_creds()
+
+    # 1) Multi-user atomic batch: 2 Dalton users bound to same Feishu open_id -> both purged in ONE tx
+    u1, u2 = "u-multi-a", "u-multi-b"
+    r1 = await db.upsert_connection(
+        user_id=u1,
+        provider="feishu",
+        service="calendar",
+        oauth_client_id="cli_db_test_1",
+        provider_account_id="ou_shared_multi",
+        granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
+        access_token="at-1",
+        refresh_token="rt-1",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    await db.upsert_connection(
+        user_id=u2,
+        provider="feishu",
+        service="calendar",
+        oauth_client_id="cli_db_test_1",
+        provider_account_id="ou_shared_multi",
+        granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
+        access_token="at-2",
+        refresh_token="rt-2",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    ev_ts_ms = str(int((r1.authorized_at + timedelta(seconds=10)).timestamp() * 1000))
+    res_both = await process_feishu_integration_event(
+        {
+            "header": {
+                "event_type": FEISHU_REVOKED_EVENT_TYPE,
+                "event_id": "evt-multi-both-1",
+                "app_id": "cli_db_test_1",
+                "create_time": ev_ts_ms,
+            },
+            "event": {"open_id": "ou_shared_multi", "revoke_reason": "Revoked by user action."},
+        }
+    )
+    assert res_both.status == "purged"
+    assert len(res_both.purge_ids) == 2
+    assert await db.get_connection(u1, "feishu", "calendar") is None
+    assert await db.get_connection(u2, "feishu", "calendar") is None
+
+    # 2) Replay when event_id was already recorded and user A has a running ledger, user B lacks one -> skips A, registers B
+    u3, u4 = "u-replay-a", "u-replay-b"
+    r3 = await db.upsert_connection(
+        user_id=u3,
+        provider="feishu",
+        service="calendar",
+        oauth_client_id="cli_db_test_1",
+        provider_account_id="ou_replay_multi",
+        granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
+        access_token="at-3",
+        refresh_token="rt-3",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    r4 = await db.upsert_connection(
+        user_id=u4,
+        provider="feishu",
+        service="calendar",
+        oauth_client_id="cli_db_test_1",
+        provider_account_id="ou_replay_multi",
+        granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
+        access_token="at-4",
+        refresh_token="rt-4",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    await db.record_webhook_event("feishu", "evt-partial-replay-1")
+    await db.insert_purge_ledger(
+        purge_id=str(uuid.uuid4()),
+        user_id=u3,
+        provider="feishu",
+        service="calendar",
+        oauth_client_id="cli_db_test_1",
+        provider_account_id="ou_replay_multi",
+        auth_epoch_upto=r3.auth_epoch,
+        trigger_reason=TriggerReason.WEBHOOK_REVOKED,
+        local_purge_status=LocalPurgeStatus.RUNNING,
+        purged_max_turn_by_thread={},
+        remote_revoke_status=RemoteRevokeStatus.NOT_APPLICABLE,
+    )
+    ev_replay_ts = str(int((r4.authorized_at + timedelta(seconds=10)).timestamp() * 1000))
+    res_replay = await process_feishu_integration_event(
+        {
+            "header": {
+                "event_type": FEISHU_REVOKED_EVENT_TYPE,
+                "event_id": "evt-partial-replay-1",
+                "app_id": "cli_db_test_1",
+                "create_time": ev_replay_ts,
+            },
+            "event": {"open_id": "ou_replay_multi", "revoke_reason": "Revoked by user action."},
+        },
+        execute_purge=False,
+    )
+    assert res_replay.status == "purged"
+    assert len(res_replay.purge_ids) == 1
+    u3_ledgers = await db.list_user_purge_ledgers(u3, active_only=True)
+    u4_ledgers = await db.list_user_purge_ledgers(u4, active_only=True)
+    assert len(u3_ledgers) == 1  # untouched
+    assert len(u4_ledgers) == 1  # registered on replay!
+
+    # 3) Same-client Feishu re-authorization updates authorized_at and bumps auth_epoch so older event is skipped
+    u5 = "u-feishu-reauth"
+    initial_row = await db.upsert_connection(
+        user_id=u5,
+        provider="feishu",
+        service="calendar",
+        oauth_client_id="cli_db_test_1",
+        provider_account_id="ou_reauth_race",
+        granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
+        access_token="at-old",
+        refresh_token="rt-old",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    old_event_ts_ms = str(int((initial_row.authorized_at + timedelta(milliseconds=10)).timestamp() * 1000))
+    await asyncio.sleep(0.05)
+    reauthed, _ = await oauth_mod._finalize_connection(
+        user_id=u5,
+        provider="feishu",
+        service="calendar",
+        oauth_client_id="cli_db_test_1",
+        provider_account_id="ou_reauth_race",
+        provider_union_id=None,
+        provider_email="u5@example.com",
+        granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
+        access_token="at-fresh",
+        refresh_token="rt-fresh",
+        expires_at=datetime.now(UTC) + timedelta(hours=2),
+        preferences={},
+        allow_account_switch=False,
+    )
+    assert reauthed.auth_epoch > initial_row.auth_epoch
+    assert reauthed.authorized_at > initial_row.authorized_at
+    stale_after_reauth = await process_feishu_integration_event(
+        {
+            "header": {
+                "event_type": FEISHU_REVOKED_EVENT_TYPE,
+                "event_id": "evt-race-stale-1",
+                "app_id": "cli_db_test_1",
+                "create_time": old_event_ts_ms,
+            },
+            "event": {"open_id": "ou_reauth_race", "revoke_reason": "Revoked by user action."},
+        }
+    )
+    assert stale_after_reauth.status == "ignored"
+    assert stale_after_reauth.reason == "stale_before_authorized_at"
+    assert await db.get_connection(u5, "feishu", "calendar") is not None
+
+
+async def test_same_project_dual_service_rotation_no_revoke_retryable_queue_and_commit_supersede_db(
+    gws_live_pool: Any,
+) -> None:
+    """Real PG (Item 7): same-project rotation with active new client skips revoke; RETRYABLE queues then supersedes on commit."""
+    _ = gws_live_pool
+    uid = LOCAL_DEV_USER_ID
+    client_old = "111222333-old.apps.googleusercontent.com"
+    client_new = "111222333-new.apps.googleusercontent.com"
+    _install_creds(google_client_id=client_new)
+
+    # Case A: Calendar already rebound to client_new; Gmail still on client_old -> starting Gmail OAuth MUST NOT revoke!
+    await db.upsert_connection(
+        user_id=uid,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_new,
+        provider_account_id="sub-dual",
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-cal-new",
+        refresh_token="rt-cal-new",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        status=IntegrationStatus.CONNECTED,
+    )
+    await db.upsert_connection(
+        user_id=uid,
+        provider="google",
+        service="mail",
+        oauth_client_id=client_old,
+        provider_account_id="sub-dual",
+        granted_scopes=" ".join(GOOGLE_GMAIL_MIN_SCOPES),
+        access_token="at-mail-old",
+        refresh_token="rt-mail-old",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        status=IntegrationStatus.NEEDS_REAUTH,
+    )
+    revoker = create_autospec(RemoteRevoker, instance=True)
+    revoker.revoke.return_value = RevokeOutcome.SUCCEEDED
+
+    await start_oauth_authorization(
+        user_id=uid,
+        provider="google",
+        service="mail",
+        auth_mode="oss",
+        revoker=revoker,
+    )
+    assert revoker.revoke.await_count == 0
+    ledgers_a = await db.list_user_purge_ledgers(uid, active_only=False)
+    assert any(
+        l.oauth_client_id == client_old
+        and l.remote_revoke_status == RemoteRevokeStatus.SUPERSEDED
+        for l in ledgers_a
+    )
+
+    # Case B: Sole service on old client, revoker returns RETRYABLE -> queued in retry queue -> commit supersedes under revoke_lock
+    uid_b = "u-rot-retryable"
+    await db.upsert_connection(
+        user_id=uid_b,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_old,
+        provider_account_id="sub-solo",
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-solo-old",
+        refresh_token="rt-solo-old",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        status=IntegrationStatus.NEEDS_REAUTH,
+    )
+    revoker_retry = create_autospec(RemoteRevoker, instance=True)
+    revoker_retry.revoke.return_value = RevokeOutcome.RETRYABLE
+
+    await start_oauth_authorization(
+        user_id=uid_b,
+        provider="google",
+        service="calendar",
+        auth_mode="oss",
+        revoker=revoker_retry,
+    )
+    assert revoker_retry.revoke.await_count == 1
+    active_b = await db.list_active_revokes_for_google_project_sub(
+        uid_b, "111222333", "sub-solo", decrypt_revoke_token=True
+    )
+    assert len(active_b) == 1
+    assert active_b[0].remote_revoke_status == RemoteRevokeStatus.FAILED_RETRYABLE
+    assert active_b[0].revoke_token == "rt-solo-old"
+
+    # Committing the new grant supersedes that retryable ledger atomically under revoke_lock
+    await oauth_mod._finalize_connection(
+        user_id=uid_b,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_new,
+        provider_account_id="sub-solo",
+        provider_union_id=None,
+        provider_email="solo@example.com",
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-solo-new",
+        refresh_token="rt-solo-new",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        preferences={},
+        allow_account_switch=False,
+        revoker=revoker_retry,
+    )
+    after_b = await db.get_purge_ledger(active_b[0].purge_id, decrypt_revoke_token=True)
+    assert after_b is not None
+    assert after_b.remote_revoke_status == RemoteRevokeStatus.SUPERSEDED
+    assert after_b.revoke_token is None
+
+
+async def test_interleaved_account_switch_confirmations_bound_to_old_epoch_db(
+    gws_live_pool: Any,
+) -> None:
+    """Real PG (Item 8): interleaved switch confirmations cannot overwrite a newer account."""
+    _ = gws_live_pool
+    uid = LOCAL_DEV_USER_ID
+    client_a = "111222333-alpha.apps.googleusercontent.com"
+    _install_creds(google_client_id=client_a)
+
+    g_client = create_autospec(GoogleOAuthClient, instance=True)
+    g_client.revoke.return_value = RevokeOutcome.SUCCEEDED
+
+    def _mock_google(sub: str, email: str, rt: str) -> None:
+        g_client.exchange_code.return_value = OAuthTokenResponse(
+            access_token=f"at-{sub}",
+            refresh_token=rt,
+            expires_in=3600,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            scope=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+            id_token=f"id-{sub}",
+        )
+        g_client.verify_id_token.return_value = GoogleIdTokenClaims(
+            sub=sub,
+            email=email,
+            email_verified=True,
+            aud=client_a,
+            iss="https://accounts.google.com",
+            exp=int(time.time()) + 3600,
+        )
+
+    await db.upsert_connection(
+        user_id=uid,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_a,
+        provider_account_id="sub-a",
+        provider_email="a@example.com",
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-a",
+        refresh_token="rt-a",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+
+    # Stage ticket B and ticket C both against Account A
+    _mock_google("sub-b", "b@example.com", "rt-b")
+    s_b = await start_oauth_authorization(
+        user_id=uid, provider="google", service="calendar", auth_mode="oss", switch_account=True, revoker=g_client
+    )
+    cb_b = await handle_oauth_callback(
+        provider="google", code="cb", state=s_b.state, google_client=g_client, revoker=g_client
+    )
+    assert cb_b.status == "account_switch_confirmation_required" and cb_b.confirmation_token
+
+    _mock_google("sub-c", "c@example.com", "rt-c")
+    s_c = await start_oauth_authorization(
+        user_id=uid, provider="google", service="calendar", auth_mode="oss", switch_account=True, revoker=g_client
+    )
+    cb_c = await handle_oauth_callback(
+        provider="google", code="cc", state=s_c.state, google_client=g_client, revoker=g_client
+    )
+    assert cb_c.status == "account_switch_confirmation_required" and cb_c.confirmation_token
+
+    # Confirm C first -> switches A -> C
+    conf_c = await confirm_pending_integration(
+        user_id=uid, confirmation_token=cb_c.confirmation_token, confirm_account_switch=True, revoker=g_client
+    )
+    assert conf_c.status == "connected"
+    assert conf_c.connection is not None and conf_c.connection.provider_account_id == "sub-c"
+
+    # Now confirming stale ticket B MUST fail (409) and void ticket B while keeping Account C intact!
+    with pytest.raises(PendingConfirmationInvalidError) as stale_exc:
+        await confirm_pending_integration(
+            user_id=uid, confirmation_token=cb_b.confirmation_token, confirm_account_switch=True, revoker=g_client
+        )
+    assert stale_exc.value.code == "account_switch_state_changed"
+    cur_conn = await db.get_connection(uid, "google", "calendar")
+    assert cur_conn is not None and cur_conn.provider_account_id == "sub-c"
+
+
+async def test_local_mode_browser_binding_and_sweep_shared_credential_grouping_db(
+    gws_live_pool: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real PG (Items 9 & 11): local browser cookie binding; sweep groups Google siblings into 1 refresh; force_refresh reuses newer gen."""
+    async with gws_live_pool.connection() as conn:
+        await conn.execute(
+            "UPDATE dalton_integration_health_sweep_state SET last_started_at = NULL, last_completed_at = NULL, last_worker_id = NULL"
+        )
+    _install_creds()
+    uid = "u-local-browser"
+    client_a = "111222333-alpha.apps.googleusercontent.com"
+
+    # 1) Local mode browser binding cookie (Item 9)
+    monkeypatch.setenv("DALTON_AUTH_MODE", "local")
+    monkeypatch.setattr(
+        oauth_mod,
+        "verify_local_session_active",
+        create_autospec(oauth_mod.verify_local_session_active, return_value=None),
+    )
+    g_client = create_autospec(GoogleOAuthClient, instance=True)
+    g_client.exchange_code.return_value = OAuthTokenResponse(
+        access_token="at-loc-1",
+        refresh_token="rt-loc-1",
+        expires_in=3600,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        scope=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        id_token="id-loc",
+    )
+    g_client.verify_id_token.return_value = GoogleIdTokenClaims(
+        sub="sub-loc",
+        email="loc@example.com",
+        email_verified=True,
+        aud=client_a,
+        iss="https://accounts.google.com",
+        exp=int(time.time()) + 3600,
+    )
+
+    started = await start_oauth_authorization(
+        user_id=uid,
+        provider="google",
+        service="calendar",
+        auth_mode="local",
+        session_id="sid-1",
+        revoker=g_client,
+    )
+    assert started.browser_binding_cookie
+
+    # Different browser (no cookie / wrong cookie) -> confirmation_required, NOT immediately connected
+    cb_other = await handle_oauth_callback(
+        provider="google",
+        code="c-other",
+        state=started.state,
+        browser_binding_token="wrong-browser-cookie",
+        google_client=g_client,
+        revoker=g_client,
+    )
+    assert cb_other.status == "confirmation_required"
+    assert cb_other.confirmation_token
+    assert await db.get_connection(uid, "google", "calendar") is None
+
+    # Authenticated confirmation activates the connection
+    conf = await confirm_pending_integration(
+        user_id=uid, confirmation_token=cb_other.confirmation_token, revoker=g_client
+    )
+    assert conf.status == "connected"
+    assert await db.get_connection(uid, "google", "calendar") is not None
+
+    # 2) Sweep groups Google calendar + mail sharing (client, sub) into ONE upstream refresh (Item 11)
+    await db.upsert_connection(
+        user_id=uid,
+        provider="google",
+        service="mail",
+        oauth_client_id=client_a,
+        provider_account_id="sub-loc",
+        granted_scopes=" ".join(GOOGLE_GMAIL_MIN_SCOPES),
+        access_token="at-loc-1",
+        refresh_token="rt-loc-1",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    g_client.refresh_token.return_value = OAuthTokenResponse(
+        access_token="at-swept-once",
+        refresh_token="rt-swept-once",
+        expires_in=3600,
+        expires_at=datetime.now(UTC) + timedelta(hours=2),
+        scope=" ".join((*GOOGLE_CALENDAR_MIN_SCOPES, *GOOGLE_GMAIL_MIN_SCOPES)),
+    )
+    rep = await run_integration_health_sweep_once(force=True, google_client=g_client)
+    assert rep.acquired is True
+    assert g_client.refresh_token.await_count == 1
+    cal_after = await db.get_connection(uid, "google", "calendar", decrypt_tokens=True)
+    mail_after = await db.get_connection(uid, "google", "mail", decrypt_tokens=True)
+    assert cal_after is not None and cal_after.access_token == "at-swept-once"
+    assert mail_after is not None and mail_after.access_token == "at-swept-once"

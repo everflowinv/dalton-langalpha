@@ -6259,4 +6259,61 @@ describe("Feishu card envelope constants parity with Python", () => {
     );
     expect(() => assertFeishuCardWithinEnvelope(sentCard)).not.toThrow();
   });
+
+  it("registers auth.user_access_token.revoked_v4 and forwards revocation events to Dalton backend", async () => {
+    const { FeishuChannelAdapter } = await import(
+      "../src/channels/feishu/monitor.js"
+    );
+    const { client } = createFakeLarkClient();
+    const registeredHandlers: Record<string, (data: unknown) => Promise<void>> = {};
+    const forwarded: Array<Record<string, unknown>> = [];
+
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_gw_rev_test",
+      appSecret: "sec_gw_rev_test",
+      botOpenId: "ou_test_bot_open_id",
+      client,
+      wsClientFactory: () => ({
+        start: async () => undefined,
+        close: () => undefined,
+        getConnectionStatus: () => ({ state: "connected" }),
+      }),
+      eventDispatcherFactory: () =>
+        ({
+          register: (map: Record<string, (data: unknown) => Promise<void>>) => {
+            Object.assign(registeredHandlers, map);
+          },
+        }) as unknown as import("@larksuiteoapi/node-sdk").EventDispatcher,
+    });
+
+    adapter.setBackendClient({
+      forwardFeishuRevokedEvent: async (payload: Record<string, unknown>) => {
+        forwarded.push(payload);
+        return { status: "purged", event_id: "evt_ws_1", purge_ids: ["p1"] };
+      },
+    } as unknown as import("../src/backend-client.js").BackendClient);
+
+    await adapter.start();
+    try {
+      expect(typeof registeredHandlers["auth.user_access_token.revoked_v4"]).toBe(
+        "function",
+      );
+      await registeredHandlers["auth.user_access_token.revoked_v4"]!({
+        event_id: "evt_ws_1",
+        open_id: "ou_user_rev",
+        revoke_reason: "Revoked by user action.",
+        create_time: String(Date.now()),
+      });
+      expect(forwarded).toHaveLength(1);
+      expect(forwarded[0]).toMatchObject({
+        app_id: "cli_gw_rev_test",
+        event_type: "auth.user_access_token.revoked_v4",
+        event_id: "evt_ws_1",
+        open_id: "ou_user_rev",
+        revoke_reason: "Revoked by user action.",
+      });
+    } finally {
+      await adapter.stop();
+    }
+  });
 });

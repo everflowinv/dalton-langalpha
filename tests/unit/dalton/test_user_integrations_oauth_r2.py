@@ -95,7 +95,6 @@ from src.dalton.services.integration_health_sweep import run_integration_health_
 from src.dalton.services.integration_revoke import RemoteRevoker, RevokeOutcome
 from src.dalton.services.user_integrations_lifecycle import (
     AccountSwitchResult,
-    DuplicateWebhookEventError,
     FinishDisconnectResult,
 )
 from src.dalton.services.user_integrations_oauth import (
@@ -232,6 +231,7 @@ def _make_state_row(
     redirect_uri: str = "https://dalton.example.com" + GOOGLE_OAUTH_CALLBACK_PATH,
     return_to: str = "/settings?tab=integrations",
     expires_at: datetime | None = None,
+    browser_binding_hash: str | None = None,
 ) -> OAuthStateRow:
     now = datetime.now(UTC)
     return OAuthStateRow(
@@ -250,6 +250,7 @@ def _make_state_row(
         expires_at=expires_at or (now + timedelta(minutes=10)),
         created_at=now,
         code_verifier="pkce-verifier-secret-value",
+        browser_binding_hash=browser_binding_hash,
     )
 
 
@@ -258,7 +259,7 @@ def _make_fake_lock_pool(
     try_lock_results: list[bool] | None = None,
     fetchone_results: list[Any] | None = None,
 ) -> tuple[Any, list[tuple[str, Any]]]:
-    """Create a fake ``get_db_connection`` context manager using ``create_autospec``."""
+    """Create a fake ``get_db_connection`` context manager tracking commits & rollbacks."""
     executed: list[tuple[str, Any]] = []
     lock_queue = list(try_lock_results) if try_lock_results is not None else [True]
     fetch_queue = list(fetchone_results or [])
@@ -298,7 +299,13 @@ def _make_fake_lock_pool(
 
         @asynccontextmanager
         async def transaction(self) -> Any:
-            yield
+            try:
+                yield
+            except BaseException:
+                executed.append(("TX_ROLLBACK", None))
+                raise
+            else:
+                executed.append(("TX_COMMIT", None))
 
     @asynccontextmanager
     async def _get_conn(_existing: Any = None) -> Any:
@@ -472,6 +479,15 @@ class TestOAuthStateAndSessionVerification:
         )
         monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=None))
 
+        fake_conn_ctx, _ = _make_fake_lock_pool()
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_conn_ctx)
+        supersede_tx_spy = create_autospec(
+            db.supersede_active_revokes_for_google_project_sub_tx, return_value=0
+        )
+        monkeypatch.setattr(
+            db, "supersede_active_revokes_for_google_project_sub_tx", supersede_tx_spy
+        )
+
         staged: dict[tuple[str, str], PendingConfirmationRow] = {}
 
         async def _insert_pending(**kw: Any) -> None:
@@ -492,6 +508,9 @@ class TestOAuthStateAndSessionVerification:
                 created_at=datetime.now(UTC),
                 access_token=kw["access_token"],
                 refresh_token=kw["refresh_token"],
+                expected_old_oauth_client_id=kw.get("expected_old_oauth_client_id"),
+                expected_old_provider_account_id=kw.get("expected_old_provider_account_id"),
+                expected_old_auth_epoch=kw.get("expected_old_auth_epoch"),
             )
 
         async def _peek_pending(ch: str, uid: str, *, conn: Any = None) -> PendingConfirmationRow | None:
@@ -694,10 +713,14 @@ class TestGoogleThreeCases:
                 completed_at=datetime.now(UTC),
             ),
         )
-        supersede_spy = create_autospec(oauth_mod.supersede_pending_revokes, return_value=1)
+        supersede_tx_spy = create_autospec(
+            db.supersede_active_revokes_for_google_project_sub_tx, return_value=1
+        )
         monkeypatch.setattr(db, "upsert_connection", upsert_spy)
         monkeypatch.setattr(db, "insert_purge_ledger", ledger_spy)
-        monkeypatch.setattr(oauth_mod, "supersede_pending_revokes", supersede_spy)
+        monkeypatch.setattr(
+            db, "supersede_active_revokes_for_google_project_sub_tx", supersede_tx_spy
+        )
 
         saved, purge_id = await oauth_mod._finalize_connection(
             user_id=LOCAL_DEV_USER_ID,
@@ -727,7 +750,10 @@ class TestGoogleThreeCases:
         assert ledger_kwargs["local_purge_status"] == LocalPurgeStatus.NOT_REQUIRED
         assert ledger_kwargs["remote_revoke_status"] == RemoteRevokeStatus.SUPERSEDED
         assert ledger_kwargs["encrypted_revoke_token"] is None
-        supersede_spy.assert_awaited_once_with(LOCAL_DEV_USER_ID, "111222333", "sub-alice")
+        # Pending revokes were superseded INSIDE the commit transaction under revoke_lock
+        supersede_tx_spy.assert_awaited_once()
+        assert supersede_tx_spy.await_args.args[:3] == (LOCAL_DEV_USER_ID, "111222333", "sub-alice")
+        assert supersede_tx_spy.await_args.kwargs.get("conn") is not None
 
     @pytest.mark.asyncio
     async def test_google_account_switch_returns_needs_confirm_then_runs_2a_and_saves_new(
@@ -775,6 +801,15 @@ class TestGoogleThreeCases:
             db, "has_running_local_purge_for_service", create_autospec(db.has_running_local_purge_for_service, return_value=[])
         )
 
+        fake_conn_ctx, _ = _make_fake_lock_pool()
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_conn_ctx)
+        supersede_tx_spy = create_autospec(
+            db.supersede_active_revokes_for_google_project_sub_tx, return_value=0
+        )
+        monkeypatch.setattr(
+            db, "supersede_active_revokes_for_google_project_sub_tx", supersede_tx_spy
+        )
+
         staged: dict[tuple[str, str], PendingConfirmationRow] = {}
 
         async def _insert_pending(**kw: Any) -> None:
@@ -795,6 +830,9 @@ class TestGoogleThreeCases:
                 created_at=datetime.now(UTC),
                 access_token=kw["access_token"],
                 refresh_token=kw["refresh_token"],
+                expected_old_oauth_client_id=kw.get("expected_old_oauth_client_id"),
+                expected_old_provider_account_id=kw.get("expected_old_provider_account_id"),
+                expected_old_auth_epoch=kw.get("expected_old_auth_epoch"),
             )
 
         monkeypatch.setattr(db, "insert_pending_confirmation", create_autospec(db.insert_pending_confirmation, side_effect=_insert_pending))
@@ -844,12 +882,10 @@ class TestGoogleThreeCases:
                 remote_revoke_status=RemoteRevokeStatus.SUCCEEDED,
             ),
         )
-        supersede_spy = create_autospec(oauth_mod.supersede_pending_revokes, return_value=0)
         revoker = create_autospec(RemoteRevoker, instance=True)
 
         monkeypatch.setattr(oauth_mod, "replace_connection_for_account_switch", replace_spy)
         monkeypatch.setattr(oauth_mod, "finish_disconnect", finish_spy)
-        monkeypatch.setattr(oauth_mod, "supersede_pending_revokes", supersede_spy)
 
         confirmed = await confirm_pending_integration(
             user_id=LOCAL_DEV_USER_ID,
@@ -862,8 +898,13 @@ class TestGoogleThreeCases:
         assert confirmed.connection is not None
         assert confirmed.connection.provider_account_id == "sub-bob"
         replace_spy.assert_awaited_once()
+        assert replace_spy.await_args.kwargs["expected_old_oauth_client_id"] == old_row.oauth_client_id
+        assert replace_spy.await_args.kwargs["expected_old_provider_account_id"] == old_row.provider_account_id
+        assert replace_spy.await_args.kwargs["expected_old_auth_epoch"] == old_row.auth_epoch
         finish_spy.assert_awaited_once_with(purge_uuid, revoker=revoker)
-        supersede_spy.assert_awaited_once_with(LOCAL_DEV_USER_ID, "111222333", "sub-bob")
+        # Staging the pending confirmation coordinated under revoke_lock and superseded old revokes
+        supersede_tx_spy.assert_awaited_once()
+        assert supersede_tx_spy.await_args.args[:3] == (LOCAL_DEV_USER_ID, "111222333", "sub-bob")
 
 
 # ---------------------------------------------------------------------------
@@ -1081,9 +1122,9 @@ class TestSerializedRefreshAndCAS:
             )
         begin_disc_spy.assert_not_awaited()
 
-        # 4) Feishu confirmed user revocation code (20071) -> triggers begin_disconnect(ERROR_CODE_REVOKED) + finish_disconnect
+        # 4) Feishu confirmed user revocation code -> atomic Phase 1 via begin_disconnect + finish_disconnect
         f_client.refresh_token.side_effect = OAuthUpstreamError(
-            provider="feishu", kind="revoked", error_code="feishu_20071", feishu_code=20071
+            provider="feishu", kind="revoked", error_code="feishu_confirmed_rev", feishu_code=99999
         )
         with pytest.raises(IntegrationRevokedError):
             await ensure_fresh_access_token(
@@ -1095,6 +1136,12 @@ class TestSerializedRefreshAndCAS:
             "calendar",
             trigger_reason=TriggerReason.ERROR_CODE_REVOKED,
             remote_mode="local_only",
+            expected_oauth_client_id="cli_test_app_1",
+            expected_provider_account_id="ou_1",
+            expected_auth_epoch=expired_row.auth_epoch,
+            expected_token_generation=expired_row.token_generation,
+            last_error_code="feishu_confirmed_rev",
+            clear_tokens=True,
         )
         finish_disc_spy.assert_awaited_once_with("purge-1", revoker=None)
 
@@ -1231,8 +1278,31 @@ class TestFeishuRevocationEvents:
         _install_saved_credentials(
             feishu_encrypt_key=enc_key, feishu_verification_token=ver_tok
         )
-        inner = {"type": "url_verification", "challenge": "chal-xyz", "token": ver_tok}
-        body = json.dumps({"encrypt": encrypt_feishu_event_payload(json.dumps(inner), enc_key)}).encode()
+        # 1) Official Feishu url_verification handshake succeeds WITHOUT X-Lark-Signature headers
+        challenge_inner = {"type": "url_verification", "challenge": "chal-xyz", "token": ver_tok}
+        challenge_body = json.dumps(
+            {"encrypt": encrypt_feishu_event_payload(json.dumps(challenge_inner), enc_key)}
+        ).encode()
+        decoded_challenge = verify_and_decode_feishu_event(
+            raw_body=challenge_body,
+            headers={},
+        )
+        assert decoded_challenge["type"] == "url_verification"
+        assert decoded_challenge["challenge"] == "chal-xyz"
+
+        # 2) Normal event callback requires valid X-Lark-Signature and 5-minute replay window
+        event_inner = {
+            "schema": "2.0",
+            "header": {
+                "event_id": "evt-sig-1",
+                "event_type": FEISHU_REVOKED_EVENT_TYPE,
+                "token": ver_tok,
+                "app_id": "cli_test_app_1",
+                "create_time": str(int(time.time() * 1000)),
+            },
+            "event": {"open_id": "ou_1", "revoke_reason": "Revoked by user action."},
+        }
+        body = json.dumps({"encrypt": encrypt_feishu_event_payload(json.dumps(event_inner), enc_key)}).encode()
         now_ts = int(time.time())
         ts = str(now_ts)
         nonce = "nonce-42"
@@ -1249,7 +1319,16 @@ class TestFeishuRevocationEvents:
             },
             now_epoch_s=float(now_ts),
         )
-        assert decoded["challenge"] == "chal-xyz"
+        assert decoded["header"]["event_id"] == "evt-sig-1"
+
+        # Missing signature headers on normal event rejected
+        with pytest.raises(FeishuEventAuthError) as missing_sig:
+            verify_and_decode_feishu_event(
+                raw_body=body,
+                headers={},
+                now_epoch_s=float(now_ts),
+            )
+        assert missing_sig.value.code == "missing_signature_headers"
 
         # Invalid signature rejected
         with pytest.raises(FeishuEventAuthError) as bad_sig:
@@ -1298,12 +1377,14 @@ class TestFeishuRevocationEvents:
         monkeypatch.setattr(
             db, "list_connections_by_provider_account", create_autospec(db.list_connections_by_provider_account, return_value=[conn_row])
         )
-        monkeypatch.setattr(
-            db, "list_user_connections", create_autospec(db.list_user_connections, return_value=[conn_row])
+        batch_spy = create_autospec(
+            feishu_events_mod.begin_feishu_webhook_revocation_batch,
+            return_value=("purged", ["purge-fs-1"]),
         )
-        begin_spy = create_autospec(feishu_events_mod.begin_disconnect, return_value="purge-fs-1")
         finish_spy = create_autospec(feishu_events_mod.finish_disconnect, return_value=None)
-        monkeypatch.setattr(feishu_events_mod, "begin_disconnect", begin_spy)
+        monkeypatch.setattr(
+            feishu_events_mod, "begin_feishu_webhook_revocation_batch", batch_spy
+        )
         monkeypatch.setattr(feishu_events_mod, "finish_disconnect", finish_spy)
 
         # 1) Unrelated event type -> ignored
@@ -1313,22 +1394,43 @@ class TestFeishuRevocationEvents:
         assert res_other.status == "ignored"
         assert res_other.reason == "unsupported_event_type"
 
-        # 2) Non-user revocation reason -> ignored (no 2A!)
-        res_admin = await process_feishu_integration_event(
+        # 2) Non-user revocation reason & missing reason -> ignored (no 2A!)
+        for bad_event in (
+            {"open_id": "ou_user_1", "revoke_reason": "Revoked by administrator action."},
+            {"open_id": "ou_user_1", "revoke_reason": "Revoked by security and risk control action."},
+            {"open_id": "ou_user_1"},  # missing revoke_reason NEVER triggers 2A
+        ):
+            res_admin = await process_feishu_integration_event(
+                {
+                    "header": {
+                        "event_type": FEISHU_REVOKED_EVENT_TYPE,
+                        "event_id": "evt-admin",
+                        "app_id": "cli_test_app_1",
+                        "create_time": str(int(now.timestamp() * 1000)),
+                    },
+                    "event": bad_event,
+                }
+            )
+            assert res_admin.status == "ignored"
+            assert res_admin.reason == "non_user_revocation"
+
+        # 3) Missing event timestamp -> ignored (never bypasses authorized_at)
+        res_no_ts = await process_feishu_integration_event(
             {
                 "header": {
                     "event_type": FEISHU_REVOKED_EVENT_TYPE,
-                    "event_id": "evt-admin",
+                    "event_id": "evt-no-ts",
                     "app_id": "cli_test_app_1",
-                    "create_time": str(int(now.timestamp() * 1000)),
                 },
-                "event": {"open_id": "ou_user_1", "revoke_reason": "admin_disabled"},
+                "event": {"open_id": "ou_user_1", "revoke_reason": "Revoked by user action."},
             }
         )
-        assert res_admin.status == "ignored"
-        assert res_admin.reason == "non_user_revocation"
+        assert res_no_ts.status == "ignored"
+        assert res_no_ts.reason == "missing_event_timestamp"
+        batch_spy.assert_not_awaited()
 
-        # 3) Stale revocation predating authorized_at -> ignored
+        # 4) Stale revocation predating authorized_at (rejected inside tx) -> ignored
+        batch_spy.return_value = ("stale_before_authorized_at", [])
         stale_ms = str(int((now - timedelta(hours=2)).timestamp() * 1000))
         res_stale = await process_feishu_integration_event(
             {
@@ -1338,14 +1440,16 @@ class TestFeishuRevocationEvents:
                     "app_id": "cli_test_app_1",
                     "create_time": stale_ms,
                 },
-                "event": {"open_id": "ou_user_1"},
+                "event": {"open_id": "ou_user_1", "revoke_reason": "Revoked by user action."},
             }
         )
         assert res_stale.status == "ignored"
         assert res_stale.reason == "stale_before_authorized_at"
-        begin_spy.assert_not_awaited()
+        finish_spy.assert_not_awaited()
 
-        # 4) Valid user-initiated revocation newer than authorized_at -> triggers 2A!
+        # 5) Official user-initiated revocation newer than authorized_at -> triggers atomic batch 2A!
+        batch_spy.reset_mock()
+        batch_spy.return_value = ("purged", ["purge-fs-1"])
         res_ok = await process_feishu_integration_event(
             {
                 "header": {
@@ -1354,23 +1458,18 @@ class TestFeishuRevocationEvents:
                     "app_id": "cli_test_app_1",
                     "create_time": str(int(now.timestamp() * 1000)),
                 },
-                "event": {"open_id": "ou_user_1", "revoke_reason": "user_revoked"},
+                "event": {"open_id": "ou_user_1", "revoke_reason": "Revoked by user action."},
             }
         )
         assert res_ok.status == "purged"
         assert res_ok.purge_ids == ("purge-fs-1",)
-        begin_spy.assert_awaited_once_with(
-            "u-feishu-1",
-            "feishu",
-            "calendar",
-            trigger_reason=TriggerReason.WEBHOOK_REVOKED,
-            remote_mode="local_only",
-            event_id="evt-valid-1",
-        )
+        batch_spy.assert_awaited_once()
+        assert batch_spy.await_args.kwargs["event_id"] == "evt-valid-1"
+        assert batch_spy.await_args.kwargs["candidate_user_ids"] == ["u-feishu-1"]
         finish_spy.assert_awaited_once_with("purge-fs-1", revoker=None)
 
-        # 5) Duplicate event_id -> idempotent duplicate response
-        begin_spy.side_effect = DuplicateWebhookEventError("duplicate")
+        # 6) Duplicate event_id -> idempotent duplicate response
+        batch_spy.return_value = ("duplicate", [])
         res_dup = await process_feishu_integration_event(
             {
                 "header": {
@@ -1379,7 +1478,7 @@ class TestFeishuRevocationEvents:
                     "app_id": "cli_test_app_1",
                     "create_time": str(int(now.timestamp() * 1000)),
                 },
-                "event": {"open_id": "ou_user_1"},
+                "event": {"open_id": "ou_user_1", "revoke_reason": "Revoked by user action."},
             }
         )
         assert res_dup.status == "duplicate"
@@ -1537,22 +1636,20 @@ class TestCoreAndEverflowRoutingAndExports:
         assert r_list.json()["has_personal_integrations"] is True
         assert len(r_list.json()["connections"]) == 1
 
-        # 4) Core with CHANNEL_GATEWAY OFF & personal caps OFF, feishu_event configured -> /feishu/events url_verification still 200!
+        # 4) Core with CHANNEL_GATEWAY OFF & personal caps OFF, feishu_event configured -> /feishu/events url_verification still 200 WITHOUT signature headers!
         enc_key = "enc-key-secret-123456"
         ver_tok = "ver-token-secret-789"
-        ev_body = json.dumps({"type": "url_verification", "challenge": "core-ok", "token": ver_tok}).encode()
-        now_ts = str(int(time.time()))
-        sig = compute_feishu_event_signature(
-            timestamp=now_ts, nonce="n1", encrypt_key=enc_key, raw_body=ev_body
-        )
+        ev_body = json.dumps(
+            {
+                "encrypt": encrypt_feishu_event_payload(
+                    json.dumps({"type": "url_verification", "challenge": "core-ok", "token": ver_tok}),
+                    enc_key,
+                )
+            }
+        ).encode()
         r_ev = client.post(
             "/api/v1/dalton/integrations/feishu/events",
             content=ev_body,
-            headers={
-                "X-Lark-Request-Timestamp": now_ts,
-                "X-Lark-Request-Nonce": "n1",
-                "X-Lark-Signature": sig,
-            },
         )
         assert r_ev.status_code == 200
         assert r_ev.json() == {"challenge": "core-ok"}
@@ -1611,3 +1708,715 @@ class TestCoreAndEverflowRoutingAndExports:
         )
         assert r_conf.status_code == 409
         assert r_conf.json()["code"] == "account_switch_confirmation_required"
+
+
+# ---------------------------------------------------------------------------
+# 9. Round 2 Review Fixes (Items 1–13)
+# ---------------------------------------------------------------------------
+
+
+class TestRound2ReviewFixes:
+    @pytest.mark.asyncio
+    async def test_r2_item1_refresh_transactions_commit_before_raising_errors(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Item 1: narrowed scope, invalid_grant, Feishu ambiguous, and transient errors COMMIT before raising."""
+        _install_saved_credentials()
+        now = datetime.now(UTC)
+
+        # 1a) Narrowed scope on refresh commits the newly issued token + needs_reauth (zero TX_ROLLBACK)
+        start_row = _make_integration_row(
+            provider="google",
+            service="calendar",
+            expires_at=now - timedelta(seconds=30),
+            token_generation=1,
+        )
+        returned_row_dict = {
+            "user_id": start_row.user_id,
+            "provider": "google",
+            "service": "calendar",
+            "oauth_client_id": start_row.oauth_client_id,
+            "provider_account_id": start_row.provider_account_id,
+            "provider_union_id": None,
+            "provider_email": start_row.provider_email,
+            "granted_scopes": GOOGLE_SCOPE_CALENDAR_LIST_RO,
+            "auth_epoch": start_row.auth_epoch,
+            "authorized_at": start_row.authorized_at,
+            "token_generation": 2,
+            "status": "needs_reauth",
+            "refresh_inflight_gen": None,
+            "refresh_started_at": None,
+            "expires_at": now + timedelta(hours=1),
+            "last_refresh_at": now,
+            "needs_reauth_at": now,
+            "last_error_code": "missing_required_scopes",
+            "reauth_notified_at": None,
+            "preferences": {},
+            "has_access_token": True,
+            "has_refresh_token": True,
+            "created_at": start_row.created_at,
+            "updated_at": now,
+        }
+        fake_conn_ctx, executed = _make_fake_lock_pool(
+            try_lock_results=[True],
+            fetchone_results=[returned_row_dict],
+        )
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_conn_ctx)
+        monkeypatch.setattr(
+            db, "list_connections_by_account", create_autospec(db.list_connections_by_account, return_value=[start_row])
+        )
+        with pytest.raises(IntegrationNeedsReauthError) as narrow_exc:
+            await oauth_mod._commit_refresh_success_tx(
+                user_id=start_row.user_id,
+                provider="google",
+                service="calendar",
+                start_client_id=start_row.oauth_client_id,
+                start_sub=start_row.provider_account_id,
+                start_auth_epoch=start_row.auth_epoch,
+                start_token_gen=1,
+                token_resp=OAuthTokenResponse(
+                    access_token="new-at",
+                    refresh_token="new-rt",
+                    expires_in=3600,
+                    expires_at=now + timedelta(hours=1),
+                    scope=GOOGLE_SCOPE_CALENDAR_LIST_RO,
+                ),
+                required_scopes=None,
+            )
+        assert narrow_exc.value.code == "missing_required_scopes"
+        assert ("TX_COMMIT", None) in executed
+        assert ("TX_ROLLBACK", None) not in executed
+
+        # 1b) Upstream invalid_grant, Feishu ambiguous, and transient error ALL commit without rollback
+        fake_err_ctx, err_exec = _make_fake_lock_pool(try_lock_results=[True, True, True])
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_err_ctx)
+        monkeypatch.setattr(
+            db, "update_connection_status", create_autospec(db.update_connection_status, return_value=True)
+        )
+        g_client = create_autospec(GoogleOAuthClient, instance=True)
+        monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=start_row))
+
+        g_client.refresh_token.side_effect = OAuthUpstreamError(
+            provider="google", kind="invalid_grant", error_code="invalid_grant", status_code=400
+        )
+        with pytest.raises(IntegrationNeedsReauthError):
+            await ensure_fresh_access_token(LOCAL_DEV_USER_ID, "google", "calendar", google_client=g_client)
+
+        g_client.refresh_token.side_effect = OAuthUpstreamError(
+            provider="google", kind="transient", error_code="http_503", status_code=503
+        )
+        with pytest.raises(oauth_mod.IntegrationTransientError):
+            await ensure_fresh_access_token(LOCAL_DEV_USER_ID, "google", "calendar", google_client=g_client)
+
+        assert ("TX_ROLLBACK", None) not in err_exec
+        assert err_exec.count(("TX_COMMIT", None)) >= 4
+
+    @pytest.mark.asyncio
+    async def test_r2_item2_feishu_revoked_code_atomic_tx_no_swallow_and_orphan_recovery(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Item 2: revoked code does not mutate to revoked_purging before Phase 1; Phase 1 failure propagates; orphans repaired."""
+        _install_saved_credentials()
+        now = datetime.now(UTC)
+        fs_row = _make_integration_row(
+            provider="feishu",
+            service="calendar",
+            oauth_client_id="cli_test_app_1",
+            provider_account_id="ou_atomic_1",
+            expires_at=now - timedelta(seconds=30),
+        )
+        fake_ctx, _ = _make_fake_lock_pool(try_lock_results=[True])
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_ctx)
+        get_conn_mock = create_autospec(db.get_connection, return_value=fs_row)
+        monkeypatch.setattr(db, "get_connection", get_conn_mock)
+        status_spy = create_autospec(db.update_connection_status, return_value=True)
+        monkeypatch.setattr(db, "update_connection_status", status_spy)
+        f_client = create_autospec(FeishuOAuthClient, instance=True)
+        f_client.refresh_token.side_effect = OAuthUpstreamError(
+            provider="feishu", kind="revoked", error_code="feishu_confirmed_rev", feishu_code=99999
+        )
+        begin_disc_mock = create_autospec(
+            oauth_mod.begin_disconnect, side_effect=RuntimeError("phase1 failed")
+        )
+        monkeypatch.setattr(oauth_mod, "begin_disconnect", begin_disc_mock)
+        with pytest.raises(RuntimeError, match="phase1 failed"):
+            await ensure_fresh_access_token(LOCAL_DEV_USER_ID, "feishu", "calendar", feishu_client=f_client)
+        # Never pre-mutated status to revoked_purging outside begin_disconnect!
+        status_spy.assert_not_awaited()
+
+        # Orphaned revoked_purging with no running ledger repaired in ensure_fresh_access_token
+        orphan_row = _make_integration_row(
+            provider="feishu",
+            service="calendar",
+            oauth_client_id="cli_test_app_1",
+            provider_account_id="ou_orphan",
+            status=IntegrationStatus.REVOKED_PURGING,
+        )
+        get_conn_mock.return_value = orphan_row
+        monkeypatch.setattr(
+            db, "has_running_local_purge_for_service", create_autospec(db.has_running_local_purge_for_service, return_value=[])
+        )
+        begin_disc_mock.reset_mock()
+        begin_disc_mock.side_effect = None
+        begin_disc_mock.return_value = "purge-orphan-1"
+        repair_finish = create_autospec(oauth_mod.finish_disconnect, return_value=None)
+        monkeypatch.setattr(oauth_mod, "finish_disconnect", repair_finish)
+        with pytest.raises(IntegrationRevokedError):
+            await ensure_fresh_access_token(LOCAL_DEV_USER_ID, "feishu", "calendar", feishu_client=f_client)
+        begin_disc_mock.assert_awaited_once()
+        assert begin_disc_mock.await_args.kwargs["skip_if_running_ledger"] is True
+        repair_finish.assert_awaited_once_with("purge-orphan-1", revoker=None)
+
+        # Orphaned revoked_purging also repaired by health sweep
+        sweep_ctx, _ = _make_fake_lock_pool(try_lock_results=[True])
+        monkeypatch.setattr(sweep_mod, "get_db_connection", sweep_ctx)
+        monkeypatch.setattr(db, "read_health_sweep_state", create_autospec(db.read_health_sweep_state, return_value=None))
+        monkeypatch.setattr(db, "update_health_sweep_state", create_autospec(db.update_health_sweep_state, return_value=None))
+        monkeypatch.setattr(
+            db, "delete_expired_oauth_states_and_confirmations",
+            create_autospec(db.delete_expired_oauth_states_and_confirmations, return_value=(0, 0)),
+        )
+        monkeypatch.setattr(db, "list_connections_for_health_sweep", create_autospec(db.list_connections_for_health_sweep, return_value=[]))
+        monkeypatch.setattr(
+            db, "list_orphaned_revoked_purging_connections",
+            create_autospec(db.list_orphaned_revoked_purging_connections, return_value=[orphan_row]),
+        )
+        sw_begin = create_autospec(sweep_mod.begin_disconnect, return_value="purge-sw-orphan")
+        sw_finish = create_autospec(sweep_mod.finish_disconnect, return_value=None)
+        monkeypatch.setattr(sweep_mod, "begin_disconnect", sw_begin)
+        monkeypatch.setattr(sweep_mod, "finish_disconnect", sw_finish)
+        rep = await run_integration_health_sweep_once(force=True)
+        assert rep.triggered_revocation_purge == 1
+        sw_begin.assert_awaited_once()
+        sw_finish.assert_awaited_once_with("purge-sw-orphan", revoker=None)
+
+    @pytest.mark.asyncio
+    async def test_r2_item3_feishu_20071_needs_reauth_and_official_revoke_reason_only(self) -> None:
+        """Item 3: Feishu 20071 classifies as needs_reauth (NOT revoked); official revoke_reason strictly enforced."""
+        from src.dalton.integrations.constants import (
+            FEISHU_CONFIRMED_REVOKED_CODES,
+            FEISHU_NEEDS_REAUTH_CODES,
+        )
+
+        assert 20071 not in FEISHU_CONFIRMED_REVOKED_CODES
+        assert 20071 in FEISHU_NEEDS_REAUTH_CODES
+
+        http_double = create_autospec(httpx.AsyncClient, instance=True)
+        http_double.post.return_value = httpx.Response(
+            200, json={"code": 20071, "error": "invalid_request", "error_description": "redirect_uri mismatch"}
+        )
+        client = FeishuOAuthClient(http_client=http_double)
+        with pytest.raises(OAuthUpstreamError) as err_20071:
+            await client.refresh_token(app_id="cli_1", app_secret="sec", refresh_token="rt")
+        assert err_20071.value.kind == "needs_reauth"
+        assert err_20071.value.feishu_code == 20071
+
+        assert feishu_events_mod._is_user_initiated_revocation({"revoke_reason": "Revoked by user action."}) is True
+        assert feishu_events_mod._is_user_initiated_revocation({"revoke_reason": "Revoked by administrator action."}) is False
+        assert feishu_events_mod._is_user_initiated_revocation({"revoke_reason": "unknown"}) is False
+        assert feishu_events_mod._is_user_initiated_revocation({}) is False
+
+    @pytest.mark.asyncio
+    async def test_r2_item4_feishu_reauth_updates_authorized_at_and_epoch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Item 4: same-client Feishu re-authorization on a connected row resets authorized_at and bumps auth_epoch."""
+        _install_saved_credentials()
+        existing = _make_integration_row(
+            provider="feishu",
+            service="calendar",
+            oauth_client_id="cli_test_app_1",
+            provider_account_id="ou_1",
+            auth_epoch=5,
+            status=IntegrationStatus.CONNECTED,
+        )
+        fake_ctx, _ = _make_fake_lock_pool()
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_ctx)
+        monkeypatch.setattr(db, "has_running_local_purge_for_service", create_autospec(db.has_running_local_purge_for_service, return_value=[]))
+        monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=existing))
+        monkeypatch.setattr(db, "list_connections_by_account", create_autospec(db.list_connections_by_account, return_value=[existing]))
+        upsert_spy = create_autospec(db.upsert_connection, return_value=existing)
+        monkeypatch.setattr(db, "upsert_connection", upsert_spy)
+
+        await oauth_mod._finalize_connection(
+            user_id=LOCAL_DEV_USER_ID,
+            provider="feishu",
+            service="calendar",
+            oauth_client_id="cli_test_app_1",
+            provider_account_id="ou_1",
+            provider_union_id=None,
+            provider_email="u@example.com",
+            granted_scopes="offline_access calendar:calendar:readonly",
+            access_token="at-new",
+            refresh_token="rt-new",
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            preferences={},
+            allow_account_switch=False,
+        )
+        assert upsert_spy.await_args.kwargs["reset_authorized_at"] is True
+        assert upsert_spy.await_args.kwargs["bump_auth_epoch"] is True
+
+    @pytest.mark.asyncio
+    async def test_r2_item5_feishu_multi_user_event_single_batch_and_replay(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Item 5: multi-user Feishu event submits all matched users in ONE atomic batch call."""
+        _install_saved_credentials()
+        now = datetime.now(UTC)
+        r1 = _make_integration_row(user_id="u-a", provider="feishu", service="calendar", oauth_client_id="cli_test_app_1", provider_account_id="ou_shared")
+        r2 = _make_integration_row(user_id="u-b", provider="feishu", service="calendar", oauth_client_id="cli_test_app_1", provider_account_id="ou_shared")
+        monkeypatch.setattr(
+            db, "list_connections_by_provider_account",
+            create_autospec(db.list_connections_by_provider_account, return_value=[r1, r2]),
+        )
+        batch_spy = create_autospec(
+            feishu_events_mod.begin_feishu_webhook_revocation_batch,
+            return_value=("purged", ["p-a", "p-b"]),
+        )
+        finish_spy = create_autospec(feishu_events_mod.finish_disconnect, return_value=None)
+        monkeypatch.setattr(feishu_events_mod, "begin_feishu_webhook_revocation_batch", batch_spy)
+        monkeypatch.setattr(feishu_events_mod, "finish_disconnect", finish_spy)
+
+        res = await process_feishu_integration_event(
+            {
+                "header": {
+                    "event_type": FEISHU_REVOKED_EVENT_TYPE,
+                    "event_id": "evt-multi-1",
+                    "app_id": "cli_test_app_1",
+                    "create_time": str(int(now.timestamp() * 1000)),
+                },
+                "event": {"open_id": "ou_shared", "revoke_reason": "Revoked by user action."},
+            }
+        )
+        assert res.status == "purged"
+        assert res.purge_ids == ("p-a", "p-b")
+        batch_spy.assert_awaited_once()
+        assert batch_spy.await_args.kwargs["candidate_user_ids"] == ["u-a", "u-b"]
+        assert finish_spy.await_count == 2
+
+    def test_r2_item6_feishu_challenge_without_signature_and_internal_gateway_forward(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Item 6: url_verification works without X-Lark-Signature; gateway internal forward endpoint invokes unified processor."""
+        _install_saved_credentials()
+        monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "s" * 40)
+        client = TestClient(_make_app())
+
+        # Plaintext url_verification with valid verification token & NO signature headers -> 200
+        r_plain = client.post(
+            "/api/v1/dalton/integrations/feishu/events",
+            json={"type": "url_verification", "challenge": "plain-chal", "token": "ver-token-secret-789"},
+        )
+        assert r_plain.status_code == 200
+        assert r_plain.json() == {"challenge": "plain-chal"}
+
+        # Bad verification token on url_verification -> 401
+        r_bad_tok = client.post(
+            "/api/v1/dalton/integrations/feishu/events",
+            json={"type": "url_verification", "challenge": "plain-chal", "token": "wrong-token"},
+        )
+        assert r_bad_tok.status_code == 401
+
+        # Gateway internal forwarding endpoint requires X-Service-Token
+        r_unauth = client.post(
+            "/api/v1/dalton/integrations/internal/feishu/events",
+            json={"event_id": "evt-gw-1", "open_id": "ou_1", "revoke_reason": "Revoked by user action."},
+        )
+        assert r_unauth.status_code == 401
+
+        # Valid X-Service-Token normalizes flat Lark node-sdk payload and invokes process_feishu_integration_event
+        proc_spy = create_autospec(
+            router_mod.process_feishu_integration_event,
+            return_value=feishu_events_mod.FeishuEventProcessResult(
+                status="purged", event_id="evt-gw-1", purge_ids=("p-gw-1",)
+            ),
+        )
+        monkeypatch.setattr(router_mod, "process_feishu_integration_event", proc_spy)
+        r_gw = client.post(
+            "/api/v1/dalton/integrations/internal/feishu/events",
+            headers={"X-Service-Token": "s" * 40},
+            json={
+                "event_id": "evt-gw-1",
+                "event_type": FEISHU_REVOKED_EVENT_TYPE,
+                "app_id": "cli_test_app_1",
+                "create_time": str(int(time.time() * 1000)),
+                "open_id": "ou_1",
+                "revoke_reason": "Revoked by user action.",
+            },
+        )
+        assert r_gw.status_code == 200
+        assert r_gw.json()["status"] == "purged"
+        passed_payload = proc_spy.await_args.args[0]
+        assert passed_payload["header"]["event_type"] == FEISHU_REVOKED_EVENT_TYPE
+        assert passed_payload["header"]["event_id"] == "evt-gw-1"
+        assert passed_payload["event"]["revoke_reason"] == "Revoked by user action."
+
+    @pytest.mark.asyncio
+    async def test_r2_item7_same_project_rotation_checks_new_client_and_handles_retryable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Item 7: same-project rotation skips revoke when new client is active; RETRYABLE queues retry ledger."""
+        old_client = "111222333-old.apps.googleusercontent.com"
+        new_client = "111222333-new.apps.googleusercontent.com"
+        _install_saved_credentials(google_client_id=new_client)
+
+        cal_on_new = _make_integration_row(service="calendar", oauth_client_id=new_client, provider_account_id="sub-a")
+        mail_on_old = _make_integration_row(service="mail", oauth_client_id=old_client, provider_account_id="sub-a", status=IntegrationStatus.NEEDS_REAUTH)
+
+        fake_ctx, _ = _make_fake_lock_pool()
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_ctx)
+        monkeypatch.setattr(db, "list_user_purge_ledgers", create_autospec(db.list_user_purge_ledgers, return_value=[]))
+        list_conns_mock = create_autospec(db.list_user_connections, return_value=[cal_on_new, mail_on_old])
+        has_grant_mock = create_autospec(db.has_active_or_pending_google_grant, return_value=True)
+        monkeypatch.setattr(db, "list_user_connections", list_conns_mock)
+        monkeypatch.setattr(db, "has_active_or_pending_google_grant", has_grant_mock)
+        monkeypatch.setattr(db, "supersede_active_revokes_for_google_project_sub_tx", create_autospec(db.supersede_active_revokes_for_google_project_sub_tx, return_value=0))
+        ledger_spy = create_autospec(db.insert_purge_ledger, return_value=None)
+        monkeypatch.setattr(db, "insert_purge_ledger", ledger_spy)
+        revoker = create_autospec(RemoteRevoker, instance=True)
+
+        await oauth_mod._coordinate_pre_auth_google_revokes(
+            user_id=LOCAL_DEV_USER_ID,
+            service="mail",
+            target_client_id=new_client,
+            switch_account=False,
+            existing_rows=[cal_on_new, mail_on_old],
+            revoker=revoker,
+        )
+        revoker.revoke.assert_not_awaited()
+        assert ledger_spy.await_args.kwargs["remote_revoke_status"] == RemoteRevokeStatus.SUPERSEDED
+
+        # Sole service on old client with RETRYABLE -> queues into retry queue (FAILED_RETRYABLE)
+        list_conns_mock.return_value = [mail_on_old]
+        has_grant_mock.return_value = False
+        monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=mail_on_old))
+        monkeypatch.setattr(db, "update_connection_status", create_autospec(db.update_connection_status, return_value=True))
+        update_remote_spy = create_autospec(db.update_purge_ledger_remote_status, return_value=None)
+        monkeypatch.setattr(db, "update_purge_ledger_remote_status", update_remote_spy)
+        revoker.revoke.return_value = RevokeOutcome.RETRYABLE
+
+        await oauth_mod._coordinate_pre_auth_google_revokes(
+            user_id=LOCAL_DEV_USER_ID,
+            service="mail",
+            target_client_id=new_client,
+            switch_account=False,
+            existing_rows=[mail_on_old],
+            revoker=revoker,
+        )
+        revoker.revoke.assert_awaited_once()
+        update_remote_spy.assert_awaited_once()
+        assert update_remote_spy.await_args.kwargs["remote_revoke_status"] == RemoteRevokeStatus.FAILED_RETRYABLE
+        assert update_remote_spy.await_args.kwargs["clear_revoke_token"] is False
+
+    @pytest.mark.asyncio
+    async def test_r2_item8_interleaved_account_switch_confirmation_voided_on_epoch_change(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Item 8: confirmation ticket bound to old (client, sub, auth_epoch) is voided when current row changed."""
+        _install_saved_credentials()
+        now = datetime.now(UTC)
+        stale_ticket = PendingConfirmationRow(
+            confirmation_hash=hashlib.sha256(b"tok-b").hexdigest(),
+            user_id=LOCAL_DEV_USER_ID,
+            provider="google",
+            service="calendar",
+            oauth_client_id="111222333-abc.apps.googleusercontent.com",
+            provider_account_id="sub-b",
+            provider_union_id=None,
+            provider_email="b@example.com",
+            granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+            expires_at=now + timedelta(hours=1),
+            intent=oauth_mod.OAuthIntent.SWITCH_ACCOUNT.value,
+            preferences={},
+            confirm_expires_at=now + timedelta(minutes=5),
+            created_at=now,
+            access_token="at-b",
+            refresh_token="rt-b",
+            expected_old_oauth_client_id="111222333-abc.apps.googleusercontent.com",
+            expected_old_provider_account_id="sub-a",
+            expected_old_auth_epoch=3,
+        )
+        current_c = _make_integration_row(provider_account_id="sub-c", auth_epoch=4)
+        monkeypatch.setattr(db, "peek_pending_confirmation", create_autospec(db.peek_pending_confirmation, return_value=stale_ticket))
+        consume_spy = create_autospec(db.consume_pending_confirmation, return_value=stale_ticket)
+        monkeypatch.setattr(db, "consume_pending_confirmation", consume_spy)
+        monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=current_c))
+
+        with pytest.raises(PendingConfirmationInvalidError) as exc_info:
+            await confirm_pending_integration(
+                user_id=LOCAL_DEV_USER_ID,
+                confirmation_token="tok-b",
+                confirm_account_switch=True,
+            )
+        assert exc_info.value.code == "account_switch_state_changed"
+        assert exc_info.value.status_code == 409
+        consume_spy.assert_awaited_once()  # ticket voided!
+
+    @pytest.mark.asyncio
+    async def test_r2_item9_local_mode_browser_binding_cookie_and_callback_guard(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Item 9: local mode sets HttpOnly SameSite=Lax one-time cookie; mismatched browser requires confirmation."""
+        _install_saved_credentials()
+        monkeypatch.setenv("DALTON_AUTH_MODE", "local")
+        monkeypatch.setattr(
+            router_mod,
+            "_read_local_session_from_request",
+            create_autospec(router_mod._read_local_session_from_request, return_value="sid-local-1"),
+        )
+        monkeypatch.setattr(db, "list_user_connections", create_autospec(db.list_user_connections, return_value=[]))
+        monkeypatch.setattr(db, "list_user_purge_ledgers", create_autospec(db.list_user_purge_ledgers, return_value=[]))
+        captured_state: dict[str, Any] = {}
+
+        async def _capture_insert_state(**kw: Any) -> None:
+            captured_state.update(kw)
+
+        monkeypatch.setattr(db, "insert_oauth_state", create_autospec(db.insert_oauth_state, side_effect=_capture_insert_state))
+
+        client = TestClient(_make_app())
+        r_auth = client.post("/api/v1/dalton/integrations/google/calendar/authorize", json={})
+        assert r_auth.status_code == 200
+        set_cookie_hdr = r_auth.headers.get("set-cookie", "")
+        assert oauth_mod.OAUTH_BROWSER_BINDING_COOKIE_NAME in set_cookie_hdr
+        assert "httponly" in set_cookie_hdr.lower()
+        assert "samesite=lax" in set_cookie_hdr.lower()
+        assert captured_state.get("browser_binding_hash")
+
+        # Callback from a DIFFERENT browser (no matching cookie) -> confirmation_required!
+        cookie_val = r_auth.cookies.get(oauth_mod.OAUTH_BROWSER_BINDING_COOKIE_NAME)
+        assert cookie_val
+        state_row = _make_state_row(
+            auth_mode="local",
+            session_id="sid-local-1",
+            browser_binding_hash=hashlib.sha256(cookie_val.encode()).hexdigest(),
+        )
+        monkeypatch.setattr(db, "consume_oauth_state", create_autospec(db.consume_oauth_state, return_value=state_row))
+        monkeypatch.setattr(oauth_mod, "verify_local_session_active", create_autospec(oauth_mod.verify_local_session_active, return_value=None))
+        monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=None))
+        fake_ctx, _ = _make_fake_lock_pool()
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_ctx)
+        monkeypatch.setattr(db, "supersede_active_revokes_for_google_project_sub_tx", create_autospec(db.supersede_active_revokes_for_google_project_sub_tx, return_value=0))
+        monkeypatch.setattr(db, "insert_pending_confirmation", create_autospec(db.insert_pending_confirmation, return_value=None))
+
+        g_client = create_autospec(GoogleOAuthClient, instance=True)
+        g_client.exchange_code.return_value = OAuthTokenResponse(
+            access_token="at-loc",
+            refresh_token="rt-loc",
+            expires_in=3600,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            scope=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+            id_token="id.tok",
+        )
+        g_client.verify_id_token.return_value = GoogleIdTokenClaims(
+            sub="sub-loc",
+            email="loc@example.com",
+            email_verified=True,
+            aud="111222333-abc.apps.googleusercontent.com",
+            iss="https://accounts.google.com",
+            exp=int(time.time()) + 3600,
+        )
+
+        cb_mismatch = await handle_oauth_callback(
+            provider="google",
+            code="c1",
+            state="s1",
+            browser_binding_token="other-browser-cookie",
+            google_client=g_client,
+        )
+        assert cb_mismatch.status == "confirmation_required"
+        assert cb_mismatch.confirmation_token
+
+        # Callback from the SAME initiating browser (matching cookie) -> connected directly!
+        saved_loc = _make_integration_row(provider_account_id="sub-loc")
+        monkeypatch.setattr(
+            oauth_mod, "_finalize_connection", create_autospec(oauth_mod._finalize_connection, return_value=(saved_loc, None))
+        )
+        cb_match = await handle_oauth_callback(
+            provider="google",
+            code="c2",
+            state="s2",
+            browser_binding_token=cookie_val,
+            google_client=g_client,
+        )
+        assert cb_match.status == "connected"
+        assert cb_match.connection is saved_loc
+
+    def test_r2_item10_full_provider_disconnect_local_first_then_background_revoke(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Item 10: DELETE /{provider} finishes all local purges first, then schedules remote revokes in background."""
+        _install_saved_credentials()
+        monkeypatch.setattr(db, "has_user_any_integration_records", create_autospec(db.has_user_any_integration_records, return_value=True))
+        monkeypatch.setattr(
+            router_mod,
+            "begin_disconnect_all_services",
+            create_autospec(router_mod.begin_disconnect_all_services, return_value=["p-cal", "p-mail"]),
+        )
+        call_order: list[str] = []
+
+        async def _fake_finish(pid: str, *, revoker: Any = None, cancel_drain_timeout_s: float = 120.0, run_remote_revoke: bool = True) -> FinishDisconnectResult:
+            assert revoker is None
+            assert run_remote_revoke is False
+            call_order.append(f"local:{pid}")
+            return FinishDisconnectResult(
+                purge_id=pid,
+                deleted_connections=1,
+                local_purge_status=LocalPurgeStatus.COMPLETED,
+                remote_revoke_status=(
+                    RemoteRevokeStatus.PENDING if pid == "p-cal" else RemoteRevokeStatus.NOT_APPLICABLE
+                ),
+            )
+
+        monkeypatch.setattr(router_mod, "finish_disconnect", create_autospec(router_mod.finish_disconnect, side_effect=_fake_finish))
+        sched_spy = create_autospec(
+            router_mod.schedule_background_remote_revokes,
+            side_effect=lambda pids, rev: (call_order.append(f"bg:{','.join(pids)}"), [])[1],
+        )
+        monkeypatch.setattr(router_mod, "schedule_background_remote_revokes", sched_spy)
+
+        client = TestClient(_make_app())
+        r = client.delete("/api/v1/dalton/integrations/google")
+        assert r.status_code == 200
+        assert call_order == ["local:p-cal", "local:p-mail", "bg:p-cal"]
+        sched_spy.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_r2_item11_sweep_groups_shared_google_cred_and_force_refresh_reuses_newer_gen(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Item 11: sweep sends 1 refresh for shared Google (client, sub); force_refresh reuses committed newer generation."""
+        _install_saved_credentials()
+        cal_row = _make_integration_row(user_id="u1", provider="google", service="calendar", provider_account_id="sub-1")
+        mail_row = _make_integration_row(user_id="u1", provider="google", service="mail", provider_account_id="sub-1")
+
+        sw_ctx, _ = _make_fake_lock_pool(try_lock_results=[True])
+        monkeypatch.setattr(sweep_mod, "get_db_connection", sw_ctx)
+        monkeypatch.setattr(db, "read_health_sweep_state", create_autospec(db.read_health_sweep_state, return_value=None))
+        monkeypatch.setattr(db, "update_health_sweep_state", create_autospec(db.update_health_sweep_state, return_value=None))
+        monkeypatch.setattr(db, "delete_expired_oauth_states_and_confirmations", create_autospec(db.delete_expired_oauth_states_and_confirmations, return_value=(0, 0)))
+        monkeypatch.setattr(db, "list_orphaned_revoked_purging_connections", create_autospec(db.list_orphaned_revoked_purging_connections, return_value=[]))
+        monkeypatch.setattr(db, "list_connections_for_health_sweep", create_autospec(db.list_connections_for_health_sweep, return_value=[cal_row, mail_row]))
+        ensure_spy = create_autospec(sweep_mod.ensure_fresh_access_token, return_value=oauth_mod._to_fresh_token(cal_row))
+        monkeypatch.setattr(sweep_mod, "ensure_fresh_access_token", ensure_spy)
+
+        rep = await run_integration_health_sweep_once(force=True)
+        assert rep.checked == 1
+        assert ensure_spy.await_count == 1
+
+        # Winner re-reading token_generation > start_token_gen on force_refresh=True reuses committed token with 0 upstream calls
+        now = datetime.now(UTC)
+        gen1 = _make_integration_row(token_generation=1, access_token="old-at", expires_at=now + timedelta(minutes=30))
+        gen2 = _make_integration_row(token_generation=2, access_token="already-committed-at", expires_at=now + timedelta(hours=1))
+        calls = [gen1, gen2]
+        monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, side_effect=lambda *a, **k: calls.pop(0)))
+        ref_ctx, _ = _make_fake_lock_pool(try_lock_results=[True])
+        monkeypatch.setattr(oauth_mod, "get_db_connection", ref_ctx)
+        g_client = create_autospec(GoogleOAuthClient, instance=True)
+
+        tok = await ensure_fresh_access_token(
+            LOCAL_DEV_USER_ID, "google", "calendar", force_refresh=True, google_client=g_client
+        )
+        assert tok.access_token == "already-committed-at"
+        assert tok.token_generation == 2
+        g_client.refresh_token.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_r2_item12_feishu_open_id_check_only_when_app_id_matches_gateway(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Item 12: gateway open_id is checked ONLY when OAuth app_id matches gateway's Feishu app_id."""
+        from src.dalton.deployment_credentials.snapshot import build_snapshot, set_active_snapshot
+        from src.dalton.integrations.oauth_clients import FeishuUserInfo
+
+        now = datetime.now(UTC)
+        f_client = create_autospec(FeishuOAuthClient, instance=True)
+        f_client.exchange_code.return_value = OAuthTokenResponse(
+            access_token="at-fs",
+            refresh_token="rt-fs",
+            expires_in=7200,
+            expires_at=now + timedelta(hours=2),
+            scope=" ".join(oauth_mod.FEISHU_CALENDAR_SCOPES),
+        )
+        f_client.get_user_info.return_value = FeishuUserInfo(
+            open_id="ou_oauth_app", union_id="on_union_1", email="u@example.com"
+        )
+        monkeypatch.setattr(db, "get_channel_feishu_open_id", create_autospec(db.get_channel_feishu_open_id, return_value="ou_gateway_different"))
+        monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=None))
+        saved_row = _make_integration_row(provider="feishu", oauth_client_id="cli_independent_oauth", provider_account_id="ou_oauth_app")
+        monkeypatch.setattr(oauth_mod, "_finalize_connection", create_autospec(oauth_mod._finalize_connection, return_value=(saved_row, None)))
+
+        # 1) Independent OAuth app != gateway Vault app -> succeeds without mismatch error!
+        set_active_snapshot(
+            build_snapshot(
+                revision=1,
+                rows={
+                    FEISHU_APP_ID_KEY: "cli_independent_oauth",
+                    FEISHU_APP_SECRET_KEY: "sec-ind",
+                },
+                feishu_vault_pair={
+                    FEISHU_APP_ID_KEY: "cli_gateway_vault_app",
+                    FEISHU_APP_SECRET_KEY: "sec-gw",
+                },
+            )
+        )
+        consume_state_mock = create_autospec(
+            db.consume_oauth_state,
+            return_value=_make_state_row(
+                provider="feishu",
+                service="calendar",
+                oauth_client_id="cli_independent_oauth",
+                requested_scopes=" ".join(oauth_mod.FEISHU_CALENDAR_SCOPES),
+            ),
+        )
+        monkeypatch.setattr(db, "consume_oauth_state", consume_state_mock)
+        res_ind = await handle_oauth_callback(
+            provider="feishu", code="c1", state="s1", feishu_client=f_client
+        )
+        assert res_ind.status == "connected"
+
+        # 2) Same App ID as gateway Vault app + different open_id -> raises FeishuIdentityMismatchError!
+        set_active_snapshot(
+            build_snapshot(
+                revision=2,
+                rows={},
+                feishu_vault_pair={
+                    FEISHU_APP_ID_KEY: "cli_gateway_vault_app",
+                    FEISHU_APP_SECRET_KEY: "sec-gw",
+                },
+            )
+        )
+        consume_state_mock.return_value = _make_state_row(
+            provider="feishu",
+            service="calendar",
+            oauth_client_id="cli_gateway_vault_app",
+            requested_scopes=" ".join(oauth_mod.FEISHU_CALENDAR_SCOPES),
+        )
+        with pytest.raises(oauth_mod.FeishuIdentityMismatchError):
+            await handle_oauth_callback(
+                provider="feishu", code="c2", state="s2", feishu_client=f_client
+            )
+
+    def test_r2_item13_return_to_known_routes_only_and_final_location_validation(self) -> None:
+        """Item 13: control chars, protocol-relative, backslash, and unknown paths fall back to safe default; Location validated."""
+        for evil in (
+            "/\t/evil.com",
+            "/\x0b/evil.com",
+            "/\r\nLocation: https://evil.com",
+            "//evil.com/settings",
+            "/\\evil.com",
+            "https://evil.com/settings",
+            "/settings/../../evil",
+            "/unknown-route?x=1",
+        ):
+            assert oauth_mod._sanitize_return_to(evil) == "/settings?tab=integrations"
+            loc = router_mod._build_callback_redirect_url(
+                evil,
+                query_updates={"integration_status": "confirmation_required"},
+                fragment_params={"confirmation_token": "tok"},
+            )
+            assert oauth_mod.validate_callback_location(loc) is True
+            assert loc.startswith("/settings?")
+            assert "evil.com" not in loc
+
+        assert oauth_mod._sanitize_return_to("/settings?tab=integrations") == "/settings?tab=integrations"
+        assert oauth_mod._sanitize_return_to("/chat/t/abc-123") == "/chat/t/abc-123"

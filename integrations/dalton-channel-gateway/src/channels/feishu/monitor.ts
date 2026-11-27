@@ -118,6 +118,8 @@ export interface MonitorFeishuWebSocketOptions {
   resolveGroupFollowupTopic?: (event: InboundChannelEvent) => Promise<boolean>;
   client?: Lark.Client;
   onEvent: (event: InboundChannelEvent) => Promise<void>;
+  /** Thin forwarding hook for `auth.user_access_token.revoked_v4` personal integration revocations. */
+  onTokenRevoked?: (rawPayload: unknown) => Promise<void>;
   dedupe?: MemoryDedupeGuard;
   queue?: SequentialQueue;
   logger?: SubsystemLogger;
@@ -319,6 +321,11 @@ export async function monitorWebSocket(
   eventDispatcher.register({
     "im.message.receive_v1": async (data: unknown) => {
       await dispatchRawEvent(data);
+    },
+    "auth.user_access_token.revoked_v4": async (data: unknown) => {
+      if (options.onTokenRevoked) {
+        await options.onTokenRevoked(data);
+      }
     },
   });
 
@@ -849,9 +856,26 @@ export class FeishuChannelAdapter implements ChannelAdapter {
           await handler(event);
         }
       },
+      onTokenRevoked: async (data) => {
+        await this.forwardTokenRevokedEvent(data);
+      },
     });
 
     this.connected = true;
+  }
+
+  private async forwardTokenRevokedEvent(rawPayload: unknown): Promise<void> {
+    if (!this.backendClient?.forwardFeishuRevokedEvent) {
+      return;
+    }
+    const base = isRecord(rawPayload) ? { ...rawPayload } : {};
+    if (this.appId && !base.app_id && !(isRecord(base.header) && base.header.app_id)) {
+      base.app_id = this.appId;
+    }
+    if (!base.event_type && !(isRecord(base.header) && base.header.event_type)) {
+      base.event_type = "auth.user_access_token.revoked_v4";
+    }
+    await this.backendClient.forwardFeishuRevokedEvent(base);
   }
 
   async stop(): Promise<void> {

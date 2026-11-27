@@ -1629,6 +1629,13 @@ export interface BackendClient {
     delivery_id: string;
   }): Promise<DataTaskAuthorizePlanResponse>;
 
+  forwardFeishuRevokedEvent?(payload: Record<string, unknown>): Promise<{
+    status: string;
+    event_id?: string | null;
+    reason?: string | null;
+    purge_ids?: string[];
+  }>;
+
   downloadDataTaskRunArtifact?(
     runId: string,
     artifactId: string,
@@ -2966,6 +2973,33 @@ export class HttpBackendClient implements BackendClient {
     if (status >= 400) {
       throw new BackendHttpError(
         `lookupBotTopic failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
+  async forwardFeishuRevokedEvent(
+    payload: Record<string, unknown>,
+  ): Promise<{
+    status: string;
+    event_id?: string | null;
+    reason?: string | null;
+    purge_ids?: string[];
+  }> {
+    const { status, data } = await this.jsonRequest<{
+      status: string;
+      event_id?: string | null;
+      reason?: string | null;
+      purge_ids?: string[];
+    }>("POST", "/api/v1/dalton/integrations/internal/feishu/events", {
+      body: payload,
+      timeoutMs: 15_000,
+    });
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `forwardFeishuRevokedEvent failed (${status})`,
         status,
         data,
       );

@@ -19,10 +19,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 import httpx
 import jwt
 
-from src.dalton.integrations.constants import (
-    FEISHU_CONFIRMED_REVOKED_CODES,
-    FEISHU_NEEDS_REAUTH_CODES,
-)
+from src.dalton.integrations import constants as integration_constants
 from src.dalton.services.integration_revoke import RemoteRevoker, RevokeOutcome
 
 logger = logging.getLogger(__name__)
@@ -589,7 +586,7 @@ class FeishuOAuthClient:
         if status == 200 and (code_int in (None, 0)) and not err_str:
             return data
 
-        if code_int in FEISHU_CONFIRMED_REVOKED_CODES:
+        if code_int in integration_constants.FEISHU_CONFIRMED_REVOKED_CODES:
             raise OAuthUpstreamError(
                 provider="feishu",
                 kind="revoked",
@@ -597,7 +594,7 @@ class FeishuOAuthClient:
                 status_code=status,
                 feishu_code=code_int,
             )
-        if code_int in FEISHU_NEEDS_REAUTH_CODES or err_str == "invalid_grant":
+        if code_int in integration_constants.FEISHU_NEEDS_REAUTH_CODES or err_str == "invalid_grant":
             raise OAuthUpstreamError(
                 provider="feishu",
                 kind="needs_reauth",

@@ -14,11 +14,11 @@ import logging
 from typing import Protocol, runtime_checkable
 
 import anyio
-from psycopg.rows import dict_row
 
 from src.dalton.database import user_integrations as db
 from src.dalton.database.user_integrations import (
     RemoteRevokeStatus,
+    TriggerReason,
     extract_google_project,
     revoke_lock_key,
 )
@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 _BACKOFF_BASE_SECONDS = 30
 _BACKOFF_MAX_SECONDS = 3600
+_BACKGROUND_REVOKE_TASKS: set[asyncio.Task[object]] = set()
 
 
 class RevokeOutcome(StrEnum):
@@ -55,27 +56,27 @@ async def _has_newer_active_google_connection(
     google_project: str,
     sub: str,
     auth_epoch_upto: int,
+    exclude_client_id: str | None = None,
 ) -> bool:
-    """Return True if ``(user_id, google_project, sub)`` already holds a newer active token."""
+    """Return True if ``(user_id, google_project, sub)`` already holds a newer active or pending token."""
     async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                SELECT oauth_client_id
-                FROM dalton_user_integrations
-                WHERE user_id = %s
-                  AND provider = 'google'
-                  AND provider_account_id = %s
-                  AND status IN ('connected', 'refresh_ambiguous')
-                  AND auth_epoch > %s
-                """,
-                (user_id, sub, int(auth_epoch_upto)),
+        if await db.has_active_or_pending_google_grant(
+            user_id,
+            google_project,
+            sub,
+            min_auth_epoch=auth_epoch_upto,
+            conn=conn,
+        ):
+            return True
+        if exclude_client_id is not None:
+            return await db.has_active_or_pending_google_grant(
+                user_id,
+                google_project,
+                sub,
+                exclude_client_id=exclude_client_id,
+                conn=conn,
             )
-            rows = await cur.fetchall()
-    return any(
-        extract_google_project(str(r["oauth_client_id"])) == google_project
-        for r in rows
-    )
+    return False
 
 
 async def process_revoke(
@@ -121,6 +122,11 @@ async def process_revoke(
                 google_project=google_project,
                 sub=row.provider_account_id,
                 auth_epoch_upto=row.auth_epoch_upto,
+                exclude_client_id=(
+                    row.oauth_client_id
+                    if row.trigger_reason == TriggerReason.CLIENT_ROTATION
+                    else None
+                ),
             ):
                 await db.update_purge_ledger_remote_status(
                     purge_id,
@@ -254,6 +260,23 @@ async def revoke_before_new_authorization(
                 user_id, google_project, sub, decrypt_revoke_token=True
             )
             for row in active:
+                if await _has_newer_active_google_connection(
+                    user_id=user_id,
+                    google_project=google_project,
+                    sub=sub,
+                    auth_epoch_upto=row.auth_epoch_upto,
+                    exclude_client_id=row.oauth_client_id,
+                ):
+                    await db.update_purge_ledger_remote_status(
+                        row.purge_id,
+                        remote_revoke_status=RemoteRevokeStatus.SUPERSEDED,
+                        clear_revoke_token=True,
+                        next_retry_at=None,
+                        last_remote_error="superseded_by_newer_authorization",
+                        mark_remote_completed=True,
+                    )
+                    results[row.purge_id] = RemoteRevokeStatus.SUPERSEDED
+                    continue
                 if not row.revoke_token:
                     await db.update_purge_ledger_remote_status(
                         row.purge_id,
@@ -303,6 +326,40 @@ async def revoke_before_new_authorization(
         finally:
             with anyio.CancelScope(shield=True):
                 await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+
+
+async def _run_background_revoke_safe(purge_id: str, revoker: RemoteRevoker) -> None:
+    try:
+        await process_revoke(purge_id, revoker)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "[integration-revoke] background revoke failed for purge_id=%s (%s); retry loop will pick it up",
+            purge_id,
+            type(exc).__name__,
+        )
+
+
+def schedule_background_remote_revokes(
+    purge_ids: list[str],
+    revoker: RemoteRevoker,
+) -> list[asyncio.Task[object]]:
+    """Schedule independent background tasks for remote Google revocations (§4.2(3)).
+
+    Allows full-provider disconnects to complete all local 2A purges and unblock
+    shared threads before any slow/failing upstream HTTP revoke runs.
+    """
+    tasks: list[asyncio.Task[object]] = []
+    for pid in purge_ids:
+        task: asyncio.Task[object] = asyncio.create_task(
+            _run_background_revoke_safe(pid, revoker),
+            name=f"dalton-integration-revoke-{pid[:8]}",
+        )
+        _BACKGROUND_REVOKE_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_REVOKE_TASKS.discard)
+        tasks.append(task)
+    return tasks
 
 
 async def run_due_remote_revokes_once(

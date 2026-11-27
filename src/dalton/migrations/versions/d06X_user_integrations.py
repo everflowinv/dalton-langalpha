@@ -123,6 +123,7 @@ def upgrade() -> None:
             requested_scopes TEXT NOT NULL,
             redirect_uri     TEXT NOT NULL,
             return_to        TEXT NULL,
+            browser_binding_hash TEXT NULL,
             expires_at       TIMESTAMPTZ NOT NULL,
             created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
@@ -154,6 +155,9 @@ def upgrade() -> None:
             intent              TEXT NOT NULL DEFAULT 'connect' CHECK (
                 intent IN ('connect', 'switch_account', 'reauth')
             ),
+            expected_old_oauth_client_id     TEXT NULL,
+            expected_old_provider_account_id TEXT NULL,
+            expected_old_auth_epoch          BIGINT NULL,
             preferences         JSONB NOT NULL DEFAULT '{}'::jsonb,
             confirm_expires_at  TIMESTAMPTZ NOT NULL,
             created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()

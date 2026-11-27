@@ -1515,6 +1515,7 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("integrations_router.py", "disconnect_personal_integration_provider_endpoint"): CORE_CAPABILITY,
         ("integrations_router.py", "retry_personal_integration_revoke_endpoint"): CORE_CAPABILITY,
         ("integrations_router.py", "feishu_integration_events_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "feishu_integration_internal_events_endpoint"): CORE_CAPABILITY,
     }
 )
 

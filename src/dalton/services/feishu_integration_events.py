@@ -24,39 +24,24 @@ from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from src.dalton.database import user_integrations as db
-from src.dalton.database.user_integrations import TriggerReason
 from src.dalton.deployment_credentials.catalog import (
     FEISHU_APP_ID_KEY,
     FEISHU_ENCRYPT_KEY,
     FEISHU_VERIFICATION_TOKEN_KEY,
 )
 from src.dalton.deployment_credentials.snapshot import get_credential_group
-from src.dalton.integrations.constants import FEISHU_REVOKED_EVENT_TYPE
+from src.dalton.integrations.constants import (
+    FEISHU_OFFICIAL_USER_REVOKE_REASONS,
+    FEISHU_REVOKED_EVENT_TYPE,
+)
 from src.dalton.services.user_integrations_lifecycle import (
-    DuplicateWebhookEventError,
-    IntegrationNotFoundError,
-    begin_disconnect,
-    begin_disconnect_all_services,
+    begin_feishu_webhook_revocation_batch,
     finish_disconnect,
 )
 
 logger = logging.getLogger(__name__)
 
 FEISHU_EVENT_REPLAY_WINDOW_SECONDS = 300  # 5-minute replay protection (§4.2(3) item 3)
-
-_ALLOWED_USER_REVOKE_VALUES: frozenset[str] = frozenset(
-    {
-        "user",
-        "user_revoked",
-        "user_revoke",
-        "user_cancel",
-        "user_cancelled",
-        "user_action",
-        "self",
-        "self_revoked",
-        "self_revoke",
-    }
-)
 
 
 class FeishuEventAuthError(PermissionError):
@@ -151,7 +136,14 @@ def verify_and_decode_feishu_event(
     headers: Mapping[str, str],
     now_epoch_s: float | None = None,
 ) -> dict[str, Any]:
-    """Verify Feishu webhook signature / replay window / decryption / verification token.
+    """Verify Feishu webhook handshake / signature / replay window / decryption / verification token.
+
+    Per Feishu Open Platform event subscription documentation and official ``lark_oapi`` SDK:
+    - ``url_verification`` challenge requests are decrypted (if encrypted) and authenticated via
+      ``Verification Token`` without requiring ``X-Lark-Signature`` headers.
+    - All event callbacks enforce ``X-Lark-Request-Timestamp`` (5-minute replay window),
+      ``X-Lark-Request-Nonce``, and ``X-Lark-Signature`` when ``Encrypt Key`` is configured,
+      plus ``Verification Token`` verification.
 
     Reads credentials exclusively via ``get_credential_group("feishu_event")``.
     """
@@ -164,9 +156,45 @@ def verify_and_decode_feishu_event(
     encrypt_key = cred.values.get(FEISHU_ENCRYPT_KEY)
     verification_token = cred.values.get(FEISHU_VERIFICATION_TOKEN_KEY)
 
-    lower_headers = {str(k).lower(): str(v) for k, v in headers.items()}
+    try:
+        envelope = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        raise FeishuEventAuthError(
+            "invalid_json",
+            "Feishu event body is not valid JSON.",
+            status_code=400,
+        ) from None
+    if not isinstance(envelope, dict):
+        raise FeishuEventAuthError(
+            "invalid_json",
+            "Feishu event body must be a JSON object.",
+            status_code=400,
+        )
 
-    if encrypt_key:
+    if "encrypt" in envelope:
+        if not encrypt_key:
+            raise FeishuEventAuthError(
+                "encrypt_key_not_configured",
+                "Encrypted Feishu event received without configured Encrypt Key.",
+                status_code=400,
+            )
+        enc_val = envelope.get("encrypt")
+        if not isinstance(enc_val, str) or not enc_val.strip():
+            raise FeishuEventAuthError(
+                "invalid_encrypt_field",
+                "Encrypted Feishu event envelope is malformed.",
+                status_code=400,
+            )
+        payload = decrypt_feishu_event_payload(enc_val.strip(), encrypt_key)
+    else:
+        payload = envelope
+
+    is_url_verification = str(payload.get("type") or "").strip() == "url_verification"
+
+    # Official Feishu URL verification handshake does NOT send X-Lark-Signature headers;
+    # normal event callbacks MUST verify timestamp, nonce, 5-minute window, and signature.
+    if encrypt_key and not is_url_verification:
+        lower_headers = {str(k).lower(): str(v) for k, v in headers.items()}
         ts_raw = lower_headers.get("x-lark-request-timestamp", "").strip()
         nonce = lower_headers.get("x-lark-request-nonce", "").strip()
         sig = lower_headers.get("x-lark-signature", "").strip()
@@ -205,39 +233,6 @@ def verify_and_decode_feishu_event(
                 "Feishu event signature verification failed.",
                 status_code=401,
             )
-
-    try:
-        envelope = json.loads(raw_body.decode("utf-8"))
-    except Exception:
-        raise FeishuEventAuthError(
-            "invalid_json",
-            "Feishu event body is not valid JSON.",
-            status_code=400,
-        ) from None
-    if not isinstance(envelope, dict):
-        raise FeishuEventAuthError(
-            "invalid_json",
-            "Feishu event body must be a JSON object.",
-            status_code=400,
-        )
-
-    if "encrypt" in envelope:
-        if not encrypt_key:
-            raise FeishuEventAuthError(
-                "encrypt_key_not_configured",
-                "Encrypted Feishu event received without configured Encrypt Key.",
-                status_code=400,
-            )
-        enc_val = envelope.get("encrypt")
-        if not isinstance(enc_val, str) or not enc_val.strip():
-            raise FeishuEventAuthError(
-                "invalid_encrypt_field",
-                "Encrypted Feishu event envelope is malformed.",
-                status_code=400,
-            )
-        payload = decrypt_feishu_event_payload(enc_val.strip(), encrypt_key)
-    else:
-        payload = envelope
 
     if verification_token:
         header_obj = payload.get("header")
@@ -289,22 +284,51 @@ def _parse_event_timestamp(payload: Mapping[str, Any]) -> datetime | None:
 
 
 def _is_user_initiated_revocation(event: Mapping[str, Any]) -> bool:
-    """Return True iff the event represents user-initiated revocation (§4.5(3)).
+    """Return True iff the event carries an official user-initiated revocation reason (§4.5(3)).
 
-    When the payload includes an explicit reason/operator field, only user-self
-    revocation markers are admitted into Scheme 2A purge. When no reason field is
-    present on an official ``auth.user_access_token.revoked_v4`` event, default to True.
+    Per the official Feishu ``auth.user_access_token.revoked_v4`` event model, only exact
+    matches against ``FEISHU_OFFICIAL_USER_REVOKE_REASONS`` (``"Revoked by user action."``)
+    trigger Scheme 2A purge. Missing, empty, administrator, security, or unknown reasons
+    are never admitted into 2A purge.
     """
-    for key in ("revoke_reason", "reason", "operator_type", "revoke_type"):
-        val = event.get(key)
-        if val is None:
-            continue
-        cleaned = str(val).strip().lower()
-        if not cleaned:
-            continue
-        if cleaned not in _ALLOWED_USER_REVOKE_VALUES:
-            return False
-    return True
+    raw_reason = event.get("revoke_reason")
+    if not isinstance(raw_reason, str) or not raw_reason.strip():
+        return False
+    return raw_reason.strip() in FEISHU_OFFICIAL_USER_REVOKE_REASONS
+
+
+def normalize_gateway_feishu_event(
+    raw_payload: Mapping[str, Any],
+    *,
+    default_app_id: str | None = None,
+) -> dict[str, Any]:
+    """Normalize a Feishu event forwarded from the channel gateway into ``{header, event}`` form.
+
+    ``@larksuiteoapi/node-sdk`` ``EventDispatcher`` passes either an already-structured
+    ``{header, event}`` envelope or a flattened object combining header metadata
+    (``event_id``, ``event_type``, ``app_id``, ``create_time``) with event fields.
+    """
+    if isinstance(raw_payload.get("header"), Mapping) and isinstance(
+        raw_payload.get("event"), Mapping
+    ):
+        header = dict(raw_payload["header"])
+        event = dict(raw_payload["event"])
+        if default_app_id and not str(header.get("app_id") or "").strip():
+            header["app_id"] = default_app_id
+        return {**dict(raw_payload), "header": header, "event": event}
+
+    header_keys = {"event_id", "event_type", "create_time", "token", "app_id", "tenant_key"}
+    header = {k: raw_payload[k] for k in header_keys if k in raw_payload}
+    if default_app_id and not str(header.get("app_id") or "").strip():
+        header["app_id"] = default_app_id
+    if not str(header.get("event_type") or "").strip():
+        header["event_type"] = FEISHU_REVOKED_EVENT_TYPE
+    event_inner = raw_payload.get("event")
+    if isinstance(event_inner, Mapping):
+        event = dict(event_inner)
+    else:
+        event = {k: v for k, v in raw_payload.items() if k not in header_keys}
+    return {"schema": "2.0", "header": header, "event": event}
 
 
 def _extract_feishu_ids(event: Mapping[str, Any]) -> tuple[str | None, str | None]:
@@ -328,8 +352,10 @@ async def process_feishu_integration_event(
 
     1. Answers ``url_verification`` challenges.
     2. Ignores events other than ``auth.user_access_token.revoked_v4``.
-    3. Filters by user-initiated revocation reason and ``event_time >= row.authorized_at``.
-    4. Atomically deduplicates ``event_id`` and registers Phase 1 + Scheme 2A purge in one transaction.
+    3. Requires official user-initiated ``revoke_reason`` and parseable event timestamp.
+    4. Holds sorted per-user lifecycle locks and in ONE transaction re-checks ``authorized_at``
+       under ``FOR UPDATE``, deduplicates ``event_id``, skips users who already have a running
+       ledger on replay, and registers Phase 1 + Scheme 2A purge for all eligible users.
     """
     if str(payload.get("type") or "").strip() == "url_verification":
         challenge = str(payload.get("challenge") or "")
@@ -350,13 +376,25 @@ async def process_feishu_integration_event(
 
     if not _is_user_initiated_revocation(event):
         logger.info(
-            "[feishu-events] ignoring non-user revocation event_id=%s",
+            "[feishu-events] ignoring non-user or missing-reason revocation event_id=%s",
             event_id,
         )
         return FeishuEventProcessResult(
             status="ignored",
             event_id=event_id,
             reason="non_user_revocation",
+        )
+
+    event_time = _parse_event_timestamp(payload)
+    if event_time is None:
+        logger.warning(
+            "[feishu-events] ignoring revocation event_id=%s with missing/unparseable timestamp",
+            event_id,
+        )
+        return FeishuEventProcessResult(
+            status="ignored",
+            event_id=event_id,
+            reason="missing_event_timestamp",
         )
 
     open_id, union_id = _extract_feishu_ids(event)
@@ -386,87 +424,46 @@ async def process_feishu_integration_event(
         provider_union_id=union_id,
     )
     if not matches:
+        if event_id is not None and await db.has_webhook_event("feishu", event_id):
+            return FeishuEventProcessResult(
+                status="duplicate",
+                event_id=event_id,
+                reason="duplicate_event_id",
+            )
         return FeishuEventProcessResult(
             status="ignored",
             event_id=event_id,
             reason="no_matching_connection",
         )
 
-    event_time = _parse_event_timestamp(payload)
-    eligible: list[db.IntegrationRow] = []
-    for row in matches:
-        if event_time is not None and row.authorized_at is not None:
-            auth_at = (
-                row.authorized_at
-                if row.authorized_at.tzinfo is not None
-                else row.authorized_at.replace(tzinfo=UTC)
-            )
-            if event_time < auth_at:
-                logger.info(
-                    "[feishu-events] skipping stale revocation event_id=%s for user=%s service=%s (event_time < authorized_at)",
-                    event_id,
-                    row.user_id,
-                    row.service,
-                )
-                continue
-        eligible.append(row)
-
-    if not eligible:
+    candidate_uids = sorted({row.user_id for row in matches})
+    outcome, purge_ids = await begin_feishu_webhook_revocation_batch(
+        app_id=app_id,
+        open_id=open_id,
+        union_id=union_id,
+        event_id=event_id,
+        event_time=event_time,
+        candidate_user_ids=candidate_uids,
+    )
+    if outcome == "duplicate":
+        return FeishuEventProcessResult(
+            status="duplicate",
+            event_id=event_id,
+            reason="duplicate_event_id",
+        )
+    if outcome != "purged" or not purge_ids:
         return FeishuEventProcessResult(
             status="ignored",
             event_id=event_id,
-            reason="stale_before_authorized_at",
+            reason=outcome,
         )
-
-    # Group eligible connections by user_id
-    by_user: dict[str, list[db.IntegrationRow]] = {}
-    for row in eligible:
-        by_user.setdefault(row.user_id, []).append(row)
-
-    purge_ids: list[str] = []
-    event_id_consumed_in_tx = False
-    for uid, rows in by_user.items():
-        all_user_feishu = await db.list_user_connections(uid, provider="feishu")
-        # Pass event_id on the first user's atomic Phase 1 transaction so dedup + block + ledger commit together
-        tx_event_id = event_id if not event_id_consumed_in_tx else None
-        try:
-            if len(rows) == len(all_user_feishu) and len(rows) > 1:
-                pids = await begin_disconnect_all_services(
-                    uid,
-                    "feishu",
-                    trigger_reason=TriggerReason.WEBHOOK_REVOKED,
-                    remote_mode="local_only",
-                    event_id=tx_event_id,
-                )
-                purge_ids.extend(pids)
-                event_id_consumed_in_tx = True
-            else:
-                for idx, row in enumerate(rows):
-                    pid = await begin_disconnect(
-                        uid,
-                        "feishu",
-                        row.service,
-                        trigger_reason=TriggerReason.WEBHOOK_REVOKED,
-                        remote_mode="local_only",
-                        event_id=tx_event_id if idx == 0 else None,
-                    )
-                    purge_ids.append(pid)
-                    event_id_consumed_in_tx = True
-        except DuplicateWebhookEventError:
-            return FeishuEventProcessResult(
-                status="duplicate",
-                event_id=event_id,
-                reason="duplicate_event_id",
-            )
-        except IntegrationNotFoundError:
-            continue
 
     if execute_purge:
         for pid in purge_ids:
             await finish_disconnect(pid, revoker=None)
 
     return FeishuEventProcessResult(
-        status="purged" if purge_ids else "ignored",
+        status="purged",
         event_id=event_id,
         purge_ids=tuple(purge_ids),
     )
@@ -480,6 +477,7 @@ __all__ = [
     "compute_feishu_event_signature",
     "decrypt_feishu_event_payload",
     "encrypt_feishu_event_payload",
+    "normalize_gateway_feishu_event",
     "process_feishu_integration_event",
     "verify_and_decode_feishu_event",
 ]

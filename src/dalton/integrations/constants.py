@@ -69,13 +69,22 @@ FEISHU_MAIL_READONLY_SCOPES: tuple[str, ...] = (
 FEISHU_MAIL_SEND_SCOPE = "mail:user_mailbox.message:send"
 
 # Feishu refresh error code classification (§4.2(2) item 5)
-# Routine credential/token failures always transition to needs_reauth (keep online history).
+# Routine credential/token failures (including 20071 redirect_uri mismatch) transition to
+# needs_reauth so online conversation history is preserved.
 FEISHU_NEEDS_REAUTH_CODES: frozenset[int] = frozenset(
-    {20024, 20063, 20037, 20005, 20064}
+    {20024, 20063, 20037, 20005, 20064, 20071}
 )
-# Strict allowlist of Feishu error codes officially documented as user-initiated revocation.
-# Only codes in this set may trigger Scheme 2A purge from the token-refresh path.
-FEISHU_CONFIRMED_REVOKED_CODES: frozenset[int] = frozenset({20071})
+# Strict allowlist of Feishu refresh error codes officially documented as user-initiated revocation.
+# Only codes in this set may trigger Scheme 2A purge from the token-refresh path (empty by default;
+# Feishu delivers user-initiated revocation via the auth.user_access_token.revoked_v4 event).
+FEISHU_CONFIRMED_REVOKED_CODES: frozenset[int] = frozenset()
+
+# Official Feishu revoke_reason values representing user-initiated revocation (§4.5(3))
+FEISHU_OFFICIAL_USER_REVOKE_REASONS: frozenset[str] = frozenset(
+    {
+        "Revoked by user action.",
+    }
+)
 
 # Feishu webhook event type for user-initiated OAuth grant revocation (§3.2, §4.5(3))
 FEISHU_REVOKED_EVENT_TYPE = "auth.user_access_token.revoked_v4"
@@ -214,6 +223,7 @@ __all__ = [
     "FEISHU_MAIL_SEND_SCOPE",
     "FEISHU_NEEDS_REAUTH_CODES",
     "FEISHU_OAUTH_CALLBACK_PATH",
+    "FEISHU_OFFICIAL_USER_REVOKE_REASONS",
     "FEISHU_REVOKED_EVENT_TYPE",
     "FEISHU_SCOPE_OFFLINE_ACCESS",
     "GOOGLE_CALENDAR_MIN_SCOPES",

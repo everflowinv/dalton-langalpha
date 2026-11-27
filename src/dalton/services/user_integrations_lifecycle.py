@@ -8,8 +8,9 @@ Follows unidirectional lock ordering (§4.2(2)(3)):
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 import logging
 from typing import Any
 from uuid import uuid4
@@ -24,8 +25,10 @@ from src.dalton.database.user_integrations import (
     LocalPurgeStatus,
     RemoteRevokeStatus,
     TriggerReason,
+    extract_google_project,
     lifecycle_lock_key,
     refresh_lock_key,
+    revoke_lock_key,
     touch_user_lock_key,
 )
 from src.dalton.services.integration_revoke import RemoteRevoker, process_revoke
@@ -48,6 +51,18 @@ class MissingRefreshTokenOnAccountSwitchError(ValueError):
 
 class DuplicateWebhookEventError(RuntimeError):
     """Webhook event_id was already processed."""
+
+
+class AccountSwitchTargetChangedError(RuntimeError):
+    """Account-switch confirmation target (client, account, or auth_epoch) changed before Phase 1."""
+
+    code = "account_switch_state_changed"
+
+
+class DisconnectTargetMismatchError(RuntimeError):
+    """Connection identity, epoch, or generation changed before revocation disconnect registration."""
+
+    code = "integration_epoch_revoked"
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +238,13 @@ async def begin_disconnect(
     trigger_reason: str = TriggerReason.USER_DISCONNECT,
     remote_mode: str = "remote_if_sole",
     event_id: str | None = None,
+    expected_oauth_client_id: str | None = None,
+    expected_provider_account_id: str | None = None,
+    expected_auth_epoch: int | None = None,
+    expected_token_generation: int | None = None,
+    last_error_code: str | None = None,
+    clear_tokens: bool = False,
+    skip_if_running_ledger: bool = False,
 ) -> str:
     """Phase 1 atomic registration transaction for a SINGLE service (§4.2(3) item 1, §4.5(2) item 1).
 
@@ -232,7 +254,8 @@ async def begin_disconnect(
     Holds ``advisory_key('dalton_integration_user_lifecycle', user_id, provider)``
     while executing a single short transaction that:
       1. Optionally atomically deduplicates ``(provider, event_id)`` in ``dalton_integration_webhook_events``.
-      2. Transitions the target connection row to ``disconnect_pending`` (or ``revoked_purging``).
+      2. Transitions the target connection row to ``disconnect_pending`` (or ``revoked_purging``),
+         optionally verifying expected identity/epoch/token_generation and clearing tokens.
       3. Locks all affected private threads ``FOR UPDATE``, records closed turn ranges,
          sets ``personal_purge_in_progress = TRUE``, and increments ``personal_purge_generation``.
       4. Inserts the ``dalton_integration_purge_ledger`` row (``local_purge_status = 'running'``).
@@ -272,7 +295,7 @@ async def begin_disconnect(
                     await cur.execute(
                         """
                         SELECT user_id, provider, service, oauth_client_id,
-                               provider_account_id, auth_epoch,
+                               provider_account_id, auth_epoch, token_generation,
                                access_token, refresh_token, status
                         FROM dalton_user_integrations
                         WHERE user_id = %s
@@ -289,18 +312,67 @@ async def begin_disconnect(
                         )
                     target_row = dict(target)
 
+                    if (
+                        (
+                            expected_oauth_client_id is not None
+                            and str(target_row["oauth_client_id"]) != expected_oauth_client_id
+                        )
+                        or (
+                            expected_provider_account_id is not None
+                            and str(target_row["provider_account_id"])
+                            != expected_provider_account_id
+                        )
+                        or (
+                            expected_auth_epoch is not None
+                            and int(target_row["auth_epoch"]) != int(expected_auth_epoch)
+                        )
+                        or (
+                            expected_token_generation is not None
+                            and int(target_row["token_generation"])
+                            != int(expected_token_generation)
+                        )
+                    ):
+                        raise DisconnectTargetMismatchError(
+                            "Connection identity, epoch, or generation changed before disconnect registration."
+                        )
+
+                    if skip_if_running_ledger:
+                        existing_running = await db.has_running_local_purge_for_service(
+                            user_id, provider, service, conn=tx_conn
+                        )
+                        if existing_running:
+                            return existing_running[0]
+
+                    token_clear_sql = (
+                        "access_token = NULL, refresh_token = NULL, "
+                        if clear_tokens
+                        else ""
+                    )
+                    err_code_sql = (
+                        "last_error_code = %(last_error_code)s, "
+                        if last_error_code is not None
+                        else ""
+                    )
                     await cur.execute(
-                        """
+                        f"""
                         UPDATE dalton_user_integrations
-                        SET status = %s,
+                        SET {token_clear_sql}
+                            {err_code_sql}
+                            status = %(status)s,
                             refresh_inflight_gen = NULL,
                             refresh_started_at = NULL,
                             updated_at = NOW()
-                        WHERE user_id = %s
-                          AND provider = %s
-                          AND service = %s
+                        WHERE user_id = %(user_id)s
+                          AND provider = %(provider)s
+                          AND service = %(service)s
                         """,
-                        (str(target_status), user_id, provider, service),
+                        {
+                            "status": str(target_status),
+                            "last_error_code": last_error_code,
+                            "user_id": user_id,
+                            "provider": provider,
+                            "service": service,
+                        },
                     )
 
                     oauth_client_id = str(target_row["oauth_client_id"])
@@ -316,11 +388,20 @@ async def begin_disconnect(
                         active_only=True,
                         conn=tx_conn,
                     )
+                    has_other_active_grant = bool(siblings)
+                    if provider == "google" and not has_other_active_grant:
+                        has_other_active_grant = await db.has_active_or_pending_google_grant(
+                            user_id,
+                            extract_google_project(oauth_client_id),
+                            provider_account_id,
+                            exclude_client_id=oauth_client_id,
+                            conn=tx_conn,
+                        )
                     remote_status, enc_revoke_token = _determine_remote_revoke(
                         provider=provider,
                         trigger_reason=trigger_reason,
                         remote_mode=remote_mode,
-                        has_remaining_active_sibling=bool(siblings),
+                        has_remaining_active_sibling=has_other_active_grant,
                         raw_refresh_token=target_row.get("refresh_token"),
                         raw_access_token=target_row.get("access_token"),
                     )
@@ -592,6 +673,278 @@ async def begin_disconnect_all_services(
                 await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
 
 
+async def begin_feishu_webhook_revocation_batch(
+    *,
+    app_id: str,
+    open_id: str | None,
+    union_id: str | None,
+    event_id: str | None,
+    event_time: datetime,
+    candidate_user_ids: Sequence[str],
+) -> tuple[str, list[str]]:
+    """Atomically register Phase 1 + webhook dedup across ALL matching Dalton users in ONE transaction (§4.5(3)).
+
+    Acquires ``lifecycle_lock_key(uid, 'feishu')`` in ascending ``uid`` order, then in a
+    single transaction:
+      1. Locks all matching ``dalton_user_integrations`` rows ``FOR UPDATE``.
+      2. Re-checks ``event_time >= row.authorized_at`` inside the transaction so a
+         concurrent re-authorization is never purged by an older revocation event.
+      3. Skips any ``(user_id, service)`` that already has a ``running`` purge ledger
+         (allowing safe replay to complete registration for any missing users).
+      4. Records ``('feishu', event_id)`` in ``dalton_integration_webhook_events`` together
+         with all eligible users' Phase 1 status updates, thread locks, and purge ledgers.
+
+    Returns ``(outcome, purge_ids)`` where ``outcome`` is one of:
+    ``"purged"``, ``"duplicate"``, ``"stale_before_authorized_at"``, ``"no_matching_connection"``.
+    """
+    unique_uids = sorted({str(u) for u in candidate_user_ids if u})
+    if not unique_uids:
+        return "no_matching_connection", []
+
+    event_time_utc = (
+        event_time if event_time.tzinfo is not None else event_time.replace(tzinfo=UTC)
+    )
+    lock_keys = [lifecycle_lock_key(uid, "feishu") for uid in unique_uids]
+
+    async with get_db_connection() as lock_conn:
+        acquired_keys: list[int] = []
+        try:
+            for lk in lock_keys:
+                await lock_conn.execute("SELECT pg_advisory_lock(%s)", (lk,))
+                acquired_keys.append(lk)
+
+            async with get_db_connection() as tx_conn, tx_conn.transaction():
+                already_seen = (
+                    await db.has_webhook_event("feishu", event_id, conn=tx_conn)
+                    if event_id is not None
+                    else False
+                )
+
+                match_clauses: list[str] = []
+                params: dict[str, Any] = {
+                    "app_id": app_id,
+                    "user_ids": unique_uids,
+                }
+                if open_id:
+                    match_clauses.append("provider_account_id = %(open_id)s")
+                    params["open_id"] = open_id
+                if union_id:
+                    match_clauses.append("provider_union_id = %(union_id)s")
+                    params["union_id"] = union_id
+                if not match_clauses:
+                    return ("duplicate" if already_seen else "no_matching_connection"), []
+
+                async with tx_conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        f"""
+                        SELECT user_id, provider, service, oauth_client_id,
+                               provider_account_id, auth_epoch, authorized_at, status
+                        FROM dalton_user_integrations
+                        WHERE provider = 'feishu'
+                          AND oauth_client_id = %(app_id)s
+                          AND user_id = ANY(%(user_ids)s)
+                          AND ({' OR '.join(match_clauses)})
+                        ORDER BY user_id ASC, service ASC
+                        FOR UPDATE
+                        """,
+                        params,
+                    )
+                    locked_rows = [dict(r) for r in await cur.fetchall()]
+
+                if not locked_rows:
+                    return ("duplicate" if already_seen else "no_matching_connection"), []
+
+                eligible_rows: list[dict[str, Any]] = []
+                for r in locked_rows:
+                    auth_at = r.get("authorized_at")
+                    if auth_at is not None:
+                        auth_at_utc = (
+                            auth_at if auth_at.tzinfo is not None else auth_at.replace(tzinfo=UTC)
+                        )
+                        if event_time_utc < auth_at_utc:
+                            logger.info(
+                                "[feishu-events] skipping stale revocation in-tx event_id=%s user=%s service=%s (event_time < authorized_at)",
+                                event_id,
+                                r["user_id"],
+                                r["service"],
+                            )
+                            continue
+                    eligible_rows.append(r)
+
+                if not eligible_rows:
+                    return ("duplicate" if already_seen else "stale_before_authorized_at"), []
+
+                rows_needing_ledger: list[dict[str, Any]] = []
+                for r in eligible_rows:
+                    running_ids = await db.has_running_local_purge_for_service(
+                        str(r["user_id"]),
+                        "feishu",
+                        str(r["service"]),
+                        conn=tx_conn,
+                    )
+                    if running_ids:
+                        continue
+                    rows_needing_ledger.append(r)
+
+                if not rows_needing_ledger:
+                    return ("duplicate" if already_seen else "no_matching_connection"), []
+
+                if event_id is not None and not already_seen:
+                    await db.record_webhook_event("feishu", event_id, conn=tx_conn)
+
+                affected_uids = sorted({str(r["user_id"]) for r in rows_needing_ledger})
+                async with tx_conn.cursor(row_factory=dict_row) as cur:
+                    for uid in affected_uids:
+                        await cur.execute(
+                            "SELECT pg_advisory_xact_lock(%s)",
+                            (touch_user_lock_key(uid),),
+                        )
+
+                    for r in rows_needing_ledger:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_user_integrations
+                            SET status = %s,
+                                access_token = NULL,
+                                refresh_token = NULL,
+                                refresh_inflight_gen = NULL,
+                                refresh_started_at = NULL,
+                                last_error_code = 'webhook_revoked',
+                                updated_at = NOW()
+                            WHERE user_id = %s
+                              AND provider = 'feishu'
+                              AND service = %s
+                            """,
+                            (
+                                str(IntegrationStatus.REVOKED_PURGING),
+                                str(r["user_id"]),
+                                str(r["service"]),
+                            ),
+                        )
+
+                    per_row_touches: dict[tuple[str, str], dict[str, tuple[int, int]]] = {}
+                    thread_touch_bounds: dict[str, tuple[int, int]] = {}
+                    for r in rows_needing_ledger:
+                        uid = str(r["user_id"])
+                        svc = str(r["service"])
+                        epoch = int(r["auth_epoch"])
+                        await cur.execute(
+                            """
+                            SELECT thread_id::text AS thread_id,
+                                   MIN(turn_index) AS first_touched_turn_index,
+                                   MAX(turn_index) AS max_touched_turn_index
+                            FROM dalton_thread_integration_touches
+                            WHERE user_id = %s
+                              AND provider = 'feishu'
+                              AND service = %s
+                              AND auth_epoch <= %s
+                              AND purged_at IS NULL
+                            GROUP BY thread_id
+                            ORDER BY thread_id ASC
+                            """,
+                            (uid, svc, epoch),
+                        )
+                        row_map: dict[str, tuple[int, int]] = {}
+                        for grp in await cur.fetchall():
+                            tid = str(grp["thread_id"])
+                            lo = int(grp["first_touched_turn_index"])
+                            hi = int(grp["max_touched_turn_index"])
+                            row_map[tid] = (lo, hi)
+                            if tid in thread_touch_bounds:
+                                prev_lo, prev_hi = thread_touch_bounds[tid]
+                                thread_touch_bounds[tid] = (min(prev_lo, lo), max(prev_hi, hi))
+                            else:
+                                thread_touch_bounds[tid] = (lo, hi)
+                        per_row_touches[(uid, svc)] = row_map
+
+                    thread_purge_max: dict[str, int] = {}
+                    for tid in sorted(thread_touch_bounds.keys()):
+                        overall_lo, overall_max_touch = thread_touch_bounds[tid]
+                        await cur.execute(
+                            """
+                            SELECT personal_purged_turn_ranges
+                            FROM conversation_threads
+                            WHERE conversation_thread_id = %s::uuid
+                            FOR UPDATE
+                            """,
+                            (tid,),
+                        )
+                        t_row = await cur.fetchone()
+                        if t_row is None:
+                            continue
+
+                        await cur.execute(
+                            """
+                            SELECT GREATEST(
+                                COALESCE((SELECT MAX(turn_index) FROM conversation_queries WHERE conversation_thread_id = %s::uuid), -1),
+                                COALESCE((SELECT MAX(turn_index) FROM conversation_responses WHERE conversation_thread_id = %s::uuid), -1),
+                                %s
+                            ) AS max_turn
+                            """,
+                            (tid, tid, overall_max_touch),
+                        )
+                        max_row = await cur.fetchone()
+                        purge_start_max = max(
+                            overall_lo,
+                            int(max_row["max_turn"]) if max_row else overall_lo,
+                        )
+                        merged = merge_turn_range(
+                            t_row.get("personal_purged_turn_ranges"),
+                            overall_lo,
+                            purge_start_max,
+                        )
+                        await cur.execute(
+                            """
+                            UPDATE conversation_threads
+                            SET personal_purge_in_progress = TRUE,
+                                personal_purge_generation = personal_purge_generation + 1,
+                                personal_purged_turn_ranges = %s,
+                                updated_at = NOW()
+                            WHERE conversation_thread_id = %s::uuid
+                            """,
+                            (Jsonb(merged), tid),
+                        )
+                        thread_purge_max[tid] = purge_start_max
+
+                purge_ids: list[str] = []
+                for r in rows_needing_ledger:
+                    uid = str(r["user_id"])
+                    svc = str(r["service"])
+                    cid = str(r["oauth_client_id"])
+                    sub = str(r["provider_account_id"])
+                    epoch = int(r["auth_epoch"])
+                    svc_ranges: dict[str, dict[str, int]] = {}
+                    for tid, (svc_lo, _svc_hi) in per_row_touches.get((uid, svc), {}).items():
+                        if tid in thread_purge_max:
+                            svc_ranges[tid] = {
+                                "min_turn": svc_lo,
+                                "max_turn": thread_purge_max[tid],
+                            }
+                    pid = str(uuid4())
+                    await db.insert_purge_ledger(
+                        purge_id=pid,
+                        user_id=uid,
+                        provider="feishu",
+                        service=svc,
+                        oauth_client_id=cid,
+                        provider_account_id=sub,
+                        auth_epoch_upto=epoch,
+                        trigger_reason=TriggerReason.WEBHOOK_REVOKED,
+                        local_purge_status=LocalPurgeStatus.RUNNING,
+                        purged_max_turn_by_thread=svc_ranges,
+                        remote_revoke_status=RemoteRevokeStatus.NOT_APPLICABLE,
+                        encrypted_revoke_token=None,
+                        conn=tx_conn,
+                    )
+                    purge_ids.append(pid)
+
+            return "purged", purge_ids
+        finally:
+            with anyio.CancelScope(shield=True):
+                for lk in reversed(acquired_keys):
+                    await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (lk,))
+
+
 async def replace_connection_for_account_switch(
     user_id: str,
     provider: str,
@@ -607,6 +960,9 @@ async def replace_connection_for_account_switch(
     new_expires_at: datetime | None = None,
     new_preferences: dict[str, Any] | None = None,
     remote_mode: str = "remote_if_sole",
+    expected_old_oauth_client_id: str | None = None,
+    expected_old_provider_account_id: str | None = None,
+    expected_old_auth_epoch: int | None = None,
 ) -> AccountSwitchResult:
     """Explicit account switch: block & replace in ONE transaction (§4.2(1), §4.2(3)).
 
@@ -615,6 +971,10 @@ async def replace_connection_for_account_switch(
     replaces the connection row IN PLACE with the new account (``status='connected'``,
     ``token_generation=1``, ``authorized_at=NOW()``, fresh ``auth_epoch``, reset
     account-specific preferences). Never deletes the new connection row.
+
+    When ``expected_old_*`` are supplied, re-verifies them under the ``FOR UPDATE`` row
+    lock inside the Phase 1 transaction and raises ``AccountSwitchTargetChangedError``
+    on any mismatch so interleaved confirmation tickets cannot overwrite a newer account.
 
     Raises ``MissingRefreshTokenOnAccountSwitchError`` if ``new_refresh_token`` is absent,
     leaving the existing connection completely untouched.
@@ -626,9 +986,23 @@ async def replace_connection_for_account_switch(
 
     enc_key = get_encryption_key()
     lock_key = lifecycle_lock_key(user_id, provider)
+    new_revoke_key = (
+        revoke_lock_key(
+            user_id,
+            extract_google_project(new_oauth_client_id),
+            new_provider_account_id,
+        )
+        if provider == "google"
+        else None
+    )
     async with get_db_connection() as lock_conn:
         await lock_conn.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
+        revoke_locked = False
         try:
+            if new_revoke_key is not None:
+                await lock_conn.execute("SELECT pg_advisory_lock(%s)", (new_revoke_key,))
+                revoke_locked = True
+
             async with get_db_connection() as tx_conn, tx_conn.transaction():
                 async with tx_conn.cursor(row_factory=dict_row) as cur:
                     await cur.execute(
@@ -652,6 +1026,23 @@ async def replace_connection_for_account_switch(
                     old_client_id = str(existing["oauth_client_id"])
                     old_sub = str(existing["provider_account_id"])
                     old_auth_epoch = int(existing["auth_epoch"])
+                    if (
+                        (
+                            expected_old_oauth_client_id is not None
+                            and old_client_id != expected_old_oauth_client_id
+                        )
+                        or (
+                            expected_old_provider_account_id is not None
+                            and old_sub != expected_old_provider_account_id
+                        )
+                        or (
+                            expected_old_auth_epoch is not None
+                            and old_auth_epoch != int(expected_old_auth_epoch)
+                        )
+                    ):
+                        raise AccountSwitchTargetChangedError(
+                            "Existing account changed before account-switch confirmation committed."
+                        )
                     if old_sub == new_provider_account_id:
                         raise ValueError(
                             "replace_connection_for_account_switch requires a different provider_account_id"
@@ -666,11 +1057,20 @@ async def replace_connection_for_account_switch(
                         active_only=True,
                         conn=tx_conn,
                     )
+                    has_other_old_grant = bool(siblings)
+                    if provider == "google" and not has_other_old_grant:
+                        has_other_old_grant = await db.has_active_or_pending_google_grant(
+                            user_id,
+                            extract_google_project(old_client_id),
+                            old_sub,
+                            exclude_client_id=old_client_id,
+                            conn=tx_conn,
+                        )
                     remote_status, enc_revoke_token = _determine_remote_revoke(
                         provider=provider,
                         trigger_reason=TriggerReason.ACCOUNT_SWITCH,
                         remote_mode=remote_mode,
-                        has_remaining_active_sibling=bool(siblings),
+                        has_remaining_active_sibling=has_other_old_grant,
                         raw_refresh_token=existing.get("refresh_token"),
                         raw_access_token=existing.get("access_token"),
                     )
@@ -736,6 +1136,14 @@ async def replace_connection_for_account_switch(
                     assert updated_row is not None
                     new_auth_epoch = int(updated_row["auth_epoch"])
 
+                if provider == "google":
+                    await db.supersede_active_revokes_for_google_project_sub_tx(
+                        user_id,
+                        extract_google_project(new_oauth_client_id),
+                        new_provider_account_id,
+                        conn=tx_conn,
+                    )
+
             return AccountSwitchResult(
                 purge_id=purge_id,
                 old_auth_epoch=old_auth_epoch,
@@ -745,6 +1153,10 @@ async def replace_connection_for_account_switch(
             )
         finally:
             with anyio.CancelScope(shield=True):
+                if revoke_locked and new_revoke_key is not None:
+                    await lock_conn.execute(
+                        "SELECT pg_advisory_unlock(%s)", (new_revoke_key,)
+                    )
                 await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
 
 
@@ -782,6 +1194,7 @@ async def finish_disconnect_locked(
     *,
     revoker: RemoteRevoker | None = None,
     cancel_drain_timeout_s: float = 120.0,
+    run_remote_revoke: bool = True,
 ) -> FinishDisconnectResult | None:
     """Shared mutex-protected Phase 2 entry point for ``finish_disconnect`` and resume loops.
 
@@ -834,7 +1247,8 @@ async def finish_disconnect_locked(
         assert refreshed is not None
         final_remote_status = refreshed.remote_revoke_status
         if (
-            final_remote_status == RemoteRevokeStatus.PENDING
+            run_remote_revoke
+            and final_remote_status == RemoteRevokeStatus.PENDING
             and revoker is not None
         ):
             final_remote_status = await process_revoke(purge_id, revoker)
@@ -852,6 +1266,7 @@ async def finish_disconnect(
     *,
     revoker: RemoteRevoker | None = None,
     cancel_drain_timeout_s: float = 120.0,
+    run_remote_revoke: bool = True,
 ) -> FinishDisconnectResult | None:
     """Phase 2 finalization (§4.2(3) item 1), guarded by per-ledger advisory lock.
 
@@ -862,4 +1277,5 @@ async def finish_disconnect(
         purge_id,
         revoker=revoker,
         cancel_drain_timeout_s=cancel_drain_timeout_s,
+        run_remote_revoke=run_remote_revoke,
     )

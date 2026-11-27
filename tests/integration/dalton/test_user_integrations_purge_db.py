@@ -1803,13 +1803,14 @@ async def test_incomplete_layers_keep_running_and_blocked_until_repaired_and_res
             await real_cache.connect()
     assert real_cache.enabled is False
 
+    orig_render_digests = render_mod.render_and_write_conversation_digests
     with (
         patch("src.config.settings.is_redis_cache_enabled", autospec=True, return_value=True),
         patch.object(redis_cache_mod, "get_cache_client", autospec=True, return_value=real_cache),
         patch.object(
             render_mod,
             "render_and_write_conversation_digests",
-            create_autospec(render_mod.render_and_write_conversation_digests, return_value=None),
+            create_autospec(orig_render_digests, return_value=None),
         ),
     ):
         with pytest.raises(RuntimeError, match="unavailable"):
@@ -1839,7 +1840,7 @@ async def test_incomplete_layers_keep_running_and_blocked_until_repaired_and_res
             render_mod,
             "render_and_write_conversation_digests",
             create_autospec(
-                render_mod.render_and_write_conversation_digests,
+                orig_render_digests,
                 side_effect=RuntimeError("digest render failed"),
             ),
         ):

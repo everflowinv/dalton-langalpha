@@ -25,6 +25,7 @@ import anyio
 from src.dalton.database import user_integrations as db
 from src.dalton.database.user_integrations import (
     IntegrationStatus,
+    TriggerReason,
     health_sweep_lock_key,
 )
 from src.dalton.deployment_credentials.snapshot import get_credential_group
@@ -34,6 +35,12 @@ from src.dalton.integrations.oauth_clients import (
     GoogleOAuthClientProtocol,
 )
 from src.dalton.services.integration_revoke import RemoteRevoker
+from src.dalton.services.user_integrations_lifecycle import (
+    DisconnectTargetMismatchError,
+    IntegrationNotFoundError,
+    begin_disconnect,
+    finish_disconnect,
+)
 from src.dalton.services.user_integrations_oauth import (
     IntegrationCredentialsNotReadyError,
     IntegrationEpochRevokedError,
@@ -149,7 +156,47 @@ async def run_integration_health_sweep_once(
             skipped_unexpired_ambiguous = 0
             skipped_concurrent = 0
 
+            # Repair any orphaned revoked_purging rows lacking a running 2A purge ledger (§4.2(2))
+            orphaned_revoked: list[db.IntegrationRow] = []
+            try:
+                orphaned_revoked = await db.list_orphaned_revoked_purging_connections(
+                    limit=limit
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[integration-sweep] orphaned revoked_purging scan failed (%s)",
+                    type(exc).__name__,
+                )
+            for orphan in orphaned_revoked:
+                checked += 1
+                try:
+                    pid = await begin_disconnect(
+                        orphan.user_id,
+                        orphan.provider,
+                        orphan.service,
+                        trigger_reason=TriggerReason.ERROR_CODE_REVOKED,
+                        remote_mode="local_only",
+                        expected_auth_epoch=orphan.auth_epoch,
+                        clear_tokens=True,
+                        skip_if_running_ledger=True,
+                    )
+                    await finish_disconnect(pid, revoker=None)
+                    triggered_revocation_purge += 1
+                except (IntegrationNotFoundError, DisconnectTargetMismatchError):
+                    skipped_concurrent += 1
+                except Exception as exc:
+                    transient_errors += 1
+                    logger.warning(
+                        "[integration-sweep] orphaned revoked_purging repair failed for %s/%s (%s)",
+                        orphan.provider,
+                        orphan.service,
+                        type(exc).__name__,
+                    )
+
+            # Group by shared credential so Google calendar + mail on the same (client, sub)
+            # issue at most ONE upstream refresh request per sweep (§4.2(2), §4.5(3)).
             now = datetime.now(UTC)
+            seen_cred_groups: set[tuple[str, ...]] = set()
             for conn_row in connections:
                 # Never misclassify existing connections when deployment credentials are not ready
                 if not _is_provider_credentials_ready(conn_row.provider):
@@ -164,6 +211,25 @@ async def run_integration_health_sweep_once(
                         if exp_utc > now:
                             skipped_unexpired_ambiguous += 1
                             continue
+
+                if conn_row.provider == "google":
+                    cred_group_key: tuple[str, ...] = (
+                        conn_row.user_id,
+                        "google",
+                        conn_row.oauth_client_id,
+                        conn_row.provider_account_id,
+                    )
+                else:
+                    cred_group_key = (
+                        conn_row.user_id,
+                        conn_row.provider,
+                        conn_row.oauth_client_id,
+                        conn_row.provider_account_id,
+                        conn_row.service,
+                    )
+                if cred_group_key in seen_cred_groups:
+                    continue
+                seen_cred_groups.add(cred_group_key)
 
                 checked += 1
                 try:

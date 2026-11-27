@@ -235,6 +235,7 @@ class OAuthStateRow:
     expires_at: datetime
     created_at: datetime
     code_verifier: str | None = field(default=None, repr=False, compare=False)
+    browser_binding_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +256,9 @@ class PendingConfirmationRow:
     created_at: datetime
     access_token: str | None = field(default=None, repr=False, compare=False)
     refresh_token: str | None = field(default=None, repr=False, compare=False)
+    expected_old_oauth_client_id: str | None = None
+    expected_old_provider_account_id: str | None = None
+    expected_old_auth_epoch: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1088,6 +1092,26 @@ async def record_webhook_event(
             return (await cur.fetchone()) is not None
 
 
+async def has_webhook_event(
+    provider: str,
+    event_id: str,
+    *,
+    conn: Any = None,
+) -> bool:
+    """Return True if ``(provider, event_id)`` has already been recorded."""
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT 1
+                FROM dalton_integration_webhook_events
+                WHERE provider = %s AND event_id = %s
+                """,
+                (provider, event_id),
+            )
+            return (await cur.fetchone()) is not None
+
+
 # ---------------------------------------------------------------------------
 # OAuth state & Supabase pending confirmation primitives (for Step 2)
 # ---------------------------------------------------------------------------
@@ -1109,6 +1133,7 @@ async def insert_oauth_state(
     redirect_uri: str,
     return_to: str | None,
     expires_at: datetime,
+    browser_binding_hash: str | None = None,
     conn: Any = None,
 ) -> None:
     """Persist a 10-minute one-time OAuth state with encrypted PKCE ``code_verifier``."""
@@ -1121,13 +1146,13 @@ async def insert_oauth_state(
                     state_hash, user_id, auth_mode, session_id, user_email,
                     provider, service, oauth_client_id, intent,
                     code_verifier, requested_scopes, redirect_uri, return_to,
-                    expires_at, created_at
+                    browser_binding_hash, expires_at, created_at
                 )
                 VALUES (
                     %s, %s, %s, %s, %s,
                     %s, %s, %s, %s,
                     pgp_sym_encrypt(%s, %s), %s, %s, %s,
-                    %s, NOW()
+                    %s, %s, NOW()
                 )
                 """,
                 (
@@ -1145,6 +1170,7 @@ async def insert_oauth_state(
                     requested_scopes,
                     redirect_uri,
                     return_to,
+                    browser_binding_hash,
                     expires_at,
                 ),
             )
@@ -1171,7 +1197,7 @@ async def consume_oauth_state(
                     provider, service, oauth_client_id, intent,
                     pgp_sym_decrypt(code_verifier, %(enc_key)s) AS decrypted_code_verifier,
                     requested_scopes, redirect_uri, return_to,
-                    expires_at, created_at
+                    browser_binding_hash, expires_at, created_at
                 """,
                 {
                     "state_hash": state_hash,
@@ -1199,6 +1225,7 @@ async def consume_oauth_state(
         expires_at=r["expires_at"],
         created_at=r["created_at"],
         code_verifier=r.get("decrypted_code_verifier"),
+        browser_binding_hash=r.get("browser_binding_hash"),
     )
 
 
@@ -1219,9 +1246,12 @@ async def insert_pending_confirmation(
     intent: str,
     preferences: dict[str, Any] | None,
     confirm_expires_at: datetime,
+    expected_old_oauth_client_id: str | None = None,
+    expected_old_provider_account_id: str | None = None,
+    expected_old_auth_epoch: int | None = None,
     conn: Any = None,
 ) -> None:
-    """Stage a 5-minute Supabase post-callback confirmation payload (encrypted at rest)."""
+    """Stage a 5-minute post-callback confirmation payload (encrypted at rest)."""
     enc_key = get_encryption_key()
     async with get_db_connection(conn) as db_conn:
         async with db_conn.cursor() as cur:
@@ -1232,7 +1262,11 @@ async def insert_pending_confirmation(
                     oauth_client_id, provider_account_id, provider_union_id,
                     provider_email, granted_scopes,
                     access_token, refresh_token, expires_at,
-                    intent, preferences, confirm_expires_at, created_at
+                    intent,
+                    expected_old_oauth_client_id,
+                    expected_old_provider_account_id,
+                    expected_old_auth_epoch,
+                    preferences, confirm_expires_at, created_at
                 )
                 VALUES (
                     %(confirmation_hash)s, %(user_id)s, %(provider)s, %(service)s,
@@ -1243,7 +1277,11 @@ async def insert_pending_confirmation(
                     CASE WHEN %(refresh_token)s::text IS NULL THEN NULL
                          ELSE pgp_sym_encrypt(%(refresh_token)s, %(enc_key)s) END,
                     %(expires_at)s,
-                    %(intent)s, %(preferences)s, %(confirm_expires_at)s, NOW()
+                    %(intent)s,
+                    %(expected_old_oauth_client_id)s,
+                    %(expected_old_provider_account_id)s,
+                    %(expected_old_auth_epoch)s,
+                    %(preferences)s, %(confirm_expires_at)s, NOW()
                 )
                 """,
                 {
@@ -1261,6 +1299,9 @@ async def insert_pending_confirmation(
                     "enc_key": enc_key,
                     "expires_at": expires_at,
                     "intent": intent,
+                    "expected_old_oauth_client_id": expected_old_oauth_client_id,
+                    "expected_old_provider_account_id": expected_old_provider_account_id,
+                    "expected_old_auth_epoch": expected_old_auth_epoch,
                     "preferences": Jsonb(preferences or {}),
                     "confirm_expires_at": confirm_expires_at,
                 },
@@ -1273,7 +1314,7 @@ async def consume_pending_confirmation(
     *,
     conn: Any = None,
 ) -> PendingConfirmationRow | None:
-    """Atomically consume a Supabase pending confirmation owned by ``user_id``."""
+    """Atomically consume a pending confirmation owned by ``user_id``."""
     enc_key = get_encryption_key()
     async with get_db_connection(conn) as db_conn:
         async with db_conn.cursor(row_factory=dict_row) as cur:
@@ -1291,7 +1332,11 @@ async def consume_pending_confirmation(
                          ELSE pgp_sym_decrypt(access_token, %(enc_key)s) END AS decrypted_access_token,
                     CASE WHEN refresh_token IS NULL THEN NULL
                          ELSE pgp_sym_decrypt(refresh_token, %(enc_key)s) END AS decrypted_refresh_token,
-                    expires_at, intent, preferences, confirm_expires_at, created_at
+                    expires_at, intent,
+                    expected_old_oauth_client_id,
+                    expected_old_provider_account_id,
+                    expected_old_auth_epoch,
+                    preferences, confirm_expires_at, created_at
                 """,
                 {
                     "confirmation_hash": confirmation_hash,
@@ -1320,6 +1365,13 @@ async def consume_pending_confirmation(
         created_at=r["created_at"],
         access_token=r.get("decrypted_access_token"),
         refresh_token=r.get("decrypted_refresh_token"),
+        expected_old_oauth_client_id=r.get("expected_old_oauth_client_id"),
+        expected_old_provider_account_id=r.get("expected_old_provider_account_id"),
+        expected_old_auth_epoch=(
+            int(r["expected_old_auth_epoch"])
+            if r.get("expected_old_auth_epoch") is not None
+            else None
+        ),
     )
 
 
@@ -1598,7 +1650,11 @@ async def peek_pending_confirmation(
                     confirmation_hash, user_id, provider, service,
                     oauth_client_id, provider_account_id, provider_union_id,
                     provider_email, granted_scopes,
-                    expires_at, intent, preferences, confirm_expires_at, created_at
+                    expires_at, intent,
+                    expected_old_oauth_client_id,
+                    expected_old_provider_account_id,
+                    expected_old_auth_epoch,
+                    preferences, confirm_expires_at, created_at
                 FROM dalton_user_integration_pending_confirmations
                 WHERE confirmation_hash = %(confirmation_hash)s
                   AND user_id = %(user_id)s
@@ -1627,6 +1683,13 @@ async def peek_pending_confirmation(
         created_at=r["created_at"],
         access_token=None,
         refresh_token=None,
+        expected_old_oauth_client_id=r.get("expected_old_oauth_client_id"),
+        expected_old_provider_account_id=r.get("expected_old_provider_account_id"),
+        expected_old_auth_epoch=(
+            int(r["expected_old_auth_epoch"])
+            if r.get("expected_old_auth_epoch") is not None
+            else None
+        ),
     )
 
 
@@ -1755,3 +1818,128 @@ async def update_health_sweep_state(
                 """,
                 params,
             )
+
+
+async def list_orphaned_revoked_purging_connections(
+    *,
+    limit: int = 500,
+    conn: Any = None,
+) -> list[IntegrationRow]:
+    """List ``revoked_purging`` rows that lack any ``running`` local purge ledger (§4.2(2))."""
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT {_INTEGRATION_META_COLS}
+                FROM dalton_user_integrations i
+                WHERE i.status = 'revoked_purging'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM dalton_integration_purge_ledger l
+                      WHERE l.user_id = i.user_id
+                        AND l.provider = i.provider
+                        AND (l.service = i.service OR l.service IS NULL)
+                        AND l.local_purge_status = 'running'
+                  )
+                ORDER BY i.updated_at ASC, i.user_id ASC, i.provider ASC, i.service ASC
+                LIMIT %s
+                """,
+                (int(limit),),
+            )
+            rows = await cur.fetchall()
+    return [_row_to_integration(dict(r)) for r in rows]
+
+
+async def has_active_or_pending_google_grant(
+    user_id: str,
+    google_project: str,
+    sub: str,
+    *,
+    exclude_client_id: str | None = None,
+    min_auth_epoch: int | None = None,
+    conn: Any = None,
+) -> bool:
+    """Return True if ``(user_id, google_project, sub)`` holds an active connection or unexpired pending confirmation.
+
+    Used under ``revoke_lock_key(user_id, google_project, sub)`` to prevent revoking a
+    Google project grant that already has a live connection on a new client or a staged
+    confirmation token waiting to activate (§4.2(1)(3)).
+    """
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            clauses = [
+                "user_id = %(user_id)s",
+                "provider = 'google'",
+                "provider_account_id = %(sub)s",
+                "status IN ('connected', 'refresh_ambiguous')",
+            ]
+            params: dict[str, Any] = {"user_id": user_id, "sub": sub}
+            if exclude_client_id is not None:
+                clauses.append("oauth_client_id <> %(exclude_client_id)s")
+                params["exclude_client_id"] = exclude_client_id
+            if min_auth_epoch is not None:
+                clauses.append("auth_epoch > %(min_auth_epoch)s")
+                params["min_auth_epoch"] = int(min_auth_epoch)
+
+            await cur.execute(
+                f"""
+                SELECT oauth_client_id
+                FROM dalton_user_integrations
+                WHERE {' AND '.join(clauses)}
+                """,
+                params,
+            )
+            conn_rows = await cur.fetchall()
+            if any(
+                extract_google_project(str(r["oauth_client_id"])) == google_project
+                for r in conn_rows
+            ):
+                return True
+
+            await cur.execute(
+                """
+                SELECT oauth_client_id
+                FROM dalton_user_integration_pending_confirmations
+                WHERE user_id = %(user_id)s
+                  AND provider = 'google'
+                  AND provider_account_id = %(sub)s
+                  AND confirm_expires_at > clock_timestamp()
+                """,
+                {"user_id": user_id, "sub": sub},
+            )
+            pending_rows = await cur.fetchall()
+            return any(
+                extract_google_project(str(r["oauth_client_id"])) == google_project
+                for r in pending_rows
+            )
+
+
+async def supersede_active_revokes_for_google_project_sub_tx(
+    user_id: str,
+    google_project: str,
+    sub: str,
+    *,
+    reason: str = "superseded_by_new_authorization",
+    conn: Any,
+) -> int:
+    """Supersede all ``pending | failed_retryable`` Google revoke ledgers for ``(user_id, google_project, sub)`` inside an open transaction.
+
+    Caller MUST hold ``revoke_lock_key(user_id, google_project, sub)``.
+    """
+    active = await list_active_revokes_for_google_project_sub(
+        user_id, google_project, sub, decrypt_revoke_token=False, conn=conn
+    )
+    count = 0
+    for row in active:
+        updated = await update_purge_ledger_remote_status(
+            row.purge_id,
+            remote_revoke_status=RemoteRevokeStatus.SUPERSEDED,
+            clear_revoke_token=True,
+            next_retry_at=None,
+            last_remote_error=reason,
+            mark_remote_completed=True,
+            conn=conn,
+        )
+        if updated is not None:
+            count += 1
+    return count
