@@ -83,7 +83,8 @@ async def test_all_main_bucket_probes_valid_sql_and_gate_behavior_real_pg(
                 patch.object(db_pool_mod, "get_or_create_pool", return_value=test_db_pool),
                 patch.object(storage_refs, "is_storage_enabled", return_value=False),
             ):
-                # 1. Every registered probe executes with zero SQL errors and all tables exist.
+                # 1. Every registered probe executes with zero SQL errors, all tables exist,
+                # and EXPLAIN (with seqscan disabled) confirms every probe uses an index.
                 outcomes, total_ms = await storage_refs.probe_main_bucket_references()
                 assert total_ms >= 0.0
                 assert len(outcomes) == len(storage_refs.MAIN_BUCKET_CONSUMER_PROBES)
@@ -93,6 +94,20 @@ async def test_all_main_bucket_probes_valid_sql_and_gate_behavior_real_pg(
                     )
                     assert outcome.skipped_missing_table is False, (
                         f"Probe {outcome.name} table missing on migrated DB: {outcome.table}"
+                    )
+
+                plans = await storage_refs.explain_main_bucket_probes(
+                    conn,
+                    disable_seqscan=True,
+                    env={"STORAGE_PUBLIC_URL_BASE": "https://app.example.com/storage"},
+                )
+                assert set(plans.keys()) == {p.name for p in storage_refs.MAIN_BUCKET_CONSUMER_PROBES}
+                for name, plan_text in plans.items():
+                    assert "Seq Scan" not in plan_text, (
+                        f"Probe {name} fell back to Seq Scan:\n{plan_text}"
+                    )
+                    assert "Index" in plan_text, (
+                        f"Probe {name} did not use an index:\n{plan_text}"
                     )
 
                 # Clean test tables from any prior test artifacts before checking empty-DB pass.
@@ -169,6 +184,81 @@ async def test_all_main_bucket_probes_valid_sql_and_gate_behavior_real_pg(
                     await storage_refs.enforce_storage_off_startup_gate()
                 assert storage_refs.STORAGE_OFF_GATE_ERROR_PREFIX in str(exc_att.value)
                 assert "chat_attachments" in str(exc_att.value)
+
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "DELETE FROM chat_attachments WHERE attachment_id = %s::uuid",
+                        (obj_att_id,),
+                    )
+
+                # 6. External avatar URL passes gate; site avatar URL refuses gate.
+                site_env = {
+                    "STORAGE_PUBLIC_URL_BASE": "https://app.example.com/storage",
+                    "STORAGE_KEY_PREFIX": "staging",
+                }
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE users SET avatar_url = %s WHERE user_id = %s",
+                        ("https://lh3.googleusercontent.com/avatars/ext.png", uid),
+                    )
+                ext_outcomes = await storage_refs.enforce_storage_off_startup_gate(env=site_env)
+                assert all(not o.has_references for o in ext_outcomes)
+
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE users SET avatar_url = %s WHERE user_id = %s",
+                        (f"https://app.example.com/storage/staging/avatars/{uid}.png", uid),
+                    )
+                with pytest.raises(DaltonStartupConfigError) as exc_avatar:
+                    await storage_refs.enforce_storage_off_startup_gate(env=site_env)
+                assert "users_avatars" in str(exc_avatar.value)
+
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE users SET avatar_url = NULL WHERE user_id = %s",
+                        (uid,),
+                    )
+
+                # 7. Unsliced widget data_ref in checkpoint_writes refuses gate.
+                thread_id = str(uuid.uuid4())
+                try:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            INSERT INTO conversation_threads (
+                                conversation_thread_id, workspace_id, thread_index,
+                                current_status, created_at, updated_at
+                            )
+                            VALUES (%s::uuid, %s::uuid, 1, 'idle', NOW(), NOW())
+                            """,
+                            (thread_id, ws_id),
+                        )
+                        await cur.execute(
+                            """
+                            INSERT INTO checkpoint_writes (
+                                thread_id, checkpoint_ns, checkpoint_id, task_id,
+                                idx, channel, type, blob
+                            )
+                            VALUES (%s, '', 'cp-1', 't-1', 0, 'messages', 'msgpack', %s)
+                            """,
+                            (
+                                thread_id,
+                                b'{"data_ref":{"key":"widgets/' + thread_id.encode() + b'/abc.json"}}',
+                            ),
+                        )
+                    with pytest.raises(DaltonStartupConfigError) as exc_cw:
+                        await storage_refs.enforce_storage_off_startup_gate()
+                    assert "widgets_checkpoint_writes" in str(exc_cw.value)
+                finally:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "DELETE FROM checkpoint_writes WHERE thread_id = %s",
+                            (thread_id,),
+                        )
+                        await cur.execute(
+                            "DELETE FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
+                            (thread_id,),
+                        )
         finally:
             async with conn.cursor() as cur:
                 await cur.execute(

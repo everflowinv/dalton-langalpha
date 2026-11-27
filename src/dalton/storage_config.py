@@ -16,6 +16,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ import yaml
 from src.dalton.profile import (
     DaltonStartupConfigError,
     DeploymentProfile,
+    apply_core_yaml_overrides,
     resolve_profile,
     resolve_yaml_overlay_env,
 )
@@ -78,23 +80,82 @@ def _env_map(env: Mapping[str, str] | None) -> Mapping[str, str]:
     return os.environ if env is None else env
 
 
-def _deep_merge_dicts(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(base)
+def _deep_merge_dicts(base: Any, overlay: Any) -> Any:
+    """Merge YAML mappings identically to ``ptc_agent.config.file_utils._deep_merge``."""
+    if not isinstance(overlay, dict):
+        return overlay
+    merged = dict(base) if isinstance(base, dict) else {}
     for key, value in overlay.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge_dicts(merged[key], value)
-        else:
-            merged[key] = value
+        if value is not None:
+            merged[key] = _deep_merge_dicts(merged.get(key), value)
     return merged
 
 
-def _find_agent_config_path() -> Path | None:
-    cwd_path = Path.cwd() / "agent_config.yaml"
-    if cwd_path.is_file():
-        return cwd_path
-    repo_path = REPO_ROOT / "agent_config.yaml"
-    if repo_path.is_file():
-        return repo_path
+def _substitute_env_vars(value: str, env: Mapping[str, str]) -> str:
+    """Expand ``${VAR}`` and ``$VAR`` identically to ``file_utils.substitute_env_vars``."""
+    if not isinstance(value, str):
+        return value
+    result = re.sub(
+        r"\$\{([^}]+)\}",
+        lambda m: env.get(m.group(1), m.group(0)),
+        value,
+    )
+    if result.startswith("$") and not result.startswith("${"):
+        env_var = result[1:]
+        if env_var.isidentifier():
+            return env.get(env_var, env_var)
+    return result
+
+
+def _expand_yaml_env_vars(value: Any, env: Mapping[str, str]) -> Any:
+    if isinstance(value, dict):
+        return {k: _expand_yaml_env_vars(v, env) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_yaml_env_vars(item, env) for item in value]
+    if isinstance(value, str):
+        return _substitute_env_vars(value, env)
+    return value
+
+
+def _find_project_root(start_path: Path | None = None) -> Path | None:
+    current = start_path or Path.cwd()
+    while current != current.parent:
+        if (current / ".git").exists():
+            return current
+        current = current.parent
+    return None
+
+
+def _find_agent_config_path(*, env: Mapping[str, str] | None = None) -> Path | None:
+    """Follow ``ptc_agent.config.file_utils.load_agent_config`` discovery order.
+
+    1. ``PTC_CONFIG_FILE`` (when set and exists)
+    2. ``CWD/agent_config.yaml``
+    3. ``<git project root>/agent_config.yaml`` (falling back to ``REPO_ROOT``)
+    4. ``~/.ptc-agent/agent_config.yaml``
+    """
+    em = _env_map(env)
+    env_path = em.get("PTC_CONFIG_FILE")
+    if env_path:
+        candidate = Path(env_path)
+        if candidate.exists():
+            return candidate
+
+    cwd = Path.cwd()
+    search_dirs: list[Path] = [cwd]
+    project_root = _find_project_root(cwd)
+    if project_root and project_root not in search_dirs:
+        search_dirs.append(project_root)
+    if REPO_ROOT not in search_dirs:
+        search_dirs.append(REPO_ROOT)
+    home_dir = Path.home() / ".ptc-agent"
+    if home_dir not in search_dirs:
+        search_dirs.append(home_dir)
+
+    for directory in search_dirs:
+        candidate = directory / "agent_config.yaml"
+        if candidate.is_file():
+            return candidate
     return None
 
 
@@ -103,22 +164,31 @@ def _load_agent_storage_section(
     env: Mapping[str, str] | None = None,
     agent_config: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
-    """Read the merged ``storage`` mapping from ``agent_config.yaml`` (+ profile overlay)."""
+    """Read the merged ``storage`` mapping from ``agent_config.yaml`` (+ profile overlay).
+
+    Matches ``ptc_agent.config.file_utils.load_agent_config`` file selection
+    (``PTC_CONFIG_FILE`` first), sibling overlay merging, and ``$VAR`` / ``${VAR}``
+    environment variable expansion.
+    """
+    em = _env_map(env)
     if agent_config is not None:
         section = agent_config.get("storage")
-        return section if isinstance(section, Mapping) else {}
+        if not isinstance(section, Mapping):
+            return {}
+        return _expand_yaml_env_vars(dict(section), em)
 
-    base_path = _find_agent_config_path()
+    base_path = _find_agent_config_path(env=em)
     if base_path is None:
         return {}
 
-    em = _env_map(env)
     overlay_env = resolve_yaml_overlay_env(
         app_env=em.get("APP_ENV", ""),
         dalton_profile=em.get("DALTON_PROFILE", ""),
     )
     try:
-        raw_base = yaml.safe_load(base_path.read_text(encoding="utf-8")) or {}
+        raw_base = yaml.safe_load(base_path.read_text(encoding="utf-8"))
+        if raw_base is None:
+            raw_base = {}
         if not isinstance(raw_base, dict):
             raw_base = {}
         merged: dict[str, Any] = raw_base
@@ -127,14 +197,22 @@ def _load_agent_storage_section(
                 f"{base_path.stem}.{overlay_env}{base_path.suffix}"
             )
             if overlay_path.is_file():
-                raw_overlay = yaml.safe_load(overlay_path.read_text(encoding="utf-8")) or {}
+                raw_overlay = yaml.safe_load(overlay_path.read_text(encoding="utf-8"))
+                if raw_overlay is None:
+                    raw_overlay = {}
                 if isinstance(raw_overlay, dict):
                     merged = _deep_merge_dicts(merged, raw_overlay)
+                    merged = apply_core_yaml_overrides(
+                        merged, raw_overlay, overlay_env=overlay_env
+                    )
     except (OSError, yaml.YAMLError) as exc:
         logger.warning("Failed to load %s: %s", base_path, exc)
         return {}
 
-    section = merged.get("storage")
+    if not merged:
+        return {}
+    expanded = _expand_yaml_env_vars(merged, em)
+    section = expanded.get("storage") if isinstance(expanded, Mapping) else None
     return section if isinstance(section, Mapping) else {}
 
 

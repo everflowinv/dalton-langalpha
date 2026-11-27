@@ -23,11 +23,13 @@ from fastapi.testclient import TestClient
 
 from ptc_agent.core.paths import SandboxLayout
 from ptc_agent.core.sandbox import wsfiles_transfer_runtime as transfer_rt
+from ptc_agent.core.sandbox.files import FileOverCap
 from src.dalton import (
     download_ticket,
     storage_bucket_rules,
     storage_config,
     storage_refs,
+    wsfiles_write_mode,
 )
 from src.dalton.app import workspace_file_download
 from src.dalton.auth import bootstrap as auth_bootstrap
@@ -120,6 +122,18 @@ class _FakeSandbox:
         else:
             rel = abs_path
         return self.files.get(rel)
+
+    async def adownload_file_bytes_capped(self, abs_path: str, cap: Any) -> bytes | None:
+        data = await self.adownload_file_bytes(abs_path)
+        if data is None:
+            return None
+        buf = bytearray()
+        for i in range(0, len(data), 4096):
+            buf.extend(data[i : i + 4096])
+            limit = cap(buf)
+            if len(buf) > limit:
+                raise FileOverCap(limit)
+        return bytes(buf)
 
     async def aupload_file_bytes(self, abs_path: str, data: bytes) -> bool:
         self.uploaded_staged[abs_path] = data
@@ -1036,7 +1050,7 @@ class TestStartupReferenceGate:
         )
 
     @pytest.mark.asyncio
-    async def test_missing_table_skipped_and_query_error_refuses(
+    async def test_missing_table_skipped_and_query_timeout_allows_with_warning(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         def _missing_handler(sql: str, params: Any = None) -> Any:
@@ -1057,22 +1071,32 @@ class TestStartupReferenceGate:
         assert drive_out.skipped_missing_table is True
         assert drive_out.error is None
 
-        # Query failure must refuse startup (fail-closed)
-        def _error_handler(sql: str, params: Any = None) -> Any:
+        # Probe timeout/error with no confirmed hits must log WARNING and allow startup
+        caplog.clear()
+
+        def _timeout_handler(sql: str, params: Any = None) -> Any:
             if sql.startswith("SELECT set_config"):
                 return ("5s",)
             if sql.startswith("SELECT to_regclass"):
                 return (params[0],)
             if "FROM user_skills" in sql:
-                raise RuntimeError("statement timeout")
+                raise TimeoutError("canceling statement due to statement timeout")
             return (False,)
 
-        with patch.object(storage_refs, "is_storage_enabled", return_value=False):
-            with pytest.raises(DaltonStartupConfigError) as exc_err:
-                await storage_refs.enforce_storage_off_startup_gate(
-                    conn=_FakeProbeConn(_error_handler)
-                )
-        assert "user_skills" in str(exc_err.value)
+        with (
+            caplog.at_level(logging.WARNING, logger="src.dalton.storage_refs"),
+            patch.object(storage_refs, "is_storage_enabled", return_value=False),
+        ):
+            timeout_outcomes = await storage_refs.enforce_storage_off_startup_gate(
+                conn=_FakeProbeConn(_timeout_handler)
+            )
+        skill_out = next(o for o in timeout_outcomes if o.name == "user_skills")
+        assert skill_out.error is not None
+        assert "statement timeout" in skill_out.error
+        assert skill_out.has_references is False
+        warn_msgs = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("user_skills" in m for m in warn_msgs)
+        assert any("allowing startup" in m for m in warn_msgs)
 
     @pytest.mark.asyncio
     async def test_run_auth_db_startup_hook_calls_storage_checks(self) -> None:
@@ -1626,3 +1650,547 @@ class TestExclusionGlobs:
         cfg_c = DaltonConfig.model_validate(raw_core)
         assert cfg_e.enabled is True
         assert cfg_c.enabled is True
+
+
+# ---------------------------------------------------------------------------
+# 8. Step 2 Round 2 regression tests (Fixes 1-8)
+# ---------------------------------------------------------------------------
+
+
+class _FakeCliConn:
+    """Explicit async connection double for CLI probe tests."""
+
+    def __init__(self, handler: Any) -> None:
+        self._handler = handler
+        self.executed: list[tuple[str, Any]] = []
+        self.closed = False
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield
+
+    def cursor(self) -> _FakeProbeCursor:
+        def _wrapped(sql: str, params: Any = None) -> Any:
+            self.executed.append((sql, params))
+            return self._handler(sql, params)
+
+        return _FakeProbeCursor(_wrapped)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class TestStep2Round2Fixes:
+    def test_fix1_and_fix7_all_probes_indexed_limit_1_and_checkpoint_writes_covered(
+        self,
+    ) -> None:
+        names = [p.name for p in storage_refs.MAIN_BUCKET_CONSUMER_PROBES]
+        assert "widgets_checkpoint_writes" in names
+        assert "widgets_checkpoint_blobs" in names
+        for probe in storage_refs.MAIN_BUCKET_CONSUMER_PROBES:
+            assert "LIMIT 1" in probe.exists_sql, f"{probe.name} missing LIMIT 1"
+            assert probe.index_used, f"{probe.name} missing index_used metadata"
+        cw_probe = next(
+            p for p in storage_refs.MAIN_BUCKET_CONSUMER_PROBES if p.name == "widgets_checkpoint_writes"
+        )
+        assert cw_probe.table == "public.checkpoint_writes"
+        assert "FROM recent_threads" in cw_probe.exists_sql
+        assert "JOIN checkpoint_writes" in cw_probe.exists_sql
+        assert "channel = 'messages'" in cw_probe.exists_sql
+        assert "data_ref" in cw_probe.exists_sql
+        assert "widgets/" in cw_probe.exists_sql
+
+    @pytest.mark.asyncio
+    async def test_fix7_checkpoint_writes_unsliced_widget_refuses_startup(self) -> None:
+        def _handler(sql: str, params: Any = None) -> Any:
+            if sql.startswith("SELECT set_config"):
+                return ("5s",)
+            if sql.startswith("SELECT to_regclass"):
+                return (params[0],)
+            if "JOIN checkpoint_writes" in sql:
+                return (True,)
+            return (False,)
+
+        with patch.object(storage_refs, "is_storage_enabled", return_value=False):
+            with pytest.raises(DaltonStartupConfigError) as exc_info:
+                await storage_refs.enforce_storage_off_startup_gate(
+                    conn=_FakeProbeConn(_handler)
+                )
+        assert "widgets_checkpoint_writes" in str(exc_info.value)
+
+    def test_fix2_external_avatar_allowed_site_origin_prefix_key_matched(self) -> None:
+        # No site public URL base configured -> external avatar URL never matches
+        assert (
+            storage_refs.is_site_avatar_url(
+                "https://lh3.googleusercontent.com/avatars/user-1.png",
+                env={},
+            )
+            is False
+        )
+        assert storage_refs.site_avatar_url_rules(env={}) == []
+
+        # Configured explicit STORAGE_PUBLIC_URL_BASE + STORAGE_KEY_PREFIX
+        env_prefixed = {
+            "STORAGE_PUBLIC_URL_BASE": "https://app.example.com/storage",
+            "STORAGE_KEY_PREFIX": "staging",
+        }
+        # External origins are allowed
+        assert (
+            storage_refs.is_site_avatar_url(
+                "https://lh3.googleusercontent.com/storage/staging/avatars/u1.png",
+                env=env_prefixed,
+            )
+            is False
+        )
+        assert (
+            storage_refs.is_site_avatar_url(
+                "https://cdn.other.org/avatars/u1.jpg",
+                env=env_prefixed,
+            )
+            is False
+        )
+        # Same origin but missing/wrong key prefix is allowed
+        assert (
+            storage_refs.is_site_avatar_url(
+                "https://app.example.com/storage/avatars/u1.png",
+                env=env_prefixed,
+            )
+            is False
+        )
+        assert (
+            storage_refs.is_site_avatar_url(
+                "https://app.example.com/storage/prod/avatars/u1.png",
+                env=env_prefixed,
+            )
+            is False
+        )
+        # Same origin + prefix but wrong object key shape is allowed
+        assert (
+            storage_refs.is_site_avatar_url(
+                "https://app.example.com/storage/staging/images/u1.png",
+                env=env_prefixed,
+            )
+            is False
+        )
+        assert (
+            storage_refs.is_site_avatar_url(
+                "https://app.example.com/storage/staging/avatars/nested/u1.png",
+                env=env_prefixed,
+            )
+            is False
+        )
+        # All three match (origin + configured prefix + avatars/<id>.<ext>) -> True
+        assert (
+            storage_refs.is_site_avatar_url(
+                "https://APP.EXAMPLE.COM/storage/staging/avatars/user-42.webp?v=2",
+                env=env_prefixed,
+            )
+            is True
+        )
+
+        # Without prefix, PUBLIC_APP_URL fallback matches /storage/avatars/<id>.<ext>
+        env_pub = {"PUBLIC_APP_URL": "https://everflow.example.com"}
+        assert (
+            storage_refs.is_site_avatar_url(
+                "https://everflow.example.com/storage/avatars/user-9.png",
+                env=env_pub,
+            )
+            is True
+        )
+        assert (
+            storage_refs.is_site_avatar_url(
+                "https://everflow.example.com/other/avatars/user-9.png",
+                env=env_pub,
+            )
+            is False
+        )
+        origins, regexes = storage_refs._avatar_probe_params(env_prefixed)
+        assert origins == ["https://app.example.com"]
+        assert len(regexes) == 1
+        assert "/storage/staging/avatars/" in regexes[0]
+
+    @pytest.mark.asyncio
+    async def test_fix3_glob_excluding_ancestor_preserves_nested_git_in_sync_and_restore(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ws_dir = tmp_path / "ws"
+        # Nested git repo inside glob-excluded ancestors
+        (ws_dir / "projects" / "myrepo" / ".git" / "refs" / "heads").mkdir(parents=True)
+        (ws_dir / "projects" / "myrepo" / ".git" / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+        (ws_dir / "projects" / "myrepo" / ".git" / "refs" / "heads" / "main").write_bytes(b"abc123\n")
+        (ws_dir / "projects" / "myrepo" / "cache.bin").write_bytes(b"junk-cache")
+        (ws_dir / "projects" / "empty_cache").mkdir(parents=True)
+        (ws_dir / "projects" / "empty_cache" / "temp.dat").write_bytes(b"temp")
+        (ws_dir / "cn_screening_a" / "data" / "sub" / ".git").mkdir(parents=True)
+        (ws_dir / "cn_screening_a" / "data" / "sub" / ".git" / "HEAD").write_bytes(b"ref: refs/heads/dev\n")
+        (ws_dir / "cn_screening_a" / "data" / "big.parquet").write_bytes(b"parquet-junk")
+
+        scan_out = transfer_rt.scan(
+            {
+                "root": str(ws_dir),
+                "whole_dir_names": [".git"],
+                "exclude_rel_globs": ["projects/*", "cn_screening_*/data"],
+            }
+        )
+        scanned_paths = {e["path"] for e in scan_out["entries"]}
+        # Protected nested .git histories survive scan
+        assert "projects/myrepo/.git/HEAD" in scanned_paths
+        assert "projects/myrepo/.git/refs/heads/main" in scanned_paths
+        assert "cn_screening_a/data/sub/.git/HEAD" in scanned_paths
+        # Excluded non-git files and dirs without .git are omitted
+        assert "projects/myrepo/cache.bin" not in scanned_paths
+        assert "projects/empty_cache" not in scanned_paths
+        assert "projects/empty_cache/temp.dat" not in scanned_paths
+        assert "cn_screening_a/data/big.parquet" not in scanned_paths
+
+        # Run full sync_to_db -> verify pruning keeps .git rows and removes excluded cache.bin
+        sandbox_files = {
+            e["path"]: (ws_dir / e["path"]).read_bytes()
+            for e in scan_out["entries"]
+            if e["kind"] == "file"
+        }
+        scan_entries = [
+            ScanEntry(
+                path=e["path"],
+                kind=e["kind"],
+                size=e["size"],
+                mtime_ns=e["mtime_ns"],
+                mode=e["mode"],
+                sha256=e["sha256"],
+                symlink_target=e["symlink_target"],
+                is_binary=e.get("is_binary"),
+            )
+            for e in scan_out["entries"]
+        ]
+        scan_result = ScanResult(
+            entries=scan_entries,
+            oversized=[],
+            errors=[],
+            hashed=len(scan_entries),
+            reused=0,
+        )
+        existing = {
+            "projects/myrepo/.git/HEAD": {
+                "kind": "file",
+                "file_size": len(b"ref: refs/heads/main\n"),
+                "content_hash": _sha(b"ref: refs/heads/main\n"),
+                "mtime_ns": 1_700_000_000_000_000_000,
+                "permissions": "0644",
+                "blob_sha256": None,
+                "pack_sha256": None,
+                "pack_offset": None,
+                "is_binary": False,
+            },
+            "projects/myrepo/cache.bin": {
+                "kind": "file",
+                "file_size": len(b"junk-cache"),
+                "content_hash": _sha(b"junk-cache"),
+                "mtime_ns": 1_700_000_000_000_000_000,
+                "permissions": "0644",
+                "blob_sha256": None,
+                "pack_sha256": None,
+                "pack_offset": None,
+                "is_binary": False,
+            },
+        }
+        layout = SandboxLayout.for_root("/workspace").for_workspace("ws-git")
+        sync_sandbox = _FakeSandbox(sandbox_files, working_dir="/workspace", dir_name="ws-git")
+        manifest_rows: dict[str, dict[str, Any]] = {}
+        pruned_kept_sets: list[set[str]] = []
+
+        async def _fake_upsert(_ws: str, rows: list[dict[str, Any]], *, conn: Any = None) -> int:
+            for r in rows:
+                manifest_rows[r["file_path"]] = dict(r)
+            return len(rows)
+
+        async def _fake_delete_removed(
+            _ws: str, active: set[str], **_kw: Any
+        ) -> int:
+            pruned_kept_sets.append(set(active))
+            return sum(1 for p in existing if p not in active)
+
+        @asynccontextmanager
+        async def _noop_lock(*_a: Any, **_kw: Any):
+            yield NoDbConn()
+
+        clock = datetime(2026, 11, 27, 12, 0, 0, tzinfo=timezone.utc)
+        with (
+            patch.object(backup, "workspace_sync_lock", _noop_lock),
+            patch.object(backup, "manifest_clock", create_autospec(backup.manifest_clock, return_value=clock)),
+            patch.object(backup, "get_file_metadata_for_sync", create_autospec(backup.get_file_metadata_for_sync, return_value=existing)),
+            patch.object(backup, "files_restore_incomplete", create_autospec(backup.files_restore_incomplete, return_value=False)),
+            patch.object(backup, "delete_removed_files", create_autospec(backup.delete_removed_files, side_effect=_fake_delete_removed)),
+            patch.object(backup, "get_workspace_total_size", create_autospec(backup.get_workspace_total_size, return_value=0)),
+            patch.object(backup, "bulk_upsert_files", create_autospec(wf_db.bulk_upsert_files, side_effect=_fake_upsert)),
+            patch.object(blobs, "bulk_upsert_files", create_autospec(wf_db.bulk_upsert_files, side_effect=_fake_upsert)),
+            patch.object(backup, "bulk_update_file_stamps", create_autospec(backup.bulk_update_file_stamps, return_value=None)),
+            patch.object(backup, "is_storage_enabled", return_value=False),
+            patch.object(backup, "scan_workspace", create_autospec(backup.scan_workspace, return_value=scan_result)),
+        ):
+            sync_res = await backup.sync_to_db("ws-git", sync_sandbox, layout=layout)
+
+        assert sync_res.unsaved == []
+        assert pruned_kept_sets
+        assert "projects/myrepo/.git/HEAD" in pruned_kept_sets[0]
+        assert "cn_screening_a/data/sub/.git/HEAD" in pruned_kept_sets[0]
+        assert "projects/myrepo/cache.bin" not in pruned_kept_sets[0]
+        assert sync_res.deleted == 1
+
+        # Cold restore brings back nested .git history intact
+        restore_sandbox = _FakeSandbox({}, working_dir="/workspace", dir_name="ws-git")
+        # Ensure already-existing unchanged HEAD row also has content for restore
+        manifest_rows.setdefault(
+            "projects/myrepo/.git/HEAD",
+            {
+                "file_path": "projects/myrepo/.git/HEAD",
+                "kind": "file",
+                "file_size": len(b"ref: refs/heads/main\n"),
+                "content_hash": _sha(b"ref: refs/heads/main\n"),
+                "content_text": "ref: refs/heads/main\n",
+                "content_binary": None,
+                "is_binary": False,
+                "blob_sha256": None,
+                "pack_sha256": None,
+                "pack_offset": None,
+                "permissions": "0644",
+                "sandbox_modified_at": clock,
+            },
+        )
+
+        async def _fake_pull_direct(sb: _FakeSandbox, items: list[dict[str, Any]], **_kw: Any) -> dict[str, Any]:
+            out: dict[str, Any] = {}
+            for item in items:
+                staged_abs = f"{layout.workspace}/{item['file']}"
+                sb.restored_files[item["path"]] = sb.uploaded_staged[staged_abs]
+                out[item["path"]] = {"status": "ok"}
+            return out
+
+        async def _fake_get_files(*_a: Any, **_kw: Any) -> list[dict[str, Any]]:
+            return [dict(v) for v in manifest_rows.values() if v.get("kind", "file") == "file"]
+
+        with (
+            patch("src.utils.storage.BLOB_TRANSFER_MODE", "relay"),
+            patch("src.utils.storage.STORAGE_PROVIDER", "none"),
+            patch.object(restore, "workspace_sync_lock", _noop_lock),
+            patch.object(restore, "hold_workspace_skill_sync", _noop_lock),
+            patch.object(restore, "set_files_restore_incomplete", create_autospec(restore.set_files_restore_incomplete, return_value=True)),
+            patch.object(restore, "workspace_owner", create_autospec(restore.workspace_owner, return_value="u-git")),
+            patch.object(restore, "get_files_for_workspace", create_autospec(wf_db.get_files_for_workspace, side_effect=_fake_get_files)),
+            patch.object(restore, "pull_direct", create_autospec(restore.pull_direct, side_effect=_fake_pull_direct)),
+        ):
+            restored = await restore.restore_to_sandbox("ws-git", restore_sandbox, layout=layout)
+
+        assert restored["errors"] == 0
+        assert restore_sandbox.restored_files["projects/myrepo/.git/HEAD"] == b"ref: refs/heads/main\n"
+        assert restore_sandbox.restored_files["projects/myrepo/.git/refs/heads/main"] == b"abc123\n"
+        assert restore_sandbox.restored_files["cn_screening_a/data/sub/.git/HEAD"] == b"ref: refs/heads/dev\n"
+
+    @pytest.mark.asyncio
+    async def test_fix4_inline_bounded_read_rejects_1b_budget_4b_actual_as_changed(
+        self,
+    ) -> None:
+        """Both inline entry points enforce bounded read + scan size/digest check:
+        a file scanned as 1 byte (budget=1) that grew to 4 bytes is NOT written and
+        stays in result.unsaved with reason='changed'.
+        """
+        layout = SandboxLayout.for_root("/workspace").for_workspace("ws-cap")
+        scanned_entry = _entry("grow.txt", b"a")  # scanned size = 1 byte
+        assert scanned_entry.size == 1
+
+        # Sandbox now holds 4 bytes instead of scanned 1 byte
+        sandbox = _FakeSandbox({"grow.txt": b"abcd"}, working_dir="/workspace", dir_name="ws-cap")
+        upserted: list[dict[str, Any]] = []
+
+        async def _fake_upsert(_ws: str, rows: list[dict[str, Any]], *, conn: Any = None) -> int:
+            upserted.extend(rows)
+            return len(rows)
+
+        # Entry point 1: fallback_failed_uploads_inline with budget_bytes=1
+        res_fb = backup.SyncResult(max_file_bytes=100 << 20)
+        res_fb.unsaved.append(UnsavedFile("grow.txt", "failed", 1))
+        with patch.object(blobs, "bulk_upsert_files", create_autospec(wf_db.bulk_upsert_files, side_effect=_fake_upsert)):
+            out_rows = await wsfiles_write_mode.fallback_failed_uploads_inline(
+                blobs_on=True,
+                workspace_id="ws-cap",
+                sandbox=sandbox,
+                scan_entries=[scanned_entry],
+                rows=[],
+                result=res_fb,
+                scanned_unsaved=0,
+                layout=layout,
+                conn=NoDbConn(),
+                budget_bytes=1,
+            )
+        assert out_rows == []
+        assert upserted == []
+        assert res_fb.synced == 0
+        assert res_fb.unsaved == [UnsavedFile("grow.txt", "changed", 1)]
+
+        # Entry point 2: persist_needs_bytes_for_blobs_on (write_inline_only=True)
+        res_io = backup.SyncResult(max_file_bytes=100 << 20)
+        mock_blobs = create_autospec(blobs._persist_blobs, return_value=([], []))
+        with patch.object(blobs, "bulk_upsert_files", create_autospec(wf_db.bulk_upsert_files, side_effect=_fake_upsert)):
+            await wsfiles_write_mode.persist_needs_bytes_for_blobs_on(
+                user_id="u-1",
+                workspace_id="ws-cap",
+                sandbox=sandbox,
+                needs_bytes=[scanned_entry],
+                write_inline_only=True,
+                layout=layout,
+                conn=NoDbConn(),
+                rows=[],
+                result=res_io,
+                persist_blobs_fn=mock_blobs,
+            )
+        assert upserted == []
+        assert res_io.synced == 0
+        assert res_io.unsaved == [UnsavedFile("grow.txt", "changed", 1)]
+
+        # Same-size (1 byte) but mutated digest is also rejected as 'changed'
+        sandbox_mut = _FakeSandbox({"grow.txt": b"z"}, working_dir="/workspace", dir_name="ws-cap")
+        res_mut = backup.SyncResult(max_file_bytes=100 << 20)
+        with patch.object(blobs, "bulk_upsert_files", create_autospec(wf_db.bulk_upsert_files, side_effect=_fake_upsert)):
+            await wsfiles_write_mode.persist_needs_bytes_for_blobs_on(
+                user_id="u-1",
+                workspace_id="ws-cap",
+                sandbox=sandbox_mut,
+                needs_bytes=[scanned_entry],
+                write_inline_only=True,
+                layout=layout,
+                conn=NoDbConn(),
+                rows=[],
+                result=res_mut,
+                persist_blobs_fn=mock_blobs,
+            )
+        assert upserted == []
+        assert res_mut.synced == 0
+        assert res_mut.unsaved == [UnsavedFile("grow.txt", "changed", 1)]
+
+    def test_fix5_uvicorn_access_log_redacts_dl_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from uvicorn.logging import AccessFormatter
+
+        monkeypatch.setenv("JWT_SIGNING_SECRET", "z" * 40)
+        raw_ticket = download_ticket.issue_download_ticket(
+            user_id="u-log",
+            workspace_id="ws-log",
+            path="reports/big.parquet",
+            backup_ok=True,
+        )
+        assert raw_ticket is not None
+
+        cfg = download_ticket.build_uvicorn_log_config()
+        assert "dalton_redact_dl_token" in cfg["filters"]
+        assert "dalton_redact_dl_token" in cfg["loggers"]["uvicorn.access"]["filters"]
+
+        captured: list[str] = []
+
+        class _CaptureHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                captured.append(self.format(record))
+
+        test_logger = logging.getLogger("test.uvicorn.access.dl_token")
+        test_logger.handlers.clear()
+        test_logger.filters.clear()
+        test_logger.setLevel(logging.INFO)
+        test_logger.propagate = False
+        handler = _CaptureHandler()
+        handler.setFormatter(
+            AccessFormatter(fmt='%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s', use_colors=False)
+        )
+        test_logger.addHandler(handler)
+        download_ticket.install_download_ticket_log_filter(test_logger)
+
+        test_logger.info(
+            '%s - "%s %s HTTP/%s" %d',
+            "127.0.0.1:54321",
+            "GET",
+            f"/api/v1/dalton/workspace-files/download?dl_token={raw_ticket}&foo=bar",
+            "1.1",
+            200,
+        )
+        assert len(captured) == 1
+        line = captured[0]
+        assert raw_ticket not in line
+        assert "dl_token=REDACTED" in line
+        assert "foo=bar" in line
+
+        # Also covered by SensitiveQueryLogFilter attached in configure_logging()
+        from src.dalton.auth.dispatch import redact_sensitive_query_params
+
+        redacted = redact_sensitive_query_params(
+            f"/api/v1/dalton/workspace-files/download?dl_token={raw_ticket}&foo=bar"
+        )
+        assert raw_ticket not in redacted
+        assert "dl_token=REDACTED" in redacted
+
+    def test_fix6_storage_refs_cli_opens_and_closes_readonly_connection(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        def _handler(sql: str, params: Any = None) -> Any:
+            if sql.startswith("SET SESSION"):
+                return None
+            if sql.startswith("SELECT set_config"):
+                return ("5s",)
+            if sql.startswith("SELECT to_regclass"):
+                return (params[0],)
+            return (False,)
+
+        fake_conn = _FakeCliConn(_handler)
+        mock_open = create_autospec(
+            storage_refs.open_session_connection, return_value=fake_conn
+        )
+        with patch.object(storage_refs, "open_session_connection", mock_open):
+            rc = storage_refs.main(["probe"])
+
+        assert rc == 0
+        mock_open.assert_awaited_once()
+        assert fake_conn.closed is True
+        assert any("READ ONLY" in sql for sql, _ in fake_conn.executed)
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["errors"] == []
+        assert parsed["hits"] == []
+        assert len(parsed["consumers"]) == len(storage_refs.MAIN_BUCKET_CONSUMER_PROBES)
+
+    def test_fix8_ptc_config_file_selected_and_env_vars_expanded(
+        self, tmp_path: Any
+    ) -> None:
+        # Custom YAML pointed to by PTC_CONFIG_FILE with NO storage section:
+        # must NOT fall back to repo root agent_config.yaml (which sets provider: s3).
+        no_storage_yaml = tmp_path / "custom_agent.yaml"
+        no_storage_yaml.write_text("llm:\n  name: test-model\n", encoding="utf-8")
+
+        resolved_off = storage_config.resolve(
+            env={
+                "PTC_CONFIG_FILE": str(no_storage_yaml),
+                "STORAGE_BUCKET_NAME": "dalton-main",
+            }
+        )
+        assert resolved_off.provider == "none"
+        assert resolved_off.is_storage_enabled is False
+
+        # Env var expansion (${VAR} and $VAR) in PTC_CONFIG_FILE
+        env_yaml = tmp_path / "env_agent.yaml"
+        env_yaml.write_text("storage:\n  provider: ${CUSTOM_STORE_PROV}\n", encoding="utf-8")
+        resolved_on = storage_config.resolve(
+            env={
+                "PTC_CONFIG_FILE": str(env_yaml),
+                "CUSTOM_STORE_PROV": "s3",
+                "STORAGE_BUCKET_NAME": "dalton-main",
+            }
+        )
+        assert resolved_on.provider == "s3"
+        assert resolved_on.is_storage_enabled is True
+
+        simple_yaml = tmp_path / "simple_env_agent.yaml"
+        simple_yaml.write_text("storage:\n  provider: $CUSTOM_STORE_PROV\n", encoding="utf-8")
+        resolved_simple = storage_config.resolve(
+            env={
+                "PTC_CONFIG_FILE": str(simple_yaml),
+                "CUSTOM_STORE_PROV": "s3",
+                "STORAGE_BUCKET_NAME": "dalton-main",
+            }
+        )
+        assert resolved_simple.provider == "s3"
+        assert resolved_simple.is_storage_enabled is True

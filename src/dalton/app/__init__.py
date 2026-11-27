@@ -18,10 +18,12 @@ from src.dalton.app.workspace_file_download import (
 from src.dalton.auth.local_router import register_local_auth_routers
 # DALTON-HOOK(monitors): mount monitor panel endpoints under /api/v1/dalton/monitors
 from src.dalton.monitors.router import router as _monitors_router
+from src.dalton.download_ticket import install_download_ticket_log_filter
 from src.dalton.profile import is_core_profile
 from src.dalton.settings import log_dalton_startup_warnings
 
 log_dalton_startup_warnings()
+install_download_ticket_log_filter()
 
 dalton_router = APIRouter()
 dalton_router.include_router(_dalton_api_router)

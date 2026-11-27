@@ -135,13 +135,13 @@ async def close_ws_ticket_redis_client() -> None:
             pass
 
 _SENSITIVE_QUERY_PARAM_RE = re.compile(
-    r"([?&](?:ticket|token)=)[^&\s\"'<>#]+",
+    r"([?&](?:ticket|token|dl_token)=)[^&\s\"'<>#]+",
     re.IGNORECASE,
 )
 
 
 def redact_sensitive_query_params(value: Any) -> Any:
-    """Redact ``ticket=`` and ``token=`` query values from log strings."""
+    """Redact ``ticket=``, ``token=``, and ``dl_token=`` query values from log strings."""
     if not isinstance(value, str) or "?" not in value:
         return value
     return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1REDACTED", value)

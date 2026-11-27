@@ -12,11 +12,13 @@ directly to disk without buffering in tab memory.
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from dataclasses import dataclass
@@ -295,3 +297,72 @@ async def maybe_attach_backup_download_ticket(
     if not token:
         return response_payload
     return {**response_payload, "dl_token": token}
+
+
+# ---------------------------------------------------------------------------
+# Uvicorn access-log redaction for ``dl_token`` query parameter
+# ---------------------------------------------------------------------------
+
+_DL_TOKEN_QUERY_RE = re.compile(r"([?&]dl_token=)[^&\s\"']*")
+
+
+def redact_dl_token_in_text(text: str) -> str:
+    """Replace ``dl_token=<value>`` query values with ``dl_token=REDACTED``."""
+    if not isinstance(text, str) or "dl_token=" not in text:
+        return text
+    return _DL_TOKEN_QUERY_RE.sub(r"\1REDACTED", text)
+
+
+class RedactDownloadTicketLogFilter(logging.Filter):
+    """``logging.Filter`` for ``uvicorn.access`` that masks ``dl_token`` values."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str) and "dl_token=" in record.msg:
+            record.msg = redact_dl_token_in_text(record.msg)
+        args = record.args
+        if isinstance(args, tuple) and args:
+            mutated = False
+            new_args = []
+            for item in args:
+                if isinstance(item, str) and "dl_token=" in item:
+                    new_args.append(redact_dl_token_in_text(item))
+                    mutated = True
+                else:
+                    new_args.append(item)
+            if mutated:
+                record.args = tuple(new_args)
+        elif isinstance(args, dict) and args:
+            for k, v in list(args.items()):
+                if isinstance(v, str) and "dl_token=" in v:
+                    args[k] = redact_dl_token_in_text(v)
+        return True
+
+
+def install_download_ticket_log_filter(
+    target_logger: logging.Logger | None = None,
+) -> RedactDownloadTicketLogFilter:
+    """Attach :class:`RedactDownloadTicketLogFilter` idempotently to ``uvicorn.access``."""
+    access_logger = target_logger or logging.getLogger("uvicorn.access")
+    for existing in access_logger.filters:
+        if isinstance(existing, RedactDownloadTicketLogFilter):
+            return existing
+    flt = RedactDownloadTicketLogFilter()
+    access_logger.addFilter(flt)
+    return flt
+
+
+def build_uvicorn_log_config() -> dict[str, Any]:
+    """Return Uvicorn ``LOGGING_CONFIG`` extended with ``dl_token`` redaction."""
+    from uvicorn.config import LOGGING_CONFIG
+
+    cfg = copy.deepcopy(LOGGING_CONFIG)
+    filters = cfg.setdefault("filters", {})
+    filters["dalton_redact_dl_token"] = {
+        "()": "src.dalton.download_ticket.RedactDownloadTicketLogFilter",
+    }
+    access_logger = cfg.setdefault("loggers", {}).setdefault("uvicorn.access", {})
+    access_filters = list(access_logger.get("filters") or [])
+    if "dalton_redact_dl_token" not in access_filters:
+        access_filters.append("dalton_redact_dl_token")
+    access_logger["filters"] = access_filters
+    return cfg

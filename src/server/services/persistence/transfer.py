@@ -535,7 +535,6 @@ def exclusion_spec(
     }
     # DALTON-HOOK(workspace-file-exclusions): append optional Dalton exclusions when configured
     from src.dalton.storage_config import apply_wsfiles_exclusions
-
     return apply_wsfiles_exclusions(spec)
 
 

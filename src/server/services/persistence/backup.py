@@ -553,7 +553,6 @@ async def _sync_locked(
     user_id = await workspace_owner(workspace_id, conn=conn) if blobs_on else None
     # DALTON-HOOK(workspace-file-write-mode): read per-pass Level-1 inline-only write switch
     from src.dalton import wsfiles_write_mode as _wsfiles_write_mode
-
     write_inline_only = _wsfiles_write_mode.is_write_inline_only_active(blobs_on=blobs_on)
 
     # While the mirror is known incomplete a stamp that moved on an
@@ -633,9 +632,7 @@ async def _sync_locked(
             # DALTON-HOOK(workspace-file-write-mode): route <=100 MiB non-git entries inline when write_inline_only is on
             await _wsfiles_write_mode.persist_needs_bytes_for_blobs_on(
                 user_id=user_id, workspace_id=workspace_id, sandbox=sandbox, needs_bytes=needs_bytes,
-                write_inline_only=write_inline_only, layout=layout, conn=conn, started_at=started_at,
-                rows=rows, result=result, persist_blobs_fn=_persist_blobs, persist_inline_by_repo_fn=_persist_inline_by_repo,
-            )
+                write_inline_only=write_inline_only, layout=layout, conn=conn, rows=rows, result=result, persist_blobs_fn=_persist_blobs)
         else:
             # Inline rows carry their own bytes, so they are written in
             # bounded batches rather than joining ``rows`` and being held
@@ -677,11 +674,9 @@ async def _sync_locked(
         result.skipped += skipped
 
     # DALTON-HOOK(workspace-file-write-mode): bounded 64 MiB inline fallback for failed non-git uploads before hold_repos
-    if blobs_on:
-        rows = await _wsfiles_write_mode.fallback_failed_uploads_inline(
-            workspace_id=workspace_id, sandbox=sandbox, scan_entries=scan.entries, rows=rows, result=result,
-            scanned_unsaved=scanned_unsaved, layout=layout, conn=conn, started_at=started_at, persist_inline_by_repo_fn=_persist_inline_by_repo,
-        )
+    rows = await _wsfiles_write_mode.fallback_failed_uploads_inline(
+        blobs_on=blobs_on, workspace_id=workspace_id, sandbox=sandbox, scan_entries=scan.entries,
+        rows=rows, result=result, scanned_unsaved=scanned_unsaved, layout=layout, conn=conn)
 
     # A file in a repository that failed to upload holds the repository too,
     # now that the rest of it is stored: its new rows are dropped (inline

@@ -10,7 +10,7 @@ Hooked into ``src/server/services/persistence/backup.py`` under
    - Regular files outside Git repositories (``repo_of(path) is None``) with
      ``size <= INLINE_MAX_BYTES`` (100 MiB) — including small ``<= 256 KiB``
      files that would otherwise enter the pack set — are written inline to
-     PostgreSQL.
+     PostgreSQL using bounded reads verified against scanned size and SHA-256.
    - Files ``> 100 MiB`` and files inside Git repositories (including ``.git``
      history) continue writing to the main object-storage bucket (standalone
      objects and packs).
@@ -21,8 +21,11 @@ Hooked into ``src/server/services/persistence/backup.py`` under
    - Eligible items returned as ``UnsavedFile(path, "failed", size)`` by
      ``_persist_blobs`` or ``_persist_packed`` with ``repo_of(path) is None``
      and ``size <= INLINE_MAX_BYTES`` are written inline within a per-sync
-     cumulative budget of 64 MiB (counted by ``entry.size``), logging a
-     ``WARNING`` per file.
+     cumulative budget of 64 MiB (counted by ``entry.size`` and enforced on the
+     actual read stream), logging a ``WARNING`` per recovered file.
+   - Any file that grew or mutated after scan (over cap, size mismatch, or
+     SHA-256 mismatch) is rejected without writing and recorded in
+     ``result.unsaved`` as ``reason="changed"``.
    - Items over budget, ``> 100 MiB``, inside Git repositories, or with
      ``reason != "failed"`` (e.g. ``"changed"``) remain in ``result.unsaved``
      so Git repositories keep whole-repo ``hold_repos()`` protection and
@@ -32,23 +35,37 @@ Hooked into ``src/server/services/persistence/backup.py`` under
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
+import mimetypes
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any
 
 from ptc_agent.core.paths import WorkspaceLayout
+from ptc_agent.core.sandbox.files import FileOverCap
 from src.dalton.storage_config import is_wsfiles_write_inline_only
 from src.server.database.blob_keys import INLINE_MAX_BYTES
-from src.server.services.persistence._rows import _content_matches
+from src.server.services.persistence import blobs as _blobs
+from src.server.services.persistence._rows import (
+    _content_matches,
+    _detect_is_binary,
+    _row_base,
+)
 from src.server.services.persistence.repos import repo_of
 from src.server.services.persistence.sync_result import SyncResult, UnsavedFile
-from src.server.services.persistence.transfer import ScanEntry
+from src.server.services.persistence.transfer import (
+    INPROCESS_MAX_INFLIGHT_BYTES,
+    ScanEntry,
+)
 
 logger = logging.getLogger(__name__)
 
 # Maximum cumulative bytes written inline as an upload-failure fallback per sync pass.
 UPLOAD_FALLBACK_BUDGET_BYTES = 64 * 1024 * 1024  # 64 MiB
+
+_CHANGED_SENTINEL = object()
 
 
 def is_write_inline_only_active(*, blobs_on: bool) -> bool:
@@ -97,6 +114,131 @@ def unchanged_inline_only_packed_paths(
     return frozenset(kept)
 
 
+async def _read_bounded_sandbox_bytes(
+    sandbox: Any, abs_path: str, max_bytes: int
+) -> bytes | None | object:
+    """Read at most ``max_bytes`` from ``sandbox``; return ``_CHANGED_SENTINEL`` if larger."""
+    limit = max(0, int(max_bytes))
+    capped_reader = getattr(sandbox, "adownload_file_bytes_capped", None)
+    if callable(capped_reader):
+        try:
+            content = await capped_reader(abs_path, lambda _buf, _lim=limit: _lim)
+        except FileOverCap:
+            return _CHANGED_SENTINEL
+        if content is None:
+            return None
+        if len(content) > limit:
+            return _CHANGED_SENTINEL
+        return content
+
+    runtime = getattr(sandbox, "runtime", None)
+    stream_fn = getattr(runtime, "download_file_stream", None)
+    if callable(stream_fn):
+        stream = stream_fn(abs_path)
+        buf = bytearray()
+        try:
+            async for chunk in stream:
+                buf.extend(chunk)
+                if len(buf) > limit:
+                    return _CHANGED_SENTINEL
+        finally:
+            await stream.aclose()
+        return bytes(buf)
+
+    content = await sandbox.adownload_file_bytes(abs_path)
+    if content is None:
+        return None
+    if len(content) > limit:
+        return _CHANGED_SENTINEL
+    return content
+
+
+async def _persist_inline_bounded(
+    workspace_id: str,
+    sandbox: Any,
+    entries: list[ScanEntry],
+    *,
+    layout: WorkspaceLayout,
+    conn: Any,
+    max_bytes_by_path: dict[str, int] | None = None,
+) -> tuple[int, list[UnsavedFile]]:
+    """Bounded, exact-verified inline writer for Dalton write-inline-only & fallback paths.
+
+    - Streams with a strict per-file byte ceiling (never exceeding scanned size,
+      ``INLINE_MAX_BYTES``, or any caller-supplied per-entry budget cap).
+    - Verifies ``len(content) == entry.size`` and ``sha256(content) == entry.sha256``.
+    - Any file that changed or grew past the cap returns ``UnsavedFile(path, "changed")``
+      and is NOT upserted into PostgreSQL.
+    - Uses ``blobs.bulk_upsert_files`` and ``_row_base(entry)`` so pointer columns
+      (``blob_sha256``, ``pack_sha256``, ``pack_offset``) are cleared on upsert.
+    """
+    synced = 0
+    unsaved: list[UnsavedFile] = []
+
+    async def _one(entry: ScanEntry) -> dict[str, Any] | UnsavedFile:
+        hard_cap = min(int(entry.size), INLINE_MAX_BYTES)
+        if max_bytes_by_path is not None and entry.path in max_bytes_by_path:
+            hard_cap = min(hard_cap, int(max_bytes_by_path[entry.path]))
+        if hard_cap < 0:
+            return UnsavedFile(entry.path, "changed", entry.size)
+        try:
+            abs_path = _blobs._entry_abs_path(entry, layout)
+            content = await _read_bounded_sandbox_bytes(sandbox, abs_path, hard_cap)
+            if content is None or content is _CHANGED_SENTINEL:
+                return UnsavedFile(entry.path, "changed", entry.size)
+            assert isinstance(content, bytes)
+            if len(content) != entry.size or len(content) > hard_cap:
+                return UnsavedFile(entry.path, "changed", entry.size)
+            content_hash = hashlib.sha256(content).hexdigest()
+            if entry.sha256 is not None and content_hash != entry.sha256:
+                return UnsavedFile(entry.path, "changed", entry.size)
+            is_binary = _detect_is_binary(entry.path, content)
+            content_text = None
+            content_binary = None
+            if is_binary:
+                content_binary = content
+            else:
+                try:
+                    content_text = content.decode("utf-8")
+                except UnicodeDecodeError:
+                    is_binary = True
+                    content_binary = content
+            row = _row_base(entry)
+            mime, _ = mimetypes.guess_type(entry.path)
+            row.update(
+                {
+                    "file_size": len(content),
+                    "content_hash": content_hash,
+                    "content_text": content_text,
+                    "content_binary": content_binary,
+                    "mime_type": mime,
+                    "is_binary": is_binary,
+                }
+            )
+            return row
+        except Exception as e:
+            logger.warning(
+                "Error downloading file %s for bounded inline write (workspace %s): %s",
+                entry.path,
+                workspace_id,
+                e,
+            )
+            return UnsavedFile(entry.path, "failed", entry.size)
+
+    for batch in _blobs._batched_by_weight(
+        entries, INPROCESS_MAX_INFLIGHT_BYTES, _blobs.RELAY_CONCURRENCY
+    ):
+        rows: list[dict[str, Any]] = []
+        for payload in await asyncio.gather(*(_one(e) for e in batch)):
+            if isinstance(payload, UnsavedFile):
+                unsaved.append(payload)
+            else:
+                rows.append(payload)
+        if rows:
+            synced += await _blobs.bulk_upsert_files(workspace_id, rows, conn=conn)
+    return synced, unsaved
+
+
 async def persist_needs_bytes_for_blobs_on(
     *,
     user_id: str | None,
@@ -106,13 +248,14 @@ async def persist_needs_bytes_for_blobs_on(
     write_inline_only: bool,
     layout: WorkspaceLayout,
     conn: Any,
-    started_at: datetime,
     rows: list[dict[str, Any]],
     result: SyncResult,
     persist_blobs_fn: Callable[..., Awaitable[tuple[list[dict[str, Any]], list[UnsavedFile]]]],
-    persist_inline_by_repo_fn: Callable[..., Awaitable[tuple[int, int, list[UnsavedFile]]]],
+    started_at: datetime | None = None,
+    persist_inline_by_repo_fn: Callable[..., Awaitable[tuple[int, int, list[UnsavedFile]]]] | None = None,
 ) -> None:
     """Route ``needs_bytes`` when ``blobs_on`` is True, honoring ``write_inline_only``."""
+    del started_at, persist_inline_by_repo_fn  # retained for backwards compatibility
     if not write_inline_only:
         persisted, unsaved = await persist_blobs_fn(
             user_id, workspace_id, sandbox, needs_bytes, layout=layout
@@ -137,19 +280,14 @@ async def persist_needs_bytes_for_blobs_on(
         result.unsaved.extend(unsaved)
 
     if inline_entries:
-        # All inline_entries have repo_of(path) is None; pass empty ``gone`` so
-        # inline writes never delete rows backed by object storage.
-        inline_synced, inline_deleted, inline_unsaved = await persist_inline_by_repo_fn(
+        inline_synced, inline_unsaved = await _persist_inline_bounded(
             workspace_id,
             sandbox,
             inline_entries,
             layout=layout,
             conn=conn,
-            gone={},
-            untouched_since=started_at,
         )
         result.synced += inline_synced
-        result.deleted += inline_deleted
         result.unsaved.extend(inline_unsaved)
 
 
@@ -163,8 +301,9 @@ async def fallback_failed_uploads_inline(
     scanned_unsaved: int,
     layout: WorkspaceLayout,
     conn: Any,
-    started_at: datetime,
-    persist_inline_by_repo_fn: Callable[..., Awaitable[tuple[int, int, list[UnsavedFile]]]],
+    blobs_on: bool = True,
+    started_at: datetime | None = None,
+    persist_inline_by_repo_fn: Callable[..., Awaitable[tuple[int, int, list[UnsavedFile]]]] | None = None,
     budget_bytes: int | None = None,
 ) -> list[dict[str, Any]]:
     """Write eligible failed main-bucket uploads inline within a 64 MiB per-pass budget.
@@ -172,7 +311,12 @@ async def fallback_failed_uploads_inline(
     Must be called BEFORE ``hold_repos(...)`` so Git repository failures remain
     protected by ``hold_repos()`` while recovered non-Git files leave
     ``result.unsaved``, leave ``rows``, and increment ``result.synced``.
+    Files that changed after scan are updated to ``reason="changed"`` and are not
+    written or counted as synced.
     """
+    del started_at, persist_inline_by_repo_fn  # retained for backwards compatibility
+    if not blobs_on:
+        return rows
     cap = UPLOAD_FALLBACK_BUDGET_BYTES if budget_bytes is None else budget_bytes
     if cap <= 0:
         return rows
@@ -186,6 +330,7 @@ async def fallback_failed_uploads_inline(
 
     fallback_entries: list[ScanEntry] = []
     fallback_paths: set[str] = set()
+    max_bytes_by_path: dict[str, int] = {}
     used_bytes = 0
     for item in transfer_unsaved:
         if item.reason != "failed":
@@ -197,22 +342,22 @@ async def fallback_failed_uploads_inline(
             continue
         if used_bytes + entry.size > cap:
             continue
+        remaining = cap - used_bytes
         used_bytes += entry.size
         fallback_paths.add(entry.path)
         fallback_entries.append(entry)
+        max_bytes_by_path[entry.path] = min(entry.size, remaining, INLINE_MAX_BYTES)
 
     if not fallback_entries:
         return rows
 
-    # Never pass ``gone``: fallback inline writes must not trigger row deletions.
-    inline_synced, _inline_deleted, inline_unsaved = await persist_inline_by_repo_fn(
+    inline_synced, inline_unsaved = await _persist_inline_bounded(
         workspace_id,
         sandbox,
         fallback_entries,
         layout=layout,
         conn=conn,
-        gone={},
-        untouched_since=started_at,
+        max_bytes_by_path=max_bytes_by_path,
     )
     still_unsaved_by_path = {u.path: u for u in inline_unsaved}
     succeeded_paths: set[str] = set()
@@ -227,15 +372,19 @@ async def fallback_failed_uploads_inline(
                 workspace_id,
             )
 
-    if not succeeded_paths:
-        return rows
+    if succeeded_paths:
+        result.synced += inline_synced
 
-    result.synced += inline_synced
     new_transfer_unsaved: list[UnsavedFile] = []
     for item in transfer_unsaved:
-        if item.path in succeeded_paths and item.reason == "failed":
+        if item.reason == "failed" and item.path in succeeded_paths:
+            continue
+        if item.reason == "failed" and item.path in still_unsaved_by_path:
+            new_transfer_unsaved.append(still_unsaved_by_path[item.path])
             continue
         new_transfer_unsaved.append(item)
     result.unsaved[scanned_unsaved:] = new_transfer_unsaved
 
+    if not succeeded_paths:
+        return rows
     return [r for r in rows if r.get("file_path") not in succeeded_paths]
