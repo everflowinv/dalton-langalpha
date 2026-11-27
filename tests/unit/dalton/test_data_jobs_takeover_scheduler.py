@@ -805,6 +805,7 @@ async def test_claim_second_expiry_branch_also_publishes_monitor_and_persists_fa
                 ]
             },
             # Atomic claim transaction:
+            {},  # maintenance gate: shared advisory xact lock
             {"rowcount": 1, "fetchone": {"generation": 41}},  # UPDATE slot -> running
             {"fetchone": {"enabled": True, "paused_by_user": False, "deleted_at": None}},  # SELECT def FOR SHARE
             {"rowcount": 0},  # UPDATE runs -> 0 rows (NOW() >= deadline_utc!) -> _ClaimRollback("takeover_retry_expired")
