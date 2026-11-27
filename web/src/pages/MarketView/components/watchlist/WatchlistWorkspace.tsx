@@ -11,11 +11,14 @@ import { useWorkspace } from '@/hooks/useWorkspace';
 import { portfolioHoldingsQuery } from '@/hooks/membershipQueries';
 import { queryKeys } from '@/lib/queryKeys';
 import { apiErrorDetailMessage, apiErrorStatus } from '@/api/errors';
+import { useQuotes } from '@/lib/quotes';
+import { useMarketStatus } from '@/lib/quotes/useMarketStatus';
 import {
   BATCH1_WATCHLIST_COLUMNS,
   DEFAULT_WATCHLIST_COLUMNS,
   buildPersonalWatchlistContextText,
   flattenWatchlistCompanies,
+  mergeQuotesIntoWatchlistMetrics,
   mutateWatchlist,
   previewWatchlistMutation,
   reconcileWatchlist,
@@ -186,16 +189,6 @@ export function WatchlistWorkspace({
   const { data: watchlistData, isLoading, isError, refetch } = usePersonalWatchlist(true);
   const allCompanies = useMemo(() => flattenWatchlistCompanies(watchlistData), [watchlistData]);
 
-  const listedSymbols = useMemo(
-    () => allCompanies.filter((c) => !c.is_private).map((c) => c.ticker),
-    [allCompanies],
-  );
-  const { data: metricsData, isLoading: metricsLoading } = usePersonalWatchlistMetrics(
-    listedSymbols,
-    listedSymbols.length > 0,
-  );
-  const metricsMap = useMemo(() => metricsData?.items ?? {}, [metricsData]);
-
   const { data: holdingsData } = useQuery({
     ...portfolioHoldingsQuery,
     retry: false,
@@ -223,6 +216,41 @@ export function WatchlistWorkspace({
       return true;
     });
   }, [allCompanies, tierFilter, holdingsOnly, holdingSymbols, searchQuery]);
+
+  // Prioritize visible/filtered rows first so the backend warms their bars & market cap first
+  const listedSymbols = useMemo(() => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const c of filteredCompanies) {
+      if (!c.is_private && !seen.has(c.ticker)) {
+        seen.add(c.ticker);
+        out.push(c.ticker);
+      }
+    }
+    for (const c of allCompanies) {
+      if (!c.is_private && !seen.has(c.ticker)) {
+        seen.add(c.ticker);
+        out.push(c.ticker);
+      }
+    }
+    return out;
+  }, [filteredCompanies, allCompanies]);
+
+  const { quotes: liveQuotes, isLoading: quotesLoading } = useQuotes(listedSymbols, {
+    staleTime: 1000 * 30,
+    refetchInterval: 60_000,
+    enabled: listedSymbols.length > 0,
+  });
+  const marketStatus = useMarketStatus(listedSymbols.length > 0);
+
+  const { data: metricsData, isLoading: metricsLoading } = usePersonalWatchlistMetrics(
+    listedSymbols,
+    listedSymbols.length > 0,
+  );
+  const metricsMap = useMemo(
+    () => mergeQuotesIntoWatchlistMetrics(allCompanies, metricsData?.items ?? {}, liveQuotes),
+    [allCompanies, metricsData?.items, liveQuotes],
+  );
 
   // Privacy boundary: ONLY inject personal watchlist context in private sessions
   // (Chief of Staff Home scope === 'all', or the user's own non-shared workspace).
@@ -546,7 +574,9 @@ export function WatchlistWorkspace({
           <WatchlistFullTable
             companies={filteredCompanies}
             metrics={metricsMap}
-            metricsLoading={metricsLoading}
+            quotes={liveQuotes}
+            marketStatus={marketStatus}
+            metricsLoading={metricsLoading || quotesLoading}
             visibleColumns={visibleColumns}
             groupedByTier={groupedByTier}
             holdingSymbols={holdingSymbols}

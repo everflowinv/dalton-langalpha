@@ -529,6 +529,7 @@ def get_capabilities_payload() -> dict[str, Any]:
             "name": brand_name,
         },
         "ticker_logos": bool(GINLIX_DATA_ENABLED),
+        "market_enabled": True,
     }
 
 
