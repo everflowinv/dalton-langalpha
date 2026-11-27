@@ -106,6 +106,7 @@ async def publish_target(
     if kind == "thread":
         await upsert_org_library_title_meta(item_id, is_custom_title)
     row = await _item(item_id, user_id)
+    # DALTON-HOOK(share-redaction): record per-row custom_title flag in activity detail
     detail: dict[str, Any] = {"kind": kind, "title": row["title"][:256]}
     if kind == "thread":
         detail["custom_title"] = bool(is_custom_title)

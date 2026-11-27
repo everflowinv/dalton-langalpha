@@ -718,8 +718,9 @@ count_env_key_assignments() {
 remove_env_key_all() {
   local key="$1"
   [[ -f "$ENV_FILE" ]] || return 0
-  local env_dir tmp
+  local env_dir tmp orig_mode="600"
   env_dir="$(dirname "$ENV_FILE")"
+  orig_mode="$(get_file_mode "$ENV_FILE")"
   tmp="$(mktemp "${env_dir}/.env.tmp.XXXXXX")"
   chmod 600 "$tmp"
   awk -v k="$key" '
@@ -738,12 +739,16 @@ remove_env_key_all() {
       print $0
     }
   ' "$ENV_FILE" > "$tmp"
-  chmod 600 "$tmp"
+  chmod "$orig_mode" "$tmp"
   mv "$tmp" "$ENV_FILE"
 }
 
 append_env_key_unique() {
   local key="$1" val="$2"
+  local orig_mode="600"
+  if [[ -f "$ENV_FILE" ]]; then
+    orig_mode="$(get_file_mode "$ENV_FILE")"
+  fi
   remove_env_key_all "$key"
   local env_dir tmp
   env_dir="$(dirname "$ENV_FILE")"
@@ -753,7 +758,7 @@ append_env_key_unique() {
     cat "$ENV_FILE" > "$tmp"
   fi
   printf '%s=%s\n' "$key" "$val" >> "$tmp"
-  chmod 600 "$tmp"
+  chmod "$orig_mode" "$tmp"
   mv "$tmp" "$ENV_FILE"
 }
 

@@ -254,11 +254,20 @@ def _sanitize_historical_url(raw_url: str) -> tuple[str | None, str, str | None]
         return None, "<invalid-url>", "invalid historical URL: malformed port"
     clean_netloc = f"{host_fmt}:{port}" if port is not None else host_fmt
     path = parsed.path or "/"
+    had_userinfo = parsed.username is not None or parsed.password is not None
     had_query_or_frag = bool(parsed.query or parsed.fragment)
+    had_credentials = had_userinfo or had_query_or_frag
 
-    if _GRANT_PATH_RE.search(path):
+    decoded_path = path
+    for _ in range(3):
+        nxt = urllib.parse.unquote(decoded_path)
+        if nxt == decoded_path:
+            break
+        decoded_path = nxt
+
+    if _GRANT_PATH_RE.search(path) or _GRANT_PATH_RE.search(decoded_path):
         redacted_display = f"{scheme}://{clean_netloc}/<redacted-grant>"
-        if had_query_or_frag:
+        if had_credentials:
             redacted_display = f"{redacted_display}?<redacted>"
         return (
             None,
@@ -267,7 +276,7 @@ def _sanitize_historical_url(raw_url: str) -> tuple[str | None, str, str | None]
         )
 
     probe_url = f"{scheme}://{clean_netloc}{path}"
-    display_url = f"{probe_url}?<redacted>" if had_query_or_frag else probe_url
+    display_url = f"{probe_url}?<redacted>" if had_credentials else probe_url
     return probe_url, display_url, None
 
 
@@ -529,22 +538,24 @@ async def _close_cli_pools(
     from src.server.utils.checkpointer import close_checkpointer_pool
 
     first_err: BaseException | None = None
-    if opened_checkpointer and cp is not None:
-        try:
-            await close_checkpointer_pool(cp)
-        except Exception as exc:
-            first_err = exc
-            logger.warning("Failed to close checkpointer pool: %s", exc)
-        finally:
-            setup.checkpointer = None
-            CheckpointHistoryReader.reset_instance()
-    if opened_app_pool and conv_pool is not None:
-        try:
-            await conv_pool.close()
-        except Exception as exc:
-            if first_err is None:
+    try:
+        if opened_checkpointer and cp is not None:
+            try:
+                await close_checkpointer_pool(cp)
+            except Exception as exc:
                 first_err = exc
-            logger.warning("Failed to close app DB pool: %s", exc)
+                logger.warning("Failed to close checkpointer pool: %s", exc)
+            finally:
+                setup.checkpointer = None
+                CheckpointHistoryReader.reset_instance()
+    finally:
+        if opened_app_pool and conv_pool is not None:
+            try:
+                await conv_pool.close()
+            except Exception as exc:
+                if first_err is None:
+                    first_err = exc
+                logger.warning("Failed to close app DB pool: %s", exc)
     if first_err is not None:
         raise first_err
 

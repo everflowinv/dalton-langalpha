@@ -260,10 +260,11 @@ class TestBuildAttachmentMetadata:
         ):
             await _meta(_inline(f"data:image/png;base64,{ABC}", "img"))
             key = mock_upload.call_args[0][0]
-            # attachments/<batch_id>/<file id>/img.png, no double //
+            # DALTON-HOOK(share-redaction): new inline attachments upload under private-media/attachments/
+            # private-media/attachments/<batch_id>/<file id>/img.png, no double //
             parts = key.split("/")
-            assert parts[0] == "attachments"
-            assert len(parts) == 4 and all(parts)
+            assert parts[:2] == ["private-media", "attachments"]
+            assert len(parts) == 5 and all(parts)
 
     # --- REGRESSION: newline in description must not reach S3 key ---
 

@@ -269,10 +269,7 @@ async def list_shared_files(
 
 
 @share_files_router.post("/shared/{share_token}/files/resolve")
-async def resolve_shared_file(
-    share_token: str,
-    body: ResolveFileRefRequest,
-):
+async def resolve_shared_file(share_token: str, body: ResolveFileRefRequest):
     """Resolve a file reference inside a shared thread's workspace.
 
     Matches against the same listing the shared file panel browses, so it never

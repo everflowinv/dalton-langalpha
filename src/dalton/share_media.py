@@ -204,9 +204,12 @@ _OWNERSHIP_FALLBACK_CODES = frozenset(
     {
         "OwnershipControlsNotFoundError",
         "NoSuchOwnershipControls",
-        "NotImplemented",
+    }
+)
+_OWNERSHIP_PROBE_UNSUPPORTED_CODES = frozenset(
+    {
         "MethodNotAllowed",
-        "InvalidRequest",
+        "NotImplemented",
     }
 )
 
@@ -290,16 +293,26 @@ def probe_bucket_object_acl_mode(
                 return "supported"
         return "unknown"
     except Exception as exc:
-        if is_acl_not_supported_error(exc):
-            with _BUCKET_ACL_CACHE_LOCK:
-                _BUCKET_ACL_SUPPORT_CACHE[cache_key] = False
-            return "disabled"
         resp_map = getattr(exc, "response", None)
         code = (
             str((resp_map.get("Error") or {}).get("Code") or "")
             if isinstance(resp_map, Mapping)
             else ""
         )
+        if code in _OWNERSHIP_PROBE_UNSUPPORTED_CODES:
+            logger.debug(
+                "Ownership controls probe unsupported for %s (%s); treating ACL mode as unknown",
+                bucket_name,
+                code,
+            )
+            return "unknown"
+        if code == "AccessControlListNotSupported" or (
+            code in ("InvalidRequest", "InvalidArgument")
+            and is_acl_not_supported_error(exc)
+        ):
+            with _BUCKET_ACL_CACHE_LOCK:
+                _BUCKET_ACL_SUPPORT_CACHE[cache_key] = False
+            return "disabled"
         if code in _OWNERSHIP_FALLBACK_CODES:
             with _BUCKET_ACL_CACHE_LOCK:
                 _BUCKET_ACL_SUPPORT_CACHE[cache_key] = True
@@ -1304,7 +1317,7 @@ async def require_media_viewer(
     credentials: HTTPAuthorizationCredentials | None,
 ) -> str:
     """Enforce owner media viewer authentication across ``supabase``, ``local``, and ``oss``."""
-    from src.server.utils.api import get_current_user_id
+    from src.server.utils.api import admit_caller, get_current_user_id
 
     if is_dalton_multiuser_auth_enabled():
         if credentials is None or not credentials.credentials:
@@ -1355,7 +1368,22 @@ async def require_media_viewer(
         if expected_org and not hmac.compare_digest(_sha256_hex(caller_origin), expected_org):
             raise HTTPException(status_code=401, detail="Media origin mismatch")
 
-    return str(claims.get("vid") or "")
+    viewer_id = str(claims.get("vid") or "")
+    if viewer_id:
+        await admit_caller(request, viewer_id)
+    return viewer_id
+
+
+async def _owner_media_caller_gate(
+    thread_id: str,
+    media_token: str,
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
+) -> tuple[dict[str, Any], str]:
+    """FastAPI route dependency enforcing owner media token verification and account-suspension admission."""
+    claims = verify_owner_media_token(media_token, expected_thread_id=thread_id)
+    viewer_id = await require_media_viewer(request, thread_id, claims, credentials)
+    return claims, viewer_id
 
 
 async def _verify_viewer_thread_read(thread_id: str, viewer_id: str) -> None:
@@ -1391,24 +1419,58 @@ async def _verify_viewer_thread_read(thread_id: str, viewer_id: str) -> None:
 # THREAD MEDIA BINDINGS & URL REWRITING (ALLOW_FILES=TRUE & OWNER REPLAY)
 # =============================================================================
 
-_UPSTREAM_KEY_EXTRACT_RE = re.compile(
-    r"/(private-media/(?:response-images|attachments|widgets)/[^?#\s\"'<>)]+|(?:response-images|attachments|widgets)/[^?#\s\"'<>)]+)",
-    re.IGNORECASE,
-)
+_UPSTREAM_ROOT_SEGMENTS = frozenset({"response-images", "attachments", "widgets"})
 
 
 def extract_upstream_key_from_url(url: str) -> str | None:
-    """Extract logical upstream object key from a stored public/CDN URL."""
+    """Extract and validate logical upstream object key from a stored public/CDN URL.
+
+    Decodes each path segment from the full URL path (preserving spaces,
+    parentheses, CJK characters, and percent-encoded filenames) and rejects
+    unsafe segments such as ``.``, ``..``, embedded ``/`` (``%2F``), ``\\``,
+    or control characters.
+    """
     if not url:
         return None
     try:
-        path = unquote(urlsplit(url).path or "")
+        raw_path = urlsplit(url).path or ""
     except Exception:
         return None
-    m = _UPSTREAM_KEY_EXTRACT_RE.search(path)
-    if not m:
+    stripped_path = raw_path.lstrip("/")
+    if not stripped_path:
         return None
-    return m.group(1).lstrip("/")
+
+    raw_parts = stripped_path.split("/")
+    decoded_parts: list[str] = []
+    for seg in raw_parts:
+        dec = unquote(seg)
+        if not dec or "/" in dec or "\\" in dec or "\x00" in dec or "\r" in dec or "\n" in dec:
+            return None
+        if dec in (".", ".."):
+            return None
+        decoded_parts.append(dec)
+
+    key_parts: list[str] | None = None
+    n_parts = len(decoded_parts)
+    for idx, seg in enumerate(decoded_parts):
+        low = seg.lower()
+        if (
+            low == "private-media"
+            and idx + 2 < n_parts
+            and decoded_parts[idx + 1].lower() in _UPSTREAM_ROOT_SEGMENTS
+        ):
+            key_parts = decoded_parts[idx:]
+            break
+        if low in _UPSTREAM_ROOT_SEGMENTS and idx + 1 < n_parts:
+            key_parts = decoded_parts[idx:]
+            break
+
+    if not key_parts:
+        return None
+    candidate = "/".join(key_parts)
+    if not _is_safe_object_key(candidate):
+        return None
+    return candidate
 
 
 async def _fetch_ready_chat_uploads(
@@ -1474,7 +1536,7 @@ async def _fetch_ready_chat_uploads(
 
 def _is_safe_object_key(key: str) -> bool:
     cleaned = str(key or "").strip().lstrip("/")
-    if not cleaned or "\x00" in cleaned or "\\" in cleaned:
+    if not cleaned or "\x00" in cleaned or "\\" in cleaned or "\r" in cleaned or "\n" in cleaned:
         return False
     parts = cleaned.split("/")
     return all(p and p not in (".", "..") for p in parts)
@@ -1876,12 +1938,14 @@ async def _load_thread_media_registry_from_db(
                 if turns is not None:
                     await cur.execute(
                         """
-                        SELECT lines
-                        FROM turn_slices
-                        WHERE conversation_thread_id = %s::uuid
-                          AND lines IS NOT NULL
-                          AND position('"steering_delivered"' in lines) > 0
-                          AND turn_index = ANY(%s::int[])
+                        SELECT ts.lines
+                        FROM turn_slices ts
+                        JOIN conversation_responses r
+                          ON r.conversation_response_id = ts.conversation_response_id
+                        WHERE ts.conversation_thread_id = %s::uuid
+                          AND ts.lines IS NOT NULL
+                          AND position('"steering_delivered"' in ts.lines) > 0
+                          AND r.turn_index = ANY(%s::int[])
                         """,
                         (str(thread_id), turns),
                     )
@@ -2429,13 +2493,12 @@ def rewrite_items_for_public_media(
 ) -> list[dict[str, Any]]:
     """Rewrite stored URLs and ``upload_id``-only attachments to ``/api/v1/public/shared/{token}/media/{ref}``.
 
-    When ``bindings is None`` (DB media registry failed to load), fails closed by
-    stripping raw configured-storage URLs without issuing any media refs.
+    Fail-closed: when ``bindings is None`` or any configured-storage URL could
+    not be signed into a controlled media ref, that raw object URL is erased
+    rather than left verbatim in the replay payload.
     """
     if bindings is None:
         return [_strip_raw_storage_urls_from_item(it) for it in items]
-    if not bindings:
-        return items
     url_map: dict[str, str] = {}
     upload_id_map: dict[str, str] = {}
     for key, (backend, ref_id) in bindings.items():
@@ -2445,7 +2508,15 @@ def rewrite_items_for_public_media(
             upload_id_map[key[len("upload_id:") :]] = controlled
         else:
             url_map[key] = controlled
-    return [_rewrite_item_urls(it, url_map, upload_id_map) for it in items]
+    out: list[dict[str, Any]] = []
+    for it in items:
+        rewritten = (
+            _rewrite_item_urls(it, url_map, upload_id_map)
+            if (url_map or upload_id_map)
+            else it
+        )
+        out.append(_strip_raw_storage_urls_from_item(rewritten))
+    return out
 
 
 def rewrite_lines_for_owner_media(
@@ -2459,15 +2530,14 @@ def rewrite_lines_for_owner_media(
 ) -> list[Any]:
     """Rewrite stored media URLs in owner replay ``Line``s to ``/api/v1/threads/{id}/media/{token}``.
 
-    When ``bindings is None`` (DB media registry failed to load), fails closed by
-    stripping raw configured-storage URLs without issuing any media tokens.
+    Fail-closed: when ``bindings is None`` or any configured-storage URL could
+    not be signed into a controlled media token, that raw object URL is erased
+    rather than left verbatim in the replay payload.
     """
     from src.server.services.history.replay.lines import Line, line_of
 
     if bindings is None:
         return _strip_raw_storage_urls_from_lines(lines)
-    if not bindings:
-        return lines
     url_map: dict[str, str] = {}
     upload_id_map: dict[str, str] = {}
     for key, (backend, ref_id) in bindings.items():
@@ -2493,14 +2563,21 @@ def rewrite_lines_for_owner_media(
         if ln.event not in ("user_message", "message_chunk", "steering_delivered"):
             out.append(ln)
             continue
-        needs = any(u in ln.data_json for u in url_map) or (
+        needs_rewrite = (url_map and any(u in ln.data_json for u in url_map)) or (
             bool(upload_id_map) and '"upload_id"' in ln.data_json
         )
-        if not needs:
+        has_http = "http" in ln.data_json.lower()
+        if not needs_rewrite and not has_http:
             out.append(ln)
             continue
-        rewritten = _rewrite_item_urls(ln.item(), url_map, upload_id_map)
-        out.append(line_of(rewritten))
+        raw_item = ln.item()
+        rewritten = (
+            _rewrite_item_urls(raw_item, url_map, upload_id_map)
+            if needs_rewrite
+            else raw_item
+        )
+        cleaned = _strip_raw_storage_urls_from_item(rewritten)
+        out.append(line_of(cleaned) if cleaned is not raw_item else ln)
     return out
 
 
@@ -2542,15 +2619,14 @@ async def prepare_owner_replay_media(
             if ln.event in ("user_message", "message_chunk", "steering_delivered")
         ],
     )
-    if bindings is None or bindings:
-        replay_lines = rewrite_lines_for_owner_media(
-            replay_lines,
-            thread_id=thread_id,
-            viewer_id=viewer_id,
-            bindings=bindings,
-            sid_hash=sid_hash,
-            origin_hash=origin_hash,
-        )
+    replay_lines = rewrite_lines_for_owner_media(
+        replay_lines,
+        thread_id=thread_id,
+        viewer_id=viewer_id,
+        bindings=bindings,
+        sid_hash=sid_hash,
+        origin_hash=origin_hash,
+    )
     return replay_lines, set_cookies
 
 
@@ -2639,14 +2715,12 @@ async def _serve_media_payload(
 async def serve_owner_thread_media(
     thread_id: str,
     media_token: str,
-    request: Request,
-    credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
+    gate: tuple[dict[str, Any], str] = Depends(_owner_media_caller_gate),
 ) -> Response:
     """Serve controlled session media to an authenticated thread viewer."""
     from src.server.database.conversation import get_thread_by_id
 
-    claims = verify_owner_media_token(media_token, expected_thread_id=thread_id)
-    await require_media_viewer(request, thread_id, claims, credentials)
+    claims, _viewer_id = gate
 
     thread = await get_thread_by_id(thread_id)
     if not thread:

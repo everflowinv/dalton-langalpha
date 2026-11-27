@@ -393,7 +393,6 @@ async def apply_thread_share_update(
             is_shared=is_shared,
             shared_at=shared_at,
             share_permissions_patch=dict(patch) if patch is not None else None,
-            share_permissions=dict(effective_perms) if patch is None else None,
         )
 
     kwargs: dict[str, Any] = {"is_shared": is_shared}
@@ -641,6 +640,8 @@ def _strip_thinking_from_plain_chunk(chunk: str, *, is_tail: bool) -> str:
 
 def _split_code_protected_segments(text: str) -> list[tuple[str, str]]:
     """Split markdown into ``(kind, segment)`` where ``kind`` is ``"plain"``, ``"inline_code"``, or ``"fence"``."""
+    from src.dalton.thinking_spans import _skip_fenced_code_block
+
     segments: list[tuple[str, str]] = []
     buf: list[str] = []
     i = 0
@@ -653,47 +654,15 @@ def _split_code_protected_segments(text: str) -> list[tuple[str, str]]:
 
     at_line_start = True
     while i < n:
-        # Check fenced code block at line start (up to 3 leading spaces)
+        # Check fenced code block at line start (including inside ``>`` blockquotes)
         if at_line_start:
-            j = i
-            spaces = 0
-            while j < n and text[j] == " " and spaces < 3:
-                j += 1
-                spaces += 1
-            if j < n and text[j] in ("`", "~"):
-                ch = text[j]
-                k = j
-                while k < n and text[k] == ch:
-                    k += 1
-                fence_len = k - j
-                if fence_len >= 3:
-                    line_end = text.find("\n", k)
-                    if line_end == -1:
-                        line_end = n
-                    info = text[k:line_end]
-                    # Backtick fence info string cannot contain backticks in CommonMark
-                    if not (ch == "`" and "`" in info):
-                        flush_plain()
-                        block_start = i
-                        scan = line_end + 1 if line_end < n else n
-                        while scan < n:
-                            next_nl = text.find("\n", scan)
-                            if next_nl == -1:
-                                next_nl = n
-                            line_str = text[scan:next_nl]
-                            stripped = line_str.lstrip(" ")
-                            if (
-                                len(line_str) - len(stripped) <= 3
-                                and stripped.startswith(ch * fence_len)
-                                and stripped.lstrip(ch).strip() == ""
-                            ):
-                                scan = next_nl + 1 if next_nl < n else n
-                                break
-                            scan = next_nl + 1 if next_nl < n else n
-                        segments.append(("fence", text[block_start:scan]))
-                        i = scan
-                        at_line_start = True
-                        continue
+            fence_end = _skip_fenced_code_block(text, i)
+            if fence_end is not None:
+                flush_plain()
+                segments.append(("fence", text[i:fence_end]))
+                i = fence_end
+                at_line_start = True
+                continue
 
         # Check inline code span
         if text[i] == "`":
@@ -3709,13 +3678,20 @@ class StrictNoFilesShareRedactor:
     def _apply_message_opening_thinking_scan(
         self, cycle_body: list[tuple[str, Any]]
     ) -> list[tuple[str, Any]]:
-        """Scan all text events per message id across all phases using ``scan_opening_thinking_spans``.
+        """Scan all text events per message id across all phases using ``scan_all_thinking_spans``.
 
-        - Unclosed opening thinking block -> drops ALL text chunks of that message.
-        - Closed opening thinking block -> maps stripped spans back onto each chunk
-          so cross-phase residual text in ``final_answer`` is removed before selection.
+        Runs BEFORE phase selection so thinking blocks that follow normal prefix
+        text, span ``commentary`` -> ``final_answer``, or contain literal closing
+        tags inside Markdown/blockquote code fences never leak residual body text
+        into ``final_answer``:
+        - Unclosed opening thinking block at message start -> drops ALL text chunks
+          of that message.
+        - Closed thinking spans anywhere in the message and any unclosed thinking
+          tail after prefix text -> mapped back onto each chunk across all phases
+          before phase selection.
         """
-        from src.dalton.thinking_spans import scan_opening_thinking_spans
+        from src.dalton.thinking_spans import scan_all_thinking_spans
+        from src.server.utils.thinking_leak import decide_opening
 
         # Group indices of text message_chunk entries by message id (preserving order).
         groups: dict[str, list[int]] = {}
@@ -3732,13 +3708,26 @@ class StrictNoFilesShareRedactor:
             full_text = "".join(parts)
             if not full_text:
                 continue
-            scan = scan_opening_thinking_spans(full_text)
-            if scan.unclosed:
+            scan = scan_all_thinking_spans(full_text)
+            if (
+                scan.unclosed_start is not None
+                and not scan.strip_spans
+                and full_text[: scan.unclosed_start].strip() == ""
+            ):
                 for i in indices:
                     replacements[i] = None
                 continue
-            if not scan.strip_spans:
+            spans_to_strip: list[tuple[int, int]] = list(scan.strip_spans)
+            for _s_start, s_end in list(scan.strip_spans):
+                if s_end < len(full_text):
+                    after_opening = decide_opening(full_text[s_end:])
+                    if after_opening is not None and after_opening.kind == "need":
+                        spans_to_strip.append((s_end, s_end + after_opening.end))
+            if scan.unclosed_start is not None:
+                spans_to_strip.append((scan.unclosed_start, len(full_text)))
+            if not spans_to_strip:
                 continue
+            spans_to_strip.sort()
             offset = 0
             for i, text_part in zip(indices, parts):
                 b_start = offset
@@ -3746,7 +3735,7 @@ class StrictNoFilesShareRedactor:
                 offset = b_end
                 cursor = b_start
                 kept: list[str] = []
-                for s_start, s_end in scan.strip_spans:
+                for s_start, s_end in spans_to_strip:
                     if s_end <= cursor:
                         continue
                     if s_start >= b_end:

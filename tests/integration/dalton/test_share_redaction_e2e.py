@@ -769,14 +769,15 @@ async def test_e2e_b6_deleted_thread_org_library_and_activity_cursor_pagination(
                 await cur.execute(
                     """
                     INSERT INTO conversation_threads
-                        (conversation_thread_id, workspace_id, user_id, title,
-                         is_shared, share_token, share_permissions, shared_at)
-                    VALUES (%s::uuid, %s::uuid, %s, %s, TRUE, %s, %s::jsonb, NOW())
+                        (conversation_thread_id, workspace_id, user_id, current_status, thread_index,
+                         title, is_shared, share_token, share_permissions, shared_at)
+                    VALUES (%s::uuid, %s::uuid, %s, 'completed', %s, %s, TRUE, %s, %s::jsonb, NOW())
                     """,
                     (
                         tid,
                         workspace_id,
                         user_id,
+                        idx + 1,
                         f"SECRET_AUTO_LIB_{idx}",
                         tok,
                         json.dumps({"allow_files": False, "allow_download": False, "audience": "public"}),
@@ -942,6 +943,280 @@ async def test_e2e_b6_deleted_thread_org_library_and_activity_cursor_pagination(
         assert "SECRET_DELETED_THREAD_TITLE" not in combined_act_text
         assert "SECRET_AUTO_LIB_" not in combined_act_text
         assert "财报.pdf" not in combined_act_text
+
+
+@pytest.mark.asyncio
+async def test_e2e_b6_r5_omit_permissions_preserves_concurrent_revocation_real_pg(
+    test_db_pool: Any,
+    dalton_schema: Any,
+    patched_get_db_connection: Any,
+    seed_user: dict[str, Any],
+    seed_workspace: dict[str, Any],
+) -> None:
+    """AU1 r5 #2 (Real PG): Interleaving revocation with an omit-permissions share update keeps allow_files=False."""
+    from src.server.database.conversation import threads_write
+
+    user_id = str(seed_user["user_id"])
+    workspace_id = str(seed_workspace["workspace_id"])
+    tid = str(uuid.uuid4())
+    tok = f"r5perm_{uuid.uuid4().hex[:8]}"
+
+    async with patched_get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO conversation_threads
+                    (conversation_thread_id, workspace_id, user_id, current_status, thread_index,
+                     title, is_shared, share_token, share_permissions, shared_at)
+                VALUES (%s::uuid, %s::uuid, %s, 'completed', 101, 'Perm Race', TRUE, %s, %s::jsonb, NOW())
+                """,
+                (
+                    tid,
+                    workspace_id,
+                    user_id,
+                    tok,
+                    json.dumps({"allow_files": True, "allow_download": True, "audience": "public"}),
+                ),
+            )
+
+    # Request A reads stale permissions BEFORE concurrent revocation and omits `permissions` in its request body.
+    stale_existing = {"allow_files": True, "allow_download": True, "audience": "public"}
+    effective_a, patch_a = share_redaction.prepare_share_permissions_update(stale_existing, None)
+    assert patch_a is None
+    assert effective_a["allow_files"] is True
+
+    # Request B concurrently revokes file access (allow_files=False).
+    effective_b, patch_b = share_redaction.prepare_share_permissions_update(
+        stale_existing, {"allow_files": False}
+    )
+    revoked = await share_redaction.apply_thread_share_update(
+        threads_write.update_thread_sharing,
+        tid,
+        is_shared=True,
+        shared_at=None,
+        effective_perms=effective_b,
+        patch=patch_b,
+    )
+    assert revoked is not None
+    assert revoked["share_permissions"]["allow_files"] is False
+    assert revoked["share_permissions"]["allow_download"] is False
+
+    # Request A now executes its UPDATE with patch=None: MUST NOT overwrite share_permissions back to True.
+    after_a = await share_redaction.apply_thread_share_update(
+        threads_write.update_thread_sharing,
+        tid,
+        is_shared=True,
+        shared_at=None,
+        effective_perms=effective_a,
+        patch=patch_a,
+    )
+    assert after_a is not None
+    assert after_a["share_permissions"]["allow_files"] is False
+    assert after_a["share_permissions"]["allow_download"] is False
+
+    async with patched_get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT share_permissions FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
+                (tid,),
+            )
+            row = await cur.fetchone()
+    assert row is not None
+    stored_perms = row["share_permissions"] if isinstance(row, dict) else row[0]
+    assert stored_perms["allow_files"] is False
+    assert stored_perms["allow_download"] is False
+
+
+@pytest.mark.asyncio
+async def test_e2e_b6_r5_paginated_replay_media_issuance_and_two_gets_real_pg(
+    monkeypatch: pytest.MonkeyPatch,
+    test_db_pool: Any,
+    dalton_schema: Any,
+    patched_get_db_connection: Any,
+    seed_user: dict[str, Any],
+    seed_workspace: dict[str, Any],
+) -> None:
+    """AU1 r5 #3 (Real PG): Paginated replay SQL joins turn_slices -> conversation_responses, issues controlled media refs, and both media GETs return 200."""
+    import re
+    from src.server.services.history.replay import lines as replay_lines
+
+    monkeypatch.setenv("DALTON_MEDIA_SIGNING_SECRET", "r5-real-pg-media-secret-32-bytes!")
+    monkeypatch.setenv("STORAGE_PUBLIC_URL_BASE", "https://cdn.pg.example")
+    monkeypatch.setenv("STORAGE_PROVIDER", "s3")
+    monkeypatch.setenv("S3_BUCKET_NAME", "pg-media-bucket")
+    monkeypatch.setenv("S3_ENDPOINT_URL", "https://s3.pg.example")
+    monkeypatch.setenv("S3_ACCESS_KEY_ID", "ak")
+    monkeypatch.setenv("S3_SECRET_ACCESS_KEY", "sk")
+
+    user_id = str(seed_user["user_id"])
+    workspace_id = str(seed_workspace["workspace_id"])
+    tid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    tok = f"r5med_{uuid.uuid4().hex[:8]}"
+
+    img_key = f"private-media/response-images/{tid}/chart_1.png"
+    img_url = f"https://cdn.pg.example/{img_key}"
+    att_key = f"private-media/attachments/{tid}/batch1/Q1 Report 财报.pdf"
+    att_url = f"https://cdn.pg.example/private-media/attachments/{tid}/batch1/Q1%20Report%20%E8%B4%A2%E6%8A%A5.pdf"
+    steer_key = f"private-media/attachments/{tid}/steer1/note file.png"
+    steer_url = f"https://cdn.pg.example/private-media/attachments/{tid}/steer1/note%20file.png"
+
+    steer_line = replay_lines.line_of(
+        {
+            "event": "steering_delivered",
+            "data": {
+                "thread_id": tid,
+                "turn_index": 1,
+                "messages": [
+                    {
+                        "user_id": user_id,
+                        "content": "added note",
+                        "attachments": [{"name": "note file.png", "url": steer_url}],
+                    }
+                ],
+            },
+        }
+    )
+    encoded_slice_lines = replay_lines.encode([steer_line])
+
+    async with patched_get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO conversation_threads
+                    (conversation_thread_id, workspace_id, user_id, current_status, thread_index,
+                     title, is_shared, share_token, share_permissions, shared_at)
+                VALUES (%s::uuid, %s::uuid, %s, 'completed', 201, 'Paginated Media', TRUE, %s, %s::jsonb, NOW())
+                """,
+                (
+                    tid,
+                    workspace_id,
+                    user_id,
+                    tok,
+                    json.dumps({"allow_files": True, "allow_download": True, "audience": "public"}),
+                ),
+            )
+            await cur.execute(
+                """
+                INSERT INTO conversation_queries
+                    (conversation_thread_id, turn_index, content, type, metadata, created_at)
+                VALUES (%s::uuid, 1, 'Check report', 'initial', %s::jsonb, NOW())
+                """,
+                (
+                    tid,
+                    json.dumps({"attachments": [{"name": "Q1 Report 财报.pdf", "url": att_url}]}),
+                ),
+            )
+            await cur.execute(
+                """
+                INSERT INTO conversation_responses
+                    (conversation_response_id, conversation_thread_id, turn_index, status,
+                     metadata, replay_facts, created_at)
+                VALUES (%s::uuid, %s::uuid, 1, 'completed', %s::jsonb, %s::jsonb, NOW())
+                """,
+                (
+                    rid,
+                    tid,
+                    json.dumps({"user_id": user_id}),
+                    json.dumps({"images": {"c1": img_url}}),
+                ),
+            )
+            await cur.execute(
+                """
+                INSERT INTO turn_slices
+                    (conversation_response_id, conversation_thread_id,
+                     input_checkpoint_id, tail_checkpoint_id, slice_key, slice_codec,
+                     slice, lines_key, lines)
+                VALUES (%s::uuid, %s::uuid, 'cp-0', 'cp-1', 'sk-1', 'zstd', %s, 'lk-1', %s)
+                """,
+                (rid, tid, b"slice-bytes", encoded_slice_lines),
+            )
+
+    page_items = [
+        {
+            "event": "user_message",
+            "data": {
+                "thread_id": tid,
+                "turn_index": 1,
+                "content": "Check report",
+                "metadata": {"attachments": [{"name": "Q1 Report 财报.pdf", "url": att_url}]},
+            },
+        },
+        {
+            "event": "message_chunk",
+            "data": {
+                "thread_id": tid,
+                "turn_index": 1,
+                "content": f"Chart:\n![c]({img_url})",
+            },
+        },
+    ]
+    thread_row = {
+        "conversation_thread_id": tid,
+        "workspace_id": workspace_id,
+        "user_id": user_id,
+        "is_shared": True,
+        "share_token": tok,
+        "share_permissions": {"allow_files": True, "allow_download": True, "audience": "public"},
+    }
+
+    # Paginated issuance (page_turns=[1]) executes real turn_slices JOIN conversation_responses SQL
+    bindings = await share_media.resolve_thread_media_bindings(
+        thread_row,
+        [{"turn_index": 1, "metadata": {"attachments": [{"name": "Q1 Report 财报.pdf", "url": att_url}]}}],
+        page_items,
+    )
+    assert bindings is not None
+    assert img_url in bindings
+    assert att_url in bindings
+    assert bindings[att_url] == ("upstream", att_key)
+    assert steer_url in bindings
+    assert bindings[steer_url] == ("upstream", steer_key)
+
+    rewritten = share_media.rewrite_items_for_public_media(
+        page_items, thread_id=tid, share_token=tok, bindings=bindings
+    )
+    att_controlled = rewritten[0]["data"]["metadata"]["attachments"][0]["url"]
+    img_controlled_match = re.search(r"(/api/v1/public/shared/[^\s)]+)", rewritten[1]["data"]["content"])
+    assert att_controlled.startswith(f"/api/v1/public/shared/{tok}/media/")
+    assert img_controlled_match is not None
+    img_controlled = img_controlled_match.group(1)
+
+    stored_blobs = {
+        img_key: b"\x89PNG-CHART-BYTES",
+        att_key: b"%PDF-1.7-SPACE-CHINESE",
+    }
+
+    def _fake_read(key: str, *, reader: Any = None) -> bytes | None:
+        return stored_blobs.get(key)
+
+    monkeypatch.setattr(
+        share_media,
+        "read_controlled_object_bytes",
+        create_autospec(share_media.read_controlled_object_bytes, side_effect=_fake_read),
+    )
+    monkeypatch.setattr(
+        share_redaction,
+        "resolve_effective_share_permissions",
+        create_autospec(
+            share_redaction.resolve_effective_share_permissions,
+            return_value=share_redaction.EffectiveSharePermissions(
+                allow_files=True, allow_download=True
+            ),
+        ),
+    )
+
+    app = FastAPI()
+    app.include_router(share_media.public_media_router, prefix="/api/v1/public")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+        r_att = await client.get(att_controlled)
+        r_img = await client.get(img_controlled)
+
+    assert r_att.status_code == 200
+    assert r_att.content == b"%PDF-1.7-SPACE-CHINESE"
+    assert r_img.status_code == 200
+    assert r_img.content == b"\x89PNG-CHART-BYTES"
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.dalton.thinking_spans import scan_opening_thinking_spans
+from src.dalton.thinking_spans import (
+    scan_all_thinking_spans,
+    scan_opening_thinking_spans,
+)
 from src.llms.content_utils import extract_content_with_type
 from src.server.utils.text_phase import agreed_phase, block_phase
 from src.server.utils.thinking_leak import decide_opening
@@ -132,23 +135,52 @@ def split_content_blocks_by_phase(
         return [], reasoning
 
     joined = "".join(t for t, _ in text_items)
-    scan = scan_opening_thinking_spans(joined)
-    if scan.unclosed:
+    distinct_phases = {p for _, p in text_items}
+    opening_scan = scan_opening_thinking_spans(joined)
+    if opening_scan.unclosed:
         # Preserve all blocks unmodified so strict share filtering sees the
         # opening thinking tag and drops the entire unclosed message.
         return _coalesce_phase_segments(text_items), reasoning
 
-    strip_spans: list[tuple[int, int]] = list(scan.strip_spans)
-    tail_start = strip_spans[-1][1] if strip_spans else 0
-    tail_text = joined[tail_start:]
+    strip_spans: list[tuple[int, int]] = []
+    has_opening_marker = False
+    if len(distinct_phases) > 1:
+        # Mixed-phase message (e.g. commentary -> final_answer): identify ALL
+        # thinking spans across the full concatenated message BEFORE phase
+        # selection so thinking blocks preceded by normal prefix text or
+        # spanning phases never leave residual body text in final_answer.
+        all_scan = scan_all_thinking_spans(joined)
+        if all_scan.strip_spans:
+            strip_spans.extend(all_scan.strip_spans)
+            if opening_scan.strip_spans:
+                has_opening_marker = True
+    else:
+        if opening_scan.strip_spans:
+            strip_spans.extend(opening_scan.strip_spans)
+            has_opening_marker = True
+
+    opening_tail_start = (
+        opening_scan.strip_spans[-1][1] if opening_scan.strip_spans else 0
+    )
+    tail_text = joined[opening_tail_start:]
     if tail_text:
         opening = decide_opening(tail_text)
         if opening is not None and opening.kind == "need":
-            strip_spans.append((tail_start, tail_start + opening.end))
+            strip_spans.append((opening_tail_start, opening_tail_start + opening.end))
+            has_opening_marker = True
+
+    # A NEED MORE THINKING paragraph directly following any stripped closed thinking
+    # block must also be stripped before the surrounding text is concatenated.
+    for _s_start, s_end in list(strip_spans):
+        if s_end < len(joined):
+            after_opening = decide_opening(joined[s_end:])
+            if after_opening is not None and after_opening.kind == "need":
+                strip_spans.append((s_end, s_end + after_opening.end))
 
     if strip_spans:
-        if followed_by_tool_call:
+        if has_opening_marker and followed_by_tool_call:
             return [], reasoning
+        strip_spans.sort()
         text_items = _subtract_spans_from_blocks(text_items, tuple(strip_spans))
 
     segments = _coalesce_phase_segments(text_items)
