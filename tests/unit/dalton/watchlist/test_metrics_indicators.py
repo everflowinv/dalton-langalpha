@@ -478,10 +478,11 @@ async def test_pending_subset_poll_warmup_dedup_and_bounded_mcap_concurrency(
     )
 
     svc = metrics_mod.WatchlistMetricsService()
-    # 1. Initial full call returns snapshots immediately (grouped by US & HK buckets) and marks all pending
+    # 1. Initial full call returns snapshots concurrently per symbol and marks all pending
     res1 = await svc.get_metrics_for_user("u1", symbols=tickers, wait_for_cold=False)
     assert set(res1["pending_symbols"]) == set(tickers)
-    assert len(snap_batches) == 2  # US chunk + HK chunk fetched concurrently
+    assert len(snap_batches) == len(tickers)
+    assert all(len(batch) == 1 for batch in snap_batches)
     await asyncio.sleep(0.02)
 
     # Bounded market-cap concurrency <= MAX_MCAP_CONCURRENCY (4)
@@ -511,3 +512,149 @@ async def test_pending_subset_poll_warmup_dedup_and_bounded_mcap_concurrency(
     assert res_done["items"]["0700.HK"]["market_cap"] == 1_000_000_000_000.0
     assert res_done["items"]["0700.HK"]["currency"] == "HKD"
     assert res_done["items"]["0700.HK"]["rsi_14d"] is not None
+
+
+def test_r3_indicators_emit_price_source_and_price_ts() -> None:
+    """Indicators explicitly label price_source ('snapshot' vs 'daily_close') and normalized epoch-ms price_ts."""
+    bars = [
+        {"date": "2026-05-14", "close": 100.0, "high": 102.0, "low": 98.0, "volume": 1000},
+        {"date": "2026-05-15", "close": 105.0, "high": 106.0, "low": 101.0, "volume": 1200},
+    ]
+    snap_out = ind_mod.compute_symbol_metrics(
+        bars,
+        symbol="NVDA",
+        latest_price=112.5,
+        quote_timestamp="2026-05-15T18:30:00Z",
+        now_utc=datetime(2026, 5, 15, 18, 30, tzinfo=timezone.utc),
+    )
+    assert snap_out["price"] == 112.5
+    assert snap_out["price_source"] == "snapshot"
+    assert snap_out["price_ts"] == int(datetime(2026, 5, 15, 18, 30, tzinfo=timezone.utc).timestamp() * 1000)
+
+    daily_out = ind_mod.compute_symbol_metrics(
+        bars,
+        symbol="NVDA",
+        latest_price=None,
+        now_utc=datetime(2026, 5, 15, 18, 30, tzinfo=timezone.utc),
+    )
+    assert daily_out["price"] == 105.0
+    assert daily_out["price_source"] == "daily_close"
+    assert isinstance(daily_out["price_ts"], int) and daily_out["price_ts"] > 0
+
+    empty_out = ind_mod.compute_symbol_metrics([], symbol="NVDA", latest_price=None)
+    assert empty_out["price"] is None
+    assert empty_out["price_source"] is None
+    assert empty_out["price_ts"] is None
+
+
+@pytest.mark.asyncio
+async def test_r3_snapshot_per_symbol_timeout_isolation_and_pending_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One slow snapshot times out in isolation without discarding peers, enters snapshot_pending/pending_symbols even when bars+mcap are cached, is not cached, and retries alone."""
+    metrics_mod._clear_metrics_cache_for_tests()
+    monkeypatch.setattr(metrics_mod, "SNAPSHOT_SYMBOL_TIMEOUT_SECONDS", 0.05)
+
+    tickers = ["AAPL", "MSFT", "0700.HK"]
+    monkeypatch.setattr(
+        coverage_db,
+        "list_coverage_rows",
+        create_autospec(
+            coverage_db.list_coverage_rows,
+            return_value=[
+                {"user_id": "u1", "ticker": sym, "tier": "core", "is_private": False}
+                for sym in tickers
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        coverage_db,
+        "get_earnings_calendar_mirror",
+        create_autospec(coverage_db.get_earnings_calendar_mirror, return_value=None),
+    )
+
+    # Pre-warm BOTH daily bars and market cap caches so ONLY snapshot timeout can put 0700.HK in pending_symbols
+    warm_bars = [
+        {"date": (date(2026, 1, 2) + timedelta(days=i)).isoformat(), "close": 380.0 + i, "high": 385.0 + i, "low": 375.0 + i, "volume": 1000}
+        for i in range(40)
+    ]
+    for sym in tickers:
+        key = metrics_mod._bars_cache_key(sym, provider_name="yfinance", split_adjusted=True)
+        await metrics_mod._write_bars_to_cache(key, warm_bars)
+        metrics_mod._MARKET_CAP_CACHE[sym] = (
+            metrics_mod.time.monotonic(),
+            2_000_000_000_000.0,
+            "HKD" if sym.endswith(".HK") else "USD",
+        )
+
+    hk_attempts = {"n": 0}
+    requested_batches: list[list[str]] = []
+    mkt_prov = create_autospec(MarketDataProvider, instance=True)
+
+    async def _snaps(symbols: list[str], asset_type: str = "stocks", user_id: str | None = None) -> list[dict[str, Any]]:
+        _ = (asset_type, user_id)
+        requested_batches.append(list(symbols))
+        assert len(symbols) == 1
+        sym = symbols[0]
+        if sym == "0700.HK":
+            hk_attempts["n"] += 1
+            if hk_attempts["n"] == 1:
+                await asyncio.sleep(0.25)  # exceeds per-symbol 0.05s timeout
+            return [{"symbol": "0700.HK", "price": 432.5, "previous_close": 420.0, "currency": "HKD", "as_of": 1_764_151_200_000}]
+        return [
+            {
+                "symbol": sym,
+                "price": 210.0 if sym == "AAPL" else 440.0,
+                "previous_close": 200.0 if sym == "AAPL" else 435.0,
+                "currency": "USD",
+                "as_of": 1_764_151_200_000,
+            }
+        ]
+
+    mkt_prov.get_snapshots.side_effect = _snaps
+    monkeypatch.setattr(
+        metrics_mod,
+        "_resolve_provider_and_key",
+        create_autospec(metrics_mod._resolve_provider_and_key, return_value=(mkt_prov, "yfinance", True)),
+    )
+    monkeypatch.setattr(
+        metrics_mod,
+        "_resolve_financial_provider",
+        create_autospec(
+            metrics_mod._resolve_financial_provider,
+            return_value=FinancialDataProvider(financial=None),
+        ),
+    )
+
+    svc = metrics_mod.WatchlistMetricsService()
+    res1 = await svc.get_metrics_for_user("u1", symbols=tickers, wait_for_cold=False)
+
+    # AAPL and MSFT succeeded normally despite 0700.HK timing out
+    assert res1["items"]["AAPL"]["price"] == 210.0
+    assert res1["items"]["AAPL"]["price_source"] == "snapshot"
+    assert res1["items"]["AAPL"]["price_ts"] == 1_764_151_200_000
+    assert res1["items"]["AAPL"]["snapshot_pending"] is False
+    assert res1["items"]["MSFT"]["price"] == 440.0
+    assert res1["items"]["MSFT"]["price_source"] == "snapshot"
+    assert res1["items"]["MSFT"]["snapshot_pending"] is False
+
+    # 0700.HK fell back to daily_close, entered snapshot_pending + pending_symbols, and was NOT cached
+    assert res1["items"]["0700.HK"]["price_source"] == "daily_close"
+    assert res1["items"]["0700.HK"]["snapshot_pending"] is True
+    assert res1["snapshot_pending_symbols"] == ["0700.HK"]
+    assert res1["pending_symbols"] == ["0700.HK"]
+    assert "0700.HK" not in metrics_mod._SNAPSHOT_CACHE
+    assert "AAPL" in metrics_mod._SNAPSHOT_CACHE
+    assert "MSFT" in metrics_mod._SNAPSHOT_CACHE
+
+    # Subset poll retries ONLY 0700.HK and recovers live snapshot without re-fetching AAPL/MSFT
+    requested_batches.clear()
+    res2 = await svc.get_metrics_for_user("u1", symbols=["0700.HK"], wait_for_cold=False)
+    assert requested_batches == [["0700.HK"]]
+    assert res2["items"]["0700.HK"]["price"] == 432.5
+    assert res2["items"]["0700.HK"]["price_source"] == "snapshot"
+    assert res2["items"]["0700.HK"]["price_ts"] == 1_764_151_200_000
+    assert res2["items"]["0700.HK"]["snapshot_pending"] is False
+    assert res2["pending_symbols"] == []
+    assert res2["snapshot_pending_symbols"] == []
+    assert "0700.HK" in metrics_mod._SNAPSHOT_CACHE

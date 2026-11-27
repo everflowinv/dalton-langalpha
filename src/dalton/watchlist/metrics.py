@@ -16,10 +16,10 @@ from src.dalton.watchlist.indicators import compute_symbol_metrics
 
 logger = logging.getLogger(__name__)
 
-MAX_SNAPSHOT_CHUNK = 30
-MAX_SNAPSHOT_CHUNK_CONCURRENCY = 6
-SNAPSHOT_CHUNK_TIMEOUT_SECONDS = 8.0
+MAX_SNAPSHOT_SYMBOL_CONCURRENCY = 12
+SNAPSHOT_SYMBOL_TIMEOUT_SECONDS = 8.0
 SNAPSHOT_CACHE_TTL_SECONDS = 15.0
+MAX_SNAPSHOT_CONSECUTIVE_FAILURES = 2
 MAX_BAR_CONCURRENCY = 8
 MAX_MCAP_CONCURRENCY = 4
 DAILY_BARS_CACHE_TTL_SECONDS = 4 * 3600  # 4 hours (§6.2)
@@ -30,6 +30,7 @@ MAX_BARS_CONSECUTIVE_EMPTY = 2
 _BARS_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _MARKET_CAP_CACHE: dict[str, tuple[float, float, str | None]] = {}
 _SNAPSHOT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_SNAPSHOT_FAILURE_STREAK: dict[str, tuple[int, float]] = {}
 _INFLIGHT_BARS: dict[str, asyncio.Task[list[dict[str, Any]]]] = {}
 _INFLIGHT_MCAP: dict[str, asyncio.Task[tuple[float | None, str | None]]] = {}
 _BARS_EMPTY_STREAK: dict[str, tuple[int, float]] = {}
@@ -57,6 +58,7 @@ def _clear_metrics_cache_for_tests() -> None:
     _BARS_CACHE.clear()
     _MARKET_CAP_CACHE.clear()
     _SNAPSHOT_CACHE.clear()
+    _SNAPSHOT_FAILURE_STREAK.clear()
     _INFLIGHT_BARS.clear()
     _INFLIGHT_MCAP.clear()
     _BARS_EMPTY_STREAK.clear()
@@ -469,30 +471,40 @@ def _schedule_market_cap_warmup(
     return True
 
 
-def _symbol_market_bucket(symbol: str) -> str:
-    sym = str(symbol or "").strip().upper()
-    if sym.endswith(".HK"):
-        return "hk"
-    if sym.endswith((".SS", ".SH", ".SZ", ".BJ")):
-        return "cn"
-    if "." in sym and not sym.endswith(".US"):
-        return "other"
-    return "us"
+def _record_snapshot_failure(sym: str, now: float) -> bool:
+    """Record a snapshot timeout/failure without caching it.
+
+    Returns True while the symbol should enter the ``snapshot_pending`` retry state
+    (resetting after ``WARMUP_FAILURE_COOLDOWN_SECONDS`` so permanently invalid
+    tickers do not spin 3s polls indefinitely).
+    """
+    prev = _SNAPSHOT_FAILURE_STREAK.get(sym)
+    if prev is not None and (now - prev[1]) >= WARMUP_FAILURE_COOLDOWN_SECONDS:
+        prev = None
+    count = (prev[0] if prev is not None else 0) + 1
+    _SNAPSHOT_FAILURE_STREAK[sym] = (count, now)
+    return count <= MAX_SNAPSHOT_CONSECUTIVE_FAILURES
 
 
-async def _fetch_snapshots_chunked(
+async def _fetch_snapshots_per_symbol(
     symbols: Sequence[str],
     *,
     user_id: str,
     provider: Any = None,
-) -> dict[str, dict[str, Any]]:
-    """Fetch snapshots concurrently in market-grouped chunks with per-chunk timeout and short TTL cache."""
+) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    """Fetch snapshots concurrently per symbol with isolated per-symbol timeout.
+
+    A slow or failing symbol never cancels or discards other symbols' snapshots.
+    Failures/timeouts are never cached and are returned in ``snapshot_pending``
+    so the next subset poll retries only those symbols.
+    """
     if not symbols:
-        return {}
+        return {}, set()
     out: dict[str, dict[str, Any]] = {}
+    snapshot_pending: set[str] = set()
     deduped = list(dict.fromkeys(str(s).strip().upper() for s in symbols if str(s).strip()))
     if not deduped:
-        return out
+        return out, snapshot_pending
 
     now = time.monotonic()
     missing: list[str] = []
@@ -503,7 +515,7 @@ async def _fetch_snapshots_chunked(
         else:
             missing.append(sym)
     if not missing:
-        return out
+        return out, snapshot_pending
 
     eff_provider = provider
     if eff_provider is None:
@@ -511,45 +523,47 @@ async def _fetch_snapshots_chunked(
             eff_provider, _, _ = await _resolve_provider_and_key()
         except Exception as exc:
             logger.debug("[WATCHLIST_METRICS] provider unavailable: %s", exc)
-            return out
+            for sym in missing:
+                if _record_snapshot_failure(sym, now):
+                    snapshot_pending.add(sym)
+            return out, snapshot_pending
 
-    buckets: dict[str, list[str]] = {}
-    for sym in missing:
-        buckets.setdefault(_symbol_market_bucket(sym), []).append(sym)
+    sem = asyncio.Semaphore(MAX_SNAPSHOT_SYMBOL_CONCURRENCY)
 
-    chunks: list[list[str]] = []
-    for bucket_syms in buckets.values():
-        for i in range(0, len(bucket_syms), MAX_SNAPSHOT_CHUNK):
-            chunks.append(bucket_syms[i : i + MAX_SNAPSHOT_CHUNK])
-
-    sem = asyncio.Semaphore(MAX_SNAPSHOT_CHUNK_CONCURRENCY)
-
-    async def _fetch_chunk(chunk: list[str]) -> list[dict[str, Any]]:
+    async def _fetch_one(sym: str) -> tuple[str, dict[str, Any] | None]:
         async with sem:
             try:
                 snaps = await asyncio.wait_for(
-                    eff_provider.get_snapshots(chunk, asset_type="stocks", user_id=user_id),
-                    timeout=SNAPSHOT_CHUNK_TIMEOUT_SECONDS,
+                    eff_provider.get_snapshots([sym], asset_type="stocks", user_id=user_id),
+                    timeout=SNAPSHOT_SYMBOL_TIMEOUT_SECONDS,
                 )
-                return [s for s in (snaps or []) if isinstance(s, dict)]
+                valid_snaps = [s for s in (snaps or []) if isinstance(s, dict)]
+                for snap in valid_snaps:
+                    snap_sym = str(snap.get("symbol") or snap.get("ticker") or sym).strip().upper()
+                    if snap_sym == sym or len(valid_snaps) == 1:
+                        if _positive_float(
+                            snap.get("price") or snap.get("last_price") or snap.get("close")
+                        ) is not None:
+                            return sym, snap
+                return sym, None
             except asyncio.TimeoutError:
-                logger.debug("[WATCHLIST_METRICS] snapshot chunk timed out (%d symbols)", len(chunk))
-                return []
+                logger.debug("[WATCHLIST_METRICS] snapshot timed out for %s", sym)
+                return sym, None
             except Exception as exc:
-                logger.debug("[WATCHLIST_METRICS] snapshot chunk failed: %s", exc)
-                return []
+                logger.debug("[WATCHLIST_METRICS] snapshot failed for %s: %s", sym, exc)
+                return sym, None
 
-    chunk_results = await asyncio.gather(*(_fetch_chunk(chunk) for chunk in chunks))
+    results = await asyncio.gather(*(_fetch_one(sym) for sym in missing))
     fetched_at = time.monotonic()
-    for snaps in chunk_results:
-        for snap in snaps:
-            sym = str(snap.get("symbol") or snap.get("ticker") or "").strip().upper()
-            if not sym:
-                continue
+    for sym, snap in results:
+        if snap is not None:
             out[sym] = snap
-            if _positive_float(snap.get("price") or snap.get("last_price") or snap.get("close")) is not None:
-                _SNAPSHOT_CACHE[sym] = (fetched_at, snap)
-    return out
+            _SNAPSHOT_CACHE[sym] = (fetched_at, snap)
+            _SNAPSHOT_FAILURE_STREAK.pop(sym, None)
+        else:
+            if _record_snapshot_failure(sym, fetched_at):
+                snapshot_pending.add(sym)
+    return out, snapshot_pending
 
 
 def _build_full_roster_summary(
@@ -642,7 +656,10 @@ class WatchlistMetricsService:
                     "ticker": sym,
                     "is_private": True,
                     "status": "unlisted",
+                    "snapshot_pending": False,
                     "price": None,
+                    "price_source": None,
+                    "price_ts": None,
                     "currency": None,
                     "chg_1d": None,
                     "chg_1w": None,
@@ -691,8 +708,10 @@ class WatchlistMetricsService:
             and getattr(financial_provider, "financial", None) is not None
         )
 
-        snaps = await _fetch_snapshots_chunked(listed_symbols, user_id=uid, provider=provider)
-        pending_set: set[str] = set()
+        snaps, snapshot_pending_set = await _fetch_snapshots_per_symbol(
+            listed_symbols, user_id=uid, provider=provider
+        )
+        pending_set: set[str] = set(snapshot_pending_set)
 
         async def _compute_one(sym: str) -> tuple[str, dict[str, Any]]:
             snap = snaps.get(sym) or {}
@@ -772,11 +791,14 @@ class WatchlistMetricsService:
             eff_currency = snap_currency or mcap_currency
             eff_mcap_currency = mcap_currency or snap_currency
 
+            freshness = snap.get("freshness") if isinstance(snap.get("freshness"), Mapping) else {}
             quote_ts = (
-                snap.get("timestamp")
+                snap.get("live_tick_at")
                 or snap.get("as_of")
+                or snap.get("timestamp")
                 or snap.get("last_trade_at")
                 or snap.get("updated_at")
+                or freshness.get("actual_latest")
             )
 
             metric = compute_symbol_metrics(
@@ -793,6 +815,7 @@ class WatchlistMetricsService:
                 next_earnings=next_earn,
                 quote_timestamp=quote_ts,
             )
+            is_snapshot_pending = sym in snapshot_pending_set
             status = (
                 "ok"
                 if metric.get("price") is not None
@@ -802,6 +825,7 @@ class WatchlistMetricsService:
                 "ticker": sym,
                 "is_private": False,
                 "status": status,
+                "snapshot_pending": is_snapshot_pending,
                 **metric,
             }
 
@@ -810,11 +834,13 @@ class WatchlistMetricsService:
             items[sym] = payload
 
         pending_symbols = [sym for sym in listed_symbols if sym in pending_set]
+        snapshot_pending_symbols = [sym for sym in listed_symbols if sym in snapshot_pending_set]
 
         return {
             "ok": True,
             "items": items,
             "pending_symbols": pending_symbols,
+            "snapshot_pending_symbols": snapshot_pending_symbols,
             "summary": _build_full_roster_summary(items, rows_by_ticker),
             "as_of": datetime.now(timezone.utc).isoformat(),
         }

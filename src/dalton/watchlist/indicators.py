@@ -124,6 +124,62 @@ def _parse_date_in_tz(raw: Any, tz: ZoneInfo) -> date | None:
     return None
 
 
+def _parse_timestamp_ms(raw: Any, *, tz: ZoneInfo | None = None) -> int | None:
+    """Normalize a quote or bar timestamp into Unix epoch milliseconds."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    eff_tz = tz or ZoneInfo(_DEFAULT_EXCHANGE_TZ)
+    if isinstance(raw, datetime):
+        dt = raw if raw.tzinfo is not None else raw.replace(tzinfo=timezone.utc)
+        return int(round(dt.timestamp() * 1000))
+    if isinstance(raw, date):
+        dt = datetime(raw.year, raw.month, raw.day, tzinfo=eff_tz)
+        return int(round(dt.timestamp() * 1000))
+    if isinstance(raw, (int, float)) and math.isfinite(float(raw)):
+        ts = float(raw)
+        if ts <= 0:
+            return None
+        return int(round(ts * 1000)) if abs(ts) < 1e11 else int(round(ts))
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        if len(text) == 10:
+            try:
+                d = date.fromisoformat(text)
+                return int(round(datetime(d.year, d.month, d.day, tzinfo=eff_tz).timestamp() * 1000))
+            except ValueError:
+                return None
+        try:
+            ts = float(text)
+            if math.isfinite(ts) and ts > 0:
+                return int(round(ts * 1000)) if abs(ts) < 1e11 else int(round(ts))
+        except ValueError:
+            pass
+        try:
+            parsed_dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed_dt.tzinfo is None:
+                parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+            return int(round(parsed_dt.timestamp() * 1000))
+        except ValueError:
+            if len(text) >= 10:
+                try:
+                    d = date.fromisoformat(text[:10])
+                    return int(round(datetime(d.year, d.month, d.day, tzinfo=eff_tz).timestamp() * 1000))
+                except ValueError:
+                    return None
+    return None
+
+
+def _bar_raw_ts(bar: Mapping[str, Any]) -> Any:
+    raw = bar.get("timestamp")
+    if raw is None:
+        raw = bar.get("time")
+    if raw is None:
+        raw = bar.get("date")
+    return raw
+
+
 def _bar_date(bar: Mapping[str, Any], *, tz: ZoneInfo | None = None) -> date | None:
     eff_tz = tz or ZoneInfo(_DEFAULT_EXCHANGE_TZ)
     raw = bar.get("date")
@@ -204,16 +260,18 @@ def compute_symbol_metrics(
 ) -> dict[str, Any]:
     """Compute Batch-1 watchlist indicators from split-adjusted daily bars + live snapshot."""
     tz = exchange_timezone_for_symbol(symbol)
-    raw_parsed: list[tuple[date | None, float, float | None, float | None, float | None]] = []
+    raw_parsed: list[tuple[date | None, float, float | None, float | None, float | None, Any]] = []
     for bar in bars:
         c = _bar_close(bar)
         if c is None or c <= 0:
             continue
-        raw_parsed.append((_bar_date(bar, tz=tz), c, _bar_high(bar), _bar_low(bar), _bar_volume(bar)))
+        raw_parsed.append(
+            (_bar_date(bar, tz=tz), c, _bar_high(bar), _bar_low(bar), _bar_volume(bar), _bar_raw_ts(bar))
+        )
 
     # Deduplicate by trade date (keep latest entry per date) and sort ascending
     if raw_parsed and all(row[0] is not None for row in raw_parsed):
-        deduped_by_dt: dict[date, tuple[date | None, float, float | None, float | None, float | None]] = {}
+        deduped_by_dt: dict[date, tuple[date | None, float, float | None, float | None, float | None, Any]] = {}
         for row in raw_parsed:
             assert row[0] is not None
             deduped_by_dt[row[0]] = row
@@ -222,9 +280,26 @@ def compute_symbol_metrics(
         parsed = raw_parsed
 
     closes = [row[1] for row in parsed]
-    price = _to_float(latest_price)
-    if price is None and closes:
+    snap_price = _to_float(latest_price)
+    price: float | None
+    price_source: str | None
+    price_ts: int | None
+    if snap_price is not None:
+        price = snap_price
+        price_source = "snapshot"
+        price_ts = _parse_timestamp_ms(quote_timestamp, tz=tz)
+    elif closes:
         price = closes[-1]
+        price_source = "daily_close"
+        last_raw_ts = parsed[-1][5] if parsed else None
+        price_ts = _parse_timestamp_ms(
+            last_raw_ts if last_raw_ts is not None else parsed[-1][0],
+            tz=tz,
+        )
+    else:
+        price = None
+        price_source = None
+        price_ts = None
 
     last_bar_date = parsed[-1][0] if parsed else None
     quote_trade_date = _parse_date_in_tz(quote_timestamp, tz)
@@ -326,6 +401,8 @@ def compute_symbol_metrics(
 
     return {
         "price": round(price, 4) if price is not None else None,
+        "price_source": price_source,
+        "price_ts": price_ts,
         "currency": currency,
         "chg_1d": chg_1d,
         "chg_1w": chg_1w,

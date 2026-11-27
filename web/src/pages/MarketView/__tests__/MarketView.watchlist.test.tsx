@@ -12,7 +12,7 @@ import {
   type WatchlistMetricsResponse,
 } from '@/lib/dalton/watchlist';
 import { WatchlistAddModal } from '../components/watchlist/WatchlistAddModal';
-import { WatchlistFullTable } from '../components/watchlist/WatchlistFullTable';
+import { WatchlistFullTable, type WatchlistFullTableProps } from '../components/watchlist/WatchlistFullTable';
 
 const mocks = vi.hoisted(() => ({
   toast: vi.fn(),
@@ -77,6 +77,8 @@ const mocks = vi.hoisted(() => ({
         is_private: false,
         status: 'ok' as const,
         price: 138.4,
+        price_source: 'snapshot' as const,
+        price_ts: 1_764_151_200_000,
         currency: 'USD',
         chg_1d: 2.45,
         chg_1w: 6.1,
@@ -548,9 +550,9 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
           visibleColumns={['tier', 'price', 'chg_1d', 'market_cap']}
           groupedByTier={false}
           holdingSymbols={new Set()}
-          onSelectSymbol={vi.fn<(symbol: string) => void>()}
-          onRequestTierChange={vi.fn()}
-          onRequestRemove={vi.fn()}
+          onSelectSymbol={vi.fn<WatchlistFullTableProps['onSelectSymbol']>()}
+          onRequestTierChange={vi.fn<WatchlistFullTableProps['onRequestTierChange']>()}
+          onRequestRemove={vi.fn<WatchlistFullTableProps['onRequestRemove']>()}
         />,
       );
 
@@ -612,7 +614,10 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
     expect(screen.getByTestId('watchlist-row-0700.HK').textContent).toContain('HK$');
   });
 
-  it('shows price and 1D change from shared useQuotes before /metrics returns, then prefers /metrics timestamp when both exist', async () => {
+  it('keeps shared live quote price when /metrics subsequently returns daily_close fallback, and picks newer trade timestamp otherwise', async () => {
+    const T1 = 1_764_151_200_000;
+    const T2 = 1_764_151_260_000;
+
     // 1. /metrics has not returned yet, while shared useQuotes cache is already warm (e.g. from Dashboard)
     mocks.metricsOverride = {
       data: undefined,
@@ -621,8 +626,8 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
       isSuccess: false,
     };
     mocks.liveQuotes = {
-      NVDA: { symbol: 'NVDA', price: 142.5, change_percent: 3.15, currency: 'USD' },
-      AVGO: { symbol: 'AVGO', price: 185.2, change_percent: -0.85, currency: 'USD' },
+      NVDA: { symbol: 'NVDA', price: 142.5, change_percent: 3.15, currency: 'USD', as_of: T1 },
+      AVGO: { symbol: 'AVGO', price: 185.2, change_percent: -0.85, currency: 'USD', as_of: T1 },
     };
 
     const view = renderAt(['/market']);
@@ -645,16 +650,24 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
     // Private company stays unlisted even if quotes exist
     expect(oaiRow.textContent).not.toContain('$142.50');
 
-    // 2. /metrics returns AND useQuotes ticks to a newer price -> /metrics timestamp wins to avoid flicker
+    // 2. /metrics arrives with daily_close fallback (e.g. snapshot timed out) -> UI MUST keep live quote ($142.50 / +3.15%) while adopting RSI (64.2)!
     mocks.metricsOverride = {
-      data: mocks.watchlistMetrics,
+      data: {
+        ...mocks.watchlistMetrics,
+        items: {
+          ...mocks.watchlistMetrics.items,
+          NVDA: {
+            ...mocks.watchlistMetrics.items.NVDA,
+            price: 138.4,
+            price_source: 'daily_close',
+            price_ts: T2,
+            chg_1d: 2.45,
+          },
+        },
+      },
       isLoading: false,
       isError: false,
       isSuccess: true,
-    };
-    mocks.liveQuotes = {
-      NVDA: { symbol: 'NVDA', price: 149.99, change_percent: 6.5, currency: 'USD' },
-      AVGO: { symbol: 'AVGO', price: 185.2, change_percent: -0.85, currency: 'USD' },
     };
 
     view.rerender(
@@ -669,12 +682,40 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
       </QueryClientProvider>,
     );
 
-    const nvdaAfter = await screen.findByTestId('watchlist-row-NVDA');
-    // Uses /metrics snapshot price ($138.40) and 1D% (+2.45%) + indicator (64.2), NOT the newer quote ($149.99)
-    expect(nvdaAfter.textContent).toContain('$138.40');
-    expect(nvdaAfter.textContent).toContain('+2.45%');
-    expect(nvdaAfter.textContent).toContain('64.2');
-    expect(nvdaAfter.textContent).not.toContain('$149.99');
+    const nvdaAfterDaily = await screen.findByTestId('watchlist-row-NVDA');
+    expect(nvdaAfterDaily.textContent).toContain('$142.50');
+    expect(nvdaAfterDaily.textContent).toContain('+3.15%');
+    expect(nvdaAfterDaily.textContent).toContain('64.2');
+    expect(nvdaAfterDaily.textContent).not.toContain('$138.40');
+
+    // 3. /metrics returns snapshot at equal timestamp T1 -> /metrics wins; later live WS tick at T2 -> newer live quote wins!
+    mocks.metricsOverride = {
+      data: mocks.watchlistMetrics,
+      isLoading: false,
+      isError: false,
+      isSuccess: true,
+    };
+    mocks.liveQuotes = {
+      NVDA: { symbol: 'NVDA', price: 149.99, change_percent: 6.5, currency: 'USD', live_tick_at: T2 },
+      AVGO: { symbol: 'AVGO', price: 185.2, change_percent: -0.85, currency: 'USD', as_of: T1 },
+    };
+
+    view.rerender(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MemoryRouter initialEntries={['/market']}>
+          <LocationProbe />
+          <Routes>
+            <Route path="/market" element={<MarketView />} />
+            <Route path="/chat/*" element={<div data-testid="chat-route" />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const nvdaAfterLiveTick = await screen.findByTestId('watchlist-row-NVDA');
+    expect(nvdaAfterLiveTick.textContent).toContain('$149.99');
+    expect(nvdaAfterLiveTick.textContent).toContain('+6.50%');
+    expect(nvdaAfterLiveTick.textContent).toContain('64.2');
     // AVGO has no /metrics row yet -> continues displaying useQuotes price
     expect(screen.getByTestId('watchlist-row-AVGO').textContent).toContain('$185.20');
   });

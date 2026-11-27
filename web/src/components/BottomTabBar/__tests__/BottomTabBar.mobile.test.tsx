@@ -1,23 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { renderWithProviders } from '@/test/utils';
-import { NAV_ITEMS, type NavItem } from '../../nav/navItems';
-import type { useNavItems as useNavItemsFn } from '../../nav/useNavItems';
+import { createTestQueryClient, renderWithProviders } from '@/test/utils';
+import { queryKeys } from '@/lib/queryKeys';
+import type { CapabilitiesApiResponse } from '@/hooks/useCapabilities';
 import BottomTabBar from '../BottomTabBar';
 
 const openPalette = vi.fn<(...args: unknown[]) => void>();
 const preloadPalette = vi.fn<() => void>();
-let navItemsOverride: NavItem[] | null = null;
-
-vi.mock('../../nav/useNavItems', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../nav/useNavItems')>();
-  const mockUseNavItems = vi.fn<typeof useNavItemsFn>(() => navItemsOverride ?? actual.useNavItems());
-  return {
-    ...actual,
-    useNavItems: mockUseNavItems,
-  };
-});
 
 vi.mock('@/components/CommandPalette/CommandPaletteProvider', () => ({
   useCommandPalette: () => ({
@@ -26,18 +16,21 @@ vi.mock('@/components/CommandPalette/CommandPaletteProvider', () => ({
   }),
 }));
 
-vi.mock('@/hooks/useFeatures', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/hooks/useFeatures')>();
-  return {
-    ...actual,
-    useFeatures: () => ({
-      data: [
-        { key: 'org_library', enabled: true },
-        { key: 'drive', enabled: false },
-      ],
-    }),
+function makeClient(options: { marketEnabled?: boolean; profile?: 'core' | 'everflow' } = {}) {
+  const { marketEnabled = true, profile = 'everflow' } = options;
+  const client = createTestQueryClient();
+  client.setQueryData(queryKeys.features.list(), [
+    { key: 'org_library', enabled: true },
+    { key: 'drive', enabled: false },
+  ]);
+  const capsPayload: CapabilitiesApiResponse = {
+    profile,
+    capabilities: profile === 'everflow' ? ['company_wiki', 'data_jobs'] : ['company_wiki'],
+    market_enabled: marketEnabled,
   };
-});
+  client.setQueryData(queryKeys.dalton.capabilities(), capsPayload);
+  return client;
+}
 
 function getPrimaryLabels(container: HTMLElement): string[] {
   const pill = container.querySelector('.bottom-tab-bar-pill') as HTMLElement;
@@ -49,14 +42,16 @@ function getPrimaryLabels(container: HTMLElement): string[] {
 
 describe('BottomTabBar mobile overflow menu', () => {
   afterEach(() => {
-    navItemsOverride = null;
     vi.unstubAllEnvs();
+    openPalette.mockClear();
+    preloadPalette.mockClear();
   });
 
   it('caps direct bottom-bar buttons to <= 5, uses Radix DropdownMenu with keyboard navigation, and opens Search', async () => {
     const user = userEvent.setup();
     const { container } = renderWithProviders(<BottomTabBar />, {
       route: '/chat',
+      queryClient: makeClient({ marketEnabled: true }),
     });
 
     const pill = container.querySelector('.bottom-tab-bar-pill') as HTMLElement;
@@ -101,6 +96,7 @@ describe('BottomTabBar mobile overflow menu', () => {
   it('highlights the More tab and sets aria-current="page" when the active route belongs to an overflow item', () => {
     renderWithProviders(<BottomTabBar />, {
       route: '/plugins',
+      queryClient: makeClient({ marketEnabled: true }),
     });
 
     const moreBtn = screen.getByTestId('bottom-tab-more');
@@ -108,13 +104,14 @@ describe('BottomTabBar mobile overflow menu', () => {
     expect(moreBtn).toHaveAttribute('aria-current', 'page');
   });
 
-  it('places Market in the primary bar instead of Automations and moves Automations to More in standard mode', async () => {
+  it('uses real useNavItems + useCapabilities chain for standard mode: [Dashboard, Chat, Market, Monitors] and Automations in More', async () => {
     const user = userEvent.setup();
     const { container } = renderWithProviders(<BottomTabBar />, {
       route: '/automations',
+      queryClient: makeClient({ marketEnabled: true }),
     });
 
-    // Standard mode (dashboard + market): [Dashboard, Chat Agent, Market View, Monitors]
+    // Standard mode (dashboard + market capability): [Dashboard, Chat Agent, Market View, Monitors]
     expect(getPrimaryLabels(container)).toEqual([
       'Dashboard',
       'Chat Agent',
@@ -122,7 +119,7 @@ describe('BottomTabBar mobile overflow menu', () => {
       'Monitors',
     ]);
 
-    // Automations is now in More, so active route /automations highlights the More trigger
+    // Automations is in More, so active route /automations highlights the More trigger
     const moreBtn = screen.getByTestId('bottom-tab-more');
     expect(moreBtn).toHaveClass('active');
     expect(moreBtn).toHaveAttribute('aria-current', 'page');
@@ -131,13 +128,12 @@ describe('BottomTabBar mobile overflow menu', () => {
     expect(await screen.findByRole('menuitem', { name: 'Automations' })).toBeInTheDocument();
   });
 
-  it('uses [Chat, Market, Monitors, Settings] in Dalton mode when market capability is available', async () => {
+  it('uses real useNavItems + useCapabilities chain for Dalton mode (VITE_DALTON_MODE=1): [Chat, Market, Monitors, Settings] when market capability is enabled', async () => {
     const user = userEvent.setup();
-    navItemsOverride = NAV_ITEMS.filter(
-      (item) => item.key !== '/dashboard' && item.key !== '/drive' && item.key !== '/library',
-    );
+    vi.stubEnv('VITE_DALTON_MODE', '1');
     const { container } = renderWithProviders(<BottomTabBar />, {
       route: '/chat',
+      queryClient: makeClient({ marketEnabled: true }),
     });
 
     expect(getPrimaryLabels(container)).toEqual([
@@ -151,13 +147,11 @@ describe('BottomTabBar mobile overflow menu', () => {
     expect(await screen.findByRole('menuitem', { name: 'Automations' })).toBeInTheDocument();
   });
 
-  it('falls back to Automations in the primary bar (keeping 4 primary tabs) when market capability is unavailable', () => {
-    // Case 1: dashboard present, requires: 'market' unsatisfied
-    navItemsOverride = NAV_ITEMS.filter(
-      (item) => item.requires !== 'market' && item.requires !== 'drive' && item.requires !== 'org_library',
-    );
+  it('falls back to Automations in both modes (keeping 4 primary tabs) when useCapabilities reports market capability unavailable', () => {
+    // Case 1: Standard mode (dashboard present) + market_enabled: false
     const { container: withDashboardContainer, unmount } = renderWithProviders(<BottomTabBar />, {
       route: '/chat',
+      queryClient: makeClient({ marketEnabled: false }),
     });
     expect(getPrimaryLabels(withDashboardContainer)).toEqual([
       'Dashboard',
@@ -165,13 +159,14 @@ describe('BottomTabBar mobile overflow menu', () => {
       'Automations',
       'Monitors',
     ]);
+    expect(screen.queryByRole('button', { name: 'Market View' })).not.toBeInTheDocument();
     unmount();
 
-    // Case 2: VITE_DALTON_MODE=1 (neither dashboard nor market available)
-    navItemsOverride = null;
+    // Case 2: Dalton mode (VITE_DALTON_MODE=1, no dashboard) + market_enabled: false
     vi.stubEnv('VITE_DALTON_MODE', '1');
     const { container: daltonModeContainer } = renderWithProviders(<BottomTabBar />, {
       route: '/chat',
+      queryClient: makeClient({ marketEnabled: false }),
     });
     expect(getPrimaryLabels(daltonModeContainer)).toEqual([
       'Chat Agent',
@@ -179,5 +174,6 @@ describe('BottomTabBar mobile overflow menu', () => {
       'Monitors',
       'Settings',
     ]);
+    expect(screen.queryByRole('button', { name: 'Market View' })).not.toBeInTheDocument();
   });
 });

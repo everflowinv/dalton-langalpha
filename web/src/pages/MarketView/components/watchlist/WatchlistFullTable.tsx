@@ -21,7 +21,7 @@ import {
 
 export type WatchlistSortField = 'ticker' | WatchlistColumnKey;
 
-interface WatchlistFullTableProps {
+export interface WatchlistFullTableProps {
   companies: readonly PersonalWatchlistCompany[];
   metrics: Record<string, WatchlistMetricRow>;
   metricsLoading: boolean;

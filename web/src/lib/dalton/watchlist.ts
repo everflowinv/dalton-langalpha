@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { api } from '@/api/client';
 import { queryKeys } from '@/lib/queryKeys';
 import { isDaltonBuild } from '@/config/brand';
@@ -72,11 +72,16 @@ export interface PersonalWatchlistSummary {
   pending_reconcile_count?: number;
 }
 
+export type WatchlistPriceSource = 'snapshot' | 'daily_close';
+
 export interface WatchlistMetricRow {
   ticker: string;
   is_private: boolean;
   status: 'ok' | 'warming' | 'unlisted' | 'unavailable';
+  snapshot_pending?: boolean;
   price: number | null;
+  price_source?: WatchlistPriceSource | null;
+  price_ts?: number | string | null;
   currency: string | null;
   chg_1d: number | null;
   chg_1w: number | null;
@@ -111,6 +116,7 @@ export interface WatchlistMetricsResponse {
   ok: boolean;
   items: Record<string, WatchlistMetricRow>;
   pending_symbols: string[];
+  snapshot_pending_symbols?: string[];
   summary?: WatchlistMetricsSummary;
   as_of: string;
 }
@@ -363,38 +369,160 @@ function recomputeSummaryFromItems(
   };
 }
 
-/** Merge a pending-only subset poll response into the full cached metrics response. */
+/** Parse a Unix sec/ms or ISO timestamp into Unix epoch milliseconds. */
+export function parsePriceTimestampMs(ts: unknown): number | null {
+  if (ts == null || typeof ts === 'boolean') return null;
+  if (typeof ts === 'number') {
+    if (!Number.isFinite(ts) || ts <= 0) return null;
+    return ts < 1e11 ? Math.round(ts * 1000) : Math.round(ts);
+  }
+  if (typeof ts === 'string') {
+    const trimmed = ts.trim();
+    if (!trimmed) return null;
+    if (/^\d+(\.\d+)?$/.test(trimmed)) {
+      const num = Number(trimmed);
+      if (!Number.isFinite(num) || num <= 0) return null;
+      return num < 1e11 ? Math.round(num * 1000) : Math.round(num);
+    }
+    const parsed = Date.parse(trimmed);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  }
+  return null;
+}
+
+function extractQuoteTimestampMs(quote: QuoteRow): number | null {
+  const record = quote as Record<string, unknown>;
+  const candidates = [
+    parsePriceTimestampMs(quote.live_tick_at),
+    parsePriceTimestampMs(quote.as_of),
+    parsePriceTimestampMs(quote.freshness?.actual_latest),
+    parsePriceTimestampMs(record.timestamp),
+    parsePriceTimestampMs(record.updated_at),
+  ].filter((v): v is number => v != null);
+  return candidates.length > 0 ? Math.max(...candidates) : null;
+}
+
+function mergeMetricRow(
+  prevRow: WatchlistMetricRow | undefined,
+  nextRow: WatchlistMetricRow,
+): WatchlistMetricRow {
+  if (!prevRow || nextRow.is_private) return nextRow;
+
+  let price = prevRow.price;
+  let chg1d = prevRow.chg_1d;
+  let priceSource = prevRow.price_source ?? null;
+  let priceTs = prevRow.price_ts ?? null;
+
+  if (nextRow.price == null) {
+    chg1d = nextRow.chg_1d ?? prevRow.chg_1d;
+  } else if (prevRow.price == null) {
+    price = nextRow.price;
+    chg1d = nextRow.chg_1d ?? prevRow.chg_1d;
+    priceSource = nextRow.price_source ?? null;
+    priceTs = nextRow.price_ts ?? null;
+  } else {
+    const prevIsSnapshot = prevRow.price_source === 'snapshot';
+    const nextIsDailyClose = nextRow.price_source === 'daily_close';
+    const prevIsDailyClose = prevRow.price_source === 'daily_close';
+    const nextIsSnapshot = nextRow.price_source === 'snapshot';
+
+    let takeNext = true;
+    if (prevIsSnapshot && nextIsDailyClose) {
+      takeNext = false;
+    } else if (prevIsDailyClose && nextIsSnapshot) {
+      takeNext = true;
+    } else {
+      const prevTs = parsePriceTimestampMs(prevRow.price_ts);
+      const nextTs = parsePriceTimestampMs(nextRow.price_ts);
+      if (prevTs != null && nextTs != null) {
+        takeNext = nextTs >= prevTs;
+      } else if (prevTs != null && nextTs == null) {
+        takeNext = false;
+      } else {
+        takeNext = true;
+      }
+    }
+
+    if (takeNext) {
+      price = nextRow.price;
+      chg1d = nextRow.chg_1d ?? prevRow.chg_1d;
+      priceSource = nextRow.price_source ?? prevRow.price_source ?? null;
+      priceTs = nextRow.price_ts ?? prevRow.price_ts ?? null;
+    }
+  }
+
+  return {
+    ...prevRow,
+    ...nextRow,
+    status: price != null ? 'ok' : nextRow.status,
+    price,
+    price_source: priceSource,
+    price_ts: priceTs,
+    currency: nextRow.currency ?? prevRow.currency,
+    chg_1d: chg1d,
+    chg_1w: nextRow.chg_1w ?? prevRow.chg_1w,
+    chg_1m: nextRow.chg_1m ?? prevRow.chg_1m,
+    chg_3m: nextRow.chg_3m ?? prevRow.chg_3m,
+    chg_ytd: nextRow.chg_ytd ?? prevRow.chg_ytd,
+    chg_1y: nextRow.chg_1y ?? prevRow.chg_1y,
+    high_52w: nextRow.high_52w ?? prevRow.high_52w,
+    low_52w: nextRow.low_52w ?? prevRow.low_52w,
+    position_52w: nextRow.position_52w ?? prevRow.position_52w,
+    rsi_14d: nextRow.rsi_14d ?? prevRow.rsi_14d,
+    rsi_30d: nextRow.rsi_30d ?? prevRow.rsi_30d,
+    vol_ratio_5_20: nextRow.vol_ratio_5_20 ?? prevRow.vol_ratio_5_20,
+    market_cap: nextRow.market_cap ?? prevRow.market_cap,
+    market_cap_currency: nextRow.market_cap_currency ?? prevRow.market_cap_currency,
+    next_earnings: nextRow.next_earnings ?? prevRow.next_earnings,
+  };
+}
+
+function mergePendingList(
+  prevList: readonly string[] | undefined,
+  nextList: readonly string[] | undefined,
+  polledSet: ReadonlySet<string>,
+): string[] {
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  for (const sym of prevList ?? []) {
+    const up = sym.toUpperCase();
+    if (!polledSet.has(up) && !seen.has(up)) {
+      seen.add(up);
+      merged.push(sym);
+    }
+  }
+  for (const sym of nextList ?? []) {
+    const up = sym.toUpperCase();
+    if (!seen.has(up)) {
+      seen.add(up);
+      merged.push(sym);
+    }
+  }
+  return merged;
+}
+
+/** Merge a pending-only subset poll response into the full cached metrics response without clobbering existing values with nulls. */
 export function mergeWatchlistMetricsResponse(
   prev: WatchlistMetricsResponse,
   subset: WatchlistMetricsResponse,
   polledSymbols: readonly string[],
 ): WatchlistMetricsResponse {
-  const mergedItems: Record<string, WatchlistMetricRow> = {
-    ...prev.items,
-    ...subset.items,
-  };
+  const mergedItems: Record<string, WatchlistMetricRow> = { ...prev.items };
+  for (const [sym, row] of Object.entries(subset.items ?? {})) {
+    mergedItems[sym] = mergeMetricRow(prev.items[sym], row);
+  }
   const polledSet = new Set(polledSymbols.map((s) => s.toUpperCase()));
-  const nextPending: string[] = [];
-  const seen = new Set<string>();
-  for (const sym of prev.pending_symbols ?? []) {
-    const up = sym.toUpperCase();
-    if (!polledSet.has(up) && !seen.has(up)) {
-      seen.add(up);
-      nextPending.push(sym);
-    }
-  }
-  for (const sym of subset.pending_symbols ?? []) {
-    const up = sym.toUpperCase();
-    if (!seen.has(up)) {
-      seen.add(up);
-      nextPending.push(sym);
-    }
-  }
+  const nextPending = mergePendingList(prev.pending_symbols, subset.pending_symbols, polledSet);
+  const nextSnapshotPending =
+    prev.snapshot_pending_symbols || subset.snapshot_pending_symbols
+      ? mergePendingList(prev.snapshot_pending_symbols, subset.snapshot_pending_symbols, polledSet)
+      : undefined;
   return {
     ...prev,
     ok: prev.ok && subset.ok,
     items: mergedItems,
     pending_symbols: nextPending,
+    ...(nextSnapshotPending !== undefined ? { snapshot_pending_symbols: nextSnapshotPending } : {}),
     summary: recomputeSummaryFromItems(prev.summary ?? subset.summary, mergedItems),
     as_of: subset.as_of || prev.as_of,
   };
@@ -404,11 +532,11 @@ export function mergeWatchlistMetricsResponse(
  * Merge live per-symbol quotes from the shared `useQuotes` cache with `/metrics` rows.
  *
  * - Real-time quote columns (`price`, `chg_1d`, `currency`) hydrate immediately from
- *   `useQuotes` (already warm when navigating from the Dashboard watchlist widget) before
- *   `/api/v1/dalton/watchlist/metrics` finishes computing daily-bar indicators & market cap.
- * - Once `/metrics` has a timestamped price for a symbol (`metric.price != null`),
- *   `/metrics` stays authoritative for `price` and `chg_1d` so every column on the row
- *   reflects the same `/metrics` snapshot timestamp without flickering between polls.
+ *   `useQuotes` before `/api/v1/dalton/watchlist/metrics` resolves.
+ * - When both exist: compare trade timestamps (`price_ts` vs quote `live_tick_at`/`as_of`)
+ *   and pick the newer price & 1D change; ties favor `/metrics`.
+ * - A `/metrics` row backed only by `price_source: 'daily_close'` NEVER overwrites a live
+ *   `useQuotes` price.
  * - Private/unlisted companies never inherit quote prices.
  */
 export function mergeQuotesIntoWatchlistMetrics(
@@ -445,6 +573,7 @@ export function mergeQuotesIntoWatchlistMetrics(
       quoteChg1d = roundQuote2(((quotePrice - prevClose) / prevClose) * 100);
     }
     const quoteCurrencyCode = quote.currency ?? null;
+    const quoteTs = extractQuoteTimestampMs(quote);
 
     if (!metric) {
       if (quotePrice == null && quoteChg1d == null && quoteCurrencyCode == null) continue;
@@ -453,6 +582,8 @@ export function mergeQuotesIntoWatchlistMetrics(
         is_private: false,
         status: quotePrice != null ? 'ok' : 'warming',
         price: quotePrice,
+        price_source: quotePrice != null ? 'snapshot' : null,
+        price_ts: quoteTs,
         currency: quoteCurrencyCode,
         chg_1d: quoteChg1d,
         chg_1w: null,
@@ -473,30 +604,73 @@ export function mergeQuotesIntoWatchlistMetrics(
       continue;
     }
 
-    // Both `/metrics` and `useQuotes` exist: prefer `/metrics` timestamped quote values.
-    if (metric.price != null) {
-      if (metric.currency == null && quoteCurrencyCode != null) {
+    if (metric.price == null) {
+      if (quotePrice != null || quoteChg1d != null || quoteCurrencyCode != null) {
         out[ticker] = {
           ...metric,
-          currency: quoteCurrencyCode,
+          status: quotePrice != null ? 'ok' : metric.status,
+          price: quotePrice ?? metric.price,
+          price_source: quotePrice != null ? 'snapshot' : (metric.price_source ?? null),
+          price_ts: quotePrice != null ? (quoteTs ?? metric.price_ts ?? null) : (metric.price_ts ?? null),
+          currency: metric.currency ?? quoteCurrencyCode,
+          chg_1d: quoteChg1d ?? metric.chg_1d,
           market_cap_currency: metric.market_cap_currency ?? quoteCurrencyCode,
         };
       }
       continue;
     }
 
-    if (quotePrice != null || quoteChg1d != null || quoteCurrencyCode != null) {
+    // Both `/metrics` and `useQuotes` have prices:
+    // 1. `daily_close` fallback from `/metrics` NEVER overwrites a live `useQuotes` price.
+    // 2. Otherwise compare trade timestamps; strictly newer quote wins, ties favor `/metrics`.
+    const metricTs = parsePriceTimestampMs(metric.price_ts);
+    const metricIsDailyClose = metric.price_source === 'daily_close';
+    const quoteWins =
+      quotePrice != null &&
+      (metricIsDailyClose ||
+        (quoteTs != null && (metricTs == null || quoteTs > metricTs)));
+
+    if (quoteWins) {
       out[ticker] = {
         ...metric,
-        status: quotePrice != null ? 'ok' : metric.status,
-        price: quotePrice ?? metric.price,
+        status: 'ok',
+        price: quotePrice,
+        price_source: 'snapshot',
+        price_ts: quoteTs ?? metric.price_ts ?? null,
+        chg_1d: quoteChg1d ?? metric.chg_1d,
         currency: metric.currency ?? quoteCurrencyCode,
-        chg_1d: metric.chg_1d ?? quoteChg1d,
+        market_cap_currency: metric.market_cap_currency ?? quoteCurrencyCode,
+      };
+    } else if (metric.currency == null && quoteCurrencyCode != null) {
+      out[ticker] = {
+        ...metric,
+        currency: quoteCurrencyCode,
         market_cap_currency: metric.market_cap_currency ?? quoteCurrencyCode,
       };
     }
   }
   return out;
+}
+
+interface MetricsRequestOrderState {
+  nextGen: number;
+  appliedGen: number;
+}
+
+const metricsOrderByClient = new WeakMap<QueryClient, Map<string, MetricsRequestOrderState>>();
+
+function getMetricsOrderState(queryClient: QueryClient, normalizedKey: string): MetricsRequestOrderState {
+  let byKey = metricsOrderByClient.get(queryClient);
+  if (!byKey) {
+    byKey = new Map();
+    metricsOrderByClient.set(queryClient, byKey);
+  }
+  let state = byKey.get(normalizedKey);
+  if (!state) {
+    state = { nextGen: 0, appliedGen: 0 };
+    byKey.set(normalizedKey, state);
+  }
+  return state;
 }
 
 export function usePersonalWatchlistMetrics(
@@ -506,10 +680,33 @@ export function usePersonalWatchlistMetrics(
   const queryClient = useQueryClient();
   const normalizedKey = symbols.length > 0 ? symbols.slice().sort().join(',') : 'all';
   const isEnabled = enabled && isDaltonBuild && symbols.length > 0;
+  const queryKey = queryKeys.dalton.watchlistMetrics(normalizedKey);
 
   const query = useQuery({
-    queryKey: queryKeys.dalton.watchlistMetrics(normalizedKey),
-    queryFn: () => fetchPersonalWatchlistMetrics(symbols.length > 0 ? symbols : undefined),
+    queryKey,
+    queryFn: async () => {
+      const state = getMetricsOrderState(queryClient, normalizedKey);
+      const gen = ++state.nextGen;
+      const data = await fetchPersonalWatchlistMetrics(symbols.length > 0 ? symbols : undefined);
+      if (gen < state.appliedGen) {
+        const current = queryClient.getQueryData<WatchlistMetricsResponse>(queryKey);
+        if (current) return current;
+      }
+      state.appliedGen = gen;
+      const prev = queryClient.getQueryData<WatchlistMetricsResponse>(queryKey);
+      if (prev) {
+        const mergedItems: Record<string, WatchlistMetricRow> = {};
+        for (const [sym, row] of Object.entries(data.items ?? {})) {
+          mergedItems[sym] = mergeMetricRow(prev.items[sym], row);
+        }
+        return {
+          ...data,
+          items: mergedItems,
+          summary: recomputeSummaryFromItems(data.summary ?? prev.summary, mergedItems),
+        };
+      }
+      return data;
+    },
     enabled: isEnabled,
     staleTime: 30_000,
     refetchInterval: 60_000,
@@ -535,13 +732,27 @@ export function usePersonalWatchlistMetrics(
           return;
         }
         const batch = currentPending;
+        const state = getMetricsOrderState(queryClient, normalizedKey);
+        const gen = ++state.nextGen;
         try {
           const subset = await fetchPersonalWatchlistMetrics(batch);
           if (cancelled) return;
-          queryClient.setQueryData<WatchlistMetricsResponse>(key, (prev) =>
-            prev ? mergeWatchlistMetricsResponse(prev, subset, batch) : subset,
-          );
-          currentPending = subset.pending_symbols ?? [];
+          if (gen < state.appliedGen) {
+            const latest = queryClient.getQueryData<WatchlistMetricsResponse>(key);
+            currentPending = latest?.pending_symbols ?? [];
+            if (currentPending.length > 0 && currentPending.join(',') === pendingKey) {
+              scheduleNext();
+            }
+            return;
+          }
+          state.appliedGen = gen;
+          let mergedPending: string[] = subset.pending_symbols ?? [];
+          queryClient.setQueryData<WatchlistMetricsResponse>(key, (prev) => {
+            const merged = prev ? mergeWatchlistMetricsResponse(prev, subset, batch) : subset;
+            mergedPending = merged.pending_symbols ?? [];
+            return merged;
+          });
+          currentPending = mergedPending;
           if (currentPending.length > 0 && currentPending.join(',') === pendingKey) {
             scheduleNext();
           }
