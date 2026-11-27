@@ -7,6 +7,14 @@ import WorkspaceImage from '../WorkspaceImage';
 import { WorkspaceProvider } from '../../contexts/WorkspaceContext';
 import { CapturedImagesContext } from '../../contexts/CapturedImagesContext';
 import type { ComputerFolders } from '../../utils/agentPaths';
+// DALTON-HOOK(share-redaction): test published-doc versioned image boundary vs /s/ controlled media redaction
+import { SharedRedactionProvider } from '@/components/dalton/RedactedSharePlaceholders';
+import {
+  beginScopedImageRead,
+  buildSharedImageScope,
+  commitScopedImageUrl,
+  revokeSharedImageScope,
+} from '@/lib/dalton/sharedImageCache';
 
 // WorkspaceImage's only utils/api dependency is the authenticated downloader.
 const downloadWorkspaceFile = vi.fn((..._args: unknown[]) => Promise.resolve('blob:authed'));
@@ -357,5 +365,148 @@ describe('WorkspaceImage shows the copy its reply was captured with', () => {
     );
 
     await waitFor(() => expect(downloadWorkspaceFile).toHaveBeenCalledWith('ws-other', 'charts/a.png'));
+  });
+});
+
+// DALTON-HOOK(share-redaction): published doc (/m/, /a/) images always follow versioned authorization while /s/ keeps AU1 controlled media & redaction
+describe('WorkspaceImage — published doc versioned authorization vs /s/ controlled media', () => {
+  const originalCreateObjectUrl = URL.createObjectURL;
+  const originalRevokeObjectUrl = URL.revokeObjectURL;
+
+  beforeEach(() => {
+    downloadWorkspaceFile.mockClear();
+    URL.createObjectURL = vi.fn<typeof URL.createObjectURL>(() => 'blob:controlled-public');
+    URL.revokeObjectURL = vi.fn<typeof URL.revokeObjectURL>();
+  });
+
+  afterEach(() => {
+    revokeSharedImageScope('tok-stale');
+    revokeSharedImageScope('tok-s1');
+    revokeSharedImageScope('tok-s2');
+    vi.unstubAllGlobals();
+    URL.createObjectURL = originalCreateObjectUrl;
+    URL.revokeObjectURL = originalRevokeObjectUrl;
+  });
+
+  it('routes controlled-media URLs through resolveImagePath and versioned downloader in published document views without viewer credentials or sharedImageCache reuse', async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => {
+      throw new Error('direct controlled-media fetch must not run in published document views');
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    // Seed AU1 sharedImageCache with a pre-downgrade blob for a public controlled media route.
+    const staleScope = buildSharedImageScope('tok-stale', true);
+    const { epoch } = beginScopedImageRead(staleScope);
+    commitScopedImageUrl(staleScope, '/api/v1/public/shared/tok-stale/media/m-1', epoch, 'blob:stale-before-downgrade');
+
+    const resolveV1 = vi.fn<(p: string) => string | null>((p) =>
+      p.startsWith('http') ? null : `doc/${p.replace(/^\/+/, '')}`,
+    );
+    const downloadV1 = vi.fn<(p: string) => Promise<string>>(async () => 'blob:doc-v1-owner');
+    const downloadV2 = vi.fn<(p: string) => Promise<string>>(async () => 'blob:doc-v2-owner');
+
+    // 1. Owner controlled media path in published doc -> versioned downloader, versioned cache key, zero direct fetch
+    const ownerView = render(
+      <WorkspaceProvider
+        workspaceId={null}
+        downloadFile={downloadV1}
+        imageScope="share:pubdoc:v1"
+        resolveImagePath={resolveV1}
+      >
+        <WorkspaceImage src="/api/v1/threads/t-1/media/m-1" alt="owner-media" />
+      </WorkspaceProvider>,
+    );
+    await waitFor(() => expect(screen.getByAltText('owner-media')).toHaveAttribute('src', 'blob:doc-v1-owner'));
+    expect(resolveV1).toHaveBeenCalledWith('/api/v1/threads/t-1/media/m-1');
+    expect(downloadV1).toHaveBeenCalledWith('/api/v1/threads/t-1/media/m-1');
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Switching version changes cache key (scope + resolved path) and fetches from v2
+    ownerView.rerender(
+      <WorkspaceProvider
+        workspaceId={null}
+        downloadFile={downloadV2}
+        imageScope="share:pubdoc:v2"
+        resolveImagePath={resolveV1}
+      >
+        <WorkspaceImage src="/api/v1/threads/t-1/media/m-1" alt="owner-media" />
+      </WorkspaceProvider>,
+    );
+    await waitFor(() => expect(screen.getByAltText('owner-media')).toHaveAttribute('src', 'blob:doc-v2-owner'));
+    expect(downloadV2).toHaveBeenCalledWith('/api/v1/threads/t-1/media/m-1');
+    ownerView.unmount();
+
+    // 2. Public controlled media path in published doc -> ignores sharedImageCache and uses versioned downloader
+    const pubDownload = vi.fn<(p: string) => Promise<string>>(async () => 'blob:doc-v2-public');
+    const pubView = render(
+      <WorkspaceProvider
+        workspaceId={null}
+        downloadFile={pubDownload}
+        imageScope="monitor:mon-1:v2"
+        resolveImagePath={resolveV1}
+      >
+        <WorkspaceImage src="/api/v1/public/shared/tok-stale/media/m-1" alt="pub-media" />
+      </WorkspaceProvider>,
+    );
+    await waitFor(() => expect(screen.getByAltText('pub-media')).toHaveAttribute('src', 'blob:doc-v2-public'));
+    expect(screen.getByAltText('pub-media')).not.toHaveAttribute('src', 'blob:stale-before-downgrade');
+    expect(pubDownload).toHaveBeenCalledWith('/api/v1/public/shared/tok-stale/media/m-1');
+    expect(fetchSpy).not.toHaveBeenCalled();
+    pubView.unmount();
+
+    // 3. Absolute controlled media URL in published doc -> never falls through to raw <img src="https://...">
+    const rejectDownload = vi.fn<(p: string) => Promise<string>>(async () => {
+      throw new Error('Image path outside shared scope');
+    });
+    render(
+      <WorkspaceProvider
+        workspaceId={null}
+        downloadFile={rejectDownload}
+        imageScope="monitor:mon-1:v2"
+        resolveImagePath={resolveV1}
+      >
+        <WorkspaceImage src="https://app.example.com/api/v1/threads/t-1/media/m-abs" alt="abs-owner-media" />
+      </WorkspaceProvider>,
+    );
+    await waitFor(() => expect(screen.getByText('m-abs could not be loaded')).toBeInTheDocument());
+    expect(screen.queryByRole('img')).toBeNull();
+    expect(rejectDownload).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('keeps AU1 controlled media and redaction intact in /s/ shared chat views without resolveImagePath', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => ({
+      ok: true,
+      status: 200,
+      blob: async () => new Blob(['png-bytes'], { type: 'image/png' }),
+    } as Response));
+    vi.stubGlobal('fetch', fetchMock);
+
+    // Text-only /s/ share (allowFiles=false): renders static redacted placeholder with zero network requests
+    const redactedView = render(
+      <WorkspaceProvider workspaceId={null} downloadFile={null} imageScope="share:tok-s1:text">
+        <SharedRedactionProvider allowFiles={false} shareToken="tok-s1" imageScope="share:tok-s1:text">
+          <WorkspaceImage src="/api/v1/public/shared/tok-s1/media/m-1" alt="Secret Chart" />
+        </SharedRedactionProvider>
+      </WorkspaceProvider>,
+    );
+    expect(screen.getByText('Secret Chart')).toBeInTheDocument();
+    expect(screen.queryByRole('img')).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+    redactedView.unmount();
+
+    // Files-enabled /s/ share (allowFiles=true): fetches AU1 public controlled media with credentials: 'omit'
+    render(
+      <WorkspaceProvider workspaceId={null} downloadFile={null} imageScope="share:tok-s2:files">
+        <SharedRedactionProvider allowFiles={true} shareToken="tok-s2" imageScope="share:tok-s2:files">
+          <WorkspaceImage src="/api/v1/public/shared/tok-s2/media/m-2" alt="Allowed Chart" />
+        </SharedRedactionProvider>
+      </WorkspaceProvider>,
+    );
+    const img = await screen.findByAltText('Allowed Chart');
+    await waitFor(() => expect(img).toHaveAttribute('src', 'blob:controlled-public'));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/public/shared/tok-s2/media/m-2');
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ credentials: 'omit', cache: 'no-store' });
   });
 });

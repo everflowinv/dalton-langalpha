@@ -11,6 +11,7 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from src.dalton import share_redaction
 from src.dalton.app import dalton_router, public_og
 from src.dalton.settings import get_brand_name
 from src.server.app import share_access
@@ -248,6 +249,128 @@ class TestPublicOgMetaEndpoint:
         assert "非管理员历史分享标题" not in resp.text
         assert "LegacyWS" not in resp.text
         mock_allows_files.assert_awaited_once()
+
+    def test_public_text_only_share_displays_au1_safe_title_from_visible_query(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        thread = {
+            "conversation_thread_id": "t-safe-1",
+            "title": "内部机密原始标题",
+            "workspace_name": "SecretProject",
+            "owner_id": "owner-1",
+            "share_permissions": {"allow_files": False},
+        }
+        mock_resolve_link = create_autospec(public_og._resolve_link, return_value=None)
+        mock_get_thread = create_autospec(get_thread_by_share_token, return_value=thread)
+        mock_serves_public = create_autospec(serves_public_links, return_value=True)
+        mock_eff_perms = create_autospec(
+            share_redaction.resolve_effective_share_permissions,
+            wraps=share_redaction.resolve_effective_share_permissions,
+        )
+        mock_meta_fields = create_autospec(
+            share_redaction.resolve_public_metadata_fields,
+            return_value={
+                "title": "分析英伟达 Q3 数据中心营收增速",
+                "workspace_name": "SecretProject",
+                "root_dir": None,
+                "previous_root_dirs": [],
+                "dir_name": None,
+            },
+        )
+        mock_brand = create_autospec(get_brand_name, return_value="Everflow")
+
+        monkeypatch.setattr(public_og, "_resolve_link", mock_resolve_link)
+        monkeypatch.setattr(public_og, "get_thread_by_share_token", mock_get_thread)
+        monkeypatch.setattr(public_og, "serves_public_links", mock_serves_public)
+        monkeypatch.setattr(
+            share_redaction, "resolve_effective_share_permissions", mock_eff_perms
+        )
+        monkeypatch.setattr(
+            share_redaction, "resolve_public_metadata_fields", mock_meta_fields
+        )
+        monkeypatch.setattr(public_og, "get_brand_name", mock_brand)
+
+        client = _make_client()
+        resp = client.get("/api/v1/public/og-meta", params={"path": "/s/textOnlySafe1"})
+
+        assert resp.status_code == 200
+        assert resp.headers["cache-control"] == "no-store"
+        metas = _extract_meta(resp.text)
+        assert metas["og:title"] == ["分析英伟达 Q3 数据中心营收增速"]
+        assert metas["og:site_name"] == ["Everflow"]
+        assert "内部机密原始标题" not in resp.text
+        assert "SecretProject" not in resp.text
+        mock_eff_perms.assert_awaited_once_with(thread)
+        mock_meta_fields.assert_awaited_once_with(thread, allow_files=False)
+
+    def test_disabled_files_share_never_leaks_original_title_and_falls_back_when_au1_has_no_safe_title(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        thread_denied = {
+            "conversation_thread_id": "t-denied-1",
+            "title": "关闭文件权限的原始线程标题",
+            "workspace_name": "PrivateResearchWS",
+            "owner_id": "owner-non-admin",
+            "share_permissions": {"allow_files": True},
+        }
+        mock_resolve_link = create_autospec(public_og._resolve_link, return_value=None)
+        mock_get_thread = create_autospec(
+            get_thread_by_share_token, return_value=thread_denied
+        )
+        mock_serves_public = create_autospec(serves_public_links, return_value=True)
+        mock_allows_files = create_autospec(shared_thread_allows_files, return_value=False)
+        mock_eff_perms = create_autospec(
+            share_redaction.resolve_effective_share_permissions,
+            wraps=share_redaction.resolve_effective_share_permissions,
+        )
+        mock_meta_fields = create_autospec(
+            share_redaction.resolve_public_metadata_fields,
+            return_value={
+                "title": "对比两家半导体公司毛利率变化",
+                "workspace_name": "PrivateResearchWS",
+                "root_dir": None,
+                "previous_root_dirs": [],
+                "dir_name": None,
+            },
+        )
+        mock_brand = create_autospec(get_brand_name, return_value="Everflow")
+
+        monkeypatch.setattr(public_og, "_resolve_link", mock_resolve_link)
+        monkeypatch.setattr(public_og, "get_thread_by_share_token", mock_get_thread)
+        monkeypatch.setattr(public_og, "serves_public_links", mock_serves_public)
+        monkeypatch.setattr(share_access, "shared_thread_allows_files", mock_allows_files)
+        monkeypatch.setattr(
+            share_redaction, "resolve_effective_share_permissions", mock_eff_perms
+        )
+        monkeypatch.setattr(
+            share_redaction, "resolve_public_metadata_fields", mock_meta_fields
+        )
+        monkeypatch.setattr(public_og, "get_brand_name", mock_brand)
+
+        client = _make_client()
+        resp_safe = client.get("/api/v1/public/og-meta", params={"path": "/s/deniedFiles1"})
+        assert resp_safe.status_code == 200
+        assert _extract_meta(resp_safe.text)["og:title"] == ["对比两家半导体公司毛利率变化"]
+        assert "关闭文件权限的原始线程标题" not in resp_safe.text
+        assert "PrivateResearchWS" not in resp_safe.text
+        mock_meta_fields.assert_awaited_with(thread_denied, allow_files=False)
+
+        # When AU1 cannot derive a query-based title (returns DEFAULT_SHARED_TITLE), fall back to brand name.
+        mock_meta_fields.return_value = {
+            "title": share_redaction.DEFAULT_SHARED_TITLE,
+            "workspace_name": "PrivateResearchWS",
+            "root_dir": None,
+            "previous_root_dirs": [],
+            "dir_name": None,
+        }
+        resp_fallback = client.get(
+            "/api/v1/public/og-meta", params={"path": "/s/deniedFiles1"}
+        )
+        assert resp_fallback.status_code == 200
+        assert _extract_meta(resp_fallback.text)["og:title"] == ["Everflow"]
+        assert "关闭文件权限的原始线程标题" not in resp_fallback.text
+        assert "PrivateResearchWS" not in resp_fallback.text
+        assert share_redaction.DEFAULT_SHARED_TITLE not in resp_fallback.text
 
     def test_public_file_share_uses_published_version_title_or_filename_stem(
         self, monkeypatch: pytest.MonkeyPatch

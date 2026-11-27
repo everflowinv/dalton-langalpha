@@ -9,7 +9,7 @@ import { normalizeFilePath, parseFolderHref, parseWsPath } from '../utils/filePa
 import ImageLightbox from './ImageLightbox';
 import { useCapturedImageUrl } from '../contexts/CapturedImagesContext';
 // DALTON-HOOK(share-redaction): controlled media fetcher, redacted placeholder, and epoch-guarded share image cache
-import { RedactedImage, useControlledMediaSrc, useSharedRedaction } from '@/components/dalton/RedactedSharePlaceholders';
+import { classifyControlledMediaUrl, RedactedImage, useControlledMediaSrc, useSharedRedaction } from '@/components/dalton/RedactedSharePlaceholders';
 import { beginScopedImageRead, finishScopedImageRead, onSharedImageScopeRevoked, parseSharedImageScopeFromKey, shouldCommitScopedImageRead } from '@/lib/dalton/sharedImageCache';
 
 // key:path → blob URL of the copy last read. A path is not a version: the agent
@@ -111,11 +111,12 @@ function WorkspaceImage({ src: written, alt, ...props }: WorkspaceImageProps) {
   const contextWorkspaceId = useWorkspaceId();
   const downloadFileFn = useWorkspaceDownloadFile();
   const imageScope = useWorkspaceImageScope();
-  // DALTON-HOOK(share-redaction): resolve controlled media routes via credentialed blob fetch and block images in text-only shares
-  const shareRedaction = useSharedRedaction();
-  const controlled = useControlledMediaSrc(src);
-  const redacted = (shareRedaction.active && !shareRedaction.allowFiles) || controlled.redacted;
   const resolveImagePath = useWorkspaceResolveImagePath(); // DALTON-HOOK(monitors)
+  // DALTON-HOOK(share-redaction): resolve controlled media routes via credentialed blob fetch and block images in text-only shares; published docs stay under versioned image authorization
+  const shareRedaction = useSharedRedaction();
+  const controlled = useControlledMediaSrc(resolveImagePath ? undefined : src);
+  const redacted = (shareRedaction.active && !shareRedaction.allowFiles) || controlled.redacted;
+  const versionedControlledSrc = Boolean(resolveImagePath && classifyControlledMediaUrl(src));
 
   // Support __wsref__/{workspaceId}/path for cross-workspace file references,
   // and another workspace's folder (`../NVDA/chart.png`), which names its
@@ -137,7 +138,7 @@ function WorkspaceImage({ src: written, alt, ...props }: WorkspaceImageProps) {
   // endpoint and get a 401.
   const effectiveDownloadFn = (wsRef || other) && contextWorkspaceId ? null : downloadFileFn;
 
-  const canFetch = !redacted && !controlled.isControlled && !!(src && !elsewhere && !isExternalUrl(src) && (workspaceId || effectiveDownloadFn));
+  const canFetch = !redacted && !controlled.isControlled && !!(src && !elsewhere && (!isExternalUrl(src) || versionedControlledSrc) && (workspaceId || effectiveDownloadFn));
   // The one reading of the destination, the same one a file link gets, so
   // `/home/workspace/charts/x.png` fetches `charts/x.png`, and `../<own
   // folder>/x.png` fetches `x.png`, rather than a path no workspace holds. The

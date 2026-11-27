@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 
+from src.dalton import share_redaction
 from src.dalton.settings import get_brand_name
 from src.server.database import artifacts as artifacts_db
 from src.server.database.conversation import get_thread_by_share_token
@@ -86,23 +87,29 @@ def _filename_stem(path: str | None) -> str | None:
     return _clean_title(stem or name)
 
 
-def _resolve_thread_title(
+async def _resolve_thread_title(
     thread: Mapping[str, Any], *, allow_files: bool
 ) -> str | None:
-    """Resolve the public OG title for a shared thread.
+    """Resolve the public OG title for a shared thread via AU1 metadata rules.
 
     - When ``allow_files`` is True, returns the visible thread title (falling
       back to ``workspace_name`` when empty), matching public metadata and
       ``SharePage``.
-    - When ``allow_files`` is False, suppresses the title (brand fallback) so
-      unredacted thread titles or workspace names are never leaked.
+    - When ``allow_files`` is False, delegates to AU1's
+      ``resolve_public_metadata_fields`` for the safe title derived from the
+      first visible ordinary query; falls back to ``None`` (brand name) when
+      no query-derived safe title is available, never exposing the original
+      thread title or ``workspace_name``.
     """
-    if not allow_files:
-        # AU1 合并后改为调用 src.dalton.share_redaction.resolve_public_metadata_fields
-        return None
-    return _clean_title(thread.get("title")) or _clean_title(
-        thread.get("workspace_name")
+    fields = await share_redaction.resolve_public_metadata_fields(
+        thread, allow_files=allow_files
     )
+    title = _clean_title(fields.get("title"))
+    if allow_files:
+        return title or _clean_title(fields.get("workspace_name"))
+    if not title or title == share_redaction.DEFAULT_SHARED_TITLE:
+        return None
+    return title
 
 
 async def _resolve_file_title(access: LinkAccess) -> str | None:
@@ -137,7 +144,7 @@ async def _resolve_link(token: str, *, user_id: str | None = None) -> LinkAccess
 
 async def _resolve_public_thread_title(share_token: str) -> str | None:
     """Resolve the public OG title for a shared thread token, or None if unavailable."""
-    from src.server.app.share_access import get_permissions, shared_thread_allows_files
+    from src.server.app.share_access import get_permissions
 
     thread = await get_thread_by_share_token(share_token)
     if not thread:
@@ -147,10 +154,8 @@ async def _resolve_public_thread_title(share_token: str) -> str | None:
         return None
     if not await serves_public_links(thread.get("owner_id")):
         return None
-    allow_files = bool(perms.get("allow_files", False)) and await shared_thread_allows_files(
-        thread
-    )
-    return _resolve_thread_title(thread, allow_files=allow_files)
+    eff = await share_redaction.resolve_effective_share_permissions(thread)
+    return await _resolve_thread_title(thread, allow_files=eff.allow_files)
 
 
 async def resolve_og_title_for_path(raw_path: str | None) -> str | None:
