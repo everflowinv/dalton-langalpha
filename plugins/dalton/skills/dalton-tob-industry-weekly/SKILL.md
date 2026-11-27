@@ -231,7 +231,7 @@ python3 .agents/skills/dalton-tob-industry-weekly/scripts/tob_industry_weekly.py
   --file temp/tob-industry-weekly/<friday>.md --profile report
 ```
 
-`vague_phrase`、`missing_section`、`feishu_latex_risk`、`caliber_label`、`card_too_long` 清零才提交。`number_without_period` 是提醒。卡片上限 10000 字。不用 Markdown 表格，正文不出现 `$`。数字、股票代码与期间格式见 `.agents/skills/dalton-conventions/references/writing.md` §5。
+`vague_phrase`、`missing_section`、`feishu_latex_risk`、`caliber_label`、`card_too_long` 清零才提交。`number_without_period` 是提醒。卡片上限 10000 字。不用 Markdown 表格，正文不出现 `$`。数字、股票代码与期间格式见 dalton-conventions 技能的 `references/writing.md` §5。
 
 三组口径必须标清：指引和实际分开；营收、ARR、cRPO 不混用；beat/miss 写明对比的是市场共识还是公司指引。卖方修正那行要出现「盈利预测」或「目标价」。公司改指引时写明「指引」并给新旧区间。
 

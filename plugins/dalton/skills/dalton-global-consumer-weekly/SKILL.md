@@ -159,7 +159,7 @@ python3 .agents/skills/dalton-global-consumer-weekly/scripts/global_consumer_wee
 
 补扫采集之后的增量：`jp-disclosures --days 1`。不传 `--as-of`，截止日期是香港时间当天，不折成周五。美股 8-K。命中的用 `add-note` 入库。行情命令仍传周五。
 
-卡片八节按 `templates/card.md`，顺序固定，最后一节是待验证，不设细分指数节。全文按 `templates/full-report.md`。专家、成本和观察写不出时分别写「本周无相关新增访谈」「本周大宗成本无显著变动」「本期无降级事项」。正文不出现 `$`，不用 Markdown 表格。数字、股票代码与期间格式见 `.agents/skills/dalton-conventions/references/writing.md` §5。
+卡片八节按 `templates/card.md`，顺序固定，最后一节是待验证，不设细分指数节。全文按 `templates/full-report.md`。专家、成本和观察写不出时分别写「本周无相关新增访谈」「本周大宗成本无显著变动」「本期无降级事项」。正文不出现 `$`，不用 Markdown 表格。数字、股票代码与期间格式见 dalton-conventions 技能的 `references/writing.md` §5。
 
 ```bash
 python3 .agents/skills/dalton-global-consumer-weekly/scripts/global_consumer_weekly.py \
