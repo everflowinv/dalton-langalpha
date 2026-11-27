@@ -14,6 +14,8 @@
     <array>
         <string>/bin/bash</string>
         <string>__REPO__/scripts/dalton/ops/prod/backup.sh</string>
+        <string>--tag</string>
+        <string>auto</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__REPO__</string>

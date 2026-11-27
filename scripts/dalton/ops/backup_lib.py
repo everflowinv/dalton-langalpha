@@ -1008,16 +1008,29 @@ class PreflightDiskReport:
         }
 
 
+def _nearest_existing_path(path: Path) -> Path:
+    """Return ``path`` if it exists, otherwise walk upward to the nearest existing ancestor."""
+    cur = path
+    while not cur.exists():
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
+    return cur
+
+
 def verify_external_mount(
     mount_root: Path,
     target_path: Path,
     *,
     is_mount_fn: Callable[[Path], bool] = os.path.ismount,
+    stat_fn: Callable[[Path], Any] = os.stat,
 ) -> None:
-    """Ensure ``mount_root`` is a mounted volume and ``target_path`` lives inside it.
+    """Ensure ``mount_root`` is a mounted volume and ``target_path`` lives on the same filesystem device.
 
-    Refuses to run if ``mount_root`` is missing or merely an unmounted folder on ``/``,
-    preventing weekly backups from spilling onto the internal disk.
+    Checks both canonical path containment and actual filesystem device ID (``st_dev``) of
+    ``target_path`` (or its nearest existing ancestor), preventing nested mounts or internal
+    symlinks from spilling onto the internal disk.
     """
     if not mount_root.exists() or not mount_root.is_dir():
         raise MountCheckError(f"External mount root does not exist: {mount_root}")
@@ -1036,6 +1049,20 @@ def verify_external_mount(
             f"Backup target {resolved_target} is outside external mount {resolved_mount}"
         ) from exc
 
+    existing_target = _nearest_existing_path(resolved_target)
+    try:
+        mount_dev = stat_fn(resolved_mount).st_dev
+        target_dev = stat_fn(existing_target).st_dev
+    except OSError as exc:
+        raise MountCheckError(
+            f"Cannot inspect device ID for {existing_target} against {resolved_mount}: {exc}"
+        ) from exc
+    if target_dev != mount_dev:
+        raise MountCheckError(
+            f"Target {resolved_target} (nearest existing {existing_target}, st_dev={target_dev}) "
+            f"is on a different device than external mount {resolved_mount} (st_dev={mount_dev})"
+        )
+
 
 def verify_backup_mount_layout(
     mount_root: Path,
@@ -1043,16 +1070,76 @@ def verify_backup_mount_layout(
     *,
     subdirs: Sequence[str] = STANDARD_BACKUP_SUBDIRS,
     is_mount_fn: Callable[[Path], bool] = os.path.ismount,
+    stat_fn: Callable[[Path], Any] = os.stat,
 ) -> list[Path]:
     """Verify ``backups_root`` and all standard backup subdirs reside on ``mount_root`` (§2.1 step 1)."""
     checked: list[Path] = []
-    verify_external_mount(mount_root, backups_root, is_mount_fn=is_mount_fn)
+    verify_external_mount(mount_root, backups_root, is_mount_fn=is_mount_fn, stat_fn=stat_fn)
     checked.append(backups_root)
     for sub in subdirs:
         target = backups_root / sub
-        verify_external_mount(mount_root, target, is_mount_fn=is_mount_fn)
+        verify_external_mount(mount_root, target, is_mount_fn=is_mount_fn, stat_fn=stat_fn)
         checked.append(target)
     return checked
+
+
+_COLIMA_DISK_NAMES = frozenset({"diffdisk", "basedisk", "datadisk"})
+_COLIMA_DISK_SUFFIXES = (".img", ".qcow2", ".raw")
+
+
+def _discover_colima_disk_paths(
+    colima_dir: Path,
+    *,
+    profile: str = "default",
+) -> list[Path]:
+    """Return paths to inspect for the active Colima profile's virtual disk(s) and Lima dir."""
+    prof = (profile or "default").strip() or "default"
+    instance_name = "colima" if prof == "default" else f"colima-{prof}"
+    lima_root = colima_dir / "_lima"
+    instance_dir = lima_root / instance_name
+    candidates: list[Path] = []
+
+    if lima_root.exists() or lima_root.is_symlink():
+        candidates.append(lima_root)
+    if instance_dir.exists() or instance_dir.is_symlink():
+        candidates.append(instance_dir)
+        for name in sorted(_COLIMA_DISK_NAMES):
+            p = instance_dir / name
+            if p.exists() or p.is_symlink():
+                candidates.append(p)
+        try:
+            for child in sorted(instance_dir.iterdir()):
+                if child.name.lower().endswith(_COLIMA_DISK_SUFFIXES) and child not in candidates:
+                    candidates.append(child)
+        except OSError:
+            pass
+
+    disks_root = lima_root / "_disks"
+    if disks_root.is_dir():
+        for disk_dir in sorted(disks_root.iterdir()):
+            if disk_dir.is_dir() or disk_dir.is_symlink():
+                candidates.append(disk_dir)
+                for name in sorted(_COLIMA_DISK_NAMES):
+                    dp = disk_dir / name
+                    if dp.exists() or dp.is_symlink():
+                        candidates.append(dp)
+
+    profile_dir = colima_dir / prof
+    if profile_dir.exists() or profile_dir.is_symlink():
+        candidates.append(profile_dir)
+        for child_name in ("disk", "diffdisk", "datadisk"):
+            cp = profile_dir / child_name
+            if cp.exists() or cp.is_symlink():
+                candidates.append(cp)
+
+    # Deduplicate preserving order
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for p in candidates:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
 
 
 def parse_df_available_bytes(df_stdout: str) -> int | None:
@@ -1097,27 +1184,35 @@ def preflight_disk_space(
     external_mount_root: Path = Path("/Volumes/EveSSD"),
     internal_root: Path = Path("/"),
     colima_dir: Path | None = None,
+    colima_profile: str | None = None,
     min_external_gb: int = PREFLIGHT_EXT_SSD_MIN_GB,
     min_internal_gb: int = PREFLIGHT_INTERNAL_ROOT_MIN_GB,
     min_colima_docker_gb: int = PREFLIGHT_COLIMA_DOCKER_MIN_GB,
     is_mount_fn: Callable[[Path], bool] = os.path.ismount,
     disk_usage_fn: Callable[[Path], Any] = shutil.disk_usage,
     realpath_fn: Callable[[str], str] = os.path.realpath,
+    stat_fn: Callable[[Path], Any] = os.stat,
     colima_docker_free_bytes_fn: Callable[[], int | None] | None = None,
 ) -> PreflightDiskReport:
     """Run §2.1 Step 0 preflight gates before any write/migration starts.
 
     Gates:
-    1. ``realpath ~/.colima`` must reside on the mounted external volume (never on internal ``/``).
+    1. ``realpath ~/.colima`` AND the active Colima profile's virtual disk file(s) must reside
+       on the mounted external volume with matching device ID (``st_dev``).
     2. External volume free space >= ``min_external_gb`` (default 150 GB).
     3. Host internal root ``/`` free space >= ``min_internal_gb`` (default 10 GB).
     4. Colima ``/var/lib/docker`` free space >= ``min_colima_docker_gb`` (default 55 GB).
     """
     colima_target = colima_dir if colima_dir is not None else (Path.home() / ".colima")
+    active_profile = (
+        colima_profile
+        if colima_profile is not None
+        else (os.getenv("COLIMA_PROFILE") or "default")
+    )
     resolved_colima = Path(realpath_fn(str(colima_target)))
     checks: list[PreflightDiskCheckItem] = []
 
-    # Gate 0: Colima virtual disk must be on the external mount (not internal '/')
+    # Gate 0: Colima root AND active profile virtual disk file(s) must be on the external mount's st_dev
     if not colima_target.exists() and not colima_target.is_symlink():
         checks.append(
             PreflightDiskCheckItem(
@@ -1135,12 +1230,28 @@ def preflight_disk_space(
                 external_mount_root,
                 resolved_colima,
                 is_mount_fn=is_mount_fn,
+                stat_fn=stat_fn,
             )
+            disk_paths = _discover_colima_disk_paths(resolved_colima, profile=active_profile)
+            verified_disks: list[str] = []
+            for dp in disk_paths:
+                resolved_dp = Path(realpath_fn(str(dp)))
+                verify_external_mount(
+                    external_mount_root,
+                    resolved_dp,
+                    is_mount_fn=is_mount_fn,
+                    stat_fn=stat_fn,
+                )
+                verified_disks.append(str(resolved_dp))
+            disk_note = f"; checked {len(verified_disks)} disk/lima path(s)" if verified_disks else ""
             checks.append(
                 PreflightDiskCheckItem(
                     name="colima_location",
                     ok=True,
-                    detail=f"{colima_target} -> {resolved_colima} is on external volume {external_mount_root}",
+                    detail=(
+                        f"{colima_target} -> {resolved_colima} is on external volume "
+                        f"{external_mount_root}{disk_note}"
+                    ),
                 )
             )
         except MountCheckError as exc:
@@ -1151,7 +1262,7 @@ def preflight_disk_space(
                     detail=(
                         f"Colima virtual disk ({colima_target} -> {resolved_colima}) is not on "
                         f"external volume {external_mount_root} (likely on internal disk '/'): {exc}. "
-                        "Move ~/.colima to the external SSD before proceeding."
+                        "Move ~/.colima and its active disk files to the external SSD before proceeding."
                     ),
                 )
             )
@@ -1159,7 +1270,12 @@ def preflight_disk_space(
     # Gate 1: External SSD >= 150 GB
     req_ext = int(min_external_gb) * _BYTES_PER_GB
     try:
-        verify_external_mount(external_mount_root, external_mount_root, is_mount_fn=is_mount_fn)
+        verify_external_mount(
+            external_mount_root,
+            external_mount_root,
+            is_mount_fn=is_mount_fn,
+            stat_fn=stat_fn,
+        )
         ext_free = int(disk_usage_fn(external_mount_root).free)
         ok_ext = ext_free >= req_ext
         checks.append(
@@ -1864,6 +1980,10 @@ def _cmd_reconcile_restored_inflight_states(args: argparse.Namespace) -> int:
     sub_argv = ["reconcile-restored-inflight-states"]
     if args.skip_object_check:
         sub_argv.append("--skip-object-check")
+    if args.asr_jobs_dir:
+        sub_argv.extend(["--asr-jobs-dir", args.asr_jobs_dir])
+    if args.restored_before:
+        sub_argv.extend(["--restored-before", args.restored_before])
     return consistent_backup.main(sub_argv)
 
 
@@ -2124,6 +2244,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p_rri = sub.add_parser("reconcile-restored-inflight-states")
     p_rri.add_argument("--skip-object-check", action="store_true")
+    p_rri.add_argument("--asr-jobs-dir", default="")
+    p_rri.add_argument("--restored-before", default="")
     p_rri.set_defaults(func=_cmd_reconcile_restored_inflight_states)
 
     p_pg = sub.add_parser("latest-pg-dump")

@@ -15,6 +15,7 @@ import os
 import plistlib
 import shutil
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 from typing import Any
@@ -260,6 +261,9 @@ class _FakeAsyncConn:
 
     def transaction(self) -> _FakeAsyncTx:
         return _FakeAsyncTx(self)
+
+    async def close(self) -> None:
+        return None
 
 
 def _sha(data: bytes) -> str:
@@ -1163,11 +1167,14 @@ def test_local_backup_set_publish_and_tiered_pool_pruning(tmp_path: Path) -> Non
     backups_root = tmp_path / "backups"
     pool_dir = backups_root / "minio-mirror" / "objects"
 
+    pool_sizes: dict[str, int] = {}
+
     def _seed_pool(data: bytes) -> str:
         sha = _sha(data)
         p = pool_dir / sha[:2] / sha
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(data)
+        pool_sizes[sha] = len(data)
         return sha
 
     sha_shared = _seed_pool(b"shared-across-sets")
@@ -1191,7 +1198,7 @@ def test_local_backup_set_publish_and_tiered_pool_pruning(tmp_path: Path) -> Non
                 bucket="dalton-main",
                 key=f"blobs/u1/{s}",
                 version_id="v1",
-                size=10,
+                size=pool_sizes[s],
                 archived_sha256=s,
             )
             for s in shas
@@ -1436,6 +1443,7 @@ def test_prod_db_offsite_backup_set_mode_subprocess_e2e(tmp_path: Path) -> None:
                 "version": 1,
                 "backup_set_id": "20261127-030000",
                 "tag": "daily",
+                "created_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
                 "dump_path": str(dump_path),
                 "manifest_path": str(manifest_path),
                 "asr_archive_path": str(asr_tar),
@@ -1505,3 +1513,1097 @@ def test_prod_db_offsite_backup_set_mode_subprocess_e2e(tmp_path: Path) -> None:
         fname = latest_data["artifacts"][art_key]["filename"]
         assert (today_dir / fname).is_file()
     assert list(today_dir.glob("*.staged-*")) == []
+
+
+# ---------------------------------------------------------------------------
+# 6. Round 2 review regression tests (covering every High & Medium finding)
+# ---------------------------------------------------------------------------
+
+
+def test_default_cli_reconcile_uses_compute_stored_object_digest_ready_branch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Codex #1 / Lead #4: default CLI calls compute_stored_object_digest (not missing sha256_object)."""
+    from src.dalton import chat_upload_storage
+    from src.server.database import pool as db_pool
+
+    payload = b"assembled-multipart-chat-upload-payload"
+    digest = _sha(payload)
+    promoted: list[str] = []
+
+    def _db_handler(sql: str, params: Any) -> Any:
+        s = " ".join(sql.split())
+        if s.startswith("SELECT to_regclass"):
+            return (params[0],)
+        if "SELECT upload_id, object_key, size_bytes" in s:
+            return [("up-ready-1", "private-media/chat-uploads/ws1/up-ready-1/a.bin", len(payload), digest, None)]
+        if "SELECT upload_id FROM dalton_chat_file_uploads" in s and "FOR UPDATE" in s:
+            return [(params[0],)]
+        if "UPDATE dalton_chat_file_uploads SET state = 'ready'" in s:
+            promoted.append(params[1])
+            return 1
+        return 0
+
+    conn = _FakeAsyncConn(_db_handler)
+
+    async def _fake_open() -> Any:
+        return conn
+
+    class _FakeBody:
+        def __init__(self, data: bytes) -> None:
+            self._stream = io.BytesIO(data)
+
+        def read(self, n: int = -1) -> bytes:
+            return self._stream.read(n)
+
+        def close(self) -> None:
+            self._stream.close()
+
+    class _FakeClient:
+        def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
+            assert Bucket == "dalton-asr"
+            assert Key == "private-media/chat-uploads/ws1/up-ready-1/a.bin"
+            return {"Body": _FakeBody(payload)}
+
+    monkeypatch.setattr(
+        db_pool,
+        "open_session_connection",
+        create_autospec(db_pool.open_session_connection, side_effect=_fake_open),
+    )
+    monkeypatch.setattr(
+        chat_upload_storage,
+        "is_chat_upload_storage_configured",
+        create_autospec(chat_upload_storage.is_chat_upload_storage_configured, return_value=True),
+    )
+    monkeypatch.setattr(
+        chat_upload_storage,
+        "_get_client",
+        create_autospec(chat_upload_storage._get_client, return_value=_FakeClient()),
+    )
+    monkeypatch.setattr(
+        chat_upload_storage,
+        "_bucket_name",
+        create_autospec(chat_upload_storage._bucket_name, return_value="dalton-asr"),
+    )
+    monkeypatch.setattr(
+        chat_upload_storage,
+        "resolve_full_key",
+        create_autospec(chat_upload_storage.resolve_full_key, side_effect=lambda k: k),
+    )
+
+    rc = consistent_backup.main(["reconcile-restored-inflight-states"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["chat_uploads_promoted_ready"] == 1
+    assert promoted == ["up-ready-1"]
+
+
+def test_hold_lock_timeout_and_early_snapshot_commit_terminates_pg_dump(tmp_path: Path) -> None:
+    """Codex #2 + Grok #1 / Lead #1: early snapshot commit, hard deadline kills pg_dump & releases locks."""
+    events: list[str] = []
+
+    def _empty_db(sql: str, params: Any) -> Any:
+        s = " ".join(sql.split())
+        if s.startswith("SELECT pg_export_snapshot"):
+            return ("00000009-00000010-1",)
+        if s.startswith("SELECT pg_advisory_lock"):
+            events.append("lock")
+            return (True, True)
+        if s.startswith("SELECT pg_advisory_unlock"):
+            events.append("unlock")
+            return (True, True)
+        if s == "COMMIT":
+            events.append("commit")
+            return None
+        if s == "ROLLBACK":
+            events.append("rollback")
+            return None
+        if s.startswith("SELECT to_regclass"):
+            return (None,)
+        return []
+
+    # Case 1: pg_dump emits initial bytes then pauses briefly -> COMMIT fires BEFORE pg_dump exits,
+    # and GC advisory locks are released BEFORE versioned mirror download runs!
+    s3 = _FakeS3Client(versioning_by_bucket={"dalton-main": True})
+    s3.seed_object("dalton-main", "blobs/u1/k1", b"mirror-bytes")
+    orig_get = s3.get_object
+
+    def _tracked_get(*args: Any, **kwargs: Any) -> Any:
+        events.append("mirror_get")
+        return orig_get(*args, **kwargs)
+
+    s3.get_object = _tracked_get  # type: ignore[method-assign]
+
+    dump_out = tmp_path / "early-commit.dump"
+
+    def _slow_finish_pg_dump(snap_id: str, out_path: Path) -> consistent_backup.PgDumpProcess:
+        assert snap_id == "00000009-00000010-1"
+        cmd = [
+            sys.executable,
+            "-c",
+            "import sys, time; sys.stdout.buffer.write(b'PGDMP-hdr'); sys.stdout.buffer.flush(); "
+            "time.sleep(0.25); sys.stdout.buffer.write(b'-tail'); sys.stdout.buffer.flush()",
+        ]
+        return consistent_backup.start_pg_dump_process(cmd, out_path, cmd_label="fake_pg_dump")
+
+    conn1 = _FakeAsyncConn(_empty_db)
+    sink1 = consistent_backup.MirrorPoolSink(tmp_path / "mirror1")
+    res1 = asyncio.run(
+        consistent_backup.run_consistent_backup(
+            conn=conn1,
+            pg_dump_path=dump_out,
+            pg_dump_fn=_slow_finish_pg_dump,
+            bucket_specs=[
+                consistent_backup.BucketArchiveSpec(bucket="dalton-main", roles=("main",), s3_client=s3)
+            ],
+            object_sink=sink1,
+            snapshot_import_timeout_s=5.0,
+            pg_dump_timeout_s=5.0,
+            lock_phase_timeout_s=5.0,
+            mirror_timeout_s=5.0,
+        )
+    )
+    assert res1.reconcile_report.ok is True
+    assert dump_out.read_bytes() == b"PGDMP-hdr-tail"
+    assert events.index("lock") < events.index("commit") < events.index("unlock") < events.index("mirror_get")
+
+    # Case 2: hanging pg_dump hits snapshot_import_timeout_s -> terminates child, ROLLBACKs, unlocks!
+    events.clear()
+    spawned: list[consistent_backup.PgDumpProcess] = []
+
+    def _hanging_pg_dump(_snap_id: str, out_path: Path) -> consistent_backup.PgDumpProcess:
+        proc = consistent_backup.start_pg_dump_process(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            out_path,
+            cmd_label="hanging_pg_dump",
+        )
+        spawned.append(proc)
+        return proc
+
+    conn2 = _FakeAsyncConn(_empty_db)
+    sink2 = consistent_backup.MirrorPoolSink(tmp_path / "mirror2")
+    with pytest.raises(consistent_backup.BackupTimeoutError):
+        asyncio.run(
+            consistent_backup.run_consistent_backup(
+                conn=conn2,
+                pg_dump_path=tmp_path / "hang.dump",
+                pg_dump_fn=_hanging_pg_dump,
+                bucket_specs=[],
+                object_sink=sink2,
+                snapshot_import_timeout_s=0.2,
+                pg_dump_timeout_s=0.4,
+                lock_phase_timeout_s=0.4,
+            )
+        )
+    assert spawned and spawned[0].popen.poll() is not None
+    assert "rollback" in events
+    assert "unlock" in events
+
+
+def test_response_images_private_media_and_percent_encoded_attachments_reconcile() -> None:
+    """Codex #3 / Lead #5: real writer URLs for private-media/response-images & encoded attachments reconcile."""
+    from urllib.parse import quote
+    from src.ptc_agent.agent.middleware.image_capture import image_storage_key
+
+    env = {
+        "PUBLIC_APP_URL": "https://app.example.com",
+        "STORAGE_BUCKET_NAME": "dalton-main",
+        "STORAGE_PUBLIC_URL_BASE": "https://cdn.example.com",
+    }
+
+    # 1. Real writer key for new sandbox response images (`private-media/response-images/...`)
+    new_img_key = image_storage_key("thread-42", "a" * 64, "chart_q4.png")
+    assert new_img_key.startswith("private-media/response-images/thread-42/")
+    new_img_url = f"https://cdn.example.com/{new_img_key}"
+    legacy_img_url = "https://app.example.com/storage/response-images/thread-42/0123456789abcdef/old.png"
+    foreign_img_url = "https://evil.example.net/private-media/response-images/thread-42/0123456789abcdef/x.png"
+
+    assert storage_refs.extract_response_image_object_key(new_img_url, env=env) == new_img_key
+    assert (
+        storage_refs.extract_response_image_object_key(legacy_img_url, env=env)
+        == "response-images/thread-42/0123456789abcdef/old.png"
+    )
+    assert storage_refs.extract_response_image_object_key(foreign_img_url, env=env) is None
+
+    # 2. Real writer URL for attachments (`quote(key, safe="/")` with Chinese, spaces, `#`)
+    raw_att_key = "private-media/attachments/thread-42/batch1/id1/研报 #1 (终版).pdf"
+    encoded_att_url = f"https://cdn.example.com/{quote(raw_att_key, safe='/')}"
+    legacy_att_key = "attachments/thread-42/my doc #2.pdf"
+    legacy_att_url = f"https://app.example.com/storage/{quote(legacy_att_key, safe='/')}"
+    foreign_att_url = f"https://evil.example.net/{quote(raw_att_key, safe='/')}"
+
+    assert storage_refs.extract_attachment_object_key(encoded_att_url, env=env) == raw_att_key
+    assert storage_refs.extract_attachment_object_key(legacy_att_url, env=env) == legacy_att_key
+    assert storage_refs.extract_attachment_object_key(foreign_att_url, env=env) is None
+
+    # 3. Full reconciliation passes against the REAL unencoded S3 object keys!
+    inv = storage_refs.SnapshotRefInventory(
+        references=[
+            storage_refs.ObjectReference(
+                consumer="response_images_turns",
+                bucket_role="main",
+                object_key=storage_refs.extract_response_image_object_key(new_img_url, env=env) or "",
+                row_id="resp-1",
+                check_mode="exists_only",
+            ),
+            storage_refs.ObjectReference(
+                consumer="chat_attachment_history",
+                bucket_role="main",
+                object_key=storage_refs.extract_attachment_object_key(encoded_att_url, env=env) or "",
+                row_id="q-1",
+                check_mode="exists_only",
+            ),
+        ]
+    )
+    manifest = [
+        {"bucket": "dalton-main", "key": new_img_key, "size": 12, "archived_sha256": _sha(b"img")},
+        {"bucket": "dalton-main", "key": raw_att_key, "size": 34, "archived_sha256": _sha(b"pdf")},
+    ]
+    report = storage_refs.reconcile_inventory_against_manifest(
+        inv, manifest, bucket_targets={"main": ("dalton-main", "")}
+    )
+    assert report.ok is True
+
+
+def test_independent_ref_enumeration_fails_on_missing_bucket_and_supports_aws_creds(
+    tmp_path: Path,
+) -> None:
+    """Codex #4 / Lead #5: runtime AWS_* creds work; DB refs without matching bucket fail loudly."""
+    seen_kwargs: list[dict[str, Any]] = []
+
+    def _factory(**kw: Any) -> Any:
+        seen_kwargs.append(kw)
+        return _FakeS3Client()
+
+    specs = consistent_backup.resolve_runtime_bucket_specs(
+        env={
+            "STORAGE_PROVIDER": "s3",
+            "STORAGE_BUCKET_NAME": "prod-aws-bucket",
+            "AWS_ACCESS_KEY_ID": "AKIA_TEST",
+            "AWS_SECRET_ACCESS_KEY": "SECRET_TEST",
+            "AWS_DEFAULT_REGION": "ap-southeast-1",
+        },
+        client_factory=_factory,
+    )
+    assert len(specs) == 1
+    assert specs[0].bucket == "prod-aws-bucket"
+    assert specs[0].roles == ("main",)
+    assert seen_kwargs[0]["access_key"] == "AKIA_TEST"
+    assert seen_kwargs[0]["secret_key"] == "SECRET_TEST"
+    assert seen_kwargs[0]["region"] == "ap-southeast-1"
+
+    # DB has a main-bucket reference, but backup caller passed empty bucket_specs -> MUST raise!
+    blob_sha = _sha(b"blob-data")
+
+    def _db_with_main_ref(sql: str, params: Any) -> Any:
+        s = " ".join(sql.split())
+        if s.startswith("SELECT pg_export_snapshot"):
+            return ("00000001-00000002-1",)
+        if s.startswith("SELECT pg_advisory_lock") or s.startswith("SELECT pg_advisory_unlock"):
+            return (True, True)
+        if s.startswith("SELECT to_regclass"):
+            return ("public.workspace_file_blobs",) if params[0] == "public.workspace_file_blobs" else (None,)
+        if "FROM workspace_file_blobs" in s:
+            return [("u1", blob_sha, 9)]
+        return []
+
+    conn = _FakeAsyncConn(_db_with_main_ref)
+    sink = consistent_backup.MirrorPoolSink(tmp_path / "mirror")
+    with pytest.raises(consistent_backup.MissingBucketConfigError, match="main"):
+        asyncio.run(
+            consistent_backup.run_consistent_backup(
+                conn=conn,
+                pg_dump_path=tmp_path / "pg.dump",
+                pg_dump_fn=lambda _s, p: p.write_bytes(b"PGDMP"),
+                bucket_specs=[],
+                object_sink=sink,
+            )
+        )
+
+
+def test_mirror_pool_rejects_corrupt_same_length_file_locks_and_aborts_prune_on_bad_manifest(
+    tmp_path: Path,
+) -> None:
+    """Codex #5 + Grok #6 / Lead #2: overwrite corrupt same-length pool file, verify bytes before publish, abort prune."""
+    backups_root = tmp_path / "backups"
+    mirror_root = backups_root / "minio-mirror"
+    good_bytes = b"GOOD-BYTES-12345"
+    good_sha = _sha(good_bytes)
+    corrupt_same_len = b"BAD!-BYTES-12345"
+    assert len(corrupt_same_len) == len(good_bytes)
+
+    # 1. Pre-seed corrupt same-length file -> MirrorPoolSink MUST overwrite it with verified bytes
+    pool_file = mirror_root / "objects" / good_sha[:2] / good_sha
+    pool_file.parent.mkdir(parents=True, exist_ok=True)
+    pool_file.write_bytes(corrupt_same_len)
+
+    s3 = _FakeS3Client(versioning_by_bucket={"dalton-main": True})
+    ver_id = s3.seed_object("dalton-main", "blobs/u1/obj", good_bytes)
+    sink = consistent_backup.MirrorPoolSink(mirror_root)
+    rec = sink.archive_object(
+        s3,
+        consistent_backup.SelectedObjectVersion(
+            bucket="dalton-main", key="blobs/u1/obj", version_id=ver_id, size=len(good_bytes)
+        ),
+    )
+    assert pool_file.read_bytes() == good_bytes
+
+    # 2. Corrupt pool file AFTER mirroring -> publish_local_backup_set MUST refuse to publish!
+    pool_file.write_bytes(corrupt_same_len)
+    staged_dump = tmp_path / "staged.dump"
+    staged_dump.write_bytes(b"PGDMP-valid")
+    with pytest.raises(RuntimeError, match="corrupted"):
+        local_backup_set.publish_local_backup_set(
+            backups_root=backups_root,
+            backup_set_id="20261127-030000",
+            tag="daily",
+            snapshot_id="snap-bad",
+            staged_dump_path=staged_dump,
+            manifest_objects=[rec],
+            asr_summary=None,
+            reconcile_ok=True,
+        )
+    assert not (backups_root / "sets" / "latest-verified-set.json").exists()
+
+    # 3. Restore valid bytes -> publish 2 sets, corrupt surviving manifest -> prune MUST abort deleting ZERO files!
+    pool_file.write_bytes(good_bytes)
+    extra_bytes = b"EXTRA-OBJ"
+    extra_sha = _sha(extra_bytes)
+    extra_pool = mirror_root / "objects" / extra_sha[:2] / extra_sha
+    extra_pool.parent.mkdir(parents=True, exist_ok=True)
+    extra_pool.write_bytes(extra_bytes)
+    extra_rec = consistent_backup.ArchivedObjectRecord(
+        bucket="dalton-main", key="blobs/u1/extra", version_id="v1", size=len(extra_bytes), archived_sha256=extra_sha
+    )
+    for sid, recs in (("20261126-030000", [rec]), ("20261127-030000", [extra_rec])):
+        sd = tmp_path / f"{sid}.dump"
+        sd.write_bytes(b"PGDMP")
+        local_backup_set.publish_local_backup_set(
+            backups_root=backups_root,
+            backup_set_id=sid,
+            tag="daily",
+            snapshot_id="snap",
+            staged_dump_path=sd,
+            manifest_objects=recs,
+            asr_summary=None,
+            reconcile_ok=True,
+        )
+
+    # Corrupt surviving manifest JSON
+    surviving_manifest = backups_root / "sets" / "minio-manifest-20261127-030000.json"
+    surviving_manifest.write_text("{broken-json", encoding="utf-8")
+    with pytest.raises(local_backup_set.PoolPruneAbortedError):
+        local_backup_set.prune_local_backup_sets_and_pool(backups_root, retain_daily=1)
+    # ZERO files or pool objects deleted!
+    assert (backups_root / "sets" / "backup-set-20261126-030000.json").is_file()
+    assert pool_file.is_file()
+    assert extra_pool.is_file()
+
+
+def test_weekly_baseline_immutable_pointer_after_verify_abort_prune_and_default_versioned(
+    tmp_path: Path,
+) -> None:
+    """Codex #6 + #12 / Lead #3 & #8: weekly baseline empty-bucket exit, pointer only after remote verify, prune fail-closed."""
+    from tests.unit.dalton.test_offsite_backup import (
+        _make_mounted_python_wrapper,
+        _write_fake_rclone,
+        _write_test_env,
+    )
+
+    # 1. Empty bucket env -> weekly-minio-baseline exits non-zero (never uploads 0-object baseline)
+    res_empty = subprocess.run(
+        [
+            sys.executable,
+            str(PROD_DIR / "offsite_sync.py"),
+            "weekly-minio-baseline",
+            "--baseline-id",
+            "2026-11-27-run1",
+            "--out-tar",
+            str(tmp_path / "empty.tar.gz"),
+        ],
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_empty.returncode != 0
+    assert "No active MinIO/S3 buckets" in res_empty.stderr
+
+    # 2. Verify data_backup.sh defaults to versioned mode and loads PROD_ENV_FILE
+    data_sh_text = (PROD_DIR / "data_backup.sh").read_text(encoding="utf-8")
+    assert 'DALTON_WEEKLY_MINIO_MODE:-versioned' in data_sh_text
+    assert 'source "${PROD_ENV_FILE}"' in data_sh_text
+
+    # 3. Subprocess test: when daily LATEST.json cat fails during weekly prune, zero weekly dirs are purged!
+    home_dir = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    drive_store = tmp_path / "drive_store"
+    ext_mount = tmp_path / "ext_ssd"
+    prod_dir = tmp_path / "prod"
+    prod_var = prod_dir / "var"
+    for d in (home_dir, fake_bin, drive_store, ext_mount, prod_var):
+        d.mkdir(parents=True)
+    (prod_var / "keep.txt").write_text("ok\n", encoding="utf-8")
+    prod_env = prod_dir / ".env"
+    prod_env.write_text("REDIS_PASSWORD=pw\n", encoding="utf-8")
+
+    # Seed old weekly dir that WOULD be pruned + a daily dir with LATEST.json
+    old_week = drive_store / "DaltonBackup" / "weekly" / "2026-09-01"
+    old_week.mkdir(parents=True)
+    (old_week / "sentinel.txt").write_text("keep-me\n", encoding="utf-8")
+    for w in ("2026-10-01", "2026-10-08", "2026-10-15", "2026-10-22", "2026-10-29"):
+        (drive_store / "DaltonBackup" / "weekly" / w).mkdir(parents=True)
+    daily_dir = drive_store / "DaltonBackup" / "db" / "2026-11-26"
+    daily_dir.mkdir(parents=True)
+    (daily_dir / "LATEST.json").write_text(json.dumps({"baseline_id": "2026-09-01-run1"}), encoding="utf-8")
+
+    minio_tar = tmp_path / "m.tar.gz"
+    with tarfile.open(minio_tar, "w:gz") as tf:
+        info = tarfile.TarInfo("a.txt")
+        info.size = 2
+        tf.addfile(info, io.BytesIO(b"ok"))
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        f"""#!/usr/bin/env python3
+import pathlib, sys
+cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+if cmd in ("info", "volume", "inspect"): sys.exit(0)
+if cmd == "ps": sys.exit(0)
+if cmd == "run":
+    sys.stdout.buffer.write(pathlib.Path({str(minio_tar)!r}).read_bytes())
+    sys.exit(0)
+if cmd == "exec":
+    sys.stdin.read()
+    sys.stdout.buffer.write(b"REDIS0011ok")
+    sys.exit(0)
+sys.exit(1)
+""",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    about_file = tmp_path / "about.json"
+    about_file.write_text('{"free": 100000000}\n', encoding="utf-8")
+    _write_fake_rclone(
+        fake_bin,
+        drive_store=drive_store,
+        about_file=about_file,
+        proxy_check_file=tmp_path / "proxy.txt",
+        rcat_sizes_log=tmp_path / "sizes.jsonl",
+    )
+    key_file = home_dir / ".config" / "dalton" / "backup.key"
+    alerts_file = home_dir / "Library" / "Logs" / "alerts.log"
+    log_file = home_dir / "Library" / "Logs" / "backup.log"
+    env_file = tmp_path / "offsite.env"
+    _write_test_env(
+        env_file,
+        home_dir=home_dir,
+        repo_dir=tmp_path / "repo",
+        key_file=key_file,
+        alerts_file=alerts_file,
+        log_file=log_file,
+        prod_checkout=prod_dir,
+        prod_var=prod_var,
+        user_config=home_dir / ".config" / "dalton",
+        launchagents=home_dir / "Library" / "LaunchAgents",
+        backup_scripts=tmp_path / "bs",
+        colima=home_dir / ".colima",
+        ext_mount=ext_mount,
+    )
+    with env_file.open("a", encoding="utf-8") as fh:
+        fh.write(f'DALTON_PROD_ENV_FILE="{prod_env}"\n')
+        fh.write('DALTON_WEEKLY_MINIO_MODE="volume"\n')
+        fh.write('DALTON_DRIVE_RETAIN_WEEKS="2"\n')
+
+    mounted_py = _make_mounted_python_wrapper(tmp_path, ext_mount)
+    res = subprocess.run(
+        ["bash", str(PROD_DIR / "data_backup.sh")],
+        env={
+            "PATH": f"{fake_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+            "HOME": str(home_dir),
+            "DALTON_OFFSITE_BACKUP_ENV_FILE": str(env_file),
+            "DALTON_REPO_PYTHON": str(mounted_py),
+            "FAKE_RCLONE_FAIL_CAT": "1",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 0, res.stderr
+    assert old_week.is_dir(), "Incomplete dependency scan must abort weekly prune without deleting anything"
+
+    # 4. publish_weekly_baseline_pointer & find_latest_weekly_baseline_manifest
+    sets_dir = tmp_path / "sets"
+    staged_bl = tmp_path / "staged-bl.json"
+    staged_bl.write_text(
+        json.dumps({"version": 2, "baseline_id": "2026-11-27-run42", "objects": [{"archived_sha256": "a" * 64}]}),
+        encoding="utf-8",
+    )
+    # Before pointer publish, sets_dir has no visible baseline
+    assert offsite_sync.find_latest_weekly_baseline_manifest(sets_dir) == ("", [])
+    offsite_sync.publish_weekly_baseline_pointer(
+        staged_manifest_path=staged_bl, sets_dir=sets_dir, baseline_id="2026-11-27-run42"
+    )
+    bid, objs = offsite_sync.find_latest_weekly_baseline_manifest(sets_dir)
+    assert bid == "2026-11-27-run42"
+    assert len(objs) == 1
+    # Immutable baseline_id protects its YYYY-MM-DD weekly directory from pruning!
+    pruned = offsite_sync.select_weekly_baselines_to_prune(
+        ["2026-11-01/", "2026-11-08/", "2026-11-15/", "2026-11-22/", "2026-11-27/"],
+        retain_weeks=2,
+        referenced_baseline_ids=["2026-11-01-20261101-050000-abc123"],
+    )
+    assert "2026-11-01" not in pruned
+
+
+def test_daily_offsite_immutable_reruns_preserve_old_latest_and_reject_stale_set(
+    tmp_path: Path,
+) -> None:
+    """Codex #7 + Grok #5 / Lead #3: stale set rejected; same-day rerun never overwrites old artifacts."""
+    from tests.unit.dalton.test_offsite_backup import (
+        _make_mounted_python_wrapper,
+        _write_fake_rclone,
+        _write_test_env,
+    )
+
+    home_dir = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    drive_store = tmp_path / "drive_store"
+    ext_mount = tmp_path / "ext_ssd"
+    for d in (home_dir, fake_bin, drive_store, ext_mount):
+        d.mkdir(parents=True)
+
+    backups_root = ext_mount / "Dalton" / "backups"
+    sets_dir = backups_root / "sets"
+    pg_dir = backups_root / "pg"
+    mirror_objs = backups_root / "minio-mirror" / "objects"
+    for d in (sets_dir, pg_dir, mirror_objs):
+        d.mkdir(parents=True)
+
+    dump_path = pg_dir / "dalton-pg-20261127-030000.dump"
+    dump_path.write_bytes(b"PGDMP-immutable-rerun-test")
+    manifest_path = sets_dir / "minio-manifest-20261127-030000.json"
+    manifest_path.write_text(json.dumps({"version": 2, "objects": []}), encoding="utf-8")
+
+    # 1. Stale set (yesterday's created_at) MUST fail with BACKUP_SET_INVALID
+    yesterday = (dt.datetime.now().astimezone() - dt.timedelta(days=1)).isoformat(timespec="seconds")
+    latest_set = sets_dir / "latest-verified-set.json"
+    latest_set.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "backup_set_id": "20261126-030000",
+                "tag": "daily",
+                "created_at": yesterday,
+                "dump_path": str(dump_path),
+                "manifest_path": str(manifest_path),
+                "reconcile_ok": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    key_file = home_dir / ".config" / "dalton" / "backup.key"
+    alerts_file = home_dir / "Library" / "Logs" / "alerts.log"
+    log_file = home_dir / "Library" / "Logs" / "backup.log"
+    env_file = tmp_path / "offsite.env"
+    about_file = tmp_path / "about.json"
+    about_file.write_text('{"free": 1000000000}\n', encoding="utf-8")
+    _write_test_env(
+        env_file,
+        home_dir=home_dir,
+        repo_dir=tmp_path / "repo",
+        key_file=key_file,
+        alerts_file=alerts_file,
+        log_file=log_file,
+        prod_checkout=tmp_path / "prod",
+        prod_var=tmp_path / "prod" / "var",
+        user_config=home_dir / ".config" / "dalton",
+        launchagents=home_dir / "Library" / "LaunchAgents",
+        backup_scripts=pg_dir,
+        colima=home_dir / ".colima",
+        ext_mount=ext_mount,
+    )
+    with env_file.open("a", encoding="utf-8") as fh:
+        fh.write(f'DALTON_BACKUP_ROOT="{backups_root}"\n')
+        fh.write('DALTON_RCLONE_REMOTE="gdrive"\n')
+        fh.write('DALTON_RCLONE_DRIVE_DIR="DaltonBackup"\n')
+
+    _write_fake_rclone(
+        fake_bin,
+        drive_store=drive_store,
+        about_file=about_file,
+        proxy_check_file=tmp_path / "proxy.txt",
+        rcat_sizes_log=tmp_path / "sizes.jsonl",
+    )
+    mounted_py = _make_mounted_python_wrapper(tmp_path, ext_mount)
+    base_env = {
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+        "HOME": str(home_dir),
+        "DALTON_OFFSITE_BACKUP_ENV_FILE": str(env_file),
+        "DALTON_REPO_PYTHON": str(mounted_py),
+    }
+
+    res_stale = subprocess.run(
+        ["bash", str(PROD_DIR / "db_offsite.sh")],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_stale.returncode != 0
+    assert "BACKUP_SET_INVALID" in alerts_file.read_text(encoding="utf-8")
+
+    # 2. Fresh today set -> Run 1 succeeds and publishes LATEST.json with run1 artifacts
+    today_iso = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    latest_set.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "backup_set_id": "20261127-030000",
+                "tag": "daily",
+                "created_at": today_iso,
+                "dump_path": str(dump_path),
+                "manifest_path": str(manifest_path),
+                "reconcile_ok": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    res_run1 = subprocess.run(
+        ["bash", str(PROD_DIR / "db_offsite.sh")],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_run1.returncode == 0, res_run1.stderr
+    today_dir = drive_store / "DaltonBackup" / "db" / dt.datetime.now().strftime("%Y-%m-%d")
+    latest_run1 = json.loads((today_dir / "LATEST.json").read_text(encoding="utf-8"))
+    run1_dump_name = latest_run1["artifacts"]["dump"]["filename"]
+    run1_dump_md5 = latest_run1["artifacts"]["dump"]["md5"]
+    assert latest_run1["run_id"] in run1_dump_name
+
+    # 3. Same-day rerun fails when uploading LATEST.json -> Run 1's LATEST.json AND dump MD5 stay 100% intact!
+    res_run2_fail = subprocess.run(
+        ["bash", str(PROD_DIR / "db_offsite.sh")],
+        env={**base_env, "FAKE_RCLONE_FAIL_MATCH": "LATEST.json"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_run2_fail.returncode != 0
+    latest_after_fail = json.loads((today_dir / "LATEST.json").read_text(encoding="utf-8"))
+    assert latest_after_fail["run_id"] == latest_run1["run_id"]
+    actual_md5 = hashlib.md5((today_dir / run1_dump_name).read_bytes()).hexdigest()
+    assert actual_md5 == run1_dump_md5
+
+
+def test_asr_excludes_indeterminate_and_retried_jobs_and_converges_restored_dirs(
+    tmp_path: Path,
+) -> None:
+    """Codex #8 + Grok #7 / Lead #4: indeterminate excluded, live retried dir skipped, restored dirs converged before startup."""
+    from src.dalton.transcription_service.jobs import TERMINAL_JOB_STATUSES
+
+    assert storage_refs.TERMINAL_ASR_ARCHIVE_STATUSES == TERMINAL_JOB_STATUSES
+    assert "indeterminate" not in storage_refs.TERMINAL_ASR_ARCHIVE_STATUSES
+
+    asr_dir = tmp_path / "asr_jobs"
+    asr_dir.mkdir()
+    (asr_dir / "asr_usage.jsonl").write_text('{"job_id":"j-ok"}\n', encoding="utf-8")
+
+    # 1. Terminal succeeded job (included)
+    (asr_dir / "j-ok").mkdir()
+    (asr_dir / "j-ok" / "state.json").write_text(json.dumps({"status": "succeeded"}), encoding="utf-8")
+    (asr_dir / "j-ok" / "result.json").write_text(json.dumps({"text": "hi"}), encoding="utf-8")
+    # 2. Failed in snapshot, but retried in-place before packing (live status = transcribing -> MUST skip!)
+    (asr_dir / "j-retried").mkdir()
+    (asr_dir / "j-retried" / "state.json").write_text(json.dumps({"status": "transcribing"}), encoding="utf-8")
+    # 3. Indeterminate job (MUST skip!)
+    (asr_dir / "j-indet").mkdir()
+    (asr_dir / "j-indet" / "state.json").write_text(json.dumps({"status": "indeterminate"}), encoding="utf-8")
+
+    arch_path = tmp_path / "asr.tar.gz"
+    summary = consistent_backup.archive_terminal_asr_jobs(
+        asr_dir, ["j-ok", "j-retried", "j-indet"], arch_path
+    )
+    assert summary.included_job_ids == ("j-ok",)
+
+    # Reconcile rejects any tar containing a non-terminal/indeterminate state.json
+    bad_tar = tmp_path / "bad-asr.tar.gz"
+    with tarfile.open(bad_tar, "w:gz") as tf:
+        raw = json.dumps({"status": "indeterminate"}).encode("utf-8")
+        info = tarfile.TarInfo("j-indet/state.json")
+        info.size = len(raw)
+        tf.addfile(info, io.BytesIO(raw))
+    bad_report = storage_refs.reconcile_inventory_against_manifest(
+        storage_refs.SnapshotRefInventory(),
+        [],
+        bucket_targets={},
+        asr_jobs_archive=bad_tar,
+    )
+    assert bad_report.ok is False
+    assert any(e.code == "non_terminal_archived_asr_job" for e in bad_report.errors)
+
+    # Pre-service-start convergence marks restored dirs failed (including indeterminate) & blocks auto-resume!
+    seen_statuses_arg: list[Any] = []
+
+    def _rec_handler(sql: str, params: Any) -> Any:
+        s = " ".join(sql.split())
+        if s.startswith("SELECT to_regclass"):
+            return (params[0],)
+        if "SELECT upload_id, object_key" in s:
+            return []
+        if "UPDATE dalton_transcription_jobs SET status = 'failed'" in s:
+            seen_statuses_arg.append(params)
+            return 2
+        return 0
+
+    conn = _FakeAsyncConn(_rec_handler)
+    rec_summary = asyncio.run(
+        consistent_backup.reconcile_restored_inflight_states(
+            conn,
+            asr_jobs_dir=asr_dir,
+            restored_before=dt.datetime(2026, 11, 27, 3, 0, tzinfo=dt.timezone.utc),
+        )
+    )
+    assert rec_summary.asr_dirs_failed == 2
+    assert "indeterminate" in seen_statuses_arg[0][1]
+    assert json.loads((asr_dir / "j-indet" / "state.json").read_text(encoding="utf-8"))["status"] == "failed"
+    assert json.loads((asr_dir / "j-retried" / "state.json").read_text(encoding="utf-8"))["status"] == "failed"
+
+    mgr = AsrJobManager(jobs_dir=asr_dir, worker=FakeAsrWorker(), auto_recover=False)
+    assert mgr.recover_incomplete_jobs() == []
+
+
+def test_transcription_resubmit_stable_attempt_id_concurrent_and_lost_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex #9 / Lead #4: same original job reuses one persisted attempt row on double-submit, concurrency & dropped response."""
+    audio_bytes = b"RIFF-stable-attempt-audio"
+    audio_sha = _sha(audio_bytes)
+    old_job_id = "22222222-2222-2222-2222-222222222222"
+    source_key = f"transcriptions/ws-1/{old_job_id}/source/call.mp3"
+
+    jobs_store: dict[str, dict[str, Any]] = {
+        old_job_id: {
+            "job_id": old_job_id,
+            "created_by_user_id": "user-internal-1",
+            "workspace_id": "ws-1",
+            "thread_id": "th-1",
+            "source_object_key": source_key,
+            "source_size_bytes": len(audio_bytes),
+            "source_sha256": audio_sha,
+            "language": "zh",
+            "hotwords": [],
+            "status": "failed",
+            "stage": "failed",
+            "segment_count": 0,
+            "completed_segments": 0,
+            "provider_request_ids": [],
+            "usage": {"upload": {"completed": True}},
+            "result_object_key": None,
+            "error_category": "restored_inflight",
+            "error_message": consistent_backup.RESTORED_INFLIGHT_ERROR_MESSAGE,
+            "idempotency_key": "orig-idemp-2",
+            "version": 1,
+        }
+    }
+
+    async def _fake_get_job(jid: str, *, conn: Any = None) -> dict[str, Any] | None:
+        row = jobs_store.get(jid)
+        return dict(row) if row else None
+
+    async def _fake_create_job(**kwargs: Any) -> dict[str, Any]:
+        for existing in jobs_store.values():
+            if existing["idempotency_key"] == kwargs["idempotency_key"]:
+                return dict(existing)
+        row = {
+            "job_id": str(kwargs["job_id"]),
+            "created_by_user_id": kwargs["created_by_user_id"],
+            "workspace_id": kwargs["workspace_id"],
+            "thread_id": kwargs.get("thread_id") or "",
+            "source_object_key": kwargs["source_object_key"],
+            "source_size_bytes": int(kwargs["source_size_bytes"]),
+            "source_sha256": kwargs["source_sha256"],
+            "language": kwargs.get("language"),
+            "hotwords": list(kwargs.get("hotwords") or []),
+            "status": str(kwargs.get("status", "awaiting_upload")),
+            "stage": str(kwargs.get("stage", "awaiting_upload")),
+            "segment_count": 0,
+            "completed_segments": 0,
+            "provider_request_ids": [],
+            "usage": {},
+            "result_object_key": None,
+            "error_category": None,
+            "error_message": None,
+            "idempotency_key": kwargs["idempotency_key"],
+            "version": 1,
+        }
+        jobs_store[row["job_id"]] = row
+        return dict(row)
+
+    async def _fake_update_versioned(job_id: str, *, expected_version: int, **kwargs: Any):
+        row = jobs_store.get(job_id)
+        if row is None or int(row["version"]) != int(expected_version):
+            return False, dict(row) if row else None
+        for k in ("status", "stage", "usage", "segment_count", "completed_segments"):
+            if kwargs.get(k) is not None:
+                row[k] = kwargs[k].value if hasattr(kwargs[k], "value") else kwargs[k]
+        row["version"] = int(row["version"]) + 1
+        return True, dict(row)
+
+    mgr = AsrJobManager(jobs_dir=tmp_path / "asr_jobs", worker=FakeAsrWorker())
+    bridge_calls: list[dict[str, Any]] = []
+    drop_first = {"drop": True}
+
+    async def _flaky_bridge_submit(payload: dict[str, Any]):
+        bridge_calls.append(dict(payload))
+        code, resp = await mgr.submit_job(payload)
+        if drop_first["drop"]:
+            drop_first["drop"] = False
+            raise TimeoutError("simulated lost bridge response after accept")
+        return code, resp
+
+    monkeypatch.setattr(tr_db, "get_transcription_job", create_autospec(tr_db.get_transcription_job, side_effect=_fake_get_job))
+    monkeypatch.setattr(tr_db, "create_transcription_job", create_autospec(tr_db.create_transcription_job, side_effect=_fake_create_job))
+    monkeypatch.setattr(tr_db, "update_transcription_job_versioned", create_autospec(tr_db.update_transcription_job_versioned, side_effect=_fake_update_versioned))
+    monkeypatch.setattr(tr_svc, "require_internal_transcription_caller", create_autospec(tr_svc.require_internal_transcription_caller, side_effect=lambda u: u))
+    monkeypatch.setattr(tr_svc, "authorize_job_access", create_autospec(tr_svc.authorize_job_access, return_value=None))
+    monkeypatch.setattr(tr_svc, "is_transcription_storage_configured", create_autospec(tr_svc.is_transcription_storage_configured, return_value=True))
+    monkeypatch.setattr(tr_svc, "object_size", create_autospec(tr_svc.object_size, return_value=len(audio_bytes)))
+    monkeypatch.setattr(tr_svc, "call_bridge_submit_transcription", create_autospec(tr_svc.call_bridge_submit_transcription, side_effect=_flaky_bridge_submit))
+
+    async def _scenario() -> None:
+        # 1. First submit: bridge accepts job, then response is lost -> caller receives 502
+        with pytest.raises(Exception) as exc_info:
+            await tr_svc.resubmit_transcription_job(job_id=old_job_id, caller_user_id="user-internal-1")
+        assert getattr(exc_info.value, "status_code", None) == 502
+
+        # 2. Retry + concurrent duplicate calls on the SAME old_job_id -> ALL converge on ONE job_id!
+        r1, r2 = await asyncio.gather(
+            tr_svc.resubmit_transcription_job(job_id=old_job_id, caller_user_id="user-internal-1"),
+            tr_svc.resubmit_transcription_job(job_id=old_job_id, caller_user_id="user-internal-1"),
+        )
+        assert r1["job"]["job_id"] == r2["job"]["job_id"]
+        assert r1["job"]["idempotency_key"] == r2["job"]["idempotency_key"]
+
+        # 3. Calling /resubmit again on old_job_id returns the exact same attempt row without creating a 2nd row
+        r3 = await tr_svc.resubmit_transcription_job(job_id=old_job_id, caller_user_id="user-internal-1")
+        assert r3["job"]["job_id"] == r1["job"]["job_id"]
+        assert len(jobs_store) == 2  # only original + 1 attempt row
+        assert len({c["job_id"] for c in bridge_calls}) == 1
+        assert len({c["idempotency_key"] for c in bridge_calls}) == 1
+
+    asyncio.run(_scenario())
+
+
+def test_standalone_unified_dsn_and_backup_sh_consistent_protocol(tmp_path: Path) -> None:
+    """Codex #10 + Grok #2 / Lead #6: unified DSN for control conn + pg_dump; backup.sh calls consistent_backup."""
+    # 1. Verify scripts/standalone/backup.sh invokes consistent_backup.py compose-backup with --snapshot
+    backup_sh = (REPO_ROOT / "scripts" / "standalone" / "backup.sh").read_text(encoding="utf-8")
+    assert "scripts/standalone/consistent_backup.py compose-backup" in backup_sh
+    assert '--snapshot=${SNAPSHOT_ID}' in backup_sh
+
+    # 2. Verify standalone consistent_backup uses the EXACT SAME --pg-dsn for control conn and pg_dump
+    target_dsn = "postgresql://custom_u:secret@pg-custom.internal:5433/custom_db?sslmode=require"
+    seen_conn_dsns: list[str] = []
+    seen_dump_dsns: list[str] = []
+    seen_snap_ids: list[str] = []
+
+    def _db_handler(sql: str, params: Any) -> Any:
+        s = " ".join(sql.split())
+        if s.startswith("SELECT pg_export_snapshot"):
+            return ("00000012-00000099-1",)
+        if s.startswith("SELECT pg_advisory_lock") or s.startswith("SELECT pg_advisory_unlock"):
+            return (True, True)
+        if s.startswith("SELECT to_regclass"):
+            return (None,)
+        return []
+
+    async def _fake_open(dsn: str) -> Any:
+        seen_conn_dsns.append(dsn)
+        return _FakeAsyncConn(_db_handler)
+
+    def _fake_dump_starter(snap_id: str, out_path: Path, *, dsn: str) -> consistent_backup.PgDumpProcess:
+        seen_dump_dsns.append(dsn)
+        seen_snap_ids.append(snap_id)
+        return consistent_backup.start_pg_dump_process(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'PGDMP-custom-dsn')"],
+            out_path,
+            cmd_label="fake_standalone_pg_dump",
+        )
+
+    s3 = _FakeS3Client(versioning_by_bucket={"dalton-storage": True})
+    s3.seed_object("dalton-storage", "blobs/u1/abc", b"core-blob")
+    args = standalone_cb.build_arg_parser().parse_args(
+        ["backup", "--output-dir", str(tmp_path / "out"), "--pg-dsn", target_dsn]
+    )
+    rc = standalone_cb._cmd_backup(
+        args,
+        conn_opener=_fake_open,
+        pg_dump_starter=_fake_dump_starter,
+        bucket_resolver=lambda _env: [
+            consistent_backup.BucketArchiveSpec(bucket="dalton-storage", roles=("main",), s3_client=s3)
+        ],
+    )
+    assert rc == 0
+    assert seen_conn_dsns == [target_dsn]
+    assert seen_dump_dsns == [target_dsn]
+    assert seen_snap_ids == ["00000012-00000099-1"]
+    assert (tmp_path / "out" / "postgres.dump").read_bytes() == b"PGDMP-custom-dsn"
+    with tarfile.open(tmp_path / "out" / "minio-objects.tar.gz", "r:gz") as tf:
+        m = json.loads(tf.extractfile("_minio_manifest.json").read().decode("utf-8"))
+        assert m["object_count"] == 1
+        assert m["objects"][0]["sha256"] == _sha(b"core-blob")
+        assert m["objects"][0]["archived_sha256"] == _sha(b"core-blob")
+
+
+def test_preflight_and_verify_mount_check_device_ids_and_colima_disk_files(tmp_path: Path) -> None:
+    """Codex #11 / Lead #7: st_dev verification on backup dir/parent and active Colima virtual disk file."""
+    ext_mount = tmp_path / "EveSSD"
+    internal_disk = tmp_path / "internal_root"
+    colima_ext = ext_mount / "colima"
+    lima_dir = colima_ext / "_lima" / "colima"
+    lima_dir.mkdir(parents=True)
+    internal_disk.mkdir(parents=True)
+
+    # Case 1: ~/.colima is on external SSD, but diffdisk is symlinked back to internal disk -> FAIL!
+    internal_diffdisk = internal_disk / "diffdisk"
+    internal_diffdisk.write_bytes(b"qcow")
+    (lima_dir / "diffdisk").symlink_to(internal_diffdisk)
+
+    report_bad_link = backup_lib.preflight_disk_space(
+        external_mount_root=ext_mount,
+        internal_root=internal_disk,
+        colima_dir=colima_ext,
+        is_mount_fn=lambda p: p == ext_mount,
+        disk_usage_fn=lambda _p: type("U", (), {"free": 300 * 1024**3})(),
+        colima_docker_free_bytes_fn=lambda: 80 * 1024**3,
+    )
+    assert report_bad_link.ok is False
+    colima_chk = next(c for c in report_bad_link.checks if c.name == "colima_location")
+    assert colima_chk.ok is False
+
+    # Case 2: Nested backup subdir on a different st_dev -> verify_external_mount raises MountCheckError!
+    backups_root = ext_mount / "Dalton" / "backups"
+    nested_pg = backups_root / "pg"
+    nested_pg.mkdir(parents=True)
+
+    def _split_dev_stat(p: Path) -> Any:
+        dev = 999 if str(p.resolve(strict=False)).startswith(str(nested_pg.resolve())) else 100
+        return type("Stat", (), {"st_dev": dev})()
+
+    with pytest.raises(backup_lib.MountCheckError, match="different device"):
+        backup_lib.verify_backup_mount_layout(
+            ext_mount,
+            backups_root,
+            is_mount_fn=lambda p: p == ext_mount,
+            stat_fn=_split_dev_stat,
+        )
+
+
+def test_sunday_weekly_tag_and_deploy_tag_and_deploy_main_running_backup_defer(
+    tmp_path: Path,
+) -> None:
+    """Grok #3 + #4 / Lead #8: Sunday -> --tag weekly, deploy -> --tag deploy, running backup defers cleanly."""
+    # 1. plist passes --tag auto
+    pg_plist = plistlib.loads((PROD_DIR / "launchd" / "com.dalton.pg-backup.plist.template").read_bytes())
+    assert pg_plist["ProgramArguments"][-2:] == ["--tag", "auto"]
+
+    # 2. prod/backup.sh --tag auto resolves Sunday->weekly, Monday->daily, hint->deploy
+    fake_py = tmp_path / "fake_py.sh"
+    recorded_tags = tmp_path / "tags.txt"
+    fake_py.write_text(
+        f"""#!/usr/bin/env bash
+if [[ "$2" == "verify-mount" ]]; then exit 0; fi
+if [[ "$2" == "read-json-field" ]]; then
+  printf '%s\\n%s\\n' "{tmp_path}/d.dump" "set-1"
+  exit 0
+fi
+for ((i=1; i<=$#; i++)); do
+  if [[ "${{!i}}" == "--tag" ]]; then
+    j=$((i+1))
+    echo "${{!j}}" >> "{recorded_tags}"
+  fi
+done
+echo '{{"dump_path":"{tmp_path}/d.dump","backup_set_id":"set-1"}}'
+""",
+        encoding="utf-8",
+    )
+    fake_py.chmod(0o755)
+    (tmp_path / "d.dump").write_bytes(b"PGDMP")
+    tag_hint = tmp_path / ".next-tag"
+
+    base_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "DALTON_REPO_PYTHON": str(fake_py),
+        "DALTON_BACKUP_LOAD_ENV": "0",
+        "DALTON_BACKUP_ROOT": str(tmp_path / "backups"),
+        "DALTON_PG_BACKUP_TAG_FILE": str(tag_hint),
+    }
+    (tmp_path / "backups" / ".tmp").mkdir(parents=True)
+
+    # Sunday -> weekly
+    r_sun = subprocess.run(
+        ["bash", str(PROD_DIR / "backup.sh"), "--tag", "auto", "--skip-mount-check"],
+        env={**base_env, "DALTON_BACKUP_WEEKDAY": "0"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r_sun.returncode == 0, r_sun.stderr
+    # Monday -> daily
+    r_mon = subprocess.run(
+        ["bash", str(PROD_DIR / "backup.sh"), "--tag", "auto", "--skip-mount-check"],
+        env={**base_env, "DALTON_BACKUP_WEEKDAY": "1"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r_mon.returncode == 0, r_mon.stderr
+    # Deploy one-shot hint -> deploy (and hint file consumed!)
+    tag_hint.write_text("deploy\n", encoding="utf-8")
+    r_dep = subprocess.run(
+        ["bash", str(PROD_DIR / "backup.sh"), "--tag", "auto", "--skip-mount-check"],
+        env={**base_env, "DALTON_BACKUP_WEEKDAY": "1"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r_dep.returncode == 0, r_dep.stderr
+    assert not tag_hint.exists()
+    assert recorded_tags.read_text(encoding="utf-8").splitlines() == ["weekly", "daily", "deploy"]
+
+    # 3. deploy_main.sh: timeout while backup job is STILL running defers (exit 75, NOT "backup failed")
+    # and does NOT duplicate-kickstart an already running backup!
+    deploy_sh_text = (PROD_DIR / "deploy_main.sh").read_text(encoding="utf-8")
+    assert "DALTON_DEPLOY_BACKUP_WAIT_S:-14400" in deploy_sh_text
+    assert "_pg_backup_job_running" in deploy_sh_text
+
+    from tests.unit.dalton.test_deploy_main_reuse_backup import _run_deploy, _setup_deploy_env
+
+    ctx = _setup_deploy_env(tmp_path / "dep")
+    # Fake launchctl reports com.dalton.pg-backup is already running and never finishes within 1s
+    (ctx["fake_bin"] / "launchctl").write_text(
+        f"""#!/bin/bash
+echo "$*" >> "{ctx['launchctl_trace']}"
+if [ "$1" = "print" ]; then
+  echo "    state = running"
+  echo "    pid = 42424"
+  exit 0
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    (ctx["fake_bin"] / "launchctl").chmod(0o755)
+    res_running = _run_deploy(
+        ctx,
+        tmp_path / "dep",
+        extra_setup='DALTON_DEPLOY_BACKUP_WAIT_S=1; DALTON_DEPLOY_BACKUP_POLL_S=1',
+    )
+    assert res_running.returncode == 75, res_running.stdout + res_running.stderr
+    assert "still running" in res_running.stdout
+    assert "backup failed" not in res_running.stdout
+    assert "kickstart" not in Path(ctx["launchctl_trace"]).read_text(encoding="utf-8")

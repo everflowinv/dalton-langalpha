@@ -1472,8 +1472,36 @@ release_publish_lock() {
   fi
 }
 
+CONSISTENT_BACKEND_PID=""
+PG_DUMP_PID=""
+CTL_IN_FIFO=""
+CTL_ERR_FIFO=""
+
+stop_consistent_backup_children() {
+  local pid=""
+  for pid in "${PG_DUMP_PID:-}" "${CONSISTENT_BACKEND_PID:-}"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 0.2
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  PG_DUMP_PID=""
+  CONSISTENT_BACKEND_PID=""
+  if [[ -n "${CTL_IN_FIFO:-}" ]]; then
+    rm -f "$CTL_IN_FIFO" 2>/dev/null || true
+    CTL_IN_FIFO=""
+  fi
+  if [[ -n "${CTL_ERR_FIFO:-}" ]]; then
+    rm -f "$CTL_ERR_FIFO" 2>/dev/null || true
+    CTL_ERR_FIFO=""
+  fi
+}
+
 cleanup() {
   trap '' INT TERM
+  stop_consistent_backup_children
   probe_and_resume_pending_wiki_pause || true
   resume_wiki_writes || true
   release_wiki_backup_lock
@@ -1490,16 +1518,204 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap cleanup EXIT
 
-info "Starting zero-downtime backup into ${FINAL_DIR}..."
+info "Starting zero-downtime consistent backup into ${FINAL_DIR}..."
 
-# 1. PostgreSQL hot backup (custom format, single database holding both Alembic chains)
-info "1/4 Backing up PostgreSQL database '${DB_NAME}'..."
+# 1 & 2. Consistent PostgreSQL + MinIO backup via shared consistent_backup protocol (§3.1):
+#   - backend container runs scripts/standalone/consistent_backup.py compose-backup
+#     (acquires both GC advisory locks, exports REPEATABLE READ snapshot, enumerates all
+#     17 consumers' DB references, waits for postgres pg_dump --snapshot to import snapshot,
+#     commits export txn immediately, selects pinned object versions, reconciles all refs).
+#   - host runs compose_cmd exec -T postgres pg_dump --snapshot=<snapshot_id> with hard timeout.
+info "1-2/5 Running consistent PostgreSQL + MinIO snapshot backup (database '${DB_NAME}')..."
+SNAP_IMPORT_TIMEOUT_S="${DALTON_BACKUP_SNAPSHOT_IMPORT_TIMEOUT_S:-120}"
+PG_DUMP_TIMEOUT_S="${DALTON_BACKUP_PG_DUMP_TIMEOUT_S:-7200}"
+CTL_IN_FIFO="${STAGE_DIR}/.consistent-ctl.in"
+CTL_ERR_FIFO="${STAGE_DIR}/.consistent-ctl.err"
+mkfifo "$CTL_IN_FIFO" "$CTL_ERR_FIFO"
+
+# Hold write-end of CTL_IN_FIFO open on fd 5 so backend waits for explicit handshake tokens.
+exec 5<>"$CTL_IN_FIFO"
+exec 6<>"$CTL_ERR_FIFO"
+
+CONSISTENT_BACKEND_ARGS=(
+  exec -T backend uv run --no-sync python scripts/standalone/consistent_backup.py compose-backup
+  --out-tar -
+  --snapshot-import-timeout-s "$SNAP_IMPORT_TIMEOUT_S"
+  --pg-dump-timeout-s "$PG_DUMP_TIMEOUT_S"
+)
+if [[ -n "${DALTON_BACKUP_LOCK_TIMEOUT_S:-}" ]]; then
+  CONSISTENT_BACKEND_ARGS+=(--lock-timeout-s "${DALTON_BACKUP_LOCK_TIMEOUT_S}")
+fi
+if [[ -n "${DALTON_BACKUP_MIRROR_TIMEOUT_S:-}" ]]; then
+  CONSISTENT_BACKEND_ARGS+=(--mirror-timeout-s "${DALTON_BACKUP_MIRROR_TIMEOUT_S}")
+fi
+
+compose_cmd "${CONSISTENT_BACKEND_ARGS[@]}" <"$CTL_IN_FIFO" >"${STAGE_DIR}/minio-objects.tar.gz" 2>"$CTL_ERR_FIFO" &
+CONSISTENT_BACKEND_PID=$!
+
+SNAPSHOT_ID=""
+SNAP_DEADLINE=$(( $(date +%s) + SNAP_IMPORT_TIMEOUT_S ))
+while true; do
+  NOW_TS="$(date +%s)"
+  if (( NOW_TS >= SNAP_DEADLINE )); then
+    err "Timed out waiting for consistent_backup snapshot export (${SNAP_IMPORT_TIMEOUT_S}s)."
+    printf 'PG_DUMP_FAILED\n' >&5 || true
+    exec 5>&- 6<&- || true
+    stop_consistent_backup_children
+    exit 1
+  fi
+  if IFS= read -r -t 1 ctl_line <&6; then
+    case "$ctl_line" in
+      "@@DALTON_CTL@@ SNAPSHOT_READY "*)
+        SNAPSHOT_ID="${ctl_line#@@DALTON_CTL@@ SNAPSHOT_READY }"
+        SNAPSHOT_ID="${SNAPSHOT_ID//$'\r'/}"
+        break
+        ;;
+      "@@DALTON_CTL@@ "*)
+        ;;
+      *)
+        printf '%s\n' "$ctl_line" >&2
+        ;;
+    esac
+  else
+    if ! kill -0 "$CONSISTENT_BACKEND_PID" 2>/dev/null; then
+      break
+    fi
+  fi
+done
+
+if [[ -z "$SNAPSHOT_ID" ]]; then
+  exec 5>&- 6<&- || true
+  wait "$CONSISTENT_BACKEND_PID" 2>/dev/null || true
+  CONSISTENT_BACKEND_PID=""
+  err "consistent_backup failed before exporting PostgreSQL snapshot."
+  exit 1
+fi
+
+info "Exported PostgreSQL snapshot '${SNAPSHOT_ID}'; launching pg_dump --snapshot..."
 compose_cmd exec -T postgres pg_dump \
   -U "$DB_USER" \
   -d "$DB_NAME" \
   -Fc \
   --no-owner \
-  --no-acl > "${STAGE_DIR}/postgres.dump"
+  --no-acl \
+  "--snapshot=${SNAPSHOT_ID}" > "${STAGE_DIR}/postgres.dump" &
+PG_DUMP_PID=$!
+
+# Wait until pg_dump emits custom-format bytes (confirming snapshot import) or exits early.
+IMPORT_DEADLINE=$(( $(date +%s) + SNAP_IMPORT_TIMEOUT_S ))
+DUMP_IMPORTED=0
+while true; do
+  if [[ -s "${STAGE_DIR}/postgres.dump" ]]; then
+    DUMP_IMPORTED=1
+    break
+  fi
+  if ! kill -0 "$PG_DUMP_PID" 2>/dev/null; then
+    break
+  fi
+  if (( $(date +%s) >= IMPORT_DEADLINE )); then
+    err "pg_dump --snapshot timed out waiting to import snapshot (${SNAP_IMPORT_TIMEOUT_S}s)."
+    printf 'PG_DUMP_FAILED\n' >&5 || true
+    exec 5>&- 6<&- || true
+    stop_consistent_backup_children
+    exit 1
+  fi
+  sleep 0.1
+done
+
+if [[ "$DUMP_IMPORTED" -eq 0 ]]; then
+  set +e
+  wait "$PG_DUMP_PID"
+  pg_rc=$?
+  set -e
+  PG_DUMP_PID=""
+  if [[ "$pg_rc" -ne 0 ]] || [[ ! -s "${STAGE_DIR}/postgres.dump" ]]; then
+    printf 'PG_DUMP_FAILED\n' >&5 || true
+    exec 5>&- 6<&- || true
+    stop_consistent_backup_children
+    err "pg_dump --snapshot failed before importing snapshot (rc=${pg_rc})."
+    exit 1
+  fi
+fi
+
+# Notify consistent_backup that pg_dump imported the snapshot so it commits the export txn immediately.
+printf 'SNAPSHOT_IMPORTED\n' >&5
+
+# Wait for pg_dump to complete within PG_DUMP_TIMEOUT_S.
+DUMP_DEADLINE=$(( $(date +%s) + PG_DUMP_TIMEOUT_S ))
+if [[ -n "$PG_DUMP_PID" ]]; then
+  while kill -0 "$PG_DUMP_PID" 2>/dev/null; do
+    if (( $(date +%s) >= DUMP_DEADLINE )); then
+      err "pg_dump --snapshot exceeded hard timeout (${PG_DUMP_TIMEOUT_S}s); terminating."
+      printf 'PG_DUMP_FAILED\n' >&5 || true
+      exec 5>&- 6<&- || true
+      stop_consistent_backup_children
+      exit 1
+    fi
+    sleep 0.5
+  done
+  set +e
+  wait "$PG_DUMP_PID"
+  pg_rc=$?
+  set -e
+  PG_DUMP_PID=""
+else
+  pg_rc=0
+fi
+
+if [[ "$pg_rc" -ne 0 ]] || [[ ! -s "${STAGE_DIR}/postgres.dump" ]]; then
+  printf 'PG_DUMP_FAILED\n' >&5 || true
+  exec 5>&- 6<&- || true
+  stop_consistent_backup_children
+  err "PostgreSQL snapshot dump failed (rc=${pg_rc})."
+  exit 1
+fi
+
+printf 'PG_DUMP_DONE\n' >&5
+exec 5>&-
+
+# Drain remaining stderr lines from consistent_backup until it exits.
+while kill -0 "$CONSISTENT_BACKEND_PID" 2>/dev/null; do
+  if IFS= read -r -t 1 ctl_line <&6; then
+    case "$ctl_line" in
+      "@@DALTON_CTL@@ BACKUP_SUMMARY "*)
+        info "Consistent backup reconciled: ${ctl_line#@@DALTON_CTL@@ BACKUP_SUMMARY }"
+        ;;
+      "@@DALTON_CTL@@ "*)
+        ;;
+      *)
+        printf '%s\n' "$ctl_line" >&2
+        ;;
+    esac
+  fi
+done
+while IFS= read -r -t 0.1 ctl_line <&6; do
+  case "$ctl_line" in
+    "@@DALTON_CTL@@ BACKUP_SUMMARY "*)
+      info "Consistent backup reconciled: ${ctl_line#@@DALTON_CTL@@ BACKUP_SUMMARY }"
+      ;;
+    "@@DALTON_CTL@@ "*)
+      ;;
+    *)
+      printf '%s\n' "$ctl_line" >&2
+      ;;
+  esac
+done
+exec 6<&-
+
+set +e
+wait "$CONSISTENT_BACKEND_PID"
+cb_rc=$?
+set -e
+CONSISTENT_BACKEND_PID=""
+rm -f "$CTL_IN_FIFO" "$CTL_ERR_FIFO"
+CTL_IN_FIFO=""
+CTL_ERR_FIFO=""
+
+if [[ "$cb_rc" -ne 0 ]]; then
+  err "Consistent object backup / reconciliation failed (rc=${cb_rc})."
+  exit 1
+fi
 
 if [[ ! -s "${STAGE_DIR}/postgres.dump" ]]; then
   err "PostgreSQL dump is empty."
@@ -1526,430 +1742,6 @@ if [[ "$VERIFY" -eq 1 ]]; then
 else
   ok "PostgreSQL dump written (${PG_DUMP_BYTES} bytes; verification skipped)."
 fi
-
-# 2. MinIO objects hot backup (chunked streaming tar.gz + incremental SHA-256; never reads whole objects into RAM)
-info "2/4 Backing up MinIO objects (streaming)..."
-compose_cmd exec -T backend uv run --no-sync python - > "${STAGE_DIR}/minio-objects.tar.gz" <<'PY'
-from __future__ import annotations
-
-import hashlib
-import io
-import json
-import os
-import sys
-import tarfile
-
-import boto3
-from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
-
-CHUNK_BYTES = 1024 * 1024  # 1 MiB streaming chunks
-RESTORE_MARKER_KEY = ".dalton-restore.json"
-RESTORE_TAG_KEY = "dalton-restore"
-BUCKET_ENV_VARS = (
-    "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME",
-    "DALTON_ASR_STORAGE_BUCKET_NAME",
-    "STORAGE_BUCKET_NAME",
-    "S3_BUCKET_NAME",
-    "OSS_BUCKET_NAME",
-    "R2_BUCKET_NAME",
-)
-
-
-def _env(primary: str, *fallbacks: str, default: str = "") -> str:
-    for key in (primary, *fallbacks):
-        val = (os.getenv(key) or "").strip()
-        if val:
-            return val
-    return default
-
-
-def is_restore_created_bucket(s3_client, bucket_name: str) -> bool:
-    """Identify restore-created buckets via bucket tag or .dalton-restore.json marker (never name suffix)."""
-    try:
-        tag_resp = s3_client.get_bucket_tagging(Bucket=bucket_name)
-        for tag in tag_resp.get("TagSet") or []:
-            if tag.get("Key") == RESTORE_TAG_KEY and str(tag.get("Value", "")).lower() == "true":
-                return True
-    except ClientError as exc:
-        code = str(exc.response.get("Error", {}).get("Code", ""))
-        status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0) or 0)
-        if code not in (
-            "NoSuchTagSet",
-            "NoSuchTagSetError",
-            "404",
-            "NotFound",
-            "NotImplemented",
-            "MethodNotAllowed",
-        ) and status not in (404, 405, 501):
-            raise
-
-    try:
-        s3_client.head_object(Bucket=bucket_name, Key=RESTORE_MARKER_KEY)
-        return True
-    except ClientError as exc:
-        code = str(exc.response.get("Error", {}).get("Code", ""))
-        status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0) or 0)
-        if code not in ("404", "NoSuchKey", "NotFound") and status != 404:
-            raise
-    return False
-
-
-class _HashingStream:
-    """Chunked streaming reader that updates SHA-256 incrementally without buffering the whole object."""
-
-    def __init__(self, body, expected_size: int) -> None:
-        self._body = body
-        self._expected_size = expected_size
-        self.hasher = hashlib.sha256()
-        self.bytes_read = 0
-
-    def read(self, size: int = -1) -> bytes:
-        to_read = CHUNK_BYTES if (size is None or size < 0) else min(size, CHUNK_BYTES)
-        chunk = self._body.read(to_read)
-        if chunk:
-            self.hasher.update(chunk)
-            self.bytes_read += len(chunk)
-            if self.bytes_read > self._expected_size:
-                raise RuntimeError(
-                    f"Object grew during backup stream ({self.bytes_read} > {self._expected_size} bytes)"
-                )
-        return chunk
-
-
-def _norm_ep(url: str) -> str:
-    raw = (url or "").strip().rstrip("/")
-    if not raw:
-        return ""
-    from urllib.parse import urlsplit, urlunsplit
-
-    try:
-        has_scheme = "://" in raw
-        parts = urlsplit(raw if has_scheme else f"//{raw}")
-        if parts.hostname is not None:
-            host = parts.hostname.lower()
-            if ":" in host and not host.startswith("["):
-                host = f"[{host}]"
-            port = parts.port
-            netloc = f"{host}:{port}" if port is not None else host
-            path = parts.path.rstrip("/") if not (parts.query or parts.fragment) else parts.path
-            if has_scheme:
-                return urlunsplit((parts.scheme.lower(), netloc, path, parts.query, parts.fragment))
-            return urlunsplit(("", netloc, path, parts.query, parts.fragment)).lstrip("/")
-    except Exception:
-        pass
-    return raw
-
-
-def _norm_prefix(raw: str) -> str:
-    return (raw or "").strip().strip("/")
-
-
-def _read_yaml_storage_provider() -> tuple[str | None, bool]:
-    """Read `storage.provider` from agent_config.yaml (+ overlay), matching `src/utils/storage/__init__.py`."""
-    from pathlib import Path
-
-    try:
-        import yaml  # type: ignore[import-not-found]
-    except Exception:
-        yaml = None
-
-    def _from_file(path: Path) -> str | None:
-        if not path.is_file():
-            return None
-        if yaml is not None:
-            try:
-                data = yaml.safe_load(path.read_text(encoding="utf-8"))
-            except Exception:
-                data = None
-            if isinstance(data, dict):
-                st = data.get("storage")
-                if isinstance(st, dict):
-                    val = st.get("provider")
-                    if val is not None and str(val).strip() != "":
-                        return str(val).strip().lower()
-        return None
-
-    base = None
-    ptc_cfg = (os.getenv("PTC_CONFIG_FILE") or "").strip()
-    if ptc_cfg and Path(ptc_cfg).is_file():
-        base = Path(ptc_cfg)
-    else:
-        for cand in (Path("/app/agent_config.yaml"), Path("agent_config.yaml")):
-            if cand.is_file():
-                base = cand
-                break
-    if base is None:
-        return None, False
-
-    provider = _from_file(base)
-    app_env = (os.getenv("APP_ENV") or os.getenv("DALTON_PROFILE") or "core").strip()
-    overlay = base.with_name(f"{base.stem}.{app_env}{base.suffix}")
-    if overlay.is_file():
-        ov_provider = _from_file(overlay)
-        if ov_provider is not None:
-            provider = ov_provider
-    return provider, True
-
-
-def resolve_runtime_storage_targets() -> dict[str, dict[str, str]]:
-    """Resolve effective storage targets for chat_upload, asr, and general storage and verify single-service invariant."""
-    targets: dict[str, dict[str, str]] = {}
-
-    asr_ep = _norm_ep(os.getenv("DALTON_ASR_STORAGE_ENDPOINT_URL") or "")
-    asr_bucket = (os.getenv("DALTON_ASR_STORAGE_BUCKET_NAME") or "").strip()
-    asr_ak = (os.getenv("DALTON_ASR_STORAGE_ACCESS_KEY_ID") or "").strip()
-    asr_sk = (os.getenv("DALTON_ASR_STORAGE_SECRET_ACCESS_KEY") or "").strip()
-    asr_prefix = _norm_prefix(os.getenv("DALTON_ASR_STORAGE_KEY_PREFIX") or "")
-    asr_target: dict[str, str] | None = None
-    if asr_ep or (asr_bucket and asr_ak and asr_sk):
-        asr_target = {
-            "service_id": f"s3:{asr_ep}" if asr_ep else "s3:asr-unset-endpoint",
-            "endpoint": asr_ep,
-            "bucket": asr_bucket,
-            "key_prefix": asr_prefix,
-        }
-        targets["asr"] = asr_target
-
-    chat_ep = _norm_ep(os.getenv("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL") or "")
-    chat_bucket = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME") or "").strip()
-    chat_ak = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID") or "").strip()
-    chat_sk = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY") or "").strip()
-    if chat_ep and chat_bucket and chat_ak and chat_sk:
-        targets["chat_upload"] = {
-            "service_id": f"s3:{chat_ep}",
-            "endpoint": chat_ep,
-            "bucket": chat_bucket,
-            "key_prefix": _norm_prefix(os.getenv("DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX") or ""),
-        }
-    elif asr_target is not None:
-        targets["chat_upload"] = dict(asr_target)
-
-    yaml_provider, yaml_found = _read_yaml_storage_provider()
-    env_provider = (os.getenv("STORAGE_PROVIDER") or "").strip().lower()
-    if yaml_found:
-        raw_provider = yaml_provider if yaml_provider else (env_provider or "none")
-    else:
-        raw_provider = env_provider if env_provider else "s3"
-
-    gen_prefix = _norm_prefix(os.getenv("STORAGE_KEY_PREFIX") or "")
-    if raw_provider == "oss":
-        oss_bucket = (os.getenv("OSS_BUCKET_NAME") or "").strip()
-        if oss_bucket:
-            oss_ep = _norm_ep(os.getenv("OSS_ENDPOINT") or "")
-            oss_region = (os.getenv("OSS_REGION") or "").strip().lower()
-            oss_id = oss_ep or (f"default-oss:{oss_region}" if oss_region else "default-oss")
-            targets["general"] = {
-                "service_id": f"oss:{oss_id}",
-                "endpoint": oss_ep,
-                "bucket": oss_bucket,
-                "key_prefix": gen_prefix,
-            }
-    elif raw_provider != "none":
-        s3_bucket = (os.getenv("STORAGE_BUCKET_NAME") or os.getenv("S3_BUCKET_NAME") or "").strip()
-        if s3_bucket:
-            s3_ep = _norm_ep(os.getenv("STORAGE_ENDPOINT_URL") or os.getenv("S3_ENDPOINT_URL") or "")
-            s3_region = (os.getenv("STORAGE_REGION") or os.getenv("S3_REGION") or "us-east-1").strip().lower()
-            targets["general"] = {
-                "service_id": f"s3:{s3_ep}" if s3_ep else f"s3:aws-s3-default:{s3_region}",
-                "endpoint": s3_ep,
-                "bucket": s3_bucket,
-                "key_prefix": gen_prefix,
-            }
-
-    distinct_services = sorted({t["service_id"] for t in targets.values()})
-    if len(distinct_services) > 1:
-        details = ", ".join(
-            f"{name}={t['service_id']} (bucket={t['bucket'] or '<unset>'})"
-            for name, t in targets.items()
-        )
-        print(
-            f"ERROR: Multiple object storage services detected: {details}",
-            file=sys.stderr,
-        )
-        print(
-            "ERROR: v1 only supports a single object storage service; configure all application buckets on the same storage service.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    return targets
-
-
-runtime_targets = resolve_runtime_storage_targets()
-endpoint = _env(
-    "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL",
-    "STORAGE_ENDPOINT_URL",
-    default="http://minio:9000",
-).rstrip("/")
-default_bucket = (
-    (runtime_targets.get("chat_upload") or {}).get("bucket")
-    or _env(
-        "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME",
-        "STORAGE_BUCKET_NAME",
-        default="chat-uploads",
-    )
-)
-default_key_prefix = (runtime_targets.get("chat_upload") or {}).get("key_prefix", "")
-access_key = _env(
-    "DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID",
-    "MINIO_ROOT_USER",
-    "STORAGE_ACCESS_KEY_ID",
-)
-secret_key = _env(
-    "DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY",
-    "MINIO_ROOT_PASSWORD",
-    "STORAGE_SECRET_ACCESS_KEY",
-)
-region = _env("DALTON_CHAT_UPLOAD_STORAGE_REGION", "STORAGE_REGION", default="us-east-1")
-addressing_style = _env(
-    "DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE",
-    "STORAGE_ADDRESSING_STYLE",
-    default="path",
-).lower()
-
-if not access_key or not secret_key:
-    print("ERROR: MinIO credentials are missing in container environment.", file=sys.stderr)
-    sys.exit(1)
-
-client = boto3.client(
-    "s3",
-    endpoint_url=endpoint,
-    aws_access_key_id=access_key,
-    aws_secret_access_key=secret_key,
-    region_name=region,
-    config=Config(
-        signature_version="s3v4",
-        s3={"addressing_style": addressing_style},
-        connect_timeout=5,
-        read_timeout=120,
-        retries={"max_attempts": 5, "mode": "standard"},
-    ),
-)
-
-# Fail loudly if buckets cannot be enumerated completely; never fall back silently.
-try:
-    resp = client.list_buckets()
-except (ClientError, BotoCoreError) as exc:
-    print(f"ERROR: Failed to list MinIO buckets: {exc}", file=sys.stderr)
-    sys.exit(1)
-
-all_buckets = sorted(b["Name"] for b in resp.get("Buckets", []) if b.get("Name"))
-
-# Collect every bucket currently configured for the application so backups always
-# include all active buckets — even if an active bucket was created by a prior restore.
-configured_var_buckets: dict[str, str] = {}
-for var_name in BUCKET_ENV_VARS:
-    val = (os.getenv(var_name) or "").strip()
-    if val:
-        configured_var_buckets[var_name] = val
-if "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME" not in configured_var_buckets and default_bucket:
-    configured_var_buckets["DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME"] = default_bucket
-active_buckets = set(configured_var_buckets.values())
-for t in runtime_targets.values():
-    if t.get("bucket"):
-        active_buckets.add(t["bucket"])
-
-buckets: list[str] = []
-skipped_buckets: list[str] = []
-for b in all_buckets:
-    if b in active_buckets:
-        buckets.append(b)
-    elif is_restore_created_bucket(client, b):
-        skipped_buckets.append(b)
-    else:
-        buckets.append(b)
-
-if skipped_buckets:
-    print(
-        f"[backup] INFO: Skipping inactive restore-created bucket(s): {', '.join(skipped_buckets)}",
-        file=sys.stderr,
-    )
-if default_bucket and default_bucket not in buckets:
-    print(
-        f"ERROR: Expected active bucket '{default_bucket}' not present in list_buckets() output ({buckets}).",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-manifest_objects: list[dict[str, object]] = []
-total_bytes = 0
-
-with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz", format=tarfile.PAX_FORMAT) as tf:
-    for bucket in buckets:
-        paginator = client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=bucket):
-            for entry in page.get("Contents", []):
-                key = entry["Key"]
-                if key == RESTORE_MARKER_KEY:
-                    continue
-                obj = client.get_object(Bucket=bucket, Key=key)
-                body = obj["Body"]
-                try:
-                    expected_size = int(obj.get("ContentLength", entry.get("Size", 0)))
-                    content_type = obj.get("ContentType") or "application/octet-stream"
-                    stream = _HashingStream(body, expected_size)
-
-                    tar_name = f"objects/{bucket}/{key}"
-                    tinfo = tarfile.TarInfo(name=tar_name)
-                    tinfo.size = expected_size
-                    tinfo.mode = 0o600
-                    tinfo.pax_headers = {"DALTON.content_type": content_type}
-                    tf.addfile(tinfo, stream)
-
-                    # Verify EOF and exact byte count match ContentLength.
-                    trailing = body.read(1)
-                    if trailing:
-                        raise RuntimeError(
-                            f"Object '{bucket}/{key}' had extra bytes beyond ContentLength={expected_size}"
-                        )
-                    if stream.bytes_read != expected_size:
-                        raise RuntimeError(
-                            f"Object '{bucket}/{key}' truncated during backup "
-                            f"({stream.bytes_read} != {expected_size} bytes)"
-                        )
-                finally:
-                    body.close()
-
-                digest = stream.hasher.hexdigest()
-                total_bytes += stream.bytes_read
-                manifest_objects.append(
-                    {
-                        "bucket": bucket,
-                        "key": key,
-                        "size": stream.bytes_read,
-                        "sha256": digest,
-                        "content_type": content_type,
-                    }
-                )
-
-    manifest_raw = json.dumps(
-        {
-            "buckets": buckets,
-            "primary_bucket": default_bucket,
-            "primary_key_prefix": default_key_prefix,
-            "targets": {
-                name: {
-                    "endpoint": t["endpoint"],
-                    "bucket": t["bucket"],
-                    "key_prefix": t["key_prefix"],
-                }
-                for name, t in runtime_targets.items()
-            },
-            "var_buckets": {k: v for k, v in configured_var_buckets.items() if v in buckets},
-            "bucket_count": len(buckets),
-            "object_count": len(manifest_objects),
-            "total_bytes": total_bytes,
-            "objects": manifest_objects,
-        },
-        ensure_ascii=False,
-        indent=2,
-    ).encode("utf-8")
-    minfo = tarfile.TarInfo(name="_minio_manifest.json")
-    minfo.size = len(manifest_raw)
-    minfo.mode = 0o600
-    tf.addfile(minfo, io.BytesIO(manifest_raw))
-PY
 
 MINIO_MANIFEST_FILE="${STAGE_DIR}/.minio-manifest.tmp.json"
 tar -xOzf "${STAGE_DIR}/minio-objects.tar.gz" _minio_manifest.json > "$MINIO_MANIFEST_FILE"

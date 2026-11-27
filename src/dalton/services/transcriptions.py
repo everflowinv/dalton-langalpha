@@ -2307,18 +2307,49 @@ async def resubmit_transcription_job(
         )
 
     old_job_id = str(job["job_id"])
-    new_job_id = str(uuid4())
+    # Persist and reuse a stable attempt ID for this original job so concurrent requests,
+    # double-clicks, and retries after a dropped bridge response all converge on one row
+    # and one idempotency key (never triggering duplicate transcription/billing).
+    canonical_attempt_id = str(
+        uuid5(
+            _TRANSCRIPTION_IDEMPOTENCY_NAMESPACE,
+            f"dalton-asr-resubmit-attempt:{old_job_id}",
+        )
+    )
+    existing_old_usage = job.get("usage") if isinstance(job.get("usage"), dict) else {}
+    persisted_attempt_id = str(existing_old_usage.get("resubmit_attempt_id") or "").strip()
+    if persisted_attempt_id:
+        attempt_id = persisted_attempt_id
+    else:
+        attempt_id = canonical_attempt_id
+        stamped_old_usage = dict(existing_old_usage)
+        stamped_old_usage["resubmit_attempt_id"] = attempt_id
+        ok_stamp, updated_old = await db.update_transcription_job_versioned(
+            old_job_id,
+            expected_version=int(job["version"]),
+            status=cur_status,
+            stage=str(job.get("stage") or cur_status),
+            usage=stamped_old_usage,
+        )
+        if not ok_stamp and isinstance(updated_old, dict):
+            latest_usage = (
+                updated_old.get("usage") if isinstance(updated_old.get("usage"), dict) else {}
+            )
+            winner_id = str(latest_usage.get("resubmit_attempt_id") or "").strip()
+            if winner_id:
+                attempt_id = winner_id
+
     new_idemp_key = str(
         uuid5(
             _TRANSCRIPTION_IDEMPOTENCY_NAMESPACE,
-            f"dalton-asr-resubmit:{old_job_id}:{new_job_id}",
+            f"dalton-asr-resubmit:{old_job_id}:{attempt_id}",
         )
     )
     eff_lang = str(job.get("language")).strip() if job.get("language") else None
     eff_hotwords = list(job.get("hotwords") or [])
 
     new_job = await db.create_transcription_job(
-        job_id=new_job_id,
+        job_id=attempt_id,
         created_by_user_id=clean_caller,
         workspace_id=str(job["workspace_id"]),
         thread_id=str(job.get("thread_id") or ""),
@@ -2331,25 +2362,52 @@ async def resubmit_transcription_job(
         status=TranscriptionJobStatus.AWAITING_UPLOAD,
         stage=TranscriptionJobStatus.AWAITING_UPLOAD.value,
     )
-    resubmit_usage: dict[str, Any] = {
-        "upload": {
-            "completed": True,
-            "aborted": False,
-            "source_size_bytes": source_size_bytes,
-            "verified_size_bytes": actual_obj_size,
-            "reused_from_job_id": old_job_id,
-        },
-        "resubmitted_from_job_id": old_job_id,
-    }
-    updated_ok, stamped_job = await db.update_transcription_job_versioned(
-        str(new_job["job_id"]),
-        expected_version=int(new_job["version"]),
-        status=TranscriptionJobStatus.AWAITING_UPLOAD,
-        stage=TranscriptionJobStatus.AWAITING_UPLOAD.value,
-        usage=resubmit_usage,
+
+    # If a prior request already submitted this attempt to the bridge and synced its status,
+    # return the existing attempt directly without re-submitting.
+    if str(new_job.get("status") or "") != TranscriptionJobStatus.AWAITING_UPLOAD.value:
+        return {
+            "ok": True,
+            "job": new_job,
+            "resubmitted_from_job_id": old_job_id,
+        }
+
+    existing_new_usage = new_job.get("usage") if isinstance(new_job.get("usage"), dict) else {}
+    existing_upload = (
+        existing_new_usage.get("upload")
+        if isinstance(existing_new_usage.get("upload"), dict)
+        else {}
     )
-    if updated_ok and stamped_job is not None:
-        new_job = stamped_job
+    if existing_upload.get("completed") is not True:
+        resubmit_usage: dict[str, Any] = {
+            **existing_new_usage,
+            "upload": {
+                "completed": True,
+                "aborted": False,
+                "source_size_bytes": source_size_bytes,
+                "verified_size_bytes": actual_obj_size,
+                "reused_from_job_id": old_job_id,
+            },
+            "resubmitted_from_job_id": old_job_id,
+            "resubmit_attempt_id": attempt_id,
+        }
+        updated_ok, stamped_job = await db.update_transcription_job_versioned(
+            str(new_job["job_id"]),
+            expected_version=int(new_job["version"]),
+            status=TranscriptionJobStatus.AWAITING_UPLOAD,
+            stage=TranscriptionJobStatus.AWAITING_UPLOAD.value,
+            usage=resubmit_usage,
+        )
+        if updated_ok and stamped_job is not None:
+            new_job = stamped_job
+        elif stamped_job is not None:
+            new_job = stamped_job
+            if str(new_job.get("status") or "") != TranscriptionJobStatus.AWAITING_UPLOAD.value:
+                return {
+                    "ok": True,
+                    "job": new_job,
+                    "resubmitted_from_job_id": old_job_id,
+                }
 
     bridge_payload: dict[str, Any] = {
         "job_id": str(new_job["job_id"]),
@@ -2363,7 +2421,7 @@ async def resubmit_transcription_job(
         "source_sha256": source_sha256,
         "language": eff_lang,
         "hotwords": eff_hotwords,
-        "idempotency_key": new_idemp_key,
+        "idempotency_key": str(new_job.get("idempotency_key") or new_idemp_key),
     }
 
     try:

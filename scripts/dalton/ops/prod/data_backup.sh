@@ -69,6 +69,21 @@ PROD_ENV_FILE="${DALTON_PROD_ENV_FILE:-${HOME}/Projects/dalton-langalpha/.env}"
 PROD_CHECKOUT_DIR="${DALTON_PROD_CHECKOUT_DIR:-${HOME}/Projects/dalton-langalpha}"
 PROD_VAR_DIR="${DALTON_PROD_VAR_DIR:-${PROD_CHECKOUT_DIR}/var/dalton}"
 DATA_VAR_EXCLUDES="${DALTON_DATA_VAR_EXCLUDES:-venv,.venv,__pycache__,*.pyc,node_modules,.DS_Store,pr_baseline,tmp,openclaw-data/temp,openclaw-data/skills/*/temp,run-secrets,.dalton-outbox-*}"
+WEEKLY_MINIO_MODE="${DALTON_WEEKLY_MINIO_MODE:-versioned}"
+
+# Load production .env storage variables (matching prod/backup.sh) while preserving
+# offsite-backup.env overrides (re-loaded right after).
+if [[ "${DALTON_DATA_BACKUP_LOAD_PROD_ENV:-1}" == "1" ]] && [[ -f "${PROD_ENV_FILE}" ]] && [[ ! -L "${PROD_ENV_FILE}" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "${PROD_ENV_FILE}" 2>/dev/null || true
+    set +a
+    load_offsite_backup_env
+    PROD_ENV_FILE="${DALTON_PROD_ENV_FILE:-${HOME}/Projects/dalton-langalpha/.env}"
+    PROD_CHECKOUT_DIR="${DALTON_PROD_CHECKOUT_DIR:-${HOME}/Projects/dalton-langalpha}"
+    PROD_VAR_DIR="${DALTON_PROD_VAR_DIR:-${PROD_CHECKOUT_DIR}/var/dalton}"
+    WEEKLY_MINIO_MODE="${DALTON_WEEKLY_MINIO_MODE:-versioned}"
+fi
 
 RCLONE_REMOTE="${DALTON_RCLONE_REMOTE:-gdrive}"
 RCLONE_DRIVE_DIR="${DALTON_RCLONE_DRIVE_DIR:-DaltonBackup}"
@@ -89,6 +104,8 @@ mkdir -p "${EXT_TMP_ROOT}" "${RCLONE_CACHE_DIR}" "${RCLONE_LOG_DIR}" \
     || fail_with_alert "EXTERNAL_DRIVE_NOT_WRITABLE" "Cannot create backup runtime directories under ${EXT_MOUNT_ROOT}"
 
 DATE_STAMP="$(date '+%Y-%m-%d')"
+RUN_ID="$(date '+%Y%m%d-%H%M%S')-$(openssl rand -hex 3)"
+BASELINE_ID="${DATE_STAMP}-${RUN_ID}"
 RUN_TMP_DIR="$(mktemp -d "${EXT_TMP_ROOT}/run-${DATE_STAMP}.XXXXXX")"
 
 if ! MOUNT_ERR="$("${PY_BIN}" "${BACKUP_LIB}" verify-mount \
@@ -113,7 +130,7 @@ if ! docker info >/dev/null 2>&1; then
     fail_with_alert "DOCKER_UNAVAILABLE" "Docker daemon is not reachable"
 fi
 
-if [[ "${DALTON_WEEKLY_MINIO_MODE:-volume}" != "versioned" ]]; then
+if [[ "${WEEKLY_MINIO_MODE}" != "versioned" ]]; then
     if ! docker volume inspect "${MINIO_VOLUME}" >/dev/null 2>&1; then
         fail_with_alert "MINIO_VOLUME_MISSING" "Docker volume not found: ${MINIO_VOLUME}"
     fi
@@ -191,26 +208,27 @@ verify_and_promote_partial() {
     fi
 
     CURRENT_PARTIAL_OBJ=""
-    rm -f "${hash_meta}"
     log_msg "INFO" "Verified & promoted ${final_obj} (${size_msg}; ${hash_msg})"
 }
 
-# 1. MinIO weekly baseline (versioned S3 baseline with _minio_manifest.json or volume stream)
+# 1. MinIO weekly baseline (versioned S3 baseline by default, with immutable RUN_ID filename;
+#    staged baseline manifest is NOT published into SETS_DIR until remote verification + LATEST.json succeed)
 RAND_MINIO="$(openssl rand -hex 6)"
-MINIO_FINAL_OBJ="${REMOTE_WEEK_DEST}/minio-${DATE_STAMP}.tar.gz.enc"
+MINIO_FINAL_NAME="minio-${DATE_STAMP}-${RUN_ID}.tar.gz.enc"
+MINIO_FINAL_OBJ="${REMOTE_WEEK_DEST}/${MINIO_FINAL_NAME}"
 MINIO_PARTIAL_OBJ="${MINIO_FINAL_OBJ}.partial-${RAND_MINIO}"
 MINIO_META="${RUN_TMP_DIR}/minio.meta.json"
+STAGED_BASELINE_MANIFEST=""
 CURRENT_PARTIAL_OBJ="${MINIO_PARTIAL_OBJ}"
 
-if [[ "${DALTON_WEEKLY_MINIO_MODE:-volume}" == "versioned" ]]; then
-    BASELINE_TAR="${RUN_TMP_DIR}/minio-baseline-${DATE_STAMP}.tar.gz"
-    BASELINE_MANIFEST_OUT="${SETS_DIR}/weekly-baseline-${DATE_STAMP}.json"
-    mkdir -p "${SETS_DIR}"
-    log_msg "INFO" "Building versioned MinIO weekly baseline ${DATE_STAMP} -> ${MINIO_PARTIAL_OBJ}"
+if [[ "${WEEKLY_MINIO_MODE}" == "versioned" ]]; then
+    BASELINE_TAR="${RUN_TMP_DIR}/minio-baseline-${BASELINE_ID}.tar.gz"
+    STAGED_BASELINE_MANIFEST="${RUN_TMP_DIR}/weekly-baseline-${BASELINE_ID}.json"
+    log_msg "INFO" "Building versioned MinIO weekly baseline ${BASELINE_ID} -> ${MINIO_PARTIAL_OBJ}"
     if ! "${PY_BIN}" "${OFFSITE_SYNC_PY}" weekly-minio-baseline \
-        --baseline-id "${DATE_STAMP}" \
+        --baseline-id "${BASELINE_ID}" \
         --out-tar "${BASELINE_TAR}" \
-        --manifest-out "${BASELINE_MANIFEST_OUT}" \
+        --manifest-out "${STAGED_BASELINE_MANIFEST}" \
         --tmp-dir "${RUN_TMP_DIR}" 2>"${RUN_TMP_DIR}/minio-baseline.err"; then
         BL_ERR="$(tr '\n' ' ' < "${RUN_TMP_DIR}/minio-baseline.err" 2>/dev/null || true)"
         fail_with_alert "MINIO_BACKUP_FAILED" "Versioned MinIO baseline build failed: ${BL_ERR}"
@@ -278,7 +296,7 @@ if [[ -n "${SANDBOX_CONTAINERS}" ]]; then
         [[ -n "${cname}" ]] || continue
         SAFE_NAME="${cname//[^A-Za-z0-9_.-]/_}"
         RAND_SB="$(openssl rand -hex 6)"
-        SB_FINAL_OBJ="${REMOTE_WEEK_DEST}/sandbox-${SAFE_NAME}-${DATE_STAMP}.tar.gz.enc"
+        SB_FINAL_OBJ="${REMOTE_WEEK_DEST}/sandbox-${SAFE_NAME}-${DATE_STAMP}-${RUN_ID}.tar.gz.enc"
         SB_PARTIAL_OBJ="${SB_FINAL_OBJ}.partial-${RAND_SB}"
         SB_META="${RUN_TMP_DIR}/sb-${SAFE_NAME}.meta.json"
         CP_ERR_FILE="${RUN_TMP_DIR}/cp-${SAFE_NAME}.err"
@@ -362,7 +380,8 @@ if [[ -f "${PROD_ENV_FILE}" ]] && [[ ! -L "${PROD_ENV_FILE}" ]]; then
 fi
 
 RAND_REDIS="$(openssl rand -hex 6)"
-REDIS_FINAL_OBJ="${REMOTE_WEEK_DEST}/redis-${DATE_STAMP}.rdb.enc"
+REDIS_FINAL_NAME="redis-${DATE_STAMP}-${RUN_ID}.rdb.enc"
+REDIS_FINAL_OBJ="${REMOTE_WEEK_DEST}/${REDIS_FINAL_NAME}"
 REDIS_PARTIAL_OBJ="${REDIS_FINAL_OBJ}.partial-${RAND_REDIS}"
 REDIS_META="${RUN_TMP_DIR}/redis.meta.json"
 CURRENT_PARTIAL_OBJ="${REDIS_PARTIAL_OBJ}"
@@ -398,7 +417,8 @@ if [[ ! -d "${PROD_VAR_DIR}" ]]; then
     fail_with_alert "VAR_DALTON_BACKUP_FAILED" "var/dalton directory not found: ${PROD_VAR_DIR}"
 fi
 
-VAR_FINAL_OBJ="${REMOTE_WEEK_DEST}/var-dalton-${DATE_STAMP}.tar.gz.enc"
+VAR_FINAL_NAME="var-dalton-${DATE_STAMP}-${RUN_ID}.tar.gz.enc"
+VAR_FINAL_OBJ="${REMOTE_WEEK_DEST}/${VAR_FINAL_NAME}"
 VAR_SQLITE_STAGING="${RUN_TMP_DIR}/var-dalton-sqlite-staging"
 VAR_SQLITE_LIST="${RUN_TMP_DIR}/var-dalton-sqlite.nul"
 VAR_SQLITE_ERR="${RUN_TMP_DIR}/var-dalton-sqlite.err"
@@ -476,57 +496,151 @@ while true; do
     break
 done
 
-# Prune Google Drive weekly/ keeping DRIVE_RETAIN_WEEKS while exempting any baseline_id
-# referenced by retained daily db/*/LATEST.json files (§3.1 step 4).
-REFERENCED_BASELINES_FILE="${RUN_TMP_DIR}/referenced-baselines.txt"
-: > "${REFERENCED_BASELINES_FILE}"
-REMOTE_DB_BASE="${RCLONE_REMOTE}:${RCLONE_DRIVE_DIR}/db"
-DAILY_DIRS="$(rclone_noproxy lsf --dirs-only "${REMOTE_DB_BASE}/" \
+# 5. Publish remote weekly/<YYYY-MM-DD>/LATEST.json ONLY after all immutable artifacts are verified & promoted,
+#    and THEN atomically publish the local weekly baseline pointer for daily delta runs.
+WEEKLY_LATEST_LOCAL="${RUN_TMP_DIR}/LATEST.json"
+"${PY_BIN}" "${OFFSITE_SYNC_PY}" build-weekly-latest-json \
+    --run-id "${RUN_ID}" \
+    --date-stamp "${DATE_STAMP}" \
+    --baseline-id "${BASELINE_ID}" \
+    --minio-mode "${WEEKLY_MINIO_MODE}" \
+    --minio-name "${MINIO_FINAL_NAME}" --minio-meta "${MINIO_META}" \
+    --redis-name "${REDIS_FINAL_NAME}" --redis-meta "${REDIS_META}" \
+    --var-name "${VAR_FINAL_NAME}" --var-meta "${VAR_META}" \
+    --out "${WEEKLY_LATEST_LOCAL}"
+
+RAND_LATEST="$(openssl rand -hex 6)"
+STAGED_WEEKLY_LATEST="${REMOTE_WEEK_DEST}/LATEST.json.partial-${RAND_LATEST}"
+FINAL_WEEKLY_LATEST="${REMOTE_WEEK_DEST}/LATEST.json"
+CURRENT_PARTIAL_OBJ="${STAGED_WEEKLY_LATEST}"
+if ! rclone_noproxy rcat "${STAGED_WEEKLY_LATEST}" \
     --cache-dir "${RCLONE_CACHE_DIR}" \
-    --temp-dir "${RUN_TMP_DIR}" 2>/dev/null || true)"
-if [[ -n "${DAILY_DIRS}" ]]; then
-    while IFS= read -r ddir; do
-        ddir="${ddir%/}"
-        [[ -n "${ddir}" ]] || continue
-        LATEST_RAW="$(rclone_noproxy cat "${REMOTE_DB_BASE}/${ddir}/LATEST.json" \
-            --cache-dir "${RCLONE_CACHE_DIR}" \
-            --temp-dir "${RUN_TMP_DIR}" 2>/dev/null || true)"
-        if [[ -n "${LATEST_RAW}" ]]; then
-            BID="$(printf '%s' "${LATEST_RAW}" | "${PY_BIN}" "${OFFSITE_SYNC_PY}" read-json-field --field baseline_id 2>/dev/null || true)"
-            if [[ -n "${BID}" ]]; then
-                printf '%s\n' "${BID}" >> "${REFERENCED_BASELINES_FILE}"
-            fi
-        fi
-    done <<EOF
-${DAILY_DIRS}
-EOF
+    --temp-dir "${RUN_TMP_DIR}" \
+    --log-file "${RCLONE_LOG_FILE}" \
+    --log-level INFO < "${WEEKLY_LATEST_LOCAL}" 2>"${RUN_TMP_DIR}/rcat-weekly-latest.err"; then
+    delete_partial_remote "${STAGED_WEEKLY_LATEST}"
+    CURRENT_PARTIAL_OBJ=""
+    fail_with_alert "WEEKLY_LATEST_UPLOAD_FAILED" "Failed uploading weekly LATEST.json for ${BASELINE_ID}"
+fi
+if ! rclone_noproxy moveto "${STAGED_WEEKLY_LATEST}" "${FINAL_WEEKLY_LATEST}" \
+    --cache-dir "${RCLONE_CACHE_DIR}" \
+    --temp-dir "${RUN_TMP_DIR}" \
+    --log-file "${RCLONE_LOG_FILE}" \
+    --log-level INFO 2>"${RUN_TMP_DIR}/moveto-weekly-latest.err"; then
+    delete_partial_remote "${STAGED_WEEKLY_LATEST}"
+    CURRENT_PARTIAL_OBJ=""
+    fail_with_alert "WEEKLY_LATEST_MOVETO_FAILED" "Failed promoting weekly LATEST.json for ${BASELINE_ID}"
+fi
+CURRENT_PARTIAL_OBJ=""
+
+if [[ "${WEEKLY_MINIO_MODE}" == "versioned" ]] && [[ -n "${STAGED_BASELINE_MANIFEST}" ]] && [[ -f "${STAGED_BASELINE_MANIFEST}" ]]; then
+    mkdir -p "${SETS_DIR}"
+    if ! PUBLISHED_BL="$("${PY_BIN}" "${OFFSITE_SYNC_PY}" publish-weekly-baseline-pointer \
+        --staged-manifest "${STAGED_BASELINE_MANIFEST}" \
+        --sets-dir "${SETS_DIR}" \
+        --baseline-id "${BASELINE_ID}" 2>"${RUN_TMP_DIR}/pub-bl.err")"; then
+        PUB_ERR="$(tr '\n' ' ' < "${RUN_TMP_DIR}/pub-bl.err" 2>/dev/null || true)"
+        fail_with_alert "BASELINE_POINTER_FAILED" "Failed publishing local weekly baseline pointer: ${PUB_ERR}"
+    fi
+    log_msg "INFO" "Published verified weekly baseline pointer: ${BASELINE_ID} (${PUBLISHED_BL})"
 fi
 
-REMOTE_WEEKLY_BASE="${RCLONE_REMOTE}:${RCLONE_DRIVE_DIR}/weekly"
-REMOTE_DIRS="$(rclone_noproxy lsf --dirs-only "${REMOTE_WEEKLY_BASE}/" \
-    --cache-dir "${RCLONE_CACHE_DIR}" \
-    --temp-dir "${RUN_TMP_DIR}" 2>/dev/null || true)"
+# Prune Google Drive weekly/ keeping DRIVE_RETAIN_WEEKS while exempting any baseline_id
+# referenced by retained daily db/*/LATEST.json files (§3.1 step 4).
+# Fail closed: if listing daily dirs or reading ANY daily LATEST.json fails, abort pruning completely.
+REFERENCED_BASELINES_FILE="${RUN_TMP_DIR}/referenced-baselines.txt"
+: > "${REFERENCED_BASELINES_FILE}"
+REMOTE_DRIVE_BASE="${RCLONE_REMOTE}:${RCLONE_DRIVE_DIR}"
+REMOTE_DB_BASE="${REMOTE_DRIVE_BASE}/db"
+DEP_SCAN_OK=1
 
-if [[ -n "${REMOTE_DIRS}" ]]; then
-    PRUNE_DRIVE_NAMES="$(printf '%s\n' "${REMOTE_DIRS}" | "${PY_BIN}" "${OFFSITE_SYNC_PY}" select-weekly-prune \
-        --retain "${DRIVE_RETAIN_WEEKS}" \
-        --referenced-file "${REFERENCED_BASELINES_FILE}")"
-    if [[ -n "${PRUNE_DRIVE_NAMES}" ]]; then
-        while IFS= read -r dname; do
-            [[ -n "${dname}" ]] || continue
-            if rclone_noproxy purge "${REMOTE_WEEKLY_BASE}/${dname}" \
+TOP_DIRS=""
+if ! TOP_DIRS="$(rclone_noproxy lsf --dirs-only "${REMOTE_DRIVE_BASE}/" \
+    --cache-dir "${RCLONE_CACHE_DIR}" \
+    --temp-dir "${RUN_TMP_DIR}" 2>"${RUN_TMP_DIR}/lsf-top.err")"; then
+    DEP_SCAN_OK=0
+    log_msg "WARN" "PRUNE_DRIVE aborted: failed listing ${REMOTE_DRIVE_BASE}/"
+fi
+
+if [[ "${DEP_SCAN_OK}" -eq 1 ]] && printf '%s\n' "${TOP_DIRS}" | grep -xE 'db/?' >/dev/null; then
+    DAILY_DIRS=""
+    if ! DAILY_DIRS="$(rclone_noproxy lsf --dirs-only "${REMOTE_DB_BASE}/" \
+        --cache-dir "${RCLONE_CACHE_DIR}" \
+        --temp-dir "${RUN_TMP_DIR}" 2>"${RUN_TMP_DIR}/lsf-db.err")"; then
+        DEP_SCAN_OK=0
+        log_msg "WARN" "PRUNE_DRIVE aborted: failed listing ${REMOTE_DB_BASE}/"
+    fi
+    if [[ "${DEP_SCAN_OK}" -eq 1 ]] && [[ -n "${DAILY_DIRS}" ]]; then
+        while IFS= read -r ddir; do
+            ddir="${ddir%/}"
+            [[ -n "${ddir}" ]] || continue
+            DAY_FILES=""
+            if ! DAY_FILES="$(rclone_noproxy lsf --files-only "${REMOTE_DB_BASE}/${ddir}/" \
                 --cache-dir "${RCLONE_CACHE_DIR}" \
-                --temp-dir "${RUN_TMP_DIR}" \
-                --log-file "${RCLONE_LOG_FILE}"; then
-                log_msg "INFO" "PRUNE_DRIVE purged ${REMOTE_WEEKLY_BASE}/${dname}"
-            else
-                log_msg "WARN" "PRUNE_DRIVE failed to purge ${REMOTE_WEEKLY_BASE}/${dname}"
+                --temp-dir "${RUN_TMP_DIR}" 2>"${RUN_TMP_DIR}/lsf-day.err")"; then
+                DEP_SCAN_OK=0
+                log_msg "WARN" "PRUNE_DRIVE aborted: failed listing ${REMOTE_DB_BASE}/${ddir}/"
+                break
+            fi
+            if printf '%s\n' "${DAY_FILES}" | grep -x 'LATEST.json' >/dev/null; then
+                LATEST_RAW=""
+                if ! LATEST_RAW="$(rclone_noproxy cat "${REMOTE_DB_BASE}/${ddir}/LATEST.json" \
+                    --cache-dir "${RCLONE_CACHE_DIR}" \
+                    --temp-dir "${RUN_TMP_DIR}" 2>"${RUN_TMP_DIR}/cat-latest.err")"; then
+                    DEP_SCAN_OK=0
+                    log_msg "WARN" "PRUNE_DRIVE aborted: failed reading ${REMOTE_DB_BASE}/${ddir}/LATEST.json"
+                    break
+                fi
+                BFIELDS=""
+                if ! BFIELDS="$(printf '%s' "${LATEST_RAW}" | "${PY_BIN}" "${OFFSITE_SYNC_PY}" read-json-field --field baseline_id --field baseline_dir 2>"${RUN_TMP_DIR}/parse-latest.err")"; then
+                    DEP_SCAN_OK=0
+                    log_msg "WARN" "PRUNE_DRIVE aborted: failed parsing ${REMOTE_DB_BASE}/${ddir}/LATEST.json"
+                    break
+                fi
+                while IFS= read -r bref; do
+                    [[ -n "${bref}" ]] && printf '%s\n' "${bref}" >> "${REFERENCED_BASELINES_FILE}"
+                done <<EOF
+${BFIELDS}
+EOF
             fi
         done <<EOF
-${PRUNE_DRIVE_NAMES}
+${DAILY_DIRS}
 EOF
     fi
 fi
 
-log_msg "INFO" "OK weekly streaming backup complete: drive=${REMOTE_WEEK_DEST}"
+REMOTE_WEEKLY_BASE="${REMOTE_DRIVE_BASE}/weekly"
+if [[ "${DEP_SCAN_OK}" -eq 1 ]]; then
+    REMOTE_DIRS=""
+    if ! REMOTE_DIRS="$(rclone_noproxy lsf --dirs-only "${REMOTE_WEEKLY_BASE}/" \
+        --cache-dir "${RCLONE_CACHE_DIR}" \
+        --temp-dir "${RUN_TMP_DIR}" 2>"${RUN_TMP_DIR}/lsf-weekly.err")"; then
+        log_msg "WARN" "PRUNE_DRIVE aborted: failed listing ${REMOTE_WEEKLY_BASE}/"
+        REMOTE_DIRS=""
+    fi
+    if [[ -n "${REMOTE_DIRS}" ]]; then
+        PRUNE_DRIVE_NAMES="$(printf '%s\n' "${REMOTE_DIRS}" | "${PY_BIN}" "${OFFSITE_SYNC_PY}" select-weekly-prune \
+            --retain "${DRIVE_RETAIN_WEEKS}" \
+            --referenced-file "${REFERENCED_BASELINES_FILE}")"
+        if [[ -n "${PRUNE_DRIVE_NAMES}" ]]; then
+            while IFS= read -r dname; do
+                [[ -n "${dname}" ]] || continue
+                if rclone_noproxy purge "${REMOTE_WEEKLY_BASE}/${dname}" \
+                    --cache-dir "${RCLONE_CACHE_DIR}" \
+                    --temp-dir "${RUN_TMP_DIR}" \
+                    --log-file "${RCLONE_LOG_FILE}"; then
+                    log_msg "INFO" "PRUNE_DRIVE purged ${REMOTE_WEEKLY_BASE}/${dname}"
+                else
+                    log_msg "WARN" "PRUNE_DRIVE failed to purge ${REMOTE_WEEKLY_BASE}/${dname}"
+                fi
+            done <<EOF
+${PRUNE_DRIVE_NAMES}
+EOF
+        fi
+    fi
+else
+    log_msg "WARN" "PRUNE_DRIVE skipped due to incomplete daily baseline dependency scan; zero remote dirs deleted"
+fi
+
+log_msg "INFO" "OK weekly streaming backup complete: drive=${REMOTE_WEEK_DEST} baseline=${BASELINE_ID}"
 finish_backup

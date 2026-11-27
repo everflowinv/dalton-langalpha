@@ -206,6 +206,7 @@ async def test_reconcile_restored_inflight_states_real_db(
     asr_await_incomplete = str(uuid4())
     asr_await_complete = str(uuid4())
     asr_inflight = str(uuid4())
+    asr_indeterminate = str(uuid4())
     asr_succeeded = str(uuid4())
     matched_sha = _sha(b"verified-assembled-chat-object")
 
@@ -217,7 +218,7 @@ async def test_reconcile_restored_inflight_states_real_db(
                 (user_id, f"{user_id}@example.test"),
             )
             await cur.execute(
-                "INSERT INTO drive_spaces (space_id, owner_type, owner_id) VALUES (%s, 'user', %s)",
+                "INSERT INTO drive_spaces (space_id, kind, user_id) VALUES (%s, 'personal', %s)",
                 (space_id, user_id),
             )
             await cur.execute(
@@ -268,12 +269,14 @@ async def test_reconcile_restored_inflight_states_real_db(
                     (%s, %s, %s, '', 'transcriptions/ws/1/source/a.mp3', 10, %s, 'awaiting_upload', 'awaiting_upload', '{}'::jsonb, %s),
                     (%s, %s, %s, '', 'transcriptions/ws/2/source/b.mp3', 10, %s, 'awaiting_upload', 'awaiting_upload', '{"upload":{"completed":true}}'::jsonb, %s),
                     (%s, %s, %s, '', 'transcriptions/ws/3/source/c.mp3', 10, %s, 'transcribing', 'transcribing', '{"upload":{"completed":true}}'::jsonb, %s),
+                    (%s, %s, %s, '', 'transcriptions/ws/5/source/e.mp3', 10, %s, 'indeterminate', 'indeterminate', '{"upload":{"completed":true}}'::jsonb, %s),
                     (%s, %s, %s, '', 'transcriptions/ws/4/source/d.mp3', 10, %s, 'succeeded', 'succeeded', '{"upload":{"completed":true}}'::jsonb, %s)
                 """,
                 (
                     asr_await_incomplete, user_id, ws_id, "1" * 64, f"id-{asr_await_incomplete}",
                     asr_await_complete, user_id, ws_id, "2" * 64, f"id-{asr_await_complete}",
                     asr_inflight, user_id, ws_id, "3" * 64, f"id-{asr_inflight}",
+                    asr_indeterminate, user_id, ws_id, "5" * 64, f"id-{asr_indeterminate}",
                     asr_succeeded, user_id, ws_id, "4" * 64, f"id-{asr_succeeded}",
                 ),
             )
@@ -289,7 +292,7 @@ async def test_reconcile_restored_inflight_states_real_db(
         assert summary.chat_uploads_promoted_ready >= 1
         assert summary.chat_uploads_aborted >= 2
         assert summary.transcriptions_cancelled >= 1
-        assert summary.transcriptions_failed >= 1
+        assert summary.transcriptions_failed >= 2
 
         async with conn.cursor() as cur:
             await cur.execute(
@@ -341,6 +344,18 @@ async def test_reconcile_restored_inflight_states_real_db(
                 "SELECT status, stage, error_message, completed_at IS NOT NULL "
                 "FROM dalton_transcription_jobs WHERE job_id = %s",
                 (asr_inflight,),
+            )
+            assert await cur.fetchone() == (
+                "failed",
+                "failed",
+                consistent_backup.RESTORED_INFLIGHT_ERROR_MESSAGE,
+                True,
+            )
+
+            await cur.execute(
+                "SELECT status, stage, error_message, completed_at IS NOT NULL "
+                "FROM dalton_transcription_jobs WHERE job_id = %s",
+                (asr_indeterminate,),
             )
             assert await cur.fetchone() == (
                 "failed",

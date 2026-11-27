@@ -198,10 +198,15 @@ upload_and_verify_encrypted_file() {
 }
 
 prune_remote_daily_dirs() {
-    local remote_dirs
-    remote_dirs="$(rclone_noproxy lsf --dirs-only "${REMOTE_DB_BASE}/" \
+    local remote_dirs=""
+    if ! remote_dirs="$(rclone_noproxy lsf --dirs-only "${REMOTE_DB_BASE}/" \
         --cache-dir "${RCLONE_CACHE_DIR}" \
-        --temp-dir "${RUN_TMP_DIR}" 2>/dev/null || true)"
+        --temp-dir "${RUN_TMP_DIR}" 2>"${RUN_TMP_DIR}/lsf-db-prune.err")"; then
+        local lsf_err
+        lsf_err="$(tr '\n' ' ' < "${RUN_TMP_DIR}/lsf-db-prune.err" 2>/dev/null || true)"
+        log_msg "WARN" "PRUNE_DB_DRIVE aborted: failed listing ${REMOTE_DB_BASE}/ (${lsf_err})"
+        return 0
+    fi
     if [[ -n "${remote_dirs}" ]]; then
         local prune_names
         prune_names="$(printf '%s\n' "${remote_dirs}" | "${PY_BIN}" "${BACKUP_LIB}" select-prune-names --retain "${DB_DRIVE_RETAIN}")"
@@ -228,10 +233,14 @@ EOF
 # Mode A: Consistent backup-set mode (when latest-verified-set.json exists)
 # ---------------------------------------------------------------------------
 if [[ -f "${LATEST_VERIFIED_SET}" ]] && [[ "${DALTON_DB_OFFSITE_LEGACY_ONLY:-0}" != "1" ]]; then
+    READ_SET_ARGS=(--set-file "${LATEST_VERIFIED_SET}" --expected-date "${DATE_STAMP}")
+    if [[ "${DALTON_DB_OFFSITE_ALLOW_STALE:-0}" == "1" ]]; then
+        READ_SET_ARGS+=(--allow-stale)
+    fi
     SET_INFO="$("${PY_BIN}" "${OFFSITE_SYNC_PY}" read-verified-set \
-        --set-file "${LATEST_VERIFIED_SET}" 2>"${RUN_TMP_DIR}/set.err")" || {
+        "${READ_SET_ARGS[@]}" 2>"${RUN_TMP_DIR}/set.err")" || {
         SET_ERR="$(cat "${RUN_TMP_DIR}/set.err" 2>/dev/null || true)"
-        fail_with_alert "BACKUP_SET_INVALID" "Invalid latest-verified-set.json (${LATEST_VERIFIED_SET}): ${SET_ERR}"
+        fail_with_alert "BACKUP_SET_INVALID" "Invalid or stale latest-verified-set.json (${LATEST_VERIFIED_SET}): ${SET_ERR}"
     }
 
     BACKUP_SET_ID="$(printf '%s\n' "${SET_INFO}" | sed -n '1p')"
@@ -278,12 +287,18 @@ if [[ -f "${LATEST_VERIFIED_SET}" ]] && [[ "${DALTON_DB_OFFSITE_LEGACY_ONLY:-0}"
     MANIFEST_BASE="$(basename "${MANIFEST_PATH}")"
     DELTA_BASE="$(basename "${DELTA_TAR}")"
 
-    STAGED_DUMP="${REMOTE_DAY_DIR}/${DUMP_BASE}.enc.staged-${RAND_TAG}"
-    FINAL_DUMP="${REMOTE_DAY_DIR}/${DUMP_BASE}.enc"
-    STAGED_MANIFEST="${REMOTE_DAY_DIR}/${MANIFEST_BASE}.enc.staged-${RAND_TAG}"
-    FINAL_MANIFEST="${REMOTE_DAY_DIR}/${MANIFEST_BASE}.enc"
-    STAGED_DELTA="${REMOTE_DAY_DIR}/${DELTA_BASE}.enc.staged-${RAND_TAG}"
-    FINAL_DELTA="${REMOTE_DAY_DIR}/${DELTA_BASE}.enc"
+    # Every remote artifact carries unique RUN_ID so same-day reruns never overwrite old artifacts
+    # referenced by a previously published LATEST.json.
+    FINAL_DUMP_NAME="${DUMP_BASE}.${RUN_ID}.enc"
+    FINAL_MANIFEST_NAME="${MANIFEST_BASE}.${RUN_ID}.enc"
+    FINAL_DELTA_NAME="${DELTA_BASE}.enc"
+
+    STAGED_DUMP="${REMOTE_DAY_DIR}/${FINAL_DUMP_NAME}.staged-${RAND_TAG}"
+    FINAL_DUMP="${REMOTE_DAY_DIR}/${FINAL_DUMP_NAME}"
+    STAGED_MANIFEST="${REMOTE_DAY_DIR}/${FINAL_MANIFEST_NAME}.staged-${RAND_TAG}"
+    FINAL_MANIFEST="${REMOTE_DAY_DIR}/${FINAL_MANIFEST_NAME}"
+    STAGED_DELTA="${REMOTE_DAY_DIR}/${FINAL_DELTA_NAME}.staged-${RAND_TAG}"
+    FINAL_DELTA="${REMOTE_DAY_DIR}/${FINAL_DELTA_NAME}"
 
     upload_and_verify_encrypted_file "${DUMP_PATH}" "${STAGED_DUMP}" "dump" "${RUN_TMP_DIR}/dump.meta.json"
     STAGED_REMOTES+=("${STAGED_DUMP}")
@@ -294,16 +309,17 @@ if [[ -f "${LATEST_VERIFIED_SET}" ]] && [[ "${DALTON_DB_OFFSITE_LEGACY_ONLY:-0}"
 
     STAGED_ASR=""
     FINAL_ASR=""
-    ASR_BASE=""
+    FINAL_ASR_NAME=""
     if [[ -n "${ASR_ARCHIVE_PATH}" ]] && [[ -f "${ASR_ARCHIVE_PATH}" ]]; then
         ASR_BASE="$(basename "${ASR_ARCHIVE_PATH}")"
-        STAGED_ASR="${REMOTE_DAY_DIR}/${ASR_BASE}.enc.staged-${RAND_TAG}"
-        FINAL_ASR="${REMOTE_DAY_DIR}/${ASR_BASE}.enc"
+        FINAL_ASR_NAME="${ASR_BASE}.${RUN_ID}.enc"
+        STAGED_ASR="${REMOTE_DAY_DIR}/${FINAL_ASR_NAME}.staged-${RAND_TAG}"
+        FINAL_ASR="${REMOTE_DAY_DIR}/${FINAL_ASR_NAME}"
         upload_and_verify_encrypted_file "${ASR_ARCHIVE_PATH}" "${STAGED_ASR}" "asr" "${RUN_TMP_DIR}/asr.meta.json"
         STAGED_REMOTES+=("${STAGED_ASR}")
     fi
 
-    # Promote all verified staged objects atomically before publishing LATEST.json
+    # Promote all verified staged objects to their immutable RUN_ID names before flipping LATEST.json
     promote_one() {
         local src="$1"
         local dst="$2"
@@ -327,13 +343,13 @@ if [[ -f "${LATEST_VERIFIED_SET}" ]] && [[ "${DALTON_DB_OFFSITE_LEGACY_ONLY:-0}"
     fi
     STAGED_REMOTES=()
 
-    # Build and publish db/<YYYY-MM-DD>/LATEST.json
+    # Build and publish db/<YYYY-MM-DD>/LATEST.json ONLY after every immutable artifact is promoted
     ARTIFACTS_JSON="${RUN_TMP_DIR}/artifacts.json"
     "${PY_BIN}" "${OFFSITE_SYNC_PY}" write-artifacts-json \
-        --dump-name "${DUMP_BASE}.enc" --dump-meta "${RUN_TMP_DIR}/dump.meta.json" \
-        --manifest-name "${MANIFEST_BASE}.enc" --manifest-meta "${RUN_TMP_DIR}/manifest.meta.json" \
-        --delta-name "${DELTA_BASE}.enc" --delta-meta "${RUN_TMP_DIR}/delta.meta.json" \
-        --asr-name "${ASR_BASE:+${ASR_BASE}.enc}" --asr-meta "${RUN_TMP_DIR}/asr.meta.json" \
+        --dump-name "${FINAL_DUMP_NAME}" --dump-meta "${RUN_TMP_DIR}/dump.meta.json" \
+        --manifest-name "${FINAL_MANIFEST_NAME}" --manifest-meta "${RUN_TMP_DIR}/manifest.meta.json" \
+        --delta-name "${FINAL_DELTA_NAME}" --delta-meta "${RUN_TMP_DIR}/delta.meta.json" \
+        --asr-name "${FINAL_ASR_NAME}" --asr-meta "${RUN_TMP_DIR}/asr.meta.json" \
         --out "${ARTIFACTS_JSON}"
 
     LATEST_LOCAL="${RUN_TMP_DIR}/LATEST.json"
@@ -361,7 +377,7 @@ if [[ -f "${LATEST_VERIFIED_SET}" ]] && [[ "${DALTON_DB_OFFSITE_LEGACY_ONLY:-0}"
     CURRENT_PARTIAL_OBJ=""
 
     prune_remote_daily_dirs
-    log_msg "INFO" "OK daily backup-set offsite upload complete: set=${BACKUP_SET_ID} baseline=${BASELINE_ID:-none} latest=${FINAL_LATEST}"
+    log_msg "INFO" "OK daily backup-set offsite upload complete: set=${BACKUP_SET_ID} run=${RUN_ID} baseline=${BASELINE_ID:-none} latest=${FINAL_LATEST}"
     finish_backup
 fi
 
@@ -377,7 +393,7 @@ PLAIN_SIZE="$(wc -c < "${LATEST_DUMP}" | tr -d ' ')"
 EXPECTED_ENC_SIZE="$("${PY_BIN}" "${BACKUP_LIB}" expected-enc-size --plain-size "${PLAIN_SIZE}")"
 
 DUMP_BASE="$(basename "${LATEST_DUMP}")"
-REMOTE_OBJ="${REMOTE_DAY_DIR}/${DUMP_BASE}.enc"
+REMOTE_OBJ="${REMOTE_DAY_DIR}/${DUMP_BASE}.${RUN_ID}.enc"
 RAND_DB="$(openssl rand -hex 6)"
 PARTIAL_OBJ="${REMOTE_OBJ}.partial-${RAND_DB}"
 HASH_META="${RUN_TMP_DIR}/db.meta.json"

@@ -17,11 +17,13 @@ import argparse
 import asyncio
 import json
 import os
-import subprocess
+import shutil
 import sys
+import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote_plus, urlsplit, urlunsplit
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -30,169 +32,253 @@ if str(REPO_ROOT) not in sys.path:
 from src.dalton import consistent_backup, storage_refs
 from src.dalton.consistent_backup import (
     BucketArchiveSpec,
+    ConsistentBackupError,
+    PgDumpProcess,
     TarGzObjectSink,
+    build_backup_s3_client,
+    resolve_runtime_bucket_specs,
     run_consistent_backup,
+    start_pg_dump_process,
 )
-from src.dalton.storage_config import resolve as resolve_storage_config
+
+RESTORE_MARKER_KEY = ".dalton-restore.json"
+RESTORE_TAG_KEY = "dalton-restore"
+CTL_PREFIX = "@@DALTON_CTL@@ "
 
 
-def _build_s3_client(
-    *,
-    endpoint_url: str,
-    access_key: str,
-    secret_key: str,
-    region: str = "us-east-1",
-    addressing_style: str = "path",
-) -> Any:
-    import boto3
-    from botocore.config import Config
+def _norm_ep(url: str) -> str:
+    raw = (url or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    try:
+        has_scheme = "://" in raw
+        parts = urlsplit(raw if has_scheme else f"//{raw}")
+        if parts.hostname is not None:
+            host = parts.hostname.lower()
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            port = parts.port
+            netloc = f"{host}:{port}" if port is not None else host
+            path = parts.path.rstrip("/") if not (parts.query or parts.fragment) else parts.path
+            if has_scheme:
+                return urlunsplit((parts.scheme.lower(), netloc, path, parts.query, parts.fragment))
+            return urlunsplit(("", netloc, path, parts.query, parts.fragment)).lstrip("/")
+    except Exception:
+        pass
+    return raw
 
-    return boto3.client(
-        "s3",
-        endpoint_url=endpoint_url,
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
-        region_name=region,
-        config=Config(
-            signature_version="s3v4",
-            s3={"addressing_style": addressing_style},
-            connect_timeout=10,
-            read_timeout=120,
-            retries={"max_attempts": 3, "mode": "standard"},
-        ),
+
+def is_restore_created_bucket(s3_client: Any, bucket_name: str) -> bool:
+    """Identify restore-created buckets via bucket tag or .dalton-restore.json marker (never name suffix)."""
+    from botocore.exceptions import ClientError
+
+    try:
+        tag_resp = s3_client.get_bucket_tagging(Bucket=bucket_name)
+        for tag in tag_resp.get("TagSet") or []:
+            if tag.get("Key") == RESTORE_TAG_KEY and str(tag.get("Value", "")).lower() == "true":
+                return True
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0) or 0)
+        if code not in (
+            "NoSuchTagSet",
+            "NoSuchTagSetError",
+            "404",
+            "NotFound",
+            "NotImplemented",
+            "MethodNotAllowed",
+        ) and status not in (404, 405, 501):
+            raise
+
+    try:
+        s3_client.head_object(Bucket=bucket_name, Key=RESTORE_MARKER_KEY)
+        return True
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0) or 0)
+        if code not in ("404", "NoSuchKey", "NotFound") and status != 404:
+            raise
+    return False
+
+
+def resolve_standalone_pg_dsn(
+    pg_dsn: str = "",
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve one unified PostgreSQL DSN for BOTH control session locks and ``pg_dump``.
+
+    Priority:
+    1. Explicit ``--pg-dsn``
+    2. ``DATABASE_URL`` environment variable
+    3. ``DB_HOST`` / ``DB_PORT`` / ``DB_NAME`` / ``DB_USER`` / ``DB_PASSWORD`` / ``DB_SSLMODE``
+    """
+    explicit = (pg_dsn or "").strip()
+    if explicit:
+        return explicit
+    em = os.environ if env is None else env
+    env_url = (em.get("DATABASE_URL") or "").strip()
+    if env_url:
+        return env_url
+    db_host = (em.get("DB_HOST") or "localhost").strip()
+    db_port = (em.get("DB_PORT") or "5432").strip()
+    db_name = (em.get("DB_NAME") or "postgres").strip()
+    db_user = (em.get("DB_USER") or "postgres").strip()
+    db_password = em.get("DB_PASSWORD") or "postgres"
+    db_sslmode = (em.get("DB_SSLMODE") or "prefer").strip() or "prefer"
+    return (
+        f"postgresql://{quote_plus(db_user)}:{quote_plus(db_password)}"
+        f"@{db_host}:{db_port}/{db_name}?sslmode={quote_plus(db_sslmode)}"
     )
+
+
+async def open_standalone_session_connection(dsn: str) -> Any:
+    """Open an autocommit control connection directly against ``dsn`` (no prepare cache)."""
+    from psycopg import AsyncConnection
+
+    conn = await AsyncConnection.connect(
+        dsn,
+        connect_timeout=10,
+        keepalives=1,
+        keepalives_idle=60,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
+    conn.prepare_threshold = None
+    await conn.set_autocommit(True)
+    return conn
 
 
 def resolve_standalone_bucket_specs(
     env: Mapping[str, str] | None = None,
     *,
-    client_factory: Callable[..., Any] = _build_s3_client,
+    client_factory: Callable[..., Any] = build_backup_s3_client,
 ) -> list[BucketArchiveSpec]:
-    """Resolve active Standalone Core buckets (supporting mixed external main + built-in aux)."""
+    """Resolve active Standalone Core buckets via shared runtime rules (supporting ``AWS_*``)."""
+    return resolve_runtime_bucket_specs(
+        env=env,
+        apply_core_defaults=True,
+        rewrite_container_minio=False,
+        client_factory=client_factory,
+    )
+
+
+def _standalone_manifest_extra(
+    specs: list[BucketArchiveSpec],
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build Standalone Core ``_minio_manifest.json`` target metadata compatible with ``restore.sh``."""
     em = os.environ if env is None else env
-    specs_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    buckets = sorted({s.bucket for s in specs})
+    primary_bucket = ""
+    primary_key_prefix = ""
+    targets: dict[str, dict[str, str]] = {}
+    var_buckets: dict[str, str] = {}
 
-    cfg = resolve_storage_config(env=em, apply_core_defaults=True)
-    if cfg.is_storage_enabled and cfg.bucket_name:
-        ep = (cfg.endpoint_url or "http://minio:9000").strip().rstrip("/")
-        ak = (
-            em.get("STORAGE_ACCESS_KEY_ID")
-            or em.get("S3_ACCESS_KEY_ID")
-            or em.get("MINIO_ROOT_USER")
-            or ""
-        ).strip()
-        sk = (
-            em.get("STORAGE_SECRET_ACCESS_KEY")
-            or em.get("S3_SECRET_ACCESS_KEY")
-            or em.get("MINIO_ROOT_PASSWORD")
-            or ""
-        ).strip()
-        region = (em.get("STORAGE_REGION") or em.get("S3_REGION") or "us-east-1").strip()
-        style = (em.get("STORAGE_ADDRESSING_STYLE") or "path").strip().lower()
-        prefix = (em.get("STORAGE_KEY_PREFIX") or "").strip().strip("/")
-        if ep and ak and sk:
-            key = (ep, cfg.bucket_name, prefix)
-            specs_by_key[key] = {
-                "endpoint": ep,
-                "bucket": cfg.bucket_name,
-                "prefix": prefix,
-                "roles": ["main"],
-                "ak": ak,
-                "sk": sk,
-                "region": region,
-                "style": style,
-            }
-
-    for role, env_prefix in (
-        ("chat_upload", "DALTON_CHAT_UPLOAD_STORAGE"),
-        ("asr", "DALTON_ASR_STORAGE"),
-    ):
-        bucket = (em.get(f"{env_prefix}_BUCKET_NAME") or "").strip()
-        if not bucket:
-            continue
-        ep = (em.get(f"{env_prefix}_ENDPOINT_URL") or "http://minio:9000").strip().rstrip("/")
-        ak = (em.get(f"{env_prefix}_ACCESS_KEY_ID") or em.get("MINIO_ROOT_USER") or "").strip()
-        sk = (
-            em.get(f"{env_prefix}_SECRET_ACCESS_KEY") or em.get("MINIO_ROOT_PASSWORD") or ""
-        ).strip()
-        region = (em.get(f"{env_prefix}_REGION") or "us-east-1").strip()
-        style = (em.get(f"{env_prefix}_ADDRESSING_STYLE") or "path").strip().lower()
-        prefix = (em.get(f"{env_prefix}_KEY_PREFIX") or "").strip().strip("/")
-        if ep and ak and sk:
-            key = (ep, bucket, prefix)
-            if key in specs_by_key:
-                if role not in specs_by_key[key]["roles"]:
-                    specs_by_key[key]["roles"].append(role)
-            else:
-                specs_by_key[key] = {
+    for spec in specs:
+        for role in spec.roles:
+            if role == "chat_upload":
+                primary_bucket = spec.bucket
+                primary_key_prefix = spec.key_prefix
+                ep = _norm_ep(
+                    em.get("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL")
+                    or em.get("DALTON_ASR_STORAGE_ENDPOINT_URL")
+                    or "http://minio:9000"
+                )
+                targets["chat_upload"] = {
                     "endpoint": ep,
-                    "bucket": bucket,
-                    "prefix": prefix,
-                    "roles": [role],
-                    "ak": ak,
-                    "sk": sk,
-                    "region": region,
-                    "style": style,
+                    "bucket": spec.bucket,
+                    "key_prefix": spec.key_prefix,
                 }
+            elif role == "asr":
+                ep = _norm_ep(em.get("DALTON_ASR_STORAGE_ENDPOINT_URL") or "http://minio:9000")
+                targets["asr"] = {
+                    "endpoint": ep,
+                    "bucket": spec.bucket,
+                    "key_prefix": spec.key_prefix,
+                }
+            elif role == "main":
+                ep = _norm_ep(
+                    em.get("STORAGE_ENDPOINT_URL")
+                    or em.get("S3_ENDPOINT_URL")
+                    or ""
+                )
+                targets["general"] = {
+                    "endpoint": ep,
+                    "bucket": spec.bucket,
+                    "key_prefix": spec.key_prefix,
+                }
+    if not primary_bucket and buckets:
+        primary_bucket = buckets[0]
+        primary_key_prefix = next((s.key_prefix for s in specs if s.bucket == primary_bucket), "")
 
-    out: list[BucketArchiveSpec] = []
-    for item in specs_by_key.values():
-        client = client_factory(
-            endpoint_url=item["endpoint"],
-            access_key=item["ak"],
-            secret_key=item["sk"],
-            region=item["region"],
-            addressing_style=item["style"],
-        )
-        out.append(
-            BucketArchiveSpec(
-                bucket=item["bucket"],
-                roles=tuple(item["roles"]),
-                key_prefix=item["prefix"],
-                s3_client=client,
-            )
-        )
-    return out
+    for var_name in (
+        "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME",
+        "DALTON_ASR_STORAGE_BUCKET_NAME",
+        "STORAGE_BUCKET_NAME",
+        "S3_BUCKET_NAME",
+        "OSS_BUCKET_NAME",
+        "R2_BUCKET_NAME",
+    ):
+        val = (em.get(var_name) or "").strip()
+        if val and val in buckets:
+            var_buckets[var_name] = val
+    if "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME" not in var_buckets and primary_bucket:
+        var_buckets["DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME"] = primary_bucket
+
+    return {
+        "buckets": buckets,
+        "primary_bucket": primary_bucket or None,
+        "primary_key_prefix": primary_key_prefix,
+        "targets": targets,
+        "var_buckets": var_buckets,
+    }
 
 
-def _run_pg_dump(snapshot_id: str, out_path: Path, *, dsn: str) -> None:
+def _start_pg_dump(snapshot_id: str, out_path: Path, *, dsn: str) -> PgDumpProcess:
     cmd = ["pg_dump", dsn, "-Fc", "--no-owner", "--no-acl", f"--snapshot={snapshot_id}"]
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("wb") as out_fh:
-        proc = subprocess.run(cmd, stdout=out_fh, stderr=subprocess.PIPE, check=False)
-    if proc.returncode != 0 or out_path.stat().st_size == 0:
-        err = proc.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"pg_dump --snapshot failed (rc={proc.returncode}): {err}")
+    return start_pg_dump_process(cmd, out_path, cmd_label="pg_dump")
 
 
-def _cmd_backup(args: argparse.Namespace) -> int:
-    from src.server.database.pool import open_session_connection
-
+def _cmd_backup(
+    args: argparse.Namespace,
+    *,
+    conn_opener: Callable[[str], Any] = open_standalone_session_connection,
+    pg_dump_starter: Callable[..., Any] = _start_pg_dump,
+    bucket_resolver: Callable[..., list[BucketArchiveSpec]] = resolve_standalone_bucket_specs,
+) -> int:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     dump_path = out_dir / "postgres.dump"
     minio_tar = out_dir / "minio-objects.tar.gz"
     asr_dir = Path(args.asr_jobs_dir) if args.asr_jobs_dir else None
     asr_tar = (out_dir / "asr-jobs.tar.gz") if (asr_dir and asr_dir.is_dir()) else None
-    dsn = args.pg_dsn or os.getenv("DATABASE_URL") or ""
+    dsn = resolve_standalone_pg_dsn(args.pg_dsn, os.environ)
     if not dsn:
-        print("DATABASE_URL or --pg-dsn is required", file=sys.stderr)
+        print("DATABASE_URL, --pg-dsn, or DB_* configuration is required", file=sys.stderr)
         return 2
 
-    specs = resolve_standalone_bucket_specs(os.environ)
-    sink = TarGzObjectSink(minio_tar, tmp_dir=out_dir)
+    specs = bucket_resolver(os.environ)
+    sink = TarGzObjectSink(
+        minio_tar,
+        tmp_dir=out_dir,
+        manifest_extra=_standalone_manifest_extra(specs, os.environ),
+    )
 
     async def _execute():
-        conn = await open_session_connection()
+        conn = await conn_opener(dsn)
         try:
             return await run_consistent_backup(
                 conn=conn,
                 pg_dump_path=dump_path,
-                pg_dump_fn=lambda snap_id, out_p: _run_pg_dump(snap_id, out_p, dsn=dsn),
+                pg_dump_fn=lambda snap_id, out_p: pg_dump_starter(snap_id, out_p, dsn=dsn),
                 bucket_specs=specs,
                 object_sink=sink,
                 asr_jobs_dir=asr_dir if asr_tar is not None else None,
                 asr_archive_path=asr_tar,
+                lock_phase_timeout_s=args.lock_timeout_s,
+                pg_dump_timeout_s=args.pg_dump_timeout_s,
+                mirror_timeout_s=args.mirror_timeout_s,
+                snapshot_import_timeout_s=args.snapshot_import_timeout_s,
             )
         finally:
             await conn.close()
@@ -216,6 +302,90 @@ def _cmd_backup(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_compose_backup(
+    args: argparse.Namespace,
+    *,
+    conn_opener: Callable[[str], Any] = open_standalone_session_connection,
+    bucket_resolver: Callable[..., list[BucketArchiveSpec]] = resolve_standalone_bucket_specs,
+) -> int:
+    """Coordinate consistent snapshot backup with host-driven ``docker compose exec postgres pg_dump``.
+
+    Protocol over stderr (control lines prefixed with ``@@DALTON_CTL@@ ``) and stdin:
+    1. Container acquires GC advisory locks, exports REPEATABLE READ snapshot, enumerates DB refs,
+       and writes ``@@DALTON_CTL@@ SNAPSHOT_READY <snapshot_id>`` to stderr.
+    2. Host starts ``pg_dump --snapshot=<snapshot_id>`` in postgres container, waits for dump output,
+       and writes ``SNAPSHOT_IMPORTED`` to stdin -> container immediately COMMITs export txn.
+    3. Container lists versions, selects objects, and waits for ``PG_DUMP_DONE`` on stdin.
+    4. Container releases GC locks (before versioned mirroring), builds ``minio-objects.tar.gz``,
+       runs full 17-consumer reconciliation, streams ``minio-objects.tar.gz`` to stdout (or ``--out-tar``),
+       and emits ``@@DALTON_CTL@@ BACKUP_SUMMARY <json>`` to stderr.
+    """
+    dsn = resolve_standalone_pg_dsn(args.pg_dsn, os.environ)
+    specs = bucket_resolver(os.environ)
+    stage_dir = Path(tempfile.mkdtemp(prefix="dalton-core-cb-"))
+    tar_path = Path(args.out_tar) if (args.out_tar and args.out_tar != "-") else (stage_dir / "minio-objects.tar.gz")
+    asr_dir = Path(args.asr_jobs_dir) if args.asr_jobs_dir else None
+    asr_tar = (stage_dir / "asr-jobs.tar.gz") if (asr_dir and asr_dir.is_dir()) else None
+
+    def _emit_ctl(msg: str) -> None:
+        sys.stderr.write(f"{CTL_PREFIX}{msg}\n")
+        sys.stderr.flush()
+
+    async def _read_ctl_token(expected: str) -> None:
+        line = await asyncio.to_thread(sys.stdin.readline)
+        tok = (line or "").strip()
+        if tok != expected:
+            raise ConsistentBackupError(
+                f"Host pg_dump handshake aborted while waiting for {expected!r} (got {tok!r})"
+            )
+
+    sink = TarGzObjectSink(
+        tar_path,
+        tmp_dir=stage_dir,
+        manifest_extra=_standalone_manifest_extra(specs, os.environ),
+    )
+
+    try:
+        async def _execute():
+            conn = await conn_opener(dsn)
+            try:
+                return await run_consistent_backup(
+                    conn=conn,
+                    pg_dump_path=stage_dir / "host-managed-postgres.dump",
+                    pg_dump_fn=lambda snap_id, _out_p: _emit_ctl(f"SNAPSHOT_READY {snap_id}"),
+                    wait_pg_dump_imported_fn=lambda _h: _read_ctl_token("SNAPSHOT_IMPORTED"),
+                    wait_pg_dump_finished_fn=lambda _h: _read_ctl_token("PG_DUMP_DONE"),
+                    bucket_specs=specs,
+                    object_sink=sink,
+                    asr_jobs_dir=asr_dir if asr_tar is not None else None,
+                    asr_archive_path=asr_tar,
+                    lock_phase_timeout_s=args.lock_timeout_s,
+                    pg_dump_timeout_s=args.pg_dump_timeout_s,
+                    mirror_timeout_s=args.mirror_timeout_s,
+                    snapshot_import_timeout_s=args.snapshot_import_timeout_s,
+                )
+            finally:
+                await conn.close()
+
+        res = asyncio.run(_execute())
+        if not args.out_tar or args.out_tar == "-":
+            with tar_path.open("rb") as fh:
+                shutil.copyfileobj(fh, sys.stdout.buffer, length=1024 * 1024)
+            sys.stdout.buffer.flush()
+
+        summary_payload = {
+            "snapshot_id": res.snapshot_id,
+            "object_count": len(res.manifest_objects),
+            "warnings": list(res.warnings),
+            "reconcile_ok": res.reconcile_report.ok,
+            "checked_refs": res.reconcile_report.checked_refs,
+        }
+        _emit_ctl("BACKUP_SUMMARY " + json.dumps(summary_payload, ensure_ascii=False))
+        return 0
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Standalone Core consistent backup & post-restore reconciliation CLI"
@@ -226,14 +396,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_bak.add_argument("--output-dir", required=True)
     p_bak.add_argument("--pg-dsn", default="")
     p_bak.add_argument("--asr-jobs-dir", default="")
+    p_bak.add_argument("--lock-timeout-s", type=float, default=None)
+    p_bak.add_argument("--pg-dump-timeout-s", type=float, default=None)
+    p_bak.add_argument("--mirror-timeout-s", type=float, default=None)
+    p_bak.add_argument("--snapshot-import-timeout-s", type=float, default=None)
     p_bak.set_defaults(func=_cmd_backup)
+
+    p_cb = sub.add_parser("compose-backup")
+    p_cb.add_argument("--pg-dsn", default="")
+    p_cb.add_argument("--out-tar", default="-")
+    p_cb.add_argument("--asr-jobs-dir", default="")
+    p_cb.add_argument("--lock-timeout-s", type=float, default=None)
+    p_cb.add_argument("--pg-dump-timeout-s", type=float, default=None)
+    p_cb.add_argument("--mirror-timeout-s", type=float, default=None)
+    p_cb.add_argument("--snapshot-import-timeout-s", type=float, default=None)
+    p_cb.set_defaults(func=_cmd_compose_backup)
 
     p_rec = sub.add_parser("reconcile-restored-inflight-states")
     p_rec.add_argument("--skip-object-check", action="store_true")
+    p_rec.add_argument("--asr-jobs-dir", default="")
+    p_rec.add_argument("--restored-before", default="")
     p_rec.set_defaults(
         func=lambda a: consistent_backup.main(
             ["reconcile-restored-inflight-states"]
             + (["--skip-object-check"] if a.skip_object_check else [])
+            + (["--asr-jobs-dir", a.asr_jobs_dir] if a.asr_jobs_dir else [])
+            + (["--restored-before", a.restored_before] if a.restored_before else [])
         )
     )
 

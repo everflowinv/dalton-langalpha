@@ -3895,6 +3895,13 @@ _is_terminal_pg_backup_line() {
   esac
 }
 
+# True when launchd reports com.dalton.pg-backup is actively running (has an active PID / state = running).
+_pg_backup_job_running() {
+  local out=""
+  out=$(launchctl print "gui/$(id -u)/com.dalton.pg-backup" 2>/dev/null) || return 1
+  printf '%s\n' "$out" | grep -Eq '^[[:space:]]*(state = running|pid = [0-9]+)'
+}
+
 # Prefer repo .venv/bin/python; fall back to python3 on PATH when absent.
 # Require Python >= 3.11.
 _resolve_deploy_python() {
@@ -4709,17 +4716,63 @@ run_deploy_main() {
       echo "backup: reusing (no migrations to deploy, dump within ${REUSE_BACKUP_MIN} min): $reused"
     else
       [ -n "$REUSE_BACKUP_MIN" ] && echo "backup: cannot reuse (migrations to deploy or no ok dump within ${REUSE_BACKUP_MIN} min); taking a fresh one"
-      launchctl kickstart "gui/$(id -u)/com.dalton.pg-backup"
-      for i in $(seq 1 360); do
+      local backup_tag_file="${DALTON_PG_BACKUP_TAG_FILE:-$HOME/Library/Logs/.dalton-pg-backup.next-tag}"
+      local backup_wait_s="${DALTON_DEPLOY_BACKUP_WAIT_S:-14400}"
+      local backup_poll_s="${DALTON_DEPLOY_BACKUP_POLL_S:-5}"
+      local backup_polls=1
+      if [ "$backup_poll_s" -gt 0 ] 2>/dev/null; then
+        backup_polls=$(( (backup_wait_s + backup_poll_s - 1) / backup_poll_s ))
+      fi
+      [ "$backup_polls" -lt 1 ] && backup_polls=1
+
+      if _pg_backup_job_running; then
+        echo "backup: com.dalton.pg-backup is already running; waiting for it instead of triggering a duplicate run"
+      else
+        mkdir -p "$(dirname "$backup_tag_file")" 2>/dev/null || true
+        printf 'deploy\n' > "$backup_tag_file" 2>/dev/null || true
+        launchctl kickstart "gui/$(id -u)/com.dalton.pg-backup"
+      fi
+
+      local backup_done=0
+      for i in $(seq 1 "$backup_polls"); do
         cur_bak_line="$(tail -1 "$LOG" 2>/dev/null)"
         if [ "$cur_bak_line" != "$before" ] && _is_terminal_pg_backup_line "$cur_bak_line"; then
+          backup_done=1
           break
         fi
-        sleep 5
-      done  # 30 min: dumps of a large db + object mirror sync
-      after=$(tail -1 "$LOG"); echo "backup: $after"
-      case "$after" in *" ok "*) [ "$after" != "$before" ] || { echo "no fresh backup, abort"; release_deploy_lock || true; exit 1; };; *) echo "backup failed, abort"; release_deploy_lock || true; exit 1;; esac
-      DEPLOY_BACKUP_STATUS="fresh"
+        sleep "$backup_poll_s"
+      done  # default 4h: covers pg_dump + full-bucket object mirror sync
+      after=$(tail -1 "$LOG" 2>/dev/null); echo "backup: $after"
+      if [ "$backup_done" -eq 1 ]; then
+        case "$after" in
+          *" ok "*)
+            if [ "$after" = "$before" ]; then
+              echo "no fresh backup, abort"; release_deploy_lock || true; exit 1
+            fi
+            ;;
+          *)
+            echo "backup failed, abort"; release_deploy_lock || true; exit 1
+            ;;
+        esac
+        DEPLOY_BACKUP_STATUS="fresh"
+      elif _pg_backup_job_running; then
+        echo "backup: still running after ${backup_wait_s}s wait (not failed; leaving running job intact and deferring deploy without re-triggering)"
+        release_deploy_lock || true
+        exit 75
+      else
+        rm -f "$backup_tag_file" 2>/dev/null || true
+        case "$after" in
+          *" ok "*)
+            if [ "$after" = "$before" ]; then
+              echo "no fresh backup, abort"; release_deploy_lock || true; exit 1
+            fi
+            DEPLOY_BACKUP_STATUS="fresh"
+            ;;
+          *)
+            echo "backup failed, abort"; release_deploy_lock || true; exit 1
+            ;;
+        esac
+      fi
     fi
     # ff and staged builds only after the idle wait and backup, right before the restart, so the new
     # frontend never goes live against the old backend and running code is not swapped under a busy backend.

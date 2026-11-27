@@ -46,7 +46,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TextIO
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from src.dalton.storage_keys import storage_user_id
 from src.server.database.pool import get_db_connection, open_session_connection
@@ -305,19 +305,8 @@ def _get_checkpoint_serde() -> Any:
     return _CHECKPOINT_SERDE
 
 
-def site_response_image_url_rules(
-    *, env: Mapping[str, str] | None = None
-) -> list[tuple[str | None, str]]:
-    """Return ``(origin_or_none, full_response_images_path_prefix)`` rules for this site/bucket.
-
-    Covers every URL base that this deployment's main bucket or site proxy can emit for
-    ``get_public_url("response-images/...")``:
-    - ``STORAGE_PUBLIC_URL_BASE`` / ``S3_PUBLIC_URL_BASE`` (absolute or site-relative ``/...``)
-    - ``PUBLIC_APP_URL`` + ``/storage``
-    - Configured S3 bucket (AWS default virtual host + ``STORAGE_ENDPOINT_URL`` /
-      ``S3_ENDPOINT_URL`` / ``STORAGE_BROWSER_ENDPOINT_URL`` in path and virtual-hosted styles)
-    - Configured OSS bucket (``OSS_BUCKET_NAME`` + ``OSS_ENDPOINT``)
-    """
+def _site_main_bucket_url_bases(env: Mapping[str, str] | None = None) -> list[str]:
+    """Return all configured URL bases that this site or main bucket can emit."""
     em = os.environ if env is None else env
     candidates: list[str] = []
 
@@ -370,18 +359,27 @@ def site_response_image_url_rules(
                 candidates.append(f"{ep_scheme}://{oss_bucket}.{ep_hostport}{ep.path.rstrip('/')}")
         else:
             candidates.append(f"https://{oss_bucket}.{oss_endpoint.strip('/')}")
+    return candidates
 
+
+def _site_prefix_rules(
+    sub_prefixes: Sequence[str], *, env: Mapping[str, str] | None = None
+) -> list[tuple[str | None, str, str]]:
+    """Build ``(origin_or_none, full_url_path_prefix, logical_prefix)`` rules for main-bucket paths."""
+    em = os.environ if env is None else env
+    candidates = _site_main_bucket_url_bases(em)
     key_prefix = _normalize_storage_key_prefix(em)
-    rules: list[tuple[str | None, str]] = []
-    seen: set[tuple[str | None, str]] = set()
+    rules: list[tuple[str | None, str, str]] = []
+    seen: set[tuple[str | None, str, str]] = set()
     for raw_base in candidates:
         if raw_base.startswith("/") and not raw_base.startswith("//"):
             base_path = raw_base.rstrip("/")
-            full_prefix = f"{base_path}/{key_prefix}response-images/"
-            pair: tuple[str | None, str] = (None, full_prefix)
-            if pair not in seen:
-                seen.add(pair)
-                rules.append(pair)
+            for sub in sub_prefixes:
+                full_prefix = f"{base_path}/{key_prefix}{sub}"
+                triple: tuple[str | None, str, str] = (None, full_prefix, sub)
+                if triple not in seen:
+                    seen.add(triple)
+                    rules.append(triple)
             continue
         try:
             parsed = urlsplit(raw_base.rstrip("/"))
@@ -391,12 +389,44 @@ def site_response_image_url_rules(
         if origin is None:
             continue
         base_path = parsed.path.rstrip("/")
-        full_prefix = f"{base_path}/{key_prefix}response-images/"
-        pair = (origin, full_prefix)
-        if pair not in seen:
-            seen.add(pair)
-            rules.append(pair)
+        for sub in sub_prefixes:
+            full_prefix = f"{base_path}/{key_prefix}{sub}"
+            triple = (origin, full_prefix, sub)
+            if triple not in seen:
+                seen.add(triple)
+                rules.append(triple)
     return rules
+
+
+_RESPONSE_IMAGE_LOGICAL_PREFIXES: tuple[str, ...] = (
+    "private-media/response-images/",
+    "response-images/",
+)
+_ATTACHMENT_LOGICAL_PREFIXES: tuple[str, ...] = (
+    "private-media/attachments/",
+    "attachments/",
+)
+
+
+def site_response_image_url_rules(
+    *, env: Mapping[str, str] | None = None
+) -> list[tuple[str | None, str]]:
+    """Return ``(origin_or_none, full_response_images_path_prefix)`` rules for this site/bucket.
+
+    Covers both current ``private-media/response-images/`` and legacy ``response-images/``
+    prefixes across every URL base that this deployment's main bucket or site proxy can emit:
+    - ``STORAGE_PUBLIC_URL_BASE`` / ``S3_PUBLIC_URL_BASE`` (absolute or site-relative ``/...``)
+    - ``PUBLIC_APP_URL`` + ``/storage``
+    - Configured S3 bucket (AWS default virtual host + ``STORAGE_ENDPOINT_URL`` /
+      ``S3_ENDPOINT_URL`` / ``STORAGE_BROWSER_ENDPOINT_URL`` in path and virtual-hosted styles)
+    - Configured OSS bucket (``OSS_BUCKET_NAME`` + ``OSS_ENDPOINT``)
+    """
+    return [
+        (origin, full_prefix)
+        for origin, full_prefix, _logical in _site_prefix_rules(
+            _RESPONSE_IMAGE_LOGICAL_PREFIXES, env=env
+        )
+    ]
 
 
 def _is_valid_response_image_tail(tail: str, *, require_hash: bool) -> bool:
@@ -468,7 +498,12 @@ def is_main_bucket_response_image_url(
     elif parsed.netloc or not path.startswith("/"):
         return False
     key_prefix = _normalize_storage_key_prefix(env)
-    for prefix in (f"/{key_prefix}response-images/", f"/storage/{key_prefix}response-images/"):
+    for prefix in (
+        f"/{key_prefix}private-media/response-images/",
+        f"/storage/{key_prefix}private-media/response-images/",
+        f"/{key_prefix}response-images/",
+        f"/storage/{key_prefix}response-images/",
+    ):
         if path.startswith(prefix) and _is_valid_response_image_tail(
             path[len(prefix) :], require_hash=True
         ):
@@ -2003,7 +2038,7 @@ _SKILL_CONTENT_HASH_RE = re.compile(r"^sha256:([0-9a-f]{64})$")
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 TERMINAL_ASR_ARCHIVE_STATUSES: frozenset[str] = frozenset(
-    {"succeeded", "failed", "cancelled", "indeterminate"}
+    {"succeeded", "failed", "cancelled"}
 )
 ACTIVE_OR_SUBMITTED_ASR_STATUSES: frozenset[str] = frozenset(
     {
@@ -2130,7 +2165,7 @@ def extract_avatar_object_key(
 def extract_response_image_object_key(
     url: str | None, *, env: Mapping[str, str] | None = None
 ) -> str | None:
-    """Return logical ``response-images/...`` key if ``url`` points to this site's main bucket."""
+    """Return logical ``private-media/response-images/...`` or ``response-images/...`` key for this site's main bucket."""
     raw = (url or "").strip()
     if not raw or not is_main_bucket_response_image_url(raw, env=env):
         return None
@@ -2139,22 +2174,25 @@ def extract_response_image_object_key(
     except ValueError:
         return None
     path = parsed.path or ""
-    rules = site_response_image_url_rules(env=env)
-    for rule_origin, full_prefix in rules:
-        if parsed.scheme:
-            origin = _origin_from_split(parsed)
-            if rule_origin != origin:
-                continue
-        if path.startswith(full_prefix):
-            tail = path[len(full_prefix) :]
-            if _is_valid_response_image_tail(tail, require_hash=False):
-                return f"response-images/{tail}"
+    rules = _site_prefix_rules(_RESPONSE_IMAGE_LOGICAL_PREFIXES, env=env)
+    if rules:
+        for rule_origin, full_prefix, logical_prefix in rules:
+            if parsed.scheme:
+                origin = _origin_from_split(parsed)
+                if rule_origin != origin:
+                    continue
+            if path.startswith(full_prefix):
+                tail = path[len(full_prefix) :]
+                if _is_valid_response_image_tail(tail, require_hash=False):
+                    return f"{logical_prefix}{tail}"
+        return None
     key_prefix = _normalize_storage_key_prefix(env)
-    for prefix in (f"/{key_prefix}response-images/", f"/storage/{key_prefix}response-images/"):
-        if path.startswith(prefix):
-            tail = path[len(prefix) :]
-            if _is_valid_response_image_tail(tail, require_hash=True):
-                return f"response-images/{tail}"
+    for logical_prefix in _RESPONSE_IMAGE_LOGICAL_PREFIXES:
+        for prefix in (f"/{key_prefix}{logical_prefix}", f"/storage/{key_prefix}{logical_prefix}"):
+            if path.startswith(prefix):
+                tail = path[len(prefix) :]
+                if _is_valid_response_image_tail(tail, require_hash=True):
+                    return f"{logical_prefix}{tail}"
     return None
 
 
@@ -2308,35 +2346,100 @@ def _extract_response_image_keys_from_checkpoint(
     return keys
 
 
+def _clean_decoded_attachment_tail(raw_tail: str, *, decode_once: bool) -> str | None:
+    tail = unquote(raw_tail) if decode_once else raw_tail
+    tail = tail.strip("/")
+    if not tail or "\x00" in tail:
+        return None
+    segments = tail.split("/")
+    if any(not seg or seg in (".", "..") for seg in segments):
+        return None
+    return tail
+
+
 def extract_attachment_object_key(
     url_or_key: str | None, *, env: Mapping[str, str] | None = None
 ) -> str | None:
-    """Extract logical ``attachments/...`` (or ``private-media/attachments/...``) key from a stored attachment URL."""
+    """Extract logical ``attachments/...`` or ``private-media/attachments/...`` key from a stored attachment URL or key.
+
+    Validates URL origin against this deployment's configured site/main-bucket URL bases
+    (when configured) and percent-decodes URL paths exactly once to match ``_object_url(quote(key, safe='/'))``.
+    """
     raw = (url_or_key or "").strip()
     if not raw:
         return None
-    if raw.startswith(("attachments/", "private-media/attachments/")):
-        return raw.lstrip("/")
+    for logical_prefix in _ATTACHMENT_LOGICAL_PREFIXES:
+        if raw.startswith(logical_prefix):
+            cleaned = _clean_decoded_attachment_tail(
+                raw[len(logical_prefix) :], decode_once=False
+            )
+            return f"{logical_prefix}{cleaned}" if cleaned else None
+
     try:
         parsed = urlsplit(raw)
     except ValueError:
         return None
     path = parsed.path or ""
-    key_prefix = _normalize_storage_key_prefix(env)
-    for marker in (
-        f"/{key_prefix}private-media/attachments/",
-        "/private-media/attachments/",
-        f"/{key_prefix}attachments/",
-        "/attachments/",
-    ):
-        idx = path.find(marker)
-        if idx >= 0:
-            tail = path[idx + len(marker) :].strip("/")
-            if not tail or ".." in tail.split("/"):
+    if "attachments/" not in path:
+        return None
+
+    rules = _site_prefix_rules(_ATTACHMENT_LOGICAL_PREFIXES, env=env)
+    if rules:
+        if parsed.scheme:
+            origin = _origin_from_split(parsed)
+            if origin is None:
                 return None
-            if "private-media/attachments/" in marker:
-                return f"private-media/attachments/{tail}"
-            return f"attachments/{tail}"
+            for rule_origin, full_prefix, logical_prefix in rules:
+                if rule_origin == origin and path.startswith(full_prefix):
+                    tail = _clean_decoded_attachment_tail(
+                        path[len(full_prefix) :], decode_once=True
+                    )
+                    if tail:
+                        return f"{logical_prefix}{tail}"
+            return None
+        if parsed.netloc or not path.startswith("/"):
+            return None
+        for _rule_origin, full_prefix, logical_prefix in rules:
+            if path.startswith(full_prefix):
+                tail = _clean_decoded_attachment_tail(
+                    path[len(full_prefix) :], decode_once=True
+                )
+                if tail:
+                    return f"{logical_prefix}{tail}"
+        key_prefix = _normalize_storage_key_prefix(env)
+        for logical_prefix in _ATTACHMENT_LOGICAL_PREFIXES:
+            for prefix in (
+                f"/{key_prefix}{logical_prefix}",
+                f"/storage/{key_prefix}{logical_prefix}",
+            ):
+                if path.startswith(prefix):
+                    tail = _clean_decoded_attachment_tail(
+                        path[len(prefix) :], decode_once=True
+                    )
+                    if tail:
+                        return f"{logical_prefix}{tail}"
+        return None
+
+    # Fallback when no site/main-bucket URL base is configured in env:
+    # still enforce valid http(s)/relative URL and exact root or /storage/ object prefix.
+    if parsed.scheme:
+        if _origin_from_split(parsed) is None:
+            return None
+    elif parsed.netloc or not path.startswith("/"):
+        return None
+
+    key_prefix = _normalize_storage_key_prefix(env)
+    for logical_prefix in _ATTACHMENT_LOGICAL_PREFIXES:
+        for prefix in (
+            f"/{key_prefix}{logical_prefix}",
+            f"/storage/{key_prefix}{logical_prefix}",
+        ):
+            if path.startswith(prefix):
+                tail = _clean_decoded_attachment_tail(
+                    path[len(prefix) :], decode_once=True
+                )
+                if tail:
+                    return f"{logical_prefix}{tail}"
     return None
 
 
@@ -3477,35 +3580,74 @@ def reconcile_inventory_against_manifest(
                     )
                 )
 
-    # Reconcile succeeded ASR jobs archive contents
+    # Reconcile ASR jobs archive:
+    # 1. Verify NO archived job directory contains a non-terminal status (e.g. indeterminate or active)
+    # 2. Verify all succeeded ASR jobs have valid state.json, result.json, and raw_response.json
     checked_asr_jobs = 0
-    if inventory.succeeded_asr_job_ids:
-        archive_members: dict[str, bytes] | None = None
-        if asr_jobs_archive is not None:
-            if not asr_jobs_archive.is_file():
+    archive_members: dict[str, bytes] | None = None
+    if asr_jobs_archive is not None:
+        if asr_jobs_archive.is_file():
+            try:
+                archive_members = _load_tar_members_bytes(asr_jobs_archive)
+            except Exception as exc:
                 errors.append(
                     ReconcileIssue(
                         consumer="dalton_transcription_jobs_archive",
-                        code="missing_asr_archive",
+                        code="corrupt_asr_archive",
                         row_id="*",
                         object_key=str(asr_jobs_archive),
-                        detail="Succeeded ASR jobs exist but asr-jobs archive is missing",
+                        detail=f"Failed reading asr-jobs archive: {exc}",
                     )
                 )
-            else:
+        elif inventory.succeeded_asr_job_ids:
+            errors.append(
+                ReconcileIssue(
+                    consumer="dalton_transcription_jobs_archive",
+                    code="missing_asr_archive",
+                    row_id="*",
+                    object_key=str(asr_jobs_archive),
+                    detail="Succeeded ASR jobs exist but asr-jobs archive is missing",
+                )
+            )
+
+    if archive_members is not None:
+        for member_name, raw_bytes in sorted(archive_members.items()):
+            parts = member_name.split("/")
+            if len(parts) == 2 and parts[1] == "state.json":
+                arch_job_id = parts[0]
                 try:
-                    archive_members = _load_tar_members_bytes(asr_jobs_archive)
+                    st_obj = json.loads(raw_bytes.decode("utf-8"))
                 except Exception as exc:
                     errors.append(
                         ReconcileIssue(
                             consumer="dalton_transcription_jobs_archive",
-                            code="corrupt_asr_archive",
-                            row_id="*",
-                            object_key=str(asr_jobs_archive),
-                            detail=f"Failed reading asr-jobs archive: {exc}",
+                            code="invalid_archived_state_json",
+                            row_id=arch_job_id,
+                            object_key=member_name,
+                            detail=f"Invalid JSON in archived state.json: {exc}",
+                        )
+                    )
+                    continue
+                arch_status = (
+                    str(st_obj.get("status") or "").strip().lower()
+                    if isinstance(st_obj, dict)
+                    else ""
+                )
+                if arch_status not in TERMINAL_ASR_ARCHIVE_STATUSES:
+                    errors.append(
+                        ReconcileIssue(
+                            consumer="dalton_transcription_jobs_archive",
+                            code="non_terminal_archived_asr_job",
+                            row_id=arch_job_id,
+                            object_key=member_name,
+                            detail=(
+                                f"ASR archive must contain only terminal jobs "
+                                f"{sorted(TERMINAL_ASR_ARCHIVE_STATUSES)}, got status={arch_status!r}"
+                            ),
                         )
                     )
 
+    if inventory.succeeded_asr_job_ids:
         if archive_members is not None or asr_jobs_dir is not None:
             req_raw_ids = set(require_raw_response_job_ids or ())
             for job_id in inventory.succeeded_asr_job_ids:

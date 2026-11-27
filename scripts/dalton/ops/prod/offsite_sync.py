@@ -9,10 +9,12 @@ for weekly date-directory pruning.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import io
 import json
 import os
+import re
 import sys
 import tarfile
 from collections.abc import Iterable, Mapping, Sequence
@@ -190,6 +192,14 @@ def build_daily_minio_delta_tar(
         tmp_tar.unlink(missing_ok=True)
 
 
+_DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:$|-)")
+
+
+def _baseline_date_dir(baseline_id: str) -> str:
+    m = _DATE_PREFIX_RE.match(str(baseline_id or "").strip().rstrip("/"))
+    return m.group(1) if m else str(baseline_id or "").strip().rstrip("/")
+
+
 def select_weekly_baselines_to_prune(
     weekly_dirs: Iterable[str],
     *,
@@ -197,11 +207,12 @@ def select_weekly_baselines_to_prune(
     referenced_baseline_ids: Iterable[str] = (),
 ) -> list[str]:
     """Select expired ``weekly/<YYYY-MM-DD>`` dirs while exempting any ``baseline_id`` referenced by retained daily sets."""
-    referenced = {
-        str(bid).strip().rstrip("/")
-        for bid in referenced_baseline_ids
-        if str(bid).strip()
-    }
+    referenced: set[str] = set()
+    for bid in referenced_baseline_ids:
+        clean = str(bid or "").strip().rstrip("/")
+        if clean:
+            referenced.add(clean)
+            referenced.add(_baseline_date_dir(clean))
     candidates = backup_lib.select_weekly_dirs_to_prune(weekly_dirs, retain_weeks)
     return [name for name in candidates if name.strip().rstrip("/") not in referenced]
 
@@ -221,14 +232,87 @@ def build_daily_latest_json(
         "date": date_stamp,
         "backup_set_id": backup_set_id,
         "baseline_id": baseline_id,
+        "baseline_dir": _baseline_date_dir(baseline_id) if baseline_id else "",
         "artifacts": {k: dict(v) for k, v in artifacts.items()},
     }
 
 
+def build_weekly_latest_json(
+    *,
+    run_id: str,
+    date_stamp: str,
+    baseline_id: str,
+    minio_mode: str,
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build the authoritative ``weekly/<YYYY-MM-DD>/LATEST.json`` manifest published after full verification."""
+    return {
+        "version": 2,
+        "run_id": run_id,
+        "date": date_stamp,
+        "baseline_id": baseline_id,
+        "minio_mode": minio_mode,
+        "artifacts": {k: dict(v) for k, v in artifacts.items()},
+    }
+
+
+def publish_weekly_baseline_pointer(
+    *,
+    staged_manifest_path: Path,
+    sets_dir: Path,
+    baseline_id: str,
+) -> Path:
+    """Atomically promote a remotely verified weekly baseline manifest and flip ``latest-weekly-baseline.json``."""
+    data = json.loads(staged_manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("objects"), list):
+        raise ValueError(f"Invalid staged weekly baseline manifest: {staged_manifest_path}")
+    sets_dir.mkdir(parents=True, exist_ok=True)
+    final_manifest = sets_dir / f"weekly-baseline-{baseline_id}.json"
+    tmp_manifest = final_manifest.with_name(f".{final_manifest.name}.tmp.{os.getpid()}")
+    tmp_manifest.write_text(
+        json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(tmp_manifest, 0o600)
+    os.replace(tmp_manifest, final_manifest)
+
+    pointer_path = sets_dir / "latest-weekly-baseline.json"
+    pointer_tmp = pointer_path.with_name(f".{pointer_path.name}.tmp.{os.getpid()}")
+    pointer_payload = {
+        "version": 2,
+        "baseline_id": baseline_id,
+        "baseline_dir": _baseline_date_dir(baseline_id),
+        "manifest_path": str(final_manifest),
+        "object_count": len(data["objects"]),
+        "published_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+    }
+    pointer_tmp.write_text(
+        json.dumps(pointer_payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(pointer_tmp, 0o600)
+    os.replace(pointer_tmp, pointer_path)
+    return final_manifest
+
+
 def find_latest_weekly_baseline_manifest(sets_dir: Path) -> tuple[str, list[dict[str, Any]]]:
-    """Locate the newest local ``weekly-baseline-<YYYY-MM-DD>.json`` manifest, if any."""
+    """Locate the published local weekly baseline manifest (preferring ``latest-weekly-baseline.json``)."""
     if not sets_dir.is_dir():
         return "", []
+    pointer_path = sets_dir / "latest-weekly-baseline.json"
+    if pointer_path.is_file():
+        try:
+            ptr = json.loads(pointer_path.read_text(encoding="utf-8"))
+            if isinstance(ptr, dict):
+                mpath_str = str(ptr.get("manifest_path") or "").strip()
+                bid = str(ptr.get("baseline_id") or "").strip()
+                mpath = Path(mpath_str) if mpath_str else (sets_dir / f"weekly-baseline-{bid}.json")
+                if mpath.is_file():
+                    data = json.loads(mpath.read_text(encoding="utf-8"))
+                    if isinstance(data, dict) and isinstance(data.get("objects"), list):
+                        return bid or str(data.get("baseline_id") or ""), data["objects"]
+        except Exception:
+            pass
     candidates = sorted(sets_dir.glob("weekly-baseline-*.json"), reverse=True)
     for path in candidates:
         try:
@@ -239,6 +323,37 @@ def find_latest_weekly_baseline_manifest(sets_dir: Path) -> tuple[str, list[dict
             bid = str(data.get("baseline_id") or path.stem.removeprefix("weekly-baseline-"))
             return bid, data["objects"]
     return "", []
+
+
+def validate_verified_set_window(
+    set_data: Mapping[str, Any],
+    *,
+    expected_date: str | None = None,
+    local_tz: dt.tzinfo | None = None,
+) -> tuple[bool, str]:
+    """Verify ``reconcile_ok`` and (when ``expected_date`` is given) ``created_at`` falls in that day's window."""
+    if not set_data.get("reconcile_ok"):
+        return False, "latest-verified-set.json is not reconciled"
+    if not expected_date:
+        return True, "ok"
+    raw_created = str(set_data.get("created_at") or "").strip()
+    if not raw_created:
+        return False, f"latest-verified-set.json is missing created_at (expected date {expected_date})"
+    try:
+        parsed = dt.datetime.fromisoformat(raw_created.replace("Z", "+00:00"))
+    except ValueError:
+        return False, f"latest-verified-set.json has invalid created_at={raw_created!r}"
+    tz = local_tz if local_tz is not None else dt.datetime.now().astimezone().tzinfo
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=tz)
+    local_date = parsed.astimezone(tz).strftime("%Y-%m-%d")
+    if local_date != expected_date:
+        return (
+            False,
+            f"latest-verified-set.json backup_set_id={set_data.get('backup_set_id')} "
+            f"created_at={raw_created} (local_date={local_date}) is outside today's window ({expected_date})",
+        )
+    return True, "ok"
 
 
 def _cmd_build_delta(args: argparse.Namespace) -> int:
@@ -295,6 +410,12 @@ def _cmd_weekly_minio_baseline(args: argparse.Namespace) -> int:
     from scripts.dalton.ops.prod.local_backup_set import resolve_everflow_bucket_specs
 
     specs = resolve_everflow_bucket_specs(os.environ)
+    if not specs:
+        print(
+            "No active MinIO/S3 buckets resolved from environment; refusing to build empty weekly baseline",
+            file=sys.stderr,
+        )
+        return 1
     records, payload = build_weekly_minio_baseline(
         bucket_specs=specs,
         baseline_id=args.baseline_id,
@@ -311,6 +432,45 @@ def _cmd_weekly_minio_baseline(args: argparse.Namespace) -> int:
             },
             ensure_ascii=False,
         )
+    )
+    return 0
+
+
+def _cmd_publish_weekly_baseline_pointer(args: argparse.Namespace) -> int:
+    final_manifest = publish_weekly_baseline_pointer(
+        staged_manifest_path=Path(args.staged_manifest),
+        sets_dir=Path(args.sets_dir),
+        baseline_id=args.baseline_id,
+    )
+    print(str(final_manifest))
+    return 0
+
+
+def _cmd_build_weekly_latest_json(args: argparse.Namespace) -> int:
+    def _meta(path_str: str) -> dict[str, Any]:
+        return json.loads(Path(path_str).read_text(encoding="utf-8"))
+
+    arts: dict[str, Any] = {
+        "minio": {"filename": args.minio_name, **_meta(args.minio_meta)},
+        "redis": {"filename": args.redis_name, **_meta(args.redis_meta)},
+        "var_dalton": {"filename": args.var_name, **_meta(args.var_meta)},
+    }
+    if args.sandboxes_json and Path(args.sandboxes_json).is_file():
+        sb_list = json.loads(Path(args.sandboxes_json).read_text(encoding="utf-8"))
+        if isinstance(sb_list, list):
+            arts["sandboxes"] = sb_list
+    payload = build_weekly_latest_json(
+        run_id=args.run_id,
+        date_stamp=args.date_stamp,
+        baseline_id=args.baseline_id,
+        minio_mode=args.minio_mode,
+        artifacts=arts,
+    )
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
     )
     return 0
 
@@ -332,8 +492,13 @@ def _cmd_build_latest_json(args: argparse.Namespace) -> int:
 
 def _cmd_read_verified_set(args: argparse.Namespace) -> int:
     data = json.loads(Path(args.set_file).read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or not data.get("reconcile_ok"):
-        print("latest-verified-set.json is not reconciled", file=sys.stderr)
+    if not isinstance(data, dict):
+        print("latest-verified-set.json is not a JSON object", file=sys.stderr)
+        return 1
+    expected_date = "" if args.allow_stale else (args.expected_date or "").strip()
+    ok, msg = validate_verified_set_window(data, expected_date=expected_date or None)
+    if not ok:
+        print(msg, file=sys.stderr)
         return 1
     print(str(data["backup_set_id"]))
     print(str(data["dump_path"]))
@@ -394,6 +559,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_wk.add_argument("--tmp-dir", default="")
     p_wk.set_defaults(func=_cmd_weekly_minio_baseline)
 
+    p_pub = sub.add_parser("publish-weekly-baseline-pointer")
+    p_pub.add_argument("--staged-manifest", required=True)
+    p_pub.add_argument("--sets-dir", required=True)
+    p_pub.add_argument("--baseline-id", required=True)
+    p_pub.set_defaults(func=_cmd_publish_weekly_baseline_pointer)
+
+    p_wlat = sub.add_parser("build-weekly-latest-json")
+    p_wlat.add_argument("--run-id", required=True)
+    p_wlat.add_argument("--date-stamp", required=True)
+    p_wlat.add_argument("--baseline-id", required=True)
+    p_wlat.add_argument("--minio-mode", default="versioned")
+    p_wlat.add_argument("--minio-name", required=True)
+    p_wlat.add_argument("--minio-meta", required=True)
+    p_wlat.add_argument("--redis-name", required=True)
+    p_wlat.add_argument("--redis-meta", required=True)
+    p_wlat.add_argument("--var-name", required=True)
+    p_wlat.add_argument("--var-meta", required=True)
+    p_wlat.add_argument("--sandboxes-json", default="")
+    p_wlat.add_argument("--out", required=True)
+    p_wlat.set_defaults(func=_cmd_build_weekly_latest_json)
+
     p_lat = sub.add_parser("build-latest-json")
     p_lat.add_argument("--run-id", required=True)
     p_lat.add_argument("--date-stamp", required=True)
@@ -405,6 +591,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p_rvs = sub.add_parser("read-verified-set")
     p_rvs.add_argument("--set-file", required=True)
+    p_rvs.add_argument("--expected-date", default="")
+    p_rvs.add_argument("--allow-stale", action="store_true")
     p_rvs.set_defaults(func=_cmd_read_verified_set)
 
     p_rjf = sub.add_parser("read-json-field")

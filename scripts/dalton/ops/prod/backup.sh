@@ -17,7 +17,7 @@ REPO_ROOT="${DALTON_REPO_ROOT:-$(cd "${SCRIPT_DIR}/../../../.." && pwd)}"
 BACKUP_LIB="${OPS_DIR}/backup_lib.py"
 LOCAL_BACKUP_SET_PY="${SCRIPT_DIR}/local_backup_set.py"
 
-TAG="daily"
+TAG="${DALTON_BACKUP_TAG:-auto}"
 SKIP_MOUNT_CHECK=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -35,7 +35,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -h|--help)
             cat <<'EOF'
-Usage: backup.sh [--tag daily|weekly|deploy|manual-<label>] [--skip-mount-check]
+Usage: backup.sh [--tag auto|daily|weekly|deploy|manual-<label>] [--skip-mount-check]
 EOF
             exit 0
             ;;
@@ -45,6 +45,30 @@ EOF
             ;;
     esac
 done
+
+# Resolve --tag auto: consume one-shot deploy/manual tag hint written by deploy_main.sh,
+# otherwise use "weekly" on Sunday (weekday 0) and "daily" Monday-Saturday.
+if [[ "${TAG}" == "auto" ]]; then
+    TAG_HINT_FILE="${DALTON_PG_BACKUP_TAG_FILE:-${HOME}/Library/Logs/.dalton-pg-backup.next-tag}"
+    HINT_VAL=""
+    if [[ -f "${TAG_HINT_FILE}" ]] && [[ ! -L "${TAG_HINT_FILE}" ]]; then
+        HINT_VAL="$(tr -d '[:space:]' < "${TAG_HINT_FILE}" 2>/dev/null || true)"
+        rm -f "${TAG_HINT_FILE}" 2>/dev/null || true
+    fi
+    case "${HINT_VAL}" in
+        daily|weekly|deploy|manual-*)
+            TAG="${HINT_VAL}"
+            ;;
+        *)
+            WEEKDAY_NUM="${DALTON_BACKUP_WEEKDAY:-$(date +%w)}"
+            if [[ "${WEEKDAY_NUM}" == "0" ]]; then
+                TAG="weekly"
+            else
+                TAG="daily"
+            fi
+            ;;
+    esac
+fi
 
 resolve_py() {
     if [[ -n "${DALTON_REPO_PYTHON:-}" ]] && [[ -x "${DALTON_REPO_PYTHON}" ]]; then

@@ -526,6 +526,8 @@ class AsrJobManager:
                 state = self.read_state(job_id)
                 if not isinstance(state, dict):
                     continue
+                if state.get("restored_no_resume") is True or state.get("error_category") == "restored_inflight":
+                    continue
                 if state.get("status") in RECOVERABLE_JOB_STATUSES:
                     self._ensure_worker_running(job_id)
                     resumed.append(job_id)
