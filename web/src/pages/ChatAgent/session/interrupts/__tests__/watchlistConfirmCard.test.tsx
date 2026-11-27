@@ -18,7 +18,9 @@ import { createPauseSlot } from '../pauseSlot';
 import { buildRenderBlocks } from '../../../components/messageList/buildRenderBlocks';
 import * as watchlistLib from '@/lib/dalton/watchlist';
 import WatchlistConfirmCard from '../../../components/WatchlistConfirmCard';
-import type { HistoryInterruptInfo, SSEEvent, StreamProcessorRefs } from '../../types';
+import type { HistoryInterruptInfo, PendingInterrupt, SetMessages, SSEEvent, StreamProcessorRefs } from '../../types';
+import type { StreamRuntime } from '../../runtime';
+import type { ReportBackWatch } from '../../../hooks/useReportBackWatch';
 
 function makeAssistantMessage(id = 'msg-1'): AssistantMessage {
   return {
@@ -333,70 +335,90 @@ describe('WatchlistConfirmCard & interrupt bucket 4-state lifecycle', () => {
   });
 
   it('collects archive_workspace and watchlist cards by interruptId on answerBoard and submits together regardless of arrival or click order', () => {
-    const makeArchiveEvent = (interruptId: string, toolCallId: string): SSEEvent =>
-      ({
-        event: 'interrupt',
-        interrupt_id: interruptId,
-        turn_index: 0,
-        action_requests: [
-          {
-            type: 'archive_workspace',
-            tool_call_id: toolCallId,
-            workspace_id: 'ws-nvda',
-            workspace_name: 'NVDA',
-          },
-        ],
-      }) as unknown as SSEEvent;
+    type InterruptAnswerDeps = Parameters<typeof useInterruptAnswers>[0];
+    type LiveInterruptRuntimeSlice = Pick<
+      StreamRuntime,
+      'setMessages' | 'renderedInterruptIdsRef' | 'currentRunIdRef' | 'pause'
+    >;
+    type LiveInterruptRefsSlice = Pick<StreamProcessorRefs, 'contentOrderCounterRef'>;
+
+    const makeArchiveEvent = (interruptId: string, toolCallId: string): SSEEvent => ({
+      event: 'interrupt',
+      interrupt_id: interruptId,
+      turn_index: 0,
+      action_requests: [
+        {
+          type: 'archive_workspace',
+          tool_call_id: toolCallId,
+          workspace_id: 'ws-nvda',
+          workspace_name: 'NVDA',
+        },
+      ],
+    });
+
+    const createHarness = (msgId: string, runId: string) => {
+      let messages: ChatMessage[] = [makeAssistantMessage(msgId)];
+      const setMessages: SetMessages = (updater) => {
+        messages = typeof updater === 'function' ? updater(messages) : updater;
+      };
+      const pendingIds = { current: new Set<string>() };
+      const sessionEpoch = { current: 1 };
+      const board = createAnswerBoard({ pendingIds, sessionEpoch, setMessages });
+      const showPause = vi.fn<Parameters<typeof createPauseSlot>[0]>();
+      const pause = createPauseSlot(showPause, board);
+      const rtSlice: LiveInterruptRuntimeSlice = {
+        setMessages,
+        renderedInterruptIdsRef: { current: new Set<string>() },
+        currentRunIdRef: { current: runId },
+        pause,
+      };
+      const refsSlice: LiveInterruptRefsSlice = { contentOrderCounterRef: { current: 0 } };
+      return {
+        getMessages: () => messages,
+        setMessages,
+        pendingIds,
+        board,
+        pause,
+        rt: rtSlice as unknown as StreamRuntime,
+        refs: refsSlice as unknown as StreamProcessorRefs,
+      };
+    };
 
     // Case A: archive_workspace arrives first, watchlist arrives last (overwriting pendingInterrupt).
     // Clicking archive first then watchlist must collect both on answerBoard and resume once together.
-    let messagesA: ChatMessage[] = [makeAssistantMessage('msg-a')];
-    const setMessagesA = (updater: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) => {
-      messagesA = typeof updater === 'function' ? updater(messagesA) : updater;
-    };
-    const pendingIdsA = { current: new Set<string>() };
-    const sessionEpochA = { current: 1 };
-    const boardA = createAnswerBoard({ pendingIds: pendingIdsA, sessionEpoch: sessionEpochA, setMessages: setMessagesA });
-    const pauseA = createPauseSlot(() => {}, boardA);
-    const rtA = {
-      setMessages: setMessagesA,
-      renderedInterruptIdsRef: { current: new Set<string>() },
-      currentRunIdRef: { current: 'run-a' },
-      pause: pauseA,
-    } as never;
-    const refsA = { contentOrderCounterRef: { current: 0 } } as StreamProcessorRefs;
+    const hA = createHarness('msg-a', 'run-a');
 
-    projectLiveInterrupt(rtA, makeArchiveEvent('intr-arch-a', 'tc-arch-a'), 'msg-a', refsA);
-    projectLiveInterrupt(rtA, { ...makeWatchlistInterruptEvent(), interrupt_id: 'intr-wl-a' } as SSEEvent, 'msg-a', refsA);
-    expect(pauseA.current()?.type).toBe('watchlist_set_tier');
-    expect([...pendingIdsA.current]).toEqual(['intr-arch-a', 'intr-wl-a']);
+    projectLiveInterrupt(hA.rt, makeArchiveEvent('intr-arch-a', 'tc-arch-a'), 'msg-a', hA.refs);
+    projectLiveInterrupt(hA.rt, { ...makeWatchlistInterruptEvent(), interrupt_id: 'intr-wl-a' }, 'msg-a', hA.refs);
+    expect(hA.pause.current()?.type).toBe('watchlist_set_tier');
+    expect([...hA.pendingIds.current]).toEqual(['intr-arch-a', 'intr-wl-a']);
 
-    const resumeMockA = vi.fn();
+    const resumeMockA = vi.fn<InterruptAnswerDeps['resumeWithHitlResponse']>();
     const { result: resA } = renderHook(() =>
       useInterruptAnswers({
-        pendingInterrupt: pauseA.current(),
-        setMessages: setMessagesA,
+        pendingInterrupt: hA.pause.current(),
+        setMessages: hA.setMessages,
         resumeWithHitlResponse: resumeMockA,
-        answerBoard: boardA,
-        pendingPTCBackfillRef: { current: new Map() },
-        armReportBackWatch: vi.fn(),
+        answerBoard: hA.board,
+        pendingPTCBackfillRef: { current: new Map<string, string>() },
+        armReportBackWatch: vi.fn<ReportBackWatch['arm']>(),
         threadIdRef: { current: 't-a' },
       }),
     );
 
-    const archCardA = (messagesA[0] as AssistantMessage).secretaryActionProposals?.['intr-arch-a'];
-    const wlCardA = (messagesA[0] as AssistantMessage).watchlistProposals?.['intr-wl-a'];
+    const archCardA = (hA.getMessages()[0] as AssistantMessage).secretaryActionProposals?.['intr-arch-a'];
+    const wlCardA = (hA.getMessages()[0] as AssistantMessage).watchlistProposals?.['intr-wl-a'];
     expect(archCardA).toBeDefined();
     expect(wlCardA).toBeDefined();
 
     // Archive button works even though pendingInterrupt is watchlist_set_tier, and waits for watchlist.
     resA.current.handleApproveSecretaryAction(archCardA as unknown as Record<string, unknown>);
-    expect((messagesA[0] as AssistantMessage).secretaryActionProposals?.['intr-arch-a']?.status).toBe('submitting');
+    expect((hA.getMessages()[0] as AssistantMessage).secretaryActionProposals?.['intr-arch-a']?.status).toBe('submitting');
     expect(resumeMockA).not.toHaveBeenCalled();
 
     // Answering watchlist completes the batch and submits both interrupt answers together.
     resA.current.handleApproveWatchlistAction(wlCardA as unknown as Record<string, unknown>);
-    expect((messagesA[0] as AssistantMessage).watchlistProposals?.['intr-wl-a']?.status).toBe('submitting');
+    expect((hA.getMessages()[0] as AssistantMessage).watchlistProposals?.['intr-wl-a']?.status).toBe('submitting');
     expect(resumeMockA).toHaveBeenCalledTimes(1);
     expect(resumeMockA).toHaveBeenCalledWith({
       'intr-arch-a': { decisions: [{ type: 'approve' }] },
@@ -405,44 +427,30 @@ describe('WatchlistConfirmCard & interrupt bucket 4-state lifecycle', () => {
 
     // Case B: watchlist arrives first, archive arrives last (pendingInterrupt is archive_workspace).
     // Rejecting archive first must wait on answerBoard rather than submitting without watchlist's answer.
-    let messagesB: ChatMessage[] = [makeAssistantMessage('msg-b')];
-    const setMessagesB = (updater: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) => {
-      messagesB = typeof updater === 'function' ? updater(messagesB) : updater;
-    };
-    const pendingIdsB = { current: new Set<string>() };
-    const sessionEpochB = { current: 1 };
-    const boardB = createAnswerBoard({ pendingIds: pendingIdsB, sessionEpoch: sessionEpochB, setMessages: setMessagesB });
-    const pauseB = createPauseSlot(() => {}, boardB);
-    const rtB = {
-      setMessages: setMessagesB,
-      renderedInterruptIdsRef: { current: new Set<string>() },
-      currentRunIdRef: { current: 'run-b' },
-      pause: pauseB,
-    } as never;
-    const refsB = { contentOrderCounterRef: { current: 0 } } as StreamProcessorRefs;
+    const hB = createHarness('msg-b', 'run-b');
 
-    projectLiveInterrupt(rtB, { ...makeWatchlistInterruptEvent(), interrupt_id: 'intr-wl-b' } as SSEEvent, 'msg-b', refsB);
-    projectLiveInterrupt(rtB, makeArchiveEvent('intr-arch-b', 'tc-arch-b'), 'msg-b', refsB);
-    expect(pauseB.current()?.type).toBe('archive_workspace');
+    projectLiveInterrupt(hB.rt, { ...makeWatchlistInterruptEvent(), interrupt_id: 'intr-wl-b' }, 'msg-b', hB.refs);
+    projectLiveInterrupt(hB.rt, makeArchiveEvent('intr-arch-b', 'tc-arch-b'), 'msg-b', hB.refs);
+    expect(hB.pause.current()?.type).toBe('archive_workspace');
 
-    const resumeMockB = vi.fn();
+    const resumeMockB = vi.fn<InterruptAnswerDeps['resumeWithHitlResponse']>();
     const { result: resB } = renderHook(() =>
       useInterruptAnswers({
-        pendingInterrupt: pauseB.current(),
-        setMessages: setMessagesB,
+        pendingInterrupt: hB.pause.current(),
+        setMessages: hB.setMessages,
         resumeWithHitlResponse: resumeMockB,
-        answerBoard: boardB,
-        pendingPTCBackfillRef: { current: new Map() },
-        armReportBackWatch: vi.fn(),
+        answerBoard: hB.board,
+        pendingPTCBackfillRef: { current: new Map<string, string>() },
+        armReportBackWatch: vi.fn<ReportBackWatch['arm']>(),
         threadIdRef: { current: 't-b' },
       }),
     );
 
-    const archCardB = (messagesB[0] as AssistantMessage).secretaryActionProposals?.['intr-arch-b'];
-    const wlCardB = (messagesB[0] as AssistantMessage).watchlistProposals?.['intr-wl-b'];
+    const archCardB = (hB.getMessages()[0] as AssistantMessage).secretaryActionProposals?.['intr-arch-b'];
+    const wlCardB = (hB.getMessages()[0] as AssistantMessage).watchlistProposals?.['intr-wl-b'];
 
     resB.current.handleRejectSecretaryAction(archCardB as unknown as Record<string, unknown>);
-    expect((messagesB[0] as AssistantMessage).secretaryActionProposals?.['intr-arch-b']?.status).toBe('rejected');
+    expect((hB.getMessages()[0] as AssistantMessage).secretaryActionProposals?.['intr-arch-b']?.status).toBe('rejected');
     expect(resumeMockB).not.toHaveBeenCalled();
 
     resB.current.handleApproveWatchlistAction(wlCardB as unknown as Record<string, unknown>);
@@ -452,4 +460,170 @@ describe('WatchlistConfirmCard & interrupt bucket 4-state lifecycle', () => {
       'intr-wl-b': { decisions: [{ type: 'approve' }] },
     });
   });
+
+  it.each([
+    {
+      label: 'create arrives first, archive arrives last -> click create then archive',
+      arrivalOrder: ['create', 'archive'] as const,
+      clickOrder: ['create', 'archive'] as const,
+      createVerdict: 'approve' as const,
+      archiveVerdict: 'approve' as const,
+    },
+    {
+      label: 'create arrives first, archive arrives last -> click archive then create',
+      arrivalOrder: ['create', 'archive'] as const,
+      clickOrder: ['archive', 'create'] as const,
+      createVerdict: 'approve' as const,
+      archiveVerdict: 'reject' as const,
+    },
+    {
+      label: 'archive arrives first, create arrives last -> click create then archive',
+      arrivalOrder: ['archive', 'create'] as const,
+      clickOrder: ['create', 'archive'] as const,
+      createVerdict: 'approve' as const,
+      archiveVerdict: 'approve' as const,
+    },
+    {
+      label: 'archive arrives first, create arrives last -> click archive then create',
+      arrivalOrder: ['archive', 'create'] as const,
+      clickOrder: ['archive', 'create'] as const,
+      createVerdict: 'reject' as const,
+      archiveVerdict: 'approve' as const,
+    },
+  ])(
+    'collects create_workspace and archive_workspace cards on answerBoard once together ($label)',
+    ({ arrivalOrder, clickOrder, createVerdict, archiveVerdict }) => {
+      type InterruptAnswerDeps = Parameters<typeof useInterruptAnswers>[0];
+      type LiveInterruptRuntimeSlice = Pick<
+        StreamRuntime,
+        'setMessages' | 'renderedInterruptIdsRef' | 'currentRunIdRef' | 'pause'
+      >;
+      type LiveInterruptRefsSlice = Pick<StreamProcessorRefs, 'contentOrderCounterRef'>;
+
+      const createId = 'intr-cw-mix';
+      const archiveId = 'intr-arch-mix';
+      const events: Record<'create' | 'archive', SSEEvent> = {
+        create: {
+          event: 'interrupt',
+          interrupt_id: createId,
+          turn_index: 0,
+          action_requests: [
+            {
+              type: 'create_workspace',
+              tool_call_id: 'tc-cw-mix',
+              workspace_name: 'AMD',
+              workspace_description: 'Semiconductor research',
+            },
+          ],
+        },
+        archive: {
+          event: 'interrupt',
+          interrupt_id: archiveId,
+          turn_index: 0,
+          action_requests: [
+            {
+              type: 'archive_workspace',
+              tool_call_id: 'tc-arch-mix',
+              workspace_id: 'ws-legacy',
+              workspace_name: 'Legacy',
+            },
+          ],
+        },
+      };
+
+      let messages: ChatMessage[] = [makeAssistantMessage('msg-mix')];
+      const setMessages: SetMessages = (updater) => {
+        messages = typeof updater === 'function' ? updater(messages) : updater;
+      };
+      const pendingIds = { current: new Set<string>() };
+      const sessionEpoch = { current: 1 };
+      const board = createAnswerBoard({ pendingIds, sessionEpoch, setMessages });
+      const showPause = vi.fn<(pending: PendingInterrupt | null) => void>();
+      const pause = createPauseSlot(showPause, board);
+      const rtSlice: LiveInterruptRuntimeSlice = {
+        setMessages,
+        renderedInterruptIdsRef: { current: new Set<string>() },
+        currentRunIdRef: { current: 'run-mix' },
+        pause,
+      };
+      const refsSlice: LiveInterruptRefsSlice = { contentOrderCounterRef: { current: 0 } };
+
+      for (const kind of arrivalOrder) {
+        projectLiveInterrupt(
+          rtSlice as unknown as StreamRuntime,
+          events[kind],
+          'msg-mix',
+          refsSlice as unknown as StreamProcessorRefs,
+        );
+      }
+
+      const lastArrived = arrivalOrder[1];
+      expect(pause.current()?.type).toBe(
+        lastArrived === 'create' ? 'create_workspace' : 'archive_workspace',
+      );
+      expect(pendingIds.current.has(createId)).toBe(true);
+      expect(pendingIds.current.has(archiveId)).toBe(true);
+
+      const resumeWithHitlResponse = vi.fn<InterruptAnswerDeps['resumeWithHitlResponse']>();
+      const armReportBackWatch = vi.fn<ReportBackWatch['arm']>();
+      const { result } = renderHook(() =>
+        useInterruptAnswers({
+          pendingInterrupt: pause.current(),
+          setMessages,
+          resumeWithHitlResponse,
+          answerBoard: board,
+          pendingPTCBackfillRef: { current: new Map<string, string>() },
+          armReportBackWatch,
+          threadIdRef: { current: 't-mix' },
+        }),
+      );
+
+      const createCard = (messages[0] as AssistantMessage).workspaceProposals?.[createId];
+      const archiveCard = (messages[0] as AssistantMessage).secretaryActionProposals?.[archiveId];
+      expect(createCard).toBeDefined();
+      expect(archiveCard).toBeDefined();
+
+      const clickCard = (kind: 'create' | 'archive') => {
+        if (kind === 'create') {
+          const handler =
+            createVerdict === 'approve'
+              ? result.current.handleApproveCreateWorkspace
+              : result.current.handleRejectCreateWorkspace;
+          handler({ ...createCard });
+        } else {
+          const handler =
+            archiveVerdict === 'approve'
+              ? result.current.handleApproveSecretaryAction
+              : result.current.handleRejectSecretaryAction;
+          handler({ ...archiveCard });
+        }
+      };
+
+      const statusOf = (kind: 'create' | 'archive') =>
+        kind === 'create'
+          ? (messages[0] as AssistantMessage).workspaceProposals?.[createId]?.status
+          : (messages[0] as AssistantMessage).secretaryActionProposals?.[archiveId]?.status;
+
+      const expectedStatus = (verdict: 'approve' | 'reject') =>
+        verdict === 'approve' ? 'submitting' : 'rejected';
+
+      // First click transitions that card and waits on AnswerBoard without resuming early.
+      clickCard(clickOrder[0]);
+      expect(statusOf(clickOrder[0])).toBe(
+        expectedStatus(clickOrder[0] === 'create' ? createVerdict : archiveVerdict),
+      );
+      expect(resumeWithHitlResponse).not.toHaveBeenCalled();
+
+      // Second click completes the batch and emits exactly one resume containing both answers.
+      clickCard(clickOrder[1]);
+      expect(statusOf(clickOrder[1])).toBe(
+        expectedStatus(clickOrder[1] === 'create' ? createVerdict : archiveVerdict),
+      );
+      expect(resumeWithHitlResponse).toHaveBeenCalledTimes(1);
+      expect(resumeWithHitlResponse).toHaveBeenCalledWith({
+        [createId]: { decisions: [{ type: createVerdict }] },
+        [archiveId]: { decisions: [{ type: archiveVerdict }] },
+      });
+    },
+  );
 });
