@@ -186,13 +186,13 @@ export function mergeRestQuoteRow(
   const incomingRecord = incoming as Record<string, unknown>;
   const incomingIsRegularOnly = incomingRecord.regular_only === true;
   const prevHasLiveWs = prev.live_tick_at != null;
-  // Exempt only regular-only snapshots with no trade time at all (neither
-  // `regular_as_of` nor `as_of`). Timed regular-only snapshots (Yahoo with
-  // `regular_as_of`, FMP with its regular print in `as_of`) compare by trade time.
+  // Exempt only regular-only snapshots without `regular_as_of` (e.g. a Yahoo
+  // pre-market fallback whose `as_of` is the fetch time, not a trade). Sources
+  // whose regular print is timed set `regular_as_of` (Yahoo enrich, FMP) and
+  // compare by trade time.
   const incomingRegularUntimed =
     incomingIsRegularOnly &&
-    parsePriceTimestampMs(incoming.regular_as_of ?? incomingRecord.regular_as_of) == null &&
-    parsePriceTimestampMs(incoming.as_of) == null;
+    parsePriceTimestampMs(incoming.regular_as_of ?? incomingRecord.regular_as_of) == null;
 
   const existingCand = quotePriceCandidateForCache(prev);
   const incomingCand = quotePriceCandidateForCache(incoming);
@@ -270,8 +270,7 @@ export function mergeWsQuoteRow(
   const prevIsRegularOnly =
     prevRecordWs.regular_only === true &&
     prev.live_tick_at == null &&
-    parsePriceTimestampMs(prev.regular_as_of ?? prevRecordWs.regular_as_of) == null &&
-    parsePriceTimestampMs(prev.as_of) == null;
+    parsePriceTimestampMs(prev.regular_as_of ?? prevRecordWs.regular_as_of) == null;
   const existingCand = quotePriceCandidateForCache(prev);
   const incomingCand: PricedCandidate = {
     price: Number.isFinite(fields.price) ? fields.price : null,

@@ -1163,11 +1163,11 @@ describe('watchlist pending-only subset polling', () => {
     expect(mergeRestQuoteRow(prev, untimed).price).toBe(102);
   });
 
-  it('r7 lead: FMP regular_only snapshot timed only by as_of compares by trade time in both directions', () => {
+  it('r7 lead: FMP regular_only snapshot (regular_as_of = its print) compares by trade time in both directions', () => {
     const T_830 = 1_792_672_200_000;
     const T_935 = 1_792_676_100_000;
     const ws102 = { symbol: 'GOOG', source: 'ws', price: 102, as_of: T_830, live_tick_at: T_830, currency: 'USD' } as QuoteRow;
-    const fmp104 = { symbol: 'GOOG', source: 'fmp', price: 104, as_of: T_935, regular_only: true, currency: 'USD' } as unknown as QuoteRow;
+    const fmp104 = { symbol: 'GOOG', source: 'fmp', price: 104, as_of: T_935, regular_as_of: T_935, regular_only: true, currency: 'USD' } as unknown as QuoteRow;
     // REST direction: newer FMP print replaces the older WS print.
     expect(mergeRestQuoteRow(ws102, fmp104).price).toBe(104);
     // WS direction: a late 08:30 frame does not overwrite the cached 09:35 FMP print.
