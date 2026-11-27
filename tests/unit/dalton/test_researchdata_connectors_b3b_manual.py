@@ -264,18 +264,25 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
 
             state = json.loads(state_path.read_text(encoding="utf-8"))
             loaded = state.setdefault("loaded", {{}})
+            keepalive_waiting = set(state.get("keepalive_waiting", []))
             cmd = args[0] if args else ""
 
             if cmd == "list":
                 print("PID\\tStatus\\tLabel")
                 for idx, lbl in enumerate(sorted(loaded.keys()), start=1001):
-                    print(f"{{idx}}\\t0\\t{{lbl}}")
+                    if lbl in keepalive_waiting:
+                        print(f"-\\t0\\t{{lbl}}")
+                    else:
+                        print(f"{{idx}}\\t0\\t{{lbl}}")
                 sys.exit(0)
             if cmd == "print":
                 target = args[1] if len(args) > 1 else ""
                 lbl = target.split("/")[-1]
                 if lbl in loaded:
-                    print(f"service {{lbl}} = active")
+                    if lbl in keepalive_waiting:
+                        print("gui/501/" + lbl + " = {{\\n\\tstate = waiting\\n\\tkeepalive = true\\n}}")
+                    else:
+                        print(f"service {{lbl}} = active")
                     sys.exit(0)
                 sys.exit(113)
             if cmd == "bootout":
@@ -289,6 +296,8 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
                     sys.exit(1)
                 if lbl in loaded:
                     del loaded[lbl]
+                    if lbl in keepalive_waiting:
+                        state["keepalive_waiting"] = [x for x in state.get("keepalive_waiting", []) if x != lbl]
                     state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
                     sys.exit(0)
                 sys.exit(3)
@@ -303,10 +312,14 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
                     print(f"missing plist {{plist_path}}", file=sys.stderr)
                     sys.exit(1)
                 loaded[lbl] = plist_path
+                if lbl in keepalive_waiting:
+                    state["keepalive_waiting"] = [x for x in state.get("keepalive_waiting", []) if x != lbl]
                 if lbl == "com.dalton.guidepoint-mcp-proxy":
                     state["draining_8943"] = False
                 elif lbl == "com.dalton.research-host":
                     state["draining_8951"] = False
+                elif lbl == "com.dalton.researchdata-bridge":
+                    state["draining_8960"] = False
                 state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
                 sys.exit(0)
             sys.exit(0)
@@ -386,10 +399,13 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
 
             state = json.loads(Path({str(state_file)!r}).read_text(encoding="utf-8"))
             loaded = state.get("loaded", {{}})
-            if "com.dalton.guidepoint-mcp-proxy" in loaded:
+            waiting = set(state.get("keepalive_waiting", []))
+            if "com.dalton.guidepoint-mcp-proxy" in loaded and "com.dalton.guidepoint-mcp-proxy" not in waiting:
                 print("2001 /opt/homebrew/bin/python3.12 /repo/scripts/dalton/research_runtime/scripts/guidepoint_mcp_proxy.py")
-            if "com.dalton.research-host" in loaded:
+            if "com.dalton.research-host" in loaded and "com.dalton.research-host" not in waiting:
                 print("2002 /repo/.venv/bin/python -m src.dalton.research_host")
+            if "com.dalton.researchdata-bridge" in loaded and "com.dalton.researchdata-bridge" not in waiting:
+                print("2003 /repo/.venv/bin/python /repo/scripts/dalton/researchdata_bridge.py")
             for extra in state.get("extra_ps_lines", []):
                 print(extra)
             sys.exit(0)
@@ -412,8 +428,11 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
             journal_file = Path({str(journal_file)!r})
             repo_env_file = Path({str(repo_env)!r})
             tokens_file = Path({str(tokens_file)!r})
+            web_cur_path = Path({str(web_cur)!r})
             expected_rh_admin = {rh_admin_token!r}
             expected_proxy_admin = {proxy_admin_token!r}
+            expected_bridge_admin = "test-bridge-admin-tok"
+            expected_svc_token = {svc_token!r}
 
             args = sys.argv[1:]
             with argv_log.open("a", encoding="utf-8") as fh:
@@ -545,7 +564,8 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
 
             # :8943 legacy guidepoint proxy (enforces MCP session handshake on /mcp)
             if ":8943" in url:
-                if "com.dalton.guidepoint-mcp-proxy" not in loaded:
+                waiting_set = set(state.get("keepalive_waiting", []))
+                if "com.dalton.guidepoint-mcp-proxy" not in loaded or "com.dalton.guidepoint-mcp-proxy" in waiting_set:
                     conn_refused()
                 if url.endswith("/admin/drain"):
                     if cfg_headers.get("authorization") != f"Bearer {{expected_proxy_admin}}":
@@ -636,8 +656,41 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
 
             # :8960 legacy bridge
             if ":8960" in url:
-                if "com.dalton.researchdata-bridge" not in loaded:
+                waiting_set = set(state.get("keepalive_waiting", []))
+                if "com.dalton.researchdata-bridge" not in loaded or "com.dalton.researchdata-bridge" in waiting_set:
                     conn_refused()
+                if url.endswith("/admin/drain"):
+                    if cfg_headers.get("authorization") != f"Bearer {{expected_bridge_admin}}":
+                        emit(401, {{"ok": False, "error": "Unauthorized"}})
+                    if method == "POST":
+                        state["draining_8960"] = True
+                        state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+                    inf_8960 = int(state.get("inflight_8960", 0))
+                    q_8960 = int(state.get("queued_8960", 0))
+                    ing_8960 = int(state.get("ingest_inflight_8960", 0))
+                    if method == "GET" and os.environ.get("FAKE_KEEP_8960_BUSY") != "1":
+                        changed = False
+                        if inf_8960 > 0:
+                            state["inflight_8960"] = inf_8960 - 1
+                            changed = True
+                        if q_8960 > 0:
+                            state["queued_8960"] = q_8960 - 1
+                            changed = True
+                        if ing_8960 > 0:
+                            state["ingest_inflight_8960"] = ing_8960 - 1
+                            changed = True
+                        if changed:
+                            state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+                    emit(
+                        200,
+                        {{
+                            "ok": True,
+                            "draining": bool(state.get("draining_8960", False)),
+                            "inflight": inf_8960,
+                            "queued": q_8960,
+                            "ingest_inflight": ing_8960,
+                        }},
+                    )
                 if url.endswith("/healthz"):
                     delay_n = int(os.environ.get("FAKE_DELAY_8960_HEALTHZ_POLLS", "0") or "0")
                     seen_n = int(state.get("seen_8960_healthz", 0))
@@ -645,7 +698,16 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
                         state["seen_8960_healthz"] = seen_n + 1
                         state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
                         conn_refused()
-                    emit(200, {{"ok": True, "inflight": 0, "queued": 0}})
+                    emit(
+                        200,
+                        {{
+                            "ok": not bool(state.get("draining_8960", False)),
+                            "draining": bool(state.get("draining_8960", False)),
+                            "inflight": int(state.get("inflight_8960", 0)),
+                            "queued": int(state.get("queued_8960", 0)),
+                            "ingest_inflight": int(state.get("ingest_inflight_8960", 0)),
+                        }},
+                    )
                 if url.endswith("/mcp"):
                     req_obj = json.loads(data) if data else {{}}
                     arguments = ((req_obj.get("params") or {{}}).get("arguments") or {{}})
@@ -681,6 +743,9 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
                         conn_refused()
                     emit(200, {{"status": "ok"}})
                 if "/maintenance/admission/probe" in url:
+                    if os.environ.get("FAKE_REQUIRE_SERVICE_TOKEN") == "1":
+                        if cfg_headers.get("x-service-token") != expected_svc_token:
+                            emit(401, {{"detail": "Invalid service token"}})
                     adm = json.loads(adm_file.read_text(encoding="utf-8")) if adm_file.is_file() else {{"paused": False, "revision": 0}}
                     if adm.get("paused") is True:
                         emit(503, {{"detail": {{"error_code": "maintenance_in_progress", "revision": adm.get("revision", 0)}}}})
@@ -688,6 +753,18 @@ def _build_isolated_harness(tmp_path: Path) -> dict[str, Any]:
                         emit(503, {{"detail": {{"error_code": "maintenance_in_progress", "revision": adm.get("revision", 0)}}}})
                     emit(200, {{"ok": True, "admitted": True, "revision": adm.get("revision", 0)}})
                 emit(200, {{"ok": True}})
+
+            # :8088 edge serving frontend /version.json
+            if ":8088" in url and url.endswith("/version.json"):
+                if os.environ.get("FAKE_FAIL_EDGE_VERSION") == "1":
+                    emit(503, {{"error": "edge unavailable"}})
+                override_build = os.environ.get("FAKE_SERVED_FRONTEND_BUILD", "").strip()
+                if override_build:
+                    emit(200, {{"build": override_build}})
+                ver_file = web_cur_path / "version.json"
+                if ver_file.is_file():
+                    emit(200, json.loads(ver_file.read_text(encoding="utf-8")))
+                emit(404, {{"error": "missing version.json"}})
 
             conn_refused()
             """
@@ -782,7 +859,7 @@ def _simulate_post_cutover_state(h: dict[str, Any]) -> None:
         encoding="utf-8",
     )
     # Remove legacy proxy plist, install research-host plist, mutate bridge plist
-    h["proxy_plist"].unlink()
+    h["proxy_plist"].unlink(missing_ok=True)
     _make_plist(
         h["rh_plist"],
         "com.dalton.research-host",
@@ -1237,6 +1314,8 @@ def test_runbook_commands_scripts_and_flags_all_exist_and_follow_writing_rules()
     assert "company-wiki" in text
     assert "probes.guidepoint.owner_lock_held" in text
     assert "drain-refresher" in text
+    assert "drain-bridge" in text
+    assert "verify-frontend-version" in text
     assert "wait-lock-free" in text
     assert "wait-owner" in text
     assert "wait-health" in text
@@ -1246,18 +1325,29 @@ def test_runbook_commands_scripts_and_flags_all_exist_and_follow_writing_rules()
     assert "var/dalton/cutover-snapshots/recovery-bin/rollback_research_host.sh" in text
     assert "docker compose -f docker-compose.yml -f docker-compose.dalton.yml" not in text
 
-    # Row 6: recovery-bin publish & manifest-verify MUST occur BEFORE the first gate-set --paused true
+    # Row 6 (R3): recovery-bin publish & manifest-verify MUST occur BEFORE the first gate-set --paused true
     pub_pos = text.index("recovery-publish")
     mver_pos = text.index("manifest-verify")
     first_close_pos = text.index("--paused true")
     assert pub_pos < mver_pos < first_close_pos, "recovery-bin publish & verify must precede closing gate"
 
-    # Row 4: wait-health MUST appear after launchctl bootstrap (:8960) and docker compose up (:8000) before gate-verify
+    # Row 5 (R4): drain-bridge MUST appear BEFORE launchctl bootout of com.dalton.researchdata-bridge
+    drain_bridge_pos = text.index("drain-bridge")
+    bridge_bootout_pos = text.index('launchctl bootout "${DOMAIN}/com.dalton.researchdata-bridge"')
+    assert drain_bridge_pos < bridge_bootout_pos, "drain-bridge must precede bridge bootout"
+
+    # Row 4 (R3): wait-health MUST appear after launchctl bootstrap (:8960) and docker compose up (:8000) before gate-verify
     step8_pos = text.index("docker compose \"${COMPOSE_ARGS[@]}\" up -d --no-deps --force-recreate backend")
     wh_8960_pos = text.index("--url http://127.0.0.1:8960/healthz")
     wh_8000_pos = text.index("--url http://127.0.0.1:8000/health")
     gate_ver_after_compose = text.index("gate-verify", step8_pos)
     assert wh_8960_pos < step8_pos < wh_8000_pos < gate_ver_after_compose
+
+    # Row 7 (R4): verify-frontend-version MUST precede Step 10 gate-set --paused false
+    step10_pos = text.index("### 第 10 步")
+    vfv_pos = text.index("verify-frontend-version", step10_pos)
+    open_gate_pos = text.index("--paused false", step10_pos)
+    assert step10_pos < vfv_pos < open_gate_pos, "verify-frontend-version must precede Step 10 gate open"
 
     # Lead Decision 7: researchdata-connectors.md §6.4b begins with manual cutover pointer to runbook
     design_doc = REPO_ROOT / "docs" / "dalton" / "features" / "researchdata-connectors.md"
@@ -2807,10 +2897,55 @@ def test_rollback_open_gate_command_failure_recloses_and_verifies_gate(tmp_path:
     adm_a = json.loads(h["adm_file"].read_text(encoding="utf-8"))
     assert adm_a["paused"] is True and adm_a["pause_host_direct"] is True and adm_a["allow_workspace_ids"] == []
 
-    # Subcase B: open gate-set writes paused=false then fails AND re-close ALSO fails -> prints CRITICAL, NOT "REMAINS CLOSED"
+    # Subcase B (R4 Row 3): open gate-set writes paused=false then fails (PG commit failure), AND locked re-close
+    # fails because PG is still unreachable -> rollback automatically falls back to emergency `--no-db-lock`,
+    # writes closed state, verifies readback, and ends with `paused=true`!
     _simulate_post_cutover_state(h)
-    open_and_reclose_fail_py = _write_exec(
-        tmp_path / "py_open_and_reclose_fail",
+    reclose_args_log = tmp_path / "reclose_argv.log"
+    pg_down_reclose_py = _write_exec(
+        tmp_path / "py_pg_down_reclose_fallback",
+        textwrap.dedent(
+            f"""\
+            #!{sys.executable}
+            import os, subprocess, sys
+            from pathlib import Path
+            if "rollback_verified" in sys.argv:
+                subprocess.run([{sys.executable!r}] + sys.argv[1:], check=False)
+                print("ERROR: simulated PG commit failure after file replace", file=sys.stderr)
+                sys.exit(1)
+            if "rollback_open_verify_failed" in sys.argv:
+                with Path({str(reclose_args_log)!r}).open("a", encoding="utf-8") as fh:
+                    fh.write(" ".join(sys.argv[1:]) + "\\n")
+                if "--no-db-lock" not in sys.argv:
+                    print("ERROR: simulated PG connection refused during locked reclose", file=sys.stderr)
+                    sys.exit(1)
+            os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
+            """
+        ),
+    )
+    r_b = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), snap_dir],
+        env={**h["env"], "DALTON_PYTHON_BIN": str(pg_down_reclose_py)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert r_b.returncode != 0
+    assert "7/7 open-gate" in r_b.stderr
+    assert "--no-db-lock" in r_b.stderr
+    assert "MAINTENANCE ADMISSION GATE REMAINS CLOSED" in r_b.stderr
+    reclose_lines = reclose_args_log.read_text(encoding="utf-8").splitlines()
+    assert len(reclose_lines) == 2
+    assert "--no-db-lock" not in reclose_lines[0]
+    assert "--no-db-lock" in reclose_lines[1]
+    adm_b = json.loads(h["adm_file"].read_text(encoding="utf-8"))
+    assert adm_b["paused"] is True and adm_b["pause_host_direct"] is True and adm_b["allow_workspace_ids"] == []
+
+    # Subcase C: even emergency `--no-db-lock` write fails (e.g. disk I/O error) -> prints CRITICAL, NOT "REMAINS CLOSED"
+    _simulate_post_cutover_state(h)
+    open_and_total_reclose_fail_py = _write_exec(
+        tmp_path / "py_open_and_total_reclose_fail",
         textwrap.dedent(
             f"""\
             #!{sys.executable}
@@ -2820,23 +2955,528 @@ def test_rollback_open_gate_command_failure_recloses_and_verifies_gate(tmp_path:
                 print("ERROR: simulated PG commit failure after file replace", file=sys.stderr)
                 sys.exit(1)
             if "rollback_open_verify_failed" in sys.argv:
-                print("ERROR: simulated PG still down on reclose", file=sys.stderr)
+                print("ERROR: simulated read-only filesystem on reclose", file=sys.stderr)
                 sys.exit(1)
             os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
             """
         ),
     )
-    r_b = subprocess.run(
+    r_c = subprocess.run(
         ["/bin/bash", str(ROLLBACK_SH), snap_dir],
-        env={**h["env"], "DALTON_PYTHON_BIN": str(open_and_reclose_fail_py)},
+        env={**h["env"], "DALTON_PYTHON_BIN": str(open_and_total_reclose_fail_py)},
         capture_output=True,
         text=True,
         timeout=30,
         check=False,
     )
-    assert r_b.returncode != 0
-    assert "7/7 reclose-gate" in r_b.stderr
-    assert "CRITICAL" in r_b.stderr
-    assert "MAINTENANCE ADMISSION GATE REMAINS CLOSED" not in r_b.stderr
-    # Disk file remained open because re-close failed — verifying rollback did NOT falsely claim closed!
-    assert json.loads(h["adm_file"].read_text(encoding="utf-8"))["paused"] is False
+    assert r_c.returncode != 0
+    assert "7/7 reclose-gate" in r_c.stderr
+    assert "CRITICAL" in r_c.stderr
+    assert "MAINTENANCE ADMISSION GATE REMAINS CLOSED" not in r_c.stderr
+
+
+# ---------------------------------------------------------------------------
+# 10. Round-4 review fixes: Codex rows 1..7 + Lead decisions 1..7 tests
+# ---------------------------------------------------------------------------
+
+
+def test_allow_down_waits_for_launchd_registered_keepalive_service_without_pid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4 Row 1: `--allow-down` skips drain ONLY when service is unloaded from launchd AND absent from ps; KeepAlive waiting-for-restart (no PID yet) keeps waiting and fails closed without bootout."""
+    h = _build_isolated_harness(tmp_path)
+    orig_run_cmd = preflight._run_cmd
+
+    # A1: launchctl print exits 0 with state=waiting and NO pid (KeepAlive pending restart) -> NOT stopped
+    rc_keepalive_print = create_autospec(orig_run_cmd, spec_set=True)
+    rc_keepalive_print.side_effect = [
+        (0, "gui/501/com.dalton.guidepoint-mcp-proxy = {\n\tstate = waiting\n\tkeepalive = true\n}\n", ""),
+    ]
+    monkeypatch.setattr(preflight, "_run_cmd", rc_keepalive_print)
+    stopped1, detail1 = preflight._is_refresher_process_stopped("legacy")
+    assert stopped1 is False and "still registered" in detail1
+
+    # A2: launchctl print returns 113, but launchctl list STILL lists label with `-` (no PID) -> NOT stopped
+    rc_keepalive_list = create_autospec(orig_run_cmd, spec_set=True)
+    rc_keepalive_list.side_effect = [
+        (113, "", "Could not find service"),
+        (0, "PID\tStatus\tLabel\n-\t0\tcom.dalton.guidepoint-mcp-proxy\n", ""),
+    ]
+    monkeypatch.setattr(preflight, "_run_cmd", rc_keepalive_list)
+    stopped2, detail2 = preflight._is_refresher_process_stopped("legacy")
+    assert stopped2 is False and "still registered" in detail2
+
+    # A3: launchctl print fails unexpectedly (rc=1, not 'not found') -> fail-closed (NOT stopped)
+    rc_print_err = create_autospec(orig_run_cmd, spec_set=True)
+    rc_print_err.side_effect = [
+        (1, "", "permission denied"),
+    ]
+    monkeypatch.setattr(preflight, "_run_cmd", rc_print_err)
+    stopped3, detail3 = preflight._is_refresher_process_stopped("legacy")
+    assert stopped3 is False and "unexpectedly" in detail3
+
+    # A4: unloaded in launchctl print (113) + absent in launchctl list + absent in ps -> stopped
+    rc_unloaded = create_autospec(orig_run_cmd, spec_set=True)
+    rc_unloaded.side_effect = [
+        (113, "", "Could not find service"),
+        (0, "PID\tStatus\tLabel\n", ""),
+        (0, "100 /sbin/launchd\n", ""),
+    ]
+    monkeypatch.setattr(preflight, "_run_cmd", rc_unloaded)
+    stopped4, _ = preflight._is_refresher_process_stopped("legacy")
+    assert stopped4 is True
+
+    # B. End-to-end rollback: legacy proxy :8943 is registered in launchd with KeepAlive waiting to restart
+    # (no PID in launchctl print/list, no process in ps, :8943/healthz refused). Rollback MUST wait until
+    # timeout, fail at 3/7 drain-legacy-proxy, MUST NOT call bootout on :8943, and MUST keep gate CLOSED!
+    monkeypatch.undo()
+    r_snap = subprocess.run(
+        ["/bin/bash", str(SNAPSHOT_SH), "--label", "r4-keepalive", "--print-path"],
+        env=h["env"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert r_snap.returncode == 0, r_snap.stderr
+    snap_dir = r_snap.stdout.strip()
+    _simulate_post_cutover_state(h)
+    st = json.loads(h["state_file"].read_text(encoding="utf-8"))
+    st["loaded"]["com.dalton.guidepoint-mcp-proxy"] = str(h["proxy_plist"])
+    st["keepalive_waiting"] = ["com.dalton.guidepoint-mcp-proxy"]
+    h["state_file"].write_text(json.dumps(st, indent=2), encoding="utf-8")
+    h["calls_log"].write_text("", encoding="utf-8")
+
+    r_rb = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), snap_dir],
+        env={**h["env"], "DALTON_ROLLBACK_SERVICE_TIMEOUT_S": "1"},
+        capture_output=True,
+        text=True,
+        timeout=25,
+        check=False,
+    )
+    assert r_rb.returncode != 0
+    assert "3/7 drain-legacy-proxy" in r_rb.stderr
+    assert "MAINTENANCE ADMISSION GATE REMAINS CLOSED" in r_rb.stderr
+    calls_txt = h["calls_log"].read_text(encoding="utf-8")
+    assert "launchctl bootout gui/501/com.dalton.guidepoint-mcp-proxy" not in calls_txt
+    adm = json.loads(h["adm_file"].read_text(encoding="utf-8"))
+    assert adm["paused"] is True and adm["pause_host_direct"] is True
+
+
+def test_rollback_closes_host_gate_verifies_snapshot_then_verifies_old_backend_with_snapshot_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4 Row 2: rollback closes host gate FIRST, verifies snapshot, then verifies still-running old backend using SNAPSHOT .env (immune to corrupted live .env INTERNAL_SERVICE_TOKEN)."""
+    h = _build_isolated_harness(tmp_path)
+    r_snap = subprocess.run(
+        ["/bin/bash", str(SNAPSHOT_SH), "--label", "r4-snap-env", "--print-path"],
+        env=h["env"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert r_snap.returncode == 0, r_snap.stderr
+    snap_dir = Path(r_snap.stdout.strip())
+
+    # Unit check: cmd_gate_verify --repo-env prefers explicit --repo-env over os.environ INTERNAL_SERVICE_TOKEN
+    import src.dalton.maintenance_gate as mg
+
+    captured_tokens: list[str | None] = []
+    orig_verify = mg.verify_container_maintenance_gate
+
+    def _fake_verify(**kwargs: Any) -> Any:
+        captured_tokens.append(kwargs.get("service_token"))
+        return mg.ContainerGateVerificationResult(
+            status="verified",
+            container_available=True,
+            container_revision=1,
+            probe_status_code=503,
+            reason="paused_verified",
+            elapsed_s=0.01,
+        )
+
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "stale-shell-env-token")
+    monkeypatch.setattr(mg, "verify_container_maintenance_gate", create_autospec(orig_verify, spec_set=True, side_effect=_fake_verify))
+    rc_gv = preflight.main(
+        [
+            "gate-verify",
+            "--repo", str(h["repo"]),
+            "--repo-env", str(snap_dir / "files" / "repo.env"),
+            "--expected-paused", "true",
+        ]
+    )
+    assert rc_gv == 0
+    assert captured_tokens == ["test-internal-svc-secret-delta"]
+
+    # End-to-end rollback: Step 8 corrupts INTERNAL_SERVICE_TOKEN in live repo/.env while old backend still
+    # requires the pre-cutover INTERNAL_SERVICE_TOKEN (returning HTTP 401 on any wrong token).
+    monkeypatch.undo()
+    _simulate_post_cutover_state(h)
+    h["repo_env"].write_text(
+        "APP_ENV=dalton\nDALTON_ENABLED=true\nINTERNAL_SERVICE_TOKEN=CORRUPTED-BY-STEP-8\n",
+        encoding="utf-8",
+    )
+    r_rb = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), str(snap_dir)],
+        env={
+            **h["env"],
+            "FAKE_REQUIRE_SERVICE_TOKEN": "1",
+            "INTERNAL_SERVICE_TOKEN": "WRONG-SHELL-TOKEN",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert r_rb.returncode == 0, r_rb.stdout + r_rb.stderr
+    assert "ROLLBACK_OK" in r_rb.stdout
+    assert "INTERNAL_SERVICE_TOKEN=test-internal-svc-secret-delta" in h["repo_env"].read_text(encoding="utf-8")
+
+
+def test_rollback_runs_db_idle_check_independently_of_backend_http_unless_skip_idle_wait(
+    tmp_path: Path,
+) -> None:
+    """R4 Row 4: rollback runs DB idle check even when backend HTTP is down/unreachable; ONLY `--skip-idle-wait` skips it."""
+    h = _build_isolated_harness(tmp_path)
+    r_snap = subprocess.run(
+        ["/bin/bash", str(SNAPSHOT_SH), "--label", "r4-db-idle", "--print-path"],
+        env=h["env"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert r_snap.returncode == 0, r_snap.stderr
+    snap_dir = r_snap.stdout.strip()
+
+    # Backend container is DOWN (HTTP unreachable), but PostgreSQL still has active threads/data tasks
+    _simulate_post_cutover_state(h)
+    st = json.loads(h["state_file"].read_text(encoding="utf-8"))
+    st["backend_running"] = False
+    h["state_file"].write_text(json.dumps(st, indent=2), encoding="utf-8")
+    h["calls_log"].write_text("", encoding="utf-8")
+
+    # 1. Default (without --skip-idle-wait): MUST run DB idle check via psql and stop at 1/7 wait-backend-idle with gate CLOSED!
+    r_busy = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), snap_dir],
+        env={**h["env"], "FAKE_PG_BUSY": "1", "DALTON_ROLLBACK_IDLE_WAIT_S": "1"},
+        capture_output=True,
+        text=True,
+        timeout=25,
+        check=False,
+    )
+    assert r_busy.returncode != 0
+    assert "1/7 wait-backend-idle" in r_busy.stderr
+    assert "MAINTENANCE ADMISSION GATE REMAINS CLOSED" in r_busy.stderr
+    calls_busy = h["calls_log"].read_text(encoding="utf-8")
+    assert "psql" in calls_busy
+    assert "launchctl bootout" not in calls_busy
+    assert json.loads(h["adm_file"].read_text(encoding="utf-8"))["paused"] is True
+
+    # 2. Explicit --skip-idle-wait: skips DB idle check and completes rollback cleanly
+    h["calls_log"].write_text("", encoding="utf-8")
+    r_skip = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), snap_dir, "--skip-idle-wait"],
+        env={**h["env"], "FAKE_PG_BUSY": "1", "DALTON_ROLLBACK_IDLE_WAIT_S": "1"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert r_skip.returncode == 0, r_skip.stdout + r_skip.stderr
+    assert "ROLLBACK_OK" in r_skip.stdout
+    assert "psql" not in h["calls_log"].read_text(encoding="utf-8")
+
+
+def test_drain_bridge_requires_inflight_queued_ingest_zero_in_forward_and_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4 Row 5: `drain-bridge` calls POST /admin/drain and polls GET /admin/drain until draining=true and inflight==queued==ingest_inflight==0; rollback drains :8960 BEFORE bootout."""
+    h = _build_isolated_harness(tmp_path)
+    orig_http = preflight._http_request
+
+    # A. Unit check: POST /admin/drain -> GET /admin/drain polls through non-zero inflight, queued, ingest_inflight until all 0
+    bridge_calls: list[tuple[str, str, str | None]] = []
+    poll_seq = iter(
+        [
+            {"ok": True, "draining": True, "inflight": 1, "queued": 1, "ingest_inflight": 1},
+            {"ok": True, "draining": True, "inflight": 0, "queued": 1, "ingest_inflight": 1},
+            {"ok": True, "draining": True, "inflight": 0, "queued": 0, "ingest_inflight": 1},
+            {"ok": True, "draining": True, "inflight": 0, "queued": 0, "ingest_inflight": 0},
+        ]
+    )
+
+    def _fake_bridge_http(
+        method: str,
+        url: str,
+        *,
+        headers: Any = None,
+        body: bytes | None = None,
+        timeout_s: float = 5.0,
+    ) -> tuple[int | None, Any, str | None]:
+        auth = (headers or {}).get("Authorization")
+        bridge_calls.append((method, url, auth))
+        assert auth == "Bearer test-bridge-admin-tok"
+        if method == "POST" and url.endswith("/admin/drain"):
+            return 200, {"ok": True, "draining": True, "inflight": 1, "queued": 1, "ingest_inflight": 1}, None
+        if method == "GET" and url.endswith("/admin/drain"):
+            return 200, next(poll_seq), None
+        return 404, {}, "unexpected"
+
+    monkeypatch.setattr(preflight, "_http_request", create_autospec(orig_http, spec_set=True, side_effect=_fake_bridge_http))
+    rc_ok = preflight.main(
+        [
+            "drain-bridge",
+            "--repo", str(h["repo"]),
+            "--home", str(h["home"]),
+            "--plist-dir", str(h["plist_dir"]),
+            "--url", "http://127.0.0.1:8960",
+            "--timeout", "5",
+            "--poll-interval", "0.02",
+        ]
+    )
+    assert rc_ok == 0
+    assert bridge_calls[0][0] == "POST" and bridge_calls[0][1].endswith("/admin/drain")
+    assert len([c for c in bridge_calls if c[0] == "GET" and c[1].endswith("/admin/drain")]) == 4
+
+    # B. Non-zero ingest_inflight until timeout -> exits 1
+    def _fake_bridge_ingest_stuck(
+        method: str,
+        url: str,
+        *,
+        headers: Any = None,
+        body: bytes | None = None,
+        timeout_s: float = 5.0,
+    ) -> tuple[int | None, Any, str | None]:
+        return 200, {"ok": True, "draining": True, "inflight": 0, "queued": 0, "ingest_inflight": 1}, None
+
+    monkeypatch.setattr(preflight, "_http_request", create_autospec(orig_http, spec_set=True, side_effect=_fake_bridge_ingest_stuck))
+    rc_stuck = preflight.main(
+        [
+            "drain-bridge",
+            "--repo", str(h["repo"]),
+            "--home", str(h["home"]),
+            "--plist-dir", str(h["plist_dir"]),
+            "--url", "http://127.0.0.1:8960",
+            "--timeout", "0.5",
+            "--poll-interval", "0.05",
+        ]
+    )
+    assert rc_stuck == 1
+
+    # C. End-to-end rollback: drains :8960 via POST+GET /admin/drain BEFORE bootout; stuck ingest_inflight blocks bootout with gate CLOSED
+    monkeypatch.undo()
+    r_snap = subprocess.run(
+        ["/bin/bash", str(SNAPSHOT_SH), "--label", "r4-bridge-drain", "--print-path"],
+        env=h["env"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert r_snap.returncode == 0, r_snap.stderr
+    snap_dir = r_snap.stdout.strip()
+
+    # C1: stuck ingest_inflight on :8960 -> aborts at 3/7 drain-legacy-bridge, NO bridge bootout, gate CLOSED
+    _simulate_post_cutover_state(h)
+    st = json.loads(h["state_file"].read_text(encoding="utf-8"))
+    st["ingest_inflight_8960"] = 2
+    h["state_file"].write_text(json.dumps(st, indent=2), encoding="utf-8")
+    h["calls_log"].write_text("", encoding="utf-8")
+    r_fail = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), snap_dir],
+        env={**h["env"], "FAKE_KEEP_8960_BUSY": "1", "DALTON_ROLLBACK_SERVICE_TIMEOUT_S": "1"},
+        capture_output=True,
+        text=True,
+        timeout=25,
+        check=False,
+    )
+    assert r_fail.returncode != 0
+    assert "3/7 drain-legacy-bridge" in r_fail.stderr
+    assert "MAINTENANCE ADMISSION GATE REMAINS CLOSED" in r_fail.stderr
+    assert "launchctl bootout gui/501/com.dalton.researchdata-bridge" not in h["calls_log"].read_text(encoding="utf-8")
+    assert json.loads(h["adm_file"].read_text(encoding="utf-8"))["paused"] is True
+
+    # C2: transient inflight/queued/ingest_inflight drains cleanly BEFORE bridge bootout
+    _simulate_post_cutover_state(h)
+    st = json.loads(h["state_file"].read_text(encoding="utf-8"))
+    st["inflight_8960"] = 1
+    st["queued_8960"] = 1
+    st["ingest_inflight_8960"] = 1
+    h["state_file"].write_text(json.dumps(st, indent=2), encoding="utf-8")
+    h["calls_log"].write_text("", encoding="utf-8")
+    r_ok = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), snap_dir],
+        env=h["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert r_ok.returncode == 0, r_ok.stdout + r_ok.stderr
+    calls = h["calls_log"].read_text(encoding="utf-8").splitlines()
+    post_drain_idx = next(i for i, c in enumerate(calls) if "POST http://127.0.0.1:8960/admin/drain" in c)
+    get_drain_idx = next(i for i, c in enumerate(calls) if "GET http://127.0.0.1:8960/admin/drain" in c)
+    bridge_bootout_idx = next(i for i, c in enumerate(calls) if "launchctl bootout gui/501/com.dalton.researchdata-bridge" in c)
+    assert post_drain_idx < get_drain_idx < bridge_bootout_idx
+
+
+def test_runbook_step9_keeps_pause_host_direct_true_and_step10_covers_journal_failure_recovery() -> None:
+    """R4 Row 6: Step 9 single-workspace verification keeps pause_host_direct=true; Step 10 provides recovery commands & state verification for journal-set failure."""
+    text = RUNBOOK_MD.read_text(encoding="utf-8")
+    invocations = _extract_runbook_script_invocations(text)
+
+    # Step 9.2 single-workspace allowlist gate-set MUST keep --pause-host-direct true
+    allow_ws_calls = [
+        cli_args
+        for script, cli_args in invocations
+        if script.endswith("preflight.py") and cli_args and cli_args[0] == "gate-set" and "--allow-workspace-id" in cli_args
+    ]
+    assert len(allow_ws_calls) == 1
+    ws_args = allow_ws_calls[0]
+    phd_idx = ws_args.index("--pause-host-direct")
+    assert ws_args[phd_idx + 1] == "true", f"Step 9.2 must keep --pause-host-direct true, got {ws_args}"
+
+    # Step 10 MUST include a journal-set failure recovery branch with gate-status, journal-read, journal-set retry, and readback checks
+    step10_start = text.index("### 第 10 步")
+    sec3_start = text.index("## 三、回滚")
+    step10_text = text[step10_start:sec3_start]
+    assert "journal-set" in step10_text
+    assert "gate-status" in step10_text
+    assert "journal-read" in step10_text
+    assert "--key completed" in step10_text
+    assert "--key target_owner" in step10_text
+
+
+def test_snapshot_requires_valid_web_releases_current_and_rollback_verifies_served_frontend_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4 Row 7: snapshot creation & verification require valid web/releases/current symlink & version.json; rollback verifies actually served /version.json BEFORE opening gate."""
+    h = _build_isolated_harness(tmp_path)
+    rel_dir = h["repo"] / "web" / "releases"
+
+    # A. Snapshot creation MUST reject missing, regular-directory, dangling, escaping, or version.json-less current
+    # A1: missing current
+    h["web_cur"].unlink()
+    with pytest.raises((ValueError, FileNotFoundError)):
+        preflight.create_cutover_snapshot(repo_root=h["repo"], home_dir=h["home"], label="no-cur", plist_dir=h["plist_dir"])
+
+    # A2: current replaced with regular directory (not a symlink)
+    h["web_cur"].mkdir()
+    (h["web_cur"] / "version.json").write_text(json.dumps({"build": "dir-not-link"}) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="symlink"):
+        preflight.create_cutover_snapshot(repo_root=h["repo"], home_dir=h["home"], label="dir-cur", plist_dir=h["plist_dir"])
+    shutil.rmtree(h["web_cur"])
+
+    # A3: dangling symlink
+    os.symlink("rel-does-not-exist", h["web_cur"])
+    with pytest.raises(FileNotFoundError, match="dangling"):
+        preflight.create_cutover_snapshot(repo_root=h["repo"], home_dir=h["home"], label="dangling", plist_dir=h["plist_dir"])
+    h["web_cur"].unlink()
+
+    # A4: symlink escaping web/releases/
+    outside_dir = tmp_path / "outside-release"
+    outside_dir.mkdir()
+    (outside_dir / "version.json").write_text(json.dumps({"build": "escape-1"}) + "\n", encoding="utf-8")
+    os.symlink(str(outside_dir), h["web_cur"])
+    with pytest.raises(ValueError, match="escapes"):
+        preflight.create_cutover_snapshot(repo_root=h["repo"], home_dir=h["home"], label="escape", plist_dir=h["plist_dir"])
+    h["web_cur"].unlink()
+
+    # A5: valid symlink but missing version.json
+    os.symlink("rel-before", h["web_cur"])
+    saved_ver = (rel_dir / "rel-before" / "version.json").read_bytes()
+    (rel_dir / "rel-before" / "version.json").unlink()
+    try:
+        with pytest.raises(ValueError, match="version.json"):
+            preflight.create_cutover_snapshot(repo_root=h["repo"], home_dir=h["home"], label="no-ver", plist_dir=h["plist_dir"])
+    finally:
+        (rel_dir / "rel-before" / "version.json").write_bytes(saved_ver)
+
+    # B. Valid snapshot succeeds, and verify_cutover_snapshot rejects manifests lacking valid symlink or version.json
+    snap_dir, _manifest = preflight.create_cutover_snapshot(
+        repo_root=h["repo"],
+        home_dir=h["home"],
+        label="valid-web",
+        plist_dir=h["plist_dir"],
+        repo_env=h["repo_env"],
+        bridge_env=h["bridge_env"],
+        research_host_env=h["rh_env"],
+        guidepoint_env=h["gp_env"],
+    )
+    assert preflight.verify_cutover_snapshot(snap_dir) == []
+
+    for mutate_name, mutator in (
+        ("not_symlink", lambda m: m["web_releases_current"].update({"is_symlink": False, "link_target": ""})),
+        ("missing_ver_rel", lambda m: m["web_releases_current"].pop("version_json_rel_path", None)),
+        ("missing_web_block", lambda m: m.pop("web_releases_current", None)),
+    ):
+        bad_dir = tmp_path / f"bad_snap_{mutate_name}"
+        shutil.copytree(snap_dir, bad_dir)
+        mp = bad_dir / "snapshot-manifest.json"
+        m_obj = json.loads(mp.read_text(encoding="utf-8"))
+        mutator(m_obj)
+        mp.write_text(json.dumps(m_obj, indent=2), encoding="utf-8")
+        errs = preflight.verify_cutover_snapshot(bad_dir)
+        assert errs, f"verify_cutover_snapshot must reject {mutate_name}"
+
+    # C. Unit check: verify-frontend-version with create_autospec(_http_request) checks served /version.json
+    orig_http = preflight._http_request
+    monkeypatch.setattr(
+        preflight,
+        "_http_request",
+        create_autospec(orig_http, spec_set=True, return_value=(200, {"build": "before-111"}, None)),
+    )
+    assert preflight.main(
+        [
+            "verify-frontend-version",
+            "--repo", str(h["repo"]),
+            "--snapshot-dir", str(snap_dir),
+            "--edge-url", "http://127.0.0.1:8088",
+            "--timeout", "1",
+            "--poll-interval", "0.05",
+        ]
+    ) == 0
+
+    monkeypatch.setattr(
+        preflight,
+        "_http_request",
+        create_autospec(orig_http, spec_set=True, return_value=(200, {"build": "wrong-served-999"}, None)),
+    )
+    assert preflight.main(
+        [
+            "verify-frontend-version",
+            "--repo", str(h["repo"]),
+            "--snapshot-dir", str(snap_dir),
+            "--edge-url", "http://127.0.0.1:8088",
+            "--timeout", "0.5",
+            "--poll-interval", "0.05",
+        ]
+    ) == 1
+
+    # D. End-to-end rollback: served /version.json mismatches restored snapshot -> fails BEFORE opening gate, leaving paused=True!
+    monkeypatch.undo()
+    _simulate_post_cutover_state(h)
+    r_bad_fe = subprocess.run(
+        ["/bin/bash", str(ROLLBACK_SH), str(snap_dir)],
+        env={
+            **h["env"],
+            "FAKE_SERVED_FRONTEND_BUILD": "stale-edge-999",
+            "DALTON_ROLLBACK_PROBE_TIMEOUT_S": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=25,
+        check=False,
+    )
+    assert r_bad_fe.returncode != 0
+    assert "6/7 verify-frontend-version" in r_bad_fe.stderr
+    assert "MAINTENANCE ADMISSION GATE REMAINS CLOSED" in r_bad_fe.stderr
+    assert "ROLLBACK_OK" not in r_bad_fe.stdout
+    assert json.loads(h["adm_file"].read_text(encoding="utf-8"))["paused"] is True

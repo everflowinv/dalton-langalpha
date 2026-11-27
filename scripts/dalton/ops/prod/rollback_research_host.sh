@@ -2,21 +2,26 @@
 # One-click idempotent rollback script for Everflow Research Host cutover.
 #
 # Flow:
-#   1. Close & verify maintenance admission gate FIRST (before snapshot verify or
-#      Compose resolution), then resolve & verify snapshot and drain backend idle
+#   1. Close & verify host maintenance admission gate FIRST (file + DB lock
+#      readback), then resolve & verify snapshot, verify running backend with
+#      SNAPSHOT .env, and run database idle check independently of backend HTTP
+#      (skipped only with --skip-idle-wait)
 #   2. Drain (controlled refresh if TTL <= 60s, /admin/drain, in_flight == 0,
-#      no .guidepoint_mcp_tokens.*.tmp) & stop com.dalton.research-host (:8951)
-#   3. Drain & stop :8943 and stop :8960, verify .guidepoint.owner.lock is free,
-#      then restore snapshot files (preserving newer live Guidepoint tokens;
-#      failing closed if web/releases/current target is missing)
+#      no .guidepoint_mcp_tokens.*.tmp; --allow-down skips only when unloaded
+#      from launchd and absent from ps) & stop com.dalton.research-host (:8951)
+#   3. Drain & stop :8943, drain :8960 via /admin/drain (inflight/queued/
+#      ingest_inflight == 0) & stop :8960, verify .guidepoint.owner.lock is
+#      free, then restore snapshot files (preserving newer live Guidepoint
+#      tokens; requiring valid web/releases/current symlink & version.json)
 #   4. Start com.dalton.guidepoint-mcp-proxy (:8943) and verify owner_lock_held,
 #      and start com.dalton.researchdata-bridge (:8960)
 #   5. Resolve Compose args from restored .env, recreate backend container, and
 #      verify health + closed gate
 #   6. Probe live legacy Wiki `search` and Guidepoint `search_library` (JSON/SSE)
+#      and verify served frontend /version.json matches restored snapshot
 #   7. Open maintenance admission gate and verify :8000 accepts requests (on
-#      verify failure, explicitly re-close and verify closure; error loudly if
-#      re-close itself fails)
+#      failure, explicitly re-close — falling back to --no-db-lock if Postgres
+#      is unavailable — and verify closure; error loudly if re-close fails)
 #
 # Any failure keeps the maintenance admission gate CLOSED and prints manual
 # remediation instructions. Re-running the script is safe and idempotent.
@@ -42,6 +47,7 @@ PROBE_TIMEOUT="${DALTON_ROLLBACK_PROBE_TIMEOUT_S:-15}"
 PROBE_RETRIES="${DALTON_ROLLBACK_PROBE_RETRIES:-3}"
 PROBE_RETRY_DELAY="${DALTON_ROLLBACK_PROBE_RETRY_DELAY_S:-1}"
 BACKEND_URL="${DALTON_BACKEND_URL:-http://127.0.0.1:8000}"
+EDGE_URL="${DALTON_EDGE_URL:-http://127.0.0.1:${DALTON_EDGE_PORT:-8088}}"
 PROXY_URL="${DALTON_PROXY_URL:-http://127.0.0.1:8943}"
 BRIDGE_URL="${DALTON_BRIDGE_LOCAL_URL:-http://127.0.0.1:8960}"
 RESEARCH_HOST_URL="${DALTON_RESEARCH_HOST_LOCAL_URL:-http://127.0.0.1:8951}"
@@ -68,6 +74,7 @@ Options:
   --probe-timeout N              HTTP timeout per live probe call in seconds (default: 15)
   --probe-retries N              Retry count per live probe (default: 3)
   --backend-url URL              Backend URL (default: http://127.0.0.1:8000)
+  --edge-url URL                 Frontend edge URL for /version.json check (default: http://127.0.0.1:8088)
   --proxy-url URL                Legacy Guidepoint proxy URL (default: http://127.0.0.1:8943)
   --bridge-url URL               Legacy bridge URL (default: http://127.0.0.1:8960)
   --research-host-url URL        Research Host URL (default: http://127.0.0.1:8951)
@@ -122,6 +129,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --backend-url)
       BACKEND_URL="${2:?missing --backend-url value}"
+      shift 2
+      ;;
+    --edge-url)
+      EDGE_URL="${2:?missing --edge-url value}"
       shift 2
       ;;
     --proxy-url)
@@ -305,13 +316,13 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
   fi
   echo "=== DRY-RUN: Research Host Rollback Plan ==="
   echo "Snapshot: ${SNAPSHOT_DIR} (SHA-256 verified)"
-  echo "1. Close & verify maintenance admission gate FIRST (${RH_ADMISSION_FILE}), then verify snapshot and wait backend idle via wait_backend_idle.sh"
+  echo "1. Close & verify host maintenance admission gate FIRST (${RH_ADMISSION_FILE}), verify snapshot, verify running backend using snapshot .env, and run database idle check via wait_backend_idle.sh"
   echo "2. Drain com.dalton.research-host (${RESEARCH_HOST_URL}: controlled refresh if TTL<=60s, /admin/drain, in_flight=0, no .tmp) and stop via launchctl bootout"
-  echo "3. Drain & stop :8943, stop :8960, verify .guidepoint.owner.lock is free, then restore files (preserving newer live Guidepoint tokens):"
+  echo "3. Drain & stop :8943, drain :8960 via /admin/drain (inflight=0, queued=0, ingest_inflight=0) & stop :8960, verify .guidepoint.owner.lock is free, then restore files (preserving newer live Guidepoint tokens):"
   rh_snapshot_restore --snapshot-dir "${SNAPSHOT_DIR}" --dry-run
   echo "4. Start com.dalton.guidepoint-mcp-proxy (${PROXY_PLIST}, verify owner_lock_held) and com.dalton.researchdata-bridge (${BRIDGE_PLIST})"
   echo "5. Recreate backend container: ${DOCKER_BIN_EFF} compose ${COMPOSE_ARGS[*]} up -d --no-deps --force-recreate backend"
-  echo "6. Probe legacy services: :8943/healthz, :8960/healthz, Wiki search, Guidepoint search_library (JSON/SSE), backend /health"
+  echo "6. Probe legacy services: :8943/healthz, :8960/healthz, Wiki search, Guidepoint search_library (JSON/SSE), backend /health, and verify served frontend ${EDGE_URL}/version.json matches snapshot"
   if [[ "${KEEP_ADMISSION_PAUSED}" -eq 1 ]]; then
     echo "7. Keep maintenance admission gate closed (--keep-admission-paused)"
   else
@@ -340,32 +351,20 @@ run_gate_set() {
   fi
 }
 
-# Step 1a: Close and verify maintenance admission gate FIRST (before snapshot verify or Compose resolution)
+# Step 1a: Close and verify host maintenance admission gate FIRST (DB lock + file readback),
+# BEFORE snapshot verification or Compose resolution.
 echo "[1/7] Closing maintenance admission gate and verifying snapshot..."
-if ! is_gate_fully_closed; then
-  echo "  Admission gate is open; closing gate before rollback..."
-  run_gate_set --paused true --pause-host-direct true --operation rollback --reason "manual_rollback_research_host" \
-    || fail_gate_state_unknown "1/7 close-gate" "Could not write maintenance-admission.json. Check Postgres connectivity or re-run with --no-db-lock if Postgres is unavailable."
-  is_gate_fully_closed \
-    || fail_gate_state_unknown "1/7 close-gate" "maintenance-admission.json does not confirm paused=true and pause_host_direct=true after write."
+if is_gate_fully_closed; then
+  echo "  Admission gate file is already paused; confirming DB-locked close state and readback..."
 else
-  echo "  Admission gate is already closed."
+  echo "  Admission gate is open; closing gate before rollback..."
 fi
+run_gate_set --paused true --pause-host-direct true --operation rollback --reason "manual_rollback_research_host" \
+  || fail_gate_state_unknown "1/7 close-gate" "Could not write maintenance-admission.json. Check Postgres connectivity or re-run with --no-db-lock if Postgres is unavailable."
+is_gate_fully_closed \
+  || fail_gate_state_unknown "1/7 close-gate" "maintenance-admission.json does not confirm paused=true and pause_host_direct=true after write."
 
-verify_out=""
-verify_out="$(rh_gate_verify --expected-paused true --backend-url "${BACKEND_URL}" --container-name "${CONTAINER_NAME}" --deadline-s "${GATE_VERIFY_TIMEOUT}" --allow-unavailable)" \
-  || fail_gate_state_unknown "1/7 verify-gate" "Backend container is running but rejected closed-gate verification. Inspect ${CONTAINER_NAME} logs and /app/var/dalton/maintenance-admission.json."
-
-container_avail="$(PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B - "${verify_out}" <<'PY'
-import json
-import sys
-
-d = json.loads(sys.argv[1])
-print("1" if d.get("container_available") is True else "0")
-PY
-)"
-
-# Step 1b: Resolve & verify snapshot directory (gate is already closed & verified)
+# Step 1b: Resolve & verify snapshot directory (host gate is already closed & read back)
 if [[ -z "${SNAPSHOT_DIR}" ]]; then
   if ! SNAPSHOT_DIR="$(rh_snapshot_latest)"; then
     fail_with_gate_closed "1/7 resolve-snapshot" "Could not find a valid latest snapshot under ${RH_SNAPSHOTS_ROOT}. Pass an explicit verified snapshot directory."
@@ -377,6 +376,24 @@ if ! rh_snapshot_verify --snapshot-dir "${SNAPSHOT_DIR}" >/dev/null; then
 fi
 
 load_snapshot_manifest_paths
+SNAPSHOT_REPO_ENV="${SNAPSHOT_DIR}/files/repo.env"
+
+# Step 1c: Verify still-running old backend container sees closed gate using SNAPSHOT .env
+# (so a corrupted live .env INTERNAL_SERVICE_TOKEN cannot block rollback with HTTP 401)
+pre_verify_args=(
+  --expected-paused true
+  --backend-url "${BACKEND_URL}"
+  --container-name "${CONTAINER_NAME}"
+  --deadline-s "${GATE_VERIFY_TIMEOUT}"
+  --allow-unavailable
+)
+if [[ -f "${SNAPSHOT_REPO_ENV}" ]]; then
+  pre_verify_args+=(--repo-env "${SNAPSHOT_REPO_ENV}")
+elif [[ -n "${REPO_ENV_PATH}" ]]; then
+  pre_verify_args+=(--repo-env "${REPO_ENV_PATH}")
+fi
+rh_gate_verify "${pre_verify_args[@]}" >/dev/null \
+  || fail_gate_state_unknown "1/7 verify-gate" "Backend container is running but rejected closed-gate verification (using snapshot .env). Inspect ${CONTAINER_NAME} logs and /app/var/dalton/maintenance-admission.json."
 
 gate_verify_extra=()
 if [[ -n "${REPO_ENV_PATH}" ]]; then
@@ -391,13 +408,14 @@ run_gate_verify() {
   fi
 }
 
-if [[ "${SKIP_IDLE_WAIT}" -eq 0 && "${container_avail}" == "1" ]]; then
-  echo "  Waiting for active backend threads and data tasks to become idle (max ${IDLE_WAIT_SECONDS}s)..."
+# Step 1d: Run database idle wait independently of backend HTTP unless --skip-idle-wait is passed
+if [[ "${SKIP_IDLE_WAIT}" -eq 0 ]]; then
+  echo "  Waiting for active database threads and data tasks to become idle (max ${IDLE_WAIT_SECONDS}s)..."
   PYTHON_BIN="${RH_PYTHON_BIN}" DOCKER_BIN="${DOCKER_BIN_EFF}" CURL_BIN="${CURL_BIN_EFF}" \
     bash "${WAIT_IDLE_SH}" --max-wait-seconds "${IDLE_WAIT_SECONDS}" \
-    || fail_with_gate_closed "1/7 wait-backend-idle" "Backend still has active work after ${IDLE_WAIT_SECONDS}s. Wait for running jobs to finish or re-run with --skip-idle-wait during emergency downtime."
+    || fail_with_gate_closed "1/7 wait-backend-idle" "Database still has active work (or Postgres is unreachable) after ${IDLE_WAIT_SECONDS}s. Wait for running jobs to finish or re-run with --skip-idle-wait during emergency downtime."
 else
-  echo "  Skipping idle wait (skip_idle_wait=${SKIP_IDLE_WAIT}, container_available=${container_avail})."
+  echo "  Skipping database idle wait (--skip-idle-wait)."
 fi
 
 http_status_code() {
@@ -464,8 +482,22 @@ rh_launchctl_bootout "com.dalton.guidepoint-mcp-proxy" "${PROXY_PLIST}" \
 wait_url_down "${PROXY_URL%/}/healthz" "${SERVICE_TIMEOUT}" \
   || fail_with_gate_closed "3/7 wait-legacy-proxy-down" "${PROXY_URL}/healthz is still responding after ${SERVICE_TIMEOUT}s."
 
+bridge_drain_args=()
+if [[ -n "${EFF_PLIST_DIR}" ]]; then bridge_drain_args+=(--plist-dir "${EFF_PLIST_DIR}"); fi
+if [[ -n "${REPO_ENV_PATH}" ]]; then bridge_drain_args+=(--repo-env "${REPO_ENV_PATH}"); fi
+if [[ -n "${BRIDGE_ENV_PATH}" ]]; then bridge_drain_args+=(--bridge-env "${BRIDGE_ENV_PATH}"); fi
+
+rh_drain_bridge \
+  --url "${BRIDGE_URL}" \
+  --timeout "${SERVICE_TIMEOUT}" \
+  --allow-down \
+  "${bridge_drain_args[@]}" >/dev/null \
+  || fail_with_gate_closed "3/7 drain-legacy-bridge" "com.dalton.researchdata-bridge did not drain via /admin/drain (draining=true, inflight=0, queued=0, ingest_inflight=0). Inspect ${BRIDGE_URL}/admin/drain and ${BRIDGE_URL}/healthz before retrying."
+
 rh_launchctl_bootout "com.dalton.researchdata-bridge" "${BRIDGE_PLIST}" \
   || fail_with_gate_closed "3/7 stop-legacy-bridge" "Failed to stop com.dalton.researchdata-bridge before file restore."
+wait_url_down "${BRIDGE_URL%/}/healthz" "${SERVICE_TIMEOUT}" \
+  || fail_with_gate_closed "3/7 wait-legacy-bridge-down" "${BRIDGE_URL}/healthz is still responding after ${SERVICE_TIMEOUT}s."
 
 rh_wait_lock_free --timeout "${SERVICE_TIMEOUT}" "${drain_common_args[@]}" >/dev/null \
   || fail_with_gate_closed "3/7 wait-owner-lock-free" "Guidepoint .guidepoint.owner.lock is still held after stopping refreshers. Stop any lingering process holding the lock before retrying."
@@ -522,6 +554,17 @@ fi
 rh_probe_services "${probe_args[@]}" \
   || fail_with_gate_closed "6/7 live-probes" "Live Wiki search or Guidepoint search_library probe failed. Inspect :8943 and :8960 logs; admission gate remains closed."
 
+fe_verify_args=(
+  --edge-url "${EDGE_URL}"
+  --snapshot-dir "${SNAPSHOT_DIR}"
+  --timeout "${PROBE_TIMEOUT}"
+)
+if [[ -n "${REPO_ENV_PATH}" ]]; then
+  fe_verify_args+=(--repo-env "${REPO_ENV_PATH}")
+fi
+rh_verify_frontend_version "${fe_verify_args[@]}" >/dev/null \
+  || fail_with_gate_closed "6/7 verify-frontend-version" "Served frontend ${EDGE_URL}/version.json does not match restored snapshot release. Confirm edge container mounts web/releases/current before re-running rollback."
+
 if [[ "${KEEP_ADMISSION_PAUSED}" -eq 1 ]]; then
   echo "[7/7] Rollback verified; keeping maintenance admission gate CLOSED as requested (--keep-admission-paused)."
   echo "ROLLBACK_OK (gate kept paused): restored from ${SNAPSHOT_DIR}"
@@ -532,16 +575,33 @@ reclose_after_open_failure() {
   local fail_step="$1"
   local fail_msg="$2"
   local reclose_ok=1
+  local used_no_db_lock_fallback=0
   if ! run_gate_set --paused true --pause-host-direct true --operation rollback --reason "rollback_open_verify_failed"; then
-    reclose_ok=0
-  elif ! is_gate_fully_closed; then
-    reclose_ok=0
-  elif ! run_gate_verify --expected-paused true --backend-url "${BACKEND_URL}" --container-name "${CONTAINER_NAME}" --deadline-s "${GATE_VERIFY_TIMEOUT}" --allow-unavailable >/dev/null; then
-    reclose_ok=0
+    if [[ "${NO_DB_LOCK}" -eq 0 ]]; then
+      echo "  WARN: locked gate re-close failed (e.g. Postgres unavailable); falling back to emergency --no-db-lock write..." >&2
+      if rh_gate_set --paused true --pause-host-direct true --operation rollback --reason "rollback_open_verify_failed" --no-db-lock >/dev/null; then
+        used_no_db_lock_fallback=1
+      else
+        reclose_ok=0
+      fi
+    else
+      reclose_ok=0
+    fi
+  fi
+  if [[ "${reclose_ok}" -eq 1 ]]; then
+    if ! is_gate_fully_closed; then
+      reclose_ok=0
+    elif ! run_gate_verify --expected-paused true --backend-url "${BACKEND_URL}" --container-name "${CONTAINER_NAME}" --deadline-s "${GATE_VERIFY_TIMEOUT}" --allow-unavailable >/dev/null; then
+      reclose_ok=0
+    fi
   fi
 
   if [[ "${reclose_ok}" -eq 1 ]]; then
-    fail_with_gate_closed "${fail_step}" "${fail_msg}; gate was re-closed and verified closed for safety."
+    local suffix="gate was re-closed and verified closed for safety."
+    if [[ "${used_no_db_lock_fallback}" -eq 1 ]]; then
+      suffix="gate was re-closed via emergency --no-db-lock fallback and verified closed for safety."
+    fi
+    fail_with_gate_closed "${fail_step}" "${fail_msg}; ${suffix}"
   else
     fail_gate_state_unknown "7/7 reclose-gate" "${fail_msg}, AND re-closing or verifying closed admission gate FAILED! Immediately close the gate manually (or with --no-db-lock if Postgres is unavailable) and inspect ${RH_ADMISSION_FILE}."
   fi

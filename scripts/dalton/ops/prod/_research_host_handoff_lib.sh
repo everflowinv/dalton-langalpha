@@ -379,6 +379,21 @@ rh_drain_refresher() {
     "$@"
 }
 
+rh_drain_bridge() {
+  rh_paths
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" drain-bridge \
+    --repo "${RH_REPO_ROOT}" \
+    --home "${RH_HOME}" \
+    "$@"
+}
+
+rh_verify_frontend_version() {
+  rh_paths
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" verify-frontend-version \
+    --repo "${RH_REPO_ROOT}" \
+    "$@"
+}
+
 rh_wait_lock_free() {
   rh_paths
   PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" wait-lock-free \
