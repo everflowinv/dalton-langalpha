@@ -65,12 +65,67 @@ _FENCE_OPEN_RE = re.compile(r"\A[ ]{0,3}(`{3,}|~{3,})(.*)\Z")
 _FENCE_CLOSE_BACKTICK_RE = re.compile(r"\A[ ]{0,3}(`{3,})[ \t]*\Z")
 _FENCE_CLOSE_TILDE_RE = re.compile(r"\A[ ]{0,3}(~{3,})[ \t]*\Z")
 _ATX_HEADING_RE = re.compile(r"\A[ ]{0,3}#{1,6}(?:[ \t]|\Z)")
+_SETEXT_UNDERLINE_RE = re.compile(r"\A[ ]{0,3}(?:=+|-+)[ \t]*\Z")
 _THEMATIC_BREAK_RE = re.compile(
     r"\A[ ]{0,3}(?:(?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\*[ \t]*){3,})\Z"
 )
-_BLOCKQUOTE_PREFIX_RE = re.compile(r"\A[ ]{0,3}>[ ]?")
 _LIST_MARKER_RE = re.compile(r"\A([ ]{0,3})([-+*]|\d{1,9}[.)])([ \t]+|\Z)")
 _RANGE_TILDE_RE = re.compile(r" ?[~～] ?")
+
+# CommonMark §4.6 HTML block rules (types 1–7), mirroring markdown_it's HTML_SEQUENCES.
+_HTML_BLOCK_CLOSE_BLANK = object()
+_HTML_BLOCK_SEQUENCES: tuple[
+    tuple[re.Pattern[str], re.Pattern[str] | None, bool], ...
+] = (
+    (
+        re.compile(r"\A<(?:script|pre|style|textarea)(?=[\s>]|$)", re.IGNORECASE),
+        re.compile(r"</(?:script|pre|style|textarea)>", re.IGNORECASE),
+        True,
+    ),
+    (
+        re.compile(r"\A<!--"),
+        re.compile(r"-->"),
+        True,
+    ),
+    (
+        re.compile(r"\A<\?"),
+        re.compile(r"\?>"),
+        True,
+    ),
+    (
+        re.compile(r"\A<![A-Z]"),
+        re.compile(r">"),
+        True,
+    ),
+    (
+        re.compile(r"\A<!\[CDATA\["),
+        re.compile(r"\]\]>"),
+        True,
+    ),
+    (
+        re.compile(
+            r"\A</?(?:address|article|aside|base|basefont|blockquote|body|caption|"
+            r"center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|"
+            r"figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|"
+            r"iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|"
+            r"p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|"
+            r"track|ul)(?=[\s>]|/>|$)",
+            re.IGNORECASE,
+        ),
+        None,
+        True,
+    ),
+    (
+        re.compile(
+            r"\A(?:<[A-Za-z][A-Za-z0-9\-]*"
+            r"(?:\s+[a-zA-Z_:][a-zA-Z0-9:._-]*"
+            r"(?:\s*=\s*(?:[^\"'=<>`\x00-\x20]+|'[^']*'|\"[^\"]*\"))?)*"
+            r"\s*/?>|</[A-Za-z][A-Za-z0-9\-]*\s*>)[ \t]*\Z"
+        ),
+        None,
+        False,
+    ),
+)
 
 _MD_PARSER: Any = None
 try:
@@ -148,8 +203,8 @@ def _strip_inline_code_on_line(line: str) -> str:
     return "".join(out)
 
 
-def _leading_columns(line: str) -> int:
-    col = 0
+def _leading_columns(line: str, start_col: int = 0) -> int:
+    col = start_col
     for ch in line:
         if ch == " ":
             col += 1
@@ -157,16 +212,53 @@ def _leading_columns(line: str) -> int:
             col = (col // 4 + 1) * 4
         else:
             break
-    return col
+    return col - start_col
 
 
-def _strip_blockquotes(line: str) -> str:
-    cur = line
-    while True:
-        match = _BLOCKQUOTE_PREFIX_RE.match(cur)
-        if not match:
-            return cur
-        cur = cur[match.end() :]
+def _consume_columns(text: str, target_cols: int, start_col: int = 0) -> tuple[str, int]:
+    """Consume up to ``target_cols`` leading whitespace columns (4-column tab stops).
+
+    When a tab crosses ``start_col + target_cols``, leftover columns are materialized
+    as leading spaces so subsequent indentation checks keep exact CommonMark widths.
+    """
+    if target_cols <= 0:
+        return text, 0
+    col = start_col
+    end_col = start_col + target_cols
+    idx = 0
+    length = len(text)
+    while idx < length and col < end_col:
+        ch = text[idx]
+        if ch == " ":
+            col += 1
+            idx += 1
+        elif ch == "\t":
+            next_col = (col // 4 + 1) * 4
+            idx += 1
+            if next_col > end_col:
+                return (" " * (next_col - end_col)) + text[idx:], target_cols
+            col = next_col
+        else:
+            break
+    return text[idx:], col - start_col
+
+
+def _match_blockquote_prefix(text: str, start_col: int) -> tuple[str, int] | None:
+    lead_cols = _leading_columns(text, start_col)
+    if lead_cols >= 4:
+        return None
+    stripped = text.lstrip(" \t")
+    if not stripped.startswith(">"):
+        return None
+    col_after_gt = start_col + lead_cols + 1
+    rest = stripped[1:]
+    if rest.startswith(" "):
+        return rest[1:], col_after_gt + 1
+    if rest.startswith("\t"):
+        next_col = (col_after_gt // 4 + 1) * 4
+        leftover = next_col - (col_after_gt + 1)
+        return (" " * leftover) + rest[1:], col_after_gt + 1
+    return rest, col_after_gt
 
 
 def _normalize_with_markdown_it(content: str, parser: Any) -> str:
@@ -197,98 +289,183 @@ def _normalize_with_markdown_it(content: str, parser: Any) -> str:
 def _normalize_stdlib(content: str) -> str:
     """CommonMark-aware fallback when ``markdown_it`` is unavailable (e.g. minimal sandbox)."""
     parts = _LINE_SPLIT_RE.split(content)
+    # Open containers: ["bq"] or ["list", indent_cols, has_content]
+    containers: list[list[Any]] = []
     in_fence: tuple[str, int] | None = None
+    in_html: Any = None
     prev_is_paragraph = False
-    list_content_indent: int | None = None
 
     for idx in range(0, len(parts), 2):
         line = parts[idx]
-        inner = _strip_blockquotes(line)
+        cur = line
+        col = 0
+        matched = 0
+
+        for container in containers:
+            if container[0] == "bq":
+                bq = _match_blockquote_prefix(cur, col)
+                if bq is None:
+                    break
+                cur, col = bq
+                matched += 1
+            else:
+                indent_cols = container[1]
+                if not cur.strip():
+                    if not container[2]:
+                        break
+                    cur = ""
+                    matched += 1
+                elif _leading_columns(cur, col) >= indent_cols:
+                    cur, _ = _consume_columns(cur, indent_cols, col)
+                    col += indent_cols
+                    container[2] = True
+                    matched += 1
+                else:
+                    break
+
+        if matched < len(containers):
+            del containers[matched:]
+            if in_fence is not None or in_html is not None:
+                in_fence = None
+                in_html = None
+                prev_is_paragraph = False
 
         if in_fence is not None:
             fence_char, fence_len = in_fence
-            close_re = (
-                _FENCE_CLOSE_BACKTICK_RE
-                if fence_char == "`"
-                else _FENCE_CLOSE_TILDE_RE
-            )
-            trimmed_for_close = (
-                inner[list_content_indent:]
-                if list_content_indent is not None
-                and _leading_columns(inner) >= list_content_indent
-                and inner.startswith(" " * list_content_indent)
-                else inner
-            )
-            close_match = close_re.match(trimmed_for_close)
-            if close_match and len(close_match.group(1)) >= fence_len:
-                in_fence = None
-                prev_is_paragraph = False
+            lead_cols = _leading_columns(cur, col)
+            if lead_cols < 4:
+                close_re = (
+                    _FENCE_CLOSE_BACKTICK_RE
+                    if fence_char == "`"
+                    else _FENCE_CLOSE_TILDE_RE
+                )
+                candidate_close = (" " * lead_cols) + cur.lstrip(" \t")
+                close_match = close_re.match(candidate_close)
+                if close_match and len(close_match.group(1)) >= fence_len:
+                    in_fence = None
+                    prev_is_paragraph = False
             continue
 
-        if not inner.strip():
-            prev_is_paragraph = False
-            continue
-
-        cols = _leading_columns(inner)
-        if list_content_indent is not None and cols < list_content_indent:
-            list_content_indent = None
-
-        base_indent = (
-            list_content_indent
-            if (list_content_indent is not None and not prev_is_paragraph)
-            else 0
-        )
-
-        # Indented code block (>= 4 columns beyond container base, cannot interrupt a paragraph).
-        if not prev_is_paragraph and (cols - base_indent) >= 4:
-            continue
-
-        candidate = (
-            inner[base_indent:]
-            if base_indent > 0 and inner.startswith(" " * base_indent)
-            else inner
-        )
-        open_match = _FENCE_OPEN_RE.match(candidate)
-        if open_match:
-            marker = open_match.group(1)
-            info = open_match.group(2)
-            fence_char = marker[0]
-            if fence_char == "~" or "`" not in info:
-                in_fence = (fence_char, len(marker))
-                prev_is_paragraph = False
+        if in_html is not None:
+            if in_html is _HTML_BLOCK_CLOSE_BLANK:
+                if not cur.strip():
+                    in_html = None
+                    prev_is_paragraph = False
                 continue
-
-        if _THEMATIC_BREAK_RE.match(candidate):
-            prev_is_paragraph = False
-            list_content_indent = None
-            continue
-
-        if _ATX_HEADING_RE.match(candidate):
-            parts[idx] = _strip_inline_code_on_line(line)
-            prev_is_paragraph = False
-            list_content_indent = None
-            continue
-
-        list_match = _LIST_MARKER_RE.match(candidate)
-        if list_match:
-            prefix_cols = len(list_match.group(1)) + len(list_match.group(2))
-            ws_after = list_match.group(3)
-            after_col = prefix_cols
-            for ch in ws_after:
-                if ch == " ":
-                    after_col += 1
-                elif ch == "\t":
-                    after_col = (after_col // 4 + 1) * 4
-            gap = after_col - prefix_cols
-            rest = candidate[list_match.end() :]
-            if rest and gap >= 5:
-                # List item whose first line starts an indented code block (`-     code`).
-                list_content_indent = base_indent + prefix_cols + 1
+            if in_html.search(cur.lstrip(" \t")):
+                in_html = None
                 prev_is_paragraph = False
-                continue
-            list_content_indent = base_indent + (after_col if rest else prefix_cols + 1)
-            prev_is_paragraph = bool(rest)
-            parts[idx] = _strip_inline_code_on_line(line)
+            continue
+
+        if not cur.strip():
+            prev_is_paragraph = False
+            continue
+
+        handled_non_prose = False
+        while True:
+            if not cur.strip():
+                prev_is_paragraph = False
+                handled_non_prose = True
+                break
+
+            lead_cols = _leading_columns(cur, col)
+
+            # Indented code block (>= 4 columns beyond container base, cannot interrupt a paragraph).
+            if not prev_is_paragraph and lead_cols >= 4:
+                handled_non_prose = True
+                break
+
+            if lead_cols >= 4:
+                break
+
+            trimmed = cur.lstrip(" \t")
+            candidate = (" " * lead_cols) + trimmed
+
+            if trimmed.startswith(">"):
+                bq = _match_blockquote_prefix(cur, col)
+                if bq is not None:
+                    containers.append(["bq"])
+                    cur, col = bq
+                    prev_is_paragraph = False
+                    continue
+
+            open_match = _FENCE_OPEN_RE.match(candidate)
+            if open_match:
+                marker = open_match.group(1)
+                info = open_match.group(2)
+                fence_char = marker[0]
+                if fence_char == "~" or "`" not in info:
+                    in_fence = (fence_char, len(marker))
+                    prev_is_paragraph = False
+                    handled_non_prose = True
+                    break
+
+            if trimmed.startswith("<"):
+                matched_html = False
+                for html_open_re, html_close_re, can_interrupt in _HTML_BLOCK_SEQUENCES:
+                    if prev_is_paragraph and not can_interrupt:
+                        continue
+                    if html_open_re.search(trimmed):
+                        prev_is_paragraph = False
+                        if html_close_re is None:
+                            in_html = _HTML_BLOCK_CLOSE_BLANK
+                        elif not html_close_re.search(trimmed):
+                            in_html = html_close_re
+                        matched_html = True
+                        break
+                if matched_html:
+                    handled_non_prose = True
+                    break
+
+            if prev_is_paragraph and _SETEXT_UNDERLINE_RE.match(candidate):
+                prev_is_paragraph = False
+                handled_non_prose = True
+                break
+
+            if _THEMATIC_BREAK_RE.match(candidate):
+                prev_is_paragraph = False
+                handled_non_prose = True
+                break
+
+            if _ATX_HEADING_RE.match(candidate):
+                parts[idx] = _strip_inline_code_on_line(line)
+                prev_is_paragraph = False
+                handled_non_prose = True
+                break
+
+            list_match = _LIST_MARKER_RE.match(candidate)
+            if list_match:
+                marker_tok = list_match.group(2)
+                rest = candidate[list_match.end() :]
+                can_interrupt_para = bool(rest) and (
+                    marker_tok in ("-", "+", "*") or marker_tok in ("1.", "1)")
+                )
+                if not prev_is_paragraph or can_interrupt_para:
+                    prefix_cols = lead_cols + len(marker_tok)
+                    ws_after = list_match.group(3)
+                    after_abs_col = col + prefix_cols
+                    for ch in ws_after:
+                        if ch == " ":
+                            after_abs_col += 1
+                        elif ch == "\t":
+                            after_abs_col = (after_abs_col // 4 + 1) * 4
+                    gap = after_abs_col - (col + prefix_cols)
+                    if rest and gap >= 5:
+                        # List item whose first line starts an indented code block (`-     code`).
+                        containers.append(["list", prefix_cols + 1, True])
+                        prev_is_paragraph = False
+                        handled_non_prose = True
+                        break
+                    indent_cols = (after_abs_col - col) if rest else (prefix_cols + 1)
+                    containers.append(["list", indent_cols, bool(rest)])
+                    col += indent_cols
+                    cur = rest
+                    prev_is_paragraph = False
+                    continue
+
+            break
+
+        if handled_non_prose:
             continue
 
         prev_is_paragraph = True

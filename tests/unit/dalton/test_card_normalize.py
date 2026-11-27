@@ -297,6 +297,73 @@ def test_strips_decorative_inline_code_backticks_and_preserves_code() -> None:
         assert fmn._normalize_stdlib(raw) == expected
 
 
+def test_stdlib_fallback_matches_markdown_it_for_list_fences_tabs_and_html_blocks() -> None:
+    import subprocess
+    import sys
+
+    assert fmn._MD_PARSER is not None
+    cases = [
+        # List-item fenced code blocks (4-space, 2-space, tab, nested tab, same-line, outdent)
+        "10. 列表项 `15%~18%`\n    ```python\n    x = `15%~18%`\n    ```\n    后文 `15%~18%`",
+        "- 列表项 `15%~18%`\n  ```python\n  x = `15%~18%`\n  ```\n  后文 `15%~18%`",
+        "- 列表项 `15%~18%`\n\t```python\n\tx = `15%~18%`\n\t```\n\t后文 `15%~18%`",
+        "-\t列表项 `15%~18%`\n\t```python\n\tx = `15%~18%`\n\t```\n\t后文 `15%~18%`",
+        "- ```python\n  x = `15%~18%`\n  ```\n  后文 `15%~18%`",
+        "- 外层 `ANT`\n\t- 内层 `15%~18%`\n\t\t```python\n\t\tx = `15%~18%`\n\t\t```\n\t\t后文 `15%~18%`",
+        "- item\n  ```python\n  a = `15%~18%`\n\n  b = `15%~18%`\n  ```\n  after `15%~18%`",
+        "- item\n  ```python\n  `15%~18%`\n```\n`ANT`",
+        ">\t```python\n>\t`15%~18%`\n>\t```\n> 后文 `15%~18%`",
+        # CommonMark HTML blocks (types 1-7, top-level and inside lists/blockquotes)
+        "正文 `ANT`\n<pre>\n`15%~18%`\n</pre>\n后文 `15%~18%`",
+        "<pre>`15%~18%`</pre>\n后文 `15%~18%`",
+        "正文 `ANT`\n<!--\n`15%~18%`\n-->\n后文 `15%~18%`",
+        "<!-- `15%~18%` -->\n后文 `15%~18%`",
+        "<?xml `15%~18%`\n`ANT` ?>\n后文 `15%~18%`",
+        "<!DOCTYPE `15%~18%`\n`ANT`>\n后文 `15%~18%`",
+        "<![CDATA[\n`15%~18%`\n]]>\n后文 `15%~18%`",
+        "正文 `ANT`\n<div>\n`15%~18%`\n</div>\n\n后文 `15%~18%`",
+        "<div>\n`15%~18%`\n</div>\n紧跟 `15%~18%`\n\n空行后 `15%~18%`",
+        "正文 `ANT`\n<span>\n`15%~18%`\n</span>\n\n后文 `15%~18%`",
+        "<span>\n`15%~18%`\n</span>\n\n后文 `15%~18%`",
+        "<span>`15%~18%`</span>\n后文 `15%~18%`",
+        "- 列表 `ANT`\n  <div>\n  `15%~18%`\n  </div>\n\n  后文 `15%~18%`",
+        "- 列表 `ANT`\n\t<div>\n\t`15%~18%`\n\t</div>\n\n\t后文 `15%~18%`",
+        "- 列表 `ANT`\n  <div>\n  `15%~18%`\n外部 `15%~18%`",
+        "> <div>\n> `15%~18%`\n外部 `15%~18%`",
+    ]
+    for sample in cases:
+        md_out = fmn._normalize_with_markdown_it(sample, fmn._MD_PARSER)
+        stdlib_out = fmn._normalize_stdlib(sample)
+        assert stdlib_out == md_out, f"stdlib mismatch for:\n{sample!r}"
+
+    # Verify a real interpreter without site-packages (python -S) falls back to stdlib
+    # because markdown_it cannot be imported, and produces the exact same output.
+    repo_root = Path(__file__).resolve().parents[3]
+    canonical = repo_root / "src" / "dalton" / "notify" / "feishu_markdown_normalize.py"
+    combined = "\n\n".join(cases)
+    expected_combined = fmn._normalize_with_markdown_it(combined, fmn._MD_PARSER)
+    probe = (
+        "import importlib.util, json, sys\n"
+        f"spec = importlib.util.spec_from_file_location('fmn_no_deps', {str(canonical)!r})\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+        "assert mod._MD_PARSER is None, 'expected markdown_it to be absent under -S'\n"
+        "text = sys.stdin.read()\n"
+        "print(json.dumps({'out': mod.normalize_feishu_markdown_inline_code(text)}, ensure_ascii=False))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-S", "-c", probe],
+        input=combined,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    import json
+
+    assert json.loads(proc.stdout)["out"] == expected_combined
+
+
 def test_feishu_markdown_normalize_skill_mirror_matches_canonical_source() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     canonical = repo_root / "src" / "dalton" / "notify" / "feishu_markdown_normalize.py"

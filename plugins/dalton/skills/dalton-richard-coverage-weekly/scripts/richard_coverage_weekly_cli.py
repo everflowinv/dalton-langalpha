@@ -869,65 +869,72 @@ def _strip_separators(text: str) -> str:
     return re.sub(r"(?m)^\s*---+\s*$", "", text).strip()
 
 
+def _segment_variants(text: str) -> list[str]:
+    # Accept both normalized text (written after inline-code normalization rolled out) and raw
+    # draft text (already landed before upgrade) so readback matches either representation.
+    norm_stripped = _strip_separators(normalize_feishu_markdown_inline_code(text))
+    raw_stripped = _strip_separators(text)
+    return list(dict.fromkeys(v for v in (norm_stripped, raw_stripped) if v))
+
+
 def _evaluate_segment_match(
     doc_text: str,
     part_text: str,
     *,
     expected_after: str | None = None,
 ) -> tuple[str, str | None]:
-    # Apply the same Feishu markdown inline-code normalization used by feishu_create_doc /
-    # feishu_append before matching draft segments against feishu_read output.
-    stripped = _strip_separators(normalize_feishu_markdown_inline_code(part_text))
-    if not stripped:
+    part_variants = _segment_variants(part_text)
+    if not part_variants:
         return "error", "part_text contains no non-separator content"
-    stripped_after = (
-        _strip_separators(normalize_feishu_markdown_inline_code(expected_after))
-        if expected_after
-        else None
-    )
+    after_variants = _segment_variants(expected_after) if expected_after else []
 
     out_of_order = False
     for norm_fn in (_norm_ws, _strip_md_ws):
         doc_s = norm_fn(doc_text)
-        part_s = norm_fn(stripped)
-        if not part_s:
-            continue
-        if stripped_after:
-            after_s = norm_fn(stripped_after)
-            pos_after = doc_s.find(after_s) if after_s else -1
-            if pos_after >= 0 and doc_s.find(part_s, pos_after + len(after_s)) >= 0:
+        after_norms = [s for s in (norm_fn(a) for a in after_variants) if s]
+        for variant in part_variants:
+            part_s = norm_fn(variant)
+            if not part_s:
+                continue
+            if after_variants:
+                for after_s in after_norms:
+                    pos_after = doc_s.find(after_s)
+                    if pos_after >= 0 and doc_s.find(part_s, pos_after + len(after_s)) >= 0:
+                        return "full", None
+                if part_s in doc_s:
+                    out_of_order = True
+            elif part_s in doc_s:
                 return "full", None
-            if part_s in doc_s:
-                out_of_order = True
-        elif part_s in doc_s:
-            return "full", None
 
     if out_of_order:
         return "partial", None
 
     for norm_fn in (_norm_ws, _strip_md_ws):
         doc_s = norm_fn(doc_text)
-        part_s = norm_fn(stripped)
-        if not doc_s or not part_s:
+        if not doc_s:
             continue
-        n = len(part_s)
-        probe_len = min(40, max(16, n // 4)) if n >= 24 else max(8, n // 2)
-        if n < probe_len:
-            continue
-        probes: list[str] = [part_s[:probe_len], part_s[-probe_len:]]
-        if n > probe_len * 2:
-            step = max(probe_len // 2, 20)
-            for start in range(probe_len // 2, n - probe_len + 1, step):
-                probes.append(part_s[start : start + probe_len])
-        for line in stripped.splitlines():
-            line_s = norm_fn(line)
-            if len(line_s) >= probe_len:
-                probes.append(line_s[:probe_len])
-                if len(line_s) > probe_len:
-                    probes.append(line_s[-probe_len:])
-        for probe in dict.fromkeys(probes):
-            if len(probe) >= probe_len and probe in doc_s:
-                return "partial", None
+        for variant in part_variants:
+            part_s = norm_fn(variant)
+            if not part_s:
+                continue
+            n = len(part_s)
+            probe_len = min(40, max(16, n // 4)) if n >= 24 else max(8, n // 2)
+            if n < probe_len:
+                continue
+            probes: list[str] = [part_s[:probe_len], part_s[-probe_len:]]
+            if n > probe_len * 2:
+                step = max(probe_len // 2, 20)
+                for start in range(probe_len // 2, n - probe_len + 1, step):
+                    probes.append(part_s[start : start + probe_len])
+            for line in variant.splitlines():
+                line_s = norm_fn(line)
+                if len(line_s) >= probe_len:
+                    probes.append(line_s[:probe_len])
+                    if len(line_s) > probe_len:
+                        probes.append(line_s[-probe_len:])
+            for probe in dict.fromkeys(probes):
+                if len(probe) >= probe_len and probe in doc_s:
+                    return "partial", None
 
     return "none", None
 
