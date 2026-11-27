@@ -1491,7 +1491,7 @@ def test_d058_single_head_and_no_business_imports() -> None:
     assert heads == ["d058"], f"Expected single head ['d058'], got {heads}"
     rev = script.get_revision("d058")
     assert rev is not None
-    assert rev.down_revision == "d055"
+    assert rev.down_revision == "d057"
 
     tree = ast.parse(MIGRATION_D058_PATH.read_text(encoding="utf-8"))
     bad: list[str] = []
@@ -1516,7 +1516,7 @@ def test_d058_alembic_offline_sql_upgrade_and_downgrade() -> None:
             "-c",
             "src/dalton/alembic.ini",
             "upgrade",
-            "d055:d058",
+            "d057:d058",
             "--sql",
         ],
         cwd=str(REPO_ROOT),
@@ -1587,7 +1587,7 @@ def test_d058_alembic_offline_sql_upgrade_and_downgrade() -> None:
             "-c",
             "src/dalton/alembic.ini",
             "downgrade",
-            "d058:d055",
+            "d058:d057",
             "--sql",
         ],
         cwd=str(REPO_ROOT),
