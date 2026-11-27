@@ -82,6 +82,9 @@
 (dalton_site_common) {
 	root * /srv
 	encode zstd gzip
+	# Disable response compression on share pages so site-level encode cannot
+	# open an empty gzip stream before handle_errors falls back to static index.html.
+	request_header @share_pages -Accept-Encoding
 	import dalton_access_log
 
 	# Baseline security response headers.
@@ -223,7 +226,7 @@
 		}
 		@share_og_fallback {
 			expression {err.status_code} >= 500
-			vars {vars.og_share_fallback} 1
+			vars og_share_fallback 1
 		}
 		handle @share_og_fallback {
 			header Cache-Control "no-cache, no-store, must-revalidate"

@@ -17,8 +17,6 @@ Design invariants:
 from __future__ import annotations
 
 import html
-import inspect
-import json
 import logging
 import os
 import re
@@ -34,7 +32,6 @@ from src.dalton.settings import get_brand_name
 from src.server.database import artifacts as artifacts_db
 from src.server.database.conversation import get_thread_by_share_token
 from src.server.database.share_links import KIND_FILE
-from src.server.services import share_redaction
 from src.server.services.account import serves_public_links
 from src.server.services.share_audience import ORGANIZATION, thread_audience
 
@@ -89,41 +86,20 @@ def _filename_stem(path: str | None) -> str | None:
     return _clean_title(stem or name)
 
 
-def _call_safe_share_title_resolver(
-    resolver: Any, thread: Mapping[str, Any]
+def _resolve_thread_title(
+    thread: Mapping[str, Any], *, allow_files: bool
 ) -> str | None:
-    """Invoke ``share_redaction.resolve_safe_share_title`` across candidate signatures."""
-    try:
-        params = [
-            p
-            for p in inspect.signature(resolver).parameters.values()
-            if p.kind
-            in (
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            )
-        ]
-    except (TypeError, ValueError):
-        params = []
-
-    if params and params[0].name in {"title", "raw_title", "text"}:
-        result = resolver(thread.get("title"))
-    else:
-        result = resolver(thread)
-    return _clean_title(result)
-
-
-def _resolve_thread_title(thread: Mapping[str, Any]) -> str | None:
     """Resolve the public OG title for a shared thread.
 
-    Prefers ``share_redaction.resolve_safe_share_title`` when available on the
-    active branch (and respects its None/empty suppression). Falls back to the
-    existing public metadata endpoint's visible title (``title`` / ``workspace_name``)
-    when that helper is absent.
+    - When ``allow_files`` is True, returns the visible thread title (falling
+      back to ``workspace_name`` when empty), matching public metadata and
+      ``SharePage``.
+    - When ``allow_files`` is False, suppresses the title (brand fallback) so
+      unredacted thread titles or workspace names are never leaked.
     """
-    resolver = getattr(share_redaction, "resolve_safe_share_title", None)
-    if callable(resolver):
-        return _call_safe_share_title_resolver(resolver, thread)
+    if not allow_files:
+        # AU1 合并后改为调用 src.dalton.share_redaction.resolve_public_metadata_fields
+        return None
     return _clean_title(thread.get("title")) or _clean_title(
         thread.get("workspace_name")
     )
@@ -137,23 +113,19 @@ async def _resolve_file_title(access: LinkAccess) -> str | None:
     artifact = link.artifact
     if artifact is None or not artifact.shared:
         return None
-
-    if artifact.shared_seq > 0:
-        version = await artifacts_db.get_version(
-            artifact.artifact_id, artifact.shared_seq
-        )
-        if version is None:
-            return None
-        return _clean_title(version.title) or _filename_stem(
-            version.entry_path or artifact.path
-        )
-
-    # Legacy link shared before artifact versions: strictly read-only here
-    # (never trigger `legacy_snapshot`). Refused legacy links return 404 on
-    # the real share route, so fall back to brand name.
-    if artifact.legacy_refused:
+    if artifact.shared_seq <= 0:
+        # Legacy link with no published version yet: never call `legacy_snapshot`
+        # here, and fall back to brand name until a visitor mints v1.
         return None
-    return _filename_stem(artifact.path or link.path)
+
+    version = await artifacts_db.get_version(
+        artifact.artifact_id, artifact.shared_seq
+    )
+    if version is None:
+        return None
+    return _clean_title(version.title) or _filename_stem(
+        version.entry_path or artifact.path
+    )
 
 
 async def _resolve_link(token: str, *, user_id: str | None = None) -> LinkAccess | None:
@@ -163,24 +135,22 @@ async def _resolve_link(token: str, *, user_id: str | None = None) -> LinkAccess
     return await resolve_link(token, user_id=user_id)
 
 
-def _get_permissions(thread: Mapping[str, Any]) -> dict[str, Any]:
-    """Extract share permissions dict from a thread row."""
-    perms = thread.get("share_permissions") or {}
-    if isinstance(perms, str):
-        perms = json.loads(perms)
-    return perms if isinstance(perms, dict) else {}
-
-
 async def _resolve_public_thread_title(share_token: str) -> str | None:
     """Resolve the public OG title for a shared thread token, or None if unavailable."""
+    from src.server.app.share_access import get_permissions, shared_thread_allows_files
+
     thread = await get_thread_by_share_token(share_token)
     if not thread:
         return None
-    if thread_audience(_get_permissions(thread)) == ORGANIZATION:
+    perms = get_permissions(thread)
+    if thread_audience(perms) == ORGANIZATION:
         return None
     if not await serves_public_links(thread.get("owner_id")):
         return None
-    return _resolve_thread_title(thread)
+    allow_files = bool(perms.get("allow_files", False)) and await shared_thread_allows_files(
+        thread
+    )
+    return _resolve_thread_title(thread, allow_files=allow_files)
 
 
 async def resolve_og_title_for_path(raw_path: str | None) -> str | None:

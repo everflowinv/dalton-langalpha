@@ -3,37 +3,27 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 from unittest.mock import create_autospec
 
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-from src.dalton.app import dalton_router
-from src.dalton.app import public_og
+from src.dalton.app import dalton_router, public_og
 from src.dalton.settings import get_brand_name
+from src.server.app import share_access
+from src.server.app.share_access import LinkAccess, shared_thread_allows_files
 from src.server.database import artifacts as artifacts_db
 from src.server.database.artifacts.records import Artifact
 from src.server.database.artifacts.versions import Version
 from src.server.database.conversation import get_thread_by_share_token
 from src.server.database.share_links import KIND_APP, KIND_FILE, ShareLink
-from src.server.services import share_redaction
 from src.server.services.account import serves_public_links
 from src.server.services.share_audience import LINK_NOT_FOUND, ORGANIZATION, MEMBERS_ONLY
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-
-
-@dataclass(frozen=True)
-class _FakeLinkAccess:
-    link: ShareLink
-    workspace: dict[str, Any]
-    owner: bool
-    member: bool = False
 
 
 def _make_client() -> TestClient:
@@ -80,7 +70,7 @@ def _make_file_access(
     audience: str | None = None,
     legacy_refused: str | None = None,
     kind: str = KIND_FILE,
-) -> _FakeLinkAccess:
+) -> LinkAccess:
     now = datetime(2026, 11, 1, tzinfo=timezone.utc)
     artifact = (
         _make_artifact(
@@ -107,7 +97,7 @@ def _make_file_access(
         revision=1,
         artifact=artifact,
     )
-    return _FakeLinkAccess(
+    return LinkAccess(
         link=link, workspace={"workspace_id": "ws-1", "user_id": "owner-1"}, owner=False
     )
 
@@ -143,7 +133,7 @@ class TestPublicOgMetaEndpoint:
         paths = {getattr(r, "path", None) for r in dalton_router.routes}
         assert "/api/v1/public/og-meta" in paths
 
-    def test_public_thread_share_returns_thread_title(
+    def test_public_thread_allow_files_true_returns_thread_title(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         mock_resolve_link = create_autospec(public_og._resolve_link, return_value=None)
@@ -154,17 +144,18 @@ class TestPublicOgMetaEndpoint:
                 "title": "英伟达 Q3 财报深度分析",
                 "workspace_name": "NVDA",
                 "owner_id": "owner-1",
-                "share_permissions": {},
+                "share_permissions": {"allow_files": True},
             },
         )
         mock_serves_public = create_autospec(serves_public_links, return_value=True)
+        mock_allows_files = create_autospec(shared_thread_allows_files, return_value=True)
         mock_brand = create_autospec(get_brand_name, return_value="Everflow")
 
         monkeypatch.setattr(public_og, "_resolve_link", mock_resolve_link)
         monkeypatch.setattr(public_og, "get_thread_by_share_token", mock_get_thread)
         monkeypatch.setattr(public_og, "serves_public_links", mock_serves_public)
+        monkeypatch.setattr(share_access, "shared_thread_allows_files", mock_allows_files)
         monkeypatch.setattr(public_og, "get_brand_name", mock_brand)
-        monkeypatch.delattr(share_redaction, "resolve_safe_share_title", raising=False)
 
         client = _make_client()
         resp = client.get("/api/v1/public/og-meta", params={"path": "/s/threadToken123"})
@@ -178,13 +169,23 @@ class TestPublicOgMetaEndpoint:
         assert metas["og:description"] == ["来自 Everflow 的分享"]
         mock_resolve_link.assert_awaited_once_with("threadToken123", user_id=None)
         mock_get_thread.assert_awaited_once_with("threadToken123")
+        mock_allows_files.assert_awaited_once()
 
-    def test_public_thread_prefers_resolve_safe_share_title_when_present(
+        # Empty thread title with allow_files=True falls back to workspace_name
+        mock_get_thread.return_value = {
+            "conversation_thread_id": "t-1b",
+            "title": "   ",
+            "workspace_name": "NVDA 研究空间",
+            "owner_id": "owner-1",
+            "share_permissions": {"allow_files": True},
+        }
+        resp_ws = client.get("/api/v1/public/og-meta", params={"path": "/s/threadToken123"})
+        assert resp_ws.status_code == 200
+        assert _extract_meta(resp_ws.text)["og:title"] == ["NVDA 研究空间"]
+
+    def test_public_thread_allow_files_false_returns_brand_name(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def _safe_title_fn(thread: dict) -> str | None:
-            return None
-
         mock_resolve_link = create_autospec(public_og._resolve_link, return_value=None)
         mock_get_thread = create_autospec(
             get_thread_by_share_token,
@@ -193,37 +194,60 @@ class TestPublicOgMetaEndpoint:
                 "title": "内部敏感标题-机密",
                 "workspace_name": "SecretWS",
                 "owner_id": "owner-1",
-                "share_permissions": {},
+                "share_permissions": {"allow_files": False},
             },
         )
         mock_serves_public = create_autospec(serves_public_links, return_value=True)
+        mock_allows_files = create_autospec(shared_thread_allows_files, return_value=True)
         mock_brand = create_autospec(get_brand_name, return_value="Everflow")
-        mock_safe_title = create_autospec(_safe_title_fn, return_value="脱敏后的公开标题")
 
         monkeypatch.setattr(public_og, "_resolve_link", mock_resolve_link)
         monkeypatch.setattr(public_og, "get_thread_by_share_token", mock_get_thread)
         monkeypatch.setattr(public_og, "serves_public_links", mock_serves_public)
+        monkeypatch.setattr(share_access, "shared_thread_allows_files", mock_allows_files)
         monkeypatch.setattr(public_og, "get_brand_name", mock_brand)
-        monkeypatch.setattr(
-            share_redaction, "resolve_safe_share_title", mock_safe_title, raising=False
-        )
 
         client = _make_client()
-        resp = client.get("/api/v1/public/og-meta", params={"path": "/s/safeTok1"})
+        resp = client.get("/api/v1/public/og-meta", params={"path": "/s/noFilesTok1"})
 
         assert resp.status_code == 200
-        metas = _extract_meta(resp.text)
-        assert metas["og:title"] == ["脱敏后的公开标题"]
+        assert _extract_meta(resp.text)["og:title"] == ["Everflow"]
         assert "内部敏感标题" not in resp.text
-        mock_safe_title.assert_called_once()
+        assert "SecretWS" not in resp.text
+        mock_allows_files.assert_not_awaited()
 
-        # When resolve_safe_share_title suppresses the title (returns None),
-        # must fall back to brand name and never leak raw thread title.
-        mock_safe_title.return_value = None
-        resp_suppressed = client.get("/api/v1/public/og-meta", params={"path": "/s/safeTok1"})
-        assert resp_suppressed.status_code == 200
-        assert _extract_meta(resp_suppressed.text)["og:title"] == ["Everflow"]
-        assert "内部敏感标题" not in resp_suppressed.text
+    def test_public_thread_perms_allow_files_but_policy_denies_returns_brand_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_resolve_link = create_autospec(public_og._resolve_link, return_value=None)
+        mock_get_thread = create_autospec(
+            get_thread_by_share_token,
+            return_value={
+                "conversation_thread_id": "t-3",
+                "title": "非管理员历史分享标题",
+                "workspace_name": "LegacyWS",
+                "owner_id": "owner-non-admin",
+                "share_permissions": {"allow_files": True},
+            },
+        )
+        mock_serves_public = create_autospec(serves_public_links, return_value=True)
+        mock_allows_files = create_autospec(shared_thread_allows_files, return_value=False)
+        mock_brand = create_autospec(get_brand_name, return_value="Everflow")
+
+        monkeypatch.setattr(public_og, "_resolve_link", mock_resolve_link)
+        monkeypatch.setattr(public_og, "get_thread_by_share_token", mock_get_thread)
+        monkeypatch.setattr(public_og, "serves_public_links", mock_serves_public)
+        monkeypatch.setattr(share_access, "shared_thread_allows_files", mock_allows_files)
+        monkeypatch.setattr(public_og, "get_brand_name", mock_brand)
+
+        client = _make_client()
+        resp = client.get("/api/v1/public/og-meta", params={"path": "/s/nonAdminTok1"})
+
+        assert resp.status_code == 200
+        assert _extract_meta(resp.text)["og:title"] == ["Everflow"]
+        assert "非管理员历史分享标题" not in resp.text
+        assert "LegacyWS" not in resp.text
+        mock_allows_files.assert_awaited_once()
 
     def test_public_file_share_uses_published_version_title_or_filename_stem(
         self, monkeypatch: pytest.MonkeyPatch
@@ -263,11 +287,15 @@ class TestPublicOgMetaEndpoint:
         assert resp_md.status_code == 200
         assert _extract_meta(resp_md.text)["og:title"] == ["NVDA_Q3_Memo"]
 
-    def test_public_legacy_file_share_is_read_only_and_respects_refusal(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("legacy_refused", [None, "too_many_files"])
+    def test_public_legacy_file_share_always_returns_brand_name(
+        self, monkeypatch: pytest.MonkeyPatch, legacy_refused: str | None
     ) -> None:
         access_legacy = _make_file_access(
-            code="LegacyFile01", path="notes/季度复盘.pdf", shared_seq=0
+            code="LegacyFile01",
+            path="notes/季度复盘.pdf",
+            shared_seq=0,
+            legacy_refused=legacy_refused,
         )
         mock_resolve_link = create_autospec(public_og._resolve_link, return_value=access_legacy)
         mock_get_version = create_autospec(artifacts_db.get_version)
@@ -280,19 +308,9 @@ class TestPublicOgMetaEndpoint:
         client = _make_client()
         resp = client.get("/api/v1/public/og-meta", params={"path": "/a/LegacyFile01"})
         assert resp.status_code == 200
-        assert _extract_meta(resp.text)["og:title"] == ["季度复盘"]
+        assert _extract_meta(resp.text)["og:title"] == ["Everflow"]
+        assert "季度复盘" not in resp.text
         mock_get_version.assert_not_awaited()
-
-        # Refused legacy link -> brand fallback
-        mock_resolve_link.return_value = _make_file_access(
-            code="LegacyRef001",
-            path="notes/季度复盘.pdf",
-            shared_seq=0,
-            legacy_refused="too_many_files",
-        )
-        resp_refused = client.get("/api/v1/public/og-meta", params={"path": "/a/LegacyRef001"})
-        assert resp_refused.status_code == 200
-        assert _extract_meta(resp_refused.text)["og:title"] == ["Everflow"]
 
     @pytest.mark.parametrize(
         "raw_path",
@@ -444,17 +462,18 @@ class TestPublicOgMetaEndpoint:
                 "title": evil_title,
                 "workspace_name": "WS",
                 "owner_id": "owner-1",
-                "share_permissions": {},
+                "share_permissions": {"allow_files": True},
             },
         )
         mock_serves_public = create_autospec(serves_public_links, return_value=True)
+        mock_allows_files = create_autospec(shared_thread_allows_files, return_value=True)
         mock_brand = create_autospec(get_brand_name, return_value='Ever"flow <Core>')
 
         monkeypatch.setattr(public_og, "_resolve_link", mock_resolve_link)
         monkeypatch.setattr(public_og, "get_thread_by_share_token", mock_get_thread)
         monkeypatch.setattr(public_og, "serves_public_links", mock_serves_public)
+        monkeypatch.setattr(share_access, "shared_thread_allows_files", mock_allows_files)
         monkeypatch.setattr(public_og, "get_brand_name", mock_brand)
-        monkeypatch.delattr(share_redaction, "resolve_safe_share_title", raising=False)
 
         client = _make_client()
         resp = client.get("/api/v1/public/og-meta", params={"path": "/s/xssToken0001"})
@@ -508,7 +527,16 @@ class TestCaddyfileOgShareRouting:
     ) -> None:
         text = (REPO_ROOT / caddyfile_rel).read_text(encoding="utf-8")
 
-        # 1. Dedicated anonymous /api/v1/public/og-meta route precedes @backend_routes
+        # 1a. Site-level request_header strips Accept-Encoding for @share_pages
+        #     at the same level as encode (outside handle @share_pages) so gzip
+        #     never opens before handle_errors fallback runs.
+        encode_idx = text.index("encode zstd gzip")
+        strip_ae_line = "\n\trequest_header @share_pages -Accept-Encoding\n"
+        assert strip_ae_line in text
+        share_idx = text.index("@share_pages {")
+        assert encode_idx < text.index(strip_ae_line) < share_idx
+
+        # 1b. Dedicated anonymous /api/v1/public/og-meta route precedes @backend_routes
         og_idx = text.index("@public_og_meta path /api/v1/public/og-meta")
         backend_idx = text.index("@backend_routes path /api/* /ws/*")
         assert og_idx < backend_idx
@@ -521,11 +549,11 @@ class TestCaddyfileOgShareRouting:
         assert "response_header_timeout" in og_block
 
         # 2. @share_pages precedes @spa_read and matches only /s/<token> and /a/<token>
-        share_idx = text.index("@share_pages {")
         spa_idx = text.index("@spa_read {")
         assert share_idx < spa_idx
 
         share_block = text[share_idx:spa_idx]
+        assert "request_header @share_pages -Accept-Encoding" not in share_block
         match = re.search(r"path_regexp share_pages (\S+)", share_block)
         assert match is not None
         share_re = re.compile(match.group(1))
@@ -545,7 +573,8 @@ class TestCaddyfileOgShareRouting:
         errors_idx = text.index("handle_errors {")
         errors_block = text[errors_idx:share_idx]
         assert "@share_og_fallback" in errors_block
-        assert "vars {vars.og_share_fallback} 1" in errors_block
+        assert "vars og_share_fallback 1" in errors_block
+        assert "vars {vars.og_share_fallback}" not in text
         assert "rewrite * /index.html" in errors_block
         assert "status 200" in errors_block
 
