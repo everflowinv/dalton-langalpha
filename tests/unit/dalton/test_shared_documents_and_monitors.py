@@ -1727,3 +1727,309 @@ async def test_legacy_public_link_migrated_with_keep_updated_false_stops_turn_en
     await snapshot_svc.keep_updated_after_turn(workspace_id=WS_ID, user_id="admin-1")
     keep_one_spy.assert_not_called()
     commit_doc_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_managed_shared_document_rejects_generic_keep_updated_and_blocks_turn_version_public_advance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import asynccontextmanager
+    from psycopg import AsyncCursor
+
+    from src.server.app.artifacts import records as artifact_records_app
+    from src.server.app.artifacts.models import KeepUpdatedRequest
+    from src.server.database.artifacts import versions as artifact_versions_db
+    from src.server.services.shared_workspaces.access import Access
+
+    monkeypatch.setenv("DALTON_ARTIFACT_PUBLISHING_ENABLED", "1")
+    managed_art = _make_artifact(
+        artifact_id="71000000-0000-4000-8000-000000000811",
+        path="reports/managed.md",
+        shared_at=NOW,
+        shared_seq=2,
+        latest_seq=2,
+        keep_updated=False,
+        files=("reports/managed.md",),
+    )
+    managed_doc = _make_doc(
+        doc_id="70000000-0000-4000-8000-000000000811",
+        artifact_id=managed_art.artifact_id,
+        owner_user_id="admin-1",
+        entry_path=managed_art.path,
+        visibility="public",
+        published_seq=2,
+        keep_updated=False,
+    )
+
+    monkeypatch.setattr(
+        artifact_records_app,
+        "reached",
+        create_autospec(
+            artifact_records_app.reached,
+            return_value=(managed_art, Access("admin-1")),
+        ),
+    )
+    monkeypatch.setattr(
+        artifact_records_app,
+        "_require_non_external_for_publish",
+        create_autospec(
+            artifact_records_app._require_non_external_for_publish, return_value=None
+        ),
+    )
+    monkeypatch.setattr(
+        artifact_records_app,
+        "_require_admin_for_public_publish",
+        create_autospec(
+            artifact_records_app._require_admin_for_public_publish, return_value=None
+        ),
+    )
+    monkeypatch.setattr(
+        artifact_records_app,
+        "refuse_link_change",
+        create_autospec(artifact_records_app.refuse_link_change, return_value=None),
+    )
+    monkeypatch.setattr(
+        shared_doc_service,
+        "get_shared_document_by_artifact_id",
+        create_autospec(
+            shared_doc_service.get_shared_document_by_artifact_id,
+            return_value=managed_doc,
+        ),
+    )
+    set_keep_spy = create_autospec(
+        artifact_records_app.artifacts_db.set_keep_updated,
+        return_value=managed_art,
+    )
+    monkeypatch.setattr(
+        artifact_records_app.artifacts_db, "set_keep_updated", set_keep_spy
+    )
+    monkeypatch.setattr(
+        artifact_records_app,
+        "_changed",
+        create_autospec(
+            artifact_records_app._changed,
+            return_value=SimpleNamespace(keep_updated=False),
+        ),
+    )
+
+    # 1) Generic PATCH /artifacts/{id} refuses keep_updated=True with 409 once taken over.
+    with pytest.raises(HTTPException) as exc_patch:
+        await artifact_records_app.update_artifact(
+            managed_art.artifact_id,
+            KeepUpdatedRequest(keep_updated=True),
+            x_user_id="admin-1",
+        )
+    assert exc_patch.value.status_code == 409
+    assert exc_patch.value.detail == shared_doc_service.SHARED_DOCUMENT_TAKEOVER_KEEP_UPDATED_DETAIL
+    set_keep_spy.assert_not_called()
+
+    # Turning keep_updated OFF stays open for cleanup.
+    await artifact_records_app.update_artifact(
+        managed_art.artifact_id,
+        KeepUpdatedRequest(keep_updated=False),
+        x_user_id="admin-1",
+    )
+    set_keep_spy.assert_awaited_once()
+
+    # 2) Even if share_links.keep_updated is True, turn_version checks dalton_shared_documents
+    #    under FOR SHARE in the same commit transaction and never advances /a/ public shared_seq.
+    from dataclasses import replace
+
+    cur = create_autospec(AsyncCursor, instance=True)
+    executed_sql: list[str] = []
+
+    async def _exec(sql: str, _params: Any = None) -> None:
+        norm = " ".join(sql.split())
+        executed_sql.append(norm)
+        if "FROM dalton_shared_documents" in norm:
+            cur._row = {"?column?": 1}
+        else:
+            cur._row = None
+
+    cur.execute.side_effect = _exec
+    cur.fetchone.side_effect = lambda: getattr(cur, "_row", None)
+
+    re_enabled_art = replace(managed_art, keep_updated=True, kept_at=None)
+    state: dict[str, Artifact] = {"locked": re_enabled_art}
+
+    @asynccontextmanager
+    async def _fake_locked(_user_id: str, _artifact_id: str):
+        yield cur, state["locked"]
+
+    monkeypatch.setattr(artifact_versions_db, "_locked", _fake_locked)
+    cut_spy = create_autospec(
+        artifact_versions_db._cut,
+        return_value=PublishResult(artifact=re_enabled_art, seq=3, cut=True, shared_now=False),
+    )
+    monkeypatch.setattr(artifact_versions_db, "_cut", cut_spy)
+
+    vfile = VersionFile(
+        path=managed_art.path,
+        sha256="9" * 64,
+        content_type="text/markdown",
+        byte_len=10,
+        content=b"# v3 edit\n",
+    )
+    res_unkept = await artifact_versions_db.turn_version(
+        user_id="admin-1",
+        artifact_id=managed_art.artifact_id,
+        read=artifact_versions_db.ReadBasis.of(re_enabled_art),
+        files=[vfile],
+        title="Managed",
+    )
+    assert res_unkept.cut is False
+    assert res_unkept.seq == 2
+    cut_spy.assert_not_called()
+    assert any("FROM dalton_shared_documents" in s and "FOR SHARE" in s for s in executed_sql)
+
+    # 3) If the artifact is also privately kept (kept_at set), turn_version cuts private only (to_visitors=False).
+    kept_art = replace(re_enabled_art, kept_at=NOW)
+    state["locked"] = kept_art
+    res_kept = await artifact_versions_db.turn_version(
+        user_id="admin-1",
+        artifact_id=managed_art.artifact_id,
+        read=artifact_versions_db.ReadBasis.of(kept_art),
+        files=[vfile],
+        title="Managed",
+    )
+    assert res_kept.cut is True
+    cut_spy.assert_awaited_once()
+    assert cut_spy.await_args.kwargs["to_visitors"] is False
+
+
+@pytest.mark.asyncio
+async def test_superseded_monitor_turn_refresh_skips_without_recording_publish_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import asynccontextmanager
+    from psycopg import AsyncCursor
+
+    monkeypatch.setenv("DALTON_ARTIFACT_PUBLISHING_ENABLED", "1")
+    legacy_mon = _make_monitor(
+        monitor_id="60000000-0000-4000-8000-000000000821",
+        slug="legacy-racing-md",
+        artifact_id="71000000-0000-4000-8000-000000000821",
+        entry_path="notes/racing.md",
+        owner_user_id="owner-1",
+        visibility="company",
+        keep_updated=True,
+        published_seq=1,
+    )
+    art = _make_artifact(
+        artifact_id=legacy_mon.artifact_id,
+        path=legacy_mon.entry_path,
+        latest_seq=1,
+    )
+    snap = Snapshot(
+        entries=[ManifestEntry("notes/racing.md", 12, "entry")],
+        left_out=[],
+        files=[
+            VersionFile(
+                path="notes/racing.md",
+                sha256="8" * 64,
+                content_type="text/markdown",
+                byte_len=12,
+                content=b"# updated\n",
+            )
+        ],
+        blobs={},
+        title="Racing",
+    )
+
+    monkeypatch.setattr(
+        monitor_db,
+        "list_workspace_auto_update_monitors",
+        create_autospec(
+            monitor_db.list_workspace_auto_update_monitors,
+            return_value=[legacy_mon],
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "db_get_workspace",
+        create_autospec(
+            monitor_service.db_get_workspace,
+            return_value={"workspace_id": WS_ID, "user_id": "owner-1", "status": "running", "config": {}},
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "_get_superseded_shared_document",
+        create_autospec(
+            monitor_service._get_superseded_shared_document, return_value=None
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "get_user_tier",
+        create_autospec(monitor_service.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        monitor_service.artifacts_db,
+        "get_artifact",
+        create_autospec(monitor_service.artifacts_db.get_artifact, return_value=art),
+    )
+    monkeypatch.setattr(
+        monitor_service.artifact_snapshot,
+        "capture_workspace_monitor_snapshot",
+        create_autospec(
+            monitor_service.artifact_snapshot.capture_workspace_monitor_snapshot,
+            return_value=snap,
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "_abort_if_absent_dependencies",
+        create_autospec(monitor_service._abort_if_absent_dependencies, return_value=None),
+    )
+    # Takeover happens after snapshot read starts: commit raises MonitorSupersededBySharedDocumentError.
+    monkeypatch.setattr(
+        monitor_service,
+        "cut_monitor_version",
+        create_autospec(
+            monitor_service.cut_monitor_version,
+            side_effect=monitor_db.MonitorSupersededBySharedDocumentError(),
+        ),
+    )
+    record_fail_spy = create_autospec(monitor_db.record_monitor_publish_failure)
+    monkeypatch.setattr(monitor_db, "record_monitor_publish_failure", record_fail_spy)
+
+    await monitor_service.republish_workspace_monitors_after_turn(workspace_id=WS_ID)
+    record_fail_spy.assert_not_called()
+
+    # record_monitor_publish_failure itself re-checks dalton_shared_documents in its UPDATE guard.
+    monkeypatch.undo()
+    executed_sql: list[str] = []
+    cur = create_autospec(AsyncCursor, instance=True)
+
+    async def _exec_fail(sql: str, _params: Any = None) -> None:
+        executed_sql.append(" ".join(sql.split()))
+
+    cur.execute.side_effect = _exec_fail
+    cur.__aenter__.return_value = cur
+    cur.__aexit__.return_value = False
+
+    class _FakeConn:
+        def cursor(self, **_kwargs: Any) -> Any:
+            return cur
+
+    @asynccontextmanager
+    async def _fake_conn():
+        yield _FakeConn()
+
+    monkeypatch.setattr(monitor_db, "get_db_connection", _fake_conn)
+    monkeypatch.setattr(
+        monitor_db,
+        "get_monitor_by_id",
+        create_autospec(monitor_db.get_monitor_by_id, return_value=legacy_mon),
+    )
+
+    await monitor_db.record_monitor_publish_failure(
+        legacy_mon.monitor_id, error_message="some transient error"
+    )
+    assert any(
+        "UPDATE dalton_monitors SET last_publish_error" in s
+        and "FROM dalton_shared_documents d" in s
+        and "WHERE d.artifact_id = dalton_monitors.artifact_id" in s
+        for s in executed_sql
+    )

@@ -981,6 +981,13 @@ async def republish_workspace_monitors_after_turn(*, workspace_id: str) -> None:
                 verify_public_authority=_verify_user_is_admin,
                 check_pending_outbound_confirm=sharing_auth_enabled,
             )
+        except monitor_db.MonitorSupersededBySharedDocumentError:
+            logger.info(
+                "Skipping auto-update for workspace monitor %s (%s): superseded by shared document",
+                monitor.slug,
+                monitor.monitor_id,
+            )
+            continue
         except Exception as exc:
             logger.warning(
                 "Auto-updating workspace monitor %s (%s) failed: %s",

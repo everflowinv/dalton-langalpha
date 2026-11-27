@@ -221,6 +221,16 @@ async def list_workspace_auto_update_monitors(workspace_id: str) -> list[Monitor
             return [r for row in await cur.fetchall() if (r := _row_to_record(row))]
 
 
+class MonitorSupersededBySharedDocumentError(HTTPException):
+    """Raised when a legacy non-HTML monitor mutation is rejected after shared-document takeover."""
+
+    def __init__(
+        self,
+        detail: str = "该文档已由分享文档接管，旧监控入口仅保留历史只读记录",
+    ) -> None:
+        super().__init__(status_code=403, detail=detail)
+
+
 async def _reject_if_superseded_by_shared_document_in_cur(
     cur: Any, artifact_id: str, *, entry_path: str | None = None
 ) -> None:
@@ -237,10 +247,7 @@ async def _reject_if_superseded_by_shared_document_in_cur(
         (artifact_id,),
     )
     if await cur.fetchone() is not None:
-        raise HTTPException(
-            status_code=403,
-            detail="该文档已由分享文档接管，旧监控入口仅保留历史只读记录",
-        )
+        raise MonitorSupersededBySharedDocumentError()
 
 
 async def pick_available_slug(base_raw: str) -> str:
@@ -1560,7 +1567,10 @@ async def record_monitor_publish_failure(
     error_message: str,
     run_id: str | None = None,
 ) -> MonitorRecord | None:
-    """Record the latest failure message/timestamp without marking ``run_id`` as processed."""
+    """Record the latest failure message/timestamp without marking ``run_id`` as processed.
+
+    Skips updating legacy workspace monitors already taken over by ``dalton_shared_documents``.
+    """
     _ = run_id
     clipped = _clip_publish_error(error_message, limit=1000)
     async with get_db_connection() as conn:
@@ -1571,6 +1581,14 @@ async def record_monitor_publish_failure(
                    SET last_publish_error = %s,
                        last_publish_failed_at = NOW()
                  WHERE monitor_id = %s::uuid
+                   AND NOT (
+                       source_kind = 'workspace'
+                       AND EXISTS (
+                           SELECT 1
+                             FROM dalton_shared_documents d
+                            WHERE d.artifact_id = dalton_monitors.artifact_id
+                       )
+                   )
                 """,
                 (clipped, monitor_id),
             )

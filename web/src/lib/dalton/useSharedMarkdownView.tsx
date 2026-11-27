@@ -156,6 +156,15 @@ export function useSharedMarkdownView({
     [frameBase, path, entryUrl, anonymousEntry],
   );
 
+  const resolveImagePath = useCallback(
+    (imagePath: string) =>
+      resolveSharedRelativePath(activePath, imagePath, {
+        rootRelative: isRootRelative,
+        anonymousEntry,
+      }),
+    [activePath, isRootRelative, anonymousEntry],
+  );
+
   const imageDownloader = useCallback(
     (imagePath: string) =>
       fetchSharedImageObjectUrl(frameBase, activePath, imagePath, servedObjectUrl, {
@@ -224,6 +233,7 @@ export function useSharedMarkdownView({
     activePath,
     readers,
     imageDownloader,
+    resolveImagePath,
     renderFileLink,
     subDocBar,
   };

@@ -271,6 +271,46 @@ async def _deactivate_legacy_non_html_monitor_in_cur(
     )
 
 
+SHARED_DOCUMENT_TAKEOVER_KEEP_UPDATED_DETAIL = (
+    "该文档已由分享文档接管，请在分享设置中调整自动更新"
+)
+
+
+async def is_artifact_managed_by_shared_document_in_cur(
+    cur: Any, artifact_id: str, *, entry_path: str | None = None
+) -> bool:
+    """Return True when *artifact_id* is managed by ``dalton_shared_documents`` inside an open tx."""
+    from src.dalton.settings import is_dalton_enabled
+
+    if not is_dalton_enabled() or is_html_entry_path(entry_path):
+        return False
+    await cur.execute(
+        """
+        SELECT 1
+          FROM dalton_shared_documents
+         WHERE artifact_id = %s::uuid
+           FOR SHARE
+        """,
+        (artifact_id,),
+    )
+    return await cur.fetchone() is not None
+
+
+async def refuse_keep_updated_if_managed_by_shared_document(
+    artifact_id: str, *, entry_path: str | None = None
+) -> None:
+    """Refuse enabling legacy ``share_links.keep_updated`` once managed by shared documents."""
+    from src.dalton.settings import is_dalton_enabled
+
+    if not is_dalton_enabled() or is_html_entry_path(entry_path):
+        return
+    if await get_shared_document_by_artifact_id(artifact_id) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=SHARED_DOCUMENT_TAKEOVER_KEEP_UPDATED_DETAIL,
+        )
+
+
 async def _disable_legacy_share_link_auto_update_in_cur(
     cur: Any, locked: Any, *, workspace_owner_id: str
 ) -> Any:

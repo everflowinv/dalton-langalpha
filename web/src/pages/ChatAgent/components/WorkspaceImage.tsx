@@ -2,7 +2,7 @@ import React, { useState, useEffect, useSyncExternalStore } from 'react';
 import { useTranslation } from 'react-i18next';
 import { authSessionCheck, registerAuthReset } from '@/lib/authResets';
 import { createEmitter } from '@/lib/emitter';
-import { useWorkspaceId, useWorkspaceDownloadFile, useWorkspaceFolders, useWorkspaceImageScope } from '../contexts/WorkspaceContext';
+import { useWorkspaceId, useWorkspaceDownloadFile, useWorkspaceFolders, useWorkspaceImageScope, useWorkspaceResolveImagePath } from '../contexts/WorkspaceContext'; // DALTON-HOOK(monitors)
 import { downloadWorkspaceFile } from '../utils/api';
 import { onOtherComputer, parseAgentHref } from '../utils/agentPaths';
 import { normalizeFilePath, parseFolderHref, parseWsPath } from '../utils/filePaths';
@@ -88,6 +88,7 @@ function WorkspaceImage({ src: written, alt, ...props }: WorkspaceImageProps) {
   const contextWorkspaceId = useWorkspaceId();
   const downloadFileFn = useWorkspaceDownloadFile();
   const imageScope = useWorkspaceImageScope();
+  const resolveImagePath = useWorkspaceResolveImagePath(); // DALTON-HOOK(monitors)
 
   // Support __wsref__/{workspaceId}/path for cross-workspace file references,
   // and another workspace's folder (`../NVDA/chart.png`), which names its
@@ -117,7 +118,9 @@ function WorkspaceImage({ src: written, alt, ...props }: WorkspaceImageProps) {
   // encoded (`.../%E5%9B%BE%E8%A1%A8.png`) reaches the API as raw Unicode;
   // callers hand over the raw destination for that reason.
   const normalizedPath = canFetch ? other?.path ?? normalizeFilePath(src!, folders) : '';
-  const cacheKey = canFetch ? `${imageScope || workspaceId || 'shared'}:${normalizedPath}` : '';
+  // DALTON-HOOK(monitors): key shared image cache by version scope + resolved full target path
+  const resolvedCachePath = canFetch && resolveImagePath ? (resolveImagePath(normalizedPath) ?? `__invalid__:${normalizedPath}`) : normalizedPath;
+  const cacheKey = canFetch ? `${imageScope || workspaceId || 'shared'}:${resolvedCachePath}` : '';
 
   const readCached = () => (cacheKey ? blobCache.get(cacheKey) ?? null : null);
   const blobUrl = useSyncExternalStore(changes.subscribe, readCached, readCached);

@@ -56,7 +56,8 @@ export function FileBody({ scope, path, frameBase, onDownload, downloading, onGo
     <div className="share-scroll">
       {sharedView.subDocBar}
       <div className={cn(!wide && 'share-document', fill && 'share-fill')}>
-        <WorkspaceProvider workspaceId={null} downloadFile={sharedView.imageDownloader} imageScope={scope}>
+        {/* DALTON-HOOK(monitors): include resolved target path in shared image cache keys */}
+        <WorkspaceProvider workspaceId={null} downloadFile={sharedView.imageDownloader} imageScope={scope} resolveImagePath={sharedView.resolveImagePath}>
           <FileViewer
             path={sharedView.activePath}
             body={body}

@@ -13,7 +13,7 @@ export function isMarkdownFile(path: string | null | undefined): boolean {
 }
 
 function parentDir(path: string): string {
-  const clean = path.replace(/^\/+|\/+$/g, '');
+  const clean = path.trim().replace(/^\/+|\/+$/g, '');
   const idx = clean.lastIndexOf('/');
   return idx >= 0 ? clean.slice(0, idx) : '';
 }
@@ -116,6 +116,10 @@ export function resolveSharedRelativePath(
 
   const baseDir = options?.rootRelative ? '' : parentDir(docPath);
   if (options?.anonymousEntry) {
+    if (!options.rootRelative && docPath.trim().startsWith('/')) {
+      const resolved = resolveAgainstDir(baseDir, target);
+      return resolved ? `/${resolved}` : null;
+    }
     return resolveAnonymousAgainstDir(baseDir, target);
   }
   return resolveAgainstDir(baseDir, target);

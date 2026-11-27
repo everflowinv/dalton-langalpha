@@ -93,6 +93,36 @@ describe('WorkspaceImage — __wsref__ downloader selection', () => {
     await waitFor(() => expect(screen.getByAltText('chart')).toHaveAttribute('src', 'blob:v2'));
     expect(second).toHaveBeenCalledWith('scoped/chart.png');
   });
+
+  // DALTON-HOOK(monitors): same-named relative images in different shared subdocuments do not share one cache entry
+  it('keys the cache by version scope plus resolved target path so a missing subdoc namesake shows a placeholder', async () => {
+    const entryDownloader = vi.fn<(p: string) => Promise<string>>(() => Promise.resolve('blob:entry-logo'));
+    const missingSubdocDownloader = vi.fn<(p: string) => Promise<string>>(() => Promise.reject(new Error('404')));
+    const view = render(
+      <WorkspaceProvider
+        workspaceId={null}
+        downloadFile={entryDownloader}
+        imageScope="share:doc:v2"
+        resolveImagePath={(p) => `reports/q4/${p}`}
+      >
+        <WorkspaceImage src="logo.png" alt="logo" />
+      </WorkspaceProvider>,
+    );
+    await waitFor(() => expect(screen.getByAltText('logo')).toHaveAttribute('src', 'blob:entry-logo'));
+
+    view.rerender(
+      <WorkspaceProvider
+        workspaceId={null}
+        downloadFile={missingSubdocDownloader}
+        imageScope="share:doc:v2"
+        resolveImagePath={(p) => `reports/shared/${p}`}
+      >
+        <WorkspaceImage src="logo.png" alt="logo" />
+      </WorkspaceProvider>,
+    );
+    await waitFor(() => expect(screen.getByText('logo.png could not be loaded')).toBeInTheDocument());
+    expect(screen.queryByAltText('logo')).toBeNull();
+  });
 });
 
 describe('WorkspaceImage reads a destination the way a link does', () => {

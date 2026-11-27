@@ -5,6 +5,7 @@ import userEvent from '@testing-library/user-event';
 
 import { renderWithProviders } from '@/test/utils';
 import { buildServeUrl, versionPrefix } from '@/pages/ChatAgent/components/viewers/html/wsfilesUrl';
+import { FileBody } from '@/pages/SharedChat/SharedFileView';
 import SharedPageView from '@/pages/SharedChat/SharedPageView';
 import type { SharedPublicFileMetadata } from '@/pages/SharedChat/api';
 import { isMarkdownFile, resolveSharedImageCandidates, resolveSharedRelativePath } from '../sharedMarkdown';
@@ -113,6 +114,69 @@ describe('sharedMarkdown helpers', () => {
         anonymousEntry: true,
       }),
     ).toBeNull();
+  });
+
+  it('keeps root-anchored subdocument directory semantics for relative and root-prefixed targets', () => {
+    // Opening /reports/shared/overview.md from reports/q4/memo.md under anonymous /m/
+    expect(
+      resolveSharedRelativePath('legacy-public-md.md', '/reports/shared/overview.md', {
+        rootRelative: true,
+        anonymousEntry: true,
+      }),
+    ).toBe('/reports/shared/overview.md');
+    expect(
+      resolveSharedRelativePath('/reports/shared/overview.md', 'logo.png', {
+        rootRelative: false,
+        anonymousEntry: true,
+      }),
+    ).toBe('/reports/shared/logo.png');
+    expect(
+      resolveSharedRelativePath('/reports/shared/overview.md', './detail.md', {
+        rootRelative: false,
+        anonymousEntry: true,
+      }),
+    ).toBe('/reports/shared/detail.md');
+    expect(
+      resolveSharedRelativePath('/reports/shared/overview.md', '../q4/charts/rev.png', {
+        rootRelative: false,
+        anonymousEntry: true,
+      }),
+    ).toBe('/reports/q4/charts/rev.png');
+    expect(
+      resolveSharedRelativePath('/reports/shared/overview.md', '/assets/banner.png', {
+        rootRelative: false,
+        anonymousEntry: true,
+      }),
+    ).toBe('/assets/banner.png');
+    expect(
+      resolveSharedRelativePath('/reports/shared/overview.md', '../../../escape.png', {
+        rootRelative: false,
+        anonymousEntry: true,
+      }),
+    ).toBeNull();
+    expect(
+      resolveSharedRelativePath('/overview.md', 'logo.png', {
+        rootRelative: false,
+        anonymousEntry: true,
+      }),
+    ).toBe('/logo.png');
+    expect(
+      resolveSharedRelativePath('/overview.md', '../escape.png', {
+        rootRelative: false,
+        anonymousEntry: true,
+      }),
+    ).toBeNull();
+
+    // Direct mode (/a/ or authenticated /m/): leading / resolves against version root, subdoc relative against subdoc dir
+    expect(resolveSharedRelativePath('reports/q4/memo.md', '/reports/shared/overview.md')).toBe(
+      'reports/shared/overview.md',
+    );
+    expect(resolveSharedImageCandidates('reports/shared/overview.md', 'logo.png')).toEqual([
+      'reports/shared/logo.png',
+    ]);
+    expect(resolveSharedRelativePath('reports/shared/overview.md', '/assets/guide.md')).toBe(
+      'assets/guide.md',
+    );
   });
 });
 
@@ -277,5 +341,163 @@ describe('SharedPageView Markdown rendering & security', () => {
     expect(screen.queryByRole('heading', { level: 1, name: 'Not a heading' })).toBeNull();
     expect(screen.queryByRole('button', { name: /View raw/i })).toBeNull();
     expect(screen.getByRole('button', { name: /Download/i })).toBeInTheDocument();
+  });
+
+  it('resolves subdocument relative images/links and version-root links after opening /reports/shared/overview.md on anonymous /m/', async () => {
+    const user = userEvent.setup();
+    const anonFrameBase = '/api/v1/dalton/monitors/public/legacy-public-md/v/2';
+    const anonEntryUrl = `${anonFrameBase}/`;
+    const entryDir = 'reports/q4';
+
+    // Mirrors backend _resolve_public_entry_relative_path("reports/q4/memo.md", rel)
+    const resolveBackendRel = (rel: string): string | null => {
+      const stack = rel.startsWith('/') ? [] : entryDir.split('/').filter(Boolean);
+      for (const seg of rel.split('/')) {
+        if (!seg || seg === '.') continue;
+        if (seg === '..') {
+          if (stack.length === 0) return null;
+          stack.pop();
+          continue;
+        }
+        stack.push(seg);
+      }
+      return stack.length > 0 ? stack.join('/') : null;
+    };
+
+    const files: Record<string, { body: string; contentType: string }> = {
+      'reports/q4/memo.md': {
+        body: '# Q4 Memo\n\nOpen [Shared Overview](/reports/shared/overview.md).\n',
+        contentType: 'text/markdown; charset=utf-8',
+      },
+      'reports/shared/overview.md': {
+        body: [
+          '# Shared Overview',
+          '',
+          '![Shared Logo](logo.png)',
+          '',
+          'Read [Sibling Detail](./detail.md) or [Root Guide](/assets/guide.md).',
+        ].join('\n'),
+        contentType: 'text/markdown; charset=utf-8',
+      },
+      'reports/shared/logo.png': {
+        body: 'shared-logo-bytes',
+        contentType: 'image/png',
+      },
+      'reports/shared/detail.md': {
+        body: '# Sibling Detail Page\n',
+        contentType: 'text/markdown; charset=utf-8',
+      },
+      'assets/guide.md': {
+        body: '# Root Guide Page\n',
+        contentType: 'text/markdown; charset=utf-8',
+      },
+    };
+
+    let blobCounter = 0;
+    URL.createObjectURL = vi.fn<typeof URL.createObjectURL>(() => `blob:subdoc-${++blobCounter}`);
+
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const url = String(input);
+      if (url === anonEntryUrl) {
+        const entry = files['reports/q4/memo.md'];
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'content-type': entry.contentType }),
+          text: async () => entry.body,
+          blob: async () => new Blob([entry.body], { type: entry.contentType }),
+        } as Response;
+      }
+      const parsed = new URL(url, 'http://localhost');
+      const rel = parsed.searchParams.get('rel');
+      const resolved = rel ? resolveBackendRel(rel) : null;
+      const hit = resolved ? files[resolved] : undefined;
+      if (!hit) {
+        return { ok: false, status: 404, headers: new Headers() } as Response;
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ 'content-type': hit.contentType }),
+        text: async () => hit.body,
+        blob: async () => new Blob([hit.body], { type: hit.contentType }),
+      } as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderWithProviders(
+      <FileBody
+        scope="monitor:anon-subdoc:v2"
+        path="legacy-public-md.md"
+        frameBase={anonFrameBase}
+        entryUrl={anonEntryUrl}
+        anonymousEntry
+        onDownload={vi.fn<() => void>()}
+        downloading={false}
+      />,
+    );
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Q4 Memo' })).toBeInTheDocument();
+    const overviewLink = await screen.findByRole('link', { name: 'Shared Overview' });
+    await user.click(overviewLink);
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Shared Overview' })).toBeInTheDocument();
+    const logoImg = await screen.findByAltText('Shared Logo');
+    await waitFor(() => expect(logoImg).toHaveAttribute('src', 'blob:subdoc-1'));
+
+    const requestedUrls = fetchMock.mock.calls.map(([input]) => String(input));
+    expect(requestedUrls).toContain(`${anonFrameBase}/?rel=%2Freports%2Fshared%2Flogo.png`);
+    expect(requestedUrls).not.toContain(`${anonFrameBase}/?rel=reports%2Fshared%2Flogo.png`);
+
+    const detailLink = await screen.findByRole('link', { name: 'Sibling Detail' });
+    expect(detailLink).toHaveAttribute('href', `${anonFrameBase}/?rel=%2Freports%2Fshared%2Fdetail.md`);
+
+    const rootGuideLink = await screen.findByRole('link', { name: 'Root Guide' });
+    expect(rootGuideLink).toHaveAttribute('href', `${anonFrameBase}/?rel=%2Fassets%2Fguide.md`);
+
+    await user.click(detailLink);
+    expect(await screen.findByRole('heading', { level: 1, name: 'Sibling Detail Page' })).toBeInTheDocument();
+  });
+
+  it('does not reuse entry image cache when a subdocument references a missing same-named logo.png', async () => {
+    const user = userEvent.setup();
+    let blobCounter = 0;
+    URL.createObjectURL = vi.fn<typeof URL.createObjectURL>(() => `blob:same-name-${++blobCounter}`);
+
+    mockServedFiles({
+      'reports/q4/memo.md': {
+        body: '# Entry Doc\n\n![Entry Logo](logo.png)\n\nSee [Sub Overview](../shared/overview.md).\n',
+        contentType: 'text/markdown; charset=utf-8',
+      },
+      'reports/q4/logo.png': {
+        body: 'entry-logo-bytes',
+        contentType: 'image/png',
+      },
+      // Subdocument also references logo.png, but reports/shared/logo.png is NOT included in the snapshot (404).
+      'reports/shared/overview.md': {
+        body: '# Sub Overview\n\n![Sub Logo](logo.png)\n',
+        contentType: 'text/markdown; charset=utf-8',
+      },
+    });
+
+    renderWithProviders(
+      <SharedPageView
+        code="cacheiso1234"
+        metadata={makeVisitorMetadata('reports/q4/memo.md')}
+        onStale={vi.fn<() => void>()}
+      />,
+    );
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Entry Doc' })).toBeInTheDocument();
+    const entryImg = await screen.findByAltText('Entry Logo');
+    await waitFor(() => expect(entryImg).toHaveAttribute('src', 'blob:same-name-1'));
+
+    const subLink = await screen.findByRole('link', { name: 'Sub Overview' });
+    await user.click(subLink);
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Sub Overview' })).toBeInTheDocument();
+    expect(await screen.findByText('logo.png could not be loaded')).toBeInTheDocument();
+    expect(screen.queryByAltText('Sub Logo')).toBeNull();
+    expect(screen.queryByAltText('Entry Logo')).toBeNull();
   });
 });
