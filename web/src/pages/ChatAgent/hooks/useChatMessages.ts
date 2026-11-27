@@ -3707,7 +3707,7 @@ export function useChatMessages(
         disconnected: result?.disconnected, isResendNotice: refs.retryNotice?.recovery === 'resend', hasRetryNotice: Boolean(notice),
         contentLocation: result?.contentLocation, assistantMessageId, onConfirmedRun: latchAdmittedRun, setMessages, attemptReconnect: attemptReconnectAfterDisconnect,
       });
-      if (disconnect) { ({ admitted, pauseGone, wasDisconnected } = disconnect); return; }
+      if (disconnect) { if (disconnect !== 'unadmitted') ({ admitted, pauseGone, wasDisconnected } = disconnect); return; }
 
       // Mark message as complete (use live ref in case steering_delivered switched it)
       {

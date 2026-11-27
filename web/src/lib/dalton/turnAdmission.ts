@@ -249,14 +249,15 @@ export async function handleHitlResumeDisconnect(
     setMessages,
     attemptReconnect,
   }: HandleHitlDisconnectParams,
-): Promise<HitlDisconnectFlags | null> {
+): Promise<HitlDisconnectFlags | 'unadmitted' | null> {
   if (hasRetryNotice || (!disconnected && !isResendNotice && !guard.isUnadmittedCleanEnd())) {
     return null;
   }
   const outcome = await guard.verifyDisconnect(contentLocation, isResendNotice, onConfirmedRun);
   if (outcome === 'unadmitted') {
     markHitlBubbleUnadmitted(setMessages, assistantMessageId, true);
-    return { admitted: false, pauseGone: false, wasDisconnected: false };
+    // The caller returns with its settlement flags unchanged.
+    return 'unadmitted';
   }
   attemptReconnect(assistantMessageId);
   return {
