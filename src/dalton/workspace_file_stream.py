@@ -49,8 +49,21 @@ _STREAM_SLOT_WAIT_S: float = 30.0
 _RO_BINARY_DETAIL = "Binary file download is not available in read-only mode"
 
 
+# Sentinel distinguishing "version field not provided" from a literal SQL NULL.
+_UNSET: Any = object()
+
+
 class StoredStreamSizeMismatchError(RuntimeError):
     """Raised mid-stream when bytes read disagree with the manifest ``file_size``."""
+
+
+class StoredStreamVersionChangedError(FileBytesUnavailable):
+    """Raised when an inline file row changes version between metadata, sniff, and slices.
+
+    Subclasses :class:`FileBytesUnavailable` so pre-header reads map cleanly to
+    HTTP ``503`` in :func:`backup_large_download` and HTTP ``404`` in
+    :func:`shared_large_download`, while mid-stream changes abort the response.
+    """
 
 
 async def get_large_file_meta(
@@ -61,18 +74,20 @@ async def get_large_file_meta(
 ) -> dict[str, Any] | None:
     """Fetch lightweight file metadata without reading inline byte columns.
 
-    Returns ``file_path, file_name, file_size, content_hash, blob_sha256,
-    pack_sha256, pack_offset, mime_type, is_binary, inline_kind`` where
-    ``inline_kind`` is ``'binary'``, ``'text'``, or ``None``.
+    Returns ``workspace_file_id, file_path, file_name, file_size, content_hash,
+    updated_at, blob_sha256, pack_sha256, pack_offset, mime_type, is_binary,
+    inline_kind`` where ``inline_kind`` is ``'binary'``, ``'text'``, or ``None``.
     """
 
     async def _execute(cur) -> dict[str, Any] | None:
         await cur.execute(
             """
-            SELECT file_path,
+            SELECT workspace_file_id,
+                   file_path,
                    file_name,
                    file_size,
                    content_hash,
+                   updated_at,
                    blob_sha256,
                    pack_sha256,
                    pack_offset,
@@ -106,14 +121,20 @@ async def get_inline_file_byte_range(
     length: int,
     *,
     inline_kind: str | None = None,
+    expected_file_id: Any = _UNSET,
+    expected_updated_at: Any = _UNSET,
+    expected_content_hash: Any = _UNSET,
     conn=None,
 ) -> bytes:
     """Read a byte slice of an inline ``workspace_files`` row in SQL.
 
     ``offset`` is 0-based; PostgreSQL ``substring(... FROM n FOR m)`` is
     1-based, so this always passes ``offset + 1`` as the first slice argument.
-    Returns ``b""`` when ``offset`` is at or past EOF or the row has no inline
-    bytes.
+    When any version pin (``expected_file_id``, ``expected_updated_at``,
+    ``expected_content_hash``) is provided, the ``WHERE`` clause binds to that
+    exact row version and raises :class:`StoredStreamVersionChangedError` if
+    the row was overwritten, deleted, or had its inline column cleared.
+    Returns ``b""`` when ``offset`` is at or past EOF for the matched version.
     """
     if offset < 0:
         raise ValueError(f"offset must be non-negative, got {offset}")
@@ -121,22 +142,46 @@ async def get_inline_file_byte_range(
         return b""
 
     pg_from = offset + 1
+    where_clauses = ["workspace_id = %s", "file_path = %s", "kind = 'file'"]
+    where_params: list[Any] = [workspace_id, file_path]
+    version_pinned = False
+
+    if expected_file_id is not _UNSET:
+        where_clauses.append("workspace_file_id = %s")
+        where_params.append(expected_file_id)
+        version_pinned = True
+    if expected_updated_at is not _UNSET:
+        where_clauses.append("updated_at IS NOT DISTINCT FROM %s")
+        where_params.append(expected_updated_at)
+        version_pinned = True
+    if expected_content_hash is not _UNSET:
+        where_clauses.append("content_hash IS NOT DISTINCT FROM %s")
+        where_params.append(expected_content_hash)
+        version_pinned = True
+
     if inline_kind == "binary":
-        sql = """
+        if version_pinned:
+            where_clauses.append("content_binary IS NOT NULL")
+        where_sql = " AND ".join(where_clauses)
+        sql = f"""
             SELECT substring(content_binary FROM %s FOR %s) AS chunk
             FROM workspace_files
-            WHERE workspace_id = %s AND file_path = %s AND kind = 'file'
+            WHERE {where_sql}
         """
-        params: tuple[Any, ...] = (pg_from, length, workspace_id, file_path)
+        params: tuple[Any, ...] = (pg_from, length, *where_params)
     elif inline_kind == "text":
-        sql = """
+        if version_pinned:
+            where_clauses.append("content_text IS NOT NULL")
+        where_sql = " AND ".join(where_clauses)
+        sql = f"""
             SELECT substring(convert_to(content_text, 'UTF8') FROM %s FOR %s) AS chunk
             FROM workspace_files
-            WHERE workspace_id = %s AND file_path = %s AND kind = 'file'
+            WHERE {where_sql}
         """
-        params = (pg_from, length, workspace_id, file_path)
+        params = (pg_from, length, *where_params)
     else:
-        sql = """
+        where_sql = " AND ".join(where_clauses)
+        sql = f"""
             SELECT CASE
                        WHEN content_binary IS NOT NULL
                            THEN substring(content_binary FROM %s FOR %s)
@@ -145,17 +190,37 @@ async def get_inline_file_byte_range(
                        ELSE NULL
                    END AS chunk
             FROM workspace_files
-            WHERE workspace_id = %s AND file_path = %s AND kind = 'file'
+            WHERE {where_sql}
         """
-        params = (pg_from, length, pg_from, length, workspace_id, file_path)
+        params = (pg_from, length, pg_from, length, *where_params)
 
     async def _execute(cur) -> bytes:
         await cur.execute(sql, params)
         row = await cur.fetchone()
         if row is None:
+            if version_pinned:
+                logger.error(
+                    "Stored inline stream version changed workspace=%s path=%r offset=%d",
+                    workspace_id,
+                    file_path,
+                    offset,
+                )
+                raise StoredStreamVersionChangedError(
+                    f"Stored file version changed while streaming {file_path!r}"
+                )
             return b""
         chunk = row["chunk"] if isinstance(row, dict) else row[0]
         if chunk is None:
+            if version_pinned:
+                logger.error(
+                    "Stored inline bytes cleared mid-stream workspace=%s path=%r offset=%d",
+                    workspace_id,
+                    file_path,
+                    offset,
+                )
+                raise StoredStreamVersionChangedError(
+                    f"Stored inline bytes cleared while streaming {file_path!r}"
+                )
             return b""
         return bytes(chunk) if isinstance(chunk, memoryview) else bytes(chunk)
 
@@ -178,10 +243,13 @@ async def resolve_stored_byte_range(
 ) -> bytes:
     """Read up to ``length`` bytes starting at 0-based ``offset`` from any stored row.
 
-    Dispatches inline rows to :func:`get_inline_file_byte_range` and blob/pack
-    pointer rows to upstream :func:`resolve_file_byte_range` (stripping any
-    inline columns from ``file_meta`` first). Returns ``b""`` past EOF and
-    propagates :class:`FileBytesUnavailable` on storage errors.
+    Dispatches inline rows to :func:`get_inline_file_byte_range` (binding to
+    the metadata's ``workspace_file_id``, ``updated_at``, and ``content_hash``
+    when present) and blob/pack pointer rows to upstream
+    :func:`resolve_file_byte_range` (stripping any inline columns from
+    ``file_meta`` first). Returns ``b""`` past EOF and propagates
+    :class:`FileBytesUnavailable` (including
+    :class:`StoredStreamVersionChangedError`) on storage or version errors.
     """
     if offset < 0:
         raise ValueError(f"offset must be non-negative, got {offset}")
@@ -197,6 +265,13 @@ async def resolve_stored_byte_range(
         file_path = file_meta.get("file_path")
         if not file_path:
             raise ValueError("file_meta must include 'file_path' for inline range reads")
+        pin_kwargs: dict[str, Any] = {}
+        if "workspace_file_id" in file_meta:
+            pin_kwargs["expected_file_id"] = file_meta["workspace_file_id"]
+        if "updated_at" in file_meta:
+            pin_kwargs["expected_updated_at"] = file_meta["updated_at"]
+        if "content_hash" in file_meta:
+            pin_kwargs["expected_content_hash"] = file_meta["content_hash"]
         return await get_inline_file_byte_range(
             workspace_id,
             file_path,
@@ -204,6 +279,7 @@ async def resolve_stored_byte_range(
             length,
             inline_kind=inline_kind,
             conn=conn,
+            **pin_kwargs,
         )
 
     # Strip inline keys so upstream resolve_file_byte_range never treats a

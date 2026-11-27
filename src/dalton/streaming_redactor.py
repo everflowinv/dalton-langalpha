@@ -21,6 +21,9 @@ MAX_TOKEN_PREFIX_DIGITS = 64 * 1024
 _SANDBOX_TOKEN_PATTERN = rb"gxs[ar]_[A-Za-z0-9_.\-]+"
 _SETUP_TOKEN_PATTERN = rb"sk-ant-oat\d+-[A-Za-z0-9_-]+"
 
+_SANDBOX_TOKEN_RE = re.compile(_SANDBOX_TOKEN_PATTERN)
+_SETUP_TOKEN_RE = re.compile(_SETUP_TOKEN_PATTERN)
+
 _SANDBOX_CONT_RE = re.compile(rb"^[A-Za-z0-9_.\-]+")
 _SETUP_CONT_RE = re.compile(rb"^[A-Za-z0-9_-]+")
 
@@ -110,6 +113,18 @@ def _unclosed_token_prefix_len(buf: bytes, start: int) -> int:
     return best
 
 
+def _prefer_end_token(a: str | None, b: str | None) -> str | None:
+    """Choose the swallowing continuation class when token spans reach buffer end.
+
+    ``sandbox`` continuation bytes (``[A-Za-z0-9_.-]``) are a strict superset of
+    ``setup`` continuation bytes (``[A-Za-z0-9_-]``), so prefer ``"sandbox"`` if
+    both reach the chunk end.
+    """
+    if a == "sandbox" or b == "sandbox":
+        return "sandbox"
+    return a or b
+
+
 class StreamingSecretRedactor:
     """Incremental byte-stream secret redactor.
 
@@ -118,11 +133,16 @@ class StreamingSecretRedactor:
        ``vault_secrets`` (character length ``>= MIN_REDACT_SECRET_LEN``) in
        UTF-8 and, where encodable, Latin-1 byte encodings, longest-first.
     2. Unbounded sandbox tokens (``gxs[ar]_[A-Za-z0-9_.-]+``) and Claude setup
-       tokens (``sk-ant-oat\\d+-[A-Za-z0-9_-]+``), entering an O(1)-memory
-       swallow state when a token runs past the end of a chunk.
+       tokens (``sk-ant-oat\\d+-[A-Za-z0-9_-]+``), entering an O(L)-memory
+       swallow state when a token runs past the end of a chunk while retaining
+       the last ``max_lit_len - 1`` swallowed bytes so a literal bridging past
+       the end of the token is never leaked.
 
-    Emitted ``[REDACTED:...]`` markers are written directly to output and are
-    never re-scanned.
+    All literal occurrences and token occurrences are collected independently
+    and overlapping spans are merged into a single redacted union before
+    emitting, so neither staggered overlapping secrets nor literal/token
+    overlaps can leak a prefix or suffix fragment. Emitted ``[REDACTED:...]``
+    markers are written directly to output and are never re-scanned.
     """
 
     def __init__(self, vault_secrets: Mapping[str, str] | None = None) -> None:
@@ -157,19 +177,18 @@ class StreamingSecretRedactor:
                 _add_secret(name, value)
 
         sorted_patterns = sorted(pattern_to_repl.keys(), key=len, reverse=True)
-        self._pattern_to_repl = pattern_to_repl
+        self._lit_patterns: list[tuple[bytes, bytes]] = [
+            (pat, pattern_to_repl[pat]) for pat in sorted_patterns
+        ]
         self._max_lit_len = len(sorted_patterns[0]) if sorted_patterns else 0
         self._lit_keep = max(self._max_lit_len - 1, 0)
 
-        parts: list[bytes] = []
-        if sorted_patterns:
-            lit_alt = b"|".join(re.escape(p) for p in sorted_patterns)
-            parts.append(rb"(?P<lit>" + lit_alt + rb")")
-        parts.append(rb"(?P<sandbox>" + _SANDBOX_TOKEN_PATTERN + rb")")
-        parts.append(rb"(?P<setup>" + _SETUP_TOKEN_PATTERN + rb")")
-        self._regex = re.compile(b"|".join(parts))
-
         self._tail: bytes = b""
+        # Number of leading bytes in ``self._tail`` already covered by an
+        # emitted ``[REDACTED:...]`` marker; retained only to detect overlapping
+        # matches bridging out of an already-emitted span (including swallowed
+        # unbounded tokens) and never re-emitted as plaintext.
+        self._covered_prefix: int = 0
         # None, "sandbox", or "setup" while discarding continuation bytes of an
         # unbounded token that reached the end of the previous chunk.
         self._swallowing: str | None = None
@@ -185,26 +204,39 @@ class StreamingSecretRedactor:
             )
             m = cont_re.match(chunk)
             if m is not None:
+                swallowed = chunk[: m.end()]
+                if self._lit_keep > 0:
+                    self._tail = (self._tail + swallowed)[-self._lit_keep :]
+                    self._covered_prefix = len(self._tail)
+                else:
+                    self._tail = b""
+                    self._covered_prefix = 0
                 if m.end() == len(chunk):
                     return b""
                 chunk = chunk[m.end() :]
             self._swallowing = None
 
         buf = self._tail + chunk if self._tail else chunk
+        covered = self._covered_prefix
         self._tail = b""
-        return self._process(buf, final=False)
+        self._covered_prefix = 0
+        return self._process(buf, covered=covered, final=False)
 
     def flush(self) -> bytes:
         """Flush buffered tail bytes at end-of-stream and reset state."""
         if self._swallowing is not None:
             self._swallowing = None
             self._tail = b""
+            self._covered_prefix = 0
             return b""
         if not self._tail:
+            self._covered_prefix = 0
             return b""
         buf = self._tail
+        covered = self._covered_prefix
         self._tail = b""
-        return self._process(buf, final=True)
+        self._covered_prefix = 0
+        return self._process(buf, covered=covered, final=True)
 
     async def redact_stream(
         self, chunks: AsyncIterator[bytes]
@@ -218,50 +250,169 @@ class StreamingSecretRedactor:
         if tail:
             yield tail
 
-    def _process(self, buf: bytes, *, final: bool) -> bytes:
+    def _collect_merged_spans(
+        self, buf: bytes, *, covered: int
+    ) -> list[tuple[int, int, bytes, str | None]]:
+        """Find all literal & token matches and merge strictly overlapping spans.
+
+        Returns sorted disjoint tuples ``(start, end, replacement, end_token)``
+        where ``end_token`` is ``"sandbox"`` / ``"setup"`` if a token match in
+        the merged group reaches ``len(buf)``, else ``None``.
+        """
         n = len(buf)
-        safe_limit = n if final else n - self._lit_keep
+        # Span tuple: (start, end, priority, repl, end_token)
+        # priority: (-1, 0) already-covered prefix (emits b"");
+        #           (0, idx) literals longest-first (global before vault on tie);
+        #           (1, 0) sandbox token; (2, 0) setup token.
+        spans: list[tuple[int, int, tuple[int, int], bytes, str | None]] = []
+
+        if covered > 0:
+            spans.append((0, covered, (-1, 0), b"", None))
+
+        for pat_idx, (pat, repl) in enumerate(self._lit_patterns):
+            pat_len = len(pat)
+            idx = buf.find(pat)
+            while idx != -1:
+                spans.append((idx, idx + pat_len, (0, pat_idx), repl, None))
+                idx = buf.find(pat, idx + 1)
+
+        for m in _SANDBOX_TOKEN_RE.finditer(buf):
+            end = m.end()
+            spans.append(
+                (
+                    m.start(),
+                    end,
+                    (1, 0),
+                    _SANDBOX_REPLACEMENT,
+                    "sandbox" if end == n else None,
+                )
+            )
+
+        for m in _SETUP_TOKEN_RE.finditer(buf):
+            end = m.end()
+            spans.append(
+                (
+                    m.start(),
+                    end,
+                    (2, 0),
+                    _SETUP_REPLACEMENT,
+                    "setup" if end == n else None,
+                )
+            )
+
+        if not spans:
+            return []
+
+        spans.sort(key=lambda item: (item[0], -item[1], item[2]))
+
+        merged: list[tuple[int, int, bytes, str | None]] = []
+        cur_s, cur_e, cur_pri, cur_repl, cur_end_tok = spans[0]
+        for s, e, pri, repl, end_tok in spans[1:]:
+            if s < cur_e:
+                if e > cur_e:
+                    cur_e = e
+                if pri < cur_pri:
+                    cur_pri = pri
+                    cur_repl = repl
+                cur_end_tok = _prefer_end_token(cur_end_tok, end_tok)
+            else:
+                merged.append((cur_s, cur_e, cur_repl, cur_end_tok))
+                cur_s, cur_e, cur_pri, cur_repl, cur_end_tok = s, e, pri, repl, end_tok
+        merged.append((cur_s, cur_e, cur_repl, cur_end_tok))
+        return merged
+
+    def _process(self, buf: bytes, *, covered: int, final: bool) -> bytes:
+        n = len(buf)
+        merged = self._collect_merged_spans(buf, covered=covered)
         out: list[bytes] = []
         pos = 0
 
-        while pos < n:
-            m = self._regex.search(buf, pos)
-            if m is None or (not final and m.start() >= safe_limit):
-                break
-
-            if m.start() > pos:
-                out.append(buf[pos : m.start()])
-
-            group = m.lastgroup
-            if group == "lit":
-                out.append(self._pattern_to_repl[m.group(0)])
-                pos = m.end()
-            elif group == "sandbox":
-                out.append(_SANDBOX_REPLACEMENT)
-                pos = m.end()
-                if not final and pos == n:
-                    self._swallowing = "sandbox"
-                    self._tail = b""
-                    return b"".join(out)
-            else:  # "setup"
-                out.append(_SETUP_REPLACEMENT)
-                pos = m.end()
-                if not final and pos == n:
-                    self._swallowing = "setup"
-                    self._tail = b""
-                    return b"".join(out)
-
         if final:
+            for ms, me, repl, _ in merged:
+                if ms > pos:
+                    out.append(buf[pos:ms])
+                if repl:
+                    out.append(repl)
+                pos = me
             if pos < n:
                 out.append(buf[pos:])
             return b"".join(out)
 
-        tok_keep = _unclosed_token_prefix_len(buf, pos)
+        tok_keep = _unclosed_token_prefix_len(buf, 0)
         keep = max(self._lit_keep, tok_keep)
-        emit_end = max(pos, n - keep)
-        if emit_end > pos:
-            out.append(buf[pos:emit_end])
-        self._tail = buf[emit_end:]
+        hold_start = max(0, n - keep)
+
+        for ms, me, repl, end_token in merged:
+            # An unbounded token reaching the end of the chunk can keep growing
+            # in subsequent chunks regardless of hold_start (e.g. when lit_keep == 0).
+            if me == n and end_token is not None:
+                if (n - ms) > self._lit_keep:
+                    if ms > pos:
+                        out.append(buf[pos:ms])
+                    if repl:
+                        out.append(repl)
+                    if self._lit_keep > 0:
+                        self._tail = buf[max(ms, n - self._lit_keep) : n]
+                        self._covered_prefix = len(self._tail)
+                    else:
+                        self._tail = b""
+                        self._covered_prefix = 0
+                    self._swallowing = end_token
+                    return b"".join(out)
+                # Short token prefix within lit_keep: keep in tail so a literal
+                # completing in the next chunk merges cleanly before emitting.
+                if ms > pos:
+                    out.append(buf[pos:ms])
+                self._tail = buf[ms:]
+                self._covered_prefix = covered if ms == 0 else 0
+                return b"".join(out)
+
+            if me <= hold_start:
+                # Completely before hold-back boundary: no future incomplete
+                # literal or unclosed token prefix can overlap [ms, me).
+                if ms > pos:
+                    out.append(buf[pos:ms])
+                if repl:
+                    out.append(repl)
+                pos = me
+                continue
+
+            if ms < hold_start:
+                # Interval straddles hold_start.
+                if repl == b"" or (me - ms) > self._lit_keep:
+                    # Already-covered prefix or long merged span: emit now and
+                    # keep buf[hold_start:] with covered_prefix = me - hold_start
+                    # so tail memory stays O(lit_keep + tok_keep).
+                    if ms > pos:
+                        out.append(buf[pos:ms])
+                    if repl:
+                        out.append(repl)
+                    self._tail = buf[hold_start:]
+                    self._covered_prefix = me - hold_start
+                    return b"".join(out)
+
+                # Short span straddling hold_start: retain from ms so an
+                # overlapping longer literal in the next chunk merges with the
+                # exact same marker as whole-buffer redaction.
+                if ms > pos:
+                    out.append(buf[pos:ms])
+                self._tail = buf[ms:]
+                self._covered_prefix = covered if ms == 0 else 0
+                return b"".join(out)
+
+            # ms >= hold_start: emit safe plaintext before hold_start and hold the rest.
+            if hold_start > pos:
+                out.append(buf[pos:hold_start])
+            self._tail = buf[hold_start:]
+            self._covered_prefix = (
+                covered - hold_start if pos == 0 and hold_start < covered else 0
+            )
+            return b"".join(out)
+
+        if hold_start > pos:
+            out.append(buf[pos:hold_start])
+        self._tail = buf[hold_start:]
+        self._covered_prefix = 0
         return b"".join(out)
 
 

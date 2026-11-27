@@ -18,9 +18,11 @@ from psycopg.rows import dict_row
 from src.dalton import company_identity
 from src.dalton import wsfiles_backfill as bf_mod
 from src.dalton.workspace_file_stream import (
+    StoredStreamVersionChangedError,
     get_inline_file_byte_range,
     get_large_file_meta,
     resolve_stored_byte_range,
+    stream_stored_file,
 )
 from src.server.database import pool as db_pool_mod
 from src.server.database.blob_keys import blob_key
@@ -120,7 +122,7 @@ async def _insert_workspace_file(
 
 @pytest.mark.asyncio
 async def test_sql_inline_byte_range_and_large_file_meta_real_pg(
-    test_db_pool, test_db_uri, dalton_schema
+    disable_dotenv_loading, test_db_pool, test_db_uri, dalton_schema
 ):
     """Real PostgreSQL verifies offset+1 slicing for content_binary and non-ASCII content_text."""
     async with await psycopg.AsyncConnection.connect(
@@ -210,10 +212,59 @@ async def test_sql_inline_byte_range_and_large_file_meta_real_pg(
             assert (t0 + t1 + t2).decode("utf-8") == text_str
             assert t_eof == b""
 
+            # 3) Version consistency: overwriting the same path mid-stream (even
+            # with identical byte length) aborts the next slice with
+            # StoredStreamVersionChangedError.
+            v1_text = "version-one-plain-text-payload!!"
+            v2_bin = b"\xff\xfe\x00\x01" + b"\xab" * (len(v1_text.encode("utf-8")) - 4)
+            assert len(v2_bin) == len(v1_text.encode("utf-8"))
+
+            await _insert_workspace_file(
+                conn,
+                workspace_id=ws_id,
+                file_path="race/overwrite.dat",
+                file_name="overwrite.dat",
+                content_text=v1_text,
+                is_binary=False,
+                mime_type="text/plain",
+            )
+            meta_v1 = await get_large_file_meta(ws_id, "race/overwrite.dat")
+            assert meta_v1 is not None
+            assert meta_v1["inline_kind"] == "text"
+            assert "workspace_file_id" in meta_v1 and "updated_at" in meta_v1
+
+            first = await resolve_stored_byte_range(ws_id, meta_v1, 0, 8, user_id=uid)
+            assert first == v1_text.encode("utf-8")[:8]
+
+            # Overwrite same path with same-length binary bytes & new hash/updated_at.
+            v2_hash = hashlib.sha256(v2_bin).hexdigest()
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE workspace_files
+                       SET content_text = NULL,
+                           content_binary = %s,
+                           content_hash = %s,
+                           is_binary = TRUE,
+                           updated_at = updated_at + INTERVAL '1 second'
+                     WHERE workspace_id = %s::uuid AND file_path = %s
+                    """,
+                    (v2_bin, v2_hash, ws_id, "race/overwrite.dat"),
+                )
+
+            with pytest.raises(StoredStreamVersionChangedError):
+                await resolve_stored_byte_range(ws_id, meta_v1, 8, 8, user_id=uid)
+
+            with pytest.raises(StoredStreamVersionChangedError):
+                async for _ in stream_stored_file(
+                    ws_id, meta_v1, user_id=uid, first_chunk=first
+                ):
+                    pass
+
 
 @pytest.mark.asyncio
 async def test_backfill_stats_only_and_apply_real_pg(
-    test_db_pool, test_db_uri, dalton_schema
+    disable_dotenv_loading, test_db_pool, test_db_uri, dalton_schema
 ):
     """Real PostgreSQL + in-memory storage double runs --stats-only and --apply end-to-end."""
     async with await psycopg.AsyncConnection.connect(

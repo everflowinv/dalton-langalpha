@@ -45,6 +45,7 @@ from src.dalton.streaming_redactor import (
 )
 from src.dalton.workspace_file_stream import (
     StoredStreamSizeMismatchError,
+    StoredStreamVersionChangedError,
     backup_large_download,
     get_inline_file_byte_range,
     resolve_stored_byte_range,
@@ -305,6 +306,232 @@ def test_streaming_redactor_randomized_chunk_equivalence_200_trials():
             assert b"".join(out_parts) == expected, f"mismatch on trial {trial}"
 
 
+def _run_streaming_chunks(
+    data: bytes,
+    split_sizes: list[int],
+    *,
+    vault_secrets: dict[str, str] | None = None,
+) -> bytes:
+    sr = StreamingSecretRedactor(vault_secrets=vault_secrets)
+    parts: list[bytes] = []
+    pos = 0
+    for step in split_sizes:
+        if pos >= len(data):
+            break
+        parts.append(sr.feed(data[pos : pos + step]))
+        pos += step
+    if pos < len(data):
+        parts.append(sr.feed(data[pos:]))
+    parts.append(sr.flush())
+    return b"".join(parts)
+
+
+def test_streaming_redactor_staggered_overlapping_secrets_whole_split_and_latin1():
+    """Staggered overlapping secrets leave zero secret fragments across whole, arbitrary splits & Latin-1."""
+    s_short = "ABCDEFGH"
+    s_long = "Hpassword-987654"
+    s_short_l1 = "ABCDÉFGH"
+    s_long_l1 = "Hpasswörd-987654"
+    non_overlap = "plain_secret_8888"
+
+    redactor = _make_upstream_redactor([("SHORT", s_short), ("SHORT_L1", s_short_l1)])
+    vault = {
+        "LONG": s_long,
+        "LONG_L1": s_long_l1,
+        "PLAIN": non_overlap,
+    }
+
+    utf8_payload = (
+        f"head {s_short}{s_long[1:]} mid {non_overlap} tail"
+    ).encode("utf-8")
+    latin1_payload = (
+        b"\xff\xfe"
+        + s_short_l1.encode("latin-1")
+        + s_long_l1[1:].encode("latin-1")
+        + b" "
+        + non_overlap.encode("latin-1")
+        + b"\x80end"
+    )
+
+    rng = random.Random(20261127)
+    with patch.object(sr_mod, "get_redactor", return_value=redactor):
+        for payload, forbidden in (
+            (
+                utf8_payload,
+                (
+                    b"ABCDEFGH",
+                    b"ABCDEFG",
+                    b"Hpassword-987654",
+                    b"password-987654",
+                    non_overlap.encode("utf-8"),
+                ),
+            ),
+            (
+                latin1_payload,
+                (
+                    s_short_l1.encode("latin-1"),
+                    s_short_l1[:-1].encode("latin-1"),
+                    s_long_l1.encode("latin-1"),
+                    s_long_l1[1:].encode("latin-1"),
+                    non_overlap.encode("latin-1"),
+                ),
+            ),
+        ):
+            whole_out = _run_streaming_chunks(payload, [len(payload)], vault_secrets=vault)
+            for frag in forbidden:
+                assert frag not in whole_out
+            assert b"[REDACTED:PLAIN]" in whole_out
+            # Non-overlapping suffix/prefix matches redact_bytes.
+            expected_plain = redactor.redact_bytes(
+                b" mid " + non_overlap.encode("utf-8") + b" tail", vault_secrets=vault
+            )
+            if payload is utf8_payload:
+                assert whole_out.endswith(expected_plain)
+
+            # Every single split point and 1-byte chunks produce identical output.
+            for cut in range(1, len(payload)):
+                out_cut = _run_streaming_chunks(
+                    payload, [cut, len(payload) - cut], vault_secrets=vault
+                )
+                assert out_cut == whole_out, f"mismatch at cut={cut}"
+            assert (
+                _run_streaming_chunks(payload, [1] * len(payload), vault_secrets=vault)
+                == whole_out
+            )
+            for _ in range(50):
+                steps = [rng.randint(1, 7) for _ in range(len(payload))]
+                assert (
+                    _run_streaming_chunks(payload, steps, vault_secrets=vault)
+                    == whole_out
+                )
+
+
+def test_streaming_redactor_token_before_literal_and_swallow_bridge():
+    """Token starting earlier than literal (gxsa_prod_key+SUPER) never leaks literal suffix."""
+    secret_ascii = "prod_key+SUPER"
+    secret_latin1 = "pröd_key+SÜPER"
+    redactor = _make_upstream_redactor([])
+    vault = {"PROD": secret_ascii, "PROD_L1": secret_latin1}
+
+    # Short overlap: token prefix fits inside lit_keep.
+    payload_short = b"pre gxsa_prod_key+SUPER post"
+    # Long overlap: token runs > lit_keep before literal bridges out of swallow state!
+    payload_long_swallow = b"pre gxsa_" + (b"Z" * 128) + b"prod_key+SUPER post"
+    # Latin-1 input where non-ASCII byte terminates sandbox token right inside literal.
+    payload_latin1 = (
+        b"\xff\xfe gxsa_abc" + secret_latin1.encode("latin-1") + b" \x80tail"
+    )
+
+    rng = random.Random(20261128)
+    with patch.object(sr_mod, "get_redactor", return_value=redactor):
+        for payload, forbidden in (
+            (
+                payload_short,
+                (b"gxsa_", b"prod_key", b"+SUPER", b"SUPER"),
+            ),
+            (
+                payload_long_swallow,
+                (b"gxsa_", b"ZZZZ", b"prod_key", b"+SUPER", b"SUPER"),
+            ),
+            (
+                payload_latin1,
+                (
+                    b"gxsa_",
+                    secret_latin1.encode("latin-1"),
+                    b"+S\xdcPER",
+                    b"S\xdcPER",
+                ),
+            ),
+        ):
+            whole_out = _run_streaming_chunks(payload, [len(payload)], vault_secrets=vault)
+            for frag in forbidden:
+                assert frag not in whole_out
+            assert whole_out.startswith(payload[:3])
+            assert whole_out.endswith(payload[-4:])
+
+            # Every 2-way split + 1-byte split + random splits leave zero fragments.
+            for cut in range(1, len(payload)):
+                out_cut = _run_streaming_chunks(
+                    payload, [cut, len(payload) - cut], vault_secrets=vault
+                )
+                for frag in forbidden:
+                    assert frag not in out_cut, f"leaked {frag!r} at cut={cut}"
+                if payload is payload_short:
+                    assert out_cut == whole_out
+
+            out_1b = _run_streaming_chunks(
+                payload, [1] * len(payload), vault_secrets=vault
+            )
+            for frag in forbidden:
+                assert frag not in out_1b
+
+            for _ in range(50):
+                steps = [rng.randint(1, 9) for _ in range(len(payload))]
+                out_rand = _run_streaming_chunks(payload, steps, vault_secrets=vault)
+                for frag in forbidden:
+                    assert frag not in out_rand
+
+
+def test_streaming_redactor_literal_overlapping_token_leaves_zero_token_tail():
+    """Literal grabbing token prefix (or inside token) merges spans so zero token tail leaks."""
+    lit_grab_sb = "mysecret_gxsa"
+    lit_grab_setup = "lead_sk-ant-oat01"
+    lit_inside = "prod_key"
+    lit_l1 = "café_gxsa"
+
+    redactor = _make_upstream_redactor(
+        [
+            ("GRAB_SB", lit_grab_sb),
+            ("GRAB_SETUP", lit_grab_setup),
+            ("INSIDE", lit_inside),
+            ("GRAB_L1", lit_l1),
+        ]
+    )
+
+    utf8_payload = (
+        b"A "
+        + b"mysecret_gxsa_tok_987654321 "
+        + b"lead_sk-ant-oat01-xyz_999888 "
+        + b"gxsa_prod_key_tail_777666 "
+        + b"Z"
+    )
+    latin1_payload = (
+        b"\xff\xfe " + lit_l1.encode("latin-1") + b"_secret_tail_555 \x80Z"
+    )
+
+    rng = random.Random(20261129)
+    with patch.object(sr_mod, "get_redactor", return_value=redactor):
+        for payload, forbidden in (
+            (
+                utf8_payload,
+                (
+                    b"mysecret",
+                    b"gxsa_",
+                    b"tok_987654321",
+                    b"lead_sk-ant-oat01",
+                    b"xyz_999888",
+                    b"prod_key",
+                    b"tail_777666",
+                ),
+            ),
+            (
+                latin1_payload,
+                (lit_l1.encode("latin-1"), b"gxsa_", b"secret_tail_555"),
+            ),
+        ):
+            whole_out = _run_streaming_chunks(payload, [len(payload)])
+            for frag in forbidden:
+                assert frag not in whole_out
+
+            assert _run_streaming_chunks(payload, [1] * len(payload)) == whole_out
+            for _ in range(60):
+                steps = [rng.randint(1, 11) for _ in range(len(payload))]
+                out_rand = _run_streaming_chunks(payload, steps)
+                assert out_rand == whole_out
+                for frag in forbidden:
+                    assert frag not in out_rand
+
+
 # ---------------------------------------------------------------------------
 # 2. SQL inline slicing & resolve_stored_byte_range
 # ---------------------------------------------------------------------------
@@ -367,7 +594,18 @@ async def test_resolve_stored_byte_range_dispatches_and_reassembles():
 
     inline_stub = create_autospec(get_inline_file_byte_range, spec_set=True)
 
-    async def _fake_inline(ws_id, path, offset, length, *, inline_kind=None, conn=None):
+    async def _fake_inline(
+        ws_id,
+        path,
+        offset,
+        length,
+        *,
+        inline_kind=None,
+        expected_file_id=wfs_mod._UNSET,
+        expected_updated_at=wfs_mod._UNSET,
+        expected_content_hash=wfs_mod._UNSET,
+        conn=None,
+    ):
         return inline_data[offset : offset + length]
 
     inline_stub.side_effect = _fake_inline
@@ -795,6 +1033,121 @@ async def test_stream_stored_file_aborts_on_size_mismatch():
             )
 
 
+@pytest.mark.asyncio
+async def test_inline_stream_version_pin_aborts_on_midstream_overwrite():
+    """Overwriting an inline file mid-stream raises StoredStreamVersionChangedError (and 503/404 pre-header)."""
+    from datetime import datetime, timezone
+
+    fid = str(uuid.uuid4())
+    ts_v1 = datetime(2026, 11, 26, 12, 0, 0, tzinfo=timezone.utc)
+    v1_body = b"plain-text-line-" * 2048  # 32 KiB
+    v1_hash = hashlib.sha256(v1_body).hexdigest()
+
+    # Simulated DB row that gets overwritten with same-length binary bytes after slice 0!
+    state = {
+        "workspace_file_id": fid,
+        "updated_at": ts_v1,
+        "content_hash": v1_hash,
+        "content_text": v1_body.decode("utf-8"),
+        "content_binary": None,
+    }
+    recorded_sqls: list[tuple[str, tuple]] = []
+
+    class _VersionedConn:
+        def cursor(self, row_factory=None):
+            class _Cur:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *exc):
+                    return False
+
+                async def execute(self, sql, params):
+                    recorded_sqls.append((" ".join(sql.split()), params))
+                    self._last = params
+
+                async def fetchone(self):
+                    pg_from, length, ws_id, fpath, exp_fid, exp_ts, exp_hash = self._last
+                    if (
+                        state["workspace_file_id"] != exp_fid
+                        or state["updated_at"] != exp_ts
+                        or state["content_hash"] != exp_hash
+                        or state["content_text"] is None
+                    ):
+                        return None
+                    raw = state["content_text"].encode("utf-8")
+                    start = pg_from - 1
+                    return {"chunk": raw[start : start + length]}
+
+            return _Cur()
+
+    meta = {
+        "workspace_file_id": fid,
+        "file_path": "report.txt",
+        "file_name": "report.txt",
+        "file_size": len(v1_body),
+        "content_hash": v1_hash,
+        "updated_at": ts_v1,
+        "blob_sha256": None,
+        "pack_sha256": None,
+        "pack_offset": None,
+        "mime_type": "text/plain",
+        "is_binary": False,
+        "inline_kind": "text",
+    }
+
+    conn = _VersionedConn()
+    first = await resolve_stored_byte_range(
+        "ws-1", meta, 0, UTF8_SNIFF_BYTES, user_id="u1", conn=conn
+    )
+    assert first == v1_body[:UTF8_SNIFF_BYTES]
+    assert "workspace_file_id = %s" in recorded_sqls[0][0]
+    assert "updated_at IS NOT DISTINCT FROM %s" in recorded_sqls[0][0]
+    assert "content_hash IS NOT DISTINCT FROM %s" in recorded_sqls[0][0]
+    assert "content_text IS NOT NULL" in recorded_sqls[0][0]
+
+    # Overwrite same path with same-length binary bytes mid-download!
+    v2_bin = b"\xff\xfe\x00\x01" * (len(v1_body) // 4)
+    state["content_text"] = None
+    state["content_binary"] = v2_bin
+    state["content_hash"] = hashlib.sha256(v2_bin).hexdigest()
+    state["updated_at"] = datetime(2026, 11, 26, 12, 0, 5, tzinfo=timezone.utc)
+
+    # Next slice via stream_stored_file must abort and never yield v2_bin bytes!
+    emitted: list[bytes] = []
+    with pytest.raises(StoredStreamVersionChangedError):
+        async for ch in stream_stored_file(
+            "ws-1", meta, user_id="u1", first_chunk=first, conn=conn
+        ):
+            emitted.append(ch)
+    assert b"".join(emitted) == first
+    assert b"\xff\xfe" not in b"".join(emitted)
+
+    # Pre-header version change maps to 503 in backup_large_download and 404 in shared_large_download.
+    large_meta = {**meta, "file_size": SERVE_MAX_BYTES + 4096}
+    meta_stub = create_autospec(wfs_mod.get_large_file_meta, spec_set=True, return_value=large_meta)
+    range_stub = create_autospec(
+        wfs_mod.resolve_stored_byte_range,
+        spec_set=True,
+        side_effect=StoredStreamVersionChangedError("overwritten before sniff"),
+    )
+    with (
+        patch.object(wfs_mod, "get_large_file_meta", meta_stub),
+        patch.object(wfs_mod, "resolve_stored_byte_range", range_stub),
+    ):
+        with pytest.raises(HTTPException) as exc_backup:
+            await backup_large_download(
+                "ws-1", {"user_id": "owner-1"}, "report.txt", "attachment"
+            )
+        assert exc_backup.value.status_code == 503
+
+        with pytest.raises(HTTPException) as exc_share:
+            await shared_large_download(
+                "ws-1", "owner-1", "report.txt", not_found_detail="File not found"
+            )
+        assert exc_share.value.status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # 4. Public share streaming download (shared_large_download)
 # ---------------------------------------------------------------------------
@@ -1017,6 +1370,12 @@ class _FakeBackfillConn:
         self.register_calls: list[tuple] = []
         self.repoint_calls: list[tuple] = []
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
     @asynccontextmanager
     async def transaction(self):
         yield
@@ -1093,16 +1452,15 @@ async def test_backfill_stats_only_runs_when_storage_disabled_and_flags_bad_owne
     next_stub = create_autospec(bf_mod._next_inline_ids, spec_set=True, side_effect=_next_ids)
     load_stub = create_autospec(bf_mod._load_row, spec_set=True, side_effect=_load_row)
     is_enabled_stub = create_autospec(script.is_storage_enabled, spec_set=True, return_value=False)
-
-    @asynccontextmanager
-    async def _fake_connect(*args, **kwargs):
-        yield conn
+    connect_stub = create_autospec(
+        script.psycopg.AsyncConnection.connect, spec_set=True, return_value=conn
+    )
 
     with (
         patch.object(bf_mod, "_next_inline_ids", next_stub),
         patch.object(bf_mod, "_load_row", load_stub),
         patch.object(script, "is_storage_enabled", is_enabled_stub),
-        patch.object(script.psycopg.AsyncConnection, "connect", side_effect=_fake_connect),
+        patch.object(script.psycopg.AsyncConnection, "connect", connect_stub),
     ):
         rc = await script._run(
             apply=False,
@@ -1314,3 +1672,102 @@ def test_reverse_choose_inline_target_keeps_large_text_in_content_binary_with_or
         small_text, False, script._inline_columns
     )
     assert t2 == "hello" and b2 is None and f2 is False and r2 is False
+
+
+@pytest.mark.asyncio
+async def test_backfill_second_batch_put_invalidates_verified_digest_and_rejects_bad_bytes():
+    """After batch 1 PUT->verify->CAS, a batch 2 PUT writing same-length bad bytes must NOT CAS-clear."""
+    uid = str(uuid.uuid4())
+    payload = "shared-content-across-two-batches"
+    r1 = _make_inline_row(user_id=uid, content_text=payload, file_path="batch1.txt")
+    r2 = _make_inline_row(user_id=uid, content_text=payload, file_path="batch2.txt")
+    assert r1["content_hash"] == r2["content_hash"]
+
+    rows = {r1["workspace_file_id"]: r1, r2["workspace_file_id"]: r2}
+    conn = _FakeBackfillConn(rows)
+    store: dict[str, bytes] = {}
+    put_calls = 0
+
+    # Batch 1 page returns r1; between batch 1 and batch 2 the object vanishes
+    # so batch 2 performs a fresh PUT that writes same-length corrupt bytes.
+    pages = [[r1["workspace_file_id"]], [r2["workspace_file_id"]], []]
+
+    async def _next_ids(c, after, limit, ws_id):
+        if len(pages) == 2:
+            # Right before batch 2 starts, remove the object so batch 2 must PUT again.
+            store.clear()
+        return pages.pop(0)
+
+    def _fake_put(key, data, content_type=None, max_size=None):
+        nonlocal put_calls
+        put_calls += 1
+        if put_calls == 1:
+            store[key] = data  # Batch 1 writes good bytes
+        else:
+            # Batch 2 (and its Step-3 retry) silently writes same-length corrupt bytes
+            store[key] = b"X" * len(data)
+        return True
+
+    size_stub = create_autospec(
+        storage_facade.object_size,
+        spec_set=True,
+        side_effect=lambda k: len(store[k]) if k in store else None,
+    )
+    put_stub = create_autospec(
+        storage_facade.upload_bytes, spec_set=True, side_effect=_fake_put
+    )
+    sha_stub = create_autospec(
+        storage_facade.sha256_object,
+        spec_set=True,
+        side_effect=lambda k, **kw: (
+            hashlib.sha256(store[k]).hexdigest() if k in store else None
+        ),
+    )
+    next_stub = create_autospec(
+        bf_mod._next_inline_ids, spec_set=True, side_effect=_next_ids
+    )
+    load_stub = create_autospec(
+        bf_mod._load_row, spec_set=True, side_effect=lambda c, fid: rows[fid]
+    )
+
+    with (
+        patch.object(bf_mod, "_next_inline_ids", next_stub),
+        patch.object(bf_mod, "_load_row", load_stub),
+        patch.object(storage_facade, "object_size", size_stub),
+        patch.object(storage_facade, "upload_bytes", put_stub),
+        patch.object(storage_facade, "sha256_object", sha_stub),
+    ):
+        rc = await bf_mod.run_forward(conn, apply=True, batch=1)
+
+    assert rc == 1
+    # Only row 1 was CAS-cleared; row 2 stayed inline and counted as failed.
+    assert len(conn.repoint_calls) == 1
+    assert conn.repoint_calls[0][2] == r1["workspace_file_id"]
+    # Batch 1: 1 PUT + 1 verify. Batch 2: 1 PUT + 1 verify (mismatch) + 1 retry PUT + 1 retry verify.
+    assert put_stub.call_count == 3
+    assert sha_stub.call_count == 3
+
+
+def test_dalton_integration_conftest_disables_dotenv_before_alembic(tmp_path):
+    """The Dalton integration session fixture disables dotenv.load_dotenv for both Alembic chains."""
+    import dotenv
+    import dotenv.main
+
+    from tests.integration.dalton.conftest import disable_dotenv_loading
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("DALTON_DOTENV_LEAK_TEST_KEY=should_not_load\n", encoding="utf-8")
+
+    gen = disable_dotenv_loading.__wrapped__()
+    stub = next(gen)
+    try:
+        from dotenv import load_dotenv as imported_load_dotenv
+
+        assert imported_load_dotenv is stub
+        assert dotenv.load_dotenv is stub
+        assert dotenv.main.load_dotenv is stub
+        assert imported_load_dotenv(env_file) is False
+        assert "DALTON_DOTENV_LEAK_TEST_KEY" not in __import__("os").environ
+    finally:
+        with pytest.raises(StopIteration):
+            next(gen)

@@ -608,12 +608,11 @@ async def _run(
         build_db_uri(), autocommit=True
     ) as conn:
         # DALTON-HOOK(backfill-readback-verify): delegate --stats-only and hardened forward to Dalton
-        from src.dalton.wsfiles_backfill import run_forward, run_stats_only
-        if stats_only:
-            return await run_stats_only(conn, batch=batch, workspace_id=workspace_id, include_legacy_owners=include_legacy_owners)
-        if reverse:
-            return await _reverse(conn, apply, batch, workspace_id)
-        return await run_forward(conn, apply=apply, batch=batch, workspace_id=workspace_id, include_legacy_owners=include_legacy_owners, sleep_ms=sleep_ms)
+        from src.dalton.wsfiles_backfill import dispatch_backfill
+        return await dispatch_backfill(
+            conn, apply=apply, reverse=reverse, batch=batch, workspace_id=workspace_id,
+            include_legacy_owners=include_legacy_owners, stats_only=stats_only, sleep_ms=sleep_ms, reverse_fn=_reverse,
+        )
 
 
 def main() -> int:

@@ -13,6 +13,7 @@ import logging
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 import psycopg
 from psycopg.rows import dict_row
@@ -397,6 +398,10 @@ async def _flush_batch(
         upload_ok[dk] = ok
         if skipped:
             put_skipped_keys.add(dk)
+        else:
+            # Any actual PUT attempt invalidates prior read-back verification
+            # for this key; Step 3 must re-verify sha256_object(key) before CAS.
+            verified_digests.discard(dk)
 
     # Count skipped_put per row whose key skipped PUT (or deduplicated duplicate in batch).
     seen_uploaded_in_batch: set[tuple[str, str]] = set()
@@ -666,3 +671,35 @@ async def run_forward(
         counts.skipped_empty,
     )
     return 1 if counts.failed > 0 else 0
+
+
+async def dispatch_backfill(
+    conn: psycopg.AsyncConnection,
+    *,
+    apply: bool,
+    reverse: bool,
+    batch: int,
+    workspace_id: str | None,
+    include_legacy_owners: bool,
+    stats_only: bool,
+    sleep_ms: int,
+    reverse_fn: Callable[..., Any],
+) -> int:
+    """Route CLI backfill execution to ``--stats-only``, ``--reverse``, or hardened forward."""
+    if stats_only:
+        return await run_stats_only(
+            conn,
+            batch=batch,
+            workspace_id=workspace_id,
+            include_legacy_owners=include_legacy_owners,
+        )
+    if reverse:
+        return await reverse_fn(conn, apply, batch, workspace_id)
+    return await run_forward(
+        conn,
+        apply=apply,
+        batch=batch,
+        workspace_id=workspace_id,
+        include_legacy_owners=include_legacy_owners,
+        sleep_ms=sleep_ms,
+    )
