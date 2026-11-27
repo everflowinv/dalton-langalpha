@@ -17,11 +17,13 @@ real `~/Library/LaunchAgents`, real `~/.config/dalton`, or real `launchctl`/`doc
 
 from __future__ import annotations
 
+import http.client
 import importlib.util
 import json
 import os
 from pathlib import Path
 import plistlib
+import shutil
 import stat
 import subprocess
 import sys
@@ -41,6 +43,7 @@ PREFLIGHT_PY = PROD_OPS / "preflight.py"
 WAIT_IDLE_SH = PROD_OPS / "wait_backend_idle.sh"
 HANDOFF_LIB_SH = PROD_OPS / "_research_host_handoff_lib.sh"
 SWITCH_SH = PROD_OPS / "switch_research_host.sh"
+INSTALL_BRIDGE_SH = SCRIPTS_DALTON / "install_bridge.sh"
 MIGRATE_SH = SCRIPTS_DALTON / "ops" / "research_runtime_migrate.sh"
 HOST_SERVICES_SWITCH_SH = SCRIPTS_DALTON / "ops" / "host_services_switch.sh"
 VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
@@ -83,11 +86,22 @@ def _make_fake_curl_bin(
     return _write_exec(
         script_path,
         f"""#!/usr/bin/env python3
-import json, sys
+import json, os, re, stat, sys
 from urllib.parse import urlparse
 
 cfg = {cfg!r}
 args = sys.argv[1:]
+# Credentials must NEVER be passed via process argv (-H)
+for a in args:
+    low = a.lower()
+    if "authorization:" in low or "x-service-token:" in low:
+        sys.stderr.write("SECURITY VIOLATION: credential header passed on argv\\n")
+        sys.exit(99)
+    for secret in (cfg["svc_token"], cfg["bridge_admin_tok"], cfg["gp_admin_tok"]):
+        if secret and secret in a:
+            sys.stderr.write("SECURITY VIOLATION: secret token passed on argv\\n")
+            sys.exit(99)
+
 method = "GET"
 headers = {{}}
 write_status = False
@@ -97,6 +111,21 @@ while i < len(args):
     a = args[i]
     if a == "-X" and i + 1 < len(args):
         method = args[i + 1].upper()
+        i += 2
+    elif a in ("-K", "--config") and i + 1 < len(args):
+        cfg_file = args[i + 1]
+        st = os.stat(cfg_file)
+        if stat.S_IMODE(st.st_mode) != 0o600:
+            sys.stderr.write(f"SECURITY VIOLATION: curl config mode {{oct(stat.S_IMODE(st.st_mode))}}\\n")
+            sys.exit(98)
+        with open(cfg_file, encoding="utf-8") as fh:
+            for line in fh:
+                m = re.match(r'^\\s*header\\s*=\\s*"(.*)"\\s*$', line)
+                if m:
+                    hv = m.group(1).replace('\\\\"', '"').replace('\\\\\\\\', '\\\\')
+                    if ":" in hv:
+                        k, v = hv.split(":", 1)
+                        headers[k.strip().lower()] = v.strip()
         i += 2
     elif a == "-H" and i + 1 < len(args):
         hv = args[i + 1]
@@ -750,20 +779,65 @@ def test_preflight_switch_fails_unexpected_bridge_env_file_path(tmp_path: Path) 
 def test_preflight_switch_fails_host_process_residual_8943_override_and_warns_unreadable_ps(
     tmp_path: Path,
 ) -> None:
-    # 1. Process env has residual DALTON_GUIDEPOINT_MCP_URL=:8943 -> FAIL
+    # 1. Healthy pre-switch bridge process carrying DALTON_GUIDEPOINT_MCP_URL matching bridge.env -> PASS
+    ctx_ok = _setup_isolated_env(
+        tmp_path / "healthy_matching",
+        budgets=_make_valid_budgets_dict(),
+        ps_output_override="PID COMMAND\n5151 python researchdata_bridge.py DALTON_GUIDEPOINT_MCP_URL=http://127.0.0.1:8943/mcp\n",
+    )
+    try:
+        with ctx_ok["bridge_env"].open("a", encoding="utf-8") as fh:
+            fh.write("DALTON_GUIDEPOINT_MCP_URL=http://127.0.0.1:8943/mcp\n")
+        res_ok = _run_preflight_cli(ctx_ok, "--switch")
+        assert res_ok.returncode == 0, res_ok.stdout + res_ok.stderr
+    finally:
+        ctx_ok["cleanup"]()
+
+    # 2. Residual :8943 in bridge proc while bridge.env / stage already points to :8951 -> FAIL
     ctx = _setup_isolated_env(
         tmp_path / "override",
         budgets=_make_valid_budgets_dict(),
         ps_output_override="PID COMMAND\n5151 python researchdata_bridge.py DALTON_GUIDEPOINT_MCP_URL=http://127.0.0.1:8943/mcp\n",
     )
     try:
+        with ctx["bridge_env"].open("a", encoding="utf-8") as fh:
+            fh.write("DALTON_GUIDEPOINT_MCP_URL=http://127.0.0.1:8951/mcp/guidepoint\n")
         res = _run_preflight_cli(ctx, "--switch")
         assert res.returncode != 0
         assert "DALTON_GUIDEPOINT_MCP_URL" in (res.stderr + res.stdout)
     finally:
         ctx["cleanup"]()
 
-    # 2. ps fails (unreadable process env) -> WARN, exit 0
+    # 3. Rogue URL with embedded credentials in bridge proc -> FAIL and secret redacted from output
+    ctx_red = _setup_isolated_env(
+        tmp_path / "redact",
+        budgets=_make_valid_budgets_dict(),
+        ps_output_override="PID COMMAND\n5151 python researchdata_bridge.py DALTON_GUIDEPOINT_MCP_URL=http://admin:topsecret_pw@127.0.0.1:9999/mcp?tok=abc\n",
+    )
+    try:
+        res_red = _run_preflight_cli(ctx_red, "--switch")
+        assert res_red.returncode != 0
+        combined = res_red.stderr + res_red.stdout
+        assert "DALTON_GUIDEPOINT_MCP_URL" in combined
+        assert "topsecret_pw" not in combined
+        assert "tok=abc" not in combined
+    finally:
+        ctx_red["cleanup"]()
+
+    # 4. launchctl getenv external DALTON_GUIDEPOINT_MCP_URL override -> FAIL even on :8943
+    ctx_lc = _setup_isolated_env(
+        tmp_path / "launchctl_override",
+        budgets=_make_valid_budgets_dict(),
+        launchctl_getenv_map={"DALTON_GUIDEPOINT_MCP_URL": "http://127.0.0.1:8943/mcp"},
+    )
+    try:
+        res_lc = _run_preflight_cli(ctx_lc, "--switch")
+        assert res_lc.returncode != 0
+        assert "DALTON_GUIDEPOINT_MCP_URL" in (res_lc.stderr + res_lc.stdout)
+    finally:
+        ctx_lc["cleanup"]()
+
+    # 5. ps fails (unreadable process env) -> WARN, exit 0
     ctx_w = _setup_isolated_env(
         tmp_path / "warn_ps",
         budgets=_make_valid_budgets_dict(),
@@ -1193,21 +1267,36 @@ def test_wait_backend_idle_maintenance_check_bridge_drain_three_counters(tmp_pat
         {"ok": True, "draining": True, "inflight": 0, "queued": 0, "ingest_inflight": 0},
     ]
     curl_state = tmp_path / "curl_state.json"
-    curl_state.write_text(json.dumps({"n": 0, "responses": responses}), encoding="utf-8")
+    curl_state.write_text(json.dumps({"n": 0, "responses": responses, "cfg_paths": []}), encoding="utf-8")
     fake_curl = _write_exec(
         tmp_path / "fake_curl",
         f"""#!/usr/bin/env python3
-import json, sys
+import json, os, re, stat, sys
 from pathlib import Path
 
 args = sys.argv[1:]
+for a in args:
+    if "authorization" in a.lower() or "secret_drain_tok" in a:
+        sys.stderr.write("SECURITY VIOLATION: auth token on curl argv\\n")
+        sys.exit(99)
+
 auth = ""
 url = ""
+cfg_paths = []
 i = 0
 while i < len(args):
-    if args[i] == "-H" and i + 1 < len(args):
-        if args[i + 1].lower().startswith("authorization:"):
-            auth = args[i + 1].split(":", 1)[1].strip()
+    if args[i] in ("-K", "--config") and i + 1 < len(args):
+        cfg_file = args[i + 1]
+        cfg_paths.append(cfg_file)
+        st = os.stat(cfg_file)
+        if stat.S_IMODE(st.st_mode) != 0o600:
+            sys.stderr.write("SECURITY VIOLATION: curl config not 0600\\n")
+            sys.exit(98)
+        with open(cfg_file, encoding="utf-8") as fh:
+            for line in fh:
+                m = re.match(r'^\\s*header\\s*=\\s*"(.*)"\\s*$', line)
+                if m and m.group(1).lower().startswith("authorization:"):
+                    auth = m.group(1).split(":", 1)[1].strip()
         i += 2
     elif args[i] == "--max-time" and i + 1 < len(args):
         i += 2
@@ -1224,6 +1313,7 @@ st_path = Path({str(curl_state)!r})
 st = json.loads(st_path.read_text(encoding="utf-8"))
 idx = min(st["n"], len(st["responses"]) - 1)
 st["n"] += 1
+st.setdefault("cfg_paths", []).extend(cfg_paths)
 st_path.write_text(json.dumps(st), encoding="utf-8")
 print(json.dumps(st["responses"][idx]))
 """,
@@ -1248,33 +1338,29 @@ print(json.dumps(st["responses"][idx]))
     assert res.returncode == 0, res.stdout + res.stderr
     assert "checks=5" in res.stdout
     assert "secret_drain_tok" not in (res.stdout + res.stderr)
+    # Every temporary 0600 curl config file must have been deleted after use
+    recorded = json.loads(curl_state.read_text(encoding="utf-8"))["cfg_paths"]
+    assert len(recorded) == 5
+    for p in recorded:
+        assert not Path(p).exists(), f"temp curl config leaked: {p}"
 
 
 def test_preflight_http_request_default_urllib_path_with_autospec(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify default (non-CURL_BIN) urllib path handles 200, HTTPError 503, and URLError."""
+    """Verify default (non-CURL_BIN) urllib path handles 200, HTTPError 503, and URLError using create_autospec."""
     monkeypatch.delenv("CURL_BIN", raising=False)
-
-    class _FakeResp:
-        def __init__(self, status: int, body: bytes) -> None:
-            self.status = status
-            self._body = body
-
-        def read(self) -> bytes:
-            return self._body
-
-        def __enter__(self) -> _FakeResp:
-            return self
-
-        def __exit__(self, *args: Any) -> None:
-            return None
 
     real_urlopen = urllib.request.urlopen
 
-    def _ok_urlopen(url: Any, *args: Any, **kwargs: Any) -> _FakeResp:
+    def _ok_urlopen(url: Any, *args: Any, **kwargs: Any) -> Any:
         assert url.get_method() == "GET"
-        return _FakeResp(200, b'{"ok": true, "paused": false, "revision": 7}')
+        resp = create_autospec(http.client.HTTPResponse, instance=True)
+        resp.status = 200
+        resp.read.return_value = b'{"ok": true, "paused": false, "revision": 7}'
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = None
+        return resp
 
     monkeypatch.setattr(
         preflight.urllib.request,
@@ -1605,7 +1691,7 @@ def test_switch_research_host_check_and_dry_run_work_with_incomplete_journal_and
 def test_approve_budgets_handoff_exceeded_and_stage_b_only_exceeded_pass_preflight(
     tmp_path: Path,
 ) -> None:
-    # Branch 1: handoff > 90s
+    # Branch 1: handoff > 90s (requires existing handoff-journal.json with completed == true)
     b1 = _make_valid_budgets_dict(
         forward_budget_s=60,
         recovery_budget_s=45,
@@ -1615,6 +1701,11 @@ def test_approve_budgets_handoff_exceeded_and_stage_b_only_exceeded_pass_preflig
     )
     ctx1 = _setup_isolated_env(tmp_path / "b1", budgets=b1)
     try:
+        j1 = ctx1["cutover_dir"] / "handoff-journal.json"
+        j1_bytes = json.dumps(
+            {"operation": "stage_a", "target_owner": "legacy_proxy_8943", "completed": True}
+        ).encode("utf-8")
+        j1.write_bytes(j1_bytes)
         r = subprocess.run(
             ["/bin/bash", str(SWITCH_SH), "--approve-budgets", "--handoff-deadline-s", "120"],
             env=ctx1["env"],
@@ -1626,8 +1717,8 @@ def test_approve_budgets_handoff_exceeded_and_stage_b_only_exceeded_pass_preflig
         assert r.returncode == 0, r.stdout + r.stderr
         assert stat.S_IMODE(ctx1["budgets_file"].stat().st_mode) == 0o600
         assert preflight.validate_timing_budgets_env(ctx1["budgets_file"]) == []
-        # Must NOT write handoff-journal.json
-        assert not (ctx1["cutover_dir"] / "handoff-journal.json").exists()
+        # Must NOT modify handoff-journal.json
+        assert j1.read_bytes() == j1_bytes
         # Full preflight --switch passes now
         r_pre = _run_preflight_cli(ctx1, "--switch")
         assert r_pre.returncode == 0, r_pre.stdout + r_pre.stderr
@@ -1646,6 +1737,11 @@ def test_approve_budgets_handoff_exceeded_and_stage_b_only_exceeded_pass_preflig
     )
     ctx2 = _setup_isolated_env(tmp_path / "b2", budgets=b2)
     try:
+        j2 = ctx2["cutover_dir"] / "handoff-journal.json"
+        j2_bytes = json.dumps(
+            {"operation": "stage_a", "target_owner": "legacy_proxy_8943", "completed": True}
+        ).encode("utf-8")
+        j2.write_bytes(j2_bytes)
         r = subprocess.run(
             ["/bin/bash", str(SWITCH_SH), "--approve-budgets", "--stage-b-window-m", "75"],
             env=ctx2["env"],
@@ -1661,6 +1757,7 @@ def test_approve_budgets_handoff_exceeded_and_stage_b_only_exceeded_pass_preflig
         assert parsed["STAGE_B_WINDOW_DEADLINE_S"] == "4500"
         assert parsed["BUDGET_APPROVAL_REQUIRED"] == "false"
         assert parsed["BUDGET_APPROVED_AT"] != ""
+        assert j2.read_bytes() == j2_bytes
         assert preflight.validate_timing_budgets_env(ctx2["budgets_file"]) == []
         r_pre = _run_preflight_cli(ctx2, "--switch")
         assert r_pre.returncode == 0, r_pre.stdout + r_pre.stderr
@@ -1728,6 +1825,10 @@ def test_approve_budgets_rejections_leave_original_file_byte_identical(
 ) -> None:
     ctx = _setup_isolated_env(tmp_path / case_name, budgets=budgets)
     try:
+        (ctx["cutover_dir"] / "handoff-journal.json").write_text(
+            json.dumps({"operation": "stage_a", "target_owner": "legacy_proxy_8943", "completed": True}),
+            encoding="utf-8",
+        )
         before_bytes = ctx["budgets_file"].read_bytes()
         r = subprocess.run(
             ["/bin/bash", str(SWITCH_SH), "--approve-budgets", *cli_args],
@@ -1745,6 +1846,993 @@ def test_approve_budgets_rejections_leave_original_file_byte_identical(
 
 
 # ---------------------------------------------------------------------------
+# s34-r2 hardening regression tests (Codex + Grok review items 1-12)
+# ---------------------------------------------------------------------------
+
+
+def test_wait_backend_idle_maintenance_enforces_monotonic_deadline_on_hanging_psql_and_http(
+    tmp_path: Path,
+) -> None:
+    # 1. Hanging docker exec psql must be cut off by --max-wait-seconds
+    hanging_docker = _write_exec(
+        tmp_path / "docker_hang",
+        "#!/usr/bin/env python3\nimport time\ntime.sleep(10)\nprint('0')\n",
+    )
+    t0 = time.monotonic()
+    res_hang = subprocess.run(
+        ["/bin/bash", str(WAIT_IDLE_SH), "--max-wait-seconds", "1"],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "DOCKER_BIN": str(hanging_docker),
+            "WAIT_IDLE_POLL_S": "0.1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    elapsed = time.monotonic() - t0
+    assert res_hang.returncode == 1
+    assert "still_busy" in res_hang.stdout
+    assert elapsed < 4.0, f"hanging psql was not bounded by deadline: {elapsed:.2f}s"
+
+    # 2. Slow queries returning 0 twice AFTER deadline must STILL fail closed (not return 0)
+    slow_zero_docker = _write_exec(
+        tmp_path / "docker_slow_zero",
+        "#!/usr/bin/env python3\nimport time\ntime.sleep(0.2)\nprint('0')\n",
+    )
+    res_overrun = subprocess.run(
+        ["/bin/bash", str(WAIT_IDLE_SH), "--max-wait-seconds", "1"],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "DOCKER_BIN": str(slow_zero_docker),
+            "WAIT_IDLE_POLL_S": "0.1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    assert res_overrun.returncode == 1
+    assert "still_busy" in res_overrun.stdout
+
+    # 3. Hanging HTTP healthz must be cut off by the same monotonic deadline
+    fast_docker = _write_exec(
+        tmp_path / "docker_fast",
+        "#!/usr/bin/env python3\nprint('0')\n",
+    )
+    hanging_curl = _write_exec(
+        tmp_path / "curl_hang",
+        "#!/usr/bin/env python3\nimport time\ntime.sleep(10)\n",
+    )
+    t1 = time.monotonic()
+    res_http_hang = subprocess.run(
+        ["/bin/bash", str(WAIT_IDLE_SH), "--check-bridge-healthz", "--max-wait-seconds", "1"],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "DOCKER_BIN": str(fast_docker),
+            "CURL_BIN": str(hanging_curl),
+            "DALTON_BRIDGE_LOCAL_URL": "http://stub-bridge.invalid",
+            "WAIT_IDLE_POLL_S": "0.1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    assert res_http_hang.returncode == 1
+    assert "still_busy" in res_http_hang.stdout
+    assert (time.monotonic() - t1) < 4.0
+
+    # 4. No-arg mode ignores POSTGRES_CONTAINER (uses dalton-langalpha-postgres-1)
+    container_log = tmp_path / "pg_container.log"
+    inspect_docker = _write_exec(
+        tmp_path / "docker_inspect",
+        f"""#!/usr/bin/env python3
+import sys
+from pathlib import Path
+Path({str(container_log)!r}).write_text(sys.argv[2], encoding="utf-8")
+print("0")
+""",
+    )
+    res_noarg = subprocess.run(
+        ["/bin/bash", str(WAIT_IDLE_SH)],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "DOCKER_BIN": str(inspect_docker),
+            "POSTGRES_CONTAINER": "langalpha-postgresql",
+            "WAIT_IDLE_DEFAULT_POLL_S": "0",
+            "WAIT_IDLE_DEFAULT_MAX_ROUNDS": "3",
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert res_noarg.returncode == 0
+    assert container_log.read_text(encoding="utf-8") == "dalton-langalpha-postgres-1"
+
+
+@pytest.mark.parametrize("failure_mode", ["nonzero_rc", "corrupt_json", "missing_backend_env"])
+def test_preflight_switch_fails_closed_on_compose_errors_and_honors_compose_file_chain(
+    tmp_path: Path,
+    failure_mode: str,
+) -> None:
+    ctx = _setup_isolated_env(tmp_path / failure_mode, budgets=_make_valid_budgets_dict())
+    try:
+        docker_bin = Path(ctx["env"]["DOCKER_BIN"])
+        if failure_mode == "nonzero_rc":
+            _write_exec(docker_bin, "#!/usr/bin/env python3\nimport sys\nsys.stderr.write('compose boom\\n')\nsys.exit(1)\n")
+        elif failure_mode == "corrupt_json":
+            _write_exec(docker_bin, "#!/usr/bin/env python3\nprint('{not valid json')\n")
+        else:
+            _write_exec(
+                docker_bin,
+                "#!/usr/bin/env python3\nimport json\nprint(json.dumps({'services': {'backend': {'image': 'x'}}}))\n",
+            )
+        res = _run_preflight_cli(ctx, "--switch", "--report-json")
+        assert res.returncode != 0
+        rep = json.loads(res.stdout)
+        by_name = {c["check"]: c for c in rep["checks"]}
+        assert by_name["three_way_capability_parity"]["status"] == "fail"
+    finally:
+        ctx["cleanup"]()
+
+    # Verify COMPOSE_FILE chain + --project-directory propagation when valid and fail-closed when missing
+    ctx_cf = _setup_isolated_env(tmp_path / "compose_chain", budgets=_make_valid_budgets_dict())
+    try:
+        custom_a = ctx_cf["repo"] / "compose.custom.yml"
+        custom_a.write_text("services: {}\n", encoding="utf-8")
+        with (ctx_cf["repo"] / ".env").open("a", encoding="utf-8") as fh:
+            fh.write("COMPOSE_FILE=compose.custom.yml:docker-compose.dalton.yml\n")
+
+        args_log = tmp_path / "compose_args.json"
+        docker_bin = Path(ctx_cf["env"]["DOCKER_BIN"])
+        compose_payload = {
+            "services": {
+                "backend": {
+                    "environment": {
+                        "APP_ENV": "dalton",
+                        "DALTON_PROFILE": "everflow",
+                        "DALTON_HOST_PLATFORM": "macos",
+                        "DALTON_ENABLED": "true",
+                    }
+                }
+            }
+        }
+        _write_exec(
+            docker_bin,
+            f"""#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+Path({str(args_log)!r}).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+print(json.dumps({compose_payload!r}))
+""",
+        )
+        res_ok = _run_preflight_cli(ctx_cf, "--switch")
+        assert res_ok.returncode == 0, res_ok.stdout + res_ok.stderr
+        argv = json.loads(args_log.read_text(encoding="utf-8"))
+        assert "--project-directory" in argv
+        assert str(ctx_cf["repo"]) in argv
+        assert str(custom_a) in argv
+
+        # Missing explicit COMPOSE_FILE entry -> fail closed
+        custom_a.unlink()
+        res_miss = _run_preflight_cli(ctx_cf, "--switch", "--report-json")
+        assert res_miss.returncode != 0
+        rep_m = json.loads(res_miss.stdout)
+        by_name_m = {c["check"]: c for c in rep_m["checks"]}
+        assert by_name_m["three_way_capability_parity"]["status"] == "fail"
+        assert "COMPOSE_FILE" in by_name_m["three_way_capability_parity"]["detail"]
+    finally:
+        ctx_cf["cleanup"]()
+
+
+def test_preflight_switch_warns_on_unreadable_plist_and_missing_pid_and_handles_spaces_in_ps(
+    tmp_path: Path,
+) -> None:
+    # 1. Corrupt extra plist -> env_override_scan reports warn (not silent ok)
+    ctx_p = _setup_isolated_env(tmp_path / "corrupt_plist", budgets=_make_valid_budgets_dict())
+    try:
+        (ctx_p["plist_dir"] / "com.dalton.broken-extra.plist").write_text("<not valid plist", encoding="utf-8")
+        res_p = _run_preflight_cli(ctx_p, "--switch", "--report-json")
+        assert res_p.returncode == 0, res_p.stdout + res_p.stderr
+        by_name = {c["check"]: c for c in json.loads(res_p.stdout)["checks"]}
+        assert by_name["env_override_scan"]["status"] == "warn"
+        assert "com.dalton.broken-extra.plist" in by_name["env_override_scan"]["detail"]
+    finally:
+        ctx_p["cleanup"]()
+
+    # 2. Missing bridge PID in launchctl -> env_override_scan reports warn
+    ctx_pid = _setup_isolated_env(
+        tmp_path / "missing_bridge_pid",
+        budgets=_make_valid_budgets_dict(),
+        bridge_pid=None,
+    )
+    try:
+        res_pid = _run_preflight_cli(ctx_pid, "--switch", "--report-json")
+        assert res_pid.returncode == 0, res_pid.stdout + res_pid.stderr
+        by_name = {c["check"]: c for c in json.loads(res_pid.stdout)["checks"]}
+        assert by_name["env_override_scan"]["status"] == "warn"
+        assert "com.dalton.researchdata-bridge" in by_name["env_override_scan"]["detail"]
+    finally:
+        ctx_pid["cleanup"]()
+
+    # 3. _extract_proc_env_vars preserves paths with spaces
+    spaced_path = "/Users/example/Library/Application Support/Everflow/researchdata-bridge.env"
+    ps_line = (
+        "  PID TT STAT TIME COMMAND\n"
+        f" 5151 ?? S 0:01 /opt/py researchdata_bridge.py HOME=/Users/example "
+        f"DALTON_BRIDGE_ENV_FILE={spaced_path} PATH=/usr/bin:/bin\n"
+    )
+    extracted = preflight._extract_proc_env_vars(ps_line, {"DALTON_BRIDGE_ENV_FILE"})
+    assert extracted["DALTON_BRIDGE_ENV_FILE"] == spaced_path
+
+
+def test_preflight_uses_real_proxy_loading_order_source_overrides_plist(tmp_path: Path) -> None:
+    ctx = _setup_isolated_env(tmp_path, budgets=_make_valid_budgets_dict())
+    try:
+        # Plist has canonical paths, but guidepoint_mcp.env (sourced AFTER plist) overrides tokens & ownership!
+        other_tokens = tmp_path / "sourced_other_tokens.json"
+        other_tokens.write_text(ctx["tokens_file"].read_text(encoding="utf-8"), encoding="utf-8")
+        with ctx["gp_env"].open("a", encoding="utf-8") as fh:
+            fh.write(f"GUIDEPOINT_TOKENS_FILE={other_tokens}\n")
+
+        res_a = _run_preflight_cli(ctx, "--stage-a", "--report-json")
+        assert res_a.returncode != 0
+        by_a = {c["check"]: c for c in json.loads(res_a.stdout)["checks"]}
+        assert by_a["guidepoint_tokens_json"]["status"] == "fail"
+        assert "mismatch" in by_a["guidepoint_tokens_json"]["detail"]
+
+        res_s = _run_preflight_cli(ctx, "--switch", "--report-json")
+        assert res_s.returncode != 0
+        by_s = {c["check"]: c for c in json.loads(res_s.stdout)["checks"]}
+        assert by_s["two_sided_guidepoint_paths"]["status"] == "fail"
+        assert "tokens path mismatch" in by_s["two_sided_guidepoint_paths"]["detail"]
+    finally:
+        ctx["cleanup"]()
+
+    # Also check ownership override inside sourced guidepoint_mcp.env
+    ctx2 = _setup_isolated_env(tmp_path / "own_override", budgets=_make_valid_budgets_dict())
+    try:
+        other_own = tmp_path / "other-journal.json"
+        with ctx2["gp_env"].open("a", encoding="utf-8") as fh:
+            fh.write(f"DALTON_GUIDEPOINT_OWNERSHIP_FILE={other_own}\n")
+        res_s2 = _run_preflight_cli(ctx2, "--switch", "--report-json")
+        assert res_s2.returncode != 0
+        by_s2 = {c["check"]: c for c in json.loads(res_s2.stdout)["checks"]}
+        assert by_s2["two_sided_guidepoint_paths"]["status"] == "fail"
+        assert "handoff-journal path mismatch" in by_s2["two_sided_guidepoint_paths"]["detail"]
+    finally:
+        ctx2["cleanup"]()
+
+
+def test_preflight_rejects_research_host_startup_args_drift(tmp_path: Path) -> None:
+    ctx = _setup_isolated_env(tmp_path, budgets=_make_valid_budgets_dict())
+    try:
+        hp = ctx["plist_dir"] / "com.dalton.research-host.plist"
+        data = plistlib.loads(hp.read_bytes())
+        alt_env = tmp_path / "alt-research-host.env"
+        alt_env.write_text("DALTON_RESEARCH_HOST_TOKEN=x\n", encoding="utf-8")
+        idx = data["ProgramArguments"].index("--env-file")
+        data["ProgramArguments"][idx + 1] = str(alt_env)
+        hp.write_bytes(plistlib.dumps(data))
+
+        res = _run_preflight_cli(ctx, "--stage-a", "--report-json")
+        assert res.returncode != 0
+        by_name = {c["check"]: c for c in json.loads(res.stdout)["checks"]}
+        assert by_name["stage_a_plists"]["status"] == "fail"
+        assert "--env-file" in by_name["stage_a_plists"]["detail"]
+    finally:
+        ctx["cleanup"]()
+
+
+def test_render_stage_a_plists_reconciles_live_legacy_proxy_paths_and_rejects_conflicts(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path.resolve()
+    repo = base / "repo"
+    home = base / "home"
+    out_dir = base / "out"
+    (repo / ".venv" / "bin").mkdir(parents=True)
+    real_py = VENV_PYTHON if VENV_PYTHON.is_file() else Path(sys.executable)
+    (repo / ".venv" / "bin" / "python").symlink_to(real_py)
+    (repo / "scripts" / "dalton" / "launchd").mkdir(parents=True)
+    for tpl_name in (
+        "com.dalton.guidepoint-mcp-proxy.plist.template",
+        "com.dalton.researchdata-bridge.plist.template",
+        "com.dalton.research-host.plist.template",
+    ):
+        (repo / "scripts" / "dalton" / "launchd" / tpl_name).write_bytes(
+            (LAUNCHD_DIR / tpl_name).read_bytes()
+        )
+
+    cfg_dir = home / ".config" / "dalton"
+    cfg_dir.mkdir(parents=True)
+    bridge_env = cfg_dir / "researchdata-bridge.env"
+    bridge_env.write_text("DALTON_BRIDGE_PORT=8960\n", encoding="utf-8")
+    host_env = cfg_dir / "research-host.env"
+    host_env.write_text("DALTON_RESEARCH_HOST_TOKEN=t1\n", encoding="utf-8")
+
+    # Existing live legacy proxy points to a custom guidepoint_mcp.env that overrides GUIDEPOINT_TOKENS_FILE
+    live_gp_dir = base / "live_gp"
+    live_gp_dir.mkdir()
+    live_tokens = live_gp_dir / "actual_live_tokens.json"
+    live_gp_env = live_gp_dir / "guidepoint_mcp.env"
+    live_gp_env.write_text(f"GUIDEPOINT_TOKENS_FILE={live_tokens}\n", encoding="utf-8")
+
+    live_proxy_plist = home / "Library" / "LaunchAgents" / "com.dalton.guidepoint-mcp-proxy.plist"
+    live_proxy_plist.parent.mkdir(parents=True)
+    live_proxy_plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "com.dalton.guidepoint-mcp-proxy",
+                "EnvironmentVariables": {
+                    "GUIDEPOINT_ENV_FILE": str(live_gp_env),
+                    "GUIDEPOINT_TOKENS_FILE": str(base / "stale_plist_tokens.json"),
+                },
+            }
+        )
+    )
+
+    # Stage A render reconciles BOTH plists to live_tokens (from sourced guidepoint_mcp.env)
+    bse.render_stage_a_plists_atomic(
+        output_dir=out_dir,
+        repo_root=repo,
+        home_dir=home,
+        bridge_env_path=bridge_env,
+        research_host_env_path=host_env,
+        existing_proxy_plist_path=live_proxy_plist,
+    )
+    rh = plistlib.loads((out_dir / "com.dalton.research-host.plist").read_bytes())
+    gp = plistlib.loads((out_dir / "com.dalton.guidepoint-mcp-proxy.plist").read_bytes())
+    assert rh["EnvironmentVariables"]["GUIDEPOINT_TOKENS_FILE"] == str(live_tokens)
+    assert gp["EnvironmentVariables"]["GUIDEPOINT_TOKENS_FILE"] == str(live_tokens)
+
+    # Conflict 1: research-host.env explicitly sets a DIFFERENT GUIDEPOINT_TOKENS_FILE -> rejected
+    host_env.write_text(
+        f"DALTON_RESEARCH_HOST_TOKEN=t1\nGUIDEPOINT_TOKENS_FILE={base / 'conflicting_host_tokens.json'}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(bse.EnvFileValidationError, match="conflicts with live legacy proxy"):
+        bse.render_stage_a_plists_atomic(
+            output_dir=base / "out_conflict1",
+            repo_root=repo,
+            home_dir=home,
+            bridge_env_path=bridge_env,
+            research_host_env_path=host_env,
+            existing_proxy_plist_path=live_proxy_plist,
+        )
+
+    # Conflict 2: sourced guidepoint_mcp.env overrides DALTON_GUIDEPOINT_OWNERSHIP_FILE -> rejected
+    host_env.write_text("DALTON_RESEARCH_HOST_TOKEN=t1\n", encoding="utf-8")
+    live_gp_env.write_text(
+        f"GUIDEPOINT_TOKENS_FILE={live_tokens}\nDALTON_GUIDEPOINT_OWNERSHIP_FILE={base / 'wrong_own.json'}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(bse.EnvFileValidationError, match="overrides ownership file"):
+        bse.render_stage_a_plists_atomic(
+            output_dir=base / "out_conflict2",
+            repo_root=repo,
+            home_dir=home,
+            bridge_env_path=bridge_env,
+            research_host_env_path=host_env,
+            existing_proxy_plist_path=live_proxy_plist,
+        )
+
+
+def test_render_stage_a_plists_writes_only_inside_output_dir_and_is_all_or_nothing(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path.resolve()
+    repo = base / "repo"
+    home = base / "home"
+    out_dir = base / "out"
+    nonexistent_logs_dir = base / "outside_logs_must_not_be_created"
+    (repo / ".venv" / "bin").mkdir(parents=True)
+    real_py = VENV_PYTHON if VENV_PYTHON.is_file() else Path(sys.executable)
+    (repo / ".venv" / "bin" / "python").symlink_to(real_py)
+    (repo / "scripts" / "dalton" / "launchd").mkdir(parents=True)
+    for tpl_name in (
+        "com.dalton.guidepoint-mcp-proxy.plist.template",
+        "com.dalton.researchdata-bridge.plist.template",
+        "com.dalton.research-host.plist.template",
+    ):
+        (repo / "scripts" / "dalton" / "launchd" / tpl_name).write_bytes(
+            (LAUNCHD_DIR / tpl_name).read_bytes()
+        )
+    cfg_dir = home / ".config" / "dalton"
+    cfg_dir.mkdir(parents=True)
+    bridge_env = cfg_dir / "researchdata-bridge.env"
+    bridge_env.write_text("DALTON_BRIDGE_PORT=8960\n", encoding="utf-8")
+    host_env = cfg_dir / "research-host.env"
+    host_env.write_text("DALTON_RESEARCH_HOST_TOKEN=t1\n", encoding="utf-8")
+
+    # 1. Valid render does NOT create logs_dir outside output_dir
+    bse.render_stage_a_plists_atomic(
+        output_dir=out_dir,
+        repo_root=repo,
+        home_dir=home,
+        bridge_env_path=bridge_env,
+        research_host_env_path=host_env,
+        logs_dir=nonexistent_logs_dir,
+    )
+    assert not nonexistent_logs_dir.exists()
+    assert len(list(out_dir.iterdir())) == 3
+
+    # 2. Failure on 3rd template leaves a fresh output_dir with ZERO published plists
+    out_fail = base / "out_fail"
+    (repo / "scripts" / "dalton" / "launchd" / "com.dalton.guidepoint-mcp-proxy.plist.template").write_text(
+        "<plist><broken>__UNKNOWN_PLACEHOLDER__</plist>", encoding="utf-8"
+    )
+    with pytest.raises(bse.EnvFileValidationError):
+        bse.render_stage_a_plists_atomic(
+            output_dir=out_fail,
+            repo_root=repo,
+            home_dir=home,
+            bridge_env_path=bridge_env,
+            research_host_env_path=host_env,
+            logs_dir=nonexistent_logs_dir,
+        )
+    assert list(out_fail.iterdir()) == []
+    assert not nonexistent_logs_dir.exists()
+
+    # 3. host_services_switch.sh delegates rendering to unified bridge_subprocess_env.py
+    hss_text = HOST_SERVICES_SWITCH_SH.read_text(encoding="utf-8")
+    assert "render-host-service-plist" in hss_text
+    assert 'with open(out_path, "w"' not in hss_text
+
+
+def test_persist_recovery_bin_atomic_symlink_swap_and_failure_preserves_previous(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "scripts" / "dalton" / "ops" / "prod").mkdir(parents=True)
+    (repo / "scripts" / "dalton" / "research_runtime").mkdir(parents=True)
+    for f in ("switch_research_host.sh", "_research_host_handoff_lib.sh", "wait_backend_idle.sh", "preflight.py"):
+        (repo / "scripts" / "dalton" / "ops" / "prod" / f).write_bytes((PROD_OPS / f).read_bytes())
+    (repo / "scripts" / "dalton" / "research_runtime" / "guidepoint_lock.py").write_bytes(
+        (SCRIPTS_DALTON / "research_runtime" / "guidepoint_lock.py").read_bytes()
+    )
+
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "DALTON_REPO_ROOT": str(repo),
+        "DALTON_PYTHON_BIN": str(VENV_PYTHON if VENV_PYTHON.is_file() else Path(sys.executable)),
+    }
+    rec_link = repo / "var" / "dalton" / "cutover-snapshots" / "recovery-bin"
+
+    # First publish -> symlink to .recovery-bin.rel.*
+    r1 = subprocess.run(
+        ["/bin/bash", "-c", f'set -euo pipefail; source "{HANDOFF_LIB_SH}"; rh_persist_recovery_bin commit_v1'],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert r1.returncode == 0, r1.stderr
+    assert rec_link.is_symlink()
+    target_v1 = os.readlink(rec_link)
+    assert target_v1.startswith(".recovery-bin.rel.")
+    assert json.loads((rec_link / "recovery-manifest.json").read_text(encoding="utf-8"))["source_commit"] == "commit_v1"
+
+    # Second publish -> atomic symlink swap to new sibling release, old release cleaned up
+    r2 = subprocess.run(
+        ["/bin/bash", "-c", f'set -euo pipefail; source "{HANDOFF_LIB_SH}"; rh_persist_recovery_bin commit_v2; rh_verify_recovery_manifest'],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert r2.returncode == 0, r2.stderr
+    assert rec_link.is_symlink()
+    target_v2 = os.readlink(rec_link)
+    assert target_v2 != target_v1
+    assert not (rec_link.parent / target_v1).exists()
+    assert json.loads((rec_link / "recovery-manifest.json").read_text(encoding="utf-8"))["source_commit"] == "commit_v2"
+
+    # Publish failure when existing symlink is present (missing source file) -> previous v2 preserved intact
+    saved_gp = (repo / "scripts" / "dalton" / "research_runtime" / "guidepoint_lock.py").read_bytes()
+    (repo / "scripts" / "dalton" / "research_runtime" / "guidepoint_lock.py").unlink()
+    r_fail = subprocess.run(
+        ["/bin/bash", "-c", f'set -euo pipefail; source "{HANDOFF_LIB_SH}"; rh_persist_recovery_bin commit_v3'],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert r_fail.returncode != 0
+    assert rec_link.is_symlink() and os.readlink(rec_link) == target_v2
+    r_ver = subprocess.run(
+        ["/bin/bash", "-c", f'set -euo pipefail; source "{HANDOFF_LIB_SH}"; rh_verify_recovery_manifest'],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert r_ver.returncode == 0, r_ver.stderr
+    (repo / "scripts" / "dalton" / "research_runtime" / "guidepoint_lock.py").write_bytes(saved_gp)
+
+    # Legacy upgrade failure: replace symlink with a real directory and inject failing `mv` -> original dir preserved!
+    old_target_dir = rec_link.parent / target_v2
+    rec_link.unlink()
+    shutil.move(str(old_target_dir), str(rec_link))
+    assert rec_link.is_dir() and not rec_link.is_symlink()
+    fake_mv_dir = tmp_path / "fail_mv_bin"
+    fake_mv_dir.mkdir()
+    _write_exec(fake_mv_dir / "mv", "#!/bin/bash\necho 'simulated mv failure' >&2\nexit 1\n")
+    env_fail_mv = dict(env, PATH=f"{fake_mv_dir}:{env['PATH']}")
+    r_mv_fail = subprocess.run(
+        ["/bin/bash", "-c", f'set -euo pipefail; source "{HANDOFF_LIB_SH}"; rh_persist_recovery_bin commit_v4'],
+        env=env_fail_mv,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert r_mv_fail.returncode != 0
+    assert rec_link.is_dir() and not rec_link.is_symlink()
+    assert json.loads((rec_link / "recovery-manifest.json").read_text(encoding="utf-8"))["source_commit"] == "commit_v2"
+
+
+def test_recovery_manifest_requires_exact_five_files_and_trusted_entry_and_same_batch_import(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "scripts" / "dalton" / "ops" / "prod").mkdir(parents=True)
+    (repo / "scripts" / "dalton" / "research_runtime").mkdir(parents=True)
+    for f in ("switch_research_host.sh", "_research_host_handoff_lib.sh", "wait_backend_idle.sh", "preflight.py"):
+        (repo / "scripts" / "dalton" / "ops" / "prod" / f).write_bytes((PROD_OPS / f).read_bytes())
+    (repo / "scripts" / "dalton" / "research_runtime" / "guidepoint_lock.py").write_bytes(
+        (SCRIPTS_DALTON / "research_runtime" / "guidepoint_lock.py").read_bytes()
+    )
+
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "DALTON_REPO_ROOT": str(repo),
+        "DALTON_PYTHON_BIN": str(VENV_PYTHON if VENV_PYTHON.is_file() else Path(sys.executable)),
+    }
+    r_pub = subprocess.run(
+        ["/bin/bash", "-c", f'set -euo pipefail; source "{HANDOFF_LIB_SH}"; rh_persist_recovery_bin'],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert r_pub.returncode == 0, r_pub.stderr
+    rec_dir = repo / "var" / "dalton" / "cutover-snapshots" / "recovery-bin"
+
+    # 1. Same-batch guidepoint_lock import: break worktree's guidepoint_lock.py; recovery-bin/preflight.py must import its sibling copy!
+    (repo / "scripts" / "dalton" / "research_runtime" / "guidepoint_lock.py").write_text(
+        "raise RuntimeError('OLD WORKTREE COPY MUST NOT BE IMPORTED')\n", encoding="utf-8"
+    )
+    j_path = repo / "var" / "dalton" / "cutover-snapshots" / "research-host" / "handoff-journal.json"
+    r_same_batch = subprocess.run(
+        [
+            env["DALTON_PYTHON_BIN"],
+            "-B",
+            str(rec_dir / "preflight.py"),
+            "journal-set",
+            "--repo",
+            str(repo),
+            "--ownership-file",
+            str(j_path),
+            "operation=recover",
+            "completed=false",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert r_same_batch.returncode == 0, r_same_batch.stderr
+    assert json.loads(j_path.read_text(encoding="utf-8"))["operation"] == "recover"
+
+    # 2. Tamper recovery-bin/preflight.py to always exit 0 -> trusted rh_verify_recovery_manifest MUST STILL FAIL!
+    saved_pf = (rec_dir / "preflight.py").read_bytes()
+    (rec_dir / "preflight.py").write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n", encoding="utf-8")
+    r_rogue = subprocess.run(
+        ["/bin/bash", "-c", f'set -euo pipefail; source "{HANDOFF_LIB_SH}"; rh_verify_recovery_manifest'],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert r_rogue.returncode != 0
+    assert "preflight.py" in r_rogue.stderr
+    (rec_dir / "preflight.py").write_bytes(saved_pf)
+
+    # 3. Delete one required file AND remove its entry from recovery-manifest.json -> MUST FAIL!
+    (rec_dir / "wait_backend_idle.sh").unlink()
+    m_path = rec_dir / "recovery-manifest.json"
+    manifest = json.loads(m_path.read_text(encoding="utf-8"))
+    del manifest["files"]["wait_backend_idle.sh"]
+    m_path.write_text(json.dumps(manifest), encoding="utf-8")
+    r_drop = subprocess.run(
+        ["/bin/bash", "-c", f'set -euo pipefail; source "{HANDOFF_LIB_SH}"; rh_verify_recovery_manifest'],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert r_drop.returncode != 0
+    assert "missing required file entry" in r_drop.stderr
+
+
+def test_ops_lock_cannot_be_spoofed_by_flags_and_direct_approve_budgets_acquires_lock(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    adm_file = repo / "var" / "dalton" / "maintenance-admission.json"
+    cutover_dir = repo / "var" / "dalton" / "cutover-snapshots" / "research-host"
+    j_file = cutover_dir / "handoff-journal.json"
+    b_file = cutover_dir / "timing-budgets.env"
+    lock_file = cutover_dir / ".ops.lock"
+    adm_file.parent.mkdir(parents=True, exist_ok=True)
+    cutover_dir.mkdir(parents=True, exist_ok=True)
+
+    adm_file.write_text(json.dumps({"paused": True, "allow_workspace_ids": []}), encoding="utf-8")
+    j_file.write_text(json.dumps({"completed": False}), encoding="utf-8")
+    py_bin = str(VENV_PYTHON if VENV_PYTHON.is_file() else Path(sys.executable))
+
+    # 1. Direct preflight.py guard-check --lock-held 1 WITHOUT holding flock -> DENIED!
+    r_spoof = subprocess.run(
+        [
+            py_bin,
+            "-B",
+            str(PREFLIGHT_PY),
+            "guard-check",
+            "--action",
+            "set_target_owner",
+            "--admission-file",
+            str(adm_file),
+            "--journal-file",
+            str(j_file),
+            "--lock-file",
+            str(lock_file),
+            "--lock-held",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert r_spoof.returncode != 0
+    assert ".ops.lock" in r_spoof.stderr
+
+    # 2. Direct preflight.py approve-budgets while another process holds .ops.lock -> DENIED & file untouched!
+    j_file.write_text(json.dumps({"completed": True}), encoding="utf-8")
+    b_dict = _make_valid_budgets_dict(
+        forward_budget_s=60,
+        recovery_budget_s=45,
+        handoff_deadline_s=90,
+        approval_required="true",
+    )
+    b_file.write_text(preflight.format_timing_budgets_env(b_dict), encoding="utf-8")
+    before_bytes = b_file.read_bytes()
+
+    ready_file = tmp_path / "lock_ready"
+    release_file = tmp_path / "lock_release"
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "DALTON_REPO_ROOT": str(repo),
+        "DALTON_PYTHON_BIN": py_bin,
+    }
+    holder_script = f"""
+set -euo pipefail
+source "{HANDOFF_LIB_SH}"
+rh_acquire_ops_lock "contender_holder"
+touch "{ready_file}"
+while [ ! -f "{release_file}" ]; do sleep 0.05; done
+rh_release_ops_lock
+echo "stderr_after_release_ok" >&2
+"""
+    p_hold = subprocess.Popen(
+        ["/bin/bash", "-c", holder_script],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        while not ready_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready_file.exists()
+
+        # Direct approve-budgets must fail on busy lock
+        r_busy = subprocess.run(
+            [
+                py_bin,
+                "-B",
+                str(PREFLIGHT_PY),
+                "approve-budgets",
+                "--budgets-file",
+                str(b_file),
+                "--journal-file",
+                str(j_file),
+                "--lock-file",
+                str(lock_file),
+                "--handoff-deadline-s",
+                "120",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert r_busy.returncode != 0
+        assert "contender_holder" in r_busy.stderr
+        assert b_file.read_bytes() == before_bytes
+
+        # Spoofed shell flags RH_OPS_LOCK_HELD=1 + PID=$$ must NOT fool rh_acquire_ops_lock
+        r_flag_spoof = subprocess.run(
+            [
+                "/bin/bash",
+                "-c",
+                f'set -euo pipefail; source "{HANDOFF_LIB_SH}"; RH_OPS_LOCK_HELD=1; DALTON_OPS_LOCK_OWNER_PID="$$"; rh_acquire_ops_lock "spoof"',
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert r_flag_spoof.returncode != 0
+
+        release_file.touch()
+        _, hold_err = p_hold.communicate(timeout=5)
+        assert p_hold.returncode == 0
+        # Verify rh_release_ops_lock did NOT break caller stderr
+        assert "stderr_after_release_ok" in hold_err
+    finally:
+        release_file.touch()
+        p_hold.wait(timeout=5)
+
+
+def test_corrupt_journal_fails_closed_and_never_overwritten(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    cutover_dir = repo / "var" / "dalton" / "cutover-snapshots" / "research-host"
+    cutover_dir.mkdir(parents=True)
+    j_file = cutover_dir / "handoff-journal.json"
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "DALTON_REPO_ROOT": str(repo),
+        "DALTON_PYTHON_BIN": str(VENV_PYTHON if VENV_PYTHON.is_file() else Path(sys.executable)),
+    }
+
+    for bad_content in (b"{broken json", b'["not", "an", "object"]\n'):
+        j_file.write_bytes(bad_content)
+        r_chk = subprocess.run(
+            ["/bin/bash", "-c", f'set -euo pipefail; source "{HANDOFF_LIB_SH}"; rh_require_no_incomplete_journal'],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert r_chk.returncode != 0
+        assert j_file.read_bytes() == bad_content
+
+        r_set = subprocess.run(
+            ["/bin/bash", "-c", f'set -euo pipefail; source "{HANDOFF_LIB_SH}"; rh_journal_set phase=new_phase'],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert r_set.returncode != 0
+        assert j_file.read_bytes() == bad_content
+
+
+def test_approve_budgets_requires_completed_journal_and_rejects_dry_run(tmp_path: Path) -> None:
+    b_dict = _make_valid_budgets_dict(
+        forward_budget_s=60,
+        recovery_budget_s=45,
+        handoff_deadline_s=90,
+        approval_required="true",
+    )
+    ctx = _setup_isolated_env(tmp_path, budgets=b_dict)
+    try:
+        before_bytes = ctx["budgets_file"].read_bytes()
+        j_file = ctx["cutover_dir"] / "handoff-journal.json"
+
+        # 1. --approve-budgets --dry-run -> exit 2 immediately without writing
+        r_dry = subprocess.run(
+            ["/bin/bash", str(SWITCH_SH), "--approve-budgets", "--dry-run", "--handoff-deadline-s", "120"],
+            env=ctx["env"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert r_dry.returncode == 2
+        assert "--dry-run" in r_dry.stderr
+        assert ctx["budgets_file"].read_bytes() == before_bytes
+
+        # 2. Missing handoff-journal.json -> refused
+        assert not j_file.exists()
+        r_missing = subprocess.run(
+            ["/bin/bash", str(SWITCH_SH), "--approve-budgets", "--handoff-deadline-s", "120"],
+            env=ctx["env"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert r_missing.returncode != 0
+        assert ctx["budgets_file"].read_bytes() == before_bytes
+
+        # 3. completed == false -> refused
+        j_file.write_text(json.dumps({"operation": "stage_a", "completed": False}), encoding="utf-8")
+        r_inc = subprocess.run(
+            ["/bin/bash", str(SWITCH_SH), "--approve-budgets", "--handoff-deadline-s", "120"],
+            env=ctx["env"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert r_inc.returncode != 0
+        assert ctx["budgets_file"].read_bytes() == before_bytes
+
+        # 4. Corrupt journal -> refused
+        j_file.write_text("{corrupt", encoding="utf-8")
+        r_corrupt = subprocess.run(
+            ["/bin/bash", str(SWITCH_SH), "--approve-budgets", "--handoff-deadline-s", "120"],
+            env=ctx["env"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert r_corrupt.returncode != 0
+        assert ctx["budgets_file"].read_bytes() == before_bytes
+    finally:
+        ctx["cleanup"]()
+
+
+def test_preflight_readonly_writes_no_pycache_uses_only_plist_paths_and_survives_malformed_inputs(
+    tmp_path: Path,
+) -> None:
+    ctx = _setup_isolated_env(tmp_path / "base", budgets=_make_valid_budgets_dict())
+    try:
+        # 1. Replace symlinked research_runtime with a fresh writable copy and verify ZERO __pycache__ created
+        rr_link = ctx["repo"] / "scripts" / "dalton" / "research_runtime"
+        rr_link.unlink()
+        rr_copy = ctx["repo"] / "scripts" / "dalton" / "research_runtime"
+        rr_copy.mkdir(parents=True)
+        (rr_copy / "guidepoint_lock.py").write_bytes(
+            (SCRIPTS_DALTON / "research_runtime" / "guidepoint_lock.py").read_bytes()
+        )
+        (rr_copy / "host_connectors").mkdir()
+        (rr_copy / "host_connectors" / "__init__.py").write_text("EXTRA_HOST_ENV_KEYS = frozenset()\n", encoding="utf-8")
+        res_ro = _run_preflight_cli(ctx, "--stage-a")
+        assert res_ro.returncode == 0, res_ro.stdout + res_ro.stderr
+        assert list(rr_copy.rglob("__pycache__")) == []
+        assert list(rr_copy.rglob("*.pyc")) == []
+
+        # 2. Removing DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH from plist MUST fail venv_python_imports
+        hp = ctx["plist_dir"] / "com.dalton.research-host.plist"
+        hdata = plistlib.loads(hp.read_bytes())
+        del hdata["EnvironmentVariables"]["DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH"]
+        hp.write_bytes(plistlib.dumps(hdata))
+        res_no_extra = _run_preflight_cli(ctx, "--stage-a", "--report-json")
+        assert res_no_extra.returncode != 0
+        by_name = {c["check"]: c for c in json.loads(res_no_extra.stdout)["checks"]}
+        assert by_name["venv_python_imports"]["status"] == "fail"
+        assert "DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH" in by_name["venv_python_imports"]["detail"]
+
+        # 3. Malformed string EnvironmentVariables + invalid DALTON_PROFILE must NOT crash --report-json
+        hdata["EnvironmentVariables"] = "corrupt_string_env"
+        hp.write_bytes(plistlib.dumps(hdata))
+        (ctx["repo"] / ".env").write_text(
+            "APP_ENV=dalton\nDALTON_PROFILE=invalid_profile_xyz\nINTERNAL_SERVICE_TOKEN=svc_test_token_alpha\n",
+            encoding="utf-8",
+        )
+        for mode_flag, expected_count in (("--stage-a", 7), ("--switch", 9)):
+            res_rep = _run_preflight_cli(ctx, mode_flag, "--report-json")
+            assert res_rep.returncode != 0
+            parsed = json.loads(res_rep.stdout)
+            assert parsed["ok"] is False
+            assert len(parsed["checks"]) == expected_count
+    finally:
+        ctx["cleanup"]()
+
+
+def test_install_bridge_propagates_repo_env_and_ownership_and_fails_before_writes_when_venv_missing(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path.resolve()
+    repo = base / "repo"
+    home = base / "home"
+    la_dir = home / "Library" / "LaunchAgents"
+    logs_dir = base / "logs"
+    fake_bin = base / "fakebin"
+    for d in (repo / "scripts" / "dalton" / "launchd", home / ".config" / "dalton", la_dir, fake_bin):
+        d.mkdir(parents=True, exist_ok=True)
+    (repo / "scripts" / "dalton" / "launchd" / "com.dalton.researchdata-bridge.plist.template").write_bytes(
+        (LAUNCHD_DIR / "com.dalton.researchdata-bridge.plist.template").read_bytes()
+    )
+
+    custom_repo_env = base / "custom-repo.env"
+    custom_bridge_env = base / "custom-bridge.env"
+    custom_ownership = base / "custom-handoff-journal.json"
+    custom_repo_env.write_text("DALTON_PROFILE=everflow\n", encoding="utf-8")
+    custom_bridge_env.write_text("DALTON_BRIDGE_PORT=8960\n", encoding="utf-8")
+    before_repo = custom_repo_env.read_bytes()
+    before_bridge = custom_bridge_env.read_bytes()
+
+    fake_launchctl = _write_exec(fake_bin / "launchctl", "#!/bin/bash\nexit 0\n")
+    fake_curl = _write_exec(fake_bin / "curl", '#!/bin/bash\necho \'{"ok":true}\'\nexit 0\n')
+    real_py = VENV_PYTHON if VENV_PYTHON.is_file() else Path(sys.executable)
+
+    base_env = {
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+        "HOME": str(home),
+        "DALTON_REPO_ROOT": str(repo),
+        "DALTON_REPO_ENV_FILE": str(custom_repo_env),
+        "DALTON_BRIDGE_ENV_FILE": str(custom_bridge_env),
+        "DALTON_GUIDEPOINT_OWNERSHIP_FILE": str(custom_ownership),
+        "DALTON_LAUNCH_AGENTS_DIR": str(la_dir),
+        "DALTON_BRIDGE_LOGS_DIR": str(logs_dir),
+        "DALTON_OCW_PYTHON": str(real_py),
+        "LAUNCHCTL_BIN": str(fake_launchctl),
+        "CURL_BIN": str(fake_curl),
+        "DALTON_BRIDGE_HEALTH_RETRIES": "1",
+        "DALTON_BRIDGE_HEALTH_SLEEP_S": "0",
+    }
+
+    # 1. Missing .venv/bin/python -> fails BEFORE writing bridge.env or repo.env!
+    r_novenv = subprocess.run(
+        ["/bin/bash", str(INSTALL_BRIDGE_SH), "--research-runtime=new"],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert r_novenv.returncode != 0
+    assert "uv sync --frozen" in r_novenv.stderr
+    assert custom_repo_env.read_bytes() == before_repo
+    assert custom_bridge_env.read_bytes() == before_bridge
+    assert not (la_dir / "com.dalton.researchdata-bridge.plist").exists()
+
+    # 2. With .venv/bin/python present -> merges into custom_repo_env AND renders custom repo_env + ownership into plist
+    (repo / ".venv" / "bin").mkdir(parents=True)
+    (repo / ".venv" / "bin" / "python").symlink_to(real_py)
+    r_ok = subprocess.run(
+        ["/bin/bash", str(INSTALL_BRIDGE_SH), "--research-runtime=new"],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert r_ok.returncode == 0, r_ok.stdout + r_ok.stderr
+    plist_data = plistlib.loads((la_dir / "com.dalton.researchdata-bridge.plist").read_bytes())
+    ev = plist_data["EnvironmentVariables"]
+    assert ev["DALTON_REPO_ENV_FILE"] == str(custom_repo_env)
+    assert ev["DALTON_GUIDEPOINT_OWNERSHIP_FILE"] == str(custom_ownership)
+    assert ev["DALTON_BRIDGE_ENV_FILE"] == str(custom_bridge_env)
+    assert "DALTON_BRIDGE_TOKEN=" in custom_repo_env.read_text(encoding="utf-8")
+
+    # 3. Verify research_runtime_migrate.sh forwards the same overrides to install_bridge.sh
+    mig_text = MIGRATE_SH.read_text(encoding="utf-8")
+    assert 'DALTON_REPO_ENV_FILE="${repo_env_file}"' in mig_text
+    assert 'DALTON_GUIDEPOINT_OWNERSHIP_FILE="${ownership_file}"' in mig_text
+
+
+# ---------------------------------------------------------------------------
 # D8: bash -n syntax check on all new/modified shell scripts
 # ---------------------------------------------------------------------------
 
@@ -1757,6 +2845,7 @@ def test_approve_budgets_rejections_leave_original_file_byte_identical(
         SWITCH_SH,
         HOST_SERVICES_SWITCH_SH,
         MIGRATE_SH,
+        INSTALL_BRIDGE_SH,
     ],
 )
 def test_shell_scripts_pass_bash_n(script_path: Path) -> None:

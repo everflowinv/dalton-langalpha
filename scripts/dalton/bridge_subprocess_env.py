@@ -2645,10 +2645,159 @@ def _resolve_abs_without_symlink_deref(path: Path) -> Path:
     return Path(os.path.abspath(str(path.expanduser())))
 
 
-def render_plist_atomic(
+def _parse_simple_dotenv_lenient(path: Path) -> dict[str, str]:
+    """Read KEY=VALUE pairs from a sourced shell env file (e.g. guidepoint_mcp.env)."""
+    result: dict[str, str] = {}
+    if not path.is_file():
+        return result
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except OSError:
+        return result
+    for raw in raw_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        if key:
+            result[key] = val
+    return result
+
+
+def resolve_legacy_proxy_effective_paths(
+    *,
+    repo_root: Path,
+    home_dir: Path,
+    existing_proxy_plist_path: Path | None = None,
+    bridge_env_vals: Mapping[str, str] | None = None,
+    guidepoint_env_path: Path | None = None,
+) -> dict[str, Any]:
+    """Resolve legacy `com.dalton.guidepoint-mcp-proxy` effective paths in real runtime order.
+
+    Actual launcher order (`guidepoint_mcp_proxy_run.sh`):
+      1. Inherit `EnvironmentVariables` from `com.dalton.guidepoint-mcp-proxy.plist`.
+      2. Resolve `RESEARCH_HOME` (`DALTON_RESEARCH_HOME` > `DALTON_OCW_ROOT` > default)
+         and `GUIDEPOINT_ENV_FILE` (`$RESEARCH_HOME/config/guidepoint_mcp.env`).
+      3. `source "$ENV_FILE"` (overrides any keys inherited from the plist).
+    """
+    repo_abs = repo_root.expanduser().resolve()
+    home_abs = home_dir.expanduser().resolve()
+    bvals = dict(bridge_env_vals or {})
+
+    plist_env: dict[str, str] = {}
+    existing_plist_found = False
+    if existing_proxy_plist_path is not None:
+        p = existing_proxy_plist_path.expanduser()
+        if p.is_file():
+            existing_plist_found = True
+            plist_env = _read_plist_env_vars(p)
+
+    eff_env: dict[str, str] = {"HOME": str(home_abs)}
+    eff_env.update(plist_env)
+
+    raw_rh = (
+        str(eff_env.get("DALTON_RESEARCH_HOME") or "").strip()
+        or str(eff_env.get("DALTON_OCW_ROOT") or "").strip()
+        or str(bvals.get("DALTON_RESEARCH_HOME") or "").strip()
+    )
+    research_home_abs = (
+        _resolve_abs_without_symlink_deref(Path(raw_rh))
+        if raw_rh
+        else (home_abs / "Library" / "Application Support" / "Everflow" / "research")
+    )
+
+    if guidepoint_env_path is not None:
+        gp_env_abs = _resolve_abs_without_symlink_deref(guidepoint_env_path)
+    elif str(eff_env.get("GUIDEPOINT_ENV_FILE") or "").strip():
+        gp_env_abs = _resolve_abs_without_symlink_deref(Path(str(eff_env["GUIDEPOINT_ENV_FILE"]).strip()))
+    else:
+        gp_env_abs = research_home_abs / "config" / "guidepoint_mcp.env"
+
+    sourced_vals = _parse_simple_dotenv_lenient(gp_env_abs) if gp_env_abs.is_file() else {}
+    # `source "$ENV_FILE"` overwrites plist variables!
+    eff_env.update(sourced_vals)
+
+    sourced_tokens_raw = (
+        str(sourced_vals.get("GUIDEPOINT_TOKENS_FILE") or "").strip()
+        or str(sourced_vals.get("DALTON_GUIDEPOINT_TOKENS_FILE") or "").strip()
+    )
+    sourced_ownership_raw = (
+        str(sourced_vals.get("DALTON_GUIDEPOINT_OWNERSHIP_FILE") or "").strip()
+        or str(sourced_vals.get("DALTON_HOST_OWNERSHIP_FILE") or "").strip()
+    )
+
+    final_tokens_raw = (
+        str(eff_env.get("GUIDEPOINT_TOKENS_FILE") or "").strip()
+        or str(eff_env.get("DALTON_GUIDEPOINT_TOKENS_FILE") or "").strip()
+    )
+    if final_tokens_raw:
+        tokens_abs = _resolve_abs_without_symlink_deref(Path(final_tokens_raw))
+    else:
+        final_rh_raw = (
+            str(eff_env.get("DALTON_RESEARCH_HOME") or "").strip()
+            or str(eff_env.get("DALTON_OCW_ROOT") or "").strip()
+        )
+        final_rh = (
+            _resolve_abs_without_symlink_deref(Path(final_rh_raw))
+            if final_rh_raw
+            else research_home_abs
+        )
+        tokens_abs = final_rh / "config" / "guidepoint_mcp_tokens.json"
+
+    final_own_raw = (
+        str(eff_env.get("DALTON_GUIDEPOINT_OWNERSHIP_FILE") or "").strip()
+        or str(eff_env.get("DALTON_HOST_OWNERSHIP_FILE") or "").strip()
+    )
+    ownership_abs = (
+        _resolve_abs_without_symlink_deref(Path(final_own_raw))
+        if final_own_raw
+        else (repo_abs / _DEFAULT_OWNERSHIP_REL_PATH)
+    )
+
+    return {
+        "existing_plist_found": existing_plist_found,
+        "env_file_exists": gp_env_abs.is_file(),
+        "research_home": str(research_home_abs),
+        "guidepoint_env_file": str(gp_env_abs),
+        "tokens_file": str(tokens_abs),
+        "ownership_file": str(ownership_abs),
+        "env_file_tokens_override": (
+            str(_resolve_abs_without_symlink_deref(Path(sourced_tokens_raw)))
+            if sourced_tokens_raw
+            else ""
+        ),
+        "env_file_ownership_override": (
+            str(_resolve_abs_without_symlink_deref(Path(sourced_ownership_raw)))
+            if sourced_ownership_raw
+            else ""
+        ),
+        "plist_tokens_override": (
+            str(
+                _resolve_abs_without_symlink_deref(
+                    Path(
+                        str(plist_env.get("GUIDEPOINT_TOKENS_FILE") or "").strip()
+                        or str(plist_env.get("DALTON_GUIDEPOINT_TOKENS_FILE") or "").strip()
+                    )
+                )
+            )
+            if (
+                str(plist_env.get("GUIDEPOINT_TOKENS_FILE") or "").strip()
+                or str(plist_env.get("DALTON_GUIDEPOINT_TOKENS_FILE") or "").strip()
+            )
+            else ""
+        ),
+    }
+
+
+def _build_bridge_plist_xml(
     *,
     template_path: Path,
-    dest_path: Path,
     bridge_env_path: Path,
     repo_root: Path,
     home_dir: Path,
@@ -2656,13 +2805,11 @@ def render_plist_atomic(
     repo_env_path: Path | None = None,
     ownership_file_path: Path | None = None,
     research_runtime: str = "new",
-) -> int:
-    """Render bridge launchd plist atomically (`0644`) using `<repo>/.venv/bin/python`."""
+) -> tuple[str, int, Path]:
     if research_runtime not in ("auto", "new"):
         raise ValueError(f"unsupported research_runtime mode: {research_runtime!r}")
     validate_safe_regular_file_target(bridge_env_path, allow_missing=False)
     validate_safe_regular_file_target(template_path, allow_missing=False)
-    validate_safe_regular_file_target(dest_path, allow_missing=True)
     _, bridge_vals = parse_env_file_strict(bridge_env_path)
 
     repo_abs = repo_root.expanduser().resolve()
@@ -2700,9 +2847,6 @@ def render_plist_atomic(
         if logs_dir is not None
         else (home_abs / "Library" / "Logs")
     )
-    validate_safe_directory_target(eff_logs)
-    eff_logs.mkdir(parents=True, exist_ok=True)
-    validate_safe_directory_target(eff_logs)
 
     rendered = (
         tpl.replace(
@@ -2720,14 +2864,45 @@ def render_plist_atomic(
     )
 
     _validate_rendered_plist(rendered, template_path=template_path)
+    return rendered, port_int, eff_logs
+
+
+def render_plist_atomic(
+    *,
+    template_path: Path,
+    dest_path: Path,
+    bridge_env_path: Path,
+    repo_root: Path,
+    home_dir: Path,
+    logs_dir: Path | None = None,
+    repo_env_path: Path | None = None,
+    ownership_file_path: Path | None = None,
+    research_runtime: str = "new",
+    create_logs_dir: bool = True,
+) -> int:
+    """Render bridge launchd plist atomically (`0644` + fsync) using `<repo>/.venv/bin/python`."""
+    validate_safe_regular_file_target(dest_path, allow_missing=True)
+    rendered, port_int, eff_logs = _build_bridge_plist_xml(
+        template_path=template_path,
+        bridge_env_path=bridge_env_path,
+        repo_root=repo_root,
+        home_dir=home_dir,
+        logs_dir=logs_dir,
+        repo_env_path=repo_env_path,
+        ownership_file_path=ownership_file_path,
+        research_runtime=research_runtime,
+    )
+    if create_logs_dir:
+        validate_safe_directory_target(eff_logs)
+        eff_logs.mkdir(parents=True, exist_ok=True)
+        validate_safe_directory_target(eff_logs)
     atomic_write_text(dest_path, rendered, mode=0o644)
     return port_int
 
 
-def render_research_host_plist_atomic(
+def _build_research_host_plist_xml(
     *,
     template_path: Path,
-    dest_path: Path,
     repo_root: Path,
     home_dir: Path,
     research_host_env_path: Path | None = None,
@@ -2737,10 +2912,8 @@ def render_research_host_plist_atomic(
     research_home: Path | str | None = None,
     ownership_file_path: Path | None = None,
     tokens_file_path: Path | None = None,
-) -> dict[str, str]:
-    """Render `com.dalton.research-host.plist` atomically (`0644`) with literal absolute paths."""
+) -> tuple[str, dict[str, str], Path]:
     validate_safe_regular_file_target(template_path, allow_missing=False)
-    validate_safe_regular_file_target(dest_path, allow_missing=True)
 
     repo_abs = repo_root.expanduser().resolve()
     home_abs = home_dir.expanduser().resolve()
@@ -2800,9 +2973,6 @@ def render_research_host_plist_atomic(
         if logs_dir is not None
         else (home_abs / "Library" / "Logs")
     )
-    validate_safe_directory_target(eff_logs)
-    eff_logs.mkdir(parents=True, exist_ok=True)
-    validate_safe_directory_target(eff_logs)
 
     python_bin = str(_resolve_repo_venv_python(repo_abs))
     tpl = template_path.read_text(encoding="utf-8")
@@ -2820,32 +2990,72 @@ def render_research_host_plist_atomic(
     )
 
     _validate_rendered_plist(rendered, template_path=template_path)
-    atomic_write_text(dest_path, rendered, mode=0o644)
-    return {
-        "dest": str(dest_path),
+    meta = {
         "python_bin": python_bin,
         "ownership_file": str(ownership_abs),
         "tokens_file": str(tokens_abs),
     }
+    return rendered, meta, eff_logs
 
 
-def render_guidepoint_proxy_plist_atomic(
+def render_research_host_plist_atomic(
     *,
     template_path: Path,
     dest_path: Path,
     repo_root: Path,
     home_dir: Path,
-    bridge_env_path: Path | None = None,
+    research_host_env_path: Path | None = None,
+    repo_env_path: Path | None = None,
     logs_dir: Path | None = None,
+    research_code: Path | str | None = None,
     research_home: Path | str | None = None,
+    ownership_file_path: Path | None = None,
+    tokens_file_path: Path | None = None,
+    create_logs_dir: bool = False,
+) -> dict[str, str]:
+    """Render `com.dalton.research-host.plist` atomically (`0644` + fsync) with literal absolute paths."""
+    validate_safe_regular_file_target(dest_path, allow_missing=True)
+    rendered, meta, eff_logs = _build_research_host_plist_xml(
+        template_path=template_path,
+        repo_root=repo_root,
+        home_dir=home_dir,
+        research_host_env_path=research_host_env_path,
+        repo_env_path=repo_env_path,
+        logs_dir=logs_dir,
+        research_code=research_code,
+        research_home=research_home,
+        ownership_file_path=ownership_file_path,
+        tokens_file_path=tokens_file_path,
+    )
+    if create_logs_dir:
+        validate_safe_directory_target(eff_logs)
+        eff_logs.mkdir(parents=True, exist_ok=True)
+        validate_safe_directory_target(eff_logs)
+    atomic_write_text(dest_path, rendered, mode=0o644)
+    return {
+        "dest": str(dest_path),
+        **meta,
+    }
+
+
+def _build_launchd_service_plist_xml(
+    *,
+    template_path: Path,
+    repo_root: Path,
+    home_dir: Path,
+    logs_dir: Path | None = None,
+    runtime_env_key: str = "DALTON_RESEARCH_HOME",
+    runtime_env_val: str | None = None,
+    node_bin: str | None = None,
+    python_bin: Path | str | None = None,
     guidepoint_env_path: Path | None = None,
     tokens_file_path: Path | None = None,
     ownership_file_path: Path | None = None,
-    python_bin: Path | str | None = None,
-) -> dict[str, str]:
-    """Render `com.dalton.guidepoint-mcp-proxy.plist` atomically (`0644`)."""
+    bridge_env_path: Path | None = None,
+    research_home: Path | str | None = None,
+) -> tuple[str, dict[str, str], Path]:
+    """Unified LaunchAgent plist template renderer for host services (including guidepoint-mcp-proxy)."""
     validate_safe_regular_file_target(template_path, allow_missing=False)
-    validate_safe_regular_file_target(dest_path, allow_missing=True)
 
     repo_abs = repo_root.expanduser().resolve()
     home_abs = home_dir.expanduser().resolve()
@@ -2854,15 +3064,17 @@ def render_guidepoint_proxy_plist_atomic(
         validate_safe_regular_file_target(bridge_env_path, allow_missing=False)
         _, bridge_vals = parse_env_file_strict(bridge_env_path)
 
-    eff_research_home = (
-        str(_resolve_abs_without_symlink_deref(Path(research_home)))
-        if research_home is not None and str(research_home).strip()
-        else str(
+    if runtime_env_val is not None and str(runtime_env_val).strip():
+        eff_research_home = str(_resolve_abs_without_symlink_deref(Path(runtime_env_val)))
+    elif research_home is not None and str(research_home).strip():
+        eff_research_home = str(_resolve_abs_without_symlink_deref(Path(research_home)))
+    elif str(bridge_vals.get("DALTON_RESEARCH_HOME") or "").strip():
+        eff_research_home = str(
             _resolve_abs_without_symlink_deref(Path(bridge_vals["DALTON_RESEARCH_HOME"]))
-            if str(bridge_vals.get("DALTON_RESEARCH_HOME") or "").strip()
-            else (home_abs / "Library" / "Application Support" / "Everflow" / "research")
         )
-    )
+    else:
+        eff_research_home = str(home_abs / "Library" / "Application Support" / "Everflow" / "research")
+
     gp_env_abs = (
         _resolve_abs_without_symlink_deref(guidepoint_env_path)
         if guidepoint_env_path is not None
@@ -2883,22 +3095,26 @@ def render_guidepoint_proxy_plist_atomic(
         if logs_dir is not None
         else (home_abs / "Library" / "Logs")
     )
-    validate_safe_directory_target(eff_logs)
-    eff_logs.mkdir(parents=True, exist_ok=True)
-    validate_safe_directory_target(eff_logs)
 
     if python_bin is not None and str(python_bin).strip():
         eff_py = str(_resolve_abs_without_symlink_deref(Path(python_bin)))
     else:
         eff_py = str(_resolve_repo_venv_python(repo_abs))
 
+    eff_node = (
+        str(_resolve_abs_without_symlink_deref(Path(node_bin)))
+        if node_bin is not None and str(node_bin).strip()
+        else "/opt/homebrew/bin/node"
+    )
+
     tpl = template_path.read_text(encoding="utf-8")
     rendered = (
         tpl.replace("__REPO__", xml_escape(str(repo_abs)))
         .replace("__HOME__", xml_escape(str(home_abs)))
         .replace("__LOG_DIR__", xml_escape(str(eff_logs)))
-        .replace("__RUNTIME_ENV_KEY__", "DALTON_RESEARCH_HOME")
+        .replace("__RUNTIME_ENV_KEY__", xml_escape(str(runtime_env_key)))
         .replace("__RUNTIME_ENV_VAL__", xml_escape(eff_research_home))
+        .replace("__NODE_BIN__", xml_escape(eff_node))
         .replace("__PYTHON_BIN__", xml_escape(eff_py))
         .replace("__GUIDEPOINT_ENV_FILE__", xml_escape(str(gp_env_abs)))
         .replace("__GUIDEPOINT_TOKENS_FILE__", xml_escape(str(tokens_abs)))
@@ -2906,12 +3122,58 @@ def render_guidepoint_proxy_plist_atomic(
     )
 
     _validate_rendered_plist(rendered, template_path=template_path)
-    atomic_write_text(dest_path, rendered, mode=0o644)
-    return {
-        "dest": str(dest_path),
+    meta = {
         "python_bin": eff_py,
         "ownership_file": str(ownership_abs),
         "tokens_file": str(tokens_abs),
+        "guidepoint_env_file": str(gp_env_abs),
+    }
+    return rendered, meta, eff_logs
+
+
+def render_guidepoint_proxy_plist_atomic(
+    *,
+    template_path: Path,
+    dest_path: Path,
+    repo_root: Path,
+    home_dir: Path,
+    bridge_env_path: Path | None = None,
+    logs_dir: Path | None = None,
+    research_home: Path | str | None = None,
+    guidepoint_env_path: Path | None = None,
+    tokens_file_path: Path | None = None,
+    ownership_file_path: Path | None = None,
+    python_bin: Path | str | None = None,
+    runtime_env_key: str = "DALTON_RESEARCH_HOME",
+    runtime_env_val: str | None = None,
+    node_bin: str | None = None,
+    create_logs_dir: bool = False,
+) -> dict[str, str]:
+    """Render a host-service LaunchAgent plist (e.g. `guidepoint-mcp-proxy`) atomically (`0644` + fsync)."""
+    validate_safe_regular_file_target(dest_path, allow_missing=True)
+    rendered, meta, eff_logs = _build_launchd_service_plist_xml(
+        template_path=template_path,
+        repo_root=repo_root,
+        home_dir=home_dir,
+        logs_dir=logs_dir,
+        runtime_env_key=runtime_env_key,
+        runtime_env_val=runtime_env_val,
+        node_bin=node_bin,
+        python_bin=python_bin,
+        guidepoint_env_path=guidepoint_env_path,
+        tokens_file_path=tokens_file_path,
+        ownership_file_path=ownership_file_path,
+        bridge_env_path=bridge_env_path,
+        research_home=research_home,
+    )
+    if create_logs_dir:
+        validate_safe_directory_target(eff_logs)
+        eff_logs.mkdir(parents=True, exist_ok=True)
+        validate_safe_directory_target(eff_logs)
+    atomic_write_text(dest_path, rendered, mode=0o644)
+    return {
+        "dest": str(dest_path),
+        **meta,
     }
 
 
@@ -2926,8 +3188,14 @@ def render_stage_a_plists_atomic(
     logs_dir: Path | None = None,
     ownership_file_path: Path | None = None,
     guidepoint_python: Path | str | None = None,
+    existing_proxy_plist_path: Path | None = None,
 ) -> dict[str, str]:
-    """Render all three Stage A LaunchAgent plists into `output_dir` without installing them."""
+    """Render all three Stage A LaunchAgent plists atomically inside `output_dir` only.
+
+    - Reconciles live legacy proxy paths (plist -> `source guidepoint_mcp.env`) before rendering.
+    - Validates all three plists in a staging directory inside `output_dir` with `fsync`
+      before committing any of them, and never creates directories outside `output_dir`.
+    """
     repo_abs = repo_root.expanduser().resolve()
     home_abs = home_dir.expanduser().resolve()
     out_abs = _resolve_abs_without_symlink_deref(output_dir)
@@ -2946,42 +3214,174 @@ def render_stage_a_plists_atomic(
         if research_host_env_path is not None
         else (home_abs / ".config" / "dalton" / "research-host.env")
     )
+    target_ownership_abs = (
+        _resolve_abs_without_symlink_deref(ownership_file_path)
+        if ownership_file_path is not None
+        else (repo_abs / _DEFAULT_OWNERSHIP_REL_PATH)
+    )
+
+    bridge_vals: dict[str, str] = {}
+    if eff_bridge_env.is_file():
+        validate_safe_regular_file_target(eff_bridge_env, allow_missing=False)
+        _, bridge_vals = parse_env_file_strict(eff_bridge_env)
+
+    host_vals: dict[str, str] = {}
+    if eff_host_env.is_file():
+        validate_safe_regular_file_target(eff_host_env, allow_missing=False)
+        _, host_vals = parse_env_file_strict(eff_host_env)
+
+    # Reconcile live legacy proxy actual runtime paths (plist -> source guidepoint_mcp.env)
+    eff_existing_proxy_plist = (
+        _resolve_abs_without_symlink_deref(existing_proxy_plist_path)
+        if existing_proxy_plist_path is not None
+        else (home_abs / "Library" / "LaunchAgents" / "com.dalton.guidepoint-mcp-proxy.plist")
+    )
+    live_proxy = resolve_legacy_proxy_effective_paths(
+        repo_root=repo_abs,
+        home_dir=home_abs,
+        existing_proxy_plist_path=eff_existing_proxy_plist,
+        bridge_env_vals=bridge_vals,
+    )
+
+    # If guidepoint_mcp.env explicitly overrides ownership to a different file, fail closed
+    # because `guidepoint_mcp_proxy_run.sh` sources it AFTER the plist environment.
+    if live_proxy["env_file_ownership_override"]:
+        env_own_resolved = Path(live_proxy["env_file_ownership_override"]).resolve()
+        if env_own_resolved != target_ownership_abs.resolve():
+            raise EnvFileValidationError(
+                path=Path(live_proxy["guidepoint_env_file"]),
+                key="DALTON_GUIDEPOINT_OWNERSHIP_FILE",
+                reason=(
+                    f"sourced guidepoint env overrides ownership file to {env_own_resolved}, "
+                    f"conflicting with canonical {target_ownership_abs}"
+                ),
+            )
+
+    host_explicit_tokens_raw = (
+        str(host_vals.get("GUIDEPOINT_TOKENS_FILE") or "").strip()
+        or str(host_vals.get("DALTON_GUIDEPOINT_TOKENS_FILE") or "").strip()
+    )
+    host_explicit_tokens = (
+        _resolve_abs_without_symlink_deref(Path(host_explicit_tokens_raw))
+        if host_explicit_tokens_raw
+        else None
+    )
+    live_proxy_tokens = _resolve_abs_without_symlink_deref(Path(live_proxy["tokens_file"]))
+    live_proxy_has_explicit = bool(
+        live_proxy["existing_plist_found"]
+        or live_proxy["env_file_tokens_override"]
+        or live_proxy["env_file_exists"]
+    )
+
+    if host_explicit_tokens is not None and live_proxy_has_explicit:
+        if host_explicit_tokens.resolve() != live_proxy_tokens.resolve():
+            raise EnvFileValidationError(
+                path=eff_host_env,
+                key="GUIDEPOINT_TOKENS_FILE",
+                reason=(
+                    f"research-host tokens path {host_explicit_tokens} conflicts with live "
+                    f"legacy proxy effective tokens path {live_proxy_tokens}"
+                ),
+            )
+
+    if live_proxy["env_file_tokens_override"]:
+        eff_tokens_abs = _resolve_abs_without_symlink_deref(Path(live_proxy["env_file_tokens_override"]))
+    elif live_proxy["existing_plist_found"] or live_proxy["env_file_exists"]:
+        eff_tokens_abs = live_proxy_tokens
+    elif host_explicit_tokens is not None:
+        eff_tokens_abs = host_explicit_tokens
+    else:
+        eff_tokens_abs = live_proxy_tokens
 
     bridge_dest = out_abs / "com.dalton.researchdata-bridge.plist"
     host_dest = out_abs / "com.dalton.research-host.plist"
     proxy_dest = out_abs / "com.dalton.guidepoint-mcp-proxy.plist"
+    for dest in (bridge_dest, host_dest, proxy_dest):
+        validate_safe_regular_file_target(dest, allow_missing=True)
 
-    render_plist_atomic(
+    # Phase 1: Render and validate all three XML payloads in memory (zero disk writes yet).
+    bridge_xml, _, _ = _build_bridge_plist_xml(
         template_path=tpl_dir / "com.dalton.researchdata-bridge.plist.template",
-        dest_path=bridge_dest,
         bridge_env_path=eff_bridge_env,
         repo_root=repo_abs,
         home_dir=home_abs,
         logs_dir=logs_dir,
         repo_env_path=repo_env_path,
-        ownership_file_path=ownership_file_path,
+        ownership_file_path=target_ownership_abs,
     )
-    host_meta = render_research_host_plist_atomic(
+    host_xml, _, _ = _build_research_host_plist_xml(
         template_path=tpl_dir / "com.dalton.research-host.plist.template",
-        dest_path=host_dest,
         repo_root=repo_abs,
         home_dir=home_abs,
         research_host_env_path=eff_host_env,
         repo_env_path=repo_env_path,
         logs_dir=logs_dir,
-        ownership_file_path=ownership_file_path,
+        ownership_file_path=target_ownership_abs,
+        tokens_file_path=eff_tokens_abs,
     )
-    render_guidepoint_proxy_plist_atomic(
+    proxy_xml, _, _ = _build_launchd_service_plist_xml(
         template_path=tpl_dir / "com.dalton.guidepoint-mcp-proxy.plist.template",
-        dest_path=proxy_dest,
         repo_root=repo_abs,
         home_dir=home_abs,
         bridge_env_path=eff_bridge_env,
         logs_dir=logs_dir,
-        tokens_file_path=Path(host_meta["tokens_file"]),
-        ownership_file_path=ownership_file_path,
+        research_home=live_proxy["research_home"],
+        guidepoint_env_path=Path(live_proxy["guidepoint_env_file"]),
+        tokens_file_path=eff_tokens_abs,
+        ownership_file_path=target_ownership_abs,
         python_bin=guidepoint_python,
     )
+
+    # Phase 2: Write all three staged files inside output_dir, fsync, and re-parse from disk.
+    stage_dir = Path(tempfile.mkdtemp(prefix=".stage-a-plists.", dir=str(out_abs)))
+    staged_pairs: list[tuple[Path, Path]] = [
+        (stage_dir / bridge_dest.name, bridge_dest),
+        (stage_dir / host_dest.name, host_dest),
+        (stage_dir / proxy_dest.name, proxy_dest),
+    ]
+    payloads = [bridge_xml, host_xml, proxy_xml]
+    try:
+        for (staged_path, _dest), xml_text in zip(staged_pairs, payloads):
+            fd = os.open(str(staged_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            closed = False
+            try:
+                os.fchmod(fd, 0o644)
+                raw = xml_text.encode("utf-8")
+                view = memoryview(raw)
+                written = 0
+                while written < len(view):
+                    written += os.write(fd, view[written:])
+                os.fsync(fd)
+                os.close(fd)
+                closed = True
+            except BaseException:
+                if not closed:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                raise
+            os.chmod(staged_path, 0o644)
+            # Re-verify written bytes on disk via plistlib before committing any file
+            plistlib.loads(staged_path.read_bytes())
+        _fsync_directory(stage_dir)
+
+        # Phase 3: Commit all three validated files into output_dir
+        for staged_path, dest_path in staged_pairs:
+            validate_safe_regular_file_target(dest_path, allow_missing=True)
+            os.replace(staged_path, dest_path)
+        _fsync_directory(out_abs)
+    finally:
+        for staged_path, _ in staged_pairs:
+            try:
+                staged_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            stage_dir.rmdir()
+        except OSError:
+            pass
+
     return {
         "com.dalton.guidepoint-mcp-proxy": str(proxy_dest),
         "com.dalton.researchdata-bridge": str(bridge_dest),
@@ -3100,6 +3500,37 @@ def _cmd_render_research_host_plist(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_render_host_service_plist(args: argparse.Namespace) -> int:
+    try:
+        meta = render_guidepoint_proxy_plist_atomic(
+            template_path=Path(args.template).expanduser(),
+            dest_path=Path(args.dest).expanduser(),
+            repo_root=Path(args.repo_root).expanduser(),
+            home_dir=Path(args.home).expanduser(),
+            bridge_env_path=Path(args.bridge_env).expanduser() if args.bridge_env else None,
+            logs_dir=Path(args.logs_dir).expanduser() if args.logs_dir else None,
+            runtime_env_key=str(args.runtime_env_key or "DALTON_RESEARCH_HOME"),
+            runtime_env_val=args.runtime_env_val,
+            node_bin=args.node_bin,
+            python_bin=args.python_bin,
+            guidepoint_env_path=Path(args.guidepoint_env).expanduser() if args.guidepoint_env else None,
+            tokens_file_path=Path(args.tokens_file).expanduser() if args.tokens_file else None,
+            ownership_file_path=Path(args.ownership_file).expanduser() if args.ownership_file else None,
+            create_logs_dir=False,
+        )
+    except EnvFileValidationError as exc:
+        print(f"[render_host_service_plist] ERROR: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(
+            f"[render_host_service_plist] ERROR: failed writing launchd plist ({type(exc).__name__}: errno={exc.errno})",
+            file=sys.stderr,
+        )
+        return 1
+    print(json.dumps(meta, ensure_ascii=False))
+    return 0
+
+
 def _cmd_render_stage_a_plists(args: argparse.Namespace) -> int:
     try:
         rendered = render_stage_a_plists_atomic(
@@ -3112,6 +3543,9 @@ def _cmd_render_stage_a_plists(args: argparse.Namespace) -> int:
             logs_dir=Path(args.logs_dir).expanduser() if args.logs_dir else None,
             ownership_file_path=Path(args.ownership_file).expanduser() if args.ownership_file else None,
             guidepoint_python=args.guidepoint_python,
+            existing_proxy_plist_path=(
+                Path(args.existing_proxy_plist).expanduser() if args.existing_proxy_plist else None
+            ),
         )
     except EnvFileValidationError as exc:
         print(f"[render_stage_a_plists] ERROR: {exc}", file=sys.stderr)
@@ -3181,6 +3615,24 @@ def build_cli_parser() -> argparse.ArgumentParser:
     p_rh.add_argument("--ownership-file", default=None)
     p_rh.add_argument("--tokens-file", default=None)
 
+    p_hs = sub.add_parser(
+        "render-host-service-plist",
+        help="Atomically render a host-service LaunchAgent plist (e.g. guidepoint-mcp-proxy) with fsync",
+    )
+    p_hs.add_argument("--template", required=True)
+    p_hs.add_argument("--dest", required=True)
+    p_hs.add_argument("--repo-root", required=True)
+    p_hs.add_argument("--home", required=True)
+    p_hs.add_argument("--bridge-env", default=None)
+    p_hs.add_argument("--logs-dir", default=None)
+    p_hs.add_argument("--runtime-env-key", default="DALTON_RESEARCH_HOME")
+    p_hs.add_argument("--runtime-env-val", default=None)
+    p_hs.add_argument("--node-bin", default=None)
+    p_hs.add_argument("--python-bin", default=None)
+    p_hs.add_argument("--guidepoint-env", default=None)
+    p_hs.add_argument("--tokens-file", default=None)
+    p_hs.add_argument("--ownership-file", default=None)
+
     p_sa = sub.add_parser(
         "render-stage-a-plists",
         help="Atomically render all three Stage A LaunchAgent plists into an output directory",
@@ -3194,6 +3646,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     p_sa.add_argument("--logs-dir", default=None)
     p_sa.add_argument("--ownership-file", default=None)
     p_sa.add_argument("--guidepoint-python", default=None)
+    p_sa.add_argument("--existing-proxy-plist", default=None)
 
     p_ck = sub.add_parser("check-env-keys", help="Output boolean presence map for named keys")
     p_ck.add_argument("keys", nargs="+")
@@ -3210,6 +3663,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_render_plist(args)
     if args.subcommand == "render-research-host-plist":
         return _cmd_render_research_host_plist(args)
+    if args.subcommand == "render-host-service-plist":
+        return _cmd_render_host_service_plist(args)
     if args.subcommand == "render-stage-a-plists":
         return _cmd_render_stage_a_plists(args)
     if args.subcommand == "check-env-keys":

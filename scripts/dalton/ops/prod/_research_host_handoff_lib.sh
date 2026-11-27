@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Shared Everflow Research Host cutover handoff library (§6.4b).
 #
-# Base functions (s34-r1):
+# Base functions (s34-r1/r2):
 #   - rh_paths: canonical cutover/recovery/lock/journal/budget paths
 #   - rh_acquire_ops_lock / rh_release_ops_lock: non-blocking flock on FD 8
-#     (keeps FD 9 free for deploy_main.sh's deploy lock)
-#   - rh_persist_recovery_bin / rh_verify_recovery_manifest: atomic recovery-bin/
-#     persistence with recovery-manifest.json SHA-256 verification
+#     (keeps FD 9 free for deploy_main.sh's deploy lock); verifies kernel flock
+#   - rh_persist_recovery_bin / rh_verify_recovery_manifest: atomic sibling
+#     symlink swap with fsync + trusted 5-file manifest SHA-256 verification
 #   - rh_journal_set: atomic handoff-journal.json update via preflight.py + guidepoint_lock
-#   - rh_require_change_allowed: unified change guard (§6.4b (8) row 2)
-#   - rh_require_no_incomplete_journal: refuse new mutating ops when completed == false
+#   - rh_require_change_allowed: unified change guard (§6.4b (8) row 2) with flock check
+#   - rh_require_no_incomplete_journal / rh_require_completed_journal_for_approval
 #
 # Compatible with macOS Bash 3.2.
 
@@ -17,6 +17,8 @@ RH_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RH_OPS_LOCK_HELD="${RH_OPS_LOCK_HELD:-0}"
 
 rh_paths() {
+  export PYTHONDONTWRITEBYTECODE=1
+
   if [[ -n "${DALTON_REPO_ROOT:-}" ]]; then
     RH_REPO_ROOT="$(cd "${DALTON_REPO_ROOT}" && pwd)"
   else
@@ -33,6 +35,7 @@ rh_paths() {
     RH_PYTHON_BIN="$(command -v python3)"
   fi
 
+  # Trusted preflight.py owned by this library's directory (never switched to untrusted target_dir)
   RH_PREFLIGHT_PY="${RH_LIB_DIR}/preflight.py"
   if [[ ! -f "${RH_PREFLIGHT_PY}" ]]; then
     RH_PREFLIGHT_PY="${RH_REPO_ROOT}/scripts/dalton/ops/prod/preflight.py"
@@ -55,7 +58,12 @@ rh_paths() {
 rh_acquire_ops_lock() {
   rh_paths
   if [[ "${RH_OPS_LOCK_HELD:-0}" -eq 1 && "${DALTON_OPS_LOCK_OWNER_PID:-}" == "$$" ]]; then
-    return 0
+    # Verify FD 8 actually holds the kernel flock on RH_OPS_LOCK_FILE (never trust flags alone)
+    if PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" lock-verify \
+        --lock-file "${RH_OPS_LOCK_FILE}" --lock-fd 8 >/dev/null 2>&1; then
+      return 0
+    fi
+    RH_OPS_LOCK_HELD=0
   fi
 
   local lock_dir
@@ -72,7 +80,7 @@ rh_acquire_ops_lock() {
   fi
 
   local caller_tag="${1:-${BASH_SOURCE[1]:-unknown}}"
-  if ! "${RH_PYTHON_BIN}" - "${RH_OPS_LOCK_FILE}" "$$" "${RH_REPO_ROOT}" "${caller_tag}" <<'PY'
+  if ! PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B - "${RH_OPS_LOCK_FILE}" "$$" "${RH_REPO_ROOT}" "${caller_tag}" <<'PY'
 import datetime
 import fcntl
 import os
@@ -105,7 +113,7 @@ os.write(
 os.fsync(8)
 PY
   then
-    exec 8>&-
+    { exec 8>&-; } 2>/dev/null || true
     return 1
   fi
 
@@ -118,7 +126,7 @@ PY
 
 rh_release_ops_lock() {
   if [[ "${RH_OPS_LOCK_HELD:-0}" -eq 1 && "${DALTON_OPS_LOCK_OWNER_PID:-}" == "$$" ]]; then
-    exec 8>&- 2>/dev/null || true
+    { exec 8>&-; } 2>/dev/null || true
     RH_OPS_LOCK_HELD=0
     unset DALTON_OPS_LOCK_HELD_FD DALTON_OPS_LOCK_FILE DALTON_OPS_LOCK_OWNER_PID 2>/dev/null || true
   fi
@@ -127,6 +135,7 @@ rh_release_ops_lock() {
 
 rh_persist_recovery_bin() {
   rh_paths
+  local src_commit_override="${1:-${DALTON_RECOVERY_SOURCE_COMMIT:-}}"
   local src_dir="${RH_REPO_ROOT}/scripts/dalton/ops/prod"
   local gp_lock_src="${RH_REPO_ROOT}/scripts/dalton/research_runtime/guidepoint_lock.py"
 
@@ -149,84 +158,144 @@ rh_persist_recovery_bin() {
     return 1
   fi
 
-  mkdir -p "${RH_SNAPSHOTS_ROOT}"
+  if ! mkdir -p "${RH_SNAPSHOTS_ROOT}" 2>/dev/null; then
+    echo "ERROR: failed to create snapshots directory ${RH_SNAPSHOTS_ROOT}" >&2
+    return 1
+  fi
   chmod 0700 "${RH_SNAPSHOTS_ROOT}" 2>/dev/null || true
 
-  local tmp_dir=""
-  tmp_dir="$(mktemp -d "${RH_SNAPSHOTS_ROOT}/.recovery-bin.tmp.XXXXXX")" || return 1
-  chmod 0700 "${tmp_dir}"
+  # Build the new immutable release directory as a sibling inside RH_SNAPSHOTS_ROOT
+  local new_rel_dir=""
+  new_rel_dir="$(mktemp -d "${RH_SNAPSHOTS_ROOT}/.recovery-bin.rel.XXXXXX")" || return 1
+  chmod 0700 "${new_rel_dir}"
 
   local rc=0
-  cp "${src_dir}/switch_research_host.sh" "${tmp_dir}/switch_research_host.sh" && \
-  cp "${src_dir}/_research_host_handoff_lib.sh" "${tmp_dir}/_research_host_handoff_lib.sh" && \
-  cp "${src_dir}/wait_backend_idle.sh" "${tmp_dir}/wait_backend_idle.sh" && \
-  cp "${src_dir}/preflight.py" "${tmp_dir}/preflight.py" && \
-  cp "${gp_lock_src}" "${tmp_dir}/guidepoint_lock.py" || rc=$?
+  cp "${src_dir}/switch_research_host.sh" "${new_rel_dir}/switch_research_host.sh" && \
+  cp "${src_dir}/_research_host_handoff_lib.sh" "${new_rel_dir}/_research_host_handoff_lib.sh" && \
+  cp "${src_dir}/wait_backend_idle.sh" "${new_rel_dir}/wait_backend_idle.sh" && \
+  cp "${src_dir}/preflight.py" "${new_rel_dir}/preflight.py" && \
+  cp "${gp_lock_src}" "${new_rel_dir}/guidepoint_lock.py" || rc=$?
 
   if [[ "${rc}" -ne 0 ]]; then
-    rm -rf "${tmp_dir}" 2>/dev/null || true
-    echo "ERROR: failed copying files into staging recovery-bin directory" >&2
+    rm -rf "${new_rel_dir}" 2>/dev/null || true
+    echo "ERROR: failed copying files into staging recovery-bin release directory" >&2
     return 1
   fi
 
-  chmod 0700 "${tmp_dir}/switch_research_host.sh" "${tmp_dir}/wait_backend_idle.sh" "${tmp_dir}/preflight.py"
-  chmod 0600 "${tmp_dir}/_research_host_handoff_lib.sh" "${tmp_dir}/guidepoint_lock.py"
+  chmod 0700 "${new_rel_dir}/switch_research_host.sh" "${new_rel_dir}/wait_backend_idle.sh" "${new_rel_dir}/preflight.py"
+  chmod 0600 "${new_rel_dir}/_research_host_handoff_lib.sh" "${new_rel_dir}/guidepoint_lock.py"
 
-  local src_commit="unknown"
-  src_commit="$(git -C "${RH_REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo "unknown")"
+  local src_commit="${src_commit_override}"
+  if [[ -z "${src_commit}" ]]; then
+    src_commit="$(git -C "${src_dir}" rev-parse HEAD 2>/dev/null || git -C "${RH_REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo "unknown")"
+  fi
 
-  if ! "${RH_PYTHON_BIN}" "${tmp_dir}/preflight.py" manifest-write \
-      --recovery-dir "${tmp_dir}" \
+  # Use trusted RH_PREFLIGHT_PY to write & fsync the 5-file manifest, then verify before publishing
+  if ! PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" manifest-write \
+      --recovery-dir "${new_rel_dir}" \
       --source-commit "${src_commit}" \
       --file switch_research_host.sh \
       --file _research_host_handoff_lib.sh \
       --file wait_backend_idle.sh \
       --file preflight.py \
       --file guidepoint_lock.py; then
-    rm -rf "${tmp_dir}" 2>/dev/null || true
+    rm -rf "${new_rel_dir}" 2>/dev/null || true
     return 1
   fi
 
-  # Atomic directory replacement (no partial recovery-bin/ left behind on failure)
-  if [[ -e "${RH_RECOVERY_BIN_DIR}" ]]; then
-    local backup_dir=""
-    backup_dir="$(mktemp -d "${RH_SNAPSHOTS_ROOT}/.recovery-bin.old.XXXXXX")" || {
-      rm -rf "${tmp_dir}" 2>/dev/null || true
-      return 1
-    }
-    rmdir "${backup_dir}" 2>/dev/null || true
-    if ! mv "${RH_RECOVERY_BIN_DIR}" "${backup_dir}"; then
-      rm -rf "${tmp_dir}" 2>/dev/null || true
-      echo "ERROR: failed rotating existing recovery-bin directory" >&2
-      return 1
-    fi
-    if ! mv "${tmp_dir}" "${RH_RECOVERY_BIN_DIR}"; then
-      mv "${backup_dir}" "${RH_RECOVERY_BIN_DIR}" 2>/dev/null || true
-      rm -rf "${tmp_dir}" 2>/dev/null || true
-      echo "ERROR: failed promoting new recovery-bin directory" >&2
-      return 1
-    fi
-    rm -rf "${backup_dir}" 2>/dev/null || true
-  else
-    if ! mv "${tmp_dir}" "${RH_RECOVERY_BIN_DIR}"; then
-      rm -rf "${tmp_dir}" 2>/dev/null || true
-      echo "ERROR: failed moving recovery-bin directory into place" >&2
-      return 1
-    fi
+  if ! PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" manifest-verify \
+      --recovery-dir "${new_rel_dir}"; then
+    rm -rf "${new_rel_dir}" 2>/dev/null || true
+    echo "ERROR: staged recovery-bin release failed manifest verification" >&2
+    return 1
   fi
 
-  chmod 0700 "${RH_RECOVERY_BIN_DIR}" 2>/dev/null || true
+  local new_rel_base
+  new_rel_base="$(basename "${new_rel_dir}")"
+  local tmp_link="${RH_SNAPSHOTS_ROOT}/.recovery-bin.link.$$.${RANDOM:-0}"
+  rm -f "${tmp_link}" 2>/dev/null || true
+  if ! ln -s "${new_rel_base}" "${tmp_link}"; then
+    rm -rf "${new_rel_dir}" 2>/dev/null || true
+    echo "ERROR: failed creating sibling symlink for recovery-bin" >&2
+    return 1
+  fi
+
+  # Atomic sibling symlink swap (single POSIX rename(2) when target is absent or already a symlink)
+  if [[ -L "${RH_RECOVERY_BIN_DIR}" || ! -e "${RH_RECOVERY_BIN_DIR}" ]]; then
+    local prev_target=""
+    if [[ -L "${RH_RECOVERY_BIN_DIR}" ]]; then
+      prev_target="$(readlink "${RH_RECOVERY_BIN_DIR}" 2>/dev/null || true)"
+    fi
+    if ! PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B - "${tmp_link}" "${RH_RECOVERY_BIN_DIR}" "${RH_SNAPSHOTS_ROOT}" <<'PY'
+import os
+import sys
+
+src_link, dst_link, parent_dir = sys.argv[1:4]
+os.replace(src_link, dst_link)
+try:
+    dfd = os.open(parent_dir, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+except OSError:
+    pass
+PY
+    then
+      rm -f "${tmp_link}" 2>/dev/null || true
+      rm -rf "${new_rel_dir}" 2>/dev/null || true
+      echo "ERROR: atomic symlink swap for recovery-bin failed; previous entrypoint preserved" >&2
+      return 1
+    fi
+    # Clean up retired sibling release directory after successful swap
+    if [[ -n "${prev_target}" && "${prev_target}" != "${new_rel_base}" ]]; then
+      case "${prev_target}" in
+        .recovery-bin.rel.*)
+          rm -rf "${RH_SNAPSHOTS_ROOT}/${prev_target}" 2>/dev/null || true
+          ;;
+      esac
+    fi
+    return 0
+  fi
+
+  # Legacy upgrade path: RH_RECOVERY_BIN_DIR exists as a real non-symlink directory.
+  # Never ignore rmdir/mv failures; abort and preserve previous entrypoint on any failure.
+  local legacy_slot=""
+  legacy_slot="$(mktemp -d "${RH_SNAPSHOTS_ROOT}/.recovery-bin.legacy.XXXXXX")" || {
+    rm -f "${tmp_link}" 2>/dev/null || true
+    rm -rf "${new_rel_dir}" 2>/dev/null || true
+    echo "ERROR: failed creating legacy backup slot for recovery-bin migration" >&2
+    return 1
+  }
+  local legacy_backup="${legacy_slot}/old"
+  if ! mv "${RH_RECOVERY_BIN_DIR}" "${legacy_backup}"; then
+    rm -f "${tmp_link}" 2>/dev/null || true
+    rm -rf "${new_rel_dir}" 2>/dev/null || true
+    rmdir "${legacy_slot}" 2>/dev/null || true
+    echo "ERROR: failed moving legacy recovery-bin directory; previous entrypoint preserved" >&2
+    return 1
+  fi
+  if ! mv "${tmp_link}" "${RH_RECOVERY_BIN_DIR}"; then
+    echo "ERROR: failed promoting recovery-bin symlink; attempting to restore legacy directory" >&2
+    if ! mv "${legacy_backup}" "${RH_RECOVERY_BIN_DIR}"; then
+      echo "ERROR: CRITICAL: failed restoring legacy recovery-bin from ${legacy_backup}" >&2
+    else
+      rmdir "${legacy_slot}" 2>/dev/null || true
+    fi
+    rm -f "${tmp_link}" 2>/dev/null || true
+    rm -rf "${new_rel_dir}" 2>/dev/null || true
+    return 1
+  fi
+  rm -rf "${legacy_slot}" 2>/dev/null || true
   return 0
 }
 
 rh_verify_recovery_manifest() {
   rh_paths
   local target_dir="${1:-${RH_RECOVERY_BIN_DIR}}"
-  local preflight_py="${target_dir}/preflight.py"
-  if [[ ! -f "${preflight_py}" ]]; then
-    preflight_py="${RH_PREFLIGHT_PY}"
-  fi
-  "${RH_PYTHON_BIN}" "${preflight_py}" manifest-verify --recovery-dir "${target_dir}"
+  # Always verify with the trusted caller entrypoint BEFORE executing any code in target_dir
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" manifest-verify \
+    --recovery-dir "${target_dir}"
 }
 
 rh_journal_set() {
@@ -235,9 +304,11 @@ rh_journal_set() {
     echo "ERROR: rh_journal_set requires at least one key=value pair" >&2
     return 2
   fi
-  "${RH_PYTHON_BIN}" "${RH_PREFLIGHT_PY}" journal-set \
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" journal-set \
     --repo "${RH_REPO_ROOT}" \
     --ownership-file "${RH_JOURNAL_FILE}" \
+    --lock-file "${RH_OPS_LOCK_FILE}" \
+    --lock-fd 8 \
     "$@"
 }
 
@@ -252,26 +323,33 @@ rh_require_change_allowed() {
   if [[ "${RH_OPS_LOCK_HELD:-0}" -eq 1 && "${DALTON_OPS_LOCK_OWNER_PID:-}" == "$$" ]]; then
     lock_held=1
   fi
-  "${RH_PYTHON_BIN}" "${RH_PREFLIGHT_PY}" guard-check \
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" guard-check \
     --action "${action}" \
     --admission-file "${RH_ADMISSION_FILE}" \
     --journal-file "${RH_JOURNAL_FILE}" \
+    --lock-file "${RH_OPS_LOCK_FILE}" \
+    --lock-fd 8 \
     --lock-held "${lock_held}"
 }
 
 rh_require_no_incomplete_journal() {
   rh_paths
-  if [[ ! -f "${RH_JOURNAL_FILE}" ]]; then
+  if [[ ! -e "${RH_JOURNAL_FILE}" ]]; then
     return 0
   fi
   local completed=""
-  local op=""
-  completed="$("${RH_PYTHON_BIN}" "${RH_PREFLIGHT_PY}" journal-read \
+  local rc=0
+  completed="$(PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" journal-read \
     --repo "${RH_REPO_ROOT}" \
     --ownership-file "${RH_JOURNAL_FILE}" \
-    --key completed 2>/dev/null || true)"
+    --key completed 2>&1)" || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    echo "ERROR: handoff-journal.json is invalid or unreadable; refusing mutating operation (${completed})" >&2
+    return 1
+  fi
   if [[ "${completed}" == "false" ]]; then
-    op="$("${RH_PYTHON_BIN}" "${RH_PREFLIGHT_PY}" journal-read \
+    local op=""
+    op="$(PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" journal-read \
       --repo "${RH_REPO_ROOT}" \
       --ownership-file "${RH_JOURNAL_FILE}" \
       --key operation 2>/dev/null || true)"
@@ -282,5 +360,18 @@ rh_require_no_incomplete_journal() {
     fi
     return 1
   fi
+  if [[ "${completed}" != "true" ]]; then
+    echo "ERROR: handoff-journal.json missing boolean completed=true (got '${completed}'); refusing mutating operation" >&2
+    return 1
+  fi
   return 0
+}
+
+rh_require_completed_journal_for_approval() {
+  rh_paths
+  if [[ ! -f "${RH_JOURNAL_FILE}" ]]; then
+    echo "ERROR: --approve-budgets requires existing handoff-journal.json with completed == true (missing ${RH_JOURNAL_FILE})" >&2
+    return 1
+  fi
+  rh_require_no_incomplete_journal
 }

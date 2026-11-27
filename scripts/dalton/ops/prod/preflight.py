@@ -19,11 +19,14 @@ scripts share one single Python implementation.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import importlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -37,6 +40,10 @@ from typing import Any
 import urllib.error
 import urllib.parse
 import urllib.request
+
+# Strictly prevent read-only preflight and helpers from writing __pycache__ into production trees.
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -139,6 +146,16 @@ _EXEMPT_ACTIONS: frozenset[str] = frozenset(
     }
 )
 
+RECOVERY_REQUIRED_FILES: tuple[str, ...] = (
+    "switch_research_host.sh",
+    "_research_host_handoff_lib.sh",
+    "wait_backend_idle.sh",
+    "preflight.py",
+    "guidepoint_lock.py",
+)
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+_SECRET_KEY_HINT_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|AUTH)", re.IGNORECASE)
+
 
 # ---------------------------------------------------------------------------
 # Generic helpers
@@ -150,8 +167,11 @@ def _default_repo_root() -> Path:
     # Normal worktree: <repo>/scripts/dalton/ops/prod/preflight.py
     if here.parent.name == "prod" and len(here.parents) >= 5:
         return here.parents[4]
-    # Recovery bin: <repo>/var/dalton/cutover-snapshots/recovery-bin/preflight.py
-    if here.parent.name == "recovery-bin" and len(here.parents) >= 5:
+    # Recovery bin (canonical or versioned sibling release under cutover-snapshots):
+    # <repo>/var/dalton/cutover-snapshots/<recovery-bin|.recovery-bin.rel.XXXXXX>/preflight.py
+    if (
+        here.parent.name == "recovery-bin" or here.parent.name.startswith(".recovery-bin.rel.")
+    ) and len(here.parents) >= 5 and here.parents[1].name == "cutover-snapshots":
         return here.parents[4]
     return Path.cwd().resolve()
 
@@ -183,7 +203,11 @@ def _parse_simple_env_file(path: Path) -> dict[str, str]:
     result: dict[str, str] = {}
     if not path.is_file():
         return result
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return result
+    for raw in raw_text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -197,6 +221,54 @@ def _parse_simple_env_file(path: Path) -> dict[str, str]:
         if key:
             result[key] = val
     return result
+
+
+def _sanitize_url_for_diag(raw_url: str) -> str:
+    """Strip credentials (userinfo), query strings, and fragments from a URL before logging."""
+    try:
+        parsed = urllib.parse.urlsplit(raw_url)
+    except ValueError:
+        return "<redacted-url>"
+    if not parsed.scheme or not parsed.netloc:
+        return "<redacted>"
+    host = parsed.hostname or ""
+    port = f":{parsed.port}" if parsed.port else ""
+    userinfo = "***@" if (parsed.username is not None or parsed.password is not None) else ""
+    path = parsed.path or ""
+    return f"{parsed.scheme}://{userinfo}{host}{port}{path}"
+
+
+def _sanitize_diag_value(key: str, value: Any) -> str:
+    sval = str(value or "").strip()
+    if not sval:
+        return "<empty>"
+    if _SECRET_KEY_HINT_RE.search(key):
+        return "<redacted>"
+    if "://" in sval:
+        return _sanitize_url_for_diag(sval)
+    if key.endswith("_URL"):
+        return "<redacted-url>"
+    return sval
+
+
+def _sanitize_error_text(text: str) -> str:
+    # Redact any embedded Bearer tokens or URL userinfo in exception/error messages
+    cleaned = re.sub(r"(?i)(Bearer\s+)[^\s;\"']+", r"\1<redacted>", text)
+    cleaned = re.sub(r"(https?://)([^/@\s]+)@", r"\1***@", cleaned)
+    return cleaned
+
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        dfd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dfd)
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
 
 
 def _atomic_write_text(path: Path, content: str, *, mode: int = 0o600) -> None:
@@ -215,6 +287,7 @@ def _atomic_write_text(path: Path, content: str, *, mode: int = 0o600) -> None:
             os.fsync(fh.fileno())
         os.chmod(tmp_path, mode)
         os.replace(tmp_path, path)
+        _fsync_dir(path.parent)
     except Exception:
         try:
             if tmp_path.exists():
@@ -222,6 +295,10 @@ def _atomic_write_text(path: Path, content: str, *, mode: int = 0o600) -> None:
         except OSError:
             pass
         raise
+
+
+def _curl_escape_cfg_val(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _http_request(
@@ -246,14 +323,36 @@ def _http_request(
             "-X",
             method,
         ]
-        for k, v in req_headers.items():
-            cmd.extend(["-H", f"{k}: {v}"])
-        if body is not None:
-            cmd.extend(["--data-binary", body.decode("utf-8", errors="replace")])
-        cmd.extend(["-w", "\n%{http_code}", url])
-        rc, out, err = _run_cmd(cmd, timeout_s=max(5.0, timeout_s + 2.0))
+        cfg_path: str | None = None
+        try:
+            if req_headers:
+                fd, cfg_path = tempfile.mkstemp(prefix=".dalton-curl-", suffix=".cfg")
+                try:
+                    os.fchmod(fd, 0o600)
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        for k, v in req_headers.items():
+                            esc = _curl_escape_cfg_val(f"{k}: {v}")
+                            fh.write(f'header = "{esc}"\n')
+                        fh.flush()
+                except Exception:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    raise
+                cmd.extend(["-K", cfg_path])
+            if body is not None:
+                cmd.extend(["--data-binary", body.decode("utf-8", errors="replace")])
+            cmd.extend(["-w", "\n%{http_code}", url])
+            rc, out, err = _run_cmd(cmd, timeout_s=max(5.0, timeout_s + 2.0))
+        finally:
+            if cfg_path:
+                try:
+                    os.unlink(cfg_path)
+                except OSError:
+                    pass
         if rc != 0:
-            return None, None, f"curl failed (rc={rc}): {err.strip()}"
+            return None, None, f"curl failed (rc={rc}): {_sanitize_error_text(err.strip())}"
         if "\n" in out:
             body_text, code_str = out.rsplit("\n", 1)
         else:
@@ -291,7 +390,7 @@ def _http_request(
             parsed = raw
         return int(exc.code), parsed, None
     except Exception as exc:
-        return None, None, f"{type(exc).__name__}: {exc}"
+        return None, None, f"{type(exc).__name__}: {_sanitize_error_text(str(exc))}"
 
 
 def _run_cmd(
@@ -318,20 +417,35 @@ def _run_cmd(
         return 126, "", f"os error executing {argv[0]}: {exc}"
 
 
+def _load_module_from_path(module_name: str, file_path: Path) -> Any:
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location(module_name, str(file_path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load module spec from {file_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _import_guidepoint_lock(repo_root: Path | None = None) -> Any:
-    search_dirs: list[Path] = []
+    """Load `guidepoint_lock.py`, pinning to the same-batch sibling copy when in recovery-bin."""
+    sys.dont_write_bytecode = True
+    sibling = Path(__file__).resolve().parent / "guidepoint_lock.py"
+    if sibling.is_file():
+        return _load_module_from_path("_dalton_recovery_guidepoint_lock", sibling)
+
+    candidates: list[Path] = []
     if repo_root is not None:
-        search_dirs.append(repo_root / "scripts" / "dalton" / "research_runtime")
-    search_dirs.append(Path(__file__).resolve().parent)
-    search_dirs.append(_default_repo_root() / "scripts" / "dalton" / "research_runtime")
-    for d in search_dirs:
-        s = str(d)
-        if d.is_dir() and s not in sys.path:
-            sys.path.insert(0, s)
-    return importlib.import_module("guidepoint_lock")
+        candidates.append(repo_root / "scripts" / "dalton" / "research_runtime" / "guidepoint_lock.py")
+    candidates.append(_default_repo_root() / "scripts" / "dalton" / "research_runtime" / "guidepoint_lock.py")
+    for cand in candidates:
+        if cand.is_file():
+            return _load_module_from_path("_dalton_worktree_guidepoint_lock", cand)
+    raise ImportError("guidepoint_lock.py not found in recovery-bin or repo research_runtime")
 
 
 def _import_capabilities(repo_root: Path) -> tuple[Any, Any]:
+    sys.dont_write_bytecode = True
     for d in (repo_root / "src", repo_root):
         s = str(d)
         if d.is_dir() and s not in sys.path:
@@ -599,6 +713,16 @@ def _result(check: str, status: str, detail: str) -> dict[str, str]:
     return {"check": check, "status": status, "detail": detail}
 
 
+def _extract_flag_value(prog_args: Sequence[Any], flag: str) -> str | None:
+    for idx, arg in enumerate(prog_args):
+        s = str(arg)
+        if s == flag and idx + 1 < len(prog_args):
+            return str(prog_args[idx + 1])
+        if s.startswith(flag + "="):
+            return s[len(flag) + 1 :]
+    return None
+
+
 def _inspect_plist_file(
     plist_path: Path,
     *,
@@ -607,6 +731,7 @@ def _inspect_plist_file(
     require_venv_python: bool = False,
     require_bridge_env_match: bool = False,
     require_ownership_match: bool = False,
+    require_research_host_startup: bool = False,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     errors: list[str] = []
     if not plist_path.is_file():
@@ -655,13 +780,12 @@ def _inspect_plist_file(
                 f"{plist_path.name}: ProgramArguments[0] must be a literal absolute path (got {prog_args[0]!r})"
             )
         # Validate path-valued CLI flags like --env-file / --repo-env-file
-        for idx, arg in enumerate(prog_args):
-            if str(arg) in ("--env-file", "--repo-env-file") and idx + 1 < len(prog_args):
-                nxt = str(prog_args[idx + 1])
-                if not _is_literal_abs_path(nxt):
-                    errors.append(
-                        f"{plist_path.name}: {arg} value must be a literal absolute path (got {nxt!r})"
-                    )
+        for flag in ("--env-file", "--repo-env-file"):
+            nxt = _extract_flag_value(prog_args, flag)
+            if nxt is not None and not _is_literal_abs_path(nxt):
+                errors.append(
+                    f"{plist_path.name}: {flag} value must be a literal absolute path (got {nxt!r})"
+                )
 
     env_vars = data.get("EnvironmentVariables")
     if not isinstance(env_vars, dict):
@@ -670,7 +794,13 @@ def _inspect_plist_file(
 
     for k, v in env_vars.items():
         sv = str(v)
-        if k in _PLIST_PATH_ENV_KEYS and not _is_literal_abs_path(sv):
+        if k == "DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH":
+            parts = [part.strip() for part in re.split(r"[:,]", sv) if part.strip()]
+            if not parts or any(not _is_literal_abs_path(part) for part in parts):
+                errors.append(
+                    f"{plist_path.name}: EnvironmentVariables.{k} entries must be literal absolute paths (got {sv!r})"
+                )
+        elif k in _PLIST_PATH_ENV_KEYS and not _is_literal_abs_path(sv):
             errors.append(
                 f"{plist_path.name}: EnvironmentVariables.{k} must be a literal absolute path (got {sv!r})"
             )
@@ -729,6 +859,54 @@ def _inspect_plist_file(
                     f"{plist_path.name}: DALTON_GUIDEPOINT_OWNERSHIP_FILE resolves to {resolved_own}, "
                     f"expected {expected_own}"
                 )
+
+    if require_research_host_startup:
+        expected_host_env = cfg.research_host_env_file.expanduser().resolve()
+        expected_repo_env_resolved = cfg.repo_env_file.expanduser().resolve()
+        arg_env_file = _extract_flag_value(prog_args, "--env-file")
+        arg_repo_env = _extract_flag_value(prog_args, "--repo-env-file")
+        ev_host_env = str(env_vars.get("DALTON_RESEARCH_HOST_ENV_FILE") or "").strip()
+        ev_repo_env = str(env_vars.get("DALTON_REPO_ENV_FILE") or "").strip()
+
+        if not arg_env_file:
+            errors.append(f"{plist_path.name}: ProgramArguments missing --env-file")
+        elif Path(arg_env_file).expanduser().resolve() != expected_host_env:
+            errors.append(
+                f"{plist_path.name}: --env-file resolves to {Path(arg_env_file).expanduser().resolve()}, "
+                f"expected {expected_host_env}"
+            )
+        if not ev_host_env:
+            errors.append(f"{plist_path.name}: missing DALTON_RESEARCH_HOST_ENV_FILE")
+        elif Path(ev_host_env).expanduser().resolve() != expected_host_env:
+            errors.append(
+                f"{plist_path.name}: DALTON_RESEARCH_HOST_ENV_FILE resolves to {Path(ev_host_env).expanduser().resolve()}, "
+                f"expected {expected_host_env}"
+            )
+        if not arg_repo_env:
+            errors.append(f"{plist_path.name}: ProgramArguments missing --repo-env-file")
+        elif Path(arg_repo_env).expanduser().resolve() != expected_repo_env_resolved:
+            errors.append(
+                f"{plist_path.name}: --repo-env-file resolves to {Path(arg_repo_env).expanduser().resolve()}, "
+                f"expected {expected_repo_env_resolved}"
+            )
+        if ev_repo_env and Path(ev_repo_env).expanduser().resolve() != expected_repo_env_resolved:
+            errors.append(
+                f"{plist_path.name}: DALTON_REPO_ENV_FILE resolves to {Path(ev_repo_env).expanduser().resolve()}, "
+                f"expected {expected_repo_env_resolved}"
+            )
+
+        extra_mods = [
+            m.strip()
+            for m in str(env_vars.get("DALTON_RESEARCH_HOST_EXTRA_MODULES") or "").split(",")
+            if m.strip()
+        ]
+        if not extra_mods or "host_connectors" not in extra_mods:
+            errors.append(
+                f"{plist_path.name}: DALTON_RESEARCH_HOST_EXTRA_MODULES must include 'host_connectors'"
+            )
+        extra_pp = str(env_vars.get("DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH") or "").strip()
+        if not extra_pp:
+            errors.append(f"{plist_path.name}: missing DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH")
 
     return data, errors
 
@@ -945,14 +1123,20 @@ def _check_stage_a_plists(cfg: PreflightConfig) -> dict[str, str]:
         require_venv_python=True,
         require_bridge_env_match=False,
         require_ownership_match=True,
+        require_research_host_startup=True,
     )
     all_errors.extend(e3)
 
     if proxy_data and host_data:
-        p_own = str((proxy_data.get("EnvironmentVariables") or {}).get("DALTON_GUIDEPOINT_OWNERSHIP_FILE") or "")
-        h_own = str((host_data.get("EnvironmentVariables") or {}).get("DALTON_GUIDEPOINT_OWNERSHIP_FILE") or "")
-        if p_own and h_own and Path(p_own).expanduser().resolve() != Path(h_own).expanduser().resolve():
-            all_errors.append(f"ownership file mismatch between proxy ({p_own}) and research-host ({h_own})")
+        p_ev = proxy_data.get("EnvironmentVariables")
+        h_ev = host_data.get("EnvironmentVariables")
+        if isinstance(p_ev, dict) and isinstance(h_ev, dict):
+            p_own = str(p_ev.get("DALTON_GUIDEPOINT_OWNERSHIP_FILE") or "")
+            h_own = str(h_ev.get("DALTON_GUIDEPOINT_OWNERSHIP_FILE") or "")
+            if p_own and h_own and Path(p_own).expanduser().resolve() != Path(h_own).expanduser().resolve():
+                all_errors.append(
+                    f"ownership file mismatch between proxy ({p_own}) and research-host ({h_own})"
+                )
 
     if all_errors:
         return _result("stage_a_plists", "fail", "; ".join(all_errors))
@@ -997,42 +1181,144 @@ def _check_research_host_env(
     return _result("research_host_env", "ok", f"{p} mode=0600 keys present and valid")
 
 
-def _resolve_tokens_path_from_config(cfg: PreflightConfig) -> tuple[Path | None, str | None]:
+def _load_plist_full_strict(plist_path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    if not plist_path.is_file():
+        return None, f"missing plist: {plist_path}"
     try:
-        gl = _import_guidepoint_lock(cfg.repo_root)
+        data = plistlib.loads(plist_path.read_bytes())
     except Exception as exc:
-        return None, f"cannot import guidepoint_lock: {exc}"
+        return None, f"invalid plist {plist_path.name}: {exc}"
+    if not isinstance(data, dict):
+        return None, f"plist root is not dict: {plist_path.name}"
+    return data, None
 
-    merged_env: dict[str, str] = {"HOME": str(cfg.home_dir)}
-    for plist_name in ("com.dalton.guidepoint-mcp-proxy.plist", "com.dalton.research-host.plist"):
-        pp = cfg.plist_dir / plist_name
-        if pp.is_file():
-            try:
-                pdata = plistlib.loads(pp.read_bytes())
-                ev = pdata.get("EnvironmentVariables") if isinstance(pdata, dict) else None
-                if isinstance(ev, dict):
-                    for k in ("GUIDEPOINT_TOKENS_FILE", "DALTON_GUIDEPOINT_TOKENS_FILE", "DALTON_RESEARCH_HOME"):
-                        if ev.get(k) and k not in merged_env:
-                            merged_env[k] = str(ev[k])
-            except Exception:
-                pass
-    for env_path in (cfg.research_host_env_file, cfg.bridge_env_file):
-        ev = _parse_simple_env_file(env_path)
-        for k in ("GUIDEPOINT_TOKENS_FILE", "DALTON_GUIDEPOINT_TOKENS_FILE", "DALTON_RESEARCH_HOME"):
-            if ev.get(k) and k not in merged_env:
-                merged_env[k] = str(ev[k])
 
-    if not merged_env.get("DALTON_RESEARCH_HOME"):
-        merged_env["DALTON_RESEARCH_HOME"] = str(
+def _load_plist_env_vars_strict(plist_path: Path) -> tuple[dict[str, str] | None, str | None]:
+    """Return `(env_dict, None)` on success or `(None, reason)` if plist is unreadable/corrupt."""
+    data, err = _load_plist_full_strict(plist_path)
+    if err is not None or data is None:
+        return None, err
+    if "EnvironmentVariables" not in data or data["EnvironmentVariables"] is None:
+        return {}, None
+    ev = data["EnvironmentVariables"]
+    if not isinstance(ev, dict):
+        return None, f"{plist_path.name}: EnvironmentVariables is not a dict"
+    return {str(k): str(v) for k, v in ev.items()}, None
+
+
+def _resolve_legacy_proxy_effective_env(cfg: PreflightConfig) -> tuple[dict[str, str], Path, list[str]]:
+    """Resolve `com.dalton.guidepoint-mcp-proxy` env in real launcher order (plist -> `source ENV_FILE`)."""
+    errors: list[str] = []
+    env_map: dict[str, str] = {"HOME": str(cfg.home_dir)}
+
+    proxy_plist = cfg.plist_dir / "com.dalton.guidepoint-mcp-proxy.plist"
+    if proxy_plist.is_file():
+        plist_ev, perr = _load_plist_env_vars_strict(proxy_plist)
+        if perr:
+            errors.append(perr)
+        elif plist_ev:
+            env_map.update(plist_ev)
+
+    bridge_vals = _parse_simple_env_file(cfg.bridge_env_file)
+    raw_rh = (
+        str(env_map.get("DALTON_RESEARCH_HOME") or "").strip()
+        or str(env_map.get("DALTON_OCW_ROOT") or "").strip()
+        or str(bridge_vals.get("DALTON_RESEARCH_HOME") or "").strip()
+    )
+    if raw_rh:
+        research_home = Path(raw_rh).expanduser().resolve()
+    else:
+        research_home = (
+            cfg.home_dir / "Library" / "Application Support" / "Everflow" / "research"
+        ).resolve()
+
+    raw_gp_env = str(env_map.get("GUIDEPOINT_ENV_FILE") or "").strip()
+    gp_env_file = (
+        Path(raw_gp_env).expanduser().resolve()
+        if raw_gp_env
+        else (research_home / "config" / "guidepoint_mcp.env")
+    )
+
+    # `guidepoint_mcp_proxy_run.sh` does `set -a; source "$ENV_FILE"; set +a` AFTER inheriting plist env!
+    if gp_env_file.is_file():
+        env_map.update(_parse_simple_env_file(gp_env_file))
+
+    if not env_map.get("DALTON_RESEARCH_HOME") and not env_map.get("DALTON_OCW_ROOT"):
+        env_map["DALTON_RESEARCH_HOME"] = str(research_home)
+
+    return env_map, gp_env_file, errors
+
+
+def _resolve_research_host_effective_env(cfg: PreflightConfig) -> tuple[dict[str, str], Path, Path, list[str]]:
+    """Resolve `com.dalton.research-host` env in real startup order (host.env < repo.env < plist)."""
+    errors: list[str] = []
+    host_plist = cfg.plist_dir / "com.dalton.research-host.plist"
+    plist_ev: dict[str, str] = {}
+    host_env_path = cfg.research_host_env_file
+    repo_env_path = cfg.repo_env_file
+
+    if host_plist.is_file():
+        pdata, perr = _load_plist_full_strict(host_plist)
+        if perr or pdata is None:
+            errors.append(perr or f"unreadable {host_plist.name}")
+        else:
+            ev = pdata.get("EnvironmentVariables")
+            if isinstance(ev, dict):
+                plist_ev = {str(k): str(v) for k, v in ev.items()}
+            elif ev is not None:
+                errors.append(f"{host_plist.name}: EnvironmentVariables is not a dict")
+            prog_args = pdata.get("ProgramArguments")
+            if isinstance(prog_args, list):
+                arg_env = _extract_flag_value(prog_args, "--env-file")
+                if arg_env and _is_literal_abs_path(arg_env):
+                    host_env_path = Path(arg_env).expanduser().resolve()
+                elif plist_ev.get("DALTON_RESEARCH_HOST_ENV_FILE") and _is_literal_abs_path(
+                    plist_ev["DALTON_RESEARCH_HOST_ENV_FILE"]
+                ):
+                    host_env_path = Path(plist_ev["DALTON_RESEARCH_HOST_ENV_FILE"]).expanduser().resolve()
+                arg_repo = _extract_flag_value(prog_args, "--repo-env-file")
+                if arg_repo and _is_literal_abs_path(arg_repo):
+                    repo_env_path = Path(arg_repo).expanduser().resolve()
+                elif plist_ev.get("DALTON_REPO_ENV_FILE") and _is_literal_abs_path(
+                    plist_ev["DALTON_REPO_ENV_FILE"]
+                ):
+                    repo_env_path = Path(plist_ev["DALTON_REPO_ENV_FILE"]).expanduser().resolve()
+
+    env_map: dict[str, str] = {"HOME": str(cfg.home_dir)}
+    if host_env_path.is_file():
+        env_map.update(_parse_simple_env_file(host_env_path))
+    if repo_env_path.is_file():
+        env_map.update(_parse_simple_env_file(repo_env_path))
+    # launchd plist EnvironmentVariables populate os.environ and take precedence over .env/host.env
+    env_map.update(plist_ev)
+    if not env_map.get("DALTON_RESEARCH_HOME"):
+        env_map["DALTON_RESEARCH_HOME"] = str(
             cfg.home_dir / "Library" / "Application Support" / "Everflow" / "research"
         )
-    return gl.resolve_guidepoint_tokens_file(environ=merged_env), None
+    return env_map, host_env_path, repo_env_path, errors
 
 
 def _check_guidepoint_tokens_json(cfg: PreflightConfig) -> dict[str, str]:
-    tokens_path, err = _resolve_tokens_path_from_config(cfg)
-    if err or tokens_path is None:
-        return _result("guidepoint_tokens_json", "fail", err or "could not resolve tokens path")
+    try:
+        gl = _import_guidepoint_lock(cfg.repo_root)
+    except Exception as exc:
+        return _result("guidepoint_tokens_json", "fail", f"cannot import guidepoint_lock: {exc}")
+
+    proxy_env, _gp_env, proxy_errs = _resolve_legacy_proxy_effective_env(cfg)
+    host_env, _host_env_p, _repo_env_p, host_errs = _resolve_research_host_effective_env(cfg)
+    if proxy_errs or host_errs:
+        return _result("guidepoint_tokens_json", "fail", "; ".join(proxy_errs + host_errs))
+
+    proxy_tokens = gl.resolve_guidepoint_tokens_file(environ=proxy_env)
+    host_tokens = gl.resolve_guidepoint_tokens_file(environ=host_env)
+    if proxy_tokens != host_tokens:
+        return _result(
+            "guidepoint_tokens_json",
+            "fail",
+            f"tokens path mismatch between legacy proxy ({proxy_tokens}) and research-host ({host_tokens})",
+        )
+
+    tokens_path = proxy_tokens
     if not tokens_path.is_file():
         return _result("guidepoint_tokens_json", "fail", f"missing tokens file: {tokens_path}")
     try:
@@ -1066,56 +1352,107 @@ def _check_venv_python_imports(cfg: PreflightConfig) -> dict[str, str]:
     if not (venv_py.is_file() and os.access(venv_py, os.X_OK)):
         return _result("venv_python_imports", "fail", f"missing executable venv python: {venv_py}")
 
-    # Build PYTHONPATH from plist config (falling back to canonical paths)
-    repo_abs = cfg.repo_root.resolve()
-    pp_parts: list[str] = []
-    for plist_name in ("com.dalton.research-host.plist", "com.dalton.researchdata-bridge.plist"):
-        pp = cfg.plist_dir / plist_name
-        if pp.is_file():
-            try:
-                pdata = plistlib.loads(pp.read_bytes())
-                ev = pdata.get("EnvironmentVariables") if isinstance(pdata, dict) else {}
-                if isinstance(ev, dict):
-                    for key in ("PYTHONPATH", "DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH"):
-                        raw = str(ev.get(key) or "").strip()
-                        for entry in re.split(r"[:,]", raw):
-                            e = entry.strip()
-                            if e and e not in pp_parts:
-                                pp_parts.append(e)
-            except Exception:
-                pass
-    for fallback in (
-        str(repo_abs / "src"),
-        str(repo_abs),
-        str(repo_abs / "scripts" / "dalton" / "research_runtime"),
-    ):
-        if fallback not in pp_parts:
-            pp_parts.append(fallback)
+    # Strictly use ONLY paths declared in the plists (no synthetic repo fallbacks)
+    host_plist_path = cfg.plist_dir / "com.dalton.research-host.plist"
+    host_ev, host_err = _load_plist_env_vars_strict(host_plist_path)
+    if host_err or host_ev is None:
+        return _result("venv_python_imports", "fail", host_err or f"unreadable {host_plist_path}")
 
-    sub_env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": str(cfg.home_dir),
-        "PYTHONPATH": ":".join(pp_parts),
-    }
-    rc, _out, err = _run_cmd(
-        [
-            str(venv_py),
-            "-c",
-            "import guidepoint_lock, fastapi, uvicorn, httpx, src.dalton.capabilities",
-        ],
-        env=sub_env,
-        timeout_s=20.0,
-    )
-    if rc != 0:
+    rh_pp_raw = str(host_ev.get("PYTHONPATH") or "").strip()
+    rh_extra_pp_raw = str(host_ev.get("DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH") or "").strip()
+    rh_extra_mods_raw = str(host_ev.get("DALTON_RESEARCH_HOST_EXTRA_MODULES") or "").strip()
+    missing_keys: list[str] = []
+    if not rh_pp_raw:
+        missing_keys.append("PYTHONPATH")
+    if not rh_extra_pp_raw:
+        missing_keys.append("DALTON_RESEARCH_HOST_EXTRA_PYTHONPATH")
+    if not rh_extra_mods_raw:
+        missing_keys.append("DALTON_RESEARCH_HOST_EXTRA_MODULES")
+    if missing_keys:
         return _result(
             "venv_python_imports",
             "fail",
-            f"import probe failed (rc={rc}): {err.strip().splitlines()[-1] if err.strip() else 'unknown'}",
+            f"{host_plist_path.name} missing required import env key(s): {', '.join(missing_keys)}",
         )
+
+    rh_pp_parts: list[str] = []
+    for raw_block in (rh_pp_raw, rh_extra_pp_raw):
+        for entry in re.split(r"[:,]", raw_block):
+            e = entry.strip()
+            if e and e not in rh_pp_parts:
+                rh_pp_parts.append(e)
+
+    extra_mods = [m.strip() for m in rh_extra_mods_raw.split(",") if m.strip()]
+    for mod in extra_mods:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", mod):
+            return _result(
+                "venv_python_imports",
+                "fail",
+                f"invalid module name in DALTON_RESEARCH_HOST_EXTRA_MODULES: {mod!r}",
+            )
+
+    host_modules = [
+        "guidepoint_lock",
+        "fastapi",
+        "uvicorn",
+        "httpx",
+        "src.dalton.capabilities",
+        *extra_mods,
+    ]
+    host_import_code = "import " + ", ".join(dict.fromkeys(host_modules))
+    sub_env_host = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(cfg.home_dir),
+        "PYTHONPATH": ":".join(rh_pp_parts),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    rc, _out, err = _run_cmd(
+        [str(venv_py), "-B", "-c", host_import_code],
+        env=sub_env_host,
+        timeout_s=20.0,
+    )
+    if rc != 0:
+        last_line = err.strip().splitlines()[-1] if err.strip() else "unknown"
+        return _result(
+            "venv_python_imports",
+            "fail",
+            f"research-host import probe failed (rc={rc}): {_sanitize_error_text(last_line)}",
+        )
+
+    bridge_plist_path = cfg.plist_dir / "com.dalton.researchdata-bridge.plist"
+    bridge_ev, bridge_err = _load_plist_env_vars_strict(bridge_plist_path)
+    if bridge_err or bridge_ev is None:
+        return _result("venv_python_imports", "fail", bridge_err or f"unreadable {bridge_plist_path}")
+    bridge_pp_raw = str(bridge_ev.get("PYTHONPATH") or "").strip()
+    if not bridge_pp_raw:
+        return _result(
+            "venv_python_imports",
+            "fail",
+            f"{bridge_plist_path.name} missing required PYTHONPATH",
+        )
+    sub_env_bridge = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(cfg.home_dir),
+        "PYTHONPATH": bridge_pp_raw,
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    rc_b, _out_b, err_b = _run_cmd(
+        [str(venv_py), "-B", "-c", "import src.dalton.capabilities"],
+        env=sub_env_bridge,
+        timeout_s=20.0,
+    )
+    if rc_b != 0:
+        last_line = err_b.strip().splitlines()[-1] if err_b.strip() else "unknown"
+        return _result(
+            "venv_python_imports",
+            "fail",
+            f"bridge import probe failed (rc={rc_b}): {_sanitize_error_text(last_line)}",
+        )
+
     return _result(
         "venv_python_imports",
         "ok",
-        "guidepoint_lock, fastapi, uvicorn, httpx, src.dalton.capabilities importable",
+        f"plist-scoped imports ok ({', '.join(dict.fromkeys(host_modules))})",
     )
 
 
@@ -1188,28 +1525,8 @@ def _check_web_releases_current(cfg: PreflightConfig) -> dict[str, str]:
 
 
 def _resolve_guidepoint_env_file(cfg: PreflightConfig) -> Path:
-    proxy_plist = cfg.plist_dir / "com.dalton.guidepoint-mcp-proxy.plist"
-    if proxy_plist.is_file():
-        try:
-            pdata = plistlib.loads(proxy_plist.read_bytes())
-            ev = pdata.get("EnvironmentVariables") if isinstance(pdata, dict) else {}
-            if isinstance(ev, dict) and str(ev.get("GUIDEPOINT_ENV_FILE") or "").strip():
-                return Path(str(ev["GUIDEPOINT_ENV_FILE"])).expanduser().resolve()
-        except Exception:
-            pass
-    bridge_vals = _parse_simple_env_file(cfg.bridge_env_file)
-    raw_home = str(bridge_vals.get("DALTON_RESEARCH_HOME") or "").strip()
-    if raw_home:
-        return Path(raw_home).expanduser().resolve() / "config" / "guidepoint_mcp.env"
-    return (
-        cfg.home_dir
-        / "Library"
-        / "Application Support"
-        / "Everflow"
-        / "research"
-        / "config"
-        / "guidepoint_mcp.env"
-    )
+    _, gp_env_file, _ = _resolve_legacy_proxy_effective_env(cfg)
+    return gp_env_file
 
 
 def _check_live_services_health_and_drain(cfg: PreflightConfig) -> dict[str, str]:
@@ -1302,29 +1619,10 @@ def _check_two_sided_guidepoint_paths(cfg: PreflightConfig) -> dict[str, str]:
     except Exception as exc:
         return _result("two_sided_guidepoint_paths", "fail", f"cannot import guidepoint_lock: {exc}")
 
-    def _side_env(plist_name: str, env_file: Path | None) -> dict[str, str]:
-        env_map: dict[str, str] = {"HOME": str(cfg.home_dir)}
-        if env_file is not None and env_file.is_file():
-            env_map.update(_parse_simple_env_file(env_file))
-        pp = cfg.plist_dir / plist_name
-        if pp.is_file():
-            try:
-                pdata = plistlib.loads(pp.read_bytes())
-                ev = pdata.get("EnvironmentVariables") if isinstance(pdata, dict) else {}
-                if isinstance(ev, dict):
-                    for k, v in ev.items():
-                        env_map[str(k)] = str(v)
-            except Exception:
-                pass
-        if not env_map.get("DALTON_RESEARCH_HOME"):
-            env_map["DALTON_RESEARCH_HOME"] = str(
-                cfg.home_dir / "Library" / "Application Support" / "Everflow" / "research"
-            )
-        return env_map
-
-    gp_env_file = _resolve_guidepoint_env_file(cfg)
-    proxy_env = _side_env("com.dalton.guidepoint-mcp-proxy.plist", gp_env_file)
-    host_env = _side_env("com.dalton.research-host.plist", cfg.research_host_env_file)
+    proxy_env, _gp_env, proxy_errs = _resolve_legacy_proxy_effective_env(cfg)
+    host_env, _host_env_p, _repo_env_p, host_errs = _resolve_research_host_effective_env(cfg)
+    if proxy_errs or host_errs:
+        return _result("two_sided_guidepoint_paths", "fail", "; ".join(proxy_errs + host_errs))
 
     proxy_tokens = gl.resolve_guidepoint_tokens_file(environ=proxy_env)
     host_tokens = gl.resolve_guidepoint_tokens_file(environ=host_env)
@@ -1354,59 +1652,129 @@ def _check_two_sided_guidepoint_paths(cfg: PreflightConfig) -> dict[str, str]:
     )
 
 
-def _read_compose_backend_env(cfg: PreflightConfig) -> tuple[dict[str, str] | None, str]:
-    """Read-only `docker compose config --format json` for Everflow backend service."""
-    compose_base = cfg.repo_root / "docker-compose.yml"
-    compose_dalton = cfg.repo_root / "docker-compose.dalton.yml"
-    if not (compose_base.is_file() and compose_dalton.is_file()):
-        return None, "compose_files_absent"
+def _resolve_compose_file_chain(cfg: PreflightConfig) -> tuple[list[Path], str | None]:
+    """Mirror `deploy_main.sh`'s `compose_files_list` / `_edge_compose_files_list` chain."""
+    repo_vals = _parse_simple_env_file(cfg.repo_env_file)
+    sep = (
+        str(os.environ.get("COMPOSE_PATH_SEPARATOR") or "").strip()
+        or str(repo_vals.get("COMPOSE_PATH_SEPARATOR") or "").strip()
+        or ":"
+    )
+    cf = (
+        str(os.environ.get("COMPOSE_FILE") or "").strip()
+        or str(repo_vals.get("COMPOSE_FILE") or "").strip()
+    )
 
-    cmd = [
+    def _resolve_one(raw: str) -> Path:
+        p = Path(raw)
+        return p if p.is_absolute() else (cfg.repo_root / p)
+
+    files: list[Path] = []
+    if cf:
+        for entry in cf.split(sep):
+            item = entry.strip()
+            if not item:
+                continue
+            resolved = _resolve_one(item)
+            if not resolved.is_file():
+                return [], f"explicit COMPOSE_FILE entry not found: {resolved}"
+            files.append(resolved)
+    else:
+        for base_name in ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"):
+            base_path = cfg.repo_root / base_name
+            if base_path.is_file():
+                files.append(base_path)
+                for ovr_name in (
+                    "compose.override.yaml",
+                    "compose.override.yml",
+                    "docker-compose.override.yaml",
+                    "docker-compose.override.yml",
+                ):
+                    ovr_path = cfg.repo_root / ovr_name
+                    if ovr_path.is_file():
+                        files.append(ovr_path)
+                        break
+                break
+
+    has_dalton = any(p.name == "docker-compose.dalton.yml" for p in files)
+    dalton_compose = cfg.repo_root / "docker-compose.dalton.yml"
+    if not has_dalton and dalton_compose.is_file():
+        files.append(dalton_compose)
+
+    return files, None
+
+
+def _read_compose_backend_env(cfg: PreflightConfig) -> tuple[dict[str, str] | None, str, str | None]:
+    """Read-only `docker compose config --format json` for Everflow backend service.
+
+    Returns `(env_dict, source_tag, error_or_none)`:
+    - Only when NO compose files exist at all (and COMPOSE_FILE is unset) is `(None, "compose_files_absent", None)` returned.
+    - When compose files exist (or COMPOSE_FILE is set), any command failure, invalid JSON,
+      or missing `services.backend.environment` returns an error string (fail closed).
+    """
+    compose_files, chain_err = _resolve_compose_file_chain(cfg)
+    if chain_err is not None:
+        return None, "compose_file_missing", chain_err
+    if not compose_files:
+        return None, "compose_files_absent", None
+
+    cmd: list[str] = [
         cfg.docker_bin,
         "compose",
-        "-f",
-        str(compose_base),
-        "-f",
-        str(compose_dalton),
-        "config",
-        "--format",
-        "json",
+        "--project-directory",
+        str(cfg.repo_root),
     ]
+    if cfg.repo_env_file.is_file():
+        cmd.extend(["--env-file", str(cfg.repo_env_file)])
+    for cf in compose_files:
+        cmd.extend(["-f", str(cf)])
+    cmd.extend(["config", "--format", "json"])
+
     sub_env = dict(os.environ)
     sub_env["HOME"] = str(cfg.home_dir)
     rc, out, err = _run_cmd(cmd, env=sub_env, timeout_s=15.0)
     if rc != 0:
-        return None, f"compose_config_failed(rc={rc}: {err.strip()[:120]})"
+        return (
+            None,
+            "compose_config_failed",
+            f"docker compose config failed (rc={rc}: {_sanitize_error_text(err.strip()[:160])})",
+        )
     try:
         parsed = json.loads(out)
-        svc = (parsed.get("services") or {}).get("backend") or {}
-        raw_env = svc.get("environment") or {}
-        env_dict: dict[str, str] = {}
-        if isinstance(raw_env, dict):
-            for k, v in raw_env.items():
-                if v is not None:
-                    env_dict[str(k)] = str(v)
-        elif isinstance(raw_env, list):
-            for item in raw_env:
-                if isinstance(item, str) and "=" in item:
-                    k, v = item.split("=", 1)
-                    env_dict[k] = v
-        return env_dict, "compose_config"
     except Exception as exc:
-        return None, f"compose_json_error({exc})"
-
-
-def _load_plist_env_vars(plist_path: Path) -> dict[str, str]:
-    if not plist_path.is_file():
-        return {}
-    try:
-        data = plistlib.loads(plist_path.read_bytes())
-        ev = data.get("EnvironmentVariables") if isinstance(data, dict) else {}
-        if isinstance(ev, dict):
-            return {str(k): str(v) for k, v in ev.items()}
-    except Exception:
-        pass
-    return {}
+        return None, "compose_json_error", f"docker compose config emitted invalid JSON: {exc}"
+    if not isinstance(parsed, dict):
+        return None, "compose_json_error", "docker compose config JSON root is not an object"
+    services = parsed.get("services")
+    if not isinstance(services, dict):
+        return None, "compose_missing_services", "docker compose config missing services object"
+    svc = services.get("backend")
+    if not isinstance(svc, dict):
+        return None, "compose_missing_backend", "docker compose config missing services.backend"
+    if "environment" not in svc or svc["environment"] is None:
+        return (
+            None,
+            "compose_missing_backend_env",
+            "docker compose config missing services.backend.environment",
+        )
+    raw_env = svc["environment"]
+    env_dict: dict[str, str] = {}
+    if isinstance(raw_env, dict):
+        for k, v in raw_env.items():
+            if v is not None:
+                env_dict[str(k)] = str(v)
+    elif isinstance(raw_env, list):
+        for item in raw_env:
+            if isinstance(item, str) and "=" in item:
+                k, v = item.split("=", 1)
+                env_dict[k] = v
+    else:
+        return (
+            None,
+            "compose_invalid_backend_env",
+            f"services.backend.environment has invalid type: {type(raw_env).__name__}",
+        )
+    return env_dict, "compose_config", None
 
 
 def _check_three_way_capability_parity(cfg: PreflightConfig) -> dict[str, str]:
@@ -1416,55 +1784,82 @@ def _check_three_way_capability_parity(cfg: PreflightConfig) -> dict[str, str]:
         return _result("three_way_capability_parity", "fail", f"cannot import src.dalton.capabilities: {exc}")
 
     repo_env = cfg.repo_env_file
-    compose_env, compose_src = _read_compose_backend_env(cfg)
+    compose_env, compose_src, compose_err = _read_compose_backend_env(cfg)
+    if compose_err is not None:
+        return _result("three_way_capability_parity", "fail", compose_err)
+
     backend_merged = caps_mod.load_deployment_capability_env(
         repo_env_file=repo_env,
         environ=compose_env if compose_env is not None else {},
     )
 
-    host_plist_env = _load_plist_env_vars(cfg.plist_dir / "com.dalton.research-host.plist")
-    bridge_plist_env = _load_plist_env_vars(cfg.plist_dir / "com.dalton.researchdata-bridge.plist")
+    host_plist_path = cfg.plist_dir / "com.dalton.research-host.plist"
+    bridge_plist_path = cfg.plist_dir / "com.dalton.researchdata-bridge.plist"
+    host_plist_ev, host_plist_err = _load_plist_env_vars_strict(host_plist_path)
+    bridge_plist_ev, bridge_plist_err = _load_plist_env_vars_strict(bridge_plist_path)
+    if host_plist_err or bridge_plist_err:
+        errs = [e for e in (host_plist_err, bridge_plist_err) if e]
+        return _result("three_way_capability_parity", "fail", "; ".join(errs))
+
+    # Honor actual research-host startup --env-file / --repo-env-file if declared in plist
+    _, eff_host_env_path, eff_host_repo_env_path, rh_errs = _resolve_research_host_effective_env(cfg)
+    if rh_errs:
+        return _result("three_way_capability_parity", "fail", "; ".join(rh_errs))
+
+    eff_bridge_repo_env_path = (
+        Path(bridge_plist_ev["DALTON_REPO_ENV_FILE"]).expanduser().resolve()
+        if bridge_plist_ev and _is_literal_abs_path(str(bridge_plist_ev.get("DALTON_REPO_ENV_FILE") or ""))
+        else repo_env
+    )
+    eff_bridge_env_path = (
+        Path(bridge_plist_ev["DALTON_BRIDGE_ENV_FILE"]).expanduser().resolve()
+        if bridge_plist_ev and _is_literal_abs_path(str(bridge_plist_ev.get("DALTON_BRIDGE_ENV_FILE") or ""))
+        else cfg.bridge_env_file
+    )
 
     host_merged = caps_mod.load_deployment_capability_env(
-        repo_env_file=repo_env,
-        service_env_file=cfg.research_host_env_file,
-        environ=host_plist_env,
+        repo_env_file=eff_host_repo_env_path,
+        service_env_file=eff_host_env_path,
+        environ=host_plist_ev or {},
     )
     bridge_merged = caps_mod.load_deployment_capability_env(
-        repo_env_file=repo_env,
-        service_env_file=cfg.bridge_env_file,
-        environ=bridge_plist_env,
+        repo_env_file=eff_bridge_repo_env_path,
+        service_env_file=eff_bridge_env_path,
+        environ=bridge_plist_ev or {},
     )
 
-    def _snapshot(env_map: Mapping[str, str]) -> dict[str, Any]:
-        prof = prof_mod.resolve_profile(
-            app_env=env_map.get("APP_ENV"),
-            dalton_profile=env_map.get("DALTON_PROFILE"),
-        )
-        plat = caps_mod.resolve_host_platform(profile=prof, environ=env_map)
-        caps = sorted(c.value for c in caps_mod.effective_capabilities(profile=prof, environ=env_map))
-        b3 = bool(caps_mod.is_batch3_connectors_enabled(profile=prof, environ=env_map))
-        return {
-            "profile": prof.value,
-            "host_platform": plat,
-            "capabilities": caps,
-            "batch3_enabled": b3,
-        }
+    def _snapshot(label: str, env_map: Mapping[str, str]) -> tuple[dict[str, Any] | None, str | None]:
+        try:
+            prof = prof_mod.resolve_profile(
+                app_env=env_map.get("APP_ENV"),
+                dalton_profile=env_map.get("DALTON_PROFILE"),
+            )
+            plat = caps_mod.resolve_host_platform(profile=prof, environ=env_map)
+            caps = sorted(c.value for c in caps_mod.effective_capabilities(profile=prof, environ=env_map))
+            b3 = bool(caps_mod.is_batch3_connectors_enabled(profile=prof, environ=env_map))
+            return {
+                "profile": prof.value,
+                "host_platform": plat,
+                "capabilities": caps,
+                "batch3_enabled": b3,
+            }, None
+        except Exception as exc:
+            return None, f"{label} capability/profile resolution error ({type(exc).__name__}: {_sanitize_error_text(str(exc))})"
 
-    s_backend = _snapshot(backend_merged)
-    s_host = _snapshot(host_merged)
-    s_bridge = _snapshot(bridge_merged)
+    s_backend, err_b = _snapshot("backend", backend_merged)
+    s_host, err_h = _snapshot("research-host", host_merged)
+    s_bridge, err_br = _snapshot("bridge", bridge_merged)
 
-    errors: list[str] = []
-    if s_backend != s_host:
+    errors: list[str] = [e for e in (err_b, err_h, err_br) if e]
+    if s_backend is not None and s_host is not None and s_backend != s_host:
         errors.append(f"backend vs research-host mismatch: {s_backend} != {s_host}")
-    if s_backend != s_bridge:
+    if s_backend is not None and s_bridge is not None and s_backend != s_bridge:
         errors.append(f"backend vs bridge mismatch: {s_backend} != {s_bridge}")
 
     expected_bridge_env = cfg.bridge_env_file.expanduser().resolve()
     for svc_label, svc_file in (
-        ("research-host.env", cfg.research_host_env_file),
-        ("researchdata-bridge.env", cfg.bridge_env_file),
+        ("research-host.env", eff_host_env_path),
+        ("researchdata-bridge.env", eff_bridge_env_path),
     ):
         conflicts = caps_mod.find_capability_env_conflicts(
             repo_env_file=repo_env,
@@ -1477,6 +1872,7 @@ def _check_three_way_capability_parity(cfg: PreflightConfig) -> dict[str, str]:
 
     if errors:
         return _result("three_way_capability_parity", "fail", "; ".join(errors))
+    assert s_backend is not None
     return _result(
         "three_way_capability_parity",
         "ok",
@@ -1485,29 +1881,64 @@ def _check_three_way_capability_parity(cfg: PreflightConfig) -> dict[str, str]:
     )
 
 
+_PS_ENV_ASSIGN_RE = re.compile(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)=")
+
+
 def _extract_proc_env_vars(ps_output: str, target_keys: set[str]) -> dict[str, str]:
-    """Extract target KEY=VALUE assignments from `ps -wwwE -p <pid>` output."""
+    """Extract target KEY=VALUE assignments from `ps -wwwE -p <pid>` preserving spaces in values."""
     found: dict[str, str] = {}
-    for token in ps_output.split():
-        if "=" not in token:
+    for raw_line in ps_output.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("PID "):
             continue
-        k, v = token.split("=", 1)
-        if k in target_keys:
-            found[k] = v
+        matches = list(_PS_ENV_ASSIGN_RE.finditer(line))
+        for idx, m in enumerate(matches):
+            key = m.group(1)
+            if key not in target_keys:
+                continue
+            val_start = m.end()
+            val_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(line)
+            found[key] = line[val_start:val_end].rstrip()
     return found
 
 
-def _get_service_pid_readonly(cfg: PreflightConfig, label: str) -> int | None:
-    rc, out, _ = _run_cmd([cfg.launchctl_bin, "print", f"gui/{cfg.effective_uid}/{label}"])
+def _get_service_pid_readonly(cfg: PreflightConfig, label: str) -> tuple[int | None, str, str | None]:
+    """Return `(pid, state, detail)` where state is 'running'|'not_loaded'|'no_pid'|'error'."""
+    rc, out, err = _run_cmd([cfg.launchctl_bin, "print", f"gui/{cfg.effective_uid}/{label}"])
     if rc == 0 and out:
         m = re.search(r"^\s*pid\s*=\s*([0-9]+)\b", out, flags=re.MULTILINE)
         if m:
-            return int(m.group(1))
-    rc2, out2, _ = _run_cmd([cfg.launchctl_bin, "list"])
-    if rc2 == 0 and out2:
-        pids = _parse_launchctl_list_pids(out2)
-        return pids.get(label)
-    return None
+            pid_val = int(m.group(1))
+            if pid_val > 0:
+                return pid_val, "running", None
+    rc2, out2, err2 = _run_cmd([cfg.launchctl_bin, "list"])
+    if rc2 != 0:
+        detail = err2.strip() or err.strip() or f"rc={rc2}"
+        return None, "error", f"launchctl failed for {label} ({detail})"
+    pids = _parse_launchctl_list_pids(out2)
+    if label not in pids:
+        return None, "not_loaded", f"{label} is not loaded in launchctl"
+    pid2 = pids[label]
+    if pid2 is None or pid2 <= 0:
+        return None, "no_pid", f"{label} loaded without a running PID"
+    return pid2, "running", None
+
+
+def _expected_stage_guidepoint_urls(cfg: PreflightConfig, bridge_env_gp_url: str) -> set[str]:
+    """Return expected `DALTON_GUIDEPOINT_MCP_URL` values for the current cutover stage."""
+    journal, _ = _read_journal_strict(cfg.ownership_file)
+    target_owner = str((journal or {}).get("target_owner") or "").strip()
+    if target_owner == "research_host_8951" or (
+        bridge_env_gp_url and (":8951" in bridge_env_gp_url or bridge_env_gp_url.rstrip("/").endswith("/mcp/guidepoint"))
+    ):
+        return {
+            f"{cfg.research_host_url.rstrip('/')}/mcp/guidepoint",
+            "http://127.0.0.1:8951/mcp/guidepoint",
+        }
+    return {
+        f"{cfg.proxy_url.rstrip('/')}/mcp",
+        "http://127.0.0.1:8943/mcp",
+    }
 
 
 def _check_env_override_scan(cfg: PreflightConfig) -> dict[str, str]:
@@ -1517,6 +1948,10 @@ def _check_env_override_scan(cfg: PreflightConfig) -> dict[str, str]:
         return _result("env_override_scan", "fail", f"cannot import src.dalton.capabilities: {exc}")
 
     repo_vals = _parse_simple_env_file(cfg.repo_env_file)
+    bridge_vals = _parse_simple_env_file(cfg.bridge_env_file)
+    bridge_env_gp_url = str(bridge_vals.get("DALTON_GUIDEPOINT_MCP_URL") or "").strip()
+    expected_gp_urls = _expected_stage_guidepoint_urls(cfg, bridge_env_gp_url)
+
     scan_keys: set[str] = set(_CONTROL_SCAN_BASE_KEYS)
     for k in repo_vals:
         if caps_mod.is_capability_control_env_key(k):
@@ -1529,31 +1964,56 @@ def _check_env_override_scan(cfg: PreflightConfig) -> dict[str, str]:
 
     # 1. launchctl getenv for each target key
     lc_env: dict[str, str] = {}
+    lc_getenv_failed_keys: list[str] = []
     for key in sorted(scan_keys):
         rc, out, _ = _run_cmd([cfg.launchctl_bin, "getenv", key])
+        if rc != 0:
+            lc_getenv_failed_keys.append(key)
+            continue
         val = out.strip()
-        if rc == 0 and val:
+        if val:
             lc_env[key] = val
+    if lc_getenv_failed_keys:
+        warnings.append(
+            f"launchctl getenv failed for {len(lc_getenv_failed_keys)} key(s): "
+            f"{', '.join(lc_getenv_failed_keys[:3])}"
+        )
     if lc_env:
         extra_sources["launchctl_getenv"] = lc_env
 
-    # 2. All com.dalton.*.plist in --plist-dir
+    # 2. All com.dalton.*.plist in --plist-dir (distinguish read failure from no override)
     if cfg.plist_dir.is_dir():
         for pp in sorted(cfg.plist_dir.glob("com.dalton.*.plist")):
-            ev = _load_plist_env_vars(pp)
+            ev, perr = _load_plist_env_vars_strict(pp)
+            if perr is not None:
+                warnings.append(f"could not read plist {pp.name}: {perr}")
+                continue
             if ev:
                 extra_sources[f"plist:{pp.name}"] = ev
 
     # 3. Running process environments for bridge and research-host
     for label in ("com.dalton.researchdata-bridge", "com.dalton.research-host"):
-        pid = _get_service_pid_readonly(cfg, label)
-        if pid is None or pid <= 0:
+        pid, state, detail = _get_service_pid_readonly(cfg, label)
+        if state in ("error", "no_pid"):
+            warnings.append(f"could not read process env for {label}: {detail}")
             continue
+        if state == "not_loaded":
+            # Bridge is expected running during --switch preflight; research-host may be standby/not loaded yet.
+            if label == "com.dalton.researchdata-bridge":
+                warnings.append(f"could not read process env for {label}: {detail}")
+            continue
+        assert pid is not None
         rc, out, err = _run_cmd([cfg.ps_bin, "-wwwE", "-p", str(pid)])
         if rc != 0 or not out.strip():
             warnings.append(f"could not read process env for {label} (pid={pid}): {err.strip() or f'rc={rc}'}")
             continue
         proc_vars = _extract_proc_env_vars(out, scan_keys)
+        if label == "com.dalton.researchdata-bridge" and "DALTON_GUIDEPOINT_MCP_URL" in proc_vars:
+            proc_gp_url = proc_vars["DALTON_GUIDEPOINT_MCP_URL"].strip()
+            # Bridge loads DALTON_GUIDEPOINT_MCP_URL from researchdata-bridge.env into its own os.environ.
+            # Only flag a conflict if it differs from the env file AND is not the expected URL for this stage.
+            if (bridge_env_gp_url and proc_gp_url == bridge_env_gp_url) or (proc_gp_url in expected_gp_urls):
+                proc_vars = {k: v for k, v in proc_vars.items() if k != "DALTON_GUIDEPOINT_MCP_URL"}
         if proc_vars:
             extra_sources[f"proc:{label}(pid={pid})"] = proc_vars
 
@@ -1567,7 +2027,7 @@ def _check_env_override_scan(cfg: PreflightConfig) -> dict[str, str]:
     )
     if conflicts:
         details = [
-            f"{c.get('source')} {c.get('key')}={c.get('value')!r} ({c.get('reason')})"
+            f"{c.get('source')} {c.get('key')}={_sanitize_diag_value(str(c.get('key') or ''), c.get('value'))} ({c.get('reason')})"
             for c in conflicts
         ]
         return _result("env_override_scan", "fail", "; ".join(details))
@@ -1580,34 +2040,41 @@ def _check_env_override_scan(cfg: PreflightConfig) -> dict[str, str]:
 def run_preflight(mode: str, cfg: PreflightConfig, *, report_json: bool = False) -> tuple[int, list[dict[str, str]]]:
     """Execute preflight checks for `stage-a` or `switch` mode."""
     if mode == "stage-a":
-        checks: list[Callable[[PreflightConfig], dict[str, str]]] = [
-            _check_backend_admission_gate,
-            _check_guidepoint_proxy_pid_match,
-            _check_stage_a_plists,
-            lambda c: _check_research_host_env(c, require_distinct_tokens=False),
-            _check_guidepoint_tokens_json,
-            _check_venv_python_imports,
-            _check_web_releases_current,
+        checks: list[tuple[str, Callable[[PreflightConfig], dict[str, str]]]] = [
+            ("backend_admission_gate", _check_backend_admission_gate),
+            ("guidepoint_proxy_pid_match", _check_guidepoint_proxy_pid_match),
+            ("stage_a_plists", _check_stage_a_plists),
+            ("research_host_env", lambda c: _check_research_host_env(c, require_distinct_tokens=False)),
+            ("guidepoint_tokens_json", _check_guidepoint_tokens_json),
+            ("venv_python_imports", _check_venv_python_imports),
+            ("web_releases_current", _check_web_releases_current),
         ]
     elif mode == "switch":
         checks = [
-            _check_live_services_health_and_drain,
-            _check_bridge_plist_and_budgets,
-            lambda c: _check_research_host_env(c, require_distinct_tokens=True),
-            _check_extra_plugins,
-            _check_venv_python_imports,
-            _check_web_releases_current,
-            _check_two_sided_guidepoint_paths,
-            _check_three_way_capability_parity,
-            _check_env_override_scan,
+            ("live_services_health_and_drain", _check_live_services_health_and_drain),
+            ("bridge_plist_and_budgets", _check_bridge_plist_and_budgets),
+            ("research_host_env", lambda c: _check_research_host_env(c, require_distinct_tokens=True)),
+            ("extra_plugins", _check_extra_plugins),
+            ("venv_python_imports", _check_venv_python_imports),
+            ("web_releases_current", _check_web_releases_current),
+            ("two_sided_guidepoint_paths", _check_two_sided_guidepoint_paths),
+            ("three_way_capability_parity", _check_three_way_capability_parity),
+            ("env_override_scan", _check_env_override_scan),
         ]
     else:
         raise ValueError(f"Unsupported preflight mode: {mode!r}")
 
     results: list[dict[str, str]] = []
     failed = False
-    for fn in checks:
-        res = fn(cfg)
+    for check_name, fn in checks:
+        try:
+            res = fn(cfg)
+        except Exception as exc:
+            res = _result(
+                check_name,
+                "fail",
+                f"check failed ({type(exc).__name__}: {_sanitize_error_text(str(exc))})",
+            )
         results.append(res)
         if res["status"] == "fail":
             failed = True
@@ -1617,8 +2084,153 @@ def run_preflight(mode: str, cfg: PreflightConfig, *, report_json: bool = False)
 
 
 # ---------------------------------------------------------------------------
-# Shared helper subcommands (journal, recovery-manifest, approve-budgets, guard)
+# Shared helper subcommands (lock, journal, recovery-manifest, approve-budgets, guard)
 # ---------------------------------------------------------------------------
+
+
+def _verify_inherited_ops_lock(lock_file: Path, lock_fd: int = 8) -> tuple[bool, str]:
+    """Verify via kernel `flock` that `lock_fd` itself holds an exclusive lock on `lock_file`.
+
+    Three-step unforgeable check:
+      1. `fstat(lock_fd)` must match `stat(lock_file)` (`st_dev`, `st_ino`).
+      2. A fresh independent open on `lock_file` must get `BlockingIOError` on `LOCK_EX|LOCK_NB`
+         (proving an exclusive flock is actually held on that inode).
+      3. `flock(lock_fd, LOCK_EX|LOCK_NB)` must succeed (idempotent on the same open file
+         description that holds the lock, fails with `BlockingIOError` if another process holds it).
+    """
+    try:
+        path_st = os.stat(str(lock_file))
+    except OSError as exc:
+        return False, f"ops lock file missing or inaccessible ({lock_file}: {exc})"
+
+    try:
+        fd_st = os.fstat(int(lock_fd))
+    except OSError:
+        return False, f"ops lock FD {lock_fd} is not open"
+
+    if (fd_st.st_dev, fd_st.st_ino) != (path_st.st_dev, path_st.st_ino):
+        return False, f"ops lock FD {lock_fd} does not refer to {lock_file}"
+
+    probe_fd: int | None = None
+    try:
+        probe_fd = os.open(str(lock_file), os.O_RDONLY)
+        try:
+            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            # Nobody held the exclusive flock — immediately unlock and reject!
+            try:
+                fcntl.flock(probe_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            return False, f"no exclusive flock is held on {lock_file}"
+    except OSError as exc:
+        return False, f"failed probing {lock_file}: {exc}"
+    finally:
+        if probe_fd is not None:
+            try:
+                os.close(probe_fd)
+            except OSError:
+                pass
+
+    try:
+        fcntl.flock(int(lock_fd), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False, f"{lock_file} is held by another process, not FD {lock_fd}"
+    except OSError as exc:
+        return False, f"flock verification on FD {lock_fd} failed: {exc}"
+
+    return True, "ok"
+
+
+@contextmanager
+def _hold_or_verify_ops_lock(
+    lock_file: Path,
+    *,
+    lock_fd: int | None = None,
+    caller_tag: str = "preflight",
+) -> Iterator[None]:
+    """Reuse a verified inherited FD lock or acquire a non-blocking exclusive flock on `lock_file`."""
+    if lock_fd is not None:
+        ok, _ = _verify_inherited_ops_lock(lock_file, lock_fd=lock_fd)
+        if ok:
+            yield
+            return
+
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(lock_file.parent, 0o700)
+    except OSError:
+        pass
+
+    fd = os.open(str(lock_file), os.O_RDWR | os.O_CREAT, 0o600)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            holder = ""
+            try:
+                holder = lock_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                holder = ""
+            detail = f" ({holder})" if holder else ""
+            raise RuntimeError(
+                f"another research-host ops/deploy process holds {lock_file}{detail}"
+            ) from None
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        os.write(fd, f"pid={os.getpid()} started={ts} caller={caller_tag}\n".encode("utf-8"))
+        os.fsync(fd)
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _read_journal_strict(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    """Strictly read `handoff-journal.json`.
+
+    Returns:
+      - `(None, None)` when the file does not exist.
+      - `(dict, None)` when the file exists and parses as a JSON object.
+      - `(None, error)` when the file exists but is unreadable, not a regular file,
+        invalid JSON, or not a JSON object (fail closed).
+    """
+    if not path.exists() and not path.is_symlink():
+        return None, None
+    if not path.is_file():
+        return None, f"handoff-journal.json is not a regular file: {path}"
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, f"failed reading handoff-journal.json ({path}): {exc}"
+    try:
+        parsed = json.loads(raw_text)
+    except ValueError as exc:
+        return None, f"corrupt JSON in handoff-journal.json ({path}): {exc}"
+    if not isinstance(parsed, dict):
+        return None, f"handoff-journal.json root is not a JSON object ({path})"
+    return parsed, None
+
+
+def cmd_lock_verify(args: argparse.Namespace) -> int:
+    lock_file = Path(args.lock_file).expanduser().resolve()
+    ok, reason = _verify_inherited_ops_lock(lock_file, lock_fd=int(args.lock_fd))
+    if not ok:
+        print(f"ERROR: {reason}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _coerce_journal_value(raw: str) -> Any:
@@ -1635,7 +2247,14 @@ def cmd_journal_set(args: argparse.Namespace) -> int:
     repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
     gl = _import_guidepoint_lock(repo_root)
     ownership_path = Path(args.ownership_file).expanduser().resolve()
-    current = gl.read_ownership_journal(ownership_file=ownership_path)
+    lock_file = (
+        Path(args.lock_file).expanduser().resolve()
+        if getattr(args, "lock_file", None)
+        else (ownership_path.parent / ".ops.lock")
+    )
+    lock_fd = int(args.lock_fd) if getattr(args, "lock_fd", None) is not None else None
+
+    updates: list[tuple[str, Any]] = []
     for item in args.pairs:
         if "=" not in item:
             print(f"ERROR: expected key=value pair, got {item!r}", file=sys.stderr)
@@ -1645,19 +2264,39 @@ def cmd_journal_set(args: argparse.Namespace) -> int:
         if not k:
             print(f"ERROR: empty key in {item!r}", file=sys.stderr)
             return 2
-        current[k] = _coerce_journal_value(v)
-    current["updated_at"] = datetime.now(timezone.utc).isoformat()
-    gl.write_ownership_journal_atomic(current, ownership_file=ownership_path)
+        updates.append((k, _coerce_journal_value(v)))
+
+    try:
+        with _hold_or_verify_ops_lock(lock_file, lock_fd=lock_fd, caller_tag="preflight:journal-set"):
+            existing, j_err = _read_journal_strict(ownership_path)
+            if j_err is not None:
+                print(
+                    f"ERROR: refusing to overwrite corrupt/unreadable journal: {j_err}",
+                    file=sys.stderr,
+                )
+                return 1
+            current: dict[str, Any] = dict(existing) if existing is not None else {}
+            for k, v in updates:
+                current[k] = v
+            current["updated_at"] = datetime.now(timezone.utc).isoformat()
+            gl.write_ownership_journal_atomic(current, ownership_file=ownership_path)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
     if args.print_json:
         print(json.dumps(current, ensure_ascii=False))
     return 0
 
 
 def cmd_journal_read(args: argparse.Namespace) -> int:
-    repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
-    gl = _import_guidepoint_lock(repo_root)
     ownership_path = Path(args.ownership_file).expanduser().resolve()
-    data = gl.read_ownership_journal(ownership_file=ownership_path)
+    data, j_err = _read_journal_strict(ownership_path)
+    if j_err is not None:
+        print(f"ERROR: {j_err}", file=sys.stderr)
+        return 1
+    if data is None:
+        data = {}
     if args.key:
         val = data.get(args.key)
         if isinstance(val, bool):
@@ -1679,17 +2318,39 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _fsync_file(path: Path) -> None:
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def cmd_manifest_write(args: argparse.Namespace) -> int:
     rec_dir = Path(args.recovery_dir).expanduser().resolve()
     if not rec_dir.is_dir():
         print(f"ERROR: recovery dir not found: {rec_dir}", file=sys.stderr)
         return 1
+    requested = list(args.files)
+    if set(requested) != set(RECOVERY_REQUIRED_FILES) or len(requested) != len(RECOVERY_REQUIRED_FILES):
+        print(
+            f"ERROR: recovery manifest must cover the exact required 5-file set "
+            f"{list(RECOVERY_REQUIRED_FILES)}, got {requested}",
+            file=sys.stderr,
+        )
+        return 1
     files_meta: dict[str, dict[str, Any]] = {}
-    for name in args.files:
+    for name in RECOVERY_REQUIRED_FILES:
         fp = rec_dir / name
-        if not fp.is_file():
-            print(f"ERROR: missing file for manifest: {fp}", file=sys.stderr)
+        if fp.is_symlink() or not fp.is_file():
+            print(f"ERROR: missing or non-regular file for manifest: {fp}", file=sys.stderr)
             return 1
+        _fsync_file(fp)
         files_meta[name] = {
             "sha256": _sha256_file(fp),
             "size": fp.stat().st_size,
@@ -1706,6 +2367,7 @@ def cmd_manifest_write(args: argparse.Namespace) -> int:
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         mode=0o600,
     )
+    _fsync_dir(rec_dir)
     return 0
 
 
@@ -1720,20 +2382,46 @@ def cmd_manifest_verify(args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"ERROR: invalid recovery-manifest.json: {exc}", file=sys.stderr)
         return 1
-    files_meta = manifest.get("files") if isinstance(manifest, dict) else None
+    if not isinstance(manifest, dict) or manifest.get("version") != 1:
+        print("ERROR: recovery-manifest.json must be a version 1 JSON object", file=sys.stderr)
+        return 1
+    files_meta = manifest.get("files")
     if not isinstance(files_meta, dict) or not files_meta:
         print("ERROR: recovery-manifest.json has no files entries", file=sys.stderr)
         return 1
+
     errors: list[str] = []
-    for name, info in sorted(files_meta.items()):
-        fp = rec_dir / name
-        if not fp.is_file():
-            errors.append(f"missing file: {name}")
+    required_set = set(RECOVERY_REQUIRED_FILES)
+    manifest_keys = set(files_meta.keys())
+    missing_entries = sorted(required_set - manifest_keys)
+    extra_entries = sorted(manifest_keys - required_set)
+    if missing_entries:
+        errors.append(f"manifest missing required file entry(ies): {', '.join(missing_entries)}")
+    if extra_entries:
+        errors.append(f"manifest contains unexpected file entry(ies): {', '.join(extra_entries)}")
+
+    for name in RECOVERY_REQUIRED_FILES:
+        info = files_meta.get(name)
+        if not isinstance(info, dict):
+            if name not in missing_entries:
+                errors.append(f"invalid metadata entry for {name}")
             continue
-        expected = str((info or {}).get("sha256") or "")
+        fp = rec_dir / name
+        if fp.is_symlink() or not fp.is_file():
+            errors.append(f"missing or non-regular file: {name}")
+            continue
+        expected = str(info.get("sha256") or "")
+        if not _SHA256_HEX_RE.fullmatch(expected):
+            errors.append(f"invalid sha256 digest in manifest for {name}")
+            continue
+        expected_size = info.get("size")
+        actual_size = fp.stat().st_size
+        if isinstance(expected_size, bool) or not isinstance(expected_size, int) or actual_size != expected_size:
+            errors.append(f"size mismatch for {name}: expected={expected_size!r} actual={actual_size}")
         actual = _sha256_file(fp)
-        if not expected or actual != expected:
+        if actual != expected:
             errors.append(f"sha256 mismatch for {name}: expected={expected[:12]} actual={actual[:12]}")
+
     if errors:
         for e in errors:
             print(f"ERROR: {e}", file=sys.stderr)
@@ -1743,86 +2431,127 @@ def cmd_manifest_verify(args: argparse.Namespace) -> int:
 
 def cmd_approve_budgets(args: argparse.Namespace) -> int:
     budgets_path = Path(args.budgets_file).expanduser().resolve()
-    parsed, parse_errors = parse_timing_budgets_env(budgets_path)
-    if parse_errors:
-        print("ERROR: timing-budgets.env 校验未通过：", file=sys.stderr)
-        for err in parse_errors:
-            print(f"  - {err}", file=sys.stderr)
-        print("请核对参数或运行 --measure-budgets 重新测量。", file=sys.stderr)
-        return 1
-
-    violations: list[str] = []
-
-    def _parse_pos_int(key: str, raw: str | None) -> int | None:
-        if raw is None or not _POSITIVE_INT_RE.match(str(raw)):
-            violations.append(f"{key} must be a positive integer (got {raw!r})")
-            return None
-        return int(str(raw))
-
-    req_handoff_s = _parse_pos_int("REQUIRED_HANDOFF_WINDOW_S", parsed.get("REQUIRED_HANDOFF_WINDOW_S"))
-    req_stage_b_s = _parse_pos_int("REQUIRED_STAGE_B_WINDOW_S", parsed.get("REQUIRED_STAGE_B_WINDOW_S"))
-
-    handoff_arg = args.handoff_deadline_s
-    stage_b_m_arg = args.stage_b_window_m
-
-    if handoff_arg is not None and not _POSITIVE_INT_RE.match(str(handoff_arg)):
-        violations.append(f"--handoff-deadline-s must be a positive integer (got {handoff_arg!r})")
-    if stage_b_m_arg is not None and not _POSITIVE_INT_RE.match(str(stage_b_m_arg)):
-        violations.append(f"--stage-b-window-m must be a positive integer (got {stage_b_m_arg!r})")
-
-    candidate: dict[str, str] = dict(parsed)
-
-    if req_handoff_s is not None:
-        if req_handoff_s > HANDOFF_DEFAULT_LIMIT_S:
-            if handoff_arg is None:
-                violations.append(
-                    f"REQUIRED_HANDOFF_WINDOW_S ({req_handoff_s}s) > {HANDOFF_DEFAULT_LIMIT_S}s: "
-                    "must supply --handoff-deadline-s"
-                )
-            elif _POSITIVE_INT_RE.match(str(handoff_arg)):
-                candidate["HANDOFF_DEADLINE_S"] = str(int(handoff_arg))
-        else:
-            if handoff_arg is not None:
-                violations.append(
-                    f"REQUIRED_HANDOFF_WINDOW_S ({req_handoff_s}s) <= {HANDOFF_DEFAULT_LIMIT_S}s: "
-                    "--handoff-deadline-s is not allowed when handoff window did not exceed 90s"
-                )
-
-    if req_stage_b_s is not None:
-        if req_stage_b_s > STAGE_B_DEFAULT_LIMIT_S:
-            if stage_b_m_arg is None:
-                violations.append(
-                    f"REQUIRED_STAGE_B_WINDOW_S ({req_stage_b_s}s) > {STAGE_B_DEFAULT_LIMIT_S}s: "
-                    "must supply --stage-b-window-m"
-                )
-            elif _POSITIVE_INT_RE.match(str(stage_b_m_arg)):
-                candidate["STAGE_B_WINDOW_DEADLINE_S"] = str(int(stage_b_m_arg) * 60)
-        else:
-            if stage_b_m_arg is not None:
-                violations.append(
-                    f"REQUIRED_STAGE_B_WINDOW_S ({req_stage_b_s}s) <= {STAGE_B_DEFAULT_LIMIT_S}s: "
-                    "--stage-b-window-m is not allowed when Stage B window did not exceed 60m"
-                )
-
-    candidate["BUDGET_APPROVED_AT"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    candidate["BUDGET_APPROVAL_REQUIRED"] = "false"
-
-    # Re-validate the full candidate via the exact same validate_timing_budgets_env() function
-    violations.extend(validate_timing_budgets_env(candidate))
-    if violations:
-        print("ERROR: 预算审批复核未通过，原 timing-budgets.env 保持不变：", file=sys.stderr)
-        for v in violations:
-            print(f"  - {v}", file=sys.stderr)
-        print("请核对参数或运行 --measure-budgets 重新测量。", file=sys.stderr)
-        return 1
-
-    _atomic_write_text(budgets_path, format_timing_budgets_env(candidate), mode=0o600)
-    print(
-        f"BUDGET_APPROVAL_OK: HANDOFF_DEADLINE_S={candidate['HANDOFF_DEADLINE_S']} "
-        f"STAGE_B_WINDOW_DEADLINE_S={candidate['STAGE_B_WINDOW_DEADLINE_S']} "
-        f"BUDGET_APPROVED_AT={candidate['BUDGET_APPROVED_AT']}"
+    journal_path = (
+        Path(args.journal_file).expanduser().resolve()
+        if getattr(args, "journal_file", None)
+        else (budgets_path.parent / "handoff-journal.json")
     )
-    return 0
+    lock_file = (
+        Path(args.lock_file).expanduser().resolve()
+        if getattr(args, "lock_file", None)
+        else (budgets_path.parent / ".ops.lock")
+    )
+    lock_fd = int(args.lock_fd) if getattr(args, "lock_fd", None) is not None else None
+
+    try:
+        with _hold_or_verify_ops_lock(
+            lock_file, lock_fd=lock_fd, caller_tag="preflight:approve-budgets"
+        ):
+            # Strict journal precondition: must exist, be valid JSON object, and completed == true
+            journal, j_err = _read_journal_strict(journal_path)
+            if j_err is not None:
+                print(
+                    f"ERROR: --approve-budgets 拒绝执行，交接日志不可用：{j_err}",
+                    file=sys.stderr,
+                )
+                return 1
+            if journal is None:
+                print(
+                    f"ERROR: --approve-budgets 要求交接日志存在且 completed == true（缺失 {journal_path}）",
+                    file=sys.stderr,
+                )
+                return 1
+            if journal.get("completed") is not True:
+                print(
+                    f"ERROR: --approve-budgets 要求 handoff-journal.json 的 completed == true "
+                    f"（当前为 {journal.get('completed')!r}）",
+                    file=sys.stderr,
+                )
+                return 1
+
+            parsed, parse_errors = parse_timing_budgets_env(budgets_path)
+            if parse_errors:
+                print("ERROR: timing-budgets.env 校验未通过：", file=sys.stderr)
+                for err in parse_errors:
+                    print(f"  - {err}", file=sys.stderr)
+                print("请核对参数或运行 --measure-budgets 重新测量。", file=sys.stderr)
+                return 1
+
+            violations: list[str] = []
+
+            def _parse_pos_int(key: str, raw: str | None) -> int | None:
+                if raw is None or not _POSITIVE_INT_RE.match(str(raw)):
+                    violations.append(f"{key} must be a positive integer (got {raw!r})")
+                    return None
+                return int(str(raw))
+
+            req_handoff_s = _parse_pos_int("REQUIRED_HANDOFF_WINDOW_S", parsed.get("REQUIRED_HANDOFF_WINDOW_S"))
+            req_stage_b_s = _parse_pos_int("REQUIRED_STAGE_B_WINDOW_S", parsed.get("REQUIRED_STAGE_B_WINDOW_S"))
+
+            handoff_arg = args.handoff_deadline_s
+            stage_b_m_arg = args.stage_b_window_m
+
+            if handoff_arg is not None and not _POSITIVE_INT_RE.match(str(handoff_arg)):
+                violations.append(f"--handoff-deadline-s must be a positive integer (got {handoff_arg!r})")
+            if stage_b_m_arg is not None and not _POSITIVE_INT_RE.match(str(stage_b_m_arg)):
+                violations.append(f"--stage-b-window-m must be a positive integer (got {stage_b_m_arg!r})")
+
+            candidate: dict[str, str] = dict(parsed)
+
+            if req_handoff_s is not None:
+                if req_handoff_s > HANDOFF_DEFAULT_LIMIT_S:
+                    if handoff_arg is None:
+                        violations.append(
+                            f"REQUIRED_HANDOFF_WINDOW_S ({req_handoff_s}s) > {HANDOFF_DEFAULT_LIMIT_S}s: "
+                            "must supply --handoff-deadline-s"
+                        )
+                    elif _POSITIVE_INT_RE.match(str(handoff_arg)):
+                        candidate["HANDOFF_DEADLINE_S"] = str(int(handoff_arg))
+                else:
+                    if handoff_arg is not None:
+                        violations.append(
+                            f"REQUIRED_HANDOFF_WINDOW_S ({req_handoff_s}s) <= {HANDOFF_DEFAULT_LIMIT_S}s: "
+                            "--handoff-deadline-s is not allowed when handoff window did not exceed 90s"
+                        )
+
+            if req_stage_b_s is not None:
+                if req_stage_b_s > STAGE_B_DEFAULT_LIMIT_S:
+                    if stage_b_m_arg is None:
+                        violations.append(
+                            f"REQUIRED_STAGE_B_WINDOW_S ({req_stage_b_s}s) > {STAGE_B_DEFAULT_LIMIT_S}s: "
+                            "must supply --stage-b-window-m"
+                        )
+                    elif _POSITIVE_INT_RE.match(str(stage_b_m_arg)):
+                        candidate["STAGE_B_WINDOW_DEADLINE_S"] = str(int(stage_b_m_arg) * 60)
+                else:
+                    if stage_b_m_arg is not None:
+                        violations.append(
+                            f"REQUIRED_STAGE_B_WINDOW_S ({req_stage_b_s}s) <= {STAGE_B_DEFAULT_LIMIT_S}s: "
+                            "--stage-b-window-m is not allowed when Stage B window did not exceed 60m"
+                        )
+
+            candidate["BUDGET_APPROVED_AT"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            candidate["BUDGET_APPROVAL_REQUIRED"] = "false"
+
+            # Re-validate the full candidate via the exact same validate_timing_budgets_env() function
+            violations.extend(validate_timing_budgets_env(candidate))
+            if violations:
+                print("ERROR: 预算审批复核未通过，原 timing-budgets.env 保持不变：", file=sys.stderr)
+                for v in violations:
+                    print(f"  - {v}", file=sys.stderr)
+                print("请核对参数或运行 --measure-budgets 重新测量。", file=sys.stderr)
+                return 1
+
+            _atomic_write_text(budgets_path, format_timing_budgets_env(candidate), mode=0o600)
+            print(
+                f"BUDGET_APPROVAL_OK: HANDOFF_DEADLINE_S={candidate['HANDOFF_DEADLINE_S']} "
+                f"STAGE_B_WINDOW_DEADLINE_S={candidate['STAGE_B_WINDOW_DEADLINE_S']} "
+                f"BUDGET_APPROVED_AT={candidate['BUDGET_APPROVED_AT']}"
+            )
+            return 0
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
 
 def cmd_guard_check(args: argparse.Namespace) -> int:
@@ -1835,9 +2564,20 @@ def cmd_guard_check(args: argparse.Namespace) -> int:
 
     missing_reasons: list[str] = []
 
-    # Condition 1: current process holds .ops.lock
+    # Condition 1: current process ACTUALLY holds kernel flock on .ops.lock (never trust --lock-held alone)
+    j_path = Path(args.journal_file).expanduser().resolve()
+    lock_file = (
+        Path(args.lock_file).expanduser().resolve()
+        if getattr(args, "lock_file", None)
+        else (j_path.parent / ".ops.lock")
+    )
+    lock_fd = int(args.lock_fd) if getattr(args, "lock_fd", None) is not None else 8
     if str(args.lock_held) != "1":
         missing_reasons.append("current process does not hold .ops.lock")
+    else:
+        lock_ok, lock_reason = _verify_inherited_ops_lock(lock_file, lock_fd=lock_fd)
+        if not lock_ok:
+            missing_reasons.append(f"current process does not hold .ops.lock ({lock_reason})")
 
     # Condition 2: maintenance-admission.json fully paused (paused == true and allow_workspace_ids == [])
     adm_path = Path(args.admission_file).expanduser().resolve()
@@ -1861,20 +2601,15 @@ def cmd_guard_check(args: argparse.Namespace) -> int:
             missing_reasons.append(f"maintenance-admission.json unreadable ({exc})")
 
     # Condition 3: handoff-journal.json completed == false
-    j_path = Path(args.journal_file).expanduser().resolve()
-    if not j_path.is_file():
+    j_data, j_err = _read_journal_strict(j_path)
+    if j_err is not None:
+        missing_reasons.append(j_err)
+    elif j_data is None:
         missing_reasons.append(f"handoff-journal.json missing ({j_path})")
-    else:
-        try:
-            j = json.loads(j_path.read_text(encoding="utf-8"))
-            if not isinstance(j, dict):
-                raise ValueError("not a JSON object")
-            if j.get("completed") is not False:
-                missing_reasons.append(
-                    f"handoff-journal.json completed != false (got {j.get('completed')!r})"
-                )
-        except Exception as exc:
-            missing_reasons.append(f"handoff-journal.json unreadable ({exc})")
+    elif j_data.get("completed") is not False:
+        missing_reasons.append(
+            f"handoff-journal.json completed != false (got {j_data.get('completed')!r})"
+        )
 
     if missing_reasons:
         print(
@@ -1984,9 +2719,15 @@ def _build_subcommand_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Shared cutover ops helpers")
     sub = p.add_subparsers(dest="subcommand", required=True)
 
+    p_lv = sub.add_parser("lock-verify")
+    p_lv.add_argument("--lock-file", required=True)
+    p_lv.add_argument("--lock-fd", type=int, default=8)
+
     p_js = sub.add_parser("journal-set")
     p_js.add_argument("--ownership-file", required=True)
     p_js.add_argument("--repo", default=None)
+    p_js.add_argument("--lock-file", default=None)
+    p_js.add_argument("--lock-fd", type=int, default=None)
     p_js.add_argument("--print-json", action="store_true")
     p_js.add_argument("pairs", nargs="+")
 
@@ -2005,6 +2746,9 @@ def _build_subcommand_parser() -> argparse.ArgumentParser:
 
     p_ab = sub.add_parser("approve-budgets")
     p_ab.add_argument("--budgets-file", required=True)
+    p_ab.add_argument("--journal-file", default=None)
+    p_ab.add_argument("--lock-file", default=None)
+    p_ab.add_argument("--lock-fd", type=int, default=None)
     p_ab.add_argument("--handoff-deadline-s", default=None)
     p_ab.add_argument("--stage-b-window-m", default=None)
 
@@ -2012,6 +2756,8 @@ def _build_subcommand_parser() -> argparse.ArgumentParser:
     p_gc.add_argument("--action", required=True)
     p_gc.add_argument("--admission-file", required=True)
     p_gc.add_argument("--journal-file", required=True)
+    p_gc.add_argument("--lock-file", default=None)
+    p_gc.add_argument("--lock-fd", type=int, default=8)
     p_gc.add_argument("--lock-held", required=True)
 
     p_ss = sub.add_parser("status-summary")
@@ -2025,6 +2771,7 @@ def _build_subcommand_parser() -> argparse.ArgumentParser:
 
 _SUBCOMMANDS = frozenset(
     {
+        "lock-verify",
         "journal-set",
         "journal-read",
         "manifest-write",
@@ -2040,6 +2787,8 @@ def main(argv: list[str] | None = None) -> int:
     args_list = list(sys.argv[1:] if argv is None else argv)
     if args_list and args_list[0] in _SUBCOMMANDS:
         ns = _build_subcommand_parser().parse_args(args_list)
+        if ns.subcommand == "lock-verify":
+            return cmd_lock_verify(ns)
         if ns.subcommand == "journal-set":
             return cmd_journal_set(ns)
         if ns.subcommand == "journal-read":

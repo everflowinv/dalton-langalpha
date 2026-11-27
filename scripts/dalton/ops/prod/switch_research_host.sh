@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 # Everflow Research Host cutover & rollback orchestrator (§6.4b).
 #
-# Current scope (s34-r1):
-#   - Full CLI parsing for all §6.4b entrypoints
-#   - Read-only `--check` and `--switch --dry-run` (no lock, no writes, exempt
-#     from incomplete-journal guard)
+# Current scope (s34-r2):
+#   - Full CLI parsing & per-action flag validation for all §6.4b entrypoints
+#   - Read-only `--check` and `--switch --dry-run` (no lock, no writes, zero
+#     bytecode writes, exempt from incomplete-journal guard)
 #   - `--approve-budgets [--handoff-deadline-s N] [--stage-b-window-m M]`
-#     (acquires .ops.lock, validates candidate via preflight.py
-#      validate_timing_budgets_env(), atomic 0600 writeback without touching
+#     (rejects `--dry-run`; acquires .ops.lock; requires handoff-journal.json
+#      present with `completed == true`; validates candidate via preflight.py
+#      validate_timing_budgets_env(); atomic 0600 writeback without touching
 #      handoff-journal.json)
 #   - Unimplemented mutating entrypoints exit 2 BEFORE taking locks or writing files.
 #
 # Compatible with macOS Bash 3.2.
 
 set -euo pipefail
+
+export PYTHONDONTWRITEBYTECODE=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=_research_host_handoff_lib.sh
@@ -45,7 +48,7 @@ Actions:
     [--handoff-deadline-s N]
     [--stage-b-window-m M]
   --check                               Read-only state summary + preflight.py --switch
-  --switch                              Stage B cutover (only --dry-run enabled in s34-r1)
+  --switch                              Stage B cutover (only --dry-run enabled in this round)
     [--test-workspace-id <uuid>]
     [--keep-admission-paused]
     [--dry-run]
@@ -159,6 +162,32 @@ if [[ -z "${ACTION}" ]]; then
   exit 2
 fi
 
+# Per-action flag validation BEFORE acquiring locks or writing files
+case "${ACTION}" in
+  --approve-budgets)
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "ERROR: --approve-budgets does not support --dry-run" >&2
+      exit 2
+    fi
+    if [[ "${KEEP_ADMISSION_PAUSED}" -eq 1 || -n "${TEST_WORKSPACE_ID}" ]]; then
+      echo "ERROR: --approve-budgets does not accept --keep-admission-paused or --test-workspace-id" >&2
+      exit 2
+    fi
+    ;;
+  --check)
+    if [[ "${DRY_RUN}" -eq 1 || "${KEEP_ADMISSION_PAUSED}" -eq 1 || -n "${TEST_WORKSPACE_ID}" || -n "${HANDOFF_DEADLINE_S}" || -n "${STAGE_B_WINDOW_M}" ]]; then
+      echo "ERROR: --check does not accept mutating or approval options" >&2
+      exit 2
+    fi
+    ;;
+  --switch)
+    if [[ -n "${HANDOFF_DEADLINE_S}" || -n "${STAGE_B_WINDOW_M}" ]]; then
+      echo "ERROR: --switch does not accept --handoff-deadline-s or --stage-b-window-m" >&2
+      exit 2
+    fi
+    ;;
+esac
+
 # NOTE (s34-r2 placeholder):
 # When invoked as `--recover` from the repository worktree, the next round will
 # delegate execution to `${RH_RECOVERY_BIN_DIR}/switch_research_host.sh --recover`.
@@ -184,7 +213,7 @@ EFF_PLIST_DIR="${PLIST_DIR:-${RH_HOME}/Library/LaunchAgents}"
 
 run_preflight_switch() {
   local -a cmd=(
-    "${RH_PYTHON_BIN}" "${RH_PREFLIGHT_PY}" --switch
+    "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" --switch
     --repo "${RH_REPO_ROOT}"
     --home "${RH_HOME}"
     --plist-dir "${EFF_PLIST_DIR}"
@@ -197,13 +226,13 @@ run_preflight_switch() {
   if [[ "${REPORT_JSON}" -eq 1 ]]; then
     cmd+=(--report-json)
   fi
-  "${cmd[@]}"
+  PYTHONDONTWRITEBYTECODE=1 "${cmd[@]}"
 }
 
 case "${ACTION}" in
   --check)
     # Strictly read-only: no lock, no journal write, exempt from completed==false guard.
-    "${RH_PYTHON_BIN}" "${RH_PREFLIGHT_PY}" status-summary \
+    PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" status-summary \
       --journal-file "${RH_JOURNAL_FILE}" \
       --admission-file "${RH_ADMISSION_FILE}" \
       --budgets-file "${EFF_BUDGETS_FILE}"
@@ -214,7 +243,7 @@ case "${ACTION}" in
 
   --switch)
     # DRY_RUN == 1 guaranteed here. Strictly read-only & exempt from completed==false guard.
-    "${RH_PYTHON_BIN}" "${RH_PREFLIGHT_PY}" status-summary \
+    PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" status-summary \
       --journal-file "${RH_JOURNAL_FILE}" \
       --admission-file "${RH_ADMISSION_FILE}" \
       --budgets-file "${EFF_BUDGETS_FILE}" \
@@ -231,12 +260,17 @@ case "${ACTION}" in
     ;;
 
   --approve-budgets)
-    trap rh_release_ops_lock EXIT INT TERM
+    trap rh_release_ops_lock EXIT
+    trap 'rh_release_ops_lock; exit 130' INT
+    trap 'rh_release_ops_lock; exit 143' TERM
     rh_acquire_ops_lock "switch_research_host:--approve-budgets" || exit 1
-    rh_require_no_incomplete_journal || exit 1
+    rh_require_completed_journal_for_approval || exit 1
     cmd=(
-      "${RH_PYTHON_BIN}" "${RH_PREFLIGHT_PY}" approve-budgets
+      "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" approve-budgets
       --budgets-file "${EFF_BUDGETS_FILE}"
+      --journal-file "${RH_JOURNAL_FILE}"
+      --lock-file "${RH_OPS_LOCK_FILE}"
+      --lock-fd 8
     )
     if [[ -n "${HANDOFF_DEADLINE_S}" ]]; then
       cmd+=(--handoff-deadline-s "${HANDOFF_DEADLINE_S}")
@@ -244,7 +278,7 @@ case "${ACTION}" in
     if [[ -n "${STAGE_B_WINDOW_M}" ]]; then
       cmd+=(--stage-b-window-m "${STAGE_B_WINDOW_M}")
     fi
-    "${cmd[@]}"
+    PYTHONDONTWRITEBYTECODE=1 "${cmd[@]}"
     exit $?
     ;;
 esac

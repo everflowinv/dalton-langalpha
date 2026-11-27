@@ -1000,6 +1000,9 @@ PY
     }
 
     if ! (
+        DALTON_REPO_ROOT="${REPO_ROOT}" \
+        DALTON_REPO_ENV_FILE="${repo_env_file}" \
+        DALTON_GUIDEPOINT_OWNERSHIP_FILE="${ownership_file}" \
         DALTON_BRIDGE_ENV_FILE="${BRIDGE_ENV_FILE}" \
         DALTON_RESEARCH_CODE="${CODE_ROOT}" \
         DALTON_RESEARCH_HOME="${DST_ROOT}" \
@@ -1028,6 +1031,8 @@ PY
     if [[ "${need_host_rerender}" -eq 1 ]]; then
         echo "[switch] detected loaded com.dalton.* host service(s); running host_services_switch.sh --apply --rerender-only"
         if ! (
+            DALTON_REPO_ROOT="${REPO_ROOT}" \
+            DALTON_GUIDEPOINT_OWNERSHIP_FILE="${ownership_file}" \
             DALTON_BRIDGE_ENV_FILE="${BRIDGE_ENV_FILE}" \
             DALTON_RESEARCH_CODE="${CODE_ROOT}" \
             DALTON_RESEARCH_HOME="${DST_ROOT}" \
