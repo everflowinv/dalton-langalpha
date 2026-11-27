@@ -25,6 +25,7 @@ import {
   formatPortfolioMoney,
   normalizePortfolioCurrency,
 } from '../../utils/portfolioSummary';
+import { RowExtraContextMenu } from '../../components/dalton/RowExtraContextMenu'; // DALTON-HOOK(watchlist)
 
 type MarketStatusData = MarketStatusInput;
 /** The pre- or after-hours move under a row's change: `AH 199.10 ▲ 0.34%`. */
@@ -164,9 +165,7 @@ export function WatchlistRowItem({ item, marketStatus, onDelete, attach, extraMe
       </ContextMenu>
     );
   }
-  // DALTON-HOOK(watchlist): allow extra context-menu items on rows without an id
-  if (extraMenuItems) return <ContextMenu><ContextMenuTrigger asChild>{row}</ContextMenuTrigger><ContextMenuContent>{extraMenuItems}</ContextMenuContent></ContextMenu>;
-  return row;
+  return <RowExtraContextMenu row={row} menuItems={extraMenuItems} />; // DALTON-HOOK(watchlist)
 }
 
 interface PortfolioRowItemProps {
@@ -277,9 +276,7 @@ export function PortfolioRowItem({
       </ContextMenu>
     );
   }
-  // DALTON-HOOK(watchlist): allow extra context-menu items on rows without an id
-  if (extraMenuItems) return <ContextMenu><ContextMenuTrigger asChild>{row}</ContextMenuTrigger><ContextMenuContent>{extraMenuItems}</ContextMenuContent></ContextMenu>;
-  return row;
+  return <RowExtraContextMenu row={row} menuItems={extraMenuItems} />; // DALTON-HOOK(watchlist)
 }
 
 interface HoldingsAddButtonProps {

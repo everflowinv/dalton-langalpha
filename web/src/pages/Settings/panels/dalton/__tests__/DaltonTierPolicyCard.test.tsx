@@ -37,28 +37,42 @@ vi.mock('../DaltonCoverageCard', () => ({
   DaltonCoverageCard: () => <div data-testid="mock-team-coverage-units-card">Team Coverage Units</div>,
 }));
 
-const mockFetchPolicies = vi.fn();
-const mockPreviewPolicy = vi.fn();
-const mockUpdatePolicy = vi.fn();
-const mockResetPolicy = vi.fn();
-const mockReconcile = vi.fn();
+import type {
+  WatchlistTierPoliciesResponse,
+  fetchWatchlistTierPolicies,
+  previewWatchlistTierPolicy,
+  reconcileWatchlist,
+  resetWatchlistTierPolicy,
+  updateWatchlistTierPolicy,
+} from '@/lib/dalton/watchlist';
+
+const mockFetchPolicies = vi.fn<typeof fetchWatchlistTierPolicies>();
+const mockPreviewPolicy = vi.fn<typeof previewWatchlistTierPolicy>();
+const mockUpdatePolicy = vi.fn<typeof updateWatchlistTierPolicy>();
+const mockResetPolicy = vi.fn<typeof resetWatchlistTierPolicy>();
+const mockReconcile = vi.fn<typeof reconcileWatchlist>();
 
 vi.mock('@/lib/dalton/watchlist', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/dalton/watchlist')>();
   return {
     ...actual,
-    fetchWatchlistTierPolicies: (...args: unknown[]) => mockFetchPolicies(...args),
-    previewWatchlistTierPolicy: (...args: unknown[]) => mockPreviewPolicy(...args),
-    updateWatchlistTierPolicy: (...args: unknown[]) => mockUpdatePolicy(...args),
-    resetWatchlistTierPolicy: (...args: unknown[]) => mockResetPolicy(...args),
-    reconcileWatchlist: (...args: unknown[]) => mockReconcile(...args),
+    fetchWatchlistTierPolicies: (...args: Parameters<typeof fetchWatchlistTierPolicies>) =>
+      mockFetchPolicies(...args),
+    previewWatchlistTierPolicy: (...args: Parameters<typeof previewWatchlistTierPolicy>) =>
+      mockPreviewPolicy(...args),
+    updateWatchlistTierPolicy: (...args: Parameters<typeof updateWatchlistTierPolicy>) =>
+      mockUpdatePolicy(...args),
+    resetWatchlistTierPolicy: (...args: Parameters<typeof resetWatchlistTierPolicy>) =>
+      mockResetPolicy(...args),
+    reconcileWatchlist: (...args: Parameters<typeof reconcileWatchlist>) =>
+      mockReconcile(...args),
   };
 });
 
 import { DaltonCoveragePanel } from '../DaltonCoveragePanel';
 import { DaltonTierPolicyCard } from '../DaltonTierPolicyCard';
 
-const DEFAULT_API_POLICIES = {
+const DEFAULT_API_POLICIES: WatchlistTierPoliciesResponse = {
   ok: true,
   user_id: 'u-1',
   policies: {

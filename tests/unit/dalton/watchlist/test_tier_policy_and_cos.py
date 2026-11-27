@@ -511,8 +511,9 @@ def test_cos_prompt_mentions_tier_policies_cleanly_in_both_profiles(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """CoS prompt documents personal watchlist & tier policies with Cron Chinese explanation in both profiles."""
-    for env_val in ("dalton", "core"):
+    for env_val, profile_val in (("dalton", "everflow"), ("core", "core")):
         monkeypatch.setenv("APP_ENV", env_val)
+        monkeypatch.setenv("DALTON_PROFILE", profile_val)
         rendered = prompt_loader_mod.PromptLoader().render("components/chief_of_staff.md.j2")
         assert "get_tier_policy" in rendered
         assert "set_tier_policy" in rendered

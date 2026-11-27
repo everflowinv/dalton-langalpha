@@ -605,6 +605,8 @@ class WatchlistMetricsService:
                             coverage_row=row,
                             is_private=False,
                         )
+                        if isinstance(valuation, dict) and valuation.get("status") == "loading":
+                            pending_valuation_symbols.append(sym)
                     except Exception as exc:
                         logger.debug("[WATCHLIST_METRICS] valuation failed for %s: %s", sym, exc)
                 else:

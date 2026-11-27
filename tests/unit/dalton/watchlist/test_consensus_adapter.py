@@ -20,6 +20,72 @@ from src.dalton.database import coverage as coverage_db
 from src.dalton.watchlist import consensus as consensus_mod
 from src.dalton.watchlist import metrics as metrics_mod
 from src.data_client.fmp.fmp_client import FMPClient, FMPRequestError, FmpQuotaExhausted
+from src.utils.cache.redis_cache import RedisCacheClient
+
+
+def _make_ttl_redis_mock() -> tuple[Any, dict[str, tuple[float | None, str]], dict[str, tuple[float, str]]]:
+    """Create a ``create_autospec(RedisCacheClient, instance=True)`` double that enforces TTLs."""
+    kv: dict[str, tuple[float | None, str]] = {}
+    locks: dict[str, tuple[float, str]] = {}
+
+    redis_mock = create_autospec(RedisCacheClient, instance=True)
+    redis_mock.enabled = True
+
+    def _prune() -> float:
+        now = time.monotonic()
+        for k in [k for k, (exp, _) in kv.items() if exp is not None and exp <= now]:
+            kv.pop(k, None)
+        for k in [k for k, (exp, _) in locks.items() if exp <= now]:
+            locks.pop(k, None)
+        return now
+
+    async def _get(key: str) -> str | None:
+        _prune()
+        entry = kv.get(key)
+        return entry[1] if entry is not None else None
+
+    async def _set(key: str, value: Any, ttl: int | None = None) -> bool:
+        now = _prune()
+        exp = (now + float(ttl)) if (ttl is not None and ttl > 0) else None
+        kv[key] = (exp, value)
+        return True
+
+    async def _delete(key: str, *more: str) -> bool:
+        _prune()
+        removed = False
+        for k in (key, *more):
+            if kv.pop(k, None) is not None:
+                removed = True
+        return removed
+
+    async def _acquire_lock(key: str, token: str, ttl_ms: int) -> bool | None:
+        now = _prune()
+        if key in locks:
+            return False
+        locks[key] = (now + (ttl_ms / 1000.0), token)
+        return True
+
+    async def _release_lock(key: str, token: str) -> None:
+        _prune()
+        entry = locks.get(key)
+        if entry is not None and entry[1] == token:
+            locks.pop(key, None)
+
+    async def _extend_lock(key: str, token: str, ttl_ms: int) -> bool:
+        now = _prune()
+        entry = locks.get(key)
+        if entry is not None and entry[1] == token:
+            locks[key] = (now + (ttl_ms / 1000.0), token)
+            return True
+        return False
+
+    redis_mock.get.side_effect = _get
+    redis_mock.set.side_effect = _set
+    redis_mock.delete.side_effect = _delete
+    redis_mock.acquire_lock.side_effect = _acquire_lock
+    redis_mock.release_lock.side_effect = _release_lock
+    redis_mock.extend_lock.side_effect = _extend_lock
+    return redis_mock, kv, locks
 
 
 @pytest.fixture(autouse=True)
@@ -299,9 +365,11 @@ async def test_fmp_fallback_used_when_yfinance_missing() -> None:
         {"date": "2027-12-31", "epsAvg": 8.0, "numAnalystsEps": 25},
         {"date": "2028-12-31", "epsAvg": 10.0, "numAnalystsEps": 22},
     ]
-    fmp_mock.get_income_statement.return_value = [{"date": "2026-12-31"}]
+    fmp_mock.get_income_statement.return_value = [
+        {"date": "2026-12-31", "reportedCurrency": "USD"}
+    ]
     fmp_mock.get_profile.return_value = [
-        {"symbol": "MSFT", "currency": "USD", "reportedCurrency": "USD", "companyName": "Test Corp"}
+        {"symbol": "MSFT", "currency": "USD", "companyName": "Test Corp", "isAdr": False}
     ]
 
     async def _empty_yf(_symbol: str) -> consensus_mod.RawConsensusRecord:
@@ -421,9 +489,11 @@ async def test_fiscal_year_selection_null_eps_single_year_fmp_fill_reported_fy_a
         {"date": "2027-01-31", "epsAvg": 4.40, "numAnalystsEps": 30},
         {"date": "2028-01-31", "epsAvg": 6.00, "numAnalystsEps": 28},
     ]
-    fmp_mock.get_income_statement.return_value = [{"date": "2026-01-31"}]
+    fmp_mock.get_income_statement.return_value = [
+        {"date": "2026-01-31", "reportedCurrency": "USD"}
+    ]
     fmp_mock.get_profile.return_value = [
-        {"symbol": "NVDA", "currency": "USD", "reportedCurrency": "USD", "companyName": "NVIDIA"}
+        {"symbol": "NVDA", "currency": "USD", "companyName": "NVIDIA", "isAdr": False}
     ]
 
     async def _partial_yf(_sym: str) -> consensus_mod.RawConsensusRecord:
@@ -628,11 +698,11 @@ async def test_fmp_client_closes_on_success_and_error_and_detects_429_by_type_an
     closed_count = {"n": 0}
     mode = {"behavior": "ok"}
 
-    class _TrackedFmpClient:
-        def __init__(self, api_key: str | None = None) -> None:
-            self.api_key = api_key
+    def _build_fmp_client(api_key: str | None = None, **_kwargs: Any) -> Any:
+        _ = api_key
+        inst = create_autospec(FMPClient, instance=True)
 
-        async def get_analyst_estimates(self, symbol: str, period: str = "annual", limit: int = 6) -> list[dict[str, Any]]:
+        async def _get_est(symbol: str, period: str = "annual", limit: int = 6) -> list[dict[str, Any]]:
             _ = (symbol, period, limit)
             if mode["behavior"] == "quota":
                 # Message has NO "429" or "rate limit" substring — must be detected by FmpQuotaExhausted / status_code==429!
@@ -643,19 +713,25 @@ async def test_fmp_client_closes_on_success_and_error_and_detects_429_by_type_an
                 raise RuntimeError("harmless text mentioning 429")
             return [{"date": "2027-12-31", "epsAvg": 5.0, "numAnalystsEps": 12}]
 
-        async def get_income_statement(self, symbol: str, period: str = "annual", limit: int = 1) -> list[dict[str, Any]]:
+        async def _get_inc(symbol: str, period: str = "annual", limit: int = 1) -> list[dict[str, Any]]:
             _ = (symbol, period, limit)
-            return []
+            return [{"date": "2025-12-31", "reportedCurrency": "USD"}]
 
-        async def get_profile(self, symbol: str) -> list[dict[str, Any]]:
-            return [{"symbol": symbol, "currency": "USD", "reportedCurrency": "USD"}]
+        async def _get_prof(symbol: str) -> list[dict[str, Any]]:
+            return [{"symbol": symbol, "currency": "USD", "companyName": "Test Co", "isAdr": False}]
 
-        async def close(self) -> None:
+        async def _close() -> None:
             closed_count["n"] += 1
+
+        inst.get_analyst_estimates.side_effect = _get_est
+        inst.get_income_statement.side_effect = _get_inc
+        inst.get_profile.side_effect = _get_prof
+        inst.close.side_effect = _close
+        return inst
 
     import src.data_client.fmp.fmp_client as fmp_client_mod
 
-    monkeypatch.setattr(fmp_client_mod, "FMPClient", _TrackedFmpClient)
+    monkeypatch.setattr(fmp_client_mod, "FMPClient", create_autospec(FMPClient, side_effect=_build_fmp_client))
 
     adapter = consensus_mod.WatchlistConsensusAdapter(
         yfinance_fetcher=lambda _s: None,
@@ -693,34 +769,7 @@ async def test_redis_cross_process_semaphore_singleflight_and_local_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Shared Redis provides 8-slot cross-process semaphore + cross-process singleflight; falls back locally if Redis is unavailable."""
-
-    class _FakeSharedRedis:
-        enabled = True
-
-        def __init__(self) -> None:
-            self.kv: dict[str, str] = {}
-            self.locks: dict[str, str] = {}
-
-        async def get(self, key: str) -> str | None:
-            return self.kv.get(key)
-
-        async def set(self, key: str, value: str, ttl: int | None = None) -> bool:
-            _ = ttl
-            self.kv[key] = value
-            return True
-
-        async def acquire_lock(self, key: str, token: str, ttl_ms: int) -> bool | None:
-            _ = ttl_ms
-            if key in self.locks:
-                return False
-            self.locks[key] = token
-            return True
-
-        async def release_lock(self, key: str, token: str) -> None:
-            if self.locks.get(key) == token:
-                self.locks.pop(key, None)
-
-    fake_redis = _FakeSharedRedis()
+    fake_redis, _kv, locks = _make_ttl_redis_mock()
     redis_mock = create_autospec(consensus_mod._get_redis_cache_client, return_value=fake_redis)
     monkeypatch.setattr(consensus_mod, "_get_redis_cache_client", redis_mock)
 
@@ -785,9 +834,10 @@ async def test_redis_cross_process_semaphore_singleflight_and_local_fallback(
     adapter_sem = consensus_mod.WatchlistConsensusAdapter(
         yfinance_fetcher=_bounded_yf, today_fn=lambda: date(2026, 11, 26)
     )
-    # Also pre-occupy 2 Redis slots from "another worker" -> this worker can run at most 6 concurrently!
-    fake_redis.locks[f"{consensus_mod._REDIS_SEM_KEY_PREFIX}0"] = "other-worker-0"
-    fake_redis.locks[f"{consensus_mod._REDIS_SEM_KEY_PREFIX}1"] = "other-worker-1"
+    # Pre-occupy 2 Redis slots from "another worker" with live TTL -> this worker can run at most 6 concurrently!
+    far_exp = time.monotonic() + 30.0
+    locks[f"{consensus_mod._REDIS_SEM_KEY_PREFIX}0"] = (far_exp, "other-worker-0")
+    locks[f"{consensus_mod._REDIS_SEM_KEY_PREFIX}1"] = (far_exp, "other-worker-1")
     await asyncio.gather(
         *(
             adapter_sem.get_valuation(f"SEM{i}", latest_price=80.0, quote_currency="USD")
@@ -888,3 +938,544 @@ async def test_standalone_core_metrics_service_end_to_end_us_hk_adr_missing_unli
     assert res["items"]["NOEST.HK"]["valuation"]["status"] == "no_coverage"
     assert res["items"]["SPCX"]["is_private"] is True
     assert res["items"]["SPCX"]["valuation"]["status"] == "unlisted"
+
+
+@pytest.mark.asyncio
+async def test_cross_fy_yahoo_stale_0y_filtered_promoted_fmp_filled_and_rolled_not_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After fiscal year rollover, stale Yahoo `0y` is excluded before assigning FY1/FY2; FMP fills missing year; fully rolled-past records are never cached as fresh."""
+    import pandas as pd
+    import yfinance as yf
+    import src.data_client.yfinance.yahoo as yahoo_mod
+
+    # 1. Yahoo returns old 0y (2026-12-31) and +1y (2027-12-31) on today=2027-01-15
+    fake_ticker = create_autospec(yf.Ticker, instance=True)
+    fake_ticker.earnings_estimate = pd.DataFrame(
+        {"avg": [4.0, 5.5], "numberOfAnalysts": [40, 35]},
+        index=["0y", "+1y"],
+    )
+    fake_ticker._analysis = type(
+        "_A",
+        (),
+        {
+            "_earnings_trend": [
+                {"period": "0y", "endDate": "2026-12-31", "earningsEstimate": {"currency": "USD"}},
+                {"period": "+1y", "endDate": "2027-12-31"},
+            ]
+        },
+    )()
+    fake_ticker.info = {
+        "currency": "USD",
+        "financialCurrency": "USD",
+        "quoteType": "EQUITY",
+        "longName": "Rollover Corp",
+    }
+    monkeypatch.setattr(yahoo_mod, "yahoo_ticker", create_autospec(yahoo_mod.yahoo_ticker, return_value=fake_ticker))
+
+    fmp_mock = create_autospec(FMPClient, instance=True)
+    fmp_mock.get_analyst_estimates.return_value = [
+        {"date": "2026-12-31", "epsAvg": 4.0, "numAnalystsEps": 40},
+        {"date": "2027-12-31", "epsAvg": 5.4, "numAnalystsEps": 35},
+        {"date": "2028-12-31", "epsAvg": 7.0, "numAnalystsEps": 30},
+    ]
+    fmp_mock.get_income_statement.return_value = [
+        {"date": "2025-12-31", "reportedCurrency": "USD"}
+    ]
+    fmp_mock.get_profile.return_value = [
+        {"symbol": "ROLL", "currency": "USD", "companyName": "Rollover Corp", "isAdr": False}
+    ]
+
+    adapter = consensus_mod.WatchlistConsensusAdapter(
+        fmp_client=fmp_mock,
+        today_fn=lambda: date(2027, 1, 15),
+    )
+    val = await adapter.get_valuation("ROLL", latest_price=110.0, quote_currency="USD")
+    assert val["status"] == "ok"
+    assert val["fy1_end"] == "2027-12-31"
+    assert val["fy1_eps"] == 5.5
+    assert val["fy2_end"] == "2028-12-31"
+    assert val["fy2_eps"] == 7.0
+    assert val["pe_fy1"] == 20.0
+    assert val["provider"] == "yfinance+fmp"
+
+    # 2. Both Yahoo 0y and +1y have rolled past today=2028-02-01 (no FMP) -> NEVER written as fresh success to cache!
+    adapter_all_old = consensus_mod.WatchlistConsensusAdapter(
+        today_fn=lambda: date(2028, 2, 1),
+    )
+    old_val = await adapter_all_old.get_valuation("ALLOLD", latest_price=100.0, quote_currency="USD")
+    assert old_val["status"] == "no_coverage"
+    assert old_val["pe_fy1"] is None
+    assert consensus_mod._consensus_cache_key("ALLOLD") not in consensus_mod._CONSENSUS_CACHE
+    # Cooldown is active so non-blocking view does NOT re-trigger warmup immediately
+    cached_after, needs_warm = await adapter_all_old.get_cached_valuation(
+        "ALLOLD", latest_price=100.0, quote_currency="USD"
+    )
+    assert cached_after is not None and cached_after["status"] == "no_coverage"
+    assert needs_warm is False
+
+
+def test_single_year_fmp_fill_never_resurrects_excluded_fiscal_year() -> None:
+    """Single-year partial merge searches only eligible FMP rows and never fills back an excluded fiscal year."""
+    primary = consensus_mod.RawConsensusRecord(
+        symbol="PART",
+        fy1_eps=None,
+        fy2_eps=6.0,
+        fy1_end="2026-12-31",  # already rolled past today=2027-01-15
+        fy2_end="2027-12-31",
+        estimate_currency="USD",
+        quote_currency="USD",
+        provider="yfinance",
+        last_reported_fy_end="2026-12-31",
+    )
+    raw_fmp_rows = [
+        {"date": "2026-12-31", "epsAvg": 4.2, "numAnalystsEps": 25},  # excluded!
+        {"date": "2027-12-31", "epsAvg": 6.1, "numAnalystsEps": 25},
+        {"date": "2028-12-31", "epsAvg": 7.5, "numAnalystsEps": 20},
+    ]
+    fallback = consensus_mod.RawConsensusRecord(
+        symbol="PART",
+        fy1_eps=6.1,
+        fy2_eps=7.5,
+        fy1_end="2027-12-31",
+        fy2_end="2028-12-31",
+        estimate_currency="USD",
+        quote_currency="USD",
+        provider="fmp",
+        last_reported_fy_end="2026-12-31",
+    )
+    merged = consensus_mod._merge_partial_consensus_record(
+        primary,
+        fallback,
+        fallback_annual_rows=raw_fmp_rows,
+        today=date(2027, 1, 15),
+        last_reported_fy_end="2026-12-31",
+    )
+    # Must NOT fill excluded 2026-12-31 into fy1_eps!
+    assert merged.fy1_eps is None
+
+
+@pytest.mark.asyncio
+async def test_adr_azn_direct_ordinary_share_smfg_1_2_and_unverified_omitted() -> None:
+    """AZN is removed (direct NYSE ordinary share since 2026-02-02), SMFG uses 1.2 (since 2026-10-01), unverified ADRs show unit_unverified."""
+    assert "AZN" not in consensus_mod.VERIFIED_ADR_SHARES_PER_UNIT
+    assert "SMFG" in consensus_mod.VERIFIED_ADR_SHARES_PER_UNIT
+    smfg_entry = consensus_mod.VERIFIED_ADR_SHARES_PER_UNIT["SMFG"]
+    assert smfg_entry.shares_per_adr == 1.2
+    assert smfg_entry.underlying_currency == "JPY"
+    assert smfg_entry.effective_date == "2026-10-01"
+    assert smfg_entry.source.strip()
+    assert "SHEL" not in consensus_mod.VERIFIED_ADR_SHARES_PER_UNIT
+
+    records = {
+        # AZN direct NYSE ordinary shares (not ADR) -> 1:1, NO 0.5x scaling!
+        "AZN": consensus_mod.RawConsensusRecord(
+            symbol="AZN",
+            fy1_eps=10.0,
+            fy2_eps=11.0,
+            fy1_end="2026-12-31",
+            fy2_end="2027-12-31",
+            estimate_currency="USD",
+            quote_currency="USD",
+            analyst_count=20,
+            provider="yfinance",
+            quote_type="EQUITY",
+            security_name="AstraZeneca PLC",
+        ),
+        # SMFG ADR: ordinary EPS = 250 JPY, 1.2 shares/ADS, FX 0.006 -> per-ADS EPS = 1.8 USD -> @ $18 = 10.0x P/E
+        "SMFG": consensus_mod.RawConsensusRecord(
+            symbol="SMFG",
+            fy1_eps=250.0,
+            fy2_eps=300.0,
+            fy1_end="2027-03-31",
+            fy2_end="2028-03-31",
+            estimate_currency="JPY",
+            quote_currency="USD",
+            analyst_count=14,
+            provider="yfinance",
+            quote_type="EQUITY",
+            security_name="Sumitomo Mitsui Financial Group, Inc. ADR",
+        ),
+        # Removed/unverified ADR -> unit_unverified (`—`)
+        "SHEL": consensus_mod.RawConsensusRecord(
+            symbol="SHEL",
+            fy1_eps=7.0,
+            fy2_eps=7.5,
+            fy1_end="2026-12-31",
+            fy2_end="2027-12-31",
+            estimate_currency="USD",
+            quote_currency="USD",
+            analyst_count=18,
+            provider="yfinance",
+            quote_type="EQUITY",
+            security_name="Shell plc Sponsored ADR",
+        ),
+    }
+
+    adapter = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda s: records.get(s),
+        fx_fetcher=lambda src, dst: 0.006 if (src, dst) == ("JPY", "USD") else None,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+
+    azn = await adapter.get_valuation("AZN", latest_price=150.0, quote_currency="USD")
+    assert azn["status"] == "ok"
+    assert azn["shares_per_quote_unit"] == 1.0
+    assert azn["pe_fy1"] == 15.0  # NOT 30.0 (old 0.5 ratio)!
+
+    smfg = await adapter.get_valuation("SMFG", latest_price=18.0, quote_currency="USD")
+    assert smfg["status"] == "ok"
+    assert smfg["shares_per_quote_unit"] == 1.2
+    assert smfg["pe_fy1"] == 10.0  # 18 / (250 * 1.2 * 0.006) = 10.0, NOT 20.0 (old 0.6 ratio)!
+
+    shel = await adapter.get_valuation("SHEL", latest_price=70.0, quote_currency="USD")
+    assert shel["status"] == "unit_unverified"
+    assert shel["pe_fy1"] is None
+
+
+@pytest.mark.asyncio
+async def test_fmp_fallback_currency_strictly_from_income_statement_never_profile() -> None:
+    """FMP estimate currency comes strictly from financial statements (income statement reportedCurrency), never profile.currency."""
+    # 1. Cross-currency HK stock: profile.currency=HKD, income_statement.reportedCurrency=CNY -> applies CNY->HKD FX!
+    fmp_hk = create_autospec(FMPClient, instance=True)
+    fmp_hk.get_analyst_estimates.return_value = [
+        {"date": "2026-12-31", "epsAvg": 25.0, "numAnalystsEps": 30},
+        {"date": "2027-12-31", "epsAvg": 28.0, "numAnalystsEps": 28},
+    ]
+    fmp_hk.get_income_statement.return_value = [
+        {"date": "2025-12-31", "reportedCurrency": "CNY"}
+    ]
+    fmp_hk.get_profile.return_value = [
+        {"symbol": "0700.HK", "currency": "HKD", "companyName": "Tencent Holdings", "isAdr": False}
+    ]
+
+    adapter_hk = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: None,
+        fmp_client=fmp_hk,
+        fx_fetcher=lambda src, dst: 1.08 if (src, dst) == ("CNY", "HKD") else None,
+        today_fn=lambda: date(2026, 6, 15),
+    )
+    hk_val = await adapter_hk.get_valuation("0700.HK", latest_price=432.0, quote_currency="HKD")
+    assert hk_val["status"] == "ok"
+    assert hk_val["estimate_currency"] == "CNY"
+    assert hk_val["quote_currency"] == "HKD"
+    assert hk_val["pe_fy1"] == 16.0  # 432 / (25 * 1.08)
+
+    # 2. Missing reportedCurrency in income_statement -> MUST keep estimate_currency=None and NOT fall back to profile.currency!
+    fmp_no_ccy = create_autospec(FMPClient, instance=True)
+    fmp_no_ccy.get_analyst_estimates.return_value = [
+        {"date": "2026-12-31", "epsAvg": 25.0, "numAnalystsEps": 30},
+    ]
+    fmp_no_ccy.get_income_statement.return_value = [{"date": "2025-12-31"}]
+    fmp_no_ccy.get_profile.return_value = [
+        {"symbol": "9988.HK", "currency": "HKD", "companyName": "Alibaba Group", "isAdr": False}
+    ]
+
+    adapter_no_ccy = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: None,
+        fmp_client=fmp_no_ccy,
+        today_fn=lambda: date(2026, 6, 15),
+    )
+    missing_ccy_val = await adapter_no_ccy.get_valuation("9988.HK", latest_price=100.0, quote_currency="HKD")
+    assert missing_ccy_val["estimate_currency"] is None
+    assert missing_ccy_val["status"] == "unit_unverified"
+    assert missing_ccy_val["pe_fy1"] is None
+
+
+@pytest.mark.asyncio
+async def test_redis_singleflight_wait_timeout_no_duplicate_fetch_and_hard_deadline_under_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When another worker holds the Redis inflight lock past wait timeout (>9s default), this worker sends ZERO upstream calls; upstream hard deadline is strictly below Redis lease."""
+    # Verify default constants maintain the safety invariants
+    assert consensus_mod._REDIS_INFLIGHT_WAIT_SECONDS == 9.0
+    assert consensus_mod._UPSTREAM_SLOT_HARD_TIMEOUT_SECONDS < (consensus_mod._REDIS_SEM_LEASE_MS / 1000.0)
+    assert consensus_mod._UPSTREAM_SLOT_HARD_TIMEOUT_SECONDS < (consensus_mod._REDIS_INFLIGHT_LOCK_TTL_MS / 1000.0)
+
+    fake_redis, _kv, locks = _make_ttl_redis_mock()
+    monkeypatch.setattr(
+        consensus_mod,
+        "_get_redis_cache_client",
+        create_autospec(consensus_mod._get_redis_cache_client, return_value=fake_redis),
+    )
+    monkeypatch.setattr(consensus_mod, "_REDIS_INFLIGHT_WAIT_SECONDS", 0.12)
+    monkeypatch.setattr(consensus_mod, "_REDIS_INFLIGHT_POLL_SECONDS", 0.02)
+
+    fetch_calls = {"n": 0}
+    fx_calls = {"n": 0}
+
+    async def _counting_yf(sym: str) -> consensus_mod.RawConsensusRecord:
+        fetch_calls["n"] += 1
+        return consensus_mod.RawConsensusRecord(
+            symbol=sym, fy1_eps=5.0, fy1_end="2027-12-31", estimate_currency="USD", quote_currency="USD"
+        )
+
+    async def _counting_fx(src: str, dst: str) -> float:
+        _ = (src, dst)
+        fx_calls["n"] += 1
+        return 1.08
+
+    adapter = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=_counting_yf,
+        fx_fetcher=_counting_fx,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+
+    # 1. Cold cache + another worker holds inflight lock past timeout -> ZERO upstream calls, returns loading!
+    sym_key = consensus_mod._consensus_cache_key("BUSY1")
+    locks[f"{sym_key}:inflight"] = (time.monotonic() + 30.0, "other-worker-lock")
+    busy_cold = await adapter.get_valuation("BUSY1", latest_price=100.0, quote_currency="USD")
+    assert fetch_calls["n"] == 0
+    assert busy_cold["status"] == "loading"
+    assert busy_cold.get("pending") is True
+
+    # 2. Stale cache + another worker holds inflight lock past timeout -> ZERO upstream calls, returns stale cached PE!
+    stale_key = consensus_mod._consensus_cache_key("BUSY2")
+    consensus_mod._CONSENSUS_CACHE[stale_key] = (
+        time.time() - consensus_mod.CONSENSUS_CACHE_TTL_SECONDS - 600,
+        consensus_mod.RawConsensusRecord(
+            symbol="BUSY2",
+            fy1_eps=4.0,
+            fy2_eps=5.0,
+            fy1_end="2027-12-31",
+            fy2_end="2028-12-31",
+            estimate_currency="USD",
+            quote_currency="USD",
+            provider="yfinance",
+        ).to_dict(),
+    )
+    locks[f"{stale_key}:inflight"] = (time.monotonic() + 30.0, "other-worker-lock")
+    busy_stale = await adapter.get_valuation("BUSY2", latest_price=100.0, quote_currency="USD")
+    assert fetch_calls["n"] == 0
+    assert busy_stale["status"] == "stale"
+    assert busy_stale["pe_fy1"] == 25.0
+
+    # 3. FX singleflight lock held by another worker past timeout -> ZERO FX upstream calls!
+    fx_key = consensus_mod._fx_cache_key("CNY", "HKD")
+    locks[f"{fx_key}:inflight"] = (time.monotonic() + 30.0, "other-worker-fx")
+    rate, is_stale, is_rl, is_loading = await adapter._fetch_spot_fx_rate_with_status("CNY", "HKD")
+    assert fx_calls["n"] == 0
+    assert rate is None and is_stale is False and is_rl is False and is_loading is True
+
+    # 4. Slow FMP call exceeding hard upstream deadline is cancelled cleanly and releases the Redis slot
+    monkeypatch.setattr(consensus_mod, "CONSENSUS_FETCH_TIMEOUT_SECONDS", 0.08)
+    monkeypatch.setattr(consensus_mod, "_UPSTREAM_SLOT_HARD_TIMEOUT_SECONDS", 0.1)
+    fmp_slow = create_autospec(FMPClient, instance=True)
+
+    async def _hang(*_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+        await asyncio.sleep(5.0)
+        return []
+
+    fmp_slow.get_analyst_estimates.side_effect = _hang
+    adapter_slow = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: None,
+        fmp_client=fmp_slow,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+    slow_res = await adapter_slow.get_valuation("SLOWFMP", latest_price=50.0, quote_currency="USD")
+    assert slow_res["status"] == "no_coverage"
+    # No Redis semaphore slots leaked!
+    leaked_slots = [k for k in locks if k.startswith(consensus_mod._REDIS_SEM_KEY_PREFIX)]
+    assert leaked_slots == []
+
+
+@pytest.mark.asyncio
+async def test_empty_and_non_429_errors_enter_cooldown_and_exit_pending_valuation_symbols(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty FX results and non-429 FX/consensus errors write cooldown so symbols stop looping in pending_valuation_symbols."""
+    monkeypatch.setattr(
+        coverage_db,
+        "list_coverage_rows",
+        create_autospec(
+            coverage_db.list_coverage_rows,
+            return_value=[
+                {"user_id": "u-cd", "ticker": "0700.HK", "tier": "core", "is_private": False},
+                {"user_id": "u-cd", "ticker": "ERRCO", "tier": "watch", "is_private": False},
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        coverage_db,
+        "get_earnings_calendar_mirror",
+        create_autospec(coverage_db.get_earnings_calendar_mirror, return_value=None),
+    )
+
+    class _SimpleProvider:
+        name = "yfinance"
+        split_adjusted = True
+
+        async def get_snapshots(self, symbols: Any, *, asset_type: str = "stocks", user_id: str = "") -> list[dict[str, Any]]:
+            _ = (asset_type, user_id)
+            px = {"0700.HK": (400.0, "HKD"), "ERRCO": (50.0, "USD")}
+            return [{"symbol": s, "price": px[s][0], "previous_close": px[s][0], "currency": px[s][1]} for s in symbols if s in px]
+
+        async def get_daily(self, symbol: str, *, from_date: str, to_date: str, is_index: bool = False, user_id: str = "") -> list[dict[str, Any]]:
+            _ = (symbol, from_date, to_date, is_index, user_id)
+            return [{"date": (date(2026, 1, 2) + timedelta(days=i)).isoformat(), "close": 100.0 + i, "high": 101.0 + i, "low": 99.0 + i, "volume": 1000} for i in range(40)]
+
+    monkeypatch.setattr(
+        metrics_mod,
+        "_resolve_provider_and_key",
+        create_autospec(metrics_mod._resolve_provider_and_key, return_value=(_SimpleProvider(), "yfinance", True)),
+    )
+
+    fx_mode = {"mode": "empty"}
+
+    async def _failing_fx(src: str, dst: str) -> float | None:
+        _ = (src, dst)
+        if fx_mode["mode"] == "error":
+            raise RuntimeError("FX upstream 503")
+        return None  # empty FX result
+
+    async def _yf_for_cd(sym: str) -> consensus_mod.RawConsensusRecord:
+        if sym == "ERRCO":
+            raise RuntimeError("Yahoo 500 error")
+        return consensus_mod.RawConsensusRecord(
+            symbol="0700.HK",
+            fy1_eps=25.0,
+            fy2_eps=28.0,
+            fy1_end="2027-12-31",
+            fy2_end="2028-12-31",
+            estimate_currency="CNY",
+            quote_currency="HKD",
+            provider="yfinance",
+        )
+
+    adapter = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=_yf_for_cd,
+        fx_fetcher=_failing_fx,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+    svc = metrics_mod.WatchlistMetricsService(consensus_adapter=adapter)
+
+    # 1. Cold call queues warmup; background fetches empty FX for 0700.HK and non-429 error for ERRCO
+    r1 = await svc.get_metrics_for_user("u-cd", wait_for_cold=False)
+    assert set(r1["pending_valuation_symbols"]) == {"0700.HK", "ERRCO"}
+    await asyncio.sleep(0.05)
+
+    # 2. Next poll: BOTH entered cooldown -> explicit no_coverage status AND pending_valuation_symbols is EMPTY!
+    r2 = await svc.get_metrics_for_user("u-cd", wait_for_cold=False)
+    assert r2["pending_valuation_symbols"] == []
+    assert r2["items"]["0700.HK"]["valuation"]["status"] == "no_coverage"
+    assert r2["items"]["ERRCO"]["valuation"]["status"] == "no_coverage"
+
+    # 3. Stale FX + non-429 FX error -> enters FX cooldown, returns stale valuation with pending_valuation_symbols == []!
+    consensus_mod._FX_ERROR_COOLDOWN.clear()
+    fx_mode["mode"] = "error"
+    fx_key = consensus_mod._fx_cache_key("CNY", "HKD")
+    consensus_mod._FX_CACHE[fx_key] = (
+        time.time() - consensus_mod.FX_CACHE_TTL_SECONDS - 120,
+        1.08,
+    )
+    r3 = await svc.get_metrics_for_user("u-cd", wait_for_cold=False)
+    assert r3["items"]["0700.HK"]["valuation"]["status"] == "stale"
+    assert r3["pending_valuation_symbols"] == ["0700.HK"]
+    await asyncio.sleep(0.05)
+    r4 = await svc.get_metrics_for_user("u-cd", wait_for_cold=False)
+    assert r4["items"]["0700.HK"]["valuation"]["status"] == "stale"
+    assert r4["pending_valuation_symbols"] == []
+
+
+@pytest.mark.asyncio
+async def test_yahoo_empty_record_plus_fmp_429_enters_rate_limit_cooldown() -> None:
+    """When Yahoo returns an empty RawConsensusRecord (no EPS) and FMP raises 429, rate-limit status & cooldown are preserved."""
+    fmp_mock = create_autospec(FMPClient, instance=True)
+    fmp_mock.get_analyst_estimates.side_effect = FmpQuotaExhausted()
+
+    yf_calls = {"n": 0}
+
+    async def _empty_yf_record(sym: str) -> consensus_mod.RawConsensusRecord:
+        yf_calls["n"] += 1
+        return consensus_mod.RawConsensusRecord(
+            symbol=sym,
+            fy1_eps=None,
+            fy2_eps=None,
+            quote_currency="USD",
+            provider="yfinance",
+        )
+
+    adapter = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=_empty_yf_record,
+        fmp_client=fmp_mock,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+    res = await adapter.get_valuation("RLFALL", latest_price=100.0, quote_currency="USD")
+    assert res["status"] == "rate_limited"
+    assert res["pe_fy1"] is None
+    assert yf_calls["n"] == 1
+
+    # Non-blocking cached view reads rate_limited cooldown and does NOT request warmup!
+    cached_val, needs_warm = await adapter.get_cached_valuation(
+        "RLFALL", latest_price=100.0, quote_currency="USD"
+    )
+    assert cached_val is not None and cached_val["status"] == "rate_limited"
+    assert needs_warm is False
+
+
+@pytest.mark.asyncio
+async def test_yahoo_ticker_mapping_and_canonical_cache_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consensus reuses yahoo_ticker() (600519.SH -> 600519.SS, BRK.B -> BRK-B) and deduplicates cache by canonical repo symbol."""
+    import pandas as pd
+    import yfinance as yf
+    import src.data_client.yfinance.yahoo as yahoo_mod
+
+    real_ticker_cls = yf.Ticker
+    seen_yf_symbols: list[str] = []
+
+    def _fake_yf_ticker(sym: str) -> Any:
+        seen_yf_symbols.append(sym)
+        t = create_autospec(real_ticker_cls, instance=True)
+        t.earnings_estimate = pd.DataFrame(
+            {"avg": [70.0, 80.0], "numberOfAnalysts": [25, 22]},
+            index=["0y", "+1y"],
+        )
+        t._analysis = type(
+            "_A",
+            (),
+            {
+                "_earnings_trend": [
+                    {"period": "0y", "endDate": "2027-12-31"},
+                    {"period": "+1y", "endDate": "2028-12-31"},
+                ]
+            },
+        )()
+        ccy = "CNY" if sym.endswith(".SS") else "USD"
+        t.info = {
+            "currency": ccy,
+            "financialCurrency": ccy,
+            "quoteType": "EQUITY",
+            "longName": sym,
+        }
+        return t
+
+    monkeypatch.setattr(yahoo_mod.yf, "Ticker", create_autospec(real_ticker_cls, side_effect=_fake_yf_ticker))
+
+    adapter = consensus_mod.WatchlistConsensusAdapter(today_fn=lambda: date(2026, 11, 26))
+
+    # 1. 600519.SH calls yf.Ticker("600519.SS") and caches under canonical "600519.SH"
+    v_sh = await adapter.get_valuation("600519.SH", latest_price=1400.0, quote_currency="CNY")
+    assert seen_yf_symbols == ["600519.SS"]
+    assert v_sh["status"] == "ok"
+    assert v_sh["ticker"] == "600519.SH"
+    assert v_sh["pe_fy1"] == 20.0
+
+    # Querying via Yahoo spelling "600519.SS" hits the exact same canonical cache with ZERO extra upstream calls!
+    v_ss = await adapter.get_valuation("600519.SS", latest_price=1400.0, quote_currency="CNY")
+    assert seen_yf_symbols == ["600519.SS"]
+    assert v_ss["ticker"] == "600519.SH"
+    assert v_ss["pe_fy1"] == 20.0
+
+    # 2. BRK.B calls yf.Ticker("BRK-B") and caches under canonical "BRK-B"
+    v_dot = await adapter.get_valuation("BRK.B", latest_price=420.0, quote_currency="USD")
+    assert seen_yf_symbols == ["600519.SS", "BRK-B"]
+    assert v_dot["status"] == "ok"
+    assert v_dot["ticker"] == "BRK-B"
+    assert v_dot["pe_fy1"] == 6.0
+
+    # Querying "BRK-B" hits the same canonical cache with ZERO extra upstream calls!
+    v_dash = await adapter.get_valuation("BRK-B", latest_price=420.0, quote_currency="USD")
+    assert seen_yf_symbols == ["600519.SS", "BRK-B"]
+    assert v_dash["pe_fy1"] == 6.0

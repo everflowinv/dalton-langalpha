@@ -446,4 +446,66 @@ describe('Dashboard PortfolioWatchlistWidget coverage tab & 50-quote cap', () =>
       );
     });
   });
+
+  it('b2-r3: rows without watchlist_item_id / user_portfolio_id delegate right-click menu to Dalton RowExtraContextMenu', async () => {
+    mocks.mutateWatchlistMock.mockReset().mockResolvedValue({ ok: true, added_tickers: ['NOIDWL'] });
+    mocks.dashboardCtx = {
+      ...mocks.dashboardCtx,
+      watchlist: {
+        rows: [
+          {
+            symbol: 'NOIDWL',
+            price: 55,
+            change: 1,
+            changePercent: 1.8,
+            currency: 'USD',
+            quoteAvailable: true,
+          },
+        ],
+        loading: false,
+        loaded: true,
+      },
+      watchlistHandlers: { onAdd: vi.fn(), onDelete: vi.fn() },
+      portfolio: {
+        rows: [
+          {
+            symbol: 'NOIDPF',
+            quantity: 5,
+            marketValue: 500,
+            unrealizedPlPercent: 5.0,
+            currency: 'USD',
+            quoteAvailable: true,
+          },
+        ],
+        loading: false,
+        loaded: true,
+        hasRealHoldings: true,
+      },
+      portfolioHandlers: { onAdd: vi.fn(), onEdit: vi.fn(), onDelete: vi.fn() },
+    };
+
+    renderWidget({ defaultTab: 'watchlist', valuesHidden: false });
+    fireEvent.contextMenu(screen.getByText('NOIDWL'));
+    fireEvent.click(await screen.findByTestId('quick-add-coverage-NOIDWL-core'));
+    await waitFor(() => {
+      expect(mocks.mutateWatchlistMock).toHaveBeenCalledWith({
+        action: 'add',
+        tickers: ['NOIDWL'],
+        tier: 'core',
+      });
+    });
+    cleanup();
+
+    mocks.mutateWatchlistMock.mockReset().mockResolvedValue({ ok: true, added_tickers: ['NOIDPF'] });
+    renderWidget({ defaultTab: 'portfolio', valuesHidden: false });
+    fireEvent.contextMenu(await screen.findByText('NOIDPF'));
+    fireEvent.click(await screen.findByTestId('quick-add-coverage-NOIDPF-watch'));
+    await waitFor(() => {
+      expect(mocks.mutateWatchlistMock).toHaveBeenCalledWith({
+        action: 'add',
+        tickers: ['NOIDPF'],
+        tier: 'watch',
+      });
+    });
+  });
 });
