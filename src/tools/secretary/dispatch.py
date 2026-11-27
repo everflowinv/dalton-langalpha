@@ -245,9 +245,11 @@ async def dispatch(
     """
     import aiohttp
 
-    # DALTON-HOOK(cos-verbatim-forward): attach this turn's raw user verbatim request when not already quoted.
-    from src.dalton.cos_verbatim import append_verbatim_user_request
-    question = append_verbatim_user_request(question, state, config=config)
+    # DALTON-HOOK(cos-verbatim-forward): reuse approval-bound dispatch payload by tool_call_id on resume, else attach verbatim user request.
+    from src.dalton.cos_verbatim import resolve_dispatch_question
+    question = resolve_dispatch_question(
+        question, state, config=config, tool_call_id=tool_call_id
+    )
 
     model = (model or "").strip() or None
 

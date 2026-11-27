@@ -401,6 +401,101 @@ class WorkflowJournal:
             )
         await self.write_progress("running")
 
+    async def _artifacts_match_or_superseded(
+        self,
+        entry: dict[str, Any],
+        artifacts: list[dict[str, Any]],
+        current: dict[str, str | None],
+        index: dict[str, list[dict[str, Any]]],
+    ) -> bool:
+        """Verify each recorded artifact matches disk directly, OR was updated
+        in-place by a later completed dispatch in the same source run, OR
+        matches a verified ``consensus-snapshot-receipt.json`` pre->post
+        transition written by ``model_consensus.py write-snapshot``."""
+        mismatched = [a for a in artifacts if current.get(a["path"]) != a.get("sha256")]
+        if not mismatched:
+            return True
+        if any(current.get(a["path"]) is None for a in mismatched):
+            return False
+
+        entry_seq = entry.get("seq")
+        unresolved: list[dict[str, Any]] = []
+        for a in mismatched:
+            path = a["path"]
+            cur_sha = current.get(path)
+            superseded = False
+            for entries in index.values():
+                for later in entries:
+                    if later is entry or later.get("status") != "ok":
+                        continue
+                    later_seq = later.get("seq")
+                    if (
+                        isinstance(entry_seq, int)
+                        and isinstance(later_seq, int)
+                        and later_seq <= entry_seq
+                    ):
+                        continue
+                    for la in later.get("artifacts") or ():
+                        if la.get("path") == path and la.get("sha256") == cur_sha:
+                            superseded = True
+                            break
+                    if superseded:
+                        break
+                if superseded:
+                    break
+            if not superseded:
+                unresolved.append(a)
+
+        if not unresolved:
+            return True
+
+        # Check verified consensus-snapshot-receipt.json transition (handles interruption
+        # right after write-snapshot mutated the candidate .xlsx and coord_map.json, before
+        # the consensus stage finished and wrote an ok journal entry).
+        cm_path: str | None = None
+        for a in artifacts:
+            p = str(a.get("path") or "").replace("\\", "/")
+            if p == "coord_map.json" or p.endswith("/coord_map.json"):
+                cm_path = a["path"]
+                break
+        if cm_path is None:
+            return False
+        cm_norm = cm_path.replace("\\", "/")
+        receipt_rel = (
+            f"{cm_norm.rsplit('/', 1)[0]}/consensus-snapshot-receipt.json"
+            if "/" in cm_norm
+            else "consensus-snapshot-receipt.json"
+        )
+        try:
+            receipt = await _read_json(self.backend, receipt_rel)
+        except Exception:
+            return False
+        if not isinstance(receipt, dict):
+            return False
+
+        rec_pre_m = receipt.get("pre_snapshot_model_sha256")
+        rec_post_m = receipt.get("post_snapshot_model_sha256")
+        rec_pre_cm = receipt.get("pre_snapshot_coord_map_sha256")
+        rec_post_cm = receipt.get("post_snapshot_coord_map_sha256")
+        rec_model_name = str(receipt.get("model_name") or "").strip()
+
+        for a in unresolved:
+            path = a["path"]
+            old_sha = a.get("sha256")
+            cur_sha = current.get(path)
+            if path == cm_path:
+                if not (rec_pre_cm and rec_post_cm and old_sha == rec_pre_cm and cur_sha == rec_post_cm):
+                    return False
+            elif path.lower().endswith(".xlsx"):
+                base_name = path.replace("\\", "/").rsplit("/", 1)[-1]
+                if rec_model_name and base_name != rec_model_name:
+                    return False
+                if not (rec_pre_m and rec_post_m and old_sha == rec_pre_m and cur_sha == rec_post_m):
+                    return False
+            else:
+                return False
+        return True
+
     async def find_replayable(
         self, label: str, prompt: str, *, subagent_type: str | None = None
     ) -> dict[str, Any] | None:
@@ -454,7 +549,9 @@ class WorkflowJournal:
                 current = await digest_paths(
                     self.backend, [a["path"] for a in artifacts]
                 )
-                if any(current.get(a["path"]) != a.get("sha256") for a in artifacts):
+                if not await self._artifacts_match_or_superseded(
+                    entry, artifacts, current, index
+                ):
                     continue
                 # A terminal model verification ledger is bound to a specific run_id:
                 # never replay a prior run's ledger entry on resume so the stage re-runs

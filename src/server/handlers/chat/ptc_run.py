@@ -1354,6 +1354,18 @@ async def astream_ptc_workflow(
             is_dalton_sharing_auth_enabled as _is_colleague_sharing_auth_enabled,
         )
 
+        # DALTON-HOOK(cos-verbatim-forward): restore approval-bound dispatch payloads by tool_call_id on HITL resume
+        approved_dispatch_payloads: dict[str, Any] = {}
+        if request.hitl_response:
+            from src.dalton.cos_verbatim import load_approved_dispatch_payloads
+
+            approved_dispatch_payloads = await load_approved_dispatch_payloads(
+                getattr(ptc_graph, "checkpointer", None),
+                thread_id,
+                checkpoint_id=request.checkpoint_id or base_checkpoint_id,
+                hitl_response=request.hitl_response,
+            )
+
         # DALTON-HOOK(colleague-dispatch): stamp turn_admitted_workspace_id and workspace_owner_id in configurable
         extra_configurable = {
             **(extra_configurable or {}),
@@ -1365,8 +1377,13 @@ async def astream_ptc_workflow(
             **({"retried_origin": retried_origin} if retried_origin else {}),
             # DALTON-HOOK(colleague-access): forward agent_role and initial cross-user analyst outbound guard flag
             "agent_role": route.role,
-            # DALTON-HOOK(cos-verbatim-forward): forward pre-injection raw user request (None when turn has no user text)
+            # DALTON-HOOK(cos-verbatim-forward): forward pre-injection raw user request (None when turn has no user text) and approved HITL dispatch payloads
             "cos_turn_verbatim_request": turn_verbatim_request,
+            **(
+                {"cos_approved_dispatch_payloads": approved_dispatch_payloads}
+                if approved_dispatch_payloads
+                else {}
+            ),
             **(
                 {"colleague_outbound_blocked": True}
                 if _is_colleague_sharing_auth_enabled()

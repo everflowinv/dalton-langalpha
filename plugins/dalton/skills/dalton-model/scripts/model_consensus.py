@@ -460,6 +460,10 @@ def write_consensus_snapshot(
         or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     )[:10]
 
+    pre_model_sha = model_fingerprint.file_sha256(mpath)
+    cp_obj: Path | None = Path(coord_map_path).expanduser().resolve() if coord_map_path is not None else None
+    pre_cm_sha = model_fingerprint.file_sha256(cp_obj) if (cp_obj is not None and cp_obj.is_file()) else None
+
     with tempfile.TemporaryDirectory(prefix="consensus_snap_") as tmp:
         donor_copy = Path(tmp) / "donor.xlsx"
         editing_copy = Path(tmp) / "editing.xlsx"
@@ -748,10 +752,11 @@ def write_consensus_snapshot(
     new_sha = model_fingerprint.file_sha256(mpath)
     touched_sorted = sorted(set(touched_coords))
     snap_sorted = sorted(set(written_coords))
-    if coord_map_path is not None:
-        cp = Path(coord_map_path).expanduser().resolve()
-        if cp.is_file():
-            cm = json.loads(cp.read_text(encoding="utf-8"))
+    post_cm_sha: str | None = None
+    receipt_path: Path | None = None
+    if cp_obj is not None:
+        if cp_obj.is_file():
+            cm = json.loads(cp_obj.read_text(encoding="utf-8"))
             cm_touched = set(cm.setdefault("touched_cells", {}).get(target_sh) or ())
             cm_touched.update(touched_sorted)
             cm["touched_cells"][target_sh] = sorted(cm_touched)
@@ -759,7 +764,38 @@ def write_consensus_snapshot(
             cm_snap.update(snap_sorted)
             cm["consensus_snapshot_cells"][target_sh] = sorted(cm_snap)
             cm["candidate_sha256"] = new_sha
-            cp.write_text(json.dumps(cm, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            cp_obj.write_text(json.dumps(cm, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            post_cm_sha = model_fingerprint.file_sha256(cp_obj)
+        # Write independent snapshot receipt so workflow resume can verify the exact
+        # pre->post hash transition of both the candidate workbook and coord_map.json.
+        receipt_path = cp_obj.parent / "consensus-snapshot-receipt.json"
+        orig_model_sha = pre_model_sha
+        orig_cm_sha = pre_cm_sha
+        if receipt_path.is_file():
+            try:
+                prev_rcpt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(prev_rcpt, dict)
+                    and prev_rcpt.get("post_snapshot_model_sha256") == pre_model_sha
+                    and prev_rcpt.get("post_snapshot_coord_map_sha256") == pre_cm_sha
+                ):
+                    orig_model_sha = prev_rcpt.get("pre_snapshot_model_sha256") or pre_model_sha
+                    orig_cm_sha = prev_rcpt.get("pre_snapshot_coord_map_sha256")
+            except Exception:
+                pass
+        receipt_doc = {
+            "model_path": str(mpath),
+            "model_name": mpath.name,
+            "pre_snapshot_model_sha256": orig_model_sha,
+            "post_snapshot_model_sha256": new_sha,
+            "coord_map_path": str(cp_obj),
+            "pre_snapshot_coord_map_sha256": orig_cm_sha,
+            "post_snapshot_coord_map_sha256": post_cm_sha,
+        }
+        receipt_path.write_text(
+            json.dumps(receipt_doc, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
 
     return {
         "status": "ok",
@@ -771,6 +807,7 @@ def write_consensus_snapshot(
         "touched_cells": {target_sh: touched_sorted},
         "refreshed_diff_cells": refreshed_diffs,
         "written_count": len(written_coords),
+        "receipt_path": str(receipt_path) if receipt_path is not None else None,
     }
 
 

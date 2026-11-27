@@ -23,6 +23,7 @@ from pathlib import Path
 import re
 import sys
 from typing import Any
+import zipfile
 
 from lxml import etree
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string, get_column_letter
@@ -682,6 +683,72 @@ def _missing_full_coverage_sheets(sheet_names: list[str], mode: str) -> list[str
         if req.lower() not in lowered:
             missing.append(req)
     return missing
+
+
+def _read_workbook_sheet_names(xlsx_path: Path) -> tuple[bool, list[str], str]:
+    """Read worksheet names directly from an ``.xlsx`` file on disk (read-only)."""
+    ok_read, read_msg = model_readable.check_workbook_readable(xlsx_path)
+    if not ok_read:
+        return False, [], read_msg
+    try:
+        parser = etree.XMLParser(resolve_entities=False, no_network=True)
+        with zipfile.ZipFile(xlsx_path, "r") as zf:
+            wb_xml = zf.read("xl/workbook.xml")
+        root = etree.fromstring(wb_xml, parser=parser)
+        ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        names = [
+            str(el.get("name") or "")
+            for el in root.iter(f"{{{ns}}}sheet")
+            if el.get("name")
+        ]
+        if not names:
+            return False, [], "workbook.xml contains no worksheet entries"
+        return True, names, ""
+    except Exception as exc:
+        return False, [], str(exc)
+
+
+def check_required_sheets(
+    *,
+    candidate_path: str | Path,
+    workflow: str = "full-coverage",
+    mode: str = "update",
+) -> dict[str, Any]:
+    """Independently inspect candidate workbook sheets on disk and classify as
+    ``complete``, ``missing``, or ``unverified``."""
+    cand = Path(candidate_path).expanduser().resolve()
+    eff_mode = str(mode or "update").strip().lower()
+    if eff_mode not in ("build", "update"):
+        eff_mode = "update"
+    ok_sh, sheet_names, err = _read_workbook_sheet_names(cand)
+    if not ok_sh:
+        return {
+            "ok": False,
+            "status": "unverified",
+            "readable": False,
+            "candidate_path": str(cand),
+            "workflow": str(workflow or "").strip(),
+            "mode": eff_mode,
+            "sheet_names": [],
+            "missing_required_sheets": [],
+            "error": err,
+        }
+    missing = (
+        _missing_full_coverage_sheets(sheet_names, eff_mode)
+        if str(workflow or "").strip() == "full-coverage"
+        else []
+    )
+    return {
+        "ok": len(missing) == 0,
+        "status": "missing" if missing else "complete",
+        "readable": True,
+        "candidate_path": str(cand),
+        "workflow": str(workflow or "").strip(),
+        "mode": eff_mode,
+        "sheet_names": sheet_names,
+        "missing_required_sheets": missing,
+        "error": None,
+    }
 
 
 def run_checks(
@@ -2993,6 +3060,7 @@ def write_check_and_ledger(
     ledger = {
         "schema_version": 2,
         "workflow": workflow,
+        "mode": str(mode or "update").strip().lower(),
         "ticker": ticker.strip().upper(),
         "run_id": run_id if run_id is not None else (existing or {}).get("run_id"),
         "baseline_path": _rel_or_str(Path(res["baseline_path"]), ws) if res.get("baseline_path") else None,
@@ -3002,6 +3070,7 @@ def write_check_and_ledger(
         "enabled_stages": ["check", "consensus"],
         "fix_rounds": eff_fix_rounds,
         "failed_stages": f_stages,
+        "missing_required_sheets": list(res.get("missing_required_sheets") or []),
         "rounds": rounds,
         "final_status": final_status,
         "final_model_path": _rel_or_str(cand, ws) if res["readable"] else None,
@@ -3034,6 +3103,7 @@ def write_fallback_ledger(
     failed_stages: list[str] | None = None,
     run_id: str | None = None,
     workflow: str = "company-model",
+    mode: str | None = None,
     baseline_path: str | Path | None = None,
     fix_rounds: int | None = None,
     reason: str | None = None,
@@ -3057,7 +3127,17 @@ def write_fallback_ledger(
     ledger_path = dump_dir / "model-verification.json"
     rem_path = dump_dir / "remaining-issues.md"
     existing = _load_existing_ledger(ledger_path)
-    f_stages = _carry_unrecovered_deep_note_failures(workflow, rdir, existing, f_stages)
+    eff_workflow = workflow or (existing or {}).get("workflow") or "company-model"
+    eff_mode = str(mode or (existing or {}).get("mode") or "").strip().lower()
+    if eff_mode not in ("build", "update"):
+        eff_mode = "build" if not (base_p or (existing or {}).get("baseline_path")) else "update"
+    f_stages = _carry_unrecovered_deep_note_failures(eff_workflow, rdir, existing, f_stages)
+
+    missing_required_sheets: list[str] = []
+    if eff_workflow == "full-coverage" and ok_read:
+        ok_sh, sheet_names, _sh_err = _read_workbook_sheet_names(cand)
+        if ok_sh:
+            missing_required_sheets = _missing_full_coverage_sheets(sheet_names, eff_mode)
 
     rounds = list((existing or {}).get("rounds") or [])
     prev_fix = int((existing or {}).get("fix_rounds") or 0)
@@ -3131,8 +3211,16 @@ def write_fallback_ledger(
             needs_excel_recalc_fb = bool((xml_m.get("calc_properties") or {}).get("full_calc_on_load"))
         except Exception:
             needs_excel_recalc_fb = False
+    fallback_findings: list[dict[str, Any]] = []
+    if missing_required_sheets:
+        _add_finding(
+            fallback_findings,
+            "C01",
+            "actionable",
+            f"full-coverage ({eff_mode}) missing required worksheets per model-spec.md: {', '.join(missing_required_sheets)}",
+        )
     rem_text = _render_remaining_issues_md(
-        [],
+        fallback_findings,
         f_stages,
         cand_sha,
         needs_excel_recalc_note=needs_excel_recalc_fb,
@@ -3146,7 +3234,8 @@ def write_fallback_ledger(
 
     ledger = {
         "schema_version": 2,
-        "workflow": workflow or (existing or {}).get("workflow") or "company-model",
+        "workflow": eff_workflow,
+        "mode": eff_mode,
         "ticker": ticker.strip().upper(),
         "run_id": run_id if run_id is not None else (existing or {}).get("run_id"),
         "baseline_path": (
@@ -3158,6 +3247,7 @@ def write_fallback_ledger(
         "enabled_stages": list((existing or {}).get("enabled_stages") or ["check", "consensus"]),
         "fix_rounds": eff_fix,
         "failed_stages": f_stages,
+        "missing_required_sheets": missing_required_sheets,
         "rounds": rounds,
         "final_status": final_status,
         "final_model_path": _rel_or_str(cand, ws) if ok_read else None,
@@ -3173,6 +3263,7 @@ def write_fallback_ledger(
         "remaining_issues_path": str(rem_path),
         "model_sha256": cand_sha,
         "failed_stages": f_stages,
+        "missing_required_sheets": missing_required_sheets,
         "ledger": ledger,
     }
 
@@ -3291,8 +3382,18 @@ def verify_done(
                 f"last round model_sha256 ({last_sha}) != final_model_sha256 ({final_model_sha})"
             )
 
-        round_failed = list(last_round.get("failed_stages") or [])
-        top_failed = list(ledger.get("failed_stages") or [])
+        raw_round_failed = last_round.get("failed_stages")
+        raw_top_failed = ledger.get("failed_stages")
+        if raw_round_failed is not None and not isinstance(raw_round_failed, list):
+            errors.append("last round failed_stages must be a list")
+            round_failed: list[str] = []
+        else:
+            round_failed = [str(s).strip() for s in (raw_round_failed or []) if str(s).strip()]
+        if raw_top_failed is not None and not isinstance(raw_top_failed, list):
+            errors.append("top-level failed_stages must be a list")
+            top_failed: list[str] = []
+        else:
+            top_failed = [str(s).strip() for s in (raw_top_failed or []) if str(s).strip()]
         raw_enabled = ledger.get("enabled_stages")
         enabled_stages = list(raw_enabled) if isinstance(raw_enabled, list) else []
         required_stages = ["check", "consensus"]
@@ -3305,6 +3406,11 @@ def verify_done(
         for st in round_failed:
             if st not in top_failed:
                 errors.append(f"failed stage {st!r} missing from top-level failed_stages")
+        for st in top_failed:
+            if st not in round_failed:
+                errors.append(f"top-level failed stage {st!r} missing from last round failed_stages")
+        # Only stages verified in BOTH the last round and top-level failed_stages may exempt evidence.
+        verified_failed = [st for st in round_failed if st in top_failed]
         all_failed = list(dict.fromkeys([*round_failed, *top_failed]))
         for st in all_failed:
             if final_status != "delivered_with_open_issues":
@@ -3317,7 +3423,7 @@ def verify_done(
 
         # Verify each completed enabled stage has real on-disk artifact + self-recorded hash & counts match!
         for st in stages_to_verify:
-            if st in round_failed or st in top_failed:
+            if st in verified_failed:
                 continue
             if st == "check":
                 chk_p = dump_dir / "model-check.md"
@@ -3404,10 +3510,25 @@ def verify_done(
                 if final_status == "pass" and not exists_ok:
                     errors.append(f"earnings-deep-update pass requires >=50B {fname}")
                 elif final_status == "delivered_with_open_issues" and not exists_ok:
-                    if note_stage not in top_failed or note_stage not in rem_text:
+                    if note_stage not in verified_failed or note_stage not in rem_text:
                         errors.append(
                             f"missing {fname} on delivered_with_open_issues must record {note_stage!r} in failed_stages and remaining-issues.md"
                         )
+
+        # Full-coverage required worksheet gate: independently re-read candidate workbook on disk
+        if effective_wf == "full-coverage" and final_model_p is not None and final_model_p.is_file():
+            fc_mode = str(ledger.get("mode") or "").strip().lower()
+            if fc_mode not in ("build", "update"):
+                fc_mode = "build" if not ledger.get("baseline_path") else "update"
+            ok_sh, sh_names, sh_err = _read_workbook_sheet_names(final_model_p)
+            if not ok_sh:
+                errors.append(f"full-coverage final model sheets unreadable on disk: {sh_err}")
+            else:
+                fc_missing = _missing_full_coverage_sheets(sh_names, fc_mode)
+                if fc_missing:
+                    errors.append(
+                        f"full-coverage ({fc_mode}) final model missing required worksheets on disk: {', '.join(fc_missing)}"
+                    )
 
     return {
         "ok": len(errors) == 0,
@@ -3452,9 +3573,15 @@ def main(argv: list[str] | None = None) -> int:
     p_wl.add_argument("--failed-stages", required=True)
     p_wl.add_argument("--run-id", default=None)
     p_wl.add_argument("--workflow", default="company-model")
+    p_wl.add_argument("--mode", default=None, choices=["build", "update", "auto"])
     p_wl.add_argument("--baseline", default=None)
     p_wl.add_argument("--fix-rounds", type=int, default=None)
     p_wl.add_argument("--reason", default=None)
+
+    p_sh = sub.add_parser("check-sheets", help="Independently verify required worksheets directly on candidate .xlsx")
+    p_sh.add_argument("--candidate", required=True)
+    p_sh.add_argument("--workflow", default="full-coverage")
+    p_sh.add_argument("--mode", default="update", choices=["build", "update", "auto"])
 
     p_vd = sub.add_parser("verify-done", help="Verify terminal ledger, model readability, and evidence closure")
     p_vd.add_argument("--workspace", required=True)
@@ -3502,6 +3629,7 @@ def main(argv: list[str] | None = None) -> int:
             failed_stages=f_list,
             run_id=args.run_id,
             workflow=args.workflow,
+            mode=args.mode,
             baseline_path=args.baseline,
             fix_rounds=args.fix_rounds,
             reason=args.reason,
@@ -3509,6 +3637,15 @@ def main(argv: list[str] | None = None) -> int:
         out = {k: v for k, v in res.items() if k != "ledger"}
         print(json.dumps(out, indent=2, ensure_ascii=False))
         return 0 if res["final_status"] != "failed_unusable" else 1
+
+    if args.cmd == "check-sheets":
+        res = check_required_sheets(
+            candidate_path=args.candidate,
+            workflow=args.workflow,
+            mode=args.mode,
+        )
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0 if res["readable"] else 1
 
     if args.cmd == "verify-done":
         res = verify_done(

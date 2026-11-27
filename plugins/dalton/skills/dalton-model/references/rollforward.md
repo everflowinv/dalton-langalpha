@@ -24,7 +24,7 @@
 - 无季度拆分的远期年度列及新增远期年度列，直接在年度列放驱动假设（套驱动假设格式）。
 - 新增季度和已有季度之间隔着只有年度的年份时，先把中间年份按指标性质拆成季度（流量四季之和等于原年度、余额按季滚存对齐年末、日均量按天数加权、利润率与 take rate 由各季金额算出并保留季节性），再向后扩展，并在回复中说明。
 - 顺延已有 CAGR（复合年增长率）列、估值页（Valuation、SOTP〔分部加总估值〕）的目标年份与预测列引用，以及末尾扩列后的横向 `SUM` 与条件格式区间。
-- 全部扩列与改格操作写入编辑计划 JSON，运行 `python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline <原模型路径> --ticker <TICKER> --plan <edit_plan.json> --workspace-dir . --fingerprint <fingerprint.json> --coord-map-out <R>/model_dump/coord_map.json --mode update`：脚本先以保持 `<calcPr>` 模式调用 `insert.py` 扩行列并留存缓存母本，再由受控 `openpyxl` 只改目标格，候选落盘前先调用 `restore_donor_cache` 原子恢复非目标公司表、外链、插件、既有循环格与未改公式格的原始缓存，随后在临时副本用 LibreOffice 复算并仅合并非错误计算值。
+- 全部扩列与改格操作写入编辑计划 JSON，先运行 `python3 .agents/skills/dalton-model/scripts/model_edit.py next-path --workspace-dir . --ticker <TICKER> --baseline <原模型路径>` 确定 `<新版本路径>`，再执行首次滚动落盘：`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline <原模型路径> --ticker <TICKER> --plan <edit_plan.json> --out <新版本路径> --workspace-dir . --fingerprint <fingerprint.json> --coord-map-out <R>/model_dump/coord_map.json --expected-baseline-sha256 <原模型64位SHA-256> --mode update`：脚本先以保持 `<calcPr>` 模式调用 `insert.py` 扩行列并留存缓存母本，再由受控 `openpyxl` 只改目标格，候选落盘前先调用 `restore_donor_cache` 原子恢复非目标公司表、外链、插件、既有循环格与未改公式格的原始缓存，随后确认可读并写入坐标图，再在临时副本用 LibreOffice 复算并仅合并非错误计算值。
 
 **4. 调整预测与外部依赖处理**
 - 发现原模型预测期金额格为常数时：能按拆解区恢复计算关系的改写为公式；属管理层直接金额指引的，单设输入格（套驱动假设格式、最右备注列写来源）并由预测行公式引用，在变更记录写明。
@@ -36,7 +36,7 @@
 **5. 对照一致预期与本轮范围检查**
 - 先独立完成本方预测，再按 `.agents/skills/dalton-model/references/sanity-check.md` 运行 `model_consensus.py write-snapshot` 与 `model_consensus.py diff` 生成 `<R>/model_dump/consensus-diff.md/.json`；超阈值项拆源复核一次并补充理由。
 - 运行 `python3 .agents/skills/dalton-model/scripts/model_check.py check --workspace . --ticker <TICKER> --research-dir <R> --candidate <新版本路径> --baseline <原模型路径> --fingerprint <fingerprint.json> --coord-map <R>/model_dump/coord_map.json --workflow company-model --fix-round 0`，检查仅针对本轮改动范围做判定：
-  - 仅「本轮可修」条目交回修改，最多两轮，每轮修改后按最新哈希刷新 `consensus-diff.md/.json` 并复查；
+  - 仅「本轮可修」条目交回修改，最多两轮；定点修改（以及第 5 步超阈值一致预期返工）必须以当前候选 `<新版本路径>` 为基础增量叠加，不可把增量计划重新应用到 `<原模型路径>`：先运行 `python3 .agents/skills/dalton-model/scripts/model_fingerprint.py <新版本路径> --ticker <TICKER> --out <R>/model_dump/<TICKER>-fix<N>-fingerprint.json` 对当前候选重提指纹，再执行 `python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline <新版本路径> --ticker <TICKER> --plan <fix_plan.json> --out <新版本路径> --in-place --workspace-dir . --fingerprint <R>/model_dump/<TICKER>-fix<N>-fingerprint.json --prior-coord-map <R>/model_dump/coord_map.json --coord-map-out <R>/model_dump/coord_map.json --expected-baseline-sha256 <当前候选64位SHA-256> --mode update` 合并坐标映射并保留前序写入的实际值与扩列，每轮修改后按最新哈希重跑 `model_consensus.py diff` 刷新 `consensus-diff.md/.json` 并用 `model_check.py check --fix-round <1|2>` 复查；
   - 基线遗留、缺证据与不适用条目如实记入报告备查；
   - 扩展条件格式（`<extLst>` / `x14`）变动在检查报告末尾如实提示。
 

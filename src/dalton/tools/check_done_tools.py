@@ -1154,32 +1154,55 @@ async def _latest_run_dir(
     return best_dir
 
 
+async def _resolve_located_run_dir(
+    backend: Any, workflow: str, run_id: str | None, thread_id: str | None
+) -> tuple[str | None, str | None]:
+    """Locate the single authoritative run directory for ``(workflow, run_id, thread_id)``
+    so ``status.json``, ``journal/*.json``, and ``args.json`` all resolve from the
+    exact same directory.
+
+    Returns ``(run_dir, error_message)``. Raises ``_CannotVerify`` when scanning
+    the thread's ``status.json`` files fails or hits a corrupt status record.
+    """
+    if isinstance(run_id, str) and run_id.strip():
+        return await _verify_explicit_run_dir(backend, workflow, run_id.strip(), thread_id)
+    if not thread_id:
+        return None, None
+    latest = await _latest_run_dir(backend, workflow, thread_id)
+    return latest, None
+
+
+async def _read_run_args_checked(
+    backend: Any, run_dir: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Read and parse ``<run_dir>/args.json`` with explicit error diagnostics."""
+    args_path = f"{run_dir}/args.json"
+    status, text = await _read_text_diagnosed(backend, args_path)
+    if status == "error":
+        return None, f"启动记录读取失败（{args_path}）"
+    if status == "missing" or text is None or not text.strip():
+        return None, f"启动记录缺失或为空（{args_path}）"
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return None, f"启动记录已损坏，无法解析 JSON（{args_path}）"
+    if not isinstance(doc, dict):
+        return None, f"启动记录结构异常，非 JSON 对象（{args_path}）"
+    return doc, None
+
+
 async def _run_args_doc(
     backend: Any, workflow: str, run_id: str | None, thread_id: str | None
 ) -> dict[str, Any] | None:
     """Read this run's ``args.json`` object (named ``run_id`` or latest run of ``workflow``)."""
-    dirs: list[str]
-    if run_id:
-        dirs = [f"{_thread_prefix(thread_id)}{run_id}"]
-    else:
-        if not thread_id:
-            return None
-        try:
-            latest = await _latest_run_dir(backend, workflow, thread_id)
-        except _CannotVerify:
-            return None
-        dirs = [latest] if latest else []
-    for run_dir in dirs:
-        text = await _read_text(backend, f"{run_dir}/args.json")
-        if not text:
-            continue
-        try:
-            doc = json.loads(text)
-        except ValueError:
-            continue
-        if isinstance(doc, dict):
-            return doc
-    return None
+    try:
+        run_dir, _err = await _resolve_located_run_dir(backend, workflow, run_id, thread_id)
+    except _CannotVerify:
+        return None
+    if run_dir is None:
+        return None
+    doc, _args_err = await _read_run_args_checked(backend, run_dir)
+    return doc
 
 
 async def _run_args_as_of(
@@ -1261,7 +1284,11 @@ async def _collect_review_records(
         raise _CannotVerify("缺少线程身份（thread_id 与 run_id 均未提供），无法定位本次 run")
     prefix = _thread_prefix(thread_id)
     if run_id:
-        journals = await _glob(backend, f"{prefix}{run_id}/journal/*.json")
+        resolved_dir, _err = await _verify_explicit_run_dir(
+            backend, workflow, run_id.strip(), thread_id
+        )
+        target_dir = resolved_dir or f"{prefix}{run_id}"
+        journals = await _glob(backend, f"{target_dir}/journal/*.json")
         if journals is None:
             raise _CannotVerify("无法扫描本次 run 的运行日志（journal）")
     else:
@@ -4044,7 +4071,31 @@ async def run_check_done(
         # may omit as_of or say "latest") still find the run's artifacts —
         # never recomputed here, the run's record is the truth.
         if backend is not None and isinstance(params, dict):
-            run_args = await _run_args_doc(backend, workflow, run_id, thread_id)
+            located_run_dir: str | None = None
+            run_dir_err: str | None = None
+            run_args: dict[str, Any] | None = None
+            args_err: str | None = None
+            try:
+                located_run_dir, run_dir_err = await _resolve_located_run_dir(
+                    backend, workflow, run_id, thread_id
+                )
+            except _CannotVerify as exc:
+                run_dir_err = str(exc)
+            if located_run_dir is not None:
+                run_args, args_err = await _read_run_args_checked(
+                    backend, located_run_dir
+                )
+            elif (
+                workflow != "earnings-deep-update"
+                and isinstance(run_id, str)
+                and run_id.strip()
+                and thread_id
+            ):
+                # Legacy non-deep tests that write args.json without status.json
+                run_args, _ = await _read_run_args_checked(
+                    backend, f"{_thread_prefix(thread_id)}{run_id.strip()}"
+                )
+
             current = params.get("as_of")
             if not (
                 isinstance(current, str)
@@ -4058,6 +4109,16 @@ async def run_check_done(
                         inherited = raw_as_of.strip()
                 if inherited:
                     params = {**params, "as_of": inherited}
+            if workflow == "earnings-deep-update":
+                if located_run_dir is not None and args_err is not None:
+                    missing.append(
+                        f"已定位到深度链运行（{located_run_dir}），但启动记录无法读取（{args_err}）；"
+                        "无法确认启动时是否传入 model_path，完成核对不予放行。"
+                    )
+                elif located_run_dir is None and run_dir_err is not None:
+                    missing.append(
+                        f"深度链运行目录核验失败（{run_dir_err}），无法读取启动记录（args.json），完成核对不予放行。"
+                    )
             if workflow in ("company-model", "earnings-deep-update") and isinstance(run_args, dict):
                 raw_launched_mp = run_args.get("model_path")
                 launched_mp = (

@@ -44,6 +44,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 import model_fingerprint  # noqa: E402
+import model_readable  # noqa: E402
 import model_style  # noqa: E402
 import model_xlsx_hooks  # noqa: E402
 
@@ -1050,7 +1051,29 @@ def apply_edit_plan(
     donor_restore_res = model_xlsx_hooks.restore_donor_cache(
         editing_tmp, keep_cache_spec, recalc_mod=recalc_mod
     )
+    # For default-template builds, enable fullCalcOnLoad=1 BEFORE atomic publish so even if
+    # LibreOffice recalculation times out / is killed mid-flight, the published workbook on disk
+    # is already readable and prompts Excel to recalculate on open.
+    if is_template_build and not skip_recalc:
+        model_xlsx_hooks.set_full_calc_on_load(editing_tmp, True)
     os.replace(editing_tmp, cand)
+
+    ok_read, read_msg = model_readable.check_workbook_readable(cand)
+    if not ok_read:
+        raise ValueError(f"published candidate workbook unreadable before recalc: {read_msg} ({cand})")
+
+    pre_recalc_sha = model_fingerprint.file_sha256(cand)
+    coord_map["candidate_sha256"] = pre_recalc_sha
+    coord_map["donor_cache_restored"] = True
+    coord_map["kept_cache_count"] = donor_restore_res.get("kept_cache_count", 0)
+    coord_map["recalc_result"] = {"status": "pending"}
+    if coord_map_out is not None:
+        cp = Path(coord_map_out).expanduser().resolve()
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        pre_cm = _merge_coord_maps(prior_coord_map, coord_map) if prior_coord_map is not None else coord_map
+        tmp_cm = cp.with_name(f".{cp.name}.{os.getpid()}.tmp")
+        tmp_cm.write_text(json.dumps(pre_cm, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(tmp_cm, cp)
 
     # Step 4: Temp-copy LibreOffice recalculation & selective non-error merge
     full_calc_fallback = False
@@ -1070,12 +1093,16 @@ def apply_edit_plan(
         recalc_res = model_xlsx_hooks.recalculate_keep_cache(
             recalc_mod, cand, int(recalc_timeout), set(), keep_cache_spec
         )
-        # For default-template builds, if recalculation failed or left unmatched target formulas,
-        # enable fullCalcOnLoad=1 so Excel recalculates immediately when the user opens the workbook!
-        if is_template_build and recalc_res.get("status") in ("recalc_failed", "incomplete"):
-            model_xlsx_hooks.set_full_calc_on_load(cand, True)
-            full_calc_fallback = True
-            recalc_res["full_calc_on_load_enabled"] = True
+        # For default-template builds: if recalculation failed or left unmatched target formulas,
+        # keep fullCalcOnLoad=1 so Excel recalculates immediately on open; if it succeeded cleanly,
+        # restore the donor <calcPr>.
+        if is_template_build:
+            if recalc_res.get("status") in ("recalc_failed", "incomplete"):
+                model_xlsx_hooks.set_full_calc_on_load(cand, True)
+                full_calc_fallback = True
+                recalc_res["full_calc_on_load_enabled"] = True
+            else:
+                _preserve_calcpr_from_donor(cand, donor_path)
 
     cand_sha = model_fingerprint.file_sha256(cand)
     coord_map["candidate_sha256"] = cand_sha
@@ -1093,7 +1120,9 @@ def apply_edit_plan(
     if coord_map_out is not None:
         cp = Path(coord_map_out).expanduser().resolve()
         cp.parent.mkdir(parents=True, exist_ok=True)
-        cp.write_text(json.dumps(coord_map, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        tmp_cm = cp.with_name(f".{cp.name}.{os.getpid()}.tmp")
+        tmp_cm.write_text(json.dumps(coord_map, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(tmp_cm, cp)
 
     return {
         "status": "ok",

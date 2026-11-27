@@ -1130,6 +1130,64 @@ class DiskHost(ScriptedHost):
             return None
         if label == "读取运行ID" and label not in self.by_label:
             return {"run_id": "run-disk-1"}
+        if label in ("绑定输出路径", "计算联动新路径") and label not in self.by_label:
+            m_rec = re.search(r"写入独立记录文件 (\S+\.json)", prompt)
+            rec_path = m_rec.group(1) if m_rec else "research/planned-output.json"
+            m_base = re.search(r'--baseline "([^"]+)"', prompt)
+            if m_base:
+                nxt = self._next_model_version(m_base.group(1))
+            else:
+                nxt, _ = self._latest_disk_model()
+            return {"files": [rec_path], "summary": f"bound {nxt}", "next_path": nxt}
+        if label in ("核验候选落盘", "核验联动候选落盘") and label not in self.by_label:
+            m_cand = re.search(r"核验候选模型 (\S+?\.xlsx)", prompt)
+            rel = m_cand.group(1) if m_cand else ""
+            p = self.workspace / rel if rel else None
+            ex = bool(p and p.is_file())
+            sha = hashlib.sha256(p.read_bytes()).hexdigest() if ex and p is not None else None
+            return {"path": rel, "exists": ex, "readable": ex, "model_sha256": sha}
+        if label == "完整覆盖页签核验" and label not in self.by_label:
+            m_cand = re.search(r'--candidate "([^"]+)"', prompt)
+            cand = m_cand.group(1) if m_cand else self._latest_disk_model()[0]
+            all_sheets = [
+                "README & Changelog",
+                "Cover",
+                "Facts",
+                "Revenue Model",
+                "Income Statement",
+                "Cash Flow Statement",
+                "Balance Sheet",
+                "Scenarios",
+                "Guidance vs Actual",
+                "Street vs House",
+                "DCF Inputs",
+                "DCF",
+                "Sensitivity Analysis",
+                "Comparable Companies",
+                "Valuation Summary",
+                "Checks",
+            ]
+            return {
+                "path": cand,
+                "status": "complete",
+                "sheet_names": all_sheets,
+                "missing_required_sheets": [],
+                "summary": "all required sheets present",
+            }
+        if label == "模型联动差异与报告同步" and label not in self.by_label:
+            m_cm = re.search(r"刷新一致预期差异表 (\S*consensus-diff\.md) 与 (\S*consensus-diff\.json)", prompt)
+            files = []
+            if m_cm:
+                files.extend([m_cm.group(1), m_cm.group(2)])
+            m_rpt = re.search(r"同步更新 (\S+?\.md) 正文", prompt)
+            if m_rpt:
+                files.append(m_rpt.group(1))
+            return {
+                "files": files or ["model_dump/consensus-diff.md", "model_dump/consensus-diff.json"],
+                "summary": "diff & report synced",
+                "report_sha256": None,
+                "consensus_diff_generated": True,
+            }
         if label == "模型构建与落盘" and label not in self.by_label:
             cand, sha = self._latest_disk_model()
             return {
@@ -1432,6 +1490,7 @@ async def test_deep_model_update_mismatch_stops_before_calibration(tmp_path: Pat
     host = _deep_host(
         tmp_path,
         {},
+        writes={"模型构建与落盘": []},
         fail_labels={"模型构建与落盘"},
     )
     result = await _run("earnings-deep-update", DEEP_PARAMS, host)

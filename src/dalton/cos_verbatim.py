@@ -10,12 +10,17 @@ whitespace) plus attachment basenames for the current turn, and appends a
 
 from __future__ import annotations
 
+import inspect
+import logging
 import os
 import posixpath
 import re
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 COS_TURN_VERBATIM_CONFIG_KEY = "cos_turn_verbatim_request"
+COS_APPROVED_DISPATCH_PAYLOADS_CONFIG_KEY = "cos_approved_dispatch_payloads"
 
 _CLOSING_TAG_RE = re.compile(r"</\s*user_verbatim_request\s*>", re.IGNORECASE)
 _SYSTEM_REMINDER_RE = re.compile(
@@ -302,3 +307,102 @@ def append_verbatim_user_request(
     base = question.rstrip()
     block = f"<user_verbatim_request>\n{body}\n</user_verbatim_request>"
     return f"{base}\n\n{block}" if base else block
+
+
+def extract_approved_dispatch_payloads_from_checkpoint(
+    checkpoint_tuple: Any,
+    *,
+    hitl_response: Any = None,
+) -> dict[str, dict[str, Any]]:
+    """Extract approval-card ``ptc_agent`` dispatch payloads keyed by ``tool_call_id``
+    from a LangGraph checkpoint tuple's pending interrupts."""
+    if checkpoint_tuple is None:
+        return {}
+    from src.server.utils.checkpoint_helpers import interrupt_records
+
+    pending = interrupt_records(getattr(checkpoint_tuple, "pending_writes", None))
+    if not pending:
+        return {}
+    answered_ids = (
+        {str(k) for k in hitl_response.keys()}
+        if isinstance(hitl_response, dict) and hitl_response
+        else None
+    )
+    payloads: dict[str, dict[str, Any]] = {}
+    for rec in pending:
+        rec_id = rec.get("id")
+        if answered_ids is not None and rec_id is not None and str(rec_id) not in answered_ids:
+            continue
+        val = rec.get("value")
+        if not isinstance(val, dict):
+            continue
+        action_reqs = val.get("action_requests")
+        if not isinstance(action_reqs, list):
+            continue
+        for req in action_reqs:
+            if not isinstance(req, dict) or req.get("type") != "ptc_agent":
+                continue
+            call_id = req.get("tool_call_id")
+            card_question = req.get("question")
+            if isinstance(call_id, str) and call_id.strip() and isinstance(card_question, str):
+                payloads[call_id] = {
+                    "question": card_question,
+                    "workspace_id": req.get("workspace_id"),
+                    "thread_id": req.get("thread_id"),
+                }
+    return payloads
+
+
+async def load_approved_dispatch_payloads(
+    checkpointer: Any,
+    thread_id: str | None,
+    *,
+    checkpoint_id: str | None = None,
+    hitl_response: Any = None,
+) -> dict[str, dict[str, Any]]:
+    """Load approval-bound ``ptc_agent`` dispatch payloads from ``checkpointer``
+    so HITL resume reuses the exact card text (with verbatim block & attachments)
+    without regenerating."""
+    if checkpointer is None or not thread_id:
+        return {}
+    cfg: dict[str, Any] = {"configurable": {"thread_id": str(thread_id)}}
+    if checkpoint_id:
+        cfg["configurable"]["checkpoint_id"] = str(checkpoint_id)
+    try:
+        aget = getattr(checkpointer, "aget_tuple", None)
+        if aget is not None:
+            maybe = aget(cfg)
+            cp_tuple = await maybe if inspect.isawaitable(maybe) else maybe
+        else:
+            get = getattr(checkpointer, "get_tuple", None)
+            cp_tuple = get(cfg) if get is not None else None
+    except Exception:
+        logger.debug(
+            "Failed to load approved dispatch payloads from checkpoint",
+            extra={"thread_id": thread_id, "checkpoint_id": checkpoint_id},
+            exc_info=True,
+        )
+        return {}
+    return extract_approved_dispatch_payloads_from_checkpoint(
+        cp_tuple, hitl_response=hitl_response
+    )
+
+
+def resolve_dispatch_question(
+    question: str,
+    state: dict[str, Any] | None = None,
+    *,
+    config: Any = None,
+    tool_call_id: str | None = None,
+) -> str:
+    """Reuse the approval-bound dispatch question for ``tool_call_id`` on HITL
+    resume; otherwise enrich ``question`` with this turn's verbatim user request."""
+    if isinstance(tool_call_id, str) and tool_call_id.strip() and isinstance(config, dict):
+        configurable = config.get("configurable")
+        if isinstance(configurable, dict):
+            approved_map = configurable.get(COS_APPROVED_DISPATCH_PAYLOADS_CONFIG_KEY)
+            if isinstance(approved_map, dict):
+                saved = approved_map.get(tool_call_id)
+                if isinstance(saved, dict) and isinstance(saved.get("question"), str):
+                    return saved["question"]
+    return append_verbatim_user_request(question, state, config=config)

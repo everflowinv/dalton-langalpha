@@ -268,13 +268,19 @@ const modelResult = await runModelingPipeline({
 })
 
 let modelStatus = modelResult ? modelResult.status : 'failed_unusable'
+let modelEffMode =
+  modelResult && (modelResult.mode === 'build' || modelResult.mode === 'update')
+    ? modelResult.mode
+    : args.model_path
+      ? 'update'
+      : 'build'
 let modelPath = modelResult && modelResult.candidate_path ? normPath(modelResult.candidate_path) : null
 let modelSha = (modelResult && modelResult.model_sha256) || null
 let modelRunId = (modelResult && modelResult.run_id) || null
 let modelConsensusPath = (modelResult && modelResult.consensus_path) || null
 let modelFailedStages = modelResult && Array.isArray(modelResult.failed_stages) ? modelResult.failed_stages.slice() : []
 let modelArtifacts = modelResult && Array.isArray(modelResult.artifacts) ? modelResult.artifacts.slice() : []
-const missingRequiredSheets =
+const reportedMissingSheets =
   modelResult && Array.isArray(modelResult.missing_required_sheets) ? modelResult.missing_required_sheets : []
 let modelCheckPath = hasArtifact(modelArtifacts, `${R}/model_dump/model-check.md`)
   ? `${R}/model_dump/model-check.md`
@@ -291,8 +297,39 @@ if ((modelResult && modelResult.ok === false) || modelStatus === 'failed_unusabl
     '建模未产出可读候选模型，已停在成稿之前；补齐可读模型后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
   )
 }
-if (missingRequiredSheets.length > 0) {
-  const missList = missingRequiredSheets.join('、')
+
+// 完整覆盖成稿前独立读盘核验必需工作表：不依赖前序检查子任务是否回传 missing_required_sheets，
+// 严格区分「齐全（complete）」「缺表（missing）」「未核验（unverified）」；缺表或未核验均停在成稿之前并写入未决清单。
+const sheetGate = await verifyFullCoverageSheetsOnDisk({
+  workspaceDir: W,
+  candidatePath: modelPath,
+  mode: modelEffMode,
+  priorMissing: reportedMissingSheets,
+  phaseLabel: '建模',
+})
+if (sheetGate.status === 'missing') {
+  const missingRequiredSheets = sheetGate.missing_required_sheets
+  const missList = missingRequiredSheets.join('、') || '必需工作表'
+  if (modelFailedStages.includes('check') || !remainingIssuesPath) {
+    const fb = await writeFallbackLedger({
+      workspaceDir: W,
+      ticker: T,
+      researchDir: R,
+      progressPath,
+      workflow: 'full-coverage',
+      mode: modelEffMode,
+      candidatePath: modelPath,
+      baselinePath: (modelResult && modelResult.baseline_path) || args.model_path || null,
+      kind: 'modeling',
+      failedStages: modelFailedStages.length ? modelFailedStages : ['sheet_gate'],
+      runId: modelRunId,
+      fixRounds: modelResult && typeof modelResult.fix_rounds === 'number' ? modelResult.fix_rounds : 0,
+      reason: `完整覆盖模型缺少必需工作表（${missList}），已写入未决清单并停在成稿之前`,
+      phaseLabel: '建模',
+    })
+    if (fb && fb.remaining_issues_path) remainingIssuesPath = fb.remaining_issues_path
+    if (fb && fb.model_sha256) modelSha = fb.model_sha256
+  }
   const remHint = remainingIssuesPath || `${R}/model_dump/remaining-issues.md`
   return {
     ...gateBlock(
@@ -300,10 +337,44 @@ if (missingRequiredSheets.length > 0) {
       `完整覆盖模型缺少必需工作表（${missList}），详见 ${remHint}；补齐所需工作表后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑`
     ),
     model: modelPath,
-    model_status: modelStatus,
+    model_status: 'delivered_with_open_issues',
     model_verification: modelVerificationPath,
     remaining_issues: remHint,
+    sheet_gate_status: 'missing',
     missing_required_sheets: missingRequiredSheets,
+  }
+}
+if (sheetGate.status !== 'complete') {
+  const unverifiedStages = modelFailedStages.slice()
+  _mPushUnique(unverifiedStages, 'sheet_check')
+  const fb = await writeFallbackLedger({
+    workspaceDir: W,
+    ticker: T,
+    researchDir: R,
+    progressPath,
+    workflow: 'full-coverage',
+    mode: modelEffMode,
+    candidatePath: modelPath,
+    baselinePath: (modelResult && modelResult.baseline_path) || args.model_path || null,
+    kind: 'modeling',
+    failedStages: unverifiedStages,
+    runId: modelRunId,
+    fixRounds: modelResult && typeof modelResult.fix_rounds === 'number' ? modelResult.fix_rounds : 0,
+    reason: '完整覆盖成稿前独立页签核验失败或超时（未核验），已写入未决清单并停在成稿之前',
+    phaseLabel: '建模',
+  })
+  const remHint = (fb && fb.remaining_issues_path) || remainingIssuesPath || `${R}/model_dump/remaining-issues.md`
+  return {
+    ...gateBlock(
+      `完整覆盖模型必需工作表未核验（独立读盘核验失败或超时），已写入未决清单 ${remHint} 并停在成稿之前`,
+      `完整覆盖模型必需工作表尚未核验（详见 ${remHint}）；确认模型工作表齐全后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑`
+    ),
+    model: modelPath,
+    model_status: 'delivered_with_open_issues',
+    model_verification: modelVerificationPath,
+    remaining_issues: remHint,
+    sheet_gate_status: 'unverified',
+    missing_required_sheets: [],
   }
 }
 if (modelStatus === 'delivered_with_open_issues') {

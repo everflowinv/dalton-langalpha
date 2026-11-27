@@ -6240,8 +6240,40 @@ class _FcRunHost:
                 "baseline_legacy_issues": [],
                 "missing_evidence_issues": [],
                 "not_applicable_issues": [],
+                "missing_required_sheets": [],
                 "remaining_issues_path": None,
                 "summary_10lines": "v01 pass",
+            }
+        if label == "绑定输出路径":
+            return {
+                "files": [f"{R}/model_dump/planned-output.json"],
+                "summary": "bound v01",
+                "next_path": "model/META-model-v01.xlsx",
+            }
+        if label == "完整覆盖页签核验":
+            return {
+                "path": "model/META-model-v01.xlsx",
+                "status": "complete",
+                "sheet_names": [
+                    "README & Changelog",
+                    "Cover",
+                    "Facts",
+                    "Revenue Model",
+                    "Income Statement",
+                    "Cash Flow Statement",
+                    "Balance Sheet",
+                    "Scenarios",
+                    "Guidance vs Actual",
+                    "Street vs House",
+                    "DCF Inputs",
+                    "DCF",
+                    "Sensitivity Analysis",
+                    "Comparable Companies",
+                    "Valuation Summary",
+                    "Checks",
+                ],
+                "missing_required_sheets": [],
+                "summary": "all required sheets present",
             }
         if label == "memo 探测":
             m = re.search(r"f='([^']+)'", prompt)
@@ -6427,6 +6459,9 @@ async def test_model_readability_validator_rejects_missing_or_corrupt_and_passes
         ws2 = wb.create_sheet("Checks")
         ws2["A1"] = "Check"
         ws2["B1"] = "OK"
+        for sh_extra in ("Facts", "Guidance vs Actual", "Street vs House"):
+            ws_e = wb.create_sheet(sh_extra)
+            ws_e["A1"] = sh_extra
         wb.save(target)
 
     def _write_corrupt_sheet_xml_zip(target: Path) -> None:
@@ -6459,6 +6494,7 @@ async def test_model_readability_validator_rejects_missing_or_corrupt_and_passes
                 {
                     "schema_version": 2,
                     "workflow": wf_name,
+                    "mode": "update",
                     "ticker": "META",
                     "run_id": None,
                     "calc_engine": "libreoffice",
@@ -7709,3 +7745,135 @@ async def test_b5b_earnings_calendar_scan_persisted_and_dates_confirmed_or_pendi
         thread_id="short-1",
     )
     assert res_already_reported["done"] is True, res_already_reported["missing"]
+
+
+@pytest.mark.asyncio
+async def test_p0b_r3_deep_update_args_json_missing_corrupt_or_unreadable_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 #1: Once an earnings-deep-update run is located (status.json + journals present),
+    a missing, corrupt, or unreadable args.json MUST fail check_done rather than falling
+    back to caller params (omitting model_path); and status, journals, and args.json
+    resolve from the exact same run directory (even when thread_id is omitted)."""
+    _patch_knowledge(monkeypatch, ["thesis", "debate", "drivers", "management"])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
+
+    r_rel = "research/2026-10-28-deep-FY26Q3"
+    run_dir = ".agents/threads/short-de/workflows/run-deep-r3"
+    draft_path = "drafts/2026-10-28-deep-FY26Q3.md"
+    draft_text = "# META 深度点评\n" + ("正文内容" * 200)
+    params_no_model = {
+        "ticker": "META",
+        "quarter": "FY26Q3",
+        "workspace_dir": ".",
+        "release_date": "2026-10-28",
+    }
+
+    def _deep_files(args_text: str | None) -> dict[str, str]:
+        files = _with_full_language_sidecars(
+            {
+                draft_path: draft_text,
+                f"{r_rel}/thesis-calibration.md": "校准结论" * 40,
+                f"{r_rel}/management-delta.md": "指引兑现" * 25,
+                f"{r_rel}/reconcile.md": "对账说明" * 25,
+                f"{r_rel}/reconcile.json": json.dumps({"wrong": 0, "partial": 0}),
+                f"{r_rel}/knowledge-revision.json": json.dumps({"thesis": {"ops": []}, "pad": "x" * 40}),
+                "research/push/2026-10-28-earnings-deep-FY26Q3.md": "推送稿" * 40,
+                f"{run_dir}/status.json": json.dumps(
+                    {"run_id": "run-deep-r3", "name": "earnings-deep-update", "status": "completed", "updated_at": 100.0}
+                ),
+                f"{run_dir}/journal/审稿.json": json.dumps(
+                    {
+                        "label": "审稿",
+                        "dispatches": [
+                            {
+                                "label": "审稿",
+                                "status": "ok",
+                                "seq": 1,
+                                "recorded_at": 50.0,
+                                "draft_sha256": _draft_hash(draft_text),
+                                "result": {"verdict": "pass", "summary": "ok", "items": _nine_items(), "must_fix": []},
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        )
+        if args_text is not None:
+            files[f"{run_dir}/args.json"] = args_text
+        return files
+
+    # (a) Missing args.json -> MUST fail (cannot skip model verification)
+    res_missing = await run_check_done(
+        workflow="earnings-deep-update",
+        params=params_no_model,
+        backend=_make_backend(_deep_files(None)),
+        workspace_id=WS,
+        run_id="run-deep-r3",
+        thread_id="short-deep-uuid",
+    )
+    assert res_missing["done"] is False
+    assert any("args.json" in m and "启动记录" in m for m in res_missing["missing"]), res_missing["missing"]
+
+    # (b) Corrupt args.json -> MUST fail
+    res_corrupt = await run_check_done(
+        workflow="earnings-deep-update",
+        params=params_no_model,
+        backend=_make_backend(_deep_files("{not-valid-json")),
+        workspace_id=WS,
+        run_id="run-deep-r3",
+        thread_id="short-deep-uuid",
+    )
+    assert res_corrupt["done"] is False
+    assert any("args.json" in m and "损坏" in m for m in res_corrupt["missing"]), res_corrupt["missing"]
+
+    # (c) Unreadable args.json (transport/IO error) -> MUST fail
+    err_backend = _make_backend(_deep_files("{}"))
+    orig_aread = err_backend.aread_text.side_effect
+
+    async def _fail_args_read(path: str) -> str | None:
+        if path.endswith("/args.json"):
+            raise OSError("disk I/O error reading args.json")
+        return await orig_aread(path)
+
+    err_backend.aread_text.side_effect = _fail_args_read
+    res_io = await run_check_done(
+        workflow="earnings-deep-update",
+        params=params_no_model,
+        backend=err_backend,
+        workspace_id=WS,
+        run_id="run-deep-r3",
+        thread_id="short-deep-uuid",
+    )
+    assert res_io["done"] is False
+    assert any("args.json" in m and "读取失败" in m for m in res_io["missing"]), res_io["missing"]
+
+    # (d) Same run_dir resolution when explicit run_id is passed WITHOUT thread_id:
+    # status.json, journal/*.json, and args.json all resolve from the exact same run_dir!
+    with_model_args = json.dumps(
+        {**params_no_model, "model_path": "model/META-model-v01.xlsx"}
+    )
+    res_no_tid = await run_check_done(
+        workflow="earnings-deep-update",
+        params=params_no_model,
+        backend=_make_backend(_deep_files(with_model_args)),
+        workspace_id=WS,
+        run_id="run-deep-r3",
+        thread_id=None,
+    )
+    assert res_no_tid["done"] is False
+    assert any("model-verification.json" in m for m in res_no_tid["missing"]), res_no_tid["missing"]
+    assert any("models" in m for m in res_no_tid["missing"]), res_no_tid["missing"]
+
+    # And missing args.json with run_id & thread_id=None ALSO fails cleanly
+    res_no_tid_missing = await run_check_done(
+        workflow="earnings-deep-update",
+        params=params_no_model,
+        backend=_make_backend(_deep_files(None)),
+        workspace_id=WS,
+        run_id="run-deep-r3",
+        thread_id=None,
+    )
+    assert res_no_tid_missing["done"] is False
+    assert any("args.json" in m for m in res_no_tid_missing["missing"]), res_no_tid_missing["missing"]
