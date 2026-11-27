@@ -1,10 +1,10 @@
-"""Dalton d058: non-HTML shared document registry and member ACL.
+"""Dalton d060: non-HTML shared document registry and member ACL.
 
 Non-HTML workspace files (md, pdf, xlsx, etc.) are shared with 4-tier visibility
 without creating monitor panel entries in ``dalton_monitors``.
 
-Revision ID: d058
-Revises: d057
+Revision ID: d060
+Revises: d059
 Create Date: 2026-11-27
 """
 
@@ -14,8 +14,8 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "d058"
-down_revision: str | None = "d057"
+revision: str = "d060"
+down_revision: str | None = "d059"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
