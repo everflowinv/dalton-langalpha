@@ -9,10 +9,14 @@ and zero plaintext leakage into logs, exceptions, or scrub status rows.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 import hashlib
 import json
 import logging
+from pathlib import Path
+import re
+import subprocess
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec
@@ -27,6 +31,7 @@ from ptc_agent.core.paths import SandboxLayout
 from ptc_agent.core.sandbox import assets as sandbox_assets
 from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 from ptc_agent.core.sandbox.runtime import ExecResult, SandboxProvider
+from ptc_agent.core.session import Session
 from src.dalton import settings as dalton_settings
 from src.dalton.app.router import router as dalton_router
 from src.dalton.deployment_credentials import sandbox_scrub as scrub_mod
@@ -35,10 +40,15 @@ from src.dalton.deployment_credentials import snapshot as dc_snapshot
 from src.dalton.services import channel_vault_credentials as cvc_mod
 from src.dalton.services import report_delivery as rd_svc
 from src.server.database import user_vault_secrets as vault_db
+from src.server.models.computer import ComputerStatus
+from src.server.models.mcp_server import McpServerInput
+from src.server.services import mcp_command_check as mcp_cc
+from src.server.services.computer_manager import ComputerManager
 from src.server.services.computer_manager._lifecycle import SessionLifecycleMixin
 from src.server.services.computer_manager._mcp import McpSecretsMixin
 from src.server.services.computer_manager._provisioning import ProvisioningMixin
 from src.server.services.computer_manager._types import ComputerBinding
+from src.server.services.mcp_validation import Passed
 from src.server.services.setup_settings import environment as setup_env
 from src.server.utils.secret_redactor import SecretRedactor
 
@@ -89,6 +99,7 @@ class _InMemoryRuntime:
         working_dir: str = "/home/workspace",
         initial_files: dict[str, bytes] | None = None,
         fail_first_exec: Exception | None = None,
+        mutate_before_replace: Callable[[dict[str, bytes]], None] | None = None,
     ) -> None:
         self.id = runtime_id
         self.working_dir = working_dir
@@ -97,6 +108,7 @@ class _InMemoryRuntime:
         self.upload_log: list[tuple[str, bytes]] = []
         self.download_log: list[str] = []
         self._fail_first_exec = fail_first_exec
+        self._mutate_before_replace = mutate_before_replace
         self.started = False
         self.stopped = False
         self.autostop_called = False
@@ -134,6 +146,44 @@ class _InMemoryRuntime:
             exc = self._fail_first_exec
             self._fail_first_exec = None
             raise exc
+
+        if 'if [ "$cur" = ' in command:
+            if self._mutate_before_replace is not None:
+                cb = self._mutate_before_replace
+                self._mutate_before_replace = None
+                cb(self.files)
+            part = command.split("[ ! -e ", 1)[1].split(" ];", 1)[0]
+            vault_path = shlex.split(part)[0]
+            expected_part = command.split('if [ "$cur" = ', 1)[1].split(" ];", 1)[0]
+            expected_sha = shlex.split(expected_part)[0]
+            tmp_path: str | None = None
+            if "mv -f " in command:
+                mv_part = command.split("mv -f ", 1)[1].split(";", 1)[0]
+                tmp_path = shlex.split(mv_part)[0]
+            if vault_path not in self.files:
+                if tmp_path is not None:
+                    self.files.pop(tmp_path, None)
+                return ExecResult(
+                    stdout="",
+                    stderr="",
+                    exit_code=scrub_mod._VAULT_SCRUB_CONFLICT_EXIT_CODE,
+                )
+            cur_sha = hashlib.sha256(self.files[vault_path]).hexdigest()
+            if cur_sha != expected_sha:
+                if tmp_path is not None:
+                    self.files.pop(tmp_path, None)
+                return ExecResult(
+                    stdout="",
+                    stderr="",
+                    exit_code=scrub_mod._VAULT_SCRUB_CONFLICT_EXIT_CODE,
+                )
+            if tmp_path is not None:
+                if tmp_path not in self.files:
+                    return ExecResult(stdout="", stderr="missing src", exit_code=1)
+                self.files[vault_path] = self.files.pop(tmp_path)
+            else:
+                self.files.pop(vault_path, None)
+            return ExecResult(stdout="", stderr="", exit_code=0)
 
         if "then echo absent; else echo present; fi" in command:
             # Extract quoted path between "[ ! -e " and " ];"
@@ -430,9 +480,12 @@ async def test_mcp_vault_snapshot_settle_and_push_strip_feishu_keys_preserve_fin
             return "comp-1"
 
         async def get_session_if_ready_for_work(self, *_args: Any, **_kwargs: Any) -> Any:
-            return SimpleNamespace(sandbox=self._sb)
+            sess = create_autospec(Session, instance=True)
+            sess.sandbox = self._sb
+            return sess
 
-    sandbox_obj = SimpleNamespace(vault_secrets={})
+    sandbox_obj = create_autospec(PTCSandbox, instance=True)
+    sandbox_obj.vault_secrets = {}
     mgr = _DummyManager(sandbox_obj)
 
     # 1. _vault_snapshot strips Feishu keys and keeps DB fingerprint untouched.
@@ -489,11 +542,10 @@ async def test_assets_vault_is_behind_and_publish_changed_vault_defense_in_depth
     async def _runtime_call(fn: Any, *args: Any, **_kwargs: Any) -> Any:
         return await fn(*args)
 
-    sandbox = SimpleNamespace(
-        runtime=rt,
-        layout=layout,
-        _runtime_call=_runtime_call,
-    )
+    sandbox = create_autospec(PTCSandbox, instance=True)
+    sandbox.runtime = rt
+    sandbox.layout = layout
+    sandbox._runtime_call.side_effect = _runtime_call
     did_write = await sandbox_assets._publish_changed_vault(
         sandbox, legacy_mixed, legacy_mixed_digest
     )
@@ -596,15 +648,14 @@ async def test_sync_project_assets_strips_feishu_on_create_and_resync(
         await sandbox_assets._publish_changed_vault(sandbox_obj, bound[2], on_disk)
         return SimpleNamespace(layout_version=2)
 
-    sandbox_obj = SimpleNamespace(
-        runtime=rt,
-        layout=layout,
-        vault_secrets={},
-        installs_browser=False,
-        _tool_refresh_lock=asyncio.Lock(),
-        _runtime_call=_runtime_call,
-        sync_sandbox_assets=_fake_sync_sandbox_assets,
-    )
+    sandbox_obj = create_autospec(PTCSandbox, instance=True)
+    sandbox_obj.runtime = rt
+    sandbox_obj.layout = layout
+    sandbox_obj.vault_secrets = {}
+    sandbox_obj.installs_browser = False
+    sandbox_obj._tool_refresh_lock = asyncio.Lock()
+    sandbox_obj._runtime_call.side_effect = _runtime_call
+    sandbox_obj.sync_sandbox_assets.side_effect = _fake_sync_sandbox_assets
 
     class _DummyProvManager(ProvisioningMixin, McpSecretsMixin):
         config = SimpleNamespace(skills=SimpleNamespace(enabled=False))
@@ -885,27 +936,28 @@ async def test_scrubber_online_cleanup_retry_deferred_lock_and_cache_sync(
         prov.close.side_effect = _close
         return prov
 
-    cached_sandbox_mixed = SimpleNamespace(
-        sandbox_id="sb-mixed",
-        vault_secrets={
-            "USER_TOKEN": _FAKE_NORMAL_SECRET,
-            "DALTON_FEISHU_APP_ID": _FAKE_FEISHU_ID,
-            "DALTON_FEISHU_APP_SECRET": _FAKE_FEISHU_SECRET,
-        },
-        _tool_refresh_lock=asyncio.Lock(),
-    )
-    cached_session_mixed = SimpleNamespace(sandbox=cached_sandbox_mixed)
+    cached_sandbox_mixed = create_autospec(PTCSandbox, instance=True)
+    cached_sandbox_mixed.sandbox_id = "sb-mixed"
+    cached_sandbox_mixed.vault_secrets = {
+        "USER_TOKEN": _FAKE_NORMAL_SECRET,
+        "DALTON_FEISHU_APP_ID": _FAKE_FEISHU_ID,
+        "DALTON_FEISHU_APP_SECRET": _FAKE_FEISHU_SECRET,
+    }
+    cached_sandbox_mixed._tool_refresh_lock = asyncio.Lock()
+    cached_session_mixed = create_autospec(Session, instance=True)
+    cached_session_mixed.sandbox = cached_sandbox_mixed
 
-    fake_manager = SimpleNamespace(
-        _binding_from_computer=lambda ws_id, row: ComputerBinding(
-            workspace_id=ws_id,
-            computer_id=str(row["computer_id"]),
-            kind=row["kind"],
-            root_dir=row["root_dir"],
-            provider_ref=row["provider_ref"],
-        ),
-        _provider_for=lambda _binding: _make_provider(),
-        _cached_session=lambda cid: cached_session_mixed if cid == cid_mixed else None,
+    fake_manager = create_autospec(ComputerManager, instance=True)
+    fake_manager._binding_from_computer.side_effect = lambda ws_id, row: ComputerBinding(
+        workspace_id=ws_id,
+        computer_id=str(row["computer_id"]),
+        kind=row["kind"],
+        root_dir=row["root_dir"],
+        provider_ref=row["provider_ref"],
+    )
+    fake_manager._provider_for.side_effect = lambda _binding: _make_provider()
+    fake_manager._cached_session.side_effect = (
+        lambda cid: cached_session_mixed if cid == cid_mixed else None
     )
     monkeypatch.setattr(
         cm_mod.ComputerManager,
@@ -935,9 +987,9 @@ async def test_scrubber_online_cleanup_retry_deferred_lock_and_cache_sync(
     assert runtimes["sb-mixed"].stopped is False
     assert runtimes["sb-mixed"].autostop_called is False
 
-    # 2. Feishu-only file deleted via rm -f.
+    # 2. Feishu-only file deleted via compare-and-remove rm -f.
     assert vault_path not in runtimes["sb-only"].files
-    assert any(cmd.startswith("rm -f ") for cmd in runtimes["sb-only"].exec_log)
+    assert any("rm -f " in cmd for cmd in runtimes["sb-only"].exec_log)
     assert scrub_rows[cid_only]["status"] == "cleaned"
 
     # 3. Stopped sandbox marked deferred_stopped.
@@ -1041,18 +1093,20 @@ async def test_ready_hook_cleans_stopped_sandbox_caches_on_session_and_survives_
     async def _ensure_ready() -> None:
         return None
 
-    sandbox = SimpleNamespace(
-        sandbox_id="sb-stopped-1",
-        runtime=rt,
-        layout=layout,
-        vault_secrets={
-            "USER_TOKEN": _FAKE_NORMAL_SECRET,
-            "DALTON_FEISHU_APP_ID": _FAKE_FEISHU_ID,
-        },
-        _tool_refresh_lock=asyncio.Lock(),
-        ensure_sandbox_ready=_ensure_ready,
-    )
-    session = SimpleNamespace(sandbox=sandbox, skills_signature="sig-same")
+    sandbox = create_autospec(PTCSandbox, instance=True)
+    sandbox.sandbox_id = "sb-stopped-1"
+    sandbox.runtime = rt
+    sandbox.layout = layout
+    sandbox.vault_secrets = {
+        "USER_TOKEN": _FAKE_NORMAL_SECRET,
+        "DALTON_FEISHU_APP_ID": _FAKE_FEISHU_ID,
+    }
+    sandbox._tool_refresh_lock = asyncio.Lock()
+    sandbox.ensure_sandbox_ready.side_effect = _ensure_ready
+
+    session = create_autospec(Session, instance=True)
+    session.sandbox = sandbox
+    session.skills_signature = "sig-same"
     binding = ComputerBinding(
         workspace_id="ws-stopped",
         computer_id=cid,
@@ -1127,21 +1181,24 @@ async def test_ready_hook_cleans_stopped_sandbox_caches_on_session_and_survives_
     )
     assert get_state_mock.call_count == 1
 
-    # On scrub error during startup, startup still succeeds and status='failed' is recorded.
+    # On scrub error during startup, startup still succeeds, status='failed' is recorded,
+    # and the session caches the checked ref so repeat ready entries skip DB queries.
     failing_rt = _InMemoryRuntime(
         "sb-fail-start",
         initial_files={vault_path: legacy_bytes},
         fail_first_exec=TimeoutError(f"timeout {_FAKE_FEISHU_SECRET}"),
     )
-    failing_sandbox = SimpleNamespace(
-        sandbox_id="sb-fail-start",
-        runtime=failing_rt,
-        layout=layout,
-        vault_secrets={},
-        _tool_refresh_lock=asyncio.Lock(),
-        ensure_sandbox_ready=_ensure_ready,
-    )
-    failing_session = SimpleNamespace(sandbox=failing_sandbox, skills_signature="sig-same")
+    failing_sandbox = create_autospec(PTCSandbox, instance=True)
+    failing_sandbox.sandbox_id = "sb-fail-start"
+    failing_sandbox.runtime = failing_rt
+    failing_sandbox.layout = layout
+    failing_sandbox.vault_secrets = {}
+    failing_sandbox._tool_refresh_lock = asyncio.Lock()
+    failing_sandbox.ensure_sandbox_ready.side_effect = _ensure_ready
+
+    failing_session = create_autospec(Session, instance=True)
+    failing_session.sandbox = failing_sandbox
+    failing_session.skills_signature = "sig-same"
     failing_binding = ComputerBinding(
         workspace_id="ws-fail",
         computer_id=cid,
@@ -1168,8 +1225,46 @@ async def test_ready_hook_cleans_stopped_sandbox_caches_on_session_and_survives_
     assert res_fail is failing_session
     assert state_row["status"] == "failed"
     assert state_row["last_error"] == "TimeoutError"
-    assert getattr(failing_session, "_dalton_feishu_vault_scrub_checked", None) is None
+    assert getattr(failing_session, "_dalton_feishu_vault_scrub_checked", None) == "sb-fail-start"
     assert _FAKE_FEISHU_SECRET not in caplog.text
+
+    # Second entry on the same failed Session does NOT re-query get_scrub_state (background scrubber retries).
+    calls_after_first_fail = get_state_mock.call_count
+    await mgr._complete_phase2_sync(
+        failing_binding,
+        failing_session,
+        workspace_user_id="user-1",
+        needs_sync=True,
+        needs_deferred_sync=False,
+        phase2_owner=True,
+        phase2_event=asyncio.Event(),
+        mark=lambda _name: None,
+        skills_signature="sig-same",
+    )
+    assert get_state_mock.call_count == calls_after_first_fail
+
+    # runtime is None branch also caches _dalton_feishu_vault_scrub_checked on the session.
+    no_rt_sandbox = create_autospec(PTCSandbox, instance=True)
+    no_rt_sandbox.sandbox_id = "sb-no-rt"
+    no_rt_sandbox.runtime = None
+    no_rt_sandbox.layout = layout
+    no_rt_session = create_autospec(Session, instance=True)
+    no_rt_session.sandbox = no_rt_sandbox
+    no_rt_binding = ComputerBinding(
+        workspace_id="ws-no-rt",
+        computer_id=cid,
+        kind="docker",
+        root_dir="/home/workspace",
+        provider_ref="sb-no-rt",
+    )
+    state_row["status"] = "deferred_stopped"
+    state_row["provider_ref"] = "sb-no-rt"
+    calls_before_no_rt = get_state_mock.call_count
+    assert await scrub_mod.scrub_sandbox_on_ready(no_rt_binding, no_rt_session) is False
+    assert get_state_mock.call_count == calls_before_no_rt + 1
+    assert getattr(no_rt_session, "_dalton_feishu_vault_scrub_checked", None) == "sb-no-rt"
+    assert await scrub_mod.scrub_sandbox_on_ready(no_rt_binding, no_rt_session) is False
+    assert get_state_mock.call_count == calls_before_no_rt + 1
 
 
 # ---------------------------------------------------------------------------
@@ -1320,3 +1415,620 @@ async def test_controlled_backend_and_gateway_reads_keep_feishu_credentials_inta
     )
     assert _FAKE_FEISHU_SECRET not in redacted_out
     assert "[REDACTED:DALTON_FEISHU_APP_SECRET]" in redacted_out
+
+
+# ---------------------------------------------------------------------------
+# 7. r2: MCP command check entry guard (env, args, and extra_secrets)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("env_map", "args_list", "extra_secrets", "expected_key"),
+    [
+        (
+            {"APP_SEC": "${vault:DALTON_FEISHU_APP_SECRET}"},
+            ["-y", "@acme/mcp@1.0.0"],
+            None,
+            "DALTON_FEISHU_APP_SECRET",
+        ),
+        (
+            {},
+            ["-y", "@acme/mcp@1.0.0", "--encrypt=${vault:DALTON_FEISHU_ENCRYPT_KEY}"],
+            None,
+            "DALTON_FEISHU_ENCRYPT_KEY",
+        ),
+        (
+            {"FEISHU_ID": "${vault:DALTON_FEISHU_APP_ID}"},
+            ["-y", "@acme/mcp@1.0.0"],
+            {
+                "DALTON_FEISHU_APP_ID": _FAKE_FEISHU_ID,
+                "DALTON_FEISHU_APP_SECRET": _FAKE_FEISHU_SECRET,
+            },
+            "DALTON_FEISHU_APP_ID",
+        ),
+        (
+            {},
+            ["-y", "@acme/mcp@1.0.0", "--verify=${vault:DALTON_FEISHU_VERIFICATION_TOKEN}"],
+            {"DALTON_FEISHU_VERIFICATION_TOKEN": _FAKE_VERIFY_TOKEN},
+            "DALTON_FEISHU_VERIFICATION_TOKEN",
+        ),
+    ],
+)
+async def test_mcp_command_check_blocks_feishu_vault_refs_in_env_args_and_extra_secrets(
+    env_map: dict[str, str],
+    args_list: list[str],
+    extra_secrets: dict[str, str] | None,
+    expected_key: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """check_command_server refuses Feishu Vault refs before decrypting, waking, or running commands."""
+    decrypt_mock = create_autospec(mcp_cc.get_user_secrets_decrypted)
+    sandbox_mock = create_autospec(PTCSandbox, instance=True)
+    session_mock = create_autospec(Session, instance=True)
+    session_mock.sandbox = sandbox_mock
+    manager_mock = create_autospec(ComputerManager, instance=True)
+    manager_mock.wake_computer.return_value = session_mock
+
+    monkeypatch.setattr(mcp_cc, "get_user_secrets_decrypted", decrypt_mock)
+    monkeypatch.setattr(
+        mcp_cc.ComputerManager,
+        "current",
+        classmethod(lambda cls: manager_mock),
+    )
+
+    server = McpServerInput(
+        name="feishu_probe",
+        transport="stdio",
+        command="npx",
+        args=args_list,
+        env=env_map,
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        result = await mcp_cc.check_command_server(
+            "admin-1",
+            server,
+            extra_secrets=extra_secrets,
+        )
+
+    assert result.verdict == "command_failed"
+    assert expected_key in result.reason
+    assert "Feishu" in result.reason
+    decrypt_mock.assert_not_called()
+    manager_mock.pick_for_user.assert_not_called()
+    manager_mock.wake_computer.assert_not_called()
+    sandbox_mock.check_user_mcp_server.assert_not_called()
+    for fake_val in (_FAKE_FEISHU_ID, _FAKE_FEISHU_SECRET, _FAKE_ENCRYPT_KEY, _FAKE_VERIFY_TOKEN):
+        assert fake_val not in result.reason
+        assert fake_val not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_command_check_allows_normal_vault_refs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Normal non-Feishu Vault refs continue through check_command_server unchanged."""
+    decrypt_mock = create_autospec(
+        mcp_cc.get_user_secrets_decrypted,
+        return_value={"ACME_KEY": _FAKE_NORMAL_SECRET},
+    )
+    sandbox_mock = create_autospec(PTCSandbox, instance=True)
+    sandbox_mock.check_user_mcp_server.return_value = {"status": "ok", "tools": []}
+    session_mock = create_autospec(Session, instance=True)
+    session_mock.sandbox = sandbox_mock
+    manager_mock = create_autospec(ComputerManager, instance=True)
+    manager_mock.pick_for_user.return_value = {
+        "computer_id": "comp-1",
+        "status": "running",
+        "provider_ref": "sb-1",
+    }
+    manager_mock.wake_computer.return_value = session_mock
+
+    monkeypatch.setattr(mcp_cc, "get_user_secrets_decrypted", decrypt_mock)
+    monkeypatch.setattr(
+        mcp_cc.ComputerManager,
+        "current",
+        classmethod(lambda cls: manager_mock),
+    )
+
+    server = McpServerInput(
+        name="acme",
+        transport="stdio",
+        command="npx",
+        args=["-y", "@acme/mcp@1.0.0"],
+        env={"ACME_KEY": "${vault:ACME_KEY}"},
+    )
+    result = await mcp_cc.check_command_server("user-1", server)
+
+    assert result == Passed("acme")
+    decrypt_mock.assert_called_once_with("user-1", ["ACME_KEY"])
+    sandbox_mock.check_user_mcp_server.assert_called_once()
+    assert sandbox_mock.check_user_mcp_server.call_args.args[1] == {
+        "ACME_KEY": _FAKE_NORMAL_SECRET
+    }
+
+
+# ---------------------------------------------------------------------------
+# 8. r2: Explicit computer start (_machines.py) ready-point scrub
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_explicit_computer_start_scrubs_legacy_feishu_vault_and_survives_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Explicit machine start (_machines.py) scrubs legacy Feishu Vault keys before publishing running."""
+    from src.server.services import browser_settings
+    from src.server.services.computer_manager import _machines as machines_mod
+
+    ComputerManager.reset_instance()
+    layout = SandboxLayout.for_root("/home/workspace")
+    vault_path = layout.vault_secrets
+    legacy_bytes = sandbox_assets._canonical_vault_json(
+        {
+            "USER_TOKEN": _FAKE_NORMAL_SECRET,
+            "DALTON_FEISHU_APP_ID": _FAKE_FEISHU_ID,
+            "DALTON_FEISHU_APP_SECRET": _FAKE_FEISHU_SECRET,
+        }
+    )
+
+    cid = "00000000-0000-4000-8000-000000000077"
+    computer_row: dict[str, Any] = {
+        "computer_id": cid,
+        "user_id": "user-1",
+        "kind": "docker",
+        "status": "starting",
+        "provider_ref": "sb-explicit-1",
+        "resource_tier": "standard",
+        "is_always_on": False,
+        "root_dir": "/home/workspace",
+        "config": {},
+    }
+
+    events: list[str] = []
+    state_row: dict[str, Any] = {
+        "computer_id": cid,
+        "provider_ref": "sb-explicit-1",
+        "status": "deferred_stopped",
+        "attempt_count": 0,
+        "last_error": None,
+    }
+
+    async def _get_state(_cid: str, **_kw: Any) -> dict[str, Any]:
+        return dict(state_row)
+
+    async def _mark_cleaned(_cid: str, ref: str | None, **_kw: Any) -> None:
+        events.append("mark_cleaned")
+        state_row.update(status="cleaned", provider_ref=ref, last_error=None)
+
+    async def _mark_failed(_cid: str, ref: str | None, err: str, **_kw: Any) -> None:
+        events.append("mark_failed")
+        state_row.update(
+            status="failed",
+            provider_ref=ref,
+            last_error=scrub_store._sanitize_error_type(err),
+        )
+
+    monkeypatch.setattr(
+        scrub_store,
+        "get_scrub_state",
+        create_autospec(scrub_store.get_scrub_state, side_effect=_get_state),
+    )
+    monkeypatch.setattr(
+        scrub_store,
+        "mark_cleaned",
+        create_autospec(scrub_store.mark_cleaned, side_effect=_mark_cleaned),
+    )
+    monkeypatch.setattr(
+        scrub_store,
+        "mark_failed",
+        create_autospec(scrub_store.mark_failed, side_effect=_mark_failed),
+    )
+
+    async def _publish_status(_cid: str, status: Any, **_kw: Any) -> dict[str, Any]:
+        if status == ComputerStatus.RUNNING:
+            events.append("publish_running")
+        return {**computer_row, "status": "running"}
+
+    update_status_mock = create_autospec(
+        machines_mod.update_computer_status,
+        side_effect=_publish_status,
+    )
+    monkeypatch.setattr(machines_mod, "update_computer_status", update_status_mock)
+    get_computer_mock = create_autospec(
+        machines_mod.get_computer, return_value=dict(computer_row)
+    )
+    monkeypatch.setattr(machines_mod, "get_computer", get_computer_mock)
+    monkeypatch.setattr(
+        machines_mod,
+        "update_computer_activity",
+        create_autospec(machines_mod.update_computer_activity, return_value=None),
+    )
+    monkeypatch.setattr(
+        browser_settings,
+        "keep",
+        create_autospec(browser_settings.keep, return_value=None),
+    )
+
+    def _make_manager(sandbox_id: str) -> ComputerManager:
+        cfg = SimpleNamespace(
+            sandbox=SimpleNamespace(provider="docker"),
+            filesystem=SimpleNamespace(working_directory="/home/workspace"),
+            skills=SimpleNamespace(enabled=False),
+        )
+        mgr = ComputerManager(config=cfg)
+        mgr._entitled_tier = create_autospec(mgr._entitled_tier, return_value="standard")
+        mgr._entitled_always_on = create_autospec(mgr._entitled_always_on, return_value=False)
+        mgr._core_config_for = create_autospec(
+            mgr._core_config_for,
+            return_value=SimpleNamespace(sandbox=SimpleNamespace(provider="docker")),
+        )
+        mgr._host_unavailable_policy = create_autospec(
+            mgr._host_unavailable_policy, return_value=None
+        )
+        mgr._keep_computer_tokens = create_autospec(mgr._keep_computer_tokens, return_value=None)
+        mgr._sync_machine_assets = create_autospec(mgr._sync_machine_assets, return_value=None)
+        mgr._serve_livefs = create_autospec(
+            mgr._serve_livefs, return_value=SimpleNamespace(settled=True)
+        )
+        mgr._link_livefs_soon = create_autospec(mgr._link_livefs_soon, return_value=None)
+        mgr._apply_autostop_for_always_on = create_autospec(
+            mgr._apply_autostop_for_always_on, return_value=None
+        )
+        mgr._on_session_attached = create_autospec(mgr._on_session_attached, return_value=None)
+        mgr._record_sync = create_autospec(mgr._record_sync, return_value=None)
+        mgr._put_session = create_autospec(mgr._put_session, return_value=None)
+        mgr._read_machine_facts_soon = create_autospec(
+            mgr._read_machine_facts_soon, return_value=None
+        )
+        mgr._retire_session = create_autospec(mgr._retire_session, return_value=None)
+        mgr._session_sandbox_id = create_autospec(
+            mgr._session_sandbox_id, return_value=sandbox_id
+        )
+        return mgr
+
+    # Case 1: Reconnected computer with legacy Feishu keys -> scrubbed BEFORE publishing running.
+    rt_ok = _InMemoryRuntime("sb-explicit-1", initial_files={vault_path: legacy_bytes})
+    sb_ok = create_autospec(PTCSandbox, instance=True)
+    sb_ok.sandbox_id = "sb-explicit-1"
+    sb_ok.runtime = rt_ok
+    sb_ok.layout = layout
+    sb_ok.vault_secrets = {
+        "USER_TOKEN": _FAKE_NORMAL_SECRET,
+        "DALTON_FEISHU_APP_ID": _FAKE_FEISHU_ID,
+    }
+    sb_ok._tool_refresh_lock = asyncio.Lock()
+    sess_ok = create_autospec(Session, instance=True)
+    sess_ok.sandbox = sb_ok
+    sess_ok.initialize.return_value = None
+
+    monkeypatch.setattr(
+        machines_mod.SessionManager,
+        "get_cached_session",
+        create_autospec(machines_mod.SessionManager.get_cached_session, return_value=None),
+    )
+    get_session_mock = create_autospec(
+        machines_mod.SessionManager.get_session, return_value=sess_ok
+    )
+    monkeypatch.setattr(machines_mod.SessionManager, "get_session", get_session_mock)
+
+    mgr = _make_manager("sb-explicit-1")
+    returned = await mgr._build_machine_session(
+        dict(computer_row), user_id="user-1", on_state_observed=None
+    )
+
+    assert returned is sess_ok
+    assert json.loads(rt_ok.files[vault_path].decode("utf-8")) == {
+        "USER_TOKEN": _FAKE_NORMAL_SECRET
+    }
+    assert sb_ok.vault_secrets == {"USER_TOKEN": _FAKE_NORMAL_SECRET}
+    assert state_row["status"] == "cleaned"
+    assert events == ["mark_cleaned", "publish_running"]
+
+    # Case 2: Scrub raises during explicit start -> startup still publishes running and marks failed.
+    events.clear()
+    state_row.update(status="deferred_stopped", provider_ref="sb-explicit-err", last_error=None)
+    err_computer = {**computer_row, "provider_ref": "sb-explicit-err"}
+    get_computer_mock.return_value = dict(err_computer)
+
+    rt_err = _InMemoryRuntime(
+        "sb-explicit-err",
+        initial_files={vault_path: legacy_bytes},
+        fail_first_exec=TimeoutError(f"boom {_FAKE_FEISHU_SECRET}"),
+    )
+    sb_err = create_autospec(PTCSandbox, instance=True)
+    sb_err.sandbox_id = "sb-explicit-err"
+    sb_err.runtime = rt_err
+    sb_err.layout = layout
+    sb_err.vault_secrets = {}
+    sb_err._tool_refresh_lock = asyncio.Lock()
+    sess_err = create_autospec(Session, instance=True)
+    sess_err.sandbox = sb_err
+    sess_err.initialize.return_value = None
+
+    get_session_mock.return_value = sess_err
+
+    mgr_err = _make_manager("sb-explicit-err")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        returned_err = await mgr_err._build_machine_session(
+            dict(err_computer), user_id="user-1", on_state_observed=None
+        )
+
+    assert returned_err is sess_err
+    assert state_row["status"] == "failed"
+    assert state_row["last_error"] == "TimeoutError"
+    assert events == ["mark_failed", "publish_running"]
+    assert _FAKE_FEISHU_SECRET not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# 9. r2: Compare-and-replace conflict safety & real POSIX /bin/sh verification
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_mode", ["mixed", "feishu_only"])
+async def test_scrubber_compare_and_replace_preserves_concurrent_rotation_and_retries(
+    initial_mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If another worker rotates normal keys between read and replace, scrub preserves them, marks failed, and succeeds next pass."""
+    from src.server.database import session_lock as session_lock_mod
+    from src.server.services import computer_manager as cm_mod
+
+    layout = SandboxLayout.for_root("/home/workspace")
+    vault_path = layout.vault_secrets
+    cid = "00000000-0000-4000-8000-000000000088"
+    provider_ref = f"sb-race-{initial_mode}"
+
+    initial_dict = (
+        {
+            "USER_TOKEN": "old-normal-token",
+            "DALTON_FEISHU_APP_SECRET": _FAKE_FEISHU_SECRET,
+        }
+        if initial_mode == "mixed"
+        else {"DALTON_FEISHU_APP_SECRET": _FAKE_FEISHU_SECRET}
+    )
+    rotated_bytes = sandbox_assets._canonical_vault_json({"USER_TOKEN": "rotated-new-token"})
+
+    def _concurrent_push(files: dict[str, bytes]) -> None:
+        files[vault_path] = rotated_bytes
+
+    rt = _InMemoryRuntime(
+        provider_ref,
+        initial_files={vault_path: sandbox_assets._canonical_vault_json(initial_dict)},
+        mutate_before_replace=_concurrent_push,
+    )
+
+    scrub_rows: dict[str, dict[str, Any]] = {}
+    computer_row = {
+        "computer_id": cid,
+        "status": "running",
+        "provider_ref": provider_ref,
+        "kind": "docker",
+        "root_dir": "/home/workspace",
+    }
+
+    async def _get_state(c: str, **_kw: Any) -> dict[str, Any] | None:
+        return dict(scrub_rows[c]) if c in scrub_rows else None
+
+    async def _mark_cleaned(c: str, ref: str | None, **_kw: Any) -> None:
+        prev = scrub_rows.get(c, {})
+        scrub_rows[c] = {
+            "computer_id": c,
+            "provider_ref": ref,
+            "status": "cleaned",
+            "attempt_count": int(prev.get("attempt_count", 0)) + 1,
+            "last_error": None,
+        }
+
+    async def _mark_failed(c: str, ref: str | None, err: str, **_kw: Any) -> None:
+        prev = scrub_rows.get(c, {})
+        scrub_rows[c] = {
+            "computer_id": c,
+            "provider_ref": ref,
+            "status": "failed",
+            "attempt_count": int(prev.get("attempt_count", 0)) + 1,
+            "last_error": scrub_store._sanitize_error_type(err),
+        }
+
+    async def _list_running(
+        limit: int = 25, after: str | None = None, **_kw: Any
+    ) -> list[dict[str, Any]]:
+        st = scrub_rows.get(cid)
+        if st and st["status"] == "cleaned" and st["provider_ref"] == provider_ref:
+            return []
+        return [dict(computer_row)]
+
+    monkeypatch.setattr(
+        scrub_store,
+        "get_scrub_state",
+        create_autospec(scrub_store.get_scrub_state, side_effect=_get_state),
+    )
+    monkeypatch.setattr(
+        scrub_store,
+        "mark_cleaned",
+        create_autospec(scrub_store.mark_cleaned, side_effect=_mark_cleaned),
+    )
+    monkeypatch.setattr(
+        scrub_store,
+        "mark_failed",
+        create_autospec(scrub_store.mark_failed, side_effect=_mark_failed),
+    )
+    monkeypatch.setattr(
+        scrub_store,
+        "list_non_running_uncleaned_computer_ids",
+        create_autospec(scrub_store.list_non_running_uncleaned_computer_ids, return_value=[]),
+    )
+    monkeypatch.setattr(
+        scrub_store,
+        "list_running_uncleaned",
+        create_autospec(scrub_store.list_running_uncleaned, side_effect=_list_running),
+    )
+
+    @asynccontextmanager
+    async def _always_lock(_key: int | str):
+        yield True
+
+    monkeypatch.setattr(session_lock_mod, "try_session_lock", _always_lock)
+
+    def _make_provider() -> Any:
+        prov = create_autospec(SandboxProvider, instance=True)
+        prov.get.return_value = rt
+        prov.close.return_value = None
+        return prov
+
+    fake_manager = create_autospec(ComputerManager, instance=True)
+    fake_manager._binding_from_computer.side_effect = lambda ws_id, row: ComputerBinding(
+        workspace_id=ws_id,
+        computer_id=str(row["computer_id"]),
+        kind=row["kind"],
+        root_dir=row["root_dir"],
+        provider_ref=row["provider_ref"],
+    )
+    fake_manager._provider_for.side_effect = lambda _binding: _make_provider()
+    fake_manager._cached_session.return_value = None
+    monkeypatch.setattr(
+        cm_mod.ComputerManager,
+        "get_instance",
+        classmethod(lambda cls: fake_manager),
+    )
+
+    scrubber = scrub_mod.SandboxFeishuVaultScrubber.get_instance()
+
+    # Pass 1: concurrent write changes digest -> compare-and-replace aborts with VaultScrubConflictError.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        cleaned_p1 = await scrubber.sweep_once()
+
+    assert cleaned_p1 == 0
+    assert json.loads(rt.files[vault_path].decode("utf-8")) == {
+        "USER_TOKEN": "rotated-new-token"
+    }
+    assert list(rt.files.keys()) == [vault_path]  # no stray temp file left behind
+    assert scrub_rows[cid]["status"] == "failed"
+    assert scrub_rows[cid]["last_error"] == "VaultScrubConflictError"
+    assert scrub_rows[cid]["attempt_count"] == 1
+    assert _FAKE_FEISHU_SECRET not in caplog.text
+    assert "rotated-new-token" not in caplog.text
+
+    # Pass 2: rotated file has no Feishu keys -> marked cleaned without rewriting disk.
+    uploads_before = len(rt.upload_log)
+    cleaned_p2 = await scrubber.sweep_once()
+    assert cleaned_p2 == 1
+    assert len(rt.upload_log) == uploads_before
+    assert json.loads(rt.files[vault_path].decode("utf-8")) == {
+        "USER_TOKEN": "rotated-new-token"
+    }
+    assert scrub_rows[cid]["status"] == "cleaned"
+    assert scrub_rows[cid]["attempt_count"] == 2
+    assert scrub_rows[cid]["last_error"] is None
+
+
+def test_compare_and_replace_shell_command_real_posix_sh(tmp_path: Path) -> None:
+    """Execute _build_compare_and_replace_cmd under real /bin/sh for match, mismatch, and removal."""
+    vault_file = tmp_path / ".vault_secrets.json"
+    tmp_file = tmp_path / ".vault_secrets.json.scrub.tmp"
+
+    orig_bytes = b'{"DALTON_FEISHU_APP_SECRET":"x","USER_TOKEN":"old"}'
+    new_bytes = b'{"USER_TOKEN":"old"}'
+    rotated_bytes = b'{"USER_TOKEN":"rotated"}'
+    orig_sha = hashlib.sha256(orig_bytes).hexdigest()
+
+    # 1. Mismatch preserves rotated file, deletes tmp file, exits with conflict code 42.
+    vault_file.write_bytes(rotated_bytes)
+    tmp_file.write_bytes(new_bytes)
+    cmd_mismatch = scrub_mod._build_compare_and_replace_cmd(
+        vault_path=str(vault_file),
+        expected_sha256=orig_sha,
+        tmp_path=str(tmp_file),
+    )
+    res_mismatch = subprocess.run(["/bin/sh", "-c", cmd_mismatch], capture_output=True, text=True)
+    assert res_mismatch.returncode == scrub_mod._VAULT_SCRUB_CONFLICT_EXIT_CODE
+    assert vault_file.read_bytes() == rotated_bytes
+    assert not tmp_file.exists()
+
+    # 2. Match replaces vault_file with tmp_file and exits 0.
+    vault_file.write_bytes(orig_bytes)
+    tmp_file.write_bytes(new_bytes)
+    cmd_match = scrub_mod._build_compare_and_replace_cmd(
+        vault_path=str(vault_file),
+        expected_sha256=orig_sha,
+        tmp_path=str(tmp_file),
+    )
+    res_match = subprocess.run(["/bin/sh", "-c", cmd_match], capture_output=True, text=True)
+    assert res_match.returncode == 0
+    assert vault_file.read_bytes() == new_bytes
+    assert not tmp_file.exists()
+
+    # 3. Empty-result compare-and-remove deletes on match and preserves on mismatch.
+    feishu_only = b'{"DALTON_FEISHU_APP_SECRET":"x"}'
+    feishu_sha = hashlib.sha256(feishu_only).hexdigest()
+    vault_file.write_bytes(rotated_bytes)
+    cmd_rm_mismatch = scrub_mod._build_compare_and_replace_cmd(
+        vault_path=str(vault_file),
+        expected_sha256=feishu_sha,
+        tmp_path=None,
+    )
+    res_rm_mismatch = subprocess.run(
+        ["/bin/sh", "-c", cmd_rm_mismatch], capture_output=True, text=True
+    )
+    assert res_rm_mismatch.returncode == scrub_mod._VAULT_SCRUB_CONFLICT_EXIT_CODE
+    assert vault_file.read_bytes() == rotated_bytes
+
+    vault_file.write_bytes(feishu_only)
+    res_rm_match = subprocess.run(
+        ["/bin/sh", "-c", cmd_rm_mismatch], capture_output=True, text=True
+    )
+    assert res_rm_match.returncode == 0
+    assert not vault_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# 10. r2: Static guard ensuring shipped configs never reference server-only names
+# ---------------------------------------------------------------------------
+
+
+def test_shipped_agent_and_plugin_configs_never_reference_server_only_env_names() -> None:
+    """Shipped agent and plugin MCP config files must not contain ${VAR} refs to SERVER_ONLY_CREDENTIAL_ENV_NAMES."""
+    repo_root = Path(__file__).resolve().parents[3]
+    glob_patterns = (
+        "agent_config*.yaml",
+        "agent_config*.yml",
+        "config*.yaml",
+        "config*.yml",
+        "src/dalton/*.yaml",
+        "src/dalton/*.yml",
+        "plugins/**/*.json",
+        "plugins/**/*.yaml",
+        "plugins/**/*.yml",
+    )
+    config_files = sorted(
+        {
+            path
+            for pattern in glob_patterns
+            for path in repo_root.glob(pattern)
+            if path.is_file()
+        }
+    )
+    rel_names = {str(p.relative_to(repo_root)) for p in config_files}
+    assert "agent_config.dalton.yaml" in rel_names
+    assert "agent_config.core.yaml" in rel_names
+    assert any(name.endswith("mcp.json") for name in rel_names)
+
+    env_ref_re = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?:[:?+-][^}]*)?\}")
+    violations: list[tuple[str, str]] = []
+    for path in config_files:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for match in env_ref_re.finditer(text):
+            var_name = match.group(1)
+            if var_name in dalton_settings.SERVER_ONLY_CREDENTIAL_ENV_NAMES:
+                violations.append((str(path.relative_to(repo_root)), match.group(0)))
+
+    assert violations == []

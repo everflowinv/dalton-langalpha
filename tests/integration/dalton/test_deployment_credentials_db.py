@@ -378,24 +378,28 @@ async def test_sandbox_feishu_vault_scrub_store_transitions_concurrency_and_ref_
     user_id = f"scrub-db-user-{uuid.uuid4().hex[:8]}"
     cid_running = str(uuid.uuid4())
     cid_stopped = str(uuid.uuid4())
-
-    async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as conn:
-        await conn.execute(
-            "INSERT INTO users (user_id, name) VALUES (%s, %s)",
-            (user_id, user_id),
-        )
-        await conn.execute(
-            "INSERT INTO computers (computer_id, user_id, kind, status, provider_ref, root_dir) "
-            "VALUES (%s::uuid, %s, 'docker', 'running', 'sb-scrub-1', '/home/workspace')",
-            (cid_running, user_id),
-        )
-        await conn.execute(
-            "INSERT INTO computers (computer_id, user_id, kind, status, provider_ref, root_dir) "
-            "VALUES (%s::uuid, %s, 'docker', 'stopped', 'sb-scrub-stopped-1', '/home/workspace')",
-            (cid_stopped, user_id),
-        )
+    ref_running_v1 = f"sb-scrub-run-{uuid.uuid4().hex[:8]}"
+    ref_running_v2 = f"sb-scrub-run-v2-{uuid.uuid4().hex[:8]}"
+    ref_stopped = f"sb-scrub-stop-{uuid.uuid4().hex[:8]}"
 
     try:
+        # Explicit distinct computer names satisfy migration 097's idx_computers_user_name unique index.
+        async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as conn:
+            await conn.execute(
+                "INSERT INTO users (user_id, name) VALUES (%s, %s)",
+                (user_id, user_id),
+            )
+            await conn.execute(
+                "INSERT INTO computers (computer_id, user_id, name, kind, status, provider_ref, root_dir) "
+                "VALUES (%s::uuid, %s, %s, 'docker', 'running', %s, '/home/workspace')",
+                (cid_running, user_id, f"scrub-running-{cid_running[:8]}", ref_running_v1),
+            )
+            await conn.execute(
+                "INSERT INTO computers (computer_id, user_id, name, kind, status, provider_ref, root_dir) "
+                "VALUES (%s::uuid, %s, %s, 'docker', 'stopped', %s, '/home/workspace')",
+                (cid_stopped, user_id, f"scrub-stopped-{cid_stopped[:8]}", ref_stopped),
+            )
+
         # 1. Non-running computer is listed and marked deferred_stopped.
         non_running = await dc_scrub_store.list_non_running_uncleaned_computer_ids()
         assert cid_stopped in non_running
@@ -415,8 +419,8 @@ async def test_sandbox_feishu_vault_scrub_store_transitions_concurrency_and_ref_
 
         # 3. Two concurrent mark_failed calls increment attempt_count atomically in SQL.
         await asyncio.gather(
-            dc_scrub_store.mark_failed(cid_running, "sb-scrub-1", "TimeoutError"),
-            dc_scrub_store.mark_failed(cid_running, "sb-scrub-1", "ConnectionError"),
+            dc_scrub_store.mark_failed(cid_running, ref_running_v1, "TimeoutError"),
+            dc_scrub_store.mark_failed(cid_running, ref_running_v1, "ConnectionError"),
         )
         st_failed = await dc_scrub_store.get_scrub_state(cid_running)
         assert st_failed is not None
@@ -430,7 +434,7 @@ async def test_sandbox_feishu_vault_scrub_store_transitions_concurrency_and_ref_
         assert any(r["computer_id"] == cid_running for r in running_after_fail)
 
         # 4. Transition failed -> cleaned excludes the computer for matching provider_ref.
-        await dc_scrub_store.mark_cleaned(cid_running, "sb-scrub-1")
+        await dc_scrub_store.mark_cleaned(cid_running, ref_running_v1)
         st_clean = await dc_scrub_store.get_scrub_state(cid_running)
         assert st_clean is not None
         assert st_clean["status"] == "cleaned"
@@ -444,17 +448,17 @@ async def test_sandbox_feishu_vault_scrub_store_transitions_concurrency_and_ref_
         # 5. Changing computers.provider_ref causes list_running_uncleaned to re-list it.
         async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as conn:
             await conn.execute(
-                "UPDATE computers SET provider_ref = 'sb-scrub-2' WHERE computer_id = %s::uuid",
-                (cid_running,),
+                "UPDATE computers SET provider_ref = %s WHERE computer_id = %s::uuid",
+                (ref_running_v2, cid_running),
             )
         running_after_recreate = await dc_scrub_store.list_running_uncleaned(limit=50)
         matched = [r for r in running_after_recreate if r["computer_id"] == cid_running]
         assert len(matched) == 1
-        assert matched[0]["provider_ref"] == "sb-scrub-2"
+        assert matched[0]["provider_ref"] == ref_running_v2
 
         # Transition deferred_stopped -> failed -> cleaned on cid_stopped.
-        await dc_scrub_store.mark_failed(cid_stopped, "sb-scrub-stopped-1", "VaultScrubIOError")
-        await dc_scrub_store.mark_cleaned(cid_stopped, "sb-scrub-stopped-1")
+        await dc_scrub_store.mark_failed(cid_stopped, ref_stopped, "VaultScrubIOError")
+        await dc_scrub_store.mark_cleaned(cid_stopped, ref_stopped)
         st_stopped_clean = await dc_scrub_store.get_scrub_state(cid_stopped)
         assert st_stopped_clean is not None
         assert st_stopped_clean["status"] == "cleaned"

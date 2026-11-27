@@ -7,23 +7,32 @@ Three-layer sandbox isolation architecture:
    ``sanitize_sandbox_env_vars()``; ``src/ptc_agent/core/sandbox/ptc_sandbox.py``
    enforces both checks in ``_deployment_env_vars()`` before merging into
    ``_build_sandbox_env_vars()`` across Docker, Daytona, E2B, and SSH providers.
+   Because config loaders expand ``${VAR}`` eagerly on load, the source-name
+   check in Defense 1 relies on the static invariant (enforced in unit tests)
+   that shipped agent and plugin MCP config files keep
+   ``SERVER_ONLY_CREDENTIAL_ENV_NAMES`` out of ``${...}`` references.
 2. **High-entropy substring value scrubbing**:
    ``src/dalton/settings.py:managed_secret_token_values()`` includes configured
    server-only credential values meeting ``SERVER_ONLY_SECRET_MIN_SUBSTRING_LEN``
    (16), so renamed keys and embedded URL/header/arg leaks are scrubbed
    automatically by ``sanitize_sandbox_env_vars()``,
    ``sanitize_mcp_client_config_server()``, and ``redact_managed_tokens()``.
-3. **Sandbox Vault sync stripping & one-time online cleanup**:
+3. **Sandbox Vault sync stripping, command-check entry guard & online cleanup**:
    ``strip_sandbox_excluded_vault_secrets()`` removes
    ``SANDBOX_EXCLUDED_FEISHU_VAULT_KEYS`` at every sandbox-bound Vault delivery
    point (``src/server/services/computer_manager/_mcp.py`` and
-   ``src/ptc_agent/core/sandbox/assets.py``). For pre-existing sandboxes whose
-   on-disk ``_internal/.vault_secrets.json`` already holds legacy Feishu keys,
-   ``SandboxFeishuVaultScrubber`` cleans running sandboxes on startup with a
-   30-second jittered retry loop (mounted in ``src/server/app/setup.py``), and
-   ``scrub_sandbox_on_ready()`` cleans stopped sandboxes when they next become
-   ready in ``src/server/services/computer_manager/_lifecycle.py``, recording
-   state in ``dalton_sandbox_feishu_vault_scrub``.
+   ``src/ptc_agent/core/sandbox/assets.py``), and
+   ``sandbox_excluded_vault_refs()`` / ``sandbox_excluded_vault_ref_reason()``
+   block stdio MCP command checks referencing these keys at the entry point in
+   ``src/server/services/mcp_command_check.py`` before decryption or computer
+   wake. For pre-existing sandboxes whose on-disk ``_internal/.vault_secrets.json``
+   already holds legacy Feishu keys, ``SandboxFeishuVaultScrubber`` cleans
+   running sandboxes on startup using SHA-256 compare-and-replace disk writes
+   with a 30-second jittered retry loop (mounted in ``src/server/app/setup.py``),
+   and ``scrub_sandbox_on_ready()`` cleans sandboxes before they serve in both
+   workspace session readiness (``src/server/services/computer_manager/_lifecycle.py``)
+   and explicit computer start (``src/server/services/computer_manager/_machines.py``),
+   recording state in ``dalton_sandbox_feishu_vault_scrub``.
 
 Why controlled backend and gateway reads remain unfiltered:
 Filtering applies strictly on sandbox-bound paths so workspace sandboxes stay
@@ -40,12 +49,13 @@ rotation, and leak detection.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
 import shlex
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any, Optional
 
 from ptc_agent.core.paths import SandboxLayout
@@ -67,10 +77,15 @@ SANDBOX_EXCLUDED_FEISHU_VAULT_KEYS: frozenset[str] = frozenset(
 SWEEP_INTERVAL_S = 30.0
 SWEEP_BATCH_LIMIT = 25
 STOP_GRACE = 30.0
+_VAULT_SCRUB_CONFLICT_EXIT_CODE = 42
 
 
 class VaultScrubIOError(RuntimeError):
     """Sandbox file inspection or replacement failed (carries zero secret text)."""
+
+
+class VaultScrubConflictError(RuntimeError):
+    """On-disk sandbox vault file changed between read and replacement (carries zero secret text)."""
 
 
 class VaultScrubParseError(ValueError):
@@ -79,6 +94,30 @@ class VaultScrubParseError(ValueError):
 
 class VaultScrubVerificationError(RuntimeError):
     """Post-scrub read-back failed to confirm excluded Feishu keys were removed."""
+
+
+def sandbox_excluded_vault_refs(names: Iterable[str]) -> list[str]:
+    """Return deduplicated names matching ``SANDBOX_EXCLUDED_FEISHU_VAULT_KEYS`` in input order."""
+    seen: set[str] = set()
+    blocked: list[str] = []
+    for raw in names:
+        name = str(raw).strip()
+        if name in SANDBOX_EXCLUDED_FEISHU_VAULT_KEYS and name not in seen:
+            seen.add(name)
+            blocked.append(name)
+    return blocked
+
+
+def sandbox_excluded_vault_ref_reason(names: Iterable[str]) -> str | None:
+    """Return a refusal reason naming matched server-only Feishu Vault keys, or ``None``."""
+    blocked = sandbox_excluded_vault_refs(names)
+    if not blocked:
+        return None
+    verb = "is" if len(blocked) == 1 else "are"
+    return (
+        f"{', '.join(blocked)} {verb} kept on the server for Feishu delivery "
+        f"and {verb} not available to commands in the workspace"
+    )
 
 
 def strip_sandbox_excluded_vault_secrets(
@@ -153,6 +192,42 @@ def _parse_vault_json(raw: bytes) -> dict[str, str]:
     return {str(k): str(v) for k, v in parsed.items()}
 
 
+def _build_compare_and_replace_cmd(
+    *,
+    vault_path: str,
+    expected_sha256: str,
+    tmp_path: str | None = None,
+) -> str:
+    """Build one POSIX shell command that replaces or removes ``vault_path`` only when its SHA-256 still matches.
+
+    Prefers ``sha256sum`` (present in Ubuntu 24.04 ``Dockerfile.sandbox`` and Linux images)
+    and falls back to ``python3 -c`` when ``sha256sum`` is unavailable (e.g., macOS SSH hosts).
+    """
+    quoted_path = shlex.quote(vault_path)
+    quoted_expected = shlex.quote(expected_sha256)
+    py_hash = shlex.quote(
+        'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())'
+    )
+    if tmp_path is not None:
+        quoted_tmp = shlex.quote(tmp_path)
+        cleanup_tmp = f"rm -f {quoted_tmp}; "
+        action = f"chmod 600 {quoted_tmp} 2>/dev/null || true; mv -f {quoted_tmp} {quoted_path}"
+    else:
+        cleanup_tmp = ""
+        action = f"rm -f {quoted_path}"
+    return (
+        f"if [ ! -e {quoted_path} ]; then {cleanup_tmp}exit {_VAULT_SCRUB_CONFLICT_EXIT_CODE}; fi; "
+        f"if command -v sha256sum >/dev/null 2>&1; then cur=$(sha256sum {quoted_path}); rc=$?; "
+        f"else cur=$(python3 -c {py_hash} {quoted_path}); rc=$?; fi; "
+        f'if [ "$rc" -ne 0 ]; then '
+        f"if [ ! -e {quoted_path} ]; then {cleanup_tmp}exit {_VAULT_SCRUB_CONFLICT_EXIT_CODE}; fi; "
+        f"{cleanup_tmp}exit 1; fi; "
+        f"cur=${{cur%% *}}; "
+        f'if [ "$cur" = {quoted_expected} ]; then {action}; '
+        f"else {cleanup_tmp}exit {_VAULT_SCRUB_CONFLICT_EXIT_CODE}; fi"
+    )
+
+
 async def scrub_vault_file_on_runtime(
     runtime: Any,
     vault_path: str,
@@ -162,8 +237,12 @@ async def scrub_vault_file_on_runtime(
     Returns ``(changed, remaining_secrets)``:
     - Absent file or file without excluded keys: leaves disk untouched and returns ``False``.
     - Remaining non-empty secrets: uploads canonical JSON to a same-directory temp
-      file and atomically replaces ``vault_path`` via ``mv -f``.
-    - Remaining empty secrets: removes ``vault_path`` via ``rm -f``.
+      file and replaces ``vault_path`` via ``mv -f`` only when the on-disk SHA-256
+      still matches the bytes read.
+    - Remaining empty secrets: removes ``vault_path`` via ``rm -f`` only when the
+      on-disk SHA-256 still matches the bytes read.
+    - Concurrent modification between read and replace raises ``VaultScrubConflictError``
+      (preserving the newer on-disk content for the next retry pass).
     - Always reads back the target path to verify zero excluded keys remain.
     """
     raw = await _read_vault_file_bytes(runtime, vault_path)
@@ -174,21 +253,28 @@ async def scrub_vault_file_on_runtime(
     if not has_sandbox_excluded_vault_keys(existing):
         return False, existing
 
+    expected_sha256 = hashlib.sha256(raw).hexdigest()
     cleaned = strip_sandbox_excluded_vault_secrets(existing) or {}
-    quoted_path = shlex.quote(vault_path)
 
     if cleaned:
         payload = _canonical_vault_json_bytes(cleaned)
         tmp_path = f"{vault_path}.scrub.{uuid.uuid4().hex[:12]}.tmp"
         quoted_tmp = shlex.quote(tmp_path)
+        replace_cmd = _build_compare_and_replace_cmd(
+            vault_path=vault_path,
+            expected_sha256=expected_sha256,
+            tmp_path=tmp_path,
+        )
         try:
             await runtime.upload_file(payload, tmp_path)
-            mv_res = await runtime.exec(
-                f"chmod 600 {quoted_tmp} 2>/dev/null || true; "
-                f"mv -f {quoted_tmp} {quoted_path}"
-            )
-            if getattr(mv_res, "exit_code", 1) != 0:
+            mv_res = await runtime.exec(replace_cmd)
+            mv_code = getattr(mv_res, "exit_code", 1)
+            if mv_code == _VAULT_SCRUB_CONFLICT_EXIT_CODE:
+                raise VaultScrubConflictError("Sandbox vault file changed during scrub")
+            if mv_code != 0:
                 raise VaultScrubIOError("Failed to replace sandbox vault file")
+        except VaultScrubConflictError:
+            raise
         except BaseException:
             try:
                 await runtime.exec(f"rm -f {quoted_tmp}")
@@ -196,8 +282,16 @@ async def scrub_vault_file_on_runtime(
                 pass
             raise
     else:
-        rm_res = await runtime.exec(f"rm -f {quoted_path}")
-        if getattr(rm_res, "exit_code", 1) != 0:
+        rm_cmd = _build_compare_and_replace_cmd(
+            vault_path=vault_path,
+            expected_sha256=expected_sha256,
+            tmp_path=None,
+        )
+        rm_res = await runtime.exec(rm_cmd)
+        rm_code = getattr(rm_res, "exit_code", 1)
+        if rm_code == _VAULT_SCRUB_CONFLICT_EXIT_CODE:
+            raise VaultScrubConflictError("Sandbox vault file changed during scrub")
+        if rm_code != 0:
             raise VaultScrubIOError("Failed to remove empty sandbox vault file")
 
     verify_raw = await _read_vault_file_bytes(runtime, vault_path)
@@ -252,14 +346,16 @@ async def _scrub_runtime_under_optional_lock(
 async def scrub_sandbox_on_ready(binding: Any, session: Any) -> bool:
     """Ensure legacy Feishu Vault keys are removed when a sandbox becomes ready (§3.2).
 
-    Invoked from ``ComputerManager._complete_phase2_sync`` right after
-    ``session.sandbox.ensure_sandbox_ready()`` regardless of ``mcp_changed`` or
-    ``skills_changed``. Caches the verified ``provider_ref`` on the ``session``
-    object itself to keep repeat warm checks off the database, uses
-    ``sandbox._tool_refresh_lock`` (rather than ``computer_advisory_key``) so
-    the request path stays serialized with in-worker asset sync without pinning
-    a PostgreSQL session lock across sandbox I/O, and swallows all errors after
-    recording ``status='failed'`` so startup always succeeds.
+    Invoked from ``ComputerManager._complete_phase2_sync`` (workspace ready) and
+    ``ComputerManager._build_machine_session`` (explicit computer start before
+    publishing ``running``), regardless of ``mcp_changed`` or ``skills_changed``.
+    Records the checked ``provider_ref`` on the ``session`` object after each
+    check (whether clean, skipped, or failed) so a session queries the state
+    table at most once per ``provider_ref`` and delegates failed retries to
+    ``SandboxFeishuVaultScrubber``. Uses ``sandbox._tool_refresh_lock`` (rather
+    than ``computer_advisory_key``) so startup stays serialized with in-worker
+    asset sync without holding a PostgreSQL session lock across sandbox I/O, and
+    catches all errors after recording ``status='failed'`` so startup completes.
     """
     if not is_dalton_enabled():
         return False
@@ -293,6 +389,7 @@ async def scrub_sandbox_on_ready(binding: Any, session: Any) -> bool:
             return False
 
         if runtime is None:
+            session._dalton_feishu_vault_scrub_checked = provider_ref
             return False
 
         layout = getattr(sandbox, "layout", None)
@@ -307,6 +404,7 @@ async def scrub_sandbox_on_ready(binding: Any, session: Any) -> bool:
         session._dalton_feishu_vault_scrub_checked = provider_ref
         return True
     except Exception as exc:
+        session._dalton_feishu_vault_scrub_checked = provider_ref
         exc_type = type(exc).__name__
         logger.warning(
             "[SandboxFeishuVaultScrubber] ready-hook scrub failed computer_id=%s error_type=%s",
@@ -537,10 +635,13 @@ __all__ = [
     "SWEEP_BATCH_LIMIT",
     "SWEEP_INTERVAL_S",
     "SandboxFeishuVaultScrubber",
+    "VaultScrubConflictError",
     "VaultScrubIOError",
     "VaultScrubParseError",
     "VaultScrubVerificationError",
     "has_sandbox_excluded_vault_keys",
+    "sandbox_excluded_vault_ref_reason",
+    "sandbox_excluded_vault_refs",
     "scrub_sandbox_on_ready",
     "scrub_vault_file_on_runtime",
     "strip_sandbox_excluded_vault_secrets",
