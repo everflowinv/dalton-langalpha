@@ -725,6 +725,11 @@ def write_consensus_snapshot(
         finally:
             wb.close()
 
+        # Merge ONLY target_sh back into donor_copy so every untouched sheet (e.g. Model - JD, Model - BABA)
+        # stays BYTE-FOR-BYTE identical to the pre-snapshot workbook (including ignoredErrors, ph, s, SST)!
+        model_xlsx_hooks.merge_edited_sheets_into_donor(
+            donor_copy, editing_copy, editing_copy, modified_sheets={target_sh}
+        )
         model_edit._preserve_calcpr_from_donor(editing_copy, donor_copy)
         # Restore donor caches on ALL untouched sheets and untouched formulas, excluding updated diff formulas
         spec = {
@@ -795,6 +800,8 @@ def _extract_house_values_from_model(
     model_basis: dict[str, Any] = {
         "fiscal_year_end_month": 12,
         "unit_text": None,
+        "unit_scale": 1.0,
+        "unit_scale_explicit": False,
         "currency": None,
         "accounting_basis": "GAAP",
         "share_basis": "ordinary",
@@ -806,6 +813,8 @@ def _extract_house_values_from_model(
         model_basis["fiscal_year_end_month"] = p_axis.get("fiscal_year_end_month", 12)
         unit_text = str(p_axis.get("unit_text") or "")
         model_basis["unit_text"] = unit_text
+        model_basis["unit_scale"] = float(p_axis.get("unit_scale") or 1.0)
+        model_basis["unit_scale_explicit"] = bool(unit_text.strip())
         if "RMB" in unit_text.upper() or "CNY" in unit_text.upper():
             model_basis["currency"] = "RMB"
         elif "HK" in unit_text.upper():
@@ -901,6 +910,51 @@ def _extract_house_values_from_model(
     return house_map, model_basis
 
 
+def _parse_consensus_unit_scale(
+    raw_scale: Any,
+    raw_unit_text: Any,
+) -> tuple[float | None, bool]:
+    """Parse explicit consensus monetary unit multiplier -> ``(scale_or_none, was_explicit)``."""
+    if raw_scale is not None and raw_scale != "":
+        if isinstance(raw_scale, (int, float)) and not isinstance(raw_scale, bool):
+            val = float(raw_scale)
+            return (val, True) if val > 0 else (None, True)
+        s = str(raw_scale).strip()
+        try:
+            val = float(s)
+            return (val, True) if val > 0 else (None, True)
+        except ValueError:
+            raw_unit_text = s
+
+    if raw_unit_text is None:
+        return None, False
+    txt = str(raw_unit_text).strip()
+    if not txt:
+        return None, False
+    low = txt.lower().strip("()[] ")
+    if any(tok in low for tok in ("billion", " bn", "b)", "十亿")) or low in ("bn", "b"):
+        return 1e9, True
+    if "亿" in low and not any(tok in low for tok in ("十亿", "百亿", "千亿")):
+        return 1e8, True
+    if any(tok in low for tok in ("mm", "million", "百万", " mn", "m)")) or low in ("mm", "mn", "m"):
+        return 1e6, True
+    if any(tok in low for tok in ("'000", "000)", "thousand", "千", " k", "k)")) or low in ("k", "000"):
+        return 1e3, True
+    if low in ("1", "raw", "unit", "units", "actual", "exact", "元", "人民币元", "美元", "港元", "rmb", "cny", "usd", "hkd", "$", "¥"):
+        return 1.0, True
+    if any(tok in low for tok in ("元", "rmb", "cny", "usd", "hkd", "$", "¥")) and not any(
+        tok in low for tok in ("万", "亿", "千", "百", "k", "m", "b")
+    ):
+        return 1.0, True
+    return None, True
+
+
+def _is_monetary_amount_metric(mkey: str, cat: str) -> bool:
+    if cat == "opex_ratio" or any(k in mkey for k in ("margin", "ratio", "pct", "eps", "epads", "per_share")):
+        return False
+    return cat in ("revenue", "segment_revenue", "profit_eps")
+
+
 def compute_consensus_diff(
     *,
     model_path: str | Path,
@@ -987,13 +1041,43 @@ def compute_consensus_diff(
     if reflects_latest is False:
         basis_warnings.append("consensus snapshot does not yet reflect the latest earnings release")
 
+    m_scale = float(model_basis.get("unit_scale") or 1.0)
+    m_scale_explicit = bool(model_basis.get("unit_scale_explicit"))
+    c_scale_top, c_scale_top_exp = _parse_consensus_unit_scale(
+        c_basis.get("unit_scale"),
+        c_basis.get("unit") or c_basis.get("unit_text") or c_basis.get("scale"),
+    )
+    top_scale_aligned = True
+    if c_scale_top_exp:
+        if c_scale_top is None:
+            top_scale_aligned = False
+            basis_warnings.append(
+                f"unit_scale unrecognized: consensus={c_basis.get('unit_scale') or c_basis.get('unit') or c_basis.get('unit_text')!r}"
+            )
+        elif not m_scale_explicit and abs(c_scale_top - 1.0) > 1e-9:
+            top_scale_aligned = False
+            basis_warnings.append(
+                f"unit_scale mismatch: model unit missing while consensus scale={c_scale_top:g}"
+            )
+    checks["unit_scale"] = {
+        "model": m_scale,
+        "consensus": c_scale_top,
+        "aligned": top_scale_aligned,
+    }
+
     raw_items = list(data.get("items") or data.get("estimates") or [])
     diff_rows: list[dict[str, Any]] = []
     exceeds_count = 0
     missing_rationale_count = 0
     unaligned_count = 0
 
-    def _item_basis_warnings(item_obj: dict[str, Any]) -> list[str]:
+    def _item_basis_and_scale(
+        item_obj: dict[str, Any],
+        mkey: str,
+        cat: str,
+        house_val: float | None,
+        cons_raw: float,
+    ) -> tuple[list[str], float, float]:
         item_b = dict(c_basis)
         if isinstance(item_obj.get("basis"), dict):
             item_b.update(item_obj["basis"])
@@ -1003,6 +1087,10 @@ def compute_consensus_diff(
             "accounting_basis",
             "share_basis",
             "reflects_latest_earnings",
+            "unit_scale",
+            "unit",
+            "unit_text",
+            "scale",
         ):
             if item_obj.get(dim_k) is not None:
                 item_b[dim_k] = item_obj[dim_k]
@@ -1018,7 +1106,40 @@ def compute_consensus_diff(
                 warns.append(f"{dim} mismatch: model={m_v!r} vs consensus={c_v!r}")
         if item_b.get("reflects_latest_earnings") is False:
             warns.append("consensus snapshot does not yet reflect the latest earnings release")
-        return warns
+
+        scale_factor = 1.0
+        cons_aligned = cons_raw
+        if _is_monetary_amount_metric(mkey, cat):
+            c_sc, c_sc_exp = _parse_consensus_unit_scale(
+                item_b.get("unit_scale"),
+                item_b.get("unit") or item_b.get("unit_text") or item_b.get("scale"),
+            )
+            if c_sc_exp:
+                if c_sc is None:
+                    warns.append(
+                        f"unit_scale unrecognized: consensus={item_b.get('unit_scale') or item_b.get('unit') or item_b.get('unit_text')!r}"
+                    )
+                elif not m_scale_explicit and abs(c_sc - 1.0) > 1e-9:
+                    warns.append(
+                        f"unit_scale incomparable: model unit_text missing while consensus scale={c_sc:g}"
+                    )
+                else:
+                    scale_factor = c_sc / m_scale
+                    cons_aligned = cons_raw * scale_factor
+            else:
+                # Undeclared consensus unit scale: guard against 100x+ magnitude mismatch (e.g. raw RMB vs RMB MM)
+                if (
+                    house_val is not None
+                    and abs(house_val) > 1e-9
+                    and abs(cons_raw) > 1e-9
+                    and abs(m_scale - 1.0) > 1e-9
+                ):
+                    mag_ratio = abs(cons_raw / house_val)
+                    if mag_ratio >= 100.0 or mag_ratio <= 0.01:
+                        warns.append(
+                            f"unit_scale undeclared/incomparable: model={house_val} (unit_scale={m_scale:g}) vs consensus={cons_raw} (ratio={mag_ratio:.4g})"
+                        )
+        return warns, cons_aligned, scale_factor
 
     for item in raw_items:
         period = str(item.get("period") or "").strip()
@@ -1028,7 +1149,7 @@ def compute_consensus_diff(
         cons_val = item.get("consensus")
         if cons_val is None:
             continue
-        cons_f = float(cons_val)
+        cons_raw_f = float(cons_val)
         cat = _metric_category(mkey, item.get("category"))
 
         p_up = period.upper()
@@ -1041,15 +1162,16 @@ def compute_consensus_diff(
         house_margin = item.get("house_margin") if item.get("house_margin") is not None else (
             h_entry.get("margin") if h_entry else None
         )
+
+        item_warns, cons_f, scale_factor = _item_basis_and_scale(item, mkey, cat, house_val, cons_raw_f)
         cons_margin = item.get("consensus_margin")
         if cons_margin is None and h_entry and h_entry.get("revenue") and mkey in ("operating_income", "net_income"):
             cons_margin = cons_f / h_entry["revenue"]
 
-        item_warns = _item_basis_warnings(item)
         item_aligned = len(item_warns) == 0
 
-        # Codex R3 #5: when reporting/currency basis is unaligned, record missing_evidence and do NOT
-        # feed unaligned raw numbers into threshold / missing-rationale judgment!
+        # Codex R3 #5 / R4 #3: when reporting/currency/unit_scale basis is unaligned, record missing_evidence
+        # and do NOT feed unaligned raw numbers into threshold / missing-rationale judgment!
         if not item_aligned:
             unaligned_count += 1
             diff_rows.append(
@@ -1063,7 +1185,9 @@ def compute_consensus_diff(
                     "basis_warnings": item_warns,
                     "house": house_val,
                     "house_cell": house_cell,
-                    "consensus": cons_f,
+                    "consensus": cons_raw_f,
+                    "consensus_raw": cons_raw_f,
+                    "scale_factor": scale_factor,
                     "diff_abs": None,
                     "diff_pct": None,
                     "diff_bp": None,
@@ -1152,6 +1276,8 @@ def compute_consensus_diff(
                 "house": house_val,
                 "house_cell": house_cell,
                 "consensus": cons_f,
+                "consensus_raw": cons_raw_f,
+                "scale_factor": scale_factor,
                 "diff_abs": diff_abs,
                 "diff_pct": diff_pct,
                 "diff_bp": diff_bp,

@@ -413,6 +413,27 @@ def _find_downstream_formulas(
     return reached
 
 
+def _is_empty_cache_template(
+    fp: dict[str, Any],
+    baseline_path: Path | None = None,
+) -> bool:
+    """Return True when the baseline workbook is an empty-cache template (e.g. default_model_template.xlsx)."""
+    formula_count = 0
+    cached_formula_count = 0
+    for sh_data in (fp.get("sheets") or {}).values():
+        for cmeta in (sh_data.get("cells") or {}).values():
+            if cmeta.get("category") != "formula":
+                continue
+            formula_count += 1
+            if cmeta.get("cached_value") is not None or cmeta.get("cached_t") is not None:
+                cached_formula_count += 1
+    if formula_count > 0 and cached_formula_count == 0:
+        return True
+    if baseline_path is not None and baseline_path.name == "default_model_template.xlsx" and cached_formula_count == 0:
+        return True
+    return False
+
+
 def _build_keep_cache_spec(
     fingerprint: dict[str, Any],
     coord_map: dict[str, Any],
@@ -423,6 +444,7 @@ def _build_keep_cache_spec(
     touched_cells: dict[str, list[str]] | None = None,
     editing_path: Path | None = None,
     engine: str = "libreoffice",
+    backfill_empty_formulas: bool = False,
 ) -> dict[str, Any]:
     tk = ticker.strip().upper()
     skip_sheets: list[str] = []
@@ -531,6 +553,8 @@ def _build_keep_cache_spec(
         "recalc_target_cells": {
             sh: sorted(coords) for sh, coords in sorted(recalc_targets_map.items()) if coords
         },
+        "backfill_empty_formulas": bool(backfill_empty_formulas),
+        "from_default_template": bool(backfill_empty_formulas),
         "skip_error_writeback": True,
     }
 
@@ -550,6 +574,7 @@ def apply_edit_plan(
     skip_recalc: bool = False,
     recalc_timeout: int = 120,
     recalc_mod_override: Any | None = None,
+    mode: str = "auto",
 ) -> dict[str, Any]:
     """Execute P0 controlled edit plan and return structured result with ``coord_map``."""
     base = Path(baseline_path).expanduser().resolve()
@@ -823,7 +848,25 @@ def apply_edit_plan(
     finally:
         wb.close()
 
-    # Preserve exact <calcPr> from donor after openpyxl save
+    is_template_build = (
+        str(mode).strip().lower() == "build"
+        or str(plan.get("mode") or "").strip().lower() == "build"
+        or _is_empty_cache_template(fp, base)
+    )
+    coord_map["mode"] = "build" if is_template_build else "update"
+    coord_map["from_default_template"] = is_template_build
+
+    # Merge ONLY modified sheets from openpyxl's editing_tmp back into the post-insert donor package
+    # so EVERY non-target / untouched sheet stays BYTE-FOR-BYTE identical to donor_path (incl. ignoredErrors, ph, s, SST)!
+    modified_sheets: set[str] = set(touched_cells.keys()) | set(added_period_cols.keys())
+    for clone_spec in plan.get("clone_columns") or []:
+        if clone_spec.get("sheet"):
+            modified_sheets.add(str(clone_spec["sheet"]))
+    model_xlsx_hooks.merge_edited_sheets_into_donor(
+        donor_path, editing_tmp, editing_tmp, modified_sheets=modified_sheets
+    )
+
+    # Preserve exact <calcPr> from donor after merge
     _preserve_calcpr_from_donor(editing_tmp, donor_path)
 
     # Extend conditionalFormatting sqref for any appended rightmost period cols (§8.8 #3)
@@ -844,6 +887,7 @@ def apply_edit_plan(
         touched_cells=coord_map["touched_cells"],
         editing_path=editing_tmp,
         engine=str(plan.get("calc_engine") or "libreoffice"),
+        backfill_empty_formulas=is_template_build,
     )
     if spec_out is not None:
         sp = Path(spec_out).expanduser().resolve()
@@ -874,9 +918,18 @@ def apply_edit_plan(
             recalc_mod, cand, int(recalc_timeout), set(), keep_cache_spec
         )
 
+    # For default-template builds, if recalculation failed or left unmatched target formulas,
+    # enable fullCalcOnLoad=1 so Excel recalculates immediately when the user opens the workbook!
+    full_calc_fallback = False
+    if is_template_build and recalc_res.get("status") in ("recalc_failed", "incomplete"):
+        model_xlsx_hooks.set_full_calc_on_load(cand, True)
+        full_calc_fallback = True
+        recalc_res["full_calc_on_load_enabled"] = True
+
     cand_sha = model_fingerprint.file_sha256(cand)
     coord_map["candidate_sha256"] = cand_sha
     coord_map["donor_cache_restored"] = True
+    coord_map["full_calc_on_load_enabled_on_recalc_failure"] = full_calc_fallback
     coord_map["kept_cache_count"] = recalc_res.get(
         "kept_cache_count", donor_restore_res.get("kept_cache_count", 0)
     )
@@ -927,6 +980,7 @@ def main(argv: list[str] | None = None) -> int:
     p_apply.add_argument("--expected-baseline-sha256", default=None)
     p_apply.add_argument("--skip-recalc", action="store_true")
     p_apply.add_argument("--recalc-timeout", type=int, default=120)
+    p_apply.add_argument("--mode", default="auto", choices=["auto", "build", "update"])
 
     args = parser.parse_args(argv)
     if args.cmd == "next-path":
@@ -955,6 +1009,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_baseline_sha256=args.expected_baseline_sha256,
             skip_recalc=args.skip_recalc,
             recalc_timeout=args.recalc_timeout,
+            mode=args.mode,
         )
         print(json.dumps({k: v for k, v in res.items() if k != "coord_map"}, indent=2, ensure_ascii=False))
         return 0

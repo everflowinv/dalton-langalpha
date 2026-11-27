@@ -3393,3 +3393,478 @@ def test_recover_baseline_real_pg_dump_fc_roundtrip(tmp_path: Path) -> None:
             with conn.cursor() as cur:
                 cur.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 12. Round-5 targeted tests (3 narrowed fixes)
+# ---------------------------------------------------------------------------
+
+
+def test_default_template_build_populates_formula_caches_and_recalc_failure_enables_full_calc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R5 #1:
+    - Building from default_model_template.xlsx writes valid LO results into affected template formulas
+      (e.g. Model!O6/G6) even though template donor <v> is empty.
+    - Incomplete recalc (unmatched target formulas) is NEVER reported as success.
+    - Recalc timeout / no-output / incomplete turns ON fullCalcOnLoad=1, delivers as
+      delivered_with_open_issues with 'recalc' in failed_stages, and writes
+      '公式结果需在 Excel 中打开后重算' into remaining-issues.md.
+    - Skipping recalc on a default-template build cannot pass with empty formula results."""
+    ws = tmp_path / "ws_tpl"
+    (ws / "model").mkdir(parents=True, exist_ok=True)
+    rdir_ok = ws / "research" / "2026-11-27-build-ok"
+    rdir_ok.mkdir(parents=True, exist_ok=True)
+    tpl_copy = tmp_path / "default_model_template.xlsx"
+    shutil.copyfile(BUNDLED_TEMPLATE_XLSX, tpl_copy)
+
+    # 1. Working recalc: populate ALL formula cells in the fake LO output with real numeric / string caches
+    def _fake_soffice_tpl_ok(src: Path, out_dir: Path, timeout: int) -> Path:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        produced = out_dir / (src.stem + ".xlsx")
+        shutil.copyfile(src, produced)
+        infos_p, payload_p = mhooks._read_package(produced)
+        for sh_n, part_p in mhooks._sheet_parts(payload_p).items():
+            root_p = etree.fromstring(payload_p[part_p], mhooks._XML)
+            for c_el in root_p.iter(f"{{{mhooks._SML}}}c"):
+                if c_el.find(f"{{{mhooks._SML}}}f") is None:
+                    continue
+                ref_u = (c_el.get("r") or "").upper()
+                if sh_n == "Model" and ref_u == "O6":
+                    mhooks._apply_cached_value(c_el, None, "2500")
+                elif sh_n == "Model" and ref_u == "G4":
+                    mhooks._apply_cached_value(c_el, None, "2000")
+                elif sh_n == "Model" and ref_u == "G5":
+                    mhooks._apply_cached_value(c_el, None, "500")
+                elif sh_n == "Model" and ref_u == "G6":
+                    mhooks._apply_cached_value(c_el, None, "2500")
+                elif sh_n == "vs Consensus" and ref_u.startswith("E"):
+                    mhooks._apply_cached_value(c_el, "str", "")
+                else:
+                    mhooks._apply_cached_value(c_el, None, "0")
+            payload_p[part_p] = etree.tostring(root_p, xml_declaration=True, encoding="UTF-8", standalone=True)
+        with zipfile.ZipFile(produced, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for info in infos_p:
+                zout.writestr(info, payload_p[info.filename], compress_type=info.compress_type)
+        return produced
+
+    monkeypatch.setattr(recalc_mod, "soffice_calculate", create_autospec(_REAL_SOFFICE_CALC, side_effect=_fake_soffice_tpl_ok))
+    monkeypatch.setattr(recalc_mod.shutil, "which", create_autospec(_REAL_SHUTIL_WHICH, return_value="/usr/bin/soffice"))
+
+    plan_tpl = {
+        "cell_edits": [
+            {"sheet": "Model", "cell": "O4", "value": 2000.0},
+            {"sheet": "Model", "cell": "O5", "value": 500.0},
+        ],
+        "changelog_entry": {
+            "version": "v01",
+            "date": "2026-11-27",
+            "baseline": "default_model_template.xlsx",
+            "summary": "Initial build from default template",
+        },
+    }
+    cm_ok_p = rdir_ok / "model_dump" / "coord_map.json"
+    res_ok = medit.apply_edit_plan(
+        baseline_path=tpl_copy,
+        ticker="DEMO",
+        plan=plan_tpl,
+        workspace_dir=ws,
+        coord_map_out=cm_ok_p,
+        recalc_mod_override=recalc_mod,
+        mode="build",
+    )
+    assert res_ok["recalc_status"] == "success"
+    assert res_ok["recalc_result"]["values_written"] > 0
+    assert res_ok["recalc_result"]["unmatched"] == 0
+    cand_ok = Path(res_ok["candidate_path"])
+    model_cache_ok = _xml_cached_map(cand_ok, "Model")
+    assert model_cache_ok["O6"][1] == "2500"
+    assert model_cache_ok["G6"][1] == "2500"
+    assert mfp.build_fingerprint(cand_ok, ticker="DEMO")["calc_properties"]["full_calc_on_load"] is False
+
+    # 2. Incomplete recalc (LO leaves Model!G6 empty) -> NEVER reported as success; enables fullCalcOnLoad=1!
+    def _fake_soffice_incomplete(src: Path, out_dir: Path, timeout: int) -> Path:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        produced = out_dir / (src.stem + ".xlsx")
+        shutil.copyfile(src, produced)
+        _inject_xml_v_values(produced, {"Model": {"O6": (None, "2500")}})
+        return produced
+
+    monkeypatch.setattr(recalc_mod, "soffice_calculate", create_autospec(_REAL_SOFFICE_CALC, side_effect=_fake_soffice_incomplete))
+    rdir_inc = ws / "research" / "2026-11-27-build-inc"
+    cm_inc_p = rdir_inc / "model_dump" / "coord_map.json"
+    res_inc = medit.apply_edit_plan(
+        baseline_path=tpl_copy,
+        ticker="DEMO",
+        plan=plan_tpl,
+        output_path=ws / "model" / "DEMO-model-v02.xlsx",
+        coord_map_out=cm_inc_p,
+        recalc_mod_override=recalc_mod,
+        mode="build",
+    )
+    assert res_inc["recalc_status"] == "incomplete"
+    assert res_inc["recalc_result"]["unmatched"] > 0
+    assert any(u["cell"] == "G6" for u in res_inc["recalc_result"]["unmatched_cells"])
+    cand_inc = Path(res_inc["candidate_path"])
+    assert mfp.build_fingerprint(cand_inc, ticker="DEMO")["calc_properties"]["full_calc_on_load"] is True
+
+    # 3. Timeout & No-output on default template build -> fullCalcOnLoad=1, delivered_with_open_issues,
+    #    failed_stages includes 'recalc', remaining-issues.md states '公式结果需在 Excel 中打开后重算', verify_done ok!
+    for idx_f, (label_f, stub_fn) in enumerate(
+        (
+            ("timeout", lambda src, out_dir, timeout: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd=["soffice"], timeout=timeout))),
+            ("no_output", lambda src, out_dir, timeout: out_dir / "missing.xlsx"),
+        ),
+        start=3,
+    ):
+        monkeypatch.setattr(recalc_mod, "soffice_calculate", create_autospec(_REAL_SOFFICE_CALC, side_effect=stub_fn))
+        rdir_f = ws / "research" / f"2026-11-27-build-{label_f}"
+        cm_f_p = rdir_f / "model_dump" / "coord_map.json"
+        res_f = medit.apply_edit_plan(
+            baseline_path=tpl_copy,
+            ticker="DEMO",
+            plan=plan_tpl,
+            output_path=ws / "model" / f"DEMO-model-v0{idx_f}.xlsx",
+            coord_map_out=cm_f_p,
+            recalc_mod_override=recalc_mod,
+            mode="build",
+        )
+        assert res_f["recalc_status"] == "recalc_failed"
+        cand_f = Path(res_f["candidate_path"])
+        fp_f = mfp.build_fingerprint(cand_f, ticker="DEMO")
+        assert fp_f["calc_properties"]["full_calc_on_load"] is True
+        assert res_f["candidate_sha256"] == fp_f["source_sha256"]
+
+        chk_f = mchk.write_check_and_ledger(
+            workspace_dir=ws,
+            ticker="DEMO",
+            research_dir=rdir_f,
+            candidate_path=cand_f,
+            baseline_path=tpl_copy,
+            coord_map_path=cm_f_p,
+            run_id=f"run-tpl-{label_f}",
+            mode="build",
+        )
+        assert "recalc" in chk_f["failed_stages"]
+        assert chk_f["final_status"] == "delivered_with_open_issues"
+        assert not any(
+            f["check_id"] == "C13" and f["severity_class"] == "actionable"
+            for f in chk_f["findings"]
+        ), chk_f["findings"]
+        rem_md = (rdir_f / "model_dump" / "remaining-issues.md").read_text(encoding="utf-8")
+        assert "公式结果需在 Excel 中打开后重算" in rem_md
+        vd_f = mchk.verify_done(
+            workspace_dir=ws,
+            ticker="DEMO",
+            research_dir=rdir_f,
+            expected_run_id=f"run-tpl-{label_f}",
+        )
+        assert vd_f["ok"] is True, vd_f
+        assert vd_f["final_status"] == "delivered_with_open_issues"
+
+    # 4. Skipping recalc on default template build -> C13 actionable (refuses clean pass with empty formulas!)
+    rdir_skip = ws / "research" / "2026-11-27-build-skip"
+    cm_skip_p = rdir_skip / "model_dump" / "coord_map.json"
+    res_skip = medit.apply_edit_plan(
+        baseline_path=tpl_copy,
+        ticker="DEMO",
+        plan=plan_tpl,
+        output_path=ws / "model" / "DEMO-model-v05.xlsx",
+        coord_map_out=cm_skip_p,
+        skip_recalc=True,
+        mode="build",
+    )
+    chk_skip = mchk.write_check_and_ledger(
+        workspace_dir=ws,
+        ticker="DEMO",
+        research_dir=rdir_skip,
+        candidate_path=res_skip["candidate_path"],
+        baseline_path=tpl_copy,
+        coord_map_path=cm_skip_p,
+        run_id="run-tpl-skip",
+        mode="build",
+    )
+    assert chk_skip["final_status"] != "pass"
+    assert any(
+        f["check_id"] == "C13" and f["severity_class"] == "actionable" and "empty formula" in f["message"]
+        for f in chk_skip["findings"]
+    ), chk_skip["findings"]
+
+
+def test_editing_jd_preserves_baba_raw_xml_byte_for_byte_and_c14_catches_raw_xml_tamper(
+    tmp_path: Path,
+) -> None:
+    """R5 #2:
+    - Editing ONLY JD (both via model_edit and model_consensus.write_consensus_snapshot) leaves
+      Model - BABA, Subs - BABA, and BABA>> worksheet XML BYTE-FOR-BYTE identical to the
+      post-insert donor, including cell 'ph' attribute, raw numeric '<v>90000.00</v>', and '<ignoredErrors>'.
+    - Deliberately mutating BABA (dropping 'ph', dropping '<ignoredErrors>', or altering raw '<v>' text
+      while keeping identical numeric/string cell values) is caught by C14 as actionable."""
+    ws, _, base = _copy_fixture_to_ws(tmp_path)
+
+    # Inject Excel-native XML artifacts onto Model - BABA that openpyxl drops on whole-workbook save:
+    # 1. ph="1" attribute on Model - BABA!D4
+    # 2. non-canonical numeric formatting <v>90000.00</v> on Model - BABA!E4
+    # 3. <ignoredErrors> element at worksheet level on Model - BABA
+    infos_b, payload_b = mhooks._read_package(base)
+    parts_b = mhooks._sheet_parts(payload_b)
+    baba_part_b = parts_b["Model - BABA"]
+    baba_root = etree.fromstring(payload_b[baba_part_b], mhooks._XML)
+    for c_el in baba_root.iter(f"{{{mhooks._SML}}}c"):
+        ref = (c_el.get("r") or "").upper()
+        if ref == "D4":
+            c_el.set("ph", "1")
+        elif ref == "E4":
+            v_el = c_el.find(f"{{{mhooks._SML}}}v")
+            assert v_el is not None
+            v_el.text = "90000.00"
+    ign_el = etree.SubElement(baba_root, f"{{{mhooks._SML}}}ignoredErrors")
+    etree.SubElement(ign_el, f"{{{mhooks._SML}}}ignoredError", sqref="E4:G4", numberStoredAsText="1")
+    payload_b[baba_part_b] = etree.tostring(baba_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    with zipfile.ZipFile(base, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for info in infos_b:
+            zout.writestr(info, payload_b[info.filename], compress_type=info.compress_type)
+
+    # 1. Edit ONLY JD (with column insert on Model - JD + cell edits + changelog)
+    res_ed = medit.apply_edit_plan(
+        baseline_path=base,
+        ticker="JD",
+        plan={
+            "ops": [{"op": "insert_columns", "sheet": "Model - JD", "at": "P", "count": 1, "copy_style_from": "O"}],
+            "added_period_cols": {"Model - JD": ["P"]},
+            "cell_edits": [
+                {"sheet": "Model - JD", "cell": "P1", "value": "1Q26 Adj"},
+                {"sheet": "Model - JD", "cell": "Q25", "value": 0.115},
+            ],
+            "changelog_entry": {
+                "version": "v02",
+                "date": "2026-11-27",
+                "baseline": base.name,
+                "summary": "Edit JD only; BABA XML must stay byte-identical",
+            },
+        },
+        workspace_dir=ws,
+        skip_recalc=True,
+    )
+    cand = Path(res_ed["candidate_path"])
+    donor = Path(res_ed["cache_donor_path"])
+
+    # Assert BYTE-FOR-BYTE identity of all non-target BABA sheets against post-insert donor!
+    _, donor_pay = mhooks._read_package(donor)
+    _, cand_pay = mhooks._read_package(cand)
+    donor_parts = mhooks._sheet_parts(donor_pay)
+    cand_parts = mhooks._sheet_parts(cand_pay)
+    for nt_sh in ("BABA>>", "Model - BABA", "Subs - BABA"):
+        assert cand_pay[cand_parts[nt_sh]] == donor_pay[donor_parts[nt_sh]], f"{nt_sh} XML changed!"
+    assert b'ph="1"' in cand_pay[cand_parts["Model - BABA"]]
+    assert b"ignoredErrors" in cand_pay[cand_parts["Model - BABA"]]
+    assert b">90000.00<" in cand_pay[cand_parts["Model - BABA"]]
+
+    # Also verify write_consensus_snapshot keeps all non-consensus sheets (incl. Model - BABA) byte-identical!
+    mcons.write_consensus_snapshot(
+        model_path=cand,
+        consensus_data={
+            "source_type": "Market Consensus",
+            "as_of_date": "2026-11-27",
+            "items": [{"period": "2026E", "metric": "Total Revenue", "consensus": 12000.0}],
+        },
+        sheet_name="vs Consensus",
+    )
+    _, cand_after_cons = mhooks._read_package(cand)
+    cand_parts_after = mhooks._sheet_parts(cand_after_cons)
+    for nt_sh in ("BABA>>", "Model - BABA", "Subs - BABA"):
+        assert cand_after_cons[cand_parts_after[nt_sh]] == donor_pay[donor_parts[nt_sh]], (
+            f"{nt_sh} XML changed after write_consensus_snapshot!"
+        )
+
+    # C14 MUST pass with zero actionable findings on the clean candidate!
+    chk_ok = mchk.run_checks(
+        candidate_path=cand,
+        ticker="JD",
+        baseline_path=base,
+        coord_map=res_ed["coord_map"],
+    )
+    c14_ok = [f for f in chk_ok["findings"] if f["check_id"] == "C14" and f["severity_class"] == "actionable"]
+    assert c14_ok == [], c14_ok
+
+    # 2. Deliberately tamper BABA raw XML in 3 subtle ways that preserve identical cell values -> C14 MUST catch ALL!
+    # 2a. Remove <ignoredErrors> (all cells unchanged!)
+    t_ign = ws / "model" / "China_Ecommerce_tamper_ign_v03.xlsx"
+    shutil.copyfile(cand, t_ign)
+    inf_i, pay_i = mhooks._read_package(t_ign)
+    bp_i = mhooks._sheet_parts(pay_i)["Model - BABA"]
+    r_i = etree.fromstring(pay_i[bp_i], mhooks._XML)
+    for el in list(r_i.findall(f"{{{mhooks._SML}}}ignoredErrors")):
+        r_i.remove(el)
+    pay_i[bp_i] = etree.tostring(r_i, xml_declaration=True, encoding="UTF-8", standalone=True)
+    with zipfile.ZipFile(t_ign, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for info in inf_i:
+            zout.writestr(info, pay_i[info.filename], compress_type=info.compress_type)
+    chk_ign = mchk.run_checks(candidate_path=t_ign, ticker="JD", baseline_path=base, coord_map=res_ed["coord_map"])
+    c14_ign = [f for f in chk_ign["findings"] if f["check_id"] == "C14" and f["severity_class"] == "actionable"]
+    assert any(f.get("sheet") == "Model - BABA" and "ignoredErrors" in f["message"] for f in c14_ign), c14_ign
+
+    # 2b. Remove ph="1" from Model - BABA!D4 and rewrite <v>90000.00</v> -> <v>90000</v> on E4 (same cell values!)
+    t_cell = ws / "model" / "China_Ecommerce_tamper_cell_v04.xlsx"
+    shutil.copyfile(cand, t_cell)
+    inf_c, pay_c = mhooks._read_package(t_cell)
+    bp_c = mhooks._sheet_parts(pay_c)["Model - BABA"]
+    r_c = etree.fromstring(pay_c[bp_c], mhooks._XML)
+    for c_el in r_c.iter(f"{{{mhooks._SML}}}c"):
+        ref = (c_el.get("r") or "").upper()
+        if ref == "D4" and "ph" in c_el.attrib:
+            del c_el.attrib["ph"]
+        elif ref == "E4":
+            v_el = c_el.find(f"{{{mhooks._SML}}}v")
+            assert v_el is not None
+            v_el.text = "90000"
+    pay_c[bp_c] = etree.tostring(r_c, xml_declaration=True, encoding="UTF-8", standalone=True)
+    with zipfile.ZipFile(t_cell, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for info in inf_c:
+            zout.writestr(info, pay_c[info.filename], compress_type=info.compress_type)
+    chk_cell = mchk.run_checks(candidate_path=t_cell, ticker="JD", baseline_path=base, coord_map=res_ed["coord_map"])
+    c14_cell_coords = {
+        f.get("cell") for f in chk_cell["findings"]
+        if f["check_id"] == "C14" and f["severity_class"] == "actionable" and f.get("sheet") == "Model - BABA"
+    }
+    assert "D4" in c14_cell_coords, chk_cell["findings"]
+    assert "E4" in c14_cell_coords, chk_cell["findings"]
+
+
+def test_unchanged_model_never_triggers_c04_actionable_and_unit_scale_alignment(
+    tmp_path: Path,
+) -> None:
+    """R5 #3 & Codex R4 #3:
+    - Unchanged baseline model with above-threshold consensus diff (even with no rationale) has actionable == 0
+      because C04 only flags round-edited/affected House forecasts.
+    - Monetary unit scale is aligned before comparison: 3Q26E House 3134.8 RMB MM vs Consensus 3134800000 RMB
+      with unit='RMB' aligns to 0% diff; without declared unit_scale, 10^6 magnitude gap is missing_evidence
+      (never actionable).
+    - Editing a driver (Q25) that affects 2026E Total Revenue (G6) WITH an aligned >5% diff and no rationale
+      STILL triggers C04 actionable."""
+    ws, rdir_same, base = _copy_fixture_to_ws(tmp_path)
+    base_fp = mfp.build_fingerprint(base, ticker="JD")
+    q3_house = float(base_fp["sheets"]["Model - JD"]["cells"]["Q6"]["cached_value"])  # RMB MM
+
+    # 1. Unchanged model + consensus diff with explicit RMB raw unit (10^6 x House MM) -> aligned 0% diff, actionable == 0
+    rdir_scaled = ws / "research" / "2026-11-27-cons-scaled"
+    diff_scaled = mcons.compute_consensus_diff(
+        model_path=base,
+        ticker="JD",
+        research_dir=rdir_scaled,
+        consensus_data={
+            "source_type": "Wind Consensus",
+            "as_of_date": "2026-11-27",
+            "basis": {"currency": "RMB", "unit": "RMB"},
+            "items": [{"period": "3Q26E", "metric": "Total Revenue", "consensus": q3_house * 1e6}],
+        },
+    )
+    assert diff_scaled["status"] == "ok"
+    assert diff_scaled["basis_alignment"]["aligned"] is True
+    assert diff_scaled["exceeds_count"] == 0
+    assert diff_scaled["missing_rationale_count"] == 0
+    assert abs(float(diff_scaled["items"][0]["diff_pct"])) < 1e-9
+    chk_scaled = mchk.write_check_and_ledger(
+        workspace_dir=ws,
+        ticker="JD",
+        research_dir=rdir_scaled,
+        candidate_path=base,
+        baseline_path=base,
+        run_id="run-c04-scaled",
+    )
+    assert chk_scaled["counts"]["actionable"] == 0, chk_scaled["findings"]
+    assert chk_scaled["final_status"] == "pass"
+
+    # 2. Unchanged model + raw 10^6 consensus WITHOUT declared unit_scale -> missing_evidence, actionable == 0
+    rdir_unspec = ws / "research" / "2026-11-27-cons-unspec"
+    diff_unspec = mcons.compute_consensus_diff(
+        model_path=base,
+        ticker="JD",
+        research_dir=rdir_unspec,
+        consensus_data={
+            "source_type": "Unlabelled Consensus",
+            "as_of_date": "2026-11-27",
+            "basis": {"currency": "RMB"},
+            "items": [{"period": "3Q26E", "metric": "Total Revenue", "consensus": q3_house * 1e6}],
+        },
+    )
+    assert diff_unspec["status"] == "missing_evidence"
+    assert diff_unspec["unaligned_count"] == 1
+    assert diff_unspec["exceeds_count"] == 0
+    assert diff_unspec["missing_rationale_count"] == 0
+    chk_unspec = mchk.write_check_and_ledger(
+        workspace_dir=ws,
+        ticker="JD",
+        research_dir=rdir_unspec,
+        candidate_path=base,
+        baseline_path=base,
+        run_id="run-c04-unspec",
+    )
+    assert chk_unspec["counts"]["actionable"] == 0, chk_unspec["findings"]
+    assert any(f["check_id"] == "C04" and f["severity_class"] == "missing_evidence" for f in chk_unspec["findings"])
+
+    # 3. Unchanged model + same-scale >5% gap with NO rationale (3Q26E has no sheet rationale) -> baseline_legacy, actionable == 0!
+    diff_gap = mcons.compute_consensus_diff(
+        model_path=base,
+        ticker="JD",
+        research_dir=rdir_same,
+        consensus_data={
+            "source_type": "Market Consensus",
+            "as_of_date": "2026-11-27",
+            "basis": {"currency": "RMB", "unit": "RMB MM"},
+            "items": [{"period": "3Q26E", "metric": "Total Revenue", "consensus": 2000.0}],  # >30% off, NO rationale
+        },
+    )
+    assert diff_gap["missing_rationale_count"] == 1
+    chk_unch = mchk.write_check_and_ledger(
+        workspace_dir=ws,
+        ticker="JD",
+        research_dir=rdir_same,
+        candidate_path=base,
+        baseline_path=base,
+        run_id="run-c04-unchanged",
+    )
+    assert chk_unch["counts"]["actionable"] == 0, chk_unch["findings"]
+    assert any(f["check_id"] == "C04" and f["severity_class"] == "baseline_legacy" for f in chk_unch["findings"])
+    assert chk_unch["final_status"] == "pass"
+
+    # 4. Round-edited model where driver Q25 feeds Q6 (3Q26E Total Revenue) + aligned >5% gap without rationale
+    #    MUST STILL trigger C04 actionable!
+    rdir_ed = ws / "research" / "2026-11-27-cons-edited"
+    cm_ed_p = rdir_ed / "model_dump" / "coord_map.json"
+    res_ed = medit.apply_edit_plan(
+        baseline_path=base,
+        ticker="JD",
+        plan={
+            "cell_edits": [{"sheet": "Model - JD", "cell": "Q25", "value": 0.15}],
+            "changelog_entry": {"version": "v02", "date": "2026-11-27", "baseline": base.name, "summary": "Raise 3Q26E growth"},
+        },
+        workspace_dir=ws,
+        coord_map_out=cm_ed_p,
+        skip_recalc=True,
+    )
+    mcons.compute_consensus_diff(
+        model_path=res_ed["candidate_path"],
+        ticker="JD",
+        research_dir=rdir_ed,
+        consensus_data={
+            "source_type": "Market Consensus",
+            "as_of_date": "2026-11-27",
+            "basis": {"currency": "RMB", "unit": "RMB MM"},
+            "items": [{"period": "3Q26E", "metric": "Total Revenue", "consensus": 2000.0}],  # >30% off, NO rationale
+        },
+    )
+    chk_ed = mchk.write_check_and_ledger(
+        workspace_dir=ws,
+        ticker="JD",
+        research_dir=rdir_ed,
+        candidate_path=res_ed["candidate_path"],
+        baseline_path=base,
+        coord_map_path=cm_ed_p,
+        run_id="run-c04-edited",
+    )
+    assert any(
+        f["check_id"] == "C04" and f["severity_class"] == "actionable"
+        for f in chk_ed["findings"]
+    ), chk_ed["findings"]

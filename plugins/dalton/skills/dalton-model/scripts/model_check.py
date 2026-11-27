@@ -17,12 +17,14 @@ import argparse
 from collections import defaultdict
 from datetime import datetime, timezone
 import importlib.util
+import io
 import json
 from pathlib import Path
 import re
 import sys
 from typing import Any
 
+from lxml import etree
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string, get_column_letter
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -105,7 +107,7 @@ def _num_close(a: Any, b: Any, rel_tol: float = 1e-9, abs_tol: float = 1e-9) -> 
     return str(a) == str(b)
 
 
-def _load_insert_shift_class() -> Any:
+def _load_insert_module() -> Any:
     p = model_edit._locate_xlsx_script("insert.py")
     spec = importlib.util.spec_from_file_location("_dalton_insert_shift_mod", p)
     if spec is None or spec.loader is None:
@@ -113,7 +115,77 @@ def _load_insert_shift_class() -> Any:
     mod = importlib.util.module_from_spec(spec)
     sys.modules["_dalton_insert_shift_mod"] = mod
     spec.loader.exec_module(mod)
-    return mod.Shift
+    return mod
+
+
+def _load_insert_shift_class() -> Any:
+    return _load_insert_module().Shift
+
+
+def _expected_non_target_sheet_xml_map(
+    true_base_p: Path,
+    target_ops: list[dict[str, Any]],
+    non_target_sheets: list[str],
+) -> tuple[dict[str, bytes], dict[str, bytes]]:
+    """Return ``(sheet_xml_by_name, expected_package_payload)`` for non-target sheets after replaying ``target_ops``."""
+    if not target_ops:
+        _, base_payload = model_xlsx_hooks._read_package(true_base_p)
+        base_parts = model_xlsx_hooks._sheet_parts(base_payload)
+        return (
+            {sh: base_payload[base_parts[sh]] for sh in non_target_sheets if sh in base_parts and base_parts[sh] in base_payload},
+            base_payload,
+        )
+
+    insert_mod = _load_insert_module()
+    pkg = insert_mod.Package(true_base_p)
+    for op in target_ops:
+        kind = op.get("op")
+        target_sheet = str(op.get("sheet") or "")
+        if target_sheet not in pkg.sheets:
+            continue
+        count = int(op.get("count", 1))
+        if kind in ("insert_columns", "delete_columns"):
+            axis = "column"
+            at_val = (
+                column_index_from_string(str(op["at"]))
+                if isinstance(op["at"], str) and not str(op["at"]).isdigit()
+                else int(op["at"])
+            )
+            delete = kind == "delete_columns"
+        elif kind in ("insert_rows", "delete_rows"):
+            axis = "row"
+            at_val = int(op["at"])
+            delete = kind == "delete_rows"
+        else:
+            continue
+        copy_from_raw = op.get("copy_style_from")
+        copy_from: int | None = None
+        if copy_from_raw is not None and not delete:
+            copy_from = (
+                column_index_from_string(str(copy_from_raw))
+                if axis == "column" and isinstance(copy_from_raw, str) and not str(copy_from_raw).isdigit()
+                else int(copy_from_raw)
+            )
+        rep: dict[str, Any] = {
+            "cells_shifted": 0,
+            "formulas_rewritten": 0,
+            "names_rewritten": 0,
+            "charts_rewritten": 0,
+            "warnings": [],
+        }
+        editor = insert_mod.Editor(pkg, target_sheet, axis, at_val, count, delete, copy_from, rep)
+        editor.run()
+        buf = io.BytesIO()
+        pkg.write(buf, pkg.payload())
+        buf.seek(0)
+        pkg = insert_mod.Package(buf)
+
+    exp_payload = pkg.payload()
+    exp_parts = model_xlsx_hooks._sheet_parts(exp_payload)
+    return (
+        {sh: exp_payload[exp_parts[sh]] for sh in non_target_sheets if sh in exp_parts and exp_parts[sh] in exp_payload},
+        exp_payload,
+    )
 
 
 def _replay_formula_through_ops(
@@ -968,17 +1040,26 @@ def run_checks(
             if c_cell.get("category") == "formula":
                 hit = _reaches_any((sh_name, cu), snapshot_nodes, dep_graph, rect_graph, snap_target_idx)
                 if hit is not None:
-                    was_legacy_dep = bool(
-                        not is_touched
-                        and b_old_coord is not None
-                        and b_cell is not None
-                        and b_cell.get("category") == "formula"
-                        and _reaches_any(
-                            (sh_name, b_old_coord), base_snapshot_nodes, base_dep_graph, base_rect_graph, base_snap_idx
-                        ) is not None
-                    )
+                    # Only cells modified in this round can trigger actionable; untouched baseline formulas stay baseline_legacy.
+                    if not is_touched:
+                        was_legacy_dep = bool(
+                            b_old_coord is not None
+                            and b_cell is not None
+                            and b_cell.get("category") == "formula"
+                            and _reaches_any(
+                                (sh_name, b_old_coord), base_snapshot_nodes, base_dep_graph, base_rect_graph, base_snap_idx
+                            ) is not None
+                        )
+                        if was_legacy_dep:
+                            _add_finding(
+                                findings, "C04", "baseline_legacy",
+                                f"House forecast/driver formula {sh_name}!{cu} depends on consensus snapshot cell {hit[0]}!{hit[1]} (baseline legacy)",
+                                sheet=sh_name, cell=cu,
+                                details={"snapshot_ref": f"{hit[0]}!{hit[1]}", "formula": c_cell.get("formula")},
+                            )
+                        continue
                     _add_finding(
-                        findings, "C04", "baseline_legacy" if was_legacy_dep else "actionable",
+                        findings, "C04", "actionable",
                         f"House forecast/driver formula {sh_name}!{cu} depends on consensus snapshot cell {hit[0]}!{hit[1]} (directly, via range/table, or via defined_names)",
                         sheet=sh_name, cell=cu,
                         details={"snapshot_ref": f"{hit[0]}!{hit[1]}", "formula": c_cell.get("formula")},
@@ -989,13 +1070,9 @@ def run_checks(
                     cell_period = str((col_meta or {}).get("normalized") or (col_meta or {}).get("raw") or "").upper()
                     row_lbl = str((lim.get(str(row_i)) or {}).get("label") or "")
                     cell_mkey = model_consensus._normalize_metric_key(row_lbl) if row_lbl else None
-                    # Check whether baseline already had this exact constant (unchanged in this round)
-                    was_legacy_const = bool(
-                        not is_touched
-                        and b_cell is not None
-                        and b_cell.get("category") == "input"
-                        and _num_close(cv, b_cell.get("cached_value"), rel_tol=1e-6, abs_tol=1e-6)
-                    )
+                    # Untouched baseline constants MUST NOT trigger actionable C04!
+                    if not is_touched:
+                        continue
                     for entry in snapshot_entries:
                         snap_node = entry["node"]
                         snap_val = entry["value"]
@@ -1008,10 +1085,8 @@ def run_checks(
                             continue
                         if sm and cell_mkey and sm != cell_mkey:
                             continue
-                        if (not sp or not sm) and not is_touched:
-                            continue
                         _add_finding(
-                            findings, "C04", "baseline_legacy" if was_legacy_const else "actionable",
+                            findings, "C04", "actionable",
                             f"House result cell {sh_name}!{cu} is a hard-coded constant ({cv}) equal to consensus snapshot {snap_node[0]}!{snap_node[1]}",
                             sheet=sh_name, cell=cu,
                             details={"snapshot_ref": f"{snap_node[0]}!{snap_node[1]}", "value": cv},
@@ -1025,7 +1100,8 @@ def run_checks(
             dynamic_ref_list.append({"sheet": dsh, "cell": dcoord, "formula": df})
 
     # Consensus diff rationale & source check (Prompt R3 #4: hash mismatch -> stage failure ONLY, never actionable!
-    # Codex R3 #5: unaligned basis/currency -> missing_evidence, NEVER actionable!)
+    # Codex R3 #5 / R4 #3: unaligned basis/currency/unit_scale -> missing_evidence, NEVER actionable!
+    # R5 #3: ONLY round-edited / round-affected House cells trigger C04 actionable; untouched baseline content stays baseline_legacy!)
     if consensus_diff is not None:
         if str(consensus_diff.get("model_sha256") or "").lower() != str(cand_sha or "").lower():
             optional_notices.append(
@@ -1043,9 +1119,64 @@ def run_checks(
                     "missing_evidence",
                     f"Consensus comparison missing evidence / unaligned basis: {reason_txt}",
                 )
-            if int(consensus_diff.get("missing_rationale_count") or 0) > 0:
+            round_touched_c04: set[tuple[str, str]] = {
+                (sh, crd.upper())
+                for sh, crds in touched_cells.items()
+                if not any(k in sh.lower() for k in ("consensus", "readme", "changelog"))
+                for crd in crds
+            }
+            for sh_tf, crds_tf in (cm.get("touched_formula_cells") or {}).items():
+                if not any(k in str(sh_tf).lower() for k in ("consensus", "readme", "changelog")):
+                    for crd_tf in (crds_tf or ()):
+                        round_touched_c04.add((str(sh_tf), str(crd_tf).upper()))
+            round_touched_c04_idx = _index_target_coords(round_touched_c04)
+            added_cols_c04: dict[str, set[str]] = {
+                str(sh_ac): {str(c).upper() for c in (cols_ac or ())}
+                for sh_ac, cols_ac in (cm.get("added_period_cols") or {}).items()
+            }
+
+            diff_items = list(consensus_diff.get("items") or [])
+            if diff_items:
+                act_missing_items: list[dict[str, Any]] = []
+                leg_missing_items: list[dict[str, Any]] = []
+                for ditem in diff_items:
+                    if not ditem.get("missing_rationale"):
+                        continue
+                    is_house_affected = False
+                    if str(mode).strip().lower() == "build":
+                        is_house_affected = True
+                    elif not is_unchanged and round_touched_c04:
+                        h_cell_ref = ditem.get("house_cell")
+                        if isinstance(h_cell_ref, str) and "!" in h_cell_ref:
+                            h_sh, h_crd = h_cell_ref.rsplit("!", 1)
+                            h_crd_u = h_crd.upper()
+                            h_node = (h_sh, h_crd_u)
+                            h_col_s, _ = coordinate_from_string(h_crd_u)
+                            is_house_affected = (
+                                (h_node in round_touched_c04)
+                                or (h_col_s.upper() in added_cols_c04.get(h_sh, set()))
+                                or (_reaches_any(h_node, round_touched_c04, dep_graph, rect_graph, round_touched_c04_idx) is not None)
+                            )
+                        else:
+                            is_house_affected = True
+                    if is_house_affected:
+                        act_missing_items.append(ditem)
+                    else:
+                        leg_missing_items.append(ditem)
+                if act_missing_items:
+                    _add_finding(
+                        findings, "C04", "actionable",
+                        f"{len(act_missing_items)} above-threshold aligned consensus diff item(s) on round-edited forecasts lack rationale",
+                    )
+                if leg_missing_items:
+                    _add_finding(
+                        findings, "C04", "baseline_legacy",
+                        f"{len(leg_missing_items)} above-threshold consensus diff item(s) on untouched baseline forecasts lack rationale (baseline legacy)",
+                    )
+            elif int(consensus_diff.get("missing_rationale_count") or 0) > 0:
+                sev_mr = "baseline_legacy" if (is_unchanged or (str(mode).strip().lower() != "build" and not round_touched_c04)) else "actionable"
                 _add_finding(
-                    findings, "C04", "actionable",
+                    findings, "C04", sev_mr,
                     f"{consensus_diff['missing_rationale_count']} above-threshold aligned consensus diff item(s) lack rationale",
                 )
 
@@ -1449,8 +1580,13 @@ def run_checks(
     # pre-existing discrepancies of equal or smaller magnitude stay baseline_legacy even when another cell in the column was edited!
     # Codex R3 #4: when recalc failed (timeout / no artifact), numerical balance checks touching any affected
     # unrecalculated formula cell are classified as missing_evidence (NOT actionable), while formula/structure checks stay actionable!
+    is_template_build = (
+        str(mode).strip().lower() == "build"
+        or bool(cm.get("from_default_template"))
+        or model_edit._is_empty_cache_template(base_fp)
+    )
     recalc_st = str(((cm.get("recalc_result") or {}).get("status") or "")).strip().lower()
-    recalc_failed = (recalc_st == "recalc_failed") or (
+    recalc_failed = (recalc_st in ("recalc_failed", "incomplete")) or (
         "recalc" in {s.strip().lower() for s in (failed_stages or ())}
     )
     touched_nodes_recalc: set[tuple[str, str]] = {
@@ -1918,14 +2054,20 @@ def run_checks(
                                 sheet=sh_name, cell=f"{col_l}{es_r}",
                             )
 
-    # C13 fullCalcOnLoad, exempt cells, baseline error comparison, downstream diffs & new circular references
+    # C13 fullCalcOnLoad, default-template empty-cache guard, exempt cells, baseline error comparison, downstream diffs & new circular references
     base_full_calc = bool((base_fp.get("calc_properties") or {}).get("full_calc_on_load"))
     cand_full_calc = bool((cand_fp.get("calc_properties") or {}).get("full_calc_on_load"))
     if not base_full_calc and cand_full_calc:
-        _add_finding(
-            findings, "C13", "actionable",
-            "Workbook <calcPr> has fullCalcOnLoad=1 enabled (was disabled in baseline)",
-        )
+        if is_template_build and recalc_failed:
+            _add_finding(
+                findings, "C13", "missing_evidence",
+                "Default-template recalculation failed; fullCalcOnLoad=1 enabled so Excel recalculates on open",
+            )
+        else:
+            _add_finding(
+                findings, "C13", "actionable",
+                "Workbook <calcPr> has fullCalcOnLoad=1 enabled (was disabled in baseline)",
+            )
 
     # Build exempt cell set strictly from CANDIDATE formulas (Codex R2 #4):
     # never grant exemption to a coordinate whose original CIQ/ext formula was replaced with e.g. =1/0!
@@ -2080,6 +2222,7 @@ def run_checks(
             ),
         )
 
+    empty_target_formulas: list[tuple[str, str]] = []
     for sh_name, sh_data in (cand_fp.get("sheets") or {}).items():
         if sh_name not in target_sheets:
             continue
@@ -2092,10 +2235,35 @@ def run_checks(
                 _classify_error(sh_name, coord, str(cv or "#ERROR!"), f_txt)
             elif _formula_has_ref_literal(f_txt):
                 _classify_error(sh_name, coord, "#REF! (in formula)", f_txt, is_ref_in_formula=True)
+            elif is_template_build and cv is None and c_cell.get("cached_t") is None:
+                cu = coord.upper()
+                node = (sh_name, cu)
+                is_ex = (node in exempt_nodes) or (_reaches_any(node, exempt_nodes, dep_graph, rect_graph, exempt_idx) is not None)
+                if not is_ex:
+                    empty_target_formulas.append(node)
+
+    if is_template_build and empty_target_formulas:
+        sample_empty = ", ".join(f"{s}!{c}" for s, c in empty_target_formulas[:6])
+        if recalc_failed:
+            if cand_full_calc:
+                _add_finding(
+                    findings, "C13", "missing_evidence",
+                    f"Default-template build has {len(empty_target_formulas)} unrecalculated formula cell(s) after recalc failure ({sample_empty}); fullCalcOnLoad=1 enabled for Excel open recalc",
+                )
+            else:
+                _add_finding(
+                    findings, "C13", "actionable",
+                    f"Default-template build has {len(empty_target_formulas)} empty formula cell(s) after recalc failure without fullCalcOnLoad=1 enabled ({sample_empty})",
+                )
+        else:
+            _add_finding(
+                findings, "C13", "actionable",
+                f"Default-template build has {len(empty_target_formulas)} empty formula cell(s) without cached values ({sample_empty}); a successful recalculation is required before delivery",
+            )
 
     # C14 Multi-company non-target sheets preserved:
-    # Independently reject ANY structural op targeting a non-target sheet and compare candidate
-    # directly against TRUE baseline (only permitting cross-sheet formula shifts from target-sheet ops; Codex R2 #3).
+    # Independently reject ANY structural op targeting a non-target sheet and compare candidate's
+    # FULL normalized worksheet XML directly against TRUE baseline replayed through legal target_ops!
     if not non_target_sheets:
         _add_finding(findings, "C14", "not_applicable", "Single-company workbook (no non-target company sheets)")
     else:
@@ -2114,31 +2282,54 @@ def run_checks(
             else:
                 target_ops.append(op)
 
-        # Raw OOXML cell-state comparison on non-target sheets (Codex R3 #2 / Lead #2):
-        # verify exact t attr, <v> presence/emptiness, SST index & canonical <si> rich-text XML, and <is> XML!
+        # Full-sheet normalized raw OOXML comparison + per-cell raw XML & SST <si>/<is> verification (R5 #2)
         true_base_p: Path | None = None
         if baseline_path is not None and Path(baseline_path).is_file():
             true_base_p = Path(baseline_path).expanduser().resolve()
         elif base_fp.get("source_path") and Path(str(base_fp["source_path"])).is_file():
             true_base_p = Path(str(base_fp["source_path"])).expanduser().resolve()
-        base_raw_nt = (
-            model_xlsx_hooks.extract_raw_xml_cell_states(true_base_p, non_target_set)
-            if true_base_p is not None
-            else {}
-        )
-        cand_raw_nt = (
-            model_xlsx_hooks.extract_raw_xml_cell_states(cand, non_target_set)
-            if true_base_p is not None
-            else {}
-        )
+
+        expected_nt_xml: dict[str, bytes] = {}
+        expected_nt_cells: dict[str, dict[str, Any]] = {}
+        cand_nt_xml: dict[str, bytes] = {}
+        cand_nt_cells: dict[str, dict[str, Any]] = {}
+        base_raw_nt: dict[str, dict[str, dict[str, Any]]] = {}
+        cand_raw_nt: dict[str, dict[str, dict[str, Any]]] = {}
+        if true_base_p is not None:
+            expected_nt_xml, _ = _expected_non_target_sheet_xml_map(true_base_p, target_ops, non_target_sheets)
+            _, cand_pkg_payload = model_xlsx_hooks._read_package(cand)
+            cand_pkg_parts = model_xlsx_hooks._sheet_parts(cand_pkg_payload)
+            for nt_sh in non_target_sheets:
+                c_part = cand_pkg_parts.get(nt_sh)
+                if c_part and c_part in cand_pkg_payload:
+                    cand_nt_xml[nt_sh] = cand_pkg_payload[c_part]
+                if nt_sh in expected_nt_xml:
+                    e_root = etree.fromstring(expected_nt_xml[nt_sh], model_xlsx_hooks._XML)
+                    expected_nt_cells[nt_sh] = {
+                        (c.get("r") or "").upper(): model_xlsx_hooks._canonical_xml(c)
+                        for c in e_root.iter(f"{{{model_xlsx_hooks._SML}}}c")
+                        if c.get("r")
+                    }
+                if nt_sh in cand_nt_xml:
+                    a_root = etree.fromstring(cand_nt_xml[nt_sh], model_xlsx_hooks._XML)
+                    cand_nt_cells[nt_sh] = {
+                        (c.get("r") or "").upper(): model_xlsx_hooks._canonical_xml(c)
+                        for c in a_root.iter(f"{{{model_xlsx_hooks._SML}}}c")
+                        if c.get("r")
+                    }
+            base_raw_nt = model_xlsx_hooks.extract_raw_xml_cell_states(true_base_p, non_target_set)
+            cand_raw_nt = model_xlsx_hooks.extract_raw_xml_cell_states(cand, non_target_set)
 
         for nt_sh in non_target_sheets:
             orig_cells = (base_fp.get("sheets") or {}).get(nt_sh, {}).get("cells") or {}
             act_cells = (cand_fp.get("sheets") or {}).get(nt_sh, {}).get("cells") or {}
             orig_raw = base_raw_nt.get(nt_sh) or {}
             act_raw = cand_raw_nt.get(nt_sh) or {}
+            exp_c_map = expected_nt_cells.get(nt_sh) or {}
+            act_c_map = cand_nt_cells.get(nt_sh) or {}
+            sheet_had_cell_finding = False
 
-            all_coords = sorted(set(orig_cells) | set(act_cells) | set(orig_raw) | set(act_raw))
+            all_coords = sorted(set(orig_cells) | set(act_cells) | set(orig_raw) | set(act_raw) | set(exp_c_map) | set(act_c_map))
             for coord in all_coords:
                 oc = orig_cells.get(coord)
                 ac = act_cells.get(coord)
@@ -2150,6 +2341,7 @@ def run_checks(
                             f"Non-target sheet cell added/removed at {nt_sh}!{coord}",
                             sheet=nt_sh, cell=coord,
                         )
+                        sheet_had_cell_finding = True
                         continue
                     if oc.get("category") != ac.get("category"):
                         _add_finding(
@@ -2157,6 +2349,7 @@ def run_checks(
                             f"Non-target sheet cell category changed at {nt_sh}!{coord}",
                             sheet=nt_sh, cell=coord,
                         )
+                        sheet_had_cell_finding = True
                         continue
                     if oc.get("category") == "formula":
                         orig_f = _norm_formula(oc.get("formula"))
@@ -2173,6 +2366,7 @@ def run_checks(
                                 sheet=nt_sh, cell=coord,
                             )
                             cell_flagged = True
+                            sheet_had_cell_finding = True
                         if not _num_close(oc.get("cached_value"), ac.get("cached_value"), rel_tol=1e-9):
                             _add_finding(
                                 findings, "C14", "actionable",
@@ -2180,6 +2374,7 @@ def run_checks(
                                 sheet=nt_sh, cell=coord,
                             )
                             cell_flagged = True
+                            sheet_had_cell_finding = True
                     else:
                         if not _num_close(oc.get("cached_value"), ac.get("cached_value"), rel_tol=1e-9):
                             _add_finding(
@@ -2188,31 +2383,55 @@ def run_checks(
                                 sheet=nt_sh, cell=coord,
                             )
                             cell_flagged = True
+                            sheet_had_cell_finding = True
 
-                # Raw OOXML state verification (SST index, rich-text <si>/<is>, explicit t attr, missing vs empty <v>)
+                # Raw OOXML cell-level verification (SST index, rich-text <si>/<is>, explicit t/ph/s attrs, raw <v> text)
                 oraw = orig_raw.get(coord)
                 araw = act_raw.get(coord)
-                if not cell_flagged and oraw is not None and araw is not None:
+                if not cell_flagged:
                     xml_diffs: list[str] = []
-                    if oraw.get("t") != araw.get("t"):
-                        xml_diffs.append(f"t={oraw.get('t')!r}->{araw.get('t')!r}")
-                    if oraw.get("has_v") != araw.get("has_v") or oraw.get("v_is_empty") != araw.get("v_is_empty"):
-                        xml_diffs.append(
-                            f"v_state=(has={oraw.get('has_v')},empty={oraw.get('v_is_empty')})->(has={araw.get('has_v')},empty={araw.get('v_is_empty')})"
-                        )
-                    if oraw.get("t") == "s" and araw.get("t") == "s":
-                        if oraw.get("v") != araw.get("v"):
-                            xml_diffs.append(f"sst_index={oraw.get('v')!r}->{araw.get('v')!r}")
-                        if oraw.get("si_c14n") != araw.get("si_c14n"):
-                            xml_diffs.append("shared_string <si> rich-text XML changed")
-                    elif oraw.get("t") == "inlineStr" and araw.get("t") == "inlineStr":
-                        if oraw.get("is_c14n") != araw.get("is_c14n"):
-                            xml_diffs.append("inlineStr <is> rich-text XML changed")
+                    if oraw is not None and araw is not None:
+                        if oraw.get("t") != araw.get("t"):
+                            xml_diffs.append(f"t={oraw.get('t')!r}->{araw.get('t')!r}")
+                        if oraw.get("has_v") != araw.get("has_v") or oraw.get("v_is_empty") != araw.get("v_is_empty"):
+                            xml_diffs.append(
+                                f"v_state=(has={oraw.get('has_v')},empty={oraw.get('v_is_empty')})->(has={araw.get('has_v')},empty={araw.get('v_is_empty')})"
+                            )
+                        elif oraw.get("v") != araw.get("v"):
+                            xml_diffs.append(f"raw_v={oraw.get('v')!r}->{araw.get('v')!r}")
+                        if oraw.get("t") == "s" and araw.get("t") == "s":
+                            if oraw.get("v") != araw.get("v"):
+                                xml_diffs.append(f"sst_index={oraw.get('v')!r}->{araw.get('v')!r}")
+                            if oraw.get("si_c14n") != araw.get("si_c14n"):
+                                xml_diffs.append("shared_string <si> rich-text XML changed")
+                        elif oraw.get("t") == "inlineStr" and araw.get("t") == "inlineStr":
+                            if oraw.get("is_c14n") != araw.get("is_c14n"):
+                                xml_diffs.append("inlineStr <is> rich-text XML changed")
+                    exp_c_c14n = exp_c_map.get(coord)
+                    act_c_c14n = act_c_map.get(coord)
+                    if exp_c_c14n is not None or act_c_c14n is not None:
+                        if exp_c_c14n != act_c_c14n and not xml_diffs:
+                            xml_diffs.append("cell raw XML attributes/content changed")
                     if xml_diffs:
                         _add_finding(
                             findings, "C14", "actionable",
                             f"Non-target sheet raw OOXML cell state changed at {nt_sh}!{coord}: {', '.join(xml_diffs)}",
                             sheet=nt_sh, cell=coord,
+                        )
+                        sheet_had_cell_finding = True
+
+            # Full-sheet normalized raw XML comparison (catches ignoredErrors, cols, sheetViews, extLst, row attrs, etc.)
+            exp_sheet_bytes = expected_nt_xml.get(nt_sh)
+            act_sheet_bytes = cand_nt_xml.get(nt_sh)
+            if exp_sheet_bytes is not None and act_sheet_bytes is not None:
+                if model_xlsx_hooks.canonical_sheet_xml(exp_sheet_bytes) != model_xlsx_hooks.canonical_sheet_xml(act_sheet_bytes):
+                    elem_diffs = model_xlsx_hooks.diff_worksheet_xml_summary(exp_sheet_bytes, act_sheet_bytes)
+                    non_cell_diffs = [d for d in elem_diffs if d != "sheetData"]
+                    if non_cell_diffs or not sheet_had_cell_finding:
+                        _add_finding(
+                            findings, "C14", "actionable",
+                            f"Non-target sheet raw XML modified on {nt_sh!r} (diff elements: {', '.join(elem_diffs or ['worksheet'])})",
+                            sheet=nt_sh,
                         )
 
     # Optional 1-line notice for extLst/x14 or media/drawings (never actionable!)
@@ -2236,6 +2455,9 @@ def run_checks(
         "readable": True,
         "calc_engine": "libreoffice",
         "independent_verify": False,
+        "is_template_build": is_template_build,
+        "empty_formula_count": len(empty_target_formulas),
+        "full_calc_on_load": cand_full_calc,
         "findings": findings,
         "counts": counts,
         "optional_notices": optional_notices,
@@ -2247,6 +2469,8 @@ def _render_remaining_issues_md(
     actionable: list[dict[str, Any]],
     failed_stages: list[str],
     candidate_sha256: str | None,
+    *,
+    needs_excel_recalc_note: bool = False,
 ) -> str:
     lines = [
         "> ⚠️ **模型已按「带问题交付」完成版本登记，以下未决事项或降级阶段供审阅参考：**",
@@ -2261,6 +2485,10 @@ def _render_remaining_issues_md(
     for st in failed_stages:
         lines.append(
             f"> - `[阶段降级记录]` 阶段 `{st}` 执行失败或超时（对应候选模型 SHA-256: `{candidate_sha256 or 'unknown'}` / 前12位 `{short_sha}`）"
+        )
+    if needs_excel_recalc_note:
+        lines.append(
+            f"> - `[公式重算提示]` 复算未完成，已开启 `fullCalcOnLoad=1`，公式结果需在 Excel 中打开后重算（对应候选模型 SHA-256: `{candidate_sha256 or 'unknown'}` / 前12位 `{short_sha}`）"
         )
     return "\n".join(lines) + "\n"
 
@@ -2478,8 +2706,15 @@ def write_check_and_ledger(
     )
 
     f_stages = [s.strip() for s in (failed_stages or []) if s.strip()]
-    recalc_st = ((cm or {}).get("recalc_result") or {}).get("status")
-    if recalc_st == "recalc_failed" and "recalc" not in f_stages:
+    recalc_st = str(((cm or {}).get("recalc_result") or {}).get("status") or "").strip().lower()
+    if recalc_st in ("recalc_failed", "incomplete") and "recalc" not in f_stages:
+        f_stages.append("recalc")
+    if (
+        res.get("is_template_build")
+        and int(res.get("empty_formula_count") or 0) > 0
+        and recalc_st == "skipped"
+        and "recalc" not in f_stages
+    ):
         f_stages.append("recalc")
 
     # Principle #4: if consensus-diff.{json,md} was not generated for the current candidate,
@@ -2508,12 +2743,22 @@ def write_check_and_ledger(
     review_pack_path.write_text(_render_review_pack_md(res, ticker, summary_10), encoding="utf-8")
 
     has_open = (len(actionable_list) > 0) or (len(f_stages) > 0)
+    needs_excel_recalc_note = ("recalc" in f_stages) and bool(
+        res.get("is_template_build")
+        or int(res.get("empty_formula_count") or 0) > 0
+        or res.get("full_calc_on_load")
+    )
     if not res["readable"]:
         final_status = "failed_unusable"
     elif has_open:
         final_status = "delivered_with_open_issues"
         rem_path.write_text(
-            _render_remaining_issues_md(actionable_list, f_stages, res["candidate_sha256"]),
+            _render_remaining_issues_md(
+                actionable_list,
+                f_stages,
+                res["candidate_sha256"],
+                needs_excel_recalc_note=needs_excel_recalc_note,
+            ),
             encoding="utf-8",
         )
     else:
@@ -2687,7 +2932,14 @@ def write_fallback_ledger(
     rounds.append(round_entry)
 
     final_status = "delivered_with_open_issues" if ok_read else "failed_unusable"
-    rem_text = _render_remaining_issues_md([], f_stages, cand_sha)
+    needs_excel_recalc_fb = False
+    if ok_read and "recalc" in f_stages:
+        try:
+            xml_m = model_fingerprint._read_xml_metadata(cand)
+            needs_excel_recalc_fb = bool((xml_m.get("calc_properties") or {}).get("full_calc_on_load"))
+        except Exception:
+            needs_excel_recalc_fb = False
+    rem_text = _render_remaining_issues_md([], f_stages, cand_sha, needs_excel_recalc_note=needs_excel_recalc_fb)
     if reason:
         rem_text += f"> - `[补充说明]` {reason}\n"
     if not ok_read:

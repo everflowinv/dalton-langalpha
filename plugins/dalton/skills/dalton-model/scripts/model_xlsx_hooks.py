@@ -145,22 +145,107 @@ _CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
 _PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 _SST_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings"
 _SST_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"
+_WS_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+_WS_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"
+_STYLES_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"
+_STYLES_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"
+_STYLE_SECTION_ORDER = (
+    "numFmts",
+    "fonts",
+    "fills",
+    "borders",
+    "cellStyleXfs",
+    "cellXfs",
+    "cellStyles",
+    "dxfs",
+    "tableStyles",
+    "colors",
+    "extLst",
+)
 
 
-def _normalize_sml_tree(el: Any) -> Any:
+def set_full_calc_on_load(xlsx_path: str | Path, enabled: bool) -> None:
+    """Atomically set or clear ``fullCalcOnLoad="1"`` on ``xl/workbook.xml`` ``<calcPr>``."""
+    target = Path(xlsx_path).expanduser().resolve()
+    infos, payload = _read_package(target)
+    wb_root = etree.fromstring(payload["xl/workbook.xml"], _XML)
+    calc = wb_root.find(f"{{{_SML}}}calcPr")
+    if calc is None:
+        if not enabled:
+            return
+        calc = etree.SubElement(wb_root, f"{{{_SML}}}calcPr")
+    if enabled:
+        calc.set("fullCalcOnLoad", "1")
+    elif "fullCalcOnLoad" in calc.attrib:
+        del calc.attrib["fullCalcOnLoad"]
+    payload["xl/workbook.xml"] = etree.tostring(wb_root, encoding="UTF-8", xml_declaration=True)
+    tmp = target.with_name(target.name + ".fcol.tmp")
+    with zipfile.ZipFile(tmp, "w") as zout:
+        for info in infos:
+            zout.writestr(info, payload[info.filename], compress_type=info.compress_type)
+    os.replace(tmp, target)
+
+
+def _normalize_sml_tree(el: Any, *, strip_container_ws: bool = False) -> Any:
     """Clone an OOXML subtree with canonical default SpreadsheetML namespace to ignore prefix aliases."""
     nsmap = {None: _SML} if str(el.tag).startswith(f"{{{_SML}}}") else el.nsmap
     cloned = etree.Element(el.tag, attrib=dict(el.attrib), nsmap=nsmap)
-    cloned.text = el.text
-    cloned.tail = el.tail
-    for child in el:
-        cloned.append(_normalize_sml_tree(child))
+    elem_children = [c for c in el if isinstance(c.tag, str)]
+    if strip_container_ws and elem_children and el.tag != f"{{{_SML}}}t":
+        cloned.text = None if (el.text is None or not el.text.strip()) else el.text
+    else:
+        cloned.text = el.text
+    if strip_container_ws:
+        cloned.tail = None if (el.tail is None or not el.tail.strip()) else el.tail
+    else:
+        cloned.tail = el.tail
+    for child in elem_children:
+        cloned.append(_normalize_sml_tree(child, strip_container_ws=strip_container_ws))
     return cloned
 
 
 def _canonical_xml(el: Any) -> bytes:
-    """Deterministic canonical XML bytes for exact ``<si>`` / ``<is>`` rich-text comparison."""
-    return etree.tostring(_normalize_sml_tree(el), method="c14n")
+    """Deterministic canonical XML bytes for exact ``<si>`` / ``<is>`` / element comparison."""
+    return etree.tostring(_normalize_sml_tree(el), method="c14n", exclusive=True)
+
+
+def canonical_sheet_xml(raw_xml: bytes) -> bytes:
+    """Return Exclusive-C14N canonical XML bytes for a complete worksheet XML document."""
+    root = etree.fromstring(raw_xml, _XML)
+    return etree.tostring(_normalize_sml_tree(root, strip_container_ws=True), method="c14n", exclusive=True)
+
+
+def diff_worksheet_xml_summary(expected_xml: bytes, actual_xml: bytes) -> list[str]:
+    """Identify which top-level worksheet elements or cell XML nodes differ between two worksheet XMLs."""
+    exp_root = etree.fromstring(expected_xml, _XML)
+    act_root = etree.fromstring(actual_xml, _XML)
+    diffs: list[str] = []
+
+    if dict(exp_root.attrib) != dict(act_root.attrib):
+        diffs.append("worksheet attributes")
+
+    exp_children = [c for c in exp_root if isinstance(c.tag, str)]
+    act_children = [c for c in act_root if isinstance(c.tag, str)]
+    exp_by_tag: dict[str, list[Any]] = {}
+    act_by_tag: dict[str, list[Any]] = {}
+    for ch in exp_children:
+        local = etree.QName(ch.tag).localname
+        exp_by_tag.setdefault(local, []).append(ch)
+    for ch in act_children:
+        local = etree.QName(ch.tag).localname
+        act_by_tag.setdefault(local, []).append(ch)
+
+    for tag_name in sorted(set(exp_by_tag) | set(act_by_tag)):
+        e_list = exp_by_tag.get(tag_name, [])
+        a_list = act_by_tag.get(tag_name, [])
+        e_c14n = [etree.tostring(_normalize_sml_tree(x, strip_container_ws=True), method="c14n", exclusive=True) for x in e_list]
+        a_c14n = [etree.tostring(_normalize_sml_tree(x, strip_container_ws=True), method="c14n", exclusive=True) for x in a_list]
+        if e_c14n != a_c14n:
+            diffs.append(tag_name)
+
+    if not diffs and canonical_sheet_xml(expected_xml) != canonical_sheet_xml(actual_xml):
+        diffs.append("element_order_or_root")
+    return diffs
 
 
 def _is_plain_si(si_el: Any) -> bool:
@@ -335,6 +420,411 @@ class _SharedStringsMutator:
                 )
 
 
+class _StylesMutator:
+    """Append-only merger for ``xl/styles.xml`` that keeps donor indices ``0..donor_count-1`` immutable."""
+
+    def __init__(self, infos: list[zipfile.ZipInfo], payload: dict[str, bytes]) -> None:
+        self._infos = infos
+        self._payload = payload
+        self._seed_raw: bytes | None = payload.get("xl/styles.xml")
+        self._appended = False
+        self._root: Any = (
+            etree.fromstring(self._seed_raw, _XML)
+            if self._seed_raw
+            else etree.Element(f"{{{_SML}}}styleSheet", nsmap={None: _SML})
+        )
+
+        # Index existing custom numFmts by formatCode and track max numFmtId >= 163
+        self._numfmt_by_code: dict[str, int] = {}
+        self._max_numfmt_id = 163
+        nf_container = self._root.find(f"{{{_SML}}}numFmts")
+        if nf_container is not None:
+            for nf in nf_container.findall(f"{{{_SML}}}numFmt"):
+                nid_s = nf.get("numFmtId") or ""
+                code = nf.get("formatCode")
+                if nid_s.isdigit():
+                    nid = int(nid_s)
+                    self._max_numfmt_id = max(self._max_numfmt_id, nid)
+                    if code is not None:
+                        self._numfmt_by_code.setdefault(code, nid)
+
+        # Index indexed table sections by canonical XML
+        self._section_index: dict[str, dict[bytes, int]] = {}
+        self._section_count: dict[str, int] = {}
+        for sec, item_tag in (
+            ("fonts", "font"),
+            ("fills", "fill"),
+            ("borders", "border"),
+            ("cellXfs", "xf"),
+            ("dxfs", "dxf"),
+        ):
+            idx_map: dict[bytes, int] = {}
+            cont = self._root.find(f"{{{_SML}}}{sec}")
+            items = list(cont.findall(f"{{{_SML}}}{item_tag}")) if cont is not None else []
+            for i, el in enumerate(items):
+                idx_map.setdefault(_canonical_xml(el), i)
+            self._section_index[sec] = idx_map
+            self._section_count[sec] = len(items)
+
+        csx_cont = self._root.find(f"{{{_SML}}}cellStyleXfs")
+        self._cell_style_xfs_count = (
+            len(csx_cont.findall(f"{{{_SML}}}xf")) if csx_cont is not None else 0
+        )
+
+    def _ensure_section(self, sec_name: str) -> Any:
+        cont = self._root.find(f"{{{_SML}}}{sec_name}")
+        if cont is not None:
+            return cont
+        cont = etree.Element(f"{{{_SML}}}{sec_name}", count="0")
+        want_pos = _STYLE_SECTION_ORDER.index(sec_name) if sec_name in _STYLE_SECTION_ORDER else len(_STYLE_SECTION_ORDER)
+        insert_at = len(self._root)
+        for idx, ch in enumerate(self._root):
+            if not isinstance(ch.tag, str):
+                continue
+            loc = etree.QName(ch.tag).localname
+            pos = _STYLE_SECTION_ORDER.index(loc) if loc in _STYLE_SECTION_ORDER else len(_STYLE_SECTION_ORDER)
+            if pos > want_pos:
+                insert_at = idx
+                break
+        self._root.insert(insert_at, cont)
+        self._appended = True
+        return cont
+
+    def intern_numfmt(self, format_code: str) -> int:
+        existing = self._numfmt_by_code.get(format_code)
+        if existing is not None:
+            return existing
+        cont = self._ensure_section("numFmts")
+        self._max_numfmt_id += 1
+        new_id = self._max_numfmt_id
+        etree.SubElement(
+            cont,
+            f"{{{_SML}}}numFmt",
+            numFmtId=str(new_id),
+            formatCode=format_code,
+        )
+        cont.set("count", str(len(cont.findall(f"{{{_SML}}}numFmt"))))
+        self._numfmt_by_code[format_code] = new_id
+        self._appended = True
+        return new_id
+
+    def intern_section_item(self, sec_name: str, item_tag: str, el: Any) -> int:
+        c14n = _canonical_xml(el)
+        idx_map = self._section_index[sec_name]
+        existing = idx_map.get(c14n)
+        if existing is not None:
+            return existing
+        cont = self._ensure_section(sec_name)
+        cloned = etree.fromstring(etree.tostring(el, encoding="UTF-8"), _XML)
+        idx = self._section_count[sec_name]
+        cont.append(cloned)
+        self._section_count[sec_name] = idx + 1
+        cont.set("count", str(idx + 1))
+        idx_map[c14n] = idx
+        self._appended = True
+        return idx
+
+    def build_remappers(
+        self,
+        edited_styles_raw: bytes | None,
+    ) -> tuple[dict[int, int], dict[int, int]]:
+        """Return ``(xf_map, dxf_map)`` mapping ``edited`` indices into this donor-seeded stylesheet."""
+        if not edited_styles_raw:
+            return {}, {}
+        ed_root = etree.fromstring(edited_styles_raw, _XML)
+
+        ed_numfmts: dict[int, str] = {}
+        ed_nf_cont = ed_root.find(f"{{{_SML}}}numFmts")
+        if ed_nf_cont is not None:
+            for nf in ed_nf_cont.findall(f"{{{_SML}}}numFmt"):
+                nid_s = nf.get("numFmtId") or ""
+                code = nf.get("formatCode")
+                if nid_s.isdigit() and code is not None:
+                    ed_numfmts[int(nid_s)] = code
+
+        def _extract_list(sec: str, tag_l: str) -> list[Any]:
+            c = ed_root.find(f"{{{_SML}}}{sec}")
+            return list(c.findall(f"{{{_SML}}}{tag_l}")) if c is not None else []
+
+        ed_fonts = _extract_list("fonts", "font")
+        ed_fills = _extract_list("fills", "fill")
+        ed_borders = _extract_list("borders", "border")
+        ed_xfs = _extract_list("cellXfs", "xf")
+        ed_dxfs = _extract_list("dxfs", "dxf")
+
+        font_cache: dict[int, int] = {}
+        fill_cache: dict[int, int] = {}
+        border_cache: dict[int, int] = {}
+        xf_map: dict[int, int] = {}
+        dxf_map: dict[int, int] = {}
+
+        for old_i, xf_el in enumerate(ed_xfs):
+            cloned = etree.fromstring(etree.tostring(xf_el, encoding="UTF-8"), _XML)
+            nf_s = cloned.get("numFmtId")
+            if nf_s and nf_s.isdigit():
+                nf_id = int(nf_s)
+                if nf_id >= 164 and nf_id in ed_numfmts:
+                    cloned.set("numFmtId", str(self.intern_numfmt(ed_numfmts[nf_id])))
+            f_s = cloned.get("fontId")
+            if f_s and f_s.isdigit():
+                fi = int(f_s)
+                if 0 <= fi < len(ed_fonts):
+                    if fi not in font_cache:
+                        font_cache[fi] = self.intern_section_item("fonts", "font", ed_fonts[fi])
+                    cloned.set("fontId", str(font_cache[fi]))
+            fl_s = cloned.get("fillId")
+            if fl_s and fl_s.isdigit():
+                fli = int(fl_s)
+                if 0 <= fli < len(ed_fills):
+                    if fli not in fill_cache:
+                        fill_cache[fli] = self.intern_section_item("fills", "fill", ed_fills[fli])
+                    cloned.set("fillId", str(fill_cache[fli]))
+            b_s = cloned.get("borderId")
+            if b_s and b_s.isdigit():
+                bi = int(b_s)
+                if 0 <= bi < len(ed_borders):
+                    if bi not in border_cache:
+                        border_cache[bi] = self.intern_section_item("borders", "border", ed_borders[bi])
+                    cloned.set("borderId", str(border_cache[bi]))
+            xf_id_s = cloned.get("xfId")
+            if xf_id_s and xf_id_s.isdigit():
+                if self._cell_style_xfs_count <= 0:
+                    del cloned.attrib["xfId"]
+                elif int(xf_id_s) >= self._cell_style_xfs_count:
+                    cloned.set("xfId", "0")
+            xf_map[old_i] = self.intern_section_item("cellXfs", "xf", cloned)
+
+        for old_di, dxf_el in enumerate(ed_dxfs):
+            dxf_map[old_di] = self.intern_section_item("dxfs", "dxf", dxf_el)
+
+        return xf_map, dxf_map
+
+    def flush(self) -> None:
+        if not self._appended and self._seed_raw is not None:
+            return
+        if "xl/styles.xml" not in self._payload and not any(
+            i.filename == "xl/styles.xml" for i in self._infos
+        ):
+            zi = zipfile.ZipInfo("xl/styles.xml")
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            self._infos.append(zi)
+        self._payload["xl/styles.xml"] = etree.tostring(
+            self._root, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+
+
+def _worksheet_rels_path(sheet_part: str) -> str:
+    import posixpath
+
+    d = posixpath.dirname(sheet_part)
+    b = posixpath.basename(sheet_part)
+    return posixpath.join(d, "_rels", f"{b}.rels")
+
+
+def _register_new_sheet_in_donor(
+    donor_infos: list[zipfile.ZipInfo],
+    donor_payload: dict[str, bytes],
+    sheet_name: str,
+) -> str:
+    """Register a newly created worksheet part in donor's workbook.xml, workbook.xml.rels, and [Content_Types].xml."""
+    existing_parts = set(donor_payload)
+    n = 1
+    while f"xl/worksheets/sheet{n}.xml" in existing_parts:
+        n += 1
+    new_part = f"xl/worksheets/sheet{n}.xml"
+    zi = zipfile.ZipInfo(new_part)
+    zi.compress_type = zipfile.ZIP_DEFLATED
+    donor_infos.append(zi)
+
+    # Register in xl/_rels/workbook.xml.rels
+    rels_root = etree.fromstring(donor_payload["xl/_rels/workbook.xml.rels"], _XML)
+    used_rids = {r.get("Id") or "" for r in rels_root.findall(f"{{{_PKG_REL_NS}}}Relationship")}
+    rid_n = 1
+    while f"rId{rid_n}" in used_rids:
+        rid_n += 1
+    new_rid = f"rId{rid_n}"
+    etree.SubElement(
+        rels_root,
+        f"{{{_PKG_REL_NS}}}Relationship",
+        Id=new_rid,
+        Type=_WS_REL_TYPE,
+        Target=f"worksheets/sheet{n}.xml",
+    )
+    donor_payload["xl/_rels/workbook.xml.rels"] = etree.tostring(
+        rels_root, xml_declaration=True, encoding="UTF-8", standalone=True
+    )
+
+    # Register in xl/workbook.xml
+    wb_root = etree.fromstring(donor_payload["xl/workbook.xml"], _XML)
+    sheets_el = wb_root.find(f"{{{_SML}}}sheets")
+    if sheets_el is None:
+        sheets_el = etree.SubElement(wb_root, f"{{{_SML}}}sheets")
+    used_sids = {
+        int(s.get("sheetId"))
+        for s in sheets_el.findall(f"{{{_SML}}}sheet")
+        if (s.get("sheetId") or "").isdigit()
+    }
+    new_sid = max(used_sids, default=0) + 1
+    sh_el = etree.SubElement(sheets_el, f"{{{_SML}}}sheet", name=sheet_name, sheetId=str(new_sid))
+    sh_el.set(_REL_ID, new_rid)
+    donor_payload["xl/workbook.xml"] = etree.tostring(
+        wb_root, xml_declaration=True, encoding="UTF-8", standalone=True
+    )
+
+    # Register Override in [Content_Types].xml
+    ct_raw = donor_payload.get("[Content_Types].xml")
+    if ct_raw:
+        ct_root = etree.fromstring(ct_raw, _XML)
+        part_name = f"/{new_part}"
+        if not any(ov.get("PartName") == part_name for ov in ct_root.findall(f"{{{_CT_NS}}}Override")):
+            etree.SubElement(
+                ct_root,
+                f"{{{_CT_NS}}}Override",
+                PartName=part_name,
+                ContentType=_WS_CONTENT_TYPE,
+            )
+            donor_payload["[Content_Types].xml"] = etree.tostring(
+                ct_root, xml_declaration=True, encoding="UTF-8", standalone=True
+            )
+
+    return new_part
+
+
+def merge_edited_sheets_into_donor(
+    donor_path: str | Path,
+    edited_path: str | Path,
+    output_path: str | Path,
+    modified_sheets: set[str] | list[str],
+) -> dict[str, Any]:
+    """Merge ONLY ``modified_sheets`` from openpyxl's ``edited_path`` back into ``donor_path``'s package.
+
+    All sheets not listed in ``modified_sheets`` (including every non-target company sheet) remain
+    BYTE-FOR-BYTE identical to ``donor_path``, including ``<ignoredErrors>``, cell ``ph``/``cm``/``vm``
+    attributes, raw ``<v>`` formatting, ``s`` style indices, SST indices, drawings, and rels.
+    """
+    import posixpath
+
+    donor_p = Path(donor_path).expanduser().resolve()
+    edited_p = Path(edited_path).expanduser().resolve()
+    out_p = Path(output_path).expanduser().resolve()
+
+    donor_infos, donor_payload = _read_package(donor_p)
+    _, edited_payload = _read_package(edited_p)
+
+    donor_parts = _sheet_parts(donor_payload)
+    edited_parts = _sheet_parts(edited_payload)
+
+    styles_mut = _StylesMutator(donor_infos, donor_payload)
+    xf_map, dxf_map = styles_mut.build_remappers(edited_payload.get("xl/styles.xml"))
+
+    edited_sis = _read_shared_string_elements(edited_payload)
+    sst_mut = _SharedStringsMutator(
+        donor_infos,
+        donor_payload,
+        seed_raw=donor_payload.get("xl/sharedStrings.xml"),
+    )
+
+    merged_sheets: list[str] = []
+    for sh_name in sorted(set(modified_sheets)):
+        ed_part = edited_parts.get(sh_name)
+        if not ed_part or ed_part not in edited_payload:
+            continue
+        d_part = donor_parts.get(sh_name)
+        if d_part is None:
+            d_part = _register_new_sheet_in_donor(donor_infos, donor_payload, sh_name)
+            donor_parts[sh_name] = d_part
+
+        sh_root = etree.fromstring(edited_payload[ed_part], _XML)
+
+        # Remap style indices on modified sheet from openpyxl's stylesheet into donor-seeded stylesheet
+        if xf_map:
+            for el in sh_root.iter(f"{{{_SML}}}c"):
+                s_val = el.get("s")
+                if s_val and s_val.isdigit():
+                    mapped_s = xf_map.get(int(s_val))
+                    if mapped_s is not None:
+                        el.set("s", str(mapped_s))
+            for el in sh_root.iter(f"{{{_SML}}}row"):
+                s_val = el.get("s")
+                if s_val and s_val.isdigit():
+                    mapped_s = xf_map.get(int(s_val))
+                    if mapped_s is not None:
+                        el.set("s", str(mapped_s))
+            for el in sh_root.iter(f"{{{_SML}}}col"):
+                st_val = el.get("style")
+                if st_val and st_val.isdigit():
+                    mapped_s = xf_map.get(int(st_val))
+                    if mapped_s is not None:
+                        el.set("style", str(mapped_s))
+        if dxf_map:
+            for el in sh_root.iter(f"{{{_SML}}}cfRule"):
+                d_val = el.get("dxfId")
+                if d_val and d_val.isdigit():
+                    mapped_d = dxf_map.get(int(d_val))
+                    if mapped_d is not None:
+                        el.set("dxfId", str(mapped_d))
+
+        # Remap shared-string indices on modified sheet into donor-seeded SST
+        if edited_sis:
+            for c_el in sh_root.iter(f"{{{_SML}}}c"):
+                if c_el.get("t") != "s":
+                    continue
+                v_el = c_el.find(f"{{{_SML}}}v")
+                if v_el is not None and (v_el.text or "").isdigit():
+                    old_idx = int(v_el.text)
+                    if 0 <= old_idx < len(edited_sis):
+                        new_idx = sst_mut.intern_si(edited_sis[old_idx])
+                        v_el.text = str(new_idx)
+
+        donor_payload[d_part] = etree.tostring(
+            sh_root, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+
+        # If modified sheet carries a _rels file in edited package, sync any referenced target parts
+        ed_rels_part = _worksheet_rels_path(ed_part)
+        if ed_rels_part in edited_payload:
+            d_rels_part = _worksheet_rels_path(d_part)
+            if d_rels_part not in donor_payload and not any(i.filename == d_rels_part for i in donor_infos):
+                zi_r = zipfile.ZipInfo(d_rels_part)
+                zi_r.compress_type = zipfile.ZIP_DEFLATED
+                donor_infos.append(zi_r)
+            donor_payload[d_rels_part] = edited_payload[ed_rels_part]
+            ed_rels_root = etree.fromstring(edited_payload[ed_rels_part], _XML)
+            for rel in ed_rels_root.findall(f"{{{_PKG_REL_NS}}}Relationship"):
+                if (rel.get("TargetMode") or "").lower() == "external":
+                    continue
+                tgt = rel.get("Target") or ""
+                if not tgt:
+                    continue
+                resolved_tgt = (
+                    tgt.lstrip("/")
+                    if tgt.startswith("/")
+                    else posixpath.normpath(posixpath.join(posixpath.dirname(ed_part), tgt))
+                )
+                if resolved_tgt in edited_payload and resolved_tgt not in donor_payload:
+                    zi_t = zipfile.ZipInfo(resolved_tgt)
+                    zi_t.compress_type = zipfile.ZIP_DEFLATED
+                    donor_infos.append(zi_t)
+                    donor_payload[resolved_tgt] = edited_payload[resolved_tgt]
+
+        merged_sheets.append(sh_name)
+
+    styles_mut.flush()
+    sst_mut.flush()
+
+    tmp = out_p.with_name(out_p.name + ".merge.tmp")
+    with zipfile.ZipFile(tmp, "w") as zout:
+        for info in donor_infos:
+            zout.writestr(info, donor_payload[info.filename], compress_type=info.compress_type)
+    os.replace(tmp, out_p)
+
+    return {
+        "status": "ok",
+        "merged_sheets": merged_sheets,
+        "preserved_sheets": sorted(s for s in donor_parts if s not in set(merged_sheets)),
+    }
+
+
 def extract_raw_xml_cell_states(
     xlsx_path: str | Path,
     sheet_names: set[str] | None = None,
@@ -406,6 +896,8 @@ def extract_raw_xml_cell_states(
                 "si_c14n": si_c14n,
                 "is_xml": is_xml,
                 "is_c14n": is_c14n,
+                "c_c14n": _canonical_xml(c),
+                "attrib": dict(c.attrib),
                 "xml_bytes": etree.tostring(c, encoding="UTF-8"),
             }
         out[name] = cells
@@ -708,6 +1200,7 @@ def restore_donor_cache(
     }
 
     _, donor_payload = _read_package(donor)
+    donor_parts = _sheet_parts(donor_payload)
     donor_sst_raw = donor_payload.get("xl/sharedStrings.xml")
     donor_cells = _extract_donor_cells(donor)
     infos, payload = _read_package(target)
@@ -733,9 +1226,14 @@ def restore_donor_cache(
     for name, part in _sheet_parts(payload).items():
         if part not in payload:
             continue
+        is_skip_sheet = name in skip_sheets
+        if is_skip_sheet:
+            donor_part = donor_parts.get(name)
+            if donor_part and donor_part in donor_payload and payload.get(part) == donor_payload[donor_part]:
+                # Already byte-for-byte identical to post-insert donor: do NOT re-serialize!
+                continue
         donor_sheet = donor_cells.get(name) or {}
         root = etree.fromstring(payload[part], _XML)
-        is_skip_sheet = name in skip_sheets
         sheet_skip_cells = skip_cells.get(name, set())
         sheet_exempt_down = exempt_downstream.get(name, set())
         sheet_touched_f = touched_formulas.get(name, set())
@@ -868,8 +1366,8 @@ def _transfer_values_selective(
     values: dict[str, dict[str, tuple[str | None, str | None]]],
     formulas: dict[tuple[str, str], str],
     spec: dict[str, Any],
-) -> tuple[int, int, int, int, list[str], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Selectively merge LibreOffice values ONLY for round-affected formulas; keep donor caches intact."""
+) -> tuple[int, int, int, int, list[str], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, str]]]:
+    """Selectively merge LibreOffice values for round-affected formulas (and template builds); keep donor caches intact."""
     skip_sheets = set(spec.get("skip_sheets") or ())
     skip_cells = {
         str(sh): {str(coord).upper() for coord in (coords or ())}
@@ -888,6 +1386,7 @@ def _transfer_values_selective(
         str(sh): {str(coord).upper() for coord in (coords or ())}
         for sh, coords in (spec.get("recalc_target_cells") or {}).items()
     }
+    backfill_empty_formulas = bool(spec.get("backfill_empty_formulas", False))
     skip_error_writeback = bool(spec.get("skip_error_writeback", True))
 
     infos, payload = recalc_mod.read_package(src)
@@ -896,13 +1395,14 @@ def _transfer_values_selective(
     kept_on_error = 0
     recalc_errors: list[dict[str, Any]] = []
     downstream_exempt_diffs: list[dict[str, Any]] = []
+    unmatched_cells: list[dict[str, str]] = []
 
     for name, part in recalc_mod.sheet_parts(payload).items():
         if part not in payload:
             continue
+        is_skip_sheet = name in skip_sheets
         root = etree.fromstring(payload[part], _XML)
         sheet_values = values.get(name, {})
-        is_skip_sheet = name in skip_sheets
         sheet_skip_cells = skip_cells.get(name, set())
         sheet_exempt_down = exempt_downstream.get(name, set())
         sheet_touched_f = touched_formulas.get(name, set())
@@ -918,10 +1418,21 @@ def _transfer_values_selective(
             is_direct_exempt = is_skip_sheet or (ref_u in sheet_skip_cells)
             is_down_exempt = (not is_direct_exempt) and (ref_u in sheet_exempt_down)
             exempt = is_direct_exempt or is_down_exempt
+
+            is_touched_f = ref_u in sheet_touched_f
+            is_downstream_target = has_recalc_targets and (ref_u in sheet_targets)
+            if has_recalc_targets:
+                is_target = is_touched_f or is_downstream_target or backfill_empty_formulas
+            elif "touched_formula_cells" in spec:
+                is_target = is_touched_f or backfill_empty_formulas
+            else:
+                is_target = True
+
             got = sheet_values.get(ref) or sheet_values.get(ref_u)
             if got is None or got[1] is None:
-                if not exempt and (not has_recalc_targets or ref_u in sheet_targets or ref_u in sheet_touched_f):
+                if not exempt and is_target:
                     unmatched += 1
+                    unmatched_cells.append({"sheet": name, "cell": ref})
                 continue
             t, text = got
             is_err = _is_error_value(recalc_mod, t, text)
@@ -972,25 +1483,14 @@ def _transfer_values_selective(
                 continue
 
             # Non-exempt formula on target sheet:
-            # ONLY write for formulas newly added/modified this round (touched_formula_cells)
-            # or explicitly downstream of a modified input (recalc_target_cells); NEVER backfill
-            # untouched missing-cache formulas!
-            is_touched_f = ref_u in sheet_touched_f
-            if has_recalc_targets:
-                is_target = is_touched_f or (ref_u in sheet_targets)
-            elif "touched_formula_cells" in spec:
-                is_target = is_touched_f
-            else:
-                is_target = True
             if not is_target:
                 continue
 
             if is_err:
-                # ONLY newly added/modified formulas leave their computed error value in <c>
-                # (so C13 flags them actionable). Unmodified downstream formulas with non-empty
-                # donor <v> keep their donor <v>, and missing-cache unmodified formulas are NOT
-                # polluted with error values; errors are still collected for C13 classification.
-                if is_touched_f or (not skip_error_writeback):
+                # ONLY newly added/modified formulas (or template-build empty formulas) leave their
+                # computed error value in <c> so C13 flags them actionable. Unmodified downstream
+                # formulas with non-empty donor <v> keep their donor <v>.
+                if is_touched_f or (not skip_error_writeback) or (backfill_empty_formulas and not has_donor):
                     recalc_errors.append(
                         {
                             "sheet": name,
@@ -1020,8 +1520,10 @@ def _transfer_values_selective(
                     kept_on_error += 1
                 continue
 
-            # For unmodified formulas that had NO donor cache, do not backfill 0 / stale values
-            if not is_touched_f and not has_donor:
+            # For legacy callers without recalc_target_cells/backfill_empty_formulas, do not backfill
+            # untouched missing-cache formulas; DO write valid results for touched formulas,
+            # round-affected downstream targets (recalc_target_cells), and template builds!
+            if not is_touched_f and not is_downstream_target and not backfill_empty_formulas and not has_donor:
                 continue
 
             _apply_cached_value(c, t, text)
@@ -1047,6 +1549,7 @@ def _transfer_values_selective(
         chart_refs_skipped,
         recalc_errors,
         downstream_exempt_diffs,
+        unmatched_cells,
     )
 
 
@@ -1173,6 +1676,7 @@ def recalculate_keep_cache(
             chart_refs_skipped,
             recalc_errors,
             downstream_exempt_diffs,
+            unmatched_cells,
         ) = _transfer_values_selective(recalc_mod, src, patched, values, formulas, spec)
         kept_cache_count += kept_on_error
 
@@ -1188,8 +1692,14 @@ def recalculate_keep_cache(
         code = str(err.get("error") or "#ERROR!")
         summary[code] = summary.get(code, 0) + 1
 
+    final_status = (
+        "incomplete"
+        if unmatched > 0
+        else ("errors_found" if non_exempt_errors else "success")
+    )
+
     return {
-        "status": "errors_found" if non_exempt_errors else "success",
+        "status": final_status,
         "file": str(src),
         "total_formulas": len(formulas),
         "total_errors": len(recalc_errors),
@@ -1197,6 +1707,7 @@ def recalculate_keep_cache(
         "error_summary": summary,
         "errors": recalc_errors[: recalc_mod.MAX_LISTED],
         "downstream_exempt_diffs": downstream_exempt_diffs[: recalc_mod.MAX_LISTED],
+        "unmatched_cells": unmatched_cells[: recalc_mod.MAX_LISTED],
         "truncated": len(recalc_errors) > recalc_mod.MAX_LISTED,
         "values_written": written,
         "unmatched": unmatched,
