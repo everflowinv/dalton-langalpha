@@ -38,10 +38,10 @@ import { useChatMessages } from '../useChatMessages';
 import type { ModelOptions } from '../../session/types';
 
 const mockSendStream = sendChatMessageStream as Mock;
-// DALTON-HOOK(antigravity-series): constrain HITL resume mock to the real sendHitlResponse signature
+// DALTON-HOOK(antigravity-series): constrain HITL resume & liveness mocks to their real API signatures
 const mockSendHitl = vi.mocked(sendHitlResponse);
 const mockGetWorkflowStatus = getWorkflowStatus as Mock;
-const mockGetHandoffLiveness = getHandoffLiveness as Mock;
+const mockGetHandoffLiveness = vi.mocked(getHandoffLiveness);
 const mockReconnectStream = reconnectToWorkflowStream as Mock;
 const mockReplayHistory = replayThreadHistory as Mock;
 
@@ -279,23 +279,24 @@ describe('useChatMessages: HITL resume freshness', () => {
       '',
     ].join('\n');
     const originalFetch = globalThis.fetch;
-    const fetchSpy = vi.fn().mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      headers: new Headers({
-        'Content-Location': '/api/v1/threads/thread-1/messages/stream?run_id=run-pre-db-fail',
-      }),
-      body: {
-        getReader: () => {
-          let sent = false;
-          const bytes = new TextEncoder().encode(rawRetrySse);
-          return {
-            read: async () => (sent ? { done: true, value: undefined } : ((sent = true), { done: false, value: bytes })),
-          };
-        },
+    // DALTON-HOOK(antigravity-series): type fetch double against real fetch signature with real Response/ReadableStream
+    const { ReadableStream: StreamCtor } = await import('node:stream/web');
+    const sseStream = new StreamCtor<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(rawRetrySse));
+        controller.close();
       },
     });
-    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      new Response(sseStream as ReadableStream<Uint8Array>, {
+        status: 200,
+        headers: {
+          'Content-Location': '/api/v1/threads/thread-1/messages/stream?run_id=run-pre-db-fail',
+          'Content-Type': 'text/event-stream',
+        },
+      }),
+    );
+    globalThis.fetch = fetchSpy;
 
     const observedAdmitted: Array<boolean | undefined> = [];
     const capturedKeys: Array<string | null | undefined> = [];

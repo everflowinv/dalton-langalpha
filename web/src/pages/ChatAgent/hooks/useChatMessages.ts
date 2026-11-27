@@ -15,6 +15,7 @@ import {
   applyAdoptedDuplicateTurnModel,
   createHitlResumeModelGuard,
   createTurnModelTracker,
+  handleHitlResumeDisconnect,
   markHitlBubbleUnadmitted,
   type ActiveTurnModel,
 } from '@/lib/dalton/turnAdmission';
@@ -252,10 +253,13 @@ export function useChatMessages(
   // DALTON-HOOK(antigravity-series): track active turn model, created thread id, & per-requestKey first-submitted pick in Dalton builds
   const [activeTurnModel, setActiveTurnModel] = useState<ActiveTurnModel | null>(null);
   const [createdThreadId, setCreatedThreadId] = useState<string | null>(null);
+  const renderedThreadIdRef = useRef(threadId);
+  renderedThreadIdRef.current = threadId;
   const turnModelTrackerRef = useRef(createTurnModelTracker());
   const setThreadIdFromSend: React.Dispatch<React.SetStateAction<string>> = useCallback((next) => {
-    const resolved = typeof next === 'function' ? next(threadIdRef.current) : next;
-    if (isDaltonBuild && (!threadIdRef.current || threadIdRef.current === '__default__') && resolved && resolved !== '__default__') {
+    const prev = renderedThreadIdRef.current;
+    const resolved = typeof next === 'function' ? next(prev) : next;
+    if (isDaltonBuild && (!prev || prev === '__default__') && resolved && resolved !== '__default__') {
       setCreatedThreadId(resolved);
     }
     setThreadId(resolved);
@@ -3698,15 +3702,12 @@ export function useChatMessages(
         return;
       }
 
-      // DALTON-HOOK(antigravity-series): verify pre-first-frame disconnect, unstarted resend, or empty close before confirming or reloading
-      if ((result?.disconnected || refs.retryNotice?.recovery === 'resend' || resumeModelGuard.isUnadmittedCleanEnd()) && !notice) {
-        const outcome = await resumeModelGuard.verifyDisconnect(result?.contentLocation, refs.retryNotice?.recovery === 'resend', latchAdmittedRun);
-        if (outcome === 'unadmitted') { markHitlBubbleUnadmitted(setMessages, assistantMessageId, true); return; }
-        wasDisconnected = true;
-        if (outcome === 'confirmed_reconnect') admitted = true; else pauseGone = true;
-        attemptReconnectAfterDisconnect(assistantMessageId);
-        return;
-      }
+      // DALTON-HOOK(antigravity-series): delegate pre-first-frame disconnect, unstarted resend, or empty close verification to Dalton module
+      const disconnect = await handleHitlResumeDisconnect(resumeModelGuard, {
+        disconnected: result?.disconnected, isResendNotice: refs.retryNotice?.recovery === 'resend', hasRetryNotice: Boolean(notice),
+        contentLocation: result?.contentLocation, assistantMessageId, onConfirmedRun: latchAdmittedRun, setMessages, attemptReconnect: attemptReconnectAfterDisconnect,
+      });
+      if (disconnect) { ({ admitted, pauseGone, wasDisconnected } = disconnect); return; }
 
       // Mark message as complete (use live ref in case steering_delivered switched it)
       {

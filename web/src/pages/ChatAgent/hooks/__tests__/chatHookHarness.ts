@@ -6,8 +6,11 @@
  */
 import { vi, type Mock } from 'vitest';
 import { act } from '@testing-library/react';
-// DALTON-HOOK(antigravity-series): constrain sendHitlResponse mock in harness to its real signature
-import type { sendHitlResponse as sendHitlResponseApi } from '../../utils/api';
+// DALTON-HOOK(antigravity-series): constrain sendHitlResponse & getHandoffLiveness mocks in harness to their real signatures
+import type {
+  getHandoffLiveness as getHandoffLivenessApi,
+  sendHitlResponse as sendHitlResponseApi,
+} from '../../utils/api';
 
 /**
  * Mock module shape for `../../utils/api` used by all useChatMessages suites.
@@ -23,7 +26,8 @@ export function apiMockModule<T extends Record<string, unknown>>(overrides = {} 
     cancelWorkflow: vi.fn().mockResolvedValue({ cancelled: true, message: 'ok' }),
     replayThreadHistory: vi.fn().mockResolvedValue(undefined),
     getWorkflowStatus: vi.fn().mockResolvedValue({ can_reconnect: false, status: 'completed' }),
-    getHandoffLiveness: vi.fn().mockResolvedValue({ liveness: [], runs: [], steers: [] }),
+    // DALTON-HOOK(antigravity-series): type getHandoffLiveness mock against the real API signature
+    getHandoffLiveness: vi.fn<typeof getHandoffLivenessApi>().mockResolvedValue({ liveness: [], runs: [], steers: [] }),
     getReportBackStatus: vi.fn().mockResolvedValue({ pending_report_back: false, report_back_run_id: null }),
     reconnectToWorkflowStream: vi.fn().mockResolvedValue({ disconnected: false, aborted: false }),
     // Default: a mux socket that connects and stays silent (never resolves),

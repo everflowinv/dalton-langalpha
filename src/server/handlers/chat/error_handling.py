@@ -25,6 +25,7 @@ from ptc_agent.core.sandbox.runtime import (
 )
 
 from src.config.settings import get_max_workflow_retries
+from src.dalton.llm.run_model import adopted_run_llm_model  # DALTON-HOOK(antigravity-series)
 from src.server.services.computer_errors import ComputerUnavailableError
 from src.server.database import conversation as qr_db
 from src.server.services.runs.stream_errors import unreachable_failure, unreachable_kind
@@ -516,9 +517,8 @@ async def handle_workflow_error(
                 retryable=can_retry(existing),
             )
             # DALTON-HOOK(antigravity-series): expose adopted run's effective llm_model on SSE duplicate_request
-            _existing_meta = existing.get("metadata")
-            if isinstance(_existing_meta, dict) and isinstance(_existing_meta.get("llm_model"), str) and _existing_meta["llm_model"]:
-                error_payload["llm_model"] = _existing_meta["llm_model"]
+            if adopted_model := adopted_run_llm_model(existing):
+                error_payload["llm_model"] = adopted_model
             # The run is another message's turn: retrying it would rerun
             # that message, and adopting it shows this one as its query.
             if e.steered:

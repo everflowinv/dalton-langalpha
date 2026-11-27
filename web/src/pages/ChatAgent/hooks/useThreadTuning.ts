@@ -6,9 +6,9 @@ import type { ThreadTuning } from '@/components/ui/chat-input.types';
 import { isDaltonBuild } from '@/config/brand';
 import { useThreadWriteAccess } from '@/lib/dalton/useThreadWriteAccess';
 import {
-  bindNullHandlesToThread,
   createClearLocalTuningHandle,
   isCreatedThreadTransition,
+  resolveTuningThreadTransition,
   scrubFailedTuningHold,
   shouldDeferCreatedRowTuningSave,
   type ClearLocalHandle,
@@ -168,16 +168,9 @@ function useThreadOverride<F extends TuningField>({
   let nextDeferredPick = deferredPick;
   if (heldThreadId !== liveThreadId) {
     setHeldThreadId(liveThreadId);
-    // DALTON-HOOK(antigravity-series): bind null-origin handles only on real creation; invalidate on switch away or null->other existing thread
-    if (isCreatedThreadTransition(heldThreadId, liveThreadId, createdThreadId)) {
-      bindNullHandlesToThread(boundNullHandlesRef.current, liveThreadId!);
-    } else if (heldThreadId || (isDaltonBuild && liveThreadId !== null)) {
-      sessionEpochRef.current += 1;
-      boundNullHandlesRef.current.clear();
-      nextHeld = null;
-      nextDeferredPick = null;
-      setHeld(null);
-      setDeferredPick(null);
+    // DALTON-HOOK(antigravity-series): delegate creation handle binding / switch epoch reset to Dalton module
+    if (resolveTuningThreadTransition(heldThreadId, liveThreadId, createdThreadId, sessionEpochRef, boundNullHandlesRef) === 'reset') {
+      nextHeld = null; nextDeferredPick = null; setHeld(null); setDeferredPick(null);
     }
   }
   if (landing && landing.key !== landingKey) {

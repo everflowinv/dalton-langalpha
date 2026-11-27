@@ -81,6 +81,36 @@ export function bindNullHandlesToThread(
   handles.clear();
 }
 
+export type TuningThreadTransitionAction = 'keep' | 'reset';
+
+/**
+ * Resolves a `prevThreadId -> liveThreadId` change for tuning state:
+ * - On real thread creation (`null -> createdThreadId`), binds pending
+ *   null-origin `clearLocal` handles to the created id and returns `'keep'`.
+ * - On switching away from a thread (or in Dalton builds navigating from `null`
+ *   to an unrelated existing thread), increments `sessionEpochRef`, clears
+ *   pending binders, and returns `'reset'` so the hook clears local state.
+ * - Otherwise returns `'keep'`.
+ */
+export function resolveTuningThreadTransition(
+  prevThreadId: string | null,
+  liveThreadId: string | null,
+  createdThreadId: string | null | undefined,
+  sessionEpochRef: MutableRefObject<number>,
+  boundNullHandlesRef: MutableRefObject<Set<NullHandleBinder>>,
+): TuningThreadTransitionAction {
+  if (isCreatedThreadTransition(prevThreadId, liveThreadId, createdThreadId)) {
+    bindNullHandlesToThread(boundNullHandlesRef.current, liveThreadId!);
+    return 'keep';
+  }
+  if (prevThreadId || (isDaltonBuild && liveThreadId !== null)) {
+    sessionEpochRef.current += 1;
+    boundNullHandlesRef.current.clear();
+    return 'reset';
+  }
+  return 'keep';
+}
+
 /**
  * Creates a tokenized local-effort clear handle. When created before a thread
  * id exists (`originThreadId === null`), the handle binds to the single thread

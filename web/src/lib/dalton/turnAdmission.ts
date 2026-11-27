@@ -214,6 +214,58 @@ function parseRunIdFromLocation(contentLocation: string | null | undefined): str
   }
 }
 
+export interface HitlDisconnectFlags {
+  admitted: boolean;
+  pauseGone: boolean;
+  wasDisconnected: boolean;
+}
+
+export interface HandleHitlDisconnectParams {
+  disconnected: boolean | undefined;
+  isResendNotice: boolean;
+  hasRetryNotice: boolean;
+  contentLocation: string | null | undefined;
+  assistantMessageId: string;
+  onConfirmedRun: (runId: string) => void;
+  setMessages: (updater: (prev: ChatMessage[]) => ChatMessage[]) => void;
+  attemptReconnect: (assistantMessageId: string) => void;
+}
+
+/**
+ * Evaluates pre-first-frame disconnect, unstarted `retry/resend`, or empty-body
+ * close on a HITL resume stream. Returns updated settlement flags when handled
+ * (the caller should return immediately), or `null` when normal stream
+ * finalization should proceed.
+ */
+export async function handleHitlResumeDisconnect(
+  guard: HitlResumeModelGuard,
+  {
+    disconnected,
+    isResendNotice,
+    hasRetryNotice,
+    contentLocation,
+    assistantMessageId,
+    onConfirmedRun,
+    setMessages,
+    attemptReconnect,
+  }: HandleHitlDisconnectParams,
+): Promise<HitlDisconnectFlags | null> {
+  if (hasRetryNotice || (!disconnected && !isResendNotice && !guard.isUnadmittedCleanEnd())) {
+    return null;
+  }
+  const outcome = await guard.verifyDisconnect(contentLocation, isResendNotice, onConfirmedRun);
+  if (outcome === 'unadmitted') {
+    markHitlBubbleUnadmitted(setMessages, assistantMessageId, true);
+    return { admitted: false, pauseGone: false, wasDisconnected: false };
+  }
+  attemptReconnect(assistantMessageId);
+  return {
+    admitted: outcome === 'confirmed_reconnect',
+    pauseGone: outcome !== 'confirmed_reconnect',
+    wasDisconnected: true,
+  };
+}
+
 /**
  * Marks a refused or unstarted HITL resume placeholder bubble as `unadmitted`
  * so `projectTurns` / `newestKnownTurn()` does not assign it a backend turn
