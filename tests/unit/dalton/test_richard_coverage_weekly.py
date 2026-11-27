@@ -1277,3 +1277,468 @@ def test_transport_mcp_client_fallback_uses_call_mcp_tool_with_error_flag_f5(
     err_res = transport.call_bridge_jsonrpc("community", {"fail": True})
     assert err_res["ok"] is False and err_res["error"] == "bridge timeout"
     assert calls[0][0] == "researchdata" and calls[0][1] == "community"
+
+
+@pytest.mark.asyncio
+async def test_verify_append_matches_landed_normalized_write_after_uncertain_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When feishu_append lands normalized prose (`15%~18%` -> `15%至18%`) but returns
+    outcome='unknown', verify_doc_append normalizes the draft with the same function and
+    marks the segment completed instead of stalling with readback_partial_match."""
+    import os
+    import shutil
+    import subprocess
+
+    from src.dalton.feishu import FeishuBridgeError
+    from src.dalton.tools import feishu_tools as feishu_tools_mod
+
+    end_d = dt.date(2026, 12, 18)
+    part1_raw = "**窗口与基准**\n`SPY` 区间收益 `15%~18%`，核心标的 `ANT` 跟踪。"
+    part2_raw = (
+        "\n---\n"
+        "**Watch 异动汇总**\n"
+        "本周核心增速落在 `15%~18%`（指引区间 `15%～18%`），`2026Q3` 营收 `16,956.0`，"
+        "目标价 `$150.0`，字段 `revenue_yoy_pct`。\n\n"
+        "    const ticker = `ANT`;\n"
+    )
+    landed_chunks: list[str] = []
+
+    async def _fake_bridge(route: str, body: dict) -> dict:
+        if route == "doc/create":
+            landed_chunks.append(body["markdown"])
+            return {
+                "ok": True,
+                "document_id": "DoxNormUncertain1",
+                "url": "https://feishu.cn/docx/DoxNormUncertain1",
+            }
+        if route == "doc/append":
+            # Simulate write landing on Feishu before network timeout causes unknown outcome.
+            landed_chunks.append(body["markdown"])
+            raise FeishuBridgeError(
+                "content_insert_failed",
+                "追加请求结果未知，可能已经写入",
+                payload={
+                    "ok": False,
+                    "error": "content_insert_failed",
+                    "outcome": "unknown",
+                    "document_id": "DoxNormUncertain1",
+                    "url": "https://feishu.cn/docx/DoxNormUncertain1",
+                },
+            )
+        raise AssertionError(f"unexpected route: {route}")
+
+    monkeypatch.setattr(
+        feishu_tools_mod,
+        "post_bridge_feishu",
+        create_autospec(feishu_tools_mod.post_bridge_feishu, side_effect=_fake_bridge),
+    )
+    monkeypatch.setattr(
+        feishu_tools_mod,
+        "_caller_email",
+        create_autospec(feishu_tools_mod._caller_email, return_value=""),
+    )
+    monkeypatch.setattr(
+        feishu_tools_mod,
+        "_caller_feishu_open_id",
+        create_autospec(feishu_tools_mod._caller_feishu_open_id, return_value=""),
+    )
+
+    create_res = await feishu_tools_mod.create_feishu_doc_on_server(
+        user_id="u-richard",
+        title="Richard 覆盖周报",
+        markdown=part1_raw,
+    )
+    assert create_res["ok"] is True
+    saved = cli.save_doc_record(
+        tmp_path,
+        end_d,
+        json.dumps(create_res, ensure_ascii=False).encode("utf-8"),
+        total_parts=3,
+        attempt_id="att-norm-1",
+    )
+    assert saved["completed_parts"] == [1] and saved["pending_parts"] == [2, 3]
+
+    append_res = await feishu_tools_mod.append_feishu_doc_on_server(
+        token=create_res["url"],
+        markdown=part2_raw,
+    )
+    assert append_res["ok"] is False and append_res["outcome"] == "unknown"
+    assert "15%至18%" in landed_chunks[1]
+    assert "    const ticker = `ANT`;" in landed_chunks[1]
+
+    rec = cli.record_doc_append(
+        tmp_path,
+        end_d,
+        2,
+        json.dumps(append_res, ensure_ascii=False).encode("utf-8"),
+    )
+    assert rec["ok"] is False and rec["unverified"] is True and rec["unverified_parts"] == [2]
+
+    # Simulate feishu_read plain text derived from the exact normalized chunks that landed.
+    feishu_plain = "\n".join(
+        chunk.replace("**", "").replace("\n---\n", "\n") for chunk in landed_chunks
+    )
+    readback_json = {
+        "ok": True,
+        "title": "Richard 覆盖周报",
+        "content": feishu_plain,
+        "truncated": False,
+        "total_chars": len(feishu_plain),
+    }
+
+    verified = cli.verify_doc_append(
+        tmp_path,
+        end_d,
+        2,
+        readback_json,
+        part_text=part2_raw,
+        expected_after=part1_raw,
+    )
+    assert verified["ok"] is True
+    assert verified["present"] is True
+    assert verified["should_append"] is False
+    assert verified["indeterminate"] is False
+    assert verified["action"] == "marked_completed"
+    assert verified["completed_parts"] == [1, 2]
+    assert verified["unverified_parts"] == []
+    assert verified["pending_parts"] == [3]
+
+    # Verify standalone sandbox copy under `python -S` (genuinely without markdown_it
+    # in site-packages) produces identical verify-append result.
+    iso_dir = tmp_path / "sandbox_scripts"
+    shutil.copytree(SCRIPTS_DIR, iso_dir, ignore=shutil.ignore_patterns("__pycache__"))
+    iso_ws = tmp_path / "sandbox_ws"
+    iso_ws.mkdir()
+    cli.save_doc_record(
+        iso_ws,
+        end_d,
+        json.dumps(create_res, ensure_ascii=False).encode("utf-8"),
+        total_parts=3,
+        attempt_id="att-iso-1",
+    )
+    cli.record_doc_append(
+        iso_ws,
+        end_d,
+        2,
+        json.dumps(append_res, ensure_ascii=False).encode("utf-8"),
+    )
+    run_dir = iso_ws / cli.run_rel(end_d, "")
+    (run_dir / "part_1.md").write_text(part1_raw, encoding="utf-8")
+    (run_dir / "part_2.md").write_text(part2_raw, encoding="utf-8")
+    (run_dir / "feishu-read.json").write_text(
+        json.dumps(readback_json, ensure_ascii=False), encoding="utf-8"
+    )
+    clean_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            str(iso_dir / "richard_coverage_weekly_cli.py"),
+            "verify-append",
+            "--workspace-dir",
+            str(iso_ws),
+            "--end",
+            end_d.isoformat(),
+            "--part",
+            "2",
+            "--part-file",
+            cli.run_rel(end_d, "part_2.md"),
+            "--expected-after-file",
+            cli.run_rel(end_d, "part_1.md"),
+            "--doc-json-file",
+            cli.run_rel(end_d, "feishu-read.json"),
+        ],
+        env=clean_env,
+        cwd=str(iso_ws),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    iso_out = json.loads(proc.stdout)
+    assert iso_out["ok"] is True
+    assert iso_out["present"] is True
+    assert iso_out["action"] == "marked_completed"
+    assert iso_out["completed_parts"] == [1, 2]
+    assert iso_out["pending_parts"] == [3]
+
+
+def test_verify_append_accepts_pre_upgrade_unnormalized_landed_segment(
+    tmp_path: Path,
+) -> None:
+    """Segments written before inline-code normalization rolled out (e.g. `指引 15%~18%`)
+    with an uncertain receipt must still verify as completed after upgrade instead of
+    returning append_required and duplicating the paragraph."""
+    end_d = dt.date(2026, 12, 25)
+    part1_raw = "**窗口与基准**\n`SPY` 指引 `15%~18%`，核心标的 `ANT` 跟踪。"
+    part2_raw = (
+        "\n---\n"
+        "**Watch 异动汇总**\n"
+        "核心标的 `ANT` 指引 `15%~18%`（区间 `15%～18%`），`2026Q3` 营收 `16,956.0`。"
+    )
+
+    create_res = {
+        "ok": True,
+        "document_id": "DoxPreUpgrade1",
+        "url": "https://feishu.cn/docx/DoxPreUpgrade1",
+    }
+    cli.save_doc_record(
+        tmp_path,
+        end_d,
+        json.dumps(create_res, ensure_ascii=False).encode("utf-8"),
+        total_parts=3,
+        attempt_id="att-pre-1",
+    )
+    uncertain = {
+        "ok": False,
+        "error": "content_insert_failed",
+        "outcome": "unknown",
+        "document_id": "DoxPreUpgrade1",
+        "url": "https://feishu.cn/docx/DoxPreUpgrade1",
+    }
+    cli.record_doc_append(
+        tmp_path,
+        end_d,
+        2,
+        json.dumps(uncertain, ensure_ascii=False).encode("utf-8"),
+    )
+
+    # Pre-upgrade Feishu doc contains literal `指引 15%~18%` (and `15%～18%`), not `15%至18%`.
+    pre_upgrade_plain = (
+        "窗口与基准\n"
+        "SPY 指引 15%~18%，核心标的 ANT 跟踪。\n"
+        "Watch 异动汇总\n"
+        "核心标的 ANT 指引 15%~18%（区间 15%～18%），2026Q3 营收 16,956.0。"
+    )
+    readback_json = {
+        "ok": True,
+        "title": "Richard 覆盖周报",
+        "content": pre_upgrade_plain,
+        "truncated": False,
+        "total_chars": len(pre_upgrade_plain),
+    }
+
+    verified = cli.verify_doc_append(
+        tmp_path,
+        end_d,
+        2,
+        readback_json,
+        part_text=part2_raw,
+        expected_after=part1_raw,
+    )
+    assert verified["ok"] is True
+    assert verified["present"] is True
+    assert verified["should_append"] is False
+    assert verified["indeterminate"] is False
+    assert verified["action"] == "marked_completed"
+    assert verified["completed_parts"] == [1, 2]
+    assert verified["unverified_parts"] == []
+    assert verified["pending_parts"] == [3]
+
+    # Mixed upgrade boundary: anchor written pre-upgrade (`15%~18%`), part 2 written post-upgrade (`15%至18%`).
+    mixed_plain = (
+        "窗口与基准\n"
+        "SPY 指引 15%~18%，核心标的 ANT 跟踪。\n"
+        "Watch 异动汇总\n"
+        "核心标的 ANT 指引 15%至18%（区间 15%至18%），2026Q3 营收 16,956.0。"
+    )
+    assert cli._evaluate_segment_match(mixed_plain, part2_raw, expected_after=part1_raw) == ("full", None)
+
+    # Reverse boundary: anchor written post-upgrade (`15%至18%`), part 2 written pre-upgrade (`15%~18%`).
+    reverse_plain = (
+        "窗口与基准\n"
+        "SPY 指引 15%至18%，核心标的 ANT 跟踪。\n"
+        "Watch 异动汇总\n"
+        "核心标的 ANT 指引 15%~18%（区间 15%～18%），2026Q3 营收 16,956.0。"
+    )
+    assert cli._evaluate_segment_match(reverse_plain, part2_raw, expected_after=part1_raw) == ("full", None)
+
+
+@pytest.mark.asyncio
+async def test_verify_append_without_markdown_it_matches_server_list_fence_and_html_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Running the standalone skill script under `python -S` (no markdown_it) must match
+    the server's markdown_it normalization on list-item fenced code blocks (including tabs)
+    and HTML blocks so the same uncertain receipt still evaluates as `full` (`marked_completed`)."""
+    import os
+    import shutil
+    import subprocess
+
+    from src.dalton.feishu import FeishuBridgeError
+    from src.dalton.tools import feishu_tools as feishu_tools_mod
+
+    end_d = dt.date(2026, 12, 26)
+    part1_raw = "**窗口与基准**\n`SPY` 指引 `15%~18%`。"
+    part2_raw = (
+        "\n---\n"
+        "**技术附录**\n\n"
+        "10. 列表项 `15%~18%`\n"
+        "    ```python\n"
+        "    guidance = '`15%~18%`'\n"
+        "    ```\n"
+        "- Tab 列表 `ANT`\n"
+        "\t```python\n"
+        "\ttab_range = '`15%~18%`'\n"
+        "\t```\n"
+        "<div>\n"
+        "HTML 块内 `15%~18%`\n"
+        "</div>\n\n"
+        "末尾正文 `15%~18%`。"
+    )
+    landed_chunks: list[str] = []
+
+    async def _fake_bridge(route: str, body: dict) -> dict:
+        if route == "doc/create":
+            landed_chunks.append(body["markdown"])
+            return {
+                "ok": True,
+                "document_id": "DoxNoMdIt1",
+                "url": "https://feishu.cn/docx/DoxNoMdIt1",
+            }
+        if route == "doc/append":
+            landed_chunks.append(body["markdown"])
+            raise FeishuBridgeError(
+                "content_insert_failed",
+                "追加请求结果未知，可能已经写入",
+                payload={
+                    "ok": False,
+                    "error": "content_insert_failed",
+                    "outcome": "unknown",
+                    "document_id": "DoxNoMdIt1",
+                    "url": "https://feishu.cn/docx/DoxNoMdIt1",
+                },
+            )
+        raise AssertionError(f"unexpected route: {route}")
+
+    monkeypatch.setattr(
+        feishu_tools_mod,
+        "post_bridge_feishu",
+        create_autospec(feishu_tools_mod.post_bridge_feishu, side_effect=_fake_bridge),
+    )
+    monkeypatch.setattr(
+        feishu_tools_mod,
+        "_caller_email",
+        create_autospec(feishu_tools_mod._caller_email, return_value=""),
+    )
+    monkeypatch.setattr(
+        feishu_tools_mod,
+        "_caller_feishu_open_id",
+        create_autospec(feishu_tools_mod._caller_feishu_open_id, return_value=""),
+    )
+
+    create_res = await feishu_tools_mod.create_feishu_doc_on_server(
+        user_id="u-richard",
+        title="Richard 覆盖周报",
+        markdown=part1_raw,
+    )
+    assert create_res["ok"] is True
+
+    append_res = await feishu_tools_mod.append_feishu_doc_on_server(
+        token=create_res["url"],
+        markdown=part2_raw,
+    )
+    assert append_res["ok"] is False and append_res["outcome"] == "unknown"
+    # Server (with markdown_it) preserved code blocks & HTML block while normalizing prose.
+    assert "guidance = '`15%~18%`'" in landed_chunks[1]
+    assert "tab_range = '`15%~18%`'" in landed_chunks[1]
+    assert "HTML 块内 `15%~18%`" in landed_chunks[1]
+    assert "末尾正文 15%至18%。" in landed_chunks[1]
+
+    feishu_plain = "\n".join(
+        chunk.replace("**", "").replace("\n---\n", "\n") for chunk in landed_chunks
+    )
+    readback_json = {
+        "ok": True,
+        "title": "Richard 覆盖周报",
+        "content": feishu_plain,
+        "truncated": False,
+        "total_chars": len(feishu_plain),
+    }
+
+    iso_dir = tmp_path / "sandbox_scripts_nomdit"
+    shutil.copytree(SCRIPTS_DIR, iso_dir, ignore=shutil.ignore_patterns("__pycache__"))
+    iso_ws = tmp_path / "sandbox_ws_nomdit"
+    iso_ws.mkdir()
+    cli.save_doc_record(
+        iso_ws,
+        end_d,
+        json.dumps(create_res, ensure_ascii=False).encode("utf-8"),
+        total_parts=3,
+        attempt_id="att-nomdit-1",
+    )
+    cli.record_doc_append(
+        iso_ws,
+        end_d,
+        2,
+        json.dumps(append_res, ensure_ascii=False).encode("utf-8"),
+    )
+    run_dir = iso_ws / cli.run_rel(end_d, "")
+    (run_dir / "part_1.md").write_text(part1_raw, encoding="utf-8")
+    (run_dir / "part_2.md").write_text(part2_raw, encoding="utf-8")
+    (run_dir / "feishu-read.json").write_text(
+        json.dumps(readback_json, ensure_ascii=False), encoding="utf-8"
+    )
+    clean_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+
+    # Confirm python -S genuinely runs without markdown_it and returns match_kind == "full".
+    probe_script = (
+        "import importlib.util, json, sys\n"
+        f"spec = importlib.util.spec_from_file_location('rcw_cli', {str(iso_dir / 'richard_coverage_weekly_cli.py')!r})\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+        "fmn_mod = sys.modules['richard_cov_feishu_markdown_normalize']\n"
+        "assert fmn_mod._MD_PARSER is None, 'markdown_it should not be importable under -S'\n"
+        f"rb = json.loads(open({str(run_dir / 'feishu-read.json')!r}, encoding='utf-8').read())\n"
+        f"p1 = open({str(run_dir / 'part_1.md')!r}, encoding='utf-8').read()\n"
+        f"p2 = open({str(run_dir / 'part_2.md')!r}, encoding='utf-8').read()\n"
+        "kind, err = mod._evaluate_segment_match(rb['content'], p2, expected_after=p1)\n"
+        "print(json.dumps({'kind': kind, 'err': err}))\n"
+    )
+    probe_proc = subprocess.run(
+        [sys.executable, "-S", "-c", probe_script],
+        env=clean_env,
+        cwd=str(iso_ws),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert probe_proc.returncode == 0, probe_proc.stderr
+    assert json.loads(probe_proc.stdout) == {"kind": "full", "err": None}
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            str(iso_dir / "richard_coverage_weekly_cli.py"),
+            "verify-append",
+            "--workspace-dir",
+            str(iso_ws),
+            "--end",
+            end_d.isoformat(),
+            "--part",
+            "2",
+            "--part-file",
+            cli.run_rel(end_d, "part_2.md"),
+            "--expected-after-file",
+            cli.run_rel(end_d, "part_1.md"),
+            "--doc-json-file",
+            cli.run_rel(end_d, "feishu-read.json"),
+        ],
+        env=clean_env,
+        cwd=str(iso_ws),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    iso_out = json.loads(proc.stdout)
+    assert iso_out["ok"] is True
+    assert iso_out["present"] is True
+    assert iso_out["should_append"] is False
+    assert iso_out["action"] == "marked_completed"
+    assert iso_out["completed_parts"] == [1, 2]
+    assert iso_out["pending_parts"] == [3]

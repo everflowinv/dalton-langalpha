@@ -110,7 +110,7 @@ python3 .agents/skills/dalton-x-accounts-daily/scripts/x_accounts_daily.py \
 
 ## 5. 摘要和 Markdown
 
-每条帖用一句中文概括，保留关键数字、公司或产品名、时间点和方向。不要把不同帖合并成一条。英文只在术语或原句必要时留短语。摘要不要自己写链接。
+每条帖用一句中文概括，保留关键数字、公司或产品名、时间点和方向。不要把不同帖合并成一条。英文只在术语或原句必要时留短语。摘要不要自己写链接。数字、股票代码与期间直接写成普通文本，格式见 `.agents/skills/dalton-conventions/references/writing.md` §5 第 4 条。
 
 把摘要写到 `temp/x-accounts-daily/<summary_date>/summaries.json`，键是推文 ID（`status id`）：
 

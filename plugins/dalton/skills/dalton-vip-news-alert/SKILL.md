@@ -263,7 +263,7 @@ feishu_create_doc(title="VIP 采访记录 — <summary_date>", markdown=TRANSCRI
 
 ## 5. 卡片
 
-卡片由脚本渲染。不要手写卡片 Markdown，也不要在人物栏目里使用三级或四级标题。
+卡片由脚本渲染。不要手写卡片 Markdown，也不要在人物栏目里使用三级或四级标题。摘要与要点里的数字、股票代码与期间直接写成普通文本，格式见 `.agents/skills/dalton-conventions/references/writing.md` §5 第 4 条。
 
 ```bash
 python3 .agents/skills/dalton-vip-news-alert/scripts/vip_news_alert.py \

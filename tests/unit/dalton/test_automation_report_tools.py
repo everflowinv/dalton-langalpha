@@ -886,3 +886,26 @@ async def test_submit_valid_cards_omits_warnings_field(
 ) -> None:
     payload = await _invoke(_submit_args())
     assert "warnings" not in payload
+
+
+@pytest.mark.asyncio
+async def test_submit_preserves_inline_code_backticks_for_digest_stability(
+    storage: SimpleNamespace,
+) -> None:
+    cards = [
+        {
+            "schema": "2.0",
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": "营收 `16,956.0`，同比 `+46.7%`，代码 `ANT`。",
+                    }
+                ]
+            },
+        }
+    ]
+    payload = await _invoke(_submit_args(cards=cards))
+    forwarded_cards = storage.submit.await_args.kwargs["cards"]
+    assert forwarded_cards == cards
+    assert "warnings" not in payload

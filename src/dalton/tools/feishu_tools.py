@@ -26,6 +26,7 @@ from src.dalton.feishu import (
     is_uncertain_bridge_error,
     post_bridge_feishu,
 )
+from src.dalton.notify.card_normalize import normalize_feishu_markdown_inline_code
 from src.dalton.settings import get_dalton_invite_email_domain
 from src.dalton.tools.conversation_tools import _extract_caller_identity
 
@@ -328,7 +329,10 @@ async def create_feishu_doc_on_server(
     image_files, image_err = await _collect_markdown_image_files(markdown, filesystem_backend)
     if image_err is not None:
         return {"ok": False, "error": "image_read_failed", "message": image_err}
-    body: dict[str, Any] = {"title": title, "markdown": markdown}
+    body: dict[str, Any] = {
+        "title": title,
+        "markdown": normalize_feishu_markdown_inline_code(markdown),
+    }
     if image_files:
         body["image_files"] = image_files
     if space_id:
@@ -367,7 +371,10 @@ async def append_feishu_doc_on_server(
     image_files, image_err = await _collect_markdown_image_files(markdown, filesystem_backend)
     if image_err is not None:
         return {"ok": False, "error": "image_read_failed", "message": image_err}
-    append_body: dict[str, Any] = {"token": token, "markdown": markdown}
+    append_body: dict[str, Any] = {
+        "token": token,
+        "markdown": normalize_feishu_markdown_inline_code(markdown),
+    }
     if image_files:
         append_body["image_files"] = image_files
     res = await _bridge("doc/append", append_body)

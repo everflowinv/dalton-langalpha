@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 
+from src.dalton.notify import feishu_markdown_normalize as fmn
 from src.dalton.notify.card_normalize import (
     normalize_feishu_card,
     normalize_feishu_cards,
+    normalize_feishu_markdown_inline_code,
 )
 
 
@@ -191,3 +194,276 @@ def test_normalize_feishu_cards_prefixes_paths_per_card() -> None:
         "tag": "markdown",
         "content": "second",
     }
+
+
+# Shared sample matrix mirrored identically in
+# integrations/dalton-channel-gateway/test/feishu.test.ts
+_INLINE_CODE_SAMPLES: list[tuple[str, str]] = [
+    # Numbers / amounts / percentages / multiples / ranges -> stripped
+    (
+        "营收 `16,956.0`（`+46.7%` / `-11.9%`），估值 `3.2x`，目标价 `150.0`。",
+        "营收 16,956.0（+46.7% / -11.9%），估值 3.2x，目标价 150.0。",
+    ),
+    (
+        "金额 `$150.0`、`-$2.3B`、`$150.0 至 $170.0`、`USD 45.2B`、`452 亿美元`，利差 `+50bps`、`-2.5 ppt`。",
+        "金额 `$150.0`、`-$2.3B`、`$150.0 至 $170.0`、USD 45.2B、452 亿美元，利差 +50bps、-2.5 ppt。",
+    ),
+    (
+        "区间 `15%–18%`、`15% 至 18%`、`10-20`、`15%~18%`、`15% ~ 18%`、`15%～18%`、`2.5x~3.5x`、`120亿至130亿美元`。",
+        "区间 15%–18%、15% 至 18%、10-20、15%至18%、15%至18%、15%至18%、2.5x至3.5x、120亿至130亿美元。",
+    ),
+    # Stock tickers -> stripped
+    (
+        "标的 `ANT`、`NVDA`、`V`、`GOOGL`、`0700.HK`、`601100.SS`、`600519.SH`、`300750.SZ`、`2330.TW`、`005930.KS`、`9984.T`、`ASML.AS`、`BRK.B`。",
+        "标的 ANT、NVDA、V、GOOGL、0700.HK、601100.SS、600519.SH、300750.SZ、2330.TW、005930.KS、9984.T、ASML.AS、BRK.B。",
+    ),
+    # Periods -> stripped
+    (
+        "期间 `2026Q3`、`2026M11`、`FY26E`、`4Q27E`、`2026H1`、`1H26`、`FY2025`、`2026FY`、`2025Q1–2026Q3`、`2025Q1~2026Q3`、`2026-11-27`。",
+        "期间 2026Q3、2026M11、FY26E、4Q27E、2026H1、1H26、FY2025、2026FY、2025Q1–2026Q3、2025Q1至2026Q3、2026-11-27。",
+    ),
+    # Paths, commands, snake_case & technical identifiers -> preserved
+    (
+        "路径 `state/ai_app_db/companies/NET/metrics.jsonl`、`src/dalton/notify/card_normalize.py`、`./scripts/run.py`、`SKILL.md`、`README.MD`。",
+        "路径 `state/ai_app_db/companies/NET/metrics.jsonl`、`src/dalton/notify/card_normalize.py`、`./scripts/run.py`、`SKILL.md`、`README.MD`。",
+    ),
+    (
+        "命令 `pytest -q`、`git diff --check`、`npx vitest run`、`python3 scripts/cli.py --json`。",
+        "命令 `pytest -q`、`git diff --check`、`npx vitest run`、`python3 scripts/cli.py --json`。",
+    ),
+    (
+        "字段 `revenue_yoy_pct`、`report_run_id`、`value_usd_mn`、`NO_REPLY`、`THESIS_STRENGTHENED`、`normalizeFeishuCard`。",
+        "字段 `revenue_yoy_pct`、`report_run_id`、`value_usd_mn`、`NO_REPLY`、`THESIS_STRENGTHENED`、`normalizeFeishuCard`。",
+    ),
+    (
+        "技术标识 `v1.2.3`、`127.0.0.1`、`0x1f`、`10-K`、`P1`、`D1`、`f:rev_q8`。",
+        "技术标识 `v1.2.3`、`127.0.0.1`、`0x1f`、`10-K`、`P1`、`D1`、`f:rev_q8`。",
+    ),
+    # Mixed prose + fenced code blocks + multi-backtick + escaped backticks
+    (
+        "摘要：`ANT` 在 `2026Q3` 营收 `16,956.0`（`+46.7%`），字段 `revenue_yoy_pct`。\n"
+        "```python\n"
+        "sample = '`16,956.0` `ANT` `+46.7%` `2026Q3`'\n"
+        "```\n"
+        "~~~text\n"
+        "`0700.HK` `FY26E`\n"
+        "~~~\n"
+        "双反引号 `` `16,956.0` `` 与转义 \\`150.0\\` 保持原样，末尾 `601100.SS` 去反引号。",
+        "摘要：ANT 在 2026Q3 营收 16,956.0（+46.7%），字段 `revenue_yoy_pct`。\n"
+        "```python\n"
+        "sample = '`16,956.0` `ANT` `+46.7%` `2026Q3`'\n"
+        "```\n"
+        "~~~text\n"
+        "`0700.HK` `FY26E`\n"
+        "~~~\n"
+        "双反引号 `` `16,956.0` `` 与转义 \\`150.0\\` 保持原样，末尾 601100.SS 去反引号。",
+    ),
+    # Indented code blocks (4 spaces / tab, after blank line / heading / blockquote / list) -> preserved;
+    # lazy paragraph continuation & list continuation -> stripped as prose inline code.
+    (
+        "正文 `ANT` 增速 `15%~18%`。\n\n"
+        "    const ticker = `ANT`;\n"
+        "    const range = `15%~18%`;\n\n"
+        "\tconst tabTicker = `0700.HK`;\n\n"
+        "# 标题 `2026Q3`\n"
+        "    const afterHeading = `3.2x`;\n\n"
+        ">     const quotedCode = `NVDA`;\n\n"
+        "- 列表项 `16,956.0`\n"
+        "    列表续行 `+46.7%`\n\n"
+        "      const listCode = `FY26E`;\n\n"
+        "段落首行\n"
+        "    段落续行 `150.0`",
+        "正文 ANT 增速 15%至18%。\n\n"
+        "    const ticker = `ANT`;\n"
+        "    const range = `15%~18%`;\n\n"
+        "\tconst tabTicker = `0700.HK`;\n\n"
+        "# 标题 2026Q3\n"
+        "    const afterHeading = `3.2x`;\n\n"
+        ">     const quotedCode = `NVDA`;\n\n"
+        "- 列表项 16,956.0\n"
+        "    列表续行 +46.7%\n\n"
+        "      const listCode = `FY26E`;\n\n"
+        "段落首行\n"
+        "    段落续行 150.0",
+    ),
+]
+
+
+def test_strips_decorative_inline_code_backticks_and_preserves_code() -> None:
+    assert fmn._MD_PARSER is not None
+    for raw, expected in _INLINE_CODE_SAMPLES:
+        assert normalize_feishu_markdown_inline_code(raw) == expected
+        assert fmn._normalize_with_markdown_it(raw, fmn._MD_PARSER) == expected
+        assert fmn._normalize_stdlib(raw) == expected
+
+
+def test_stdlib_fallback_matches_markdown_it_for_list_fences_tabs_and_html_blocks() -> None:
+    import subprocess
+    import sys
+
+    assert fmn._MD_PARSER is not None
+    cases = [
+        # List-item fenced code blocks (4-space, 2-space, tab, nested tab, same-line, outdent)
+        "10. 列表项 `15%~18%`\n    ```python\n    x = `15%~18%`\n    ```\n    后文 `15%~18%`",
+        "- 列表项 `15%~18%`\n  ```python\n  x = `15%~18%`\n  ```\n  后文 `15%~18%`",
+        "- 列表项 `15%~18%`\n\t```python\n\tx = `15%~18%`\n\t```\n\t后文 `15%~18%`",
+        "-\t列表项 `15%~18%`\n\t```python\n\tx = `15%~18%`\n\t```\n\t后文 `15%~18%`",
+        "- ```python\n  x = `15%~18%`\n  ```\n  后文 `15%~18%`",
+        "- 外层 `ANT`\n\t- 内层 `15%~18%`\n\t\t```python\n\t\tx = `15%~18%`\n\t\t```\n\t\t后文 `15%~18%`",
+        "- item\n  ```python\n  a = `15%~18%`\n\n  b = `15%~18%`\n  ```\n  after `15%~18%`",
+        "- item\n  ```python\n  `15%~18%`\n```\n`ANT`",
+        ">\t```python\n>\t`15%~18%`\n>\t```\n> 后文 `15%~18%`",
+        # CommonMark HTML blocks (types 1-7, top-level and inside lists/blockquotes)
+        "正文 `ANT`\n<pre>\n`15%~18%`\n</pre>\n后文 `15%~18%`",
+        "<pre>`15%~18%`</pre>\n后文 `15%~18%`",
+        "正文 `ANT`\n<!--\n`15%~18%`\n-->\n后文 `15%~18%`",
+        "<!-- `15%~18%` -->\n后文 `15%~18%`",
+        "<?xml `15%~18%`\n`ANT` ?>\n后文 `15%~18%`",
+        "<!DOCTYPE `15%~18%`\n`ANT`>\n后文 `15%~18%`",
+        "<![CDATA[\n`15%~18%`\n]]>\n后文 `15%~18%`",
+        "正文 `ANT`\n<div>\n`15%~18%`\n</div>\n\n后文 `15%~18%`",
+        "<div>\n`15%~18%`\n</div>\n紧跟 `15%~18%`\n\n空行后 `15%~18%`",
+        "正文 `ANT`\n<span>\n`15%~18%`\n</span>\n\n后文 `15%~18%`",
+        "<span>\n`15%~18%`\n</span>\n\n后文 `15%~18%`",
+        "<span>`15%~18%`</span>\n后文 `15%~18%`",
+        "- 列表 `ANT`\n  <div>\n  `15%~18%`\n  </div>\n\n  后文 `15%~18%`",
+        "- 列表 `ANT`\n\t<div>\n\t`15%~18%`\n\t</div>\n\n\t后文 `15%~18%`",
+        "- 列表 `ANT`\n  <div>\n  `15%~18%`\n外部 `15%~18%`",
+        "> <div>\n> `15%~18%`\n外部 `15%~18%`",
+    ]
+    for sample in cases:
+        md_out = fmn._normalize_with_markdown_it(sample, fmn._MD_PARSER)
+        stdlib_out = fmn._normalize_stdlib(sample)
+        assert stdlib_out == md_out, f"stdlib mismatch for:\n{sample!r}"
+
+    # Verify a real interpreter without site-packages (python -S) falls back to stdlib
+    # because markdown_it cannot be imported, and produces the exact same output.
+    repo_root = Path(__file__).resolve().parents[3]
+    canonical = repo_root / "src" / "dalton" / "notify" / "feishu_markdown_normalize.py"
+    combined = "\n\n".join(cases)
+    expected_combined = fmn._normalize_with_markdown_it(combined, fmn._MD_PARSER)
+    probe = (
+        "import importlib.util, json, sys\n"
+        f"spec = importlib.util.spec_from_file_location('fmn_no_deps', {str(canonical)!r})\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+        "assert mod._MD_PARSER is None, 'expected markdown_it to be absent under -S'\n"
+        "text = sys.stdin.read()\n"
+        "print(json.dumps({'out': mod.normalize_feishu_markdown_inline_code(text)}, ensure_ascii=False))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-S", "-c", probe],
+        input=combined,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    import json
+
+    assert json.loads(proc.stdout)["out"] == expected_combined
+
+
+def test_feishu_markdown_normalize_skill_mirror_matches_canonical_source() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    canonical = repo_root / "src" / "dalton" / "notify" / "feishu_markdown_normalize.py"
+    skill_mirror = (
+        repo_root
+        / "plugins"
+        / "dalton"
+        / "skills"
+        / "dalton-richard-coverage-weekly"
+        / "scripts"
+        / "feishu_markdown_normalize.py"
+    )
+    assert skill_mirror.read_text(encoding="utf-8") == canonical.read_text(encoding="utf-8")
+
+
+def test_normalize_feishu_card_strips_markdown_inline_code_without_mutating_or_leaking_body() -> None:
+    card = {
+        "schema": "2.0",
+        "header": {
+            "title": {"tag": "plain_text", "content": "AI 应用周报 — 2026-11-27"},
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "**`ANT`** `2026Q3` 收入 `16,956.0`（`+46.7%`），"
+                        "字段 `revenue_yoy_pct`，路径 `state/ai_app_db/`。\n"
+                        "```bash\n"
+                        "echo `16,956.0` `ANT`\n"
+                        "```"
+                    ),
+                },
+                {
+                    "tag": "column_set",
+                    "columns": [
+                        {
+                            "tag": "column",
+                            "elements": [
+                                {
+                                    "tag": "markdown",
+                                    "content": "港股 `0700.HK` 估值 `3.2x`（`FY26E`）",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "tag": "text",
+                    "content": "A 股 `601100.SS` 同比 `-11.9%`（`4Q27E`），命令 `pytest -q`",
+                },
+                {
+                    "tag": "markdown",
+                    "content": "纯代码引用 `report_run_id` 与 `src/app.py` 无需改动",
+                },
+            ]
+        },
+    }
+    before = deepcopy(card)
+    # Default strip_inline_code=False preserves inline code backticks (digest contract)
+    # while still converting structural tags like text -> markdown.
+    norm_default, paths_default = normalize_feishu_card(card)
+    assert card == before
+    assert paths_default == ["body.elements[2]"]
+    assert "`16,956.0`" in norm_default["body"]["elements"][0]["content"]
+    assert norm_default["body"]["elements"][2] == {
+        "tag": "markdown",
+        "content": "A 股 `601100.SS` 同比 `-11.9%`（`4Q27E`），命令 `pytest -q`",
+    }
+
+    norm, paths = normalize_feishu_card(card, strip_inline_code=True)
+
+    assert card == before
+    assert paths == [
+        "body.elements[0].content",
+        "body.elements[1].columns[0].elements[0].content",
+        "body.elements[2]",
+    ]
+    assert all("16,956.0" not in p and "ANT" not in p for p in paths)
+
+    elems = norm["body"]["elements"]
+    assert elems[0]["content"] == (
+        "**ANT** 2026Q3 收入 16,956.0（+46.7%），"
+        "字段 `revenue_yoy_pct`，路径 `state/ai_app_db/`。\n"
+        "```bash\n"
+        "echo `16,956.0` `ANT`\n"
+        "```"
+    )
+    assert elems[1]["columns"][0]["elements"][0]["content"] == (
+        "港股 0700.HK 估值 3.2x（FY26E）"
+    )
+    assert elems[2] == {
+        "tag": "markdown",
+        "content": "A 股 601100.SS 同比 -11.9%（4Q27E），命令 `pytest -q`",
+    }
+    assert elems[3]["content"] == (
+        "纯代码引用 `report_run_id` 与 `src/app.py` 无需改动"
+    )
+
+    # Idempotent on second pass
+    norm_2, paths_2 = normalize_feishu_card(norm, strip_inline_code=True)
+    assert norm_2 == norm
+    assert paths_2 == []
