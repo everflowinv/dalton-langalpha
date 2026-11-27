@@ -8130,3 +8130,27 @@ async def test_preflight_cnhk_incomplete_pagination_claim_skip_branches_preserve
     assert doubles_b["logs"][-1]["decision"] == "skip"
     assert doubles_b["logs"][-1]["reason"] == "claim_failed"
     assert {"degraded_sources": ["cnhk"]} in doubles_b["logs"][-1]["signals"]
+
+
+def test_cnhk_zero_page_local_deadline_is_resumable_not_source_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Budget gone before the first page: incomplete with next_page, no page_error (no source backoff)."""
+    import requests as real_requests
+
+    fa_mod, _dg_mod = _load_cnhk_runtime_modules(monkeypatch)
+    monkeypatch.setattr(
+        fa_mod.requests,
+        "post",
+        create_autospec(real_requests.post, side_effect=AssertionError("no request once the budget is gone")),
+    )
+    out = fa_mod.fetch_announcements(
+        "600000",
+        limit=50,
+        date_from="2026-10-19",
+        date_to="2026-10-19",
+        start_page=2,
+        deadline_at=1000.0 + 1.0,
+        clock=lambda: 1000.0,
+    )
+    assert out.get("pagination_complete") is False
+    assert out.get("next_page") == 2
+    assert not out.get("page_error")

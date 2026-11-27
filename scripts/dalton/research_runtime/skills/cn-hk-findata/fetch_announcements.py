@@ -181,9 +181,9 @@ def fetch_announcements(
             if remaining <= 0:
                 has_more = True
                 next_page = page
+                # Out of local budget before this page: an incomplete page set to
+                # resume from next_page, not a source error (no source backoff).
                 deadline_reached = True
-                if pages_fetched == 0:
-                    page_error = "deadline_exceeded"
                 break
             req_timeout = min(CNINFO_PAGE_TIMEOUT_S, remaining)
         else:
