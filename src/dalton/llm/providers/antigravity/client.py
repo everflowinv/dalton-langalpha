@@ -72,10 +72,46 @@ _THOUGHT_SIGNATURES_KEY = "antigravity_thought_signatures"
 # message whose signatures can be replayed exactly; one without it predates the
 # map, and its list cannot be matched to calls.
 _CALL_SIGNATURES_KEY = "antigravity_call_signatures"
+# Model family that minted the thought signatures on this message (e.g.
+# "gemini", "claude"). Antigravity routes multiple model families behind one
+# provider_route ("antigravity-oauth"), so replay must check signature family
+# directly instead of relying on provider_route alone.
+_SIGNATURE_FAMILY_KEY = "antigravity_signature_family"
 # Gemini's documented stand-in for a call it did not sign (a Claude call, a
 # call from before the map): it validates every functionCall of the current
 # turn and refuses one with no signature or with another call's.
 _SKIP_SIGNATURE = "skip_thought_signature_validator"
+
+
+def _signature_family_for_model(model: Any) -> str | None:
+    """Infer model family for Antigravity thoughtSignature compatibility."""
+    if not isinstance(model, str):
+        return None
+    norm = model.strip().lower()
+    if not norm:
+        return None
+    if "gemini" in norm:
+        return "gemini"
+    if "claude" in norm or "anthropic" in norm:
+        return "claude"
+    if "gpt" in norm or "openai" in norm:
+        return "gpt"
+    prefix = re.split(r"[-_./:\s]+", norm, maxsplit=1)[0]
+    return prefix or None
+
+
+def _signature_source_family(message: AIMessage) -> str | None:
+    """Resolve the model family that produced ``message``'s thought signatures."""
+    extra = message.additional_kwargs or {}
+    stamped = extra.get(_SIGNATURE_FAMILY_KEY)
+    if isinstance(stamped, str) and stamped.strip():
+        return stamped.strip().lower()
+    meta = message.response_metadata or {}
+    for key in ("model_version", "model_name", "model", "catalog_model"):
+        fam = _signature_family_for_model(meta.get(key))
+        if fam is not None:
+            return fam
+    return None
 
 
 # DALTON-HOOK(antigravity-json-nan): coerce NaN/+Inf/-Inf in tool outputs and request payloads to JSON null
@@ -100,14 +136,21 @@ def _sanitize_json_non_finite(value: Any) -> Any:
 class _SignatureState:
     """The signatures of one response; never shared between calls."""
 
-    def __init__(self) -> None:
+    def __init__(self, family: str | None = None) -> None:
         self.ordered: list[str] = []
         self.by_call: dict[str, str] = {}
+        self.family: str | None = family
 
     def kwargs(self) -> dict[str, Any]:
         if not self.ordered:
             return {}
-        return {_THOUGHT_SIGNATURES_KEY: list(self.ordered), _CALL_SIGNATURES_KEY: dict(self.by_call)}
+        out: dict[str, Any] = {
+            _THOUGHT_SIGNATURES_KEY: list(self.ordered),
+            _CALL_SIGNATURES_KEY: dict(self.by_call),
+        }
+        if self.family:
+            out[_SIGNATURE_FAMILY_KEY] = self.family
+        return out
 
 
 class AntigravityApiError(RuntimeError):
@@ -354,7 +397,10 @@ def _part_from_block(block: Any) -> dict | None:
 
 
 def _messages_to_gemini(
-    messages: Sequence[BaseMessage], *, gemini_target: bool = False
+    messages: Sequence[BaseMessage],
+    *,
+    gemini_target: bool = False,
+    target_model: str | None = None,
 ) -> tuple[dict | None, list[dict]]:
     """LangChain messages → (systemInstruction, contents).
 
@@ -368,6 +414,32 @@ def _messages_to_gemini(
     # R6-3: map tool_call_id -> tool name from preceding AIMessages so
     # ToolMessages without an explicit .name still send the declared function name.
     tool_call_names: dict[str, str] = {}
+    target_family = (
+        _signature_family_for_model(target_model)
+        if target_model
+        else ("gemini" if gemini_target else None)
+    )
+    last_call_order: dict[str, int] = {}
+    # Buffer consecutive ToolMessages from one parallel tool batch so all
+    # functionResponse parts go first (in call order), followed by all
+    # inlineData attachments (in matching call order), inside a single user turn.
+    pending_tools: list[tuple[int, int, dict[str, Any], list[dict[str, Any]]]] = []
+
+    def _flush_tool_batch() -> None:
+        if not pending_tools:
+            return
+        ordered = sorted(pending_tools, key=lambda item: (item[0], item[1]))
+        fn_parts = [item[2] for item in ordered]
+        extra_batch: list[dict[str, Any]] = []
+        for item in ordered:
+            extra_batch.extend(item[3])
+        contents.append(
+            {
+                "role": "user",  # tool results ride the user turn in Gemini
+                "parts": [*fn_parts, *extra_batch],
+            }
+        )
+        pending_tools.clear()
 
     for message in messages:
         if isinstance(message, SystemMessage):
@@ -380,8 +452,8 @@ def _messages_to_gemini(
         if isinstance(message, ToolMessage):
             # Gemini expects one functionResponse per tool call, named after
             # the tool, with the payload as a JSON object. Multimodal parts
-            # (inlineData images/PDFs) ride in the same user turn right after
-            # the functionResponse part.
+            # (inlineData images/PDFs) ride in the same user turn after all
+            # functionResponse parts of the batch.
             result: Any = message.content
             extra_parts: list[dict[str, Any]] = []
             if isinstance(result, str):
@@ -431,14 +503,17 @@ def _messages_to_gemini(
             }
             if message.tool_call_id:
                 fn_resp["id"] = message.tool_call_id
-            contents.append(
-                {
-                    "role": "user",  # tool results ride the user turn in Gemini
-                    "parts": [{"functionResponse": fn_resp}, *extra_parts],
-                }
+            call_pos = (
+                last_call_order.get(str(message.tool_call_id), len(last_call_order))
+                if message.tool_call_id
+                else len(last_call_order)
+            )
+            pending_tools.append(
+                (call_pos, len(pending_tools), {"functionResponse": fn_resp}, extra_parts)
             )
             continue
 
+        _flush_tool_batch()
         role = "model" if isinstance(message, AIMessage) else "user"
         parts: list[dict] = []
         # An Anthropic-SDK message names each call twice, as a tool_use block
@@ -457,14 +532,29 @@ def _messages_to_gemini(
                     block_calls.append(part)
                 parts.append(part)
         if isinstance(message, AIMessage):
+            last_call_order = {}
+            for part_fc in block_calls:
+                block_id = str(part_fc["functionCall"].get("id") or "")
+                if block_id and block_id not in last_call_order:
+                    last_call_order[block_id] = len(last_call_order)
             # The endpoint validates that functionCall parts carry their
             # thought_signature (it 400s without one). A mapped message
-            # replays each call's own signature; Gemini gets the stand-in for
-            # any call not in the map, and for every call of an unmapped one,
-            # whose list may hold a text part's signature first.
+            # replays each call's own signature only within the same model
+            # family; cross-family messages drop foreign signatures while
+            # keeping tool call IDs, so Gemini gets the stand-in.
             extra = message.additional_kwargs or {}
-            by_call = extra.get(_CALL_SIGNATURES_KEY)
-            signatures = list(extra.get(_THOUGHT_SIGNATURES_KEY, []))
+            source_family = _signature_source_family(message)
+            signatures_compatible = (
+                source_family is None
+                or target_family is None
+                or source_family == target_family
+            )
+            if signatures_compatible:
+                by_call = extra.get(_CALL_SIGNATURES_KEY)
+                signatures = list(extra.get(_THOUGHT_SIGNATURES_KEY, []))
+            else:
+                by_call = None
+                signatures = []
             if isinstance(by_call, dict):
                 signatures = [sig for sig in signatures if sig not in by_call.values()]
             elif gemini_target:
@@ -474,6 +564,8 @@ def _messages_to_gemini(
                 call_name = call.get("name", "")
                 if call_id and call_name:
                     tool_call_names[str(call_id)] = str(call_name)
+                if call_id and str(call_id) not in last_call_order:
+                    last_call_order[str(call_id)] = len(last_call_order)
                 fc_payload: dict[str, Any] = {"name": call_name, "args": call.get("args", {})}
                 if call_id:
                     fc_payload["id"] = call_id
@@ -503,6 +595,7 @@ def _messages_to_gemini(
         if parts:
             contents.append({"role": role, "parts": parts})
 
+    _flush_tool_batch()
     system_instruction = {"parts": system_parts} if system_parts else None
     return system_instruction, contents
 
@@ -734,7 +827,9 @@ class ChatAntigravity(BaseChatModel):
         thinking_level_override: Optional[str] = None,
     ) -> dict:
         system_instruction, contents = _messages_to_gemini(
-            messages, gemini_target="gemini" in (self.model or "").lower()
+            messages,
+            gemini_target="gemini" in (self.model or "").lower(),
+            target_model=self.model,
         )
 
         inner: dict[str, Any] = {"contents": contents}
@@ -869,7 +964,7 @@ class ChatAntigravity(BaseChatModel):
         """
         # Per call, not on the client: one cached client serves concurrent
         # turns, and a shared list mixed their signatures.
-        sigs = sigs if sigs is not None else _SignatureState()
+        sigs = sigs if sigs is not None else _SignatureState(_signature_family_for_model(self.model))
         response = envelope.get("response") or {}
         candidates = response.get("candidates") or []
         if not candidates:
@@ -956,6 +1051,8 @@ class ChatAntigravity(BaseChatModel):
             model_version = response.get("modelVersion")
             if model_version:
                 meta["model_version"] = model_version
+                if not sigs.family:
+                    sigs.family = _signature_family_for_model(model_version)
             response_id = response.get("responseId")
             if response_id:
                 meta["response_id"] = response_id
@@ -1029,6 +1126,9 @@ class ChatAntigravity(BaseChatModel):
             if c.additional_kwargs.get(_THOUGHT_SIGNATURES_KEY):
                 additional_kwargs[_THOUGHT_SIGNATURES_KEY] = list(c.additional_kwargs[_THOUGHT_SIGNATURES_KEY])
                 additional_kwargs[_CALL_SIGNATURES_KEY] = dict(c.additional_kwargs.get(_CALL_SIGNATURES_KEY) or {})
+                sig_family = c.additional_kwargs.get(_SIGNATURE_FAMILY_KEY)
+                if sig_family:
+                    additional_kwargs[_SIGNATURE_FAMILY_KEY] = sig_family
 
         usage = None
         metadata: dict[str, Any] = {}
@@ -1055,7 +1155,7 @@ class ChatAntigravity(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
-        sigs = _SignatureState()
+        sigs = _SignatureState(_signature_family_for_model(self.model))
         payload = self._build_payload(messages, stop=stop, thinking_level_override=kwargs.get("thinking_level"))
         for envelope in self._stream_raw(payload):
             for chunk in self._chunks_from_frame(envelope, sigs):
@@ -1070,7 +1170,7 @@ class ChatAntigravity(BaseChatModel):
         run_manager: AsyncCallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
-        sigs = _SignatureState()
+        sigs = _SignatureState(_signature_family_for_model(self.model))
         payload = self._build_payload(messages, stop=stop, thinking_level_override=kwargs.get("thinking_level"))
         async for envelope in self._astream_raw(payload):
             for chunk in self._chunks_from_frame(envelope, sigs):

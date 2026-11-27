@@ -3,21 +3,27 @@
 
 Uses the application's existing Antigravity OAuth credential lookup (strictly
 read-only, never writing back to the database and never printing tokens) and
-``create_llm`` client builder to send three tiny probes to a specified
+``create_llm`` client builder to send four tiny probes to a specified
 Antigravity model:
 
 1. User turn with an inline generated PNG showing a 4-digit number.
 2. Simulated ``Read`` tool call whose ``ToolMessage`` carries the same PNG.
 3. Simulated ``Read`` tool call whose ``ToolMessage`` carries a 1-page PDF
    showing a 4-digit number.
+4. Two parallel ``Read`` tool calls whose ``ToolMessage`` results each carry a
+   PNG showing a different 4-digit number (sent as one user turn: FR1, FR2,
+   image 1, image 2).
 
-Each probe asks for the number, prints the model's answer and PASS/FAIL, and
-exits 0 only when all three probes pass.
+Each probe asks for the number(s), prints the model's answer and PASS/FAIL, and
+exits 0 only when all four probes pass.
 
 Usage (inside the prod backend container)::
 
     uv run python scripts/dalton/ops/prod/probe_antigravity_multimodal.py \\
         --model gemini-4-argon-medium-oauth
+
+    uv run python scripts/dalton/ops/prod/probe_antigravity_multimodal.py \\
+        --model claude-sonnet-5-5-medium-oauth
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ import io
 import os
 import re
 import sys
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -71,6 +78,8 @@ _DUMMY_READ_TOOL = {
         },
     },
 }
+
+_ANTIGRAVITY_PROVIDER = "antigravity-oauth"
 
 
 def make_number_png(digits: str, *, scale: int = 12, padding: int = 24) -> bytes:
@@ -150,6 +159,10 @@ def _answer_matches(answer: str, expected: str) -> bool:
     return bool(re.search(rf"(?<!\d){re.escape(expected)}(?!\d)", answer))
 
 
+def _answer_matches_all(answer: str, expected: Sequence[str]) -> bool:
+    return bool(expected) and all(_answer_matches(answer, code) for code in expected)
+
+
 async def _resolve_user_id(explicit_user_id: str | None) -> str:
     if explicit_user_id and explicit_user_id.strip():
         return explicit_user_id.strip()
@@ -167,19 +180,26 @@ async def _resolve_user_id(explicit_user_id: str | None) -> str:
 
 
 async def _build_readonly_client(model_name: str, user_id: str) -> Any:
-    """Resolve the model client without writing tokens back to PostgreSQL."""
+    """Resolve an Antigravity OAuth client without writing tokens back to PostgreSQL."""
     from src.dalton.llm.providers.antigravity.oauth import refresh_tokens as refresh_ag_tokens
     from src.llms.llm import LLM as LLMFactory, create_llm
     from src.server.database.oauth_tokens import get_oauth_tokens
     from src.server.services.llm.clients import subscription_route
 
     mc = LLMFactory.get_model_config()
-    route = subscription_route(model_name, mc)
+    route = subscription_route(model_name, mc, custom_entry=None)
     if route is None:
         raise RuntimeError(f"Model {model_name!r} is not a subscription/OAuth model in the catalog.")
 
-    subscription, model_info = route.subscription, route.model_info
+    model_info = route.model_info
     provider = str(model_info.get("provider") or "")
+    if provider != _ANTIGRAVITY_PROVIDER:
+        raise RuntimeError(
+            f"Model {model_name!r} uses provider={provider!r}, not {_ANTIGRAVITY_PROVIDER!r}. "
+            "Pass an Antigravity catalog model (e.g. gemini-4-argon-medium-oauth or "
+            "claude-sonnet-5-5-medium-oauth)."
+        )
+
     row = await get_oauth_tokens(user_id, provider)
     if not row or not row.get("access_token"):
         raise RuntimeError(f"No stored OAuth token found for provider={provider!r}.")
@@ -200,18 +220,20 @@ async def _build_readonly_client(model_name: str, user_id: str) -> Any:
                 raise RuntimeError(
                     f"Stored OAuth token for provider={provider!r} is expired and has no refresh_token."
                 )
-            if provider == "antigravity-oauth":
-                refreshed = await refresh_ag_tokens(refresh_tok)
-                access_token = str(refreshed["access_token"])
-            else:
-                token_set = await subscription.refresh(refresh_tok)
-                access_token = token_set.access_token
+            refreshed = await refresh_ag_tokens(refresh_tok)
+            access_token = str(refreshed["access_token"])
 
     return create_llm(model_name, api_key=access_token)
 
 
-def _build_probe_messages(img_b64: str, pdf_b64: str) -> list[tuple[str, str, list[Any], bool]]:
+def _build_probe_messages(
+    img_b64: str,
+    pdf_b64: str,
+    img2_b64: str | None = None,
+) -> list[tuple[str, tuple[str, ...], list[Any], bool]]:
     img_blocks = build_content_blocks(img_b64, "/tmp/probe_number.png", "image/png")
+    img2_payload = img2_b64 or base64.b64encode(make_number_png("4816")).decode("ascii")
+    img2_blocks = build_content_blocks(img2_payload, "/tmp/probe_number_2.png", "image/png")
     pdf_blocks = build_content_blocks(
         pdf_b64, "/tmp/probe_number.pdf", "application/pdf", pages=1
     )
@@ -258,10 +280,37 @@ def _build_probe_messages(img_b64: str, pdf_b64: str) -> list[tuple[str, str, li
         ToolMessage(content=pdf_blocks, tool_call_id="probe_call_pdf", name="Read"),
     ]
 
+    probe_4 = [
+        HumanMessage(
+            content=(
+                "Read both /tmp/probe_number.png and /tmp/probe_number_2.png and tell me both "
+                "4-digit numbers separated by a comma. Reply with the two numbers only."
+            )
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "probe_call_parallel_1",
+                    "name": "Read",
+                    "args": {"file_path": "/tmp/probe_number.png"},
+                },
+                {
+                    "id": "probe_call_parallel_2",
+                    "name": "Read",
+                    "args": {"file_path": "/tmp/probe_number_2.png"},
+                },
+            ],
+        ),
+        ToolMessage(content=img_blocks, tool_call_id="probe_call_parallel_1", name="Read"),
+        ToolMessage(content=img2_blocks, tool_call_id="probe_call_parallel_2", name="Read"),
+    ]
+
     return [
-        ("1. user_turn_image", "7391", probe_1, False),
-        ("2. tool_result_image", "7391", probe_2, True),
-        ("3. tool_result_pdf", "5924", probe_3, True),
+        ("1. user_turn_image", ("7391",), probe_1, False),
+        ("2. tool_result_image", ("7391",), probe_2, True),
+        ("3. tool_result_pdf", ("5924",), probe_3, True),
+        ("4. parallel_tool_result_images", ("7391", "4816"), probe_4, True),
     ]
 
 
@@ -281,22 +330,24 @@ async def run_probes(model_name: str, user_id: str | None = None) -> int:
         tool_client = client.bind_tools([_DUMMY_READ_TOOL])
 
         img_b64 = base64.b64encode(make_number_png("7391")).decode("ascii")
+        img2_b64 = base64.b64encode(make_number_png("4816")).decode("ascii")
         pdf_b64 = base64.b64encode(make_number_pdf("5924")).decode("ascii")
-        probes = _build_probe_messages(img_b64, pdf_b64)
+        probes = _build_probe_messages(img_b64, pdf_b64, img2_b64)
 
-        print(f"Probing model={model_name} (read-only; 3 requests)")
+        print(f"Probing model={model_name} (read-only; {len(probes)} requests)")
         all_ok = True
         for label, expected, messages, use_tools in probes:
             target = tool_client if use_tools else client
             try:
                 reply = await target.ainvoke(messages)
                 answer = _extract_answer_text(reply)
-                matched = _answer_matches(answer, expected)
+                matched = _answer_matches_all(answer, expected)
                 status = "PASS" if matched else "FAIL"
                 if not matched:
                     all_ok = False
                 snippet = answer.replace("\n", " ")[:120]
-                print(f"[{status}] {label}: expected={expected} answer={snippet!r}")
+                expected_str = ",".join(expected)
+                print(f"[{status}] {label}: expected={expected_str} answer={snippet!r}")
             except Exception as exc:
                 all_ok = False
                 safe_err = sanitize_error_text(str(exc))[:200]
@@ -313,7 +364,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--model",
         required=True,
-        help="Catalog model key (e.g. gemini-4-argon-medium-oauth or claude-sonnet-5-5-oauth).",
+        help=(
+            "Antigravity OAuth catalog model key "
+            "(e.g. gemini-4-argon-medium-oauth or claude-sonnet-5-5-medium-oauth)."
+        ),
     )
     parser.add_argument(
         "--user-id",

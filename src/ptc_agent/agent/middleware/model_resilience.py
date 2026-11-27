@@ -2279,16 +2279,11 @@ class ModelResilienceMiddleware(AgentMiddleware):
             stripped: list[str] = []
             while True:
                 attempts += 1
-                # DALTON-HOOK(refusal-handling): allow one cross-family backup retry on primary stop_reason=refusal exhaustion
-                from src.dalton.middleware.refusal_fallback import ModelRefusalExhausted, arm_refusal_fallback_for_call, retry_refusal_with_backup
-                clean_messages = list(request.messages)
                 try:
-                    with _answering(index), arm_refusal_fallback_for_call(self, request, index):
+                    with _answering(index):
                         response = await handler(req)
                     _refuse_unfinished(response)
                     return self._answered(response, name, index, request, stripped)
-                except ModelRefusalExhausted as refusal_exc:
-                    return await retry_refusal_with_backup(self, request, clean_messages, handler, refusal_exc)
                 except Exception as exc:
                     if not oauth_refreshed and extract_status_code(exc) == 401:
                         oauth_refreshed = True
