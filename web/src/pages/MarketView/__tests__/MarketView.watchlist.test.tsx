@@ -1310,4 +1310,96 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
     unmountDashUnprinted();
     unmountMvUnprinted();
   });
+
+  it('r7: Dashboard WatchlistRowItem and MarketView WatchlistFullTable agree on real Yahoo unprinted pre-market fallback ($100.00, +2.04%)', () => {
+    const T_reg = 1_792_612_800_000;
+    const preStatus: MarketStatusInput = { market: 'extended-hours', earlyHours: true, afterHours: false };
+    const company = { ticker: 'GOOG', name: 'Alphabet Inc.', tier: 'core' as const, is_private: false };
+
+    // Real core-install Yahoo pre-market fallback shape from extended_hours.py (`base_snap`):
+    // price = yesterday's close (100), regular_close = 100, previous_close = day-before-yesterday close (98).
+    const yahooPreFallback: QuoteRow = {
+      symbol: 'GOOG',
+      source: 'yfinance',
+      price: 100,
+      regular_close: 100,
+      previous_close: 98,
+      change: 2,
+      change_percent: 2.0408,
+      regular_trading_change: 2,
+      regular_trading_change_percent: 2.0408,
+      early_trading_change: null,
+      early_trading_change_percent: null,
+      late_trading_change: null,
+      late_trading_change_percent: null,
+      last_trade_price: null,
+      last_minute_close: null,
+      last_trade_at: null,
+      market_status: null,
+      as_of: T_reg,
+      regular_as_of: T_reg,
+      regular_only: true,
+      currency: 'USD',
+    };
+
+    const sp = snapshotToStockPrice('GOOG', yahooPreFallback);
+    const dashRow: WatchlistRow = {
+      watchlist_item_id: 'w-goog-yf-fb',
+      ...sp,
+      previousClose: sp.previousClose ?? null,
+      earlyTradingChangePercent: sp.earlyTradingChangePercent ?? null,
+      lateTradingChangePercent: sp.lateTradingChangePercent ?? null,
+      currency: sp.currency ?? 'USD',
+      assetClass: 'equity',
+    };
+
+    const { container: dashEl, unmount: unmountDash } = render(
+      <MemoryRouter>
+        <table>
+          <tbody>
+            <WatchlistRowItem item={dashRow} marketStatus={preStatus} />
+          </tbody>
+        </table>
+      </MemoryRouter>,
+    );
+    const { container: mvEl, unmount: unmountMv } = render(
+      <WatchlistFullTable
+        companies={[company]}
+        metrics={{
+          GOOG: {
+            ...mocks.watchlistMetrics.items.NVDA,
+            ticker: 'GOOG',
+            price: 100,
+            chg_1d: 2.04,
+            currency: 'USD',
+          },
+        }}
+        quotes={{ GOOG: yahooPreFallback }}
+        marketStatus={preStatus}
+        metricsLoading={false}
+        visibleColumns={['price', 'chg_1d']}
+        groupedByTier={false}
+        holdingSymbols={new Set()}
+        onSelectSymbol={vi.fn<WatchlistFullTableProps['onSelectSymbol']>()}
+        onRequestTierChange={vi.fn<WatchlistFullTableProps['onRequestTierChange']>()}
+        onRequestRemove={vi.fn<WatchlistFullTableProps['onRequestRemove']>()}
+      />,
+    );
+
+    const dashCells = dashEl.querySelectorAll('td');
+    const mvRow = mvEl.querySelector('[data-testid="watchlist-row-GOOG"]')!;
+    const mvPriceCell = mvRow.querySelectorAll('td')[1];
+    const mvChgCell = mvRow.querySelectorAll('td')[2];
+
+    expect(dashCells[1].textContent).toBe('$100.00');
+    expect(dashCells[1].textContent).not.toBe('$98.00');
+    expect(mvPriceCell.firstElementChild?.textContent).toBe('$100.00');
+    expect(dashCells[2].getAttribute('title')).toBe('+$2.00');
+    expect(dashCells[2].firstElementChild?.textContent).toContain('2.04%');
+    expect(mvChgCell.textContent).toBe('+2.04%');
+    expect(dashEl.querySelector('.dash-ext')).toBeNull();
+    expect(mvPriceCell.querySelector('.dash-ext')).toBeNull();
+    unmountDash();
+    unmountMv();
+  });
 });

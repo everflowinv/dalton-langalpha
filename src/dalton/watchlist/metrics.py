@@ -620,7 +620,9 @@ def _extract_selected_price_trade_ts(
         return snap.get("live_tick_at")
 
     regular_as_of = snap.get("regular_as_of")
-    if regular_as_of is not None and snap.get("regular_only") is False:
+    if snap.get("regular_only") is False:
+        return regular_as_of
+    if snap.get("regular_only") is True and regular_as_of is not None:
         return regular_as_of
 
     is_ginlix = str(snap.get("source") or "").strip().lower() == "ginlix-data"

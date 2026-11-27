@@ -6,7 +6,7 @@ import { api } from '@/api/client';
 import { queryKeys } from '@/lib/queryKeys';
 import { getQuoteBatcher } from '@/lib/quotes/quoteBatcher';
 import { deriveQuoteDisplay, snapshotToStockPrice, writeQuoteFromWs, type QuoteRow } from '@/lib/quotes';
-import { mergeRestQuoteRow } from '@/lib/dalton/quotes/quoteMerge';
+import { extractSelectedPriceTradeTsMs, mergeRestQuoteRow } from '@/lib/dalton/quotes/quoteMerge';
 import { getExtendedHoursInfo } from '@/lib/dalton/quotes/extendedHoursCore';
 import { resolveExtendedHoursDisplay } from '@/components/dalton/ExtendedHours';
 import {
@@ -898,7 +898,7 @@ describe('watchlist pending-only subset polling', () => {
       locale: 'en-US',
     });
     expect(display.session).toBe('pre');
-    expect(display.mainPrice).toBe(320.76);
+    expect(display.mainPrice).toBe(317.28);
     expect(display.mainChangePct).toBeCloseTo(-1.0849, 4);
     expect(display.ext).toBeNull();
   });
@@ -1134,5 +1134,198 @@ describe('watchlist pending-only subset polling', () => {
     expect(unprintedPre.extPrice).toBeNull();
     expect(unprintedPre.extChange).toBeNull();
     expect(unprintedPre.extChangePct).toBeNull();
+  });
+
+  it('r7: REST regular_only Yahoo snapshot (8:31) and SnapshotData-serialized Yahoo PM row never overwrite 8:30 WS trade (102)', async () => {
+    const T_prev_close = 1_792_612_800_000; // yesterday 16:00 ET
+    const T_830 = 1_792_672_200_000; // today 08:30 ET
+    const T_831 = 1_792_672_260_000; // today 08:31 ET
+
+    // 1. 8:30 WS trade at 102, followed by 8:31 Yahoo regular_only snapshot (yesterday close 100):
+    //    regular_only snapshot must not participate in newer-trade comparison or overwrite WS 102.
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const batcher = getQuoteBatcher(qc);
+    qc.setQueryData(queryKeys.quote.detail('GOOG'), {
+      symbol: 'GOOG',
+      source: 'ginlix-data',
+      price: 100,
+      regular_close: 100,
+      previous_close: 100,
+      as_of: T_prev_close,
+      currency: 'USD',
+    });
+
+    writeQuoteFromWs(qc, 'GOOG', {
+      price: 102,
+      change: 2,
+      changePercent: 2.0,
+      timestamp: T_830,
+    });
+    expect(qc.getQueryData<QuoteRow>(queryKeys.quote.detail('GOOG'))).toMatchObject({
+      price: 102,
+      last_minute_close: 102,
+      live_tick_at: T_830,
+    });
+
+    const getSpy = vi.spyOn(api, 'get') as unknown as ReturnType<typeof vi.fn<typeof api.get>>;
+    getSpy.mockResolvedValueOnce({
+      data: {
+        snapshots: [
+          {
+            symbol: 'GOOG',
+            name: 'Alphabet Inc.',
+            source: 'yfinance',
+            price: 100,
+            regular_close: 100,
+            previous_close: 98,
+            change: 2,
+            change_percent: 2.0408,
+            regular_trading_change: 2,
+            regular_trading_change_percent: 2.0408,
+            early_trading_change: null,
+            early_trading_change_percent: null,
+            late_trading_change: null,
+            late_trading_change_percent: null,
+            last_trade_at: null,
+            last_minute_close: null,
+            as_of: T_831,
+            regular_as_of: null,
+            regular_only: true,
+            currency: 'USD',
+          },
+        ],
+      },
+    } as Awaited<ReturnType<typeof api.get>>);
+
+    const req = batcher.request('GOOG');
+    await vi.advanceTimersByTimeAsync(60);
+    const afterYahooRegular = await req;
+    expect(afterYahooRegular).toMatchObject({
+      name: 'Alphabet Inc.',
+      price: 102,
+      last_minute_close: 102,
+      live_tick_at: T_830,
+    });
+
+    // 2. SnapshotData-serialized Yahoo extended-hours pre-market row (8:31) keeps regular_only: false:
+    //    its price (yesterday's close 100) is timestamped by regular_as_of (yesterday 16:00), NOT 8:31 as_of,
+    //    so it never overwrites the 8:30 WS trade (102) with 100.
+    const serializedYahooPm: QuoteRow = {
+      symbol: 'GOOG',
+      source: 'yfinance',
+      price: 100,
+      regular_close: 100,
+      previous_close: 100,
+      last_trade_price: 101,
+      last_minute_close: null,
+      last_trade_at: null,
+      early_trading_change: 1,
+      early_trading_change_percent: 1.0,
+      regular_trading_change: 2,
+      regular_trading_change_percent: 2.0408,
+      as_of: T_831,
+      regular_as_of: T_prev_close,
+      regular_only: false,
+      market_status: 'early_trading',
+      currency: 'USD',
+    };
+    expect(extractSelectedPriceTradeTsMs(serializedYahooPm, serializedYahooPm.price)).toBe(T_prev_close);
+    const mergedWithYahooPm = mergeRestQuoteRow(afterYahooRegular, serializedYahooPm);
+    expect(mergedWithYahooPm.price).toBe(102);
+    expect(mergedWithYahooPm.live_tick_at).toBe(T_830);
+
+    // 3. Cached Yahoo regular_only snapshot (as_of = 8:31) does not block an incoming 8:30 WS trade (102).
+    const qc2 = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc2.setQueryData(queryKeys.quote.detail('GOOG'), {
+      symbol: 'GOOG',
+      source: 'yfinance',
+      price: 100,
+      regular_close: 100,
+      previous_close: 98,
+      as_of: T_831,
+      regular_only: true,
+      currency: 'USD',
+    });
+    writeQuoteFromWs(qc2, 'GOOG', {
+      price: 102,
+      change: 2,
+      changePercent: 2.0,
+      timestamp: T_830,
+    });
+    expect(qc2.getQueryData<QuoteRow>(queryKeys.quote.detail('GOOG'))).toMatchObject({
+      price: 102,
+      last_minute_close: 102,
+      live_tick_at: T_830,
+      regular_only: null,
+    });
+  });
+
+  it('r7: core-install Yahoo and FMP unprinted pre-market fallbacks use latest regular close (100) instead of prior-day previous_close (98)', () => {
+    const T_prev_close = 1_792_612_800_000;
+    const preStatus = { market: 'extended-hours', earlyHours: true, afterHours: false };
+
+    // Real Yahoo pre-market fallback shape from extended_hours.py (base_snap when no PM print yet):
+    // price = yesterday close (100), regular_close = 100, previous_close = day-before-yesterday close (98).
+    const yahooFallback: QuoteRow = {
+      symbol: 'GOOG',
+      source: 'yfinance',
+      price: 100,
+      regular_close: 100,
+      previous_close: 98,
+      change: 2,
+      change_percent: 2.0408,
+      regular_trading_change: 2,
+      regular_trading_change_percent: 2.0408,
+      early_trading_change: null,
+      early_trading_change_percent: null,
+      late_trading_change: null,
+      late_trading_change_percent: null,
+      last_trade_price: null,
+      last_minute_close: null,
+      last_trade_at: null,
+      market_status: null,
+      as_of: T_prev_close,
+      regular_as_of: T_prev_close,
+      regular_only: true,
+      currency: 'USD',
+    };
+
+    const derivedYahoo = deriveQuoteDisplay(snapshotToStockPrice('GOOG', yahooFallback), preStatus);
+    expect(derivedYahoo.session).toBe('pre');
+    expect(derivedYahoo.mainPrice).toBe(100);
+    expect(derivedYahoo.mainChange).toBe(2);
+    expect(derivedYahoo.mainChangePct).toBeCloseTo(2.0408, 4);
+    expect(derivedYahoo.extPrice).toBeNull();
+
+    const resolvedYahoo = resolveExtendedHoursDisplay(yahooFallback, preStatus, {
+      symbol: 'GOOG',
+      locale: 'en-US',
+    });
+    expect(resolvedYahoo.session).toBe('pre');
+    expect(resolvedYahoo.mainPrice).toBe(100);
+    expect(resolvedYahoo.mainChangePct).toBeCloseTo(2.0408, 4);
+    expect(resolvedYahoo.ext).toBeNull();
+
+    // FMP regular_only pre-market fallback (no regular_close / regular_trading_change fields):
+    const fmpFallback: QuoteRow = {
+      symbol: 'GOOG',
+      source: 'fmp',
+      price: 100,
+      previous_close: 98,
+      change: 2,
+      change_percent: 2.0408,
+      early_trading_change_percent: null,
+      late_trading_change_percent: null,
+      market_status: null,
+      as_of: T_prev_close,
+      regular_only: true,
+      currency: 'USD',
+    };
+    const derivedFmp = deriveQuoteDisplay(snapshotToStockPrice('GOOG', fmpFallback), preStatus);
+    expect(derivedFmp.session).toBe('pre');
+    expect(derivedFmp.mainPrice).toBe(100);
+    expect(derivedFmp.mainChange).toBe(2);
+    expect(derivedFmp.mainChangePct).toBeCloseTo(2.0408, 4);
+    expect(derivedFmp.extPrice).toBeNull();
   });
 });

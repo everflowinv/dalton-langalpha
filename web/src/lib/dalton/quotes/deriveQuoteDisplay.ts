@@ -39,6 +39,8 @@ export interface QuoteDisplayInput {
   extPct?: number | null;
   liveTickAt?: number | null;
   live_tick_at?: number | null;
+  regularOnly?: boolean | null;
+  regular_only?: boolean | null;
   market_status?: string | null;
   marketStatus?: string | null;
 }
@@ -170,29 +172,47 @@ export function deriveQuoteDisplay(
 
   const prevClose = info?.prevClose ?? row?.fallbackPreviousClose ?? null;
   const regularClose = info?.regularClose ?? null;
+  const explicitRegularClose = row?.regularClose ?? row?.regular_close ?? null;
   const regChangeField = row?.regularTradingChange ?? row?.regular_trading_change ?? null;
   const regChangePctField =
     row?.regularTradingChangePercent ?? row?.regular_trading_change_percent ?? null;
+  const isRegularOnlySnapshot = row?.regularOnly === true || row?.regular_only === true;
 
-  const settledClose = (session === 'post' ? regularClose : prevClose) ?? null;
+  // In pre-market with current-session prints (`extType === 'pre'`), the snapshot has
+  // rolled to today so `prevClose` is yesterday's close (the PM anchor). When pre-market
+  // has no prints yet (`isUnprintedPreMarket`), core-install Yahoo/FMP fallback rows and
+  // prior-session AH rows still hold yesterday's close in `regular_close` / `price` and
+  // the session-before-yesterday in `previous_close` — pick the latest regular close.
+  const settledClose =
+    session === 'post'
+      ? regularClose
+      : isUnprintedPreMarket
+        ? (explicitRegularClose ?? (isRegularOnlySnapshot ? rowPrice : null) ?? prevClose)
+        : (prevClose ?? explicitRegularClose);
 
-  const prePriorClose =
-    session === 'pre' && settledClose != null && regChangeField != null
-      ? settledClose - regChangeField
+  const unprintedRegularFallbackChange =
+    isUnprintedPreMarket && isRegularOnlySnapshot
+      ? (rowChange ?? (settledClose != null && prevClose != null ? settledClose - prevClose : null))
       : null;
 
   const mainChange =
     session === 'post' && regularClose != null && prevClose != null
       ? regularClose - prevClose
       : session === 'pre'
-        ? regChangeField
+        ? (regChangeField ?? unprintedRegularFallbackChange)
         : null;
+
+  const prePriorClose =
+    session === 'pre' && settledClose != null && mainChange != null
+      ? settledClose - mainChange
+      : null;
 
   const mainChangePct =
     session === 'post'
       ? (mainChange != null && prevClose ? (mainChange / prevClose) * 100 : null)
       : session === 'pre'
         ? (regChangePctField ??
+            (isUnprintedPreMarket && isRegularOnlySnapshot ? rowChangePct : null) ??
             (mainChange != null && prePriorClose ? (mainChange / prePriorClose) * 100 : null))
         : null;
 

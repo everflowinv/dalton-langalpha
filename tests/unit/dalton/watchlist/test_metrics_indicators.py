@@ -1293,3 +1293,75 @@ async def test_r6_last_source_uses_full_remaining_symbol_budget(
     assert pending_out == set()
     assert snaps_out["AAPL"]["price"] == 215.5
     assert snaps_out["AAPL"]["source"] == "yfinance"
+
+
+def test_r7_snapshot_data_preserves_regular_only_for_yahoo_premarket_and_fallback() -> None:
+    """r7 item 1 & 2: REST SnapshotData preserves regular_only for both Yahoo pre-market enriched and fallback rows."""
+    from datetime import datetime, timezone
+    import yfinance as yf
+
+    from src.dalton.extended_hours import enrich_yfinance_snapshot_extended_hours
+    from src.server.models.market_data import SnapshotData
+
+    # 2026-10-21 16:00 ET = 1792612800; 2026-10-22 08:31 ET = 1792672260.
+    reg_close_sec = 1792612800
+    pre_trade_sec = 1792672260
+    pre_now = datetime.fromtimestamp(pre_trade_sec, tz=timezone.utc)
+    base_yahoo_snap = {
+        "symbol": "GOOG",
+        "source": "yfinance",
+        "price": 100.0,
+        "previous_close": 98.0,
+        "change": 2.0,
+        "change_percent": 2.0408,
+        "market_status": None,
+        "early_trading_change_percent": None,
+        "late_trading_change_percent": None,
+        "as_of": reg_close_sec * 1000,
+        "regular_only": True,
+    }
+
+    # 1. Yahoo pre-market enriched row serialized through REST SnapshotData keeps regular_only=False
+    #    so price (yesterday's close 100) is timestamped by regular_as_of, never 8:31 pre-market as_of.
+    pm_ticker = create_autospec(yf.Ticker, instance=True)
+    pm_ticker.info = {
+        "marketState": "PRE",
+        "preMarketPrice": 101.0,
+        "preMarketTime": pre_trade_sec,
+        "regularMarketTime": reg_close_sec,
+    }
+    enriched = enrich_yfinance_snapshot_extended_hours(
+        base_yahoo_snap, "GOOG", pm_ticker, now=pre_now
+    )
+    serialized_pm = SnapshotData(**enriched).model_dump()
+    assert serialized_pm["regular_only"] is False
+    assert serialized_pm["price"] == 100.0
+    assert serialized_pm["regular_close"] == 100.0
+    assert serialized_pm["as_of"] == pre_trade_sec * 1000
+    assert serialized_pm["regular_as_of"] == reg_close_sec * 1000
+    assert (
+        metrics_mod._extract_selected_price_trade_ts(serialized_pm, serialized_pm["price"])
+        == reg_close_sec * 1000
+    )
+
+    # 2. Core-install Yahoo pre-market fallback (no pre-market print yet) serialized through SnapshotData
+    #    keeps regular_only=True, price=100 (yesterday close), regular_close=100, previous_close=98.
+    fallback_ticker = create_autospec(yf.Ticker, instance=True)
+    fallback_ticker.info = {
+        "marketState": "PRE",
+        "preMarketPrice": None,
+        "preMarketTime": None,
+        "regularMarketTime": reg_close_sec,
+    }
+    fallback = enrich_yfinance_snapshot_extended_hours(
+        base_yahoo_snap, "GOOG", fallback_ticker, now=pre_now
+    )
+    serialized_fb = SnapshotData(**fallback).model_dump()
+    assert serialized_fb["regular_only"] is True
+    assert serialized_fb["price"] == 100.0
+    assert serialized_fb["regular_close"] == 100.0
+    assert serialized_fb["previous_close"] == 98.0
+    assert serialized_fb["regular_trading_change"] == 2.0
+    assert serialized_fb["regular_trading_change_percent"] == 2.0408
+    assert serialized_fb["early_trading_change_percent"] is None
+    assert serialized_fb["regular_as_of"] == reg_close_sec * 1000

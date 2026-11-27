@@ -70,7 +70,11 @@ export function extractSelectedPriceTradeTsMs(
     return regularAsOf;
   }
 
-  if (regularAsOf != null && record.regular_only === false) {
+  if (record.regular_only === false) {
+    return regularAsOf;
+  }
+
+  if (record.regular_only === true && regularAsOf != null) {
     return regularAsOf;
   }
 
@@ -178,19 +182,27 @@ export function mergeRestQuoteRow(
 ): QuoteRow {
   if (!prev) return incoming;
 
+  const prevRecord = prev as Record<string, unknown>;
+  const incomingRecord = incoming as Record<string, unknown>;
+  const incomingIsRegularOnly = incomingRecord.regular_only === true;
+  const prevHasLiveWs = prev.live_tick_at != null;
+
   const existingCand = quotePriceCandidateForCache(prev);
   const incomingCand = quotePriceCandidateForCache(incoming);
-  const tieBreaker = prev.live_tick_at != null ? 'existing' : 'incoming';
+  const tieBreaker = prevHasLiveWs ? 'existing' : 'incoming';
 
-  if (shouldPreferIncomingPrice(existingCand, incomingCand, tieBreaker)) {
+  // Regular-only REST snapshots (e.g. Yahoo/FMP fallback carrying yesterday's close)
+  // never participate in newer-timestamp replacement against a live WS print.
+  if (
+    !(incomingIsRegularOnly && prevHasLiveWs) &&
+    shouldPreferIncomingPrice(existingCand, incomingCand, tieBreaker)
+  ) {
     return incoming;
   }
 
   // Keep existing newer price, 1D move, and its own provenance/trade timestamp
   // fields (dropping incoming ones that prev does not carry) while refreshing
   // non-price REST metadata (name, OHLC, volume).
-  const prevRecord = prev as Record<string, unknown>;
-  const incomingRecord = incoming as Record<string, unknown>;
   const merged: QuoteRow = {
     ...incoming,
     price: prev.price,
@@ -218,11 +230,13 @@ export function mergeRestQuoteRow(
 
   // Only keep prev's extended-hours last_minute_close when prev's live WS tick
   // is at least as new as incoming's extended-hours print time; otherwise adopt
-  // incoming's last_minute_close and extended-hours fields.
+  // incoming's last_minute_close and extended-hours fields. Regular-only snapshots
+  // carry no extended-hours print, so they never clear prev's live WS minute close.
   const prevLiveTickTs = parsePriceTimestampMs(prev.live_tick_at);
-  const incomingExtTs =
-    parsePriceTimestampMs(incoming.last_trade_at ?? incomingRecord.last_trade_at) ??
-    parsePriceTimestampMs(incoming.as_of);
+  const incomingExtTs = incomingIsRegularOnly
+    ? null
+    : (parsePriceTimestampMs(incoming.last_trade_at ?? incomingRecord.last_trade_at) ??
+        parsePriceTimestampMs(incoming.as_of));
   const keepPrevLastMinuteClose =
     prev.last_minute_close != null &&
     prevLiveTickTs != null &&
@@ -245,6 +259,8 @@ export function mergeWsQuoteRow(
   fields: WsQuoteFields,
 ): QuoteRow {
   const wsTs = parsePriceTimestampMs(fields.timestamp) ?? Date.now();
+  const prevIsRegularOnly =
+    (prev as Record<string, unknown>).regular_only === true && prev.live_tick_at == null;
   const existingCand = quotePriceCandidateForCache(prev);
   const incomingCand: PricedCandidate = {
     price: Number.isFinite(fields.price) ? fields.price : null,
@@ -252,7 +268,7 @@ export function mergeWsQuoteRow(
     priceSource: 'snapshot',
   };
 
-  if (!shouldPreferIncomingPrice(existingCand, incomingCand, 'incoming')) {
+  if (!prevIsRegularOnly && !shouldPreferIncomingPrice(existingCand, incomingCand, 'incoming')) {
     return prev;
   }
 
@@ -260,6 +276,7 @@ export function mergeWsQuoteRow(
     ...prev,
     symbol: prev.symbol ?? key,
     ...(prev.source === 'daily' ? { source: 'ws' } : {}),
+    ...(prevIsRegularOnly ? { regular_only: null } : {}),
     price: fields.price,
     // A frame is a minute aggregate: its close is the row's last minute close,
     // which an extended-hours row prints as its session price.

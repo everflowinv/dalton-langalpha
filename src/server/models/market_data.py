@@ -341,6 +341,7 @@ class SnapshotData(BaseModel):
     as_of: Optional[int] = Field(None, description="Time of the quoted print (Unix ms) when the provider reports one")
     last_trade_at: Optional[int] = Field(None, description="Last trade print timestamp (Unix ms), separate from composite bid/ask as_of")  # DALTON-HOOK(watchlist)
     regular_as_of: Optional[int] = Field(None, description="Regular-session close print timestamp (Unix ms)")  # DALTON-HOOK(watchlist)
+    regular_only: Optional[bool] = Field(None, description="True when snapshot carries only regular-session prices; False when extended-hours enriched")  # DALTON-HOOK(watchlist)
     freshness: Optional[Freshness] = Field(None, description="Measured freshness of this quote")
 
 
