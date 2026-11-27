@@ -226,7 +226,8 @@ def test_lock_keys_and_google_project_extraction():
         refresh_lock_key("u1", "feishu", "cli_app", "ou_1", None)
 
     assert lifecycle_lock_key("u1", "google") != lifecycle_lock_key("u1", "feishu")
-    assert revoke_lock_key("u1", "123456789012", "sub-1") != revoke_lock_key("u1", "999999999999", "sub-1")
+    assert revoke_lock_key("123456789012", "sub-1") != revoke_lock_key("999999999999", "sub-1")
+    assert revoke_lock_key("123456789012", "sub-1") == revoke_lock_key("123456789012", "sub-1")
     assert purge_lock_key("p1") != purge_lock_key("p2")
     assert purge_lock_key("p1") == purge_lock_key("p1")
     assert touch_user_lock_key("u1") != touch_user_lock_key("u2")
@@ -604,12 +605,26 @@ async def test_process_revoke_outcomes_and_concurrency_with_autospec():
 
     async def _capture_update(purge_id, **kw):
         updates.append({"purge_id": purge_id, **kw})
-        return row
+        return _sample_ledger(
+            purge_id=purge_id,
+            remote_status=kw["remote_revoke_status"],
+        )
+
+    async def _capture_finalize(purge_id, **kw):
+        updates.append({"purge_id": purge_id, **kw})
+        return _sample_ledger(
+            purge_id=purge_id,
+            remote_status=kw["remote_revoke_status"],
+        )
 
     with (
         patch.object(revoke_mod, "get_db_connection", _fake_get_conn),
         patch.object(db, "get_purge_ledger", autospec=True, return_value=row),
+        patch.object(db, "has_running_local_purge_for_user_provider", autospec=True, return_value=False),
         patch.object(revoke_mod, "_has_newer_active_google_connection", autospec=True, return_value=False),
+        patch.object(db, "get_active_google_oauth_state_expiry", autospec=True, return_value=None),
+        patch.object(db, "claim_revoke_attempt_tx", autospec=True, return_value=1),
+        patch.object(db, "finalize_revoke_attempt_tx", autospec=True, side_effect=_capture_finalize),
         patch.object(db, "update_purge_ledger_remote_status", autospec=True, side_effect=_capture_update),
     ):
         status = await process_revoke(pid, revoker)
@@ -631,7 +646,11 @@ async def test_process_revoke_outcomes_and_concurrency_with_autospec():
     with (
         patch.object(revoke_mod, "get_db_connection", _fake_get_conn),
         patch.object(db, "get_purge_ledger", autospec=True, return_value=_sample_ledger(purge_id=pid, retry_count=2)),
+        patch.object(db, "has_running_local_purge_for_user_provider", autospec=True, return_value=False),
         patch.object(revoke_mod, "_has_newer_active_google_connection", autospec=True, return_value=False),
+        patch.object(db, "get_active_google_oauth_state_expiry", autospec=True, return_value=None),
+        patch.object(db, "claim_revoke_attempt_tx", autospec=True, return_value=2),
+        patch.object(db, "finalize_revoke_attempt_tx", autospec=True, side_effect=_capture_finalize),
         patch.object(db, "update_purge_ledger_remote_status", autospec=True, side_effect=_capture_update),
     ):
         status = await process_revoke(pid, revoker_retry)
@@ -648,7 +667,11 @@ async def test_process_revoke_outcomes_and_concurrency_with_autospec():
     with (
         patch.object(revoke_mod, "get_db_connection", _fake_get_conn),
         patch.object(db, "get_purge_ledger", autospec=True, return_value=row),
+        patch.object(db, "has_running_local_purge_for_user_provider", autospec=True, return_value=False),
         patch.object(revoke_mod, "_has_newer_active_google_connection", autospec=True, return_value=False),
+        patch.object(db, "get_active_google_oauth_state_expiry", autospec=True, return_value=None),
+        patch.object(db, "claim_revoke_attempt_tx", autospec=True, return_value=3),
+        patch.object(db, "finalize_revoke_attempt_tx", autospec=True, side_effect=_capture_finalize),
         patch.object(db, "update_purge_ledger_remote_status", autospec=True, side_effect=_capture_update),
     ):
         status = await process_revoke(pid, revoker_perm)
@@ -663,6 +686,7 @@ async def test_process_revoke_outcomes_and_concurrency_with_autospec():
     with (
         patch.object(revoke_mod, "get_db_connection", _fake_get_conn),
         patch.object(db, "get_purge_ledger", autospec=True, return_value=row),
+        patch.object(db, "has_running_local_purge_for_user_provider", autospec=True, return_value=False),
         patch.object(revoke_mod, "_has_newer_active_google_connection", autospec=True, return_value=True),
         patch.object(db, "update_purge_ledger_remote_status", autospec=True, side_effect=_capture_update),
     ):
@@ -685,29 +709,38 @@ async def test_supersede_and_revoke_before_new_authorization_and_disabled_loop(c
 
     async def _capture_update(purge_id, **kw):
         updates.append({"purge_id": purge_id, **kw})
-        return row1
+        return _sample_ledger(purge_id=purge_id, remote_status=kw["remote_revoke_status"])
 
     with (
         patch.object(revoke_mod, "get_db_connection", _fake_get_conn),
         patch.object(db, "list_active_revokes_for_google_project_sub", autospec=True, return_value=[row1, row2]),
         patch.object(db, "update_purge_ledger_remote_status", autospec=True, side_effect=_capture_update),
     ):
-        count = await supersede_pending_revokes("user-1", "123456789012", "sub-abc")
+        count = await supersede_pending_revokes("123456789012", "sub-abc")
     assert count == 2
     assert all(u["remote_revoke_status"] == RemoteRevokeStatus.SUPERSEDED and u["clear_revoke_token"] for u in updates)
 
-    # revoke_before_new_authorization: failure immediately marks superseded (never retryable)
+    # revoke_before_new_authorization: retryable failure preserves ciphertext & stays FAILED_RETRYABLE
     revoker = create_autospec(RemoteRevoker, instance=True)
     revoker.revoke.side_effect = [RevokeOutcome.SUCCEEDED, RevokeOutcome.RETRYABLE]
     updates.clear()
+    rows_by_id = {row1.purge_id: row1, row2.purge_id: row2}
     with (
         patch.object(revoke_mod, "get_db_connection", _fake_get_conn),
         patch.object(db, "list_active_revokes_for_google_project_sub", autospec=True, return_value=[row1, row2]),
-        patch.object(db, "update_purge_ledger_remote_status", autospec=True, side_effect=_capture_update),
+        patch.object(db, "get_purge_ledger", autospec=True, side_effect=lambda pid, **_k: rows_by_id[pid]),
+        patch.object(db, "has_running_local_purge_for_user_provider", autospec=True, return_value=False),
+        patch.object(revoke_mod, "_has_newer_active_google_connection", autospec=True, return_value=False),
+        patch.object(db, "get_active_google_oauth_state_expiry", autospec=True, return_value=None),
+        patch.object(db, "claim_revoke_attempt_tx", autospec=True, return_value=1),
+        patch.object(db, "finalize_revoke_attempt_tx", autospec=True, side_effect=_capture_update),
     ):
-        res = await revoke_before_new_authorization("user-1", "123456789012", "sub-abc", revoker)
+        res = await revoke_before_new_authorization("123456789012", "sub-abc", revoker)
     assert res[row1.purge_id] == RemoteRevokeStatus.SUCCEEDED
-    assert res[row2.purge_id] == RemoteRevokeStatus.SUPERSEDED
+    assert res[row2.purge_id] == RemoteRevokeStatus.FAILED_RETRYABLE
+    row2_upd = [u for u in updates if u["purge_id"] == row2.purge_id][-1]
+    assert row2_upd["clear_revoke_token"] is False
+    assert row2_upd["increment_retry"] is True
 
     # Without revoker, retry loop logs info and returns immediately
     with caplog.at_level(logging.INFO, logger=revoke_mod.__name__):

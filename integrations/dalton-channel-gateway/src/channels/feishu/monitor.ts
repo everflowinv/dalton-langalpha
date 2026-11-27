@@ -526,6 +526,11 @@ export class FeishuChannelAdapter implements ChannelAdapter {
     return Boolean(this.appId && this.appSecret);
   }
 
+  getActiveAppId(): string | undefined {
+    const cleaned = this.appId.trim();
+    return cleaned || undefined;
+  }
+
   isConnected(): boolean {
     if (!this.connected || !this.monitorHandle) {
       return false;

@@ -934,6 +934,7 @@ export interface I8AutomationRunFinishResponse {
 export interface GatewayLeaseAcquireRequest {
   instance_id: string;
   ttl_seconds: number;
+  feishu_app_id?: string | null;
 }
 
 export interface GatewayLeaseAcquireResponse {
@@ -947,6 +948,7 @@ export interface GatewayLeaseHeartbeatRequest {
   instance_id: string;
   epoch: number;
   ttl_seconds: number;
+  feishu_app_id?: string | null;
 }
 
 export interface GatewayLeaseHeartbeatResponse {

@@ -139,13 +139,17 @@ async def test_oauth_state_atomic_single_use_concurrent_two_connections_and_expi
     )
     sh = hashlib.sha256(started.state.encode()).hexdigest()
 
-    r1, r2 = await asyncio.gather(
-        db.consume_oauth_state(sh, "google"),
-        db.consume_oauth_state(sh, "google"),
+    r1, r2 = await asyncio.wait_for(
+        asyncio.gather(
+            db.consume_oauth_state(sh, "google"),
+            db.consume_oauth_state(sh, "google"),
+        ),
+        timeout=15.0,
     )
     winners = [r for r in (r1, r2) if r is not None]
     assert len(winners) == 1
     assert winners[0].user_id == LOCAL_DEV_USER_ID
+    await db.delete_oauth_state(sh, "google")
 
     # Expired state is never consumed
     exp_state = "expired-pg-state-" + uuid.uuid4().hex
@@ -347,23 +351,26 @@ async def test_serialized_refresh_concurrent_two_workers_single_upstream_call_an
 
     f_client.refresh_token.side_effect = _slow_refresh
 
-    t1, t2 = await asyncio.gather(
-        ensure_fresh_access_token(
-            uid,
-            "feishu",
-            "calendar",
-            feishu_client=f_client,
-            waiter_budget_seconds=5.0,
-            waiter_poll_interval_seconds=0.05,
+    t1, t2 = await asyncio.wait_for(
+        asyncio.gather(
+            ensure_fresh_access_token(
+                uid,
+                "feishu",
+                "calendar",
+                feishu_client=f_client,
+                waiter_budget_seconds=5.0,
+                waiter_poll_interval_seconds=0.05,
+            ),
+            ensure_fresh_access_token(
+                uid,
+                "feishu",
+                "calendar",
+                feishu_client=f_client,
+                waiter_budget_seconds=5.0,
+                waiter_poll_interval_seconds=0.05,
+            ),
         ),
-        ensure_fresh_access_token(
-            uid,
-            "feishu",
-            "calendar",
-            feishu_client=f_client,
-            waiter_budget_seconds=5.0,
-            waiter_poll_interval_seconds=0.05,
-        ),
+        timeout=15.0,
     )
     assert f_client.refresh_token.await_count == 1
     assert t1.access_token == "fresh-at-pg"
@@ -866,13 +873,17 @@ async def test_same_project_dual_service_rotation_no_revoke_retryable_queue_and_
         for l in ledgers_a
     )
 
-    # Case B: Sole service on old client, revoker returns RETRYABLE -> queued in retry queue -> commit supersedes under revoke_lock
+    # Case B: Sole service on old client (distinct project so Case A's unconsumed state does not defer),
+    # revoker returns RETRYABLE -> queued in retry queue -> commit supersedes under (project, sub) lock
+    client_old_b = "222333444-alpha.apps.googleusercontent.com"
+    client_new_b = "222333444-beta.apps.googleusercontent.com"
+    _install_creds(google_client_id=client_new_b)
     uid_b = "u-rot-retryable"
     await db.upsert_connection(
         user_id=uid_b,
         provider="google",
         service="calendar",
-        oauth_client_id=client_old,
+        oauth_client_id=client_old_b,
         provider_account_id="sub-solo",
         granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
         access_token="at-solo-old",
@@ -892,7 +903,7 @@ async def test_same_project_dual_service_rotation_no_revoke_retryable_queue_and_
     )
     assert revoker_retry.revoke.await_count == 1
     active_b = await db.list_active_revokes_for_google_project_sub(
-        uid_b, "111222333", "sub-solo", decrypt_revoke_token=True
+        "222333444", "sub-solo", user_id=uid_b, decrypt_revoke_token=True
     )
     assert len(active_b) == 1
     assert active_b[0].remote_revoke_status == RemoteRevokeStatus.FAILED_RETRYABLE
@@ -903,7 +914,7 @@ async def test_same_project_dual_service_rotation_no_revoke_retryable_queue_and_
         user_id=uid_b,
         provider="google",
         service="calendar",
-        oauth_client_id=client_new,
+        oauth_client_id=client_new_b,
         provider_account_id="sub-solo",
         provider_union_id=None,
         provider_email="solo@example.com",
@@ -1105,11 +1116,15 @@ async def test_local_mode_browser_binding_and_sweep_shared_credential_grouping_d
 async def test_r3_google_callback_exchange_and_revoke_interleaved_two_connections_db(
     gws_live_pool: Any,
 ) -> None:
-    """Real PG (Task 7): Google revoke defers during active OAuth state and serializes strictly with handle_oauth_callback exchange_code under revoke_lock."""
+    """Real PG (Task 7 + Lead §1 + Codex High #1): Google revoke defers during active state AND in-flight exchange_code without holding PG locks across HTTP; concurrent disconnect creating a new ledger mid-exchange also defers then gets superseded."""
     from src.dalton.services.integration_revoke import process_revoke
+    from src.dalton.services.user_integrations_lifecycle import (
+        begin_disconnect,
+        finish_disconnect,
+    )
 
     _ = gws_live_pool
-    uid = "u-r3-revoke-interleave"
+    uid = LOCAL_DEV_USER_ID
     client_old = "444555666-old.apps.googleusercontent.com"
     client_new = "444555666-new.apps.googleusercontent.com"
     _install_creds(google_client_id=client_new)
@@ -1138,7 +1153,7 @@ async def test_r3_google_callback_exchange_and_revoke_interleaved_two_connection
         revoker=rev_retry,
     )
     active_ledgers = await db.list_active_revokes_for_google_project_sub(
-        uid, "444555666", "sub-race", decrypt_revoke_token=True
+        "444555666", "sub-race", user_id=uid, decrypt_revoke_token=True
     )
     assert len(active_ledgers) == 1
     retry_pid = active_ledgers[0].purge_id
@@ -1146,18 +1161,37 @@ async def test_r3_google_callback_exchange_and_revoke_interleaved_two_connection
     # Case A: Background process_revoke runs while oauth_states is active -> MUST defer without calling revoker!
     rev_bg = create_autospec(RemoteRevoker, instance=True)
     rev_bg.revoke.return_value = RevokeOutcome.SUCCEEDED
-    deferred_st = await process_revoke(retry_pid, rev_bg)
+    deferred_st = await asyncio.wait_for(process_revoke(retry_pid, rev_bg), timeout=10.0)
     assert deferred_st == RemoteRevokeStatus.FAILED_RETRYABLE
     assert rev_bg.revoke.await_count == 0
 
-    # Case B: handle_oauth_callback holds revoke_lock across slow exchange_code while concurrent process_revoke races!
+    # Also seed a mail connection on client_old to test concurrent disconnect creating a BRAND-NEW ledger mid-exchange!
+    await db.upsert_connection(
+        user_id=uid,
+        provider="google",
+        service="mail",
+        oauth_client_id=client_old,
+        provider_account_id="sub-race",
+        granted_scopes=" ".join(GOOGLE_GMAIL_MIN_SCOPES),
+        access_token="at-old-mail",
+        refresh_token="rt-old-mail",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        status=IntegrationStatus.CONNECTED,
+    )
+
+    # Case B: handle_oauth_callback marks in-flight exchange in DB (WITHOUT holding PG advisory lock across exchange_code).
+    # While exchange_code is paused:
+    #   1. process_revoke(retry_pid) returns FAILED_RETRYABLE immediately (defers, does NOT hang or call revoker!)
+    #   2. Concurrent disconnect of mail creates a brand-new PENDING purge ledger + runs finish_disconnect ->
+    #      its process_revoke ALSO sees the in-flight oauth_state record and defers without calling revoker!
+    #   3. After exchange_code completes, BOTH ledgers are atomically SUPERSEDED with ciphertext wiped!
     exchange_entered = asyncio.Event()
     exchange_release = asyncio.Event()
     g_client = create_autospec(GoogleOAuthClient, instance=True)
 
     async def _slow_exchange(**_kw: Any) -> OAuthTokenResponse:
         exchange_entered.set()
-        await exchange_release.wait()
+        await asyncio.wait_for(exchange_release.wait(), timeout=10.0)
         return OAuthTokenResponse(
             access_token="at-new-safe",
             refresh_token="rt-new-safe",
@@ -1186,22 +1220,62 @@ async def test_r3_google_callback_exchange_and_revoke_interleaved_two_connection
             revoker=rev_bg,
         )
     )
-    await exchange_entered.wait()
-    # Trigger concurrent process_revoke while callback is mid-exchange_code
-    rev_task = asyncio.create_task(process_revoke(retry_pid, rev_bg))
-    await asyncio.sleep(0.08)
-    assert not rev_task.done()  # Blocked on the SAME PostgreSQL revoke_lock!
-    exchange_release.set()
+    try:
+        entered_wait = asyncio.create_task(exchange_entered.wait())
+        done, _pending = await asyncio.wait(
+            {cb_task, entered_wait},
+            timeout=10.0,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if cb_task in done:
+            entered_wait.cancel()
+            # Fail fast with the real callback exception/result instead of hanging!
+            cb_early = cb_task.result()
+            pytest.fail(f"Callback exited before exchange_code: {cb_early!r}")
+        assert exchange_entered.is_set(), "Timed out waiting for exchange_code to start"
 
-    cb_res, rev_status = await asyncio.gather(cb_task, rev_task)
+        # 1. Existing retryable ledger sees in-flight exchange -> defers immediately (no deadlock!)
+        rev_mid = await asyncio.wait_for(process_revoke(retry_pid, rev_bg), timeout=10.0)
+        assert rev_mid == RemoteRevokeStatus.FAILED_RETRYABLE
+        assert rev_bg.revoke.await_count == 0
+
+        # 2. Concurrent disconnect registers a brand-new ledger during exchange_code -> defers too!
+        disc_pid = await asyncio.wait_for(
+            begin_disconnect(uid, "google", "mail"),
+            timeout=10.0,
+        )
+        disc_fin = await asyncio.wait_for(
+            finish_disconnect(disc_pid, revoker=rev_bg),
+            timeout=10.0,
+        )
+        assert disc_fin is not None
+        assert disc_fin.local_purge_status == LocalPurgeStatus.COMPLETED
+        assert disc_fin.remote_revoke_status == RemoteRevokeStatus.FAILED_RETRYABLE
+        assert rev_bg.revoke.await_count == 0
+
+        # 3. Release exchange_code -> callback finishes and supersedes BOTH ledgers!
+        exchange_release.set()
+        cb_res = await asyncio.wait_for(cb_task, timeout=10.0)
+    finally:
+        exchange_release.set()
+        if not cb_task.done():
+            cb_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cb_task
+
     assert cb_res.status == "connected"
-    assert rev_status == RemoteRevokeStatus.SUPERSEDED
-    assert rev_bg.revoke.await_count == 0  # Old token was NEVER revoked after new token issued!
+    assert rev_bg.revoke.await_count == 0  # Old token was NEVER revoked during or after new token issued!
 
-    final_ledger = await db.get_purge_ledger(retry_pid, decrypt_revoke_token=True)
-    assert final_ledger is not None
-    assert final_ledger.remote_revoke_status == RemoteRevokeStatus.SUPERSEDED
-    assert final_ledger.revoke_token is None
+    for check_pid in (retry_pid, disc_pid):
+        final_ledger = await db.get_purge_ledger(check_pid, decrypt_revoke_token=True)
+        assert final_ledger is not None
+        assert final_ledger.remote_revoke_status == RemoteRevokeStatus.SUPERSEDED
+        assert final_ledger.revoke_token is None
+
+    # Follow-up process_revoke on either ledger sees SUPERSEDED and never calls revoker
+    assert await asyncio.wait_for(process_revoke(retry_pid, rev_bg), timeout=10.0) == RemoteRevokeStatus.SUPERSEDED
+    assert await asyncio.wait_for(process_revoke(disc_pid, rev_bg), timeout=10.0) == RemoteRevokeStatus.SUPERSEDED
+    assert rev_bg.revoke.await_count == 0
 
 
 async def test_r3_account_switch_confirm_race_deleted_or_same_target_overwritten_db(
@@ -1561,3 +1635,369 @@ async def test_r3_feishu_crash_takeover_and_google_sibling_actual_scopes_db(
     assert mail_after.last_error_code == "missing_required_scopes"
     assert GOOGLE_GMAIL_MIN_SCOPES[0] not in mail_after.granted_scopes
     assert mail_after.preferences.get("allow_create_draft") is False
+
+
+# ---------------------------------------------------------------------------
+# Round 4 Real PostgreSQL Integration Tests
+# ---------------------------------------------------------------------------
+
+
+async def test_r4_google_revoke_cross_user_same_project_sub_protects_peer_member_db(
+    gws_live_pool: Any,
+) -> None:
+    """Real PG (Lead §2.1 + Codex High #2 + Grok Medium #3): two Dalton members connect the same Google account; one disconnecting never revokes the other member's live grant."""
+    from src.dalton.services.integration_revoke import process_revoke
+    from src.dalton.services.user_integrations_lifecycle import (
+        begin_disconnect,
+        begin_disconnect_all_services,
+        finish_disconnect,
+    )
+
+    _ = gws_live_pool
+    client_id = "555666777-shared.apps.googleusercontent.com"
+    _install_creds(google_client_id=client_id)
+
+    uid_a = "u-r4-member-a"
+    uid_b = "u-r4-member-b"
+    shared_sub = "sub-shared-google-acct"
+
+    await db.upsert_connection(
+        user_id=uid_a,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_id,
+        provider_account_id=shared_sub,
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-a",
+        refresh_token="rt-a",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    await db.upsert_connection(
+        user_id=uid_b,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_id,
+        provider_account_id=shared_sub,
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-b",
+        refresh_token="rt-b",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+
+    revoker = create_autospec(RemoteRevoker, instance=True)
+    revoker.revoke.return_value = RevokeOutcome.SUCCEEDED
+
+    # Member A disconnects single service -> cross-user grant check sees Member B -> NOT_APPLICABLE, revoker NEVER called!
+    pid_a = await begin_disconnect(uid_a, "google", "calendar")
+    fin_a = await finish_disconnect(pid_a, revoker=revoker)
+    assert fin_a is not None
+    assert fin_a.remote_revoke_status == RemoteRevokeStatus.NOT_APPLICABLE
+    assert revoker.revoke.await_count == 0
+    assert await db.get_connection(uid_a, "google", "calendar") is None
+    assert await db.get_connection(uid_b, "google", "calendar") is not None
+
+    # Even if a PENDING ledger for Member A existed in the same (project, sub), process_revoke sees Member B's grant -> SUPERSEDED!
+    stale_a = await db.insert_purge_ledger(
+        user_id=uid_a,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_id,
+        provider_account_id=shared_sub,
+        auth_epoch_upto=1,
+        trigger_reason=TriggerReason.USER_DISCONNECT,
+        local_purge_status=LocalPurgeStatus.COMPLETED,
+        purged_max_turn_by_thread={},
+        remote_revoke_status=RemoteRevokeStatus.PENDING,
+        revoke_token_plaintext="rt-a-stale",
+    )
+    st_stale = await process_revoke(stale_a.purge_id, revoker)
+    assert st_stale == RemoteRevokeStatus.SUPERSEDED
+    assert revoker.revoke.await_count == 0
+
+    # Now Member B disconnects all services (last remaining user on (project, sub)) -> remote revoke DOES execute!
+    pids_b = await begin_disconnect_all_services(uid_b, "google")
+    assert len(pids_b) == 1
+    fin_b = await finish_disconnect(pids_b[0], revoker=revoker)
+    assert fin_b is not None
+    assert fin_b.remote_revoke_status == RemoteRevokeStatus.SUCCEEDED
+    assert revoker.revoke.await_count == 1
+
+
+async def test_r4_google_disconnect_and_expiry_of_pending_confirmation_revokes_staged_token_db(
+    gws_live_pool: Any,
+) -> None:
+    """Real PG (Grok Medium #2): disconnecting while a Supabase pending confirmation exists voids it & revokes its token; expiring pending confirmation enqueues revoke ledger."""
+    from src.dalton.services.integration_revoke import run_due_remote_revokes_once
+    from src.dalton.services.user_integrations_lifecycle import (
+        begin_disconnect,
+        begin_disconnect_all_services,
+        finish_disconnect,
+    )
+
+    _ = gws_live_pool
+    client_id = "666777888-pend.apps.googleusercontent.com"
+    _install_creds(google_client_id=client_id)
+
+    # Part A: Single-service disconnect while a pending confirmation exists for the SAME (client, sub)
+    uid1 = "u-r4-pend-single"
+    await db.upsert_connection(
+        user_id=uid1,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_id,
+        provider_account_id="sub-p1",
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-old-p1",
+        refresh_token="rt-old-p1",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    await db.insert_pending_confirmation(
+        confirmation_hash=hashlib.sha256(b"conf-p1").hexdigest(),
+        user_id=uid1,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_id,
+        provider_account_id="sub-p1",
+        provider_union_id=None,
+        provider_email="p1@example.com",
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-staged-p1",
+        refresh_token="rt-staged-p1",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        intent="reauth",
+        preferences={},
+        confirm_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    rev1 = create_autospec(RemoteRevoker, instance=True)
+    rev1.revoke.return_value = RevokeOutcome.SUCCEEDED
+    pid1 = await begin_disconnect(uid1, "google", "calendar")
+    fin1 = await finish_disconnect(pid1, revoker=rev1)
+    assert fin1 is not None
+    assert fin1.remote_revoke_status == RemoteRevokeStatus.SUCCEEDED
+    rev1.revoke.assert_awaited_once_with(
+        provider="google", oauth_client_id=client_id, token="rt-staged-p1"
+    )
+    assert await db.peek_pending_confirmation(hashlib.sha256(b"conf-p1").hexdigest(), uid1) is None
+
+    # Part B: Full disconnect while pending confirmation exists -> voids pending confirmation & revokes!
+    uid2 = "u-r4-pend-full"
+    await db.upsert_connection(
+        user_id=uid2,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_id,
+        provider_account_id="sub-p2",
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-old-p2",
+        refresh_token="rt-old-p2",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    await db.insert_pending_confirmation(
+        confirmation_hash=hashlib.sha256(b"conf-p2").hexdigest(),
+        user_id=uid2,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_id,
+        provider_account_id="sub-p2",
+        provider_union_id=None,
+        provider_email="p2@example.com",
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-staged-p2",
+        refresh_token="rt-staged-p2",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        intent="reauth",
+        preferences={},
+        confirm_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    rev2 = create_autospec(RemoteRevoker, instance=True)
+    rev2.revoke.return_value = RevokeOutcome.SUCCEEDED
+    pids2 = await begin_disconnect_all_services(uid2, "google")
+    assert len(pids2) == 1
+    fin2 = await finish_disconnect(pids2[0], revoker=rev2)
+    assert fin2 is not None
+    assert fin2.remote_revoke_status == RemoteRevokeStatus.SUCCEEDED
+    rev2.revoke.assert_awaited_once_with(
+        provider="google", oauth_client_id=client_id, token="rt-staged-p2"
+    )
+
+    # Part C: Expired pending confirmation cleaned up -> enqueues PENDING revoke ledger that due runner executes!
+    uid3 = "u-r4-pend-expired"
+    await db.insert_pending_confirmation(
+        confirmation_hash=hashlib.sha256(b"conf-exp").hexdigest(),
+        user_id=uid3,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_id,
+        provider_account_id="sub-expired-only",
+        provider_union_id=None,
+        provider_email="exp@example.com",
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-exp",
+        refresh_token="rt-exp-staged",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        intent="connect",
+        preferences={},
+        confirm_expires_at=datetime.now(UTC) - timedelta(seconds=10),
+    )
+    _, confirms_del = await db.delete_expired_oauth_states_and_confirmations()
+    assert confirms_del >= 1
+    active_exp = await db.list_active_revokes_for_google_project_sub(
+        "666777888", "sub-expired-only", decrypt_revoke_token=True
+    )
+    assert len(active_exp) == 1
+    assert active_exp[0].revoke_token == "rt-exp-staged"
+    rev3 = create_autospec(RemoteRevoker, instance=True)
+    rev3.revoke.return_value = RevokeOutcome.SUCCEEDED
+    outcomes = await run_due_remote_revokes_once(rev3)
+    assert outcomes[active_exp[0].purge_id] == RemoteRevokeStatus.SUCCEEDED
+    rev3.revoke.assert_awaited_with(
+        provider="google", oauth_client_id=client_id, token="rt-exp-staged"
+    )
+
+
+async def test_r4_google_account_switch_syncs_target_sibling_actual_scopes_db(
+    gws_live_pool: Any,
+) -> None:
+    """Real PG (Codex Medium #2): switching Google Calendar to an account that already has Gmail connected updates the Gmail sibling in the same tx with the new token and actual granted scopes."""
+    from src.dalton.services.user_integrations_lifecycle import (
+        replace_connection_for_account_switch,
+    )
+
+    _ = gws_live_pool
+    uid = "u-r4-switch-sibling"
+    client_id = "888999000-sw.apps.googleusercontent.com"
+    _install_creds(google_client_id=client_id)
+
+    await db.upsert_connection(
+        user_id=uid,
+        provider="google",
+        service="calendar",
+        oauth_client_id=client_id,
+        provider_account_id="sub-old-cal",
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-old-cal",
+        refresh_token="rt-old-cal",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    mail_before = await db.upsert_connection(
+        user_id=uid,
+        provider="google",
+        service="mail",
+        oauth_client_id=client_id,
+        provider_account_id="sub-target-acct",
+        granted_scopes=f"{GOOGLE_GMAIL_MIN_SCOPES[0]} https://www.googleapis.com/auth/gmail.drafts.create",
+        access_token="at-old-target-mail",
+        refresh_token="rt-old-target-mail",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        preferences={"allow_create_draft": True},
+    )
+
+    # Switch calendar from sub-old-cal -> sub-target-acct with calendar-only granted scopes
+    await replace_connection_for_account_switch(
+        uid,
+        "google",
+        "calendar",
+        new_oauth_client_id=client_id,
+        new_provider_account_id="sub-target-acct",
+        new_granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        new_access_token="at-new-shared",
+        new_refresh_token="rt-new-shared",
+        new_expires_at=datetime.now(UTC) + timedelta(hours=2),
+    )
+
+    cal_after = await db.get_connection(uid, "google", "calendar", decrypt_tokens=True)
+    mail_after = await db.get_connection(uid, "google", "mail", decrypt_tokens=True)
+    assert cal_after is not None and mail_after is not None
+    assert cal_after.provider_account_id == "sub-target-acct"
+    assert cal_after.refresh_token == "rt-new-shared"
+    # Gmail sibling on target account received the NEW shared token & actual scopes, preserved auth_epoch,
+    # and converged to needs_reauth with allow_create_draft=False since Gmail scope wasn't in the new grant!
+    assert mail_after.refresh_token == "rt-new-shared"
+    assert mail_after.access_token == "at-new-shared"
+    assert mail_after.auth_epoch == mail_before.auth_epoch
+    assert mail_after.token_generation == mail_before.token_generation + 1
+    assert mail_after.status == IntegrationStatus.NEEDS_REAUTH
+    assert mail_after.last_error_code == "missing_required_scopes"
+    assert mail_after.preferences.get("allow_create_draft") is False
+
+
+async def test_r4_local_first_process_revoke_and_live_gateway_feishu_app_id_and_historical_match_db(
+    gws_live_pool: Any,
+) -> None:
+    """Real PG (Codex High #3 + Medium #1 + Medium #3): process_revoke enforces local-first; live gateway runtime Feishu App ID overrides rotated config; has_matching_feishu_event_connection matches historical rows."""
+    from src.dalton.services.feishu_integration_events import (
+        has_matching_feishu_event_connection,
+    )
+    from src.dalton.services.integration_revoke import process_revoke
+
+    _ = gws_live_pool
+
+    # 1. Local-first in process_revoke: running local purge blocks remote revoke even on direct call
+    uid_lf = "u-r4-local-first"
+    cid_g = "999000111-lf.apps.googleusercontent.com"
+    running_ledger = await db.insert_purge_ledger(
+        user_id=uid_lf,
+        provider="google",
+        service="calendar",
+        oauth_client_id=cid_g,
+        provider_account_id="sub-lf",
+        auth_epoch_upto=1,
+        trigger_reason=TriggerReason.USER_DISCONNECT,
+        local_purge_status=LocalPurgeStatus.RUNNING,
+        purged_max_turn_by_thread={},
+        remote_revoke_status=RemoteRevokeStatus.PENDING,
+        revoke_token_plaintext="rt-lf",
+    )
+    rev_lf = create_autospec(RemoteRevoker, instance=True)
+    rev_lf.revoke.return_value = RevokeOutcome.SUCCEEDED
+    st_running = await process_revoke(running_ledger.purge_id, rev_lf)
+    assert st_running == RemoteRevokeStatus.PENDING
+    assert rev_lf.revoke.await_count == 0
+
+    # 2. Live gateway runtime Feishu App ID takes precedence over rotated deployment credentials
+    _install_creds(feishu_app_id="cli_rotated_new", feishu_app_secret="sec_new")
+    await db.upsert_channel_gateway_runtime(
+        instance_id="gw-live-1",
+        lease_epoch=10,
+        feishu_app_id="cli_running_old",
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    assert await oauth_mod._resolve_channel_gateway_feishu_app_id() == "cli_running_old"
+    await db.clear_channel_gateway_runtime(instance_id="gw-live-1", lease_epoch=10)
+    assert await oauth_mod._resolve_channel_gateway_feishu_app_id() == "cli_rotated_new"
+
+    # 3. Historical Feishu connection match helper works for gateway revocation forwarding
+    uid_fs = "u-r4-hist-fs"
+    await db.upsert_connection(
+        user_id=uid_fs,
+        provider="feishu",
+        service="calendar",
+        oauth_client_id="cli_hist_app",
+        provider_account_id="ou_hist_member",
+        granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
+        access_token="at-fs-hist",
+        refresh_token="rt-fs-hist",
+        expires_at=datetime.now(UTC) + timedelta(hours=2),
+    )
+    matched = await has_matching_feishu_event_connection(
+        {
+            "header": {
+                "event_type": FEISHU_REVOKED_EVENT_TYPE,
+                "event_id": "evt-r4-hist-1",
+                "app_id": "cli_hist_app",
+            },
+            "event": {"open_id": "ou_hist_member", "revoke_reason": "Revoked by user action."},
+        }
+    )
+    assert matched is True
+    unmatched = await has_matching_feishu_event_connection(
+        {
+            "header": {
+                "event_type": FEISHU_REVOKED_EVENT_TYPE,
+                "event_id": "evt-r4-hist-2",
+                "app_id": "cli_hist_app",
+            },
+            "event": {"open_id": "ou_nobody", "revoke_reason": "Revoked by user action."},
+        }
+    )
+    assert unmatched is False

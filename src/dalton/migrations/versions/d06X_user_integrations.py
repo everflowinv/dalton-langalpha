@@ -124,6 +124,8 @@ def upgrade() -> None:
             redirect_uri     TEXT NOT NULL,
             return_to        TEXT NULL,
             browser_binding_hash TEXT NULL,
+            consumed_at      TIMESTAMPTZ NULL,
+            exchange_expires_at TIMESTAMPTZ NULL,
             expires_at       TIMESTAMPTZ NOT NULL,
             created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
@@ -133,6 +135,13 @@ def upgrade() -> None:
         """
         CREATE INDEX IF NOT EXISTS ix_dalton_user_integration_oauth_states_expires
             ON dalton_user_integration_oauth_states (expires_at)
+        """
+    )
+    op.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_dalton_user_integration_oauth_states_google_active
+            ON dalton_user_integration_oauth_states (provider, consumed_at, expires_at, exchange_expires_at)
+            WHERE provider = 'google'
         """
     )
 
@@ -293,6 +302,8 @@ def upgrade() -> None:
                 )
             ),
             encrypted_revoke_token    BYTEA NULL,
+            revoke_attempt_gen        BIGINT NOT NULL DEFAULT 0,
+            revoke_inflight_until     TIMESTAMPTZ NULL,
             retry_count               INTEGER NOT NULL DEFAULT 0,
             next_retry_at             TIMESTAMPTZ NULL,
             last_remote_error         TEXT NULL,
@@ -320,6 +331,13 @@ def upgrade() -> None:
         """
         CREATE INDEX IF NOT EXISTS ix_dalton_integration_purge_ledger_user_account
             ON dalton_integration_purge_ledger (user_id, provider, provider_account_id)
+        """
+    )
+    op.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_dalton_integration_purge_ledger_provider_account
+            ON dalton_integration_purge_ledger (provider, provider_account_id)
+            WHERE remote_revoke_status IN ('pending', 'failed_retryable')
         """
     )
 
@@ -366,10 +384,25 @@ def upgrade() -> None:
         """
     )
 
+    # 9. Active channel-gateway runtime state (reports active Feishu App ID held by live gateway)
+    op.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dalton_integration_gateway_runtime (
+            singleton     BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+            instance_id   TEXT NOT NULL,
+            lease_epoch   BIGINT NOT NULL DEFAULT 0,
+            feishu_app_id TEXT NULL,
+            expires_at    TIMESTAMPTZ NOT NULL,
+            updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+
 
 def downgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '5s'")
 
+    op.execute("DROP TABLE IF EXISTS dalton_integration_gateway_runtime")
     op.execute("DROP TABLE IF EXISTS dalton_integration_health_sweep_state")
 
     op.execute(
@@ -384,6 +417,7 @@ def downgrade() -> None:
 
     op.execute("DROP TABLE IF EXISTS dalton_integration_webhook_events")
 
+    op.execute("DROP INDEX IF EXISTS ix_dalton_integration_purge_ledger_provider_account")
     op.execute("DROP INDEX IF EXISTS ix_dalton_integration_purge_ledger_user_account")
     op.execute("DROP INDEX IF EXISTS ix_dalton_integration_purge_ledger_remote_retry")
     op.execute("DROP INDEX IF EXISTS ix_dalton_integration_purge_ledger_local_running")
@@ -402,6 +436,7 @@ def downgrade() -> None:
     op.execute("DROP INDEX IF EXISTS ix_dalton_user_integration_pending_confirmations_user_expires")
     op.execute("DROP TABLE IF EXISTS dalton_user_integration_pending_confirmations")
 
+    op.execute("DROP INDEX IF EXISTS ix_dalton_user_integration_oauth_states_google_active")
     op.execute("DROP INDEX IF EXISTS ix_dalton_user_integration_oauth_states_expires")
     op.execute("DROP TABLE IF EXISTS dalton_user_integration_oauth_states")
 

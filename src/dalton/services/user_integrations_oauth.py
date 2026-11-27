@@ -84,8 +84,7 @@ from src.dalton.integrations.oauth_clients import (
 from src.dalton.invites import is_team_member
 from src.dalton.services.integration_revoke import (
     RemoteRevoker,
-    RevokeOutcome,
-    compute_revoke_backoff_seconds,
+    process_revoke,
     revoke_before_new_authorization,
 )
 from src.dalton.services.user_integrations_lifecycle import (
@@ -97,6 +96,7 @@ from src.dalton.services.user_integrations_lifecycle import (
     finish_disconnect,
     finish_disconnect_locked,
     replace_connection_for_account_switch,
+    sync_google_sibling_rows_tx,
 )
 from src.dalton.settings import get_dalton_auth_mode, get_dalton_public_app_url
 from src.server.database.encryption import encryption_configured, get_encryption_key
@@ -417,14 +417,27 @@ def validate_callback_location(location: str) -> bool:
 
 
 async def _resolve_channel_gateway_feishu_app_id() -> str | None:
-    """Return the Feishu App ID used by the production channel gateway, or None when disabled/unavailable (§4.3 item 2).
+    """Return the Feishu App ID actively used by the channel gateway, or None when disabled/unavailable (§4.3 item 2).
 
-    Reads via the exact same ``resolve_feishu_app_credentials()`` contract used by
-    ``POST /api/v1/dalton/channels/internal/data-task-notifications/feishu-credentials``.
-    When ``CHANNEL_FEISHU`` is enabled but the gateway's App ID cannot be resolved, logs
-    a warning and returns ``None`` so ``open_id`` comparison is skipped safely.
+    1. When a live channel gateway has reported its active ``feishu_app_id`` via the
+       deployment lease (``dalton_integration_gateway_runtime``), returns that exact
+       in-use App ID so rotating deployment credentials before restarting the gateway
+       never compares the new app's ``open_id`` against the old app's binding.
+    2. Otherwise falls back to ``resolve_feishu_app_credentials()`` — the exact same
+       source used by ``POST /api/v1/dalton/channels/internal/data-task-notifications/feishu-credentials``
+       (aligned with ``get_credential_group("feishu_app")``).
+    3. When ``CHANNEL_FEISHU`` is enabled but the gateway's App ID cannot be determined,
+       logs a warning and returns ``None`` so ``open_id`` comparison is skipped safely.
     """
     if not has_capability(CapabilityId.CHANNEL_FEISHU):
+        return None
+    has_live_gw, live_app_id = await db.get_active_channel_gateway_feishu_app_id()
+    if has_live_gw:
+        if live_app_id:
+            return live_app_id
+        logger.warning(
+            "[integration-oauth] live channel gateway reported no active Feishu App ID; skipping open_id check"
+        )
         return None
     try:
         feishu_group = await resolve_feishu_app_credentials()
@@ -585,10 +598,13 @@ async def _coordinate_pre_auth_google_revokes(
     existing_rows: list[IntegrationRow],
     revoker: RemoteRevoker,
 ) -> None:
-    """Coordinate old Google grant revocation under ``(user_id, google_project, sub)`` before issuing state (§4.2(1)(3))."""
+    """Coordinate old Google grant revocation under ``(google_project, sub)`` before issuing state (§4.2(1)(3)).
+
+    Never holds a PostgreSQL advisory lock or pool connection across upstream HTTP.
+    """
     target_project = extract_google_project(target_client_id)
 
-    # 1. Process any pending / failed_retryable ledger tasks in the same Google project
+    # 1. Attempt any pending / failed_retryable ledger tasks in the same Google project
     ledgers = await db.list_user_purge_ledgers(user_id, active_only=True, limit=100)
     pending_subs: set[str] = set()
     for ledger in ledgers:
@@ -601,7 +617,9 @@ async def _coordinate_pre_auth_google_revokes(
             pending_subs.add(ledger.provider_account_id)
 
     for sub in sorted(pending_subs):
-        await revoke_before_new_authorization(user_id, target_project, sub, revoker)
+        await revoke_before_new_authorization(
+            target_project, sub, revoker, user_id=user_id
+        )
 
     # 2. Client-rotation reconnect on same Google project when no other active sibling stays on old client
     if not switch_account:
@@ -613,12 +631,13 @@ async def _coordinate_pre_auth_google_revokes(
         ):
             old_client_id = target_existing.oauth_client_id
             sub = target_existing.provider_account_id
-            lkey = revoke_lock_key(user_id, target_project, sub)
+            lkey = revoke_lock_key(target_project, sub)
+            rotation_pid: str | None = None
+
+            # Short lock: check guards, record ledger & clear old connection tokens, then release lock
             async with get_db_connection() as lock_conn:
                 await lock_conn.execute("SELECT pg_advisory_lock(%s)", (lkey,))
                 try:
-                    # Re-check under revoke_lock: sibling still on old client OR any active/pending
-                    # grant on a new client in the same (Google project, sub)
                     latest_rows = await db.list_user_connections(user_id, provider="google")
                     other_on_old = [
                         r
@@ -636,17 +655,14 @@ async def _coordinate_pre_auth_google_revokes(
                         return
 
                     has_newer_on_project = await db.has_active_or_pending_google_grant(
-                        user_id,
                         target_project,
                         sub,
+                        exclude_user_id=user_id,
                         exclude_client_id=old_client_id,
                     )
                     if has_newer_on_project:
-                        # A new client in the same Google Cloud project already has a live/pending
-                        # grant for this sub: revoking the old token would destroy the new grant!
                         async with get_db_connection() as sup_conn, sup_conn.transaction():
                             await db.supersede_active_revokes_for_google_project_sub_tx(
-                                user_id,
                                 target_project,
                                 sub,
                                 reason="superseded_by_active_project_grant",
@@ -682,83 +698,23 @@ async def _coordinate_pre_auth_google_revokes(
                     if not old_tok:
                         return
 
-                    try:
-                        outcome = await revoker.revoke(
-                            provider="google",
-                            oauth_client_id=old_client_id,
-                            token=old_tok,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "[integration-oauth] pre-auth rotation revoke raised %s; queueing retry",
-                            type(exc).__name__,
-                        )
-                        outcome = RevokeOutcome.RETRYABLE
-
+                    rotation_pid = str(uuid4())
                     async with get_db_connection() as rec_conn, rec_conn.transaction():
-                        if outcome == RevokeOutcome.SUCCEEDED:
-                            await db.insert_purge_ledger(
-                                purge_id=str(uuid4()),
-                                user_id=user_id,
-                                provider="google",
-                                service=service,
-                                oauth_client_id=old_client_id,
-                                provider_account_id=sub,
-                                auth_epoch_upto=full_row.auth_epoch,
-                                trigger_reason=TriggerReason.CLIENT_ROTATION,
-                                local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
-                                purged_max_turn_by_thread={},
-                                remote_revoke_status=RemoteRevokeStatus.SUCCEEDED,
-                                encrypted_revoke_token=None,
-                                conn=rec_conn,
-                            )
-                        elif outcome == RevokeOutcome.RETRYABLE:
-                            # Persist encrypted token into the retry queue so abandoned reauths still revoke;
-                            # completing the new OAuth flow will supersede this task under revoke_lock.
-                            retry_pid = str(uuid4())
-                            await db.insert_purge_ledger(
-                                purge_id=retry_pid,
-                                user_id=user_id,
-                                provider="google",
-                                service=service,
-                                oauth_client_id=old_client_id,
-                                provider_account_id=sub,
-                                auth_epoch_upto=full_row.auth_epoch,
-                                trigger_reason=TriggerReason.CLIENT_ROTATION,
-                                local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
-                                purged_max_turn_by_thread={},
-                                remote_revoke_status=RemoteRevokeStatus.PENDING,
-                                revoke_token_plaintext=old_tok,
-                                conn=rec_conn,
-                            )
-                            delay_s = compute_revoke_backoff_seconds(0)
-                            await db.update_purge_ledger_remote_status(
-                                retry_pid,
-                                remote_revoke_status=RemoteRevokeStatus.FAILED_RETRYABLE,
-                                clear_revoke_token=False,
-                                increment_retry=True,
-                                next_retry_at=datetime.now(UTC) + timedelta(seconds=delay_s),
-                                last_remote_error="pre_auth_rotation_revoke_retryable",
-                                mark_remote_completed=False,
-                                conn=rec_conn,
-                            )
-                        else:
-                            await db.insert_purge_ledger(
-                                purge_id=str(uuid4()),
-                                user_id=user_id,
-                                provider="google",
-                                service=service,
-                                oauth_client_id=old_client_id,
-                                provider_account_id=sub,
-                                auth_epoch_upto=full_row.auth_epoch,
-                                trigger_reason=TriggerReason.CLIENT_ROTATION,
-                                local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
-                                purged_max_turn_by_thread={},
-                                remote_revoke_status=RemoteRevokeStatus.SUPERSEDED,
-                                encrypted_revoke_token=None,
-                                conn=rec_conn,
-                            )
-
+                        await db.insert_purge_ledger(
+                            purge_id=rotation_pid,
+                            user_id=user_id,
+                            provider="google",
+                            service=service,
+                            oauth_client_id=old_client_id,
+                            provider_account_id=sub,
+                            auth_epoch_upto=full_row.auth_epoch,
+                            trigger_reason=TriggerReason.CLIENT_ROTATION,
+                            local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
+                            purged_max_turn_by_thread={},
+                            remote_revoke_status=RemoteRevokeStatus.PENDING,
+                            revoke_token_plaintext=old_tok,
+                            conn=rec_conn,
+                        )
                         await db.update_connection_status(
                             user_id,
                             "google",
@@ -774,6 +730,10 @@ async def _coordinate_pre_auth_google_revokes(
                         await lock_conn.execute(
                             "SELECT pg_advisory_unlock(%s)", (lkey,)
                         )
+
+            # Execute remote revoke OUTSIDE the advisory lock via shared state machine
+            if rotation_pid is not None:
+                await process_revoke(rotation_pid, revoker)
 
 
 async def start_oauth_authorization(
@@ -1034,52 +994,42 @@ async def _stage_pending_confirmation(
     expected_old_oauth_client_id: str | None = None,
     expected_old_provider_account_id: str | None = None,
     expected_old_auth_epoch: int | None = None,
-    _revoke_lock_held: bool = False,
 ) -> None:
-    """Stage a pending confirmation coordinated with Google's ``(project, sub)`` revoke lock (§4.2(3))."""
+    """Stage a pending confirmation coordinated with Google's cross-user ``(project, sub)`` revoke lock (§4.2(3))."""
     if provider == "google":
         google_project = extract_google_project(oauth_client_id)
-
-        async def _commit_stage_tx() -> None:
-            async with get_db_connection() as tx_conn, tx_conn.transaction():
-                await db.supersede_active_revokes_for_google_project_sub_tx(
-                    user_id,
-                    google_project,
-                    provider_account_id,
-                    reason="superseded_by_pending_authorization",
-                    conn=tx_conn,
-                )
-                await db.insert_pending_confirmation(
-                    confirmation_hash=confirmation_hash,
-                    user_id=user_id,
-                    provider=provider,
-                    service=service,
-                    oauth_client_id=oauth_client_id,
-                    provider_account_id=provider_account_id,
-                    provider_union_id=provider_union_id,
-                    provider_email=provider_email,
-                    granted_scopes=granted_scopes,
-                    access_token=access_token,
-                    refresh_token=refresh_token,
-                    expires_at=expires_at,
-                    intent=intent,
-                    preferences=preferences,
-                    confirm_expires_at=confirm_expires_at,
-                    expected_old_oauth_client_id=expected_old_oauth_client_id,
-                    expected_old_provider_account_id=expected_old_provider_account_id,
-                    expected_old_auth_epoch=expected_old_auth_epoch,
-                    conn=tx_conn,
-                )
-
-        if _revoke_lock_held:
-            await _commit_stage_tx()
-            return
-
-        rkey = revoke_lock_key(user_id, google_project, provider_account_id)
+        rkey = revoke_lock_key(google_project, provider_account_id)
         async with get_db_connection() as lock_conn:
             await lock_conn.execute("SELECT pg_advisory_lock(%s)", (rkey,))
             try:
-                await _commit_stage_tx()
+                async with get_db_connection() as tx_conn, tx_conn.transaction():
+                    await db.supersede_active_revokes_for_google_project_sub_tx(
+                        google_project,
+                        provider_account_id,
+                        reason="superseded_by_pending_authorization",
+                        conn=tx_conn,
+                    )
+                    await db.insert_pending_confirmation(
+                        confirmation_hash=confirmation_hash,
+                        user_id=user_id,
+                        provider=provider,
+                        service=service,
+                        oauth_client_id=oauth_client_id,
+                        provider_account_id=provider_account_id,
+                        provider_union_id=provider_union_id,
+                        provider_email=provider_email,
+                        granted_scopes=granted_scopes,
+                        access_token=access_token,
+                        refresh_token=refresh_token,
+                        expires_at=expires_at,
+                        intent=intent,
+                        preferences=preferences,
+                        confirm_expires_at=confirm_expires_at,
+                        expected_old_oauth_client_id=expected_old_oauth_client_id,
+                        expected_old_provider_account_id=expected_old_provider_account_id,
+                        expected_old_auth_epoch=expected_old_auth_epoch,
+                        conn=tx_conn,
+                    )
             finally:
                 with anyio.CancelScope(shield=True):
                     await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (rkey,))
@@ -1200,11 +1150,9 @@ async def _finalize_connection(
         return updated, switch_res.purge_id
 
     # Same account (first connect, same-client reconnect/incremental, or client rotation rebind)
-    enc_key = get_encryption_key()
     life_key = lifecycle_lock_key(user_id, provider)
     revoke_key = (
         revoke_lock_key(
-            user_id,
             extract_google_project(oauth_client_id),
             provider_account_id,
         )
@@ -1251,10 +1199,9 @@ async def _finalize_connection(
                 revoke_locked = True
 
             async with get_db_connection() as tx_conn, tx_conn.transaction():
-                # Supersede pending revokes for this (Google project, sub) BEFORE committing the new grant
+                # Supersede pending revokes for this (Google project, sub) across ALL users BEFORE committing the new grant
                 if provider == "google":
                     await db.supersede_active_revokes_for_google_project_sub_tx(
-                        user_id,
                         extract_google_project(oauth_client_id),
                         provider_account_id,
                         conn=tx_conn,
@@ -1478,65 +1425,17 @@ async def _finalize_connection(
                 # and recompute each sibling's status & feature preferences against its own
                 # minimum required scopes. Siblings preserve their own auth_epoch and authorized_at.
                 if provider == "google" and effective_refresh and active_new_siblings:
-                    actual_granted_list = _parse_scopes(granted_scopes)
-                    actual_granted_str = _format_scopes(actual_granted_list)
-                    async with tx_conn.cursor() as cur:
-                        for sib in active_new_siblings:
-                            sib_prefs, _ = _converge_preferences_for_scopes(
-                                "google",
-                                sib.service,
-                                actual_granted_list,
-                                sib.preferences,
-                            )
-                            sib_missing = _missing_min_scopes(
-                                "google",
-                                sib.service,
-                                actual_granted_list,
-                            )
-                            if sib_missing:
-                                sib_status = IntegrationStatus.NEEDS_REAUTH.value
-                                sib_err_code: str | None = "missing_required_scopes"
-                            else:
-                                sib_status = IntegrationStatus.CONNECTED.value
-                                sib_err_code = None
-                            await cur.execute(
-                                """
-                                UPDATE dalton_user_integrations
-                                SET access_token = pgp_sym_encrypt(%(access_token)s, %(enc_key)s),
-                                    refresh_token = pgp_sym_encrypt(%(refresh_token)s, %(enc_key)s),
-                                    expires_at = %(expires_at)s,
-                                    granted_scopes = %(granted_scopes)s,
-                                    preferences = %(preferences)s,
-                                    token_generation = token_generation + 1,
-                                    refresh_inflight_gen = NULL,
-                                    refresh_started_at = NULL,
-                                    status = %(status)s,
-                                    needs_reauth_at = CASE WHEN %(status)s = 'needs_reauth'
-                                                           THEN COALESCE(needs_reauth_at, NOW())
-                                                           ELSE NULL END,
-                                    last_error_code = %(err_code)s,
-                                    updated_at = NOW()
-                                WHERE user_id = %(user_id)s
-                                  AND provider = 'google'
-                                  AND service = %(service)s
-                                  AND oauth_client_id = %(oauth_client_id)s
-                                  AND provider_account_id = %(provider_account_id)s
-                                """,
-                                {
-                                    "access_token": access_token,
-                                    "refresh_token": effective_refresh,
-                                    "enc_key": enc_key,
-                                    "expires_at": expires_at,
-                                    "granted_scopes": actual_granted_str,
-                                    "preferences": Jsonb(sib_prefs),
-                                    "status": sib_status,
-                                    "err_code": sib_err_code,
-                                    "user_id": user_id,
-                                    "service": sib.service,
-                                    "oauth_client_id": oauth_client_id,
-                                    "provider_account_id": provider_account_id,
-                                },
-                            )
+                    await sync_google_sibling_rows_tx(
+                        tx_conn,
+                        user_id=user_id,
+                        oauth_client_id=oauth_client_id,
+                        provider_account_id=provider_account_id,
+                        access_token=access_token,
+                        refresh_token=effective_refresh,
+                        expires_at=expires_at,
+                        granted_scopes=granted_scopes,
+                        active_siblings=active_new_siblings,
+                    )
 
                 if guard_confirmation_hash is not None:
                     await db.delete_pending_confirmation_by_hash(
@@ -1568,6 +1467,31 @@ async def _finalize_connection(
     return saved_row, None
 
 
+_INFLIGHT_REVOKE_WAIT_TIMEOUT_S = 15.0
+_INFLIGHT_REVOKE_POLL_INTERVAL_S = 0.05
+
+
+async def _wait_for_inflight_google_revokes(
+    google_project: str,
+    *,
+    timeout_s: float = _INFLIGHT_REVOKE_WAIT_TIMEOUT_S,
+    poll_interval_s: float = _INFLIGHT_REVOKE_POLL_INTERVAL_S,
+) -> bool:
+    """Wait (without holding any DB lock or pool connection) for any already in-flight Google revoke HTTP call in ``google_project`` to settle.
+
+    Returns ``True`` once no revoke HTTP attempt is in-flight, or ``False`` on timeout.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.1, float(timeout_s))
+    while True:
+        if not await db.has_inflight_google_revoke_in_project(google_project):
+            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(poll_interval_s, remaining))
+
+
 async def handle_oauth_callback(
     *,
     provider: str,
@@ -1582,14 +1506,17 @@ async def handle_oauth_callback(
 ) -> OAuthCallbackResult:
     """Handle the Bearer-less OAuth browser callback (§4.2(1), §4.3, §6).
 
-    1. For Google, acquires the shared ``(user_id, google_project, sub)`` revoke advisory lock
-       BEFORE consuming state and exchanging ``code``, keeping the lock continuously until
-       pending confirmation or commit-guard + ``superseded`` transition commits.
-    2. Atomically consumes ``state`` in PostgreSQL (single-use, 10-minute TTL).
-    3. Checks per-service capability, active ``oauth_client_id``, and original session.
-    4. Exchanges ``code`` outside any DB transaction and verifies external identity.
-    5. Stages account-switch, Supabase, or mismatched-browser ``local`` confirmations,
-       or commits immediately under canonical ``lifecycle -> refresh -> revoke`` order.
+    1. Atomically consumes ``state`` in PostgreSQL (single-use, 10-minute TTL).
+       For Google, keeps the row in PostgreSQL with ``consumed_at`` / ``exchange_expires_at``
+       so concurrent remote revocations defer immediately without holding any advisory lock
+       or DB pool connection across upstream HTTP.
+    2. Checks per-service capability, active ``oauth_client_id``, and original session.
+    3. For Google, waits (without holding locks) for any already in-flight revoke HTTP call
+       in the same Google Cloud project to finish before exchanging ``code``.
+    4. Exchanges ``code`` outside any DB lock/transaction and verifies external identity.
+    5. Under short ``revoke_lock_key(google_project, sub)``, supersedes active revokes across
+       all users and stages pending confirmation or commit-guard BEFORE removing the in-flight
+       state record in ``finally``.
     """
     _ = error_description  # never echo arbitrary upstream description text
     norm_provider = str(provider or "").strip().lower()
@@ -1601,76 +1528,16 @@ async def handle_oauth_callback(
 
     state_hash = _sha256_hex(str(state).strip())
 
-    # For Google: peek state and acquire candidate (user_id, google_project, sub) revoke_locks
-    # in deterministic ascending order BEFORE consuming state or calling exchange_code, so no
-    # background revoke can race between user consent / code exchange and DB staging/commit.
-    revoke_lock_cm: Any = None
-    revoke_lock_conn: Any = None
-    held_revoke_keys: list[int] = []
-
-    async def _release_all_revoke_locks() -> None:
-        nonlocal revoke_lock_cm, revoke_lock_conn
-        if revoke_lock_conn is None:
-            held_revoke_keys.clear()
-            return
-        with anyio.CancelScope(shield=True):
-            for rk in reversed(held_revoke_keys):
-                await revoke_lock_conn.execute("SELECT pg_advisory_unlock(%s)", (rk,))
-            held_revoke_keys.clear()
-            cm = revoke_lock_cm
-            revoke_lock_cm = None
-            revoke_lock_conn = None
-            if cm is not None:
-                await cm.__aexit__(None, None, None)
-
-    async def _ensure_single_revoke_lock(target_key: int) -> None:
-        nonlocal revoke_lock_cm, revoke_lock_conn
-        if target_key in held_revoke_keys:
-            for rk in [k for k in reversed(held_revoke_keys) if k != target_key]:
-                await revoke_lock_conn.execute("SELECT pg_advisory_unlock(%s)", (rk,))
-                held_revoke_keys.remove(rk)
-            return
-        # Release any non-matching candidate locks first so lock acquisition never inverts order
-        if held_revoke_keys and revoke_lock_conn is not None:
-            for rk in reversed(held_revoke_keys):
-                await revoke_lock_conn.execute("SELECT pg_advisory_unlock(%s)", (rk,))
-            held_revoke_keys.clear()
-        if revoke_lock_conn is None:
-            revoke_lock_cm = get_db_connection()
-            revoke_lock_conn = await revoke_lock_cm.__aenter__()
-        await revoke_lock_conn.execute("SELECT pg_advisory_lock(%s)", (target_key,))
-        held_revoke_keys.append(target_key)
+    state_row = await db.consume_oauth_state(state_hash, norm_provider)
+    if state_row is None:
+        raise OAuthStateInvalidError(
+            "OAuth state is invalid, expired, or already used.",
+            code="invalid_or_expired_state",
+        )
 
     guard_confirmation_hash: str | None = None
     guard_user_id: str | None = None
     try:
-        if norm_provider == "google":
-            peeked = await db.peek_oauth_state(state_hash, norm_provider)
-            if peeked is not None:
-                pre_uid, pre_cid = peeked
-                pre_proj = extract_google_project(pre_cid)
-                cand_subs = await db.list_google_project_revoke_lock_subs(
-                    pre_uid, pre_proj
-                )
-                if cand_subs:
-                    cand_keys = sorted(
-                        {revoke_lock_key(pre_uid, pre_proj, s) for s in cand_subs}
-                    )
-                    revoke_lock_cm = get_db_connection()
-                    revoke_lock_conn = await revoke_lock_cm.__aenter__()
-                    for rk in cand_keys:
-                        await revoke_lock_conn.execute(
-                            "SELECT pg_advisory_lock(%s)", (rk,)
-                        )
-                        held_revoke_keys.append(rk)
-
-        state_row = await db.consume_oauth_state(state_hash, norm_provider)
-        if state_row is None:
-            raise OAuthStateInvalidError(
-                "OAuth state is invalid, expired, or already used.",
-                code="invalid_or_expired_state",
-            )
-
         safe_return_to = _sanitize_return_to(state_row.return_to)
 
         # Check per-service single capability & readiness (§6 item 1)
@@ -1720,7 +1587,22 @@ async def handle_oauth_callback(
             user_email=state_row.user_email,
         )
 
-        # Upstream code -> token exchange OUTSIDE any DB transaction (under Google revoke_lock)
+        # Wait (with no DB lock held) for any pre-existing in-flight Google revoke HTTP call
+        # in the same project to finish before exchanging code, preventing Google-side interleaving.
+        if norm_provider == "google":
+            target_google_project = extract_google_project(client_id)
+            settled = await _wait_for_inflight_google_revokes(target_google_project)
+            if not settled:
+                return OAuthCallbackResult(
+                    status="error",
+                    provider=norm_provider,
+                    service=state_row.service,
+                    return_to=safe_return_to,
+                    error_code="revoke_in_progress",
+                    error_message="A previous revocation is still completing; please retry authorization.",
+                )
+
+        # Upstream code -> token exchange OUTSIDE any DB lock or transaction
         provider_union_id: str | None = None
         provider_email: str | None = None
         try:
@@ -1768,8 +1650,7 @@ async def handle_oauth_callback(
 
                 # Channel gateway Feishu identity consistency check (§4.3 item 2):
                 # Compare open_id against dalton_channel_identities ONLY when the OAuth app
-                # shares the exact same Feishu App ID as the active channel gateway (resolved
-                # from the exact same deployment credentials source the gateway uses).
+                # shares the exact same Feishu App ID as the active channel gateway.
                 gateway_app_id = await _resolve_channel_gateway_feishu_app_id()
                 if gateway_app_id and gateway_app_id == client_id:
                     bound_open_id = await db.get_channel_feishu_open_id(state_row.user_id)
@@ -1824,14 +1705,6 @@ async def handle_oauth_callback(
             existing is not None and existing.provider_account_id != provider_account_id
         )
 
-        # Narrow or acquire the exact (user_id, google_project, sub) revoke_lock before staging/guarding
-        if norm_provider == "google":
-            target_google_project = extract_google_project(client_id)
-            target_rkey = revoke_lock_key(
-                state_row.user_id, target_google_project, provider_account_id
-            )
-            await _ensure_single_revoke_lock(target_rkey)
-
         if is_account_switch:
             if not token_resp.refresh_token:
                 return OAuthCallbackResult(
@@ -1871,7 +1744,6 @@ async def handle_oauth_callback(
                 expected_old_oauth_client_id=existing.oauth_client_id,
                 expected_old_provider_account_id=existing.provider_account_id,
                 expected_old_auth_epoch=existing.auth_epoch,
-                _revoke_lock_held=(norm_provider == "google"),
             )
             return OAuthCallbackResult(
                 status="account_switch_confirmation_required",
@@ -1932,7 +1804,6 @@ async def handle_oauth_callback(
                 expected_old_auth_epoch=(
                     existing.auth_epoch if existing is not None else None
                 ),
-                _revoke_lock_held=(norm_provider == "google"),
             )
             return OAuthCallbackResult(
                 status="confirmation_required",
@@ -1945,11 +1816,10 @@ async def handle_oauth_callback(
             )
 
         # Direct commit (local same-browser / oss):
-        # For Google, BEFORE releasing revoke_lock, supersede all active revokes for
-        # (user_id, google_project, sub) AND insert a short-lived tokenless commit-guard row
-        # into pending_confirmations in ONE transaction so no concurrent revoke can sneak in
-        # while we release revoke_lock and re-enter _finalize_connection in canonical
-        # lifecycle -> refresh -> revoke order.
+        # For Google, BEFORE deleting the in-flight oauth_state record, acquire short
+        # revoke_lock_key(google_project, sub), supersede all active revokes across users,
+        # AND insert a short-lived tokenless commit-guard row into pending_confirmations
+        # in ONE transaction so there is zero gap before _finalize_connection commits.
         if norm_provider == "google":
             guard_confirmation_hash = _sha256_hex(
                 f"commit_guard:{secrets.token_urlsafe(32)}"
@@ -1971,10 +1841,11 @@ async def handle_oauth_callback(
                 intent=state_row.intent,
                 preferences={"_internal_commit_guard": True},
                 confirm_expires_at=datetime.now(UTC) + timedelta(seconds=60),
-                _revoke_lock_held=True,
             )
     finally:
-        await _release_all_revoke_locks()
+        if norm_provider == "google":
+            with anyio.CancelScope(shield=True):
+                await db.delete_oauth_state(state_hash, "google")
 
     # local (same initiating browser) / oss mode (first connect, same-account reconnect, or same-sub client rotation)
     eff_revoker = (
@@ -2035,6 +1906,61 @@ async def handle_oauth_callback(
     )
 
 
+async def _revoke_abandoned_google_pending_confirmation(
+    pending: db.PendingConfirmationRow,
+    *,
+    reason: str,
+    revoker: RemoteRevoker | None = None,
+) -> None:
+    """Enqueue and attempt remote Google revocation for an abandoned/cancelled unactivated confirmation ticket."""
+    if pending.provider != "google":
+        return
+    if (pending.preferences or {}).get("_internal_commit_guard"):
+        return
+    tok = pending.refresh_token or pending.access_token
+    if not tok:
+        return
+    proj = extract_google_project(pending.oauth_client_id)
+    rkey = revoke_lock_key(proj, pending.provider_account_id)
+    revoke_pid: str | None = None
+    async with get_db_connection() as lock_conn:
+        await lock_conn.execute("SELECT pg_advisory_lock(%s)", (rkey,))
+        try:
+            if await db.has_active_or_pending_google_grant(
+                proj, pending.provider_account_id, conn=lock_conn
+            ):
+                return
+            revoke_pid = str(uuid4())
+            await db.insert_purge_ledger(
+                purge_id=revoke_pid,
+                user_id=pending.user_id,
+                provider="google",
+                service=pending.service,
+                oauth_client_id=pending.oauth_client_id,
+                provider_account_id=pending.provider_account_id,
+                auth_epoch_upto=0,
+                trigger_reason=reason,
+                local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
+                purged_max_turn_by_thread={},
+                remote_revoke_status=RemoteRevokeStatus.PENDING,
+                revoke_token_plaintext=tok,
+                conn=lock_conn,
+            )
+        finally:
+            with anyio.CancelScope(shield=True):
+                await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (rkey,))
+
+    if revoke_pid is not None:
+        eff_revoker = revoker if revoker is not None else get_google_remote_revoker()
+        try:
+            await process_revoke(revoke_pid, eff_revoker)
+        except Exception as exc:
+            logger.warning(
+                "[integration-oauth] abandoned pending confirmation revoke deferred (%s)",
+                type(exc).__name__,
+            )
+
+
 async def confirm_pending_integration(
     *,
     user_id: str,
@@ -2058,6 +1984,11 @@ async def confirm_pending_integration(
             raise PendingConfirmationInvalidError(
                 "Confirmation token is invalid, expired, or belongs to another user.",
             )
+        await _revoke_abandoned_google_pending_confirmation(
+            consumed,
+            reason="pending_confirmation_cancelled",
+            revoker=revoker,
+        )
         return ConfirmIntegrationResult(
             status="cancelled",
             provider=consumed.provider,
@@ -2076,7 +2007,13 @@ async def confirm_pending_integration(
     )
     client_id, _secret = _load_provider_oauth_credentials(preview.provider)
     if client_id != preview.oauth_client_id:
-        await db.consume_pending_confirmation(confirm_hash, user_id)
+        voided = await db.consume_pending_confirmation(confirm_hash, user_id)
+        if voided is not None:
+            await _revoke_abandoned_google_pending_confirmation(
+                voided,
+                reason="pending_confirmation_invalidated",
+                revoker=revoker,
+            )
         raise PersonalIntegrationError(
             "Deployment OAuth client changed while confirming; please reconnect.",
             code="oauth_client_changed",
@@ -2109,7 +2046,13 @@ async def confirm_pending_integration(
             )
         )
         if not target_matches:
-            await db.consume_pending_confirmation(confirm_hash, user_id)
+            voided = await db.consume_pending_confirmation(confirm_hash, user_id)
+            if voided is not None:
+                await _revoke_abandoned_google_pending_confirmation(
+                    voided,
+                    reason="pending_confirmation_invalidated",
+                    revoker=revoker,
+                )
             raise PendingConfirmationInvalidError(
                 "Connected account changed since authorization; confirmation ticket has been invalidated.",
                 code="account_switch_state_changed",

@@ -327,6 +327,9 @@ export interface ChannelAdapter {
   /** Whether credentials/config for this channel are present. */
   isConfigured(): boolean;
 
+  /** Optional active platform App ID loaded by this adapter at startup (e.g., Feishu App ID). */
+  getActiveAppId?(): string | undefined;
+
   /** Whether the channel runtime/connection is currently healthy. */
   isConnected(): boolean;
 

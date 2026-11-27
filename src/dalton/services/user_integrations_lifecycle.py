@@ -21,6 +21,7 @@ from psycopg.types.json import Jsonb
 
 from src.dalton.database import user_integrations as db
 from src.dalton.database.user_integrations import (
+    IntegrationRow,
     IntegrationStatus,
     LocalPurgeStatus,
     RemoteRevokeStatus,
@@ -30,6 +31,10 @@ from src.dalton.database.user_integrations import (
     refresh_lock_key,
     revoke_lock_key,
     touch_user_lock_key,
+)
+from src.dalton.integrations.constants import (
+    GOOGLE_GMAIL_DRAFT_SCOPES,
+    get_connector_spec,
 )
 from src.dalton.services.integration_revoke import RemoteRevoker, process_revoke
 from src.dalton.services.purge_fence import merge_turn_range
@@ -204,6 +209,121 @@ async def _lock_and_register_phase1_tx(
         conn=conn,
     )
     return purge_id, purged_ranges_by_thread
+
+
+def _parse_scope_tokens(scope_str: str | None) -> list[str]:
+    if not scope_str:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in str(scope_str).replace(",", " ").split():
+        s = tok.strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def _format_scope_tokens(scopes: Sequence[str]) -> str:
+    return " ".join(sorted({s.strip() for s in scopes if s and s.strip()}))
+
+
+async def sync_google_sibling_rows_tx(
+    tx_conn: Any,
+    *,
+    user_id: str,
+    oauth_client_id: str,
+    provider_account_id: str,
+    access_token: str,
+    refresh_token: str,
+    expires_at: datetime | None,
+    granted_scopes: str,
+    active_siblings: Sequence[IntegrationRow],
+) -> None:
+    """Update active Google sibling rows on the same ``(oauth_client_id, sub)`` with the new token's ACTUAL scopes.
+
+    Recomputes each sibling's ``status`` (``connected`` vs ``needs_reauth`` with
+    ``missing_required_scopes``) and optional preferences against the newly issued
+    token's actual granted scopes (never unioning stale sibling scopes), while
+    preserving each sibling's own ``auth_epoch`` and ``authorized_at``.
+    """
+    if not active_siblings:
+        return
+    enc_key = get_encryption_key()
+    actual_granted_list = _parse_scope_tokens(granted_scopes)
+    actual_granted_set = set(actual_granted_list)
+    actual_granted_str = _format_scope_tokens(actual_granted_list)
+
+    async with tx_conn.cursor() as cur:
+        for sib in active_siblings:
+            sib_prefs = dict(sib.preferences or {})
+            if sib.service == "mail":
+                has_draft = any(s in actual_granted_set for s in GOOGLE_GMAIL_DRAFT_SCOPES)
+                if not has_draft:
+                    sib_prefs["allow_create_draft"] = False
+
+            spec = get_connector_spec("google", sib.service)
+            sib_missing = (
+                [s for s in spec.min_required_scopes if s not in actual_granted_set]
+                if spec is not None
+                else ["unsupported_service"]
+            )
+            if sib_missing:
+                sib_status = IntegrationStatus.NEEDS_REAUTH.value
+                sib_err_code: str | None = "missing_required_scopes"
+            else:
+                sib_status = IntegrationStatus.CONNECTED.value
+                sib_err_code = None
+
+            await cur.execute(
+                """
+                UPDATE dalton_user_integrations
+                SET access_token = pgp_sym_encrypt(%(access_token)s, %(enc_key)s),
+                    refresh_token = pgp_sym_encrypt(%(refresh_token)s, %(enc_key)s),
+                    expires_at = %(expires_at)s,
+                    granted_scopes = %(granted_scopes)s,
+                    preferences = %(preferences)s,
+                    token_generation = token_generation + 1,
+                    refresh_inflight_gen = NULL,
+                    refresh_started_at = NULL,
+                    status = %(status)s,
+                    needs_reauth_at = CASE WHEN %(status)s = 'needs_reauth'
+                                           THEN COALESCE(needs_reauth_at, NOW())
+                                           ELSE NULL END,
+                    last_error_code = %(err_code)s,
+                    updated_at = NOW()
+                WHERE user_id = %(user_id)s
+                  AND provider = 'google'
+                  AND service = %(service)s
+                  AND oauth_client_id = %(oauth_client_id)s
+                  AND provider_account_id = %(provider_account_id)s
+                """,
+                {
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "enc_key": enc_key,
+                    "expires_at": expires_at,
+                    "granted_scopes": actual_granted_str,
+                    "preferences": Jsonb(sib_prefs),
+                    "status": sib_status,
+                    "err_code": sib_err_code,
+                    "user_id": user_id,
+                    "service": sib.service,
+                    "oauth_client_id": oauth_client_id,
+                    "provider_account_id": provider_account_id,
+                },
+            )
+
+
+def _extract_pending_raw_token(row: dict[str, Any]) -> bytes | None:
+    prefs = row.get("preferences") or {}
+    if isinstance(prefs, dict) and prefs.get("_internal_commit_guard"):
+        return None
+    if row.get("refresh_token") is not None:
+        return bytes(row["refresh_token"])
+    if row.get("access_token") is not None:
+        return bytes(row["access_token"])
+    return None
 
 
 def _determine_remote_revoke(
@@ -385,6 +505,34 @@ async def begin_disconnect(
                     provider_account_id = str(target_row["provider_account_id"])
                     auth_epoch_upto = int(target_row["auth_epoch"])
 
+                    # Void any staged pending confirmations for (user_id, provider, service)
+                    # BEFORE checking remaining active/pending grants so an unconfirmed ticket
+                    # cannot suppress revocation on disconnect, and harvest its freshest token.
+                    voided_pending = await db.consume_pending_confirmations_for_user_provider(
+                        user_id, provider, service=service, conn=tx_conn
+                    )
+                    target_proj = (
+                        extract_google_project(oauth_client_id)
+                        if provider == "google"
+                        else None
+                    )
+                    override_raw_token: bytes | None = None
+                    extra_pending_revokes: list[tuple[str, str, bytes]] = []
+                    if provider == "google" and not is_revocation and remote_mode != "local_only":
+                        seen_extra: set[tuple[str, str]] = set()
+                        for prow in voided_pending:
+                            ptok = _extract_pending_raw_token(prow)
+                            if ptok is None:
+                                continue
+                            pcid = str(prow["oauth_client_id"])
+                            psub = str(prow["provider_account_id"])
+                            pproj = extract_google_project(pcid)
+                            if pproj == target_proj and psub == provider_account_id:
+                                override_raw_token = ptok
+                            elif (pproj, psub) not in seen_extra:
+                                seen_extra.add((pproj, psub))
+                                extra_pending_revokes.append((pcid, psub, ptok))
+
                     siblings = await db.get_sibling_connections(
                         user_id,
                         provider,
@@ -397,10 +545,10 @@ async def begin_disconnect(
                     has_other_active_grant = bool(siblings)
                     if provider == "google" and not has_other_active_grant:
                         has_other_active_grant = await db.has_active_or_pending_google_grant(
-                            user_id,
-                            extract_google_project(oauth_client_id),
+                            target_proj or extract_google_project(oauth_client_id),
                             provider_account_id,
-                            exclude_client_id=oauth_client_id,
+                            exclude_user_id=user_id,
+                            exclude_service=service,
                             conn=tx_conn,
                         )
                     remote_status, enc_revoke_token = _determine_remote_revoke(
@@ -408,7 +556,11 @@ async def begin_disconnect(
                         trigger_reason=trigger_reason,
                         remote_mode=remote_mode,
                         has_remaining_active_sibling=has_other_active_grant,
-                        raw_refresh_token=target_row.get("refresh_token"),
+                        raw_refresh_token=(
+                            override_raw_token
+                            if override_raw_token is not None
+                            else target_row.get("refresh_token")
+                        ),
                         raw_access_token=target_row.get("access_token"),
                     )
 
@@ -424,6 +576,26 @@ async def begin_disconnect(
                     remote_revoke_status=remote_status,
                     encrypted_revoke_token=enc_revoke_token,
                 )
+                for pcid, psub, ptok in extra_pending_revokes:
+                    pproj = extract_google_project(pcid)
+                    if not await db.has_active_or_pending_google_grant(
+                        pproj, psub, conn=tx_conn
+                    ):
+                        await db.insert_purge_ledger(
+                            purge_id=str(uuid4()),
+                            user_id=user_id,
+                            provider="google",
+                            service=service,
+                            oauth_client_id=pcid,
+                            provider_account_id=psub,
+                            auth_epoch_upto=0,
+                            trigger_reason=trigger_reason,
+                            local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
+                            purged_max_turn_by_thread={},
+                            remote_revoke_status=RemoteRevokeStatus.PENDING,
+                            encrypted_revoke_token=ptok,
+                            conn=tx_conn,
+                        )
             return purge_id
         finally:
             with anyio.CancelScope(shield=True):
@@ -604,14 +776,36 @@ async def begin_disconnect_all_services(
                         )
                         thread_purge_max[tid] = purge_start_max
 
+                # Void all staged pending confirmations for (user_id, provider) before computing
+                # remote revokes so an unactivated Google token neither suppresses revocation nor leaks.
+                voided_all_pending = await db.consume_pending_confirmations_for_user_provider(
+                    user_id, provider, conn=tx_conn
+                )
+                pending_token_by_proj_sub: dict[tuple[str, str], tuple[str, str | None, bytes]] = {}
+                if provider == "google" and not is_revocation and remote_mode != "local_only":
+                    for prow in voided_all_pending:
+                        ptok = _extract_pending_raw_token(prow)
+                        if ptok is None:
+                            continue
+                        pcid = str(prow["oauth_client_id"])
+                        psub = str(prow["provider_account_id"])
+                        pproj = extract_google_project(pcid)
+                        pending_token_by_proj_sub[(pproj, psub)] = (
+                            pcid,
+                            str(prow["service"]) if prow.get("service") else None,
+                            ptok,
+                        )
+
                 # Group by (oauth_client_id, provider_account_id) for deduplicated remote revocation
                 groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
                 for r in targets:
                     gkey = (str(r["oauth_client_id"]), str(r["provider_account_id"]))
                     groups.setdefault(gkey, []).append(r)
 
+                covered_proj_subs: set[tuple[str, str]] = set()
                 group_revoke_assignment: dict[tuple[str, str], tuple[str, RemoteRevokeStatus, bytes | None]] = {}
                 for gkey, grows in groups.items():
+                    cid_g, sub_g = gkey
                     raw_refresh = next(
                         (r["refresh_token"] for r in grows if r.get("refresh_token") is not None),
                         None,
@@ -620,11 +814,23 @@ async def begin_disconnect_all_services(
                         (r["access_token"] for r in grows if r.get("access_token") is not None),
                         None,
                     )
+                    has_other_user_grant = False
+                    if provider == "google":
+                        proj_g = extract_google_project(cid_g)
+                        covered_proj_subs.add((proj_g, sub_g))
+                        if (proj_g, sub_g) in pending_token_by_proj_sub:
+                            raw_refresh = pending_token_by_proj_sub[(proj_g, sub_g)][2]
+                        has_other_user_grant = await db.has_active_or_pending_google_grant(
+                            proj_g,
+                            sub_g,
+                            exclude_user_id=user_id,
+                            conn=tx_conn,
+                        )
                     g_status, g_token = _determine_remote_revoke(
                         provider=provider,
                         trigger_reason=trigger_reason,
                         remote_mode=remote_mode,
-                        has_remaining_active_sibling=False,
+                        has_remaining_active_sibling=has_other_user_grant,
                         raw_refresh_token=raw_refresh,
                         raw_access_token=raw_access,
                     )
@@ -672,6 +878,31 @@ async def begin_disconnect_all_services(
                         conn=tx_conn,
                     )
                     purge_ids.append(pid)
+
+                # Enqueue revocations for any voided Google pending confirmations targeting other (project, sub)
+                for (pproj, psub), (pcid, psvc, ptok) in pending_token_by_proj_sub.items():
+                    if (pproj, psub) in covered_proj_subs:
+                        continue
+                    if not await db.has_active_or_pending_google_grant(
+                        pproj, psub, exclude_user_id=user_id, conn=tx_conn
+                    ):
+                        extra_pid = str(uuid4())
+                        await db.insert_purge_ledger(
+                            purge_id=extra_pid,
+                            user_id=user_id,
+                            provider="google",
+                            service=psvc,
+                            oauth_client_id=pcid,
+                            provider_account_id=psub,
+                            auth_epoch_upto=0,
+                            trigger_reason=trigger_reason,
+                            local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
+                            purged_max_turn_by_thread={},
+                            remote_revoke_status=RemoteRevokeStatus.PENDING,
+                            encrypted_revoke_token=ptok,
+                            conn=tx_conn,
+                        )
+                        purge_ids.append(extra_pid)
 
             return purge_ids
         finally:
@@ -995,9 +1226,15 @@ async def replace_connection_for_account_switch(
 
     enc_key = get_encryption_key()
     lock_key = lifecycle_lock_key(user_id, provider)
+    target_refresh_key = refresh_lock_key(
+        user_id,
+        provider,
+        new_oauth_client_id,
+        new_provider_account_id,
+        service if provider == "feishu" else None,
+    )
     new_revoke_key = (
         revoke_lock_key(
-            user_id,
             extract_google_project(new_oauth_client_id),
             new_provider_account_id,
         )
@@ -1006,8 +1243,12 @@ async def replace_connection_for_account_switch(
     )
     async with get_db_connection() as lock_conn:
         await lock_conn.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
+        refresh_locked = False
         revoke_locked = False
         try:
+            # Canonical unidirectional lock order: lifecycle -> refresh -> revoke
+            await lock_conn.execute("SELECT pg_advisory_lock(%s)", (target_refresh_key,))
+            refresh_locked = True
             if new_revoke_key is not None:
                 await lock_conn.execute("SELECT pg_advisory_lock(%s)", (new_revoke_key,))
                 revoke_locked = True
@@ -1069,10 +1310,10 @@ async def replace_connection_for_account_switch(
                     has_other_old_grant = bool(siblings)
                     if provider == "google" and not has_other_old_grant:
                         has_other_old_grant = await db.has_active_or_pending_google_grant(
-                            user_id,
                             extract_google_project(old_client_id),
                             old_sub,
-                            exclude_client_id=old_client_id,
+                            exclude_user_id=user_id,
+                            exclude_service=service,
                             conn=tx_conn,
                         )
                     remote_status, enc_revoke_token = _determine_remote_revoke(
@@ -1145,9 +1386,43 @@ async def replace_connection_for_account_switch(
                     assert updated_row is not None
                     new_auth_epoch = int(updated_row["auth_epoch"])
 
+                # For Google: synchronize active sibling services already connected to the target
+                # (new_oauth_client_id, new_provider_account_id) under the target refresh lock,
+                # updating tokens, actual granted scopes, preferences, and status in the same tx.
                 if provider == "google":
-                    await db.supersede_active_revokes_for_google_project_sub_tx(
+                    target_siblings = await db.list_connections_by_account(
                         user_id,
+                        "google",
+                        new_oauth_client_id,
+                        new_provider_account_id,
+                        decrypt_tokens=False,
+                        for_update=True,
+                        conn=tx_conn,
+                    )
+                    active_target_siblings = [
+                        r
+                        for r in target_siblings
+                        if r.service != service
+                        and r.status
+                        not in (
+                            IntegrationStatus.DISCONNECT_PENDING,
+                            IntegrationStatus.REVOKED_PURGING,
+                        )
+                    ]
+                    if active_target_siblings:
+                        await sync_google_sibling_rows_tx(
+                            tx_conn,
+                            user_id=user_id,
+                            oauth_client_id=new_oauth_client_id,
+                            provider_account_id=new_provider_account_id,
+                            access_token=new_access_token,
+                            refresh_token=new_refresh_token,
+                            expires_at=new_expires_at,
+                            granted_scopes=new_granted_scopes,
+                            active_siblings=active_target_siblings,
+                        )
+
+                    await db.supersede_active_revokes_for_google_project_sub_tx(
                         extract_google_project(new_oauth_client_id),
                         new_provider_account_id,
                         conn=tx_conn,
@@ -1165,6 +1440,10 @@ async def replace_connection_for_account_switch(
                 if revoke_locked and new_revoke_key is not None:
                     await lock_conn.execute(
                         "SELECT pg_advisory_unlock(%s)", (new_revoke_key,)
+                    )
+                if refresh_locked:
+                    await lock_conn.execute(
+                        "SELECT pg_advisory_unlock(%s)", (target_refresh_key,)
                     )
                 await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
 

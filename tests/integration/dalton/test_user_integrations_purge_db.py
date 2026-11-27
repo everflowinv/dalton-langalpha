@@ -800,12 +800,14 @@ async def test_revoke_state_machine_outcomes_supersede_and_lock_mutual_exclusion
     l2_after = await ui_db.get_purge_ledger(l2.purge_id)
     assert l2_after is not None and l2_after.retry_count == 1 and l2_after.next_retry_at is not None
 
-    # revoke_before_new_authorization on retryable failure marks superseded immediately
-    res_pre = await revoke_before_new_authorization(uid, project, "sub-2", rev_retry)
-    assert res_pre[l2.purge_id] == RemoteRevokeStatus.SUPERSEDED
-    assert (await ui_db.get_purge_ledger(l2.purge_id, decrypt_revoke_token=True)).revoke_token is None
+    # revoke_before_new_authorization on retryable failure preserves ciphertext & stays FAILED_RETRYABLE
+    res_pre = await revoke_before_new_authorization(project, "sub-2", rev_retry, user_id=uid)
+    assert res_pre[l2.purge_id] == RemoteRevokeStatus.FAILED_RETRYABLE
+    l2_pre = await ui_db.get_purge_ledger(l2.purge_id, decrypt_revoke_token=True)
+    assert l2_pre is not None and l2_pre.revoke_token == "rt-retry"
+    assert l2_pre.retry_count == 2
 
-    # supersede_pending_revokes clears pending tasks
+    # supersede_pending_revokes clears pending tasks across users for (project, sub)
     l3 = await ui_db.insert_purge_ledger(
         user_id=uid,
         provider="google",
@@ -819,7 +821,7 @@ async def test_revoke_state_machine_outcomes_supersede_and_lock_mutual_exclusion
         remote_revoke_status=RemoteRevokeStatus.PENDING,
         revoke_token_plaintext="rt-sup",
     )
-    assert await supersede_pending_revokes(uid, project, "sub-3") == 1
+    assert await supersede_pending_revokes(project, "sub-3") == 1
     l3_after = await ui_db.get_purge_ledger(l3.purge_id, decrypt_revoke_token=True)
     assert l3_after.remote_revoke_status == RemoteRevokeStatus.SUPERSEDED
     assert l3_after.revoke_token is None

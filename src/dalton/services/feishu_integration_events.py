@@ -343,6 +343,51 @@ def _extract_feishu_ids(event: Mapping[str, Any]) -> tuple[str | None, str | Non
     return oid, uid
 
 
+async def has_matching_feishu_event_connection(
+    payload: Mapping[str, Any],
+) -> bool:
+    """Return True if a normalized Feishu revocation event matches any existing historical connection or recorded webhook event.
+
+    Used by the internal channel-gateway forwarding endpoint after ``X-Service-Token``
+    authentication so revocations for historical Feishu connections still trigger
+    Scheme 2A purge even after personal-integration capabilities are turned off.
+    """
+    header = payload.get("header") if isinstance(payload.get("header"), Mapping) else {}
+    event = payload.get("event") if isinstance(payload.get("event"), Mapping) else {}
+
+    event_type = str(header.get("event_type") or payload.get("event_type") or "").strip()
+    if event_type != FEISHU_REVOKED_EVENT_TYPE:
+        return False
+
+    event_id = str(header.get("event_id") or payload.get("uuid") or "").strip() or None
+    if event_id is not None and await db.has_webhook_event("feishu", event_id):
+        return True
+
+    open_id, union_id = _extract_feishu_ids(event)
+    if not open_id and not union_id:
+        return False
+
+    app_id = str(header.get("app_id") or event.get("app_id") or "").strip()
+    if not app_id:
+        has_live_gw, live_app_id = await db.get_active_channel_gateway_feishu_app_id()
+        if has_live_gw and live_app_id:
+            app_id = live_app_id
+    if not app_id:
+        feishu_app = get_credential_group("feishu_app")
+        if feishu_app.ready:
+            app_id = feishu_app.values.get(FEISHU_APP_ID_KEY, "")
+    if not app_id:
+        return False
+
+    matches = await db.list_connections_by_provider_account(
+        "feishu",
+        app_id,
+        provider_account_id=open_id,
+        provider_union_id=union_id,
+    )
+    return bool(matches)
+
+
 async def process_feishu_integration_event(
     payload: Mapping[str, Any],
     *,
@@ -406,6 +451,10 @@ async def process_feishu_integration_event(
         )
 
     app_id = str(header.get("app_id") or event.get("app_id") or "").strip()
+    if not app_id:
+        has_live_gw, live_app_id = await db.get_active_channel_gateway_feishu_app_id()
+        if has_live_gw and live_app_id:
+            app_id = live_app_id
     if not app_id:
         feishu_app = get_credential_group("feishu_app")
         if feishu_app.ready:
@@ -477,6 +526,7 @@ __all__ = [
     "compute_feishu_event_signature",
     "decrypt_feishu_event_payload",
     "encrypt_feishu_event_payload",
+    "has_matching_feishu_event_connection",
     "normalize_gateway_feishu_event",
     "process_feishu_integration_event",
     "verify_and_decode_feishu_event",

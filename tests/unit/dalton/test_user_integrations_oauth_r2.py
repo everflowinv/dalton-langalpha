@@ -354,19 +354,12 @@ class TestOAuthStateAndSessionVerification:
             db, "consume_oauth_state", create_autospec(db.consume_oauth_state, side_effect=_atomic_consume)
         )
         monkeypatch.setattr(
-            db,
-            "peek_oauth_state",
-            create_autospec(
-                db.peek_oauth_state,
-                side_effect=lambda sh, prov, **k: (
-                    (states_store[(sh, prov)].user_id, states_store[(sh, prov)].oauth_client_id)
-                    if (sh, prov) in states_store and states_store[(sh, prov)].expires_at > datetime.now(UTC)
-                    else None
-                ),
-            ),
+            db, "delete_oauth_state", create_autospec(db.delete_oauth_state, return_value=None)
         )
         monkeypatch.setattr(
-            db, "list_google_project_revoke_lock_subs", create_autospec(db.list_google_project_revoke_lock_subs, return_value=[])
+            db,
+            "has_inflight_google_revoke_in_project",
+            create_autospec(db.has_inflight_google_revoke_in_project, return_value=False),
         )
         fake_conn_ctx, _ = _make_fake_lock_pool()
         monkeypatch.setattr(oauth_mod, "get_db_connection", fake_conn_ctx)
@@ -469,8 +462,8 @@ class TestOAuthStateAndSessionVerification:
             ),
         )
         monkeypatch.setattr(db, "consume_oauth_state", consume_mock)
-        monkeypatch.setattr(db, "peek_oauth_state", create_autospec(db.peek_oauth_state, return_value=None))
-        monkeypatch.setattr(db, "list_google_project_revoke_lock_subs", create_autospec(db.list_google_project_revoke_lock_subs, return_value=[]))
+        monkeypatch.setattr(db, "delete_oauth_state", create_autospec(db.delete_oauth_state, return_value=None))
+        monkeypatch.setattr(db, "has_inflight_google_revoke_in_project", create_autospec(db.has_inflight_google_revoke_in_project, return_value=False))
         verify_local_spy = create_autospec(
             oauth_mod.verify_local_session_active,
             side_effect=HTTPException(status_code=401, detail="Session has been revoked"),
@@ -630,8 +623,8 @@ class TestGoogleThreeCases:
             db.consume_oauth_state, return_value=_make_state_row(service="calendar")
         )
         monkeypatch.setattr(db, "consume_oauth_state", consume_mock)
-        monkeypatch.setattr(db, "peek_oauth_state", create_autospec(db.peek_oauth_state, return_value=None))
-        monkeypatch.setattr(db, "list_google_project_revoke_lock_subs", create_autospec(db.list_google_project_revoke_lock_subs, return_value=[]))
+        monkeypatch.setattr(db, "delete_oauth_state", create_autospec(db.delete_oauth_state, return_value=None))
+        monkeypatch.setattr(db, "has_inflight_google_revoke_in_project", create_autospec(db.has_inflight_google_revoke_in_project, return_value=False))
         fake_conn_ctx, _ = _make_fake_lock_pool()
         monkeypatch.setattr(oauth_mod, "get_db_connection", fake_conn_ctx)
         monkeypatch.setattr(
@@ -791,9 +784,9 @@ class TestGoogleThreeCases:
         assert ledger_kwargs["local_purge_status"] == LocalPurgeStatus.NOT_REQUIRED
         assert ledger_kwargs["remote_revoke_status"] == RemoteRevokeStatus.SUPERSEDED
         assert ledger_kwargs["encrypted_revoke_token"] is None
-        # Pending revokes were superseded INSIDE the commit transaction under revoke_lock
+        # Pending revokes were superseded INSIDE the commit transaction under cross-user (project, sub) revoke_lock
         supersede_tx_spy.assert_awaited_once()
-        assert supersede_tx_spy.await_args.args[:3] == (LOCAL_DEV_USER_ID, "111222333", "sub-alice")
+        assert supersede_tx_spy.await_args.args[:2] == ("111222333", "sub-alice")
         assert supersede_tx_spy.await_args.kwargs.get("conn") is not None
 
     @pytest.mark.asyncio
@@ -835,10 +828,10 @@ class TestGoogleThreeCases:
             db, "consume_oauth_state", create_autospec(db.consume_oauth_state, return_value=_make_state_row())
         )
         monkeypatch.setattr(
-            db, "peek_oauth_state", create_autospec(db.peek_oauth_state, return_value=(LOCAL_DEV_USER_ID, "111222333-abc.apps.googleusercontent.com"))
+            db, "delete_oauth_state", create_autospec(db.delete_oauth_state, return_value=None)
         )
         monkeypatch.setattr(
-            db, "list_google_project_revoke_lock_subs", create_autospec(db.list_google_project_revoke_lock_subs, return_value=["sub-alice"])
+            db, "has_inflight_google_revoke_in_project", create_autospec(db.has_inflight_google_revoke_in_project, return_value=False)
         )
         current_conn = [old_row]
         monkeypatch.setattr(
@@ -951,7 +944,7 @@ class TestGoogleThreeCases:
         finish_spy.assert_awaited_once_with(purge_uuid, revoker=revoker)
         # Staging the pending confirmation coordinated under revoke_lock and superseded old revokes
         supersede_tx_spy.assert_awaited_once()
-        assert supersede_tx_spy.await_args.args[:3] == (LOCAL_DEV_USER_ID, "111222333", "sub-bob")
+        assert supersede_tx_spy.await_args.args[:2] == ("111222333", "sub-bob")
 
 
 # ---------------------------------------------------------------------------
@@ -1307,7 +1300,7 @@ class TestGoogleHttpRevokerAndCoordination:
             revoker=revoker,
         )
         pre_auth_spy.assert_awaited_once_with(
-            LOCAL_DEV_USER_ID, "111222333", "sub-alice", revoker
+            "111222333", "sub-alice", revoker, user_id=LOCAL_DEV_USER_ID
         )
         assert "access_type=offline" in started.authorize_url
         assert "code_challenge_method=S256" in started.authorize_url
@@ -2133,13 +2126,59 @@ class TestRound2ReviewFixes:
         revoker.revoke.assert_not_awaited()
         assert ledger_spy.await_args.kwargs["remote_revoke_status"] == RemoteRevokeStatus.SUPERSEDED
 
-        # Sole service on old client with RETRYABLE -> queues into retry queue (FAILED_RETRYABLE)
+        # Sole service on old client with RETRYABLE -> registers PENDING ledger under short lock,
+        # then invokes process_revoke OUTSIDE lock -> FAILED_RETRYABLE keeping ciphertext
+        from src.dalton.services import integration_revoke as revoke_mod
+
         list_conns_mock.return_value = [mail_on_old]
         has_grant_mock.return_value = False
         monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=mail_on_old))
         monkeypatch.setattr(db, "update_connection_status", create_autospec(db.update_connection_status, return_value=True))
-        update_remote_spy = create_autospec(db.update_purge_ledger_remote_status, return_value=None)
-        monkeypatch.setattr(db, "update_purge_ledger_remote_status", update_remote_spy)
+        stored_ledgers: dict[str, PurgeLedgerRow] = {}
+
+        async def _store_ledger(**kw: Any) -> PurgeLedgerRow:
+            row = PurgeLedgerRow(
+                purge_id=kw["purge_id"],
+                user_id=kw["user_id"],
+                provider=kw["provider"],
+                service=kw["service"],
+                oauth_client_id=kw["oauth_client_id"],
+                provider_account_id=kw["provider_account_id"],
+                auth_epoch_upto=kw["auth_epoch_upto"],
+                trigger_reason=kw["trigger_reason"],
+                local_purge_status=kw["local_purge_status"],
+                purged_max_turn_by_thread=kw["purged_max_turn_by_thread"],
+                tracker_reconcile_needed=False,
+                local_completed_at=datetime.now(UTC),
+                remote_revoke_status=kw["remote_revoke_status"],
+                has_revoke_token=bool(kw.get("revoke_token_plaintext") or kw.get("encrypted_revoke_token")),
+                retry_count=0,
+                next_retry_at=None,
+                last_remote_error=None,
+                remote_completed_at=None,
+                disconnected_at=datetime.now(UTC),
+                completed_at=None,
+                revoke_token=kw.get("revoke_token_plaintext"),
+            )
+            stored_ledgers[row.purge_id] = row
+            return row
+
+        import dataclasses
+
+        ledger_spy.side_effect = _store_ledger
+        monkeypatch.setattr(revoke_mod, "get_db_connection", fake_ctx)
+        monkeypatch.setattr(db, "get_purge_ledger", create_autospec(db.get_purge_ledger, side_effect=lambda pid, **_k: stored_ledgers.get(pid)))
+        monkeypatch.setattr(db, "has_running_local_purge_for_user_provider", create_autospec(db.has_running_local_purge_for_user_provider, return_value=False))
+        monkeypatch.setattr(db, "get_active_google_oauth_state_expiry", create_autospec(db.get_active_google_oauth_state_expiry, return_value=None))
+        monkeypatch.setattr(db, "claim_revoke_attempt_tx", create_autospec(db.claim_revoke_attempt_tx, return_value=1))
+        finalize_spy = create_autospec(
+            db.finalize_revoke_attempt_tx,
+            side_effect=lambda pid, **kw: dataclasses.replace(
+                stored_ledgers[pid],
+                remote_revoke_status=kw["remote_revoke_status"],
+            ),
+        )
+        monkeypatch.setattr(db, "finalize_revoke_attempt_tx", finalize_spy)
         revoker.revoke.return_value = RevokeOutcome.RETRYABLE
 
         await oauth_mod._coordinate_pre_auth_google_revokes(
@@ -2151,9 +2190,9 @@ class TestRound2ReviewFixes:
             revoker=revoker,
         )
         revoker.revoke.assert_awaited_once()
-        update_remote_spy.assert_awaited_once()
-        assert update_remote_spy.await_args.kwargs["remote_revoke_status"] == RemoteRevokeStatus.FAILED_RETRYABLE
-        assert update_remote_spy.await_args.kwargs["clear_revoke_token"] is False
+        finalize_spy.assert_awaited_once()
+        assert finalize_spy.await_args.kwargs["remote_revoke_status"] == RemoteRevokeStatus.FAILED_RETRYABLE
+        assert finalize_spy.await_args.kwargs["clear_revoke_token"] is False
 
     @pytest.mark.asyncio
     async def test_r2_item8_interleaved_account_switch_confirmation_voided_on_epoch_change(
@@ -2184,20 +2223,30 @@ class TestRound2ReviewFixes:
             expected_old_auth_epoch=3,
         )
         current_c = _make_integration_row(provider_account_id="sub-c", auth_epoch=4)
+        fake_ctx, _ = _make_fake_lock_pool()
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_ctx)
         monkeypatch.setattr(db, "peek_pending_confirmation", create_autospec(db.peek_pending_confirmation, return_value=stale_ticket))
         consume_spy = create_autospec(db.consume_pending_confirmation, return_value=stale_ticket)
         monkeypatch.setattr(db, "consume_pending_confirmation", consume_spy)
         monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=current_c))
+        monkeypatch.setattr(db, "has_active_or_pending_google_grant", create_autospec(db.has_active_or_pending_google_grant, return_value=False))
+        insert_ledger_spy = create_autospec(db.insert_purge_ledger, return_value=None)
+        monkeypatch.setattr(db, "insert_purge_ledger", insert_ledger_spy)
+        proc_rev_spy = create_autospec(oauth_mod.process_revoke, return_value=RemoteRevokeStatus.SUCCEEDED)
+        monkeypatch.setattr(oauth_mod, "process_revoke", proc_rev_spy)
 
         with pytest.raises(PendingConfirmationInvalidError) as exc_info:
             await confirm_pending_integration(
                 user_id=LOCAL_DEV_USER_ID,
                 confirmation_token="tok-b",
                 confirm_account_switch=True,
+                revoker=create_autospec(RemoteRevoker, instance=True),
             )
         assert exc_info.value.code == "account_switch_state_changed"
         assert exc_info.value.status_code == 409
         consume_spy.assert_awaited_once()  # ticket voided!
+        insert_ledger_spy.assert_awaited_once()  # unactivated staged token queued for revoke!
+        proc_rev_spy.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_r2_item9_local_mode_browser_binding_cookie_and_callback_guard(
@@ -2238,8 +2287,8 @@ class TestRound2ReviewFixes:
             browser_binding_hash=hashlib.sha256(cookie_val.encode()).hexdigest(),
         )
         monkeypatch.setattr(db, "consume_oauth_state", create_autospec(db.consume_oauth_state, return_value=state_row))
-        monkeypatch.setattr(db, "peek_oauth_state", create_autospec(db.peek_oauth_state, return_value=None))
-        monkeypatch.setattr(db, "list_google_project_revoke_lock_subs", create_autospec(db.list_google_project_revoke_lock_subs, return_value=[]))
+        monkeypatch.setattr(db, "delete_oauth_state", create_autospec(db.delete_oauth_state, return_value=None))
+        monkeypatch.setattr(db, "has_inflight_google_revoke_in_project", create_autospec(db.has_inflight_google_revoke_in_project, return_value=False))
         monkeypatch.setattr(oauth_mod, "verify_local_session_active", create_autospec(oauth_mod.verify_local_session_active, return_value=None))
         monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=None))
         fake_ctx, _ = _make_fake_lock_pool()
@@ -2605,12 +2654,12 @@ class TestRound3ReviewFixes:
     async def test_r3_item1_google_callback_holds_revoke_lock_across_exchange_and_process_revoke_defers_active_oauth(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Task 7: Google callback holds (project, sub) revoke_lock across consume + exchange + supersede; process_revoke defers during active OAuth state."""
+        """Task 7 + r4: Google callback never holds PG lock across exchange_code; keeps in-flight state visible until guard commits; process_revoke defers during active OAuth."""
         from src.dalton.services import integration_revoke as revoke_mod
 
         _install_saved_credentials()
         timeline: list[str] = []
-        target_key = db.revoke_lock_key(LOCAL_DEV_USER_ID, "111222333", "sub-alice")
+        target_key = db.revoke_lock_key("111222333", "sub-alice")
 
         class _TrackingConn:
             async def execute(self, sql: str, params: Any = None) -> None:
@@ -2628,25 +2677,17 @@ class TestRound3ReviewFixes:
             yield _TrackingConn()
 
         monkeypatch.setattr(oauth_mod, "get_db_connection", _tracking_conn_ctx)
-        monkeypatch.setattr(
-            db,
-            "peek_oauth_state",
-            create_autospec(
-                db.peek_oauth_state,
-                return_value=(LOCAL_DEV_USER_ID, "111222333-abc.apps.googleusercontent.com"),
-            ),
-        )
-        monkeypatch.setattr(
-            db,
-            "list_google_project_revoke_lock_subs",
-            create_autospec(db.list_google_project_revoke_lock_subs, return_value=["sub-alice"]),
-        )
 
         async def _track_consume(*_a: Any, **_k: Any) -> OAuthStateRow:
             timeline.append("consume_state")
             return _make_state_row()
 
+        async def _track_delete_state(*_a: Any, **_k: Any) -> None:
+            timeline.append("delete_state")
+
         monkeypatch.setattr(db, "consume_oauth_state", create_autospec(db.consume_oauth_state, side_effect=_track_consume))
+        monkeypatch.setattr(db, "delete_oauth_state", create_autospec(db.delete_oauth_state, side_effect=_track_delete_state))
+        monkeypatch.setattr(db, "has_inflight_google_revoke_in_project", create_autospec(db.has_inflight_google_revoke_in_project, return_value=False))
         monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=None))
 
         async def _track_supersede(*_a: Any, **_k: Any) -> int:
@@ -2693,17 +2734,19 @@ class TestRound3ReviewFixes:
             provider="google", code="c1", state="s1", google_client=g_client
         )
         assert cb.status == "connected"
+        # No PG advisory lock held during exchange_code; in-flight oauth_state deleted ONLY AFTER guard commits!
         assert timeline == [
-            f"lock:{target_key}",
             "consume_state",
             "exchange_code",
+            f"lock:{target_key}",
             "supersede",
             "insert_guard",
             f"unlock:{target_key}",
+            "delete_state",
             "finalize",
         ]
 
-        # process_revoke defers when an active Google OAuth state exists for (user_id, project)
+        # process_revoke defers when an active Google OAuth state/exchange exists in google_project
         pid = str(uuid.uuid4())
         ledger = PurgeLedgerRow(
             purge_id=pid,
@@ -2732,6 +2775,7 @@ class TestRound3ReviewFixes:
         fake_rev_ctx, _ = _make_fake_lock_pool()
         monkeypatch.setattr(revoke_mod, "get_db_connection", fake_rev_ctx)
         monkeypatch.setattr(db, "get_purge_ledger", create_autospec(db.get_purge_ledger, return_value=ledger))
+        monkeypatch.setattr(db, "has_running_local_purge_for_user_provider", create_autospec(db.has_running_local_purge_for_user_provider, return_value=False))
         monkeypatch.setattr(revoke_mod, "_has_newer_active_google_connection", create_autospec(revoke_mod._has_newer_active_google_connection, return_value=False))
         monkeypatch.setattr(db, "get_active_google_oauth_state_expiry", create_autospec(db.get_active_google_oauth_state_expiry, return_value=oauth_exp))
         update_remote_spy = create_autospec(db.update_purge_ledger_remote_status, return_value=ledger)
@@ -3207,3 +3251,555 @@ class TestRound3ReviewFixes:
         assert loc_norm.startswith("/settings/integrations?")
         assert "%2e" not in loc_norm.lower()
         assert oauth_mod.validate_callback_location(loc_norm) is True
+
+
+# ---------------------------------------------------------------------------
+# 10. Round 4 Review Fixes (No Lock Across HTTP, Cross-User Revoke, Gateway App ID, Local-First, Sibling Switch, Pending Revoke)
+# ---------------------------------------------------------------------------
+
+
+class TestRound4ReviewFixes:
+    @pytest.mark.asyncio
+    async def test_r4_process_revoke_releases_lock_before_http_and_commits_by_attempt_gen(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Lead §1: process_revoke checks & claims attempt_gen under short lock, calls revoker OUTSIDE any PG lock, then re-acquires lock to commit by gen."""
+        from src.dalton.services import integration_revoke as revoke_mod
+
+        pid = str(uuid.uuid4())
+        target_key = db.revoke_lock_key("111222333", "sub-alice")
+        ledger = PurgeLedgerRow(
+            purge_id=pid,
+            user_id="user-a",
+            provider="google",
+            service="calendar",
+            oauth_client_id="111222333-old.apps.googleusercontent.com",
+            provider_account_id="sub-alice",
+            auth_epoch_upto=2,
+            trigger_reason=TriggerReason.USER_DISCONNECT,
+            local_purge_status=LocalPurgeStatus.COMPLETED,
+            purged_max_turn_by_thread={},
+            tracker_reconcile_needed=False,
+            local_completed_at=datetime.now(UTC),
+            remote_revoke_status=RemoteRevokeStatus.PENDING,
+            has_revoke_token=True,
+            retry_count=0,
+            next_retry_at=None,
+            last_remote_error=None,
+            remote_completed_at=None,
+            disconnected_at=datetime.now(UTC),
+            completed_at=None,
+            revoke_token="rt-secret-r4",
+        )
+        events: list[str] = []
+
+        class _TrackConn:
+            async def execute(self, sql: str, params: Any = None) -> None:
+                if "pg_advisory_lock" in sql:
+                    events.append(f"lock:{params[0]}")
+                elif "pg_advisory_unlock" in sql:
+                    events.append(f"unlock:{params[0]}")
+
+        @asynccontextmanager
+        async def _track_pool(_conn: Any = None) -> Any:
+            yield _TrackConn()
+
+        async def _claim(purge_id: str, **_k: Any) -> int:
+            events.append("claim_gen:7")
+            return 7
+
+        import dataclasses
+
+        async def _finalize(purge_id: str, **kw: Any) -> PurgeLedgerRow:
+            events.append(f"finalize_gen:{kw['expected_attempt_gen']}:{kw['remote_revoke_status'].value}")
+            return dataclasses.replace(
+                ledger, remote_revoke_status=kw["remote_revoke_status"]
+            )
+
+        revoker = create_autospec(RemoteRevoker, instance=True)
+
+        async def _http_revoke(**_k: Any) -> RevokeOutcome:
+            events.append("http_revoke")
+            return RevokeOutcome.SUCCEEDED
+
+        revoker.revoke.side_effect = _http_revoke
+
+        monkeypatch.setattr(revoke_mod, "get_db_connection", _track_pool)
+        monkeypatch.setattr(db, "get_purge_ledger", create_autospec(db.get_purge_ledger, return_value=ledger))
+        monkeypatch.setattr(db, "has_running_local_purge_for_user_provider", create_autospec(db.has_running_local_purge_for_user_provider, return_value=False))
+        monkeypatch.setattr(revoke_mod, "_has_newer_active_google_connection", create_autospec(revoke_mod._has_newer_active_google_connection, return_value=False))
+        monkeypatch.setattr(db, "get_active_google_oauth_state_expiry", create_autospec(db.get_active_google_oauth_state_expiry, return_value=None))
+        monkeypatch.setattr(db, "claim_revoke_attempt_tx", create_autospec(db.claim_revoke_attempt_tx, side_effect=_claim))
+        monkeypatch.setattr(db, "finalize_revoke_attempt_tx", create_autospec(db.finalize_revoke_attempt_tx, side_effect=_finalize))
+
+        st = await revoke_mod.process_revoke(pid, revoker)
+        assert st == RemoteRevokeStatus.SUCCEEDED
+        assert events == [
+            f"lock:{target_key}",
+            "claim_gen:7",
+            f"unlock:{target_key}",
+            "http_revoke",
+            f"lock:{target_key}",
+            "finalize_gen:7:succeeded",
+            f"unlock:{target_key}",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_r4_callback_waits_for_inflight_google_revoke_outside_lock(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Lead §1 + Codex High #1: callback waits without holding DB locks until any pre-existing in-flight revoke lease clears, then runs exchange_code."""
+        _install_saved_credentials()
+        polls = {"n": 0}
+        order: list[str] = []
+
+        async def _inflight_check(proj: str, *, conn: Any = None) -> bool:
+            assert proj == "111222333"
+            polls["n"] += 1
+            order.append(f"poll:{polls['n']}")
+            return polls["n"] < 2
+
+        monkeypatch.setattr(oauth_mod, "_INFLIGHT_REVOKE_POLL_INTERVAL_S", 0.005)
+        monkeypatch.setattr(db, "consume_oauth_state", create_autospec(db.consume_oauth_state, return_value=_make_state_row()))
+        monkeypatch.setattr(db, "delete_oauth_state", create_autospec(db.delete_oauth_state, return_value=None))
+        monkeypatch.setattr(db, "has_inflight_google_revoke_in_project", create_autospec(db.has_inflight_google_revoke_in_project, side_effect=_inflight_check))
+        monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=None))
+        fake_ctx, _ = _make_fake_lock_pool()
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_ctx)
+        monkeypatch.setattr(db, "supersede_active_revokes_for_google_project_sub_tx", create_autospec(db.supersede_active_revokes_for_google_project_sub_tx, return_value=0))
+        monkeypatch.setattr(db, "insert_pending_confirmation", create_autospec(db.insert_pending_confirmation, return_value=None))
+        monkeypatch.setattr(oauth_mod, "_finalize_connection", create_autospec(oauth_mod._finalize_connection, return_value=(_make_integration_row(), None)))
+
+        g_client = create_autospec(GoogleOAuthClient, instance=True)
+
+        async def _ex(**_k: Any) -> OAuthTokenResponse:
+            order.append("exchange_code")
+            return OAuthTokenResponse(
+                access_token="at-ok",
+                refresh_token="rt-ok",
+                expires_in=3600,
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                scope=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+                id_token="id.ok",
+            )
+
+        g_client.exchange_code.side_effect = _ex
+        g_client.verify_id_token.return_value = GoogleIdTokenClaims(
+            sub="sub-alice",
+            email="alice@example.com",
+            email_verified=True,
+            aud="111222333-abc.apps.googleusercontent.com",
+            iss="https://accounts.google.com",
+            exp=int(time.time()) + 3600,
+        )
+
+        cb = await asyncio.wait_for(
+            handle_oauth_callback(provider="google", code="c1", state="s1", google_client=g_client),
+            timeout=5.0,
+        )
+        assert cb.status == "connected"
+        assert order == ["poll:1", "poll:2", "exchange_code"]
+
+    @pytest.mark.asyncio
+    async def test_r4_cross_user_revoke_lock_and_grant_check_prevents_destroying_peer_member(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Lead §2.1 + Codex High #2 + Grok Medium #3: revoke lock & grant check scope to (google_project, sub) across all Dalton users."""
+        from src.dalton.services import integration_revoke as revoke_mod
+
+        # Lock key depends ONLY on (google_project, sub)
+        assert db.revoke_lock_key("111222333", "sub-shared") == db.revoke_lock_key("111222333", "sub-shared")
+        assert db.revoke_lock_key("111222333", "sub-shared") != db.revoke_lock_key("999888777", "sub-shared")
+
+        pid = str(uuid.uuid4())
+        user_a_ledger = PurgeLedgerRow(
+            purge_id=pid,
+            user_id="member-a",
+            provider="google",
+            service="calendar",
+            oauth_client_id="111222333-app.apps.googleusercontent.com",
+            provider_account_id="sub-shared",
+            auth_epoch_upto=1,
+            trigger_reason=TriggerReason.USER_DISCONNECT,
+            local_purge_status=LocalPurgeStatus.COMPLETED,
+            purged_max_turn_by_thread={},
+            tracker_reconcile_needed=False,
+            local_completed_at=datetime.now(UTC),
+            remote_revoke_status=RemoteRevokeStatus.PENDING,
+            has_revoke_token=True,
+            retry_count=0,
+            next_retry_at=None,
+            last_remote_error=None,
+            remote_completed_at=None,
+            disconnected_at=datetime.now(UTC),
+            completed_at=None,
+            revoke_token="rt-member-a",
+        )
+        fake_ctx, _ = _make_fake_lock_pool()
+        monkeypatch.setattr(revoke_mod, "get_db_connection", fake_ctx)
+        monkeypatch.setattr(db, "get_purge_ledger", create_autospec(db.get_purge_ledger, return_value=user_a_ledger))
+        monkeypatch.setattr(db, "has_running_local_purge_for_user_provider", create_autospec(db.has_running_local_purge_for_user_provider, return_value=False))
+        grant_spy = create_autospec(db.has_active_or_pending_google_grant, return_value=True)
+        monkeypatch.setattr(db, "has_active_or_pending_google_grant", grant_spy)
+        upd_spy = create_autospec(db.update_purge_ledger_remote_status, return_value=user_a_ledger)
+        monkeypatch.setattr(db, "update_purge_ledger_remote_status", upd_spy)
+        revoker = create_autospec(RemoteRevoker, instance=True)
+
+        st = await revoke_mod.process_revoke(pid, revoker)
+        assert st == RemoteRevokeStatus.SUPERSEDED
+        revoker.revoke.assert_not_awaited()
+        grant_spy.assert_awaited_once()
+        # Verified called with (google_project, sub) — no user_id filter!
+        assert grant_spy.await_args.args == ("111222333", "sub-shared")
+        assert upd_spy.await_args.kwargs["remote_revoke_status"] == RemoteRevokeStatus.SUPERSEDED
+        assert upd_spy.await_args.kwargs["clear_revoke_token"] is True
+
+    @pytest.mark.asyncio
+    async def test_r4_live_gateway_reported_feishu_app_id_beats_rotated_config(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Lead §2.3 + Codex High #3: live running gateway's reported Feishu App ID takes precedence over newly rotated config; fallback uses resolve_feishu_app_credentials and warns when unavailable."""
+        from src.dalton.integrations.oauth_clients import FeishuUserInfo
+
+        _install_saved_credentials(feishu_app_id="cli_new_oauth", feishu_app_secret="sec_new")
+        gw_app_mock = create_autospec(
+            db.get_active_channel_gateway_feishu_app_id,
+            return_value=(True, "cli_old_gw"),
+        )
+        monkeypatch.setattr(db, "get_active_channel_gateway_feishu_app_id", gw_app_mock)
+        assert await oauth_mod._resolve_channel_gateway_feishu_app_id() == "cli_old_gw"
+
+        # OAuth callback using rotated cli_new_oauth does NOT compare against cli_old_gw's channel binding!
+        f_client = create_autospec(FeishuOAuthClient, instance=True)
+        f_client.exchange_code.return_value = OAuthTokenResponse(
+            access_token="at-new",
+            refresh_token="rt-new",
+            expires_in=7200,
+            expires_at=datetime.now(UTC) + timedelta(hours=2),
+            scope=" ".join(oauth_mod.FEISHU_CALENDAR_SCOPES),
+        )
+        f_client.get_user_info.return_value = FeishuUserInfo(
+            open_id="ou_new_app_id", union_id="on_u1", email="u@example.com"
+        )
+        monkeypatch.setattr(
+            db, "consume_oauth_state",
+            create_autospec(
+                db.consume_oauth_state,
+                return_value=_make_state_row(
+                    provider="feishu",
+                    service="calendar",
+                    oauth_client_id="cli_new_oauth",
+                    requested_scopes=" ".join(oauth_mod.FEISHU_CALENDAR_SCOPES),
+                ),
+            ),
+        )
+        channel_open_id_spy = create_autospec(db.get_channel_feishu_open_id, return_value="ou_old_gw_binding")
+        monkeypatch.setattr(db, "get_channel_feishu_open_id", channel_open_id_spy)
+        monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=None))
+        saved_row = _make_integration_row(
+            provider="feishu", oauth_client_id="cli_new_oauth", provider_account_id="ou_new_app_id"
+        )
+        monkeypatch.setattr(oauth_mod, "_finalize_connection", create_autospec(oauth_mod._finalize_connection, return_value=(saved_row, None)))
+
+        cb = await handle_oauth_callback(provider="feishu", code="c1", state="s1", feishu_client=f_client)
+        assert cb.status == "connected"
+        channel_open_id_spy.assert_not_awaited()
+
+        # When live gateway reports no active Feishu adapter -> warns and returns None (skips check)
+        gw_app_mock.return_value = (True, None)
+        with caplog.at_level(logging.WARNING, logger=oauth_mod.__name__):
+            assert await oauth_mod._resolve_channel_gateway_feishu_app_id() is None
+        assert any("no active Feishu App ID" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_r4_local_first_blocks_manual_retry_and_full_disconnect_when_local_purge_running(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Codex Medium #1: process_revoke defers while local purge is running; DELETE /google skips background revoke if another worker holds a running local purge."""
+        from src.dalton.services import integration_revoke as revoke_mod
+
+        pid = str(uuid.uuid4())
+        running_ledger = PurgeLedgerRow(
+            purge_id=pid,
+            user_id=LOCAL_DEV_USER_ID,
+            provider="google",
+            service="calendar",
+            oauth_client_id="111222333-app.apps.googleusercontent.com",
+            provider_account_id="sub-1",
+            auth_epoch_upto=1,
+            trigger_reason=TriggerReason.USER_DISCONNECT,
+            local_purge_status=LocalPurgeStatus.RUNNING,
+            purged_max_turn_by_thread={},
+            tracker_reconcile_needed=False,
+            local_completed_at=None,
+            remote_revoke_status=RemoteRevokeStatus.PENDING,
+            has_revoke_token=True,
+            retry_count=0,
+            next_retry_at=None,
+            last_remote_error=None,
+            remote_completed_at=None,
+            disconnected_at=datetime.now(UTC),
+            completed_at=None,
+            revoke_token="rt-1",
+        )
+        fake_ctx, _ = _make_fake_lock_pool()
+        monkeypatch.setattr(revoke_mod, "get_db_connection", fake_ctx)
+        monkeypatch.setattr(db, "get_purge_ledger", create_autospec(db.get_purge_ledger, return_value=running_ledger))
+        upd_spy = create_autospec(db.update_purge_ledger_remote_status, return_value=running_ledger)
+        monkeypatch.setattr(db, "update_purge_ledger_remote_status", upd_spy)
+        revoker = create_autospec(RemoteRevoker, instance=True)
+
+        st = await revoke_mod.process_revoke(pid, revoker)
+        assert st == RemoteRevokeStatus.PENDING
+        revoker.revoke.assert_not_awaited()
+        assert upd_spy.await_args.kwargs["last_remote_error"] == "deferred_local_purge_running"
+        assert upd_spy.await_args.kwargs["clear_revoke_token"] is False
+
+        # DELETE /google when another worker holds purge lock on one ledger (finish_disconnect returns None)
+        _install_saved_credentials()
+        monkeypatch.setattr(db, "has_user_any_integration_records", create_autospec(db.has_user_any_integration_records, return_value=True))
+        monkeypatch.setattr(
+            router_mod, "begin_disconnect_all_services",
+            create_autospec(router_mod.begin_disconnect_all_services, return_value=["p-cal", "p-mail"]),
+        )
+        monkeypatch.setattr(
+            router_mod,
+            "finish_disconnect",
+            create_autospec(
+                router_mod.finish_disconnect,
+                side_effect=[
+                    FinishDisconnectResult(
+                        purge_id="p-cal",
+                        deleted_connections=1,
+                        local_purge_status=LocalPurgeStatus.COMPLETED,
+                        remote_revoke_status=RemoteRevokeStatus.PENDING,
+                    ),
+                    None,  # Another worker currently holds local purge lock for p-mail!
+                ],
+            ),
+        )
+        sched_spy = create_autospec(router_mod.schedule_background_remote_revokes, return_value=[])
+        monkeypatch.setattr(router_mod, "schedule_background_remote_revokes", sched_spy)
+
+        client = TestClient(_make_app())
+        resp = client.delete("/api/v1/dalton/integrations/google")
+        assert resp.status_code == 200
+        sched_spy.assert_not_called()
+
+    def test_r4_everflow_gateway_feishu_revocation_allowed_after_personal_caps_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Codex Medium #3: after personal integration capabilities are disabled & feishu_event unconfigured, internal gateway route allows events matching a historical Feishu connection and rejects non-matching with 404."""
+        _install_saved_credentials(feishu_encrypt_key=None, feishu_verification_token=None)
+        monkeypatch.delenv("APP_ENV", raising=False)
+        monkeypatch.setenv("DALTON_PROFILE", "core")  # all personal integration capabilities default OFF
+        monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "s" * 40)
+
+        proc_spy = create_autospec(
+            router_mod.process_feishu_integration_event,
+            return_value=feishu_events_mod.FeishuEventProcessResult(
+                status="purged", event_id="evt-hist-1", purge_ids=("p-hist-1",)
+            ),
+        )
+        monkeypatch.setattr(router_mod, "process_feishu_integration_event", proc_spy)
+        match_mock = create_autospec(router_mod.has_matching_feishu_event_connection, return_value=True)
+        monkeypatch.setattr(router_mod, "has_matching_feishu_event_connection", match_mock)
+
+        client = TestClient(_make_app())
+        payload = {
+            "event_id": "evt-hist-1",
+            "event_type": FEISHU_REVOKED_EVENT_TYPE,
+            "app_id": "cli_test_app_1",
+            "create_time": str(int(time.time() * 1000)),
+            "open_id": "ou_hist_1",
+            "revoke_reason": "Revoked by user action.",
+        }
+        # Matching historical connection -> allowed (200)
+        r_ok = client.post(
+            "/api/v1/dalton/integrations/internal/feishu/events",
+            headers={"X-Service-Token": "s" * 40},
+            json=payload,
+        )
+        assert r_ok.status_code == 200
+        assert r_ok.json()["status"] == "purged"
+        proc_spy.assert_awaited_once()
+
+        # Non-matching event when capabilities disabled & feishu_event unconfigured -> 404
+        match_mock.return_value = False
+        r_404 = client.post(
+            "/api/v1/dalton/integrations/internal/feishu/events",
+            headers={"X-Service-Token": "s" * 40},
+            json=payload,
+        )
+        assert r_404.status_code == 404
+
+        # Public endpoint STILL returns 404 when capabilities disabled & feishu_event unconfigured
+        r_pub = client.post("/api/v1/dalton/integrations/feishu/events", json=payload)
+        assert r_pub.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_r4_cancel_google_pending_confirmation_revokes_unactivated_token_only_when_no_other_grant(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Grok Medium #2: cancelling a Google pending confirmation revokes the staged refresh token when no other active/pending grant exists."""
+        _install_saved_credentials()
+        now = datetime.now(UTC)
+        staged = PendingConfirmationRow(
+            confirmation_hash=hashlib.sha256(b"tok-cancel").hexdigest(),
+            user_id=LOCAL_DEV_USER_ID,
+            provider="google",
+            service="calendar",
+            oauth_client_id="111222333-abc.apps.googleusercontent.com",
+            provider_account_id="sub-cancel",
+            provider_union_id=None,
+            provider_email="cancel@example.com",
+            granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+            expires_at=now + timedelta(hours=1),
+            intent=oauth_mod.OAuthIntent.CONNECT.value,
+            preferences={},
+            confirm_expires_at=now + timedelta(minutes=5),
+            created_at=now,
+            access_token="at-cancel",
+            refresh_token="rt-cancel",
+        )
+        fake_ctx, _ = _make_fake_lock_pool()
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_ctx)
+        monkeypatch.setattr(db, "consume_pending_confirmation", create_autospec(db.consume_pending_confirmation, return_value=staged))
+        has_grant_mock = create_autospec(db.has_active_or_pending_google_grant, return_value=False)
+        monkeypatch.setattr(db, "has_active_or_pending_google_grant", has_grant_mock)
+        ledger_spy = create_autospec(db.insert_purge_ledger, return_value=None)
+        monkeypatch.setattr(db, "insert_purge_ledger", ledger_spy)
+        proc_spy = create_autospec(oauth_mod.process_revoke, return_value=RemoteRevokeStatus.SUCCEEDED)
+        monkeypatch.setattr(oauth_mod, "process_revoke", proc_spy)
+        revoker = create_autospec(RemoteRevoker, instance=True)
+
+        res = await confirm_pending_integration(
+            user_id=LOCAL_DEV_USER_ID,
+            confirmation_token="tok-cancel",
+            cancel=True,
+            revoker=revoker,
+        )
+        assert res.status == "cancelled"
+        ledger_spy.assert_awaited_once()
+        assert ledger_spy.await_args.kwargs["revoke_token_plaintext"] == "rt-cancel"
+        proc_spy.assert_awaited_once()
+
+        # When another active/pending grant exists for (project, sub), cancel does NOT revoke!
+        ledger_spy.reset_mock()
+        proc_spy.reset_mock()
+        has_grant_mock.return_value = True
+        res2 = await confirm_pending_integration(
+            user_id=LOCAL_DEV_USER_ID,
+            confirmation_token="tok-cancel",
+            cancel=True,
+            revoker=revoker,
+        )
+        assert res2.status == "cancelled"
+        ledger_spy.assert_not_awaited()
+        proc_spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_r4_google_account_switch_acquires_target_refresh_lock_and_syncs_target_sibling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Codex Medium #2: replace_connection_for_account_switch acquires lifecycle -> target refresh -> target revoke locks and updates active target sibling rows."""
+        from src.dalton.services import user_integrations_lifecycle as lc_mod
+
+        _install_saved_credentials()
+        uid = LOCAL_DEV_USER_ID
+        client_id = "111222333-alpha.apps.googleusercontent.com"
+        target_sibling = _make_integration_row(
+            user_id=uid,
+            provider="google",
+            service="mail",
+            oauth_client_id=client_id,
+            provider_account_id="sub-target",
+            granted_scopes=f"{oauth_mod.GOOGLE_GMAIL_MIN_SCOPES[0]} https://www.googleapis.com/auth/gmail.drafts.create",
+            preferences={"allow_create_draft": True},
+        )
+        locks_acquired: list[int] = []
+
+        class _SwitchCursor:
+            def __init__(self) -> None:
+                self._step = 0
+
+            async def __aenter__(self) -> Any:
+                return self
+
+            async def __aexit__(self, *_a: Any) -> None:
+                return None
+
+            async def execute(self, sql: str, params: Any = None) -> None:
+                self._last_sql = sql
+
+            async def fetchone(self) -> Any:
+                if "SELECT user_id, provider, service" in self._last_sql:
+                    return {
+                        "user_id": uid,
+                        "provider": "google",
+                        "service": "calendar",
+                        "oauth_client_id": client_id,
+                        "provider_account_id": "sub-old",
+                        "auth_epoch": 5,
+                        "access_token": b"enc-at-old",
+                        "refresh_token": b"enc-rt-old",
+                        "status": "connected",
+                    }
+                if "RETURNING auth_epoch" in self._last_sql:
+                    return {"auth_epoch": 6}
+                return None
+
+        class _SwitchConn:
+            async def execute(self, sql: str, params: Any = None) -> None:
+                if "pg_advisory_lock" in sql and params:
+                    locks_acquired.append(params[0])
+
+            def cursor(self, **_k: Any) -> _SwitchCursor:
+                return _SwitchCursor()
+
+            @asynccontextmanager
+            async def transaction(self) -> Any:
+                yield self
+
+        @asynccontextmanager
+        async def _switch_pool(_conn: Any = None) -> Any:
+            yield _SwitchConn()
+
+        monkeypatch.setattr(lc_mod, "get_db_connection", _switch_pool)
+        monkeypatch.setattr(db, "get_sibling_connections", create_autospec(db.get_sibling_connections, return_value=[]))
+        monkeypatch.setattr(db, "has_active_or_pending_google_grant", create_autospec(db.has_active_or_pending_google_grant, return_value=False))
+        monkeypatch.setattr(
+            lc_mod, "_lock_and_register_phase1_tx",
+            create_autospec(lc_mod._lock_and_register_phase1_tx, return_value=("pid-sw-1", {})),
+        )
+        monkeypatch.setattr(
+            db, "list_connections_by_account",
+            create_autospec(db.list_connections_by_account, return_value=[target_sibling]),
+        )
+        sync_spy = create_autospec(lc_mod.sync_google_sibling_rows_tx, return_value=None)
+        monkeypatch.setattr(lc_mod, "sync_google_sibling_rows_tx", sync_spy)
+        sup_spy = create_autospec(db.supersede_active_revokes_for_google_project_sub_tx, return_value=0)
+        monkeypatch.setattr(db, "supersede_active_revokes_for_google_project_sub_tx", sup_spy)
+
+        res = await lc_mod.replace_connection_for_account_switch(
+            uid,
+            "google",
+            "calendar",
+            new_oauth_client_id=client_id,
+            new_provider_account_id="sub-target",
+            new_granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+            new_access_token="at-new-cal",
+            new_refresh_token="rt-new-cal",
+            new_expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+        assert res.purge_id == "pid-sw-1"
+        assert locks_acquired == [
+            db.lifecycle_lock_key(uid, "google"),
+            db.refresh_lock_key(uid, "google", client_id, "sub-target"),
+            db.revoke_lock_key("111222333", "sub-target"),
+        ]
+        sync_spy.assert_awaited_once()
+        assert sync_spy.await_args.kwargs["active_siblings"] == [target_sibling]
+        assert sync_spy.await_args.kwargs["granted_scopes"] == " ".join(GOOGLE_CALENDAR_MIN_SCOPES)
+        sup_spy.assert_awaited_once()
+        assert sup_spy.await_args.args[:2] == ("111222333", "sub-target")

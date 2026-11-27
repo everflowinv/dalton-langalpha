@@ -35,6 +35,7 @@ from src.dalton.app.channels_router import require_channel_service_token
 from src.dalton.auth import resolve_dalton_create_user_email
 from src.dalton.auth.dispatch import _read_local_session_from_request
 from src.dalton.capabilities import (
+    PERSONAL_INTEGRATION_CAPABILITIES,
     CapabilityId,
     effective_capabilities,
     get_connector_providers_summary,
@@ -44,6 +45,7 @@ from src.dalton.company_identity import is_company_system_user
 from src.dalton.database import user_integrations as db
 from src.dalton.database.user_integrations import (
     IntegrationRow,
+    LocalPurgeStatus,
     PurgeLedgerRow,
     RemoteRevokeStatus,
     TriggerReason,
@@ -72,6 +74,7 @@ from src.dalton.integrations.oauth_clients import (
 from src.dalton.services.feishu_integration_events import (
     FeishuEventAuthError,
     FeishuEventNotConfiguredError,
+    has_matching_feishu_event_connection,
     normalize_gateway_feishu_event,
     process_feishu_integration_event,
     verify_and_decode_feishu_event,
@@ -786,32 +789,40 @@ async def disconnect_personal_integration_provider_endpoint(
     )
     # Complete ALL local 2A purges first so shared threads unblock immediately,
     # then progress Google remote revocations independently in the background (§4.2(3)).
+    # If any ledger is currently held by another worker (finished is None or still running),
+    # defer remote revocation to the due-revoke scanner so local purge always finishes first.
     results: list[dict[str, Any]] = []
     pending_remote_pids: list[str] = []
+    all_local_completed = True
     for pid in purge_ids:
         finished = await finish_disconnect(
             pid,
             revoker=None,
             run_remote_revoke=False,
         )
+        local_st = (
+            finished.local_purge_status
+            if finished is not None
+            else LocalPurgeStatus.RUNNING
+        )
         remote_st = (
             finished.remote_revoke_status
             if finished is not None
             else RemoteRevokeStatus.PENDING
         )
-        if norm_provider == "google" and remote_st == RemoteRevokeStatus.PENDING:
+        if finished is None or local_st == LocalPurgeStatus.RUNNING:
+            all_local_completed = False
+        elif norm_provider == "google" and remote_st == RemoteRevokeStatus.PENDING:
             pending_remote_pids.append(pid)
         results.append(
             {
                 "purge_id": pid,
-                "local_purge_status": (
-                    finished.local_purge_status.value if finished is not None else "running"
-                ),
+                "local_purge_status": local_st.value,
                 "remote_revoke_status": remote_st.value,
             }
         )
 
-    if pending_remote_pids and norm_provider == "google":
+    if all_local_completed and pending_remote_pids and norm_provider == "google":
         schedule_background_remote_revokes(
             pending_remote_pids,
             get_router_remote_revoker(),
@@ -902,12 +913,8 @@ async def feishu_integration_internal_events_endpoint(
     request: Request,
 ) -> JSONResponse:
     """Internal service-token endpoint receiving ``auth.user_access_token.revoked_v4`` forwarded from dalton-channel-gateway (§4.2(3), §4.5(3))."""
-    require_personal_integration_capability(
-        "feishu",
-        None,
-        mode="manage",
-        allow_feishu_event_configured=True,
-    )
+    if not is_dalton_enabled():
+        raise HTTPException(status_code=404, detail="Dalton mode disabled")
     try:
         raw_payload = await request.json()
     except Exception:
@@ -923,6 +930,17 @@ async def feishu_integration_internal_events_endpoint(
             headers=_NO_STORE_HEADERS,
         )
     normalized = normalize_gateway_feishu_event(raw_payload)
+    active_caps = effective_capabilities()
+    has_matching_conn = False
+    if not any(cap in active_caps for cap in PERSONAL_INTEGRATION_CAPABILITIES):
+        has_matching_conn = await has_matching_feishu_event_connection(normalized)
+    require_personal_integration_capability(
+        "feishu",
+        None,
+        mode="manage",
+        has_existing_records=has_matching_conn,
+        allow_feishu_event_configured=True,
+    )
     result = await process_feishu_integration_event(normalized, execute_purge=True)
     return JSONResponse(
         status_code=200,
