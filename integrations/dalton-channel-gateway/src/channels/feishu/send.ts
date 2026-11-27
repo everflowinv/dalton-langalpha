@@ -14,7 +14,15 @@
  */
 
 import type * as Lark from "@larksuiteoapi/node-sdk";
+import {
+  createSubsystemLogger,
+  type SubsystemLogger,
+} from "../../shared/logger.js";
 import { ChannelDeliveryError } from "../adapter.js";
+import {
+  buildMinimalMarkdownFallbackCard,
+  normalizeFeishuCard,
+} from "./card-normalize.js";
 import {
   assertFeishuCardWithinEnvelope,
   buildFeishuPostMessageContent,
@@ -35,6 +43,10 @@ export const WITHDRAWN_REPLY_ERROR_CODES = new Set<number>([
   230110,
 ]);
 export const FEISHU_SEND_RATE_LIMIT_CODES = new Set<number>([230020, 11232]);
+export const FEISHU_CARD_PARSE_ERROR_CODE = 200621;
+
+const DELIVERY_ERROR_FEISHU_CODES = new WeakMap<Error, number>();
+const feishuSendLogger = createSubsystemLogger("feishu/send");
 
 /** Default Feishu emoji types for processing status feedback (configurable via adapter options). */
 export const FEISHU_PROCESSING_EMOJI_TYPE = "Typing";
@@ -183,7 +195,29 @@ export function isWithdrawnReplyError(err: unknown): boolean {
   return false;
 }
 
+export function isFeishuCardParseError(err: unknown): boolean {
+  if (err instanceof Error) {
+    if (DELIVERY_ERROR_FEISHU_CODES.get(err) === FEISHU_CARD_PARSE_ERROR_CODE) {
+      return true;
+    }
+  }
+  const meta = extractFeishuApiErrorMeta(err);
+  if (meta.feishuCode === FEISHU_CARD_PARSE_ERROR_CODE) {
+    return true;
+  }
+  if (
+    typeof meta.feishuCode === "string" &&
+    meta.feishuCode.trim() === String(FEISHU_CARD_PARSE_ERROR_CODE)
+  ) {
+    return true;
+  }
+  return false;
+}
+
 export function shouldFallbackFromReplyTarget(err: unknown): boolean {
+  if (isFeishuCardParseError(err)) {
+    return false;
+  }
   if (isWithdrawnReplyError(err)) {
     return true;
   }
@@ -382,10 +416,15 @@ export function classifyFeishuDeliveryError(
   const stage = options?.stage ?? "send";
   if (err instanceof ChannelDeliveryError) {
     if (stage === "upload" && err.outcome === "unknown") {
-      return new ChannelDeliveryError(err.message, {
+      const wrapped = new ChannelDeliveryError(err.message, {
         outcome: "failed",
         code: err.code,
       });
+      const existingCode = DELIVERY_ERROR_FEISHU_CODES.get(err);
+      if (existingCode !== undefined) {
+        DELIVERY_ERROR_FEISHU_CODES.set(wrapped, existingCode);
+      }
+      return wrapped;
     }
     return err;
   }
@@ -398,6 +437,15 @@ export function classifyFeishuDeliveryError(
         ? Number.parseInt(meta.feishuCode, 10)
         : undefined;
 
+  const attachFeishuCode = (
+    deliveryErr: ChannelDeliveryError,
+  ): ChannelDeliveryError => {
+    if (numericFeishuCode !== undefined) {
+      DELIVERY_ERROR_FEISHU_CODES.set(deliveryErr, numericFeishuCode);
+    }
+    return deliveryErr;
+  };
+
   const detailMsg = meta.feishuMsg || meta.message || defaultPrefix;
   const formattedMsg = `${defaultPrefix}: ${detailMsg}`;
 
@@ -406,10 +454,12 @@ export function classifyFeishuDeliveryError(
     (numericFeishuCode !== undefined &&
       FEISHU_SEND_RATE_LIMIT_CODES.has(numericFeishuCode))
   ) {
-    return new ChannelDeliveryError(formattedMsg, {
-      outcome: "rate_limited",
-      code: "rate_limited",
-    });
+    return attachFeishuCode(
+      new ChannelDeliveryError(formattedMsg, {
+        outcome: "rate_limited",
+        code: "rate_limited",
+      }),
+    );
   }
 
   if (
@@ -417,10 +467,12 @@ export function classifyFeishuDeliveryError(
     (numericFeishuCode !== undefined &&
       TARGET_NOT_FOUND_FEISHU_CODES.has(numericFeishuCode))
   ) {
-    return new ChannelDeliveryError(formattedMsg, {
-      outcome: "failed",
-      code: "target_not_found",
-    });
+    return attachFeishuCode(
+      new ChannelDeliveryError(formattedMsg, {
+        outcome: "failed",
+        code: "target_not_found",
+      }),
+    );
   }
 
   if (
@@ -429,10 +481,12 @@ export function classifyFeishuDeliveryError(
     (numericFeishuCode !== undefined &&
       PERMISSION_DENIED_FEISHU_CODES.has(numericFeishuCode))
   ) {
-    return new ChannelDeliveryError(formattedMsg, {
-      outcome: "failed",
-      code: "not_allowed",
-    });
+    return attachFeishuCode(
+      new ChannelDeliveryError(formattedMsg, {
+        outcome: "failed",
+        code: "not_allowed",
+      }),
+    );
   }
 
   if (
@@ -445,10 +499,12 @@ export function classifyFeishuDeliveryError(
         ))) ||
     (meta.httpStatus !== undefined && meta.httpStatus >= 500)
   ) {
-    return new ChannelDeliveryError(formattedMsg, {
-      outcome: stage === "upload" ? "failed" : "unknown",
-      code: "unavailable",
-    });
+    return attachFeishuCode(
+      new ChannelDeliveryError(formattedMsg, {
+        outcome: stage === "upload" ? "failed" : "unknown",
+        code: "unavailable",
+      }),
+    );
   }
 
   if (
@@ -457,16 +513,20 @@ export function classifyFeishuDeliveryError(
       meta.httpStatus < 500) ||
     (numericFeishuCode !== undefined && numericFeishuCode !== 0)
   ) {
-    return new ChannelDeliveryError(formattedMsg, {
-      outcome: "failed",
-      code: "unavailable",
-    });
+    return attachFeishuCode(
+      new ChannelDeliveryError(formattedMsg, {
+        outcome: "failed",
+        code: "unavailable",
+      }),
+    );
   }
 
-  return new ChannelDeliveryError(formattedMsg, {
-    outcome: stage === "upload" ? "failed" : "unknown",
-    code: "unavailable",
-  });
+  return attachFeishuCode(
+    new ChannelDeliveryError(formattedMsg, {
+      outcome: stage === "upload" ? "failed" : "unknown",
+      code: "unavailable",
+    }),
+  );
 }
 
 export interface FeishuMessageSendResult {
@@ -753,6 +813,7 @@ export async function sendCardFeishu(
     fallbackReplyToMessageIds?: string[];
     replyInThread?: boolean;
     allowDirectFallback?: boolean;
+    logger?: SubsystemLogger;
   },
 ): Promise<FeishuMessageSendResult> {
   const { target, receiveIdType, replyToMessageId, replyInThread } =
@@ -762,20 +823,45 @@ export async function sendCardFeishu(
       replyInThread: params.replyInThread,
     });
 
-  assertFeishuCardWithinEnvelope(params.card, "Feishu outbound card");
+  const log = params.logger ?? feishuSendLogger;
+  const { card: normalizedCard, normalizedPaths } = normalizeFeishuCard(
+    params.card as Record<string, unknown>,
+  );
+  if (normalizedPaths.length > 0) {
+    log.info("feishu_card_normalized", {
+      normalized_paths: normalizedPaths,
+    });
+  }
 
-  const response = await sendReplyOrFallbackDirect(client, {
-    replyToMessageId,
-    fallbackReplyToMessageIds: params.fallbackReplyToMessageIds,
-    replyInThread,
-    allowDirectFallback: params.allowDirectFallback,
-    content: JSON.stringify(params.card),
-    msgType: "interactive",
-    target,
-    receiveIdType,
-  });
+  assertFeishuCardWithinEnvelope(normalizedCard, "Feishu outbound card");
 
-  return toFeishuMessageSendResult(response, target);
+  const dispatchCard = (cardPayload: Record<string, unknown> | FeishuSchema2Card) =>
+    sendReplyOrFallbackDirect(client, {
+      replyToMessageId,
+      fallbackReplyToMessageIds: params.fallbackReplyToMessageIds,
+      replyInThread,
+      allowDirectFallback: params.allowDirectFallback,
+      content: JSON.stringify(cardPayload),
+      msgType: "interactive",
+      target,
+      receiveIdType,
+    });
+
+  try {
+    const response = await dispatchCard(normalizedCard);
+    return toFeishuMessageSendResult(response, target);
+  } catch (err) {
+    if (!isFeishuCardParseError(err)) {
+      throw err;
+    }
+    const fallbackCard = buildMinimalMarkdownFallbackCard(normalizedCard);
+    log.warn("feishu_card_200621_fallback", {
+      feishu_code: FEISHU_CARD_PARSE_ERROR_CODE,
+      target_type: receiveIdType,
+    });
+    const fallbackResponse = await dispatchCard(fallbackCard);
+    return toFeishuMessageSendResult(fallbackResponse, target);
+  }
 }
 
 export async function sendStructuredCardFeishu(
@@ -788,6 +874,7 @@ export async function sendStructuredCardFeishu(
     replyInThread?: boolean;
     allowDirectFallback?: boolean;
     title?: string;
+    logger?: SubsystemLogger;
   },
 ): Promise<FeishuMessageSendResult> {
   const card = buildStructuredCard(params.text, { title: params.title });
@@ -798,6 +885,7 @@ export async function sendStructuredCardFeishu(
     fallbackReplyToMessageIds: params.fallbackReplyToMessageIds,
     replyInThread: params.replyInThread,
     allowDirectFallback: params.allowDirectFallback,
+    logger: params.logger,
   });
 }
 

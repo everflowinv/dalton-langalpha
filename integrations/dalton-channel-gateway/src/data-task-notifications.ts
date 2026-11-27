@@ -12,6 +12,7 @@ import {
   ChannelDeliveryError,
   type SendCardImageInput,
 } from "./channels/adapter.js";
+import { normalizeFeishuCard } from "./channels/feishu/card-normalize.js";
 import { FEISHU_CARD_MAX_BYTES } from "./channels/feishu/format.js";
 import {
   abortableRetrySleep,
@@ -1865,8 +1866,17 @@ export class DataTaskNotificationService {
         }
 
         try {
-          const outboundCard = rewriteFeishuCardLinksWithinBudget(
+          const { card: normalizedCard, normalizedPaths } = normalizeFeishuCard(
             item.card,
+          );
+          if (normalizedPaths.length > 0) {
+            this.logger.info("feishu_card_normalized", {
+              delivery_key: item.delivery_key,
+              normalized_paths: normalizedPaths,
+            });
+          }
+          const outboundCard = rewriteFeishuCardLinksWithinBudget(
+            normalizedCard,
             this.webBaseUrl,
             plan.thread_id ?? null,
             plan.workspace_id ?? null,

@@ -71,6 +71,7 @@ import {
   chunkFeishuTextMessage,
   shouldUseFeishuCard,
 } from "./format.js";
+import { normalizeFeishuCard } from "./card-normalize.js";
 import {
   hasUnresolvedGroupMention,
   parseFeishuInboundEvent,
@@ -1150,6 +1151,7 @@ export class FeishuChannelAdapter implements ChannelAdapter {
           fallbackReplyToMessageIds: options.fallbackReplyToMessageIds,
           replyInThread: options.replyInThread,
           allowDirectFallback: options.allowDirectFallback,
+          logger: this.logger,
         })
       : await sendMessageFeishu(client, {
           to: target,
@@ -1347,8 +1349,16 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       );
     }
 
+    const { card: normalizedCard, normalizedPaths } =
+      normalizeFeishuCard(resolvedCard);
+    if (normalizedPaths.length > 0) {
+      this.logger.info("feishu_card_normalized", {
+        normalized_paths: normalizedPaths,
+      });
+    }
+
     try {
-      assertFeishuCardWithinEnvelope(resolvedCard, "Feishu outbound card");
+      assertFeishuCardWithinEnvelope(normalizedCard, "Feishu outbound card");
     } catch (err) {
       throw new ChannelDeliveryError(
         err instanceof Error ? err.message : String(err),
@@ -1362,9 +1372,10 @@ export class FeishuChannelAdapter implements ChannelAdapter {
 
     const res = await sendCardFeishu(client, {
       to: target,
-      card: resolvedCard,
+      card: normalizedCard,
       replyToMessageId: options.replyToMessageId,
       replyInThread: options.replyInThread,
+      logger: this.logger,
     });
     return {
       messageId: res.messageId,

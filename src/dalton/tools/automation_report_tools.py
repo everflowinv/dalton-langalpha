@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
 from langchain_core.runnables import RunnableConfig
@@ -21,6 +21,7 @@ from src.dalton.database.automation_reports import (
     read_automation_report_status,
     submit_automation_report,
 )
+from src.dalton.notify.card_normalize import normalize_feishu_cards
 from src.dalton.notify.dispatch import dispatch_automation_report
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,10 @@ def create_automation_report_tools() -> list[BaseTool]:
                 "invalid_material",
                 "material must be yes, no, no_change, or no-change.",
             )
+        normalized_cards = cards
+        card_warnings: list[str] = []
+        if isinstance(cards, list):
+            normalized_cards, card_warnings = normalize_feishu_cards(cards)
         try:
             result = await submit_automation_report(
                 user_id=identity["user_id"],
@@ -138,7 +143,7 @@ def create_automation_report_tools() -> list[BaseTool]:
                 execution_id=identity["automation_execution_id"],
                 report_run_id=report_run_id,
                 material=material,
-                cards=cards,
+                cards=normalized_cards,
                 failure_text=failure_text,
                 text=text,
             )
@@ -154,10 +159,10 @@ def create_automation_report_tools() -> list[BaseTool]:
         if not isinstance(result, Mapping):
             return _dump(result, action="submit")
         if result.get("ok") is not True or result.get("quiet") is True:
-            return _dump(result, action="submit")
+            return _dump(result, action="submit", warnings=card_warnings)
         saved_execution_id = str(result.get("execution_id") or "").strip()
         if not saved_execution_id:
-            return _dump(result, action="submit")
+            return _dump(result, action="submit", warnings=card_warnings)
         try:
             await dispatch_automation_report(saved_execution_id)
         except asyncio.CancelledError:
@@ -166,7 +171,11 @@ def create_automation_report_tools() -> list[BaseTool]:
             logger.warning(
                 "automation_report dispatch failed: %s", type(exc).__name__
             )
-            return _dump(_retain_saved_submit(result), action="submit")
+            return _dump(
+                _retain_saved_submit(result),
+                action="submit",
+                warnings=card_warnings,
+            )
         try:
             refreshed = await read_automation_report_status(
                 user_id=identity["user_id"],
@@ -183,10 +192,22 @@ def create_automation_report_tools() -> list[BaseTool]:
             logger.warning(
                 "automation_report status refresh failed: %s", type(exc).__name__
             )
-            return _dump(_retain_saved_submit(result), action="submit")
+            return _dump(
+                _retain_saved_submit(result),
+                action="submit",
+                warnings=card_warnings,
+            )
         if not isinstance(refreshed, Mapping):
-            return _dump(_retain_saved_submit(result), action="submit")
-        return _dump(_merge_submit_delivery(result, refreshed), action="submit")
+            return _dump(
+                _retain_saved_submit(result),
+                action="submit",
+                warnings=card_warnings,
+            )
+        return _dump(
+            _merge_submit_delivery(result, refreshed),
+            action="submit",
+            warnings=card_warnings,
+        )
 
     return [automation_report]
 
@@ -225,11 +246,19 @@ def _refuse(action: str, code: str, error: str) -> str:
     )
 
 
-def _dump(result: Any, *, action: str) -> str:
+def _dump(
+    result: Any,
+    *,
+    action: str,
+    warnings: Sequence[str] | None = None,
+) -> str:
     if not isinstance(result, Mapping):
         return _refuse(action, "report_unavailable", "The report result could not be read.")
+    payload = dict(result)
+    if warnings and payload.get("ok") is True:
+        payload["warnings"] = list(warnings)
     try:
-        return json.dumps(dict(result), ensure_ascii=False)
+        return json.dumps(payload, ensure_ascii=False)
     except (TypeError, ValueError):
         logger.warning("automation_report result was not JSON")
         return _refuse(action, "report_unavailable", "The report result could not be read.")

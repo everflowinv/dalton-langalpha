@@ -6260,3 +6260,342 @@ describe("Feishu card envelope constants parity with Python", () => {
     expect(() => assertFeishuCardWithinEnvelope(sentCard)).not.toThrow();
   });
 });
+
+describe("Feishu Schema 2.0 card normalization and 200621 fallback", () => {
+  it("normalizes production 200621 failure samples (ANT missing text_tag tag & X daily tag:text) without mutating input", async () => {
+    const { normalizeFeishuCard } = await import(
+      "../src/channels/feishu/card-normalize.js"
+    );
+
+    // 1. 2026-11-27 dalton-ant-tracker: header.text_tag_list[0] missing tag
+    const antCard = {
+      schema: "2.0",
+      header: {
+        title: { tag: "plain_text", content: "ANT 多空跟踪" },
+        template: "blue",
+        text_tag_list: [
+          {
+            text: { tag: "plain_text", content: "ANT" },
+            color: "purple",
+          },
+        ],
+      },
+      body: {
+        elements: [{ tag: "markdown", content: "多空观察要点" }],
+      },
+    };
+    const antBefore = structuredClone(antCard);
+    const antRes = normalizeFeishuCard(antCard);
+    expect(antCard).toEqual(antBefore);
+    expect(antRes.normalizedPaths).toEqual(["header.text_tag_list[0].tag"]);
+    expect((antRes.card.header as Record<string, unknown>).text_tag_list).toEqual([
+      {
+        tag: "text_tag",
+        text: { tag: "plain_text", content: "ANT" },
+        color: "purple",
+      },
+    ]);
+    // Idempotent
+    expect(normalizeFeishuCard(antRes.card).normalizedPaths).toEqual([]);
+
+    // 2. 2026-11-26 X accounts daily: body elements with tag: "text"
+    const xDailyCard = {
+      schema: "2.0",
+      header: {
+        title: { tag: "plain_text", content: "X 账号日报" },
+      },
+      body: {
+        elements: [
+          { tag: "text", content: "今日要点汇总" },
+          { tag: "text", text: { tag: "plain_text", content: "来自 text.content" } },
+          { tag: "markdown", content: "已有正常块" },
+        ],
+      },
+    };
+    const xBefore = structuredClone(xDailyCard);
+    const xRes = normalizeFeishuCard(xDailyCard);
+    expect(xDailyCard).toEqual(xBefore);
+    expect(xRes.normalizedPaths).toEqual([
+      "body.elements[0]",
+      "body.elements[1]",
+    ]);
+    expect((xRes.card.body as Record<string, unknown>).elements).toEqual([
+      { tag: "markdown", content: "今日要点汇总" },
+      { tag: "markdown", content: "来自 text.content" },
+      { tag: "markdown", content: "已有正常块" },
+    ]);
+  });
+
+  it("normalizes text_tag strings, header title/subtitle strings, plain_text/lark_md body elements, nested containers, and preserves unknown elements", async () => {
+    const { normalizeFeishuCard } = await import(
+      "../src/channels/feishu/card-normalize.js"
+    );
+
+    const card = {
+      schema: "2.0",
+      header: {
+        title: "主标题字符串",
+        subtitle: "副标题字符串",
+        text_tag_list: [
+          { tag: "text_tag", text: "标签A", color: "blue" },
+          { text: "标签B", color: "green" },
+          "标签C",
+        ],
+      },
+      body: {
+        elements: [
+          { tag: "plain_text", content: "纯文本块" },
+          { tag: "lark_md", content: "**旧版 markdown**" },
+          { tag: "div", text: { tag: "lark_md", content: "保留 div.text" } },
+          { tag: "note", elements: [{ tag: "plain_text", content: "保留 note" }] },
+          {
+            tag: "column_set",
+            columns: [
+              {
+                tag: "column",
+                elements: [{ tag: "text", content: "列内文本" }],
+              },
+            ],
+          },
+          {
+            tag: "collapsible_panel",
+            elements: [{ tag: "plain_text", content: "折叠面板文本" }],
+          },
+          { tag: "custom_unknown_widget", payload: { k: 1 } },
+        ],
+      },
+    };
+
+    const { card: norm, normalizedPaths } = normalizeFeishuCard(card);
+    expect(normalizedPaths).toEqual([
+      "header.title",
+      "header.subtitle",
+      "header.text_tag_list[0].text",
+      "header.text_tag_list[1].tag",
+      "header.text_tag_list[1].text",
+      "header.text_tag_list[2]",
+      "body.elements[0]",
+      "body.elements[1]",
+      "body.elements[4].columns[0].elements[0]",
+      "body.elements[5].elements[0]",
+    ]);
+
+    const header = norm.header as Record<string, unknown>;
+    expect(header.title).toEqual({ tag: "plain_text", content: "主标题字符串" });
+    expect(header.subtitle).toEqual({ tag: "plain_text", content: "副标题字符串" });
+    expect(header.text_tag_list).toEqual([
+      { tag: "text_tag", text: { tag: "plain_text", content: "标签A" }, color: "blue" },
+      { tag: "text_tag", text: { tag: "plain_text", content: "标签B" }, color: "green" },
+      { tag: "text_tag", text: { tag: "plain_text", content: "标签C" } },
+    ]);
+
+    const elements = (norm.body as Record<string, unknown>).elements as Array<
+      Record<string, unknown>
+    >;
+    expect(elements[0]).toEqual({ tag: "markdown", content: "纯文本块" });
+    expect(elements[1]).toEqual({ tag: "markdown", content: "**旧版 markdown**" });
+    expect(elements[2]).toEqual({
+      tag: "div",
+      text: { tag: "lark_md", content: "保留 div.text" },
+    });
+    expect(elements[3]).toEqual({
+      tag: "note",
+      elements: [{ tag: "plain_text", content: "保留 note" }],
+    });
+    expect(
+      ((elements[4].columns as Array<Record<string, unknown>>)[0].elements as unknown[])[0],
+    ).toEqual({ tag: "markdown", content: "列内文本" });
+    expect((elements[5].elements as unknown[])[0]).toEqual({
+      tag: "markdown",
+      content: "折叠面板文本",
+    });
+    expect(elements[6]).toEqual({ tag: "custom_unknown_widget", payload: { k: 1 } });
+  });
+
+  it("sendCardFeishu normalizes before send and logs normalized field paths without body content", async () => {
+    const { sendCardFeishu } = await import("../src/channels/feishu/send.js");
+    const { client, calls } = createFakeLarkClient();
+    const infoLines: string[] = [];
+    const logger = createSubsystemLogger("feishu/test", {
+      sink: {
+        info: (line) => infoLines.push(line),
+        warn: () => {},
+        error: () => {},
+      },
+    });
+
+    const res = await sendCardFeishu(client, {
+      to: "chat:oc_norm_test",
+      logger,
+      card: {
+        schema: "2.0",
+        header: {
+          title: "ANT 敏感标题_DO_NOT_LOG",
+          text_tag_list: [{ text: "ANT", color: "purple" }],
+        },
+        body: {
+          elements: [{ tag: "text", content: "SECRET_CARD_BODY_CONTENT" }],
+        },
+      },
+    });
+
+    expect(res.messageId).toBe("om_created_1");
+    expect(calls.messageCreate).toHaveLength(1);
+    const sent = JSON.parse(calls.messageCreate[0].data.content);
+    expect(sent.header.title).toEqual({
+      tag: "plain_text",
+      content: "ANT 敏感标题_DO_NOT_LOG",
+    });
+    expect(sent.header.text_tag_list).toEqual([
+      {
+        tag: "text_tag",
+        text: { tag: "plain_text", content: "ANT" },
+        color: "purple",
+      },
+    ]);
+    expect(sent.body.elements).toEqual([
+      { tag: "markdown", content: "SECRET_CARD_BODY_CONTENT" },
+    ]);
+
+    expect(infoLines).toHaveLength(1);
+    expect(infoLines[0]).toContain("feishu_card_normalized");
+    expect(infoLines[0]).toContain("header.title");
+    expect(infoLines[0]).toContain("header.text_tag_list[0].tag");
+    expect(infoLines[0]).toContain("header.text_tag_list[0].text");
+    expect(infoLines[0]).toContain("body.elements[0]");
+    expect(infoLines[0]).not.toContain("SECRET_CARD_BODY_CONTENT");
+    expect(infoLines[0]).not.toContain("DO_NOT_LOG");
+  });
+
+  it("sendCardFeishu falls back once to minimal markdown-only card on 200621 and succeeds", async () => {
+    const { sendCardFeishu } = await import("../src/channels/feishu/send.js");
+    let attempt = 0;
+    const { client, calls } = createFakeLarkClient({
+      onMessageCreate: async () => {
+        attempt += 1;
+        if (attempt === 1) {
+          return { code: 200621, msg: "parse card json err: unsupported field" };
+        }
+        return { code: 0, data: { message_id: "om_fallback_ok" } };
+      },
+    });
+    const warnLines: string[] = [];
+    const logger = createSubsystemLogger("feishu/test", {
+      sink: {
+        info: () => {},
+        warn: (line) => warnLines.push(line),
+        error: () => {},
+      },
+    });
+
+    const res = await sendCardFeishu(client, {
+      to: "chat:oc_fallback_ok",
+      logger,
+      card: {
+        schema: "2.0",
+        header: {
+          title: { tag: "plain_text", content: "ANT 多空跟踪" },
+          subtitle: { tag: "plain_text", content: "2026-11-27" },
+          template: "invalid_color_triggering_200621",
+        },
+        body: {
+          elements: [
+            { tag: "markdown", content: "第一段重点内容" },
+            { tag: "custom_broken_widget", bad: true },
+            { tag: "markdown", content: "第二段结论" },
+          ],
+        },
+      },
+    });
+
+    expect(res.messageId).toBe("om_fallback_ok");
+    expect(calls.messageCreate).toHaveLength(2);
+    const fallbackCard = JSON.parse(calls.messageCreate[1].data.content);
+    expect(fallbackCard.schema).toBe("2.0");
+    expect(fallbackCard.header).toBeUndefined();
+    expect(fallbackCard.body.elements).toHaveLength(1);
+    expect(fallbackCard.body.elements[0].tag).toBe("markdown");
+    expect(fallbackCard.body.elements[0].content).toContain("**ANT 多空跟踪**");
+    expect(fallbackCard.body.elements[0].content).toContain("2026-11-27");
+    expect(fallbackCard.body.elements[0].content).toContain("第一段重点内容");
+    expect(fallbackCard.body.elements[0].content).toContain("第二段结论");
+    expect(warnLines).toHaveLength(1);
+    expect(warnLines[0]).toContain("feishu_card_200621_fallback");
+    expect(warnLines[0]).not.toContain("第一段重点内容");
+  });
+
+  it("sendCardFeishu sends 200621 fallback at most once when fallback also fails with 200621", async () => {
+    const { sendCardFeishu } = await import("../src/channels/feishu/send.js");
+    const { client, calls } = createFakeLarkClient({
+      onMessageCreate: async () => ({
+        code: 200621,
+        msg: "parse card json err",
+      }),
+    });
+
+    await expect(
+      sendCardFeishu(client, {
+        to: "chat:oc_fallback_fail",
+        card: {
+          schema: "2.0",
+          body: { elements: [{ tag: "markdown", content: "内容" }] },
+        },
+      }),
+    ).rejects.toThrow(ChannelDeliveryError);
+
+    expect(calls.messageCreate).toHaveLength(2);
+  });
+
+  it("sendCardFeishu does not trigger 200621 fallback on non-200621 errors and handles thrown 200621 HTTP errors", async () => {
+    const { sendCardFeishu, sendStructuredCardFeishu } = await import(
+      "../src/channels/feishu/send.js"
+    );
+
+    // Non-200621 error -> no fallback (only 1 call)
+    const non200621 = createFakeLarkClient({
+      onMessageCreate: async () => ({
+        code: 230001,
+        msg: "no permission",
+      }),
+    });
+    await expect(
+      sendCardFeishu(non200621.client, {
+        to: "chat:oc_perm_denied",
+        card: {
+          schema: "2.0",
+          body: { elements: [{ tag: "markdown", content: "内容" }] },
+        },
+      }),
+    ).rejects.toThrow(ChannelDeliveryError);
+    expect(non200621.calls.messageCreate).toHaveLength(1);
+
+    // Thrown Axios-like 200621 error via sendStructuredCardFeishu -> falls back once
+    let structuredAttempt = 0;
+    const thrown200621 = createFakeLarkClient({
+      onMessageCreate: async () => {
+        structuredAttempt += 1;
+        if (structuredAttempt === 1) {
+          throw {
+            response: {
+              status: 400,
+              data: { code: 200621, msg: "parse card json err" },
+            },
+          };
+        }
+        return { code: 0, data: { message_id: "om_structured_fb" } };
+      },
+    });
+    const res = await sendStructuredCardFeishu(thrown200621.client, {
+      to: "chat:oc_structured_fb",
+      title: "结构化卡片",
+      text: "```ts\nconst x = 1;\n```",
+    });
+    expect(res.messageId).toBe("om_structured_fb");
+    expect(thrown200621.calls.messageCreate).toHaveLength(2);
+    const fbCard = JSON.parse(thrown200621.calls.messageCreate[1].data.content);
+    expect(fbCard.header).toBeUndefined();
+    expect(fbCard.body.elements).toHaveLength(1);
+    expect(fbCard.body.elements[0].tag).toBe("markdown");
+    expect(fbCard.body.elements[0].content).toContain("**结构化卡片**");
+  });
+});

@@ -3330,4 +3330,126 @@ describe("automation report plain text", () => {
     expect(adapter.sentTexts).toEqual([]);
     expect(adapter.sentCards).toEqual([]);
   });
+
+  it("normalizes feishu_card and falls back once on 200621 under the same delivery_key without duplicate progress rows", async () => {
+    const { DataTaskNotificationService } = await import(
+      "../src/data-task-notifications.js"
+    );
+    let attempts = 0;
+    const { client, sentMessages } = createFakeOutboundLarkClient({
+      onMessageCreate: async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          return { code: 200621, msg: "parse card json err" };
+        }
+        return { code: 0, data: { message_id: "om_fb_once" } };
+      },
+    });
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_synth",
+      appSecret: "sec_synth",
+      outgoingOnly: true,
+      client,
+    });
+    const deliveryKey = "data-task-card-200621-key-1";
+    const cardPlan: DataTaskAuthorizePlanResponse = {
+      authorized: true,
+      status: "authorized",
+      run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa6",
+      job_key: "dalton-ant-tracker",
+      owner_user_id: SYNTH_USER_ID,
+      owner_platform_user_id: PLAIN_FEISHU_RECIPIENT,
+      platform: "feishu",
+      target_kind: "dm",
+      requested_target: "feishu:@me",
+      canonical_target_address: "feishu:@me",
+      recipient_id: PLAIN_FEISHU_RECIPIENT,
+      items: [
+        {
+          item_index: 0,
+          kind: "feishu_card",
+          delivery_key: deliveryKey,
+          card: {
+            schema: "2.0",
+            header: {
+              title: "ANT 多空跟踪",
+              text_tag_list: [
+                {
+                  text: { tag: "plain_text", content: "ANT" },
+                  color: "purple",
+                },
+              ],
+            },
+            body: {
+              elements: [
+                { tag: "text", content: "要点一" },
+                { tag: "custom_broken", bad: 1 },
+              ],
+            },
+          },
+          images: [],
+        },
+      ],
+    };
+
+    const backend = createMockBackend();
+    vi.mocked(backend.authorizeDataTaskNotificationPlan).mockResolvedValue(
+      structuredClone(cardPlan),
+    );
+    vi.mocked(backend.authorizeAndClaimDelivery).mockResolvedValue(
+      claimedDelivery("feishu", PLAIN_FEISHU_RECIPIENT),
+    );
+    const service = new DataTaskNotificationService({
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", adapter]]),
+      mode: "outgoing",
+    });
+
+    const result = await service.handleDataTaskNotification({
+      run_id: cardPlan.run_id,
+      target: "feishu:@me",
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.data.ok).toBe(true);
+    expect(result.data.status).toBe("sent");
+    expect(result.data.items_sent).toBe(1);
+    expect(result.data.items[0]?.delivery_key).toBe(deliveryKey);
+    expect(result.data.items[0]?.platform_message_ids).toEqual(["om_fb_once"]);
+
+    // Claimed once and recorded once under the same delivery_key
+    expect(backend.authorizeAndClaimDelivery).toHaveBeenCalledTimes(1);
+    expect(backend.updateDeliveryProgress).toHaveBeenCalledTimes(1);
+    expect(
+      vi.mocked(backend.updateDeliveryProgress).mock.calls[0]?.[0],
+    ).toMatchObject({
+      delivery_key: deliveryKey,
+      status: "sent",
+      platform_message_ids: ["om_fb_once"],
+    });
+
+    // Attempt 1 sent the normalized card; Attempt 2 sent the minimal markdown fallback
+    expect(sentMessages).toHaveLength(2);
+    const firstCard = JSON.parse(sentMessages[0]!.content);
+    expect(firstCard.header.title).toEqual({
+      tag: "plain_text",
+      content: "ANT 多空跟踪",
+    });
+    expect(firstCard.header.text_tag_list[0]).toEqual({
+      tag: "text_tag",
+      text: { tag: "plain_text", content: "ANT" },
+      color: "purple",
+    });
+    expect(firstCard.body.elements[0]).toEqual({
+      tag: "markdown",
+      content: "要点一",
+    });
+
+    const fallbackCard = JSON.parse(sentMessages[1]!.content);
+    expect(fallbackCard.header).toBeUndefined();
+    expect(fallbackCard.body.elements).toHaveLength(1);
+    expect(fallbackCard.body.elements[0].tag).toBe("markdown");
+    expect(fallbackCard.body.elements[0].content).toContain("**ANT 多空跟踪**");
+    expect(fallbackCard.body.elements[0].content).toContain("要点一");
+  });
 });
