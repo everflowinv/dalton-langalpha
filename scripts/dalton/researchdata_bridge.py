@@ -2961,6 +2961,7 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
         "accepted_nested_params": [
             "sender",
             "layer",
+            "sources",
             "search_mode",
             "offset",
             "max_chars",
@@ -8445,6 +8446,7 @@ class ResearchDataBridge:
             "DALTON_RESEARCH_HOME": str(home_root),
             "DALTON_BRIDGE_INTERNAL_CALL": "1",
             "DALTON_REQUEST_DEADLINE_EPOCH_MS": str(eff_deadline_ms),
+            "DALTON_ENABLED_LIBRARY_SOURCES": ",".join(self._enabled_local_library_sources()),
         }
 
         env_path = getattr(self.cfg, "env_path", None)
@@ -14184,9 +14186,10 @@ class ResearchDataBridge:
         gp_enabled = not self._is_route_capability_disabled("guidepoint")
 
         if tool_name == "research" and route == "sales-mail":
+            _sales_mail_valid_sources = ("sales-notes", "tmtb")
             enabled_sales_mail = [
                 s
-                for s in ("sales-notes", "tmtb")
+                for s in _sales_mail_valid_sources
                 if not self._is_route_capability_disabled(s)
             ]
             if not enabled_sales_mail:
@@ -14199,11 +14202,38 @@ class ResearchDataBridge:
                     "Route 'sales-mail' is disabled by deployment capability configuration.",
                 )
             p_sm = call_args.get("params") if isinstance(call_args.get("params"), dict) else {}
-            if "sources" in p_sm and isinstance(p_sm.get("sources"), list):
+            explicit_sm_sources: list[str] | None = None
+            if "sources" in p_sm and p_sm.get("sources") is not None:
+                raw_sm_sources = p_sm.get("sources")
+                if (
+                    not isinstance(raw_sm_sources, list)
+                    or not raw_sm_sources
+                    or any(
+                        not isinstance(s, str) or s.strip() not in _sales_mail_valid_sources
+                        for s in raw_sm_sources
+                    )
+                ):
+                    err_sm_src: dict[str, Any] = {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "invalid_arguments",
+                        "error_category": "参数错误",
+                        "error": (
+                            "[参数错误] 路由 'sales-mail' 的 params.sources 仅支持非空列表，"
+                            f"可选值: {list(_sales_mail_valid_sources)}。"
+                        ),
+                    }
+                    _apply_error_and_empty_contract(
+                        tool_name, route, operation, err_sm_src, norm_params_view
+                    )
+                    return self._make_tool_result_response(req_id, err_sm_src, is_error=True)
+                explicit_sm_sources = list(dict.fromkeys(s.strip() for s in raw_sm_sources))
                 disabled_explicit = [
-                    str(s).strip()
-                    for s in p_sm["sources"]
-                    if self._is_route_capability_disabled(str(s).strip())
+                    s
+                    for s in explicit_sm_sources
+                    if self._is_route_capability_disabled(s)
                 ]
                 if disabled_explicit:
                     return self._make_capability_disabled_response(
@@ -14228,6 +14258,11 @@ class ResearchDataBridge:
                         f"Source '{target_src}' required for route 'sales-mail' read is disabled by deployment capability configuration.",
                     )
             else:
+                eff_sm_sources = (
+                    explicit_sm_sources
+                    if explicit_sm_sources is not None
+                    else list(enabled_sales_mail)
+                )
                 if p_sm.get("layer") == "digest" and "sales-notes" not in enabled_sales_mail:
                     return self._make_capability_disabled_response(
                         req_id,
@@ -14237,10 +14272,12 @@ class ResearchDataBridge:
                         norm_params_view,
                         "Source 'sales-notes' required for layer='digest' is disabled by deployment capability configuration.",
                     )
-                if len(enabled_sales_mail) < 2 or operation == "list":
+                if explicit_sm_sources is not None or len(enabled_sales_mail) < 2 or operation == "list":
                     pruned_sm_params = dict(p_sm)
-                    pruned_sm_params["sources"] = list(enabled_sales_mail)
-                    if "sales-notes" not in enabled_sales_mail and pruned_sm_params.get("layer", "all") != "raw":
+                    pruned_sm_params["sources"] = list(eff_sm_sources)
+                    if "sales-notes" not in eff_sm_sources and "layer" not in pruned_sm_params:
+                        pruned_sm_params["layer"] = "raw"
+                    elif "sales-notes" not in enabled_sales_mail and pruned_sm_params.get("layer", "all") != "raw":
                         pruned_sm_params["layer"] = "raw"
                     call_args["params"] = pruned_sm_params
 

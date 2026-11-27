@@ -322,6 +322,42 @@ async def raise_maintenance_paused_from_response(
     )
 
 
+async def raise_if_maintenance_http_response(
+    resp: Any,
+    *,
+    workspace_id: str | None = None,
+    context: str = "notification_turn",
+) -> None:
+    """If ``resp`` is a 503 ``maintenance_in_progress`` response, raise ``MaintenanceAdmissionPausedError``."""
+    if getattr(resp, "status", None) != 503:
+        return
+    try:
+        payload = await resp.json()
+    except Exception:
+        return
+    if not is_maintenance_in_progress_response(503, payload):
+        return
+    await raise_maintenance_paused_from_response(
+        workspace_id,
+        context=context,
+    )
+
+
+def reraise_if_maintenance_paused(exc: BaseException) -> None:
+    """Re-raise ``MaintenanceAdmissionPausedError`` so generic HTTP retry loops do not swallow it."""
+    if isinstance(exc, MaintenanceAdmissionPausedError):
+        raise exc
+
+
+async def release_riders_if_maintenance_paused(
+    exc: BaseException,
+    release_riders: Callable[[], Awaitable[Any]] | None = None,
+) -> None:
+    """Release gathered wakeup riders when a maintenance pause exception unwinds delivery."""
+    if isinstance(exc, MaintenanceAdmissionPausedError) and release_riders is not None:
+        await release_riders()
+
+
 async def enforce_maintenance_admission_for_wakeup(
     workspace_id: str | None,
     *,

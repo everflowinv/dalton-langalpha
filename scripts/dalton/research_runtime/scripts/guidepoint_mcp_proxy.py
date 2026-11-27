@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import atexit
 import hmac
+import http.client
 import http.server
 import json
 import os
 from pathlib import Path
+import queue
 import socket
 import socketserver
 import sys
@@ -26,6 +28,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+_ORIG_URLOPEN = urllib.request.urlopen
 
 _RUNTIME_DIR = str(Path(__file__).resolve().parent.parent)
 if _RUNTIME_DIR not in sys.path:
@@ -210,18 +214,158 @@ def _read_stream_with_deadline(stream, *, deadline_mono: float) -> bytes:
     return bytes(buf)
 
 
+def _close_resource_forcefully(obj) -> None:
+    """Shutdown and close any underlying socket/connection/stream without raising."""
+    if obj is None:
+        return
+    socks = []
+    if isinstance(obj, socket.socket):
+        socks.append(obj)
+    conn_sock = getattr(obj, "sock", None)
+    if conn_sock is not None:
+        socks.append(conn_sock)
+    raw_sock = _extract_raw_socket(obj)
+    if raw_sock is not None:
+        socks.append(raw_sock)
+    seen: set[int] = set()
+    for sock in socks:
+        sid = id(sock)
+        if sid in seen:
+            continue
+        seen.add(sid)
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+    close_fn = getattr(obj, "close", None)
+    if callable(close_fn):
+        try:
+            close_fn()
+        except Exception:
+            pass
+
+
+def _abort_active_resources(resources: list, lock: threading.Lock) -> None:
+    with lock:
+        snapshot = list(resources)
+    for res in snapshot:
+        _close_resource_forcefully(res)
+
+
+def _open_upstream_tracked(
+    req: urllib.request.Request,
+    *,
+    timeout_s: float,
+    active_resources: list,
+    active_lock: threading.Lock,
+):
+    """Open an upstream request while tracking the HTTP(S) connection for hard deadline abort."""
+    eff_t = max(0.01, float(timeout_s))
+    if urllib.request.urlopen is not _ORIG_URLOPEN:
+        return urllib.request.urlopen(req, timeout=eff_t)
+
+    class _TrackedHTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, request):
+            def _factory(host, **kwargs):
+                conn = http.client.HTTPConnection(host, **kwargs)
+                with active_lock:
+                    active_resources.append(conn)
+                return conn
+
+            return self.do_open(_factory, request)
+
+    class _TrackedHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, request):
+            def _factory(host, **kwargs):
+                conn = http.client.HTTPSConnection(host, **kwargs)
+                with active_lock:
+                    active_resources.append(conn)
+                return conn
+
+            return self.do_open(_factory, request, context=self._context)
+
+    opener = urllib.request.build_opener(_TrackedHTTPHandler, _TrackedHTTPSHandler)
+    return opener.open(req, timeout=eff_t)
+
+
+def _fetch_body_with_hard_deadline(
+    req: urllib.request.Request,
+    *,
+    deadline_mono: float,
+    timeout_message: str,
+    open_timeout_s: float | None = None,
+) -> bytes:
+    """Run an HTTP request + body read in a worker thread under a single absolute deadline."""
+    rem = deadline_mono - time.monotonic()
+    if rem <= 0.0:
+        raise TimeoutError(timeout_message)
+
+    cancelled = threading.Event()
+    done = threading.Event()
+    active_lock = threading.Lock()
+    active_resources: list = []
+    outcome: dict = {}
+
+    def _worker() -> None:
+        resp = None
+        try:
+            rem_open = deadline_mono - time.monotonic()
+            if rem_open <= 0.0 or cancelled.is_set():
+                outcome["error"] = TimeoutError(timeout_message)
+                return
+            eff_open_t = (
+                float(open_timeout_s)
+                if open_timeout_s is not None
+                else min(30.0, rem_open)
+            )
+            resp = _open_upstream_tracked(
+                req,
+                timeout_s=eff_open_t,
+                active_resources=active_resources,
+                active_lock=active_lock,
+            )
+            with active_lock:
+                active_resources.append(resp)
+            if cancelled.is_set():
+                return
+            outcome["body"] = _read_stream_with_deadline(resp, deadline_mono=deadline_mono)
+        except Exception as exc:
+            outcome["error"] = exc
+        finally:
+            if resp is not None:
+                _close_resource_forcefully(resp)
+            done.set()
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+
+    wait_rem = max(0.0, deadline_mono - time.monotonic())
+    if not done.wait(timeout=wait_rem):
+        cancelled.set()
+        _abort_active_resources(active_resources, active_lock)
+        raise TimeoutError(timeout_message)
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("body", b"")
+
+
 def do_refresh(*, timeout_s: float = 30.0, deadline_mono: float | None = None) -> None:
     client_id = os.environ["GUIDEPOINT_CLIENT_ID"]
     client_secret = os.environ["GUIDEPOINT_CLIENT_SECRET"]
+    explicit_open_timeout: float | None = None
     if deadline_mono is not None:
         eff_deadline = float(deadline_mono)
         rem = eff_deadline - time.monotonic()
         if rem <= 0.0:
             raise TimeoutError("Guidepoint token refresh deadline exceeded")
-        req_timeout = max(0.01, min(30.0, rem))
     else:
         req_timeout = max(0.01, min(30.0, float(timeout_s)))
         eff_deadline = time.monotonic() + req_timeout
+        explicit_open_timeout = req_timeout
     data = urllib.parse.urlencode({
         "grant_type": "refresh_token",
         "client_id": client_id,
@@ -235,8 +379,12 @@ def do_refresh(*, timeout_s: float = 30.0, deadline_mono: float | None = None) -
             "Content-Type": "application/x-www-form-urlencoded",
         },
     )
-    with urllib.request.urlopen(req, timeout=req_timeout) as resp:
-        raw_body = _read_stream_with_deadline(resp, deadline_mono=eff_deadline)
+    raw_body = _fetch_body_with_hard_deadline(
+        req,
+        deadline_mono=eff_deadline,
+        timeout_message="Guidepoint token refresh deadline exceeded",
+        open_timeout_s=explicit_open_timeout,
+    )
     new_tokens = json.loads(raw_body.decode("utf-8"))
     new_tokens.setdefault("refresh_token", _tokens["refresh_token"])
     new_tokens["obtained_at"] = time.time()
@@ -393,18 +541,67 @@ def health_payload() -> dict:
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def _send_json(self, status: int, payload: dict) -> None:
-        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(raw)))
-        self.send_header("Connection", "close")
-        self.end_headers()
+    def _close_downstream_forcefully(self) -> None:
+        self.close_connection = True
+        sock = getattr(self, "connection", None)
+        if sock is not None:
+            _close_resource_forcefully(sock)
+
+    def _write_bytes_with_deadline(self, data: bytes, *, deadline_mono: float | None) -> bool:
+        """Write bytes to downstream socket bounded by an absolute monotonic deadline."""
+        if not data:
+            return True
+        sock = getattr(self, "connection", None)
+        if (
+            deadline_mono is not None
+            and sock is not None
+            and hasattr(sock, "send")
+            and hasattr(sock, "settimeout")
+        ):
+            view = memoryview(data)
+            while view:
+                rem = deadline_mono - time.monotonic()
+                if rem <= 0.0:
+                    return False
+                try:
+                    sock.settimeout(max(0.01, rem))
+                    sent = sock.send(view)
+                except (TimeoutError, socket.timeout, BrokenPipeError, ConnectionResetError, OSError):
+                    return False
+                if sent <= 0:
+                    return False
+                view = view[sent:]
+            return True
+        if deadline_mono is not None and time.monotonic() >= deadline_mono:
+            return False
         try:
-            self.wfile.write(raw)
+            self.wfile.write(data)
             self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            return True
+        except (TimeoutError, socket.timeout, BrokenPipeError, ConnectionResetError, OSError):
+            return False
+
+    def _send_json(self, status: int, payload: dict, *, write_timeout_s: float = 0.5) -> None:
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.close_connection = True
+        sock = getattr(self, "connection", None)
+        if sock is not None and hasattr(sock, "settimeout"):
+            try:
+                sock.settimeout(max(0.05, float(write_timeout_s)))
+            except Exception:
+                pass
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self._write_bytes_with_deadline(
+                raw,
+                deadline_mono=time.monotonic() + max(0.05, float(write_timeout_s)),
+            )
+        except (TimeoutError, socket.timeout, BrokenPipeError, ConnectionResetError, OSError):
+            self._close_downstream_forcefully()
 
     def _path_only(self) -> str:
         return self.path.split("?", 1)[0]
@@ -500,28 +697,111 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 )
                 return
             req = urllib.request.Request(UPSTREAM, data=fwd_body, method=self.command, headers=headers)
+            cancelled = threading.Event()
+            headers_ready = threading.Event()
+            active_lock = threading.Lock()
+            active_resources: list = []
+            chunk_queue: queue.Queue = queue.Queue(maxsize=4)
+            meta: dict = {}
+
+            def _abort_upstream() -> None:
+                cancelled.set()
+                _abort_active_resources(active_resources, active_lock)
+
+            def _enqueue(item: tuple) -> bool:
+                while not cancelled.is_set():
+                    rem_q = deadline_mono - time.monotonic()
+                    if rem_q <= 0.0:
+                        return False
+                    try:
+                        chunk_queue.put(item, timeout=min(0.05, max(0.01, rem_q)))
+                        return True
+                    except queue.Full:
+                        continue
+                return False
+
+            def _upstream_worker() -> None:
+                stream = None
+                try:
+                    rem_open = deadline_mono - time.monotonic()
+                    if rem_open <= 0.0 or cancelled.is_set():
+                        meta["error"] = TimeoutError(f"upstream timed out after {eff_timeout_s:.1f}s")
+                        headers_ready.set()
+                        return
+                    try:
+                        resp = _open_upstream_tracked(
+                            req,
+                            timeout_s=rem_open,
+                            active_resources=active_resources,
+                            active_lock=active_lock,
+                        )
+                        status = resp.status
+                        resp_headers = list(resp.headers.items())
+                        stream = resp
+                    except urllib.error.HTTPError as err_resp:
+                        status = err_resp.code
+                        resp_headers = list(err_resp.headers.items()) if err_resp.headers else []
+                        stream = err_resp
+                    with active_lock:
+                        active_resources.append(stream)
+                    if cancelled.is_set():
+                        return
+                    meta["status"] = status
+                    meta["headers"] = resp_headers
+                    headers_ready.set()
+
+                    raw_sock = _extract_raw_socket(stream)
+                    orig_sock_timeout: float | None = None
+                    if raw_sock is not None and hasattr(raw_sock, "gettimeout"):
+                        try:
+                            t_val = raw_sock.gettimeout()
+                            if isinstance(t_val, (int, float)) and t_val > 0:
+                                orig_sock_timeout = float(t_val)
+                        except Exception:
+                            orig_sock_timeout = None
+                    read_fn = _resolve_nonblocking_chunk_reader(stream)
+                    while not cancelled.is_set():
+                        rem_read = deadline_mono - time.monotonic()
+                        if rem_read <= 0.0:
+                            break
+                        if raw_sock is not None and hasattr(raw_sock, "settimeout"):
+                            target_t = (
+                                rem_read
+                                if orig_sock_timeout is None
+                                else min(orig_sock_timeout, rem_read)
+                            )
+                            try:
+                                raw_sock.settimeout(max(0.01, target_t))
+                            except Exception:
+                                pass
+                        try:
+                            chunk = read_fn(4096)
+                        except (TimeoutError, socket.timeout, OSError):
+                            break
+                        if not chunk:
+                            break
+                        if cancelled.is_set() or time.monotonic() >= deadline_mono:
+                            break
+                        if not _enqueue(("data", chunk)):
+                            break
+                except Exception as exc:
+                    if not headers_ready.is_set():
+                        meta["error"] = exc
+                        headers_ready.set()
+                finally:
+                    if stream is not None:
+                        _close_resource_forcefully(stream)
+                    try:
+                        chunk_queue.put_nowait(("eof", None))
+                    except queue.Full:
+                        pass
+
+            worker = threading.Thread(target=_upstream_worker, daemon=True)
+            worker.start()
             try:
-                with urllib.request.urlopen(req, timeout=max(0.01, rem_s)) as resp:
-                    self._relay(resp.status, resp.headers.items(), resp, deadline_mono=deadline_mono)
-            except urllib.error.HTTPError as e:
-                self._relay(
-                    e.code,
-                    e.headers.items() if e.headers else [],
-                    e,
-                    deadline_mono=deadline_mono,
-                )
-            except (TimeoutError, socket.timeout):
-                self._send_json(
-                    504,
-                    {
-                        "ok": False,
-                        "status": "timeout",
-                        "error_code": "upstream_timeout",
-                        "error": f"upstream timed out after {eff_timeout_s:.1f}s",
-                    },
-                )
-            except urllib.error.URLError as e:
-                if isinstance(getattr(e, "reason", None), (TimeoutError, socket.timeout)):
+                wait_hdr = max(0.0, deadline_mono - time.monotonic())
+                if not headers_ready.wait(timeout=wait_hdr):
+                    _abort_upstream()
                     self._send_json(
                         504,
                         {
@@ -531,13 +811,104 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             "error": f"upstream timed out after {eff_timeout_s:.1f}s",
                         },
                     )
-                else:
-                    self._send_json(502, {"ok": False, "error": f"upstream error: {e}"})
-            except Exception as e:
-                self._send_json(502, {"ok": False, "error": f"upstream error: {e}"})
+                    return
+                if "error" in meta:
+                    exc = meta["error"]
+                    if isinstance(exc, (TimeoutError, socket.timeout)) or (
+                        isinstance(exc, urllib.error.URLError)
+                        and isinstance(getattr(exc, "reason", None), (TimeoutError, socket.timeout))
+                    ):
+                        self._send_json(
+                            504,
+                            {
+                                "ok": False,
+                                "status": "timeout",
+                                "error_code": "upstream_timeout",
+                                "error": f"upstream timed out after {eff_timeout_s:.1f}s",
+                            },
+                        )
+                    else:
+                        self._send_json(502, {"ok": False, "error": f"upstream error: {exc}"})
+                    return
+                self._relay_from_queue(
+                    meta["status"],
+                    meta["headers"],
+                    chunk_queue,
+                    deadline_mono=deadline_mono,
+                    abort_upstream=_abort_upstream,
+                    eff_timeout_s=eff_timeout_s,
+                )
+            finally:
+                _abort_upstream()
         finally:
             with _state_lock:
                 _in_flight = max(0, _in_flight - 1)
+
+    def _relay_from_queue(
+        self,
+        status,
+        headers,
+        chunk_queue: queue.Queue,
+        *,
+        deadline_mono: float,
+        abort_upstream,
+        eff_timeout_s: float,
+    ) -> None:
+        rem_hdr = deadline_mono - time.monotonic()
+        if rem_hdr <= 0.0:
+            abort_upstream()
+            self._send_json(
+                504,
+                {
+                    "ok": False,
+                    "status": "timeout",
+                    "error_code": "upstream_timeout",
+                    "error": f"upstream timed out after {eff_timeout_s:.1f}s",
+                },
+            )
+            return
+        self.close_connection = True
+        sock = getattr(self, "connection", None)
+        if sock is not None and hasattr(sock, "settimeout"):
+            try:
+                sock.settimeout(max(0.01, rem_hdr))
+            except Exception:
+                pass
+        try:
+            self.send_response(status)
+            for k, v in headers:
+                if k.lower() in HOP_BY_HOP or k.lower() == "content-length":
+                    continue
+                self.send_header(k, v)
+            self.send_header("Connection", "close")
+            self.end_headers()
+        except (TimeoutError, socket.timeout, BrokenPipeError, ConnectionResetError, OSError):
+            abort_upstream()
+            self._close_downstream_forcefully()
+            return
+
+        while True:
+            rem = deadline_mono - time.monotonic()
+            if rem <= 0.0:
+                abort_upstream()
+                self._close_downstream_forcefully()
+                break
+            try:
+                kind, payload = chunk_queue.get(timeout=rem)
+            except queue.Empty:
+                abort_upstream()
+                self._close_downstream_forcefully()
+                break
+            if kind != "data":
+                break
+            if time.monotonic() >= deadline_mono:
+                abort_upstream()
+                self._close_downstream_forcefully()
+                break
+            if not self._write_bytes_with_deadline(payload, deadline_mono=deadline_mono):
+                abort_upstream()
+                self._close_downstream_forcefully()
+                break
 
     def _relay(
         self,
@@ -547,13 +918,30 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         *,
         deadline_mono: float | None = None,
     ) -> None:
-        self.send_response(status)
-        for k, v in headers:
-            if k.lower() in HOP_BY_HOP or k.lower() == "content-length":
-                continue
-            self.send_header(k, v)
-        self.send_header("Connection", "close")
-        self.end_headers()
+        self.close_connection = True
+        sock = getattr(self, "connection", None)
+        if deadline_mono is not None and sock is not None and hasattr(sock, "settimeout"):
+            rem_hdr = deadline_mono - time.monotonic()
+            if rem_hdr <= 0.0:
+                _close_resource_forcefully(body_stream)
+                self._close_downstream_forcefully()
+                return
+            try:
+                sock.settimeout(max(0.01, rem_hdr))
+            except Exception:
+                pass
+        try:
+            self.send_response(status)
+            for k, v in headers:
+                if k.lower() in HOP_BY_HOP or k.lower() == "content-length":
+                    continue
+                self.send_header(k, v)
+            self.send_header("Connection", "close")
+            self.end_headers()
+        except (TimeoutError, socket.timeout, BrokenPipeError, ConnectionResetError, OSError):
+            _close_resource_forcefully(body_stream)
+            self._close_downstream_forcefully()
+            return
         raw_sock = _extract_raw_socket(body_stream)
         orig_sock_timeout: float | None = None
         if raw_sock is not None and hasattr(raw_sock, "gettimeout"):
@@ -568,11 +956,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if deadline_mono is not None:
                 rem = deadline_mono - time.monotonic()
                 if rem <= 0.0:
-                    self.close_connection = True
-                    try:
-                        body_stream.close()
-                    except Exception:
-                        pass
+                    _close_resource_forcefully(body_stream)
+                    self._close_downstream_forcefully()
                     break
                 if raw_sock is not None and hasattr(raw_sock, "settimeout"):
                     target_timeout = rem if orig_sock_timeout is None else min(orig_sock_timeout, rem)
@@ -582,26 +967,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         pass
             try:
                 chunk = read_fn(4096)
-            except (TimeoutError, socket.timeout):
-                self.close_connection = True
-                try:
-                    body_stream.close()
-                except Exception:
-                    pass
+            except (TimeoutError, socket.timeout, OSError):
+                _close_resource_forcefully(body_stream)
+                self._close_downstream_forcefully()
                 break
             if not chunk:
                 break
             if deadline_mono is not None and time.monotonic() >= deadline_mono:
-                self.close_connection = True
-                try:
-                    body_stream.close()
-                except Exception:
-                    pass
+                _close_resource_forcefully(body_stream)
+                self._close_downstream_forcefully()
                 break
-            try:
-                self.wfile.write(chunk)
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
+            if not self._write_bytes_with_deadline(chunk, deadline_mono=deadline_mono):
+                _close_resource_forcefully(body_stream)
+                self._close_downstream_forcefully()
                 break
 
     def do_GET(self) -> None:

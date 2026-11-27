@@ -40,24 +40,22 @@ KEY_SQL = "COALESCE(NULLIF(message_id,''),NULLIF(email_id,''),'row:' || id)"
 
 
 def _enabled_library_sources(allowed_sources=None):
-    """Resolve enabled local library sources from explicit allowlist, env override, or Dalton capabilities."""
+    """Resolve enabled local library sources from explicit allowlist or bridge-supplied env.
+
+    Never imports app config or ``effective_capabilities()`` so child processes cannot
+    reload shared ``.env`` credentials into their environment.
+    """
     if allowed_sources is not None:
-        allowed = {str(s).strip() for s in allowed_sources if str(s).strip()}
+        if isinstance(allowed_sources, str):
+            allowed = {part.strip() for part in allowed_sources.split(",") if part.strip()}
+        else:
+            allowed = {str(s).strip() for s in allowed_sources if str(s).strip()}
         return [s for s in SOURCES if s in allowed]
     raw_env = os.environ.get("DALTON_ENABLED_LIBRARY_SOURCES")
     if raw_env is not None:
         allowed = {part.strip() for part in raw_env.split(",") if part.strip()}
         return [s for s in SOURCES if s in allowed]
-    try:
-        repo_root = Path(__file__).resolve().parents[4]
-        if str(repo_root) not in sys.path and (repo_root / "src" / "dalton" / "capabilities.py").is_file():
-            sys.path.insert(0, str(repo_root))
-        from src.dalton.capabilities import effective_capabilities, is_research_source_enabled
-
-        active = effective_capabilities(environ=os.environ)
-        return [s for s in SOURCES if is_research_source_enabled(s, capabilities=active)]
-    except Exception:
-        return list(SOURCES)
+    return list(SOURCES)
 
 
 def validate_request(route, operation, query=None, document=None, params=None, allowed_sources=None):
@@ -481,8 +479,8 @@ class Library:
         return {'ok':True,'status':source_status(results,warnings),'results':results[:limit],
                 'warnings':warnings,'coverage':{'scope':'local_index_in_requested_window','layers':coverage}}
 
-    def run(self, route, op, query=None, document=None, start=None, end=None, limit=3, params=None):
-        p,sources=validate_request(route,op,query,document,params)
+    def run(self, route, op, query=None, document=None, start=None, end=None, limit=3, params=None, allowed_sources=None):
+        p,sources=validate_request(route,op,query,document,params,allowed_sources=allowed_sources)
         if op=='read' and (start or end):raise ValueError('read 不接受日期筛选')
         if op=='read' and document.startswith('image:'):
             if p.get('offset') or p.get('max_chars'):raise ValueError('图片读取不使用正文分页参数')
@@ -568,6 +566,7 @@ def main():
     for k in ('query','document','start','end'):parser.add_argument('--'+k)
     parser.add_argument('--limit',type=int,default=3)
     parser.add_argument('--params-json',default='{}')
+    parser.add_argument('--allowed-sources',default=None)
     args=parser.parse_args()
     try:
         if not 1<=args.limit<=100:raise ValueError('limit 须在 1–100')
@@ -576,7 +575,7 @@ def main():
         if args.start and args.end and args.start>args.end:raise ValueError('起止日期倒置')
         params=json.loads(args.params_json)
         if not isinstance(params,dict):raise ValueError('params 须为对象')
-        result=Library().run(args.route,args.operation,args.query,args.document,args.start,args.end,args.limit,params)
+        result=Library().run(args.route,args.operation,args.query,args.document,args.start,args.end,args.limit,params,allowed_sources=args.allowed_sources)
     except (ValueError,OSError) as exc:
         result={'ok':False,'status':'error','error':str(exc),'hint':'核对 catalog 和内部资料参数；未执行写入。'}
     print(json.dumps(result,ensure_ascii=False))

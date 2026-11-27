@@ -220,13 +220,18 @@ def build_command(route, args):
             raise ValueError("params-json 须为对象")
         target = ("sales-notes" if operation == "read" else "all") if rid == "sales-mail" else rid
         if rid == "sales-mail" and operation == "search":
-            params={"sources":["sales-notes","tmtb"],"layer":"all","media":"text",**params}
-        validate_request(target, operation, args.query, args.document, params)
+            eff_sources = params.get("sources") if isinstance(params.get("sources"), list) else ["sales-notes", "tmtb"]
+            default_layer = "all" if "sales-notes" in eff_sources else "raw"
+            params={"sources":["sales-notes","tmtb"],"layer":default_layer,"media":"text",**params}
+        allowed_sources = getattr(args, "allowed_sources", None)
+        validate_request(target, operation, args.query, args.document, params, allowed_sources=allowed_sources)
         if operation == "read" and (args.start or args.end):
             raise ValueError("read 不接受日期筛选")
         cmd = ["bash", str(ROOT / "scripts/research_library.sh"), target,
                "--operation=" + operation, "--limit=" + str(args.limit),
                "--params-json=" + json.dumps(params, ensure_ascii=False)]
+        if allowed_sources is not None:
+            cmd.append("--allowed-sources=" + str(allowed_sources))
         for field in ("query", "document", "start", "end"):
             if getattr(args, field, None):
                 cmd.append("--" + field + "=" + getattr(args, field))
@@ -663,6 +668,7 @@ def main(argv=None):
                 a.add_argument("--" + field, type=date_arg)
             a.add_argument("--limit", type=int, default=3)
             a.add_argument("--timeout", type=int, default=180)
+            a.add_argument("--allowed-sources", default=None)
     try:
         args = p.parse_args(argv)
     except _ArgumentError as exc:

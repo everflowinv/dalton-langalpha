@@ -352,13 +352,6 @@ async def run_report_back(job: dict, p: ReportPipeline) -> Optional[NotOwed]:
         )
         if outcome == "lost":
             return None  # reclaimed: the live owner resumes; no teardown
-        # DALTON-HOOK(maintenance-gate): 503 maintenance_in_progress defers via maintenance_gate without burning attempts
-        if outcome == "maintenance":
-            from src.dalton.maintenance_gate import raise_maintenance_paused_from_response
-
-            await raise_maintenance_paused_from_response(
-                verdict.workspace_id, context="command_report_back"
-            )
         if outcome == "full":
             await outbox_db.wait_for_room(job_id, attempts=attempts, wait_s=TURN_ROOM_WAIT_S)
             return None
@@ -840,13 +833,9 @@ async def post_notification_turn(
                             f"by itself; not waiting"
                         )
                         return "refused", None
-                    # DALTON-HOOK(maintenance-gate): 503 maintenance_in_progress hands off to maintenance_gate deferral instead of generic 5xx retries
-                    if resp.status == 503 and await _is_maintenance_in_progress(resp):
-                        logger.info(
-                            f"{log_prefix} Thread {thread_id} paused for maintenance "
-                            f"(503 maintenance_in_progress); deferring {subject or 'background work'}"
-                        )
-                        return "maintenance", None
+                    # DALTON-HOOK(maintenance-gate): 503 maintenance_in_progress defers via maintenance_gate for all callers
+                    from src.dalton.maintenance_gate import raise_if_maintenance_http_response
+                    await raise_if_maintenance_http_response(resp, workspace_id=body.get("workspace_id") if isinstance(body, dict) else None)
                     if (
                         resp.status == 409
                         or resp.status >= 500
@@ -868,6 +857,9 @@ async def post_notification_turn(
                         )
                         return "drop", None
             except Exception as e:
+                # DALTON-HOOK(maintenance-gate): let maintenance pause escape the HTTP retry catch to defer outbox job
+                from src.dalton.maintenance_gate import reraise_if_maintenance_paused
+                reraise_if_maintenance_paused(e)
                 logger.warning(
                     f"{log_prefix} HTTP error POSTing to thread {thread_id}: {e}"
                 )
@@ -893,19 +885,6 @@ async def post_notification_turn(
                     f"on thread {thread_id}"
                 )
                 return "cap", None
-
-
-# DALTON-HOOK(maintenance-gate): detect 503 maintenance_in_progress so outbox callers defer via maintenance_gate
-async def _is_maintenance_in_progress(resp) -> bool:
-    if resp.status != 503:
-        return False
-    try:
-        body = await resp.json()
-    except Exception:
-        return False
-    from src.dalton.maintenance_gate import is_maintenance_in_progress_response
-
-    return is_maintenance_in_progress_response(resp.status, body)
 
 
 # DALTON-HOOK(colleague-dispatch): detect colleague_access_revoked 403 so callers terminate without retry

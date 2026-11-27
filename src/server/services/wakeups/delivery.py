@@ -260,7 +260,13 @@ async def execute_wakeup(job: dict) -> None:
     if isinstance(ids, list) and ids:
         wake.riders = await riders_db.wakeup_jobs([str(i) for i in ids])
 
-    exit_ = await _deliver(wake)
+    try:
+        exit_ = await _deliver(wake)
+    except Exception as exc:
+        # DALTON-HOOK(maintenance-gate): release gathered wakeup riders when maintenance pauses delivery
+        from src.dalton.maintenance_gate import release_riders_if_maintenance_paused
+        await release_riders_if_maintenance_paused(exc, lambda: _release_riders(wake))
+        raise
     if exit_ == "release":
         await _release_riders(wake)
     elif exit_ == "parked" and wake.riders:
@@ -481,15 +487,6 @@ async def _deliver(wake: _Wake) -> _Exit:
             return "fence_lost"
         if outcome == "superseded":
             return "release"
-        # DALTON-HOOK(maintenance-gate): 503 maintenance_in_progress defers via maintenance_gate without burning attempts
-        if outcome == "maintenance":
-            from src.dalton.maintenance_gate import raise_maintenance_paused_from_response
-
-            await raise_maintenance_paused_from_response(
-                str(thread["workspace_id"]),
-                release_riders=lambda: _release_riders(wake),
-                context="wakeup_delivery",
-            )
         # DALTON-HOOK(colleague-dispatch): 403 colleague_access_revoked terminates the wakeup immediately instead of holding via exhaust_alert
         if outcome == "revoked":
             logger.info(
