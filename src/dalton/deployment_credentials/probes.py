@@ -53,6 +53,7 @@ FEISHU_TENANT_TOKEN_ENDPOINT = (
 )
 GOOGLE_PROBE_INVALID_CODE = "dalton_probe_invalid_code"
 PROBE_TIMEOUT_SECONDS = 8.0
+PROBE_TOTAL_TIMEOUT_SECONDS = 10.0
 
 ProbeTarget = Literal["google_oauth", "feishu_app"]
 ProbeVerdict = Literal[
@@ -128,24 +129,28 @@ async def _resolve_existing_group_values(target: ProbeTarget) -> tuple[dict[str,
 def _validate_draft_values(
     target: ProbeTarget,
     draft_values: Mapping[str, Any],
-) -> tuple[dict[str, str], ProbeResult | None]:
+) -> tuple[dict[str, str], set[str], ProbeResult | None]:
     """Validate optional draft inputs against ``target``'s allowlisted keys.
 
-    Unknown keys raise ``DeploymentSettingValidationError`` with ``_unknown`` so
-    neither unrecognized key names nor raw values echo back in 422 responses.
+    Explicit ``None`` or blank-string entries record the key in ``cleared_keys``
+    so probing follows the same draft-clearing semantics as ``PUT``. Unknown keys
+    raise ``DeploymentSettingValidationError`` with ``_unknown`` so unrecognized
+    names and raw values stay out of 422 responses.
     """
     allowed = set(group_keys(target))
     unknown_errors: list[dict[str, str]] = []
     cleaned_draft: dict[str, str] = {}
+    cleared_keys: set[str] = set()
 
     for key, raw in draft_values.items():
         if key not in allowed:
             unknown_errors.append({"setting_name": "_unknown", "reason": "unknown_setting"})
             continue
         if raw is None:
+            cleared_keys.add(key)
             continue
         if not isinstance(raw, str):
-            return {}, ProbeResult(
+            return {}, set(), ProbeResult(
                 ok=False,
                 network_reachable=False,
                 credentials_valid=None,
@@ -154,9 +159,10 @@ def _validate_draft_values(
             )
         stripped = raw.strip()
         if not stripped:
+            cleared_keys.add(key)
             continue
         if len(stripped) > _MAX_VALUE_LENGTH:
-            return {}, ProbeResult(
+            return {}, set(), ProbeResult(
                 ok=False,
                 network_reachable=False,
                 credentials_valid=None,
@@ -165,7 +171,7 @@ def _validate_draft_values(
             )
         cleaned, is_invalid = _validate_credential_value(stripped)
         if is_invalid or cleaned is None:
-            return {}, ProbeResult(
+            return {}, set(), ProbeResult(
                 ok=False,
                 network_reachable=False,
                 credentials_valid=None,
@@ -177,7 +183,7 @@ def _validate_draft_values(
     if unknown_errors:
         raise DeploymentSettingValidationError(unknown_errors)
 
-    return cleaned_draft, None
+    return cleaned_draft, cleared_keys, None
 
 
 async def probe_google_oauth(
@@ -448,66 +454,95 @@ async def run_credential_probe(
     profile: DeploymentProfile | None = None,
     http_client: httpx.AsyncClient | None = None,
 ) -> ProbeResult:
-    """Resolve effective or draft credentials for ``target`` and run its real-endpoint probe."""
+    """Resolve effective or draft credentials for ``target`` and run its real-endpoint probe.
+
+    Enforces a single end-to-end deadline (``PROBE_TOTAL_TIMEOUT_SECONDS``) covering
+    pre-probe DB/Vault resolution and the outbound official HTTP request.
+    """
     _ = resolve_profile() if profile is None else profile
-    cleaned_draft, format_error = _validate_draft_values(target, draft_values or {})
+    cleaned_draft, cleared_keys, format_error = _validate_draft_values(target, draft_values or {})
     if format_error is not None:
         return format_error
 
     keys = group_keys(target)
-    if all(k in cleaned_draft for k in keys):
-        effective = dict(cleaned_draft)
-    else:
-        existing, vault_error = await _resolve_existing_group_values(target)
-        if vault_error and not cleaned_draft:
-            return ProbeResult(
-                ok=False,
-                network_reachable=False,
-                credentials_valid=None,
-                verdict="format_invalid",
-                detail_code="vault_error",
-            )
-        effective = dict(existing)
-        effective.update(cleaned_draft)
+    try:
+        async with asyncio.timeout(PROBE_TOTAL_TIMEOUT_SECONDS):
+            if cleared_keys:
+                # Any explicitly cleared key leaves a pair_required group incomplete.
+                return ProbeResult(
+                    ok=False,
+                    network_reachable=False,
+                    credentials_valid=None,
+                    verdict="format_invalid",
+                    detail_code="incomplete_credential_group",
+                )
 
-    resolved: dict[str, str] = {}
-    for key in keys:
-        cleaned, is_invalid = _validate_credential_value(effective.get(key))
-        if is_invalid:
-            return ProbeResult(
-                ok=False,
-                network_reachable=False,
-                credentials_valid=None,
-                verdict="format_invalid",
-                detail_code="invalid_format",
-            )
-        if cleaned is None:
-            return ProbeResult(
-                ok=False,
-                network_reachable=False,
-                credentials_valid=None,
-                verdict="format_invalid",
-                detail_code="incomplete_credential_group",
-            )
-        resolved[key] = cleaned
+            if all(k in cleaned_draft for k in keys):
+                effective = dict(cleaned_draft)
+            else:
+                existing, vault_error = await _resolve_existing_group_values(target)
+                if vault_error and not cleaned_draft:
+                    return ProbeResult(
+                        ok=False,
+                        network_reachable=False,
+                        credentials_valid=None,
+                        verdict="format_invalid",
+                        detail_code="vault_error",
+                    )
+                effective = dict(existing)
+                effective.update(cleaned_draft)
 
-    if target == "google_oauth":
-        redirect_uri = (
-            build_integration_redirect_uri("google")
-            or f"http://localhost{GOOGLE_OAUTH_CALLBACK_PATH}"
+            resolved: dict[str, str] = {}
+            for key in keys:
+                cleaned, is_invalid = _validate_credential_value(effective.get(key))
+                if is_invalid:
+                    return ProbeResult(
+                        ok=False,
+                        network_reachable=False,
+                        credentials_valid=None,
+                        verdict="format_invalid",
+                        detail_code="invalid_format",
+                    )
+                if cleaned is None:
+                    return ProbeResult(
+                        ok=False,
+                        network_reachable=False,
+                        credentials_valid=None,
+                        verdict="format_invalid",
+                        detail_code="incomplete_credential_group",
+                    )
+                resolved[key] = cleaned
+
+            if target == "google_oauth":
+                redirect_uri = (
+                    build_integration_redirect_uri("google")
+                    or f"http://localhost{GOOGLE_OAUTH_CALLBACK_PATH}"
+                )
+                return await probe_google_oauth(
+                    resolved[GOOGLE_OAUTH_CLIENT_ID_KEY],
+                    resolved[GOOGLE_OAUTH_CLIENT_SECRET_KEY],
+                    redirect_uri=redirect_uri,
+                    http_client=http_client,
+                )
+
+            return await probe_feishu_app(
+                resolved[FEISHU_APP_ID_KEY],
+                resolved[FEISHU_APP_SECRET_KEY],
+                http_client=http_client,
+            )
+    except TimeoutError as exc:
+        logger.info(
+            "Deployment credential probe timed out target=%s error=%s",
+            target,
+            type(exc).__name__,
         )
-        return await probe_google_oauth(
-            resolved[GOOGLE_OAUTH_CLIENT_ID_KEY],
-            resolved[GOOGLE_OAUTH_CLIENT_SECRET_KEY],
-            redirect_uri=redirect_uri,
-            http_client=http_client,
+        return ProbeResult(
+            ok=False,
+            network_reachable=False,
+            credentials_valid=None,
+            verdict="network_error",
+            detail_code="probe_timeout",
         )
-
-    return await probe_feishu_app(
-        resolved[FEISHU_APP_ID_KEY],
-        resolved[FEISHU_APP_SECRET_KEY],
-        http_client=http_client,
-    )
 
 
 __all__ = [
@@ -515,6 +550,7 @@ __all__ = [
     "GOOGLE_PROBE_INVALID_CODE",
     "GOOGLE_TOKEN_ENDPOINT",
     "PROBE_TIMEOUT_SECONDS",
+    "PROBE_TOTAL_TIMEOUT_SECONDS",
     "ProbeResult",
     "ProbeTarget",
     "ProbeVerdict",

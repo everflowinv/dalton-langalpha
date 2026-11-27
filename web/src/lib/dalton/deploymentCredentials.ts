@@ -80,10 +80,14 @@ export interface ParsedDeploymentSettingsError {
   currentRevision?: number;
   settingName?: string;
   reasons: string[];
+  isTimeout: boolean;
+  isNetworkError: boolean;
 }
 
 export const DEPLOYMENT_SETTINGS_ENDPOINT = '/api/v1/dalton/deployment-settings';
 export const ADMIN_INTEGRATIONS_HELP_URL = '/help/get-started/admin-integrations/';
+/** End-to-end browser timeout for credential probes (exceeds the backend 10s total probe budget). */
+export const PROBE_REQUEST_TIMEOUT_MS = 12_000;
 
 export async function fetchDeploymentSettings(): Promise<DeploymentSettingsResponse> {
   const { data } = await api.get<DeploymentSettingsResponse>(DEPLOYMENT_SETTINGS_ENDPOINT);
@@ -103,18 +107,40 @@ export async function updateDeploymentSettings(
 export async function testDeploymentCredentials(
   target: ProbeTarget,
   values: Record<string, string | null> = {},
+  options: { timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<DeploymentCredentialProbeResponse> {
   const { data } = await api.post<DeploymentCredentialProbeResponse>(
     `${DEPLOYMENT_SETTINGS_ENDPOINT}/test`,
     { target, values },
+    {
+      timeout: options.timeoutMs ?? PROBE_REQUEST_TIMEOUT_MS,
+      signal: options.signal,
+    },
   );
   return data;
 }
 
 /** Extract structured error codes from a failed deployment settings API call without leaking input values. */
 export function parseDeploymentSettingsError(err: unknown): ParsedDeploymentSettingsError {
-  if (!(err instanceof ApiError) || !err.response) {
-    return { status: null, code: null, reasons: [] };
+  if (!(err instanceof ApiError)) {
+    return {
+      status: null,
+      code: null,
+      reasons: [],
+      isTimeout: false,
+      isNetworkError: false,
+    };
+  }
+  const isTimeout = err.code === 'ECONNABORTED';
+  const isNetworkError = err.code === 'ERR_NETWORK';
+  if (!err.response) {
+    return {
+      status: null,
+      code: null,
+      reasons: [],
+      isTimeout,
+      isNetworkError,
+    };
   }
   const { status, data } = err.response;
   const body = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
@@ -146,5 +172,7 @@ export function parseDeploymentSettingsError(err: unknown): ParsedDeploymentSett
     currentRevision,
     settingName,
     reasons,
+    isTimeout,
+    isNetworkError,
   };
 }

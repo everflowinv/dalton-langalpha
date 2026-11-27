@@ -6,6 +6,8 @@ import { ApiError } from '@/api/client';
 import i18n from '@/i18n';
 import type { CapabilityId } from '@/hooks/useCapabilities';
 import {
+  PROBE_REQUEST_TIMEOUT_MS,
+  parseDeploymentSettingsError,
   type DeploymentSettingField,
   type DeploymentSettingsResponse,
   type fetchDeploymentSettings,
@@ -16,6 +18,7 @@ import { queryKeys } from '@/lib/queryKeys';
 
 const mocks = vi.hoisted(() => ({
   profile: 'core' as 'core' | 'everflow',
+  brandName: 'Dalton',
   authMode: 'local' as 'local' | 'supabase' | 'oss',
   isSingleUserOss: false,
   isMultiUserAuth: true,
@@ -50,7 +53,7 @@ vi.mock('@/hooks/useCapabilities', async (importOriginal) => {
       capabilities: caps,
       hasCapability: (req: Parameters<typeof actual.hasRequiredCapability>[1]) =>
         actual.hasRequiredCapability(caps, req),
-      brandName: 'Dalton',
+      brandName: mocks.brandName,
       fingerprint: 'fp-test',
       tickerLogosEnabled: false,
       isLoading: false,
@@ -107,7 +110,9 @@ vi.mock('@/lib/dalton/deploymentCredentials', async (importOriginal) => {
 
 import DaltonDeploymentCredentialsPanel from '../DaltonDeploymentCredentialsPanel';
 
-function makeBaseFields(overrides: Partial<Record<string, Partial<DeploymentSettingField>>> = {}): DeploymentSettingField[] {
+function makeBaseFields(
+  overrides: Partial<Record<string, Partial<DeploymentSettingField>>> = {},
+): DeploymentSettingField[] {
   const defaults: DeploymentSettingField[] = [
     {
       name: 'DALTON_GOOGLE_OAUTH_CLIENT_ID',
@@ -259,6 +264,7 @@ function renderPanel() {
 
 afterEach(async () => {
   mocks.profile = 'core';
+  mocks.brandName = 'Dalton';
   mocks.authMode = 'local';
   mocks.isSingleUserOss = false;
   mocks.isMultiUserAuth = true;
@@ -353,13 +359,44 @@ describe('DaltonDeploymentCredentialsPanel', () => {
     expect(document.body.textContent?.toLowerCase()).not.toContain('everflow');
   });
 
-  it('distinguishes feishu vault_readonly vs vault_error badges while keeping feishu_event keys independently editable', async () => {
+  it('shows coming-soon status for personal calendar switches and callback guidance when no boolean switches are registered', async () => {
+    await i18n.changeLanguage('zh-CN');
+    mocks.fetchMock.mockResolvedValueOnce(makeResponse());
+
+    renderPanel();
+
+    expect(await screen.findByTestId('google-connector-availability-badge')).toHaveTextContent(
+      '个人连接器即将推出',
+    );
+    expect(screen.getByTestId('feishu-connector-availability-badge')).toHaveTextContent(
+      '个人连接器即将推出',
+    );
+    const googleRow = screen.getByTestId('switch-row-coming-soon-google');
+    const feishuRow = screen.getByTestId('switch-row-coming-soon-feishu');
+    expect(googleRow).toHaveTextContent('即将推出');
+    expect(feishuRow).toHaveTextContent('即将推出');
+    expect(googleRow.querySelector('button[role="switch"]')).toBeDisabled();
+    expect(feishuRow.querySelector('button[role="switch"]')).toBeDisabled();
+  });
+
+  it('hides plaintext IDs behind per-field configured/source badges, clears vault_error dots, and keeps feishu_event editable', async () => {
     await i18n.changeLanguage('zh-CN');
 
-    // 1) vault_readonly: echoes App ID, locks feishu_app, keeps feishu_event editable & saveable
+    // 1) vault_readonly: shows configured status & source without prefilling plaintext App ID; feishu_event stays editable
     const readonlyResp = makeResponse({
       revision: 7,
       fields: makeBaseFields({
+        DALTON_GOOGLE_OAUTH_CLIENT_ID: {
+          source: 'saved',
+          readonly: false,
+          configured: true,
+          value: 'test-client-id-not-prefilled.apps.googleusercontent.com',
+        },
+        DALTON_GOOGLE_OAUTH_CLIENT_SECRET: {
+          source: 'saved',
+          readonly: false,
+          configured: true,
+        },
         DALTON_FEISHU_APP_ID: {
           source: 'vault_readonly',
           readonly: true,
@@ -385,7 +422,20 @@ describe('DaltonDeploymentCredentialsPanel', () => {
     const readonlyBadge = await screen.findByTestId('feishu-app-source-badge');
     expect(readonlyBadge).toHaveTextContent('现网飞书机器人使用中（只读 · 第 3 批迁移后可在此修改）');
     expect(screen.getByTestId('feishu-vault-readonly-notice')).toBeInTheDocument();
-    expect(screen.getByTestId('input-feishu-app-id')).toHaveValue('cli_vault_readonly_001');
+
+    // Neither Google Client ID nor Feishu App ID prefills plaintext values into inputs
+    expect(screen.getByTestId('input-google-client-id')).toHaveValue('');
+    expect(screen.getByTestId('input-feishu-app-id')).toHaveValue('');
+    expect(document.body.textContent).not.toContain('test-client-id-not-prefilled');
+    expect(document.body.textContent).not.toContain('cli_vault_readonly_001');
+
+    // Per-field badges show configured + source accurately
+    expect(screen.getByTestId('field-status-DALTON_GOOGLE_OAUTH_CLIENT_ID')).toHaveTextContent(
+      '已设置 · 网页已保存',
+    );
+    expect(screen.getByTestId('field-status-DALTON_FEISHU_APP_ID')).toHaveTextContent(
+      '已设置 · 现网 Vault 只读',
+    );
     expect(screen.getByTestId('input-feishu-app-id')).toBeDisabled();
     expect(screen.getByTestId('save-feishu-app-btn')).toBeDisabled();
 
@@ -406,7 +456,7 @@ describe('DaltonDeploymentCredentialsPanel', () => {
     });
     first.unmount();
 
-    // 2) vault_error: distinct danger badge, hides App ID echo, locks feishu_app, keeps feishu_event editable
+    // 2) vault_error: distinct danger badge, no misleading '••••••••' placeholder on secret, feishu_event stays editable
     mocks.fetchMock.mockReset();
     mocks.fetchMock.mockResolvedValue(
       makeResponse({
@@ -431,20 +481,77 @@ describe('DaltonDeploymentCredentialsPanel', () => {
     const errorBadge = await screen.findByTestId('feishu-app-source-badge');
     expect(errorBadge).toHaveTextContent('主管理员 Vault 读取异常（只读锁定 · 请检查数据库或加密密钥）');
     expect(screen.getByTestId('feishu-vault-error-notice')).toBeInTheDocument();
-    expect(screen.getByTestId('input-feishu-app-id')).toHaveValue('');
+    expect(screen.getByTestId('field-status-DALTON_FEISHU_APP_ID')).toHaveTextContent('读取异常');
+    expect(screen.getByTestId('field-status-DALTON_FEISHU_APP_SECRET')).toHaveTextContent('读取异常');
+    expect(screen.getByTestId('input-feishu-app-id')).toHaveAttribute('placeholder', '—');
+    expect(screen.getByTestId('input-feishu-app-secret')).toHaveAttribute('placeholder', '—');
     expect(screen.getByTestId('input-feishu-app-id')).toBeDisabled();
     expect(screen.getByTestId('test-feishu-app-btn')).toBeDisabled();
     expect(screen.getByTestId('input-feishu-verify-token')).not.toBeDisabled();
   });
 
-  it('shows plain Chinese errors for 409 revision_conflict, 409 env_locked, and 422 incomplete_credential_group, and displays /test verdicts', async () => {
+  it('binds drafts to their starting revision, blocks silent overwrite after refresh, and reconciles via rebase or discard', async () => {
     await i18n.changeLanguage('zh-CN');
-    mocks.fetchMock.mockResolvedValue(makeResponse({ revision: 5 }));
+    mocks.fetchMock
+      .mockResolvedValueOnce(makeResponse({ revision: 5 }))
+      .mockResolvedValueOnce(makeResponse({ revision: 9 }));
 
     renderPanel();
     await screen.findByTestId('google-oauth-card');
 
-    // 1) 422 incomplete_credential_group
+    // Begin editing on v5
+    fireEvent.change(screen.getByTestId('input-google-client-id'), {
+      target: { value: 'draft-client-id-v5' },
+    });
+    fireEvent.change(screen.getByTestId('input-google-client-secret'), {
+      target: { value: 'test-secret-not-real-v5-0001' },
+    });
+
+    // Another admin updates server to v9; this admin refreshes
+    fireEvent.click(screen.getByTestId('deployment-credentials-refresh'));
+
+    const staleNotice = await screen.findByTestId('google_oauth-stale-draft-notice');
+    expect(staleNotice.textContent).toContain('v9');
+    expect(staleNotice.textContent).toContain('v5');
+    // Save button stays locked until the admin reviews and explicitly reconciles
+    expect(screen.getByTestId('save-google-oauth-btn')).toBeDisabled();
+
+    // Explicitly re-base draft after reviewing the group
+    fireEvent.click(screen.getByTestId('google_oauth-rebase-draft-btn'));
+    expect(screen.queryByTestId('google_oauth-stale-draft-notice')).not.toBeInTheDocument();
+    expect(screen.getByTestId('save-google-oauth-btn')).not.toBeDisabled();
+
+    mocks.updateMock.mockResolvedValueOnce({
+      revision: 10,
+      changed: ['DALTON_GOOGLE_OAUTH_CLIENT_ID', 'DALTON_GOOGLE_OAUTH_CLIENT_SECRET'],
+      pending_apply: false,
+      warnings: [],
+    });
+    fireEvent.click(screen.getByTestId('save-google-oauth-btn'));
+    await waitFor(() => {
+      expect(mocks.updateMock).toHaveBeenCalledWith({
+        expected_revision: 9,
+        values: {
+          DALTON_GOOGLE_OAUTH_CLIENT_ID: 'draft-client-id-v5',
+          DALTON_GOOGLE_OAUTH_CLIENT_SECRET: 'test-secret-not-real-v5-0001',
+        },
+      });
+    });
+  });
+
+  it('shares Save/Test draft resolution, clears stale probe verdicts on edit or revision change, and shows dedicated probe timeout/error messages', async () => {
+    await i18n.changeLanguage('zh-CN');
+    mocks.fetchMock
+      .mockResolvedValueOnce(makeResponse({ revision: 5 }))
+      .mockResolvedValueOnce(makeResponse({ revision: 6 }));
+
+    renderPanel();
+    await screen.findByTestId('google-oauth-card');
+
+    // 1) Half-filled unset group sends identical payload (with null partner) to Save and Test
+    fireEvent.change(screen.getByTestId('input-google-client-id'), {
+      target: { value: 'google-client-id-1' },
+    });
     mocks.updateMock.mockRejectedValueOnce(
       makeApiError(422, {
         code: 'validation_error',
@@ -456,25 +563,45 @@ describe('DaltonDeploymentCredentialsPanel', () => {
         ],
       }),
     );
-    fireEvent.change(screen.getByTestId('input-google-client-id'), {
-      target: { value: 'google-client-id-1' },
-    });
     fireEvent.click(screen.getByTestId('save-google-oauth-btn'));
     const err422 = await screen.findByTestId('deployment-credentials-notice');
     expect(err422.textContent).toContain('成对填写完整');
+    expect(mocks.updateMock).toHaveBeenCalledWith({
+      expected_revision: 5,
+      values: {
+        DALTON_GOOGLE_OAUTH_CLIENT_ID: 'google-client-id-1',
+        DALTON_GOOGLE_OAUTH_CLIENT_SECRET: null,
+      },
+    });
 
-    // 2) 409 revision_conflict
+    mocks.testMock.mockResolvedValueOnce({
+      ok: false,
+      network_reachable: false,
+      credentials_valid: null,
+      verdict: 'format_invalid',
+      detail_code: 'incomplete_credential_group',
+    });
+    fireEvent.click(screen.getByTestId('test-google-oauth-btn'));
+    await screen.findByTestId('google-oauth-probe-result');
+    expect(mocks.testMock).toHaveBeenCalledWith('google_oauth', {
+      DALTON_GOOGLE_OAUTH_CLIENT_ID: 'google-client-id-1',
+      DALTON_GOOGLE_OAUTH_CLIENT_SECRET: null,
+    });
+
+    // 2) 409 revision_conflict & 409 env_locked
     mocks.updateMock.mockRejectedValueOnce(
       makeApiError(409, { code: 'revision_conflict', current_revision: 9 }),
     );
     fireEvent.change(screen.getByTestId('input-google-client-secret'), {
       target: { value: 'test-secret-not-real-google-0001' },
     });
+    // Editing the secret immediately cleared the previous probe verdict
+    expect(screen.queryByTestId('google-oauth-probe-result')).not.toBeInTheDocument();
+
     fireEvent.click(screen.getByTestId('save-google-oauth-btn'));
     const errConflict = await screen.findByTestId('deployment-credentials-notice');
     expect(errConflict.textContent).toContain('v9');
 
-    // 3) 409 env_locked
     mocks.updateMock.mockRejectedValueOnce(
       makeApiError(409, { code: 'env_locked', setting_name: 'DALTON_GOOGLE_OAUTH_CLIENT_ID' }),
     );
@@ -482,7 +609,7 @@ describe('DaltonDeploymentCredentialsPanel', () => {
     const errEnv = await screen.findByTestId('deployment-credentials-notice');
     expect(errEnv.textContent).toContain('环境变量');
 
-    // 4) /test probe button calls POST /test and displays structured result
+    // 3) Successful probe -> editing input clears green result
     mocks.testMock.mockResolvedValueOnce({
       ok: true,
       network_reachable: true,
@@ -493,9 +620,52 @@ describe('DaltonDeploymentCredentialsPanel', () => {
     fireEvent.click(screen.getByTestId('test-google-oauth-btn'));
     const probeOk = await screen.findByTestId('google-oauth-probe-result');
     expect(probeOk.textContent).toContain('凭据有效');
-    expect(mocks.testMock).toHaveBeenCalledWith('google_oauth', {
+    expect(mocks.testMock).toHaveBeenLastCalledWith('google_oauth', {
       DALTON_GOOGLE_OAUTH_CLIENT_ID: 'google-client-id-1',
       DALTON_GOOGLE_OAUTH_CLIENT_SECRET: 'test-secret-not-real-google-0001',
     });
+
+    fireEvent.change(screen.getByTestId('input-google-client-id'), {
+      target: { value: 'google-client-id-2' },
+    });
+    expect(screen.queryByTestId('google-oauth-probe-result')).not.toBeInTheDocument();
+
+    // 4) Client timeout (ECONNABORTED) renders dedicated probe timeout error (never "保存未完成") & re-enables buttons
+    mocks.testMock.mockRejectedValueOnce(
+      new ApiError(`timeout of ${PROBE_REQUEST_TIMEOUT_MS}ms exceeded`, 'ECONNABORTED'),
+    );
+    fireEvent.click(screen.getByTestId('test-google-oauth-btn'));
+    const timeoutErr = await screen.findByTestId('google-oauth-probe-error');
+    expect(timeoutErr.textContent).toContain('测试请求超时');
+    expect(timeoutErr.textContent).not.toContain('保存未完成');
+    expect(screen.getByTestId('test-google-oauth-btn')).not.toBeDisabled();
+    expect(screen.getByTestId('test-feishu-app-btn')).not.toBeDisabled();
+
+    // 5) Revision refresh also clears stale probe errors/results
+    fireEvent.click(screen.getByTestId('deployment-credentials-refresh'));
+    await waitFor(() => {
+      expect(screen.getByTestId('deployment-credentials-revision-badge')).toHaveTextContent('v6');
+    });
+    expect(screen.queryByTestId('google-oauth-probe-error')).not.toBeInTheDocument();
+  });
+
+  it('uses useCapabilities().profile and brandName for the profile badge and parses client timeout errors', async () => {
+    await i18n.changeLanguage('zh-CN');
+    mocks.profile = 'everflow';
+    mocks.brandName = 'Everflow';
+    mocks.fetchMock.mockResolvedValueOnce(makeResponse({ profile: 'core', revision: 2 }));
+
+    renderPanel();
+
+    const profileBadge = await screen.findByTestId('deployment-credentials-profile-badge');
+    expect(profileBadge).toHaveTextContent('Everflow');
+    expect(profileBadge.textContent).not.toContain('标准管理形态');
+
+    const parsedTimeout = parseDeploymentSettingsError(
+      new ApiError('timeout of 12000ms exceeded', 'ECONNABORTED'),
+    );
+    expect(parsedTimeout.isTimeout).toBe(true);
+    expect(parsedTimeout.isNetworkError).toBe(false);
+    expect(PROBE_REQUEST_TIMEOUT_MS).toBeGreaterThanOrEqual(10_000);
   });
 });

@@ -30,12 +30,20 @@ _STANDALONE_HELPER_RE = re.compile(
     r"remove_env_key(?:_all)?|append_env_key_unique|count_env_key_assignments)\s+"
     r"(?:\"\$[^\"]+\"\s+)?\"([A-Z][A-Z0-9_]{2,})\""
 )
+# Match every shell parameter default expansion `${ENV_KEY:-...}` across standalone and ops scripts
+# (including renamed assignments such as `EDGE_COMPOSE_TIMEOUT="${DALTON_EDGE_COMPOSE_TIMEOUT:-120}"`).
 _SHELL_OVERRIDE_RE = re.compile(
-    r"^((?:DALTON|VITE|DB|REDIS|MINIO|STORAGE|S3|AWS|R2|OSS|PUBLIC|SERVER|DOMAIN|"
+    r"\$\{((?:DALTON|VITE|DB|REDIS|MINIO|STORAGE|S3|AWS|R2|OSS|PUBLIC|SERVER|DOMAIN|"
     r"APP_ENV|HOST_MODE|BRAND|BYOK|JWT|BOOTSTRAP|INTERNAL|EGRESS|SANDBOX|SEC|EDGAR|"
     r"FMP|TAVILY|SERPER|EXA|FIRECRAWL|OPENAI|ANTHROPIC|GEMINI|GOOGLE|FEISHU|DISCORD|"
-    r"WEIXIN|SENTRY|APNS|SUPABASE|CHANNEL)[A-Z0-9_]*)=\"?\$\{\1:-",
-    re.MULTILINE,
+    r"WEIXIN|SENTRY|APNS|SUPABASE|CHANNEL)[A-Z0-9_]*):-",
+)
+
+# Local temporary shell variables unconditionally initialized inside scripts (never external env inputs).
+_SHELL_LOCAL_TEMP_VARS: frozenset[str] = frozenset(
+    {
+        "MINIO_MANIFEST_TMP",
+    }
 )
 
 # Standard POSIX / OS / toolchain environment variables (never application config).
@@ -117,6 +125,7 @@ _OPS_SCRIPT_TUNING_PREFIXES: tuple[str, ...] = (
     "DALTON_BACKEND_",
     "DALTON_BACKUP_",
     "DALTON_BRIDGE_",
+    "DALTON_CHANNEL_",
     "DALTON_COLIMA_",
     "DALTON_CONFIG_",
     "DALTON_CONTAINER_",
@@ -289,14 +298,14 @@ def _scan_shell_env_keys() -> tuple[set[str], set[str]]:
                 standalone_env_keys.add(key)
         for match in _SHELL_OVERRIDE_RE.finditer(text):
             key = match.group(1)
-            if key not in _POSIX_AND_TOOL_VARS:
+            if key not in _POSIX_AND_TOOL_VARS and key not in _SHELL_LOCAL_TEMP_VARS:
                 override_keys.add(key)
 
     for sh_path in ops_scripts:
         text = sh_path.read_text(encoding="utf-8", errors="ignore")
         for match in _SHELL_OVERRIDE_RE.finditer(text):
             key = match.group(1)
-            if key not in _POSIX_AND_TOOL_VARS:
+            if key not in _POSIX_AND_TOOL_VARS and key not in _SHELL_LOCAL_TEMP_VARS:
                 override_keys.add(key)
 
     return standalone_env_keys, override_keys

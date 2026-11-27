@@ -39,6 +39,37 @@ const FEISHU_APP_SECRET_KEY = 'DALTON_FEISHU_APP_SECRET';
 const FEISHU_ENCRYPT_KEY = 'DALTON_FEISHU_ENCRYPT_KEY';
 const FEISHU_VERIFY_TOKEN_KEY = 'DALTON_FEISHU_VERIFICATION_TOKEN';
 
+type EditableGroup = 'google_oauth' | 'feishu_app' | 'feishu_event';
+
+const GROUP_FIELDS: Record<EditableGroup, readonly string[]> = {
+  google_oauth: [GOOGLE_ID_KEY, GOOGLE_SECRET_KEY],
+  feishu_app: [FEISHU_APP_ID_KEY, FEISHU_APP_SECRET_KEY],
+  feishu_event: [FEISHU_ENCRYPT_KEY, FEISHU_VERIFY_TOKEN_KEY],
+};
+
+const FIELD_TO_GROUP: Record<string, EditableGroup> = {
+  [GOOGLE_ID_KEY]: 'google_oauth',
+  [GOOGLE_SECRET_KEY]: 'google_oauth',
+  [FEISHU_APP_ID_KEY]: 'feishu_app',
+  [FEISHU_APP_SECRET_KEY]: 'feishu_app',
+  [FEISHU_ENCRYPT_KEY]: 'feishu_event',
+  [FEISHU_VERIFY_TOKEN_KEY]: 'feishu_event',
+};
+
+/**
+ * Explicit registry of capability switch keys gated on Google redirect URI eligibility,
+ * aligned with the personal calendar/mail integration capability constants.
+ */
+const GOOGLE_CONNECTOR_SWITCH_KEYS: ReadonlySet<string> = new Set([
+  'DALTON_CAP_GOOGLE_WORKSPACE',
+  'DALTON_CAP_GOOGLE_CALENDAR',
+  'DALTON_CAP_GOOGLE_MAIL',
+]);
+
+function isGoogleConnectorSwitch(field: DeploymentSettingField): boolean {
+  return GOOGLE_CONNECTOR_SWITCH_KEYS.has(field.name) || field.section === 'calendar_mail';
+}
+
 const SOURCE_TONE: Record<CredentialSource, DaltonStatusTone> = {
   env: 'accent',
   saved: 'success',
@@ -63,6 +94,122 @@ function sourceBadgeLabel(
     case 'unset':
       return t('settings:dalton.deploymentCredentials.sourceUnset');
   }
+}
+
+function sourceShortLabel(
+  source: CredentialSource,
+  t: (key: string) => string,
+): string | null {
+  switch (source) {
+    case 'env':
+      return t('settings:dalton.deploymentCredentials.sourceShortEnv');
+    case 'saved':
+      return t('settings:dalton.deploymentCredentials.sourceShortSaved');
+    case 'vault_readonly':
+      return t('settings:dalton.deploymentCredentials.sourceShortVaultReadonly');
+    case 'vault_error':
+      return t('settings:dalton.deploymentCredentials.sourceShortVaultError');
+    case 'unset':
+      return null;
+  }
+}
+
+function FieldStatusBadge({
+  field,
+  testId,
+}: {
+  field: DeploymentSettingField | undefined;
+  testId: string;
+}) {
+  const { t } = useTranslation();
+  const source: CredentialSource = field?.source ?? 'unset';
+  if (source === 'vault_error') {
+    return (
+      <DaltonStatusBadge
+        tone="danger"
+        label={t('settings:dalton.deploymentCredentials.fieldReadError')}
+        testId={testId}
+      />
+    );
+  }
+  if (field?.configured) {
+    const shortSource = sourceShortLabel(source, t);
+    const label = shortSource
+      ? `${t('settings:dalton.deploymentCredentials.fieldConfigured')} · ${shortSource}`
+      : t('settings:dalton.deploymentCredentials.fieldConfigured');
+    return <DaltonStatusBadge tone={SOURCE_TONE[source]} label={label} testId={testId} />;
+  }
+  return (
+    <DaltonStatusBadge
+      tone="neutral"
+      label={t('settings:dalton.deploymentCredentials.fieldUnset')}
+      testId={testId}
+    />
+  );
+}
+
+function resolveFieldPlaceholder(
+  field: DeploymentSettingField | undefined,
+  options: {
+    readonly: boolean;
+    secret: boolean;
+    emptyPlaceholder: string;
+    t: (key: string) => string;
+  },
+): string {
+  const { readonly, secret, emptyPlaceholder, t } = options;
+  if (field?.source === 'vault_error') {
+    return t('settings:dalton.deploymentCredentials.vaultErrorPlaceholder');
+  }
+  if (readonly) {
+    if (field?.configured) {
+      return secret
+        ? '••••••••'
+        : t('settings:dalton.deploymentCredentials.readonlyConfiguredPlaceholder');
+    }
+    return t('settings:dalton.deploymentCredentials.readonlyUnsetPlaceholder');
+  }
+  if (field?.configured) {
+    return secret
+      ? t('settings:dalton.deploymentCredentials.secretSavedPlaceholder')
+      : t('settings:dalton.deploymentCredentials.idSavedPlaceholder');
+  }
+  return emptyPlaceholder;
+}
+
+/**
+ * Shared draft-to-payload resolver for both Save (`PUT`) and Connectivity Test (`POST /test`).
+ *
+ * - Non-empty drafts submit the trimmed replacement value.
+ * - Empty drafts on already-configured fields omit the key so both Save and Test preserve the
+ *   existing server-side value.
+ * - Empty drafts on unconfigured fields emit `null` so incomplete pairs produce identical
+ *   validation verdicts across Save and Test.
+ */
+function buildPairedGroupPayload(
+  idKey: string,
+  secretKey: string,
+  idField: DeploymentSettingField | undefined,
+  secretField: DeploymentSettingField | undefined,
+  drafts: Readonly<Record<string, string>>,
+): Record<string, string | null> {
+  const values: Record<string, string | null> = {};
+  const idVal = (drafts[idKey] ?? '').trim();
+  const secretVal = (drafts[secretKey] ?? '').trim();
+
+  if (idVal) {
+    values[idKey] = idVal;
+  } else if (!idField?.configured) {
+    values[idKey] = null;
+  }
+
+  if (secretVal) {
+    values[secretKey] = secretVal;
+  } else if (!secretField?.configured) {
+    values[secretKey] = null;
+  }
+
+  return values;
 }
 
 function redirectReasonMessage(
@@ -120,6 +267,25 @@ function formatSaveErrorMessage(
   return t('settings:dalton.deploymentCredentials.errSaveGeneric');
 }
 
+function formatProbeErrorMessage(
+  parsed: ParsedDeploymentSettingsError,
+  t: (key: string) => string,
+): string {
+  if (parsed.isTimeout) {
+    return t('settings:dalton.deploymentCredentials.probeClientTimeout');
+  }
+  if (parsed.isNetworkError) {
+    return t('settings:dalton.deploymentCredentials.probeRequestNetworkError');
+  }
+  if (parsed.status === 401 || parsed.status === 403) {
+    return t('settings:dalton.deploymentCredentials.probeAuthError');
+  }
+  if (parsed.status === 422) {
+    return t('settings:dalton.deploymentCredentials.probeFormatInvalid');
+  }
+  return t('settings:dalton.deploymentCredentials.errProbeGeneric');
+}
+
 function formatProbeMessage(
   result: DeploymentCredentialProbeResponse,
   t: (key: string) => string,
@@ -131,6 +297,12 @@ function formatProbeMessage(
     };
   }
   if (result.verdict === 'network_error') {
+    if (result.detail_code === 'network_timeout' || result.detail_code === 'probe_timeout') {
+      return {
+        tone: 'error',
+        text: t('settings:dalton.deploymentCredentials.probeTimeout'),
+      };
+    }
     return {
       tone: 'error',
       text: t('settings:dalton.deploymentCredentials.probeNetworkError'),
@@ -301,7 +473,7 @@ export default function DaltonDeploymentCredentialsPanel() {
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const identity = useCallerIdentity();
-  const { profile } = useCapabilities();
+  const { profile, brandName } = useCapabilities();
   const baseId = useId();
 
   const isOssMode =
@@ -319,15 +491,22 @@ export default function DaltonDeploymentCredentialsPanel() {
     retry: false,
   });
 
-  // Draft values keyed by env name (undefined means untouched; user edits populate string).
+  // Draft values keyed by env name (inputs always stay unprefilled; drafts hold only user edits).
   const [drafts, setDrafts] = useState<Record<string, string>>({});
+  // Each edited group records the revision active when editing began so concurrent saves never bypass 409.
+  const [draftBaseRevisions, setDraftBaseRevisions] = useState<
+    Partial<Record<EditableGroup, number>>
+  >({});
   const [statusNotice, setStatusNotice] = useState<{
     tone: 'success' | 'error' | 'warning' | 'info';
     text: string;
     showRefresh?: boolean;
   } | null>(null);
   const [probeResults, setProbeResults] = useState<
-    Partial<Record<ProbeTarget, DeploymentCredentialProbeResponse>>
+    Partial<Record<ProbeTarget, { revision: number; result: DeploymentCredentialProbeResponse }>>
+  >({});
+  const [probeErrors, setProbeErrors] = useState<
+    Partial<Record<ProbeTarget, { revision: number; text: string }>>
   >({});
   const [probingTarget, setProbingTarget] = useState<ProbeTarget | null>(null);
 
@@ -335,13 +514,25 @@ export default function DaltonDeploymentCredentialsPanel() {
     mutationFn: (payload: Parameters<typeof updateDeploymentSettings>[0]) =>
       updateDeploymentSettings(payload),
     onSuccess: (res, variables) => {
+      const touchedGroups = new Set<EditableGroup>();
       setDrafts((prev) => {
         const next = { ...prev };
         for (const key of Object.keys(variables.values)) {
           delete next[key];
+          const grp = FIELD_TO_GROUP[key];
+          if (grp) touchedGroups.add(grp);
         }
         return next;
       });
+      if (touchedGroups.size > 0) {
+        setDraftBaseRevisions((prev) => {
+          const next = { ...prev };
+          for (const grp of touchedGroups) {
+            delete next[grp];
+          }
+          return next;
+        });
+      }
       if (res.pending_apply) {
         setStatusNotice({
           tone: 'warning',
@@ -433,64 +624,116 @@ export default function DaltonDeploymentCredentialsPanel() {
     (f) => f.input_kind === 'boolean' || f.input_kind === 'boolean_one',
   );
 
-  const effectiveProfile = data.profile ?? profile;
+  // Profile and brand always come from the single frontend capability source (`useCapabilities()`).
   const profileLabel =
-    effectiveProfile === 'core'
+    profile === 'core'
       ? t('settings:dalton.deploymentCredentials.profileCore')
-      : t('settings:dalton.deploymentCredentials.profileManaged');
+      : brandName;
 
-  const getTextValue = (field: DeploymentSettingField | undefined): string => {
-    if (!field) return '';
-    if (Object.hasOwn(drafts, field.name)) return drafts[field.name];
-    return field.value ?? '';
+  const getDraftValue = (name: string): string => drafts[name] ?? '';
+
+  const clearProbeStateForGroup = (group: EditableGroup) => {
+    if (group === 'google_oauth' || group === 'feishu_app') {
+      setProbeResults((prev) => {
+        if (!prev[group]) return prev;
+        const next = { ...prev };
+        delete next[group];
+        return next;
+      });
+      setProbeErrors((prev) => {
+        if (!prev[group]) return prev;
+        const next = { ...prev };
+        delete next[group];
+        return next;
+      });
+    }
   };
-
-  const getSecretDraft = (name: string): string => drafts[name] ?? '';
 
   const setDraft = (name: string, val: string) => {
+    const group = FIELD_TO_GROUP[name];
     setDrafts((prev) => ({ ...prev, [name]: val }));
+    if (group) {
+      setDraftBaseRevisions((prev) =>
+        prev[group] === undefined ? { ...prev, [group]: data.revision } : prev,
+      );
+      clearProbeStateForGroup(group);
+    }
   };
+
+  const isGroupDraftStale = (group: EditableGroup): boolean => {
+    const baseRev = draftBaseRevisions[group];
+    return baseRev !== undefined && baseRev !== data.revision;
+  };
+
+  const discardGroupDraft = (group: EditableGroup) => {
+    setDrafts((prev) => {
+      const next = { ...prev };
+      for (const key of GROUP_FIELDS[group]) {
+        delete next[key];
+      }
+      return next;
+    });
+    setDraftBaseRevisions((prev) => {
+      const next = { ...prev };
+      delete next[group];
+      return next;
+    });
+    clearProbeStateForGroup(group);
+  };
+
+  const rebaselineGroupDraft = (group: EditableGroup) => {
+    setDraftBaseRevisions((prev) => ({ ...prev, [group]: data.revision }));
+    clearProbeStateForGroup(group);
+  };
+
+  const googleDraftStale = isGroupDraftStale('google_oauth');
+  const feishuAppDraftStale = isGroupDraftStale('feishu_app');
+  const feishuEventDraftStale = isGroupDraftStale('feishu_event');
 
   const handleSaveGoogle = () => {
     setStatusNotice(null);
-    const values: Record<string, string | null> = {};
-    const idVal = getTextValue(googleIdField).trim();
-    const secretVal = getSecretDraft(GOOGLE_SECRET_KEY).trim();
-    values[GOOGLE_ID_KEY] = idVal || null;
-    if (secretVal) {
-      values[GOOGLE_SECRET_KEY] = secretVal;
-    } else if (!googleSecretField?.configured) {
-      values[GOOGLE_SECRET_KEY] = null;
-    }
-    saveMutation.mutate({ expected_revision: data.revision, values });
+    const values = buildPairedGroupPayload(
+      GOOGLE_ID_KEY,
+      GOOGLE_SECRET_KEY,
+      googleIdField,
+      googleSecretField,
+      drafts,
+    );
+    saveMutation.mutate({
+      expected_revision: draftBaseRevisions.google_oauth ?? data.revision,
+      values,
+    });
   };
 
   const handleClearGoogle = () => {
     setStatusNotice(null);
+    clearProbeStateForGroup('google_oauth');
     saveMutation.mutate({
-      expected_revision: data.revision,
+      expected_revision: draftBaseRevisions.google_oauth ?? data.revision,
       values: { [GOOGLE_ID_KEY]: null, [GOOGLE_SECRET_KEY]: null },
     });
   };
 
   const handleSaveFeishuApp = () => {
     setStatusNotice(null);
-    const values: Record<string, string | null> = {};
-    const idVal = getTextValue(feishuIdField).trim();
-    const secretVal = getSecretDraft(FEISHU_APP_SECRET_KEY).trim();
-    values[FEISHU_APP_ID_KEY] = idVal || null;
-    if (secretVal) {
-      values[FEISHU_APP_SECRET_KEY] = secretVal;
-    } else if (!feishuSecretField?.configured) {
-      values[FEISHU_APP_SECRET_KEY] = null;
-    }
-    saveMutation.mutate({ expected_revision: data.revision, values });
+    const values = buildPairedGroupPayload(
+      FEISHU_APP_ID_KEY,
+      FEISHU_APP_SECRET_KEY,
+      feishuIdField,
+      feishuSecretField,
+      drafts,
+    );
+    saveMutation.mutate({
+      expected_revision: draftBaseRevisions.feishu_app ?? data.revision,
+      values,
+    });
   };
 
   const handleClearFeishuApp = () => {
     setStatusNotice(null);
+    clearProbeStateForGroup('feishu_app');
     saveMutation.mutate({
-      expected_revision: data.revision,
+      expected_revision: draftBaseRevisions.feishu_app ?? data.revision,
       values: { [FEISHU_APP_ID_KEY]: null, [FEISHU_APP_SECRET_KEY]: null },
     });
   };
@@ -498,45 +741,60 @@ export default function DaltonDeploymentCredentialsPanel() {
   const handleSaveFeishuEvent = () => {
     setStatusNotice(null);
     const values: Record<string, string | null> = {};
-    const encVal = getSecretDraft(FEISHU_ENCRYPT_KEY).trim();
-    const verifyVal = getSecretDraft(FEISHU_VERIFY_TOKEN_KEY).trim();
+    const encVal = getDraftValue(FEISHU_ENCRYPT_KEY).trim();
+    const verifyVal = getDraftValue(FEISHU_VERIFY_TOKEN_KEY).trim();
     if (encVal) values[FEISHU_ENCRYPT_KEY] = encVal;
     if (verifyVal) values[FEISHU_VERIFY_TOKEN_KEY] = verifyVal;
     if (Object.keys(values).length === 0) return;
-    saveMutation.mutate({ expected_revision: data.revision, values });
+    saveMutation.mutate({
+      expected_revision: draftBaseRevisions.feishu_event ?? data.revision,
+      values,
+    });
   };
 
   const handleClearFeishuEvent = () => {
     setStatusNotice(null);
     saveMutation.mutate({
-      expected_revision: data.revision,
+      expected_revision: draftBaseRevisions.feishu_event ?? data.revision,
       values: { [FEISHU_ENCRYPT_KEY]: null, [FEISHU_VERIFY_TOKEN_KEY]: null },
     });
   };
 
   const handleRunProbe = async (target: ProbeTarget) => {
+    const requestRevision = data.revision;
     setProbingTarget(target);
+    clearProbeStateForGroup(target);
     try {
-      const probeDraft: Record<string, string | null> = {};
-      if (target === 'google_oauth') {
-        const draftId = drafts[GOOGLE_ID_KEY]?.trim();
-        const draftSecret = drafts[GOOGLE_SECRET_KEY]?.trim();
-        if (draftId) probeDraft[GOOGLE_ID_KEY] = draftId;
-        if (draftSecret) probeDraft[GOOGLE_SECRET_KEY] = draftSecret;
-      } else {
-        const draftId = drafts[FEISHU_APP_ID_KEY]?.trim();
-        const draftSecret = drafts[FEISHU_APP_SECRET_KEY]?.trim();
-        if (draftId) probeDraft[FEISHU_APP_ID_KEY] = draftId;
-        if (draftSecret) probeDraft[FEISHU_APP_SECRET_KEY] = draftSecret;
-      }
-      const res = await testDeploymentCredentials(target, probeDraft);
-      setProbeResults((prev) => ({ ...prev, [target]: res }));
+      const probePayload =
+        target === 'google_oauth'
+          ? buildPairedGroupPayload(
+              GOOGLE_ID_KEY,
+              GOOGLE_SECRET_KEY,
+              googleIdField,
+              googleSecretField,
+              drafts,
+            )
+          : buildPairedGroupPayload(
+              FEISHU_APP_ID_KEY,
+              FEISHU_APP_SECRET_KEY,
+              feishuIdField,
+              feishuSecretField,
+              drafts,
+            );
+      const res = await testDeploymentCredentials(target, probePayload);
+      setProbeResults((prev) => ({
+        ...prev,
+        [target]: { revision: requestRevision, result: res },
+      }));
     } catch (err) {
       const parsed = parseDeploymentSettingsError(err);
-      setStatusNotice({
-        tone: 'error',
-        text: formatSaveErrorMessage(parsed, t),
-      });
+      setProbeErrors((prev) => ({
+        ...prev,
+        [target]: {
+          revision: requestRevision,
+          text: formatProbeErrorMessage(parsed, t),
+        },
+      }));
     } finally {
       setProbingTarget(null);
     }
@@ -567,8 +825,64 @@ export default function DaltonDeploymentCredentialsPanel() {
   };
 
   const isZh = i18n.language.startsWith('zh');
-  const googleProbe = probeResults.google_oauth;
-  const feishuProbe = probeResults.feishu_app;
+  // Probe outputs automatically expire whenever the server revision advances.
+  const googleProbe =
+    probeResults.google_oauth?.revision === data.revision
+      ? probeResults.google_oauth.result
+      : undefined;
+  const googleProbeError =
+    probeErrors.google_oauth?.revision === data.revision
+      ? probeErrors.google_oauth.text
+      : undefined;
+  const feishuProbe =
+    probeResults.feishu_app?.revision === data.revision
+      ? probeResults.feishu_app.result
+      : undefined;
+  const feishuProbeError =
+    probeErrors.feishu_app?.revision === data.revision
+      ? probeErrors.feishu_app.text
+      : undefined;
+
+  const renderStaleDraftBanner = (group: EditableGroup) => {
+    const baseRev = draftBaseRevisions[group];
+    if (baseRev === undefined || baseRev === data.revision) return null;
+    return (
+      <DaltonInlineNotice tone="warning" testId={`${group}-stale-draft-notice`}>
+        <div className="space-y-2">
+          <div>
+            {t('settings:dalton.deploymentCredentials.staleDraftNotice', {
+              current: data.revision,
+              base: baseRev,
+            })}
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 text-xs"
+              data-testid={`${group}-discard-draft-btn`}
+              onClick={() => discardGroupDraft(group)}
+            >
+              {t('settings:dalton.deploymentCredentials.discardDraft')}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 text-xs"
+              data-testid={`${group}-rebase-draft-btn`}
+              onClick={() => rebaselineGroupDraft(group)}
+            >
+              {t('settings:dalton.deploymentCredentials.confirmDraftRebase', {
+                revision: data.revision,
+              })}
+            </Button>
+          </div>
+        </div>
+      </DaltonInlineNotice>
+    );
+  };
 
   return (
     <div id="dalton-deployment-credentials" className="space-y-6" data-testid="deployment-credentials-panel">
@@ -655,12 +969,21 @@ export default function DaltonDeploymentCredentialsPanel() {
         title={t('settings:dalton.deploymentCredentials.googleTitle')}
         description={t('settings:dalton.deploymentCredentials.googleDesc')}
         action={
-          <DaltonStatusBadge
-            tone={SOURCE_TONE[googleSource]}
-            dot
-            label={sourceBadgeLabel(googleSource, t)}
-            testId="google-oauth-source-badge"
-          />
+          <div className="flex flex-wrap items-center gap-1.5">
+            {booleanFields.length === 0 && (
+              <DaltonStatusBadge
+                tone="neutral"
+                label={t('settings:dalton.deploymentCredentials.personalConnectorComingSoonBadge')}
+                testId="google-connector-availability-badge"
+              />
+            )}
+            <DaltonStatusBadge
+              tone={SOURCE_TONE[googleSource]}
+              dot
+              label={sourceBadgeLabel(googleSource, t)}
+              testId="google-oauth-source-badge"
+            />
+          </div>
         }
       >
         <div className="space-y-4">
@@ -675,55 +998,79 @@ export default function DaltonDeploymentCredentialsPanel() {
             </DaltonInlineNotice>
           )}
 
+          {booleanFields.length === 0 && (
+            <p className="text-xs text-[var(--color-text-tertiary)]" data-testid="google-callback-availability-hint">
+              {t('settings:dalton.deploymentCredentials.googleCallbackComingSoonHint')}
+            </p>
+          )}
+
           <CopyableUrlRow
             label={t('settings:dalton.deploymentCredentials.googleCallbackLabel')}
             url={data.redirect_uris.google}
             testId="google-redirect-uri"
           />
 
+          {renderStaleDraftBanner('google_oauth')}
+
           <div className="grid gap-3 sm:grid-cols-2">
             <div className="space-y-1">
-              <label
-                htmlFor={`${baseId}-google-id`}
-                className="text-xs font-medium text-[var(--color-text-secondary)]"
-              >
-                {isZh
-                  ? (googleIdField?.label_zh ?? 'Google OAuth 客户端 ID')
-                  : (googleIdField?.label_en ?? 'Google OAuth Client ID')}
-              </label>
+              <div className="flex flex-wrap items-center justify-between gap-1.5">
+                <label
+                  htmlFor={`${baseId}-google-id`}
+                  className="text-xs font-medium text-[var(--color-text-secondary)]"
+                >
+                  {isZh
+                    ? (googleIdField?.label_zh ?? 'Google OAuth 客户端 ID')
+                    : (googleIdField?.label_en ?? 'Google OAuth Client ID')}
+                </label>
+                <FieldStatusBadge
+                  field={googleIdField}
+                  testId={`field-status-${GOOGLE_ID_KEY}`}
+                />
+              </div>
               <Input
                 id={`${baseId}-google-id`}
                 type="text"
-                value={getTextValue(googleIdField)}
+                value={getDraftValue(GOOGLE_ID_KEY)}
                 disabled={googleReadonly || saveMutation.isPending}
                 onChange={(e) => setDraft(GOOGLE_ID_KEY, e.target.value)}
-                placeholder="1234567890-xxxx.apps.googleusercontent.com"
+                placeholder={resolveFieldPlaceholder(googleIdField, {
+                  readonly: googleReadonly,
+                  secret: false,
+                  emptyPlaceholder: '1234567890-xxxx.apps.googleusercontent.com',
+                  t,
+                })}
                 autoComplete="off"
                 data-testid="input-google-client-id"
               />
             </div>
             <div className="space-y-1">
-              <label
-                htmlFor={`${baseId}-google-secret`}
-                className="text-xs font-medium text-[var(--color-text-secondary)]"
-              >
-                {isZh
-                  ? (googleSecretField?.label_zh ?? 'Google OAuth 客户端密钥')
-                  : (googleSecretField?.label_en ?? 'Google OAuth Client Secret')}
-              </label>
+              <div className="flex flex-wrap items-center justify-between gap-1.5">
+                <label
+                  htmlFor={`${baseId}-google-secret`}
+                  className="text-xs font-medium text-[var(--color-text-secondary)]"
+                >
+                  {isZh
+                    ? (googleSecretField?.label_zh ?? 'Google OAuth 客户端密钥')
+                    : (googleSecretField?.label_en ?? 'Google OAuth Client Secret')}
+                </label>
+                <FieldStatusBadge
+                  field={googleSecretField}
+                  testId={`field-status-${GOOGLE_SECRET_KEY}`}
+                />
+              </div>
               <Input
                 id={`${baseId}-google-secret`}
                 type="password"
-                value={getSecretDraft(GOOGLE_SECRET_KEY)}
+                value={getDraftValue(GOOGLE_SECRET_KEY)}
                 disabled={googleReadonly || saveMutation.isPending}
                 onChange={(e) => setDraft(GOOGLE_SECRET_KEY, e.target.value)}
-                placeholder={
-                  googleReadonly
-                    ? '••••••••'
-                    : googleSecretField?.configured
-                      ? t('settings:dalton.deploymentCredentials.secretSavedPlaceholder')
-                      : t('settings:dalton.deploymentCredentials.secretEmptyPlaceholder')
-                }
+                placeholder={resolveFieldPlaceholder(googleSecretField, {
+                  readonly: googleReadonly,
+                  secret: true,
+                  emptyPlaceholder: t('settings:dalton.deploymentCredentials.secretEmptyPlaceholder'),
+                  t,
+                })}
                 autoComplete="new-password"
                 data-testid="input-google-client-secret"
               />
@@ -734,7 +1081,7 @@ export default function DaltonDeploymentCredentialsPanel() {
             <Button
               type="button"
               size="sm"
-              disabled={googleReadonly || saveMutation.isPending}
+              disabled={googleReadonly || googleDraftStale || saveMutation.isPending}
               onClick={handleSaveGoogle}
               data-testid="save-google-oauth-btn"
             >
@@ -761,7 +1108,7 @@ export default function DaltonDeploymentCredentialsPanel() {
                 type="button"
                 variant="ghost"
                 size="sm"
-                disabled={saveMutation.isPending}
+                disabled={googleDraftStale || saveMutation.isPending}
                 onClick={handleClearGoogle}
                 data-testid="clear-google-oauth-btn"
               >
@@ -778,6 +1125,11 @@ export default function DaltonDeploymentCredentialsPanel() {
               {formatProbeMessage(googleProbe, t).text}
             </DaltonInlineNotice>
           )}
+          {googleProbeError && (
+            <DaltonInlineNotice tone="error" testId="google-oauth-probe-error">
+              {googleProbeError}
+            </DaltonInlineNotice>
+          )}
         </div>
       </DaltonSettingsCard>
 
@@ -788,16 +1140,30 @@ export default function DaltonDeploymentCredentialsPanel() {
         title={t('settings:dalton.deploymentCredentials.feishuTitle')}
         description={t('settings:dalton.deploymentCredentials.feishuDesc')}
         action={
-          <DaltonStatusBadge
-            tone={SOURCE_TONE[feishuAppSource]}
-            dot
-            label={sourceBadgeLabel(feishuAppSource, t)}
-            testId="feishu-app-source-badge"
-          />
+          <div className="flex flex-wrap items-center gap-1.5">
+            {booleanFields.length === 0 && (
+              <DaltonStatusBadge
+                tone="neutral"
+                label={t('settings:dalton.deploymentCredentials.personalConnectorComingSoonBadge')}
+                testId="feishu-connector-availability-badge"
+              />
+            )}
+            <DaltonStatusBadge
+              tone={SOURCE_TONE[feishuAppSource]}
+              dot
+              label={sourceBadgeLabel(feishuAppSource, t)}
+              testId="feishu-app-source-badge"
+            />
+          </div>
         }
       >
         <div className="space-y-5">
           <div className="space-y-3">
+            {booleanFields.length === 0 && (
+              <p className="text-xs text-[var(--color-text-tertiary)]" data-testid="feishu-callback-availability-hint">
+                {t('settings:dalton.deploymentCredentials.feishuCallbackComingSoonHint')}
+              </p>
+            )}
             <CopyableUrlRow
               label={t('settings:dalton.deploymentCredentials.feishuCallbackLabel')}
               url={data.redirect_uris.feishu}
@@ -825,49 +1191,68 @@ export default function DaltonDeploymentCredentialsPanel() {
             <div className="text-xs font-medium text-[var(--color-text-primary)]">
               {t('settings:dalton.deploymentCredentials.feishuAppGroupTitle')}
             </div>
+
+            {renderStaleDraftBanner('feishu_app')}
+
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="space-y-1">
-                <label
-                  htmlFor={`${baseId}-feishu-id`}
-                  className="text-xs font-medium text-[var(--color-text-secondary)]"
-                >
-                  {isZh
-                    ? (feishuIdField?.label_zh ?? '飞书应用 App ID')
-                    : (feishuIdField?.label_en ?? 'Feishu App ID')}
-                </label>
+                <div className="flex flex-wrap items-center justify-between gap-1.5">
+                  <label
+                    htmlFor={`${baseId}-feishu-id`}
+                    className="text-xs font-medium text-[var(--color-text-secondary)]"
+                  >
+                    {isZh
+                      ? (feishuIdField?.label_zh ?? '飞书应用 App ID')
+                      : (feishuIdField?.label_en ?? 'Feishu App ID')}
+                  </label>
+                  <FieldStatusBadge
+                    field={feishuIdField}
+                    testId={`field-status-${FEISHU_APP_ID_KEY}`}
+                  />
+                </div>
                 <Input
                   id={`${baseId}-feishu-id`}
                   type="text"
-                  value={feishuAppSource === 'vault_error' ? '' : getTextValue(feishuIdField)}
+                  value={getDraftValue(FEISHU_APP_ID_KEY)}
                   disabled={feishuAppReadonly || saveMutation.isPending}
                   onChange={(e) => setDraft(FEISHU_APP_ID_KEY, e.target.value)}
-                  placeholder={feishuAppSource === 'vault_error' ? '—' : 'cli_xxxxxxxxxxxxxxxx'}
+                  placeholder={resolveFieldPlaceholder(feishuIdField, {
+                    readonly: feishuAppReadonly,
+                    secret: false,
+                    emptyPlaceholder: 'cli_xxxxxxxxxxxxxxxx',
+                    t,
+                  })}
                   autoComplete="off"
                   data-testid="input-feishu-app-id"
                 />
               </div>
               <div className="space-y-1">
-                <label
-                  htmlFor={`${baseId}-feishu-secret`}
-                  className="text-xs font-medium text-[var(--color-text-secondary)]"
-                >
-                  {isZh
-                    ? (feishuSecretField?.label_zh ?? '飞书应用 App Secret')
-                    : (feishuSecretField?.label_en ?? 'Feishu App Secret')}
-                </label>
+                <div className="flex flex-wrap items-center justify-between gap-1.5">
+                  <label
+                    htmlFor={`${baseId}-feishu-secret`}
+                    className="text-xs font-medium text-[var(--color-text-secondary)]"
+                  >
+                    {isZh
+                      ? (feishuSecretField?.label_zh ?? '飞书应用 App Secret')
+                      : (feishuSecretField?.label_en ?? 'Feishu App Secret')}
+                  </label>
+                  <FieldStatusBadge
+                    field={feishuSecretField}
+                    testId={`field-status-${FEISHU_APP_SECRET_KEY}`}
+                  />
+                </div>
                 <Input
                   id={`${baseId}-feishu-secret`}
                   type="password"
-                  value={getSecretDraft(FEISHU_APP_SECRET_KEY)}
+                  value={getDraftValue(FEISHU_APP_SECRET_KEY)}
                   disabled={feishuAppReadonly || saveMutation.isPending}
                   onChange={(e) => setDraft(FEISHU_APP_SECRET_KEY, e.target.value)}
-                  placeholder={
-                    feishuAppReadonly
-                      ? '••••••••'
-                      : feishuSecretField?.configured
-                        ? t('settings:dalton.deploymentCredentials.secretSavedPlaceholder')
-                        : t('settings:dalton.deploymentCredentials.secretEmptyPlaceholder')
-                  }
+                  placeholder={resolveFieldPlaceholder(feishuSecretField, {
+                    readonly: feishuAppReadonly,
+                    secret: true,
+                    emptyPlaceholder: t('settings:dalton.deploymentCredentials.secretEmptyPlaceholder'),
+                    t,
+                  })}
                   autoComplete="new-password"
                   data-testid="input-feishu-app-secret"
                 />
@@ -878,7 +1263,7 @@ export default function DaltonDeploymentCredentialsPanel() {
               <Button
                 type="button"
                 size="sm"
-                disabled={feishuAppReadonly || saveMutation.isPending}
+                disabled={feishuAppReadonly || feishuAppDraftStale || saveMutation.isPending}
                 onClick={handleSaveFeishuApp}
                 data-testid="save-feishu-app-btn"
               >
@@ -909,7 +1294,7 @@ export default function DaltonDeploymentCredentialsPanel() {
                   type="button"
                   variant="ghost"
                   size="sm"
-                  disabled={saveMutation.isPending}
+                  disabled={feishuAppDraftStale || saveMutation.isPending}
                   onClick={handleClearFeishuApp}
                   data-testid="clear-feishu-app-btn"
                 >
@@ -924,6 +1309,11 @@ export default function DaltonDeploymentCredentialsPanel() {
                 testId="feishu-app-probe-result"
               >
                 {formatProbeMessage(feishuProbe, t).text}
+              </DaltonInlineNotice>
+            )}
+            {feishuProbeError && (
+              <DaltonInlineNotice tone="error" testId="feishu-app-probe-error">
+                {feishuProbeError}
               </DaltonInlineNotice>
             )}
           </div>
@@ -949,55 +1339,67 @@ export default function DaltonDeploymentCredentialsPanel() {
               />
             </div>
 
+            {renderStaleDraftBanner('feishu_event')}
+
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="space-y-1">
-                <label
-                  htmlFor={`${baseId}-feishu-encrypt`}
-                  className="text-xs font-medium text-[var(--color-text-secondary)]"
-                >
-                  {isZh
-                    ? (feishuEncryptField?.label_zh ?? '飞书事件加密密钥（Encrypt Key）')
-                    : (feishuEncryptField?.label_en ?? 'Feishu Event Encrypt Key')}
-                </label>
+                <div className="flex flex-wrap items-center justify-between gap-1.5">
+                  <label
+                    htmlFor={`${baseId}-feishu-encrypt`}
+                    className="text-xs font-medium text-[var(--color-text-secondary)]"
+                  >
+                    {isZh
+                      ? (feishuEncryptField?.label_zh ?? '飞书事件加密密钥（Encrypt Key）')
+                      : (feishuEncryptField?.label_en ?? 'Feishu Event Encrypt Key')}
+                  </label>
+                  <FieldStatusBadge
+                    field={feishuEncryptField}
+                    testId={`field-status-${FEISHU_ENCRYPT_KEY}`}
+                  />
+                </div>
                 <Input
                   id={`${baseId}-feishu-encrypt`}
                   type="password"
-                  value={getSecretDraft(FEISHU_ENCRYPT_KEY)}
+                  value={getDraftValue(FEISHU_ENCRYPT_KEY)}
                   disabled={feishuEventReadonly || saveMutation.isPending}
                   onChange={(e) => setDraft(FEISHU_ENCRYPT_KEY, e.target.value)}
-                  placeholder={
-                    feishuEventReadonly
-                      ? '••••••••'
-                      : feishuEncryptField?.configured
-                        ? t('settings:dalton.deploymentCredentials.secretSavedPlaceholder')
-                        : t('settings:dalton.deploymentCredentials.secretEmptyPlaceholder')
-                  }
+                  placeholder={resolveFieldPlaceholder(feishuEncryptField, {
+                    readonly: feishuEventReadonly,
+                    secret: true,
+                    emptyPlaceholder: t('settings:dalton.deploymentCredentials.secretEmptyPlaceholder'),
+                    t,
+                  })}
                   autoComplete="new-password"
                   data-testid="input-feishu-encrypt-key"
                 />
               </div>
               <div className="space-y-1">
-                <label
-                  htmlFor={`${baseId}-feishu-verify`}
-                  className="text-xs font-medium text-[var(--color-text-secondary)]"
-                >
-                  {isZh
-                    ? (feishuVerifyField?.label_zh ?? '飞书事件验证令牌（Verification Token）')
-                    : (feishuVerifyField?.label_en ?? 'Feishu Event Verification Token')}
-                </label>
+                <div className="flex flex-wrap items-center justify-between gap-1.5">
+                  <label
+                    htmlFor={`${baseId}-feishu-verify`}
+                    className="text-xs font-medium text-[var(--color-text-secondary)]"
+                  >
+                    {isZh
+                      ? (feishuVerifyField?.label_zh ?? '飞书事件验证令牌（Verification Token）')
+                      : (feishuVerifyField?.label_en ?? 'Feishu Event Verification Token')}
+                  </label>
+                  <FieldStatusBadge
+                    field={feishuVerifyField}
+                    testId={`field-status-${FEISHU_VERIFY_TOKEN_KEY}`}
+                  />
+                </div>
                 <Input
                   id={`${baseId}-feishu-verify`}
                   type="password"
-                  value={getSecretDraft(FEISHU_VERIFY_TOKEN_KEY)}
+                  value={getDraftValue(FEISHU_VERIFY_TOKEN_KEY)}
                   disabled={feishuEventReadonly || saveMutation.isPending}
                   onChange={(e) => setDraft(FEISHU_VERIFY_TOKEN_KEY, e.target.value)}
-                  placeholder={
-                    feishuEventReadonly
-                      ? '••••••••'
-                      : feishuVerifyField?.configured
-                        ? t('settings:dalton.deploymentCredentials.secretSavedPlaceholder')
-                        : t('settings:dalton.deploymentCredentials.secretEmptyPlaceholder')
-                  }
+                  placeholder={resolveFieldPlaceholder(feishuVerifyField, {
+                    readonly: feishuEventReadonly,
+                    secret: true,
+                    emptyPlaceholder: t('settings:dalton.deploymentCredentials.secretEmptyPlaceholder'),
+                    t,
+                  })}
                   autoComplete="new-password"
                   data-testid="input-feishu-verify-token"
                 />
@@ -1010,9 +1412,10 @@ export default function DaltonDeploymentCredentialsPanel() {
                 size="sm"
                 disabled={
                   feishuEventReadonly ||
+                  feishuEventDraftStale ||
                   saveMutation.isPending ||
-                  (!getSecretDraft(FEISHU_ENCRYPT_KEY).trim() &&
-                    !getSecretDraft(FEISHU_VERIFY_TOKEN_KEY).trim())
+                  (!getDraftValue(FEISHU_ENCRYPT_KEY).trim() &&
+                    !getDraftValue(FEISHU_VERIFY_TOKEN_KEY).trim())
                 }
                 onClick={handleSaveFeishuEvent}
                 data-testid="save-feishu-event-btn"
@@ -1024,7 +1427,7 @@ export default function DaltonDeploymentCredentialsPanel() {
                   type="button"
                   variant="ghost"
                   size="sm"
-                  disabled={saveMutation.isPending}
+                  disabled={feishuEventDraftStale || saveMutation.isPending}
                   onClick={handleClearFeishuEvent}
                   data-testid="clear-feishu-event-btn"
                 >
@@ -1036,20 +1439,18 @@ export default function DaltonDeploymentCredentialsPanel() {
         </div>
       </DaltonSettingsCard>
 
-      {/* Tri-state capability switches (rendered dynamically when registered in catalog) */}
-      {booleanFields.length > 0 && (
-        <DaltonSettingsCard
-          id="deployment-credentials-switches"
-          testId="deployment-switches-card"
-          title={t('settings:dalton.deploymentCredentials.switchesTitle')}
-          description={t('settings:dalton.deploymentCredentials.switchesDesc')}
-          layout="rows"
-        >
-          {booleanFields.map((field) => {
-            const isGoogleSwitch =
-              field.name.toUpperCase().includes('GOOGLE') ||
-              field.section === 'calendar_mail';
-            const googleBlocked = isGoogleSwitch && !data.google_redirect_uri_eligible;
+      {/* Connector capability switches: live tri-state switches once registered, or coming-soon status in Batch 1 */}
+      <DaltonSettingsCard
+        id="deployment-credentials-switches"
+        testId="deployment-switches-card"
+        title={t('settings:dalton.deploymentCredentials.switchesTitle')}
+        description={t('settings:dalton.deploymentCredentials.switchesDesc')}
+        layout="rows"
+      >
+        {booleanFields.length > 0 ? (
+          booleanFields.map((field) => {
+            const googleBlocked =
+              isGoogleConnectorSwitch(field) && !data.google_redirect_uri_eligible;
             const checked = field.value === 'true' || field.value === '1';
             const disabled = field.readonly || googleBlocked || saveMutation.isPending;
             const label = isZh ? field.label_zh : field.label_en;
@@ -1096,9 +1497,70 @@ export default function DaltonDeploymentCredentialsPanel() {
                 </div>
               </div>
             );
-          })}
-        </DaltonSettingsCard>
-      )}
+          })
+        ) : (
+          <>
+            <div
+              className="settings-row is-inline"
+              data-testid="switch-row-coming-soon-google"
+            >
+              <div className="settings-row-text">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="settings-row-label">
+                    {t('settings:dalton.deploymentCredentials.switchGoogleCalendarLabel')}
+                  </span>
+                  <DaltonStatusBadge
+                    tone="neutral"
+                    label={t('settings:dalton.deploymentCredentials.comingSoonBadge')}
+                  />
+                </div>
+                <p className="settings-row-desc">
+                  {!data.google_redirect_uri_eligible
+                    ? t('settings:dalton.deploymentCredentials.googleSwitchDisabledHint')
+                    : t('settings:dalton.deploymentCredentials.switchGoogleCalendarDesc')}
+                </p>
+              </div>
+              <div className="settings-row-control">
+                <ToggleSwitch
+                  id={`${baseId}-sw-google-coming-soon`}
+                  checked={false}
+                  disabled
+                  ariaLabel={t('settings:dalton.deploymentCredentials.switchGoogleCalendarLabel')}
+                  onChange={() => {}}
+                />
+              </div>
+            </div>
+            <div
+              className="settings-row is-inline"
+              data-testid="switch-row-coming-soon-feishu"
+            >
+              <div className="settings-row-text">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="settings-row-label">
+                    {t('settings:dalton.deploymentCredentials.switchFeishuCalendarLabel')}
+                  </span>
+                  <DaltonStatusBadge
+                    tone="neutral"
+                    label={t('settings:dalton.deploymentCredentials.comingSoonBadge')}
+                  />
+                </div>
+                <p className="settings-row-desc">
+                  {t('settings:dalton.deploymentCredentials.switchFeishuCalendarDesc')}
+                </p>
+              </div>
+              <div className="settings-row-control">
+                <ToggleSwitch
+                  id={`${baseId}-sw-feishu-coming-soon`}
+                  checked={false}
+                  disabled
+                  ariaLabel={t('settings:dalton.deploymentCredentials.switchFeishuCalendarLabel')}
+                  onChange={() => {}}
+                />
+              </div>
+            </div>
+          </>
+        )}
+      </DaltonSettingsCard>
     </div>
   );
 }

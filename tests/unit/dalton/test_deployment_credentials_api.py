@@ -1453,3 +1453,70 @@ class TestDeploymentCredentialProbes:
             "detail_code": "vault_error",
         }
         mock_http_unused.post.assert_not_awaited()
+
+    def test_probe_explicit_null_draft_clears_existing_value_and_total_timeout_caps_pre_resolution(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import asyncio
+        import httpx
+
+        _patch_local_admin(monkeypatch, is_admin=True)
+        fake_store = _FakeEncryptedStore(
+            revision=3,
+            rows={
+                "DALTON_GOOGLE_OAUTH_CLIENT_ID": "google-saved-id.apps.googleusercontent.com",
+                "DALTON_GOOGLE_OAUTH_CLIENT_SECRET": FAKE_GOOGLE_SECRET,
+            },
+        )
+        monkeypatch.setattr(dc_store, "get_db_connection", fake_store.make_get_db_connection())
+        client = _make_client()
+
+        # 1) Passing explicit null for an existing saved ID refuses fallback to old ID (matches PUT 422)
+        mock_http_unused = self._patch_probe_client(
+            monkeypatch, response=httpx.Response(400, json={"error": "invalid_grant"})
+        )
+        resp_cleared = client.post(
+            f"{ENDPOINT}/test",
+            json={
+                "target": "google_oauth",
+                "values": {"DALTON_GOOGLE_OAUTH_CLIENT_ID": None},
+            },
+        )
+        assert resp_cleared.status_code == 200
+        assert resp_cleared.json() == {
+            "ok": False,
+            "network_reachable": False,
+            "credentials_valid": None,
+            "verdict": "format_invalid",
+            "detail_code": "incomplete_credential_group",
+        }
+        mock_http_unused.post.assert_not_awaited()
+
+        # 2) Hung DB/Vault lookup hits PROBE_TOTAL_TIMEOUT_SECONDS and returns structured probe_timeout
+        async def _slow_resolve(target: dc_probes.ProbeTarget) -> tuple[dict[str, str], bool]:
+            _ = target
+            await asyncio.sleep(0.5)
+            return {}, False
+
+        monkeypatch.setattr(dc_probes, "PROBE_TOTAL_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(
+            dc_probes,
+            "_resolve_existing_group_values",
+            create_autospec(
+                dc_probes._resolve_existing_group_values,
+                side_effect=_slow_resolve,
+            ),
+        )
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            resp_timeout = client.post(f"{ENDPOINT}/test", json={"target": "google_oauth"})
+        assert resp_timeout.status_code == 200
+        assert resp_timeout.json() == {
+            "ok": False,
+            "network_reachable": False,
+            "credentials_valid": None,
+            "verdict": "network_error",
+            "detail_code": "probe_timeout",
+        }
+        _assert_no_secrets_leaked(resp_timeout.text)
+        _assert_no_secrets_leaked(caplog.text)

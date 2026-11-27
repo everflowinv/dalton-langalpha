@@ -884,6 +884,56 @@ console.log(JSON.stringify({ ok: true, links: matches }));
         assert proc.returncode == 0, f"admin-integrations check failed:\n{proc.stderr}\n{proc.stdout}"
         assert json.loads(proc.stdout.strip())["ok"] is True
 
+    def test_standalone_dockerfile_edge_copies_site_artifacts_sources_and_sets_core_profile(
+        self,
+    ) -> None:
+        """Verify Dockerfile.edge docs-builder copies every frontend file scanned by site-artifacts.mjs and sets Core profile."""
+        site_artifacts_src = (
+            REPO_ROOT / "docs-site" / "src" / "integrations" / "site-artifacts.mjs"
+        ).read_text(encoding="utf-8")
+        dockerfile_src = (
+            REPO_ROOT / "deploy" / "standalone" / "Dockerfile.edge"
+        ).read_text(encoding="utf-8")
+
+        # Extract the docs-builder stage from Dockerfile.edge
+        stage_match = re.search(
+            r"FROM\s+\S+\s+AS\s+docs-builder\b([\s\S]*?)^FROM\s+",
+            dockerfile_src,
+            flags=re.MULTILINE,
+        )
+        assert stage_match is not None, "Expected docs-builder stage in deploy/standalone/Dockerfile.edge"
+        docs_stage = stage_match.group(1)
+
+        # Extract every `path.join(repoRoot, 'web', ...)` read by collectFrontendHelpLinks
+        frontend_paths: list[str] = []
+        for m in re.finditer(
+            r"path\.join\(\s*repoRoot\s*,\s*['\"]web['\"]((?:\s*,\s*['\"][^'\"]+['\"])+)\s*\)",
+            site_artifacts_src,
+        ):
+            parts = re.findall(r"['\"]([^'\"]+)['\"]", m.group(1))
+            frontend_paths.append("web/" + "/".join(parts))
+
+        assert "web/src/lib/dalton/deploymentCredentials.ts" in frontend_paths
+        for rel_path in frontend_paths:
+            expected_copy = f"COPY {rel_path} /{rel_path}"
+            assert expected_copy in docs_stage, (
+                f"deploy/standalone/Dockerfile.edge docs-builder missing `{expected_copy}` "
+                "required by docs-site/src/integrations/site-artifacts.mjs"
+            )
+
+        # docs-builder must explicitly build the Core docs profile so Everflow blocks are stripped
+        assert re.search(r'^ARG\s+DALTON_PROFILE="core"', docs_stage, flags=re.MULTILINE)
+        assert re.search(
+            r"^ENV\s+DALTON_PROFILE=\$\{DALTON_PROFILE\}",
+            docs_stage,
+            flags=re.MULTILINE,
+        )
+        assert re.search(
+            r"^ENV\s+BRAND_NAME=\$\{VITE_BRAND_NAME\}",
+            docs_stage,
+            flags=re.MULTILINE,
+        )
+
     def test_everflow_docs_site_output_matches_pre_change_sha256_verbatim(self) -> None:
         baseline_path = (
             REPO_ROOT / "tests" / "unit" / "dalton" / "snapshots" / "everflow" / "docs_site_everflow_sha256.json"

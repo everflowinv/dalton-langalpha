@@ -63,8 +63,13 @@ RUN find src public \( -name '._*' -o -name '.DS_Store' \) -delete
 COPY web/src/config/supportLinks.ts /web/src/config/supportLinks.ts
 COPY web/src/lib/claudeCode.ts /web/src/lib/claudeCode.ts
 COPY web/src/components/Sidebar/AccountMenu.tsx /web/src/components/Sidebar/AccountMenu.tsx
+COPY web/src/lib/dalton/deploymentCredentials.ts /web/src/lib/dalton/deploymentCredentials.ts
 
+ARG DALTON_PROFILE="core"
+ARG VITE_BRAND_NAME="Dalton"
 ARG DOCS_SITE_ORIGIN=""
+ENV DALTON_PROFILE=${DALTON_PROFILE}
+ENV BRAND_NAME=${VITE_BRAND_NAME}
 ENV DOCS_SITE_ORIGIN=${DOCS_SITE_ORIGIN}
 
 RUN pnpm run build \
