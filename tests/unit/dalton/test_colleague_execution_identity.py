@@ -707,6 +707,14 @@ async def test_thread_maintenance_summarize_uses_workspace_owner_for_session_and
         "_resolver",
         create_autospec(thread_maintenance._resolver, return_value=None),
     )
+    # #875: the agent build reads the thread's fork lineage.
+    from src.server.database.conversation import threads_read as _threads_read
+
+    monkeypatch.setattr(
+        _threads_read,
+        "get_thread_metadata",
+        create_autospec(_threads_read.get_thread_metadata, return_value={}),
+    )
 
     async def _fake_resolve_turn_config(
         u_id: str, t_id: str, **kwargs: Any

@@ -40,6 +40,7 @@ def _artifact():
     from src.server.database import artifacts as artifacts_db
 
     return artifacts_db.Artifact(
+        kind="file",
         artifact_id=ARTIFACT_ID,
         code="artsw1test",
         workspace_id="ws-switch-1",

@@ -43,7 +43,7 @@ def _make_artifact(
     legacy_refused: str | None = None,
 ) -> Artifact:
     now = datetime(2026, 11, 1, tzinfo=timezone.utc)
-    return Artifact(
+    return Artifact(kind="file", 
         artifact_id="art-1",
         code=code,
         workspace_id="ws-1",

@@ -1023,6 +1023,7 @@ BACKGROUND_LOOP_REGISTRY: Mapping[str, CapabilityId | None] = MappingProxyType(
         "warm-brokerage-marks": CORE_CAPABILITY,
         "heap-settle": CORE_CAPABILITY,
         "PlatformSecretSweeper": CORE_CAPABILITY,
+        "ToolsetSweeper": CORE_CAPABILITY,
         "HookOutboxDrainer": CORE_CAPABILITY,
         "RecoveryScanner": CORE_CAPABILITY,
         "restart_drain": CORE_CAPABILITY,

@@ -85,6 +85,7 @@ def _make_monitor(**overrides: Any) -> MonitorRecord:
 def _make_artifact(**overrides: Any) -> Artifact:
     defaults: dict[str, Any] = dict(
         artifact_id=ARTIFACT_ID,
+        kind="file",
         code="moncode12345",
         workspace_id=WS_ID,
         path="report.html",
@@ -4650,6 +4651,7 @@ def _setup_legacy_migration_db(
     def _artifact_row(row: dict[str, Any]) -> dict[str, Any]:
         return {
             "artifact_id": row["artifact_id"],
+            "kind": row.get("kind", "file"),
             "code": row["code"],
             "workspace_id": row["workspace_id"],
             "path": row["path"],
@@ -4748,7 +4750,7 @@ def _setup_legacy_migration_db(
                 cur._rows = [_artifact_row(link)] if link else []
                 return
             if "INSERT INTO SHARE_LINKS AS L (CODE, WORKSPACE_ID, KIND, PATH)" in upper:
-                code, ws_id, path = params
+                code, ws_id, _kind, path = params
                 existing = _find_link_by_path(ws_id, path)
                 if existing is not None:
                     cur._rows = []
