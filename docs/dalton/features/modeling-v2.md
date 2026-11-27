@@ -1,270 +1,294 @@
-# 公司财务建模 v2 设计方案——默认格式模板、原地更新与代码拦截门禁
+# 公司财务建模 v2 设计方案——默认格式模板、原地编辑与工作流闭环核验
 
-> **状态**：设计定稿（待实施）
-> **适用形态**：同时支持 **Everflow 生产形态**（部署形态变量 `DALTON_PROFILE=everflow`）与 **独立核心安装形态**（`DALTON_PROFILE=core`，分离规范见 `docs/dalton/features/standalone-core.md`）
-> **替代与演进关系**：升级 `docs/dalton/features/modeling-skill.md` 中的工作簿编辑方式、检查定位与审查闭环；修订 `docs/dalton/archive/dev-guide/README.md` 决定记录 `L14`
+> **状态**：第 2 轮修订定稿（纳入用户 6 项补充要求，待实施）
+> **适用形态**：同时支持 **Everflow 生产形态**（部署形态配置变量 `DALTON_PROFILE=everflow`）与 **独立核心安装形态**（`DALTON_PROFILE=core`，分离规范见 `docs/dalton/features/standalone-core.md`）
+> **演进关系**：完整沿用 `plugins/dalton/skills/dalton-model/` 与 `plugins/dalton/skills/dalton-conventions/references/model-standards.md` 的全部既有建模约定，在其之上升级工作簿原地编辑工具、一致预期独立对照流程与多阶段建模工作流；同步修订 `docs/dalton/archive/dev-guide/README.md` 决定记录 `L14`
 
 ---
 
 ## 一页摘要
 
-### 1. 要解决什么问题
+### 1. 核心目标
 
-围绕用户的核心诉求——**「遵循公司默认格式建模，或在现有模型上根据新财报扩展期间、更新实际数与预测、补充和修改必要项目，保持原有格式与结构完好，且全流程无需用户额外确认」**——将财务建模从「智能体手写大型脚本整本生成 + 提示性自检」切换为**「模型指纹引导 + 原地最小化编辑 + 交付前代码硬拦截 + 异族模型独立抽查」**。
+围绕核心诉求——**「保留全部既有建模约定，按原始中国电商模型的公司工作表标准格式新建模型，或在存量模型上根据新财报扩展期间、更新实际数与预测、补充和修改必要项目，保持原有格式与公式结构完好，独立建模后再对照一致预期，并通过与报告一致的工作流检查回路保障质量，全程零额外确认步骤」**——将建模链路升级为**「模型指纹引导 + 原地最小化编辑 + 独立建模后对照一致预期 + 三层检查核验与最多两轮修改反馈回路」**。
 
 ### 2. v1 与 v2 核心机制对比
 
 | 维度 | v1 现状（`modeling-skill.md`） | v2 方案（本文） |
 |---|---|---|
-| **任务模式与交互** | 4 类场景描述分散；多公司或双目录偶发追问确认 | 收敛为**按公司默认格式新建**与**存量模型滚动更新**两种模式；自动识别模式与目标公司，**零额外确认步骤** |
-| **结构感知方式** | `model_style.py profile` 仅提取粗粒度字体/颜色统计摘要 | 开工前自动生成内部**模型指纹**（逐格公式/输入/常数分类、样式槽、列宽、行列分组、冻结窗格、条件格式、嵌入图与绘图、表顺序、期间轴与勾稽行锚点） |
-| **工作簿编辑方式** | 智能体自由编写数千行 `openpyxl`（Python 电子表格读写库）脚本，常整本重写工作簿 | **原地最小化编辑**：主路径用 `gridcraft`（`gridcraft-cli`，命令行电子表格编辑与重算引擎）插列、向右平移填充公式、格式刷套样式；回退路径加载原文件副本仅改目标格（配合 XML〔可扩展标记语言〕级扩列保留媒体部件） |
-| **质量门禁定位** | `model_scan.py` 为「提示性只读扫描、退出码恒为 `0`、不阻断交付」；契约仅调 `model_readable.py` 验文件可读 | **`model_gate.py` 代码硬拦截**：逐格对比指纹、校验版面/部件/三表勾稽/分部加总/滚存/`fullCalcOnLoad`（打开时强制全表重算属性）及第二引擎独立复算；未通过时服务端拒绝登记模型与完成交付 |
-| **交付呈现与审查** | 智能体自写 `Checks` 页与口头总结；纯模型更新无独立异族审查 | 交付回复**原样附上代码生成的检查报告**与**约 10 行关键数字变更摘要**；按 `L16` 派**不同家族模型**只读抽查，只提问题、不改文件 |
-| **单轮范围与转派** | 单轮可同时改多公司整本模型；Home（主空间）转派只传改写后的任务描述 | **一轮只更新一家公司**（非目标公司工作表锁定校验）；Home 研究总监（`Chief of Staff`）转派时**由代码自动附上用户原话** |
+| **既有建模约定** | 写在 `dalton-model` 与 `model-standards.md` 提示词中，靠智能体自觉遵守 | **100% 沿用现有建模约定**（逐条保留，见第 2 章），并将可自动判定的规则（预测期全公式、季度加总年零假设、期间覆盖跨度、空值留空、表头与最右红字备注列等）全部落实为确定性代码检查项 |
+| **默认格式来源** | 仅提供粗粒度样式常量与统计摘要 | 从**中国电商原始模型（被改坏前的版本）**提取「公司 `sheet`（工作表）标准格式」生成内置脱敏模板，双形态开箱可用且无需用户额外提供模板 |
+| **工作簿编辑方式** | 智能体自由编写大型 `openpyxl`（Python 电子表格读写库）脚本，常整本重写 `.xlsx`（Excel 电子表格工作簿） | **原地最小化编辑**：主路径用 `gridcraft`（`gridcraft-cli`，命令行电子表格原地编辑与重算工具）插列、向右填充公式、格式刷套样式；回退路径加载原文件副本配合 `XML`（可扩展标记语言）扩列定点改格 |
+| **一致预期对照** | 常在建模过程中直接向结果格填目标常数硬凑一致预期 | **先按本方驱动假设独立建模，算出结果后再对照**：代码生成分部与费用拆解差异表，超阈值（默认收入 `±5%`、利润/`EPS`〔每股收益〕`±10%`）进入一次返工复核（只调驱动假设或保留判断并附一句理由）；预测行填一致预期常数或引用一致预期参考区均列为问题交回修改 |
+| **流程编排与质量回路** | 单智能体手写 `Checks` 页 + `model_scan.py` 提示性扫描，无数字对源与异族审查 | 建成标准工作流 `workflows/company-model/`（与 `earnings-deep-update` 共用同一组阶段）：**准备 → 建模/更新与一致预期对照 → 格式与结构检查 → 历史数字核验（`PASS/FAIL`〔通过/未通过〕表）→ 不同家族模型只读审查 → 修改与复查（最多两轮）→ 交付**；两轮后仍有未通过项时照常交付，并在回复顶部原样列出剩余问题 |
+| **单轮范围与转派** | 单轮可混改多公司页签；`Home`（主空间）转派仅传改写摘要 | **一轮只更新一家公司**（多公司请求按家串行拆轮，其余公司工作表保持零改动）；研究总监（`Chief of Staff`）转派时由代码自动附上用户原话 |
 
-### 3. 分批路线与唯一待提供项
+### 3. 分批实施概览
 
-- **P0（止血与硬门禁）**：模型指纹提取器 + 14 项代码拦截检查与服务端门禁 + 一轮一家锁定 + Home 转派自动附用户原话 + 标准模型骨架提取器。
-- **P1（原地编辑引擎）**：沙箱镜像集成 `gridcraft-cli` + 原地编辑封装器 `model_edit.py` + Excel 2010 扩展条件格式（`extLst`/`x14`）丢失检测与 XML 补回 + 修订决定记录 `L14`。
-- **P2（异族审查与对源）**：修复子智能体按 `L16` 动态选不同家族模型 + 新增模型只读独立审查子智能体 + 历史披露数抽样对源核查。
-- **P3（历史数自动填充）**：法定财报结构化数据（`XBRL`〔可扩展商业报告语言〕与财报表格）→ 模型行项映射缓存 → 历史实际值与累计拆单季确定性自动填充。
-- **需要用户提供的事项**：仅**「公司默认格式模板 `.xlsx` 文件」**一项（在用户指定正式文件前，P0 先从现有标准模型自动脱敏提取默认模板骨架）。
+- **P0（指纹、默认模板提取、代码检查与工作流回路）**：从改坏前的中国电商模型提取默认格式模板 + `model_fingerprint.py` 指纹提取 + `model_check.py` 格式结构与一致预期隔离检查 + `model_consensus.py` 差异表生成 + `workflows/company-model/`（含最多两轮修改回路，并与 `earnings-deep-update` 共用阶段）+ 一轮一家锁定 + `Home` 转派附用户原话。
+- **P1（`gridcraft` 原地编辑引擎接入）**：沙箱镜像集成 `gridcraft-cli` + `model_edit.py` 优先走 `gridcraft` 脚本化原地编辑 + Excel 2010 扩展条件格式（`extLst`/`x14`）自动补回 + 修订决定记录 `L14`。
+- **P2（历史数字核验与异族模型独立审查）**：`model_audit.py` 历史披露数逐项对一手财报原文（输出 `PASS/FAIL` 表，复用报告数字核验架构）+ 修复子智能体按 `L16` 动态选不同家族模型 + 只读审查子智能体 `dalton-model-reviewer` 接入两轮修改回路。
+- **P3（历史披露数结构化自动填充）**：法定财报 `XBRL`（可扩展商业报告语言）与财报表格解析 → 模型行项映射持久化缓存 → 历史实际值与累计拆单季确定性自动回填。
 
 ---
 
 ## 1. 现状与问题（附实测证据与代码根因）
 
-### 1.1 近期真实翻车案例与实测证据
+### 1.1 近期真实案例与实测证据
 
-在中国电商多公司整本模型（连续 3 天、6 轮迭代仍不可用）及龙溪模型更新任务中，暴露出四类系统性故障：
+在中国电商多公司整本模型（连续 3 天、6 轮迭代仍无法投入使用）及龙溪模型更新任务中，暴露出四类核心故障：
 
-1. **整本重写摧毁公式链、视图结构与嵌入部件**：
-   - 智能体编写了一个约 **14 万字节**的 `openpyxl` Python 脚本，在脚本内把预测数字算成浮点数后从头写出整本 `.xlsx`（Excel 电子表格工作簿）。
-   - **公式变常数**：`v2.0` 交付件预测期出现 **917 个硬编码数字常数**，原本动态联动的收入、利润行退化为死数字。
-   - **冻结窗格严重错位**：京东主表 `Model - JD` 原冻结位置为 `xSplit=10, ySplit=2`（横向冻结 10 列、纵向冻结 2 行，即固定左侧标签/早年列与顶部两行表头），重写后错位至 `xSplit=51, ySplit=101`，打开工作表后主视口无法正常滚动阅读。
-   - **媒体与绘图大面积丢失**：工作簿内嵌入图片由 **18 张锐减至 2 张**，绘图部件（`xl/drawings/*`）由 **15 个锐减至 1 个**；全书单元格样式从头重建，且工作簿被写入 `fullCalcOnLoad=1` 掩盖未计算的空缓存值。
-2. **「对齐一致预期」时直接改写结果数字，导致集团与分部严重脱节**：
-   - 当智能体试图调整预测以贴近市场一致预期（`Consensus`，多位卖方分析师预测的统计均值）时，直接向利润结果格写入目标常数，绕过底层业务分部驱动。
-   - 结果导致 `Model - JD` 中**集团营业利润（54.7B〔十亿〕）与各业务分部营业利润加总（约 44B）相差超过 10B**，上下游计算链完全断裂。
-3. **历史披露数据大面积空缺**：
-   - 分部改口径后的新口径历史可比同期数据留空未填，资产负债表历史期核心科目空缺，模型缺乏连续可比的历史基准。
-4. **「运动员兼裁判」式自检失效，门禁形同虚设**：
-   - 工作簿内的 `Checks` 页公式与核查脚本均由同一智能体编写并自跑，仅对已填入数字的少量行做简单相等判断，在存在 917 个预测常数、10B 分部脱节、16 张图片丢失和历史表空缺的情况下，依然输出**「40/40 全通过」**。
+1. **整本重写破坏公式链与视图版面**：
+   - 智能体编写了一个约 **14 万字节**的 `openpyxl` 脚本，在 Python 中把预测数字算成浮点数后从头写出整本 `.xlsx`。
+   - **公式退化为常数**：`v2.0` 交付件预测期出现 **917 个硬编码数字常数**，原本动态联动的收入、利润行变成死数字。
+   - **冻结窗格严重错位**：京东主表 `Model - JD` 原冻结位置为 `xSplit=10, ySplit=2`（横向冻结 10 列、纵向冻结 2 行，对应 `topLeftCell="K3"`），重写后错位至 `xSplit=51, ySplit=101`，打开工作表后主视口无法正常滚动。
+   - **样式重建与未计算掩盖**：全书单元格样式从头重设，且工作簿被写入 `fullCalcOnLoad=1`（打开工作簿时强制全表重算属性）掩盖空缓存值。
+2. **「贴合一致预期」时直接改写结果行，造成集团与分部脱节**：
+   - 当智能体试图调整预测贴近市场一致预期（`Consensus`，多位卖方分析师预测的统计均值）时，直接向利润结果格写入目标常数，绕过底层业务分部驱动。
+   - `Model - JD` 中**集团营业利润（54.7B〔十亿〕）与各业务分部营业利润加总（约 44B）相差超过 10B**，上下游计算链断裂。
+3. **历史披露数据空缺且未经对源核验**：
+   - 分部改口径后的新口径历史可比同期数据留空未填，资产负债表历史核心科目缺失；已填入的历史数也缺少像研究报告 `check_draft` 那样的逐项对一手财报原文核验。
+4. **单轮自写自查，缺乏工作流级的修改闭环**：
+   - 工作簿内的 `Checks` 页与自检脚本均由同一智能体编写并自跑，在存在 917 个预测常数与 10B 分部脱节的情况下依然报告**「40/40 全通过」**；现有流程缺少独立的代码基线指纹对比、历史数字核验、异族模型只读审查及受控轮次的返工反馈回路。
 
-### 1.2 现有代码与规范层的根因定位
+### 1.2 现有代码层成因定位
 
-核查当前仓库代码与设计文档，上述故障在架构上有四处直接成因：
-
-1. **检查脚本与完成契约均被设计为「不阻断」**：
-   - `docs/dalton/features/modeling-skill.md:13,261` 与 `plugins/dalton/skills/dalton-model/scripts/model_scan.py:13` 明确设定扫描器「无论检出多少问题退出码恒为 `0`，不做对错裁决也不阻断交付」；
-   - `workflows/earnings-deep-update/contract.json:43-45` 与 `workflows/full-coverage/contract.json:81-83` 的完成契约仅调用 `model_readable.py` 验证文件能被 `openpyxl` 打开，甚至在 `plugins/dalton/skills/dalton-earnings-deep/SKILL.md:113` 写明「只要新模型文件可读，无论重算或提示性扫描是否超时、报错或留有提示项，均调用 `knowledge_update(doc="models", ...)` 登记新版本」。
-2. **缺少原模型基线指纹对比**：
-   - `model_scan.py` 只看新文件单本状态，不与原模型逐格比对，因此无法识别「原模型是公式、新模型被改成了常数」「原模型历史格有数、新模型被清空」「原模型冻结在 `10/2`、新模型跳到 `51/101`」以及「顺手改坏了同工作簿内另一家公司的工作表」。
-3. **缺少受控原地编辑封装，沙箱未装 `gridcraft`**：
-   - `gridcraft-cli`（0.19.1）在宿主机实测表现优异：对中国电商原模型 **57,173 条公式重算仅需 0.7 秒**，**57,018 条与原缓存一致**（仅有的 155 条差异全部来自 `CIQ`〔Capital IQ，标普金融终端插件〕函数与原模型有意的循环引用）；打开再保存**完整保留 18 张嵌入图、15 个绘图与全部冻结窗格**，仅丢弃可选的 `calcChain`（`xl/calcChain.xml`，公式计算链缓存）与 Excel 2010 扩展条件格式（`<extLst>` / `x14`）；原生支持插列、向右填充、格式刷、冻结窗格与引用追踪。
-   - 但当前 Docker 沙箱镜像（`Dockerfile.sandbox` 与 `src/ptc_agent/core/sandbox/providers/_image_recipe.py`）尚未安装 Linux 版 `gridcraft-cli`，智能体只能退回手写自由度过高的 `openpyxl` 脚本。
-4. **Home 转派丢失用户原话，且草稿审查子智能体未实现动态异族选模**：
-   - `src/tools/secretary/chief_of_staff.py:182-229` 的 `delegate_to_analyst(question=...)` 仅传递研究总监改写后的文本，未附带 `state["messages"]` 中的用户原话，常把「更新某一家财报且别乱动格式」稀释成宽泛指令；
-   - `plugins/dalton/agents/dalton-reviewer.md:3` 固定写死 `model: gpt-6.2-sol-oauth` 且仅面向文字报告的 1–9 项检查，`src/server/services/llm/subagents.py:268-345` 并未像正式发布审稿 `src/dalton/publish/review.py:302` 那样调用 `role_policy.family_of()` 动态切换不同家族模型。
+1. **缺少原模型基线指纹对比与约定自动化检查**：`plugins/dalton/skills/dalton-model/scripts/model_scan.py` 仅扫描单本新文件，未与原模型逐格比对，无法识别「原预测公式被改成常数」「原冻结窗格从 `10/2` 跳到 `51/101`」「预测行直接抄入一致预期常数」或「顺手改坏其他公司工作表」。
+2. **建模尚未做成标准多阶段工作流**：正式研报在 `workflows/earnings-deep-update/workflow.js` 与 `workflows/bullbear-doc/workflow.js` 中已具备「语言审查 → 审稿 → 修改 → 复审（最多两轮）」与 `check_draft` 数字核验环节，而单次建模任务仍靠智能体自由发挥，且 `earnings-deep-update/workflow.js:84-90` 中的「模型更新」仅为一个单步子任务派发，与独立建模技能存在两套维护面。
+3. **沙箱尚未内置 `gridcraft-cli` 原地编辑工具**：宿主机实测 `gridcraft-cli`（0.19.1）对中国电商原模型 **57,173 条公式重算仅需 0.7 秒**，**57,018 条与原缓存一致**（155 条差异来自 `CIQ`〔Capital IQ，标普金融终端插件〕函数与原模型既有迭代计算），打开再保存完整保留全部冻结窗格与图形部件（仅丢弃可选的 `calcChain.xml`〔公式求值顺序缓存〕与 Excel 2010 扩展条件格式 `<extLst>`/`x14`）；但当前 Docker 沙箱镜像（`Dockerfile.sandbox` 与 `src/ptc_agent/core/sandbox/providers/_image_recipe.py`）尚未安装 Linux 版二进制。
+4. **`Home` 转派未附用户原话，且审查子智能体写死单一模型**：`src/tools/secretary/chief_of_staff.py:182-229` 的 `delegate_to_analyst` 仅传递改写后的任务描述；`plugins/dalton/agents/dalton-reviewer.md:3` 写死 `model: gpt-6.2-sol-oauth` 且 `src/server/services/llm/subagents.py:268-345` 未按 `role_policy.family_of()` 动态切换不同家族模型。
 
 ### 1.3 决定记录 `L14` 修订
 
-将 `docs/dalton/archive/dev-guide/README.md` 第 6.2 节 `L14` 由原条文：
-> 旧 `L14`：「gridcraft 不作为建模主路径。建模用 LangAlpha 的 xlsx 流程；gridcraft 的 `check` 留作 P3 之后可选的第二引擎复算」
-
-正式修订为：
-> **新 `L14`：「`gridcraft` 作为原地编辑引擎与第二复算引擎；主流程交付物与持久化载体仍是标准 `.xlsx` 文件。`gridcraft` 保存丢失的 Excel 2010 扩展条件格式（`<extLst>` / `x14`）在代码检查报告中逐表列出，并在需要保留时由后处理脚本从原文件 XML 节点或通过 `openpyxl` 补回。」**
+将 `docs/dalton/archive/dev-guide/README.md` 第 6.2 节 `L14` 修订为：
+> **新 `L14`：「`gridcraft` 作为原地编辑引擎与第二复算引擎；主流程交付物与持久化载体仍是标准 `.xlsx` 文件。`gridcraft` 保存丢失的 Excel 2010 扩展条件格式（`<extLst>` / `x14`）由后处理脚本从原文件 XML 节点（或通过 `openpyxl`）补回，并在代码检查报告末尾一行提示信息中说明。」**
 
 ---
 
-## 2. 两种模式端到端流程（零额外确认）
+## 2. 沿用的现有建模约定（逐条溯源与代码检查映射）
 
-系统在开工时根据工作区现有文件与用户指令自动判定进入**新建模式**或**滚动更新模式**，全程自动推进至最终交付，省去确认计划、确认目录或确认列结构的中间步骤。
+建模 v2 是在现有 `dalton-model` 技能与 `dalton-conventions` 方法论之上的**流程编排与工具自动化升级**，完整保留全部既有财务建模约定。下表逐条列出沿用的约定、仓库原文出处及在 v2「格式与结构检查 / 数字核验」中的自动化落点：
+
+| 约定类别 | 沿用的具体建模约定内容 | 原文精确出处 | v2 自动化检查与执行落点 |
+|---|---|---|---|
+| **核心规则 1：预测期全公式与驱动调整** | 收入、成本、费用、利润等预测期金额全部由公式算出（如 `=GMV〔商品交易总额〕× Take rate〔货币化率〕`、`=去年同期×(1+增速)`、`=各分部之和`）；调预测数值只改驱动假设输入格；调建模方法可改公式结构并在变更记录写明；管理层直接给出的金额指引（如明年 `CapEx`〔资本开支〕金额）在对应区块或表下方单设输入格（套驱动假设格式，最右备注列写来源），预测行用公式引用该输入格；原模型里是公式的预测行更新后仍是公式。 | `plugins/dalton/skills/dalton-model/SKILL.md` 第 14–18 行 | 代码检查 **`C03`**（逐格核查原公式格保持公式、预测期金额列零裸常数、管理层金额指引走独立输入格引用） |
+| **核心规则 2：季度汇总年度列口径** | 同表已有对应四财季列的年度列全部由公式算出，驱动假设只放在预测季度列和无季度拆分的远期年度列：<br/>- 流量（收入、成本、利润、现金流）：四季相加；<br/>- 时点余额（现金、债务、期末股本）：取财年最后一季；<br/>- 比率（增速、利润率、`Take rate`、占比）：用本年度列分子和分母重算；<br/>- 年度 `EPS`：年度利润 ÷ 年度加权平均稀释股数（与公司披露口径一致；维护原模型时兼容原表既有同口径公式）；<br/>- 用户数、活跃商家等 `KPI`（关键经营指标）：按公司披露口径（第四季期末、四季均值或年度去重数）。 | `plugins/dalton/skills/dalton-model/SKILL.md` 第 19–24 行 | 代码检查 **`C10`**（按 `annual_sum_quarters` 逐行检验加总年度列零驱动常数及流量/余额/比率/EPS 公式与数值恒等关系） |
+| **核心规则 3：一致预期重大差异归因** | 本方预测与一致预期或主要卖方预测存在重大差异时，拆到分部、驱动假设、费用、利息、股本查明来源：有可核实的新信息支撑就保留判断并写明理由；发现自身驱动假设遗漏或口径错误就修正驱动假设。 | `plugins/dalton/skills/dalton-model/SKILL.md` 第 25 行；`references/sanity-check.md` 第 23–30 行 | `model_consensus.py` 超阈值返工复核 + 代码检查 **`C04`**（预测行与一致预期隔离及明显差异理由齐备检查）+ 异族审查 |
+| **核心规则 4：原模型维护、只读留存与变更记录** | 提供或存在原模型时在原模型基础上维护，沿用结构、预测方法和格式；原模型文件保持只读，修改版另存为 `model/` 下的新版本文件；在最前面的 `README & Changelog`（或原模型既有 `Change Log`）工作表写明版本号、日期、基线文件、补充的实际值、新增期间、修改的驱动假设及理由、结构调整及与一致预期的主要差异理由。 | `plugins/dalton/skills/dalton-model/SKILL.md` 第 10、26、60–63 行；`references/rollforward.md` 第 3、45–51 行 | 指纹 `source_sha256` 原件只读校验 + 代码检查 **`C01`**（表顺序与 `README & Changelog` 本轮更新记录检查） |
+| **期间覆盖跨度与单向扩展** | - 新建模型历史跨度：年度历史至少自 `FY2018A`（或招股书最早完整财年）连续覆盖至最近完整财年；单季历史至少自 `2024Q1A` 连续覆盖至最近已披露季度；<br/>- 预测跨度：季度预测逐季覆盖本财年剩余季度与下一完整财年直至次年 `Q4`（如当前 `FY26` 做到 `4Q27E`）；年度预测至少覆盖 3 个完整财年至下下财年（如 `2026E–2028E`），无季度拆分的远期年份直接在年度列放驱动假设；<br/>- 单向向后扩展，完整保留原模型全部既有历史列；非自然年结账公司在 `A2` 或表头旁注明财年截止月（如 `FY ends Mar`）。 | `plugins/dalton/skills/dalton-conventions/references/model-standards.md` 第 5–10、92–94 行；`dalton-model/references/forecast-rules.md` 第 5–11 行 | 代码检查 **`C02`**（自动解析 `period_axis` 校验历史起始年/季、预测截止季/年跨度、存量历史列零删减、非自然年标注） |
+| **一手披露取数、累计拆单季与空值留空** | - 历史实际数只取一手监管定期报告（美股 `SEC`〔美国证券交易委员会〕`10-K`/`10-Q`/`20-F`〔年报、季报、外国发行人年报〕，港股/A 股法定财报与业绩公告），配套可追溯来源元数据；<br/>- 仅披露累计期间（`6M`/`9M`/`FY`）时按算术差分推导单季（`Q2=H1-Q1`、`Q3=9M-H1`、`Q4=FY-9M`），标记为披露衍生值并注明两期财报出处；<br/>- 未披露细项或未单独预测假设一律留空（`Blank`），仅在确认实际发生或显式预测为零时填 `0`；<br/>- 财报更新后完成当季实际值相对前版预测的事后偏差分解并记入修订日志。 | `plugins/dalton/skills/dalton-conventions/references/model-standards.md` 第 16–33、52–65 行；`dalton-model/references/forecast-rules.md` 第 208–220 行 | **数字核验阶段** `model_audit.py`（逐格对源与拆单季验算）+ 代码检查 **`C08`**（历史格完整性、未预测项留空与无备注裸 `0` 检查） |
+| **季节性、大促跨季与管理层指引** | - 季度路径按历史季节性（同比或历史季度结构）设定在各季假设上，避免写成「占全年比例 × 本年合计」引发循环引用；<br/>- 春节移动与 618/双十一/黑五跨季挪动单设「日历调整」驱动假设行，并在相邻季度做等额反向调整（同财年内全年合计保持不变，跨财年分别反映两年影响，远期趋势维持常态）；53 周财年仅计入多一周当季；<br/>- 指引记录：单设「指引」表或指引区逐条记录发布日期、适用期间、指标、形式与数值、实际值与兑现情况（区分年初首次全年指引与年内修订）；季度预测直接采用全年指引时，剩余季度引用「全年指引 − 已披露累计」按季节性拆分，年度列保持四季公式之和。 | `plugins/dalton/skills/dalton-model/references/forecast-rules.md` 第 9、65–66、81–100 行 | 代码检查 **`C10`**（年度列四季公式汇总）、**`C13`**（零新增循环引用）+ 异族审查 `dalton-model-reviewer`（核查指引兑现表、季节性与跨季反向调整逻辑） |
+| **版面样板、表头与最右备注列** | - 版面列序：`A–D` 层级缩进标签列 → 年度列 → 窄空隔列 → 可选 `CAGR`（复合年增长率）列 → 窄空隔列 → 季度列 → 最右备注列；行序依次为期间表头与 `A1` 单位、利润表（浅蓝 `99CCFF`）、`Non-GAAP`（非公认会计准则，棕红 `993300`）、分部报告（棕红）、业务拆解区（浅桃 `FFCC99`）、现金流量表（浅蓝）、资产负债表（浅蓝），衍生比率斜体分组；多公司模型前放行业页并以 `{TICKER}>>` 空白页分隔各公司；<br/>- 第 1 行亮蓝底 `3366FF` 白字加粗，`A1` 左对齐写单位，期间列右对齐；英文数字 `Arial` 8 号、中文 `等线` 8 号；驱动假设与管理层金额指引 `FFFFC8` 浅米黄底配 `hair` 四边细虚线框；<br/>- 来源和说明统一写在数据区最右侧备注列（红字 `FF0000`，以 `<` 或 `<<` 开头指向左侧数据），工作簿内保持零单元格批注。 | `plugins/dalton/skills/dalton-model/references/forecast-rules.md` 第 13–43 行；`references/format-spec.md` 第 18–88 行 | 默认格式模板继承 + 代码检查 **`C05`**（样式角色、字号表头色、最右红字 `<`/`<<` 备注列、零新增 Excel 批注）与 **`C06`**（窗格、列宽、分组） |
+| **一致预期取数、口径对齐与基础检查** | - 按部署能力调用 `researchdata.finance(route="estimates")` 或公开 `yf_analysis` / `fundamentals` 取数，原始数据落盘 `data/consensus/<YYYY-MM-DD_HHMM>.json`；<br/>- 比较前先对齐财年截止日、币种、会计口径（`GAAP`〔公认会计准则〕/`IFRS`〔国际财务报告准则〕与 `Non-GAAP`）、普通股与 `ADS`（美国存托股份，`EPADS` 为每份美国存托股份收益）及是否已反映最新财报；<br/>- 核对全表金额单位一致、币种换算一致、估值页目标年份/倍数对应 `EPS`/净现金引用已指向更新后的预测列。 | `plugins/dalton/skills/dalton-model/references/sanity-check.md` 第 6–21 行；`SKILL.md` 第 55 行 | `model_consensus.py` 快照读取与口径元数据核对 + 代码检查 **`C07`**（单位标识、估值页跨表引用列更新检查） |
+
+---
+
+## 3. 建模工作流与「最多两轮」反馈回路设计
+
+### 3.1 合并单一工作流 `workflows/company-model/`（支持新建与更新双模式）
+
+参照现有报告工作流引擎（`src/ptc_agent/agent/middleware/background_subagent/workflow/engine.py` 的 `QuickJS`〔嵌入式轻量级 JavaScript 引擎〕编排器 + `src/dalton/workflows/contracts.py` 完成契约），择简设立**单一建模工作流 `workflows/company-model/`**（包含 `workflow.js` 与 `contract.json`），通过参数 `mode` 统一承载新建与更新：
+
+- **输入参数（`args`）**：
+  - `ticker`（必填）：本轮唯一目标公司股票代码（如 `"PDD"`、`"JD"`、`"META"`）；
+  - `workspace_dir`（必填）：当前工作区根目录（`"."`）；
+  - `as_of`（必填）：基准日期 `YYYY-MM-DD`（财报更新场景可传 `release_date`）；
+  - `mode`（可选，默认 `"auto"`）：`"build"`（按默认格式模板新建）、`"update"`（存量模型滚动更新）或 `"auto"`（工作区或 `model_path` 已有匹配模型时自动进 `"update"`，无存量模型时进 `"build"`，全程无需询问用户确认）；
+  - `model_path`（可选）：用户本轮上传或指定的起点 `.xlsx` 路径；缺省时自动按 `data/models.json` `current` 与 `model/` 最新版本解析；
+  - `quarter`（可选）：本次更新对应的最新披露财季（如 `"3Q26"`），用于命名研究目录 `research/{as_of}-model-{ticker}`（或接入深度链时复用 `research/{release_date}-deep-{quarter}`）；
+  - `consensus_thresholds`（可选）：按公司特征微调的一致预期差异复核阈值覆盖项；
+  - `progress_path`（可选）：断点续跑进度文件路径（默认 `research/{as_of}-model-{ticker}/.progress.json`）。
 
 ```mermaid
 flowchart TD
-    Start["接收建模任务<br/>(工作区直发 或 Home 附用户原话转派)"] --> Scope["范围锁定：确定唯一目标公司代码 TICKER<br/>(多公司请求按家拆轮，本轮只改一家)"]
-    Scope --> Detect{"工作区或本轮上传中<br/>是否已有目标模型?"}
-    Detect -->|"无存量模型"| ModeNew["模式 A：按公司默认格式新建<br/>1. 复制默认格式模板至工作副本<br/>2. 提取模板指纹"]
-    Detect -->|"已有存量模型"| ModeRoll["模式 B：存量模型滚动更新<br/>1. 原件只读留存，复制新版本工作副本<br/>2. 提取原模型全量指纹"]
-    ModeNew --> Edit["原地编辑引擎 (model_edit.py)<br/>优先 gridcraft-cli / 回退受控 openpyxl+insert.py<br/>扩列、平移公式、填历史实数、设驱动假设、套格式"]
-    ModeRoll --> Edit
-    Edit --> PostFix["后处理：重算回写缓存值<br/>补回丢失的 x14 扩展条件格式 + 复位 fullCalcOnLoad"]
-    PostFix --> Gate{"代码拦截检查 (model_gate.py)<br/>14 项逐格/勾稽检查 + 第二引擎独立复算"}
-    Gate -->|"存在 BLOCK 拦截项"| FixLoop["智能体仅针对报错坐标定点修正"] --> Edit
-    Gate -->|"0 项拦截"| Review["异族模型独立只读审查 (L16)<br/>审阅检查报告、变更摘要并抽查对源"]
-    Review -->|"发现实质问题"| FixLoop
-    Review -->|"通过"| Register["服务端校验通过门禁凭据后<br/>knowledge_update(doc='models') 登记版本"]
-    Register --> Reply["向用户交付：<br/>1. 新版本 .xlsx 链接<br/>2. 约 10 行关键数字变更摘要<br/>3. 原样附上代码生成的检查报告"]
+    S1["阶段 1：准备 (phase: 准备)<br/>确定起点模型/默认模板 → 提取指纹 fingerprint.json<br/>拉取一手财报数据与一致预期快照 data/consensus/*.json"] --> S2["阶段 2：建模/更新与一致预期对照 (phase: 建模与一致预期对照)<br/>2a. 按本方驱动假设原地编辑 (model_edit.py)，写入独立一致预期参考区<br/>2b. 代码生成差异表 (model_consensus.py)；超阈值进入 1 次返工复核<br/>(只调驱动假设 或 保留判断并写明每项明显差异的一句理由)"]
+    S2 --> CheckEntry["进入三层质量核验"]
+    CheckEntry --> S3["阶段 3：格式与结构检查 (phase: 格式与结构检查)<br/>model_check.py 跑 C01-C14（指纹对比、公式保护、一致预期隔离、<br/>期间跨度、窗格列宽分组、三表配平、季度加总、集团=分部、滚存、复算）"]
+    S3 --> S4["阶段 4：数字核验 (phase: 数字核验)<br/>model_audit.py 将历史实际数逐项核对 SEC / 财报原文<br/>生成 PASS / FAIL 对照表 model-audit.md"]
+    S4 --> S5["阶段 5：独立审查 (phase: 独立审查)<br/>按 L16 派不同家族模型只读运行 dalton-model-reviewer<br/>审阅检查报告、数字核验表与变更摘要，提问题不改文件"]
+    S5 --> Judge{"汇总三层问题清单<br/>是否全部通过?"}
+    Judge -->|"0 项问题"| S7["阶段 7：交付 (phase: 交付)<br/>登记 knowledge_update(doc='models') + dalton_check_done 校验<br/>交付模型文件 + 10行关键变更摘要(含预期差异理由) + 检查/核验报告"]
+    Judge -->|"仍有未通过项 且 修改轮次 < 2"| S6["阶段 6：修改与复查 (phase: 修改与复查，第 1..2 轮)<br/>将代码与审查生成的问题清单交回建模智能体定点修改<br/>重算后回到阶段 3–5 复查"]
+    S6 --> S3
+    Judge -->|"已满 2 轮仍有未通过项"| DeliverOpen["写入 model-verification.json (status=delivered_with_open_issues)<br/>照常完成登记与交付，在交付回复最顶部原样列出剩余问题清单"]
+    DeliverOpen --> S7
 ```
 
-### 2.1 自动模式判定与起点选择规则
+### 3.2 复用现有报告核验的轮次与反馈机制（代码出处与对齐设计）
 
-按以下确定性优先级直接选定起点文件：
-1. 用户在本轮消息中上传或点名的 `.xlsx` 模型文件 → 进入**滚动更新模式**；
-2. 工作区 `data/models.json`（`JSON` 为结构化数据交换格式）中 `current` 指向的 `.xlsx` 文件（当 `model/` 与历史 `models/` 同时存在文件时，先比对 `SHA-256`〔安全哈希算法 256 位摘要〕去重，再取版本号最新且与目标公司股票代码 `TICKER` 匹配的模型） → 进入**滚动更新模式**；
-3. 工作区尚无匹配的 `.xlsx` 模型文件 → 进入**新建模式**，直接读取公司默认格式模板作为起点。
+现有仓库中，正式报告的质量核验由三处代码协同实现「反馈修改 + 固定轮次上限 + 日常交付可带未决项列明交付」：
 
-### 2.2 模式 A：按公司默认格式新建
+1. **工作流两轮修改循环（`workflows/earnings-deep-update/workflow.js:244-315`、`workflows/bullbear-doc/workflow.js:315`、`workflows/topic-research/workflow.js:373`）**：
+   - 现有报告工作流通过 `let rounds = 0; while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) { rounds += 1; ... }` 控制「发现问题 → 交回主笔智能体修订 → 重新核验」**最多执行 2 轮**。
+2. **轮次侧车账本与哈希绑定（`src/dalton/publish/language.py:408-425,620-705` 与 `src/dalton/tools/check_done_tools.py:2601-2677`）**：
+   - `run_check_language(round=1|2)` 将每轮检查的模型、草稿 `SHA-256`（安全哈希算法 256 位摘要）与问题数组追加写入 `<draft>.language.json` 的 `rounds[]` 列表，并生成给人读的 `<draft>.language.md` 修改清单。
+3. **数字核验非阻断日常交付语义（`src/dalton/publish/service.py:953-1132`、`plugins/dalton/skills/dalton-publish/SKILL.md:38-42`、`src/dalton/tools/check_done_tools.py:3046-3071`）**：
+   - `run_check_draft()` 生成 `.audit.md` 问题清单供智能体按行修正，日常交付允许在明确列出未核实项后交付；`dalton_check_done` 的 `_check_draft_sidecar()` 核对 `.audit.md` 已针对当前最终文件的 `SHA-256` 跑完核验，而非因残留个别未决项卡死整个会话。
 
-1. **初始化骨架**：从第 4.5 节定义的默认格式模板复制生成工作副本 `model/<TICKER>-model-v01.xlsx`，运行 `model_fingerprint.py extract` 提取模板指纹（锁定标准页签结构、Arial / 等线 8 号字体体系、亮蓝表头 `3366FF`、浅米黄假设格 `FFFFC8`、三级分节条配色、列宽、冻结窗格与标准数字格式）。
-2. **填充历史期与搭建驱动链**：读取法定定期报告（美股年报 `10-K`、季报 `10-Q`、外国发行人年报 `20-F` 或港股/A 股法定财报），填入连续历史年度与历史单季实际值（累计披露项按算术差分拆出单季并在最右备注列标明出处）；按公司核心经营指标（`KPI`〔Key Performance Indicator〕，如电商 `GMV`〔商品交易总额〕与 `Take rate`〔货币化率〕）搭建分部收入 → 成本费用 → 营业利润 → 无循环期初余额计息 → 税与少数股东 → 股本滚存与 `EPS`（每股收益）/ `EPADS`（每份美国存托股份收益，`ADS` 为美国存托股份） → 现金流量表与资产负债表 → 估值与 `Street vs House`（市场预期对照表）全公式链路。
-3. **门禁、异族抽查与交付**：通过第 5 章全部新建适用拦截项与第二引擎复算、经第 6 章不同家族模型抽查无误后，登记 `v01` 并输出变更摘要与原样检查报告。
+**建模 v2 对上述机制的直接复用与统一落盘**：
+- 在 `workflows/company-model/workflow.js`（及共用阶段模块）中采用完全相同的 `let fixRounds = 0; while (openIssues.length > 0 && fixRounds < 2)` 循环：
+  - **初检（`round = 0`）**：阶段 2 产出候选新版本 `model/<TICKER>-model-v<NN>.xlsx` 后，依次运行阶段 3（`model_check.py`）、阶段 4（`model_audit.py`）与阶段 5（`dalton-model-reviewer`），由聚合脚本 `model_check.py merge-issues` 汇总三处未通过项，生成统一的待修清单 `<R>/model-issues-round0.md` 并追加记录至轮次账本 `<R>/model-verification.json`。
+  - **交回修改与复查（`fixRounds = 1, 2`）**：只要 `openIssues` 非空且 `fixRounds < 2`，把 `<R>/model-issues-round<k>.md` 交回建模智能体，在当前新版本工作副本上通过 `model_edit.py` 定点修正并重算（原模型基线文件始终保持只读），随后重跑阶段 3–5 验证修改结果并追加写入 `rounds[]`。
+  - **两轮封顶照常交付**：当 `openIssues.length === 0` 时，账本标记 `status = "pass"`；当 `fixRounds === 2` 后仍有未解决项时，循环立即终止，账本标记 `status = "delivered_with_open_issues"` 并将剩余问题固化到 `<R>/remaining-issues.md`；`knowledge_update(doc="models")` 照常登记新版本（在版本记录 `reason` / 元数据中如实记录核验状态），智能体在**交付回复的最顶部原样贴出 `<R>/remaining-issues.md` 中的剩余问题清单**。
+- **完成契约校验（`src/dalton/tools/check_done_tools.py` + `contract.json`）**：
+  - `workflows/company-model/contract.json` 的 `validators` 调用 `python3 .agents/skills/dalton-model/scripts/model_check.py verify-done --workspace {workspace_dir} --ticker {ticker} --ledger {research_dir}/model-verification.json`（`pass_when: "exit_zero"`）：核对磁盘最终模型可读且已重算，核对 `model-verification.json` 最后一轮记录的 `model_sha256` 与磁盘最终模型实时 `SHA-256` 完全一致，且终态满足 `status == "pass"` 或（`fix_rounds == 2` 且 `status == "delivered_with_open_issues"` 且 `remaining-issues.md` 非空）。这与 `_check_draft_sidecar` 和 `_check_language_record` 的哈希绑定校验完全一致：既确保三层检查与必要的两轮修改真实跑完、未跳步，又保证两轮后仍有疑难项时顺畅交付。
 
-### 2.3 模式 B：存量模型滚动更新（核心高频路径）
+### 3.3 `earnings-deep-update`（及 `full-coverage`）如何共用同一条建模流水线
 
-1. **原件字节级只读与全量指纹提取**：记录原模型 `SHA-256`，复制到新版本路径（单公司 `model/<TICKER>-model-v<NN>.xlsx`；多公司行业整本沿用原命名递增版本号），对原模型运行 `model_fingerprint.py extract` 生成基线指纹与目标公司工作表紧凑结构图。
-2. **五步原地最小化修改**（只触碰目标公司的需要修改格）：
-   - **扩展期间列**：在目标公司各计算表的季度区末尾（及必要的远期年度区）插入新预测期间列，**所有公式行直接由相邻同类期间列向右平移填充生成**，用格式刷克隆相邻预测列的完整样式、列宽与数字格式；当新增四个季度使某远期年度具备完整四季拆分时，将该年度列切换为四季汇总公式（流量求和、期末余额取第四季、比率由本年金额反算），原年度假设下沉至季度列；顺延 `CAGR`（复合年增长率）列与估值页引用列。
-   - **回填新财报实际值**：将刚披露季度的列头去掉预测后缀（如 `3Q26E` → `3Q26`）；仅将前序历史季度原本填实际数的明细行与 KPI 行替换为财报披露值（套蓝字无底色实际值格式，并在 `justifications.json` 自动批量登记为「预测转披露实际值」），将原驱动假设格切换为当季实际反算比率公式（斜体无底色），**小计、合计、毛利率、同比增速与跨表引用公式保持原样不动**。
-   - **补充新披露项与重述同期数**：公司新增披露细分指标或调整分部口径时，在对应业务区块内原地插行增补，同步回填财报提供的历史重述可比期间数据（避免历史同期留空），并将新分部汇总挂钩至集团分部对账行。
-   - **按原公式逻辑滚动更新预测与对齐一致预期**：基于最新业绩、管理层指引及可核实证据微调预测期**驱动假设输入格**（增速、货币化率、利润率、费用率、资本开支 `CapEx`〔Capital Expenditures〕、回购额）；对照一致预期时，所有调整只落在驱动输入格，由原模型公式链自然传导至分部汇总、集团营业利润、净利润与 EPS。
-   - **更新变更记录表**：在工作簿 `README & Changelog`（或原模型既有的 `Change Log`）工作表记录版本号、基线文件哈希、新增期间、补入的披露项、关键驱动调整及与一致预期的差异原因。
-3. **门禁、异族抽查与交付**：运行 `model_gate.py` 与原模型指纹逐格对比并跑第二引擎复算；存在任何 `BLOCK`（拦截项）时在内部循环定点修复直至 `0 BLOCK`；经异族模型只读审查通过后登记新版本并交付。
+核查工作流引擎代码，子智能体不持有主智能体专属的 `RunWorkflow` 工具（`src/ptc_agent/agent/middleware/background_subagent/workflow/tool.py:257`），且 `QuickJS` 运行时不提供运行时跨文件 `import` 模块加载器（`workflows/full-coverage/workflow.js:101-102`），但所有预置 `workflow.js` 在编译与启动前均统一经过 `src/ptc_agent/agent/middleware/background_subagent/workflow/prebuilt.py:20,45` 的 `read_assembled_workflow_file()`（调用 `src/dalton/content_assembly.py`）。
 
-### 2.4 范围控制：一轮只更新一家公司 + Home 转派附上用户原话
+为彻底消除两套建模逻辑，采用**「源码期单一阶段模块 + 装配期自动内联 + 同一校验器」**方案：
 
-1. **一轮只更新一家公司**：
-   - 单公司工作区天然绑定单一标的；在多公司行业工作区或包含多家公司页签的整本模型（如中国电商模型同时含 `BABA`、`JD`、`PDD`）中，**单轮执行严格锁定唯一一家目标公司**。
-   - 若用户在一条消息中仅上传了一家公司的新财报或点名一家公司，仅修改该公司所属工作表（如 `Valuation - PDD`、`Key Metrics - PDD`、`Model - PDD`、`Subs - PDD`）及变更记录页；行业横向汇总页（如 `Peers`、`Global Comps`）仅通过既有跨表引用公式自动重算缓存值，不改动其他公司的工作表。
-   - 若用户一次要求更新多家公司（如「把 BABA、JD、PDD 三季报都更新进电商模型」），智能体按公司顺序拆分为串行独立子轮次（每家公司各自提取上家完成后的基线指纹、独立过一次 `model_gate.py` 产出递增小版本或阶段快照），由 `G14` 检查项强制校验每轮除当前目标公司外的其他公司工作表零公式与零输入变动。
-2. **Home（研究总监 `Chief of Staff`）转派任务自动附带用户原话**：
-   - **代码层保真注入**：在 `src/tools/secretary/chief_of_staff.py` 与 `src/tools/secretary/dispatch.py`（标注 `# DALTON-HOOK(cos-verbatim-forward)`，`DALTON-HOOK` 为 Dalton 在上游源码中标注的差异挂载点注释）中，当 `delegate_to_analyst` 执行派发时，服务端直接从当前回合注入状态 `state["messages"]` 提取最新一条用户原始消息文本（`HumanMessage`，用户消息对象），当派发 `question` 尚未完整包含该原文时，在发往工作区分析师的消息末尾自动追加只读块：
-     ```xml
-     <user_verbatim_request>
-     （用户在 Home 的原始输入原话，逐字保留）
-     </user_verbatim_request>
-     ```
-   - **提示词同步对齐**：在 `src/ptc_agent/agent/prompts/templates/components/chief_of_staff.md.j2` 写明：转派建模与模型更新任务时，保留用户对格式、范围与具体科目的原话约束，且多公司建模需求按一家公司一轮派发。
+1. **抽取唯一共享阶段实现 `workflows/_shared/modeling_stages.js`**：
+   - 将「准备 → 建模/更新与一致预期对照 → 格式与结构检查 → 数字核验 → 异族独立审查 → 最多两轮修改与复查 → 解析最终模型与验证账本」封装为单一异步函数 `runModelingPipeline(ctx)`，存放在 `workflows/_shared/modeling_stages.js`。
+   - 在 `src/dalton/content_assembly.py` 新增受控白名单片段展开指令 `/* DALTON_INCLUDE:_shared/modeling_stages.js */`（仅允许引用 `workflows/_shared/*.js`，在能力条件块裁剪后做确定性文本内联，随后交 `QuickJS` `compile_check` 校验语法与缓存）。
+2. **`workflows/company-model/workflow.js` 直接调用**：
+   - 顶层声明 `export const meta = { name: 'company-model', ... }`，内联 `_shared/modeling_stages.js` 后直接调用 `return await runModelingPipeline({ ...args, standalone: true })`。
+3. **`workflows/earnings-deep-update/workflow.js` 替换原单步「模型更新」**：
+   - 在 `phase('深度点评与模型')` 的 `parallel([...])` 中，将原本第 `84–90` 行单次派发 `agent(..., { label: '模型更新' })` 替换为调用同一个 `runModelingPipeline({ ticker: T, company: C, quarter: Q, workspace_dir: W, as_of: D, mode: 'update', model_path: args.model_path, research_dir: R, standalone: false })`；
+   - 财报深度链的模型支线由此在进入「校准与对账 → 审稿」之前，自动走完**指纹提取、原地更新、一致预期对照、格式检查、财报数字核验、异族模型审查及最多两轮修改复查**全套环节；
+   - 若后续深度报告「审稿」阶段（`workflow.js:246`）对模型提出联动修订，同样调用 `_shared/modeling_stages.js` 中的单轮复查辅助函数 `reverifyModelAfterEdit(...)` 刷新 `model-verification.json` 哈希绑定；若模型在两轮修改后留有 `remaining-issues.md`，深度链工作流继续正常完成（`ok` 按已完成两轮核验放行），并在推送稿与最终回复顶部原样附上模型剩余问题清单；
+   - `workflows/earnings-deep-update/contract.json` 第 `22–48` 行的「模型更新」阶段与 `workflows/company-model/contract.json` 共用同一组产物声明（新增 `model-verification.json`、`model-check.md`、`model-audit.md`、`consensus-diff.md`）与同一条 `model_check.py verify-done` 校验命令。`workflows/full-coverage/` 同步采用同一方式接入。
+
+### 3.4 单轮范围控制与 `Home` 转派保真
+
+1. **一轮只更新一家公司（兼顾多公司行业工作区路由）**：
+   - 包含多家公司工作表的行业整本模型（如中国电商模型含 `BABA`、`JD`、`PDD` 等）中，每次运行 `company-model` 严格指定唯一目标 `ticker`，只允许修改该公司所属工作表（如 `Valuation - PDD`、`Key Metrics - PDD`、`Model - PDD`、`Subs - PDD`）及 `README & Changelog`；多公司更新需求由主智能体按公司拆分为串行独立运行，每次基于上一家完成后的最新文件提取指纹并独立走完核验。
+   - **行业工作区路由兼容**：修改 `src/dalton/workflows/company_routing.py`（将 `company-model` 纳入路由守卫的同时，当当前工作区为行业工作区 `is_sector == True` 且 `model_path` 指向本工作区内的多公司整本模型时，允许在行业工作区就地对成员公司 `ticker` 运行 `company-model`，同时继续执行 `_guard_workspace_dir` 保证产物留在当前工作区内）。
+2. **`Home`（研究总监 `Chief of Staff`）转派自动附上用户原话**：
+   - 在 `src/tools/secretary/chief_of_staff.py` 与 `src/tools/secretary/dispatch.py`（附 `# DALTON-HOOK(cos-verbatim-forward)` 并在 `scripts/dalton/check_hooks.sh` 登记，`DALTON-HOOK` 为 Dalton 在上游源码中标注的差异挂载点注释）中，当 `delegate_to_analyst` 派发任务时，服务端从当前回合 `state["messages"]` 提取最新一条用户消息原文，若派发 `question` 未逐字包含该原文，则在派发消息末尾自动追加 `<user_verbatim_request>...</user_verbatim_request>` 原话块；同步在 `src/ptc_agent/agent/prompts/templates/components/chief_of_staff.md.j2` 说明多公司建模请求按一家公司一轮派发。
 
 ---
 
-## 3. 模型指纹规范（内部结构，用户不可见）
+## 4. 默认格式模板提取（源自改坏前的中国电商模型）与模型指纹
 
-模型指纹由新增确定性脚本 `plugins/dalton/skills/dalton-model/scripts/model_fingerprint.py` 在开工前只读解析原模型（或默认格式模板）生成，保存在线程内部工作目录（`.agents/threads/<thread8>/modeling/<TICKER>-fingerprint.json`），**仅限系统内部使用（对用户隐藏）**，同时服务于两个下游：
-- **供智能体读取**：通过 `model_fingerprint.py summary <fingerprint.json> --company <TICKER>` 输出数千字符以内的紧凑结构地图（表清单、期间列字母映射、分节行号、勾稽锚点行号、代表列公式模板与样式槽编号），智能体直接据此定位目标行列与公式模板；
-- **供拦截检查器读取**：`model_gate.py` 读取全量 `fingerprint.json` 与新版本模型做逐格、逐列、逐部件精确比对。
+### 4.1 从改坏前的原始中国电商模型定位与提取默认模板
 
-### 3.1 模型指纹完整字段表
+用户原始的 **China Ecommerce（中国电商）模型在被智能体改坏之前的版本**中，各家公司的工作表（公司 `sheet`）即为团队标准格式。本方案明确规定：**直接从该模型被改坏之前的原始版本提取「公司工作表标准格式」作为新建模型的默认模板，确保使用的是未经智能体改写过的纯净原版**。
+
+#### （1）在工作区历史与备份中精确定位「改坏前原版」的四级方法
+
+按以下从近到远的四条只读路径查找原始中国电商 `.xlsx`（如 v1 实测记录的 40 页原件 `ecom_20261008.xlsx`），找到首个通过第（2）步全部验真断言的文件即锁定为母本：
+
+1. **路径 1 —— 聊天上传原始对象存储与沙箱上传落地目录（首选，字节级保留首次上传原件）**：
+   - 查询数据库 `dalton_chat_uploads` 表（`src/dalton/services/chat_uploads.py:625-637`）与中国电商工作区关联的最早 `.xlsx` 上传记录，核对 `sha256` 与上传时间 `created_at`，从 `MinIO`（兼容 S3 协议的对象存储服务）桶路径 `chat-uploads/<workspace_id>/<upload_id>/<safe_filename>`（`src/dalton/chat_upload_storage.py:223`）或工作区只读落地目录 `work/uploads/<stem>_<id8>.xlsx` 直接读取原始字节；
+   - 若原件通过常规附件通道上传，同步查询 `chat_attachments` 表（`src/server/services/chat_attachments.py:28,88`）对应的对象存储键，或检查工作区 `sources/`、`models/` 目录中修改时间早于首轮智能体运行的文件。
+2. **路径 2 —— 模型血统记录与知识层首版台账**：
+   - 读取工作区 `research/*/model_lineage.json`（由 `model_style.py lineage --baseline` 生成）中最早一条记录的 `baseline_path` 与 `baseline_sha256`，以及 `dalton_knowledge_versions` 表中 `doc_key = 'models'` 的最早版本记录，顺藤定位最初作为输入基线的原件路径。
+3. **路径 3 —— 工作区离线文件镜像表 `workspace_files`**：
+   - 查询 PostgreSQL `workspace_files` 表（`src/dalton/channel_deliverables.py:15,646`）中该工作区 `sandbox_modified_at` 早于 3 天 6 轮迭代起始时刻的 `.xlsx` 快照哈希与底层存储对象。
+4. **路径 4 —— Everflow 周度加密异地备份恢复（当工作区原文件已被覆盖或清理时使用）**：
+   - Everflow 现网每周由 `scripts/dalton/ops/dalton_data_backup.sh:192-298` 将 `MinIO` 卷（`minio-<YYYY-MM-DD>.tar.gz.enc`）与全部沙箱容器 `/home/workspace`（`sandbox-langalpha-sandbox-*-<YYYY-MM-DD>.tar.gz.enc`）经 `AES-256-CBC`（高级加密标准 256 位密码分组链接模式）加密备份至 `gdrive:DaltonBackup/weekly/<YYYY-MM-DD>/`（保留 4 周）。
+   - 由宿主机生产专用只读提取脚本 `scripts/dalton/ops/prod/recover_baseline_model.sh`（严格归入 `scripts/dalton/ops/prod/`，不混入独立核心包）选取**本轮 6 次改写发生日期之前最近一期**的周度归档，在宿主机隔离临时目录只读流式解密提取出中国电商原始 `.xlsx` 文件，全程不触碰运行中容器与现网数据库。
+
+#### （2）提取前的四项「未改动原版」硬性验真标准
+
+运行一次性模板提取脚本 `plugins/dalton/skills/dalton-model/scripts/extract_default_template.py` 时，必须先对候选中国电商模型通过以下 4 项只读验真断言，确认其确系改坏前的原始版本：
+1. **文件身份与时间线验真**：文件命名与属性不含智能体生成的 `-model-vNN` 或 `v2.0` 标记，且上传/归档时间戳早于首轮改坏脚本执行时间；
+2. **公式规模与计算属性验真**：全工作簿公式总数约 `57,173` 条（含约 `155` 处原始 `CIQ` 终端插件公式），`xl/workbook.xml` 中 `<calcPr>` 未被写入强制 `fullCalcOnLoad=1`，预测期计算行均为动态公式（零出现 `v2.0` 中 917 个预测硬编码常数的重写特征）；
+3. **标志性冻结窗格坐标验真**：`Model - JD` 工作表的 `<pane>` 精确为原始 `xSplit=10, ySplit=2`（`topLeftCell="K3"`），排除 `xSplit=51, ySplit=101` 等被脚本重排后的版本；
+4. **原生样式槽验真**：公司页签具备完整的 `Arial` / `等线` 8 号字、第 1 行亮蓝表头 `3366FF`、浅米黄假设格 `FFFFC8` 配 `hair` 细虚线框、浅蓝 `99CCFF` / 棕红 `993300` / 浅桃 `FFCC99` 三级分节条及最右红字 `FF0000` 备注列。
+
+#### （3）标准公司页签骨架脱敏提取与双形态读取
+
+1. **提取内容**：从通过验真的原始中国电商模型中选取标准单公司页签组合（`Model` 主计算表、`Key Metrics` 关键经营指标表、`Subs` 子业务拆解表、`Valuation` 估值表，并在最前配齐标准 `README & Changelog`、在末尾配齐标准 `vs Consensus` 一致预期对照页），清空特定公司的商业数据、股票代码、公司名称与外部 `CIQ` 链接，完整保留原始列序布局、列宽、行分组、早年列折叠大纲、冻结窗格（如 `K3` / `E2`）、全套样式槽与通用三表及分部勾稽公式骨架，生成 `plugins/dalton/skills/dalton-model/assets/default_model_template.xlsx`。
+2. **双形态分离加载（遵循 `docs/dalton/features/standalone-core.md`）**：
+   - 形态判定统一调用 `src.dalton.profile`，路径解析函数 `get_model_default_template_path()` 置于 `src/dalton/settings.py`：优先读取部署环境变量 `DALTON_MODEL_DEFAULT_TEMPLATE_PATH`（Everflow 生产配置归 `scripts/dalton/ops/prod/`，独立核心安装客户自定义自有机构模板配置归 `scripts/standalone/`，解析逻辑单点共用）；未设置时默认读取随包脱敏模板 `plugins/dalton/skills/dalton-model/assets/default_model_template.xlsx`（位于 `plugins/dalton/` 白名单内，`everflow` 与 `core` 双形态开箱可用，且不含任何专有商业数据）。
+
+### 4.2 模型指纹规范（内部结构，对用户隐藏）
+
+开工准备阶段由 `plugins/dalton/skills/dalton-model/scripts/model_fingerprint.py` 只读解析起点模型（存量原模型或 `default_model_template.xlsx`），在 `.agents/threads/<thread8>/modeling/<TICKER>-fingerprint.json` 生成完整基线指纹（仅系统内部读取，不暴露给用户）：
+- 供建模智能体读取：`model_fingerprint.py summary` 输出紧凑结构地图（表清单、期间列字母映射、分节行号、勾稽锚点行号、代表列公式模板与样式槽编号）；
+- 供格式与结构检查读取：`model_check.py` 读取全量 `fingerprint.json` 与新版本逐格比对。
 
 | 层级 | 字段路径 | 类型 | 记录内容与提取方式 | 下游用途 |
 |---|---|---|---|---|
-| **顶层与工作簿级** | `schema_version` | `int` | 固定为 `1` | 指纹格式版本兼容 |
-| 同上 | `source_path` / `source_sha256` / `source_bytes` | `str` / `int` | 基线 `.xlsx` 路径、64 位十六进制 `SHA-256` 摘要与字节大小 | 校验原件只读未改、绑定拦截报告基线 |
-| 同上 | `calc_properties` | `object` | 从 `xl/workbook.xml` `<calcPr>` 提取：`full_calc_on_load`（`bool`）、`calc_mode`（`auto`/`manual`）、`iterate`（`bool`）、`iterate_count`（`int`）、`iterate_delta`（`float`） | 拦截 `G12` 检查 `fullCalcOnLoad` 是否被擅自打开、识别原模型有意迭代计算 |
-| 同上 | `theme_palette` | `dict[str, str]` | 解析 `xl/theme/theme1.xml` `<a:clrScheme>` 12 个主题色槽对应的 6 位十六进制 `RGB`（红绿蓝）色值 | 将主题色加色调（`theme + tint`）精确还原为统一 `RGB` 比较样式 |
-| 同上 | `style_catalog` | `dict[str, StyleEntry]` | 工作簿去重样式字典（键如 `"s0"`..`"sN"`）：含 `font_name`、`font_size`、`bold`、`italic`、`font_rgb`、`fill_type`、`fill_rgb`、`borders`（四边线型与色值）、`number_format`、`horiz_align`、`locked` | 压缩数万单元格样式体积；拦截 `G04` 比对同行同类列样式一致性 |
-| 同上 | `sheet_order` | `list[SheetTab]` | 按顺序排列的全部工作表：`index`、`name`、`xml_part`（如 `xl/worksheets/sheet3.xml`）、`state`（`visible`/`hidden`/`veryHidden`）、`tab_color`（`RGB` 或 `null`）、`sheet_type`（`content_sheet`/`blank_divider`/`hidden_sheet`）、`company_tag`（如 `"JD"`、`"PDD"` 或 `null`） | 拦截 `G01` 表顺序与工作表增删、拦截 `G14` 非目标公司工作表锁定 |
-| 同上 | `defined_names` | `list[DefinedName]` | 工作簿级与工作表级命名区域：`scope`、`name`、`attr_text`（引用表达式）、`has_external_link`、`has_ref_error` | 保留汇率（如 `hkd`、`ex`）等内部命名区域，跟踪引用完整性 |
-| 同上 | `package_parts` | `object` | OOXML（Office Open XML，开放式办公文档标准格式）包级清单：`media`（路径、扩展名、`sha256`）、`drawings`、`charts`、`external_links`、`pivot_tables`、`slicers`、`vba_project`、`has_calc_chain` | 拦截 `G06` 检查嵌入图片、绘图与图表数量及文件完整性 |
-| **工作表级**（`sheets[name]`） | `period_axis` | `object` | `header_row`（主期间表头行号）、`sub_header_rows`（子区块表头行号）、`fiscal_year_end_month`（1–12，从表头旁标注如 `FY ends Mar` 或财季归属推断）、`unit_label`（如 `"(RMB MM)"`）、`columns`（每列 `col`、`idx`、`raw`、`period_key`、`role` ∈ `label\|spacer\|annual_actual\|annual_forecast\|quarter_actual\|quarter_forecast\|cagr_delta\|source_note\|other`、`fy`、`fq`、`annual_sum_quarters`〔该年度对应的四财季列字母列表〕） | 智能体定位扩列插入点与参照列；拦截 `G02`/`G07`/`G09` 判定历史期、预测期与年度＝四季之和 |
-| 同上 | `freeze_panes` | `object` | 直接解析工作表 XML `<sheetViews><sheetView><pane>`：`state`（`frozen`/`frozenSplit`/`split`/`none`）、`x_split`（`int`）、`y_split`（`int`）、`top_left_cell`（如 `"K3"`）、`active_pane`、`show_grid_lines`（`bool`） | 拦截 `G05` 精确捕获 `xSplit`/`ySplit` 错位（如 `10/2` 变 `51/101`） |
-| 同上 | `column_layout` | `dict[str, ColDim]` | 各列或列区间维度：`width`（浮点字符宽）、`custom_width`（`bool`）、`outline_level`（`0`–`7`）、`hidden`（`bool`）、`collapsed`（`bool`） | 拦截 `G05` 校验存量列宽漂移、早年历史列折叠分组保留与新列宽继承 |
-| 同上 | `row_groups` | `dict[int, RowDim]` | 带分组、隐藏或自定义行高的行：`height`、`outline_level`、`hidden`、`collapsed` | 拦截 `G05` 校验增速/利润率子行大纲分组保留 |
-| 同上 | `merged_ranges` | `list[str]` | 合并单元格坐标区间列表（如 `["A1:D1", ...]`） | 编辑时跳过非左上角合并格，防止破坏表头版面 |
-| 同上 | `conditional_formats` | `object` | 分两类记录：`standard_cf`（标准 `<conditionalFormatting>` 的 `sqref`、规则类型、公式与样式摘要）；`ext_x14_cf`（`<extLst>` 下 `x14:conditionalFormatting` 的规则数、`sqref` 列表及序列化 XML 片段备份） | `gridcraft` 保存后对比并自动补回丢失的 `x14` 扩展条件格式 |
-| 同上 | `attachments` | `object` | 本工作表通过 `.rels` 挂载的 `drawings`、`media`、`charts`（含每个图表系列的公式引用区间 `series_refs`）、`sparklines_count`、`data_validations_count` | 按工作表精确定位丢失的图片/绘图，扩列后校验图表数据系列区间顺延 |
-| 同上 | `semantic_anchors` | `object` | 通过分节标题与行标签识别出的勾稽锚点行号映射：`sections`（利润表/非公认会计准则 `Non-GAAP`/分部报告/现金流量表/资产负债表起止行）、`group_revenue_row`、`segment_revenue_rows`、`group_op_profit_row`、`segment_op_profit_rows`、`unallocated_elim_rows`、`total_assets_row`、`total_liab_row`、`total_equity_row`、`beg_cash_row`、`end_cash_row`、`net_cash_chg_row`、`beg_shares_row`、`end_shares_row`、`buyback_cash_row`、`diluted_shares_row`、`eps_rows` | 支撑 `G08`（资产负债表配平）、`G10`（集团＝分部＋抵销）、`G11`（现金与股本滚存）及 10 行关键数字变更摘要自动提取 |
-| 同上 | `circular_baseline` | `list[str]` | 原模型已存在的循环引用强连通分量单元格集合（采用 `Tarjan` 有向图强连通分量检测算法提取） | 区分「原模型既有有意循环引用」与「本轮误引入的新循环引用」 |
-| **单元格级**（`sheets[name].cells[coord]`） | `category` | `str` | 必取三主类之一并附细分子类：<br/>1. `"formula"`（细分子类：`same_sheet` 同表公式 / `cross_sheet` 跨表引用 / `plugin` 外部终端插件函数 / `array` 数组公式）<br/>2. `"input"`（位于期间数据列且带输入蓝字或假设底色的可调数值格，细分子类：`actual_input` 历史披露值 / `hist_estimate` 历史估算 / `driver_input` 预测驱动假设 / `external_input` 外部参考值）<br/>3. `"constant"`（静态标签或无输入标记常数，细分子类：`numeric_const` 无输入标记的数值常数 / `label` 行列文本标签 / `source_note` 红字来源说明 / `error_literal` 错误字面量） | 智能体识别填实数行、驱动假设行与受保护公式行；拦截 `G02`/`G03`/`G07` 逐格对照 |
-| 同上 | `formula` | `str \| null` | 以 `=` 开头的原始公式文本（非公式格为 `null`） | 平移生成新列公式、检测公式被改写为常数或插件函数变动 |
-| 同上 | `cached_value` | `number \| str \| bool \| null` | 原文件存储的 `<v>` 缓存计算值 | 生成「关键数字变更摘要」旧值列、校验其余工作表数值保持一致 |
-| 同上 | `style_id` | `str` | 指向顶层 `style_catalog` 的样式键（如 `"s14"`） | 逐格常数时间比对字体、字色、底色、边框与数字格式 |
+| **顶层与工作簿级** | `schema_version` | `int` | 固定为 `1` | 指纹结构版本兼容 |
+| 同上 | `source_path` / `source_sha256` / `source_bytes` | `str` / `int` | 基线 `.xlsx` 路径、64 位十六进制 `SHA-256` 摘要与字节数 | 核验原模型保持字节级只读 |
+| 同上 | `calc_properties` | `object` | 解析 `xl/workbook.xml` `<calcPr>`：`full_calc_on_load`、`calc_mode`、`iterate`、`iterate_count`、`iterate_delta` | 检查 **`C13`** 核对 `fullCalcOnLoad` 与原模型既有迭代计算设置 |
+| 同上 | `theme_palette` / `style_catalog` | `dict` | 解析 `xl/theme/theme1.xml` 12 主题色槽（支持 `theme + tint` 还原为 6 位 `RGB`〔红绿蓝十六进制色值〕），建立去重样式字典 `"s0".."sN"`（字体、字号、加粗/斜体、字色、底色、四边边框、`number_format`、对齐） | 检查 **`C05`** 逐格常数时间比对同行同类列样式一致性 |
+| 同上 | `sheet_order` | `list[SheetTab]` | 全部工作表顺序：`index`、`name`、`state`（`visible`/`hidden`/`veryHidden`）、`tab_color`、`sheet_type`（`content_sheet`/`blank_divider`/`hidden_sheet`）、`company_tag`（如 `"JD"`、`"PDD"` 或 `null`） | 检查 **`C01`** 工作表完整性与 **`C14`** 非目标公司工作表零改动 |
+| 同上 | `defined_names` / `package_summary` | `list` / `object` | 内部命名区域（如汇率 `hkd`、`ex`）与 `OOXML`（Office Open XML，开放式办公文档标准格式）包部件概览（图表、数据验证、迷你图、媒体与绘图计数） | 维护命名区域引用；包内媒体/绘图计数仅用于生成报告末尾一行提示信息 |
+| **工作表级**（`sheets[name]`） | `period_axis` | `object` | `header_row`、`sub_header_rows`、`fiscal_year_end_month`（1–12，从 `A2` 如 `FY ends Mar` 或财季归属识别）、`unit_label`（如 `"(RMB MM)"`）、`source_note_col`（最右红字备注列字母）、`columns`（每列角色 `label\|spacer\|annual_actual\|annual_forecast\|quarter_actual\|quarter_forecast\|cagr_delta\|consensus_ref\|source_note`、`fy`、`fq`、`annual_sum_quarters`） | 引导扩列位置；支撑 **`C02`**（期间覆盖跨度）、**`C08`**（历史期完整）、**`C10`**（年度＝四季之和） |
+| 同上 | `freeze_panes` / `column_layout` / `row_groups` / `merged_ranges` | `object` | 工作表 XML `<pane>`（`x_split`、`y_split`、`top_left_cell`、`show_grid_lines`）、列宽与列折叠大纲（`width`、`outline_level`、`hidden`）、行分组与合并单元格区间 | 检查 **`C06`** 精确核对冻结窗格、列宽与行列分组保留 |
+| 同上 | `conditional_formats` | `object` | 标准 `<conditionalFormatting>` 与 `<extLst>` 下 `x14:conditionalFormatting` 的规则区间及原始 XML 片段备份 | `gridcraft` 保存后自动无损补回 `x14` 扩展条件格式 |
+| 同上 | `semantic_anchors` | `object` | 关键语义锚点行号与区块坐标：利润表/`Non-GAAP`/分部/现金流/资产负债表起止行、集团与各分部收入及营业利润行、总部及抵销行、总资产/总负债/股东权益行、期初期末现金与净变动行、期初期末股数与回购流出及加权稀释股数行、`EPS` 行、管理层指引区、**一致预期参考区块/对照表坐标集合 `consensus_ref_ranges`** | 支撑 **`C04`**（一致预期隔离）、**`C09`**（配平）、**`C11`**（集团＝分部）、**`C12`**（滚存）及生成一致预期差异表与 10 行摘要 |
+| 同上 | `circular_baseline` | `list[str]` | 原模型已存在的循环引用强连通分量单元格集合 | 保留原模型既有有意循环引用，仅识别本轮新增循环引用 |
+| **单元格级**（`sheets[name].cells[coord]`） | `category` / `formula` / `cached_value` / `style_id` | `object` | 单元格分类（`formula`：`same_sheet`/`cross_sheet`/`plugin`/`array`；`input`：`actual_input`/`hist_estimate`/`driver_input`/`guidance_input`/`external_input`；`constant`：`numeric_const`/`label`/`source_note`/`error_literal`）、原始公式文本、缓存值 `<v>`、样式键 `style_id` 及是否存在单元格批注 `has_comment` | 智能体定位可编辑驱动格；支撑 **`C03`**–**`C05`** 及历史数字核验抽数 |
 
 ---
 
-## 4. 原地编辑引擎与回退机制
+## 5. 原地编辑引擎与一致预期独立对照流程
 
-### 4.1 原地编辑核心铁律
+### 5.1 原地编辑引擎（`model_edit.py`：`gridcraft-cli` 主路径 + 受控回退路径）
 
-1. **只改目标单元格，其余部分原样保留**：在工作副本上仅对本次任务涉及的新增列、刚披露季度列、补充披露行及需调整的驱动假设输入格执行定点操作；其余工作表、存量历史列、嵌入图、绘图、命名区域与页面打印设置保持原状。
-2. **新增期间的公式一律由相邻同类期间列平移生成**：新增季度列的公式从紧邻的前一预测季度列（或同比参照季度列）向右填充/公式平移得到，新增远期年度列的公式从紧邻的前一远期年度列向右填充得到，全部保持动态公式计算。
-3. **对齐一致预期只改驱动输入格**：需要校准预测水平时，只修改指纹中标为 `driver_input`（驱动假设输入格）的增长率、货币化率、利润率、费用率、利率或回购假设，让现有公式链算出新结果。
+所有工作簿写入统一通过 `plugins/dalton/skills/dalton-model/scripts/model_edit.py` 在新版本副本上原地修改目标单元格，保持其余工作表、未改动历史列、命名区域与视图结构原样留存：
 
-### 4.2 主编辑引擎：`gridcraft-cli` 原地脚本化编辑（P1 接入）
+1. **主编辑引擎：`gridcraft-cli` 脚本化原地编辑（P1 装入沙箱镜像后默认启用）**：
+   - `model_edit.py` 将扩列、填实数、调假设与套格式编译为 `JSONL`（按行分隔的 `JSON`〔结构化数据交换格式〕命令流）脚本，调用 `gridcraft-cli run --in <base.xlsx> --script <ops.jsonl> --out <target.xlsx> --quiet` 一次性执行：
+     - **扩列与公式平移**：`home.insertColumns` 插入新预测季度/远期年度列（自动顺延同表公式、跨表引用、命名区域与图表系列） → `edit.fillRight` 从相邻同类预测列向右平移填充全部公式行 → `edit.formatPainter` + `home.columnWidth` 克隆相邻同类期间列的完整样式与列宽；当某远期年度凑齐完整四季时，自动将该年度列切换为四季汇总公式并将驱动假设下沉至季度列；
+     - **新披露季度转实际值**：更新列头去掉预测后缀（如 `3Q26E → 3Q26`），仅对前序历史季度原本就是 `actual_input` 的明细行与 `KPI` 行用 `range.setValues` 填入一手财报实际数、用 `home.formatCells` 套历史实数样式（蓝字 `#0000FF`、无底色），并将原驱动假设行切换为当季实际反算比率公式（斜体无底色），自动写入 `justifications.json`；**小计、合计、利润率、同比增速与跨表引用公式原封保留**；
+     - **补充新披露项与微调驱动假设**：`home.insertRows` 在对应分部/子业务块内插行补入新披露明细及历史重述可比数据；预测调整仅写入 `driver_input` / `guidance_input` 输入格及最右红字 `source_note` 备注列；
+     - **全表重算与 `x14` 扩展条件格式补回**：末尾执行 `formulas.calculateNow` 亚秒级重算回写 `<v>` 缓存值；针对 `gridcraft-cli` 保存会丢弃工作表尾部 `<extLst>`（含 `x14:conditionalFormatting` 扩展条件格式）的特性，由 `model_edit.py` 内置后处理器通过 `zipfile` + `lxml`（Python XML 解析库）对照原模型指纹提取原 `<extLst>` 子树（顺延扩列后的 `<xm:sqref>` 坐标区间）无损写回输出文件，或在简单单表场景用 `openpyxl` 补齐。
+2. **回退编辑路径：受控原文件副本改格 + XML 包级扩列（P0 默认及无 `gridcraft` 环境自动兜底）**：
+   - 仅接受原模型或默认格式模板路径复制生成新版本副本；需要插列/插行时先调用仓库现有 `plugins/langalpha_deliverables/skills/xlsx/scripts/insert.py`（带 `--copy-style-from`）在 ZIP（压缩归档格式）/ XML 层平移坐标与重写公式；
+   - 对常规表格用 `openpyxl.load_workbook(target_path)` 仅定点改写目标单元格值、用 `Translator`（`openpyxl` 公式坐标平移器）平移公式并调用 `model_style.py` 的 `clone_period_column_style` / `apply_cell_style` 套样式；对含矢量图或复杂 `<extLst>` 的工作簿直接在工作表 XML 中定点更新目标 `<c>` 节点的 `<f>`、`<v>` 与同角色样式索引 `s`；
+   - 最后调用 `plugins/langalpha_deliverables/skills/xlsx/scripts/recalc.py`（优先 `IronCalc`〔Rust 电子表格计算引擎〕，自动回退 `LibreOffice`〔开源办公套件无头重算〕）回写全部公式 `<v>` 缓存值，并将 `<calcPr>` 的 `fullCalcOnLoad` 恢复为原模型指纹状态。
 
-通过统一封装脚本 `plugins/dalton/skills/dalton-model/scripts/model_edit.py` 将高阶建模动作编译为 `gridcraft-cli run --in <base.xlsx> --script <ops.jsonl> --out <target.xlsx> --quiet` 的确定性 `JSONL`（按行分隔的 JSON 命令流）脚本一次性执行：
+### 5.2 一致预期对照流程（先独立建模 → 代码出差异表 → 超阈值返工复核 → 明显差异附理由）
 
-| 建模编辑操作 | `gridcraft-cli` 命令映射 | 保真效果 |
-|---|---|---|
-| **插入新增季度/年度列** | `{"command": "home.insertColumns", "params": {"cols": "<COL_START>:<COL_END>"}}`（先 `selection.set` 切至目标表） | 自动平移右侧列，自动重写同表公式、跨表公式、命名区域与图表系列引用，完整保留 `xl/media`（18 张嵌入图）与 `xl/drawings`（15 个绘图） |
-| **向右平移填充预测公式** | `{"command": "edit.fillRight", "params": {"range": "<SRC_COL><R1>:<DST_COL><R2>"}}` 或 `edit.autoFill`（`mode: "copy"`） | 相对引用随列自动平移，绝对引用（`$A`）锁定不变，零手写常数 |
-| **格式刷克隆同类期间列样式与列宽** | `{"command": "selection.set", "params": {"sheet": S, "range": "<SRC_COL>1:<SRC_COL><MAX_R>"}}` → `{"command": "edit.formatPainter", "params": {}}` → `{"command": "edit.formatPainter", "params": {"apply": "<DST_COL1>1:<DST_COL2><MAX_R>"}}` + `{"command": "home.columnWidth", "params": {"sheet": S, "cols": "<DST_COL1>:<DST_COL2>", "chars": W}}` | 字体、字号、底色、细虚线框、对齐方式、数字格式与列宽 100% 沿用原表同类列 |
-| **刚披露季度填入实际值并切换样式** | 明细实数格用 `cell.set` / `range.setValues`（`parse: true`）写入披露数字，再用 `home.formatCells` 套该表 `actual_input` 样式（蓝字 `#0000FF`、无底色 `"none"`、清除边框）；原假设比率行用 `cell.set` 写入反算比率公式并套斜体无底色样式 | 合计行、毛利率行与跨表引用公式完全不触碰，天然保留原公式 |
-| **插入新披露明细行或新口径分部行** | `{"command": "home.insertRows", "params": {"rows": "<R1>:<R2>"}}` + `edit.formatPainter` 复制同区块相邻明细行样式 + `range.setValues` 填入历史重述数与预测公式 | 若插入点在原 `SUM` 区间内部自动扩围；位于区间边界时由 `model_edit.py` 显式更新父合计行公式 |
-| **微调预测驱动假设格** | 仅允许目标坐标在指纹中属于 `driver_input`（或新增预测列的同角色行）：调用 `cell.set` 更新假设参数，并在最右来源备注列（`source_note`）写入红字依据 | `model_edit.py` 在写入前校验坐标角色，若智能体尝试用常数覆写存量 `formula` 结果行且未附带合法转实数豁免，编辑封装器当场拒绝执行 |
-| **冻结窗格与分组维护** | 默认保留原表 `view.freezePanes` 与 `data.group` 不动；仅当在冻结线左侧插列导致可视区偏移时调用 `view.freezePanes` 对齐原可视列数 | 杜绝冻结窗格乱跳 |
-| **全表重算与错误溯源** | 编辑脚本末尾固定追加 `{"command": "formulas.calculateNow", "params": {}}`；若出现公式错误，调用 `formulas.traceError` 定位源头格 | 5.7 万条公式亚秒级重算并写入 `<v>` 缓存值 |
+严格执行「**本方独立驱动建模在前、一致预期对照在后、参考数据与本方预测物理隔离**」四步闭环：
 
-### 4.3 `gridcraft` 丢失扩展条件格式与 `calcChain` 的处理机制
-
-1. **Excel 2010 扩展条件格式（`<extLst>` / `x14:conditionalFormatting`）检测与补回**：
-   - `gridcraft-cli` 当前版本（0.19.1 alpha）打开再保存会丢弃工作表 XML 尾部的 `<extLst>` 节点（内含跨表引用条件格式、数据条扩展属性及迷你图）。
-   - **自动补回与报告双保险**：
-     - `model_edit.py` 在 `gridcraft-cli` 保存完成后，立即对照原模型指纹的 `conditional_formats.ext_x14_cf`：若某工作表在原模型含有 `<extLst>` 而在输出文件中丢失，后处理器通过 `zipfile` + `lxml`（Python XML 解析与处理库）从原模型对应工作表 XML 提取 `<extLst>` 子树（若该表执行过插列或插行，同步调用坐标平移函数顺延其中的 `<xm:sqref>` 与 `<xm:f>` 引用范围）注入回输出文件对应工作表 XML 末尾；若某条规则为简单单表条件格式且需重建，亦可通过 `openpyxl` 标准 `conditional_formatting` 接口补写。
-     - `model_gate.py` 在最终检查报告的「部件与条件格式对比」小节如实列出原模型扩展条件格式条数、补回条数及任何未能平移补回的残留差异条数与所在工作表。
-2. **`calcChain.xml` 丢弃说明**：
-   - OOXML 规范中 `xl/calcChain.xml` 属于可选的求值顺序缓存。只要全表公式单元格均已写入准确的 `<v>` 缓存值且 `fullCalcOnLoad=0`，Excel、WPS（金山办公套件）、LibreOffice 及网页预览器打开时均直接渲染缓存值并在后台自动重建计算链。
-
-### 4.4 回退编辑路径：受控 `openpyxl` 原地改格 + XML 扩列（P0 默认及 P1 兜底）
-
-当运行环境尚未安装 `gridcraft-cli`（如 P0 阶段或自定义轻量环境）或 `gridcraft-cli` 对极个别特殊工作簿返回非零退出码时，`model_edit.py` 自动切换至受控原地编辑路径：
-
-1. **强制基于原模型副本加载编辑**：回退路径只接收原模型（或默认格式模板）路径，先复制生成新版本副本并在副本上原地修改；代码门禁直接拒绝任何从空白 `openpyxl.Workbook()` 重写存量模型的产物。
-2. **结构扩列先走 XML 包级 `insert.py`**：需要插列或插行时，调用仓库已有的 `plugins/langalpha_deliverables/skills/xlsx/scripts/insert.py`（带 `--copy-style-from`），直接在 ZIP（压缩归档格式）/ XML 包层平移坐标并重写公式引用，完整保留 `EMF`/`WMF`（Windows 增强型矢量图元文件）嵌入图片、绘图与 `<extLst>`。
-3. **单元格定点修改分层处理**：
-   - 指纹显示工作簿为常规纯表格部件时：使用 `openpyxl.load_workbook(target_path)` 加载副本，仅对变更清单中的目标单元格改值、用 `openpyxl.formula.translate.Translator` 平移相邻列公式、调用 `model_style.py` 的 `clone_period_column_style` / `apply_cell_style` 套用原表画像样式后保存；
-   - 指纹显示工作簿含有 `EMF`/`WMF` 矢量图、复杂绘图或 `<extLst>`（如含 18 张嵌入图、15 个绘图的中国电商模型）时：在 `insert.py` 扩列后的副本上，由 `model_edit.py` 直接在工作表 XML 中定点更新目标 `<c>` 节点的公式 `<f>`、数值 `<v>` 与样式索引 `s`（复用原表同类单元格的 `s` 索引），保持包内媒体、绘图与冻结窗格字节级完好。
-4. **统一重算与 `fullCalcOnLoad` 复位**：编辑完成后调用 `plugins/langalpha_deliverables/skills/xlsx/scripts/recalc.py`（优先 `IronCalc`〔Rust 电子表格计算引擎〕毫秒级重算，自动回退 `LibreOffice`〔`soffice` 开源办公套件无头重算〕）将计算结果回写至每个公式格的 `<v>` 缓存节点并刷新图表缓存点，最后将 `xl/workbook.xml` 中 `<calcPr>` 的 `fullCalcOnLoad` 恢复为原模型指纹记录的原始状态。
-5. **同一门禁验收**：`gridcraft` 主路径与回退路径的产物统一执行第 5 章全部 14 项代码拦截检查。
-
-### 4.5 公司默认格式模板来源与双形态分离设计
-
-遵循 `docs/dalton/features/standalone-core.md` 的双形态分离原则，新建模型所用的「公司默认格式模板」通过统一配置与随包资产目录加载，同时兼容 Everflow 生产与独立核心安装：
-
-1. **配置解析优先级（形态判定统一走 `src.dalton.profile`，路径解析置于 `src/dalton/settings.py`）**：
-   - **优先级 1（部署自定义模板）**：环境变量 `DALTON_MODEL_DEFAULT_TEMPLATE_PATH` 或配置文件 `modeling.default_template_path`（Everflow 生产环境的模板挂载由 `scripts/dalton/ops/prod/` 运维脚本配置；独立核心安装客户通过 `scripts/standalone/` 部署配置挂载自有标准模板并设置同一变量，读取逻辑在单一实现处共用）；
-   - **优先级 2（随包内置标准模板）**：`plugins/dalton/skills/dalton-model/assets/default_model_template.xlsx`（位于 `plugins/dalton/` 下，直接落入 `scripts/dalton/dalton_paths.txt` 与 `scripts/standalone/package_release.sh` 的核心发行白名单，Everflow 与 Core 双形态开箱即用）。
-2. **用户提供正式模板文件前的过渡提取方案**：
-   - 在收到正式「公司默认格式模板」文件前，P0 提供一次性脱敏骨架提取脚本 `plugins/dalton/skills/dalton-model/scripts/extract_default_template.py`：从现有标准实测模型中抽取单公司标准页签骨架（`README & Changelog`、`Summary`、`Key Metrics`、`Model`、`Valuation`、`Street vs House`），清空具体公司名称、商业专有数据与外部链接，保留标准列序布局（`A–D` 层级缩进标签列 → 年度列 → 窄空隔列 → `CAGR` 列 → 窄空隔列 → 季度列 → 最右红字备注列）、`Arial` / `等线` 8pt（磅）字体、亮蓝表头 `3366FF`、浅米黄假设格 `FFFFC8` 配 `hair` 细虚线框、浅蓝/棕红/浅桃三级分节条、标准数字格式、列宽、大纲分组与冻结窗格，生成通用干净的 `default_model_template.xlsx`；
-   - 收到用户指定的正式默认格式模板文件后，直接替换该文件（或通过 `DALTON_MODEL_DEFAULT_TEMPLATE_PATH` 挂载）即可生效。
+1. **第 1 步 —— 独立建模与一致预期参考快照落表**：
+   - 建模智能体先依据公司一手财报、管理层指引与工作区研究认知独立设定各业务分部与费用驱动假设，由公式链算出本方收入、营业利润、净利润与 `EPS`；
+   - 一致预期数据按双形态能力（`src.dalton.capabilities`：`researchdata.finance(route="estimates")` 或公开 `yf_analysis` / `fundamentals` 及卖方报告检索）获取后保存至 `data/consensus/<YYYY-MM-DD_HHMM>.json`，**允许写入模型中单独的一致预期对照表（如 `vs Consensus` / `Street vs House` 工作表）或汇总表下方独立的参考区块**：参考格采用外部输入样式（`role="external_input"`，蓝字无底色常数快照），并在最右备注列（或对照表「来源类型与日期」列）明确写出数据来源与取数日期（如 `<Visible Alpha / Yahoo Finance, 2026-11-26` 或 `<GS 2026-11-17`）；
+   - **隔离边界**：本方主模型与汇总表中的收入、成本、费用、营业利润、净利润、现金流、`EPS` 等预测行全部由本方驱动假设经公式算出；一致预期参考格仅作为对比基准被「差异计算列」（如 `=本方预测格/一致预期参考格 - 1`）单向读取。
+2. **第 2 步 —— 代码自动生成「我们 vs 一致预期」分拆差异表（`model_consensus.py diff`）**：
+   - 独立建模重算完成后，运行确定性脚本 `plugins/dalton/skills/dalton-model/scripts/model_consensus.py diff`：先校验比较口径对齐（财年截止月、报表币种、`GAAP`/`IFRS` 或 `Non-GAAP`、普通股或 `ADS`、是否已反映最新季报），再自动读取本方模型结果与一致预期参考快照，输出 `<R>/consensus-diff.md` 与 `<R>/consensus-diff.json`：
+     - **核心汇总层**：下一季度、本财年、下一财年及远期财年的**营业总收入、营业利润、净利润、稀释 `EPS`/`EPADS`**，逐项列出「本方预测 | 一致预期 | 绝对差额 | 差异百分比（近零或盈亏方向相反时标绝对差额与方向）」；
+     - **业务分部与关键费用拆解层**：按各业务分部收入、分部营业利润/利润率，以及毛利率、销售费用率、研发费用率、管理费用率、净利息收入、有效税率、稀释股数拆开对比（有卖方分项预期时直接算差额，仅有一致预期总量时并列展示本方隐含增速/费用率变化以定位偏离点）。
+3. **第 3 步 —— 超阈值触发一次「返工复核」（可按公司调整阈值）**：
+   - **默认复核触发阈值**（定义在 `model_consensus.py` 默认配置，支持通过工作流 `consensus_thresholds` 参数按公司高增长/盈亏平衡特征调整；用户在原话中点名关注的指标无条件纳入）：
+     - 营业总收入：差异超过 **`±5.0%`**；
+     - 营业利润、归母净利润、稀释 `EPS`/`EPADS`：差异超过 **`±10.0%`**（利润率接近盈亏平衡即绝对利润率 `< 3%` 时，改为营业利润率或净利率相差超过 **`±150bp`**〔基点，1bp = 0.01%〕）；
+     - 主要业务分部收入：差异超过 **`±8.0%`**；关键期间费用率：相差超过 **`±200bp`**。
+   - 当任一指标超出阈值时，工作流在阶段 2b 自动触发**一次「一致预期返工复核」**：智能体逐项拆解到具体分部、量价/`Take rate` 驱动假设、费用率、利息、税率与股本，核查分歧根源（严格沿用 `SKILL.md` 第 25 行规则）：
+     - **发现本方假设遗漏或口径偏差**（如漏计新披露重组费用、`ADS` 换算比未对齐、季节性基数误含一次性损益）→ 通过 `model_edit.py` **修改对应的驱动假设输入格**，让公式重新算出结果；
+     - **有可核实的新信息或独立研究判断支撑**（如最新电话会管理层投放表态、高频渠道数据、指引一贯保守规律）→ **保留本方驱动假设与预测结果，无需贴合一致预期**，为该项差异写明具体支撑理由。
+4. **第 4 步 —— 交付时每个明显差异附一句理由，并由代码检查一致预期隔离**：
+   - 返工复核后重新运行 `model_consensus.py diff` 更新差异表，确保每一项超阈值明显差异在工作簿对照表「差异说明」列、`README & Changelog` 及交付摘要中均附有一句清晰理由（例如：「结合我们的研究，认为主站货币化率提升带动收入增速快于市场预期，同时海外新业务投入使销售费用率高于市场预期」）；
+   - 在阶段 3 的代码检查 **`C04`** 中强制核查本方预测行与一致预期参考区的隔离关系及来源日期完整性（详见第 6.1 节）。
 
 ---
 
-## 5. 代码拦截检查清单与门禁接入
+## 6. 三层质量核验规范（格式结构检查 + 数字核验 + 异族审查）
 
-### 5.1 替换「提示性扫描」，实行三道硬拦截接入
+### 6.1 第一层：格式、结构与建模约定代码检查（`model_check.py`，共 14 项）
 
-新增确定性门禁脚本 `plugins/dalton/skills/dalton-model/scripts/model_gate.py`，退出码严格区分：**`0` = 全部必过项通过（`0 BLOCK`）**，**`2` = 命中至少一项拦截规则（阻止交付）**，**`1` = 脚本参数或文件读取错误**。
+新增确定性检查脚本 `plugins/dalton/skills/dalton-model/scripts/model_check.py`，在阶段 3 与每次返工修改后执行，对照基线指纹（`fingerprint.json`）、变更豁免登记（`justifications.json`）与第 2 章建模约定逐项检查，输出结构化结果 `model-check.json`（每项含 `code`、`status ∈ PASS | FAIL`、精确到 `工作表!单元格坐标` 的问题列表与修复指引）及给人读的 `model-check.md`。凡检出 `FAIL` 条目，即进入第 3.2 节问题清单交回建模智能体修改（最多两轮）。
 
-> **与开发指南「草稿阶段不阻止保存」原则的边界对齐**：分析师在工作区磁盘上保存临时迭代副本、运行重算和排查数据的文件写入操作不受阻断；硬拦截精确卡在**「向用户正式交付模型」**的三个法定关口：
-> 1. **关口 1（知识层版本登记硬校验）**：修改 `src/dalton/knowledge/service.py` 在处理 `knowledge_update(doc="models", ...)` 时，核验当次目标 `.xlsx` 对应的门禁通过凭据文件（含目标模型实时 `SHA-256`、基线模型 `SHA-256` 与 `verdict == "PASS"`，或由服务端在沙箱直接复核 `model_gate.py --verify`）；未通过或文件被事后改动导致哈希不匹配时，直接拒绝登记并返回具体的 `BLOCK` 条目清单；
-> 2. **关口 2（工作流与手动完成契约硬校验）**：将 `workflows/earnings-deep-update/contract.json` 与 `workflows/full-coverage/contract.json` 中原本只跑 `model_readable.py` 的校验器替换为 `model_gate.py`（`pass_when: "exit_zero"`），同步删去 `dalton-earnings-deep/SKILL.md` 中「无论报错均登记新版本」的旧规则；
-> 3. **关口 3（单技能运行交付要求）**：`dalton-model/SKILL.md` 规定交付前运行 `model_gate.py` 生成机器签名的 `.gate-report.md` 与 10 行变更摘要，原样附入最终回复。
+> **嵌入图片与绘图部件的处理口径**：工作簿内嵌入图片（`xl/media/*`）与绘图部件（`xl/drawings/*`）的增减**免于列入检查项与验收标准**；`model_check.py` 仅在检查报告末尾附一行简短提示信息（如存在 `x14` 扩展条件格式自动补回或包部件变动时顺带提示一行），绝不产生 `FAIL` 项。
 
-### 5.2 代码检查项完整清单（共 14 项）
+| 编号 | 检查项（含对应建模约定） | 确定性判定规则 | 代码实现方式（`model_check.py`） |
+|---|---|---|---|
+| **C01** | **工作簿可读性、表顺序与变更记录更新** | 1. 文件为合法 `.xlsx` 且全部工作表 XML 流式解析完整；<br/>2. 存量更新模式下，原模型指纹 `sheet_order` 中的工作表齐全、相对顺序未变；<br/>3. 工作簿包含 `README & Changelog`（或原模型既有 `Change Log`）工作表，且本轮新增了对应当前新版本号的变更记录行。 | 复用 `model_readable.py` 流式解析器 + 比对新旧 `sheet_order` + 检查变更记录表新增文本。 |
+| **C02** | **期间覆盖跨度与历史列保留（约定映射）** | 1. **存量更新**：原模型指纹中的全部历史年度列与历史季度列完整保留（单向扩展，零删减早年列）；<br/>2. **新建模型**：年度历史自 `FY2018`（或公司上市最早完整财年）连续覆盖至最近完整财年，单季历史自 `1Q24` 连续覆盖至最近已披露季；<br/>3. **预测跨度**（新建及扩展预测任务）：季度预测连续覆盖至下一财年 `Q4`（如 `4Q27E`），年度预测至少覆盖 3 个完整财年（如 `2026E–2028E`）；非 12 月结账公司在 `A2` 或表头区标有财年截止月。 | 解析主计算表 `period_axis`，按当前基准日与公司财年截止月校验起止期间连续性。 |
+| **C03** | **预测期全公式与公式变常数检查（核心规则 1）** | 1. **存量格对比**：计入扩列/插行坐标平移后，原指纹 `category == "formula"` 的单元格在新模型变为常数时，逐格核查 `justifications.json`：仅放行两类合法转换——① 刚披露季度列中前序历史季度原本就是 `actual_input` 的明细/`KPI` 行（**小计、合计、利润率、同比增速等衍生行在刚披露季仍须保持公式，改为常数即判 `FAIL`**）；② 抽离外部终端插件至独立输入格且原格保留引用公式；<br/>2. **新增预测列与新建模型**：预测期间列中所有财务结果金额行与衍生比率行均为公式（管理层金额指引须写在独立 `guidance_input`/`driver_input` 输入格并由结果行公式引用，结果行直接填数字常数即判 `FAIL`）。 | 基于扩列平移映射表 `insert_log.json` 对齐新旧 `(sheet, row, col)`，检查公式存在性与 `justifications.json` 前序历史行角色。 |
+| **C04** | **一致预期隔离、参考区来源日期与差异理由检查（补充要求 6）** | 1. **防公式引用一致预期**：用 `openpyxl.formula.tokenizer.Tokenizer` 递归解析主计算表与汇总表全部预测行（收入、成本、费用、营业利润、税前利润、净利润、现金流、`EPS`、目标价）及驱动假设格的依赖树，凡直接或间接引用一致预期参考区块/对照表（`consensus_ref_ranges`）即判 `FAIL`；<br/>2. **防填一致预期相同常数**：本方预测结果行出现任何数值常数（含与 `data/consensus/*.json` 或模型内一致预期参考格数值相同的常数，相对误差 `< 1e-4`）即判 `FAIL`；<br/>3. **一致预期参考区规范**：模型内一致预期参考区块允许填常数快照（`external_input`），其同行最右备注列或对照表来源列须写明来源名称与取数日期；且 `consensus-diff.json` 中超阈值的明显差异项均已填写非空差异理由。 | 公式依赖图遍历 + 预测格与一致预期快照数值碰撞比对 + 参考区备注列正则核验。 |
+| **C05** | **单元格样式、表头与最右备注列规范（约定映射）** | 1. 本轮新增或修改的单元格样式与同表同行相邻同类期间列一致（新建模型对照默认模板：`Arial`/`等线` 8pt、第 1 行亮蓝表头 `3366FF` 白字加粗且 `A1` 左对齐写单位、假设格浅米黄 `FFFFC8` 配 `hair` 框、历史实数蓝字 `0000FF` 无底色、公式黑字/跨表绿字 `008000`、比率斜体、合计加粗）；<br/>2. 历史估算格、管理层指引输入格在最右备注列（红字 `FF0000`）标有 `<` 或 `<<` 开头的来源说明；<br/>3. 本轮未新增任何 Excel 单元格批注（`xl/comments*.xml`）。 | 还原 `theme + tint -> RGB` 比对同行参照列 `style_id`，检查最右备注列与批注部件。 |
+| **C06** | **冻结窗格、列宽与行列分组保留** | 1. 每张内容表的冻结行数 `y_split` 与原指纹相等，冻结列数 `x_split` 与原指纹相等（仅允许因在冻结线左侧插列产生等量平移，精准捕获如 `10/2 → 51/101` 的错位）；<br/>2. 存量列宽偏差在 `±0.5` 字符以内，新增期间列宽与相邻同类列偏差在 `±0.5` 以内；<br/>3. 原指纹中的早年列折叠分组与衍生比率行分组（`outline_level`、`hidden`）完整保留。 | 解析工作表 XML `<pane>`、`<cols><col>` 与 `<row outlineLevel=...>` 与基线指纹逐表对比。 |
+| **C07** | **单位标识、汇总表全公式与估值页引用同步** | 1. 各计算表 `A1`（或表头单位格）标明统一金额单位；<br/>2. `Summary` / `Key Metrics` 汇总表的历史与预测数据格全部为引用主计算表的公式；<br/>3. 滚动更新扩展期间后，`Valuation` / `SOTP`（分部加总估值）页的目标财年引用列已指向更新后的预测年度 `EPS`/利润与净现金列。 | 检查 `A1` 单位文本、汇总表非公式数据格及估值页跨表引用列号。 |
+| **C08** | **历史期完整性与空值留空纪律（约定映射）** | 1. 原模型指纹中非空的历史期间单元格在新模型保持非空；<br/>2. 新增已披露季度列、分部重述同期列及历史资产负债表中，前序连续 2 期非空的科目若留空，须在最右备注列及 `justifications.json` 注明法定财报未披露原因；<br/>3. 未单独预测的科目在预测期保持空白（`Blank`），预测期新增裸 `0` 输入格而无最右备注列一手依据说明的判 `FAIL`。 | 遍历历史列与预测列非空掩码，结合 `justifications.json` 与备注列核验。 |
+| **C09** | **资产负债表配平与现金表对齐** | 1. 含完整资产负债表的工作表，每期满足 `\|总资产 - (总负债 + 股东权益)\| ≤ max(1.0, 1e-4 × \|总资产\|)`；<br/>2. 现金流量表期末现金与资产负债表同口径现金（或现金＋受限现金）逐期相等。 | 读取 `semantic_anchors` 资产、负债、权益与现金行缓存值逐列验算。 |
+| **C10** | **年度 ＝ 季度公式汇总（核心规则 2）** | 同表存在完整四财季列的年度列（含跨自然年财年，如 3 月结账 `FY27 = 2Q26..1Q27`）：<br/>1. 预测加总年度列**零手填驱动常数**，全部为公式；<br/>2. 流量行＝四财季之和，时点余额行＝第四财季值，比率行由本年度列分子分母公式计算，年度 `EPS` 与归母净利润÷年度加权稀释股数（或原表既有同口径公式）一致。 | 按 `period_axis.annual_sum_quarters` 逐行检验公式形态与数值恒等式。 |
+| **C11** | **集团 ＝ 分部 ＋ 未分配总部与抵销** | 存在分部报告或 `Subs` 子表汇总时，全部预测期与可比历史期满足：<br/>- `集团总收入 == ∑各分部收入 + 分部间抵销`<br/>- `集团同口径营业利润 == ∑各分部营业利润 + 未分配总部项 + 分部间抵销`（容差 `max(1.0, 1e-4 × \|集团值\|)`；直接捕获类似 `JD` 54.7B vs 44B 的脱节）。 | 读取集团行、分部行与总部抵销行逐期核算差额（仅豁免公司未重述且对账行已留空备注的早期历史季）。 |
+| **C12** | **现金与股本滚存连贯** | 预测期每期 `期初现金 == 上期期末现金` 且 `期末现金 == 期初现金 + 本期现金净变动`；`期初股数 == 上期期末股数`，且存在股份回购现金流出时股本同步扣减并与稀释股数、`EPS` 分母联动。 | 跨列校验期初期末公式衔接与数值恒等关系。 |
+| **C13** | **`fullCalcOnLoad`、公式缓存值与零新增错误/循环** | 1. 原模型未开启 `fullCalcOnLoad` 时保持关闭；<br/>2. 全部非插件公式均带 `<v>` 缓存值；<br/>3. 本轮新增或受影响区域零公式错误值（`#REF!`〔断裂引用错误〕、`#DIV/0!`〔除零错误〕、`#VALUE!`、`#NAME?`、`#N/A`、`#NUM!`，含 `IFERROR`〔错误值兜底函数〕内部 `#REF!`）；<br/>4. 零出现 `circular_baseline` 之外的新增循环引用。 | 解析 `<calcPr>`、`<c><f>/<v>`、公式词法标记与 `Tarjan` 有向图强连通分量差集。 |
+| **C14** | **多公司整本模型非目标公司表零改动** | 多公司工作簿中，除本轮目标 `ticker` 所属工作表与 `README & Changelog` 外，其余公司专属工作表的公式、输入值与版面结构与原指纹 100% 一致。 | 遍历 `company_tag != target_ticker` 的工作表逐格核对哈希。 |
 
-| 编号 | 检查项 | 具体判定规则与容差 | 级别 | 代码实现方式（`model_gate.py`） |
-|---|---|---|---|---|
-| **G01** | **工作簿可读性与表顺序完整** | 1. 交付文件为合法 `.xlsx` 且全部工作表 XML 流式解析完整；<br/>2. 滚动更新模式下，原模型指纹 `sheet_order` 中的工作表无缺失、相对顺序未变（允许按规范新增 `README & Changelog` 或对照页）。 | **拦截（`BLOCK`）** | 复用 `model_readable.py` 流式解析器 + 比对新旧指纹 `sheet_order` 列表。 |
-| **G02** | **公式变常数拦截（含预测期常数）** | 1. **存量格对比**：计入插列/插行坐标平移映射后，凡原模型指纹 `category == "formula"` 的单元格在新模型变为数值常数，逐格核查 `justifications.json`：仅允许两类登记理由——① 新披露实际期列中原本在前序历史期就是 `actual_input` 的明细/KPI 行（**小计、合计、同比增速、利润率等衍生行即便在刚披露季度也必须保持公式，改成常数一律直接拦截**）；② 外部插件公式抽离（原格须改为引用独立输入格的公式，直接填常数仍拦截）。其余未登记或理由不合规的公式变常数一律拦截；<br/>2. **新增预测列与新建模型**：预测期间列中除 `driver_input`（套假设样式的驱动参数行）和 `external_input`（对照表外部预期列）外的任何数值常数一律拦截。 | **拦截（`BLOCK`）** | 基于 `insert_log.json`（扩列平移映射表）对齐原指纹与新文件 `(sheet, row, col)`，逐格检查 `formula -> constant` 跃迁并校验豁免规则。 |
-| **G03** | **对齐一致预期禁改结果格** | 主计算表与汇总表的财务结果行（收入、毛利、各项费用金额、营业利润、税前利润、净利润、现金流、EPS、目标价）的公式只能向上游业务驱动或分部明细追溯，禁止直接引用 `vs Consensus` / `Street vs House` 外部预期列或嵌入硬编码凑数常数。 | **拦截（`BLOCK`）** | 用 `openpyxl.formula.tokenizer.Tokenizer` 解析预测结果行公式引用树，命中对照表外部预期区或结果行硬编码即报错拦截。 |
-| **G04** | **样式与位置用途一致性** | 对本轮**新增或修改过**的单元格，核对其样式与同表同行相邻同类期间列的指纹 `style_id` 一致（新建模型对照默认模板规范）：<br/>- 公式结果格使用无底色正体（衍生比率斜体、跨表链接绿字）；<br/>- 预测驱动假设格使用该表假设底色（默认 `FFFFC8`）与蓝字；<br/>- 历史披露实际值使用该表实际值字色（默认蓝 `0000FF`）与无底色；<br/>- 字体族、字号与数字格式（整数/小数位/百分比/倍数）与同行相邻列保持一致。<br/>（原模型未触碰存量格的历史既有样式特例记为 `WARN`〔提示〕，保留原表习惯。） | 改动区违规：**拦截（`BLOCK`）**<br/>存量历史特例：**提示（`WARN`）** | 还原新文件改动格的 `theme+tint -> RGB`、字号、斜体/加粗与 `number_format`，与同行参照列指纹样式比对。 |
-| **G05** | **冻结窗格、列宽与行列分组** | 1. **冻结窗格**：每张内容表的 `y_split`（冻结行数）与原指纹完全相等；`x_split`（冻结列数）与原指纹相等（仅允许因在冻结线左侧插列产生的等量平移，拦截如 `10/2` 跳变为 `51/101` 的错位或冻结丢失）；<br/>2. **列宽**：存量列宽保持在原值 `±0.5` 字符宽以内，新增期间列宽与相邻同类期间列宽保持在 `±0.5` 以内；<br/>3. **大纲分组（`Outline`）**：原指纹中的行分组与早年列折叠分组（`outline_level`、`hidden`）完整保留。 | **拦截（`BLOCK`）** | 解析工作表 XML `<pane>`、`<cols><col>` 与 `<row outlineLevel=...>`，与基线指纹逐表对比。 |
-| **G06** | **嵌入图、绘图与扩展条件格式** | 1. **嵌入图与绘图/图表**：对比 `xl/media/*`、`xl/drawings/*`、`xl/charts/*` 总数与按工作表归属集合，出现任何减少即拦截；<br/>2. **数据验证与迷你图**：条数减少即拦截；<br/>3. **Excel 2010 扩展条件格式（`<extLst>`/`x14`）**：先由后处理器自动补回；若仍有因引擎限制未能平移的扩展条件格式减少，在检查报告显著列出工作表名与规则数（不单独阻断已无损保留全部图片/绘图/数据的 `gridcraft` 交付，必要时触发 XML 补回）。 | 图片/绘图/图表/验证减少：**拦截（`BLOCK`）**<br/>残留 `x14` 扩展格式差异：**提示（`WARN`，必列报告）** | 调用并增强 `model_style.py` 的 `_inspect_workbook_parts` 按工作表 `.rels` 关系链精确核对。 |
-| **G07** | **历史披露期空格检查** | 1. **存量历史格防清空**：原模型指纹中非空的历史期间单元格（实际数或公式）在新模型变为空白 → 拦截；<br/>2. **新披露期与重述期防漏填**：本轮新增的已披露季度列、分部新口径重述同期列及历史资产负债表区域中，凡前序连续 2 个及以上历史同类期间非空的行出现空白，且未在最右备注列及 `justifications.json` 登记「法定财报本季未披露该项」及财报出处 → 拦截。 | **拦截（`BLOCK`）** | 遍历 `period_axis` 中所有 `annual_actual` 与 `quarter_actual` 列，对照原指纹非空掩码与前序历史期连续性。 |
-| **G08** | **资产负债表配平与现金对齐** | 1. 含完整资产负债表的工作表：每个历史与预测期间须满足 `\|总资产 - (总负债 + 股东权益)\| ≤ max(1.0, 1e-4 × \|总资产\|)`（兼容报表四舍五入 1 单位尾差）；<br/>2. 现金流量表期末现金须与资产负债表同口径现金（或现金＋受限现金）行逐期相等。 | **拦截（`BLOCK`）** | 读取 `semantic_anchors` 识别的资产、负债、权益与现金行重算缓存值逐列验算。 |
-| **G09** | **年度 ＝ 季度之和（加总年零假设）** | 当某财年列在同表存在完整四个财季列（按 `fiscal_year_end_month` 绑定跨自然年财季，如 3 月结账公司 `FY27 = 2Q26..1Q27`）时：<br/>1. 流量金额行：年度值 ＝ 四财季之和（相对容差 `1e-4`）；<br/>2. 时点余额行：年度值 ＝ 第四财季值；<br/>3. 衍生比率行：由本年度列自身分子分母公式计算；<br/>4. 预测加总年度列**零手填驱动常数**。 | **拦截（`BLOCK`）** | 按 `period_axis.annual_sum_quarters` 映射逐行检验公式结构与缓存数值恒等关系。 |
-| **G10** | **集团 ＝ 分部 ＋ 未分配总部与抵销** | 存在分部报告（`Segment Reporting` 或 `Subs` 子表汇总）时，逐期检验：<br/>- `集团总收入 == ∑各分部收入 + 分部间抵销`<br/>- `集团营业利润（同口径 GAAP〔公认会计准则〕或 Non-GAAP）== ∑各分部营业利润 + 未分配总部项 + 分部间抵销`（容差 `max(1.0, 1e-4 × \|集团值\|)`；仅公司未重述早期历史季且对账行显式留空备注时豁免该不可比历史期，**全部预测期与可比历史期强制相等**）。 | **拦截（`BLOCK`）** | 读取 `semantic_anchors` 的集团行、分部行与总部抵销行逐期核算差额（直接拦截类似 JD 54.7B vs 44B 的脱节）。 |
-| **G11** | **现金与股本滚存连贯** | 1. **现金滚存**：预测期每期 `期初现金 == 上期期末现金`，且 `期末现金 == 期初现金 + 本期现金净变动`（或 `OCF〔经营现金流〕 - CapEx + 其他投融资净额`）；<br/>2. **股本滚存**：预测期每期 `期初股数 == 上期期末股数`，且当现金流量表存在股份回购流出时，股本行同步扣减回购注销股数并与加权稀释股数、`EPS` 分母联动。 | **拦截（`BLOCK`）** | 跨列校验期初期末衔接公式与数值恒等式，核查回购现金流非零期间的股数变动符号。 |
-| **G12** | **`fullCalcOnLoad`、错误值与循环引用** | 1. 原模型未开启 `fullCalcOnLoad` 时，新模型 `calcPr.fullCalcOnLoad` 保持关闭 → 开启即拦截；<br/>2. 全部非插件公式均包含 `<v>` 缓存值 → 缺失即拦截；<br/>3. 本轮新增或受影响区域出现 `#REF!`（断裂引用）、`#DIV/0!`（除零错误）、`#VALUE!`、`#NAME?`、`#N/A`、`#NUM!`、`#SPILL!`、`#CALC!`（含嵌套在 `IFERROR`〔错误值兜底函数〕内部的 `#REF!`）→ 拦截；<br/>4. 出现原模型 `circular_baseline` 之外的新增循环引用或擅自修改 `iterate` 开关 → 拦截。 | **拦截（`BLOCK`）** | 检查 `xl/workbook.xml` `<calcPr>`、工作表 XML `<c><f>` 是否伴随 `<v>`、公式词法 `#REF!` 与 `Tarjan` 强连通分量差集。 |
-| **G13** | **第二引擎独立复算一致** | 使用独立于编辑器的第二计算引擎对交付文件全表求值，逐格对比重算值与交付文件 `<v>` 缓存值：<br/>- 编辑用 `gridcraft` 时，用 `LibreOffice`（或 `IronCalc`）独立复算；编辑用回退路径时，优先用 `gridcraft-cli check --json`（不可用时用另一引擎）复算；<br/>- 排除原模型指纹已登记的第三方插件公式（`CIQ`、`BQL`〔彭博查询函数〕、`BDH`〔彭博历史函数〕）及原模型既有迭代计算收敛微差后，任何公式格相对偏差 `> 1e-5`（且绝对差 `> 1e-4`）即拦截。 | **拦截（`BLOCK`）** | 在临时目录运行第二引擎重算，逐格读取计算结果与交付文件缓存值比对，统计总公式数、一致数与豁免插件数。 |
-| **G14** | **单轮单公司非目标表零改动** | 多公司整本模型中，除本轮指定的唯一目标公司工作表及变更记录页外，其余公司专属工作表的公式文本、输入常数与版面结构须与原模型指纹 100% 一致。 | **拦截（`BLOCK`）** | 遍历 `sheet_order` 中 `company_tag != target_ticker` 的全部工作表，逐格断言公式与输入值哈希零变化。 |
+#### 合法公式转实际数登记格式（`justifications.json`）
 
-### 5.3 公式变常数登记文件格式（`justifications.json`）
-
-滚动更新中唯一需要把原预测公式换成数字的场景是「新财报披露后，将刚披露季度的预测明细格切换为法定财报实际披露值」。`model_edit.py` 在执行「补实际值」动作时自动生成结构化登记条目，智能体如需手工补充单格豁免也写入同一文件交 `model_gate.py` 校验：
+`model_edit.py` 在将刚披露季度列由预测切换为财报实际值时自动生成 `justifications.json`（`model_check.py` 校验该行在前一历史季度确实也是 `actual_input`，防止把合计或利润率公式误覆盖为常数）：
 
 ```json
 {
@@ -283,142 +307,128 @@ flowchart TD
       "sheet": "Valuation - PDD",
       "cell": "D6",
       "reason_kind": "plugin_extraction",
-      "source": "抽离原 CIQ 实时股价公式至独立蓝字输入格 D6，原结果格已改为 =D6（收盘价截至 2026-11-26）"
+      "source": "抽离原 CIQ 股价公式至独立输入格 D6，原格改为 =D6（收盘价截至 2026-11-26）"
     }
   ]
 }
 ```
-> **防滥用校验规则**（上例 `6-K` 为外国私人发行人临时报告）：`model_gate.py` 按结构化规则核验豁免项——`actual_rollover_columns` 仅对列头已去掉 `E`/`F`/`P` 后缀的历史披露列生效，且逐行验证该行在前一历史季度（如 `AY` 列 `2Q26`）本身就是 `actual_input`；若该行在前一历史季度是 `=SUM(...)`（求和函数）或利润率公式，`model_gate.py` 直接判定 `BLOCK`。
 
-### 5.4 交付给用户的两项固定输出格式
+### 6.2 第二层：历史数字核验（`model_audit.py`，逐项核对一手财报原文输出 `PASS/FAIL` 表）
 
-每次模型新建或更新交付时，智能体在对话回复中直接给出以下两部分内容：
+与正式报告数字核验 `check_draft`（`src/dalton/publish/service.py:953`、`src/dalton/publish/audit.py`、`src/dalton/publish/match.py`，遵循决定记录 `L22`、`L28`、`L29`）采用**完全一致的核验方法与来源底座**，新增脚本 `plugins/dalton/skills/dalton-model/scripts/model_audit.py`（并封装为分析师可调工具 `check_model_numbers`）：
 
-1. **约 10 行「关键数字变更摘要」**（由 `model_gate.py --summary` 从新旧缓存值辅助生成底表，智能体补充一句驱动原因）：
-   - 第 1–2 行：交付文件路径、所基于的原模型版本、本次动作（例如：补入 `3Q26` 实际值、新增 `1Q27E–4Q27E` 季度列与 `2029E` 年度列）；
-   - 第 3–7 行：核心指标新旧对比与一致预期对比简表（覆盖最近实际季与未来两个核心预测财年的**营业总收入、核心分部利润、集团 Non-GAAP 营业利润、Non-GAAP 净利润、稀释 EPS/EPADS 及目标价**，列示：`上一版 → 本版（变动%） | 一致预期（差异%）`）；
-   - 第 8–10 行：驱动本次预测变化的 2–3 个关键假设调整及与一致预期最主要的分歧原因。
-2. **代码生成的检查报告（原样附在回复代码块或折叠块中，智能体一字不改）**：
+1. **待核验历史格抽取**：
+   - **滚动更新模式**：抽取本轮全部新写入或修改过的历史披露格（刚披露季度的全部 `actual_input` 明细与 `KPI` 格、累计期间拆单季衍生格、新增披露行与分部重述同期历史格、本轮补填的历史资产负债表与现金流单元格）；
+   - **新建模式**：抽取最近 3 个完整历史财年与最近 8 个历史季度的核心报表行、分部行、期末现金/债务与稀释股数。
+2. **双轨对源匹配（确定性优先 + 轻量模型原文锚定 + 代码复算）**：
+   - **轨道 A（结构化确定性对账）**：美股与外国发行人直接匹配 `dalton_sec.get_company_facts` 归一化 `XBRL` 事实表（含 `R1–R10` 单季衍生值）及工作区 `facts.md` 机器账本，按工作表单位（如 `(RMB MM)`、`(US$'000)`）自动换算量纲并在容差内（复用 `src/dalton/publish/match.py:values_within_tolerance`）判定 `PASS` 或 `FAIL`；
+   - **轨道 B（财报原文锚定 + 代码算术核验，遵循 `L28/L29`）**：对 `6-K`（外国私人发行人临时报告）业绩公告、港股/A 股公告 `PDF`（便携式文档格式）/ `HTML`（超文本标记语言）、财报附注分部表或累计拆单季项目，从工作区 `provenance_records` 与上传财报文本中检索候选段落，调用 `assist_json` 定位财报原文中的逐字引文与原始数字，再由 **Python 代码亲自执行量纲换算、正负号对齐与累计拆单季算术差分（如验算 `Q4 == FY - 9M`）**，核对与模型单元格数值一致后判 `PASS`，数值/单位/期间/正负号不符判 `FAIL`，未找到一手披露依据且未标历史估算样式判 `UNVERIFIED`。
+3. **固定输出 `PASS/FAIL` 核验表（`<R>/model-audit.md` 与 `<R>/model-audit.json`）**：
    ```markdown
-   ### 模型代码门禁报告（自动生成，sha256: 8f3a1c92...）
-   - 门禁结论：PASS（0 项拦截 / 1 项提示）
-   - 模式与范围：存量滚动更新 | 目标公司：PDD（其余公司工作表 31 张：0 格改动）
-   - 编辑与复算引擎：编辑 = gridcraft-cli 0.19.1 | 第二复算 = LibreOffice 24.2（57,312 条公式：57,157 条一致，155 条为原表既有 CIQ/有意迭代项，0 条新增偏差）
-   - 逐格与结构核对：
-     - [PASS] G01–G03 公式保护：新增预测列 0 处结果常数；3Q26 预测转实数 48 格（全部匹配前序历史实数行），合计与比率公式 100% 保留
-     - [PASS] G04–G06 格式与部件：改动区样式一致；冻结窗格保留（Model - PDD: K3 [10/2]）；嵌入图 18→18，绘图 15→15
-     - [WARN] G06 扩展条件格式：原模型含 4 处 x14 扩展条件格式，已由 XML 后处理器原样补回 4 处（Peers 表）
-     - [PASS] G07–G12 财务勾稽：历史披露期 0 新增空格；资产负债表全期配平；年度=四季之和通过；集团营业利润=分部+抵销全期吻合；现金与股本滚存连贯；fullCalcOnLoad=off，0 新增公式错误
+   ### 模型历史数字核验报告（model_audit.py，绑定模型 sha256: 4d91e0...）
+   - 核验统计：共核验 54 格 | PASS 52 | FAIL 2 | UNVERIFIED 0
+   | 坐标 | 行标签 | 期间 | 模型值 (RMB MM) | 一手财报原文值与出处 | 换算/拆单季核验 | 结论 |
+   |---|---|---|---|---|---|---|
+   | Model - PDD!AZ8 | Online marketing services | 3Q26 | 49,351 | 49,351.2 RMB MM (3Q26 6-K p.2) | 四舍五入至整数匹配 | PASS |
+   | Model - PDD!AZ14 | Transaction services | 3Q26 | 50,000 | 49,998.5 RMB MM (3Q26 6-K p.2) | 差 +1.5 (> 容差 1.0) | FAIL |
+   | Model - PDD!AZ68 | Diluted ADS (MM) | 3Q26 | 1,482.4 | 5,929.6M 普通股 ÷ 4 = 1,482.4M ADS (6-K p.9) | 1 ADS = 4 普通股匹配 | PASS |
    ```
+   凡结论为 `FAIL` 或 `UNVERIFIED` 的单元格自动汇入阶段 6 待修清单交回建模智能体修正。
 
----
+### 6.3 第三层：不同家族模型独立只读审查（`dalton-model-reviewer`，遵循 `L16`）
 
-## 6. 不同家族模型独立审查（遵循 `L16`）
+1. **动态异族选模（修复 `subagents.py`，双形态兼容）**：
+   - 在 `src/server/services/llm/subagents.py`（附 `# DALTON-HOOK(subagent-cross-family-reviewer)`）为 `dalton-reviewer` 与新增的 `dalton-model-reviewer` 统一接入 `src/dalton/publish/review.py:pick_reviewer_model()`：按当前回合主模型 `turn_model`，通过 `src.dalton.llm.role_policy.family_of()` 自动挑选底层厂商家族不同于主模型的可用审稿模型；在 `DALTON_PROFILE=core` 单家族或自定义网关部署下自动回退复用客户已配可用模型并记录 `review_mode: "single_family" | "unknown_family"`。
+2. **只读子智能体 `plugins/dalton/agents/dalton-model-reviewer.md`**：
+   - 前置声明 `tools: [web]`（仅具备工作区只读文件读取权限，无 `Write`/`Edit`/`Bash`/`ExecuteCode` 写盘能力），系统提示词固定为「只读检查报告、数字核验表、一致预期差异表与变更切片，只提问题、不改文件」。
+   - **四项审查重点**：① 复核 `model-check.md` 与 `model-audit.md` 中口径与期间匹配是否准确；② 检查新增预测驱动假设、季节性、大促跨季反向调整与管理层指引兑现记录是否自洽合理（有无把一次性项目线性外推）；③ 检查 `consensus-diff.md` 中五大比较口径是否真正对齐、超阈值明显差异的一句理由是否有据可查；④ 逐字对照 `<user_verbatim_request>` 确认用户要求补充和修改的项目均已到位。
+   - **结构化输出**：返回 `{"verdict": "pass" | "revise", "summary": "...", "must_fix": [...], "notes": [...]}`；`must_fix` 条目并入阶段 6 的两轮修改反馈回路。
 
-在代码拦截检查（`0 BLOCK`）负责守住全部算术、勾稽、公式结构与格式部件之后，引入**不同模型家族的只读独立审查环节**负责把关建模逻辑、披露口径与来源真实性。
+### 6.4 交付阶段输出格式（含两轮后剩余问题置顶规则）
 
-### 6.1 修复子智能体动态异族选模（严格落实 `L16` 与 `L20`）
+每次建模工作流完成交付时，智能体向用户回复的内容按固定顺序组织：
 
-1. **动态模型家族解析**：
-   - 在 `src/server/services/llm/subagents.py` 为审查类子智能体（`dalton-reviewer` 与新增的 `dalton-model-reviewer`）接入与 `src/dalton/publish/review.py:pick_reviewer_model()` 共享的异族选模逻辑：根据当前回合主分析师模型 `turn_model`，通过 `src.dalton.llm.role_policy.family_of()`（Core 形态下用配置感知的 `resolve_model_family()`）从 `dalton_reviewer_models` 候选链中挑选**第一个底层厂商家族不同于主模型**且当前凭据可用的模型（例如主模型为 `claude-opus-5-5-oauth`〔`anthropic-claude`〕时选 `gpt-6.2-sol-oauth`〔`openai-gpt`〕或 `grok-4.7-oauth`〔`xai-grok`〕；主模型切为 `gpt-6.2-*` 时自动避开 OpenAI 家族改选 Claude / Gemini / Grok）。
-   - **双形态兼容（遵循分离原则）**：在 `DALTON_PROFILE=core` 单模型或未知自定义网关部署下，按 `docs/dalton/features/standalone-core.md` 已定事项 3 自动回退复用客户已配可用模型，并在审查元数据记录 `review_mode: "single_family" | "unknown_family"`，全程零报错。
-
-### 6.2 模型独立审查子智能体（`dalton-model-reviewer`）职责与边界
-
-新建只读子智能体 `plugins/dalton/agents/dalton-model-reviewer.md`（与审文字报告 1–9 项结构的 `dalton-reviewer` 解耦，避免触发 `driver.py:690` 的备忘录章节契约）：
-
-- **工具权限（严格只读）**：仅授予只读文件读取/检索与只读核查脚本输出读取权限，**不授予任何文件写入、编辑或工作簿保存工具**；系统提示词明确规定「只提问题、不改文件、不替主智能体算修补值」。
-- **输入材料**：
-  1. 用户原始请求（含 `<user_verbatim_request>`）；
-  2. 代码生成的 `gate_report.json` / `.gate-report.md` 与 `justifications.json`；
-  3. 约 10 行「关键数字变更摘要」与工作簿 `README & Changelog` 新增记录；
-  4. 本轮引用的法定财报原文片段 / 一致预期快照 `data/consensus/*.json` 及新模型可读抽样切片（由 `model_fingerprint.py slice` 导出目标变更区块的公式+数值对照表）。
-- **四项抽查重点**：
-  1. **历史披露数抽样对源**：随机或针对重点行抽查至少 5–8 个新填入的历史实际值（含收入分项、核心分部营业利润、期末现金、稀释股数、重述同期数），核对与一手财报原文的金额、单位（百万 vs 千）、币种、正负号及单季差分计算是否完全一致；
-  2. **驱动假设与管理层指引合理性**：检查新增预测期驱动假设是否反映了最新季报趋势与管理层指引，是否存在把一次性收益/补贴线性外推、或用极端不合理假设（如把未分配总部费用设为 0）硬凑目标利润的行为；
-  3. **一致预期差异解释真实性**：检查 `vs Consensus` 对照表口径（`GAAP` vs `Non-GAAP`、普通股 vs `ADS`、财年截止月）是否真已对齐，重大偏离是否有据可查；
-  4. **用户诉求覆盖度**：逐字对照用户原话，确认要求补充的项目已补充、要求修改的项目已修改、未要求改动的区块未受干扰。
-- **结构化返回契约**：输出 JSON `{"verdict": "pass" | "revise", "summary": "...", "issues": [{"severity": "must_fix" | "note", "sheet": "...", "cells": "...", "problem": "..."}]}`。返回 `revise` 时，主分析师做一轮定点修正、重过 `model_gate.py` 后复审。
+1. **【仅当两轮修改后仍有未通过项时展示】回复最顶部原样列出剩余问题清单**：
+   ```markdown
+   > ⚠️ **两轮自动复查后仍留有以下未通过项（已照常交付最新版本，供审阅参考）：**
+   > - `[C11 集团与分部对账]` `Model - JD!BG45`（`2Q25`）：公司未重述早期单季新分部营业利润，差额 -312 未在备注列补齐说明
+   > - `[数字核验 UNVERIFIED]` `Subs - JD!AZ19`（`3Q26` 京东外卖单季订单量）：6-K 正文未直接披露该细分数字，需补充电话会或估算来源备注
+   ```
+2. **模型文件链接 + 约 10 行「关键数字变更摘要」**（由 `model_check.py --summary` 从新旧缓存值与 `consensus-diff.json` 辅助生成底表）：
+   - 第 1–2 行：新版本文件路径、所基于的原模型版本、本次动作（补入哪季实际值、扩展至哪个预测季度与年度）；
+   - 第 3–7 行：核心指标新旧对比与一致预期对比简表（最近实际季与未来两个核心预测财年的**营业总收入、核心分部利润、集团营业利润、净利润、稀释 `EPS`/`EPADS` 及目标价**，列示：`上一版 → 本版（变动%） | 一致预期（差异%）`）；
+   - 第 8–10 行：本次调整的 2–3 个关键驱动假设，以及**每一项明显偏离一致预期的指标各附一句具体理由**（如「结合我们的研究，认为收入增速快于市场，费用率也更高」）。
+3. **代码生成的格式结构检查报告与数字核验摘要**（原样附在折叠块或代码块中；工作簿内嵌入图/绘图或 `x14` 扩展条件格式变动最多在报告末尾附一行提示信息）。
 
 ---
 
 ## 7. 分批实施计划（P0 – P3）
 
-四批按顺序递进合并，每批完成后均可独立运行并通过基线门禁。所有形态判断统一调用 `src.dalton.profile`，能力门控统一调用 `src.dalton.capabilities`，上游文件挂钩统一附 `# DALTON-HOOK(<topic>): <reason>` 并通过 `bash scripts/dalton/check_hooks.sh --strict`。
+四批按顺序独立合并，每批均遵守双形态分离原则（形态只用 `src.dalton.profile`、能力只用 `src.dalton.capabilities`、上游改动附 `# DALTON-HOOK(...)` 并过 `bash scripts/dalton/check_hooks.sh --strict`、生产专用运维脚本放 `scripts/dalton/ops/prod/`、独立核心运维脚本放 `scripts/standalone/`）。
 
 ```mermaid
 flowchart LR
-    P0["P0：止血与硬门禁<br/>模型指纹 + 14项拦截检查<br/>一轮一家 + Home附原话<br/>默认模板脱敏提取"] --> P1["P1：原地编辑引擎<br/>沙箱集成 gridcraft-cli<br/>model_edit 封装 + x14补回<br/>修订决定记录 L14"]
-    P1 --> P2["P2：异族审查与对源<br/>修复子智能体 L16 异族选模<br/>dalton-model-reviewer<br/>历史数抽样对源核查"]
-    P2 --> P3["P3：历史数自动填充<br/>财报 XBRL/表格结构化提取<br/>行项映射记忆缓存<br/>历史期与拆单季自动回填"]
+    P0["P0：模板提取 + 代码检查 + 工作流两轮回路<br/>改坏前电商模型提取默认模板<br/>指纹 + C01-C14检查 + 一致预期对照<br/>company-model工作流(≤2轮修改) + 深度链共用"] --> P1["P1：原地编辑引擎接入<br/>沙箱镜像安装 gridcraft-cli<br/>model_edit 优先走 gridcraft<br/>x14 扩展条件格式补回 + 修订 L14"]
+    P1 --> P2["P2：历史数字核验 + 异族审查<br/>model_audit 逐项对财报原文(PASS/FAIL表)<br/>修复子智能体 L16 动态异族选模<br/>只读 dalton-model-reviewer 入回路"]
+    P2 --> P3["P3：历史数据结构化自动填充<br/>XBRL 与财报表格结构化提取<br/>模型行项映射持久化缓存<br/>历史实数与拆单季确定性自动回填"]
 ```
 
-### 7.1 P0：模型指纹 + 代码拦截检查 + 一轮一家 + Home 附原话
+### 7.1 P0：改坏前默认模板提取 + 指纹与代码检查 + 一致预期对照 + 工作流两轮回路
 
-- **批次目标**：在不依赖新二进制入镜像的前提下，立即封堵「14 万字节脚本整本重写、公式变常数、丢图、错冻结窗格、分部脱节、自检放水、一次乱改多家、转派丢原话」全部核心出血点。
+- **批次目标**：从改坏前的原始中国电商模型提取标准默认格式模板；落地模型指纹、`C01–C14` 格式结构与建模约定代码检查、一致预期独立对照流程，以及带「最多两轮修改、超时或残留问题置顶照常交付」的 `workflows/company-model/` 工作流（并与 `earnings-deep-update` / `full-coverage` 共用阶段）。
 - **新增与修改文件清单**：
-  - `plugins/dalton/skills/dalton-model/scripts/model_fingerprint.py`（**新建**）：只读提取第 3 章定义的完整模型指纹 `fingerprint.json` 及面向智能体的紧凑结构摘要 `summary`、面向审查的变更切片 `slice`。
-  - `plugins/dalton/skills/dalton-model/scripts/model_gate.py`（**新建**）：实现第 5.2 节 `G01`–`G14` 共 14 项确定性检查、第二引擎复算对账（P0 容器内使用 `IronCalc` 与 `LibreOffice` 双引擎交叉复算，宿主机环境已装 `gridcraft-cli` 时自动纳入）、签发带文件哈希的门禁凭据 `.gate.json` / `.gate-report.md` 及生成约 10 行关键数字变更摘要底表。
-  - `plugins/dalton/skills/dalton-model/scripts/model_edit.py`（**新建**，P0 先交付受控回退引擎实现）：封装 `insert.py` XML 扩列 + 定点单元格公式平移/改值/套样式（含媒体部件保护分支）+ `recalc.py` 重算 + `fullCalcOnLoad` 复位 + 自动生成 `justifications.json` 与 `insert_log.json`。
-  - `plugins/dalton/skills/dalton-model/scripts/extract_default_template.py` 与 `plugins/dalton/skills/dalton-model/assets/default_model_template.xlsx`（**新建**）：从标准模型提取脱敏默认格式模板骨架，并通过 `src/dalton/settings.py` 支持 `DALTON_MODEL_DEFAULT_TEMPLATE_PATH` 自定义覆盖。
-  - `src/dalton/settings.py`（**修改**）：新增 `get_model_default_template_path()`，兼容 `DALTON_PROFILE=everflow` 与 `DALTON_PROFILE=core`。
-  - `src/dalton/knowledge/service.py`（**修改**）：在 `knowledge_update(doc="models", ...)` 校验目标 `.xlsx` 的 `model_gate` 通过凭据与实时 `SHA-256` 一致，未过门禁拒绝登记。
-  - `plugins/dalton/skills/dalton-model/{SKILL.md,references/rollforward.md,references/format-spec.md,references/sanity-check.md}`、`plugins/dalton/skills/dalton-earnings-deep/SKILL.md`、`plugins/dalton/skills/dalton-full-coverage/{SKILL.md,references/model-spec.md,references/memo-writing.md}`（**修改**）：切换至「提取指纹 → `model_edit.py` 原地编辑 → `model_gate.py` 硬拦截 → 附原样报告与 10 行变更摘要」流程，写明一轮只更新一家公司与无需额外确认步骤，移除「提示性扫描不阻断 / 报错照常登记」旧表述（过提示词语言审查，保持 `DALTON_CAP` 双形态条件块完整并刷新 Everflow 快照）。
-  - `workflows/earnings-deep-update/{workflow.js,contract.json}`、`workflows/full-coverage/{workflow.js,contract.json}`（**修改**）：将完成契约中的 `model_readable.py` 升级为 `model_gate.py` 硬校验。
-  - `src/tools/secretary/chief_of_staff.py`、`src/tools/secretary/dispatch.py`、`src/ptc_agent/agent/prompts/templates/components/chief_of_staff.md.j2`（**上游挂钩修改**，附 `# DALTON-HOOK(cos-verbatim-forward)` 并在 `scripts/dalton/check_hooks.sh` 登记）：`delegate_to_analyst` 自动从 `state["messages"]` 提取当前回合用户原话附加到派发消息，提示词同步要求一轮一家转派。
-  - `tests/unit/dalton/test_modeling_v2_p0.py`（**新建**）及 `tests/unit/dalton/snapshots/everflow/**`（更新快照）。
+  - `scripts/dalton/ops/prod/recover_baseline_model.sh`（**新建**，Everflow 生产专用只读恢复辅助脚本）：按第 4.1 节路径只读提取改坏前的中国电商原始 `.xlsx` 并验证哈希（独立核心发行包排除该目录）。
+  - `plugins/dalton/skills/dalton-model/scripts/extract_default_template.py` 与 `plugins/dalton/skills/dalton-model/assets/default_model_template.xlsx`（**新建**）：先执行第 4.1 节 4 项未改动原版验真断言，再从原始中国电商模型抽取单公司标准页签骨架并脱敏生成默认模板；在 `src/dalton/settings.py` 新增 `get_model_default_template_path()` 支持 `DALTON_MODEL_DEFAULT_TEMPLATE_PATH` 覆盖，双形态开箱即用。
+  - `plugins/dalton/skills/dalton-model/scripts/model_fingerprint.py`（**新建**）：提取第 4.2 节 `fingerprint.json`、紧凑结构摘要 `summary` 与变更切片 `slice`。
+  - `plugins/dalton/skills/dalton-model/scripts/model_edit.py`（**新建**，P0 先交付受控回退引擎）：封装原文件副本复制、`insert.py` XML 扩列、定点公式平移与改值套格式、`recalc.py` 重算、`fullCalcOnLoad` 复位及 `justifications.json` 自动生成。
+  - `plugins/dalton/skills/dalton-model/scripts/model_consensus.py`（**新建**）：对比本方独立预测与 `data/consensus/*.json`（及模型内参考区），生成分部与费用拆解差异表 `consensus-diff.md/.json`，判定超阈值返工复核项。
+  - `plugins/dalton/skills/dalton-model/scripts/model_check.py`（**新建**）：实现 `C01–C14` 共 14 项确定性检查（含 `IronCalc` + `LibreOffice` 第二引擎交叉复算、一致预期隔离检查、建模约定检查；包部件变动最多输出一行提示信息）、问题聚合器 `merge-issues`、轮次账本 `model-verification.json` 维护及完成契约校验入口 `verify-done`。
+  - `src/dalton/content_assembly.py`、`src/dalton/workflows/company_routing.py`、`src/dalton/tools/check_done_tools.py`（**修改**）：支持 `workflows/_shared/*.js` 白名单片段内联；支持 `company-model` 工作流路由（允许行业工作区就地对本工作区多公司整本模型中的单家 `ticker` 运行）与 `dalton_check_done` 核对。
+  - `workflows/_shared/modeling_stages.js`、`workflows/company-model/{workflow.js,contract.json}`（**新建**），`workflows/earnings-deep-update/{workflow.js,contract.json}`、`workflows/full-coverage/{workflow.js,contract.json}`（**修改**）：建成统一建模工作流阶段（含一致预期超阈值返工复核与最多两轮检查修改回路，两轮后留有未通过项照常完成并在回复顶部列出），替换深度链与完整覆盖中的旧单步建模逻辑。
+  - `plugins/dalton/skills/dalton-model/{SKILL.md,references/rollforward.md,references/format-spec.md,references/sanity-check.md}`、`plugins/dalton/skills/dalton-earnings-deep/SKILL.md`、`plugins/dalton/skills/dalton-full-coverage/SKILL.md`（**修改**）：保留第 2 章全部建模约定，接入 `company-model` 工作流、一致预期独立对照与置顶列出两轮后剩余问题的交付规范（过提示词语言审查并更新 Everflow 快照）。
+  - `src/tools/secretary/chief_of_staff.py`、`src/tools/secretary/dispatch.py`、`src/ptc_agent/agent/prompts/templates/components/chief_of_staff.md.j2`（**上游挂钩修改**，附 `# DALTON-HOOK(cos-verbatim-forward)` 并在 `scripts/dalton/check_hooks.sh` 登记）：转派自动附带 `<user_verbatim_request>` 用户原话，多公司按一家一轮派发。
+  - `tests/unit/dalton/test_modeling_v2_p0.py`（**新建**）。
 - **验收标准**：
-  1. 用合成故障工作簿逐项触发 `G01`–`G14`（917 个预测常数、`10/2 -> 51/101` 冻结错位、丢嵌入图/绘图、JD 集团与分部差 10B、历史格清空、资产负债表不平、年度≠四季之和、`fullCalcOnLoad=1`、非目标公司页被改），`model_gate.py` 100% 返回退出码 `2` 并准确报出坐标，且 `knowledge_update(doc="models")` 拒绝写入；
-  2. 对真实中国电商整本模型执行单公司（如 `PDD`）原地扩列更新测试：保留全部 18 张嵌入图、15 个绘图与原冻结窗格，其余公司工作表零改动，`model_gate.py` 返回 `0` 并输出完整检查报告与 10 行摘要；
-  3. Home 转派单测验证分析师收到的消息自动包含 `<user_verbatim_request>` 用户原话；
-  4. `check_hooks.sh --strict`、核心态黑名单门禁与 Everflow 快照测试全绿。
+  1. `extract_default_template.py` 对改坏前的原始中国电商模型通过全部 4 项原版验真断言（对被改坏的 `v2.0` 准确识别并拒绝作为母本），产出的 `default_model_template.xlsx` 在 `everflow` 与 `core` 双形态下均可正常新建单公司模型；
+  2. 构造故障样本逐项验证 `C01–C14`（预测常数、预测行填入一致预期相同数字或引用一致预期参考格、一致预期参考格缺来源日期、预测跨度不足、`10/2 → 51/101` 冻结窗格错位、`JD` 集团与分部营业利润脱节、季度加总年残留假设、资产负债表不平、非目标公司表被改动），`model_check.py` 100% 检出精确坐标；同时验证嵌入图片/绘图减少仅产生最多一行提示信息、不计入问题清单；
+  3. 验证反馈回路：当第 1 轮存在检查问题时工作流自动交回修改并复查；人为构造连续两轮仍残留 1 项问题的场景，工作流在第 2 轮修改复查后按上限平稳收束，照常推进完成 `knowledge_update` 版本登记与 `dalton_check_done` 契约核对，并将 `remaining-issues.md` 原样置顶输出；
+  4. 验证 `earnings-deep-update` 与 `company-model` 共用 `_shared/modeling_stages.js` 零重复逻辑，`Home` 转派自动携带用户原话，`check_hooks.sh --strict` 全绿。
 
-### 7.2 P1：原地编辑接入 `gridcraft` + 扩展条件格式补回 + 决定记录修订
+### 7.2 P1：沙箱接入 `gridcraft-cli` 原地编辑引擎 + `x14` 扩展条件格式补回
 
-- **批次目标**：将 `gridcraft-cli` 正式装入沙箱环境并设为 `model_edit.py` 的首选原地编辑引擎与第二复算引擎，补齐 `x14` 扩展条件格式 XML 无损恢复闭环。
+- **批次目标**：将 Linux 版 `gridcraft-cli` 集成进沙箱镜像，设为 `model_edit.py` 首选原地编辑引擎与第二复算引擎，落地 `x14` 扩展条件格式 XML 补回并修订决定记录 `L14`。
 - **新增与修改文件清单**：
-  - `Dockerfile.sandbox`、`src/ptc_agent/core/sandbox/providers/_image_recipe.py`、`src/ptc_agent/core/sandbox/_defaults.py`（**上游挂钩修改**，附 `# DALTON-HOOK(sandbox-gridcraft)` 并登记 `check_hooks.sh`）：下载并按处理器架构（`amd64`〔64 位 x86 架构〕/ `arm64`〔64 位 ARM 架构〕）校验固定 `SHA-256` 安装 Linux 版 `gridcraft-cli` 至 `/usr/local/bin/gridcraft-cli`，提供构建参数 `INSTALL_GRIDCRAFT=1`（默认开启；无二进制环境自动走 P0 回退路径；Everflow 生产镜像构建脚本归入 `scripts/dalton/ops/prod/`，独立核心安装构建与升级脚本归入 `scripts/standalone/`，共用安装步骤统一维护在 `Dockerfile.sandbox` 与 `_image_recipe.py`）。
-  - `plugins/dalton/skills/dalton-model/scripts/model_edit.py`（**修改**）：新增 `GridcraftBackend`，优先使用 `gridcraft-cli run --in ... --script ... --out ...` 执行插列、向右填充、格式刷、改值与重算；内置 `restore_preserved_extlst()` 在保存后自动比对并从原模型 XML 补回丢失的 `<extLst>` / `x14:conditionalFormatting`（含扩列坐标顺延）；`gridcraft-cli` 不可用时无缝回退 P0 引擎。
-  - `plugins/dalton/skills/dalton-model/scripts/model_gate.py`（**修改**）：打通「`gridcraft` 编辑 → `LibreOffice` 第二引擎复算」与「回退引擎编辑 → `gridcraft-cli check --json` 第二引擎复算」双向交叉验证，并在报告中输出 `x14` 扩展条件格式补回明细。
-  - `docs/dalton/archive/dev-guide/README.md`（**修改**）：更新第 6.2 节 `L14` 决定记录条文。
+  - `Dockerfile.sandbox`、`src/ptc_agent/core/sandbox/providers/_image_recipe.py`、`src/ptc_agent/core/sandbox/_defaults.py`（**上游挂钩修改**，附 `# DALTON-HOOK(sandbox-gridcraft)` 并登记 `check_hooks.sh`）：按 `amd64`（64 位 x86 架构）/ `arm64`（64 位 ARM 架构）处理器架构校验固定 `SHA-256` 安装 `gridcraft-cli`（支持 `INSTALL_GRIDCRAFT=1` 构建参数；Everflow 生产镜像构建运维脚本归 `scripts/dalton/ops/prod/`，独立核心安装升级构建脚本归 `scripts/standalone/`）。
+  - `plugins/dalton/skills/dalton-model/scripts/model_edit.py`、`model_check.py`（**修改**）：优先调用 `gridcraft-cli run` 执行插列、向右填充、格式刷与重算，保存后自动从原模型 XML 补回 `<extLst>` / `x14:conditionalFormatting`；打通 `gridcraft` 与 `LibreOffice`/`IronCalc` 双向交叉复算，无二进制环境自动平滑回退 P0 路径。
+  - `docs/dalton/archive/dev-guide/README.md`（**修改**）：更新第 6.2 节 `L14`。
   - `tests/unit/dalton/test_modeling_v2_p1_gridcraft.py`（**新建**）。
 - **验收标准**：
-  1. 在安装 `gridcraft-cli` 的环境中对中国电商模型执行插列、向右填充预测公式、格式刷克隆样式与重算保存：5.7 万条公式亚秒级重算，18 张嵌入图、15 个绘图与冻结窗格原样保留，原模型的 `x14` 扩展条件格式经后处理器补回并在检查报告列明；
-  2. 模拟移除 `gridcraft-cli` 后，`model_edit.py` 自动切入回退路径并通过全部 `G01`–`G14` 门禁；
-  3. 双向第二引擎复算准确识别人工注入的缓存值篡改并放行已登记的 `CIQ` 插件格。
+  1. 对原始中国电商模型单家公司（如 `PDD`）执行 `gridcraft` 原地扩列、向右填充预测公式、格式刷克隆样式与重算：5.7 万条公式亚秒级重算，冻结窗格与其余公司工作表保持原状，`x14` 扩展条件格式自动补回并在报告末尾一行提示中说明；
+  2. 移除 `gridcraft-cli` 时自动回退受控 XML/`openpyxl` 路径并通过全部 `C01–C14` 检查。
 
-### 7.3 P2：不同家族模型独立审查 + 历史数据抽样对源
+### 7.3 P2：历史数字核验（`PASS/FAIL` 表）+ 不同家族模型独立审查
 
-- **批次目标**：落地 `L16` 动态异族审查机制，补上代码算术检查覆盖不到的「财报源数据抄错口径/单位、假设脱离指引、遗漏用户原话诉求」语义抽查关口。
+- **批次目标**：补齐工作流阶段 4（历史披露数字逐项核对 SEC / 财报原文，输出 `PASS/FAIL` 表）与阶段 5（`L16` 动态不同家族模型只读审查），并完整接入最多两轮修改回路。
 - **新增与修改文件清单**：
-  - `src/server/services/llm/subagents.py`、`src/dalton/llm/role_policy.py`（**修改**，上游文件附 `# DALTON-HOOK(subagent-cross-family-reviewer)`）：为审查类子智能体动态调用 `pick_reviewer_model(turn_model, user_id=...)` 选择与当前主模型不同底层家族的模型，并在 `DALTON_PROFILE=core` 单家族部署下平滑回退且记录 `review_mode`。
-  - `plugins/dalton/agents/dalton-model-reviewer.md`（**新建**）：定义只读模型独立审查子智能体提示词与输出 JSON Schema（结构化数据校验格式），不授予任何写文件工具。
-  - `plugins/dalton/skills/dalton-model/scripts/model_source_sample.py`（**新建**）：从本轮新填入的历史实际值与重述同期值中按重要性分层抽取核查样本表（附单元格坐标、模型值、单位、备注出处），供 `dalton-model-reviewer` 与财报原文逐条核对。
-  - `plugins/dalton/skills/dalton-model/SKILL.md`、`workflows/earnings-deep-update/{workflow.js,contract.json}`、`workflows/full-coverage/{workflow.js,contract.json}`（**修改**）：在 `model_gate.py` 通过后串接 `dalton-model-reviewer` 只读抽查（`revise` 时定点修一轮并重过门禁）。
-  - `tests/unit/dalton/test_modeling_v2_p2_review.py`（**新建**）。
+  - `plugins/dalton/skills/dalton-model/scripts/model_audit.py` 与 `src/dalton/tools/` 对应工具封装（**新建**）：复用 `src/dalton/publish/match.py` 容差换算器与 `assist_json`（遵循 `L22/L28/L29`），将模型历史实数与拆单季衍生值逐项核对 `dalton_sec` `XBRL` 事实表、`provenance_records` 及财报原文，生成 `model-audit.md`（`PASS/FAIL` 表）与 `model-audit.json`。
+  - `src/server/services/llm/subagents.py`、`src/dalton/llm/role_policy.py`（**修改**，上游文件附 `# DALTON-HOOK(subagent-cross-family-reviewer)` 并登记 `check_hooks.sh`）：为 `dalton-reviewer` 与 `dalton-model-reviewer` 动态选择不同于主模型家族的审稿模型，兼容 `DALTON_PROFILE=core` 单家族部署自动回退。
+  - `plugins/dalton/agents/dalton-model-reviewer.md`（**新建**）：只读模型审查子智能体（`tools: [web]`，无写文件权限）。
+  - `workflows/_shared/modeling_stages.js`、`workflows/company-model/contract.json`、`workflows/earnings-deep-update/contract.json`、`workflows/full-coverage/contract.json`（**修改**）：串入阶段 4 `model_audit.py` 与阶段 5 `dalton-model-reviewer`，三层问题统一汇总进入最多两轮修改回路。
+  - `tests/unit/dalton/test_modeling_v2_p2_audit_and_review.py`（**新建**）。
 - **验收标准**：
-  1. 当主模型分别为 Claude、GPT、Gemini 家族时，`dalton-model-reviewer` 与 `dalton-reviewer` 均自动解析到不同家族模型；`DALTON_PROFILE=core` 仅配单一商业模型密钥（`API Key`）时自动回退执行；
-  2. 审查子智能体仅绑定只读工具，对故意填反单位（千当百万）或漏补用户点名科目的测试样例返回 `verdict: "revise"` 并指出具体单元格坐标，目标文件哈希保持只读一致。
+  1. 注入历史实数抄错单位（千当百万）、单季差分算错（`FY - 9M` 漏减）的测试模型，`model_audit.py` 在 `PASS/FAIL` 表中精准标为 `FAIL` 并交回建模智能体在 1 轮内修至 `PASS`；
+  2. 主模型分别为 Claude、GPT、Gemini 时，`dalton-model-reviewer` 自动解析至不同家族模型且全过程对工作区文件零写入；`DALTON_PROFILE=core` 单密钥环境下自动回退运行无报错。
 
-### 7.4 P3：历史数据结构化自动填充
+### 7.4 P3：历史披露数据结构化自动填充
 
-- **批次目标**：将最耗时且易漏填的「历史实际数录入、新口径同期重述补齐、累计披露拆单季、历史资产负债表填充」升级为结构化对表与确定性自动写入。
+- **批次目标**：将新季报回填、累计期间拆单季、分部重述同期补齐与历史资产负债表录入升级为确定性行项映射与自动写入，从源头减少人工抄数差错。
 - **新增与修改文件清单**：
   - `plugins/dalton/skills/dalton-model/scripts/model_actuals_autofill.py`（**新建**）：
-    1. **多源结构化取数（遵循 `src.dalton.capabilities` 双形态能力门控）**：美股与外国发行人优先读取公开 `dalton_sec`（`SEC EDGAR`〔美国证券交易委员会企业电子信息披露系统〕`XBRL` 事实表与财报 `HTML`〔超文本标记语言〕表格解析）；当 `has_capability(CapabilityId.RESEARCHDATA_BRIDGE)` 为真时可补充桥接财报标准化数据，核心安装形态直接使用 `dalton_sec` 与用户上传至 `sources/` 的财报 `PDF`（便携式文档格式）/ `HTML` 表格提取器；
-    2. **行项映射持久化记忆**：在工作区维护 `data/model_line_mapping_<TICKER>.json`（记录财报标准科目名/标签 → 模型工作表名、行标签锚点、单位换算系数、正负号方向、是否由 `6M - Q1` / `9M - 6M` / `FY - 9M` 累计差分拆单季）；首次建立后历次季报更新直接复用映射（行号因插行移动时按指纹行标签锚点自动重定位）；
-    3. **确定性批量回填**：生成经单位换算与累计差分校验的标准编辑指令交 `model_edit.py` 一次性写入，自动填充完整利润表、资产负债表、现金流量表与分部重述同期数据，并在最右备注列自动写入法定报告出处（如 `<20-F FY25 p.82`、`<3Q26 6-K, FY-9M derived`）。
-  - `plugins/dalton/skills/dalton-model/{SKILL.md,references/rollforward.md}`（**修改**）：滚动更新补实际值与新建模型填历史期优先调用 `model_actuals_autofill.py`。
+    1. 按 `src.dalton.capabilities` 读取公开 `dalton_sec`（`SEC EDGAR`〔美国证券交易委员会企业电子信息披露系统〕`XBRL` 与财报表格）及上传财报 `PDF`（便携式文档格式）/ `HTML`（超文本标记语言）表格（`researchdata_bridge` 启用时可补充标准化财报路由）；
+    2. 在工作区维护持久化行项映射表 `data/model_line_mapping_<TICKER>.json`（绑定财报科目 → 模型工作表、行标签锚点、量纲系数、正负号与 `Q2=6M-Q1`/`Q3=9M-6M`/`Q4=FY-9M` 拆单季规则）；
+    3. 生成标准编辑指令交 `model_edit.py` 批量回填并在最右备注列写入法定报告出处。
+  - `workflows/_shared/modeling_stages.js`、`plugins/dalton/skills/dalton-model/{SKILL.md,references/rollforward.md}`（**修改**）：阶段 2 补实际值优先调用 `model_actuals_autofill.py`。
   - `tests/unit/dalton/test_modeling_v2_p3_autofill.py`（**新建**）。
 - **验收标准**：
-  1. 给定新披露季报（含仅披露累计数的半年报/年报拆单季场景及分部改口径重述表），`model_actuals_autofill.py` 自动完成单位换算、正负号对齐、单季差分推导与最右红字出处标注，填充后一次通过 `G07`（历史期完整）与 `G08`（资产负债表配平）；
-  2. 在 `DALTON_PROFILE=core` 与 `DALTON_PROFILE=everflow` 下均顺畅运行并通过全量专有词清零检查。
-
----
-
-## 8. 需要用户提供的事项
-
-日常建模与滚动更新全程自动执行至交付；落地本方案仅需用户提供以下 **1 项材料**：
-
-- **公司默认格式模板文件（`.xlsx`）**：一份代表团队标准版面、配色、字体、表头与常用页签结构的 Excel 模型文件，作为「新建模型」模式与默认模板指纹的标准母本。
-  - **提供前的过渡安排**：在收到该文件前，P0 先运行 `extract_default_template.py` 从现有标准实测模型中脱敏提取单公司骨架生成 `default_model_template.xlsx`，收到正式模板文件后直接替换即可生效。
+  1. 给定新季报与半年报/年报拆单季场景，`model_actuals_autofill.py` 自动完成换算、差分与备注标注，写入后一次通过 `C08`（历史期完整）、`C09`（配平）与 `model_audit.py` 全项 `PASS`；
+  2. `DALTON_PROFILE=core` 与 `DALTON_PROFILE=everflow` 双形态验收与专有词清零检查全绿。
