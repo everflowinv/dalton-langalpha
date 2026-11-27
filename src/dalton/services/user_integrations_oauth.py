@@ -95,6 +95,7 @@ from src.dalton.services.integration_revoke import (
 from src.dalton.services.user_integrations_lifecycle import (
     AccountSwitchTargetChangedError,
     DisconnectTargetMismatchError,
+    GoogleAccountAlreadyConnectedError,
     IntegrationNotFoundError,
     MissingRefreshTokenOnAccountSwitchError,
     begin_disconnect,
@@ -113,6 +114,11 @@ _DEFAULT_WAITER_BUDGET_SECONDS = 12.0
 _DEFAULT_WAITER_POLL_INTERVAL_SECONDS = 0.2
 _FEISHU_DB_COMMIT_RETRIES = 3
 _REFRESH_INFLIGHT_LEASE_SECONDS = 25
+_GOOGLE_EXCHANGE_LEASE_SECONDS = 30
+_OAUTH_EXCHANGE_TOTAL_TIMEOUT_SECONDS = 20.0
+_GOOGLE_ACCOUNT_OWNED_BY_OTHER_MEMBER_MSG = (
+    "这个 Google 账号已被团队里另一位成员连接，请换一个账号或请对方先断开"
+)
 
 OAUTH_BROWSER_BINDING_COOKIE_NAME = "dalton_oauth_bind"
 
@@ -201,6 +207,26 @@ class FeishuIdentityMismatchError(PersonalIntegrationError):
 class PendingConfirmationInvalidError(PersonalIntegrationError):
     status_code = 400
     code = "invalid_or_expired_confirmation"
+
+
+class GoogleAccountAlreadyConnectedByOtherMemberError(PersonalIntegrationError):
+    status_code = 409
+    code = "google_account_already_connected"
+
+    def __init__(
+        self,
+        message: str = _GOOGLE_ACCOUNT_OWNED_BY_OTHER_MEMBER_MSG,
+    ) -> None:
+        super().__init__(
+            message,
+            code="google_account_already_connected",
+            status_code=409,
+        )
+
+
+class OAuthExchangeLeaseExpiredError(PersonalIntegrationError):
+    status_code = 409
+    code = "exchange_lease_expired"
 
 
 class IntegrationNotConnectedError(PersonalIntegrationError):
@@ -631,103 +657,98 @@ async def _coordinate_pre_auth_google_revokes(
             lkey = revoke_lock_key(target_project, sub)
             rotation_pid: str | None = None
 
-            # Short lock: check guards, record ledger & clear old connection tokens, then release lock
-            async with get_db_connection() as lock_conn:
-                await lock_conn.execute("SELECT pg_advisory_lock(%s)", (lkey,))
-                try:
-                    with track_advisory_lock("revoke", lkey):
-                        latest_rows = await db.list_user_connections(user_id, provider="google")
-                        other_on_old = [
-                            r
-                            for r in latest_rows
-                            if r.service != service
-                            and r.oauth_client_id == old_client_id
-                            and r.provider_account_id == sub
-                            and r.status
-                            not in (
-                                IntegrationStatus.DISCONNECT_PENDING,
-                                IntegrationStatus.REVOKED_PURGING,
-                            )
-                        ]
-                        if other_on_old:
-                            return
+            # Short tx on ONE pooled connection: check guards, record ledger & clear old tokens
+            async with get_db_connection() as tx_conn, tx_conn.transaction():
+                await tx_conn.execute("SELECT pg_advisory_xact_lock(%s)", (lkey,))
+                with track_advisory_lock("revoke", lkey):
+                    latest_rows = await db.list_user_connections(
+                        user_id, provider="google", conn=tx_conn
+                    )
+                    other_on_old = [
+                        r
+                        for r in latest_rows
+                        if r.service != service
+                        and r.oauth_client_id == old_client_id
+                        and r.provider_account_id == sub
+                        and r.status
+                        in (
+                            IntegrationStatus.CONNECTED,
+                            IntegrationStatus.REFRESH_AMBIGUOUS,
+                        )
+                    ]
+                    if other_on_old:
+                        return
 
-                        has_newer_on_project = await db.has_active_or_pending_google_grant(
+                    has_newer_on_project = await db.has_active_or_pending_google_grant(
+                        target_project,
+                        sub,
+                        user_id=user_id,
+                        exclude_client_id=old_client_id,
+                        conn=tx_conn,
+                    )
+                    if has_newer_on_project:
+                        await db.supersede_active_revokes_for_google_project_sub_tx(
                             target_project,
                             sub,
-                            exclude_user_id=user_id,
-                            exclude_client_id=old_client_id,
+                            reason="superseded_by_active_project_grant",
+                            conn=tx_conn,
                         )
-                        if has_newer_on_project:
-                            async with get_db_connection() as sup_conn, sup_conn.transaction():
-                                await db.supersede_active_revokes_for_google_project_sub_tx(
-                                    target_project,
-                                    sub,
-                                    reason="superseded_by_active_project_grant",
-                                    conn=sup_conn,
-                                )
-                                await db.insert_purge_ledger(
-                                    purge_id=str(uuid4()),
-                                    user_id=user_id,
-                                    provider="google",
-                                    service=service,
-                                    oauth_client_id=old_client_id,
-                                    provider_account_id=sub,
-                                    auth_epoch_upto=target_existing.auth_epoch,
-                                    trigger_reason=TriggerReason.CLIENT_ROTATION,
-                                    local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
-                                    purged_max_turn_by_thread={},
-                                    remote_revoke_status=RemoteRevokeStatus.SUPERSEDED,
-                                    encrypted_revoke_token=None,
-                                    conn=sup_conn,
-                                )
-                            return
+                        await db.insert_purge_ledger(
+                            purge_id=str(uuid4()),
+                            user_id=user_id,
+                            provider="google",
+                            service=service,
+                            oauth_client_id=old_client_id,
+                            provider_account_id=sub,
+                            auth_epoch_upto=target_existing.auth_epoch,
+                            trigger_reason=TriggerReason.CLIENT_ROTATION,
+                            local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
+                            purged_max_turn_by_thread={},
+                            remote_revoke_status=RemoteRevokeStatus.SUPERSEDED,
+                            encrypted_revoke_token=None,
+                            conn=tx_conn,
+                        )
+                        return
 
-                        full_row = await db.get_connection(
-                            user_id, "google", service, decrypt_tokens=True
-                        )
-                        if (
-                            full_row is None
-                            or full_row.oauth_client_id != old_client_id
-                            or full_row.provider_account_id != sub
-                        ):
-                            return
-                        old_tok = full_row.refresh_token or full_row.access_token
-                        if not old_tok:
-                            return
+                    full_row = await db.get_connection(
+                        user_id, "google", service, decrypt_tokens=True, conn=tx_conn
+                    )
+                    if (
+                        full_row is None
+                        or full_row.oauth_client_id != old_client_id
+                        or full_row.provider_account_id != sub
+                    ):
+                        return
+                    old_tok = full_row.refresh_token or full_row.access_token
+                    if not old_tok:
+                        return
 
-                        rotation_pid = str(uuid4())
-                        async with get_db_connection() as rec_conn, rec_conn.transaction():
-                            await db.insert_purge_ledger(
-                                purge_id=rotation_pid,
-                                user_id=user_id,
-                                provider="google",
-                                service=service,
-                                oauth_client_id=old_client_id,
-                                provider_account_id=sub,
-                                auth_epoch_upto=full_row.auth_epoch,
-                                trigger_reason=TriggerReason.CLIENT_ROTATION,
-                                local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
-                                purged_max_turn_by_thread={},
-                                remote_revoke_status=RemoteRevokeStatus.PENDING,
-                                revoke_token_plaintext=old_tok,
-                                conn=rec_conn,
-                            )
-                            await db.update_connection_status(
-                                user_id,
-                                "google",
-                                service,
-                                status=IntegrationStatus.NEEDS_REAUTH,
-                                last_error_code="oauth_client_rotated",
-                                clear_tokens=True,
-                                expected_auth_epoch=full_row.auth_epoch,
-                                conn=rec_conn,
-                            )
-                finally:
-                    with anyio.CancelScope(shield=True):
-                        await lock_conn.execute(
-                            "SELECT pg_advisory_unlock(%s)", (lkey,)
-                        )
+                    rotation_pid = str(uuid4())
+                    await db.insert_purge_ledger(
+                        purge_id=rotation_pid,
+                        user_id=user_id,
+                        provider="google",
+                        service=service,
+                        oauth_client_id=old_client_id,
+                        provider_account_id=sub,
+                        auth_epoch_upto=full_row.auth_epoch,
+                        trigger_reason=TriggerReason.CLIENT_ROTATION,
+                        local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
+                        purged_max_turn_by_thread={},
+                        remote_revoke_status=RemoteRevokeStatus.PENDING,
+                        revoke_token_plaintext=old_tok,
+                        conn=tx_conn,
+                    )
+                    await db.update_connection_status(
+                        user_id,
+                        "google",
+                        service,
+                        status=IntegrationStatus.NEEDS_REAUTH,
+                        last_error_code="oauth_client_rotated",
+                        clear_tokens=True,
+                        expected_auth_epoch=full_row.auth_epoch,
+                        conn=tx_conn,
+                    )
 
             # Execute remote revoke OUTSIDE the advisory lock via shared state machine
             if rotation_pid is not None:
@@ -1012,68 +1033,141 @@ async def _stage_pending_confirmation(
     expected_old_oauth_client_id: str | None = None,
     expected_old_provider_account_id: str | None = None,
     expected_old_auth_epoch: int | None = None,
+    consume_state_hash: str | None = None,
+    baseline_existed: bool | None = None,
 ) -> None:
-    """Stage a pending confirmation coordinated with Google's cross-user ``(project, sub)`` revoke lock (§4.2(3))."""
-    if provider == "google":
-        google_project = extract_google_project(oauth_client_id)
-        rkey = revoke_lock_key(google_project, provider_account_id)
-        async with get_db_connection() as lock_conn:
-            await lock_conn.execute("SELECT pg_advisory_lock(%s)", (rkey,))
-            try:
-                with track_advisory_lock("revoke", rkey):
-                    async with get_db_connection() as tx_conn, tx_conn.transaction():
-                        await db.supersede_active_revokes_for_google_project_sub_tx(
-                            google_project,
-                            provider_account_id,
-                            reason="superseded_by_pending_authorization",
-                            conn=tx_conn,
-                        )
-                        await db.insert_pending_confirmation(
-                            confirmation_hash=confirmation_hash,
-                            user_id=user_id,
-                            provider=provider,
-                            service=service,
-                            oauth_client_id=oauth_client_id,
-                            provider_account_id=provider_account_id,
-                            provider_union_id=provider_union_id,
-                            provider_email=provider_email,
-                            granted_scopes=granted_scopes,
-                            access_token=access_token,
-                            refresh_token=refresh_token,
-                            expires_at=expires_at,
-                            intent=intent,
-                            preferences=preferences,
-                            confirm_expires_at=confirm_expires_at,
-                            expected_old_oauth_client_id=expected_old_oauth_client_id,
-                            expected_old_provider_account_id=expected_old_provider_account_id,
-                            expected_old_auth_epoch=expected_old_auth_epoch,
-                            conn=tx_conn,
-                        )
-            finally:
-                with anyio.CancelScope(shield=True):
-                    await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (rkey,))
-        return
+    """Atomically verify connect intent/exchange lease/revocation claim/ownership and stage a pending confirmation on ONE pooled connection.
 
-    await db.insert_pending_confirmation(
-        confirmation_hash=confirmation_hash,
-        user_id=user_id,
-        provider=provider,
-        service=service,
-        oauth_client_id=oauth_client_id,
-        provider_account_id=provider_account_id,
-        provider_union_id=provider_union_id,
-        provider_email=provider_email,
-        granted_scopes=granted_scopes,
-        access_token=access_token,
-        refresh_token=refresh_token,
-        expires_at=expires_at,
-        intent=intent,
-        preferences=preferences,
-        confirm_expires_at=confirm_expires_at,
-        expected_old_oauth_client_id=expected_old_oauth_client_id,
-        expected_old_provider_account_id=expected_old_provider_account_id,
-        expected_old_auth_epoch=expected_old_auth_epoch,
+    Canonical lock order (all ``pg_advisory_xact_lock`` on ``tx_conn``):
+      ``lifecycle_lock_key(user_id, provider)`` -> ``revoke_lock_key(google_project, sub)``
+      -> ``google_project_coord_lock_key(google_project)``.
+    """
+    life_key = lifecycle_lock_key(user_id, provider)
+    google_project = (
+        extract_google_project(oauth_client_id) if provider == "google" else None
     )
+    rkey = (
+        revoke_lock_key(google_project, provider_account_id)
+        if google_project is not None
+        else None
+    )
+    coord_key = (
+        google_project_coord_lock_key(google_project)
+        if google_project is not None
+        else None
+    )
+
+    async with get_db_connection() as tx_conn, tx_conn.transaction():
+        with ExitStack() as lock_stack:
+            await tx_conn.execute("SELECT pg_advisory_xact_lock(%s)", (life_key,))
+            lock_stack.enter_context(track_advisory_lock("lifecycle", life_key))
+            if rkey is not None:
+                await tx_conn.execute("SELECT pg_advisory_xact_lock(%s)", (rkey,))
+                lock_stack.enter_context(track_advisory_lock("revoke", rkey))
+            if coord_key is not None:
+                await tx_conn.execute("SELECT pg_advisory_xact_lock(%s)", (coord_key,))
+                lock_stack.enter_context(
+                    track_advisory_lock("google_project_coord", coord_key)
+                )
+
+            if consume_state_hash is not None:
+                intent_status, _intent_row = await db.consume_active_oauth_intent_tx(
+                    consume_state_hash,
+                    provider,
+                    require_valid_exchange_lease=(provider == "google"),
+                    conn=tx_conn,
+                )
+                if intent_status in ("voided", "missing"):
+                    raise PendingConfirmationInvalidError(
+                        "Connection was disconnected during OAuth callback; authorization discarded.",
+                        code="connection_disconnected_during_callback",
+                        status_code=409,
+                    )
+                if intent_status == "lease_expired":
+                    raise OAuthExchangeLeaseExpiredError(
+                        "OAuth exchange protection lease expired before staging; please retry."
+                    )
+
+            if google_project is not None:
+                if await db.has_inflight_google_revoke_for_project_sub(
+                    google_project, provider_account_id, conn=tx_conn
+                ):
+                    raise OAuthExchangeLeaseExpiredError(
+                        "A remote revocation claimed execution before staging; please retry."
+                    )
+                if await db.has_other_user_google_account_claim(
+                    google_project,
+                    provider_account_id,
+                    exclude_user_id=user_id,
+                    conn=tx_conn,
+                ):
+                    raise GoogleAccountAlreadyConnectedByOtherMemberError()
+
+            if baseline_existed is True:
+                cur_row = await db.get_connection(
+                    user_id,
+                    provider,
+                    service,
+                    decrypt_tokens=False,
+                    for_update=True,
+                    conn=tx_conn,
+                )
+                baseline_ok = (
+                    cur_row is not None
+                    and cur_row.status
+                    not in (
+                        IntegrationStatus.DISCONNECT_PENDING,
+                        IntegrationStatus.REVOKED_PURGING,
+                    )
+                    and (
+                        expected_old_oauth_client_id is None
+                        or cur_row.oauth_client_id == expected_old_oauth_client_id
+                    )
+                    and (
+                        expected_old_provider_account_id is None
+                        or cur_row.provider_account_id == expected_old_provider_account_id
+                    )
+                    and (
+                        expected_old_auth_epoch is None
+                        or cur_row.auth_epoch == int(expected_old_auth_epoch)
+                    )
+                )
+                if not baseline_ok:
+                    raise PendingConfirmationInvalidError(
+                        "Connection was disconnected or changed during OAuth callback; authorization discarded.",
+                        code="connection_disconnected_during_callback",
+                        status_code=409,
+                    )
+
+            if google_project is not None:
+                await db.supersede_active_revokes_for_google_project_sub_tx(
+                    google_project,
+                    provider_account_id,
+                    reason="superseded_by_pending_authorization",
+                    conn=tx_conn,
+                )
+
+            await db.insert_pending_confirmation(
+                confirmation_hash=confirmation_hash,
+                user_id=user_id,
+                provider=provider,
+                service=service,
+                oauth_client_id=oauth_client_id,
+                provider_account_id=provider_account_id,
+                provider_union_id=provider_union_id,
+                provider_email=provider_email,
+                granted_scopes=granted_scopes,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                expires_at=expires_at,
+                intent=intent,
+                preferences=preferences,
+                confirm_expires_at=confirm_expires_at,
+                expected_old_oauth_client_id=expected_old_oauth_client_id,
+                expected_old_provider_account_id=expected_old_provider_account_id,
+                expected_old_auth_epoch=expected_old_auth_epoch,
+                conn=tx_conn,
+            )
 
 
 async def _finalize_connection(
@@ -1097,22 +1191,34 @@ async def _finalize_connection(
     expected_old_auth_epoch: int | None = None,
     guard_confirmation_hash: str | None = None,
     consume_confirmation_hash: str | None = None,
+    consume_state_hash: str | None = None,
+    baseline_existed: bool | None = None,
 ) -> tuple[IntegrationRow, str | None]:
-    """Commit a verified OAuth grant into ``dalton_user_integrations``.
+    """Commit a verified OAuth grant into ``dalton_user_integrations`` using ONE pooled connection.
 
     Handles all 3 Google cases (first connect, same-sub client rotation rebind preserving
     history, confirmed account switch reusing Step 1 Phase 1 + 2A purge) and Feishu connect.
-    Coordinates with ``revoke_lock_key(google_project, sub)`` inside the commit
-    transaction (strict unidirectional order: lifecycle -> refresh -> revoke) so pending
-    revocations are marked ``superseded`` BEFORE the new grant commits.
-    When ``consume_confirmation_hash`` or ``guard_confirmation_hash`` is supplied, atomically
-    consumes and verifies that pending confirmation / commit-guard row INSIDE the activation
-    transaction (aborting without mutating DB state if voided by a concurrent disconnect or
-    already consumed).
-    When ``expected_old_*`` are bound, verifies them inside the ``FOR UPDATE`` transaction
-    across EVERY commit branch so stale tickets never overwrite or resurrect a changed row.
+    Coordinates under ``pg_advisory_xact_lock`` in canonical unidirectional order
+    (``lifecycle -> refresh -> revoke -> google_project_coord``):
+      - Atomically consumes ``consume_state_hash`` (direct callback intent) or
+        ``consume_confirmation_hash`` (staged confirmation) INSIDE the activation transaction.
+      - Re-verifies Google exchange lease and absence of in-flight revokes when consuming
+        a direct-commit ``consume_state_hash``.
+      - Enforces the 1-Google-account-per-Dalton-member invariant.
+      - Supersedes active revokes for ``(google_project, sub)`` BEFORE committing.
+      - Re-verifies ``baseline_existed`` and ``expected_old_*`` under ``FOR UPDATE``.
     Returns ``(connection_row, purge_id_if_account_switch)``.
     """
+    # Fast-fail before waiting on any running purge if a concurrent disconnect already voided this intent
+    if consume_state_hash is not None and await db.peek_oauth_state_voided(
+        consume_state_hash, provider
+    ):
+        raise PendingConfirmationInvalidError(
+            "Connection was disconnected during OAuth callback; authorization discarded.",
+            code="connection_disconnected_during_callback",
+            status_code=409,
+        )
+
     await _wait_for_running_service_purge(user_id, provider, service)
 
     effective_consume_hash = consume_confirmation_hash or guard_confirmation_hash
@@ -1120,6 +1226,7 @@ async def _finalize_connection(
         expected_old_oauth_client_id is not None
         or expected_old_provider_account_id is not None
         or expected_old_auth_epoch is not None
+        or baseline_existed is True
     )
 
     # Check if account switch is required BEFORE holding lifecycle lock because
@@ -1158,6 +1265,8 @@ async def _finalize_connection(
                 expected_old_auth_epoch=expected_old_auth_epoch,
                 consume_confirmation_hash=effective_consume_hash,
             )
+        except GoogleAccountAlreadyConnectedError:
+            raise GoogleAccountAlreadyConnectedByOtherMemberError() from None
         except (AccountSwitchTargetChangedError, IntegrationNotFoundError):
             if has_expected_old or effective_consume_hash is not None:
                 raise PendingConfirmationInvalidError(
@@ -1176,24 +1285,26 @@ async def _finalize_connection(
 
     # Same account (first connect, same-client reconnect/incremental, or client rotation rebind)
     life_key = lifecycle_lock_key(user_id, provider)
+    google_project = (
+        extract_google_project(oauth_client_id) if provider == "google" else None
+    )
     revoke_key = (
-        revoke_lock_key(
-            extract_google_project(oauth_client_id),
-            provider_account_id,
-        )
-        if provider == "google"
+        revoke_lock_key(google_project, provider_account_id)
+        if google_project is not None
+        else None
+    )
+    coord_key = (
+        google_project_coord_lock_key(google_project)
+        if google_project is not None and consume_state_hash is not None
         else None
     )
     cross_project_revoke_purge_id: str | None = None
 
-    async with get_db_connection() as lock_conn:
-        await lock_conn.execute("SELECT pg_advisory_lock(%s)", (life_key,))
-        refresh_keys: list[int] = []
-        revoke_locked = False
-        lock_stack = ExitStack()
-        try:
+    async with get_db_connection() as tx_conn, tx_conn.transaction():
+        with ExitStack() as lock_stack:
+            await tx_conn.execute("SELECT pg_advisory_xact_lock(%s)", (life_key,))
             lock_stack.enter_context(track_advisory_lock("lifecycle", life_key))
-            # Determine refresh lock key(s) in deterministic ascending order (unidirectional: lifecycle -> refresh -> revoke)
+            # Determine refresh lock key(s) in deterministic ascending order (lifecycle -> refresh -> revoke -> coord)
             r_keys_set: set[int] = set()
             r_keys_set.add(
                 refresh_lock_key(
@@ -1217,291 +1328,303 @@ async def _finalize_connection(
                         service if provider == "feishu" else None,
                     )
                 )
-            refresh_keys = sorted(r_keys_set)
-            for rk in refresh_keys:
-                await lock_conn.execute("SELECT pg_advisory_lock(%s)", (rk,))
+            for rk in sorted(r_keys_set):
+                await tx_conn.execute("SELECT pg_advisory_xact_lock(%s)", (rk,))
                 lock_stack.enter_context(track_advisory_lock("refresh", rk))
 
             if revoke_key is not None:
-                await lock_conn.execute("SELECT pg_advisory_lock(%s)", (revoke_key,))
-                revoke_locked = True
+                await tx_conn.execute("SELECT pg_advisory_xact_lock(%s)", (revoke_key,))
                 lock_stack.enter_context(track_advisory_lock("revoke", revoke_key))
+            if coord_key is not None:
+                await tx_conn.execute("SELECT pg_advisory_xact_lock(%s)", (coord_key,))
+                lock_stack.enter_context(
+                    track_advisory_lock("google_project_coord", coord_key)
+                )
 
-            async with get_db_connection() as tx_conn, tx_conn.transaction():
-                # Atomically consume & verify pending confirmation or direct-commit guard
-                # INSIDE the activation transaction so a concurrent DELETE or double-confirm
-                # aborts cleanly and can NEVER resurrect a disconnected connection.
-                if effective_consume_hash is not None:
-                    consumed_ticket = await db.consume_pending_confirmation(
-                        effective_consume_hash,
-                        user_id,
-                        conn=tx_conn,
-                    )
-                    if consumed_ticket is None:
-                        if guard_confirmation_hash is not None and consume_confirmation_hash is None:
-                            raise PendingConfirmationInvalidError(
-                                "Connection was disconnected during OAuth callback; authorization discarded.",
-                                code="connection_disconnected_during_callback",
-                                status_code=409,
-                            )
-                        raise PendingConfirmationInvalidError(
-                            "Confirmation token is invalid, expired, or already used.",
-                            code="invalid_or_expired_confirmation",
-                            status_code=400,
-                        )
-
-                # Supersede pending revokes for this (Google project, sub) across ALL users BEFORE committing the new grant
-                if provider == "google":
-                    await db.supersede_active_revokes_for_google_project_sub_tx(
-                        extract_google_project(oauth_client_id),
-                        provider_account_id,
-                        conn=tx_conn,
-                    )
-
-                existing = await db.get_connection(
-                    user_id,
+            # Atomically consume & verify pending connect intent (direct callback) OR
+            # staged pending confirmation INSIDE the activation transaction.
+            if consume_state_hash is not None:
+                intent_status, _intent_row = await db.consume_active_oauth_intent_tx(
+                    consume_state_hash,
                     provider,
-                    service,
-                    decrypt_tokens=True,
-                    for_update=True,
+                    require_valid_exchange_lease=(provider == "google"),
                     conn=tx_conn,
                 )
-                # Re-verify confirmation ticket's bound old connection INSIDE the FOR UPDATE
-                # lifecycle transaction across ALL commit branches (normal connect/reauth/rebind
-                # as well as 2A account switch). Missing old row, disconnecting/purging status,
-                # or changed client/account/epoch invalidates the stale ticket without mutating DB state.
-                if has_expected_old:
-                    old_matches = (
-                        existing is not None
-                        and existing.status
-                        not in (
-                            IntegrationStatus.DISCONNECT_PENDING,
-                            IntegrationStatus.REVOKED_PURGING,
-                        )
-                        and (
-                            expected_old_oauth_client_id is None
-                            or existing.oauth_client_id == expected_old_oauth_client_id
-                        )
-                        and (
-                            expected_old_provider_account_id is None
-                            or existing.provider_account_id == expected_old_provider_account_id
-                        )
-                        and (
-                            expected_old_auth_epoch is None
-                            or existing.auth_epoch == int(expected_old_auth_epoch)
-                        )
-                    )
-                    if not old_matches:
-                        raise PendingConfirmationInvalidError(
-                            "Connected account changed before confirmation; confirmation ticket invalidated.",
-                            code="account_switch_state_changed",
-                            status_code=409,
-                        )
-                # Guard against a concurrent switch changing provider_account_id between pre-check and lock
-                if (
-                    existing is not None
-                    and existing.provider_account_id != provider_account_id
-                ):
-                    raise PersonalIntegrationError(
-                        "Connected account changed concurrently; please retry.",
-                        code="account_switch_confirmation_required",
+                if intent_status in ("voided", "missing"):
+                    raise PendingConfirmationInvalidError(
+                        "Connection was disconnected during OAuth callback; authorization discarded.",
+                        code="connection_disconnected_during_callback",
                         status_code=409,
                     )
-
-                new_client_siblings = await db.list_connections_by_account(
+                if intent_status == "lease_expired":
+                    raise OAuthExchangeLeaseExpiredError(
+                        "OAuth exchange protection lease expired before activation; please retry."
+                    )
+                if google_project is not None and await db.has_inflight_google_revoke_for_project_sub(
+                    google_project, provider_account_id, conn=tx_conn
+                ):
+                    raise OAuthExchangeLeaseExpiredError(
+                        "A remote revocation claimed execution before activation; please retry."
+                    )
+            elif effective_consume_hash is not None:
+                consumed_ticket = await db.consume_pending_confirmation(
+                    effective_consume_hash,
                     user_id,
-                    provider,
-                    oauth_client_id,
-                    provider_account_id,
-                    decrypt_tokens=True,
-                    for_update=True,
                     conn=tx_conn,
                 )
-                active_new_siblings = [
-                    r
-                    for r in new_client_siblings
-                    if r.service != service
-                    and r.status
+                if consumed_ticket is None:
+                    if guard_confirmation_hash is not None and consume_confirmation_hash is None:
+                        raise PendingConfirmationInvalidError(
+                            "Connection was disconnected during OAuth callback; authorization discarded.",
+                            code="connection_disconnected_during_callback",
+                            status_code=409,
+                        )
+                    raise PendingConfirmationInvalidError(
+                        "Confirmation token is invalid, expired, or already used.",
+                        code="invalid_or_expired_confirmation",
+                        status_code=400,
+                    )
+
+            # Enforce 1-Google-account-per-Dalton-member invariant atomically under revoke_lock_key
+            if google_project is not None:
+                if await db.has_other_user_google_account_claim(
+                    google_project,
+                    provider_account_id,
+                    exclude_user_id=user_id,
+                    conn=tx_conn,
+                ):
+                    raise GoogleAccountAlreadyConnectedByOtherMemberError()
+                await db.supersede_active_revokes_for_google_project_sub_tx(
+                    google_project,
+                    provider_account_id,
+                    conn=tx_conn,
+                )
+
+            existing = await db.get_connection(
+                user_id,
+                provider,
+                service,
+                decrypt_tokens=True,
+                for_update=True,
+                conn=tx_conn,
+            )
+            if has_expected_old:
+                old_matches = (
+                    existing is not None
+                    and existing.status
                     not in (
                         IntegrationStatus.DISCONNECT_PENDING,
                         IntegrationStatus.REVOKED_PURGING,
                     )
-                ]
-
-                effective_refresh = refresh_token
-                if not effective_refresh:
-                    if existing is not None and existing.oauth_client_id == oauth_client_id and existing.refresh_token:
-                        effective_refresh = existing.refresh_token
-                    else:
-                        sib_with_refresh = next(
-                            (r for r in active_new_siblings if r.refresh_token),
-                            None,
-                        )
-                        if sib_with_refresh is not None:
-                            effective_refresh = sib_with_refresh.refresh_token
-
-                is_client_rotation = (
-                    existing is not None
-                    and existing.oauth_client_id != oauth_client_id
+                    and (
+                        expected_old_oauth_client_id is None
+                        or existing.oauth_client_id == expected_old_oauth_client_id
+                    )
+                    and (
+                        expected_old_provider_account_id is None
+                        or existing.provider_account_id == expected_old_provider_account_id
+                    )
+                    and (
+                        expected_old_auth_epoch is None
+                        or existing.auth_epoch == int(expected_old_auth_epoch)
+                    )
+                )
+                if not old_matches:
+                    err_code = (
+                        "connection_disconnected_during_callback"
+                        if consume_state_hash is not None
+                        else "account_switch_state_changed"
+                    )
+                    raise PendingConfirmationInvalidError(
+                        "Connected account changed before confirmation; authorization discarded.",
+                        code=err_code,
+                        status_code=409,
+                    )
+            if (
+                existing is not None
+                and existing.provider_account_id != provider_account_id
+            ):
+                raise PersonalIntegrationError(
+                    "Connected account changed concurrently; please retry.",
+                    code="account_switch_confirmation_required",
+                    status_code=409,
                 )
 
-                if is_client_rotation and not effective_refresh:
-                    raise MissingRefreshTokenOnClientRotationError(
-                        "Reconnecting after OAuth client rotation requires a refresh token.",
-                    )
-                if existing is None and not effective_refresh:
-                    raise MissingRefreshTokenError(
-                        "OAuth provider did not return a refresh token; please re-authorize with consent.",
-                    )
+            new_client_siblings = await db.list_connections_by_account(
+                user_id,
+                provider,
+                oauth_client_id,
+                provider_account_id,
+                decrypt_tokens=True,
+                for_update=True,
+                conn=tx_conn,
+            )
+            active_new_siblings = [
+                r
+                for r in new_client_siblings
+                if r.service != service
+                and r.status
+                not in (
+                    IntegrationStatus.DISCONNECT_PENDING,
+                    IntegrationStatus.REVOKED_PURGING,
+                )
+            ]
 
-                if is_client_rotation:
-                    assert existing is not None
-                    old_client_id = existing.oauth_client_id
-                    old_auth_epoch = existing.auth_epoch
-
-                    # Read raw encrypted old refresh/access token bytes before overwriting
-                    async with tx_conn.cursor(row_factory=dict_row) as cur:
-                        await cur.execute(
-                            """
-                            SELECT refresh_token, access_token
-                            FROM dalton_user_integrations
-                            WHERE user_id = %s AND provider = %s AND service = %s
-                            """,
-                            (user_id, provider, service),
-                        )
-                        raw_old = await cur.fetchone()
-                    raw_old_bytes = (
-                        bytes(raw_old["refresh_token"])
-                        if raw_old and raw_old.get("refresh_token") is not None
-                        else (
-                            bytes(raw_old["access_token"])
-                            if raw_old and raw_old.get("access_token") is not None
-                            else None
-                        )
-                    )
-
-                    # Rebind IN PLACE preserving conversation history (local_purge_status = 'not_required')
-                    merged_prefs = dict(existing.preferences)
-                    merged_prefs.update(preferences)
-                    saved_row = await db.upsert_connection(
-                        user_id=user_id,
-                        provider=provider,
-                        service=service,
-                        oauth_client_id=oauth_client_id,
-                        provider_account_id=provider_account_id,
-                        provider_union_id=provider_union_id,
-                        provider_email=provider_email,
-                        granted_scopes=granted_scopes,
-                        access_token=access_token,
-                        refresh_token=effective_refresh,
-                        expires_at=expires_at,
-                        preferences=merged_prefs,
-                        status=IntegrationStatus.CONNECTED,
-                        bump_auth_epoch=True,
-                        reset_authorized_at=True,
-                        reset_token_generation=True,
-                        conn=tx_conn,
-                    )
-
-                    if provider == "google":
-                        remaining_on_old = await db.get_sibling_connections(
-                            user_id,
-                            "google",
-                            old_client_id,
-                            provider_account_id,
-                            exclude_service=service,
-                            active_only=True,
-                            conn=tx_conn,
-                        )
-                        if remaining_on_old:
-                            r_status = RemoteRevokeStatus.NOT_APPLICABLE
-                            r_tok = None
-                        elif extract_google_project(old_client_id) == extract_google_project(
-                            oauth_client_id
-                        ):
-                            # Same Google Cloud project: new token already issued -> mark superseded
-                            r_status = RemoteRevokeStatus.SUPERSEDED
-                            r_tok = None
-                        elif raw_old_bytes is not None:
-                            r_status = RemoteRevokeStatus.PENDING
-                            r_tok = raw_old_bytes
-                        else:
-                            r_status = RemoteRevokeStatus.NOT_APPLICABLE
-                            r_tok = None
-
-                        ledger_row = await db.insert_purge_ledger(
-                            purge_id=str(uuid4()),
-                            user_id=user_id,
-                            provider="google",
-                            service=service,
-                            oauth_client_id=old_client_id,
-                            provider_account_id=provider_account_id,
-                            auth_epoch_upto=old_auth_epoch,
-                            trigger_reason=TriggerReason.CLIENT_ROTATION,
-                            local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
-                            purged_max_turn_by_thread={},
-                            remote_revoke_status=r_status,
-                            encrypted_revoke_token=r_tok,
-                            conn=tx_conn,
-                        )
-                        if r_status == RemoteRevokeStatus.PENDING:
-                            cross_project_revoke_purge_id = ledger_row.purge_id
+            effective_refresh = refresh_token
+            if not effective_refresh:
+                if existing is not None and existing.oauth_client_id == oauth_client_id and existing.refresh_token:
+                    effective_refresh = existing.refresh_token
                 else:
-                    # First connect OR same-account same-client reconnect/incremental auth
-                    # Always refresh authorized_at on explicit OAuth activation (and bump auth_epoch for Feishu reauth)
-                    merged_prefs = dict(existing.preferences) if existing is not None else {}
-                    merged_prefs.update(preferences)
-                    need_new_epoch = (
-                        existing is None
-                        or existing.status != IntegrationStatus.CONNECTED
-                        or provider == "feishu"
+                    sib_with_refresh = next(
+                        (r for r in active_new_siblings if r.refresh_token),
+                        None,
                     )
-                    saved_row = await db.upsert_connection(
-                        user_id=user_id,
-                        provider=provider,
-                        service=service,
-                        oauth_client_id=oauth_client_id,
-                        provider_account_id=provider_account_id,
-                        provider_union_id=provider_union_id,
-                        provider_email=provider_email,
-                        granted_scopes=granted_scopes,
-                        access_token=access_token,
-                        refresh_token=effective_refresh,
-                        expires_at=expires_at,
-                        preferences=merged_prefs,
-                        status=IntegrationStatus.CONNECTED,
-                        bump_auth_epoch=need_new_epoch,
-                        reset_authorized_at=True,
-                        reset_token_generation=(existing is None),
+                    if sib_with_refresh is not None:
+                        effective_refresh = sib_with_refresh.refresh_token
+
+            is_client_rotation = (
+                existing is not None
+                and existing.oauth_client_id != oauth_client_id
+            )
+
+            if is_client_rotation and not effective_refresh:
+                raise MissingRefreshTokenOnClientRotationError(
+                    "Reconnecting after OAuth client rotation requires a refresh token.",
+                )
+            if existing is None and not effective_refresh:
+                raise MissingRefreshTokenError(
+                    "OAuth provider did not return a refresh token; please re-authorize with consent.",
+                )
+
+            if is_client_rotation:
+                assert existing is not None
+                old_client_id = existing.oauth_client_id
+                old_auth_epoch = existing.auth_epoch
+
+                async with tx_conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        """
+                        SELECT refresh_token, access_token
+                        FROM dalton_user_integrations
+                        WHERE user_id = %s AND provider = %s AND service = %s
+                        """,
+                        (user_id, provider, service),
+                    )
+                    raw_old = await cur.fetchone()
+                raw_old_bytes = (
+                    bytes(raw_old["refresh_token"])
+                    if raw_old and raw_old.get("refresh_token") is not None
+                    else (
+                        bytes(raw_old["access_token"])
+                        if raw_old and raw_old.get("access_token") is not None
+                        else None
+                    )
+                )
+
+                merged_prefs = dict(existing.preferences)
+                merged_prefs.update(preferences)
+                saved_row = await db.upsert_connection(
+                    user_id=user_id,
+                    provider=provider,
+                    service=service,
+                    oauth_client_id=oauth_client_id,
+                    provider_account_id=provider_account_id,
+                    provider_union_id=provider_union_id,
+                    provider_email=provider_email,
+                    granted_scopes=granted_scopes,
+                    access_token=access_token,
+                    refresh_token=effective_refresh,
+                    expires_at=expires_at,
+                    preferences=merged_prefs,
+                    status=IntegrationStatus.CONNECTED,
+                    bump_auth_epoch=True,
+                    reset_authorized_at=True,
+                    reset_token_generation=True,
+                    conn=tx_conn,
+                )
+
+                if provider == "google":
+                    remaining_on_old = await db.get_sibling_connections(
+                        user_id,
+                        "google",
+                        old_client_id,
+                        provider_account_id,
+                        exclude_service=service,
+                        active_only=True,
                         conn=tx_conn,
                     )
+                    if remaining_on_old:
+                        r_status = RemoteRevokeStatus.NOT_APPLICABLE
+                        r_tok = None
+                    elif extract_google_project(old_client_id) == extract_google_project(
+                        oauth_client_id
+                    ):
+                        r_status = RemoteRevokeStatus.SUPERSEDED
+                        r_tok = None
+                    elif raw_old_bytes is not None:
+                        r_status = RemoteRevokeStatus.PENDING
+                        r_tok = raw_old_bytes
+                    else:
+                        r_status = RemoteRevokeStatus.NOT_APPLICABLE
+                        r_tok = None
 
-                # For Google: update active sibling rows on same (oauth_client_id, sub) with
-                # the NEW token's ACTUAL granted scopes (never union with stale sibling scopes)
-                # and recompute each sibling's status & feature preferences against its own
-                # minimum required scopes. Siblings preserve their own auth_epoch and authorized_at.
-                if provider == "google" and effective_refresh and active_new_siblings:
-                    await sync_google_sibling_rows_tx(
-                        tx_conn,
+                    ledger_row = await db.insert_purge_ledger(
+                        purge_id=str(uuid4()),
                         user_id=user_id,
-                        oauth_client_id=oauth_client_id,
+                        provider="google",
+                        service=service,
+                        oauth_client_id=old_client_id,
                         provider_account_id=provider_account_id,
-                        access_token=access_token,
-                        refresh_token=effective_refresh,
-                        expires_at=expires_at,
-                        granted_scopes=granted_scopes,
-                        active_siblings=active_new_siblings,
+                        auth_epoch_upto=old_auth_epoch,
+                        trigger_reason=TriggerReason.CLIENT_ROTATION,
+                        local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
+                        purged_max_turn_by_thread={},
+                        remote_revoke_status=r_status,
+                        encrypted_revoke_token=r_tok,
+                        conn=tx_conn,
                     )
-        finally:
-            lock_stack.close()
-            with anyio.CancelScope(shield=True):
-                if revoke_locked and revoke_key is not None:
-                    await lock_conn.execute(
-                        "SELECT pg_advisory_unlock(%s)", (revoke_key,)
-                    )
-                for rk in reversed(refresh_keys):
-                    await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (rk,))
-                await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (life_key,))
+                    if r_status == RemoteRevokeStatus.PENDING:
+                        cross_project_revoke_purge_id = ledger_row.purge_id
+            else:
+                merged_prefs = dict(existing.preferences) if existing is not None else {}
+                merged_prefs.update(preferences)
+                need_new_epoch = (
+                    existing is None
+                    or existing.status != IntegrationStatus.CONNECTED
+                    or provider == "feishu"
+                )
+                saved_row = await db.upsert_connection(
+                    user_id=user_id,
+                    provider=provider,
+                    service=service,
+                    oauth_client_id=oauth_client_id,
+                    provider_account_id=provider_account_id,
+                    provider_union_id=provider_union_id,
+                    provider_email=provider_email,
+                    granted_scopes=granted_scopes,
+                    access_token=access_token,
+                    refresh_token=effective_refresh,
+                    expires_at=expires_at,
+                    preferences=merged_prefs,
+                    status=IntegrationStatus.CONNECTED,
+                    bump_auth_epoch=need_new_epoch,
+                    reset_authorized_at=True,
+                    reset_token_generation=(existing is None),
+                    conn=tx_conn,
+                )
+
+            if provider == "google" and effective_refresh and active_new_siblings:
+                await sync_google_sibling_rows_tx(
+                    tx_conn,
+                    user_id=user_id,
+                    oauth_client_id=oauth_client_id,
+                    provider_account_id=provider_account_id,
+                    access_token=access_token,
+                    refresh_token=effective_refresh,
+                    expires_at=expires_at,
+                    granted_scopes=granted_scopes,
+                    active_siblings=active_new_siblings,
+                )
 
     if provider == "google" and cross_project_revoke_purge_id is not None and revoker is not None:
         from src.dalton.services.integration_revoke import process_revoke
@@ -1547,60 +1670,106 @@ async def _claim_google_oauth_state_coordinated(
     *,
     error: str | None,
     code: str | None,
+    exchange_lease_seconds: int = _GOOGLE_EXCHANGE_LEASE_SECONDS,
     timeout_s: float = _INFLIGHT_REVOKE_WAIT_TIMEOUT_S,
     poll_interval_s: float = _INFLIGHT_REVOKE_POLL_INTERVAL_S,
-) -> tuple[db.OAuthStateRow | None, bool]:
-    """Atomically coordinate Google OAuth state consumption with project-level in-flight revokes.
+) -> tuple[db.OAuthStateRow | None, bool, bool]:
+    """Atomically coordinate Google OAuth state consumption with lifecycle & project-level in-flight revokes on ONE connection.
 
-    Returns ``(state_row, revoke_timed_out)``.
-    Under short ``google_project_coord_lock_key(project)`` (no HTTP held inside):
+    Returns ``(state_row, revoke_timed_out, intent_voided)``.
+    Under short ``pg_advisory_xact_lock`` (canonical order ``lifecycle -> google_project_coord``):
       - If any Google revoke HTTP attempt in the same project currently holds an unexpired
-        ``revoke_inflight_until`` lease, releases the lock and DB connection, sleeps briefly
+        ``revoke_inflight_until`` lease, commits/releases the connection, sleeps briefly
         outside any lock, and retries until settled or ``timeout_s`` elapses.
-      - Once no revoke is in-flight, atomically consumes ``state`` (writing ``consumed_at`` /
-        ``exchange_expires_at``) inside the SAME project-level lock so no concurrent revoke
-        can slip in between checking and claiming.
+      - Once no revoke is in-flight, atomically consumes ``state`` (recording ``consumed_at``,
+        ``exchange_expires_at``, and ``baseline_*`` snapshot) inside the SAME transaction.
     """
     if error or not code or not str(code).strip():
-        return await db.consume_oauth_state(state_hash, "google"), False
+        consumed = await db.consume_oauth_state(
+            state_hash, "google", exchange_ttl_seconds=exchange_lease_seconds
+        )
+        if consumed is None and await db.peek_oauth_state_voided(state_hash, "google"):
+            return None, False, True
+        return consumed, False, False
 
     peeked = await db.peek_oauth_state(state_hash, "google")
     if peeked is None:
-        return await db.consume_oauth_state(state_hash, "google"), False
+        if await db.peek_oauth_state_voided(state_hash, "google"):
+            return None, False, True
+        consumed = await db.consume_oauth_state(
+            state_hash, "google", exchange_ttl_seconds=exchange_lease_seconds
+        )
+        return consumed, False, False
 
-    _peek_uid, peeked_client_id = peeked
+    peek_uid, peeked_client_id = peeked
     google_project = extract_google_project(peeked_client_id)
+    life_key = lifecycle_lock_key(peek_uid, "google")
     coord_key = google_project_coord_lock_key(google_project)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(0.1, float(timeout_s))
 
     while True:
-        inflight = False
-        async with get_db_connection() as coord_conn:
-            await coord_conn.execute("SELECT pg_advisory_lock(%s)", (coord_key,))
-            try:
-                with track_advisory_lock("google_project_coord", coord_key):
-                    inflight = await db.has_inflight_google_revoke_in_project(
-                        google_project, conn=coord_conn
+        async with get_db_connection() as tx_conn, tx_conn.transaction():
+            with ExitStack() as lock_stack:
+                await tx_conn.execute("SELECT pg_advisory_xact_lock(%s)", (life_key,))
+                lock_stack.enter_context(track_advisory_lock("lifecycle", life_key))
+                await tx_conn.execute("SELECT pg_advisory_xact_lock(%s)", (coord_key,))
+                lock_stack.enter_context(
+                    track_advisory_lock("google_project_coord", coord_key)
+                )
+                inflight = await db.has_inflight_google_revoke_in_project(
+                    google_project, conn=tx_conn
+                )
+                if not inflight:
+                    consumed = await db.consume_oauth_state(
+                        state_hash,
+                        "google",
+                        exchange_ttl_seconds=exchange_lease_seconds,
+                        conn=tx_conn,
                     )
-                    if not inflight:
-                        consumed = await db.consume_oauth_state(
-                            state_hash,
-                            "google",
-                            exchange_ttl_seconds=30,
-                            conn=coord_conn,
-                        )
-                        return consumed, False
-            finally:
-                with anyio.CancelScope(shield=True):
-                    await coord_conn.execute(
-                        "SELECT pg_advisory_unlock(%s)", (coord_key,)
-                    )
+                    if consumed is None and await db.peek_oauth_state_voided(
+                        state_hash, "google", conn=tx_conn
+                    ):
+                        return None, False, True
+                    return consumed, False, False
 
         remaining = deadline - loop.time()
         if remaining <= 0:
-            return None, True
+            return None, True, False
         await asyncio.sleep(min(poll_interval_s, remaining))
+
+
+async def _claim_feishu_oauth_state_coordinated(
+    state_hash: str,
+    *,
+    exchange_lease_seconds: int = _GOOGLE_EXCHANGE_LEASE_SECONDS,
+) -> tuple[db.OAuthStateRow | None, bool]:
+    """Atomically consume Feishu OAuth state & capture baseline epoch under ``lifecycle_lock_key`` on ONE connection."""
+    peeked = await db.peek_oauth_state(state_hash, "feishu")
+    if peeked is None:
+        if await db.peek_oauth_state_voided(state_hash, "feishu"):
+            return None, True
+        consumed = await db.consume_oauth_state(
+            state_hash, "feishu", exchange_ttl_seconds=exchange_lease_seconds
+        )
+        return consumed, False
+
+    peek_uid, _peeked_client_id = peeked
+    life_key = lifecycle_lock_key(peek_uid, "feishu")
+    async with get_db_connection() as tx_conn, tx_conn.transaction():
+        await tx_conn.execute("SELECT pg_advisory_xact_lock(%s)", (life_key,))
+        with track_advisory_lock("lifecycle", life_key):
+            consumed = await db.consume_oauth_state(
+                state_hash,
+                "feishu",
+                exchange_ttl_seconds=exchange_lease_seconds,
+                conn=tx_conn,
+            )
+            if consumed is None and await db.peek_oauth_state_voided(
+                state_hash, "feishu", conn=tx_conn
+            ):
+                return None, True
+            return consumed, False
 
 
 async def handle_oauth_callback(
@@ -1614,17 +1783,23 @@ async def handle_oauth_callback(
     google_client: GoogleOAuthClientProtocol | None = None,
     feishu_client: FeishuOAuthClientProtocol | None = None,
     revoker: RemoteRevoker | None = None,
+    exchange_lease_seconds: int = _GOOGLE_EXCHANGE_LEASE_SECONDS,
+    exchange_timeout_seconds: float = _OAUTH_EXCHANGE_TOTAL_TIMEOUT_SECONDS,
 ) -> OAuthCallbackResult:
     """Handle the Bearer-less OAuth browser callback (§4.2(1), §4.3, §6).
 
-    1. For Google, coordinates atomically under short ``google_project_coord_lock_key(project)``
-       to verify no revoke HTTP is in-flight and mark ``consumed_at`` / ``exchange_expires_at``
-       in one atomic step (zero window against ``process_revoke`` claiming).
-    2. Checks per-service capability, active ``oauth_client_id``, and original session.
-    3. Exchanges ``code`` strictly OUTSIDE any DB lock or pool connection and verifies identity.
-    4. Under short ``revoke_lock_key(google_project, sub)``, supersedes active revokes across
-       all users and stages pending confirmation or commit-guard BEFORE removing the in-flight
-       state record in ``finally``.
+    1. Step 1 (short ``pg_advisory_xact_lock`` on ONE pooled connection): atomically consume
+       ``state``, capture ``baseline_*`` connection epoch, and (for Google) wait for any
+       in-flight project revoke and set ``exchange_expires_at`` protection lease.
+    2. Step 2 (outside all DB locks/pool connections, bounded by ``exchange_timeout_seconds``):
+       exchange ``code`` and verify identity. Enforces 1-Google-account-per-Dalton-member.
+    3. Step 3 (short ``pg_advisory_xact_lock`` on ONE pooled connection): atomically verify &
+       consume the pending connect intent (aborting if voided by a concurrent disconnect or if
+       the exchange lease expired / a revoke claimed execution), verify 1-member ownership,
+       supersede old revokes, and stage or commit the connection.
+    Any unactivated Google token obtained from ``exchange_code`` that does not commit or stage
+    (except when rejected because another Dalton member owns the Google account) is queued for
+    remote revocation.
     """
     _ = error_description  # never echo arbitrary upstream description text
     norm_provider = str(provider or "").strip().lower()
@@ -1635,12 +1810,14 @@ async def handle_oauth_callback(
         raise OAuthStateInvalidError("Missing OAuth state.", code="invalid_or_expired_state")
 
     state_hash = _sha256_hex(str(state).strip())
+    intent_voided = False
 
     if norm_provider == "google":
-        state_row, revoke_timed_out = await _claim_google_oauth_state_coordinated(
+        state_row, revoke_timed_out, intent_voided = await _claim_google_oauth_state_coordinated(
             state_hash,
             error=error,
             code=code,
+            exchange_lease_seconds=exchange_lease_seconds,
         )
         if revoke_timed_out:
             return OAuthCallbackResult(
@@ -1652,7 +1829,22 @@ async def handle_oauth_callback(
                 error_message="A previous revocation is still completing; please retry authorization.",
             )
     else:
-        state_row = await db.consume_oauth_state(state_hash, norm_provider)
+        state_row, intent_voided = await _claim_feishu_oauth_state_coordinated(
+            state_hash,
+            exchange_lease_seconds=exchange_lease_seconds,
+        )
+
+    if intent_voided:
+        with anyio.CancelScope(shield=True):
+            await db.delete_oauth_state(state_hash, norm_provider)
+        return OAuthCallbackResult(
+            status="error",
+            provider=norm_provider,
+            service="calendar",
+            return_to=DEFAULT_INTEGRATIONS_RETURN_TO,
+            error_code="connection_disconnected_during_callback",
+            error_message="Connection was disconnected during OAuth callback; authorization discarded.",
+        )
 
     if state_row is None:
         raise OAuthStateInvalidError(
@@ -1660,8 +1852,18 @@ async def handle_oauth_callback(
             code="invalid_or_expired_state",
         )
 
-    guard_confirmation_hash: str | None = None
-    guard_user_id: str | None = None
+    eff_revoker = (
+        revoker
+        if revoker is not None
+        else (get_google_remote_revoker() if norm_provider == "google" else None)
+    )
+    exchanged_google_token: str | None = None
+    exchanged_google_sub: str | None = None
+    exchanged_google_client_id: str = state_row.oauth_client_id
+    token_committed_or_staged = False
+    rejected_owned_by_other_member = False
+    abandon_reason = "callback_aborted_after_exchange"
+
     try:
         safe_return_to = _sanitize_return_to(state_row.return_to)
 
@@ -1694,6 +1896,7 @@ async def handle_oauth_callback(
             )
 
         client_id, client_secret = _load_provider_oauth_credentials(norm_provider)
+        exchanged_google_client_id = client_id
         if client_id != state_row.oauth_client_id:
             return OAuthCallbackResult(
                 status="error",
@@ -1712,99 +1915,137 @@ async def handle_oauth_callback(
             user_email=state_row.user_email,
         )
 
-        # Upstream code -> token exchange OUTSIDE any DB lock or transaction
+        # Step 2: Upstream code -> token exchange OUTSIDE any DB lock or transaction,
+        # bounded by a total timeout strictly less than the exchange protection lease.
         provider_union_id: str | None = None
         provider_email: str | None = None
         try:
-            if norm_provider == "google":
-                g_client = google_client or get_google_oauth_client()
-                assert_no_advisory_lock_held("google.exchange_code")
-                token_resp = await g_client.exchange_code(
-                    client_id=client_id,
-                    client_secret=client_secret,
-                    code=str(code).strip(),
-                    redirect_uri=state_row.redirect_uri,
-                    code_verifier=state_row.code_verifier or "",
-                )
-                if not token_resp.id_token:
-                    return OAuthCallbackResult(
-                        status="error",
-                        provider=norm_provider,
-                        service=state_row.service,
-                        return_to=safe_return_to,
-                        error_code="missing_id_token",
-                        error_message="Google did not return an OIDC id_token.",
+            async with asyncio.timeout(max(0.05, float(exchange_timeout_seconds))):
+                if norm_provider == "google":
+                    g_client = google_client or get_google_oauth_client()
+                    assert_no_advisory_lock_held("google.exchange_code")
+                    token_resp = await g_client.exchange_code(
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        code=str(code).strip(),
+                        redirect_uri=state_row.redirect_uri,
+                        code_verifier=state_row.code_verifier or "",
                     )
-                assert_no_advisory_lock_held("google.verify_id_token")
-                claims = await g_client.verify_id_token(
-                    id_token=token_resp.id_token,
-                    expected_aud=client_id,
-                )
-                provider_account_id = claims.sub
-                provider_email = claims.email
-                granted_list = _parse_scopes(token_resp.scope)
-            else:
-                f_client = feishu_client or get_feishu_oauth_client()
-                assert_no_advisory_lock_held("feishu.exchange_code")
-                token_resp = await f_client.exchange_code(
-                    app_id=client_id,
-                    app_secret=client_secret,
-                    code=str(code).strip(),
-                    redirect_uri=state_row.redirect_uri,
-                    code_verifier=state_row.code_verifier or "",
-                )
-                assert_no_advisory_lock_held("feishu.get_user_info")
-                user_info = await f_client.get_user_info(
-                    access_token=token_resp.access_token
-                )
-                provider_account_id = user_info.open_id
-                provider_union_id = user_info.union_id
-                provider_email = user_info.email
-                granted_list = _parse_scopes(token_resp.scope or state_row.requested_scopes)
+                    # Record minted Google token immediately so post-exchange failures clean it up
+                    exchanged_google_token = token_resp.refresh_token or token_resp.access_token
+                    if not token_resp.id_token:
+                        abandon_reason = "callback_missing_id_token"
+                        return OAuthCallbackResult(
+                            status="error",
+                            provider=norm_provider,
+                            service=state_row.service,
+                            return_to=safe_return_to,
+                            error_code="missing_id_token",
+                            error_message="Google did not return an OIDC id_token.",
+                        )
+                    assert_no_advisory_lock_held("google.verify_id_token")
+                    claims = await g_client.verify_id_token(
+                        id_token=token_resp.id_token,
+                        expected_aud=client_id,
+                    )
+                    provider_account_id = claims.sub
+                    exchanged_google_sub = claims.sub
+                    provider_email = claims.email
+                    granted_list = _parse_scopes(token_resp.scope)
+                else:
+                    f_client = feishu_client or get_feishu_oauth_client()
+                    assert_no_advisory_lock_held("feishu.exchange_code")
+                    token_resp = await f_client.exchange_code(
+                        app_id=client_id,
+                        app_secret=client_secret,
+                        code=str(code).strip(),
+                        redirect_uri=state_row.redirect_uri,
+                        code_verifier=state_row.code_verifier or "",
+                    )
+                    assert_no_advisory_lock_held("feishu.get_user_info")
+                    user_info = await f_client.get_user_info(
+                        access_token=token_resp.access_token
+                    )
+                    provider_account_id = user_info.open_id
+                    provider_union_id = user_info.union_id
+                    provider_email = user_info.email
+                    granted_list = _parse_scopes(token_resp.scope or state_row.requested_scopes)
 
-                # Channel gateway Feishu identity consistency check (§4.3 item 2):
-                # Compare open_id strictly against the binding's OWN recorded feishu_app_id
-                # so gateway app rotation + restart never compares a new app's open_id against
-                # an old binding from a previous app. When binding ownership cannot be confirmed
-                # (legacy binding without feishu_app_id), warn and skip safely.
-                if has_capability(CapabilityId.CHANNEL_FEISHU):
-                    bound_open_id, binding_app_id = await db.get_channel_feishu_binding(
-                        state_row.user_id
-                    )
-                    if bound_open_id:
-                        if not binding_app_id:
-                            logger.warning(
-                                "[integration-oauth] Feishu channel binding has no recorded feishu_app_id; "
-                                "cannot confirm app ownership, skipping open_id check (rebind Feishu channel to update)"
-                            )
-                        elif binding_app_id == client_id:
-                            if bound_open_id != provider_account_id:
-                                raise FeishuIdentityMismatchError(
-                                    "Feishu OAuth account does not match your bound Feishu channel identity."
+                    if has_capability(CapabilityId.CHANNEL_FEISHU):
+                        bound_open_id, binding_app_id = await db.get_channel_feishu_binding(
+                            state_row.user_id
+                        )
+                        if bound_open_id:
+                            if not binding_app_id:
+                                logger.warning(
+                                    "[integration-oauth] Feishu channel binding has no recorded feishu_app_id; "
+                                    "cannot confirm app ownership, skipping open_id check (rebind Feishu channel to update)"
                                 )
-                        else:
-                            logger.info(
-                                "[integration-oauth] Feishu channel binding belongs to a different app_id; "
-                                "skipping open_id check (rebind Feishu channel to align with current app)"
-                            )
-        except (OAuthUpstreamError, GoogleIdTokenVerificationError) as exc:
-            err_code = (
-                exc.error_code
-                if isinstance(exc, OAuthUpstreamError)
-                else exc.reason
-            )
+                            elif binding_app_id == client_id:
+                                if bound_open_id != provider_account_id:
+                                    raise FeishuIdentityMismatchError(
+                                        "Feishu OAuth account does not match your bound Feishu channel identity."
+                                    )
+                            else:
+                                logger.info(
+                                    "[integration-oauth] Feishu channel binding belongs to a different app_id; "
+                                    "skipping open_id check (rebind Feishu channel to align with current app)"
+                                )
+        except TimeoutError:
+            abandon_reason = "callback_exchange_timeout"
             return OAuthCallbackResult(
                 status="error",
                 provider=norm_provider,
                 service=state_row.service,
                 return_to=safe_return_to,
-                error_code=err_code,
+                error_code="exchange_timeout",
+                error_message="OAuth token exchange timed out; please retry authorization.",
+            )
+        except OAuthUpstreamError as exc:
+            # Exchange itself failed -> no newly minted Google token to revoke
+            exchanged_google_token = None
+            return OAuthCallbackResult(
+                status="error",
+                provider=norm_provider,
+                service=state_row.service,
+                return_to=safe_return_to,
+                error_code=exc.error_code,
                 error_message="Failed to complete OAuth token exchange with provider.",
             )
+        except GoogleIdTokenVerificationError as exc:
+            abandon_reason = "callback_id_token_verification_failed"
+            return OAuthCallbackResult(
+                status="error",
+                provider=norm_provider,
+                service=state_row.service,
+                return_to=safe_return_to,
+                error_code=exc.reason,
+                error_message="Failed to verify Google identity token.",
+            )
+
+        # Decision 1: one Google (project, sub) can only connect to ONE Dalton member.
+        # Reject immediately at entry without revoking the existing owner's grant.
+        if norm_provider == "google":
+            google_proj = extract_google_project(client_id)
+            if await db.has_other_user_google_account_claim(
+                google_proj,
+                provider_account_id,
+                exclude_user_id=state_row.user_id,
+            ):
+                rejected_owned_by_other_member = True
+                return OAuthCallbackResult(
+                    status="error",
+                    provider=norm_provider,
+                    service=state_row.service,
+                    return_to=safe_return_to,
+                    error_code="google_account_already_connected",
+                    error_message=_GOOGLE_ACCOUNT_OWNED_BY_OTHER_MEMBER_MSG,
+                )
 
         # Validate minimum required scopes (§3.3, §4.2(1))
         missing_scopes = _missing_min_scopes(norm_provider, state_row.service, granted_list)
         if missing_scopes:
+            abandon_reason = "callback_missing_required_scopes"
             return OAuthCallbackResult(
                 status="error",
                 provider=norm_provider,
@@ -1826,16 +2067,33 @@ async def handle_oauth_callback(
         )
         granted_scopes_str = _format_scopes(granted_list)
 
-        # Check if this callback selects a DIFFERENT external account than the existing connection
         existing = await db.get_connection(
             state_row.user_id, norm_provider, state_row.service
         )
+        # Prefer Step 1's snapshotted baseline epoch when available so a concurrent disconnect
+        # that deleted the row during exchange_code is NEVER mistaken for a fresh first connect.
+        if state_row.baseline_existed is not None:
+            baseline_existed = state_row.baseline_existed
+            expected_old_cid = state_row.baseline_oauth_client_id
+            expected_old_sub = state_row.baseline_provider_account_id
+            expected_old_epoch = state_row.baseline_auth_epoch
+        else:
+            baseline_existed = existing is not None
+            expected_old_cid = existing.oauth_client_id if existing is not None else None
+            expected_old_sub = existing.provider_account_id if existing is not None else None
+            expected_old_epoch = existing.auth_epoch if existing is not None else None
+
         is_account_switch = (
             existing is not None and existing.provider_account_id != provider_account_id
+        ) or (
+            baseline_existed
+            and expected_old_sub is not None
+            and expected_old_sub != provider_account_id
         )
 
         if is_account_switch:
             if not token_resp.refresh_token:
+                abandon_reason = "callback_missing_refresh_token_on_account_switch"
                 return OAuthCallbackResult(
                     status="error",
                     provider=norm_provider,
@@ -1849,46 +2107,72 @@ async def handle_oauth_callback(
             confirm_expires = datetime.now(UTC) + timedelta(
                 seconds=PENDING_CONFIRMATION_TTL_SECONDS
             )
+            prev_email = existing.provider_email if existing is not None else None
+            prev_sub = existing.provider_account_id if existing is not None else expected_old_sub
             staged_prefs = {
                 **service_prefs,
-                "_account_switch_previous_email": existing.provider_email,
-                "_account_switch_previous_account_id": existing.provider_account_id,
+                "_account_switch_previous_email": prev_email,
+                "_account_switch_previous_account_id": prev_sub,
             }
-            await _stage_pending_confirmation(
-                confirmation_hash=confirm_hash,
-                user_id=state_row.user_id,
-                provider=norm_provider,
-                service=state_row.service,
-                oauth_client_id=client_id,
-                provider_account_id=provider_account_id,
-                provider_union_id=provider_union_id,
-                provider_email=provider_email,
-                granted_scopes=granted_scopes_str,
-                access_token=token_resp.access_token,
-                refresh_token=token_resp.refresh_token,
-                expires_at=token_resp.expires_at,
-                intent=OAuthIntent.SWITCH_ACCOUNT.value,
-                preferences=staged_prefs,
-                confirm_expires_at=confirm_expires,
-                expected_old_oauth_client_id=existing.oauth_client_id,
-                expected_old_provider_account_id=existing.provider_account_id,
-                expected_old_auth_epoch=existing.auth_epoch,
-            )
+            try:
+                await _stage_pending_confirmation(
+                    confirmation_hash=confirm_hash,
+                    user_id=state_row.user_id,
+                    provider=norm_provider,
+                    service=state_row.service,
+                    oauth_client_id=client_id,
+                    provider_account_id=provider_account_id,
+                    provider_union_id=provider_union_id,
+                    provider_email=provider_email,
+                    granted_scopes=granted_scopes_str,
+                    access_token=token_resp.access_token,
+                    refresh_token=token_resp.refresh_token,
+                    expires_at=token_resp.expires_at,
+                    intent=OAuthIntent.SWITCH_ACCOUNT.value,
+                    preferences=staged_prefs,
+                    confirm_expires_at=confirm_expires,
+                    expected_old_oauth_client_id=expected_old_cid,
+                    expected_old_provider_account_id=expected_old_sub,
+                    expected_old_auth_epoch=expected_old_epoch,
+                    consume_state_hash=state_hash,
+                    baseline_existed=baseline_existed,
+                )
+            except GoogleAccountAlreadyConnectedByOtherMemberError as exc:
+                rejected_owned_by_other_member = True
+                return OAuthCallbackResult(
+                    status="error",
+                    provider=norm_provider,
+                    service=state_row.service,
+                    return_to=safe_return_to,
+                    error_code=exc.code,
+                    error_message=str(exc),
+                )
+            except (PendingConfirmationInvalidError, OAuthExchangeLeaseExpiredError) as exc:
+                abandon_reason = (
+                    "callback_exchange_lease_expired"
+                    if isinstance(exc, OAuthExchangeLeaseExpiredError)
+                    else "callback_disconnected_before_commit"
+                )
+                return OAuthCallbackResult(
+                    status="error",
+                    provider=norm_provider,
+                    service=state_row.service,
+                    return_to=safe_return_to,
+                    error_code=exc.code,
+                    error_message=str(exc),
+                )
+            token_committed_or_staged = True
             return OAuthCallbackResult(
                 status="account_switch_confirmation_required",
                 provider=norm_provider,
                 service=state_row.service,
                 return_to=safe_return_to,
                 confirmation_token=raw_confirm,
-                previous_account_email=existing.provider_email,
+                previous_account_email=prev_email,
                 new_account_email=provider_email,
                 partial_grant=partial_grant,
             )
 
-        # Determine whether post-callback authenticated confirmation is required:
-        # - Supabase mode always stages tokens for 5-minute authenticated Bearer confirmation.
-        # - Local mode verifies the one-time browser-binding cookie; if missing or mismatched
-        #   (e.g., another browser finished the OAuth flow), stage for logged-in page confirmation.
         local_browser_mismatch = False
         if state_row.auth_mode == "local":
             cleaned_cookie = (
@@ -1908,32 +2192,54 @@ async def handle_oauth_callback(
             confirm_expires = datetime.now(UTC) + timedelta(
                 seconds=PENDING_CONFIRMATION_TTL_SECONDS
             )
-            await _stage_pending_confirmation(
-                confirmation_hash=confirm_hash,
-                user_id=state_row.user_id,
-                provider=norm_provider,
-                service=state_row.service,
-                oauth_client_id=client_id,
-                provider_account_id=provider_account_id,
-                provider_union_id=provider_union_id,
-                provider_email=provider_email,
-                granted_scopes=granted_scopes_str,
-                access_token=token_resp.access_token,
-                refresh_token=token_resp.refresh_token,
-                expires_at=token_resp.expires_at,
-                intent=state_row.intent,
-                preferences=service_prefs,
-                confirm_expires_at=confirm_expires,
-                expected_old_oauth_client_id=(
-                    existing.oauth_client_id if existing is not None else None
-                ),
-                expected_old_provider_account_id=(
-                    existing.provider_account_id if existing is not None else None
-                ),
-                expected_old_auth_epoch=(
-                    existing.auth_epoch if existing is not None else None
-                ),
-            )
+            try:
+                await _stage_pending_confirmation(
+                    confirmation_hash=confirm_hash,
+                    user_id=state_row.user_id,
+                    provider=norm_provider,
+                    service=state_row.service,
+                    oauth_client_id=client_id,
+                    provider_account_id=provider_account_id,
+                    provider_union_id=provider_union_id,
+                    provider_email=provider_email,
+                    granted_scopes=granted_scopes_str,
+                    access_token=token_resp.access_token,
+                    refresh_token=token_resp.refresh_token,
+                    expires_at=token_resp.expires_at,
+                    intent=state_row.intent,
+                    preferences=service_prefs,
+                    confirm_expires_at=confirm_expires,
+                    expected_old_oauth_client_id=expected_old_cid,
+                    expected_old_provider_account_id=expected_old_sub,
+                    expected_old_auth_epoch=expected_old_epoch,
+                    consume_state_hash=state_hash,
+                    baseline_existed=baseline_existed,
+                )
+            except GoogleAccountAlreadyConnectedByOtherMemberError as exc:
+                rejected_owned_by_other_member = True
+                return OAuthCallbackResult(
+                    status="error",
+                    provider=norm_provider,
+                    service=state_row.service,
+                    return_to=safe_return_to,
+                    error_code=exc.code,
+                    error_message=str(exc),
+                )
+            except (PendingConfirmationInvalidError, OAuthExchangeLeaseExpiredError) as exc:
+                abandon_reason = (
+                    "callback_exchange_lease_expired"
+                    if isinstance(exc, OAuthExchangeLeaseExpiredError)
+                    else "callback_disconnected_before_commit"
+                )
+                return OAuthCallbackResult(
+                    status="error",
+                    provider=norm_provider,
+                    service=state_row.service,
+                    return_to=safe_return_to,
+                    error_code=exc.code,
+                    error_message=str(exc),
+                )
+            token_committed_or_staged = True
             return OAuthCallbackResult(
                 status="confirmation_required",
                 provider=norm_provider,
@@ -1945,127 +2251,122 @@ async def handle_oauth_callback(
             )
 
         # Direct commit (local same-browser / oss):
-        # Stage a short-lived tokenless commit-guard row in pending_confirmations BEFORE
-        # releasing the in-flight oauth_state record (and for Google, atomically supersede
-        # active revokes under revoke_lock_key). _finalize_connection MUST atomically consume
-        # this commit-guard inside its activation transaction so a concurrent DELETE (which
-        # deletes pending_confirmations) aborts the callback instead of resurrecting the row.
-        guard_confirmation_hash = _sha256_hex(
-            f"commit_guard:{secrets.token_urlsafe(32)}"
-        )
-        guard_user_id = state_row.user_id
-        expected_old_cid = existing.oauth_client_id if existing is not None else None
-        expected_old_sub = existing.provider_account_id if existing is not None else None
-        expected_old_epoch = existing.auth_epoch if existing is not None else None
-        await _stage_pending_confirmation(
-            confirmation_hash=guard_confirmation_hash,
-            user_id=state_row.user_id,
-            provider=norm_provider,
-            service=state_row.service,
-            oauth_client_id=client_id,
-            provider_account_id=provider_account_id,
-            provider_union_id=provider_union_id,
-            provider_email=provider_email,
-            granted_scopes=granted_scopes_str,
-            access_token=None,
-            refresh_token=None,
-            expires_at=token_resp.expires_at,
-            intent=state_row.intent,
-            preferences={"_internal_commit_guard": True},
-            confirm_expires_at=datetime.now(UTC) + timedelta(seconds=60),
-            expected_old_oauth_client_id=expected_old_cid,
-            expected_old_provider_account_id=expected_old_sub,
-            expected_old_auth_epoch=expected_old_epoch,
-        )
-    finally:
-        if norm_provider == "google":
-            with anyio.CancelScope(shield=True):
-                await db.delete_oauth_state(state_hash, "google")
-
-    # local (same initiating browser) / oss mode (first connect, same-account reconnect, or same-sub client rotation)
-    eff_revoker = (
-        revoker if revoker is not None else (get_google_remote_revoker() if norm_provider == "google" else None)
-    )
-    try:
-        saved_row, _ = await _finalize_connection(
-            user_id=state_row.user_id,
-            provider=norm_provider,
-            service=state_row.service,
-            oauth_client_id=client_id,
-            provider_account_id=provider_account_id,
-            provider_union_id=provider_union_id,
-            provider_email=provider_email,
-            granted_scopes=granted_scopes_str,
-            access_token=token_resp.access_token,
-            refresh_token=token_resp.refresh_token,
-            expires_at=token_resp.expires_at,
-            preferences=service_prefs,
-            allow_account_switch=False,
-            revoker=eff_revoker,
-            expected_old_oauth_client_id=expected_old_cid,
-            expected_old_provider_account_id=expected_old_sub,
-            expected_old_auth_epoch=expected_old_epoch,
-            guard_confirmation_hash=guard_confirmation_hash,
-        )
-    except PendingConfirmationInvalidError as exc:
-        if guard_confirmation_hash is not None and guard_user_id is not None:
-            with anyio.CancelScope(shield=True):
-                await db.delete_pending_confirmation_by_hash(
-                    guard_confirmation_hash, guard_user_id
-                )
-        if norm_provider == "google":
-            await _revoke_abandoned_google_token(
+        # Atomically verifies & consumes the pending connect intent (state_hash) INSIDE
+        # _finalize_connection's activation tx, checking voided_at, exchange lease,
+        # inflight revoke claim, 1-member ownership, and baseline epoch.
+        try:
+            saved_row, _ = await _finalize_connection(
                 user_id=state_row.user_id,
+                provider=norm_provider,
                 service=state_row.service,
                 oauth_client_id=client_id,
                 provider_account_id=provider_account_id,
-                token=token_resp.refresh_token or token_resp.access_token,
-                reason="callback_disconnected_before_commit",
+                provider_union_id=provider_union_id,
+                provider_email=provider_email,
+                granted_scopes=granted_scopes_str,
+                access_token=token_resp.access_token,
+                refresh_token=token_resp.refresh_token,
+                expires_at=token_resp.expires_at,
+                preferences=service_prefs,
+                allow_account_switch=False,
                 revoker=eff_revoker,
+                expected_old_oauth_client_id=expected_old_cid,
+                expected_old_provider_account_id=expected_old_sub,
+                expected_old_auth_epoch=expected_old_epoch,
+                consume_state_hash=state_hash,
+                baseline_existed=baseline_existed,
             )
-        return OAuthCallbackResult(
-            status="error",
-            provider=norm_provider,
-            service=state_row.service,
-            return_to=safe_return_to,
-            error_code=exc.code,
-            error_message=str(exc),
-        )
-    except (
-        MissingRefreshTokenOnClientRotationError,
-        MissingRefreshTokenError,
-        MissingRefreshTokenOnAccountSwitchError,
-    ) as exc:
-        if guard_confirmation_hash is not None and guard_user_id is not None:
-            with anyio.CancelScope(shield=True):
-                await db.delete_pending_confirmation_by_hash(
-                    guard_confirmation_hash, guard_user_id
-                )
-        return OAuthCallbackResult(
-            status="error",
-            provider=norm_provider,
-            service=state_row.service,
-            return_to=safe_return_to,
-            error_code=getattr(exc, "code", "missing_refresh_token"),
-            error_message=str(exc),
-        )
-    except BaseException:
-        if guard_confirmation_hash is not None and guard_user_id is not None:
-            with anyio.CancelScope(shield=True):
-                await db.delete_pending_confirmation_by_hash(
-                    guard_confirmation_hash, guard_user_id
-                )
-        raise
+        except GoogleAccountAlreadyConnectedByOtherMemberError as exc:
+            rejected_owned_by_other_member = True
+            return OAuthCallbackResult(
+                status="error",
+                provider=norm_provider,
+                service=state_row.service,
+                return_to=safe_return_to,
+                error_code=exc.code,
+                error_message=str(exc),
+            )
+        except (PendingConfirmationInvalidError, OAuthExchangeLeaseExpiredError) as exc:
+            abandon_reason = (
+                "callback_exchange_lease_expired"
+                if isinstance(exc, OAuthExchangeLeaseExpiredError)
+                else "callback_disconnected_before_commit"
+            )
+            return OAuthCallbackResult(
+                status="error",
+                provider=norm_provider,
+                service=state_row.service,
+                return_to=safe_return_to,
+                error_code=exc.code,
+                error_message=str(exc),
+            )
+        except (
+            MissingRefreshTokenOnClientRotationError,
+            MissingRefreshTokenError,
+            MissingRefreshTokenOnAccountSwitchError,
+        ) as exc:
+            abandon_reason = "callback_missing_refresh_token"
+            return OAuthCallbackResult(
+                status="error",
+                provider=norm_provider,
+                service=state_row.service,
+                return_to=safe_return_to,
+                error_code=getattr(exc, "code", "missing_refresh_token"),
+                error_message=str(exc),
+            )
 
-    return OAuthCallbackResult(
-        status="connected",
-        provider=norm_provider,
-        service=state_row.service,
-        return_to=safe_return_to,
-        connection=saved_row,
-        new_account_email=provider_email,
-        partial_grant=partial_grant,
-    )
+        token_committed_or_staged = True
+        return OAuthCallbackResult(
+            status="connected",
+            provider=norm_provider,
+            service=state_row.service,
+            return_to=safe_return_to,
+            connection=saved_row,
+            new_account_email=provider_email,
+            partial_grant=partial_grant,
+        )
+    finally:
+        with anyio.CancelScope(shield=True):
+            try:
+                await db.delete_oauth_state(state_hash, norm_provider)
+            except Exception:
+                pass
+            if (
+                norm_provider == "google"
+                and exchanged_google_token is not None
+                and not token_committed_or_staged
+                and not rejected_owned_by_other_member
+            ):
+                try:
+                    if exchanged_google_sub is not None:
+                        await _revoke_abandoned_google_token(
+                            user_id=state_row.user_id,
+                            service=state_row.service,
+                            oauth_client_id=exchanged_google_client_id,
+                            provider_account_id=exchanged_google_sub,
+                            token=exchanged_google_token,
+                            reason=abandon_reason,
+                            revoker=eff_revoker,
+                        )
+                    else:
+                        proj = extract_google_project(exchanged_google_client_id)
+                        if not await db.has_any_active_google_grant_in_project(proj):
+                            await _revoke_abandoned_google_token(
+                                user_id=state_row.user_id,
+                                service=state_row.service,
+                                oauth_client_id=exchanged_google_client_id,
+                                provider_account_id=(
+                                    state_row.expected_provider_account_id or "unverified_sub"
+                                ),
+                                token=exchanged_google_token,
+                                reason=abandon_reason,
+                                revoker=eff_revoker,
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        "[integration-oauth] abandoned Google token cleanup failed (%s)",
+                        type(exc).__name__,
+                    )
 
 
 async def _revoke_abandoned_google_token(
@@ -2084,33 +2385,29 @@ async def _revoke_abandoned_google_token(
     proj = extract_google_project(oauth_client_id)
     rkey = revoke_lock_key(proj, provider_account_id)
     revoke_pid: str | None = None
-    async with get_db_connection() as lock_conn:
-        await lock_conn.execute("SELECT pg_advisory_lock(%s)", (rkey,))
-        try:
-            with track_advisory_lock("revoke", rkey):
-                if await db.has_active_or_pending_google_grant(
-                    proj, provider_account_id, conn=lock_conn
-                ):
-                    return
-                revoke_pid = str(uuid4())
-                await db.insert_purge_ledger(
-                    purge_id=revoke_pid,
-                    user_id=user_id,
-                    provider="google",
-                    service=service,
-                    oauth_client_id=oauth_client_id,
-                    provider_account_id=provider_account_id,
-                    auth_epoch_upto=0,
-                    trigger_reason=reason,
-                    local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
-                    purged_max_turn_by_thread={},
-                    remote_revoke_status=RemoteRevokeStatus.PENDING,
-                    revoke_token_plaintext=token,
-                    conn=lock_conn,
-                )
-        finally:
-            with anyio.CancelScope(shield=True):
-                await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (rkey,))
+    async with get_db_connection() as tx_conn, tx_conn.transaction():
+        await tx_conn.execute("SELECT pg_advisory_xact_lock(%s)", (rkey,))
+        with track_advisory_lock("revoke", rkey):
+            if await db.has_active_or_pending_google_grant(
+                proj, provider_account_id, user_id=user_id, conn=tx_conn
+            ):
+                return
+            revoke_pid = str(uuid4())
+            await db.insert_purge_ledger(
+                purge_id=revoke_pid,
+                user_id=user_id,
+                provider="google",
+                service=service,
+                oauth_client_id=oauth_client_id,
+                provider_account_id=provider_account_id,
+                auth_epoch_upto=0,
+                trigger_reason=reason,
+                local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
+                purged_max_turn_by_thread={},
+                remote_revoke_status=RemoteRevokeStatus.PENDING,
+                revoke_token_plaintext=token,
+                conn=tx_conn,
+            )
 
     if revoke_pid is not None:
         eff_revoker = revoker if revoker is not None else get_google_remote_revoker()
@@ -2312,6 +2609,10 @@ async def confirm_pending_integration(
             expected_old_auth_epoch=preview.expected_old_auth_epoch,
             consume_confirmation_hash=confirm_hash,
         )
+    except GoogleAccountAlreadyConnectedByOtherMemberError:
+        # Another Dalton member owns this (google_project, sub): drop our ticket WITHOUT revoking their grant.
+        await db.consume_pending_confirmation(confirm_hash, user_id)
+        raise
     except (
         PendingConfirmationInvalidError,
         MissingRefreshTokenOnClientRotationError,
@@ -2449,19 +2750,23 @@ async def _commit_refresh_success_tx(
     token_resp: OAuthTokenResponse,
     required_scopes: Collection[str] | None,
     expected_attempt_gen: int | None = None,
+    claimed_targets: dict[str, tuple[int, int, int]] | None = None,
+    conn: Any = None,
 ) -> FreshAccessToken:
-    """Row-lock CAS commit with 3-element + attempt-generation conflict check and Google sibling propagation (§4.2(2) step 3).
+    """Row-lock CAS commit with 3-element + per-service claimed attempt-generation check and Google sibling propagation (§4.2(2) step 3).
 
-    Commits all persisted token/status mutations BEFORE raising business exceptions
-    (such as ``IntegrationNeedsReauthError`` on narrowed scopes or ``IntegrationEpochRevokedError``
-    after clearing inflight markers on concurrent disconnect) so committed new tokens
-    and status transitions are never rolled back.
+    Every updated row (both the initiating service and any Google sibling sharing the credential)
+    is verified against its Step 1 claimed ``(auth_epoch, token_generation, refresh_attempt_gen)``.
+    If a sibling was re-authorized or superseded while HTTP was in flight, its CAS matches zero
+    rows and the stale refresh result is discarded without overwriting the newer credential.
+    Reuses ``conn`` when provided (zero second pooled connection while holding the refresh lock).
     """
     enc_key = get_encryption_key()
     committed_row: IntegrationRow | None = None
     deferred_exc: Exception | None = None
 
-    async with get_db_connection() as tx_conn, tx_conn.transaction():
+    async def _run_commit(tx_conn: Any) -> None:
+        nonlocal committed_row, deferred_exc
         if provider == "google":
             locked_rows = await db.list_connections_by_account(
                 user_id,
@@ -2474,7 +2779,6 @@ async def _commit_refresh_success_tx(
             )
             cur = next((r for r in locked_rows if r.service == service), None)
             if cur is None:
-                # Re-fetch by PK in case client/sub changed under concurrent rebind/switch
                 cur = await db.get_connection(
                     user_id, provider, service, decrypt_tokens=True, for_update=True, conn=tx_conn
                 )
@@ -2490,40 +2794,60 @@ async def _commit_refresh_success_tx(
             )
             siblings = []
 
+        def _eligible_claimed_sibling(sib: IntegrationRow) -> tuple[int, int, int | None] | None:
+            if claimed_targets is not None:
+                claimed = claimed_targets.get(sib.service)
+                if claimed is None:
+                    return None
+                c_epoch, c_tok_gen, c_att_gen = claimed
+                if (
+                    sib.auth_epoch != c_epoch
+                    or sib.token_generation != c_tok_gen
+                    or sib.refresh_attempt_gen != c_att_gen
+                ):
+                    return None
+                return c_epoch, c_tok_gen, c_att_gen
+            if expected_attempt_gen is not None and sib.refresh_attempt_gen != expected_attempt_gen:
+                return None
+            return sib.auth_epoch, sib.token_generation, expected_attempt_gen
+
         if cur is None:
             deferred_exc = IntegrationEpochRevokedError("Connection no longer exists.")
-        else:
-            # 3-element identity check: client, sub, auth_epoch
-            identity_matches = (
-                cur.oauth_client_id == start_client_id
-                and cur.provider_account_id == start_sub
-                and cur.auth_epoch == start_auth_epoch
+            return
+
+        identity_matches = (
+            cur.oauth_client_id == start_client_id
+            and cur.provider_account_id == start_sub
+            and cur.auth_epoch == start_auth_epoch
+        )
+        if not identity_matches:
+            deferred_exc = IntegrationEpochRevokedError(
+                "Connection client, account, or auth_epoch changed during refresh."
             )
-            if not identity_matches:
-                deferred_exc = IntegrationEpochRevokedError(
-                    "Connection client, account, or auth_epoch changed during refresh."
-                )
-            elif cur.status in (
-                IntegrationStatus.DISCONNECT_PENDING,
-                IntegrationStatus.REVOKED_PURGING,
-            ):
-                # Concurrent disconnect intervened: commit cleanup & Google sibling updates first
-                async with tx_conn.cursor() as cur_sql:
-                    if provider == "feishu":
-                        await cur_sql.execute(
-                            """
-                            UPDATE dalton_user_integrations
-                            SET access_token = NULL,
-                                refresh_token = NULL,
-                                refresh_inflight_gen = NULL,
-                                refresh_started_at = NULL,
-                                refresh_inflight_until = NULL,
-                                updated_at = NOW()
-                            WHERE user_id = %s AND provider = %s AND service = %s
-                            """,
-                            (user_id, provider, service),
-                        )
-                    else:
+            return
+
+        if cur.status in (
+            IntegrationStatus.DISCONNECT_PENDING,
+            IntegrationStatus.REVOKED_PURGING,
+        ):
+            # Concurrent disconnect intervened on the initiating service.
+            async with tx_conn.cursor() as cur_sql:
+                if provider == "feishu":
+                    await cur_sql.execute(
+                        """
+                        UPDATE dalton_user_integrations
+                        SET access_token = NULL,
+                            refresh_token = NULL,
+                            refresh_inflight_gen = NULL,
+                            refresh_started_at = NULL,
+                            refresh_inflight_until = NULL,
+                            updated_at = NOW()
+                        WHERE user_id = %s AND provider = %s AND service = %s
+                        """,
+                        (user_id, provider, service),
+                    )
+                else:
+                    if expected_attempt_gen is None or cur.refresh_attempt_gen == expected_attempt_gen:
                         await cur_sql.execute(
                             """
                             UPDATE dalton_user_integrations
@@ -2535,126 +2859,38 @@ async def _commit_refresh_success_tx(
                             """,
                             (user_id, provider, service),
                         )
-                        # Google single-service disconnect: still update remaining active siblings
-                        for sib in siblings:
-                            new_sib_scopes = (
-                                _format_scopes(_parse_scopes(token_resp.scope))
-                                if token_resp.scope
-                                else sib.granted_scopes
-                            )
-                            sib_scope_list = _parse_scopes(new_sib_scopes)
-                            sib_prefs, _ = _converge_preferences_for_scopes(
-                                "google",
-                                sib.service,
-                                sib_scope_list,
-                                sib.preferences,
-                            )
-                            sib_missing = _missing_min_scopes(
-                                "google", sib.service, sib_scope_list
-                            )
-                            sib_status = (
-                                IntegrationStatus.NEEDS_REAUTH.value
-                                if sib_missing
-                                else IntegrationStatus.CONNECTED.value
-                            )
-                            sib_err_code = "missing_required_scopes" if sib_missing else None
-                            await cur_sql.execute(
-                                """
-                                UPDATE dalton_user_integrations
-                                SET access_token = pgp_sym_encrypt(%(access)s, %(enc_key)s),
-                                    refresh_token = CASE WHEN %(refresh)s::text IS NULL THEN refresh_token
-                                                         ELSE pgp_sym_encrypt(%(refresh)s, %(enc_key)s) END,
-                                    expires_at = %(expires_at)s,
-                                    granted_scopes = %(scopes)s,
-                                    preferences = %(preferences)s,
-                                    token_generation = token_generation + 1,
-                                    refresh_inflight_gen = NULL,
-                                    refresh_started_at = NULL,
-                                    refresh_inflight_until = NULL,
-                                    status = %(status)s,
-                                    needs_reauth_at = CASE WHEN %(status)s = 'needs_reauth'
-                                                           THEN COALESCE(needs_reauth_at, NOW())
-                                                           ELSE NULL END,
-                                    last_error_code = %(err_code)s,
-                                    last_refresh_at = NOW(),
-                                    updated_at = NOW()
-                                WHERE user_id = %(user_id)s
-                                  AND provider = 'google'
-                                  AND service = %(service)s
-                                  AND auth_epoch = %(auth_epoch)s
-                                """,
-                                {
-                                    "access": token_resp.access_token,
-                                    "refresh": token_resp.refresh_token,
-                                    "enc_key": enc_key,
-                                    "expires_at": token_resp.expires_at,
-                                    "scopes": new_sib_scopes,
-                                    "preferences": Jsonb(sib_prefs),
-                                    "status": sib_status,
-                                    "err_code": sib_err_code,
-                                    "user_id": user_id,
-                                    "service": sib.service,
-                                    "auth_epoch": sib.auth_epoch,
-                                },
-                            )
-                deferred_exc = IntegrationEpochRevokedError(
-                    "Connection was disconnected during refresh."
-                )
-            elif cur.token_generation != start_token_gen or (
-                expected_attempt_gen is not None
-                and cur.refresh_attempt_gen != expected_attempt_gen
-            ):
-                # CAS generation / attempt-generation conflict branch (§4.2(2) step 3)
-                if cur.status == IntegrationStatus.CONNECTED and cur.access_token:
-                    committed_row = cur
-                elif cur.status == IntegrationStatus.NEEDS_REAUTH:
-                    deferred_exc = IntegrationNeedsReauthError(
-                        "Connection transitioned to needs_reauth.",
-                        code=cur.last_error_code or "needs_reauth",
-                    )
-                else:
-                    deferred_exc = IntegrationEpochRevokedError(
-                        "Connection state no longer servable after CAS conflict."
-                    )
-            elif cur.status not in (
-                IntegrationStatus.CONNECTED,
-                IntegrationStatus.REFRESH_AMBIGUOUS,
-            ):
-                deferred_exc = IntegrationNeedsReauthError(
-                    "Connection requires re-authorization.",
-                    code=cur.last_error_code or "needs_reauth",
-                )
-            else:
-                # Normal CAS commit: authorized_at stays UNCHANGED (§4.2(2) item 5).
-                # When scopes narrowed below minimum, we STILL commit the new token + token_generation + 1
-                # together with status='needs_reauth' (old Feishu single-use refresh token may already be consumed).
-                rows_to_update = [cur] + siblings
-                async with tx_conn.cursor(row_factory=dict_row) as cur_sql:
-                    for target in rows_to_update:
-                        updated_scopes = (
+                    # Google single-service disconnect: update ONLY siblings whose claimed
+                    # (auth_epoch, token_generation, refresh_attempt_gen) STILL match Step 1.
+                    # Any sibling re-authorized or superseded during HTTP fails CAS and is untouched.
+                    for sib in siblings:
+                        cas = _eligible_claimed_sibling(sib)
+                        if cas is None:
+                            continue
+                        c_epoch, c_tok_gen, c_att_gen = cas
+                        new_sib_scopes = (
                             _format_scopes(_parse_scopes(token_resp.scope))
                             if token_resp.scope
-                            else target.granted_scopes
+                            else sib.granted_scopes
                         )
-                        updated_prefs, _ = _converge_preferences_for_scopes(
-                            provider,
-                            target.service,
-                            _parse_scopes(updated_scopes),
-                            target.preferences,
+                        sib_scope_list = _parse_scopes(new_sib_scopes)
+                        sib_prefs, _ = _converge_preferences_for_scopes(
+                            "google",
+                            sib.service,
+                            sib_scope_list,
+                            sib.preferences,
                         )
-                        missing_min = _missing_min_scopes(
-                            provider, target.service, _parse_scopes(updated_scopes)
+                        sib_missing = _missing_min_scopes(
+                            "google", sib.service, sib_scope_list
                         )
-                        if missing_min:
-                            new_status = IntegrationStatus.NEEDS_REAUTH.value
-                            err_code = "missing_required_scopes"
-                        else:
-                            new_status = IntegrationStatus.CONNECTED.value
-                            err_code = None
-
+                        sib_status = (
+                            IntegrationStatus.NEEDS_REAUTH.value
+                            if sib_missing
+                            else IntegrationStatus.CONNECTED.value
+                        )
+                        sib_err_code = "missing_required_scopes" if sib_missing else None
                         attempt_clause = (
-                            "AND refresh_attempt_gen = %(expected_attempt_gen)s"
-                            if (expected_attempt_gen is not None and target.service == service)
+                            "AND refresh_attempt_gen = %(claimed_attempt_gen)s"
+                            if c_att_gen is not None
                             else ""
                         )
                         await cur_sql.execute(
@@ -2671,49 +2907,173 @@ async def _commit_refresh_success_tx(
                                 refresh_started_at = NULL,
                                 refresh_inflight_until = NULL,
                                 status = %(status)s,
-                                last_refresh_at = NOW(),
-                                needs_reauth_at = CASE WHEN %(status)s = 'needs_reauth' THEN COALESCE(needs_reauth_at, NOW()) ELSE NULL END,
+                                needs_reauth_at = CASE WHEN %(status)s = 'needs_reauth'
+                                                       THEN COALESCE(needs_reauth_at, NOW())
+                                                       ELSE NULL END,
                                 last_error_code = %(err_code)s,
+                                last_refresh_at = NOW(),
                                 updated_at = NOW()
                             WHERE user_id = %(user_id)s
-                              AND provider = %(provider)s
+                              AND provider = 'google'
                               AND service = %(service)s
                               AND oauth_client_id = %(client_id)s
                               AND provider_account_id = %(sub)s
                               AND auth_epoch = %(auth_epoch)s
                               AND token_generation = %(token_gen)s
+                              AND status IN ('connected', 'refresh_ambiguous')
                               {attempt_clause}
-                            RETURNING {db._INTEGRATION_META_COLS}
                             """,
                             {
                                 "access": token_resp.access_token,
                                 "refresh": token_resp.refresh_token,
                                 "enc_key": enc_key,
                                 "expires_at": token_resp.expires_at,
-                                "scopes": updated_scopes,
-                                "preferences": Jsonb(updated_prefs),
-                                "status": new_status,
-                                "err_code": err_code,
+                                "scopes": new_sib_scopes,
+                                "preferences": Jsonb(sib_prefs),
+                                "status": sib_status,
+                                "err_code": sib_err_code,
                                 "user_id": user_id,
-                                "provider": provider,
-                                "service": target.service,
-                                "client_id": target.oauth_client_id,
-                                "sub": target.provider_account_id,
-                                "auth_epoch": target.auth_epoch,
-                                "token_gen": target.token_generation,
-                                "expected_attempt_gen": expected_attempt_gen,
+                                "service": sib.service,
+                                "client_id": start_client_id,
+                                "sub": start_sub,
+                                "auth_epoch": c_epoch,
+                                "token_gen": c_tok_gen,
+                                "claimed_attempt_gen": c_att_gen,
                             },
                         )
-                        updated_dict = await cur_sql.fetchone()
-                        if target.service == service and updated_dict is not None:
-                            committed_row = db._row_to_integration(
-                                {**dict(updated_dict), "decrypted_access_token": token_resp.access_token}
-                            )
+            deferred_exc = IntegrationEpochRevokedError(
+                "Connection was disconnected during refresh."
+            )
+            return
 
-                if committed_row is None:
-                    deferred_exc = IntegrationEpochRevokedError("CAS update matched zero rows.")
+        if cur.token_generation != start_token_gen or (
+            expected_attempt_gen is not None
+            and cur.refresh_attempt_gen != expected_attempt_gen
+        ):
+            # CAS generation / attempt-generation conflict branch (§4.2(2) step 3): discard stale result
+            if cur.status == IntegrationStatus.CONNECTED and cur.access_token:
+                committed_row = cur
+            elif cur.status == IntegrationStatus.NEEDS_REAUTH:
+                deferred_exc = IntegrationNeedsReauthError(
+                    "Connection transitioned to needs_reauth.",
+                    code=cur.last_error_code or "needs_reauth",
+                )
+            else:
+                deferred_exc = IntegrationEpochRevokedError(
+                    "Connection state no longer servable after CAS conflict."
+                )
+            return
 
-    # Transaction is now COMMITTED. Perform post-commit validation and raise business errors safely.
+        if cur.status not in (
+            IntegrationStatus.CONNECTED,
+            IntegrationStatus.REFRESH_AMBIGUOUS,
+        ):
+            deferred_exc = IntegrationNeedsReauthError(
+                "Connection requires re-authorization.",
+                code=cur.last_error_code or "needs_reauth",
+            )
+            return
+
+        # Normal CAS commit: authorized_at stays UNCHANGED (§4.2(2) item 5).
+        rows_to_update: list[tuple[IntegrationRow, int, int, int | None]] = [
+            (cur, start_auth_epoch, start_token_gen, expected_attempt_gen)
+        ]
+        for sib in siblings:
+            cas = _eligible_claimed_sibling(sib)
+            if cas is not None:
+                rows_to_update.append((sib, cas[0], cas[1], cas[2]))
+
+        async with tx_conn.cursor(row_factory=dict_row) as cur_sql:
+            for target, c_epoch, c_tok_gen, c_att_gen in rows_to_update:
+                updated_scopes = (
+                    _format_scopes(_parse_scopes(token_resp.scope))
+                    if token_resp.scope
+                    else target.granted_scopes
+                )
+                updated_prefs, _ = _converge_preferences_for_scopes(
+                    provider,
+                    target.service,
+                    _parse_scopes(updated_scopes),
+                    target.preferences,
+                )
+                missing_min = _missing_min_scopes(
+                    provider, target.service, _parse_scopes(updated_scopes)
+                )
+                if missing_min:
+                    new_status = IntegrationStatus.NEEDS_REAUTH.value
+                    err_code = "missing_required_scopes"
+                else:
+                    new_status = IntegrationStatus.CONNECTED.value
+                    err_code = None
+
+                attempt_clause = (
+                    "AND refresh_attempt_gen = %(expected_attempt_gen)s"
+                    if c_att_gen is not None
+                    else ""
+                )
+                await cur_sql.execute(
+                    f"""
+                    UPDATE dalton_user_integrations
+                    SET access_token = pgp_sym_encrypt(%(access)s, %(enc_key)s),
+                        refresh_token = CASE WHEN %(refresh)s::text IS NULL THEN refresh_token
+                                             ELSE pgp_sym_encrypt(%(refresh)s, %(enc_key)s) END,
+                        expires_at = %(expires_at)s,
+                        granted_scopes = %(scopes)s,
+                        preferences = %(preferences)s,
+                        token_generation = token_generation + 1,
+                        refresh_inflight_gen = NULL,
+                        refresh_started_at = NULL,
+                        refresh_inflight_until = NULL,
+                        status = %(status)s,
+                        last_refresh_at = NOW(),
+                        needs_reauth_at = CASE WHEN %(status)s = 'needs_reauth' THEN COALESCE(needs_reauth_at, NOW()) ELSE NULL END,
+                        last_error_code = %(err_code)s,
+                        updated_at = NOW()
+                    WHERE user_id = %(user_id)s
+                      AND provider = %(provider)s
+                      AND service = %(service)s
+                      AND oauth_client_id = %(client_id)s
+                      AND provider_account_id = %(sub)s
+                      AND auth_epoch = %(auth_epoch)s
+                      AND token_generation = %(token_gen)s
+                      AND status IN ('connected', 'refresh_ambiguous')
+                      {attempt_clause}
+                    RETURNING {db._INTEGRATION_META_COLS}
+                    """,
+                    {
+                        "access": token_resp.access_token,
+                        "refresh": token_resp.refresh_token,
+                        "enc_key": enc_key,
+                        "expires_at": token_resp.expires_at,
+                        "scopes": updated_scopes,
+                        "preferences": Jsonb(updated_prefs),
+                        "status": new_status,
+                        "err_code": err_code,
+                        "user_id": user_id,
+                        "provider": provider,
+                        "service": target.service,
+                        "client_id": target.oauth_client_id,
+                        "sub": target.provider_account_id,
+                        "auth_epoch": c_epoch,
+                        "token_gen": c_tok_gen,
+                        "expected_attempt_gen": c_att_gen,
+                    },
+                )
+                updated_dict = await cur_sql.fetchone()
+                if target.service == service and updated_dict is not None:
+                    committed_row = db._row_to_integration(
+                        {**dict(updated_dict), "decrypted_access_token": token_resp.access_token}
+                    )
+
+        if committed_row is None:
+            deferred_exc = IntegrationEpochRevokedError("CAS update matched zero rows.")
+
+    if conn is not None:
+        await _run_commit(conn)
+    else:
+        async with get_db_connection() as tx_conn, tx_conn.transaction():
+            await _run_commit(tx_conn)
+
     if deferred_exc is not None:
         raise deferred_exc
     assert committed_row is not None
@@ -2861,7 +3221,7 @@ async def ensure_fresh_access_token(
         _check_required_scopes(row.granted_scopes, required_scopes)
         return _to_fresh_token(row)
 
-    # Step 1: Short lock — check state / active lease, or register refresh intent, then UNLOCK & RELEASE connections
+    # Step 1: Short transaction-scoped advisory lock on ONE pooled connection
     r_lock_key = refresh_lock_key(
         user_id,
         norm_provider,
@@ -2873,6 +3233,7 @@ async def ensure_fresh_access_token(
     revocation_error_code: str | None = None
     winner_token_gen = start_token_gen
     winner_attempt_gen: int | None = None
+    claimed_targets: dict[str, tuple[int, int, int]] = {}
     winner_refresh_token: str | None = None
     winner_expires_at: datetime | None = None
     winner_access_token: str | None = None
@@ -2881,264 +3242,251 @@ async def ensure_fresh_access_token(
     pre_exc: Exception | None = None
     become_waiter = False
 
-    async with get_db_connection() as lock_conn:
-        async with lock_conn.cursor() as cur:
-            await cur.execute("SELECT pg_try_advisory_lock(%s)", (r_lock_key,))
+    async with get_db_connection() as pre_conn, pre_conn.transaction():
+        async with pre_conn.cursor() as cur:
+            await cur.execute("SELECT pg_try_advisory_xact_lock(%s)", (r_lock_key,))
             lock_row = await cur.fetchone()
             won_short_lock = bool(lock_row and lock_row[0])
 
         if not won_short_lock:
             become_waiter = True
         else:
-            try:
-                with track_advisory_lock("refresh", r_lock_key):
-                    async with get_db_connection() as pre_conn, pre_conn.transaction():
-                        if norm_provider == "google":
-                            group_rows = await db.list_connections_by_account(
-                                user_id,
-                                "google",
-                                start_client_id,
-                                start_sub,
-                                decrypt_tokens=True,
-                                for_update=True,
-                                conn=pre_conn,
-                            )
-                            current = next(
-                                (r for r in group_rows if r.service == norm_service),
-                                None,
-                            )
-                            if current is None:
-                                current = await db.get_connection(
-                                    user_id,
-                                    norm_provider,
-                                    norm_service,
-                                    decrypt_tokens=True,
-                                    for_update=True,
-                                    conn=pre_conn,
-                                )
-                            active_group = [
-                                r
-                                for r in group_rows
-                                if r.status
-                                in (
-                                    IntegrationStatus.CONNECTED,
-                                    IntegrationStatus.REFRESH_AMBIGUOUS,
-                                )
-                            ]
-                        else:
-                            current = await db.get_connection(
+            with track_advisory_lock("refresh", r_lock_key):
+                if norm_provider == "google":
+                    group_rows = await db.list_connections_by_account(
+                        user_id,
+                        "google",
+                        start_client_id,
+                        start_sub,
+                        decrypt_tokens=True,
+                        for_update=True,
+                        conn=pre_conn,
+                    )
+                    current = next(
+                        (r for r in group_rows if r.service == norm_service),
+                        None,
+                    )
+                    if current is None:
+                        current = await db.get_connection(
+                            user_id,
+                            norm_provider,
+                            norm_service,
+                            decrypt_tokens=True,
+                            for_update=True,
+                            conn=pre_conn,
+                        )
+                    active_group = [
+                        r
+                        for r in group_rows
+                        if r.status
+                        in (
+                            IntegrationStatus.CONNECTED,
+                            IntegrationStatus.REFRESH_AMBIGUOUS,
+                        )
+                    ]
+                else:
+                    current = await db.get_connection(
+                        user_id,
+                        norm_provider,
+                        norm_service,
+                        decrypt_tokens=True,
+                        for_update=True,
+                        conn=pre_conn,
+                    )
+                    active_group = [current] if current is not None else []
+
+                if current is None or current.status in (
+                    IntegrationStatus.DISCONNECT_PENDING,
+                    IntegrationStatus.REVOKED_PURGING,
+                ):
+                    pre_exc = IntegrationEpochRevokedError("Connection was disconnected.")
+                elif (
+                    current.oauth_client_id != start_client_id
+                    or current.provider_account_id != start_sub
+                    or current.auth_epoch != start_auth_epoch
+                ):
+                    pre_exc = IntegrationEpochRevokedError(
+                        "Connection identity changed while waiting for refresh lock."
+                    )
+                elif current.status == IntegrationStatus.NEEDS_REAUTH:
+                    pre_exc = IntegrationNeedsReauthError(
+                        "Connection requires re-authorization.",
+                        code=current.last_error_code or "needs_reauth",
+                    )
+                else:
+                    now_inner = datetime.now(UTC)
+                    rem_inner = _remaining_seconds(current.expires_at, now_inner)
+                    any_lease_active = _is_refresh_lease_active(
+                        current, now_inner
+                    ) or any(
+                        _is_refresh_lease_active(sib, now_inner)
+                        for sib in active_group
+                    )
+                    if any_lease_active:
+                        become_waiter = True
+                    elif (
+                        norm_provider == "feishu"
+                        and current.refresh_inflight_gen == current.token_generation
+                    ):
+                        if current.expires_at is not None and rem_inner > 0:
+                            await db.update_connection_status(
                                 user_id,
                                 norm_provider,
                                 norm_service,
-                                decrypt_tokens=True,
-                                for_update=True,
+                                status=IntegrationStatus.REFRESH_AMBIGUOUS,
+                                last_error_code="previous_refresh_crashed",
+                                clear_tokens=False,
+                                clear_refresh_token_only=True,
+                                expected_auth_epoch=current.auth_epoch,
                                 conn=pre_conn,
                             )
-                            active_group = [current] if current is not None else []
-
-                        if current is None or current.status in (
-                            IntegrationStatus.DISCONNECT_PENDING,
-                            IntegrationStatus.REVOKED_PURGING,
-                        ):
-                            pre_exc = IntegrationEpochRevokedError("Connection was disconnected.")
-                        elif (
-                            current.oauth_client_id != start_client_id
-                            or current.provider_account_id != start_sub
-                            or current.auth_epoch != start_auth_epoch
-                        ):
-                            pre_exc = IntegrationEpochRevokedError(
-                                "Connection identity changed while waiting for refresh lock."
+                            if not force_refresh and current.access_token:
+                                pre_return_row = current
+                            else:
+                                pre_exc = IntegrationTransientError(
+                                    "Feishu token refresh outcome was ambiguous; reconnect if needed.",
+                                    code="refresh_ambiguous",
+                                )
+                        else:
+                            await db.update_connection_status(
+                                user_id,
+                                norm_provider,
+                                norm_service,
+                                status=IntegrationStatus.NEEDS_REAUTH,
+                                last_error_code="previous_refresh_crashed",
+                                clear_tokens=True,
+                                expected_auth_epoch=current.auth_epoch,
+                                conn=pre_conn,
                             )
-                        elif current.status == IntegrationStatus.NEEDS_REAUTH:
                             pre_exc = IntegrationNeedsReauthError(
-                                "Connection requires re-authorization.",
-                                code=current.last_error_code or "needs_reauth",
+                                "Previous Feishu refresh crashed after access token expiry; please reconnect.",
+                                code="previous_refresh_crashed",
+                            )
+                    elif (
+                        norm_provider == "feishu"
+                        and current.status == IntegrationStatus.REFRESH_AMBIGUOUS
+                    ):
+                        if current.expires_at is not None and rem_inner > 0:
+                            if not force_refresh and current.access_token:
+                                pre_return_row = current
+                            else:
+                                pre_exc = IntegrationTransientError(
+                                    "Feishu token refresh outcome was ambiguous; reconnect if needed.",
+                                    code="refresh_ambiguous",
+                                )
+                        else:
+                            err_code = current.last_error_code or "refresh_ambiguous_expired"
+                            await db.update_connection_status(
+                                user_id,
+                                norm_provider,
+                                norm_service,
+                                status=IntegrationStatus.NEEDS_REAUTH,
+                                last_error_code=err_code,
+                                clear_tokens=True,
+                                expected_auth_epoch=current.auth_epoch,
+                                conn=pre_conn,
+                            )
+                            pre_exc = IntegrationNeedsReauthError(
+                                "Feishu access token expired after ambiguous refresh; please reconnect.",
+                                code=err_code,
+                            )
+                    else:
+                        already_refreshed = (
+                            current.status == IntegrationStatus.CONNECTED
+                            and bool(current.access_token)
+                            and rem_inner >= min_remaining_seconds
+                            and (
+                                not force_refresh
+                                or current.token_generation > start_token_gen
+                            )
+                        )
+                        if already_refreshed:
+                            pre_return_row = current
+                        elif not current.refresh_token:
+                            await db.update_connection_status(
+                                user_id,
+                                norm_provider,
+                                norm_service,
+                                status=IntegrationStatus.NEEDS_REAUTH,
+                                last_error_code="missing_refresh_token",
+                                clear_tokens=True,
+                                expected_auth_epoch=current.auth_epoch,
+                                conn=pre_conn,
+                            )
+                            pre_exc = IntegrationNeedsReauthError(
+                                "Missing refresh token; please reconnect.",
+                                code="missing_refresh_token",
                             )
                         else:
-                            now_inner = datetime.now(UTC)
-                            rem_inner = _remaining_seconds(current.expires_at, now_inner)
-                            any_lease_active = _is_refresh_lease_active(
-                                current, now_inner
-                            ) or any(
-                                _is_refresh_lease_active(sib, now_inner)
-                                for sib in active_group
+                            # Register ONE shared refresh attempt across the credential group
+                            # and snapshot every claimed row's (auth_epoch, token_generation, shared_attempt_gen).
+                            winner_token_gen = current.token_generation
+                            winner_refresh_token = current.refresh_token
+                            winner_expires_at = current.expires_at
+                            winner_access_token = current.access_token
+                            winner_granted_scopes = current.granted_scopes
+
+                            claim_rows = (
+                                active_group
+                                if norm_provider == "google"
+                                else [current]
                             )
-                            if any_lease_active:
-                                # Another worker currently holds an active HTTP refresh lease ->
-                                # release lock + DB connection and poll without calling upstream!
-                                become_waiter = True
-                            elif (
-                                norm_provider == "feishu"
-                                and current.refresh_inflight_gen == current.token_generation
-                            ):
-                                # Crash recovery for Feishu: leftover inflight marker with expired/NULL
-                                # lease means a previous worker crashed mid-refresh. NEVER replay the
-                                # possibly-consumed single-use refresh token: wipe refresh_token now,
-                                # keeping access_token until expiry or converging directly to needs_reauth.
-                                if current.expires_at is not None and rem_inner > 0:
-                                    await db.update_connection_status(
+                            if not any(r.service == norm_service for r in claim_rows):
+                                claim_rows = [current, *claim_rows]
+                            shared_attempt_gen = (
+                                max(r.refresh_attempt_gen for r in claim_rows) + 1
+                            )
+                            claim_services = [r.service for r in claim_rows]
+
+                            async with pre_conn.cursor() as cur_sql:
+                                await cur_sql.execute(
+                                    """
+                                    UPDATE dalton_user_integrations
+                                    SET refresh_inflight_gen = token_generation,
+                                        refresh_attempt_gen = %s,
+                                        refresh_started_at = NOW(),
+                                        refresh_inflight_until = clock_timestamp() + make_interval(secs => %s),
+                                        updated_at = NOW()
+                                    WHERE user_id = %s
+                                      AND provider = %s
+                                      AND service = ANY(%s)
+                                      AND oauth_client_id = %s
+                                      AND provider_account_id = %s
+                                      AND status IN ('connected', 'refresh_ambiguous')
+                                    RETURNING service, auth_epoch, token_generation, refresh_attempt_gen
+                                    """,
+                                    (
+                                        shared_attempt_gen,
+                                        _REFRESH_INFLIGHT_LEASE_SECONDS,
                                         user_id,
                                         norm_provider,
-                                        norm_service,
-                                        status=IntegrationStatus.REFRESH_AMBIGUOUS,
-                                        last_error_code="previous_refresh_crashed",
-                                        clear_tokens=False,
-                                        clear_refresh_token_only=True,
-                                        expected_auth_epoch=current.auth_epoch,
-                                        conn=pre_conn,
-                                    )
-                                    if not force_refresh and current.access_token:
-                                        pre_return_row = current
-                                    else:
-                                        pre_exc = IntegrationTransientError(
-                                            "Feishu token refresh outcome was ambiguous; reconnect if needed.",
-                                            code="refresh_ambiguous",
-                                        )
-                                else:
-                                    await db.update_connection_status(
-                                        user_id,
-                                        norm_provider,
-                                        norm_service,
-                                        status=IntegrationStatus.NEEDS_REAUTH,
-                                        last_error_code="previous_refresh_crashed",
-                                        clear_tokens=True,
-                                        expected_auth_epoch=current.auth_epoch,
-                                        conn=pre_conn,
-                                    )
-                                    pre_exc = IntegrationNeedsReauthError(
-                                        "Previous Feishu refresh crashed after access token expiry; please reconnect.",
-                                        code="previous_refresh_crashed",
-                                    )
-                            elif (
-                                norm_provider == "feishu"
-                                and current.status == IntegrationStatus.REFRESH_AMBIGUOUS
-                            ):
-                                # Already in refresh_ambiguous (after crash or ambiguous timeout):
-                                # NEVER replay old refresh token — serve unexpired access token until
-                                # expiry, then converge directly to needs_reauth with 0 upstream calls!
-                                if current.expires_at is not None and rem_inner > 0:
-                                    if not force_refresh and current.access_token:
-                                        pre_return_row = current
-                                    else:
-                                        pre_exc = IntegrationTransientError(
-                                            "Feishu token refresh outcome was ambiguous; reconnect if needed.",
-                                            code="refresh_ambiguous",
-                                        )
-                                else:
-                                    err_code = current.last_error_code or "refresh_ambiguous_expired"
-                                    await db.update_connection_status(
-                                        user_id,
-                                        norm_provider,
-                                        norm_service,
-                                        status=IntegrationStatus.NEEDS_REAUTH,
-                                        last_error_code=err_code,
-                                        clear_tokens=True,
-                                        expected_auth_epoch=current.auth_epoch,
-                                        conn=pre_conn,
-                                    )
-                                    pre_exc = IntegrationNeedsReauthError(
-                                        "Feishu access token expired after ambiguous refresh; please reconnect.",
-                                        code=err_code,
-                                    )
-                            else:
-                                # Reuse a newly committed token (including for force_refresh when
-                                # token_generation already advanced past our start_token_gen!)
-                                already_refreshed = (
-                                    current.status == IntegrationStatus.CONNECTED
-                                    and bool(current.access_token)
-                                    and rem_inner >= min_remaining_seconds
-                                    and (
-                                        not force_refresh
-                                        or current.token_generation > start_token_gen
-                                    )
+                                        claim_services,
+                                        start_client_id,
+                                        start_sub,
+                                    ),
                                 )
-                                if already_refreshed:
-                                    pre_return_row = current
-                                elif not current.refresh_token:
-                                    await db.update_connection_status(
-                                        user_id,
-                                        norm_provider,
-                                        norm_service,
-                                        status=IntegrationStatus.NEEDS_REAUTH,
-                                        last_error_code="missing_refresh_token",
-                                        clear_tokens=True,
-                                        expected_auth_epoch=current.auth_epoch,
-                                        conn=pre_conn,
-                                    )
-                                    pre_exc = IntegrationNeedsReauthError(
-                                        "Missing refresh token; please reconnect.",
-                                        code="missing_refresh_token",
-                                    )
-                                else:
-                                    # Register refresh intent + lease before leaving DB lock
-                                    winner_token_gen = current.token_generation
-                                    winner_refresh_token = current.refresh_token
-                                    winner_expires_at = current.expires_at
-                                    winner_access_token = current.access_token
-                                    winner_granted_scopes = current.granted_scopes
-
-                                    async with pre_conn.cursor() as cur_sql:
-                                        await cur_sql.execute(
-                                            """
-                                            UPDATE dalton_user_integrations
-                                            SET refresh_inflight_gen = token_generation,
-                                                refresh_attempt_gen = refresh_attempt_gen + 1,
-                                                refresh_started_at = NOW(),
-                                                refresh_inflight_until = clock_timestamp() + make_interval(secs => %s),
-                                                updated_at = NOW()
-                                            WHERE user_id = %s
-                                              AND provider = %s
-                                              AND service = %s
-                                              AND auth_epoch = %s
-                                              AND token_generation = %s
-                                            RETURNING refresh_attempt_gen
-                                            """,
-                                            (
-                                                _REFRESH_INFLIGHT_LEASE_SECONDS,
-                                                user_id,
-                                                norm_provider,
-                                                norm_service,
-                                                start_auth_epoch,
-                                                winner_token_gen,
-                                            ),
-                                        )
-                                        claimed_row = await cur_sql.fetchone()
-                                        if claimed_row is not None:
-                                            winner_attempt_gen = int(claimed_row[0])
-                                        elif cur_sql.rowcount == 0:
-                                            become_waiter = True
-
-                                        if not become_waiter and norm_provider == "google":
-                                            # Stamp inflight lease on active Google siblings so concurrent
-                                            # callers on sibling services (e.g. mail while calendar refreshes)
-                                            # see the active lease and join as waiters with 0 duplicate HTTP!
-                                            for sib in active_group:
-                                                if sib.service == norm_service:
-                                                    continue
-                                                await cur_sql.execute(
-                                                    """
-                                                    UPDATE dalton_user_integrations
-                                                    SET refresh_inflight_gen = token_generation,
-                                                        refresh_started_at = NOW(),
-                                                        refresh_inflight_until = clock_timestamp() + make_interval(secs => %s),
-                                                        updated_at = NOW()
-                                                    WHERE user_id = %s
-                                                      AND provider = 'google'
-                                                      AND service = %s
-                                                      AND auth_epoch = %s
-                                                      AND token_generation = %s
-                                                    """,
-                                                    (
-                                                        _REFRESH_INFLIGHT_LEASE_SECONDS,
-                                                        user_id,
-                                                        sib.service,
-                                                        sib.auth_epoch,
-                                                        sib.token_generation,
-                                                    ),
-                                                )
-            finally:
-                with anyio.CancelScope(shield=True):
-                    await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (r_lock_key,))
+                                claimed_rows = await cur_sql.fetchall()
+                                if claimed_rows:
+                                    for crow in claimed_rows:
+                                        if len(crow) >= 4:
+                                            claimed_targets[str(crow[0])] = (
+                                                int(crow[1]),
+                                                int(crow[2]),
+                                                int(crow[3]),
+                                            )
+                                    if norm_service in claimed_targets:
+                                        winner_attempt_gen = claimed_targets[norm_service][2]
+                                    else:
+                                        # Fallback for minimal unit-test cursor doubles returning single scalar
+                                        winner_attempt_gen = shared_attempt_gen
+                                        for r in claim_rows:
+                                            claimed_targets[r.service] = (
+                                                r.auth_epoch,
+                                                r.token_generation,
+                                                shared_attempt_gen,
+                                            )
+                                elif cur_sql.rowcount == 0:
+                                    become_waiter = True
 
     # ALL PG advisory locks and DB pool connections are now RELEASED!
     if pre_exc is not None:
@@ -3189,37 +3537,33 @@ async def ensure_fresh_access_token(
         except OAuthUpstreamError as exc:
             upstream_err = exc
 
-        # Step 3: Re-acquire short lock, verify identity + token_generation + refresh_attempt_gen, commit!
+        # Step 3: Re-acquire short lock on ONE pooled connection, verify claimed generations, commit!
         if token_resp is not None:
             attempts = _FEISHU_DB_COMMIT_RETRIES if norm_provider == "feishu" else 1
             last_db_exc: Exception | None = None
             for attempt in range(attempts):
                 try:
-                    async with get_db_connection() as commit_lock_conn:
-                        await commit_lock_conn.execute(
-                            "SELECT pg_advisory_lock(%s)", (r_lock_key,)
+                    async with get_db_connection() as commit_conn, commit_conn.transaction():
+                        await commit_conn.execute(
+                            "SELECT pg_advisory_xact_lock(%s)", (r_lock_key,)
                         )
-                        try:
-                            with track_advisory_lock("refresh", r_lock_key):
-                                fresh = await _commit_refresh_success_tx(
-                                    user_id=user_id,
-                                    provider=norm_provider,
-                                    service=norm_service,
-                                    start_client_id=start_client_id,
-                                    start_sub=start_sub,
-                                    start_auth_epoch=start_auth_epoch,
-                                    start_token_gen=winner_token_gen,
-                                    token_resp=token_resp,
-                                    required_scopes=required_scopes,
-                                    expected_attempt_gen=winner_attempt_gen,
-                                )
-                                committed_or_handled = True
-                                return fresh
-                        finally:
-                            with anyio.CancelScope(shield=True):
-                                await commit_lock_conn.execute(
-                                    "SELECT pg_advisory_unlock(%s)", (r_lock_key,)
-                                )
+                        with track_advisory_lock("refresh", r_lock_key):
+                            fresh = await _commit_refresh_success_tx(
+                                user_id=user_id,
+                                provider=norm_provider,
+                                service=norm_service,
+                                start_client_id=start_client_id,
+                                start_sub=start_sub,
+                                start_auth_epoch=start_auth_epoch,
+                                start_token_gen=winner_token_gen,
+                                token_resp=token_resp,
+                                required_scopes=required_scopes,
+                                expected_attempt_gen=winner_attempt_gen,
+                                claimed_targets=claimed_targets or None,
+                                conn=commit_conn,
+                            )
+                            committed_or_handled = True
+                            return fresh
                 except PersonalIntegrationError:
                     committed_or_handled = True
                     raise
@@ -3233,237 +3577,257 @@ async def ensure_fresh_access_token(
         assert upstream_err is not None
 
         # Verify 3-element identity, token_generation & refresh_attempt_gen before mutating on upstream error.
-        # Commit ALL state transitions BEFORE raising business exceptions!
+        # Single pooled connection with pg_advisory_xact_lock; commits ALL transitions BEFORE raising!
         err_return_token: FreshAccessToken | None = None
         err_return_scopes: str | None = None
         err_to_raise: Exception | None = None
 
-        async with get_db_connection() as err_lock_conn:
-            await err_lock_conn.execute("SELECT pg_advisory_lock(%s)", (r_lock_key,))
-            try:
-                with track_advisory_lock("refresh", r_lock_key):
-                    async with get_db_connection() as err_conn, err_conn.transaction():
-                        latest = await db.get_connection(
+        async with get_db_connection() as err_conn, err_conn.transaction():
+            await err_conn.execute("SELECT pg_advisory_xact_lock(%s)", (r_lock_key,))
+            with track_advisory_lock("refresh", r_lock_key):
+                latest = await db.get_connection(
+                    user_id,
+                    norm_provider,
+                    norm_service,
+                    decrypt_tokens=False,
+                    for_update=True,
+                    conn=err_conn,
+                )
+                if latest is None or (
+                    latest.oauth_client_id != start_client_id
+                    or latest.provider_account_id != start_sub
+                    or latest.auth_epoch != start_auth_epoch
+                ):
+                    err_to_raise = IntegrationEpochRevokedError(
+                        "Connection changed during failed refresh."
+                    )
+                elif latest.token_generation != winner_token_gen or (
+                    winner_attempt_gen is not None
+                    and latest.refresh_attempt_gen != winner_attempt_gen
+                ):
+                    if latest.status == IntegrationStatus.CONNECTED:
+                        full_latest = await db.get_connection(
                             user_id,
                             norm_provider,
                             norm_service,
+                            decrypt_tokens=True,
+                            conn=err_conn,
+                        )
+                        if full_latest and full_latest.access_token:
+                            err_return_token = _to_fresh_token(full_latest)
+                            err_return_scopes = full_latest.granted_scopes
+                    if err_return_token is None:
+                        err_to_raise = IntegrationEpochRevokedError(
+                            "Connection generation moved during failed refresh."
+                        )
+                elif upstream_err.kind == "revoked":
+                    async with err_conn.cursor() as cur_sql:
+                        await cur_sql.execute(
+                            """
+                            UPDATE dalton_user_integrations
+                            SET refresh_inflight_gen = NULL,
+                                refresh_started_at = NULL,
+                                refresh_inflight_until = NULL,
+                                updated_at = NOW()
+                            WHERE user_id = %s
+                              AND provider = %s
+                              AND service = %s
+                              AND auth_epoch = %s
+                              AND token_generation = %s
+                            """,
+                            (
+                                user_id,
+                                norm_provider,
+                                norm_service,
+                                start_auth_epoch,
+                                winner_token_gen,
+                            ),
+                        )
+                    trigger_revocation_after_unlock = True
+                    revocation_error_code = upstream_err.error_code
+                elif upstream_err.kind in ("invalid_grant", "needs_reauth"):
+                    if norm_provider == "google":
+                        sibling_rows = await db.list_connections_by_account(
+                            user_id,
+                            "google",
+                            start_client_id,
+                            start_sub,
                             decrypt_tokens=False,
                             for_update=True,
                             conn=err_conn,
                         )
-                        if latest is None or (
-                            latest.oauth_client_id != start_client_id
-                            or latest.provider_account_id != start_sub
-                            or latest.auth_epoch != start_auth_epoch
-                        ):
-                            err_to_raise = IntegrationEpochRevokedError(
-                                "Connection changed during failed refresh."
+                        targets_to_mark: list[IntegrationRow] = []
+                        for r in sibling_rows:
+                            if r.status not in (
+                                IntegrationStatus.CONNECTED,
+                                IntegrationStatus.REFRESH_AMBIGUOUS,
+                            ):
+                                continue
+                            if claimed_targets and r.service in claimed_targets:
+                                c_ep, c_tg, c_ag = claimed_targets[r.service]
+                                if (
+                                    r.auth_epoch != c_ep
+                                    or r.token_generation != c_tg
+                                    or r.refresh_attempt_gen != c_ag
+                                ):
+                                    continue
+                            elif claimed_targets:
+                                continue
+                            targets_to_mark.append(r)
+                        if not any(r.service == norm_service for r in targets_to_mark):
+                            targets_to_mark.append(latest)
+                        for t_row in targets_to_mark:
+                            await db.update_connection_status(
+                                user_id,
+                                norm_provider,
+                                t_row.service,
+                                status=IntegrationStatus.NEEDS_REAUTH,
+                                last_error_code=upstream_err.error_code,
+                                clear_tokens=True,
+                                expected_auth_epoch=t_row.auth_epoch,
+                                conn=err_conn,
                             )
-                        elif latest.token_generation != winner_token_gen or (
-                            winner_attempt_gen is not None
-                            and latest.refresh_attempt_gen != winner_attempt_gen
-                        ):
-                            # Another commit/takeover intervened; do not overwrite it
-                            if latest.status == IntegrationStatus.CONNECTED:
-                                full_latest = await db.get_connection(
-                                    user_id,
-                                    norm_provider,
-                                    norm_service,
-                                    decrypt_tokens=True,
-                                    conn=err_conn,
-                                )
-                                if full_latest and full_latest.access_token:
-                                    err_return_token = _to_fresh_token(full_latest)
-                                    err_return_scopes = full_latest.granted_scopes
-                            if err_return_token is None:
-                                err_to_raise = IntegrationEpochRevokedError(
-                                    "Connection generation moved during failed refresh."
-                                )
-                        elif upstream_err.kind == "revoked":
-                            # Official confirmed user-revoked error code:
-                            # Clear inflight markers and run begin_disconnect AFTER releasing refresh lock
-                            # (strict lifecycle -> refresh order).
-                            async with err_conn.cursor() as cur_sql:
+                    else:
+                        await db.update_connection_status(
+                            user_id,
+                            norm_provider,
+                            norm_service,
+                            status=IntegrationStatus.NEEDS_REAUTH,
+                            last_error_code=upstream_err.error_code,
+                            clear_tokens=True,
+                            expected_auth_epoch=start_auth_epoch,
+                            conn=err_conn,
+                        )
+                    err_to_raise = IntegrationNeedsReauthError(
+                        "Integration authorization expired or became invalid; please reconnect.",
+                        code=upstream_err.error_code,
+                    )
+                elif upstream_err.kind == "ambiguous" and norm_provider == "feishu":
+                    now_err = datetime.now(UTC)
+                    if (
+                        winner_expires_at is not None
+                        and _remaining_seconds(winner_expires_at, now_err) > 0
+                    ):
+                        await db.update_connection_status(
+                            user_id,
+                            norm_provider,
+                            norm_service,
+                            status=IntegrationStatus.REFRESH_AMBIGUOUS,
+                            last_error_code=upstream_err.error_code,
+                            clear_tokens=False,
+                            clear_refresh_token_only=True,
+                            expected_auth_epoch=start_auth_epoch,
+                            conn=err_conn,
+                        )
+                        if not force_refresh and winner_access_token:
+                            err_return_token = FreshAccessToken(
+                                access_token=winner_access_token,
+                                provider=norm_provider,
+                                service=norm_service,
+                                oauth_client_id=start_client_id,
+                                provider_account_id=start_sub,
+                                auth_epoch=start_auth_epoch,
+                                token_generation=winner_token_gen,
+                                granted_scopes=winner_granted_scopes,
+                                expires_at=winner_expires_at,
+                            )
+                            err_return_scopes = winner_granted_scopes
+                        else:
+                            err_to_raise = IntegrationTransientError(
+                                "Feishu token refresh outcome was ambiguous; reconnect if needed.",
+                                code="refresh_ambiguous",
+                            )
+                    else:
+                        await db.update_connection_status(
+                            user_id,
+                            norm_provider,
+                            norm_service,
+                            status=IntegrationStatus.NEEDS_REAUTH,
+                            last_error_code="refresh_timeout_after_expiry",
+                            clear_tokens=True,
+                            expected_auth_epoch=start_auth_epoch,
+                            conn=err_conn,
+                        )
+                        err_to_raise = IntegrationNeedsReauthError(
+                            "Feishu refresh timed out after access token expiry; please reconnect.",
+                            code="refresh_timeout_after_expiry",
+                        )
+                else:
+                    async with err_conn.cursor() as cur_sql:
+                        if norm_provider == "google":
+                            if winner_attempt_gen is not None:
                                 await cur_sql.execute(
                                     """
                                     UPDATE dalton_user_integrations
                                     SET refresh_inflight_gen = NULL,
                                         refresh_started_at = NULL,
                                         refresh_inflight_until = NULL,
+                                        last_error_code = %s,
                                         updated_at = NOW()
                                     WHERE user_id = %s
-                                      AND provider = %s
-                                      AND service = %s
-                                      AND auth_epoch = %s
-                                      AND token_generation = %s
+                                      AND provider = 'google'
+                                      AND oauth_client_id = %s
+                                      AND provider_account_id = %s
+                                      AND refresh_attempt_gen = %s
+                                      AND status IN ('connected', 'refresh_ambiguous')
                                     """,
                                     (
+                                        upstream_err.error_code,
                                         user_id,
-                                        norm_provider,
-                                        norm_service,
-                                        start_auth_epoch,
-                                        winner_token_gen,
+                                        start_client_id,
+                                        start_sub,
+                                        winner_attempt_gen,
                                     ),
                                 )
-                            trigger_revocation_after_unlock = True
-                            revocation_error_code = upstream_err.error_code
-                        elif upstream_err.kind in ("invalid_grant", "needs_reauth"):
-                            # Routine credential failure -> needs_reauth ONLY (keep online conversation history!)
-                            if norm_provider == "google":
-                                sibling_rows = await db.list_connections_by_account(
-                                    user_id,
-                                    "google",
-                                    start_client_id,
-                                    start_sub,
-                                    decrypt_tokens=False,
-                                    for_update=True,
-                                    conn=err_conn,
-                                )
-                                targets_to_mark = [
-                                    r
-                                    for r in sibling_rows
-                                    if r.status
-                                    in (
-                                        IntegrationStatus.CONNECTED,
-                                        IntegrationStatus.REFRESH_AMBIGUOUS,
-                                    )
-                                ]
-                                if not any(r.service == norm_service for r in targets_to_mark):
-                                    targets_to_mark.append(latest)
-                                for t_row in targets_to_mark:
-                                    await db.update_connection_status(
+                            else:
+                                await cur_sql.execute(
+                                    """
+                                    UPDATE dalton_user_integrations
+                                    SET refresh_inflight_gen = NULL,
+                                        refresh_started_at = NULL,
+                                        refresh_inflight_until = NULL,
+                                        last_error_code = %s,
+                                        updated_at = NOW()
+                                    WHERE user_id = %s
+                                      AND provider = 'google'
+                                      AND oauth_client_id = %s
+                                      AND provider_account_id = %s
+                                      AND status IN ('connected', 'refresh_ambiguous')
+                                    """,
+                                    (
+                                        upstream_err.error_code,
                                         user_id,
-                                        norm_provider,
-                                        t_row.service,
-                                        status=IntegrationStatus.NEEDS_REAUTH,
-                                        last_error_code=upstream_err.error_code,
-                                        clear_tokens=True,
-                                        expected_auth_epoch=t_row.auth_epoch,
-                                        conn=err_conn,
-                                    )
-                            else:
-                                await db.update_connection_status(
-                                    user_id,
-                                    norm_provider,
-                                    norm_service,
-                                    status=IntegrationStatus.NEEDS_REAUTH,
-                                    last_error_code=upstream_err.error_code,
-                                    clear_tokens=True,
-                                    expected_auth_epoch=start_auth_epoch,
-                                    conn=err_conn,
-                                )
-                            err_to_raise = IntegrationNeedsReauthError(
-                                "Integration authorization expired or became invalid; please reconnect.",
-                                code=upstream_err.error_code,
-                            )
-                        elif upstream_err.kind == "ambiguous" and norm_provider == "feishu":
-                            now_err = datetime.now(UTC)
-                            if (
-                                winner_expires_at is not None
-                                and _remaining_seconds(winner_expires_at, now_err) > 0
-                            ):
-                                await db.update_connection_status(
-                                    user_id,
-                                    norm_provider,
-                                    norm_service,
-                                    status=IntegrationStatus.REFRESH_AMBIGUOUS,
-                                    last_error_code=upstream_err.error_code,
-                                    clear_tokens=False,
-                                    clear_refresh_token_only=True,
-                                    expected_auth_epoch=start_auth_epoch,
-                                    conn=err_conn,
-                                )
-                                if not force_refresh and winner_access_token:
-                                    err_return_token = FreshAccessToken(
-                                        access_token=winner_access_token,
-                                        provider=norm_provider,
-                                        service=norm_service,
-                                        oauth_client_id=start_client_id,
-                                        provider_account_id=start_sub,
-                                        auth_epoch=start_auth_epoch,
-                                        token_generation=winner_token_gen,
-                                        granted_scopes=winner_granted_scopes,
-                                        expires_at=winner_expires_at,
-                                    )
-                                    err_return_scopes = winner_granted_scopes
-                                else:
-                                    err_to_raise = IntegrationTransientError(
-                                        "Feishu token refresh outcome was ambiguous; reconnect if needed.",
-                                        code="refresh_ambiguous",
-                                    )
-                            else:
-                                # Access token already expired -> converge directly to needs_reauth (§4.2(2) item 5)
-                                await db.update_connection_status(
-                                    user_id,
-                                    norm_provider,
-                                    norm_service,
-                                    status=IntegrationStatus.NEEDS_REAUTH,
-                                    last_error_code="refresh_timeout_after_expiry",
-                                    clear_tokens=True,
-                                    expected_auth_epoch=start_auth_epoch,
-                                    conn=err_conn,
-                                )
-                                err_to_raise = IntegrationNeedsReauthError(
-                                    "Feishu refresh timed out after access token expiry; please reconnect.",
-                                    code="refresh_timeout_after_expiry",
+                                        start_client_id,
+                                        start_sub,
+                                    ),
                                 )
                         else:
-                            # Transient error (timeout / 429 / 5xx) -> clear inflight lease/markers, keep connected
-                            async with err_conn.cursor() as cur_sql:
-                                if norm_provider == "google":
-                                    await cur_sql.execute(
-                                        """
-                                        UPDATE dalton_user_integrations
-                                        SET refresh_inflight_gen = NULL,
-                                            refresh_started_at = NULL,
-                                            refresh_inflight_until = NULL,
-                                            last_error_code = %s,
-                                            updated_at = NOW()
-                                        WHERE user_id = %s
-                                          AND provider = 'google'
-                                          AND oauth_client_id = %s
-                                          AND provider_account_id = %s
-                                          AND status IN ('connected', 'refresh_ambiguous')
-                                        """,
-                                        (
-                                            upstream_err.error_code,
-                                            user_id,
-                                            start_client_id,
-                                            start_sub,
-                                        ),
-                                    )
-                                else:
-                                    await cur_sql.execute(
-                                        """
-                                        UPDATE dalton_user_integrations
-                                        SET refresh_inflight_gen = NULL,
-                                            refresh_started_at = NULL,
-                                            refresh_inflight_until = NULL,
-                                            last_error_code = %s,
-                                            updated_at = NOW()
-                                        WHERE user_id = %s
-                                          AND provider = %s
-                                          AND service = %s
-                                          AND auth_epoch = %s
-                                        """,
-                                        (
-                                            upstream_err.error_code,
-                                            user_id,
-                                            norm_provider,
-                                            norm_service,
-                                            start_auth_epoch,
-                                        ),
-                                    )
-                            err_to_raise = IntegrationTransientError(
-                                "Temporary upstream OAuth error; retry shortly.",
-                                code=upstream_err.error_code,
+                            await cur_sql.execute(
+                                """
+                                UPDATE dalton_user_integrations
+                                SET refresh_inflight_gen = NULL,
+                                    refresh_started_at = NULL,
+                                    refresh_inflight_until = NULL,
+                                    last_error_code = %s,
+                                    updated_at = NOW()
+                                WHERE user_id = %s
+                                  AND provider = %s
+                                  AND service = %s
+                                  AND auth_epoch = %s
+                                """,
+                                (
+                                    upstream_err.error_code,
+                                    user_id,
+                                    norm_provider,
+                                    norm_service,
+                                    start_auth_epoch,
+                                ),
                             )
-                    committed_or_handled = True
-            finally:
-                with anyio.CancelScope(shield=True):
-                    await err_lock_conn.execute(
-                        "SELECT pg_advisory_unlock(%s)", (r_lock_key,)
+                    err_to_raise = IntegrationTransientError(
+                        "Temporary upstream OAuth error; retry shortly.",
+                        code=upstream_err.error_code,
                     )
+                committed_or_handled = True
 
         # Error transaction is now COMMITTED & lock is RELEASED. Return or raise cleanly.
         if err_return_token is not None:
@@ -3528,6 +3892,7 @@ __all__ = [
     "ConfirmIntegrationResult",
     "FeishuIdentityMismatchError",
     "FreshAccessToken",
+    "GoogleAccountAlreadyConnectedByOtherMemberError",
     "IntegrationCredentialsNotReadyError",
     "IntegrationEpochRevokedError",
     "IntegrationNeedsReauthError",
@@ -3540,6 +3905,7 @@ __all__ = [
     "MissingRequiredScopesError",
     "OAUTH_BROWSER_BINDING_COOKIE_NAME",
     "OAuthCallbackResult",
+    "OAuthExchangeLeaseExpiredError",
     "OAuthSessionInvalidError",
     "OAuthStateInvalidError",
     "PendingConfirmationInvalidError",

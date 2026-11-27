@@ -60,19 +60,22 @@ async def _has_newer_active_google_connection(
     *,
     google_project: str,
     sub: str,
+    user_id: str | None = None,
     conn: object = None,
 ) -> bool:
-    """Return True if ``(google_project, sub)`` holds any active or pending grant across ANY Dalton user."""
+    """Return True if the owner holds another active or pending Google grant on ``(google_project, sub)``."""
     if conn is not None:
         return await db.has_active_or_pending_google_grant(
             google_project,
             sub,
+            user_id=user_id,
             conn=conn,
         )
     async with get_db_connection() as db_conn:
         return await db.has_active_or_pending_google_grant(
             google_project,
             sub,
+            user_id=user_id,
             conn=db_conn,
         )
 
@@ -83,14 +86,14 @@ async def process_revoke(
 ) -> RemoteRevokeStatus:
     """Execute one remote revocation attempt coordinated by ``(google_project, sub)`` without holding DB locks across HTTP.
 
-    Phase 1 (short ``revoke_lock_key(google_project, sub)``):
+    Phase 1 (short ``pg_advisory_xact_lock`` on ONE pooled connection):
       - Verifies local 2A purges for ``(user_id, provider)`` have completed (local-first).
-      - Checks cross-user active/pending Google grants for ``(google_project, sub)`` -> ``superseded``.
+      - Checks same-member active/pending Google grants for ``(google_project, sub)`` -> ``superseded``.
       - Checks active Google OAuth states / in-flight code exchanges in ``google_project`` -> defer.
-      - Claims a monotonic ``revoke_attempt_gen`` + short ``revoke_inflight_until`` lease, then RELEASES the lock.
+      - Claims a monotonic ``revoke_attempt_gen`` + short ``revoke_inflight_until`` lease, then COMMITS (releasing locks).
     Phase 2 (outside any DB lock or pool connection):
       - Invokes ``revoker.revoke(...)``.
-    Phase 3 (short ``revoke_lock_key(google_project, sub)``):
+    Phase 3 (short ``pg_advisory_xact_lock`` on ONE pooled connection):
       - Verifies ``revoke_attempt_gen`` matches and commits ``succeeded`` / ``failed_retryable`` / ``superseded``.
     """
     initial = await db.get_purge_ledger(purge_id, decrypt_revoke_token=False)
@@ -116,128 +119,121 @@ async def process_revoke(
     provider = initial.provider
     retry_count_before = initial.retry_count
 
-    # Phase 1: short lock — check guards & claim in-flight revoke attempt generation.
+    # Phase 1: short transaction-scoped advisory locks on ONE pooled connection.
     # Lock order: revoke_lock_key(project, sub) -> google_project_coord_lock_key(project).
-    async with get_db_connection() as lock_conn:
-        await lock_conn.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
-        coord_locked = False
-        try:
-            with track_advisory_lock("revoke", lock_key):
-                if coord_key is not None:
-                    await lock_conn.execute("SELECT pg_advisory_lock(%s)", (coord_key,))
-                    coord_locked = True
-                row = await db.get_purge_ledger(
-                    purge_id, decrypt_revoke_token=True, conn=lock_conn
+    async with get_db_connection() as tx_conn, tx_conn.transaction():
+        await tx_conn.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+        with track_advisory_lock("revoke", lock_key):
+            if coord_key is not None:
+                await tx_conn.execute("SELECT pg_advisory_xact_lock(%s)", (coord_key,))
+            row = await db.get_purge_ledger(
+                purge_id, decrypt_revoke_token=True, conn=tx_conn
+            )
+            if row is None:
+                raise LookupError(f"Purge ledger {purge_id} not found")
+            if row.remote_revoke_status not in (
+                RemoteRevokeStatus.PENDING,
+                RemoteRevokeStatus.FAILED_RETRYABLE,
+            ):
+                return row.remote_revoke_status
+
+            # Local-first invariant: never call upstream revoke while any local 2A purge
+            # for (user_id, provider) is still running.
+            if (
+                row.local_purge_status == LocalPurgeStatus.RUNNING
+                or await db.has_running_local_purge_for_user_provider(
+                    row.user_id, row.provider, conn=tx_conn
                 )
-                if row is None:
-                    raise LookupError(f"Purge ledger {purge_id} not found")
-                if row.remote_revoke_status not in (
-                    RemoteRevokeStatus.PENDING,
-                    RemoteRevokeStatus.FAILED_RETRYABLE,
+            ):
+                defer_until = datetime.now(UTC) + timedelta(seconds=5)
+                await db.update_purge_ledger_remote_status(
+                    purge_id,
+                    remote_revoke_status=row.remote_revoke_status,
+                    clear_revoke_token=False,
+                    increment_retry=False,
+                    next_retry_at=defer_until,
+                    last_remote_error="deferred_local_purge_running",
+                    mark_remote_completed=False,
+                    conn=tx_conn,
+                )
+                return row.remote_revoke_status
+
+            if row.provider == "google" and await _has_newer_active_google_connection(
+                google_project=google_project,
+                sub=row.provider_account_id,
+                user_id=row.user_id,
+                conn=tx_conn,
+            ):
+                await db.update_purge_ledger_remote_status(
+                    purge_id,
+                    remote_revoke_status=RemoteRevokeStatus.SUPERSEDED,
+                    clear_revoke_token=True,
+                    next_retry_at=None,
+                    last_remote_error="superseded_by_newer_authorization",
+                    mark_remote_completed=True,
+                    conn=tx_conn,
+                )
+                return RemoteRevokeStatus.SUPERSEDED
+
+            if row.provider == "google":
+                # At most ONE in-flight revoke HTTP attempt per (google_project, sub)
+                if await db.has_inflight_google_revoke_for_project_sub(
+                    google_project,
+                    row.provider_account_id,
+                    conn=tx_conn,
                 ):
                     return row.remote_revoke_status
 
-                # Local-first invariant: never call upstream revoke while any local 2A purge
-                # for (user_id, provider) is still running.
-                if (
-                    row.local_purge_status == LocalPurgeStatus.RUNNING
-                    or await db.has_running_local_purge_for_user_provider(
-                        row.user_id, row.provider, conn=lock_conn
+                active_oauth_exp = await db.get_active_google_oauth_state_expiry(
+                    google_project,
+                    sub=row.provider_account_id,
+                    conn=tx_conn,
+                )
+                if active_oauth_exp is not None:
+                    exp_utc = (
+                        active_oauth_exp
+                        if active_oauth_exp.tzinfo is not None
+                        else active_oauth_exp.replace(tzinfo=UTC)
                     )
-                ):
-                    defer_until = datetime.now(UTC) + timedelta(seconds=5)
+                    defer_until = max(
+                        datetime.now(UTC) + timedelta(seconds=5),
+                        exp_utc + timedelta(seconds=5),
+                    )
                     await db.update_purge_ledger_remote_status(
                         purge_id,
-                        remote_revoke_status=row.remote_revoke_status,
+                        remote_revoke_status=RemoteRevokeStatus.FAILED_RETRYABLE,
                         clear_revoke_token=False,
                         increment_retry=False,
                         next_retry_at=defer_until,
-                        last_remote_error="deferred_local_purge_running",
+                        last_remote_error="deferred_for_active_oauth_flow",
                         mark_remote_completed=False,
-                        conn=lock_conn,
+                        conn=tx_conn,
                     )
-                    return row.remote_revoke_status
+                    return RemoteRevokeStatus.FAILED_RETRYABLE
 
-                if row.provider == "google" and await _has_newer_active_google_connection(
-                    google_project=google_project,
-                    sub=row.provider_account_id,
-                    conn=lock_conn,
-                ):
-                    await db.update_purge_ledger_remote_status(
-                        purge_id,
-                        remote_revoke_status=RemoteRevokeStatus.SUPERSEDED,
-                        clear_revoke_token=True,
-                        next_retry_at=None,
-                        last_remote_error="superseded_by_newer_authorization",
-                        mark_remote_completed=True,
-                        conn=lock_conn,
-                    )
-                    return RemoteRevokeStatus.SUPERSEDED
-
-                if row.provider == "google":
-                    # At most ONE in-flight revoke HTTP attempt per (google_project, sub)
-                    if await db.has_inflight_google_revoke_for_project_sub(
-                        google_project,
-                        row.provider_account_id,
-                        conn=lock_conn,
-                    ):
-                        return row.remote_revoke_status
-
-                    active_oauth_exp = await db.get_active_google_oauth_state_expiry(
-                        google_project,
-                        sub=row.provider_account_id,
-                        conn=lock_conn,
-                    )
-                    if active_oauth_exp is not None:
-                        exp_utc = (
-                            active_oauth_exp
-                            if active_oauth_exp.tzinfo is not None
-                            else active_oauth_exp.replace(tzinfo=UTC)
-                        )
-                        defer_until = max(
-                            datetime.now(UTC) + timedelta(seconds=5),
-                            exp_utc + timedelta(seconds=5),
-                        )
-                        await db.update_purge_ledger_remote_status(
-                            purge_id,
-                            remote_revoke_status=RemoteRevokeStatus.FAILED_RETRYABLE,
-                            clear_revoke_token=False,
-                            increment_retry=False,
-                            next_retry_at=defer_until,
-                            last_remote_error="deferred_for_active_oauth_flow",
-                            mark_remote_completed=False,
-                            conn=lock_conn,
-                        )
-                        return RemoteRevokeStatus.FAILED_RETRYABLE
-
-                token_to_revoke = row.revoke_token
-                if not token_to_revoke:
-                    await db.update_purge_ledger_remote_status(
-                        purge_id,
-                        remote_revoke_status=RemoteRevokeStatus.SUPERSEDED,
-                        clear_revoke_token=True,
-                        next_retry_at=None,
-                        last_remote_error="missing_revoke_token",
-                        mark_remote_completed=True,
-                        conn=lock_conn,
-                    )
-                    return RemoteRevokeStatus.SUPERSEDED
-
-                attempt_gen = await db.claim_revoke_attempt_tx(
+            token_to_revoke = row.revoke_token
+            if not token_to_revoke:
+                await db.update_purge_ledger_remote_status(
                     purge_id,
-                    lease_seconds=_REVOKE_INFLIGHT_LEASE_SECONDS,
-                    conn=lock_conn,
+                    remote_revoke_status=RemoteRevokeStatus.SUPERSEDED,
+                    clear_revoke_token=True,
+                    next_retry_at=None,
+                    last_remote_error="missing_revoke_token",
+                    mark_remote_completed=True,
+                    conn=tx_conn,
                 )
-                if attempt_gen is None:
-                    return row.remote_revoke_status
-                oauth_client_id = row.oauth_client_id
-                provider = row.provider
-                retry_count_before = row.retry_count
-        finally:
-            with anyio.CancelScope(shield=True):
-                if coord_locked and coord_key is not None:
-                    await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (coord_key,))
-                await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+                return RemoteRevokeStatus.SUPERSEDED
+
+            attempt_gen = await db.claim_revoke_attempt_tx(
+                purge_id,
+                lease_seconds=_REVOKE_INFLIGHT_LEASE_SECONDS,
+                conn=tx_conn,
+            )
+            if attempt_gen is None:
+                return row.remote_revoke_status
+            oauth_client_id = row.oauth_client_id
+            provider = row.provider
+            retry_count_before = row.retry_count
 
     # Phase 2: external HTTP revoke OUTSIDE any PostgreSQL lock or pool connection
     assert attempt_gen is not None and token_to_revoke is not None
@@ -258,63 +254,57 @@ async def process_revoke(
             )
             outcome = RevokeOutcome.RETRYABLE
 
-        # Phase 3: short lock — verify attempt_gen and commit outcome
-        async with get_db_connection() as commit_conn:
-            await commit_conn.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
-            try:
-                with track_advisory_lock("revoke", lock_key):
-                    if outcome == RevokeOutcome.SUCCEEDED:
-                        updated = await db.finalize_revoke_attempt_tx(
-                            purge_id,
-                            expected_attempt_gen=attempt_gen,
-                            remote_revoke_status=RemoteRevokeStatus.SUCCEEDED,
-                            clear_revoke_token=True,
-                            next_retry_at=None,
-                            last_remote_error=None,
-                            mark_remote_completed=True,
-                            conn=commit_conn,
-                        )
-                    elif outcome == RevokeOutcome.RETRYABLE:
-                        delay_s = compute_revoke_backoff_seconds(retry_count_before)
-                        next_retry = datetime.now(UTC) + timedelta(seconds=delay_s)
-                        updated = await db.finalize_revoke_attempt_tx(
-                            purge_id,
-                            expected_attempt_gen=attempt_gen,
-                            remote_revoke_status=RemoteRevokeStatus.FAILED_RETRYABLE,
-                            clear_revoke_token=False,
-                            increment_retry=True,
-                            next_retry_at=next_retry,
-                            last_remote_error="retryable_remote_revoke_failure",
-                            mark_remote_completed=False,
-                            conn=commit_conn,
-                        )
-                    else:
-                        updated = await db.finalize_revoke_attempt_tx(
-                            purge_id,
-                            expected_attempt_gen=attempt_gen,
-                            remote_revoke_status=RemoteRevokeStatus.SUPERSEDED,
-                            clear_revoke_token=True,
-                            next_retry_at=None,
-                            last_remote_error="permanent_remote_revoke_failure",
-                            mark_remote_completed=True,
-                            conn=commit_conn,
-                        )
-                    committed = True
-                    if updated is not None:
-                        return updated.remote_revoke_status
-                    latest = await db.get_purge_ledger(
-                        purge_id, decrypt_revoke_token=False, conn=commit_conn
+        # Phase 3: short transaction-scoped advisory lock on ONE pooled connection
+        async with get_db_connection() as commit_conn, commit_conn.transaction():
+            await commit_conn.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+            with track_advisory_lock("revoke", lock_key):
+                if outcome == RevokeOutcome.SUCCEEDED:
+                    updated = await db.finalize_revoke_attempt_tx(
+                        purge_id,
+                        expected_attempt_gen=attempt_gen,
+                        remote_revoke_status=RemoteRevokeStatus.SUCCEEDED,
+                        clear_revoke_token=True,
+                        next_retry_at=None,
+                        last_remote_error=None,
+                        mark_remote_completed=True,
+                        conn=commit_conn,
                     )
-                    return (
-                        latest.remote_revoke_status
-                        if latest is not None
-                        else RemoteRevokeStatus.SUPERSEDED
+                elif outcome == RevokeOutcome.RETRYABLE:
+                    delay_s = compute_revoke_backoff_seconds(retry_count_before)
+                    next_retry = datetime.now(UTC) + timedelta(seconds=delay_s)
+                    updated = await db.finalize_revoke_attempt_tx(
+                        purge_id,
+                        expected_attempt_gen=attempt_gen,
+                        remote_revoke_status=RemoteRevokeStatus.FAILED_RETRYABLE,
+                        clear_revoke_token=False,
+                        increment_retry=True,
+                        next_retry_at=next_retry,
+                        last_remote_error="retryable_remote_revoke_failure",
+                        mark_remote_completed=False,
+                        conn=commit_conn,
                     )
-            finally:
-                with anyio.CancelScope(shield=True):
-                    await commit_conn.execute(
-                        "SELECT pg_advisory_unlock(%s)", (lock_key,)
+                else:
+                    updated = await db.finalize_revoke_attempt_tx(
+                        purge_id,
+                        expected_attempt_gen=attempt_gen,
+                        remote_revoke_status=RemoteRevokeStatus.SUPERSEDED,
+                        clear_revoke_token=True,
+                        next_retry_at=None,
+                        last_remote_error="permanent_remote_revoke_failure",
+                        mark_remote_completed=True,
+                        conn=commit_conn,
                     )
+                committed = True
+                if updated is not None:
+                    return updated.remote_revoke_status
+                latest = await db.get_purge_ledger(
+                    purge_id, decrypt_revoke_token=False, conn=commit_conn
+                )
+                return (
+                    latest.remote_revoke_status
+                    if latest is not None
+                    else RemoteRevokeStatus.SUPERSEDED
+                )
     finally:
         if not committed:
             with anyio.CancelScope(shield=True):
@@ -327,36 +317,32 @@ async def supersede_pending_revokes(
     google_project: str,
     sub: str,
 ) -> int:
-    """Supersede all pending/retryable tasks for ``(google_project, sub)`` across all Dalton users.
+    """Supersede all pending/retryable tasks for ``(google_project, sub)``.
 
     Called after Google issues a new token so stale revocation tasks cannot revoke
     the newly issued grant in the same Google Cloud project.
     """
     lock_key = revoke_lock_key(google_project, sub)
-    async with get_db_connection() as lock_conn:
-        await lock_conn.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
-        try:
-            with track_advisory_lock("revoke", lock_key):
-                active = await db.list_active_revokes_for_google_project_sub(
-                    google_project, sub, decrypt_revoke_token=False, conn=lock_conn
+    async with get_db_connection() as tx_conn, tx_conn.transaction():
+        await tx_conn.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+        with track_advisory_lock("revoke", lock_key):
+            active = await db.list_active_revokes_for_google_project_sub(
+                google_project, sub, decrypt_revoke_token=False, conn=tx_conn
+            )
+            count = 0
+            for row in active:
+                updated = await db.update_purge_ledger_remote_status(
+                    row.purge_id,
+                    remote_revoke_status=RemoteRevokeStatus.SUPERSEDED,
+                    clear_revoke_token=True,
+                    next_retry_at=None,
+                    last_remote_error="superseded_by_new_authorization",
+                    mark_remote_completed=True,
+                    conn=tx_conn,
                 )
-                count = 0
-                for row in active:
-                    updated = await db.update_purge_ledger_remote_status(
-                        row.purge_id,
-                        remote_revoke_status=RemoteRevokeStatus.SUPERSEDED,
-                        clear_revoke_token=True,
-                        next_retry_at=None,
-                        last_remote_error="superseded_by_new_authorization",
-                        mark_remote_completed=True,
-                        conn=lock_conn,
-                    )
-                    if updated is not None:
-                        count += 1
-                return count
-        finally:
-            with anyio.CancelScope(shield=True):
-                await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+                if updated is not None:
+                    count += 1
+            return count
 
 
 async def revoke_before_new_authorization(

@@ -88,52 +88,84 @@ def _is_provider_credentials_ready(provider: str) -> bool:
 _SWEEP_INFLIGHT_LEASE_SECONDS = 600
 
 
+async def _renew_sweep_lease_or_false(
+    *,
+    lock_key: int,
+    expected_sweep_gen: int,
+    worker_id: str,
+    lease_seconds: int,
+) -> bool:
+    """Renew ``inflight_until`` under a short ``pg_advisory_xact_lock`` on ONE pooled connection.
+
+    Returns ``False`` (so the caller stops immediately) if the lease expired, was taken over
+    by another worker (``sweep_gen`` changed), or the DB renewal fails.
+    """
+    try:
+        async with get_db_connection() as tx_conn, tx_conn.transaction():
+            await tx_conn.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+            with track_advisory_lock("health_sweep", lock_key):
+                return await db.renew_health_sweep_lease(
+                    expected_sweep_gen=expected_sweep_gen,
+                    worker_id=worker_id,
+                    lease_seconds=lease_seconds,
+                    conn=tx_conn,
+                )
+    except Exception as exc:
+        logger.warning(
+            "[integration-sweep] lease renewal failed for sweep_gen=%s (%s); stopping sweep",
+            expected_sweep_gen,
+            type(exc).__name__,
+        )
+        return False
+
+
 async def run_integration_health_sweep_once(
     *,
     force: bool = False,
     min_interval_seconds: int = HEALTH_SWEEP_INTERVAL_SECONDS,
     limit: int = 500,
+    lease_seconds: int = _SWEEP_INFLIGHT_LEASE_SECONDS,
     google_client: GoogleOAuthClientProtocol | None = None,
     feishu_client: FeishuOAuthClientProtocol | None = None,
     revoker: RemoteRevoker | None = None,
 ) -> HealthSweepReport:
     """Run one cluster-wide mutually-exclusive personal integration health sweep (§4.5(3)).
 
-    Follows the 3-step no-lock-across-HTTP pattern:
-      1. Short global lock (``health_sweep_lock_key()``): verify no active sweep lease and
-         12-hour interval elapsed, claim a monotonic ``sweep_gen`` + ``inflight_until`` lease,
-         clean up expired OAuth states/confirmations, snapshot candidate rows, then RELEASE
-         the global lock and DB pool connection completely.
-      2. Outside any global lock or pool connection: repair orphaned ``revoked_purging`` rows
-         and group candidate connections by shared credential so each credential group
-         independently executes its own 3-step refresh (never holding a global lock across HTTP).
-      3. Short global lock: verify ``sweep_gen`` still matches and commit ``last_completed_at``
-         + clear ``inflight_until``.
+    Guarantees at most ONE active sweep at any time using ONE pooled connection per short DB step:
+      1. Short ``pg_try_advisory_xact_lock(health_sweep_lock_key())`` on ONE connection:
+         verify no active sweep lease and 12-hour interval elapsed, claim a monotonic
+         ``sweep_gen`` + ``inflight_until`` lease, and snapshot candidates in the SAME
+         transaction (any claim or listing failure rolls back automatically and exits
+         immediately without leaving a stale lease or continuing execution).
+      2. Outside any global lock or pool connection: before each orphan repair and each
+         shared-credential group, renew and verify ``sweep_gen`` + unexpired ``inflight_until``;
+         if the lease was lost or taken over by another worker, stop immediately.
+      3. Short ``pg_advisory_xact_lock`` on ONE connection: verify ``sweep_gen`` still matches
+         and commit ``last_completed_at`` + clear ``inflight_until``.
     """
     lock_key = health_sweep_lock_key()
     worker_id = _worker_identity()
+    eff_lease_seconds = max(1, int(lease_seconds))
     claimed_sweep_gen: int | None = None
     expired_states = 0
     expired_confirms = 0
     connections: list[db.IntegrationRow] = []
     orphaned_revoked: list[db.IntegrationRow] = []
 
-    # Step 1: short global advisory lock — check lease/interval, claim sweep_gen, fetch candidates, UNLOCK
-    async with get_db_connection() as lock_conn:
-        async with lock_conn.cursor() as cur:
-            await cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
-            row = await cur.fetchone()
-            acquired = bool(row and row[0])
-        if not acquired:
-            return HealthSweepReport(acquired=False, skipped_reason="lock_busy")
+    # Step 1: ONE pooled connection + pg_try_advisory_xact_lock.
+    # Claiming sweep_gen and snapshotting candidates share one atomic transaction so a failure
+    # rolls back the lease automatically and exits immediately.
+    try:
+        async with get_db_connection() as tx_conn, tx_conn.transaction():
+            async with tx_conn.cursor() as cur:
+                await cur.execute("SELECT pg_try_advisory_xact_lock(%s)", (lock_key,))
+                row = await cur.fetchone()
+                acquired = bool(row and row[0])
+            if not acquired:
+                return HealthSweepReport(acquired=False, skipped_reason="lock_busy")
 
-        try:
             with track_advisory_lock("health_sweep", lock_key):
-                try:
-                    state = await db.read_health_sweep_state(conn=lock_conn)
-                except Exception:
-                    state = None
-
+                state = await db.read_health_sweep_state(for_update=True, conn=tx_conn)
                 if state:
                     db_now = state.get("db_now") or datetime.now(UTC)
                     if db_now.tzinfo is None:
@@ -150,7 +182,11 @@ async def run_integration_health_sweep_once(
                                 acquired=False,
                                 skipped_reason="lock_busy",
                             )
-                    if not force and min_interval_seconds > 0 and state.get("last_completed_at") is not None:
+                    if (
+                        not force
+                        and min_interval_seconds > 0
+                        and state.get("last_completed_at") is not None
+                    ):
                         last_done = state["last_completed_at"]
                         if last_done.tzinfo is None:
                             last_done = last_done.replace(tzinfo=UTC)
@@ -161,46 +197,42 @@ async def run_integration_health_sweep_once(
                                 skipped_reason="interval_not_elapsed",
                             )
 
-                try:
-                    claimed_sweep_gen = await db.update_health_sweep_state(
-                        started=True,
-                        worker_id=worker_id,
-                        claim_lease_seconds=_SWEEP_INFLIGHT_LEASE_SECONDS,
-                        conn=lock_conn,
-                    )
-                except Exception as exc:
+                expected_gen = int(state["sweep_gen"]) if state and state.get("sweep_gen") is not None else None
+                claimed_sweep_gen = await db.update_health_sweep_state(
+                    started=True,
+                    worker_id=worker_id,
+                    claim_lease_seconds=eff_lease_seconds,
+                    expected_sweep_gen=expected_gen,
+                    conn=tx_conn,
+                )
+                if claimed_sweep_gen is None:
                     logger.warning(
-                        "[integration-sweep] could not stamp last_started_at (%s)",
-                        type(exc).__name__,
+                        "[integration-sweep] failed to claim sweep_gen; exiting immediately"
+                    )
+                    return HealthSweepReport(
+                        acquired=False,
+                        skipped_reason="claim_failed",
                     )
 
-                try:
-                    (
-                        expired_states,
-                        expired_confirms,
-                    ) = await db.delete_expired_oauth_states_and_confirmations()
-                except Exception as exc:
-                    logger.warning(
-                        "[integration-sweep] expired state cleanup failed (%s)",
-                        type(exc).__name__,
-                    )
+                connections = await db.list_connections_for_health_sweep(
+                    limit=limit, conn=tx_conn
+                )
+                orphaned_revoked = await db.list_orphaned_revoked_purging_connections(
+                    limit=limit, conn=tx_conn
+                )
+    except Exception as exc:
+        logger.warning(
+            "[integration-sweep] sweep claim/snapshot failed (%s); exiting immediately",
+            type(exc).__name__,
+        )
+        return HealthSweepReport(
+            acquired=False,
+            skipped_reason="claim_failed",
+        )
 
-                connections = await db.list_connections_for_health_sweep(limit=limit)
+    assert claimed_sweep_gen is not None
 
-                try:
-                    orphaned_revoked = await db.list_orphaned_revoked_purging_connections(
-                        limit=limit
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "[integration-sweep] orphaned revoked_purging scan failed (%s)",
-                        type(exc).__name__,
-                    )
-        finally:
-            with anyio.CancelScope(shield=True):
-                await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
-
-    # Step 2: OUTSIDE global lock and DB pool connection — process each credential group independently
+    # Step 2: OUTSIDE global lock and DB pool connection — renew lease before each unit of work
     checked = 0
     healthy = 0
     marked_needs_reauth = 0
@@ -210,10 +242,30 @@ async def run_integration_health_sweep_once(
     skipped_unexpired_ambiguous = 0
     skipped_concurrent = 0
     completed_ok = False
+    lease_lost = False
 
     try:
+        try:
+            (
+                expired_states,
+                expired_confirms,
+            ) = await db.delete_expired_oauth_states_and_confirmations()
+        except Exception as exc:
+            logger.warning(
+                "[integration-sweep] expired state cleanup failed (%s)",
+                type(exc).__name__,
+            )
+
         # Repair any orphaned revoked_purging rows lacking a running 2A purge ledger (§4.2(2))
         for orphan in orphaned_revoked:
+            if not await _renew_sweep_lease_or_false(
+                lock_key=lock_key,
+                expected_sweep_gen=claimed_sweep_gen,
+                worker_id=worker_id,
+                lease_seconds=eff_lease_seconds,
+            ):
+                lease_lost = True
+                break
             checked += 1
             try:
                 pid = await begin_disconnect(
@@ -243,94 +295,123 @@ async def run_integration_health_sweep_once(
         # issue at most ONE upstream refresh request per sweep (§4.2(2), §4.5(3)).
         now = datetime.now(UTC)
         seen_cred_groups: set[tuple[str, ...]] = set()
-        for conn_row in connections:
-            # Never misclassify existing connections when deployment credentials are not ready
-            if not _is_provider_credentials_ready(conn_row.provider):
-                skipped_credentials_not_ready += 1
-                continue
+        if not lease_lost:
+            for conn_row in connections:
+                if not _is_provider_credentials_ready(conn_row.provider):
+                    skipped_credentials_not_ready += 1
+                    continue
 
-            # For refresh_ambiguous rows whose access token has NOT expired yet, wait until expiry
-            if conn_row.status == IntegrationStatus.REFRESH_AMBIGUOUS:
-                exp = conn_row.expires_at
-                if exp is not None:
-                    exp_utc = exp if exp.tzinfo is not None else exp.replace(tzinfo=UTC)
-                    if exp_utc > now:
-                        skipped_unexpired_ambiguous += 1
-                        continue
+                if conn_row.status == IntegrationStatus.REFRESH_AMBIGUOUS:
+                    exp = conn_row.expires_at
+                    if exp is not None:
+                        exp_utc = exp if exp.tzinfo is not None else exp.replace(tzinfo=UTC)
+                        if exp_utc > now:
+                            skipped_unexpired_ambiguous += 1
+                            continue
 
-            if conn_row.provider == "google":
-                cred_group_key: tuple[str, ...] = (
-                    conn_row.user_id,
-                    "google",
-                    conn_row.oauth_client_id,
-                    conn_row.provider_account_id,
-                )
-            else:
-                cred_group_key = (
-                    conn_row.user_id,
-                    conn_row.provider,
-                    conn_row.oauth_client_id,
-                    conn_row.provider_account_id,
-                    conn_row.service,
-                )
-            if cred_group_key in seen_cred_groups:
-                continue
-            seen_cred_groups.add(cred_group_key)
+                if conn_row.provider == "google":
+                    cred_group_key: tuple[str, ...] = (
+                        conn_row.user_id,
+                        "google",
+                        conn_row.oauth_client_id,
+                        conn_row.provider_account_id,
+                    )
+                else:
+                    cred_group_key = (
+                        conn_row.user_id,
+                        conn_row.provider,
+                        conn_row.oauth_client_id,
+                        conn_row.provider_account_id,
+                        conn_row.service,
+                    )
+                if cred_group_key in seen_cred_groups:
+                    continue
+                seen_cred_groups.add(cred_group_key)
 
-            checked += 1
-            try:
-                await ensure_fresh_access_token(
-                    conn_row.user_id,
-                    conn_row.provider,
-                    conn_row.service,
-                    min_remaining_seconds=600,
-                    force_refresh=True,
-                    google_client=google_client,
-                    feishu_client=feishu_client,
-                    revoker=revoker,
-                )
-                healthy += 1
-            except IntegrationCredentialsNotReadyError:
-                skipped_credentials_not_ready += 1
-            except IntegrationNeedsReauthError:
-                marked_needs_reauth += 1
-            except IntegrationRevokedError:
-                triggered_revocation_purge += 1
-            except IntegrationTransientError:
-                transient_errors += 1
-            except (
-                IntegrationRefreshBusyError,
-                IntegrationEpochRevokedError,
-                IntegrationNotConnectedError,
-            ):
-                skipped_concurrent += 1
-            except Exception as exc:
-                transient_errors += 1
-                logger.warning(
-                    "[integration-sweep] unexpected error checking %s/%s (%s)",
-                    conn_row.provider,
-                    conn_row.service,
-                    type(exc).__name__,
-                )
+                # Renew and verify sweep_gen BEFORE starting each credential group!
+                if not await _renew_sweep_lease_or_false(
+                    lock_key=lock_key,
+                    expected_sweep_gen=claimed_sweep_gen,
+                    worker_id=worker_id,
+                    lease_seconds=eff_lease_seconds,
+                ):
+                    lease_lost = True
+                    break
 
-        # Step 3: short global lock — verify sweep_gen & stamp last_completed_at + clear lease
-        try:
-            async with get_db_connection() as commit_conn:
-                await commit_conn.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
+                checked += 1
                 try:
-                    with track_advisory_lock("health_sweep", lock_key):
-                        await db.update_health_sweep_state(
-                            completed=True,
-                            worker_id=worker_id,
-                            expected_sweep_gen=claimed_sweep_gen,
-                            conn=commit_conn,
-                        )
+                    await ensure_fresh_access_token(
+                        conn_row.user_id,
+                        conn_row.provider,
+                        conn_row.service,
+                        min_remaining_seconds=600,
+                        force_refresh=True,
+                        google_client=google_client,
+                        feishu_client=feishu_client,
+                        revoker=revoker,
+                    )
+                    healthy += 1
+                except IntegrationCredentialsNotReadyError:
+                    skipped_credentials_not_ready += 1
+                except IntegrationNeedsReauthError:
+                    marked_needs_reauth += 1
+                except IntegrationRevokedError:
+                    triggered_revocation_purge += 1
+                except IntegrationTransientError:
+                    transient_errors += 1
+                except (
+                    IntegrationRefreshBusyError,
+                    IntegrationEpochRevokedError,
+                    IntegrationNotConnectedError,
+                ):
+                    skipped_concurrent += 1
+                except Exception as exc:
+                    transient_errors += 1
+                    logger.warning(
+                        "[integration-sweep] unexpected error checking %s/%s (%s)",
+                        conn_row.provider,
+                        conn_row.service,
+                        type(exc).__name__,
+                    )
+
+        if lease_lost:
+            logger.warning(
+                "[integration-sweep] lost sweep lease (sweep_gen=%s); stopping early after checked=%d",
+                claimed_sweep_gen,
+                checked,
+            )
+            return HealthSweepReport(
+                acquired=True,
+                skipped_reason="lease_lost",
+                checked=checked,
+                healthy=healthy,
+                marked_needs_reauth=marked_needs_reauth,
+                triggered_revocation_purge=triggered_revocation_purge,
+                transient_errors=transient_errors,
+                skipped_credentials_not_ready=skipped_credentials_not_ready,
+                skipped_unexpired_ambiguous=skipped_unexpired_ambiguous,
+                skipped_concurrent=skipped_concurrent,
+                expired_states_deleted=expired_states,
+                expired_confirmations_deleted=expired_confirms,
+            )
+
+        # Step 3: short pg_advisory_xact_lock on ONE connection — verify sweep_gen & stamp last_completed_at
+        try:
+            async with get_db_connection() as commit_conn, commit_conn.transaction():
+                await commit_conn.execute(
+                    "SELECT pg_advisory_xact_lock(%s)", (lock_key,)
+                )
+                with track_advisory_lock("health_sweep", lock_key):
+                    final_gen = await db.update_health_sweep_state(
+                        completed=True,
+                        worker_id=worker_id,
+                        expected_sweep_gen=claimed_sweep_gen,
+                        conn=commit_conn,
+                    )
+                    if final_gen is None:
+                        lease_lost = True
+                    else:
                         completed_ok = True
-                finally:
-                    with anyio.CancelScope(shield=True):
-                        await commit_conn.execute(
-                            "SELECT pg_advisory_unlock(%s)", (lock_key,)
-                        )
         except Exception as exc:
             logger.warning(
                 "[integration-sweep] could not stamp last_completed_at (%s)",
@@ -339,6 +420,7 @@ async def run_integration_health_sweep_once(
 
         return HealthSweepReport(
             acquired=True,
+            skipped_reason="lease_lost" if lease_lost else None,
             checked=checked,
             healthy=healthy,
             marked_needs_reauth=marked_needs_reauth,
@@ -351,7 +433,7 @@ async def run_integration_health_sweep_once(
             expired_confirmations_deleted=expired_confirms,
         )
     finally:
-        if not completed_ok and claimed_sweep_gen is not None:
+        if not completed_ok and not lease_lost and claimed_sweep_gen is not None:
             with anyio.CancelScope(shield=True):
                 try:
                     await db.update_health_sweep_state(

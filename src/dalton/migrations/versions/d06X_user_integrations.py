@@ -129,6 +129,11 @@ def upgrade() -> None:
             browser_binding_hash TEXT NULL,
             consumed_at      TIMESTAMPTZ NULL,
             exchange_expires_at TIMESTAMPTZ NULL,
+            baseline_existed BOOLEAN NULL,
+            baseline_oauth_client_id TEXT NULL,
+            baseline_provider_account_id TEXT NULL,
+            baseline_auth_epoch BIGINT NULL,
+            voided_at        TIMESTAMPTZ NULL,
             expires_at       TIMESTAMPTZ NOT NULL,
             created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )

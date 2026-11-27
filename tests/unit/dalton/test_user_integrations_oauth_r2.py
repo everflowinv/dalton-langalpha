@@ -135,6 +135,68 @@ def _clean_env_and_snapshot(monkeypatch: pytest.MonkeyPatch) -> Any:
         "DALTON_CAP_CHANNEL_GATEWAY",
     ):
         monkeypatch.delenv(cap, raising=False)
+    async def _default_has_other_user_claim(
+        google_project: str, sub: str, *, exclude_user_id: str, conn: Any = None
+    ) -> bool:
+        return False
+
+    async def _default_has_any_active_in_project(
+        google_project: str, *, conn: Any = None
+    ) -> bool:
+        return False
+
+    async def _default_peek_oauth_state_voided(
+        state_hash: str, provider: str, *, conn: Any = None
+    ) -> bool:
+        return False
+
+    async def _default_void_oauth_states(
+        user_id: str, provider: str, *, service: str | None = None, conn: Any = None
+    ) -> int:
+        return 0
+
+    async def _default_consume_active_intent(
+        state_hash: str,
+        provider: str,
+        *,
+        require_valid_exchange_lease: bool = False,
+        conn: Any = None,
+    ) -> tuple[str, OAuthStateRow | None]:
+        return "ok", None
+
+    async def _default_has_inflight_sub(
+        google_project: str,
+        sub: str,
+        *,
+        exclude_purge_id: Any = None,
+        conn: Any = None,
+    ) -> bool:
+        return False
+
+    async def _default_renew_sweep_lease(
+        *, expected_sweep_gen: int, worker_id: str, lease_seconds: int, conn: Any = None
+    ) -> bool:
+        return True
+
+    async def _default_peek_oauth_state(
+        state_hash: str, provider: str, *, conn: Any = None
+    ) -> tuple[str, str] | None:
+        return None
+
+    async def _default_delete_oauth_state(
+        state_hash: str, provider: str, *, conn: Any = None
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(db, "has_other_user_google_account_claim", _default_has_other_user_claim)
+    monkeypatch.setattr(db, "has_any_active_google_grant_in_project", _default_has_any_active_in_project)
+    monkeypatch.setattr(db, "peek_oauth_state_voided", _default_peek_oauth_state_voided)
+    monkeypatch.setattr(db, "void_oauth_states_for_user_provider", _default_void_oauth_states)
+    monkeypatch.setattr(db, "consume_active_oauth_intent_tx", _default_consume_active_intent)
+    monkeypatch.setattr(db, "has_inflight_google_revoke_for_project_sub", _default_has_inflight_sub)
+    monkeypatch.setattr(db, "renew_health_sweep_lease", _default_renew_sweep_lease)
+    monkeypatch.setattr(db, "peek_oauth_state", _default_peek_oauth_state)
+    monkeypatch.setattr(db, "delete_oauth_state", _default_delete_oauth_state)
     yield
     reset_active_snapshot_for_test()
 
@@ -280,7 +342,10 @@ def _make_fake_lock_pool(
             executed.append((sql, params))
 
         async def fetchone(self) -> Any:
-            if "pg_try_advisory_lock" in self._last_sql:
+            if (
+                "pg_try_advisory_lock" in self._last_sql
+                or "pg_try_advisory_xact_lock" in self._last_sql
+            ):
                 val = lock_queue.pop(0) if lock_queue else True
                 return (val,)
             if fetch_queue:
@@ -288,6 +353,9 @@ def _make_fake_lock_pool(
             return None
 
         async def fetchall(self) -> list[Any]:
+            if "RETURNING service, auth_epoch, token_generation, refresh_attempt_gen" in self._last_sql and fetch_queue:
+                nxt = fetch_queue.pop(0)
+                return nxt if isinstance(nxt, list) else [nxt]
             return []
 
     class _Conn:
@@ -1588,7 +1656,11 @@ class TestHealthSweepAndUnreadyCredentials:
         fake_win_ctx, _ = _make_fake_lock_pool(try_lock_results=[True])
         monkeypatch.setattr(sweep_mod, "get_db_connection", fake_win_ctx)
         monkeypatch.setattr(db, "read_health_sweep_state", create_autospec(db.read_health_sweep_state, return_value=None))
-        monkeypatch.setattr(db, "update_health_sweep_state", create_autospec(db.update_health_sweep_state, return_value=None))
+        monkeypatch.setattr(db, "update_health_sweep_state", create_autospec(db.update_health_sweep_state, return_value=1))
+        monkeypatch.setattr(
+            db, "list_orphaned_revoked_purging_connections",
+            create_autospec(db.list_orphaned_revoked_purging_connections, return_value=[]),
+        )
         monkeypatch.setattr(
             db, "delete_expired_oauth_states_and_confirmations",
             create_autospec(db.delete_expired_oauth_states_and_confirmations, return_value=(2, 1)),
@@ -1953,7 +2025,7 @@ class TestRound2ReviewFixes:
         sweep_ctx, _ = _make_fake_lock_pool(try_lock_results=[True])
         monkeypatch.setattr(sweep_mod, "get_db_connection", sweep_ctx)
         monkeypatch.setattr(db, "read_health_sweep_state", create_autospec(db.read_health_sweep_state, return_value=None))
-        monkeypatch.setattr(db, "update_health_sweep_state", create_autospec(db.update_health_sweep_state, return_value=None))
+        monkeypatch.setattr(db, "update_health_sweep_state", create_autospec(db.update_health_sweep_state, return_value=1))
         monkeypatch.setattr(
             db, "delete_expired_oauth_states_and_confirmations",
             create_autospec(db.delete_expired_oauth_states_and_confirmations, return_value=(0, 0)),
@@ -2434,7 +2506,7 @@ class TestRound2ReviewFixes:
         sw_ctx, _ = _make_fake_lock_pool(try_lock_results=[True])
         monkeypatch.setattr(sweep_mod, "get_db_connection", sw_ctx)
         monkeypatch.setattr(db, "read_health_sweep_state", create_autospec(db.read_health_sweep_state, return_value=None))
-        monkeypatch.setattr(db, "update_health_sweep_state", create_autospec(db.update_health_sweep_state, return_value=None))
+        monkeypatch.setattr(db, "update_health_sweep_state", create_autospec(db.update_health_sweep_state, return_value=1))
         monkeypatch.setattr(db, "delete_expired_oauth_states_and_confirmations", create_autospec(db.delete_expired_oauth_states_and_confirmations, return_value=(0, 0)))
         monkeypatch.setattr(db, "list_orphaned_revoked_purging_connections", create_autospec(db.list_orphaned_revoked_purging_connections, return_value=[]))
         monkeypatch.setattr(db, "list_connections_for_health_sweep", create_autospec(db.list_connections_for_health_sweep, return_value=[cal_row, mail_row]))
@@ -2620,14 +2692,18 @@ class TestRound3ReviewFixes:
 
         class _TrackingConn:
             async def execute(self, sql: str, params: Any = None) -> None:
-                if "pg_advisory_lock" in sql:
+                if "pg_advisory_xact_lock" in sql or "pg_advisory_lock" in sql:
                     timeline.append(f"lock:{params[0]}")
                 elif "pg_advisory_unlock" in sql:
                     timeline.append(f"unlock:{params[0]}")
 
             @asynccontextmanager
             async def transaction(self) -> Any:
-                yield self
+                timeline.append("tx_begin")
+                try:
+                    yield self
+                finally:
+                    timeline.append("tx_end")
 
         @asynccontextmanager
         async def _tracking_conn_ctx(_conn: Any = None) -> Any:
@@ -2693,20 +2769,21 @@ class TestRound3ReviewFixes:
             provider="google", code="c1", state="s1", google_client=g_client
         )
         assert cb.status == "connected"
-        # No PG advisory lock held during exchange_code; in-flight oauth_state deleted ONLY AFTER guard commits!
+        # No PG advisory lock held during exchange_code; Step 1 tx commits before exchange_code,
+        # and Step 3 finalize consumes intent before finally cleanup!
+        life_key = db.lifecycle_lock_key(LOCAL_DEV_USER_ID, "google")
         coord_key = db.google_project_coord_lock_key("111222333")
         assert timeline == [
+            "tx_begin",
+            f"lock:{life_key}",
             f"lock:{coord_key}",
             "consume_state",
-            f"unlock:{coord_key}",
+            "tx_end",
             "exchange_code",
-            f"lock:{target_key}",
-            "supersede",
-            "insert_guard",
-            f"unlock:{target_key}",
-            "delete_state",
             "finalize",
+            "delete_state",
         ]
+        _ = target_key
 
         # process_revoke defers when an active Google OAuth state/exchange exists in google_project
         pid = str(uuid.uuid4())
@@ -3257,10 +3334,16 @@ class TestRound4ReviewFixes:
 
         class _TrackConn:
             async def execute(self, sql: str, params: Any = None) -> None:
-                if "pg_advisory_lock" in sql:
+                if "pg_advisory_xact_lock" in sql or "pg_advisory_lock" in sql:
                     events.append(f"lock:{params[0]}")
-                elif "pg_advisory_unlock" in sql:
-                    events.append(f"unlock:{params[0]}")
+
+            @asynccontextmanager
+            async def transaction(self) -> Any:
+                events.append("tx_begin")
+                try:
+                    yield self
+                finally:
+                    events.append("tx_end")
 
         @asynccontextmanager
         async def _track_pool(_conn: Any = None) -> Any:
@@ -3299,15 +3382,16 @@ class TestRound4ReviewFixes:
         assert st == RemoteRevokeStatus.SUCCEEDED
         coord_key = db.google_project_coord_lock_key("111222333")
         assert events == [
+            "tx_begin",
             f"lock:{target_key}",
             f"lock:{coord_key}",
             "claim_gen:7",
-            f"unlock:{coord_key}",
-            f"unlock:{target_key}",
+            "tx_end",
             "http_revoke",
+            "tx_begin",
             f"lock:{target_key}",
             "finalize_gen:7:succeeded",
-            f"unlock:{target_key}",
+            "tx_end",
         ]
 
     @pytest.mark.asyncio
@@ -3368,13 +3452,12 @@ class TestRound4ReviewFixes:
         assert order == ["poll:1", "poll:2", "exchange_code"]
 
     @pytest.mark.asyncio
-    async def test_r4_cross_user_revoke_lock_and_grant_check_prevents_destroying_peer_member(
+    async def test_r4_same_member_revoke_lock_and_grant_check_protects_sibling_service(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Lead §2.1 + Codex High #2 + Grok Medium #3: revoke lock & grant check scope to (google_project, sub) across all Dalton users."""
+        """Decision 1: revoke lock & grant check scope to same member's (google_project, sub) so disconnecting calendar never revokes an active Gmail sibling."""
         from src.dalton.services import integration_revoke as revoke_mod
 
-        # Lock key depends ONLY on (google_project, sub)
         assert db.revoke_lock_key("111222333", "sub-shared") == db.revoke_lock_key("111222333", "sub-shared")
         assert db.revoke_lock_key("111222333", "sub-shared") != db.revoke_lock_key("999888777", "sub-shared")
 
@@ -3416,8 +3499,8 @@ class TestRound4ReviewFixes:
         assert st == RemoteRevokeStatus.SUPERSEDED
         revoker.revoke.assert_not_awaited()
         grant_spy.assert_awaited_once()
-        # Verified called with (google_project, sub) — no user_id filter!
         assert grant_spy.await_args.args == ("111222333", "sub-shared")
+        assert grant_spy.await_args.kwargs["user_id"] == "member-a"
         assert upd_spy.await_args.kwargs["remote_revoke_status"] == RemoteRevokeStatus.SUPERSEDED
         assert upd_spy.await_args.kwargs["clear_revoke_token"] is True
 
@@ -3719,7 +3802,7 @@ class TestRound4ReviewFixes:
 
         class _SwitchConn:
             async def execute(self, sql: str, params: Any = None) -> None:
-                if "pg_advisory_lock" in sql and params:
+                if ("pg_advisory_xact_lock" in sql or "pg_advisory_lock" in sql) and params:
                     locks_acquired.append(params[0])
 
             def cursor(self, **_k: Any) -> _SwitchCursor:
@@ -3847,31 +3930,33 @@ class TestRound5ReviewFixes:
 
             async def execute(self, sql: str, params: Any = None) -> None:
                 self._last_sql = sql
-                if "pg_try_advisory_lock" in sql:
+                if "pg_try_advisory_xact_lock" in sql or "pg_try_advisory_lock" in sql:
                     events.append("try_lock")
-                elif "RETURNING refresh_attempt_gen" in sql:
+                elif "RETURNING service, auth_epoch, token_generation, refresh_attempt_gen" in sql:
                     events.append("claim_attempt_gen")
 
             async def fetchone(self) -> Any:
-                if "pg_try_advisory_lock" in self._last_sql:
+                if "pg_try_advisory_xact_lock" in self._last_sql or "pg_try_advisory_lock" in self._last_sql:
                     return (True,)
-                if "RETURNING refresh_attempt_gen" in self._last_sql:
-                    return (1,)
                 return None
+
+            async def fetchall(self) -> list[Any]:
+                if "RETURNING service, auth_epoch, token_generation, refresh_attempt_gen" in self._last_sql:
+                    return [("calendar", 1, 1, 1)]
+                return []
 
         class _StepConn:
             def cursor(self, **_k: Any) -> _StepCur:
                 return _StepCur()
 
             async def execute(self, sql: str, params: Any = None) -> None:
-                if "pg_advisory_lock" in sql:
+                if "pg_advisory_xact_lock" in sql or "pg_advisory_lock" in sql:
                     events.append("lock")
-                elif "pg_advisory_unlock" in sql:
-                    events.append("unlock")
 
             @asynccontextmanager
             async def transaction(self) -> Any:
                 yield
+                events.append("tx_commit")
 
         @asynccontextmanager
         async def _tracked_pool(_conn: Any = None) -> Any:
@@ -3938,11 +4023,11 @@ class TestRound5ReviewFixes:
         assert events == [
             "try_lock",
             "claim_attempt_gen",
-            "unlock",
+            "tx_commit",
             "http_refresh",
             "lock",
             "commit_step3",
-            "unlock",
+            "tx_commit",
         ]
 
         # Loser path: when active refresh_inflight_until lease is seen, exits lock & DB conn BEFORE polling!
@@ -4005,11 +4090,11 @@ class TestRound5ReviewFixes:
 
             async def execute(self, sql: str, params: Any = None) -> None:
                 self._last_sql = sql
-                if "pg_try_advisory_lock" in sql:
+                if "pg_try_advisory_xact_lock" in sql or "pg_try_advisory_lock" in sql:
                     timeline.append("global_try_lock")
 
             async def fetchone(self) -> Any:
-                if "pg_try_advisory_lock" in self._last_sql:
+                if "pg_try_advisory_xact_lock" in self._last_sql or "pg_try_advisory_lock" in self._last_sql:
                     return (True,)
                 return None
 
@@ -4018,10 +4103,13 @@ class TestRound5ReviewFixes:
                 return _SwCur()
 
             async def execute(self, sql: str, params: Any = None) -> None:
-                if "pg_advisory_lock" in sql:
-                    timeline.append("global_lock_commit")
-                elif "pg_advisory_unlock" in sql:
-                    timeline.append("global_unlock")
+                if "pg_advisory_xact_lock" in sql or "pg_advisory_lock" in sql:
+                    timeline.append("global_lock_step")
+
+            @asynccontextmanager
+            async def transaction(self) -> Any:
+                yield
+                timeline.append("tx_end")
 
         @asynccontextmanager
         async def _sw_pool(_conn: Any = None) -> Any:
@@ -4056,10 +4144,12 @@ class TestRound5ReviewFixes:
         assert rep.healthy == 1
         assert timeline == [
             "global_try_lock",
-            "global_unlock",
+            "tx_end",
+            "global_lock_step",
+            "tx_end",
             "refresh_group",
-            "global_lock_commit",
-            "global_unlock",
+            "global_lock_step",
+            "tx_end",
         ]
 
         # Active inflight_until lease blocks a second worker immediately with lock_busy
@@ -4373,7 +4463,7 @@ class TestRound5ReviewFixes:
     async def test_r5_core_direct_callback_aborts_and_revokes_if_commit_guard_voided_by_disconnect(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Codex High #4: if concurrent DELETE deletes commit-guard row before _finalize_connection commits, callback aborts without resurrecting connection and revokes new Google token."""
+        """Decision 4 + Codex High #1/#4: if concurrent disconnect voids the connect intent before _finalize_connection commits, callback aborts without resurrecting connection and revokes new Google token."""
         _install_saved_credentials()
         fake_ctx, _ = _make_fake_lock_pool()
         monkeypatch.setattr(oauth_mod, "get_db_connection", fake_ctx)
@@ -4384,10 +4474,8 @@ class TestRound5ReviewFixes:
         monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=None))
         monkeypatch.setattr(db, "has_running_local_purge_for_service", create_autospec(db.has_running_local_purge_for_service, return_value=[]))
         monkeypatch.setattr(db, "supersede_active_revokes_for_google_project_sub_tx", create_autospec(db.supersede_active_revokes_for_google_project_sub_tx, return_value=0))
-        monkeypatch.setattr(db, "insert_pending_confirmation", create_autospec(db.insert_pending_confirmation, return_value=None))
-        monkeypatch.setattr(db, "delete_pending_confirmation_by_hash", create_autospec(db.delete_pending_confirmation_by_hash, return_value=None))
-        # Simulate concurrent DELETE having deleted the commit-guard row -> consume returns None!
-        monkeypatch.setattr(db, "consume_pending_confirmation", create_autospec(db.consume_pending_confirmation, return_value=None))
+        # Simulate concurrent DELETE having voided the connect intent in oauth_states -> consume returns ("voided", None)!
+        monkeypatch.setattr(db, "consume_active_oauth_intent_tx", create_autospec(db.consume_active_oauth_intent_tx, return_value=("voided", None)))
         upsert_spy = create_autospec(db.upsert_connection)
         monkeypatch.setattr(db, "upsert_connection", upsert_spy)
         revoke_tok_spy = create_autospec(oauth_mod._revoke_abandoned_google_token, return_value=None)
@@ -4486,3 +4574,310 @@ class TestRound5ReviewFixes:
         exp_spy.assert_awaited_once()
         assert exp_spy.await_args.args == ("111222333",)
         assert exp_spy.await_args.kwargs["sub"] == "sub-target-b"
+
+
+# ---------------------------------------------------------------------------
+# Round 6 Narrowed Scope Fixes (Decisions 1–5 + Grok Medium/Low)
+# ---------------------------------------------------------------------------
+
+
+class TestRound6NarrowedFixes:
+    @pytest.mark.asyncio
+    async def test_r6_decision1_second_member_same_google_account_rejected_without_revoking_owner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Decision 1: connecting a Google (project, sub) already owned by another Dalton member rejects with exact Chinese prompt and NEVER revokes the owner's grant."""
+        _install_saved_credentials()
+        fake_ctx, _ = _make_fake_lock_pool()
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_ctx)
+        monkeypatch.setattr(db, "peek_oauth_state", create_autospec(db.peek_oauth_state, return_value=(LOCAL_DEV_USER_ID, "111222333-abc.apps.googleusercontent.com")))
+        monkeypatch.setattr(db, "has_inflight_google_revoke_in_project", create_autospec(db.has_inflight_google_revoke_in_project, return_value=False))
+        monkeypatch.setattr(db, "consume_oauth_state", create_autospec(db.consume_oauth_state, return_value=_make_state_row()))
+        monkeypatch.setattr(db, "delete_oauth_state", create_autospec(db.delete_oauth_state, return_value=None))
+        monkeypatch.setattr(db, "has_other_user_google_account_claim", create_autospec(db.has_other_user_google_account_claim, return_value=True))
+        revoke_spy = create_autospec(oauth_mod._revoke_abandoned_google_token, return_value=None)
+        monkeypatch.setattr(oauth_mod, "_revoke_abandoned_google_token", revoke_spy)
+        upsert_spy = create_autospec(db.upsert_connection)
+        monkeypatch.setattr(db, "upsert_connection", upsert_spy)
+
+        g_client = create_autospec(GoogleOAuthClient, instance=True)
+        g_client.exchange_code.return_value = OAuthTokenResponse(
+            access_token="at-b",
+            refresh_token="rt-b",
+            expires_in=3600,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            scope=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+            id_token="id.b",
+        )
+        g_client.verify_id_token.return_value = GoogleIdTokenClaims(
+            sub="sub-owned-by-member-a",
+            email="shared@example.com",
+            email_verified=True,
+            aud="111222333-abc.apps.googleusercontent.com",
+            iss="https://accounts.google.com",
+            exp=int(time.time()) + 3600,
+        )
+
+        cb = await handle_oauth_callback(
+            provider="google", code="c-b", state="s-b", google_client=g_client
+        )
+        assert cb.status == "error"
+        assert cb.error_code == "google_account_already_connected"
+        assert cb.error_message == "这个 Google 账号已被团队里另一位成员连接，请换一个账号或请对方先断开"
+        upsert_spy.assert_not_awaited()
+        revoke_spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_r6_decision2_short_lock_tx_never_borrows_second_pooled_connection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Decision 2: disconnect, refresh, revoke, and health sweep each hold at most ONE pooled connection at any time (pg_advisory_xact_lock on same conn)."""
+        from src.dalton.services import integration_revoke as revoke_mod
+        from src.dalton.services import user_integrations_lifecycle as lc_mod
+
+        _install_saved_credentials()
+        conn_stats = {"cur": 0, "max": 0}
+        base_ctx, _ = _make_fake_lock_pool()
+
+        @asynccontextmanager
+        async def _strict_single_conn(_existing: Any = None) -> Any:
+            if _existing is not None:
+                yield _existing
+                return
+            conn_stats["cur"] += 1
+            conn_stats["max"] = max(conn_stats["max"], conn_stats["cur"])
+            assert conn_stats["cur"] <= 1, f"Nested pool borrow detected: cur={conn_stats['cur']}"
+            try:
+                async with base_ctx() as c:
+                    yield c
+            finally:
+                conn_stats["cur"] -= 1
+
+        monkeypatch.setattr(oauth_mod, "get_db_connection", _strict_single_conn)
+        monkeypatch.setattr(revoke_mod, "get_db_connection", _strict_single_conn)
+        monkeypatch.setattr(sweep_mod, "get_db_connection", _strict_single_conn)
+        monkeypatch.setattr(lc_mod, "get_db_connection", _strict_single_conn)
+
+        # 1) Health sweep
+        monkeypatch.setattr(db, "read_health_sweep_state", create_autospec(db.read_health_sweep_state, return_value=None))
+        monkeypatch.setattr(db, "update_health_sweep_state", create_autospec(db.update_health_sweep_state, return_value=1))
+        monkeypatch.setattr(db, "delete_expired_oauth_states_and_confirmations", create_autospec(db.delete_expired_oauth_states_and_confirmations, return_value=(0, 0)))
+        monkeypatch.setattr(db, "list_connections_for_health_sweep", create_autospec(db.list_connections_for_health_sweep, return_value=[]))
+        monkeypatch.setattr(db, "list_orphaned_revoked_purging_connections", create_autospec(db.list_orphaned_revoked_purging_connections, return_value=[]))
+        rep = await run_integration_health_sweep_once(force=True)
+        assert rep.acquired is True
+
+        # 2) Refresh winner
+        exp_row = _make_integration_row(expires_at=datetime.now(UTC) - timedelta(seconds=60))
+        fresh_tok = oauth_mod._to_fresh_token(_make_integration_row(token_generation=2))
+        monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=exp_row))
+        monkeypatch.setattr(db, "list_connections_by_account", create_autospec(db.list_connections_by_account, return_value=[exp_row]))
+        monkeypatch.setattr(oauth_mod, "_commit_refresh_success_tx", create_autospec(oauth_mod._commit_refresh_success_tx, return_value=fresh_tok))
+        g_client = create_autospec(GoogleOAuthClient, instance=True)
+        g_client.refresh_token.return_value = OAuthTokenResponse(
+            access_token="at-new",
+            refresh_token="rt-new",
+            expires_in=3600,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            scope=exp_row.granted_scopes,
+        )
+        got = await ensure_fresh_access_token(
+            LOCAL_DEV_USER_ID, "google", "calendar", google_client=g_client
+        )
+        assert got.token_generation == 2
+        assert conn_stats["max"] == 1
+
+    @pytest.mark.asyncio
+    async def test_r6_decision3_health_sweep_claim_fail_exits_and_lease_loss_stops_immediately(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Decision 3 + Grok Low #1: sweep exits immediately on claim/list failure (rolling back lease), renews before each group, and stops immediately when lease is lost."""
+        _install_saved_credentials()
+        fake_ctx, executed = _make_fake_lock_pool()
+        monkeypatch.setattr(sweep_mod, "get_db_connection", fake_ctx)
+        monkeypatch.setattr(db, "read_health_sweep_state", create_autospec(db.read_health_sweep_state, return_value={"sweep_gen": 1, "inflight_until": None, "last_completed_at": None, "db_now": datetime.now(UTC)}))
+        monkeypatch.setattr(db, "delete_expired_oauth_states_and_confirmations", create_autospec(db.delete_expired_oauth_states_and_confirmations, return_value=(0, 0)))
+        monkeypatch.setattr(db, "list_orphaned_revoked_purging_connections", create_autospec(db.list_orphaned_revoked_purging_connections, return_value=[]))
+        refresh_spy = create_autospec(sweep_mod.ensure_fresh_access_token)
+        monkeypatch.setattr(sweep_mod, "ensure_fresh_access_token", refresh_spy)
+
+        # (a) Claim returns None -> exit immediately with claim_failed, 0 refreshes
+        upd_spy = create_autospec(db.update_health_sweep_state, return_value=None)
+        monkeypatch.setattr(db, "update_health_sweep_state", upd_spy)
+        rep_fail = await run_integration_health_sweep_once(force=True)
+        assert rep_fail.acquired is False
+        assert rep_fail.skipped_reason == "claim_failed"
+        refresh_spy.assert_not_awaited()
+
+        # (b) Listing candidates raises -> transaction rolls back (no leaked lease), exits with claim_failed
+        executed.clear()
+        upd_spy.return_value = 2
+        list_spy = create_autospec(db.list_connections_for_health_sweep, side_effect=RuntimeError("db_boom"))
+        monkeypatch.setattr(db, "list_connections_for_health_sweep", list_spy)
+        rep_boom = await run_integration_health_sweep_once(force=True)
+        assert rep_boom.acquired is False
+        assert rep_boom.skipped_reason == "claim_failed"
+        assert ("TX_ROLLBACK", None) in executed
+        refresh_spy.assert_not_awaited()
+
+        # (c) Two groups: renew succeeds for group 1, fails (lease taken over) before group 2 -> stops after 1 group, does NOT stamp completed!
+        r1 = _make_integration_row(user_id="u-1", provider="google", service="calendar", provider_account_id="sub-1")
+        r2 = _make_integration_row(user_id="u-2", provider="google", service="calendar", provider_account_id="sub-2")
+        upd_spy.reset_mock()
+        upd_spy.return_value = 3
+        list_spy.side_effect = None
+        list_spy.return_value = [r1, r2]
+        renew_spy = create_autospec(db.renew_health_sweep_lease, side_effect=[True, False])
+        monkeypatch.setattr(db, "renew_health_sweep_lease", renew_spy)
+        refresh_spy.return_value = oauth_mod._to_fresh_token(r1)
+
+        rep_lost = await run_integration_health_sweep_once(force=True)
+        assert rep_lost.acquired is True
+        assert rep_lost.skipped_reason == "lease_lost"
+        assert rep_lost.checked == 1
+        assert rep_lost.healthy == 1
+        assert refresh_spy.await_count == 1
+        assert renew_spy.await_count == 2
+        # Never called update_health_sweep_state(completed=True) after lease loss!
+        assert not any(call.kwargs.get("completed") for call in upd_spy.await_args_list)
+
+    @pytest.mark.asyncio
+    async def test_r6_decision4_exchange_timeout_lease_expiry_and_missing_scope_revoke(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Decision 4 + Grok Medium #1: exchange total timeout aborts cleanly; lease expiry in Step 3 discards & revokes; missing required scope on first connect revokes minted refresh_token; failed exchange_code does NOT revoke."""
+        _install_saved_credentials()
+        fake_ctx, _ = _make_fake_lock_pool()
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_ctx)
+        monkeypatch.setattr(db, "peek_oauth_state", create_autospec(db.peek_oauth_state, return_value=(LOCAL_DEV_USER_ID, "111222333-abc.apps.googleusercontent.com")))
+        monkeypatch.setattr(db, "has_inflight_google_revoke_in_project", create_autospec(db.has_inflight_google_revoke_in_project, return_value=False))
+        monkeypatch.setattr(db, "consume_oauth_state", create_autospec(db.consume_oauth_state, return_value=_make_state_row()))
+        monkeypatch.setattr(db, "delete_oauth_state", create_autospec(db.delete_oauth_state, return_value=None))
+        monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=None))
+        monkeypatch.setattr(db, "has_running_local_purge_for_service", create_autospec(db.has_running_local_purge_for_service, return_value=[]))
+        revoke_spy = create_autospec(oauth_mod._revoke_abandoned_google_token, return_value=None)
+        monkeypatch.setattr(oauth_mod, "_revoke_abandoned_google_token", revoke_spy)
+
+        # (a) Slow exchange_code exceeds exchange_timeout_seconds -> exchange_timeout, 0 revokes (no token minted)
+        g_slow = create_autospec(GoogleOAuthClient, instance=True)
+
+        async def _hang(**_k: Any) -> OAuthTokenResponse:
+            await asyncio.sleep(2.0)
+            raise AssertionError("unreachable")
+
+        g_slow.exchange_code.side_effect = _hang
+        cb_to = await handle_oauth_callback(
+            provider="google", code="c-to", state="s-to", google_client=g_slow, exchange_timeout_seconds=0.05
+        )
+        assert cb_to.status == "error"
+        assert cb_to.error_code == "exchange_timeout"
+        revoke_spy.assert_not_awaited()
+
+        # (b) Grok Med #1: first connect missing required scope -> missing_required_scopes AND revokes minted refresh_token!
+        g_scope = create_autospec(GoogleOAuthClient, instance=True)
+        g_scope.exchange_code.return_value = OAuthTokenResponse(
+            access_token="at-part",
+            refresh_token="rt-abandoned-scope",
+            expires_in=3600,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            scope="openid email",
+            id_token="id.part",
+        )
+        g_scope.verify_id_token.return_value = GoogleIdTokenClaims(
+            sub="sub-scope-fail",
+            email="sf@example.com",
+            email_verified=True,
+            aud="111222333-abc.apps.googleusercontent.com",
+            iss="https://accounts.google.com",
+            exp=int(time.time()) + 3600,
+        )
+        cb_sc = await handle_oauth_callback(
+            provider="google", code="c-sc", state="s-sc", google_client=g_scope
+        )
+        assert cb_sc.status == "error"
+        assert cb_sc.error_code == "missing_required_scopes"
+        revoke_spy.assert_awaited_once()
+        assert revoke_spy.await_args.kwargs["token"] == "rt-abandoned-scope"
+        assert revoke_spy.await_args.kwargs["provider_account_id"] == "sub-scope-fail"
+
+        # (c) Exchange lease expired before Step 3 activation -> exchange_lease_expired AND revokes minted token!
+        revoke_spy.reset_mock()
+        monkeypatch.setattr(db, "consume_active_oauth_intent_tx", create_autospec(db.consume_active_oauth_intent_tx, return_value=("lease_expired", None)))
+        g_exp = create_autospec(GoogleOAuthClient, instance=True)
+        g_exp.exchange_code.return_value = OAuthTokenResponse(
+            access_token="at-late",
+            refresh_token="rt-late-expired-lease",
+            expires_in=3600,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            scope=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+            id_token="id.late",
+        )
+        g_exp.verify_id_token.return_value = GoogleIdTokenClaims(
+            sub="sub-late",
+            email="late@example.com",
+            email_verified=True,
+            aud="111222333-abc.apps.googleusercontent.com",
+            iss="https://accounts.google.com",
+            exp=int(time.time()) + 3600,
+        )
+        cb_exp = await handle_oauth_callback(
+            provider="google", code="c-late", state="s-late", google_client=g_exp
+        )
+        assert cb_exp.status == "error"
+        assert cb_exp.error_code == "exchange_lease_expired"
+        revoke_spy.assert_awaited_once()
+        assert revoke_spy.await_args.kwargs["token"] == "rt-late-expired-lease"
+
+    @pytest.mark.asyncio
+    async def test_r6_decision5_disconnect_branch_cas_discards_stale_sibling_update_after_reauth(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Decision 5 + Codex High #4: when calendar disconnects and Gmail re-authorizes during calendar's in-flight refresh, Step 3 checks claimed_targets and discards stale refresh without overwriting Gmail."""
+        import dataclasses
+
+        _install_saved_credentials()
+        fake_ctx, executed = _make_fake_lock_pool()
+        monkeypatch.setattr(oauth_mod, "get_db_connection", fake_ctx)
+
+        cal_disc = dataclasses.replace(
+            _make_integration_row(service="calendar", auth_epoch=1, token_generation=1, status=IntegrationStatus.DISCONNECT_PENDING),
+            refresh_attempt_gen=2,
+        )
+        mail_reauthed = dataclasses.replace(
+            _make_integration_row(service="mail", auth_epoch=1, token_generation=2, status=IntegrationStatus.CONNECTED, access_token="at-fresh-reauth", refresh_token="rt-fresh-reauth"),
+            refresh_attempt_gen=2,
+        )
+        monkeypatch.setattr(
+            db, "list_connections_by_account",
+            create_autospec(db.list_connections_by_account, return_value=[cal_disc, mail_reauthed]),
+        )
+
+        with pytest.raises(IntegrationEpochRevokedError):
+            await oauth_mod._commit_refresh_success_tx(
+                user_id=LOCAL_DEV_USER_ID,
+                provider="google",
+                service="calendar",
+                start_client_id=cal_disc.oauth_client_id,
+                start_sub=cal_disc.provider_account_id,
+                start_auth_epoch=1,
+                start_token_gen=1,
+                token_resp=OAuthTokenResponse(
+                    access_token="at-stale-refresh",
+                    refresh_token="rt-stale-refresh",
+                    expires_in=3600,
+                    expires_at=datetime.now(UTC) + timedelta(hours=1),
+                    scope=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+                ),
+                required_scopes=None,
+                expected_attempt_gen=1,
+                claimed_targets={
+                    "calendar": (1, 1, 1),
+                    "mail": (1, 1, 1),  # mail was claimed at tok_gen=1, attempt_gen=1; now at (1, 2, 2)!
+                },
+            )
+        # Zero UPDATEs executed against mail (stale result discarded by CAS)!
+        mail_updates = [
+            sql for sql, params in executed
+            if "UPDATE dalton_user_integrations" in sql and isinstance(params, dict) and params.get("service") == "mail"
+        ]
+        assert mail_updates == []
