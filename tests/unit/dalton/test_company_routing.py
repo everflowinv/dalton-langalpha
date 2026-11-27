@@ -816,6 +816,90 @@ async def test_launch_routing_allows_readonly_colleague_with_hint_but_refuses_de
 
 
 @pytest.mark.asyncio
+async def test_company_model_sector_workspace_in_place_passthrough_serial_pdd_to_jd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Modeling v2 §3.4: company-model in a sector workspace with an in-workspace
+    model_path passes both launch routing and check_done routing even when member
+    companies (PDD, JD) own dedicated company workspaces; omitting model_path or
+    passing an escaping model_path still routes/refuses normally."""
+    assert "company-model" in COMPANY_WORKFLOWS
+    sector_root = "/home/daytona/workspace/中国电商"
+
+    # Both PDD and JD have their own dedicated company workspaces.
+    _current(monkeypatch, WorkspaceCoverageIdentity(KIND_SECTOR, SOURCE_COMPAT), is_sector=True)
+    finder = _finder(monkeypatch, [_ws(WS_OTHER, "拼多多-PDD")])
+
+    # 1. Serial PDD -> JD in-place on sector workbook: both launch and check_done pass without consulting finder.
+    for ticker, mp in (
+        ("PDD", "model/China_Ecommerce_v01.xlsx"),
+        ("JD", "model/China_Ecommerce_v02.xlsx"),
+        ("JD", f"{sector_root}/model/China_Ecommerce_v02.xlsx"),
+    ):
+        note = await resolve_launch_company_routing(
+            "company-model",
+            {"ticker": ticker, "workspace_dir": ".", "model_path": mp},
+            {"user_id": U1, "workspace_id": WS_CURRENT},
+            workspace_root=sector_root,
+        )
+        assert note is None, (ticker, mp)
+        hint = await routing_hint_for_check(
+            {"ticker": ticker, "workspace_dir": ".", "model_path": mp},
+            U1,
+            WS_CURRENT,
+            workflow="company-model",
+            workspace_root=sector_root,
+        )
+        assert hint is None, (ticker, mp)
+    finder.assert_not_awaited()
+
+    # 2. workspace_dir escape is still refused even on the sector in-place path.
+    with pytest.raises(CompanyRoutingRefused, match="越出了当前工作区"):
+        await resolve_launch_company_routing(
+            "company-model",
+            {
+                "ticker": "PDD",
+                "workspace_dir": "../拼多多-PDD",
+                "model_path": "model/China_Ecommerce_v01.xlsx",
+            },
+            {"user_id": U1, "workspace_id": WS_CURRENT},
+            workspace_root=sector_root,
+        )
+
+    # 3. Missing model_path (new single-company build) or escaping model_path falls back to normal refusal.
+    for bad_params in (
+        {"ticker": "PDD", "workspace_dir": "."},
+        {"ticker": "PDD", "workspace_dir": ".", "model_path": "../拼多多-PDD/model/PDD-model-v01.xlsx"},
+        {"ticker": "PDD", "workspace_dir": ".", "model_path": "/home/daytona/workspace/拼多多-PDD/model/PDD-model-v01.xlsx"},
+    ):
+        with pytest.raises(CompanyRoutingRefused, match="「拼多多-PDD」"):
+            await resolve_launch_company_routing(
+                "company-model",
+                bad_params,
+                {"user_id": U1, "workspace_id": WS_CURRENT},
+                workspace_root=sector_root,
+            )
+        hint = await routing_hint_for_check(
+            bad_params,
+            U1,
+            WS_CURRENT,
+            workflow="company-model",
+            workspace_root=sector_root,
+        )
+        assert hint is not None and "「拼多多-PDD」" in hint
+
+    # 4. Non-sector workspace (e.g. JD's workspace trying to update PDD with model_path) is still refused.
+    _current(monkeypatch, _company_identity("JD"), is_sector=False)
+    with pytest.raises(CompanyRoutingRefused, match="「拼多多-PDD」"):
+        await resolve_launch_company_routing(
+            "company-model",
+            {"ticker": "PDD", "workspace_dir": ".", "model_path": "model/PDD-model-v01.xlsx"},
+            {"user_id": U1, "workspace_id": WS_CURRENT},
+            workspace_root=sector_root,
+        )
+
+
+@pytest.mark.asyncio
 async def test_flag_off_keeps_legacy_ticker_key_and_historical_duplicates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

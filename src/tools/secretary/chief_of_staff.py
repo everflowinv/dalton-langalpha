@@ -223,9 +223,11 @@ async def delegate_to_analyst(
             'manage_workspaces(action="create") first, then hand off to it.',
             tool_call_id,
         )
+    # DALTON-HOOK(cos-verbatim-forward): forward state so dispatch attaches latest user verbatim request.
     return await dispatch(
         question, config, workspace_id, thread_id, report_back, tool_call_id,
         preapproved=preapproved(state, tool_call_id), model=model, effort=effort,
+        state=state,
     )
 
 

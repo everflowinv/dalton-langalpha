@@ -1,11 +1,14 @@
 export const meta = {
   name: 'earnings-deep-update',
-  description: 'Dalton 财报深度链：八节点评 ∥ 模型更新 → thesis 校准 + 前瞻对账 → 审稿 → 知识层修订草案',
+  description: 'Dalton 财报深度链：八节点评 ∥ 模型更新流水线 → thesis 校准 + 前瞻对账 → 审稿与共享改模 → 知识层修订草案',
 }
+
+/* DALTON_INCLUDE:_shared/modeling_stages.js */
 
 const { ticker: T, company: C, quarter: Q, workspace_dir: W } = args
 const D = args.release_date
 const R = `${W}/research/${D}-deep-${Q}`
+const progressPath = args.progress_path || `${R}/.progress.json`
 const S = '.agents/skills/dalton-earnings-deep'
 const base = `先读 .agents/skills/dalton-conventions/SKILL.md 与 ${S}/SKILL.md；${C || T}（${T}）${Q}，发布日 ${D}。快讯稿在 ${W}/research/ 或 ${W}/drafts/ 下 flash-${Q}。`
 const OUT = {
@@ -71,9 +74,11 @@ const shaOf = (r) =>
   r && typeof r === 'object' && typeof r.sha256 === 'string' && /^[0-9a-f]{64}$/.test(r.sha256)
     ? r.sha256
     : null
+const normPath = (p) => _mNormPath(p, W)
+const hasArtifact = (list, target) => _mHasPath(list, target, W)
 
 phase('深度点评与模型')
-const [report, model] = await parallel([
+const [report, modelResult] = await parallel([
   () =>
     agent(
       `${base} 按 ${S}/templates/deep.md（首个二级标题为「## 摘要」，后接「业绩与指引」「投资逻辑的验证」「赔率与行动」「跟踪」、按需「附注」及文末「引用」，对账与校准的逐条表格留内部文件、不在正文展开；改判条件只在「跟踪」完整列一次，「赔率与行动」和「摘要」只写决定行动的那一个条件；成稿后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处）与 ${S}/references/eight-sections.md${
@@ -82,78 +87,41 @@ const [report, model] = await parallel([
       { agentType: 'general-purpose', label: '八节点评', phase: '深度点评与模型', schema: DRAFT_OUT }
     ),
   () =>
-    args.model_path
-      ? agent(
-          `${base} 按 .agents/skills/dalton-model/SKILL.md 与 .agents/skills/dalton-model/references/rollforward.md（对照一致预期时按需读 .agents/skills/dalton-model/references/sanity-check.md）基于原模型 ${args.model_path}（已按 dalton-model 第 1 步优先采用用户本次上传或指定的文件，其次为已登记模型）滚动更新：原件与已有版本保持只读，先输出财报披露行项与模型行项映射表到 ${R}/mapping.md，写入当季实际值并校准远期驱动假设；工作区尚无 model/${T}-model-v*.xlsx 时另存为 ${W}/model/${T}-model-v01.xlsx，已有版本时另存为下一版，并在变更记录（工作簿最前面的 README & Changelog 工作表，或原模型已有的 Change Log 工作表）写明本次改动与原因；运行 python3 .agents/skills/xlsx/scripts/recalc.py <新版本路径> 重算缓存值、python3 .agents/skills/dalton-model/scripts/model_style.py parts-diff ${args.model_path} <新版本路径> 核对部件变动，以及 python3 .agents/skills/dalton-model/scripts/model_scan.py --recalc <新版本路径> 提示性扫描并逐条核对（属问题的修正并重算；合理建模处理、扫描超时或执行失败、以及 Checks〔勾稽检查〕表个别未显示 OK 的条目均写入变更记录后继续）；运行 python3 .agents/skills/dalton-model/scripts/model_style.py lineage --file ${R}/model_lineage.json --output <新版本路径> --baseline ${args.model_path} 记录输入输出路径与哈希；输出新旧版本每股收益（EPS）变动拆解（EPS walk）与估值变化到 ${R}/model-delta.md。`,
-          { agentType: 'general-purpose', label: '模型更新', phase: '深度点评与模型', schema: OUT }
-        )
-      : Promise.resolve(null),
+    runModelingPipeline({
+      workspaceDir: W,
+      ticker: T,
+      company: C || T,
+      researchDir: R,
+      progressPath,
+      workflow: 'earnings-deep-update',
+      mode: 'update',
+      modelPath: args.model_path || null,
+      expectedBaselineSha256: args.expected_baseline_sha256 || null,
+      consensusThresholds: args.consensus_thresholds || null,
+      quarter: Q,
+      asOf: D,
+      phaseLabel: '深度点评与模型',
+      emitPhases: false,
+      skipIfNoModel: true,
+      deepNotes: true,
+      contextNote: base,
+    }),
 ])
 
-// 回报文件里的模型路径（取其版本号最大者）。
-const modelFileIn = (files) => {
-  const found = (Array.isArray(files) ? files : [])
-    .map((f) => {
-      const m = typeof f === 'string' ? f.match(/-model-v(\d+)\.xlsx$/) : null
-      return m ? { path: f, version: Number(m[1]) } : null
-    })
-    .filter(Boolean)
-  return found.length ? found.reduce((a, b) => (b.version > a.version ? b : a)).path : null
-}
-const nextVersion = (p) =>
-  p.replace(/-model-v(\d+)\.xlsx$/, (_, v) => `-model-v${String(Number(v) + 1).padStart(v.length, '0')}.xlsx`)
-const reportedModelPath = model ? modelFileIn(model.files) : null
+let modelStatus = modelResult ? modelResult.status : args.model_path ? 'failed_unusable' : 'skipped_no_model'
+let modelPath = modelResult && modelResult.candidate_path ? normPath(modelResult.candidate_path) : null
+let modelSha = (modelResult && modelResult.model_sha256) || null
+let modelRunId = (modelResult && modelResult.run_id) || null
+let modelArtifacts = modelResult && Array.isArray(modelResult.artifacts) ? modelResult.artifacts.slice() : []
+let hasMapping = hasArtifact(modelArtifacts, `${R}/mapping.md`)
+let hasModelDelta = hasArtifact(modelArtifacts, `${R}/model-delta.md`)
+let modelCheckPath = hasArtifact(modelArtifacts, `${R}/model_dump/model-check.md`) ? `${R}/model_dump/model-check.md` : null
+let remainingIssuesPath =
+  modelStatus === 'delivered_with_open_issues'
+    ? (modelResult && modelResult.remaining_issues_path) || `${R}/model_dump/remaining-issues.md`
+    : null
+const modelVerificationPath = args.model_path ? `${R}/model_dump/model-verification.json` : null
 
-// 确定性子任务解析磁盘上的最终模型（ls … | sort -V | tail -1）：模型更新后、
-// 每轮修订后（复审前）、循环结束后各一次；校准/审稿/知识草案/核验/返回值只认它。
-const FINAL_MODEL = {
-  type: 'object',
-  properties: {
-    path: { type: 'string', minLength: 1 },
-    sha256: { type: 'string', minLength: 64 },
-  },
-  required: ['path', 'sha256'],
-}
-// Compare model paths relative to the workspace: callers pass workspace_dir
-// either as '.' or as an absolute folder, while the resolver reports model/….
-const normPath = (p) => {
-  if (typeof p !== 'string') return p
-  let s = p.replace(/^\.\//, '')
-  const w = typeof W === 'string' ? W.replace(/\/+$/, '').replace(/^\.\//, '') : ''
-  if (w && w !== '.' && s.startsWith(w + '/')) s = s.slice(w.length + 1)
-  return s.replace(/^\.\//, '')
-}
-const resolveFinalModel = async (label) => {
-  const r = await agent(
-    `在 workspace 里执行：ls model/${T}-model-v*.xlsx 2>/dev/null | sort -V | tail -1，对输出文件计算 sha256sum。只返回 JSON：path（ls 的原样输出）与 sha256（64 位十六进制）。不写任何文件。`,
-    { agentType: 'dalton-evidence', label, phase: '解析最终模型', schema: FINAL_MODEL }
-  )
-  return r && typeof r.path === 'string' && r.path && shaOf(r) ? { path: normPath(r.path), sha256: r.sha256 } : null
-}
-phase('解析最终模型')
-let modelFile = null
-if (args.model_path && report !== null) {
-  const updated = await resolveFinalModel('解析模型（模型更新后）')
-  if (updated === null) {
-    return {
-      ok: false,
-      report: report && `${W}/drafts/${D}-deep-${Q}.md`,
-      model_file: null,
-      incomplete: ['解析最终模型的子任务失败，流程终止'],
-    }
-  }
-  if (reportedModelPath !== null && normPath(reportedModelPath) !== updated.path) {
-    return {
-      ok: false,
-      report: report && `${W}/drafts/${D}-deep-${Q}.md`,
-      model_file: updated.path,
-      incomplete: [
-        `模型更新回报的模型（${reportedModelPath}）与磁盘最大版本（${updated.path}）不一致，最终模型不确定，流程终止`,
-      ],
-    }
-  }
-  modelFile = updated.path
-}
 // 第 1 轮语言审查：八节点评写完之后、校准与第一次独立审稿之前（改稿会换哈希，必须先改再送审）。
 const reportPath = `${W}/drafts/${D}-deep-${Q}.md`
 phase('语言审查')
@@ -185,8 +153,8 @@ const calib =
 2) 按第二节的财报后校准规则，对 ${W}/thesis.md 每个支柱给信号与状态，写 ${R}/thesis-calibration.md；
 3) 更新指引兑现记录：本季实际 vs 上季给的指引，判断管理层指引风格是否延续，写 ${R}/management-delta.md；
 4) 把 ${R}/reconcile.md、${R}/thesis-calibration.md、${R}/management-delta.md 的结论各用一两句话写进 ${reportPath} 正文「投资逻辑的验证」节（逐条表格留在内部文件），改完返回 ${reportPath} 新的 sha256。
-材料：${W}/drafts/${D}-deep-${Q}.md${model ? `，${R}/model-delta.md` : ''}${
-          modelFile ? `；最终模型 ${modelFile}（只读）` : ''
+材料：${W}/drafts/${D}-deep-${Q}.md${hasModelDelta ? `，${R}/model-delta.md` : ''}${
+          modelPath ? `；最终模型 ${modelPath}（只读）` : ''
         }。`,
         { agentType: 'general-purpose', label: '校准与对账', phase: '校准与对账', schema: DRAFT_OUT }
       )
@@ -200,7 +168,7 @@ let review =
     : await agent(
         `审阅 ${reportPath}（被审草稿 sha256：${
           currentSha || '未知'
-        }）及 ${R}/ 下的对账与校准文件${modelFile ? `、最终模型 ${modelFile}` : ''}（只读不改任何文件）。重点：超预期/低于预期（beat/miss）口径；摘要与各节是否有独立判断；核心论点（thesis）信号是否被价格走势替代；对账是否回避了错判；核对正文「投资逻辑的验证」节是否已各用一两句话准确写入 reconcile.md、thesis-calibration.md、management-delta.md 的结论（逐条表格留在内部文件）。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
+        }）及 ${R}/ 下的对账与校准文件${modelPath ? `、最终模型 ${modelPath}` : ''}（只读不改任何文件）。重点：超预期/低于预期（beat/miss）口径；摘要与各节是否有独立判断；核心论点（thesis）信号是否被价格走势替代；对账是否回避了错判；核对正文「投资逻辑的验证」节是否已各用一两句话准确写入 reconcile.md、thesis-calibration.md、management-delta.md 的结论（逐条表格留在内部文件）。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
         { agentType: 'dalton-reviewer', label: '审稿', phase: '审稿', schema: VERDICT, reviewDraft: reportPath }
       )
 
@@ -212,20 +180,17 @@ if (review !== null && !completeReview(review)) {
 }
 let finalReview = review
 let rounds = 0
-let modelPath = modelFile
-// 提前结束时解析一次磁盘上的模型，作为返回值里的 model_file；没有模型则为 null。
-const resolveOnExit = async () => {
-  if (modelPath === null) return null
-  const r = await resolveFinalModel('解析模型（终止）')
-  if (r === null) incomplete.push('解析最终模型的子任务失败')
-  return r
-}
-// 所有提前返回的出口都经过 finish：返回值里的 model_file 只取传进来的解析结果。
-const finish = (resolved, extra = {}) => ({
+
+// 所有提前返回的出口都经过 finish：直接读取当前流水线与账本终态。
+const finish = (extra = {}) => ({
   ok: false,
   report: report && reportPath,
-  model_delta: model && `${R}/model-delta.md`,
-  model_file: resolved ? resolved.path : null,
+  model_delta: hasModelDelta ? `${R}/model-delta.md` : null,
+  model_file: modelPath,
+  model_status: modelStatus,
+  model_verification: modelVerificationPath,
+  model_check: modelCheckPath,
+  remaining_issues: remainingIssuesPath,
   reconcile: calib && `${R}/reconcile.md`,
   revise_rounds: rounds,
   incomplete,
@@ -234,26 +199,63 @@ const finish = (resolved, extra = {}) => ({
 
 if (review && verdictOf(review) === 'block') {
   incomplete.push(`审稿 block：${review.summary || '存在不可修订级问题'}`)
-  return finish(await resolveOnExit(), {
+  return finish({
     blocked: review.summary || '审稿 block',
     resume_hint:
       '修订报告后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，修订之后的阶段重新派发',
   })
 }
 
-// revise → 修订 → 解析模型 → 复审，最多 2 轮；每个失败出口都写进 incomplete 并停下
-let resolved = null
+// revise → 共享改模入口 + 报告修订 → 复审，最多 2 轮；每个失败出口都写进 incomplete 并停下
 while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
   rounds += 1
-  const target = modelPath === null ? null : nextVersion(modelPath)
-  const modelClause =
-    modelPath === null
-      ? ''
-      : `模型若有改动，按 .agents/skills/dalton-model/SKILL.md 与 .agents/skills/dalton-model/references/rollforward.md 保持原件只读，另存为 ${target}，运行 python3 .agents/skills/xlsx/scripts/recalc.py ${target} 重算与 python3 .agents/skills/dalton-model/scripts/model_scan.py --recalc ${target} 提示性扫描并逐条核对（属问题的修正并重算；保留项、扫描超时或执行失败随本次改动一并写入变更记录〔README & Changelog 或 Change Log 工作表〕后继续），再运行 python3 .agents/skills/dalton-model/scripts/model_style.py lineage --file ${R}/model_lineage.json --output ${target} --baseline ${modelPath} 记录输入输出路径与哈希；另存后将报告与 ${R}/model-delta.md 中代表当前模型的路径及单元格引用改为指向 ${target}（model-delta.md 中用于对比的旧版本数值保留原引用），模型输出有变化时同步更新两份文档中受影响的数值；模型未改则原样沿用 ${modelPath}。无论是否修改，均须在 files 里回报当前模型路径（另存报 ${target}，未改报 ${modelPath}）。`
+  if (modelPath !== null) {
+    const revModel = await reviseModelForReport({
+      workspaceDir: W,
+      ticker: T,
+      researchDir: R,
+      progressPath,
+      workflow: 'earnings-deep-update',
+      currentModelPath: modelPath,
+      currentModelSha256: modelSha,
+      currentStatus: modelStatus,
+      currentArtifacts: modelArtifacts,
+      runId: modelRunId,
+      reportPath,
+      reviewFeedback: finalReview,
+      extraSyncPaths: hasModelDelta ? [`${R}/model-delta.md`] : [],
+      phaseLabel: '审稿',
+    })
+    modelPath = revModel.modelPath || modelPath
+    modelSha = revModel.modelSha256 || modelSha
+    modelStatus = revModel.status
+    modelRunId = revModel.runId || modelRunId
+    modelArtifacts = Array.isArray(revModel.artifacts) ? revModel.artifacts : modelArtifacts
+    modelCheckPath = hasArtifact(modelArtifacts, `${R}/model_dump/model-check.md`)
+      ? `${R}/model_dump/model-check.md`
+      : null
+    remainingIssuesPath =
+      modelStatus === 'delivered_with_open_issues'
+        ? revModel.remainingIssuesPath || `${R}/model_dump/remaining-issues.md`
+        : null
+    if (modelStatus === 'failed_unusable' || !modelPath) {
+      incomplete.push(`第 ${rounds} 轮报告联动改模未能维持可读候选模型，未复审，流程终止`)
+      return finish()
+    }
+  }
+  const existingModelReports = []
+  if (modelCheckPath) existingModelReports.push(modelCheckPath)
+  if (hasArtifact(modelArtifacts, `${R}/model_dump/consensus-diff.md`)) {
+    existingModelReports.push(`${R}/model_dump/consensus-diff.md`)
+  }
+  if (remainingIssuesPath) existingModelReports.push(remainingIssuesPath)
+  const modelRefClause = modelPath
+    ? `当前最终模型为 ${modelPath}${modelSha ? `（sha256：${modelSha}）` : ''}（已由共享改模入口更新，此处不再改写 .xlsx；若报告正文${hasModelDelta ? `或 ${R}/model-delta.md ` : ''}引用模型，请核对已指向 ${modelPath}${existingModelReports.length ? `，可参考 ${existingModelReports.join('、')}` : ''}）。`
+    : ''
   const fixed = await agent(
     `先核对 ${reportPath} 的 sha256 是否与审稿前（${
       currentSha || '成稿记录值'
-    }）一致；按审稿意见做第 ${rounds} 轮修订（必改项 must_fix 全改，不新增未核实数字；修订后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处），并核对 ${R}/reconcile.md、${R}/thesis-calibration.md、${R}/management-delta.md 的结论是否已各用一两句话准确写进正文「投资逻辑的验证」节（如有缺漏或偏差一并修正，逐条表格留在内部文件），改完返回新 sha256。${modelClause}审稿意见：\n${JSON.stringify(
+    }）一致；按审稿意见做第 ${rounds} 轮修订（必改项 must_fix 全改，不新增未核实数字；修订后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处），并核对 ${R}/reconcile.md、${R}/thesis-calibration.md、${R}/management-delta.md 的结论是否已各用一两句话准确写进正文「投资逻辑的验证」节（如有缺漏或偏差一并修正，逐条表格留在内部文件），改完返回新 sha256。${modelRefClause}审稿意见：\n${JSON.stringify(
       finalReview
     )}`,
     { agentType: 'general-purpose', label: `修订 ${rounds}`, phase: '审稿', schema: DRAFT_OUT }
@@ -261,27 +263,7 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
   const fixedSha = shaOf(fixed)
   if (fixedSha === null) {
     incomplete.push(`第 ${rounds} 轮修订失败（修订结果或其 sha256 缺失/非法），未复审，流程终止`)
-    return finish(await resolveOnExit())
-  }
-  if (modelPath !== null) {
-    const reportedPath = modelFileIn(fixed.files)
-    if (!reportedPath) {
-      incomplete.push(`第 ${rounds} 轮修订未回报模型路径（模型未改也须回报 ${modelPath}），未复审，流程终止`)
-      return finish(await resolveOnExit())
-    }
-    const disk = await resolveFinalModel(`解析模型（修订 ${rounds}）`)
-    if (disk === null) {
-      incomplete.push(`第 ${rounds} 轮修订后解析模型的子任务失败，未复审，流程终止`)
-      return finish(null)
-    }
-    if (normPath(reportedPath) !== disk.path) {
-      incomplete.push(
-        `第 ${rounds} 轮修订后模型版本不一致：回报 ${reportedPath}，磁盘最大版本 ${disk.path}，最终模型不确定，未复审，流程终止`
-      )
-      return finish(disk)
-    }
-    modelPath = disk.path
-    resolved = disk
+    return finish()
   }
   currentSha = fixedSha
   const reReview = await agent(
@@ -296,15 +278,15 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
   )
   if (reReview === null) {
     incomplete.push(`第 ${rounds} 轮复审失败，流程终止`)
-    return finish(resolved)
+    return finish()
   }
   if (!completeReview(reReview)) {
     incomplete.push(`第 ${rounds} 轮复审结果未覆盖 1–9 项检查，按复审失败处理，流程终止`)
-    return finish(resolved)
+    return finish()
   }
   if (verdictOf(reReview) === 'block') {
     incomplete.push(`复审 block：${reReview.summary || '存在不可修订级问题'}，流程终止`)
-    return finish(resolved, {
+    return finish({
       blocked: reReview.summary || '复审 block',
       resume_hint:
         '修订报告后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，修订之后的阶段重新派发',
@@ -314,15 +296,22 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
 }
 let reviewPassed = finalReview !== null && verdictOf(finalReview) === 'pass'
 
-// 笔记两轮：一次写完、不再改的校准/对账笔记同样审两轮——第 1 轮审完按清单改，
-// 第 2 轮复核（改动过的文件再补一次 round=2 确认，绑定终态哈希）。
+// 笔记两轮：只对本次实际已生成的给人读 .md 笔记做两轮语言审查；model_dump/ 下机器报告免审。
+const noteFiles = [
+  `${R}/reconcile.md`,
+  `${R}/thesis-calibration.md`,
+  `${R}/management-delta.md`,
+]
+if (hasMapping) noteFiles.push(`${R}/mapping.md`)
+if (hasModelDelta) noteFiles.push(`${R}/model-delta.md`)
+
 const notesReview =
   !reportOk || !reviewPassed
     ? null
     : await agent(
-        `对本次运行产出、给人读的 .md 笔记逐一做两轮语言审查（规则见 .agents/skills/dalton-language/SKILL.md，只标问题）。每个文件依次：1) 调用工具 check_language(draft_path="<文件>", round=1)，读 <文件>.language.md 清单并按清单修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）；2) 调用 check_language(draft_path="<文件>", round=2) 复核；若第 1 轮后改过稿，改完再调用一次 round=2 确认（记录追加在同一 json）。\n文件清单：\n- ${R}/reconcile.md\n- ${R}/thesis-calibration.md\n- ${R}/management-delta.md${
-          args.model_path ? `\n- ${R}/mapping.md\n- ${R}/model-delta.md` : ''
-        }\n清单之外本次运行写的其他给人读的 .md 一并同法处理；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/ 下的文件、知识层渲染文件与 .audit/.annotated/.language 侧车不审。返回处理过的文件列表与摘要。`,
+        `对本次运行产出、给人读的 .md 笔记逐一做两轮语言审查（规则见 .agents/skills/dalton-language/SKILL.md，只标问题）。每个文件依次：1) 调用工具 check_language(draft_path="<文件>", round=1)，读 <文件>.language.md 清单并按清单修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）；2) 调用 check_language(draft_path="<文件>", round=2) 复核；若第 1 轮后改过稿，改完再调用一次 round=2 确认（记录追加在同一 json）。\n文件清单：\n${noteFiles
+          .map((p) => `- ${p}`)
+          .join('\n')}\n清单之外本次运行写的其他给人读的 .md 一并同法处理；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/ 下的文件、知识层渲染文件与 .audit/.annotated/.language 侧车不审。返回处理过的文件列表与摘要。`,
         { agentType: 'general-purpose', label: '笔记语言审查', phase: '审稿', schema: OUT }
       )
 if (reportOk && reviewPassed && notesReview === null) {
@@ -330,8 +319,6 @@ if (reportOk && reviewPassed && notesReview === null) {
 }
 
 // 第 2 轮语言审查：终稿内容定稿（审稿修订循环结束）之后、提交最后一次审稿之前。
-// 改了稿就再跑一次 round=2 复核，使最后一条第 2 轮记录绑定终稿哈希；哈希有变
-// 则终稿审稿重新绑定独立审稿哈希——语言修改不能让已有 pass 记录失效却无人重审。
 const preLang2Sha = currentSha
 const lang2 =
   !reportOk || !reviewPassed
@@ -347,7 +334,7 @@ if (reportOk && reviewPassed && lang2Sha === null) {
 } else if (reportOk && reviewPassed && lang2Sha !== preLang2Sha) {
   currentSha = lang2Sha
   const finalCheck = await agent(
-    `终稿审稿（语言修改后）：审阅 ${reportPath}（被审草稿 sha256：${lang2Sha}）及 ${R}/ 下的对账与校准文件${modelFile ? `、最终模型 ${modelFile}` : ''}（只读不改任何文件）。重点：语言修改未动事实与数字，上一轮 must_fix 仍全部解决。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
+    `终稿审稿（语言修改后）：审阅 ${reportPath}（被审草稿 sha256：${lang2Sha}）及 ${R}/ 下的对账与校准文件${modelPath ? `、最终模型 ${modelPath}` : ''}（只读不改任何文件）。重点：语言修改未动事实与数字，上一轮 must_fix 仍全部解决。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
     { agentType: 'dalton-reviewer', label: '终稿审稿', phase: '审稿', schema: VERDICT, reviewDraft: reportPath }
   )
   if (finalCheck === null) {
@@ -362,29 +349,12 @@ if (reportOk && reviewPassed && lang2Sha === null) {
   }
 }
 
-// 循环结束后再确认一次：磁盘最大版本必须就是循环里最后确认的 modelPath。
-// 之后的知识草案、核验清单、返回值都只用 finalModel.path。
-let finalModel = null
-if (modelPath !== null) {
-  finalModel = await resolveFinalModel('解析最终模型')
-  if (finalModel === null) {
-    incomplete.push('解析最终模型的子任务失败，流程终止')
-    return finish(null)
-  }
-  if (finalModel.path !== modelPath) {
-    incomplete.push(
-      `最终模型与修订确认的版本（${modelPath}）不一致：磁盘最大版本 ${finalModel.path}，最终模型不确定，流程终止`
-    )
-    return finish(finalModel)
-  }
-}
-
 const kp = await agent(
   `${base} 先核对 ${reportPath} 的 sha256 是否与修订后（${
     currentSha || '修订后记录值'
-  }）一致。${finalModel ? `最终模型为 ${finalModel.path}。` : ''}然后汇总 ${R}/ 全部文件与审稿意见（${
+  }）一致。${modelPath ? `最终模型为 ${modelPath}（终态：${modelStatus}，账本：${modelVerificationPath}）。` : ''}然后汇总 ${R}/ 全部文件与审稿意见（${
     finalReview ? '见下' : '审稿缺席：只写 NO_CHANGE 以外结论为待审说明，不改核心支柱状态'
-  }），按 PK.2 的 JSON Schema 写知识层修订草案 ${R}/knowledge-revision.json（{doc: {ops, reason, evidence_refs}}）：thesis 支柱信号与证据行、debate 变化、drivers 新读数、management 指引兑现行、lessons（前瞻错判的原因）、models（按 .agents/skills/dalton-model/SKILL.md 第 7 步登记新模型版本与关键输出单元格；若模型更新失败则写“模型未更新”并在 agenda_ops 排入人工跟进待办）、事件五词终判。\n${
+  }），按知识层修订 JSON 规范写知识层修订草案 ${R}/knowledge-revision.json（{doc: {ops, reason, evidence_refs}}）：thesis 支柱信号与证据行、debate 变化、drivers 新读数、management 指引兑现行、lessons（前瞻错判的原因）、models（按 .agents/skills/dalton-model/SKILL.md 登记新模型版本与关键输出单元格；若模型未产出可读候选则写“模型未更新”并在 agenda_ops 排入人工跟进待办）、事件五词终判。\n${
     finalReview ? JSON.stringify(finalReview) : ''
   }`,
   { agentType: 'general-purpose', label: '知识层修订草案', phase: '审稿', schema: OUT }
@@ -392,7 +362,7 @@ const kp = await agent(
 
 if (!reportOk) incomplete.push('八节点评失败（草稿或其 sha256 缺失/非法）')
 if (lang1Failed) incomplete.push('语言审查第 1 轮失败（结果或其 sha256 缺失/非法），未按清单修改')
-if (args.model_path && model === null) incomplete.push('模型更新失败（须人工跟进）')
+if (args.model_path && modelStatus === 'failed_unusable') incomplete.push('模型更新失败（无可读候选模型，须人工跟进）')
 if (calibSha === null && reportOk) incomplete.push('校准与对账失败（结果或其 sha256 缺失/非法）')
 if (review === null && calibSha !== null) incomplete.push('审稿失败')
 if (!reviewPassed && !incomplete.length) incomplete.push('审稿未最终通过（无 pass 记录）')
@@ -412,9 +382,12 @@ const deliverables = [
   `${R}/knowledge-revision.json`,
 ]
 if (args.model_path) {
-  deliverables.push(`${R}/mapping.md`, `${R}/mapping.md.language.json`, `${R}/model-delta.md`, `${R}/model-delta.md.language.json`)
+  if (modelVerificationPath) deliverables.push(modelVerificationPath)
+  if (remainingIssuesPath) deliverables.push(remainingIssuesPath)
+  if (hasMapping) deliverables.push(`${R}/mapping.md`, `${R}/mapping.md.language.json`)
+  if (hasModelDelta) deliverables.push(`${R}/model-delta.md`, `${R}/model-delta.md.language.json`)
+  if (modelPath) deliverables.push(modelPath)
 }
-if (finalModel) deliverables.push(finalModel.path)
 const check =
   !reportOk
     ? null
@@ -443,8 +416,12 @@ for (const path of deliverables) {
 return {
   ok: reportOk && reviewPassed && incomplete.length === 0,
   report: report && `${W}/drafts/${D}-deep-${Q}.md`,
-  model_delta: model && `${R}/model-delta.md`,
-  model_file: finalModel ? finalModel.path : null,
+  model_delta: hasModelDelta ? `${R}/model-delta.md` : null,
+  model_file: modelPath,
+  model_status: modelStatus,
+  model_verification: modelVerificationPath,
+  model_check: modelCheckPath,
+  remaining_issues: remainingIssuesPath,
   reconcile: calib && `${R}/reconcile.md`,
   review_done: finalReview !== null,
   review_verdict: finalReview && verdictOf(finalReview),

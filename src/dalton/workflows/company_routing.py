@@ -50,11 +50,17 @@ from src.dalton.settings import is_coverage_units_enabled
 
 logger = logging.getLogger(__name__)
 
-# 公司级 workflow：契约 params_required 里带 ticker 的那四个（topic-research
+# 公司级 workflow：契约 params_required 里带 ticker 的五个（topic-research
 # 按专题、weekly-coverage-review 在 Home 跑，都不是公司级）。名单由
 # tests/unit/dalton/test_company_routing.py 对照全部契约钉住。
 COMPANY_WORKFLOWS = frozenset(
-    {"initial-coverage", "full-coverage", "bullbear-doc", "earnings-deep-update"}
+    {
+        "initial-coverage",
+        "full-coverage",
+        "bullbear-doc",
+        "earnings-deep-update",
+        "company-model",
+    }
 )
 
 # 身份解析只读文档的 ticker 字段，枚举就只投影这一列（第 2 轮 agy 6）。
@@ -113,6 +119,41 @@ def _workspace_dir_escapes(workspace_dir: Any, root: Any = None) -> bool:
         return False
     normalized = posixpath.normpath(cleaned)
     return normalized == ".." or normalized.startswith("../")
+
+
+def _model_path_in_workspace(model_path: Any, root: Any = None) -> bool:
+    """起点模型路径是否非空且落在当前工作区目录内（行业工作区单列放行专用）。"""
+    if not isinstance(model_path, str):
+        return False
+    cleaned = model_path.strip()
+    if not cleaned or "\x00" in cleaned or "\\" in cleaned:
+        return False
+    anchor = str(root).rstrip("/") if isinstance(root, str) and str(root).strip() else ""
+    if anchor:
+        absolute = cleaned if cleaned.startswith("/") else posixpath.join(anchor, cleaned)
+        normalized = posixpath.normpath(absolute)
+        return normalized.startswith(anchor + "/")
+    if cleaned.startswith("/"):
+        return False
+    normalized = posixpath.normpath(cleaned)
+    return normalized not in ("", ".", "..") and not normalized.startswith("../")
+
+
+def _is_sector_company_model_in_place(
+    workflow: str | None,
+    params: dict[str, Any],
+    is_sector: bool,
+    workspace_root: Any = None,
+) -> bool:
+    """行业工作区整本建模单列放行规则（启动与 check_done 共用，设计 §3.4）。
+
+    仅当 workflow == "company-model"、当前工作区为行业工作区（is_sector == True），
+    且 params.model_path 非空并落在当前工作区目录内时返回 True；在非行业工作区或
+    未传本工作区 model_path 新建单公司模型时照常走目标公司工作区路由。
+    """
+    if workflow != "company-model" or not is_sector:
+        return False
+    return _model_path_in_workspace(params.get("model_path"), workspace_root)
 
 
 def _is_sector_workspace(
@@ -389,6 +430,13 @@ async def resolve_launch_company_routing(
                 identity is not None
                 and identity.source == SOURCE_HISTORICAL_DUPLICATE
             )
+            if _is_sector_company_model_in_place(
+                workflow, params, is_sector, workspace_root
+            ):
+                # 行业工作区传入本工作区整本 model_path：校验 workspace_dir 后就地放行，
+                # 跳过成员公司独立工作区反查（设计 §3.4）。
+                _guard_workspace_dir(params, ticker, workspace_root)
+                return None
             if (
                 identity is not None
                 and identity.is_company
@@ -504,6 +552,10 @@ async def routing_hint_for_check(
                 identity is not None
                 and identity.source == SOURCE_HISTORICAL_DUPLICATE
             )
+            if _is_sector_company_model_in_place(
+                workflow, params, is_sector, workspace_root
+            ):
+                return _dir_hint(params, workspace_root)
             if (
                 identity is not None
                 and identity.is_company

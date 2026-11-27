@@ -160,19 +160,92 @@ class ScriptedHost:
                 "questions": ["Q1"],
                 "summary": "plan",
             }
-        if label == "建模":
-            # The full-coverage model child declares the xlsx; scan findings /
-            # Checks non-OK are recorded in changelog and do not block drafting.
+        if label == "建模准备":
+            m_map = re.search(r"写入 (\S*mapping\.md)", prompt)
+            files = ["research/2026-10-23-fc/model_dump/META-fingerprint.json"]
+            if m_map:
+                files.append(m_map.group(1))
+            return {
+                "files": files,
+                "summary": "prep ok",
+                "mode": "update" if "起点路径为" in prompt else "build",
+                "baseline_path": "model/META-model-v01.xlsx" if "起点路径为" in prompt else None,
+                "baseline_sha256": "1" * 64 if "起点路径为" in prompt else None,
+                "fingerprint_path": files[0],
+                "consensus_path": "data/consensus/2026-10-23_0900.json",
+                "baseline_health_warning": None,
+            }
+        if label == "建模与一致预期对照":
+            cand = "model/META-model-v02.xlsx" if "模式：update" in prompt else "model/META-model-v01.xlsx"
+            return {
+                "files": [cand],
+                "summary": "model ok",
+                "candidate_path": cand,
+                "model_sha256": "a" * 64,
+                "run_id": "run-test-1",
+                "recalc_status": "ok",
+                "consensus_status": "ok",
+                "consensus_diff_generated": True,
+            }
+        if label == "模型本轮范围检查" or label.startswith("模型本轮范围复查 "):
+            return {
+                "files": ["model_dump/model-check.md", "model_dump/model-verification.json"],
+                "summary": "check pass",
+                "readable": True,
+                "final_status": "pass",
+                "model_sha256": "a" * 64,
+                "actionable_count": 0,
+                "actionable_issues": [],
+                "baseline_legacy_issues": [],
+                "missing_evidence_issues": [],
+                "not_applicable_issues": [],
+                "remaining_issues_path": None,
+                "summary_10lines": "summary",
+            }
+        if label.startswith("模型修改 "):
             return {
                 "files": ["model/META-model-v01.xlsx"],
-                "summary": "built, checks all green",
-                "sha256": "a" * 64,
-                "checks_passed": True,
+                "summary": "fixed",
+                "candidate_path": "model/META-model-v01.xlsx",
+                "model_sha256": "b" * 64,
+                "recalc_status": "ok",
+                "consensus_diff_generated": True,
             }
-        if label.startswith("模型可读性核验"):
-            m = re.search(r"f='([^']+)'", prompt)
-            assert m, "the model-readability probe prompt must quote the model path"
-            return {"files": [f"{m.group(1)}|readable_ok"]}
+        if label == "模型变动拆解":
+            m_delta = re.search(r"至 (\S*model-delta\.md)", prompt)
+            return {
+                "files": [m_delta.group(1) if m_delta else "research/2026-10-28-deep-FY26Q3/model-delta.md"],
+                "summary": "delta ok",
+            }
+        if label == "写入降级账本":
+            m_led = re.search(r"(\S*model_dump/model-verification\.json)", prompt)
+            m_rem = re.search(r"(\S*model_dump/remaining-issues\.md)", prompt)
+            return {
+                "files": [
+                    m_led.group(1) if m_led else "model_dump/model-verification.json",
+                    m_rem.group(1) if m_rem else "model_dump/remaining-issues.md",
+                ],
+                "summary": "fallback ledger written",
+                "final_status": "delivered_with_open_issues",
+                "model_sha256": "a" * 64,
+                "run_id": "run-test-1",
+            }
+        if label == "模型联动修订":
+            m_cur = re.search(r"当前模型 (\S+?\.xlsx)", prompt)
+            cur = m_cur.group(1) if m_cur else "model/META-model-v01.xlsx"
+            return {
+                "files": [cur],
+                "summary": "no model change",
+                "changed": False,
+                "model_path": cur,
+                "model_sha256": "a" * 64,
+                "status": "pass",
+                "open_issues": [],
+                "check_generated": True,
+                "consensus_generated": True,
+                "recalc_status": "ok",
+                "run_id": "run-test-1",
+            }
         if label == "memo 探测":
             m = re.search(r"f='([^']+)'", prompt)
             assert m, "the memo probe prompt must quote the draft path"
@@ -285,7 +358,11 @@ IC_PARAMS: dict[str, Any] = {
 
 
 def _script(name: str) -> str:
-    return (REPO_ROOT / "workflows" / name / "workflow.js").read_text(encoding="utf-8")
+    from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
+        read_assembled_workflow_file,
+    )
+
+    return read_assembled_workflow_file(REPO_ROOT / "workflows" / name / "workflow.js")
 
 
 async def _run(name: str, params: dict[str, Any], host: ScriptedHost) -> Any:
@@ -602,19 +679,67 @@ class CapturingHost:
         self.calls.append((prompt, dict(opts)))
         await asyncio.sleep(0.02)
         label = str(opts.get("label") or "")
-        if label.startswith("解析"):
-            return {"path": "model/META-model-v01.xlsx", "sha256": "a" * 64}
-        if label == "建模":
+        if label == "建模准备":
+            m_map = re.search(r"写入 (\S*mapping\.md)", prompt)
+            files = ["research/2026-10-23-fc/model_dump/META-fingerprint.json"]
+            if m_map:
+                files.append(m_map.group(1))
+            return {
+                "files": files,
+                "summary": "prep ok",
+                "mode": "update" if "起点路径为" in prompt else "build",
+                "baseline_path": "model/META-model-v01.xlsx" if "起点路径为" in prompt else None,
+                "baseline_sha256": "1" * 64 if "起点路径为" in prompt else None,
+                "fingerprint_path": files[0],
+                "consensus_path": "data/consensus/2026-10-23_0900.json",
+                "baseline_health_warning": None,
+            }
+        if label == "建模与一致预期对照":
             return {
                 "files": ["model/META-model-v01.xlsx"],
-                "summary": "built, checks all green",
-                "sha256": "a" * 64,
-                "checks_passed": True,
+                "summary": "model ok",
+                "candidate_path": "model/META-model-v01.xlsx",
+                "model_sha256": "a" * 64,
+                "run_id": "run-cap-1",
+                "recalc_status": "ok",
+                "consensus_status": "ok",
+                "consensus_diff_generated": True,
             }
-        if label.startswith("模型可读性核验"):
-            m = re.search(r"f='([^']+)'", prompt)
-            assert m, "the model-readability probe prompt must quote the model path"
-            return {"files": [f"{m.group(1)}|readable_ok"]}
+        if label == "模型本轮范围检查" or label.startswith("模型本轮范围复查 "):
+            return {
+                "files": ["model_dump/model-check.md", "model_dump/model-verification.json"],
+                "summary": "check pass",
+                "readable": True,
+                "final_status": "pass",
+                "model_sha256": "a" * 64,
+                "actionable_count": 0,
+                "actionable_issues": [],
+                "baseline_legacy_issues": [],
+                "missing_evidence_issues": [],
+                "not_applicable_issues": [],
+                "remaining_issues_path": None,
+                "summary_10lines": "summary",
+            }
+        if label == "模型变动拆解":
+            m_delta = re.search(r"至 (\S*model-delta\.md)", prompt)
+            return {
+                "files": [m_delta.group(1) if m_delta else "research/2026-10-28-deep-FY26Q3/model-delta.md"],
+                "summary": "delta ok",
+            }
+        if label == "模型联动修订":
+            return {
+                "files": ["model/META-model-v01.xlsx"],
+                "summary": "no change",
+                "changed": False,
+                "model_path": "model/META-model-v01.xlsx",
+                "model_sha256": "a" * 64,
+                "status": "pass",
+                "open_issues": [],
+                "check_generated": True,
+                "consensus_generated": True,
+                "recalc_status": "ok",
+                "run_id": "run-cap-1",
+            }
         if label == "memo 探测":
             m = re.search(r"f='([^']+)'", prompt)
             assert m, "the memo probe prompt must quote the draft path"
@@ -684,6 +809,10 @@ _WORKFLOW_PARAMS: dict[str, dict[str, Any]] = {
         "ticker": "META", "company": "Meta", "quarter": "FY26Q3", "workspace_dir": ".",
         "release_date": "2026-10-28", "model_path": "model/META-model-v01.xlsx",
         "preview_predictions": "research/predictions.json",
+    },
+    "company-model": {
+        "ticker": "META", "company": "Meta", "workspace_dir": ".", "as_of": "2026-10-23",
+        "progress_path": "research/2026-10-23-model-META/.progress.json",
     },
     "weekly-coverage-review": {"home_dir": "dalton", "end": "2026-10-23", "coverage_path": "dalton/coverage.yaml"},
     "topic-research": {
@@ -912,22 +1041,18 @@ def _pick(workspace: Path, command: str) -> str:
     return done.stdout.strip()
 
 
-def _contract_audit_pick(name: str, workspace: Path, ticker: str = "META") -> str:
-    """The file the workflow contract's readability validator
-    (`model_readable.py "$(ls … | sort -V | tail -1)"`) would check,
-    evaluated in ``workspace``."""
+def _contract_verify_done_cmd(name: str) -> str:
+    """The workflow contract's modeling closure validator (`model_check.py verify-done`)."""
     text = (REPO_ROOT / "workflows" / name / "contract.json").read_text(encoding="utf-8")
     commands = [
         v["command"]
         for stage in json.loads(text)["stages"]
         for v in stage.get("validators") or []
-        if "model_readable.py" in v.get("command", "")
+        if "model_check.py verify-done" in v.get("command", "")
     ]
     assert len(commands) == 1, commands
     assert "model_scan.py" not in commands[0] and "audit.py" not in commands[0], commands[0]
-    match = _CONTRACT_PICK.search(commands[0])
-    assert match, commands[0]
-    return _pick(workspace, match.group(1).replace("{ticker}", ticker))
+    return commands[0]
 
 
 # Supplies prompt- and disk-dependent answers; `_run` hands the engine a
@@ -935,38 +1060,121 @@ def _contract_audit_pick(name: str, workspace: Path, ticker: str = "META") -> st
 @dataclass
 class DiskHost(ScriptedHost):
     workspace: Path = Path(".")
-    # Revision label -> "save" (save as the version the prompt names),
-    # "keep" (memo-only: report the prompt's current model), "omit" (no model).
+    # Revision round index (1-based) or label -> "save" (bump version via reviseModelForReport),
+    # "keep" (memo-only: unchanged model), or "unusable" (report_revision failed_unusable).
     revise_modes: dict[str, str] = field(default_factory=dict)
     # Label -> workspace files that appear when that label dispatches.
     writes: dict[str, list[str]] = field(default_factory=dict)
+    _rev_model_count: int = 0
 
     def touch(self, rel: str) -> None:
         path = self.workspace / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(f"model {rel}".encode() * 100)
 
-    def resolve(self, prompt: str) -> Any:
-        match = _RESOLVER_CMD.search(prompt)
-        assert match, "the resolver prompt must carry the sort -V command"
-        out = _pick(self.workspace, match.group(1))
-        if not out:
-            return None
-        return {"path": out, "sha256": hashlib.sha256((self.workspace / out).read_bytes()).hexdigest()}
+    def _latest_disk_model(self) -> tuple[str, str]:
+        candidates = sorted(
+            self.workspace.glob("model/*-model-v*.xlsx"),
+            key=lambda p: int(re.search(r"-v(\d+)\.xlsx$", p.name).group(1)),
+        )
+        if not candidates:
+            self.touch("model/META-model-v01.xlsx")
+            candidates = [self.workspace / "model" / "META-model-v01.xlsx"]
+        latest = candidates[-1]
+        rel = latest.relative_to(self.workspace).as_posix()
+        return rel, hashlib.sha256(latest.read_bytes()).hexdigest()
+
+    def _next_model_version(self, cur: str) -> str:
+        return re.sub(
+            r"-model-v(\d+)\.xlsx$",
+            lambda m: f"-model-v{int(m.group(1)) + 1:0{len(m.group(1))}d}.xlsx",
+            cur,
+        )
 
     def outcome_for(self, label: str, prompt: str) -> Any:
         for rel in self.writes.get(label, []):
             self.touch(rel)
         if label in self.fail_labels:
             return None
-        if label.startswith("解析"):
-            return self.resolve(prompt)
+        if label == "建模与一致预期对照" and label not in self.by_label:
+            cand, sha = self._latest_disk_model()
+            return {
+                "files": [cand],
+                "summary": "model ok",
+                "candidate_path": cand,
+                "model_sha256": sha,
+                "run_id": "run-disk-1",
+                "recalc_status": "ok",
+                "consensus_status": "ok",
+                "consensus_diff_generated": True,
+            }
+        if (label == "模型本轮范围检查" or label.startswith("模型本轮范围复查 ")) and label not in self.by_label:
+            cand, sha = self._latest_disk_model()
+            return {
+                "files": ["model_dump/model-check.md", "model_dump/model-verification.json"],
+                "summary": "check pass",
+                "readable": True,
+                "final_status": "pass",
+                "model_sha256": sha,
+                "actionable_count": 0,
+                "actionable_issues": [],
+                "baseline_legacy_issues": [],
+                "missing_evidence_issues": [],
+                "not_applicable_issues": [],
+                "remaining_issues_path": None,
+                "summary_10lines": f"{cand} pass",
+            }
+        if label == "模型联动修订" and label not in self.by_label:
+            self._rev_model_count += 1
+            mode = self.revise_modes.get(f"修订 {self._rev_model_count}") or self.revise_modes.get(label) or "keep"
+            m_cur = re.search(r"当前模型 (\S+?\.xlsx)", prompt)
+            cur = m_cur.group(1) if m_cur else self._latest_disk_model()[0]
+            if mode == "save":
+                nxt = self._next_model_version(cur)
+                self.touch(nxt)
+                sha = hashlib.sha256((self.workspace / nxt).read_bytes()).hexdigest()
+                return {
+                    "files": [nxt],
+                    "summary": f"saved {nxt}",
+                    "changed": True,
+                    "model_path": nxt,
+                    "model_sha256": sha,
+                    "status": "pass",
+                    "open_issues": [],
+                    "check_generated": True,
+                    "consensus_generated": True,
+                    "recalc_status": "ok",
+                    "run_id": "run-disk-1",
+                }
+            if mode == "unusable":
+                return {
+                    "files": [cur],
+                    "summary": "unusable",
+                    "changed": True,
+                    "model_path": None,
+                    "model_sha256": None,
+                    "status": "failed_unusable",
+                    "open_issues": ["unusable"],
+                    "check_generated": False,
+                    "consensus_generated": False,
+                    "recalc_status": "recalc_failed",
+                    "run_id": "run-disk-1",
+                }
+            sha = hashlib.sha256((self.workspace / cur).read_bytes()).hexdigest() if (self.workspace / cur).exists() else "a" * 64
+            return {
+                "files": [cur],
+                "summary": "unchanged",
+                "changed": False,
+                "model_path": cur,
+                "model_sha256": sha,
+                "status": "pass",
+                "open_issues": [],
+                "check_generated": True,
+                "consensus_generated": True,
+                "recalc_status": "ok",
+                "run_id": "run-disk-1",
+            }
         if label == "memo 探测":
-            # Disk-backed, with the real probe's semantics (round 3 #2 + Batch 2 r3 #4):
-            # a draft counts as reusable only when it clears validate_memo's structure
-            # check AND its cited model path + recorded model sha256 match the current
-            # final model; stale model citations/hash yield stale_model so the writer
-            # refreshes affected predictions, valuation, and citations before review.
             m = re.search(r"f='([^']+)'", prompt)
             assert m, "the memo probe prompt must quote the draft path"
             rel = m.group(1)[2:] if m.group(1).startswith("./") else m.group(1)
@@ -999,20 +1207,13 @@ class DiskHost(ScriptedHost):
                             return {"files": [f"{m.group(1)}|stale_model"]}
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             return {"files": [f"{m.group(1)}|ok|{digest}"]}
-        mode = self.revise_modes.get(label)
-        if mode is None:
-            return super().outcome_for(label, prompt)
-        files = ["drafts/revised.md"]
-        if mode == "save":
-            target = re.search(r"另存为 (\S+?\.xlsx)", prompt)
-            assert target, "the revision prompt must name the next version"
-            self.touch(target.group(1))
-            files.append(target.group(1))
-        elif mode == "keep":
-            current = re.search(r"原样沿用 (\S+?\.xlsx)", prompt)
-            assert current, "the revision prompt must name the current model"
-            files.append(current.group(1))
-        return {"files": files, "summary": label, "sha256": hashlib.sha256(label.encode()).hexdigest()}
+        if label.startswith("修订 ") and label in self.revise_modes:
+            return {
+                "files": ["drafts/revised.md"],
+                "summary": label,
+                "sha256": hashlib.sha256(label.encode()).hexdigest(),
+            }
+        return super().outcome_for(label, prompt)
 
 
 def test_scripted_hosts_match_the_workflow_host_protocol() -> None:
@@ -1045,10 +1246,10 @@ def _fc_host(tmp_path: Path, **kw: Any) -> DiskHost:
 
 @pytest.mark.asyncio
 async def test_full_model_revision_saves_v02_and_ends_there(tmp_path: Path) -> None:
-    """One revision round only (batch 2): round 1 saves v02, the re-review
+    """One revision round only: shared reviseModelForReport saves v02, the re-review
     passes, the final language round edits the draft and the final re-review
-    re-binds the hash — the run ends on v02 in the return value, the evidence
-    list and the contract audit; no v03 round is dispatched."""
+    re-binds the hash — the run ends on v02 in the return value and evidence list;
+    no v03 round is dispatched."""
     host = _fc_host(
         tmp_path,
         by_label={
@@ -1062,13 +1263,17 @@ async def test_full_model_revision_saves_v02_and_ends_there(tmp_path: Path) -> N
     result = await _run("full-coverage", FC_PARAMS, host)
 
     labels = host.labels()
-    assert "另存为 model/META-model-v02.xlsx" in host.prompts[labels.index("修订 1")]
+    assert "模型联动修订" in labels
+    assert "只读审模型" not in labels
+    assert "model/META-model-v02.xlsx" in host.prompts[labels.index("修订 1")]
     assert "model/META-model-v02.xlsx" in host.prompts[labels.index("复审 1")]
     assert "修订 2" not in labels and "复审 2" not in labels, "one revision round only"
     assert labels.index("终稿审稿") > labels.index("语言审查 2"), "final review follows round 2"
     final = "model/META-model-v02.xlsx"
     assert result["model"] == final
-    assert _contract_audit_pick("full-coverage", tmp_path) == final
+    assert result["model_status"] == "pass"
+    assert result["model_verification"].endswith("/model_dump/model-verification.json")
+    assert _contract_verify_done_cmd("full-coverage")
     assert _evidence_models(host) == [final]
     assert result["ok"] is True, result["incomplete"]
     assert result["revise_rounds"] == 1
@@ -1091,38 +1296,28 @@ async def test_full_rereview_still_revise_has_no_second_round(tmp_path: Path) ->
 
 @pytest.mark.asyncio
 async def test_full_reported_v02_but_disk_v03_stops_before_rereview(tmp_path: Path) -> None:
-    """The revision reports v02 while the disk maximum is v03: the run stops
-    at that round's resolver — the re-review is never dispatched."""
+    """If shared report-revision model edit fails to maintain a readable candidate,
+    the revision loop stops before re-review and records incomplete."""
     host = _fc_host(
         tmp_path,
-        by_label={
-            "独立审稿": REVISE,
-            "复审 1": PASS,
-            "修订 1": {
-                "files": ["drafts/2026-10-23-memo.md", "model/META-model-v02.xlsx"],
-                "summary": "r1",
-                "sha256": "b" * 64,
-            },
-        },
-        writes={"修订 1": ["model/META-model-v02.xlsx", "model/META-model-v03.xlsx"]},
+        by_label={"独立审稿": REVISE, "复审 1": PASS},
+        revise_modes={"修订 1": "unusable"},
     )
     result = await _run("full-coverage", FC_PARAMS, host)
 
     labels = host.labels()
-    assert "解析模型（修订 1）" in labels
-    assert "复审 1" not in labels, "a mismatched revision must not be re-reviewed"
+    assert "模型联动修订" in labels
+    assert "复审 1" not in labels, "an unusable model revision must not be re-reviewed"
     assert "知识层修订草案" not in labels and "产物核验" not in labels
     assert result["ok"] is False
-    assert any("回报 model/META-model-v02.xlsx" in i and "磁盘最大版本 model/META-model-v03.xlsx" in i for i in result["incomplete"])
-    assert result["model"] == "model/META-model-v03.xlsx" == _contract_audit_pick("full-coverage", tmp_path)
+    assert any("报告联动改模未能维持可读候选模型" in i for i in result["incomplete"])
 
 
 @pytest.mark.asyncio
 async def test_full_memo_only_revision_keeps_the_existing_model(tmp_path: Path) -> None:
-    """A model exists and the revision only touched the memo: it reports the
-    unchanged v01, which is accepted and carried to the end. Round 2 of the
-    language review finds nothing to change (same hash), so no final
-    re-review runs."""
+    """A model exists and the revision only touched the memo: reviseModelForReport
+    returns changed=false keeping v01, carried to the end. Round 2 of the
+    language review finds nothing to change (same hash), so no final re-review runs."""
     round1_sha = hashlib.sha256("修订 1".encode()).hexdigest()
     host = _fc_host(
         tmp_path,
@@ -1136,7 +1331,7 @@ async def test_full_memo_only_revision_keeps_the_existing_model(tmp_path: Path) 
     assert "终稿审稿" not in labels, "an unchanged draft needs no final re-review"
     final = "model/META-model-v01.xlsx"
     assert result["ok"] is True, result["incomplete"]
-    assert result["model"] == final == _contract_audit_pick("full-coverage", tmp_path)
+    assert result["model"] == final
     assert _evidence_models(host) == [final]
     assert final in host.prompts[labels.index("复审 1")]
     assert result["language_done"] is True
@@ -1144,15 +1339,20 @@ async def test_full_memo_only_revision_keeps_the_existing_model(tmp_path: Path) 
 
 @pytest.mark.asyncio
 async def test_full_revision_without_model_path_fails(tmp_path: Path) -> None:
+    """When report revision fails to return a valid revised draft sha256, the loop stops before re-review."""
     host = _fc_host(
         tmp_path,
-        by_label={"独立审稿": REVISE, "复审 1": PASS},
-        revise_modes={"修订 1": "omit"},
+        by_label={
+            "独立审稿": REVISE,
+            "复审 1": PASS,
+            "修订 1": {"files": ["drafts/2026-10-23-memo.md"], "summary": "missing sha"},
+        },
+        revise_modes={},
     )
     result = await _run("full-coverage", FC_PARAMS, host)
 
     assert result["ok"] is False
-    assert any("未回报模型路径" in i for i in result["incomplete"])
+    assert any("sha256" in i for i in result["incomplete"])
     assert "复审 1" not in host.labels()
     assert result["model"] == "model/META-model-v01.xlsx"
 
@@ -1165,18 +1365,13 @@ DEEP_PARAMS: dict[str, Any] = {
     "model_path": "model/META-model-v01.xlsx",
     "preview_predictions": None,
 }
-DEEP_UPDATE = {
-    "files": ["research/2026-10-28-deep-FY26Q3/mapping.md", "model/META-model-v02.xlsx"],
-    "summary": "updated",
-    "sha256": "a" * 64,
-}
 
 
 def _deep_host(tmp_path: Path, by_label: dict[str, Any], **kw: Any) -> DiskHost:
     host = DiskHost(
         workspace=tmp_path,
-        by_label={"模型更新": DEEP_UPDATE, **by_label},
-        writes={"模型更新": ["model/META-model-v02.xlsx"], **kw.pop("writes", {})},
+        by_label=by_label,
+        writes={"建模与一致预期对照": ["model/META-model-v02.xlsx"], **kw.pop("writes", {})},
         **kw,
     )
     host.touch("model/META-model-v01.xlsx")
@@ -1185,21 +1380,25 @@ def _deep_host(tmp_path: Path, by_label: dict[str, Any], **kw: Any) -> DiskHost:
 
 @pytest.mark.asyncio
 async def test_deep_model_update_mismatch_stops_before_calibration(tmp_path: Path) -> None:
-    host = _deep_host(tmp_path, {}, writes={"模型更新": ["model/META-model-v02.xlsx", "model/META-model-v03.xlsx"]})
+    """When modeling produces no readable candidate (failed_unusable), deep-update
+    records incomplete without crashing the report path."""
+    host = _deep_host(
+        tmp_path,
+        {},
+        fail_labels={"建模与一致预期对照"},
+    )
     result = await _run("earnings-deep-update", DEEP_PARAMS, host)
 
     assert result["ok"] is False
-    assert any("磁盘最大版本" in i and "v03" in i for i in result["incomplete"])
-    labels = host.labels()
-    assert "解析模型（模型更新后）" in labels
-    assert "校准与对账" not in labels and "审稿" not in labels and "产物核验" not in labels
+    assert result["model_status"] == "failed_unusable"
+    assert any("无可读候选模型" in i for i in result["incomplete"])
 
 
 @pytest.mark.asyncio
 async def test_deep_two_model_revisions_and_prompts_name_the_model(tmp_path: Path) -> None:
-    """Update saves v02; two revisions save v03 then v04. Calibration and the
-    review name v02, each re-review names its round's model, and the return
-    value, evidence list and contract audit all pick v04."""
+    """Update saves v02; two report revisions via shared reviseModelForReport save
+    v03 then v04. Calibration and the review name v02, each re-review names its
+    round's model, and the return value and evidence list pick v04."""
     host = _deep_host(
         tmp_path,
         {"审稿": REVISE, "复审 1": REVISE, "复审 2": PASS, "终稿审稿": PASS},
@@ -1210,36 +1409,33 @@ async def test_deep_two_model_revisions_and_prompts_name_the_model(tmp_path: Pat
     labels = host.labels()
     assert "model/META-model-v02.xlsx" in host.prompts[labels.index("校准与对账")]
     assert "model/META-model-v02.xlsx" in host.prompts[labels.index("审稿")]
-    assert "另存为 model/META-model-v03.xlsx" in host.prompts[labels.index("修订 1")]
-    assert "另存为 model/META-model-v04.xlsx" in host.prompts[labels.index("修订 2")]
+    assert labels.count("模型联动修订") == 2
     assert "model/META-model-v03.xlsx" in host.prompts[labels.index("复审 1")]
     assert "model/META-model-v04.xlsx" in host.prompts[labels.index("复审 2")]
     final = "model/META-model-v04.xlsx"
-    assert result["model_file"] == final == _contract_audit_pick("earnings-deep-update", tmp_path)
+    assert result["model_file"] == final
+    assert _contract_verify_done_cmd("earnings-deep-update")
     assert _evidence_models(host) == [final]
     assert result["ok"] is True, result["incomplete"]
 
 
 @pytest.mark.asyncio
 async def test_deep_reported_v03_but_disk_v04_stops_before_rereview(tmp_path: Path) -> None:
+    """If shared reviseModelForReport fails to maintain a readable candidate, the
+    deep-update revision loop stops before re-review."""
     host = _deep_host(
         tmp_path,
-        {
-            "审稿": REVISE,
-            "复审 1": PASS,
-            "修订 1": {"files": ["drafts/x.md", "model/META-model-v03.xlsx"], "summary": "r1", "sha256": "b" * 64},
-        },
-        writes={"修订 1": ["model/META-model-v03.xlsx", "model/META-model-v04.xlsx"]},
+        {"审稿": REVISE, "复审 1": PASS},
+        revise_modes={"修订 1": "unusable"},
     )
     result = await _run("earnings-deep-update", DEEP_PARAMS, host)
 
     labels = host.labels()
-    assert "解析模型（修订 1）" in labels
-    assert "复审 1" not in labels, "a mismatched revision must not be re-reviewed"
+    assert "模型联动修订" in labels
+    assert "复审 1" not in labels
     assert "知识层修订草案" not in labels and "产物核验" not in labels
     assert result["ok"] is False
-    assert any("回报 model/META-model-v03.xlsx" in i and "磁盘最大版本 model/META-model-v04.xlsx" in i for i in result["incomplete"])
-    assert result["model_file"] == "model/META-model-v04.xlsx" == _contract_audit_pick("earnings-deep-update", tmp_path)
+    assert any("报告联动改模未能维持可读候选模型" in i for i in result["incomplete"])
 
 
 @pytest.mark.asyncio
@@ -1249,31 +1445,41 @@ async def test_deep_report_only_revision_keeps_the_updated_model(tmp_path: Path)
 
     final = "model/META-model-v02.xlsx"
     assert result["ok"] is True, result["incomplete"]
-    assert result["model_file"] == final == _contract_audit_pick("earnings-deep-update", tmp_path)
+    assert result["model_file"] == final
     assert _evidence_models(host) == [final]
 
 
 @pytest.mark.asyncio
 async def test_deep_revision_without_model_path_fails(tmp_path: Path) -> None:
-    host = _deep_host(tmp_path, {"审稿": REVISE, "复审 1": PASS}, revise_modes={"修订 1": "omit"})
+    """A revision returning no valid draft sha256 stops before re-review."""
+    host = _deep_host(
+        tmp_path,
+        {
+            "审稿": REVISE,
+            "复审 1": PASS,
+            "修订 1": {"files": ["drafts/x.md"], "summary": "missing sha"},
+        },
+        revise_modes={},
+    )
     result = await _run("earnings-deep-update", DEEP_PARAMS, host)
 
     assert result["ok"] is False
-    assert any("未回报模型路径" in i for i in result["incomplete"])
+    assert any("sha256" in i for i in result["incomplete"])
     assert "复审 1" not in host.labels()
 
 
 @pytest.mark.asyncio
 async def test_deep_without_model_path_never_resolves() -> None:
-    """No model_path: no resolver dispatch, no model in the result, and a
-    revision is not asked to report a model."""
+    """No model_path: runModelingPipeline returns skipped_no_model with zero modeling
+    dispatches and no model in the result."""
     params = {**DEEP_PARAMS, "model_path": None}
     host = ScriptedHost(by_label={"审稿": REVISE, "复审 1": PASS})
     result = await _run("earnings-deep-update", params, host)
 
-    assert not any(label.startswith("解析") for label in host.labels())
+    assert "建模准备" not in host.labels()
+    assert "模型联动修订" not in host.labels()
     assert result["model_file"] is None
-    assert "原样沿用" not in host.prompts[host.labels().index("修订 1")]
+    assert result["model_status"] == "skipped_no_model"
     assert result["ok"] is True, result["incomplete"]
 
 
@@ -1745,103 +1951,42 @@ class _ModelProbeHost(ScriptedHost):
 
 @pytest.mark.asyncio
 async def test_full_model_failure_blocks_before_the_draft() -> None:
-    """建模串行在前、仅在模型缺失或不可读时停在成稿之前：建模子任务 null、
-    未声明本次公司的 model/<TICKER>-model-vNN.xlsx、声明的模型在盘缺失/过小、
-    或只读可读性探针（model_readable.py）判定文件损坏或探针本身失败，均停在
-    成稿之前；提示性扫描失败/超时与 checks_passed=False 不阻断（另见独立用例）。"""
+    """建模流水线仅在无可读候选（failed_unusable）时 gateBlock 停在成稿之前：
+    准备阶段失败、建模与一致预期对照返回空、或检查返回 readable=false，均停在成稿之前。"""
     params = _WORKFLOW_PARAMS["full-coverage"]
 
-    host = ScriptedHost(fail_labels={"建模"})
+    # 1. Stage 1 prepare fails
+    host = ScriptedHost(fail_labels={"建模准备"})
     result = await _run("full-coverage", params, host)
     assert result["ok"] is False
-    assert "建模失败" in result["blocked"] and "未产出" in result["blocked"]
+    assert "建模失败" in result["blocked"]
     assert "resume_hint" in result and "resume=" in result["resume_hint"]
-    labels = host.labels()
-    assert "成稿" not in labels, "a failed model build must not dispatch the writer"
-    assert "独立审稿" not in labels and "产物核验" not in labels
+    assert "成稿" not in host.labels()
+    assert "独立审稿" not in host.labels() and "产物核验" not in host.labels()
 
-    # 只回报了建模脚本、没有模型文件：不算建模产物。
-    host = ScriptedHost(
-        by_label={
-            "建模": {
-                "files": ["research/2026-10-23-fc/build_model.py"],
-                "summary": "script written",
-                "sha256": "a" * 64,
-                "checks_passed": True,
-            },
-        },
-    )
+    # 2. Stage 2 modeling returns null
+    host = ScriptedHost(fail_labels={"建模与一致预期对照"})
     result = await _run("full-coverage", params, host)
     assert result["ok"] is False
-    assert "建模失败" in result["blocked"] and "未声明本次的模型文件" in result["blocked"]
+    assert "建模失败" in result["blocked"]
     assert "成稿" not in host.labels()
 
-    # 回报了别的目录 / 别的公司的 xlsx（第 3 轮 #3）：规范化路径必须正好等于
-    # model/<本次 ticker>-model-vNN.xlsx，archive/AAPL-… 不算本次的建模产物。
-    for wrong in ("archive/AAPL-model-v01.xlsx", "research/2026-10-23-fc/META-model-v01.xlsx"):
-        host = ScriptedHost(
-            by_label={
-                "建模": {
-                    "files": [wrong],
-                    "summary": "built",
-                    "sha256": "a" * 64,
-                    "checks_passed": True,
-                },
-            },
-        )
-        result = await _run("full-coverage", params, host)
-        assert result["ok"] is False, wrong
-        assert "未声明本次的模型文件 model/META-model-vNN.xlsx" in result["blocked"], wrong
-        assert "成稿" not in host.labels()
-
-    # 只读探针对模型实跑工作簿可读性检查失败（文件损坏或不可读）：停在成稿之前。
+    # 3. Stage 3 check reports candidate unreadable
     host = ScriptedHost(
         by_label={
-            "建模": {
-                "files": ["model/META-model-v01.xlsx"],
-                "summary": "built, checks all green",
-                "sha256": "a" * 64,
-                "checks_passed": True,
-            },
-            "模型可读性核验": {"files": ["model/META-model-v01.xlsx|readable_failed"]},
-        },
-    )
-    result = await _run("full-coverage", params, host)
-    assert result["ok"] is False
-    assert "不可读或已损坏" in result["blocked"]
-    assert "成稿" not in host.labels()
-
-    # 可读性探针子任务本身失败：fail-closed，同样停在成稿之前。
-    host = ScriptedHost(
-        by_label={
-            "建模": {
-                "files": ["model/META-model-v01.xlsx"],
-                "summary": "built, checks all green",
-                "sha256": "a" * 64,
-                "checks_passed": True,
-            },
-        },
-        fail_labels={"模型可读性核验"},
-    )
-    result = await _run("full-coverage", params, host)
-    assert result["ok"] is False
-    assert "模型可读性探针失败" in result["blocked"]
-    assert "成稿" not in host.labels()
-
-    # 自检通过、也声明了 xlsx，但探针在盘上找不到（不足契约的 1000 字节下限）。
-    host = _ModelProbeHost(
-        by_label={
-            "建模": {
-                "files": ["model/META-model-v01.xlsx"],
-                "summary": "built",
-                "sha256": "a" * 64,
-                "checks_passed": True,
+            "模型本轮范围检查": {
+                "files": ["model_dump/model-check.md"],
+                "summary": "workbook unreadable",
+                "readable": False,
+                "final_status": "failed_unusable",
+                "model_sha256": None,
+                "actionable_count": 1,
             },
         },
     )
     result = await _run("full-coverage", params, host)
     assert result["ok"] is False
-    assert "建模失败" in result["blocked"] and "1000" in result["blocked"]
+    assert "建模失败" in result["blocked"]
     assert "成稿" not in host.labels()
 
 
@@ -1888,9 +2033,8 @@ async def test_full_partial_draft_is_completed_not_rewritten(tmp_path: Path) -> 
 
 @pytest.mark.asyncio
 async def test_full_resume_reviews_and_revises_the_latest_model_version(tmp_path: Path) -> None:
-    """Round 3 #1: with v02 already on disk (a previous run's revision), the
-    first review sees v02 and a revision names v03 as the next version —
-    never reviewing v01 or colliding with the existing v02."""
+    """With v02 as the pipeline candidate, the first review sees v02 and shared
+    reviseModelForReport operates on v02 (never v01), with no legacy 只读审模型."""
     round1_sha = hashlib.sha256("修订 1".encode()).hexdigest()
     host = _fc_host(
         tmp_path,
@@ -1905,42 +2049,44 @@ async def test_full_resume_reviews_and_revises_the_latest_model_version(tmp_path
     result = await _run("full-coverage", FC_PARAMS, host)
 
     labels = host.labels()
+    assert "只读审模型" not in labels
     review_prompt = host.prompts[labels.index("独立审稿")]
-    assert "model/META-model-v02.xlsx" in review_prompt, "the first review must see the latest version"
+    assert "model/META-model-v02.xlsx" in review_prompt, "the first review must see the pipeline candidate"
     assert "model/META-model-v01.xlsx" not in review_prompt
-    revise_prompt = host.prompts[labels.index("修订 1")]
-    assert "另存为 model/META-model-v03.xlsx" in revise_prompt, "the next version rides the latest"
-    assert "另存为 model/META-model-v02.xlsx" not in revise_prompt
-    assert "model/META-model-v02.xlsx" in host.prompts[labels.index("只读审模型")]
+    rev_model_prompt = host.prompts[labels.index("模型联动修订")]
+    assert "当前模型 model/META-model-v02.xlsx" in rev_model_prompt
     assert result["ok"] is True, result["incomplete"]
     assert result["model"] == "model/META-model-v02.xlsx"
 
 
 @pytest.mark.asyncio
 async def test_full_latest_model_failing_audit_blocks_before_the_draft(tmp_path: Path) -> None:
-    """The model the gate verifies must be the model the run then uses: with a
-    readable v01 built and a corrupt/unreadable v02 already on disk, the run
-    stops before the draft instead of writing from an unreadable v02."""
+    """When the pipeline candidate is unreadable (readable=false / failed_unusable),
+    the run stops before drafting."""
     host = _fc_host(
         tmp_path,
         by_label={
-            "模型可读性核验（最新版本）": {"files": ["model/META-model-v02.xlsx|readable_failed"]},
+            "模型本轮范围检查": {
+                "files": ["model_dump/model-check.md"],
+                "summary": "v02 unreadable",
+                "readable": False,
+                "final_status": "failed_unusable",
+                "model_sha256": None,
+                "actionable_count": 1,
+            },
         },
     )
     host.touch("model/META-model-v02.xlsx")
     result = await _run("full-coverage", FC_PARAMS, host)
 
     assert result["ok"] is False
-    assert "model/META-model-v02.xlsx" in result["blocked"]
     assert "成稿" not in host.labels()
 
 
 @pytest.mark.asyncio
 async def test_full_resume_with_saved_v02_accepts_latest_model(tmp_path: Path) -> None:
-    """Resume after an earlier run's revision saved v02 (round 2 #4): this
-    run does not revise (the review passes on the first try), and the final
-    resolver adopts the disk maximum version instead of aborting on a
-    mismatch with the built v01."""
+    """When the pipeline returns v02 and the first review passes, full-coverage
+    returns v02 cleanly without a legacy resolver mismatch."""
     host = _fc_host(tmp_path, by_label={"独立审稿": PASS})
     host.touch("model/META-model-v02.xlsx")
     result = await _run("full-coverage", FC_PARAMS, host)
@@ -1948,7 +2094,6 @@ async def test_full_resume_with_saved_v02_accepts_latest_model(tmp_path: Path) -
     assert result["ok"] is True, result["incomplete"]
     assert result["model"] == "model/META-model-v02.xlsx"
     assert not any("不一致" in item for item in result["incomplete"]), result["incomplete"]
-    assert result["model"] == _contract_audit_pick("full-coverage", tmp_path)
 
 
 TOPIC_PARAMS: dict[str, Any] = {
@@ -2499,47 +2644,69 @@ async def test_initial_coverage_writer_must_declare_the_payoff_summary() -> None
 async def test_full_model_scan_failure_or_non_ok_checks_continues_to_draft(
     tmp_path: Path,
 ) -> None:
-    """Modeling Batch 2 r2 (#1): advisory scan timeout/failure or non-OK rows in
-    Checks (recorded in changelog) never block drafting when the workbook file
-    exists and is readable."""
-    for summary, extra in (
-        ("model_scan.py --recalc 超时，已记入 README & Changelog", {"checks_passed": False}),
-        ("model_scan.py --recalc 执行失败且 Checks 第 4 行非 OK，已在变更记录写明原因", {"checks_passed": False}),
-        ("已按原模型滚动完成并记录扫描结果", {}),
-    ):
-        ws = tmp_path / f"case_{len(summary)}"
-        ws.mkdir()
-        host = _fc_host(
-            ws,
-            by_label={
-                "建模": {
-                    "files": ["model/META-model-v01.xlsx"],
-                    "summary": summary,
-                    "sha256": "a" * 64,
-                    **extra,
-                },
-                "独立审稿": PASS,
+    """Modeling v2 (§3.2 / §3.3): when the modeling pipeline finishes with
+    delivered_with_open_issues (e.g. check timeout fallback or remaining open issues
+    on a readable candidate), full-coverage logs the notice and proceeds to drafting."""
+    # Case 1: check child times out -> writeFallbackLedger -> delivered_with_open_issues -> proceeds to draft
+    ws1 = tmp_path / "case_timeout"
+    ws1.mkdir()
+    host1 = _fc_host(ws1, by_label={"独立审稿": PASS}, fail_labels={"模型本轮范围检查"})
+    res1 = await _run("full-coverage", FC_PARAMS, host1)
+    assert res1["ok"] is True, res1["incomplete"]
+    assert res1["model_status"] == "delivered_with_open_issues"
+    assert res1["model_check"] is None
+    assert res1["remaining_issues"] is not None
+    assert "写入降级账本" in host1.labels()
+    assert "成稿" in host1.labels()
+    assert any("带问题交付" in line for line in host1.logs)
+
+    # Case 2: recalc_failed on readable candidate -> delivered_with_open_issues -> proceeds to draft
+    ws2 = tmp_path / "case_recalc_failed"
+    ws2.mkdir()
+    host2 = _fc_host(
+        ws2,
+        by_label={
+            "建模与一致预期对照": {
+                "files": ["model/META-model-v01.xlsx"],
+                "summary": "recalc failed",
+                "candidate_path": "model/META-model-v01.xlsx",
+                "model_sha256": "a" * 64,
+                "run_id": "run-disk-2",
+                "recalc_status": "recalc_failed",
+                "consensus_status": "ok",
+                "consensus_diff_generated": True,
             },
-        )
-        result = await _run("full-coverage", FC_PARAMS, host)
-        assert result["ok"] is True, (summary, result["incomplete"])
-        labels = host.labels()
-        assert "模型可读性核验" in labels
-        assert "成稿" in labels, f"advisory scan issue must not block drafting: {summary}"
-        if extra.get("checks_passed") is False:
-            assert any("工作流继续" in line for line in host.logs)
+            "模型本轮范围检查": {
+                "files": [
+                    "research/2026-10-23-fc/model_dump/model-check.md",
+                    "research/2026-10-23-fc/model_dump/model-verification.json",
+                    "research/2026-10-23-fc/model_dump/remaining-issues.md",
+                ],
+                "summary": "delivered with recalc_failed",
+                "readable": True,
+                "final_status": "delivered_with_open_issues",
+                "model_sha256": "a" * 64,
+                "actionable_count": 0,
+                "actionable_issues": [],
+                "remaining_issues_path": "research/2026-10-23-fc/model_dump/remaining-issues.md",
+            },
+            "独立审稿": PASS,
+        },
+    )
+    res2 = await _run("full-coverage", FC_PARAMS, host2)
+    assert res2["ok"] is True, res2["incomplete"]
+    assert res2["model_status"] == "delivered_with_open_issues"
+    assert "成稿" in host2.labels()
 
 
 @pytest.mark.asyncio
 async def test_modeling_batch2_workflows_and_contracts_route_to_dalton_model(
     tmp_path: Path,
 ) -> None:
-    """Modeling Batch 2 (§8.3 + r2): earnings-deep-update and full-coverage route
-    model build, rollforward, read-only model review, and revision to
-    `.agents/skills/dalton-model/...`, `model_scan.py --recalc`, and
-    `model_lineage.json`, while fast readability checks (`zipfile`/`testzip`)
-    verify the deliverable without blocking on advisory scans."""
-    # 1. earnings-deep-update: model update + revision loop
+    """Modeling v2 P0-b (§3.3): earnings-deep-update, full-coverage, and company-model
+    share runModelingPipeline & reviseModelForReport (dalton-model scripts, model_dump/
+    artifacts, terminal model-verification.json ledger, and model_check.py verify-done)."""
+    # 1. earnings-deep-update: shared pipeline + shared report revision entry
     deep_host = _deep_host(
         tmp_path,
         {"审稿": REVISE, "复审 1": PASS, "终稿审稿": PASS},
@@ -2549,24 +2716,22 @@ async def test_modeling_batch2_workflows_and_contracts_route_to_dalton_model(
     assert deep_res["ok"] is True, deep_res["incomplete"]
     deep_labels = deep_host.labels()
 
-    update_prompt = deep_host.prompts[deep_labels.index("模型更新")]
-    assert ".agents/skills/dalton-model/SKILL.md" in update_prompt
-    assert ".agents/skills/dalton-model/references/rollforward.md" in update_prompt
-    assert ".agents/skills/dalton-model/scripts/model_scan.py --recalc" in update_prompt
-    assert "model_lineage.json" in update_prompt
-    assert "mapping.md" in update_prompt and "model-delta.md" in update_prompt
-    assert "Change Log" in update_prompt
-    assert "用户本次上传或指定的文件" in update_prompt
-    assert "model-update/SKILL.md" not in update_prompt
-    assert "audit.py" not in update_prompt
+    prep_prompt = deep_host.prompts[deep_labels.index("建模准备")]
+    assert ".agents/skills/dalton-model/SKILL.md" in prep_prompt
+    assert "model_fingerprint.py" in prep_prompt
+    assert "mapping.md" in prep_prompt
+    s2_prompt = deep_host.prompts[deep_labels.index("建模与一致预期对照")]
+    assert "model_edit.py apply" in s2_prompt
+    assert "model_consensus.py" in s2_prompt
+    assert ".progress.json" in s2_prompt
+    chk_prompt = deep_host.prompts[deep_labels.index("模型本轮范围检查")]
+    assert "model_check.py check" in chk_prompt
+    rev_model_prompt = deep_host.prompts[deep_labels.index("模型联动修订")]
+    assert "model_edit.py apply" in rev_model_prompt
+    assert "--append-revision" in rev_model_prompt
+    assert "model-update/SKILL.md" not in rev_model_prompt
 
-    deep_rev_prompt = deep_host.prompts[deep_labels.index("修订 1")]
-    assert ".agents/skills/dalton-model/SKILL.md" in deep_rev_prompt
-    assert ".agents/skills/dalton-model/scripts/model_scan.py --recalc" in deep_rev_prompt
-    assert "model_lineage.json" in deep_rev_prompt
-    assert "model-update/SKILL.md" not in deep_rev_prompt
-
-    # 2. full-coverage: model build + readability probe + writer + read-only model review + revision loop
+    # 2. full-coverage: shared pipeline + no legacy 只读审模型 + shared report revision entry
     fc_dir = tmp_path / "fc"
     fc_dir.mkdir()
     fc_host = _fc_host(
@@ -2578,43 +2743,20 @@ async def test_modeling_batch2_workflows_and_contracts_route_to_dalton_model(
     assert fc_res["ok"] is True, fc_res["incomplete"]
     fc_labels = fc_host.labels()
 
-    build_prompt = fc_host.prompts[fc_labels.index("建模")]
-    assert ".agents/skills/dalton-model/SKILL.md" in build_prompt
-    assert "第 1 步选择起点原模型" in build_prompt
-    assert ".agents/skills/dalton-model/scripts/model_style.py" in build_prompt
-    assert ".agents/skills/dalton-model/scripts/model_scan.py --recalc" in build_prompt
-    assert "model_lineage.json" in build_prompt
-    assert "Facts" in build_prompt and "Guidance vs Actual" in build_prompt
-    assert "Street vs House" in build_prompt and "Checks" in build_prompt
-    assert "不新建情景页" in build_prompt
-    assert "不阻断交付" in build_prompt
-    assert "audit.py" not in build_prompt
-
-    probe_prompt = fc_host.prompts[fc_labels.index("模型可读性核验")]
-    assert ".agents/skills/dalton-model/scripts/model_readable.py" in probe_prompt
-    assert "model_scan.py" not in probe_prompt
-    assert "audit.py" not in probe_prompt
-
+    assert "只读审模型" not in fc_labels
+    assert "建模准备" in fc_labels and "建模与一致预期对照" in fc_labels and "模型本轮范围检查" in fc_labels
+    assert "模型联动修订" in fc_labels
     draft_prompt = fc_host.prompts[fc_labels.index("成稿")]
     assert "原模型未设情景页" in draft_prompt and "模型里没有对应计算" in draft_prompt
+    fc_notes_prompt = fc_host.prompts[fc_labels.index("笔记语言审查")]
+    assert "model-check.md" not in fc_notes_prompt
+    assert "model_dump/" in fc_notes_prompt
 
-    review_model_prompt = fc_host.prompts[fc_labels.index("只读审模型")]
-    assert ".agents/skills/dalton-model/SKILL.md" in review_model_prompt
-    assert ".agents/skills/dalton-model/references/sanity-check.md" in review_model_prompt
-    assert ".agents/skills/dalton-model/scripts/model_scan.py --recalc" in review_model_prompt
-    assert "扫描超时或执行失败" in review_model_prompt
-    assert "check-model/SKILL.md" not in review_model_prompt
-
-    fc_rev_prompt = fc_host.prompts[fc_labels.index("修订 1")]
-    assert ".agents/skills/dalton-model/SKILL.md" in fc_rev_prompt
-    assert ".agents/skills/dalton-model/scripts/model_scan.py --recalc" in fc_rev_prompt
-    assert "model_lineage.json" in fc_rev_prompt
-    assert "model-update/SKILL.md" not in fc_rev_prompt
-
-    # 3. Both contract.json files use shared model_readable.py, not model_scan.py or audit.py
-    for wf in ("earnings-deep-update", "full-coverage"):
+    # 3. All three contracts use model-verification.json + model_check.py verify-done
+    for wf in ("company-model", "earnings-deep-update", "full-coverage"):
         contract_text = (REPO_ROOT / "workflows" / wf / "contract.json").read_text(encoding="utf-8")
-        assert ".agents/skills/dalton-model/scripts/model_readable.py" in contract_text, wf
+        assert "model_dump/model-verification.json" in contract_text, wf
+        assert "model_check.py verify-done" in contract_text, wf
         assert "model_scan.py" not in contract_text, wf
         assert "audit.py" not in contract_text, wf
 

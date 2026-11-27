@@ -564,6 +564,9 @@ ALLOWED_HOOKS=(
   # recalc.py (pre-recalc donor cache restore + selective non-error LibreOffice writeback).
   "xlsx-preserve-calcpr"
   "xlsx-recalc-keep-cache"
+  # Modeling v2 P0-b: Chief of Staff delegate_to_analyst appends latest user verbatim
+  # request when omitted from question, and guides serial per-company modeling dispatch.
+  "cos-verbatim-forward"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

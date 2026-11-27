@@ -229,6 +229,8 @@ async def dispatch(
     preapproved: bool = False,
     model: str | None = None,
     effort: str | None = None,
+    # DALTON-HOOK(cos-verbatim-forward): accept caller state to attach latest user verbatim request.
+    state: dict | None = None,
 ) -> Command:
     """Start ``question`` as a background turn of a workspace's own agent.
 
@@ -242,6 +244,10 @@ async def dispatch(
     runs at where the model has no such level.
     """
     import aiohttp
+
+    # DALTON-HOOK(cos-verbatim-forward): attach latest user verbatim request when not already quoted.
+    from src.dalton.cos_verbatim import append_verbatim_user_request
+    question = append_verbatim_user_request(question, state)
 
     model = (model or "").strip() or None
 

@@ -1154,17 +1154,10 @@ async def _latest_run_dir(
     return best_dir
 
 
-async def _run_args_as_of(
+async def _run_args_doc(
     backend: Any, workflow: str, run_id: str | None, thread_id: str | None
-) -> str | None:
-    """The effective ``as_of`` recorded in this run's ``args.json``.
-
-    Resolution mirrors the run checks: the named run when ``run_id`` was
-    passed, else the thread's latest run of the same workflow. The date is
-    read, never recomputed — the launch path's trading-day default is what
-    the run's artifacts are keyed on. An unreadable record inherits nothing;
-    the missing-parameter check then names the gap honestly.
-    """
+) -> dict[str, Any] | None:
+    """Read this run's ``args.json`` object (named ``run_id`` or latest run of ``workflow``)."""
     dirs: list[str]
     if run_id:
         dirs = [f"{_thread_prefix(thread_id)}{run_id}"]
@@ -1184,11 +1177,42 @@ async def _run_args_as_of(
             doc = json.loads(text)
         except ValueError:
             continue
-        if not isinstance(doc, dict):
-            continue
-        as_of = doc.get("as_of")
-        if isinstance(as_of, str) and as_of.strip() and as_of.strip() != "latest":
-            return as_of.strip()
+        if isinstance(doc, dict):
+            return doc
+    return None
+
+
+async def _run_args_as_of(
+    backend: Any, workflow: str, run_id: str | None, thread_id: str | None
+) -> str | None:
+    """The effective ``as_of`` recorded in this run's ``args.json``.
+
+    Resolution mirrors the run checks: the named run when ``run_id`` was
+    passed, else the thread's latest run of the same workflow. The date is
+    read, never recomputed — the launch path's trading-day default is what
+    the run's artifacts are keyed on. An unreadable record inherits nothing;
+    the missing-parameter check then names the gap honestly.
+    """
+    doc = await _run_args_doc(backend, workflow, run_id, thread_id)
+    if not doc:
+        return None
+    as_of = doc.get("as_of")
+    if isinstance(as_of, str) and as_of.strip() and as_of.strip() != "latest":
+        return as_of.strip()
+    return None
+
+
+async def _run_args_model_path(
+    backend: Any, workflow: str, run_id: str | None, thread_id: str | None
+) -> str | None:
+    """The ``model_path`` recorded in this run's ``args.json`` (used by ``company-model``
+    so closing routing hits the same sector single-track pass-through as launch, §8.8 #5)."""
+    doc = await _run_args_doc(backend, workflow, run_id, thread_id)
+    if not doc:
+        return None
+    model_path = doc.get("model_path")
+    if isinstance(model_path, str) and model_path.strip():
+        return model_path.strip()
     return None
 
 
@@ -1729,6 +1753,121 @@ async def _check_initial_coverage_structure(
         )
 
 
+async def _resolve_model_ledger_run_context(
+    backend: Any,
+    workflow: str,
+    params: dict[str, Any],
+    run_id: str | None,
+    thread_id: str | None,
+) -> tuple[str | None, bool, list[str]]:
+    """Resolve ``(expected_run_id, is_manual_path, errors)`` for ``model-verification.json`` (§3.2)."""
+    if isinstance(run_id, str) and run_id.strip():
+        return run_id.strip(), False, []
+
+    manual = _is_manual(params)
+    if thread_id:
+        try:
+            all_dirs, finished_dirs = await _thread_run_dirs(backend, thread_id)
+            latest = await _latest_run_dir(backend, workflow, thread_id)
+        except _CannotVerify as error:
+            return None, False, [f"模型核验账本无法确认本线程运行记录（{error}），请重试。"]
+        if latest:
+            return posixpath.basename(latest), False, []
+        unfinished = all_dirs - finished_dirs
+        if unfinished:
+            return (
+                None,
+                False,
+                [
+                    "本线程存在未完成的 workflow 运行目录，不能按 manual=true 放行模型核验账本；"
+                    "请先完成或清理未完运行后再核对。"
+                ],
+            )
+        if manual:
+            return None, True, []
+        return (
+            None,
+            False,
+            [
+                f"本线程未找到 {workflow} 的运行记录，无法核对模型核验账本的 run_id；"
+                "工作流运行请传 run_id，手动降级路径请在 params 中传 manual=true。"
+            ],
+        )
+
+    if manual:
+        return None, True, []
+    return (
+        None,
+        False,
+        [
+            "缺少线程身份（thread_id 与 run_id 均未提供），无法核对模型核验账本的 run_id；"
+            "工作流运行请传 run_id，手动降级路径请在 params 中传 manual=true。"
+        ],
+    )
+
+
+async def _check_model_verification_ledger(
+    backend: Any,
+    workflow: str,
+    ledger_path: str,
+    params: dict[str, Any],
+    run_id: str | None,
+    thread_id: str | None,
+    since_epoch: int | None,
+) -> tuple[str | None, bool, list[str]]:
+    """Verify ``model-verification.json`` ``run_id`` / ``manual=true`` & freshness (§3.2)."""
+    expected_run_id, is_manual_path, ctx_errors = await _resolve_model_ledger_run_context(
+        backend, workflow, params, run_id, thread_id
+    )
+    errors = list(ctx_errors)
+
+    status, text = await _read_text_diagnosed(backend, ledger_path)
+    if status == "error" or text is None:
+        errors.append(f"模型核验账本读取失败（{ledger_path}），无法核对 run_id，请重试。")
+        return expected_run_id, is_manual_path, errors
+    if status == "missing":
+        errors.append(f"缺少模型核验账本（{ledger_path}）。")
+        return expected_run_id, is_manual_path, errors
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        errors.append(f"模型核验账本不是合法 JSON（{ledger_path}），请重新生成。")
+        return expected_run_id, is_manual_path, errors
+    if not isinstance(doc, dict):
+        errors.append(f"模型核验账本结构异常（{ledger_path}），应为 JSON 对象。")
+        return expected_run_id, is_manual_path, errors
+
+    ledger_run_id = doc.get("run_id")
+    if expected_run_id is not None:
+        if ledger_run_id != expected_run_id:
+            errors.append(
+                f"模型核验账本（{ledger_path}）的 run_id（{ledger_run_id!r}）"
+                f"与本次工作流 run_id（{expected_run_id!r}）不一致；"
+                "请确认账本由本次工作流生成并传入对应的 run_id。"
+            )
+    elif is_manual_path:
+        if ledger_run_id is not None:
+            errors.append(
+                f"手动降级路径（manual=true）的模型核验账本（{ledger_path}）"
+                f"携带了非空 run_id（{ledger_run_id!r}），不能用其他工作流运行的旧账本顶替。"
+            )
+        if since_epoch is not None:
+            info = await _file_info(backend, ledger_path)
+            if not info.exists:
+                errors.append(f"模型核验账本不存在（{ledger_path}）。")
+            elif info.mtime_epoch is None:
+                errors.append(
+                    f"无法读取模型核验账本（{ledger_path}）修改时间，无法核对本轮手动降级时间窗口，请重试。"
+                )
+            elif info.mtime_epoch + MTIME_TOLERANCE_SECONDS < since_epoch:
+                errors.append(
+                    f"模型核验账本（{ledger_path}）不是本轮写入的（修改时间早于本轮开始时间），"
+                    "请重新运行 model_check.py 生成本轮账本。"
+                )
+
+    return expected_run_id, is_manual_path, errors
+
+
 async def _check_stages(
     contract: dict[str, Any],
     params: dict[str, Any],
@@ -1755,6 +1894,7 @@ async def _check_stages(
         if stage.get("requires_param") and not params.get(stage["requires_param"]):
             continue
         stage_missing = False
+        stage_ledger_path: str | None = None
         for artifact in stage.get("artifacts", []):
             gap, warn, artifact_resolved = await _check_artifact(
                 backend, artifact, params, since_epoch
@@ -1763,8 +1903,26 @@ async def _check_stages(
             warnings.extend(warn)
             resolved.update(artifact_resolved)
             stage_missing = stage_missing or bool(gap)
+            for resolved_p in artifact_resolved.values():
+                if resolved_p.endswith("/model_dump/model-verification.json") or resolved_p == "model_dump/model-verification.json":
+                    stage_ledger_path = resolved_p
         if draft_path is not None and draft_path in resolved:
             draft_path = resolved[draft_path]
+        ledger_expected_run_id: str | None = None
+        ledger_is_manual = False
+        if stage_ledger_path is not None and not stage_missing:
+            ledger_expected_run_id, ledger_is_manual, ledger_errors = (
+                await _check_model_verification_ledger(
+                    backend,
+                    contract["name"],
+                    stage_ledger_path,
+                    params,
+                    run_id,
+                    thread_id,
+                    since_epoch,
+                )
+            )
+            missing.extend(ledger_errors)
         for validator in stage.get("validators", []):
             try:
                 command = render_command(validator["command"], params)
@@ -1776,6 +1934,11 @@ async def _check_stages(
                     f"校验命令未重跑（本阶段有产物缺失，先补文件）：{command}"
                 )
                 continue
+            if "model_check.py verify-done" in command:
+                if ledger_expected_run_id and "--expected-run-id" not in command:
+                    command = f"{command} --expected-run-id {shlex.quote(ledger_expected_run_id)}"
+                elif ledger_is_manual and "--manual" not in command:
+                    command = f"{command} --manual"
             result = await _run_command(backend, command)
             if result is None:
                 missing.append(
@@ -3805,6 +3968,14 @@ async def run_check_done(
                 inherited = await _run_args_as_of(backend, workflow, run_id, thread_id)
                 if inherited:
                     params = {**params, "as_of": inherited}
+            if workflow == "company-model":
+                cur_mp = params.get("model_path")
+                if not (isinstance(cur_mp, str) and cur_mp.strip()):
+                    inherited_mp = await _run_args_model_path(
+                        backend, workflow, run_id, thread_id
+                    )
+                    if inherited_mp:
+                        params = {**params, "model_path": inherited_mp}
         gap_params = missing_params(contract, params)
         if gap_params:
             return {
@@ -3910,7 +4081,7 @@ def create_check_done_tools(
     ) -> str:
         """对照完成契约核对一次 workflow 或多步 skill 是否全部完成，汇报完成前必须调用。
 
-        `workflow` 传工作流名（`"initial-coverage"`、`"full-coverage"`、`"bullbear-doc"`、`"earnings-deep-update"`、`"weekly-coverage-review"`、`"topic-research"` 之一）或多步技能名（`"dalton-earnings-preview"`、`"dalton-earnings-flash"`、`"dalton-stock-move"`、`"dalton-filing-review"`、`"dalton-thesis-delta"`、`"dalton-sector-delta"`、`"dalton-call"`、`"dalton-publish"`、`"dalton-earnings-calendar"` 之一，`params` 按该技能收尾段所列），`params` 用启动时的同一组参数；`run_id` 传本次运行的任务 ID（`.progress.json` 的 `run_id`），不传则取本线程最近一次同名工作流的运行记录。
+        `workflow` 传工作流名（`"initial-coverage"`、`"full-coverage"`、`"bullbear-doc"`、`"earnings-deep-update"`、`"company-model"`、`"weekly-coverage-review"`、`"topic-research"` 之一）或多步技能名（`"dalton-earnings-preview"`、`"dalton-earnings-flash"`、`"dalton-stock-move"`、`"dalton-filing-review"`、`"dalton-thesis-delta"`、`"dalton-sector-delta"`、`"dalton-call"`、`"dalton-publish"`、`"dalton-earnings-calendar"` 之一，`params` 按该技能收尾段所列），`params` 用启动时的同一组参数；`run_id` 传本次运行的任务 ID（`.progress.json` 的 `run_id`），不传则取本线程最近一次同名工作流的运行记录。
         `workflow.enabled` 关闭、按技能说明手动执行时，`params` 加 `"manual": true`，审稿改为核对技能指定的 `review.json`。
         只读不改：重查文件、哈希、校验脚本、知识层版本、`verdict`、本次运行的审稿 `pass` 与两轮语言审查记录。`done=false` 时先按 `missing` 补齐再查；补不了的只能汇报“未完成”。
         Returns: JSON `{done, missing, warnings}`，`missing` 为中文缺项说明与下一步操作。
