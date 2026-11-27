@@ -12,6 +12,7 @@ import {
   ChannelDeliveryError,
   type SendCardImageInput,
 } from "./channels/adapter.js";
+import { normalizeFeishuCard } from "./channels/feishu/card-normalize.js";
 import { FEISHU_CARD_MAX_BYTES } from "./channels/feishu/format.js";
 import {
   abortableRetrySleep,
@@ -1428,7 +1429,8 @@ export class DataTaskNotificationService {
       if (
         plan.target_kind === "group" &&
         !groupLiveVerified &&
-        item.existing_status !== "sent"
+        item.existing_status !== "sent" &&
+        item.existing_status !== "partial"
       ) {
         const preClaimLiveCheck = await readyAdapter.checkTargetLive!({
           userId: plan.owner_user_id ?? "",
@@ -1589,6 +1591,7 @@ export class DataTaskNotificationService {
           });
           continue;
         }
+        tracker.claimedAnyItem = hadPriorClaim;
         itemOutcomes.push({
           item_index: item.item_index,
           delivery_key: item.delivery_key,
@@ -1596,23 +1599,10 @@ export class DataTaskNotificationService {
           duplicate: true,
           platform_message_ids: validatedClaim.platformMessageIds,
           code: "partial",
-          message: "Earlier attempt partially delivered this item; automatic resend is blocked.",
+          message:
+            "Earlier attempt partially delivered this item; automatic resend is blocked.",
         });
-        return {
-          status: 200,
-          data: {
-            ok: false,
-            status: "unknown",
-            code: "partial",
-            message: "Earlier attempt partially delivered an item; automatic resend is blocked.",
-            run_id: runId,
-            target,
-            platform,
-            items_total: planItems.length,
-            items_sent: itemsSent,
-            items: itemOutcomes,
-          },
-        };
+        continue;
       }
 
       if (validatedClaim.kind === "in_flight_or_unknown") {
@@ -1660,10 +1650,12 @@ export class DataTaskNotificationService {
           code: denyCode,
           message: validatedClaim.message,
         });
+        const hasDeliveredOrPartial =
+          itemsSent > 0 || itemOutcomes.some((it) => it.status === "partial");
         const overallStatus =
           validatedClaim.status === "unknown"
             ? "unknown"
-            : itemsSent === 0 && SKIP_CODES.has(denyCode)
+            : !hasDeliveredOrPartial && SKIP_CODES.has(denyCode)
               ? "skipped"
               : "failed";
         return {
@@ -1865,8 +1857,17 @@ export class DataTaskNotificationService {
         }
 
         try {
-          const outboundCard = rewriteFeishuCardLinksWithinBudget(
+          const { card: normalizedCard, normalizedPaths } = normalizeFeishuCard(
             item.card,
+          );
+          if (normalizedPaths.length > 0) {
+            this.logger.info("feishu_card_normalized", {
+              delivery_key: item.delivery_key,
+              normalized_paths: normalizedPaths,
+            });
+          }
+          const outboundCard = rewriteFeishuCardLinksWithinBudget(
+            normalizedCard,
             this.webBaseUrl,
             plan.thread_id ?? null,
             plan.workspace_id ?? null,
@@ -1875,13 +1876,27 @@ export class DataTaskNotificationService {
             targetAddress,
             recipientPlatformUserId,
             card: outboundCard,
+            fallbackSourceCard: item.card,
             images: cardImages,
+            webBaseUrl: this.webBaseUrl,
+            threadId: plan.thread_id ?? null,
+            workspaceId: plan.workspace_id ?? null,
           });
+          const usedMarkdownFallback = sendRes.usedMarkdownFallback === true;
+          const droppedCardImages =
+            usedMarkdownFallback && item.images.length > 0;
           const filesStatus = item.images.map((img) => ({
             path: img.filename,
-            status: "sent" as const,
-            reason: null,
+            status: droppedCardImages ? ("failed" as const) : ("sent" as const),
+            reason: droppedCardImages
+              ? "feishu_card_200621_markdown_fallback"
+              : null,
           }));
+          const deliveryStatus = droppedCardImages
+            ? ("partial" as const)
+            : ("sent" as const);
+          const droppedImagesMsg =
+            "Feishu card fell back to minimal markdown on 200621; embedded card images were not delivered.";
           try {
             await this.recordValidatedDeliveryProgress(
               {
@@ -1890,9 +1905,15 @@ export class DataTaskNotificationService {
                 total_chunks: 1,
                 platform_message_ids: [sendRes.messageId],
                 files_status: filesStatus,
-                status: "sent",
+                status: deliveryStatus,
+                ...(droppedCardImages
+                  ? {
+                      error_code: "file_not_sent",
+                      error_message: droppedImagesMsg,
+                    }
+                  : {}),
                 first_response_json: {
-                  status: "sent",
+                  status: deliveryStatus,
                   platform_message_ids: [sendRes.messageId],
                 },
               },
@@ -1927,6 +1948,19 @@ export class DataTaskNotificationService {
                 items: itemOutcomes,
               },
             };
+          }
+
+          if (droppedCardImages) {
+            itemOutcomes.push({
+              item_index: item.item_index,
+              delivery_key: item.delivery_key,
+              status: "partial",
+              duplicate: false,
+              platform_message_ids: [sendRes.messageId],
+              code: "partial",
+              message: droppedImagesMsg,
+            });
+            continue;
           }
 
           itemsSent += 1;
@@ -2675,6 +2709,28 @@ export class DataTaskNotificationService {
         platform_message_ids: [...messageIds],
         code: null,
       });
+    }
+
+    const partialItems = itemOutcomes.filter((it) => it.status === "partial");
+    if (partialItems.length > 0) {
+      const firstPartial = partialItems[0]!;
+      return {
+        status: 200,
+        data: {
+          ok: false,
+          status: "unknown",
+          code: "partial",
+          message:
+            firstPartial.message ??
+            "One or more items were partially delivered; automatic resend is blocked.",
+          run_id: runId,
+          target,
+          platform,
+          items_total: planItems.length,
+          items_sent: itemsSent,
+          items: itemOutcomes,
+        },
+      };
     }
 
     return {

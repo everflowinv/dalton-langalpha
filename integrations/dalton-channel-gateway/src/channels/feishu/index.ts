@@ -2,6 +2,7 @@
  * Feishu channel adapter barrel exports.
  */
 
+export * from "./card-normalize.js";
 export * from "./client.js";
 export * from "./directory.js";
 export * from "./format.js";

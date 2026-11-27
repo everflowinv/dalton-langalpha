@@ -10,14 +10,10 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { SETTINGS_ITEM, type NavItem } from '../nav/navItems';
 import { useNavActive } from '../nav/useNavActive';
 import { useNavItems } from '../nav/useNavItems';
+import { useMobileBottomNavItems } from '@/lib/dalton/mobileBottomNav'; // DALTON-HOOK(mobile-web)
 import './BottomTabBar.css';
-
-// DALTON-HOOK(mobile-web): cap bottom bar to 4 core tabs + "More" overflow so every button clears >= 44px on 390px phones
-const PRIMARY_WITH_DASHBOARD = new Set(['/dashboard', '/chat', '/automations', '/monitors']);
-const PRIMARY_DALTON_MODE = new Set(['/chat', '/automations', '/monitors', '/settings']);
 
 export default function BottomTabBar() {
   const { t } = useTranslation();
@@ -30,18 +26,7 @@ export default function BottomTabBar() {
   const openingPaletteRef = useRef(false);
   // Settings rides at the end of whichever primary items this user can see.
   const navItems = useNavItems();
-  const menuItems = [...navItems, SETTINGS_ITEM];
-  const hasDashboard = menuItems.some((item) => item.key === '/dashboard');
-  const primaryKeys = hasDashboard ? PRIMARY_WITH_DASHBOARD : PRIMARY_DALTON_MODE;
-  const primaryItems: NavItem[] = [];
-  const overflowItems: NavItem[] = [];
-  for (const item of menuItems) {
-    if (primaryKeys.has(item.key) && primaryItems.length < 4) {
-      primaryItems.push(item);
-    } else {
-      overflowItems.push(item);
-    }
-  }
+  const { primaryItems, overflowItems } = useMobileBottomNavItems(navItems); // DALTON-HOOK(mobile-web)
   const hasMoreMenu = overflowItems.length > 0 || Boolean(palette);
   const moreActive = overflowItems.some((item) => isActive(item));
 

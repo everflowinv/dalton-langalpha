@@ -15,6 +15,9 @@ from src.dalton.database import coverage as coverage_db
 from src.dalton.watchlist import indicators as ind_mod
 from src.dalton.watchlist import metrics as metrics_mod
 from src.dalton.watchlist import privacy as privacy_mod
+from src.data_client.financial_data_provider import FinancialDataProvider
+from src.data_client.fmp.financial_source import FMPFinancialSource
+from src.data_client.market_data_provider import MarketDataProvider
 from src.server.models.additional_context import AdditionalContext, WatchlistContext
 
 
@@ -153,31 +156,35 @@ async def test_metrics_service_skips_private_and_enriches_earnings(
 
     snap_calls: list[list[str]] = []
 
-    class _FakeProvider:
-        name = "fmp"
-        split_adjusted = True
+    async def _get_snapshots(symbols: list[str], asset_type: str = "stocks", user_id: str | None = None) -> list[dict[str, Any]]:
+        _ = (asset_type, user_id)
+        snap_calls.append(list(symbols))
+        return [{"symbol": "NVDA", "price": 140.0, "previous_close": 135.0, "currency": "USD"}]
 
-        async def get_snapshots(self, symbols: Any, *, asset_type: str = "stocks", user_id: str = "") -> list[dict[str, Any]]:
-            _ = (asset_type, user_id)
-            snap_calls.append(list(symbols))
-            return [{"symbol": "NVDA", "price": 140.0, "previous_close": 135.0, "currency": "USD"}]
+    async def _get_daily(symbol: str, from_date: str | None = None, to_date: str | None = None, is_index: bool = False, user_id: str | None = None) -> list[dict[str, Any]]:
+        _ = (symbol, from_date, to_date, is_index, user_id)
+        return [
+            {"date": (date(2026, 1, 2) + timedelta(days=i)).isoformat(), "close": 100.0 + i, "high": 101.0 + i, "low": 99.0 + i, "volume": 1000}
+            for i in range(40)
+        ]
 
-        async def get_daily(self, symbol: str, *, from_date: str, to_date: str, is_index: bool = False, user_id: str = "") -> list[dict[str, Any]]:
-            _ = (symbol, from_date, to_date, is_index, user_id)
-            return [
-                {"date": (date(2026, 1, 2) + timedelta(days=i)).isoformat(), "close": 100.0 + i, "high": 101.0 + i, "low": 99.0 + i, "volume": 1000}
-                for i in range(40)
-            ]
+    fake_prov = create_autospec(MarketDataProvider, instance=True)
+    fake_prov.get_snapshots.side_effect = _get_snapshots
+    fake_prov.get_daily.side_effect = _get_daily
 
-        async def get_company_profile(self, symbol: str, *, user_id: str = "") -> dict[str, Any]:
-            _ = (symbol, user_id)
-            return {"marketCap": 3.4e12}
+    fin_source = create_autospec(FMPFinancialSource, instance=True)
+    fin_source.get_company_profile.return_value = [{"marketCap": 3.4e12, "currency": "USD"}]
+    fake_fin_prov = FinancialDataProvider(financial=fin_source)
 
-    fake_prov = _FakeProvider()
     monkeypatch.setattr(
         metrics_mod,
         "_resolve_provider_and_key",
         create_autospec(metrics_mod._resolve_provider_and_key, return_value=(fake_prov, "fmp", True)),
+    )
+    monkeypatch.setattr(
+        metrics_mod,
+        "_resolve_financial_provider",
+        create_autospec(metrics_mod._resolve_financial_provider, return_value=fake_fin_prov),
     )
 
     res = await metrics_mod.WatchlistMetricsService().get_metrics_for_user("u1", wait_for_cold=True)
@@ -240,6 +247,14 @@ async def test_r4_metrics_no_empty_bar_cache_progressive_warmup_and_watchlist_co
         "_resolve_provider_and_key",
         create_autospec(metrics_mod._resolve_provider_and_key, return_value=(prov, "yfinance", True)),
     )
+    monkeypatch.setattr(
+        metrics_mod,
+        "_resolve_financial_provider",
+        create_autospec(
+            metrics_mod._resolve_financial_provider,
+            return_value=FinancialDataProvider(financial=None),
+        ),
+    )
 
     # First progressive call returns live snapshot immediately & lists TSM as pending
     res1 = await metrics_mod.WatchlistMetricsService().get_metrics_for_user("u1", wait_for_cold=False)
@@ -294,3 +309,352 @@ def test_r5_new_years_day_holiday_ytd_is_zero_not_prior_year_gain() -> None:
         now_utc=datetime(2026, 1, 1, 15, 0, tzinfo=timezone.utc),
     )
     assert res["chg_ytd"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_market_cap_from_financial_provider_currency_and_error_handling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Market cap reads financial.get_company_profile, propagates HKD currency, handles financial=None, and never caches exceptions."""
+    metrics_mod._clear_metrics_cache_for_tests()
+
+    # 1. Financial source returns marketCap + currency (AAPL USD & 0700.HK HKD) and caches 24h
+    fin_source = create_autospec(FMPFinancialSource, instance=True)
+
+    async def _profile(symbol: str) -> list[dict[str, Any]]:
+        if symbol == "AAPL":
+            return [{"symbol": "AAPL", "marketCap": 5167353167872, "currency": "USD"}]
+        if symbol == "0700.HK":
+            return [{"symbol": "0700.HK", "mktCap": 3111992426496, "currency": "HKD"}]
+        return []
+
+    fin_source.get_company_profile.side_effect = _profile
+    fin_prov = FinancialDataProvider(financial=fin_source)
+
+    cap_aapl, cur_aapl = await metrics_mod._fetch_market_cap_cached("AAPL", financial_provider=fin_prov)
+    assert cap_aapl == 5167353167872.0
+    assert cur_aapl == "USD"
+    # Second lookup hits 24h cache without calling provider again
+    cap_aapl2, cur_aapl2 = await metrics_mod._fetch_market_cap_cached("AAPL", financial_provider=fin_prov)
+    assert (cap_aapl2, cur_aapl2) == (5167353167872.0, "USD")
+    assert fin_source.get_company_profile.await_count == 1
+
+    # 2. financial is None -> returns (None, None) cleanly
+    none_fin_prov = FinancialDataProvider(financial=None)
+    cap_none, cur_none = await metrics_mod._fetch_market_cap_cached("MSFT", financial_provider=none_fin_prov)
+    assert (cap_none, cur_none) == (None, None)
+
+    # 3. Exception raised -> returns (None, None) and is NOT cached (next call succeeds)
+    flaky_source = create_autospec(FMPFinancialSource, instance=True)
+    flaky_calls = {"n": 0}
+
+    async def _flaky_profile(symbol: str) -> list[dict[str, Any]]:
+        _ = symbol
+        flaky_calls["n"] += 1
+        if flaky_calls["n"] == 1:
+            raise RuntimeError("transient upstream timeout")
+        return [{"market_cap": 900_000_000_000, "currency": "USD"}]
+
+    flaky_source.get_company_profile.side_effect = _flaky_profile
+    flaky_prov = FinancialDataProvider(financial=flaky_source)
+    assert await metrics_mod._fetch_market_cap_cached("META", financial_provider=flaky_prov) == (None, None)
+    assert "META" not in metrics_mod._MARKET_CAP_CACHE
+    assert await metrics_mod._fetch_market_cap_cached("META", financial_provider=flaky_prov) == (900_000_000_000.0, "USD")
+    assert flaky_calls["n"] == 2
+
+    # 4. HK stock end-to-end through WatchlistMetricsService carries HKD currency even when snapshot omits currency
+    monkeypatch.setattr(
+        coverage_db,
+        "list_coverage_rows",
+        create_autospec(
+            coverage_db.list_coverage_rows,
+            return_value=[{"user_id": "u1", "ticker": "0700.HK", "tier": "core", "is_private": False}],
+        ),
+    )
+    monkeypatch.setattr(
+        coverage_db,
+        "get_earnings_calendar_mirror",
+        create_autospec(coverage_db.get_earnings_calendar_mirror, return_value=None),
+    )
+    mkt_prov = create_autospec(MarketDataProvider, instance=True)
+    mkt_prov.get_snapshots.return_value = [{"symbol": "0700.HK", "price": 410.0, "previous_close": 405.0}]
+    mkt_prov.get_daily.return_value = [
+        {"date": (date(2026, 1, 2) + timedelta(days=i)).isoformat(), "close": 380.0 + i, "high": 385.0 + i, "low": 375.0 + i, "volume": 1000}
+        for i in range(40)
+    ]
+    monkeypatch.setattr(
+        metrics_mod,
+        "_resolve_provider_and_key",
+        create_autospec(metrics_mod._resolve_provider_and_key, return_value=(mkt_prov, "yfinance", True)),
+    )
+    monkeypatch.setattr(
+        metrics_mod,
+        "_resolve_financial_provider",
+        create_autospec(metrics_mod._resolve_financial_provider, return_value=fin_prov),
+    )
+
+    out = await metrics_mod.WatchlistMetricsService().get_metrics_for_user("u1", wait_for_cold=True)
+    hk_item = out["items"]["0700.HK"]
+    assert hk_item["market_cap"] == 3111992426496.0
+    assert hk_item["currency"] == "HKD"
+    assert hk_item["market_cap_currency"] == "HKD"
+
+
+@pytest.mark.asyncio
+async def test_pending_subset_poll_warmup_dedup_and_bounded_mcap_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated pending-subset polls do not duplicate in-flight bars/mcap warmups, reuse short snapshot cache, and cap mcap concurrency."""
+    metrics_mod._clear_metrics_cache_for_tests()
+    tickers = ["AAPL", "MSFT", "NVDA", "META", "AMZN", "0700.HK"]
+    monkeypatch.setattr(
+        coverage_db,
+        "list_coverage_rows",
+        create_autospec(
+            coverage_db.list_coverage_rows,
+            return_value=[
+                {"user_id": "u1", "ticker": sym, "tier": "core", "is_private": False}
+                for sym in tickers
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        coverage_db,
+        "get_earnings_calendar_mirror",
+        create_autospec(coverage_db.get_earnings_calendar_mirror, return_value=None),
+    )
+
+    release_warmups = asyncio.Event()
+    daily_started: dict[str, int] = {}
+    mcap_started: dict[str, int] = {}
+    active_mcap = 0
+    max_active_mcap = 0
+    snap_batches: list[list[str]] = []
+
+    mkt_prov = create_autospec(MarketDataProvider, instance=True)
+
+    async def _snaps(symbols: list[str], asset_type: str = "stocks", user_id: str | None = None) -> list[dict[str, Any]]:
+        _ = (asset_type, user_id)
+        snap_batches.append(list(symbols))
+        return [{"symbol": s, "price": 100.0, "previous_close": 99.0} for s in symbols]
+
+    async def _daily(symbol: str, from_date: str | None = None, to_date: str | None = None, is_index: bool = False, user_id: str | None = None) -> list[dict[str, Any]]:
+        _ = (from_date, to_date, is_index, user_id)
+        daily_started[symbol] = daily_started.get(symbol, 0) + 1
+        await release_warmups.wait()
+        return [
+            {"date": (date(2026, 1, 2) + timedelta(days=i)).isoformat(), "close": 100.0 + i, "high": 101.0 + i, "low": 99.0 + i, "volume": 1000}
+            for i in range(40)
+        ]
+
+    mkt_prov.get_snapshots.side_effect = _snaps
+    mkt_prov.get_daily.side_effect = _daily
+
+    fin_source = create_autospec(FMPFinancialSource, instance=True)
+
+    async def _profile(symbol: str) -> list[dict[str, Any]]:
+        nonlocal active_mcap, max_active_mcap
+        mcap_started[symbol] = mcap_started.get(symbol, 0) + 1
+        active_mcap += 1
+        max_active_mcap = max(max_active_mcap, active_mcap)
+        try:
+            await release_warmups.wait()
+        finally:
+            active_mcap -= 1
+        return [{"marketCap": 1_000_000_000_000, "currency": "HKD" if symbol.endswith(".HK") else "USD"}]
+
+    fin_source.get_company_profile.side_effect = _profile
+    fin_prov = FinancialDataProvider(financial=fin_source)
+
+    monkeypatch.setattr(
+        metrics_mod,
+        "_resolve_provider_and_key",
+        create_autospec(metrics_mod._resolve_provider_and_key, return_value=(mkt_prov, "yfinance", True)),
+    )
+    monkeypatch.setattr(
+        metrics_mod,
+        "_resolve_financial_provider",
+        create_autospec(metrics_mod._resolve_financial_provider, return_value=fin_prov),
+    )
+
+    svc = metrics_mod.WatchlistMetricsService()
+    # 1. Initial full call returns snapshots concurrently per symbol and marks all pending
+    res1 = await svc.get_metrics_for_user("u1", symbols=tickers, wait_for_cold=False)
+    assert set(res1["pending_symbols"]) == set(tickers)
+    assert len(snap_batches) == len(tickers)
+    assert all(len(batch) == 1 for batch in snap_batches)
+    await asyncio.sleep(0.02)
+
+    # Bounded market-cap concurrency <= MAX_MCAP_CONCURRENCY (4)
+    assert max_active_mcap <= metrics_mod.MAX_MCAP_CONCURRENCY
+
+    # 2. Repeated subset poll while warmups are still in flight:
+    #    - only returns requested subset
+    #    - reuses 15s snapshot cache (no new get_snapshots call)
+    #    - does NOT spawn duplicate bars or market_cap warmup tasks
+    snap_count_before = len(snap_batches)
+    res_poll = await svc.get_metrics_for_user("u1", symbols=["0700.HK"], wait_for_cold=False)
+    assert list(res_poll["items"].keys()) == ["0700.HK"]
+    assert res_poll["pending_symbols"] == ["0700.HK"]
+    assert len(snap_batches) == snap_count_before
+
+    # Release all in-flight warmups and wait for completion
+    release_warmups.set()
+    await asyncio.sleep(0.05)
+
+    # Every symbol ran get_daily and get_company_profile AT MOST ONCE (no duplicate warmup)
+    assert all(cnt == 1 for cnt in daily_started.values())
+    assert all(cnt == 1 for cnt in mcap_started.values())
+
+    # 3. Subset poll after warmups complete returns full metrics & empty pending_symbols
+    res_done = await svc.get_metrics_for_user("u1", symbols=["0700.HK"], wait_for_cold=False)
+    assert res_done["pending_symbols"] == []
+    assert res_done["items"]["0700.HK"]["market_cap"] == 1_000_000_000_000.0
+    assert res_done["items"]["0700.HK"]["currency"] == "HKD"
+    assert res_done["items"]["0700.HK"]["rsi_14d"] is not None
+
+
+def test_r3_indicators_emit_price_source_and_price_ts() -> None:
+    """Indicators explicitly label price_source ('snapshot' vs 'daily_close') and normalized epoch-ms price_ts."""
+    bars = [
+        {"date": "2026-05-14", "close": 100.0, "high": 102.0, "low": 98.0, "volume": 1000},
+        {"date": "2026-05-15", "close": 105.0, "high": 106.0, "low": 101.0, "volume": 1200},
+    ]
+    snap_out = ind_mod.compute_symbol_metrics(
+        bars,
+        symbol="NVDA",
+        latest_price=112.5,
+        quote_timestamp="2026-05-15T18:30:00Z",
+        now_utc=datetime(2026, 5, 15, 18, 30, tzinfo=timezone.utc),
+    )
+    assert snap_out["price"] == 112.5
+    assert snap_out["price_source"] == "snapshot"
+    assert snap_out["price_ts"] == int(datetime(2026, 5, 15, 18, 30, tzinfo=timezone.utc).timestamp() * 1000)
+
+    daily_out = ind_mod.compute_symbol_metrics(
+        bars,
+        symbol="NVDA",
+        latest_price=None,
+        now_utc=datetime(2026, 5, 15, 18, 30, tzinfo=timezone.utc),
+    )
+    assert daily_out["price"] == 105.0
+    assert daily_out["price_source"] == "daily_close"
+    assert isinstance(daily_out["price_ts"], int) and daily_out["price_ts"] > 0
+
+    empty_out = ind_mod.compute_symbol_metrics([], symbol="NVDA", latest_price=None)
+    assert empty_out["price"] is None
+    assert empty_out["price_source"] is None
+    assert empty_out["price_ts"] is None
+
+
+@pytest.mark.asyncio
+async def test_r3_snapshot_per_symbol_timeout_isolation_and_pending_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One slow snapshot times out in isolation without discarding peers, enters snapshot_pending/pending_symbols even when bars+mcap are cached, is not cached, and retries alone."""
+    metrics_mod._clear_metrics_cache_for_tests()
+    monkeypatch.setattr(metrics_mod, "SNAPSHOT_SYMBOL_TIMEOUT_SECONDS", 0.05)
+
+    tickers = ["AAPL", "MSFT", "0700.HK"]
+    monkeypatch.setattr(
+        coverage_db,
+        "list_coverage_rows",
+        create_autospec(
+            coverage_db.list_coverage_rows,
+            return_value=[
+                {"user_id": "u1", "ticker": sym, "tier": "core", "is_private": False}
+                for sym in tickers
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        coverage_db,
+        "get_earnings_calendar_mirror",
+        create_autospec(coverage_db.get_earnings_calendar_mirror, return_value=None),
+    )
+
+    # Pre-warm BOTH daily bars and market cap caches so ONLY snapshot timeout can put 0700.HK in pending_symbols
+    warm_bars = [
+        {"date": (date(2026, 1, 2) + timedelta(days=i)).isoformat(), "close": 380.0 + i, "high": 385.0 + i, "low": 375.0 + i, "volume": 1000}
+        for i in range(40)
+    ]
+    for sym in tickers:
+        key = metrics_mod._bars_cache_key(sym, provider_name="yfinance", split_adjusted=True)
+        await metrics_mod._write_bars_to_cache(key, warm_bars)
+        metrics_mod._MARKET_CAP_CACHE[sym] = (
+            metrics_mod.time.monotonic(),
+            2_000_000_000_000.0,
+            "HKD" if sym.endswith(".HK") else "USD",
+        )
+
+    hk_attempts = {"n": 0}
+    requested_batches: list[list[str]] = []
+    mkt_prov = create_autospec(MarketDataProvider, instance=True)
+
+    async def _snaps(symbols: list[str], asset_type: str = "stocks", user_id: str | None = None) -> list[dict[str, Any]]:
+        _ = (asset_type, user_id)
+        requested_batches.append(list(symbols))
+        assert len(symbols) == 1
+        sym = symbols[0]
+        if sym == "0700.HK":
+            hk_attempts["n"] += 1
+            if hk_attempts["n"] == 1:
+                await asyncio.sleep(0.25)  # exceeds per-symbol 0.05s timeout
+            return [{"symbol": "0700.HK", "price": 432.5, "previous_close": 420.0, "currency": "HKD", "as_of": 1_764_151_200_000}]
+        return [
+            {
+                "symbol": sym,
+                "price": 210.0 if sym == "AAPL" else 440.0,
+                "previous_close": 200.0 if sym == "AAPL" else 435.0,
+                "currency": "USD",
+                "as_of": 1_764_151_200_000,
+            }
+        ]
+
+    mkt_prov.get_snapshots.side_effect = _snaps
+    monkeypatch.setattr(
+        metrics_mod,
+        "_resolve_provider_and_key",
+        create_autospec(metrics_mod._resolve_provider_and_key, return_value=(mkt_prov, "yfinance", True)),
+    )
+    monkeypatch.setattr(
+        metrics_mod,
+        "_resolve_financial_provider",
+        create_autospec(
+            metrics_mod._resolve_financial_provider,
+            return_value=FinancialDataProvider(financial=None),
+        ),
+    )
+
+    svc = metrics_mod.WatchlistMetricsService()
+    res1 = await svc.get_metrics_for_user("u1", symbols=tickers, wait_for_cold=False)
+
+    # AAPL and MSFT succeeded normally despite 0700.HK timing out
+    assert res1["items"]["AAPL"]["price"] == 210.0
+    assert res1["items"]["AAPL"]["price_source"] == "snapshot"
+    assert res1["items"]["AAPL"]["price_ts"] == 1_764_151_200_000
+    assert res1["items"]["AAPL"]["snapshot_pending"] is False
+    assert res1["items"]["MSFT"]["price"] == 440.0
+    assert res1["items"]["MSFT"]["price_source"] == "snapshot"
+    assert res1["items"]["MSFT"]["snapshot_pending"] is False
+
+    # 0700.HK fell back to daily_close, entered snapshot_pending + pending_symbols, and was NOT cached
+    assert res1["items"]["0700.HK"]["price_source"] == "daily_close"
+    assert res1["items"]["0700.HK"]["snapshot_pending"] is True
+    assert res1["snapshot_pending_symbols"] == ["0700.HK"]
+    assert res1["pending_symbols"] == ["0700.HK"]
+    assert "0700.HK" not in metrics_mod._SNAPSHOT_CACHE
+    assert "AAPL" in metrics_mod._SNAPSHOT_CACHE
+    assert "MSFT" in metrics_mod._SNAPSHOT_CACHE
+
+    # Subset poll retries ONLY 0700.HK and recovers live snapshot without re-fetching AAPL/MSFT
+    requested_batches.clear()
+    res2 = await svc.get_metrics_for_user("u1", symbols=["0700.HK"], wait_for_cold=False)
+    assert requested_batches == [["0700.HK"]]
+    assert res2["items"]["0700.HK"]["price"] == 432.5
+    assert res2["items"]["0700.HK"]["price_source"] == "snapshot"
+    assert res2["items"]["0700.HK"]["price_ts"] == 1_764_151_200_000
+    assert res2["items"]["0700.HK"]["snapshot_pending"] is False
+    assert res2["pending_symbols"] == []
+    assert res2["snapshot_pending_symbols"] == []
+    assert "0700.HK" in metrics_mod._SNAPSHOT_CACHE
