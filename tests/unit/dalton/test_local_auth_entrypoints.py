@@ -353,8 +353,11 @@ class TestAuthModeStartupValidationAndTranscriptionSecret:
 
         monkeypatch.setattr(
             storage_refs_mod,
-            "enforce_storage_off_startup_gate",
-            create_autospec(storage_refs_mod.enforce_storage_off_startup_gate, return_value=[]),
+            "warn_main_bucket_references_on_startup",
+            create_autospec(
+                storage_refs_mod.warn_main_bucket_references_on_startup,
+                return_value=[],
+            ),
         )
         mock_logger = create_autospec(logging.Logger, instance=True)
 

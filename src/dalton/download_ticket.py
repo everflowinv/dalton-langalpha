@@ -23,6 +23,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import unquote, unquote_plus
 
 from fastapi import HTTPException
 
@@ -161,14 +162,13 @@ def verify_download_ticket(
         raise _reject()
 
     payload_b64, sig_b64 = parts[0], parts[1]
-    expected_sig = hmac.new(
-        hmac_key, payload_b64.encode("ascii"), hashlib.sha256
-    ).digest()
     try:
+        payload_b64_bytes = payload_b64.encode("ascii")
         supplied_sig = _b64url_decode(sig_b64)
     except Exception:
         raise _reject() from None
 
+    expected_sig = hmac.new(hmac_key, payload_b64_bytes, hashlib.sha256).digest()
     if not hmac.compare_digest(supplied_sig, expected_sig):
         raise _reject()
 
@@ -300,40 +300,106 @@ async def maybe_attach_backup_download_ticket(
 
 
 # ---------------------------------------------------------------------------
-# Uvicorn access-log redaction for ``dl_token`` query parameter
+# Uvicorn access-log & OpenTelemetry query stripping for the redemption route
 # ---------------------------------------------------------------------------
 
-_DL_TOKEN_QUERY_RE = re.compile(r"([?&]dl_token=)[^&\s\"']*")
+DOWNLOAD_TICKET_ROUTE_PATH = "/api/v1/dalton/workspace-files/download"
+_URL_WITH_QUERY_RE = re.compile(r"[^\s\"'<>#]+\?[^\s\"'<>#]*")
+_MULTI_SLASH_RE = re.compile(r"/+")
+
+
+def _decode_percent_layers(text: str) -> str:
+    decoded = text
+    for _ in range(4):
+        nxt = unquote(decoded)
+        if nxt == decoded:
+            break
+        decoded = nxt
+    return decoded
+
+
+def is_download_ticket_path(path: str) -> bool:
+    """Return True iff ``path`` targets the download-ticket redemption route.
+
+    Handles optional mount prefixes, trailing/duplicate slashes, full URLs,
+    and percent-encoded path characters so URL-encoded bypasses cannot evade
+    query-string stripping in access logs or OpenTelemetry spans.
+    """
+    if not isinstance(path, str) or not path:
+        return False
+    decoded = _decode_percent_layers(path)
+    normalized = _MULTI_SLASH_RE.sub("/", decoded).rstrip("/")
+    return (
+        normalized == DOWNLOAD_TICKET_ROUTE_PATH
+        or normalized.endswith(DOWNLOAD_TICKET_ROUTE_PATH)
+        or f"{DOWNLOAD_TICKET_ROUTE_PATH}/" in f"{normalized}/"
+    )
+
+
+def _redact_encoded_dl_token_params(query: str) -> str:
+    """Defense-in-depth redaction for any non-redemption URL carrying ``dl_token`` (even URL-encoded)."""
+    if not query:
+        return query
+    parts = query.split("&")
+    changed = False
+    out: list[str] = []
+    for part in parts:
+        key, sep, _val = part.partition("=")
+        decoded_key = unquote_plus(key).strip().lower()
+        if sep and decoded_key == "dl_token":
+            out.append(f"{key}=REDACTED")
+            changed = True
+        else:
+            out.append(part)
+    return "&".join(out) if changed else query
 
 
 def redact_dl_token_in_text(text: str) -> str:
-    """Replace ``dl_token=<value>`` query values with ``dl_token=REDACTED``."""
-    if not isinstance(text, str) or "dl_token=" not in text:
+    """Drop the entire query string on the download-ticket redemption route.
+
+    For any token ``<path>?<query>`` where ``<path>`` targets
+    :data:`DOWNLOAD_TICKET_ROUTE_PATH` (including percent-encoded path or
+    query-parameter names such as ``?%64l_token=...``), drops ``?<query>``
+    completely. For unrelated URLs, falls back to masking any plain or
+    percent-encoded ``dl_token`` parameter value.
+    """
+    if not isinstance(text, str) or "?" not in text:
         return text
-    return _DL_TOKEN_QUERY_RE.sub(r"\1REDACTED", text)
+
+    def _replace(match: re.Match[str]) -> str:
+        token = match.group(0)
+        path_part, _sep, query_part = token.partition("?")
+        if is_download_ticket_path(path_part):
+            return path_part
+        redacted_query = _redact_encoded_dl_token_params(query_part)
+        return token if redacted_query == query_part else f"{path_part}?{redacted_query}"
+
+    return _URL_WITH_QUERY_RE.sub(_replace, text)
 
 
 class RedactDownloadTicketLogFilter(logging.Filter):
-    """``logging.Filter`` for ``uvicorn.access`` that masks ``dl_token`` values."""
+    """``logging.Filter`` for ``uvicorn.access`` that strips queries on the download-ticket route."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.msg, str) and "dl_token=" in record.msg:
+        if isinstance(record.msg, str) and "?" in record.msg:
             record.msg = redact_dl_token_in_text(record.msg)
         args = record.args
         if isinstance(args, tuple) and args:
             mutated = False
             new_args = []
             for item in args:
-                if isinstance(item, str) and "dl_token=" in item:
-                    new_args.append(redact_dl_token_in_text(item))
-                    mutated = True
+                if isinstance(item, str) and "?" in item:
+                    cleaned = redact_dl_token_in_text(item)
+                    new_args.append(cleaned)
+                    if cleaned != item:
+                        mutated = True
                 else:
                     new_args.append(item)
             if mutated:
                 record.args = tuple(new_args)
         elif isinstance(args, dict) and args:
             for k, v in list(args.items()):
-                if isinstance(v, str) and "dl_token=" in v:
+                if isinstance(v, str) and "?" in v:
                     args[k] = redact_dl_token_in_text(v)
         return True
 

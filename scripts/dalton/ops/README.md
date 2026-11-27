@@ -100,3 +100,15 @@ bash scripts/dalton/ops/dalton_data_backup.sh
 - `com.dalton.colima.plist.template`：登录后前台保活运行 `prod/colima_launch.sh`。
 - `com.dalton.pg-backup.plist.template`：每天 03:00 执行 `prod/backup.sh`。
 - `com.dalton.portwatch.plist.template`：每 300 秒执行 `prod/portwatch.sh`，记录临时端口（49152–65535）占用和占用最多的进程，写入 `~/Library/Logs/dalton-portwatch/portwatch.jsonl`；占用超过 60% 时另存一份完整快照，便于事后找出泄漏连接的进程（起因是 2026-09-07 端口耗尽事故）。
+
+## 7. 关闭主桶前必跑引用核验（`storage_refs`）
+
+后端启动时的主桶引用检查仅记录 `WARNING`、不会拒绝启动。**关闭主桶（将 `STORAGE_PROVIDER` 改为 `none` 或清空 `STORAGE_BUCKET_NAME`）前，必须先手动执行以下只读全量核验命令，且确认退出码为 `0`**：
+
+```bash
+python -m src.dalton.storage_refs check --strict
+```
+
+- **退出码 `0`**：全库 17 类主桶消费者均未检出确认引用，可以关闭主桶（若日志中出现头像 `avatar_url` 形状疑似告警，请人工复核确认无主桶头像后再关停）。
+- **退出码 `1`**：已确认存在主桶对象引用（命中即停）；此时**禁止关闭主桶**，保持 `STORAGE_PROVIDER=s3`（若只想让新工作区文件写回数据库，设 `DALTON_WSFILES_WRITE_INLINE_ONLY=1` 并重建后端容器）。
+- **退出码 `2`**：检查本身失败或被中断（连接、查询、反序列化异常或 `Ctrl+C`）；请先排障并重新跑通直到退出码为 `0`。

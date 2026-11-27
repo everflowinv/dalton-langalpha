@@ -141,10 +141,15 @@ _SENSITIVE_QUERY_PARAM_RE = re.compile(
 
 
 def redact_sensitive_query_params(value: Any) -> Any:
-    """Redact ``ticket=``, ``token=``, and ``dl_token=`` query values from log strings."""
+    """Drop download-ticket route queries and redact ``ticket=`` / ``token=`` / ``dl_token=`` values."""
     if not isinstance(value, str) or "?" not in value:
         return value
-    return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1REDACTED", value)
+    from src.dalton.download_ticket import redact_dl_token_in_text
+
+    cleaned = redact_dl_token_in_text(value)
+    if "?" not in cleaned:
+        return cleaned
+    return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1REDACTED", cleaned)
 
 
 class SensitiveQueryLogFilter(logging.Filter):

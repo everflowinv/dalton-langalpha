@@ -240,6 +240,13 @@ class _FakeProbeCursor:
     async def fetchone(self) -> Any:
         return self._result
 
+    async def fetchall(self) -> list[Any]:
+        if self._result is None:
+            return []
+        if isinstance(self._result, list):
+            return self._result
+        return [self._result]
+
 
 class _FakeProbeConn:
     def __init__(self, handler: Any) -> None:
@@ -985,10 +992,10 @@ class TestStartupReferenceGate:
         def _handler(_sql: str, _params: Any = None) -> Any:
             nonlocal called
             called = True
-            return (True,)
+            return (1,)
 
         with patch.object(storage_refs, "is_storage_enabled", return_value=True):
-            outcomes = await storage_refs.enforce_storage_off_startup_gate(
+            outcomes = await storage_refs.warn_main_bucket_references_on_startup(
                 conn=_FakeProbeConn(_handler)
             )
         assert outcomes == []
@@ -1001,18 +1008,18 @@ class TestStartupReferenceGate:
                 return ("5s",)
             if sql.startswith("SELECT to_regclass"):
                 return (params[0],)
-            return (False,)
+            return (0,)
 
         with patch.object(storage_refs, "is_storage_enabled", return_value=False):
-            outcomes = await storage_refs.enforce_storage_off_startup_gate(
+            outcomes = await storage_refs.warn_main_bucket_references_on_startup(
                 conn=_FakeProbeConn(_handler)
             )
-        assert len(outcomes) == len(storage_refs.MAIN_BUCKET_CONSUMER_PROBES)
-        assert all(not o.has_references and o.error is None for o in outcomes)
+        assert len(outcomes) == len(storage_refs.STARTUP_MAIN_BUCKET_PROBES)
+        assert all(not o.has_references and o.hit_count == 0 and o.error is None for o in outcomes)
 
     @pytest.mark.asyncio
-    async def test_refuses_when_consumer_hits_and_allows_override_with_critical(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    async def test_warns_only_never_refuses_when_consumer_hits(
+        self, caplog: pytest.LogCaptureFixture
     ) -> None:
         def _handler(sql: str, params: Any = None) -> Any:
             if sql.startswith("SELECT set_config"):
@@ -1020,33 +1027,28 @@ class TestStartupReferenceGate:
             if sql.startswith("SELECT to_regclass"):
                 return (params[0],)
             if "FROM workspace_files" in sql:
-                return (True,)
-            return (False,)
+                return (7,)
+            if "FROM chat_attachments" in sql:
+                return (storage_refs.STARTUP_COUNT_CAP,)
+            return (0,)
 
-        monkeypatch.delenv(storage_refs.ALLOW_UNMIGRATED_ENV, raising=False)
-        with patch.object(storage_refs, "is_storage_enabled", return_value=False):
-            with pytest.raises(DaltonStartupConfigError) as exc_info:
-                await storage_refs.enforce_storage_off_startup_gate(
-                    conn=_FakeProbeConn(_handler)
-                )
-        msg = str(exc_info.value)
-        assert storage_refs.STORAGE_OFF_GATE_ERROR_PREFIX in msg
-        assert "workspace_files" in msg
-        assert "重建后端容器" in msg
-
-        # Override env degrades refusal to CRITICAL log
-        monkeypatch.setenv(storage_refs.ALLOW_UNMIGRATED_ENV, "1")
         with (
-            caplog.at_level(logging.CRITICAL),
+            caplog.at_level(logging.WARNING, logger="src.dalton.storage_refs"),
             patch.object(storage_refs, "is_storage_enabled", return_value=False),
         ):
-            outcomes = await storage_refs.enforce_storage_off_startup_gate(
+            outcomes = await storage_refs.warn_main_bucket_references_on_startup(
                 conn=_FakeProbeConn(_handler)
             )
-        assert any(o.name == "workspace_files" and o.has_references for o in outcomes)
+        ws_out = next(o for o in outcomes if o.name == "workspace_files")
+        att_out = next(o for o in outcomes if o.name == "chat_attachments")
+        assert ws_out.has_references is True and ws_out.hit_count == 7 and not ws_out.hit_count_capped
+        assert att_out.has_references is True and att_out.hit_count_capped is True
+        warn_msgs = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert any(
-            r.levelno == logging.CRITICAL and "workspace_files" in r.message
-            for r in caplog.records
+            "public.workspace_files (workspace_files): 7" in m
+            and f"public.chat_attachments (chat_attachments): {storage_refs.STARTUP_COUNT_CAP}+" in m
+            and "check --strict" in m
+            for m in warn_msgs
         )
 
     @pytest.mark.asyncio
@@ -1058,20 +1060,20 @@ class TestStartupReferenceGate:
                 return ("5s",)
             if sql.startswith("SELECT to_regclass"):
                 return (None,) if params[0] == "public.drive_contents" else (params[0],)
-            return (False,)
+            return (0,)
 
         with (
             caplog.at_level(logging.INFO, logger="src.dalton.storage_refs"),
             patch.object(storage_refs, "is_storage_enabled", return_value=False),
         ):
-            outcomes = await storage_refs.enforce_storage_off_startup_gate(
+            outcomes = await storage_refs.warn_main_bucket_references_on_startup(
                 conn=_FakeProbeConn(_missing_handler)
             )
         drive_out = next(o for o in outcomes if o.name == "drive_contents")
         assert drive_out.skipped_missing_table is True
         assert drive_out.error is None
 
-        # Probe timeout/error with no confirmed hits must log WARNING and allow startup
+        # Probe timeout/error logs WARNING and allows startup
         caplog.clear()
 
         def _timeout_handler(sql: str, params: Any = None) -> Any:
@@ -1081,13 +1083,13 @@ class TestStartupReferenceGate:
                 return (params[0],)
             if "FROM user_skills" in sql:
                 raise TimeoutError("canceling statement due to statement timeout")
-            return (False,)
+            return (0,)
 
         with (
             caplog.at_level(logging.WARNING, logger="src.dalton.storage_refs"),
             patch.object(storage_refs, "is_storage_enabled", return_value=False),
         ):
-            timeout_outcomes = await storage_refs.enforce_storage_off_startup_gate(
+            timeout_outcomes = await storage_refs.warn_main_bucket_references_on_startup(
                 conn=_FakeProbeConn(_timeout_handler)
             )
         skill_out = next(o for o in timeout_outcomes if o.name == "user_skills")
@@ -1099,19 +1101,21 @@ class TestStartupReferenceGate:
         assert any("allowing startup" in m for m in warn_msgs)
 
     @pytest.mark.asyncio
-    async def test_run_auth_db_startup_hook_calls_storage_checks(self) -> None:
+    async def test_run_auth_db_startup_hook_calls_storage_checks(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         mock_validate_provider = create_autospec(
             storage_config.validate_core_storage_provider, return_value=None
         )
-        mock_gate = create_autospec(
-            storage_refs.enforce_storage_off_startup_gate, return_value=[]
+        mock_warn = create_autospec(
+            storage_refs.warn_main_bucket_references_on_startup, return_value=[]
         )
         mock_validate_auth = create_autospec(
             auth_bootstrap.validate_dalton_auth_config, return_value=None
         )
         with (
             patch.object(storage_config, "validate_core_storage_provider", mock_validate_provider),
-            patch.object(storage_refs, "enforce_storage_off_startup_gate", mock_gate),
+            patch.object(storage_refs, "warn_main_bucket_references_on_startup", mock_warn),
             patch.object(auth_bootstrap, "validate_dalton_auth_config", mock_validate_auth),
             patch.object(auth_bootstrap, "is_dalton_local_auth_enabled", return_value=False),
             patch.object(auth_bootstrap, "get_dalton_auth_mode", return_value="oss"),
@@ -1120,8 +1124,28 @@ class TestStartupReferenceGate:
 
         assert res is True
         mock_validate_provider.assert_called_once()
-        mock_gate.assert_awaited_once()
+        mock_warn.assert_awaited_once()
         mock_validate_auth.assert_called_once()
+
+        # Even if the startup storage check unexpectedly raises, bootstrap MUST NOT refuse startup.
+        failing_warn = create_autospec(
+            storage_refs.warn_main_bucket_references_on_startup,
+            side_effect=RuntimeError("db pool unavailable"),
+        )
+        with (
+            caplog.at_level(logging.WARNING),
+            patch.object(storage_config, "validate_core_storage_provider", mock_validate_provider),
+            patch.object(storage_refs, "warn_main_bucket_references_on_startup", failing_warn),
+            patch.object(auth_bootstrap, "validate_dalton_auth_config", mock_validate_auth),
+            patch.object(auth_bootstrap, "is_dalton_local_auth_enabled", return_value=False),
+            patch.object(auth_bootstrap, "get_dalton_auth_mode", return_value="oss"),
+        ):
+            res_after_err = await auth_bootstrap.run_auth_db_startup_hook("oss")
+        assert res_after_err is True
+        assert any(
+            r.levelno == logging.WARNING and "continuing startup" in r.message
+            for r in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1681,42 +1705,22 @@ class _FakeCliConn:
 
 
 class TestStep2Round2Fixes:
-    def test_fix1_and_fix7_all_probes_indexed_limit_1_and_checkpoint_writes_covered(
+    def test_fix1_and_fix7_no_recent_window_probes_and_all_17_strict_consumers_registered(
         self,
     ) -> None:
-        names = [p.name for p in storage_refs.MAIN_BUCKET_CONSUMER_PROBES]
-        assert "widgets_checkpoint_writes" in names
-        assert "widgets_checkpoint_blobs" in names
-        for probe in storage_refs.MAIN_BUCKET_CONSUMER_PROBES:
-            assert "LIMIT 1" in probe.exists_sql, f"{probe.name} missing LIMIT 1"
-            assert probe.index_used, f"{probe.name} missing index_used metadata"
-        cw_probe = next(
-            p for p in storage_refs.MAIN_BUCKET_CONSUMER_PROBES if p.name == "widgets_checkpoint_writes"
-        )
-        assert cw_probe.table == "public.checkpoint_writes"
-        assert "FROM recent_threads" in cw_probe.exists_sql
-        assert "JOIN checkpoint_writes" in cw_probe.exists_sql
-        assert "channel = 'messages'" in cw_probe.exists_sql
-        assert "data_ref" in cw_probe.exists_sql
-        assert "widgets/" in cw_probe.exists_sql
-
-    @pytest.mark.asyncio
-    async def test_fix7_checkpoint_writes_unsliced_widget_refuses_startup(self) -> None:
-        def _handler(sql: str, params: Any = None) -> Any:
-            if sql.startswith("SELECT set_config"):
-                return ("5s",)
-            if sql.startswith("SELECT to_regclass"):
-                return (params[0],)
-            if "JOIN checkpoint_writes" in sql:
-                return (True,)
-            return (False,)
-
-        with patch.object(storage_refs, "is_storage_enabled", return_value=False):
-            with pytest.raises(DaltonStartupConfigError) as exc_info:
-                await storage_refs.enforce_storage_off_startup_gate(
-                    conn=_FakeProbeConn(_handler)
-                )
-        assert "widgets_checkpoint_writes" in str(exc_info.value)
+        strict_names = [c.name for c in storage_refs.STRICT_MAIN_BUCKET_CONSUMERS]
+        assert len(strict_names) == 17
+        assert "widgets_checkpoint_writes" in strict_names
+        assert "widgets_checkpoint_blobs" in strict_names
+        assert "widgets_turn_slices" in strict_names
+        assert "users_avatars" in strict_names
+        for probe in storage_refs.STARTUP_MAIN_BUCKET_PROBES:
+            assert "ORDER BY created_at DESC LIMIT" not in probe.count_sql
+            assert f"LIMIT {storage_refs.STARTUP_COUNT_CAP}" in probe.count_sql
+        for spec in storage_refs.STRICT_MAIN_BUCKET_CONSUMERS:
+            assert "ORDER BY created_at DESC LIMIT" not in spec.exists_sql
+            assert "ORDER BY created_at DESC LIMIT" not in spec.batch_sql_first
+            assert "recent_threads" not in spec.exists_sql
 
     def test_fix2_external_avatar_allowed_site_origin_prefix_key_matched(self) -> None:
         # No site public URL base configured -> external avatar URL never matches
@@ -1804,10 +1808,6 @@ class TestStep2Round2Fixes:
             )
             is False
         )
-        origins, regexes = storage_refs._avatar_probe_params(env_prefixed)
-        assert origins == ["https://app.example.com"]
-        assert len(regexes) == 1
-        assert "/storage/staging/avatars/" in regexes[0]
 
     @pytest.mark.asyncio
     async def test_fix3_glob_excluding_ancestor_preserves_nested_git_in_sync_and_restore(
@@ -2113,8 +2113,10 @@ class TestStep2Round2Fixes:
         assert len(captured) == 1
         line = captured[0]
         assert raw_ticket not in line
-        assert "dl_token=REDACTED" in line
-        assert "foo=bar" in line
+        assert "dl_token" not in line
+        assert "foo=bar" not in line
+        assert "?" not in line
+        assert "/api/v1/dalton/workspace-files/download HTTP/1.1" in line
 
         # Also covered by SensitiveQueryLogFilter attached in configure_logging()
         from src.dalton.auth.dispatch import redact_sensitive_query_params
@@ -2122,8 +2124,7 @@ class TestStep2Round2Fixes:
         redacted = redact_sensitive_query_params(
             f"/api/v1/dalton/workspace-files/download?dl_token={raw_ticket}&foo=bar"
         )
-        assert raw_ticket not in redacted
-        assert "dl_token=REDACTED" in redacted
+        assert redacted == "/api/v1/dalton/workspace-files/download"
 
     def test_fix6_storage_refs_cli_opens_and_closes_readonly_connection(
         self, capsys: pytest.CaptureFixture[str]
@@ -2135,7 +2136,7 @@ class TestStep2Round2Fixes:
                 return ("5s",)
             if sql.startswith("SELECT to_regclass"):
                 return (params[0],)
-            return (False,)
+            return (0,)
 
         fake_conn = _FakeCliConn(_handler)
         mock_open = create_autospec(
@@ -2151,7 +2152,7 @@ class TestStep2Round2Fixes:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["errors"] == []
         assert parsed["hits"] == []
-        assert len(parsed["consumers"]) == len(storage_refs.MAIN_BUCKET_CONSUMER_PROBES)
+        assert len(parsed["consumers"]) == len(storage_refs.STARTUP_MAIN_BUCKET_PROBES)
 
     def test_fix8_ptc_config_file_selected_and_env_vars_expanded(
         self, tmp_path: Any
@@ -2194,3 +2195,666 @@ class TestStep2Round2Fixes:
         )
         assert resolved_simple.provider == "s3"
         assert resolved_simple.is_storage_enabled is True
+
+
+# ---------------------------------------------------------------------------
+# 9. Step 2 Round 3 regression tests (Lead decisions + Codex High 4 / Med 5)
+# ---------------------------------------------------------------------------
+
+
+class _FakeOtelSpan:
+    """Explicit OpenTelemetry span double for ``drop_span_query`` tests."""
+
+    def __init__(self, attributes: dict[str, str], *, recording: bool = True) -> None:
+        self.attributes = dict(attributes)
+        self._recording = recording
+
+    def is_recording(self) -> bool:
+        return self._recording
+
+    def set_attribute(self, key: str, value: str) -> None:
+        self.attributes[key] = value
+
+
+class TestStep2Round3Fixes:
+    @pytest.mark.asyncio
+    async def test_r3_startup_hits_warn_only_never_block_bootstrap(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Startup main-bucket check only logs WARNING (table + count, no content) and never blocks."""
+
+        def _hit_handler(sql: str, params: Any = None) -> Any:
+            if sql.startswith("SELECT set_config"):
+                return ("5s",)
+            if sql.startswith("SELECT to_regclass"):
+                return (params[0],)
+            if "FROM workspace_file_blobs" in sql:
+                return (3,)
+            return (0,)
+
+        with (
+            caplog.at_level(logging.WARNING, logger="src.dalton.storage_refs"),
+            patch.object(storage_refs, "is_storage_enabled", return_value=False),
+        ):
+            outcomes = await storage_refs.warn_main_bucket_references_on_startup(
+                conn=_FakeProbeConn(_hit_handler)
+            )
+
+        assert any(o.name == "workspace_file_blobs" and o.hit_count == 3 for o in outcomes)
+        warn_lines = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "public.workspace_file_blobs (workspace_file_blobs): 3" in m for m in warn_lines
+        )
+
+        # Even inside bootstrap.run_auth_db_startup_hook, hits NEVER raise DaltonStartupConfigError
+        async def _warn_with_hits(**_kw: Any) -> list[storage_refs.ConsumerCheckOutcome]:
+            return await storage_refs.warn_main_bucket_references_on_startup(
+                conn=_FakeProbeConn(_hit_handler)
+            )
+
+        with (
+            patch.object(storage_refs, "is_storage_enabled", return_value=False),
+            patch.object(
+                storage_refs,
+                "warn_main_bucket_references_on_startup",
+                create_autospec(
+                    storage_refs.warn_main_bucket_references_on_startup,
+                    side_effect=_warn_with_hits,
+                ),
+            ),
+            patch.object(
+                storage_config,
+                "validate_core_storage_provider",
+                create_autospec(storage_config.validate_core_storage_provider, return_value=None),
+            ),
+            patch.object(
+                auth_bootstrap,
+                "validate_dalton_auth_config",
+                create_autospec(auth_bootstrap.validate_dalton_auth_config, return_value=None),
+            ),
+            patch.object(auth_bootstrap, "is_dalton_local_auth_enabled", return_value=False),
+            patch.object(auth_bootstrap, "get_dalton_auth_mode", return_value="oss"),
+        ):
+            assert await auth_bootstrap.run_auth_db_startup_hook("oss") is True
+
+    def test_r3_strict_cli_no_false_positive_on_plain_messages_and_hits_real_widgets(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """``check --strict`` ignores plain message strings containing data_ref/widgets/ (exit 0),
+        reports exit 1 on real ShowWidget data_ref.key (fail-fast), and exit 2 on error/interrupt.
+        """
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+        from langgraph.checkpoint.serde.types import _DeltaSnapshot
+
+        serde = JsonPlusSerializer()
+        # Plain messages mentioning data_ref and widgets/ + inlined ShowWidget (has 'data')
+        plain_human = HumanMessage(
+            content='Please check {"data_ref":{"key":"widgets/t1/abc.json"}} in show_widget.py'
+        )
+        plain_ai = AIMessage(content="Look at artifact data_ref widgets/t1/abc.json")
+        non_widget_tool = ToolMessage(
+            content='{"data_ref":{"key":"widgets/t1/abc.json"}}',
+            tool_call_id="c1",
+            name="Read",
+            artifact={"data_ref": {"key": "widgets/t1/not-a-widget.json"}},
+        )
+        inlined_widget = ToolMessage(
+            content="Widget rendered",
+            tool_call_id="c2",
+            name="ShowWidget",
+            artifact={
+                "type": "html_widget",
+                "html": "<div/>",
+                "data": {"a.json": "1"},
+                "data_ref": {"key": "widgets/t1/ignored-because-inlined.json"},
+            },
+        )
+        plain_type, plain_blob = serde.dumps_typed(
+            _DeltaSnapshot([plain_human, plain_ai, non_widget_tool, inlined_widget])
+        )
+        plain_slice_lines = "\n".join(
+            [
+                "message_chunk\t\t"
+                + json.dumps({"content": '{"data_ref":{"key":"widgets/t1/plain.json"}}'}),
+                "artifact\t\t"
+                + json.dumps(
+                    {
+                        "artifact_type": "file_operation",
+                        "payload": {"data_ref": {"key": "widgets/t1/not-widget.json"}},
+                    }
+                ),
+                "artifact\t\t"
+                + json.dumps(
+                    {
+                        "artifact_type": "html_widget",
+                        "payload": {
+                            "data": {"x": "1"},
+                            "data_ref": {"key": "widgets/t1/already-inlined.json"},
+                        },
+                    }
+                ),
+            ]
+        )
+
+        # Real widget ToolMessage with data_ref.key (no inlined 'data')
+        real_widget = ToolMessage(
+            content="Widget rendered: rev",
+            tool_call_id="c3",
+            name="ShowWidget",
+            artifact={
+                "type": "html_widget",
+                "html": "<div/>",
+                "data_ref": {"key": "widgets/t9/real.json", "sha256": "deadbeef", "size": 2048},
+            },
+        )
+        real_type, real_blob = serde.dumps_typed([real_widget])
+        real_slice_line = "artifact\tw\t" + json.dumps(
+            {
+                "artifact_type": "html_widget",
+                "payload": {
+                    "type": "html_widget",
+                    "data_ref": {"key": "widgets/t9/slice.json", "sha256": "abcd", "size": 1024},
+                },
+            }
+        )
+
+        def _make_strict_handler(
+            *,
+            slice_rows: list[tuple[Any, ...]] | None = None,
+            blob_rows: list[tuple[Any, ...]] | None = None,
+            write_rows: list[tuple[Any, ...]] | None = None,
+            raise_on_table: str | None = None,
+            interrupt_on_table: str | None = None,
+        ) -> Any:
+            s_rows = list(slice_rows or [])
+            b_rows = list(blob_rows or [])
+            w_rows = list(write_rows or [])
+
+            def _handler(sql: str, params: Any = None) -> Any:
+                if sql.startswith("SET SESSION"):
+                    return None
+                if sql.startswith("SELECT set_config"):
+                    return ("30s",)
+                if sql.startswith("SELECT to_regclass"):
+                    return (params[0],)
+                if "FROM pg_attribute" in sql:
+                    return None
+                if sql.startswith("SELECT EXISTS"):
+                    return (False,)
+                if raise_on_table and f"FROM {raise_on_table}" in sql:
+                    raise RuntimeError(f"boom on {raise_on_table}")
+                if interrupt_on_table and f"FROM {interrupt_on_table}" in sql:
+                    raise KeyboardInterrupt()
+                if "FROM turn_slices" in sql:
+                    limit = int(params[-1])
+                    if "WHERE conversation_response_id >" in sql:
+                        cursor = params[0]
+                        page = [r for r in s_rows if r[0] > cursor][:limit]
+                    else:
+                        page = s_rows[:limit]
+                    return page
+                if "FROM checkpoint_blobs" in sql:
+                    limit = int(params[-1])
+                    if "WHERE (" in sql:
+                        cursor = tuple(params[:-1])
+                        page = [r for r in b_rows if r[:4] > cursor][:limit]
+                    else:
+                        page = b_rows[:limit]
+                    return page
+                if "FROM checkpoint_writes" in sql:
+                    limit = int(params[-1])
+                    if "WHERE (" in sql:
+                        cursor = tuple(params[:-1])
+                        page = [r for r in w_rows if r[:5] > cursor][:limit]
+                    else:
+                        page = w_rows[:limit]
+                    return page
+                return []
+
+            return _handler
+
+        # Case 1: Plain messages across multiple batches (batch_size=2) -> exit 0, progress emitted
+        conn_clean = _FakeCliConn(
+            _make_strict_handler(
+                slice_rows=[
+                    ("r-01", plain_slice_lines),
+                    ("r-02", None),
+                    ("r-03", plain_slice_lines),
+                ],
+                blob_rows=[
+                    ("t-01", "", "messages", "v1", plain_type, plain_blob),
+                    ("t-02", "", "messages", "v1", None, None),
+                    ("t-03", "", "messages", "v1", plain_type, plain_blob),
+                ],
+                write_rows=[
+                    ("t-01", "", "cp1", "task1", 0, plain_type, plain_blob),
+                    ("t-02", "", "cp1", "task1", 0, plain_type, plain_blob),
+                    ("t-03", "", "cp1", "task1", 0, plain_type, plain_blob),
+                ],
+            )
+        )
+        with patch.object(
+            storage_refs,
+            "open_session_connection",
+            create_autospec(storage_refs.open_session_connection, return_value=conn_clean),
+        ):
+            rc_clean = storage_refs.main(["check", "--strict", "--batch-size", "2"])
+        captured_clean = capsys.readouterr()
+        assert rc_clean == 0
+        assert conn_clean.closed is True
+        report_clean = json.loads(captured_clean.out)
+        assert report_clean["exit_code"] == 0
+        assert report_clean["hits"] == []
+        assert report_clean["errors"] == []
+        assert "[storage_refs]" in captured_clean.err
+        # Verified multi-batch pagination scanned all 3 rows per table
+        ts_out = next(c for c in report_clean["consumers"] if c["name"] == "widgets_turn_slices")
+        assert ts_out["scanned_rows"] == 3
+        cw_out = next(
+            c for c in report_clean["consumers"] if c["name"] == "widgets_checkpoint_writes"
+        )
+        assert cw_out["scanned_rows"] == 3
+
+        # Case 2: Real widget in checkpoint_writes -> exit 1 (fail-fast stops immediately)
+        conn_cw_hit = _FakeCliConn(
+            _make_strict_handler(
+                write_rows=[
+                    ("t-01", "", "cp1", "task1", 0, plain_type, plain_blob),
+                    ("t-02", "", "cp1", "task1", 0, real_type, real_blob),
+                    ("t-03", "", "cp1", "task1", 0, plain_type, plain_blob),
+                ],
+            )
+        )
+        with patch.object(
+            storage_refs,
+            "open_session_connection",
+            create_autospec(storage_refs.open_session_connection, return_value=conn_cw_hit),
+        ):
+            rc_cw = storage_refs.main(["check", "--strict", "--batch-size", "2"])
+        report_cw = json.loads(capsys.readouterr().out)
+        assert rc_cw == 1
+        assert conn_cw_hit.closed is True
+        assert report_cw["hits"] == ["widgets_checkpoint_writes"]
+        assert report_cw["stopped_early"] is True
+        cw_hit_out = next(
+            c for c in report_cw["consumers"] if c["name"] == "widgets_checkpoint_writes"
+        )
+        assert cw_hit_out["scanned_rows"] == 2  # stopped immediately on 2nd row
+
+        # Case 3: Real widget in turn_slices -> exit 1 (fail-fast stops before checkpoint tables)
+        conn_ts_hit = _FakeCliConn(
+            _make_strict_handler(slice_rows=[("r-01", real_slice_line)])
+        )
+        with patch.object(
+            storage_refs,
+            "open_session_connection",
+            create_autospec(storage_refs.open_session_connection, return_value=conn_ts_hit),
+        ):
+            rc_ts = storage_refs.main(["check", "--strict"])
+        report_ts = json.loads(capsys.readouterr().out)
+        assert rc_ts == 1
+        assert report_ts["hits"] == ["widgets_turn_slices"]
+        assert report_ts["stopped_early"] is True
+
+        # Case 4: Real widget in checkpoint_blobs -> exit 1
+        conn_cb_hit = _FakeCliConn(
+            _make_strict_handler(
+                blob_rows=[("t-09", "", "messages", "v9", real_type, real_blob)]
+            )
+        )
+        with patch.object(
+            storage_refs,
+            "open_session_connection",
+            create_autospec(storage_refs.open_session_connection, return_value=conn_cb_hit),
+        ):
+            rc_cb = storage_refs.main(["check", "--strict"])
+        report_cb = json.loads(capsys.readouterr().out)
+        assert rc_cb == 1
+        assert report_cb["hits"] == ["widgets_checkpoint_blobs"]
+
+        # Case 5: Query error -> exit 2, connection closed
+        conn_err = _FakeCliConn(_make_strict_handler(raise_on_table="provenance_result_bodies"))
+        with patch.object(
+            storage_refs,
+            "open_session_connection",
+            create_autospec(storage_refs.open_session_connection, return_value=conn_err),
+        ):
+            rc_err = storage_refs.main(["check", "--strict"])
+        report_err = json.loads(capsys.readouterr().out)
+        assert rc_err == 2
+        assert conn_err.closed is True
+        assert "provenance_result_bodies" in report_err["errors"]
+
+        # Case 6: KeyboardInterrupt -> exit 2, connection closed
+        conn_int = _FakeCliConn(_make_strict_handler(interrupt_on_table="turn_slices"))
+        with patch.object(
+            storage_refs,
+            "open_session_connection",
+            create_autospec(storage_refs.open_session_connection, return_value=conn_int),
+        ):
+            rc_int = storage_refs.main(["check", "--strict"])
+        capsys.readouterr()
+        assert rc_int == 2
+        assert conn_int.closed is True
+
+    @pytest.mark.asyncio
+    async def test_r3_strict_cli_avatar_url_shape_warns_only_exit_0_recorded_key_exits_1(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Site-shaped ``users.avatar_url`` without a recorded object key logs WARNING only (exit 0);
+        only an upload-recorded object key column counts as a confirmed hit (exit 1).
+        """
+        site_env = {
+            "STORAGE_PUBLIC_URL_BASE": "https://app.example.com/storage",
+            "STORAGE_KEY_PREFIX": "prod",
+        }
+        avatar_spec = tuple(
+            c for c in storage_refs.STRICT_MAIN_BUCKET_CONSUMERS if c.name == "users_avatars"
+        )
+
+        # Subcase A: No recorded object key column; site-shaped URL -> suspected WARNING only, exit 0
+        def _url_only_handler(sql: str, params: Any = None) -> Any:
+            if sql.startswith("SELECT set_config"):
+                return ("30s",)
+            if sql.startswith("SELECT to_regclass"):
+                return (params[0],)
+            if "FROM pg_attribute" in sql:
+                return None
+            if "FROM users" in sql:
+                if "WHERE user_id >" in sql:
+                    return []
+                return [
+                    ("u-1", None, "https://app.example.com/storage/prod/avatars/u-1.png"),
+                    ("u-2", None, "https://lh3.googleusercontent.com/a/ext.png"),
+                ]
+            return []
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="src.dalton.storage_refs"):
+            report_url_only = await storage_refs.run_strict_main_bucket_check(
+                conn=_FakeProbeConn(_url_only_handler),
+                consumers=avatar_spec,
+                env=site_env,
+            )
+        assert report_url_only.exit_code == 0
+        assert report_url_only.confirmed_hits == []
+        assert report_url_only.suspected_warnings == {"users_avatars": 1}
+        warn_msgs = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("1 row(s)" in m and "users" in m for m in warn_msgs)
+        assert all("u-1.png" not in m for m in warn_msgs)  # does not leak URL/user_id
+
+        # Subcase B: Recorded object key column exists and is populated -> confirmed hit, exit 1
+        def _recorded_key_handler(sql: str, params: Any = None) -> Any:
+            if sql.startswith("SELECT set_config"):
+                return ("30s",)
+            if sql.startswith("SELECT to_regclass"):
+                return (params[0],)
+            if "FROM pg_attribute" in sql:
+                return ("avatar_object_key",)
+            if "FROM users" in sql:
+                return [
+                    ("u-1", "avatars/u-1.png", "https://app.example.com/storage/prod/avatars/u-1.png")
+                ]
+            return []
+
+        report_key = await storage_refs.run_strict_main_bucket_check(
+            conn=_FakeProbeConn(_recorded_key_handler),
+            consumers=avatar_spec,
+            env=site_env,
+        )
+        assert report_key.exit_code == 1
+        assert report_key.confirmed_hits == ["users_avatars"]
+
+    @pytest.mark.asyncio
+    async def test_r3_glob_ancestor_dir_read_failure_preserves_manifest_and_git_rows(
+        self, tmp_path: Any
+    ) -> None:
+        """When an ancestor dir matched by ``exclude_rel_globs`` (or a subdir inside it)
+        fails ``os.scandir`` with ``PermissionError``, ``scan`` records a read error and
+        ``backup.sync_to_db`` keeps every manifest row (never pruning existing ``.git`` rows).
+        """
+        import errno as errno_mod
+        import os as os_mod
+
+        ws_dir = tmp_path / "ws"
+        (ws_dir / "projects" / "myrepo" / ".git").mkdir(parents=True)
+        (ws_dir / "projects" / "myrepo" / ".git" / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+        (ws_dir / "projects" / "outer" / "locked_sub" / ".git").mkdir(parents=True)
+        (ws_dir / "projects" / "outer" / "locked_sub" / ".git" / "HEAD").write_bytes(
+            b"ref: refs/heads/dev\n"
+        )
+        (ws_dir / "notes.txt").write_bytes(b"keep-me")
+
+        real_scandir = os_mod.scandir
+        blocked_top = str(ws_dir / "projects" / "myrepo")
+        blocked_nested = str(ws_dir / "projects" / "outer" / "locked_sub")
+
+        def _deny_top(path: Any = ".") -> Any:
+            if str(path) == blocked_top:
+                raise PermissionError(errno_mod.EACCES, "Permission denied", str(path))
+            return real_scandir(path)
+
+        # Subcase 1: Glob-matched ancestor dir itself unreadable -> scan reports EACCES
+        with patch.object(transfer_rt.os, "scandir", side_effect=_deny_top):
+            scan_out = transfer_rt.scan(
+                {
+                    "root": str(ws_dir),
+                    "whole_dir_names": [".git"],
+                    "exclude_rel_globs": ["projects/*"],
+                }
+            )
+            sweep_out = transfer_rt.sweep(
+                {
+                    "whole_dir_names": [".git"],
+                    "exclude_rel_globs": ["projects/*"],
+                    "projects": [
+                        {
+                            "key": "ws-lock",
+                            "root": str(ws_dir),
+                            "mark": {
+                                "ns": 9_999_999_999_999_999_999,
+                                "boot_id": transfer_rt._boot_id(),
+                                "offset_ns": transfer_rt._clock_offset_ns(),
+                            },
+                        }
+                    ],
+                }
+            )
+
+        assert any(
+            e["path"] == "projects/myrepo" and e["errno"] == errno_mod.EACCES
+            for e in scan_out["errors"]
+        )
+        assert "ws-lock" in sweep_out["changed"]
+
+        # Feed that scan result into backup.sync_to_db: delete_removed_files MUST NOT run!
+        scan_entries = [
+            ScanEntry(
+                path=e["path"],
+                kind=e["kind"],
+                size=e["size"],
+                mtime_ns=e["mtime_ns"],
+                mode=e["mode"],
+                sha256=e["sha256"],
+                symlink_target=e["symlink_target"],
+                is_binary=e.get("is_binary"),
+            )
+            for e in scan_out["entries"]
+        ]
+        scan_result = ScanResult(
+            entries=scan_entries,
+            oversized=[],
+            errors=scan_out["errors"],
+            hashed=len(scan_entries),
+            reused=0,
+        )
+        existing = {
+            "projects/myrepo/.git/HEAD": {
+                "kind": "file",
+                "file_size": len(b"ref: refs/heads/main\n"),
+                "content_hash": _sha(b"ref: refs/heads/main\n"),
+                "mtime_ns": 1_700_000_000_000_000_000,
+                "permissions": "0644",
+                "blob_sha256": None,
+                "pack_sha256": None,
+                "pack_offset": None,
+                "is_binary": False,
+            },
+            "notes.txt": {
+                "kind": "file",
+                "file_size": len(b"keep-me"),
+                "content_hash": _sha(b"keep-me"),
+                "mtime_ns": 1_700_000_000_000_000_000,
+                "permissions": "0644",
+                "blob_sha256": None,
+                "pack_sha256": None,
+                "pack_offset": None,
+                "is_binary": False,
+            },
+        }
+        layout = SandboxLayout.for_root("/workspace").for_workspace("ws-lock")
+        sandbox = _FakeSandbox({"notes.txt": b"keep-me"}, working_dir="/workspace", dir_name="ws-lock")
+        mock_delete_removed = create_autospec(backup.delete_removed_files, return_value=0)
+
+        @asynccontextmanager
+        async def _noop_lock(*_a: Any, **_kw: Any):
+            yield NoDbConn()
+
+        clock = datetime(2026, 11, 27, 12, 0, 0, tzinfo=timezone.utc)
+        with (
+            patch.object(backup, "workspace_sync_lock", _noop_lock),
+            patch.object(backup, "manifest_clock", create_autospec(backup.manifest_clock, return_value=clock)),
+            patch.object(backup, "get_file_metadata_for_sync", create_autospec(backup.get_file_metadata_for_sync, return_value=existing)),
+            patch.object(backup, "files_restore_incomplete", create_autospec(backup.files_restore_incomplete, return_value=False)),
+            patch.object(backup, "delete_removed_files", mock_delete_removed),
+            patch.object(backup, "get_workspace_total_size", create_autospec(backup.get_workspace_total_size, return_value=0)),
+            patch.object(backup, "bulk_upsert_files", create_autospec(wf_db.bulk_upsert_files, return_value=0)),
+            patch.object(blobs, "bulk_upsert_files", create_autospec(wf_db.bulk_upsert_files, return_value=0)),
+            patch.object(backup, "bulk_update_file_stamps", create_autospec(backup.bulk_update_file_stamps, return_value=None)),
+            patch.object(backup, "is_storage_enabled", return_value=False),
+            patch.object(backup, "scan_workspace", create_autospec(backup.scan_workspace, return_value=scan_result)),
+        ):
+            sync_res = await backup.sync_to_db("ws-lock", sandbox, layout=layout)
+
+        mock_delete_removed.assert_not_awaited()
+        assert sync_res.deleted == 0
+        assert sync_res.pruned is False
+        assert any(
+            u.path == "projects/myrepo" and u.reason == "unreadable" for u in sync_res.unsaved
+        )
+
+        # Subcase 2: Nested child dir inside matched ancestor unreadable -> also records EACCES
+        def _deny_nested(path: Any = ".") -> Any:
+            if str(path) == blocked_nested:
+                raise PermissionError(errno_mod.EACCES, "Permission denied", str(path))
+            return real_scandir(path)
+
+        with patch.object(transfer_rt.os, "scandir", side_effect=_deny_nested):
+            scan_nested = transfer_rt.scan(
+                {
+                    "root": str(ws_dir),
+                    "whole_dir_names": [".git"],
+                    "exclude_rel_globs": ["projects/*"],
+                }
+            )
+        assert any(
+            e["path"] == "projects/outer" and e["errno"] == errno_mod.EACCES
+            for e in scan_nested["errors"]
+        )
+
+    def test_r3_download_ticket_drops_entire_query_in_uvicorn_access_and_otel_span(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Redemption route drops the ENTIRE query string (including URL-encoded param names
+        and URL-encoded path segments) in Uvicorn access logs and OpenTelemetry span attributes.
+        """
+        from src.dalton.auth.dispatch import SensitiveQueryLogFilter
+        from src.observability.private_query import AccessLogQueryFilter, drop_span_query
+
+        monkeypatch.setenv("JWT_SIGNING_SECRET", "q" * 40)
+        tok = download_ticket.issue_download_ticket(
+            user_id="u-otel",
+            workspace_id="ws-otel",
+            path="reports/secret.parquet",
+            backup_ok=True,
+        )
+        assert tok is not None
+
+        encoded_targets = [
+            f"/api/v1/dalton/workspace-files/download?dl_token={tok}&extra=1",
+            f"/api/v1/dalton/workspace-files/download?%64l_token={tok}&extra=1",
+            f"/api/v1/dalton/workspace-files/download?%64%6c_token={tok}",
+            f"/api/v1/dalton/workspace-files/%64ownload?%64l_token={tok}",
+        ]
+
+        # 1. RedactDownloadTicketLogFilter, AccessLogQueryFilter, SensitiveQueryLogFilter
+        for flt in (
+            download_ticket.RedactDownloadTicketLogFilter(),
+            AccessLogQueryFilter(),
+            SensitiveQueryLogFilter(),
+        ):
+            for target in encoded_targets:
+                rec = logging.LogRecord(
+                    "uvicorn.access",
+                    logging.INFO,
+                    __file__,
+                    1,
+                    '%s - "%s %s HTTP/%s" %d',
+                    ("127.0.0.1:50000", "GET", target, "1.1", 200),
+                    None,
+                )
+                assert flt.filter(rec) is True
+                logged_target = rec.args[2]
+                assert tok not in logged_target
+                assert "?" not in logged_target
+                assert "extra=1" not in logged_target
+                assert logged_target == target.partition("?")[0]
+
+            # Unrelated route keeps its normal query string
+            rec_ok = logging.LogRecord(
+                "uvicorn.access",
+                logging.INFO,
+                __file__,
+                1,
+                '%s - "%s %s HTTP/%s" %d',
+                ("127.0.0.1:50000", "GET", "/api/v1/threads?limit=20&offset=0", "1.1", 200),
+                None,
+            )
+            flt.filter(rec_ok)
+            assert rec_ok.args[2] == "/api/v1/threads?limit=20&offset=0"
+
+        # 2. OpenTelemetry span hook drops entire query string for plain and URL-encoded params
+        for raw_query in (f"dl_token={tok}&extra=1", f"%64l_token={tok}&extra=1"):
+            span = _FakeOtelSpan(
+                {
+                    "http.url": f"https://app.example.com/api/v1/dalton/workspace-files/download?{raw_query}",
+                    "url.full": f"https://app.example.com/api/v1/dalton/workspace-files/download?{raw_query}",
+                    "http.target": f"/api/v1/dalton/workspace-files/download?{raw_query}",
+                    "url.path": "/api/v1/dalton/workspace-files/download",
+                    "url.query": raw_query,
+                }
+            )
+            drop_span_query(
+                span,
+                {
+                    "path": "/api/v1/dalton/workspace-files/download",
+                    "query_string": raw_query.encode("latin-1"),
+                },
+            )
+            assert span.attributes == {
+                "http.url": "https://app.example.com/api/v1/dalton/workspace-files/download",
+                "url.full": "https://app.example.com/api/v1/dalton/workspace-files/download",
+                "http.target": "/api/v1/dalton/workspace-files/download",
+                "url.path": "/api/v1/dalton/workspace-files/download",
+                "url.query": "",
+            }
+            for v in span.attributes.values():
+                assert tok not in v
+                assert "?" not in v
+
+        # 3. Non-ASCII malformed ticket returns uniform 401 (never 500 UnicodeEncodeError)
+        with pytest.raises(HTTPException) as exc_non_ascii:
+            download_ticket.verify_download_ticket("非ASCII.sig")
+        assert exc_non_ascii.value.status_code == 401
+        assert exc_non_ascii.value.detail == download_ticket.INVALID_DOWNLOAD_TICKET_DETAIL

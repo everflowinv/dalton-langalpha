@@ -1,16 +1,34 @@
-"""Main-bucket consumer reference registry and storage-off startup gate (§6.1 #2).
+"""Main-bucket consumer reference audit: warning-only startup check & strict operator CLI.
 
 Shared by Everflow and Standalone Core (``CORE_CAPABILITY = None``).
-Batch 1 Step 2 provides:
-- Declarative registry of all main-bucket database consumers (aligned with §3.1 matrix)
-- Indexed, bounded ``EXISTS (...) LIMIT 1`` probe queries with per-query ``statement_timeout``
-- Startup gate invoked when ``is_storage_enabled()`` is False (refuses ONLY on confirmed
-  references; timeouts/query errors log a ``WARNING`` and allow startup)
-- Read-only operator CLI ``python -m src.dalton.storage_refs probe`` (opens and closes
-  its own read-only session connection without requiring the FastAPI lifespan pool)
 
-Batch 1 Step 3 extends this same module with snapshot reference enumeration and
-backup reconciliation.
+Two modes with clear separation of responsibilities:
+
+1. **Backend startup advisory check** (:func:`warn_main_bucket_references_on_startup`):
+   - No-op when ``is_storage_enabled()`` is True.
+   - Runs fast, index-backed probes over exact pointer tables (no recent-N windows,
+     no plain-string checkpoint scans, no URL-shape avatar false positives).
+   - Logs a ``WARNING`` listing hit tables and row counts (never object keys, URLs,
+     or row contents). **Never refuses or blocks backend startup** on any result or
+     error.
+
+2. **Operator pre-shutdown strict audit CLI**::
+
+       python -m src.dalton.storage_refs check --strict
+
+   Run manually by operators **before disabling the main bucket** (closing the main
+   bucket requires exit code ``0``):
+   - Batched full-table scans across all 17 main-bucket consumers (no recent-N
+     windows), with progress output to ``stderr`` and clean ``SIGINT`` interruption.
+   - Stops immediately on the first confirmed reference hit (fail-fast).
+   - Structurally verifies widget events and ``data_ref.key`` using the exact
+     replay contract (string hits are only a candidate pre-filter; plain message
+     text never triggers false positives).
+   - Avatars treat only an upload-recorded object key column as a confirmed hit;
+     URL-shape-only evidence logs a suspected ``WARNING`` and does NOT count as a
+     confirmed hit.
+   - Exit codes: ``0`` = no confirmed references, ``1`` = confirmed reference found,
+     ``2`` = check failed or interrupted.
 """
 
 from __future__ import annotations
@@ -23,27 +41,28 @@ import os
 import re
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TextIO
 from urllib.parse import urlsplit
 
-from src.dalton.profile import DaltonStartupConfigError
 from src.server.database.pool import get_db_connection, open_session_connection
 from src.utils.storage import is_storage_enabled
 
 logger = logging.getLogger(__name__)
 
-PROBE_STATEMENT_TIMEOUT = "5s"
-ALLOW_UNMIGRATED_ENV = "DALTON_ALLOW_UNMIGRATED_STORAGE_OFF"
-STORAGE_OFF_GATE_ERROR_PREFIX = (
-    "主桶已有数据，请保持 `STORAGE_PROVIDER=s3`；"
-    "只想让新文件写回数据库，请设 `DALTON_WSFILES_WRITE_INLINE_ONLY=1`"
-)
+STARTUP_STATEMENT_TIMEOUT = "5s"
+STARTUP_COUNT_CAP = 1000
+STRICT_BATCH_SIZE = 500
+STRICT_BATCH_TIMEOUT = "30s"
 
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
+EXIT_CLEAN = 0
+EXIT_REFERENCES_FOUND = 1
+EXIT_CHECK_FAILED = 2
+
 _ERE_SPECIAL_RE = re.compile(r"([\\.^$*+?()[\]{}|])")
 _AVATAR_KEY_TAIL_RE = re.compile(r"^[^/?#]+\.[A-Za-z0-9]+$")
+_AVATAR_OBJECT_KEY_COLUMNS = ("avatar_object_key", "avatar_key")
 
 
 def _escape_ere(literal: str) -> str:
@@ -63,13 +82,14 @@ def site_avatar_url_rules(
 ) -> list[tuple[str, str, str]]:
     """Return ``(origin, full_avatar_path_prefix, pg_ere_pattern)`` rules for this site.
 
-    Matches ONLY URLs produced by this deployment's main-bucket ``get_public_url("avatars/<id>.<ext>")``:
+    Matches ONLY URLs shaped like this deployment's main-bucket
+    ``get_public_url("avatars/<id>.<ext>")``:
     1. Origin (case-insensitive ``scheme://host[:port]``) and configured public base path
     2. Configured ``STORAGE_KEY_PREFIX`` (if any)
     3. Single-segment object key ``avatars/<name>.<ext>``
 
-    External avatar URLs (e.g. OAuth/Gravatar/third-party CDNs) or URLs missing the
-    configured prefix never match.
+    Used solely for suspected-avatar warnings when no upload-recorded object key
+    column exists; external avatar URLs (OAuth/Gravatar/third-party CDNs) never match.
     """
     em = os.environ if env is None else env
     candidates: list[str] = []
@@ -119,7 +139,7 @@ def site_avatar_url_rules(
 def is_site_avatar_url(
     avatar_url: str | None, *, env: Mapping[str, str] | None = None
 ) -> bool:
-    """Return True iff ``avatar_url`` matches this deployment's main-bucket avatar URL."""
+    """Return True iff ``avatar_url`` matches this deployment's main-bucket avatar URL shape."""
     raw = (avatar_url or "").strip()
     if not raw:
         return False
@@ -139,354 +159,293 @@ def is_site_avatar_url(
     return False
 
 
-def _avatar_probe_params(env: Mapping[str, str] | None = None) -> tuple[list[str], list[str]]:
-    rules = site_avatar_url_rules(env=env)
-    return [r[0] for r in rules], [r[2] for r in rules]
+# ---------------------------------------------------------------------------
+# Structural widget verification (aligned with replay/widgets.py & projector.py)
+# ---------------------------------------------------------------------------
+
+
+def _widget_payload_has_data_ref(payload: Any) -> bool:
+    """Match ``replay.widgets._resolve_widget_data_refs`` (widgets.py:33-38).
+
+    A widget payload references object storage iff it is a dict without an
+    inlined ``data`` key and carries ``data_ref: {"key": "<non-empty str>"}``.
+    """
+    if not isinstance(payload, dict) or "data" in payload:
+        return False
+    ref = payload.get("data_ref")
+    if not isinstance(ref, dict):
+        return False
+    key = ref.get("key")
+    return isinstance(key, str) and bool(key.strip())
+
+
+def turn_slice_has_widget_data_ref(lines_text: str | None) -> bool:
+    """Return True iff ``turn_slices.lines`` contains a replayable html_widget ``data_ref.key``."""
+    if not lines_text or '"data_ref"' not in lines_text:
+        return False
+    for raw in lines_text.split("\n"):
+        if "\t" not in raw:
+            continue
+        parts = raw.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        event, _flags, data_json = parts
+        if event != "artifact":
+            continue
+        try:
+            data = json.loads(data_json)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict) or data.get("artifact_type") != "html_widget":
+            continue
+        if _widget_payload_has_data_ref(data.get("payload")):
+            return True
+    return False
+
+
+def _is_show_widget_tool_artifact(tool_name: Any, artifact: Any) -> bool:
+    """Match ``history.projector._build_artifact_event`` for ``ShowWidget``."""
+    if not isinstance(artifact, dict) or not artifact:
+        return False
+    if isinstance(tool_name, str) and tool_name:
+        if tool_name != "ShowWidget":
+            return False
+    else:
+        art_type = artifact.get("type") or artifact.get("artifact_type")
+        if art_type != "html_widget":
+            return False
+    return _widget_payload_has_data_ref(artifact)
+
+
+def checkpoint_value_has_widget_data_ref(value: Any) -> bool:
+    """Return True iff a deserialized ``messages`` checkpoint value has a ShowWidget ``data_ref.key``.
+
+    Inspects ONLY ``ToolMessage.artifact`` for ``ShowWidget`` (never message
+    ``content`` text), so ordinary user/assistant/tool messages discussing
+    ``data_ref`` or ``widgets/`` never trigger false positives.
+    """
+    if value is None:
+        return False
+
+    # Unwrap LangGraph DeltaChannel snapshot container without hard-importing private types at module import.
+    if type(value).__name__ == "_DeltaSnapshot" and hasattr(value, "value"):
+        return checkpoint_value_has_widget_data_ref(value.value)
+
+    if isinstance(value, (list, tuple)):
+        return any(checkpoint_value_has_widget_data_ref(item) for item in value)
+
+    # LangChain ToolMessage instance (check type == 'tool' and .artifact, ignoring .content)
+    msg_type = getattr(value, "type", None)
+    if msg_type == "tool" and hasattr(value, "artifact"):
+        return _is_show_widget_tool_artifact(
+            getattr(value, "name", None), getattr(value, "artifact", None)
+        )
+
+    # Serialized dict representations (plain dict or LangChain constructor dict)
+    if isinstance(value, dict):
+        if value.get("type") == "tool" and "artifact" in value:
+            return _is_show_widget_tool_artifact(value.get("name"), value.get("artifact"))
+        if (
+            value.get("lc") == 1
+            and value.get("type") == "constructor"
+            and isinstance(value.get("id"), list)
+            and value["id"]
+            and value["id"][-1] == "ToolMessage"
+            and isinstance(value.get("kwargs"), dict)
+        ):
+            kw = value["kwargs"]
+            return _is_show_widget_tool_artifact(kw.get("name"), kw.get("artifact"))
+
+    return False
+
+
+_CHECKPOINT_SERDE: Any = None
+
+
+def _get_checkpoint_serde() -> Any:
+    global _CHECKPOINT_SERDE
+    if _CHECKPOINT_SERDE is None:
+        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+        _CHECKPOINT_SERDE = JsonPlusSerializer()
+    return _CHECKPOINT_SERDE
+
+
+def decode_and_check_checkpoint_widget_ref(
+    blob_type: str | None,
+    blob: bytes | bytearray | memoryview | None,
+    *,
+    serde: Any | None = None,
+) -> bool:
+    """Deserialize one candidate ``checkpoint_blobs`` / ``checkpoint_writes`` row and verify widget ``data_ref``."""
+    if not blob_type or blob_type == "empty" or blob is None:
+        return False
+    raw = bytes(blob)
+    if b"data_ref" not in raw:
+        return False
+    ser = serde if serde is not None else _get_checkpoint_serde()
+    value = ser.loads_typed((blob_type, raw))
+    return checkpoint_value_has_widget_data_ref(value)
+
+
+# ---------------------------------------------------------------------------
+# Fast startup probes (warning-only, index-backed, zero false positives)
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class MainBucketConsumerProbe:
-    """One main-bucket consumer table probe for the storage-off startup gate."""
+class StartupConsumerProbe:
+    """One fast, index-backed main-bucket consumer probe for warning-only startup checks."""
 
     name: str
     table: str
-    exists_sql: str
+    count_sql: str
     where_summary: str
     source_ref: str
-    index_used: str
     required_tables: tuple[str, ...] = ()
-    params_factory: Callable[[Mapping[str, str] | None], tuple[Any, ...]] | None = None
 
     def tables_to_check(self) -> tuple[str, ...]:
         return self.required_tables or (self.table,)
 
-    def build_params(self, env: Mapping[str, str] | None = None) -> tuple[Any, ...] | None:
-        if self.params_factory is None:
-            return None
-        return self.params_factory(env)
 
-
-# Every main-bucket consumer from the §3.1 reconciliation matrix.
-# Secondary-bucket consumers (dalton_chat_file_uploads, dalton_transcription_jobs,
-# channel_snapshots) live in the dedicated secondary bucket and are excluded here.
-# Every probe is index-backed with LIMIT 1 so startup checks never full-scan multi-GB tables.
-MAIN_BUCKET_CONSUMER_PROBES: tuple[MainBucketConsumerProbe, ...] = (
-    MainBucketConsumerProbe(
+STARTUP_MAIN_BUCKET_PROBES: tuple[StartupConsumerProbe, ...] = (
+    StartupConsumerProbe(
         name="workspace_file_blobs",
         table="public.workspace_file_blobs",
-        exists_sql=(
-            "SELECT EXISTS ("
-            "SELECT 1 FROM workspace_file_blobs ORDER BY user_id, sha256 LIMIT 1"
-            ")"
+        count_sql=(
+            f"SELECT COUNT(*) FROM ("
+            f"SELECT 1 FROM workspace_file_blobs LIMIT {STARTUP_COUNT_CAP}"
+            f") sub"
         ),
-        where_summary="any row (PK index-only LIMIT 1)",
+        where_summary=f"any row (PK index, capped at {STARTUP_COUNT_CAP})",
         source_ref="migrations/versions/039_workspace_file_blobs.py:105; src/server/database/blob_keys.py:158-175",
-        index_used="workspace_file_blobs_pkey (user_id, sha256)",
     ),
-    MainBucketConsumerProbe(
+    StartupConsumerProbe(
         name="workspace_files",
         table="public.workspace_files",
-        exists_sql=(
-            "SELECT EXISTS (SELECT 1 FROM workspace_files WHERE blob_sha256 IS NOT NULL LIMIT 1) "
-            "OR EXISTS (SELECT 1 FROM workspace_files WHERE pack_sha256 IS NOT NULL LIMIT 1)"
+        count_sql=(
+            "SELECT COUNT(*) FROM ("
+            f"SELECT workspace_file_id FROM workspace_files WHERE blob_sha256 IS NOT NULL LIMIT {STARTUP_COUNT_CAP} "
+            "UNION "
+            f"SELECT workspace_file_id FROM workspace_files WHERE pack_sha256 IS NOT NULL LIMIT {STARTUP_COUNT_CAP}"
+            ") sub"
         ),
-        where_summary="blob_sha256 IS NOT NULL (partial index) OR pack_sha256 IS NOT NULL (partial index)",
+        where_summary=f"blob_sha256 IS NOT NULL OR pack_sha256 IS NOT NULL (partial indexes, capped at {STARTUP_COUNT_CAP})",
         source_ref="migrations/versions/039_workspace_file_blobs.py:172-181; src/server/database/blob_keys.py:163-168,181",
-        index_used="idx_workspace_files_blob_sha256 (partial), idx_workspace_files_pack_sha256 (partial)",
     ),
-    MainBucketConsumerProbe(
+    StartupConsumerProbe(
         name="thread_transcript_files",
         table="public.thread_transcript_files",
-        exists_sql=(
-            "SELECT EXISTS ("
+        count_sql=(
+            "SELECT COUNT(*) FROM ("
             "SELECT 1 FROM workspace_file_blobs b "
             "JOIN thread_transcript_files t ON t.sha256 = b.sha256 AND t.user_id = b.user_id "
-            "WHERE t.content IS NULL LIMIT 1"
-            ")"
+            f"WHERE t.content IS NULL LIMIT {STARTUP_COUNT_CAP}"
+            ") sub"
         ),
-        where_summary="blob-backed row (joined via workspace_file_blobs) with content IS NULL",
+        where_summary=f"blob-backed row (joined via workspace_file_blobs) with content IS NULL (capped at {STARTUP_COUNT_CAP})",
         source_ref="migrations/versions/056_thread_transcripts.py:43-60; src/server/database/blob_keys.py:169-170",
-        index_used="workspace_file_blobs_pkey + idx_thread_transcript_files_sha256",
         required_tables=("public.workspace_file_blobs", "public.thread_transcript_files"),
     ),
-    MainBucketConsumerProbe(
+    StartupConsumerProbe(
         name="artifact_version_files",
         table="public.artifact_version_files",
-        exists_sql=(
-            "SELECT EXISTS ("
+        count_sql=(
+            "SELECT COUNT(*) FROM ("
             "SELECT 1 FROM workspace_file_blobs b "
             "JOIN artifact_version_files a ON a.sha256 = b.sha256 AND a.user_id = b.user_id "
-            "WHERE a.content IS NULL LIMIT 1"
-            ")"
+            f"WHERE a.content IS NULL LIMIT {STARTUP_COUNT_CAP}"
+            ") sub"
         ),
-        where_summary="blob-backed row (joined via workspace_file_blobs) with content IS NULL",
+        where_summary=f"blob-backed row (joined via workspace_file_blobs) with content IS NULL (capped at {STARTUP_COUNT_CAP})",
         source_ref="migrations/versions/101_artifacts.py:163-187; src/server/database/blob_keys.py:171-172",
-        index_used="workspace_file_blobs_pkey + idx_artifact_version_files_sha256",
         required_tables=("public.workspace_file_blobs", "public.artifact_version_files"),
     ),
-    MainBucketConsumerProbe(
+    StartupConsumerProbe(
         name="drive_contents",
         table="public.drive_contents",
-        exists_sql=(
-            "SELECT EXISTS (SELECT 1 FROM drive_contents "
-            "WHERE blob_user_id IS NOT NULL LIMIT 1)"
+        count_sql=(
+            "SELECT COUNT(*) FROM ("
+            f"SELECT 1 FROM drive_contents WHERE blob_user_id IS NOT NULL LIMIT {STARTUP_COUNT_CAP}"
+            ") sub"
         ),
-        where_summary="blob_user_id IS NOT NULL",
+        where_summary=f"blob_user_id IS NOT NULL (partial index, capped at {STARTUP_COUNT_CAP})",
         source_ref="migrations/versions/150_drive.py:156-184; src/server/database/blob_keys.py:173-174",
-        index_used="ix_drive_contents_blob (partial WHERE blob_user_id IS NOT NULL)",
     ),
-    MainBucketConsumerProbe(
-        name="provenance_result_bodies",
-        table="public.provenance_result_bodies",
-        exists_sql=(
-            "SELECT EXISTS ("
-            "SELECT 1 FROM ("
-            "SELECT object_key FROM provenance_result_bodies ORDER BY created_at DESC LIMIT 1000"
-            ") recent WHERE recent.object_key IS NOT NULL LIMIT 1"
-            ")"
-        ),
-        where_summary="recent 1000 rows by created_at DESC with object_key IS NOT NULL",
-        source_ref="migrations/versions/015_add_provenance_result_bodies.py:38-58; src/server/database/provenance_bodies.py:107-115",
-        index_used="idx_provenance_result_bodies_created_at (created_at)",
-    ),
-    MainBucketConsumerProbe(
-        name="memo_binaries",
-        table="public.store",
-        exists_sql=(
-            "SELECT EXISTS ("
-            "SELECT 1 FROM ("
-            "SELECT user_id FROM users ORDER BY created_at DESC LIMIT 1000"
-            ") u "
-            "JOIN store s ON s.prefix = replace(u.user_id, '.', '%2E') || '.memos' "
-            "WHERE s.value ? 'binary_ref' "
-            "AND jsonb_typeof(s.value -> 'binary_ref') = 'object' "
-            "AND COALESCE(s.value -> 'binary_ref' ->> 'key', '') <> '' LIMIT 1"
-            ")"
-        ),
-        where_summary="users memo namespaces (store_pkey prefix lookup) with non-empty binary_ref.key",
-        source_ref="migrations/versions/001_initial_schema.py:535-549; src/ptc_agent/agent/backends/langgraph_store.py:175-176; src/server/app/memo.py:566-575",
-        index_used="idx_users_created_at + store_pkey (prefix, key)",
-        required_tables=("public.users", "public.store"),
-    ),
-    MainBucketConsumerProbe(
+    StartupConsumerProbe(
         name="user_skills",
         table="public.user_skills",
-        exists_sql=(
-            "SELECT EXISTS (SELECT 1 FROM user_skills "
-            "WHERE archive_key IS NOT NULL LIMIT 1)"
+        count_sql=(
+            "SELECT COUNT(*) FROM ("
+            f"SELECT 1 FROM user_skills WHERE archive_key IS NOT NULL LIMIT {STARTUP_COUNT_CAP}"
+            ") sub"
         ),
-        where_summary="archive_key IS NOT NULL",
+        where_summary=f"archive_key IS NOT NULL (partial index, capped at {STARTUP_COUNT_CAP})",
         source_ref="migrations/versions/026_user_skills.py:56-120; src/server/services/skill_archive_storage.py:54-65,94-117",
-        index_used="idx_user_skills_archive_key (partial WHERE archive_key IS NOT NULL)",
     ),
-    MainBucketConsumerProbe(
+    StartupConsumerProbe(
         name="org_library_items",
         table="public.org_library_items",
-        exists_sql=(
-            "SELECT EXISTS (SELECT 1 FROM org_library_items "
-            "WHERE kind = 'skill' AND archive_key IS NOT NULL LIMIT 1)"
+        count_sql=(
+            "SELECT COUNT(*) FROM ("
+            f"SELECT 1 FROM org_library_items WHERE kind = 'skill' AND archive_key IS NOT NULL LIMIT {STARTUP_COUNT_CAP}"
+            ") sub"
         ),
-        where_summary="kind = 'skill' AND archive_key IS NOT NULL",
+        where_summary=f"kind = 'skill' AND archive_key IS NOT NULL (partial index, capped at {STARTUP_COUNT_CAP})",
         source_ref="migrations/versions/140_org_library_skills.py:35-59; src/server/services/skill_archive_storage.py:67-91",
-        index_used="idx_org_library_items_skill (partial WHERE kind = 'skill')",
     ),
-    MainBucketConsumerProbe(
-        name="widgets_turn_slices",
-        table="public.turn_slices",
-        exists_sql=(
-            "SELECT EXISTS ("
-            "SELECT 1 FROM ("
-            "SELECT conversation_response_id FROM conversation_responses ORDER BY created_at DESC LIMIT 500"
-            ") r "
-            "JOIN turn_slices ts ON ts.conversation_response_id = r.conversation_response_id "
-            "WHERE ts.lines IS NOT NULL AND position('\"data_ref\"' in ts.lines) > 0 LIMIT 1"
-            ")"
-        ),
-        where_summary="recent 500 responses joined to turn_slices PK where lines contains \"data_ref\"",
-        source_ref="migrations/versions/064_turn_slices.py:27-47; src/server/services/history/replay/lines.py:38-42,55",
-        index_used="idx_responses_created_at + turn_slices_pkey (conversation_response_id)",
-        required_tables=("public.conversation_responses", "public.turn_slices"),
-    ),
-    MainBucketConsumerProbe(
-        name="widgets_checkpoint_blobs",
-        table="public.checkpoint_blobs",
-        exists_sql=(
-            "WITH recent_threads AS ("
-            "SELECT conversation_thread_id::text AS thread_id FROM ("
-            "SELECT conversation_thread_id FROM conversation_responses ORDER BY created_at DESC LIMIT 100"
-            ") r "
-            "UNION "
-            "SELECT conversation_thread_id::text AS thread_id FROM ("
-            "SELECT conversation_thread_id FROM conversation_threads ORDER BY created_at DESC LIMIT 100"
-            ") t"
-            ") "
-            "SELECT EXISTS ("
-            "SELECT 1 FROM recent_threads rt "
-            "JOIN checkpoint_blobs cb ON cb.thread_id = rt.thread_id "
-            "WHERE cb.channel = 'messages' AND cb.blob IS NOT NULL "
-            "AND position(convert_to('data_ref', 'UTF8') in cb.blob) > 0 "
-            "AND position(convert_to('widgets/', 'UTF8') in cb.blob) > 0 LIMIT 1"
-            ")"
-        ),
-        where_summary="recent active threads joined via checkpoint_blobs_thread_id_idx where messages blob contains data_ref + widgets/",
-        source_ref="src/ptc_agent/agent/tools/show_widget.py:272-305; src/server/services/history/replay/widgets.py:19-39",
-        index_used="idx_responses_created_at, idx_threads_created_at + checkpoint_blobs_thread_id_idx / checkpoint_blobs_pkey",
-        required_tables=("public.conversation_responses", "public.conversation_threads", "public.checkpoint_blobs"),
-    ),
-    MainBucketConsumerProbe(
-        name="widgets_checkpoint_writes",
-        table="public.checkpoint_writes",
-        exists_sql=(
-            "WITH recent_threads AS ("
-            "SELECT conversation_thread_id::text AS thread_id FROM ("
-            "SELECT conversation_thread_id FROM conversation_responses ORDER BY created_at DESC LIMIT 100"
-            ") r "
-            "UNION "
-            "SELECT conversation_thread_id::text AS thread_id FROM ("
-            "SELECT conversation_thread_id FROM conversation_threads ORDER BY created_at DESC LIMIT 100"
-            ") t"
-            ") "
-            "SELECT EXISTS ("
-            "SELECT 1 FROM recent_threads rt "
-            "JOIN checkpoint_writes cw ON cw.thread_id = rt.thread_id "
-            "WHERE cw.channel = 'messages' AND cw.blob IS NOT NULL "
-            "AND position(convert_to('data_ref', 'UTF8') in cw.blob) > 0 "
-            "AND position(convert_to('widgets/', 'UTF8') in cw.blob) > 0 LIMIT 1"
-            ")"
-        ),
-        where_summary="recent active threads joined via checkpoint_writes_thread_id_idx where unsliced DeltaChannel messages blob contains data_ref + widgets/",
-        source_ref="src/server/database/thread_fork.py:14-16; src/ptc_agent/agent/tools/show_widget.py:272-305",
-        index_used="idx_responses_created_at, idx_threads_created_at + checkpoint_writes_thread_id_idx / checkpoint_writes_pkey",
-        required_tables=("public.conversation_responses", "public.conversation_threads", "public.checkpoint_writes"),
-    ),
-    MainBucketConsumerProbe(
-        name="users_avatars",
-        table="public.users",
-        exists_sql=(
-            "SELECT EXISTS ("
-            "SELECT 1 FROM ("
-            "SELECT avatar_url FROM users ORDER BY created_at DESC LIMIT 1000"
-            ") recent "
-            "JOIN unnest(%s::text[], %s::text[]) AS cfg(origin, path_re) "
-            "ON lower(substring(recent.avatar_url FROM '^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]+')) = cfg.origin "
-            "WHERE recent.avatar_url IS NOT NULL "
-            "AND substring(recent.avatar_url FROM '^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]+(.*)') ~ cfg.path_re "
-            "LIMIT 1"
-            ")"
-        ),
-        where_summary="avatar_url matches site origin + configured STORAGE_KEY_PREFIX + avatars/<user>.<ext> (external URLs allowed)",
-        source_ref="migrations/versions/001_initial_schema.py:77-94; src/server/app/users.py:407,1172-1182",
-        index_used="idx_users_created_at (created_at DESC)",
-        params_factory=_avatar_probe_params,
-    ),
-    MainBucketConsumerProbe(
-        name="response_images_turns",
-        table="public.conversation_responses",
-        exists_sql=(
-            "SELECT EXISTS ("
-            "SELECT 1 FROM ("
-            "SELECT replay_facts FROM conversation_responses ORDER BY created_at DESC LIMIT 1000"
-            ") recent "
-            "WHERE recent.replay_facts IS NOT NULL "
-            "AND recent.replay_facts ? 'images' "
-            "AND jsonb_typeof(recent.replay_facts -> 'images') = 'object' "
-            "AND recent.replay_facts -> 'images' <> '{}'::jsonb "
-            "AND (recent.replay_facts -> 'images')::text LIKE '%response-images/%' LIMIT 1"
-            ")"
-        ),
-        where_summary="recent 1000 responses by created_at DESC where replay_facts->'images' references response-images/*",
-        source_ref="migrations/versions/065_replay_facts.py:25-28; src/server/services/history/replay/facts.py:48-49,181; src/ptc_agent/agent/middleware/image_capture.py:88-91",
-        index_used="idx_responses_created_at (created_at DESC)",
-    ),
-    MainBucketConsumerProbe(
-        name="response_images_subagents",
-        table="public.subagent_runs",
-        exists_sql=(
-            "WITH recent_threads AS ("
-            "SELECT conversation_thread_id AS thread_id FROM ("
-            "SELECT conversation_thread_id FROM conversation_responses ORDER BY created_at DESC LIMIT 500"
-            ") r "
-            "UNION "
-            "SELECT conversation_thread_id AS thread_id FROM ("
-            "SELECT conversation_thread_id FROM conversation_threads ORDER BY created_at DESC LIMIT 200"
-            ") t"
-            ") "
-            "SELECT EXISTS ("
-            "SELECT 1 FROM recent_threads rt "
-            "JOIN subagent_runs s ON s.thread_id = rt.thread_id "
-            "WHERE s.replay_facts IS NOT NULL "
-            "AND s.replay_facts ? 'images' "
-            "AND jsonb_typeof(s.replay_facts -> 'images') = 'object' "
-            "AND s.replay_facts -> 'images' <> '{}'::jsonb "
-            "AND (s.replay_facts -> 'images')::text LIKE '%response-images/%' LIMIT 1"
-            ")"
-        ),
-        where_summary="recent active threads joined via ix_subagent_runs_thread_task where replay_facts->'images' references response-images/*",
-        source_ref="migrations/versions/065_replay_facts.py:29-31; src/server/services/history/replay/facts.py:64-65; src/ptc_agent/agent/middleware/image_capture.py:88-91",
-        index_used="idx_responses_created_at, idx_threads_created_at + ix_subagent_runs_thread_task (thread_id, task_id, started_at)",
-        required_tables=("public.conversation_responses", "public.conversation_threads", "public.subagent_runs"),
-    ),
-    MainBucketConsumerProbe(
+    StartupConsumerProbe(
         name="chat_attachments",
         table="public.chat_attachments",
-        exists_sql=(
-            "SELECT EXISTS ("
-            "SELECT 1 FROM chat_attachments "
-            "WHERE sent_at IS NOT NULL AND object_key IS NOT NULL AND cleaned_at IS NULL LIMIT 1"
-            ") OR EXISTS ("
-            "SELECT 1 FROM chat_attachments "
-            "WHERE sent_at IS NULL AND state <> 'aborted' AND object_key IS NOT NULL AND cleaned_at IS NULL LIMIT 1"
-            ") OR EXISTS ("
-            "SELECT 1 FROM chat_attachments "
-            "WHERE state = 'aborted' AND cleaned_at IS NULL AND object_key IS NOT NULL LIMIT 1"
-            ")"
+        count_sql=(
+            "SELECT COUNT(*) FROM ("
+            f"SELECT 1 FROM chat_attachments WHERE object_key IS NOT NULL AND cleaned_at IS NULL LIMIT {STARTUP_COUNT_CAP}"
+            ") sub"
         ),
-        where_summary="object_key IS NOT NULL AND cleaned_at IS NULL across partial indexes (inline rows excluded)",
+        where_summary=f"object_key IS NOT NULL AND cleaned_at IS NULL (inline rows excluded, capped at {STARTUP_COUNT_CAP})",
         source_ref="migrations/versions/123_chat_attachments.py:49-117; src/server/services/chat_attachments.py:365-379",
-        index_used="chat_attachments_sent (partial), chat_attachments_staged (partial), chat_attachments_aborted (partial)",
-    ),
-    MainBucketConsumerProbe(
-        name="chat_attachment_history",
-        table="public.conversation_queries",
-        exists_sql=(
-            "SELECT EXISTS ("
-            "SELECT 1 FROM ("
-            "SELECT metadata FROM conversation_queries ORDER BY created_at DESC LIMIT 1000"
-            ") recent "
-            "WHERE recent.metadata IS NOT NULL "
-            "AND recent.metadata ? 'attachments' "
-            "AND jsonb_typeof(recent.metadata -> 'attachments') = 'array' "
-            "AND EXISTS (SELECT 1 FROM jsonb_array_elements(recent.metadata -> 'attachments') AS att "
-            "WHERE COALESCE(att ->> 'url', '') LIKE '%/attachments/%') LIMIT 1"
-            ")"
-        ),
-        where_summary="recent 1000 queries by created_at DESC where metadata->'attachments' element url contains '/attachments/'",
-        source_ref="migrations/versions/001_initial_schema.py:309-329; src/server/utils/multimodal_context.py:171-196; src/server/handlers/chat/ptc_run.py:641-658",
-        index_used="idx_queries_created_at (created_at DESC)",
     ),
 )
 
+# Compatibility alias for callers inspecting registered startup probes
+MAIN_BUCKET_CONSUMER_PROBES = STARTUP_MAIN_BUCKET_PROBES
+
 
 @dataclass(frozen=True)
-class ConsumerProbeOutcome:
-    """Result of probing one main-bucket consumer."""
+class ConsumerCheckOutcome:
+    """Result of checking one main-bucket consumer (startup or strict CLI)."""
 
     name: str
     table: str
     has_references: bool
+    hit_count: int = 0
+    hit_count_capped: bool = False
+    suspected_count: int = 0
+    scanned_rows: int = 0
     skipped_missing_table: bool = False
     error: str | None = None
     elapsed_ms: float = 0.0
+
+    def formatted_hit_count(self) -> str:
+        return f"{self.hit_count}+" if self.hit_count_capped else str(self.hit_count)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "table": self.table,
             "has_references": self.has_references,
+            "hit_count": self.hit_count,
+            "hit_count_capped": self.hit_count_capped,
+            "suspected_count": self.suspected_count,
+            "scanned_rows": self.scanned_rows,
             "skipped_missing_table": self.skipped_missing_table,
             "error": self.error,
             "elapsed_ms": round(self.elapsed_ms, 2),
         }
+
+
+# Backwards-compatible name
+ConsumerProbeOutcome = ConsumerCheckOutcome
 
 
 def _extract_first_value(row: Any) -> Any:
@@ -497,14 +456,30 @@ def _extract_first_value(row: Any) -> Any:
     return row[0]
 
 
-async def _probe_single_consumer(
+def _extract_tuple(row: Any, width: int) -> tuple[Any, ...]:
+    if isinstance(row, dict):
+        vals = tuple(row.values())
+        return vals[:width]
+    return tuple(row[:width])
+
+
+async def _check_tables_exist(cur: Any, tables: tuple[str, ...]) -> str | None:
+    """Return the first missing table name, or None if all exist."""
+    for req_table in tables:
+        await cur.execute("SELECT to_regclass(%s)", (req_table,))
+        reg_row = await cur.fetchone()
+        if _extract_first_value(reg_row) is None:
+            return req_table
+    return None
+
+
+async def _probe_single_startup_consumer(
     conn: Any,
-    consumer: MainBucketConsumerProbe,
+    consumer: StartupConsumerProbe,
     *,
     statement_timeout: str,
     target_logger: logging.Logger,
-    env: Mapping[str, str] | None = None,
-) -> ConsumerProbeOutcome:
+) -> ConsumerCheckOutcome:
     started = time.monotonic()
     try:
         async with conn.transaction():
@@ -513,49 +488,49 @@ async def _probe_single_consumer(
                     "SELECT set_config('statement_timeout', %s, true)",
                     (statement_timeout,),
                 )
-                for req_table in consumer.tables_to_check():
-                    await cur.execute("SELECT to_regclass(%s)", (req_table,))
-                    reg_row = await cur.fetchone()
-                    if _extract_first_value(reg_row) is None:
-                        elapsed_ms = (time.monotonic() - started) * 1000.0
-                        target_logger.info(
-                            "Main-storage reference probe skipped %s: table %s does not exist",
-                            consumer.name,
-                            req_table,
-                        )
-                        return ConsumerProbeOutcome(
-                            name=consumer.name,
-                            table=consumer.table,
-                            has_references=False,
-                            skipped_missing_table=True,
-                            elapsed_ms=elapsed_ms,
-                        )
+                missing = await _check_tables_exist(cur, consumer.tables_to_check())
+                if missing is not None:
+                    elapsed_ms = (time.monotonic() - started) * 1000.0
+                    target_logger.info(
+                        "Main-storage startup check skipped %s: table %s does not exist",
+                        consumer.name,
+                        missing,
+                    )
+                    return ConsumerCheckOutcome(
+                        name=consumer.name,
+                        table=consumer.table,
+                        has_references=False,
+                        skipped_missing_table=True,
+                        elapsed_ms=elapsed_ms,
+                    )
 
-                params = consumer.build_params(env)
-                if params is not None:
-                    await cur.execute(consumer.exists_sql, params)
+                await cur.execute(consumer.count_sql)
+                row = await cur.fetchone()
+                raw_val = _extract_first_value(row)
+                if isinstance(raw_val, bool):
+                    count = 1 if raw_val else 0
                 else:
-                    await cur.execute(consumer.exists_sql)
-                exists_row = await cur.fetchone()
-                found = bool(_extract_first_value(exists_row))
+                    count = int(raw_val or 0)
                 elapsed_ms = (time.monotonic() - started) * 1000.0
-                return ConsumerProbeOutcome(
+                return ConsumerCheckOutcome(
                     name=consumer.name,
                     table=consumer.table,
-                    has_references=found,
+                    has_references=count > 0,
+                    hit_count=count,
+                    hit_count_capped=count >= STARTUP_COUNT_CAP,
                     elapsed_ms=elapsed_ms,
                 )
     except Exception as exc:
         elapsed_ms = (time.monotonic() - started) * 1000.0
         err_text = f"{type(exc).__name__}: {exc}"
         target_logger.warning(
-            "Main-storage reference probe failed or timed out for %s (%s): %s "
-            "(not treated as confirmed reference)",
+            "Main-storage startup check failed or timed out for %s (%s): %s "
+            "(warning only; startup continues)",
             consumer.name,
             consumer.table,
             err_text,
         )
-        return ConsumerProbeOutcome(
+        return ConsumerCheckOutcome(
             name=consumer.name,
             table=consumer.table,
             has_references=False,
@@ -567,37 +542,34 @@ async def _probe_single_consumer(
 async def probe_main_bucket_references(
     *,
     conn: Any | None = None,
-    probes: tuple[MainBucketConsumerProbe, ...] = MAIN_BUCKET_CONSUMER_PROBES,
-    statement_timeout: str = PROBE_STATEMENT_TIMEOUT,
+    probes: tuple[StartupConsumerProbe, ...] = STARTUP_MAIN_BUCKET_PROBES,
+    statement_timeout: str = STARTUP_STATEMENT_TIMEOUT,
     target_logger: logging.Logger | None = None,
-    env: Mapping[str, str] | None = None,
-) -> tuple[list[ConsumerProbeOutcome], float]:
-    """Run every main-bucket consumer probe sequentially, each in its own timed transaction."""
+) -> tuple[list[ConsumerCheckOutcome], float]:
+    """Run startup advisory probes sequentially, each in its own timed transaction."""
     log = target_logger or logger
     total_start = time.monotonic()
-    outcomes: list[ConsumerProbeOutcome] = []
+    outcomes: list[ConsumerCheckOutcome] = []
 
     if conn is not None:
         for consumer in probes:
             outcomes.append(
-                await _probe_single_consumer(
+                await _probe_single_startup_consumer(
                     conn,
                     consumer,
                     statement_timeout=statement_timeout,
                     target_logger=log,
-                    env=env,
                 )
             )
     else:
         async with get_db_connection() as db_conn:
             for consumer in probes:
                 outcomes.append(
-                    await _probe_single_consumer(
+                    await _probe_single_startup_consumer(
                         db_conn,
                         consumer,
                         statement_timeout=statement_timeout,
                         target_logger=log,
-                        env=env,
                     )
                 )
 
@@ -605,70 +577,46 @@ async def probe_main_bucket_references(
     return outcomes, total_ms
 
 
-async def explain_main_bucket_probes(
-    conn: Any,
-    *,
-    probes: tuple[MainBucketConsumerProbe, ...] = MAIN_BUCKET_CONSUMER_PROBES,
-    disable_seqscan: bool = True,
-    env: Mapping[str, str] | None = None,
-) -> dict[str, str]:
-    """Return ``EXPLAIN (FORMAT TEXT)`` plan text per consumer probe (for verification/tests)."""
-    plans: dict[str, str] = {}
-    for consumer in probes:
-        async with conn.transaction():
-            async with conn.cursor() as cur:
-                if disable_seqscan:
-                    await cur.execute("SET LOCAL enable_seqscan = off")
-                params = consumer.build_params(env)
-                explain_sql = f"EXPLAIN (FORMAT TEXT) {consumer.exists_sql}"
-                if params is not None:
-                    await cur.execute(explain_sql, params)
-                else:
-                    await cur.execute(explain_sql)
-                rows = await cur.fetchall()
-                plans[consumer.name] = "\n".join(str(_extract_first_value(r)) for r in rows)
-    return plans
-
-
-def _allow_unmigrated_storage_off() -> bool:
-    return (os.getenv(ALLOW_UNMIGRATED_ENV, "") or "").strip().lower() in _TRUTHY
-
-
-async def enforce_storage_off_startup_gate(
+async def warn_main_bucket_references_on_startup(
     *,
     conn: Any | None = None,
-    probes: tuple[MainBucketConsumerProbe, ...] = MAIN_BUCKET_CONSUMER_PROBES,
-    statement_timeout: str = PROBE_STATEMENT_TIMEOUT,
+    probes: tuple[StartupConsumerProbe, ...] = STARTUP_MAIN_BUCKET_PROBES,
+    statement_timeout: str = STARTUP_STATEMENT_TIMEOUT,
     target_logger: logging.Logger | None = None,
-    env: Mapping[str, str] | None = None,
-) -> list[ConsumerProbeOutcome]:
-    """Refuse startup ONLY if main storage is disabled AND main-bucket references are confirmed.
+) -> list[ConsumerCheckOutcome]:
+    """Advisory startup check when main storage is disabled: WARNING only, never blocks boot.
 
     - No-op when ``is_storage_enabled()`` is True.
     - Runs in both Everflow and Standalone Core profiles.
-    - Probe timeouts or query errors log a ``WARNING`` and allow startup (never block
-      storage-off deployments without a confirmed main-bucket reference).
-    - Confirmed reference hits refuse startup (unless
-      ``DALTON_ALLOW_UNMIGRATED_STORAGE_OFF=1`` degrades refusal to a ``CRITICAL`` log).
+    - Lists only hit table names and counts (never object keys, URLs, or row content).
+    - Any probe hit, timeout, or DB error logs ``WARNING`` and allows startup to proceed.
     """
     if is_storage_enabled():
         return []
 
     log = target_logger or logger
-    outcomes, total_ms = await probe_main_bucket_references(
-        conn=conn,
-        probes=probes,
-        statement_timeout=statement_timeout,
-        target_logger=log,
-        env=env,
-    )
+    try:
+        outcomes, total_ms = await probe_main_bucket_references(
+            conn=conn,
+            probes=probes,
+            statement_timeout=statement_timeout,
+            target_logger=log,
+        )
+    except Exception as exc:
+        log.warning(
+            "Main-storage startup reference check could not run (%s); "
+            "allowing startup to proceed. Run `python -m src.dalton.storage_refs check --strict` "
+            "manually before disabling the main bucket.",
+            type(exc).__name__,
+        )
+        return []
 
-    hits = [o.name for o in outcomes if o.has_references]
-    errors = [f"{o.name} ({o.error})" for o in outcomes if o.error]
+    hits = [o for o in outcomes if o.has_references]
+    errors = [o for o in outcomes if o.error]
     skipped = sum(1 for o in outcomes if o.skipped_missing_table)
 
     log.info(
-        "Main-storage startup reference gate probed %d consumer(s) in %.1f ms "
+        "Main-storage startup advisory check probed %d consumer(s) in %.1f ms "
         "(hits=%d, errors=%d, skipped_missing_tables=%d)",
         len(outcomes),
         total_ms,
@@ -677,36 +625,823 @@ async def enforce_storage_off_startup_gate(
         skipped,
     )
 
-    if errors and not hits:
-        log.warning(
-            "Main-storage startup reference gate encountered %d probe timeout/error(s) "
-            "with no confirmed main-bucket references; allowing startup: %s",
-            len(errors),
-            "; ".join(errors),
+    if hits:
+        hit_summary = ", ".join(
+            f"{o.table} ({o.name}): {o.formatted_hit_count()}" for o in hits
         )
-        return outcomes
+        log.warning(
+            "Main storage is disabled (`is_storage_enabled()=False`), but existing "
+            "main-bucket references were detected — %s. Startup is NOT blocked; "
+            "keep `STORAGE_PROVIDER=s3` (or set `DALTON_WSFILES_WRITE_INLINE_ONLY=1` "
+            "to route new workspace files inline) and run "
+            "`python -m src.dalton.storage_refs check --strict` before shutting down "
+            "the main bucket.",
+            hit_summary,
+        )
+    elif errors:
+        err_summary = ", ".join(f"{o.table} ({o.name})" for o in errors)
+        log.warning(
+            "Main-storage startup advisory check encountered %d probe error/timeout(s) (%s); "
+            "allowing startup to proceed.",
+            len(errors),
+            err_summary,
+        )
 
-    if not hits:
-        return outcomes
+    return outcomes
 
-    details: list[str] = [f"命中的消费者: {', '.join(hits)}"]
-    if errors:
-        details.append(f"探测超时或出错的消费者: {', '.join(errors)}")
-    detail_str = "；".join(details)
-    message = (
-        f"{STORAGE_OFF_GATE_ERROR_PREFIX}（{detail_str}；"
-        "修改 .env 后请重建后端容器以加载新环境变量）"
+
+# Backwards-compatible alias — never raises DaltonStartupConfigError.
+enforce_storage_off_startup_gate = warn_main_bucket_references_on_startup
+
+
+# ---------------------------------------------------------------------------
+# Strict full-table batched audit for `python -m src.dalton.storage_refs check --strict`
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StrictConsumerSpec:
+    """Declarative specification for one of the 17 strict main-bucket consumers."""
+
+    name: str
+    table: str
+    mode: str  # "indexed_exists" | "batched_bool" | "turn_slices" | "checkpoint_blobs" | "checkpoint_writes" | "users_avatars"
+    where_summary: str
+    source_ref: str
+    required_tables: tuple[str, ...] = ()
+    exists_sql: str = ""
+    pk_columns: tuple[str, ...] = ()
+    batch_sql_first: str = ""
+    batch_sql_next: str = ""
+
+    def tables_to_check(self) -> tuple[str, ...]:
+        return self.required_tables or (self.table,)
+
+
+def _build_batched_bool_spec(
+    *,
+    name: str,
+    table: str,
+    table_ident: str,
+    pk_columns: tuple[str, ...],
+    hit_expr: str,
+    where_summary: str,
+    source_ref: str,
+    required_tables: tuple[str, ...] = (),
+) -> StrictConsumerSpec:
+    pk_select = ", ".join(pk_columns)
+    order_by = ", ".join(f"{col} ASC" for col in pk_columns)
+    if len(pk_columns) == 1:
+        cursor_cond = f"{pk_columns[0]} > %s"
+    else:
+        placeholders = ", ".join(["%s"] * len(pk_columns))
+        cursor_cond = f"({pk_select}) > ({placeholders})"
+    return StrictConsumerSpec(
+        name=name,
+        table=table,
+        mode="batched_bool",
+        where_summary=where_summary,
+        source_ref=source_ref,
+        required_tables=required_tables,
+        pk_columns=pk_columns,
+        batch_sql_first=(
+            f"SELECT {pk_select}, ({hit_expr}) AS is_hit "
+            f"FROM {table_ident} ORDER BY {order_by} LIMIT %s"
+        ),
+        batch_sql_next=(
+            f"SELECT {pk_select}, ({hit_expr}) AS is_hit "
+            f"FROM {table_ident} WHERE {cursor_cond} ORDER BY {order_by} LIMIT %s"
+        ),
     )
 
-    if _allow_unmigrated_storage_off():
-        log.critical(
-            "%s — bypassing startup refusal because %s=1 is set",
-            message,
-            ALLOW_UNMIGRATED_ENV,
-        )
-        return outcomes
 
-    raise DaltonStartupConfigError(message)
+STRICT_MAIN_BUCKET_CONSUMERS: tuple[StrictConsumerSpec, ...] = (
+    # --- Indexed full-table exact checks (1-7) ---
+    StrictConsumerSpec(
+        name="workspace_file_blobs",
+        table="public.workspace_file_blobs",
+        mode="indexed_exists",
+        exists_sql="SELECT EXISTS (SELECT 1 FROM workspace_file_blobs LIMIT 1)",
+        where_summary="any row (PK index full-table)",
+        source_ref="migrations/versions/039_workspace_file_blobs.py:105; src/server/database/blob_keys.py:158-175",
+    ),
+    StrictConsumerSpec(
+        name="workspace_files",
+        table="public.workspace_files",
+        mode="indexed_exists",
+        exists_sql=(
+            "SELECT EXISTS (SELECT 1 FROM workspace_files WHERE blob_sha256 IS NOT NULL LIMIT 1) "
+            "OR EXISTS (SELECT 1 FROM workspace_files WHERE pack_sha256 IS NOT NULL LIMIT 1)"
+        ),
+        where_summary="blob_sha256 IS NOT NULL OR pack_sha256 IS NOT NULL (partial indexes)",
+        source_ref="migrations/versions/039_workspace_file_blobs.py:172-181; src/server/database/blob_keys.py:163-168,181",
+    ),
+    StrictConsumerSpec(
+        name="thread_transcript_files",
+        table="public.thread_transcript_files",
+        mode="indexed_exists",
+        exists_sql=(
+            "SELECT EXISTS ("
+            "SELECT 1 FROM workspace_file_blobs b "
+            "JOIN thread_transcript_files t ON t.sha256 = b.sha256 AND t.user_id = b.user_id "
+            "WHERE t.content IS NULL LIMIT 1"
+            ")"
+        ),
+        where_summary="blob-backed row (joined via workspace_file_blobs) with content IS NULL",
+        source_ref="migrations/versions/056_thread_transcripts.py:43-60; src/server/database/blob_keys.py:169-170",
+        required_tables=("public.workspace_file_blobs", "public.thread_transcript_files"),
+    ),
+    StrictConsumerSpec(
+        name="artifact_version_files",
+        table="public.artifact_version_files",
+        mode="indexed_exists",
+        exists_sql=(
+            "SELECT EXISTS ("
+            "SELECT 1 FROM workspace_file_blobs b "
+            "JOIN artifact_version_files a ON a.sha256 = b.sha256 AND a.user_id = b.user_id "
+            "WHERE a.content IS NULL LIMIT 1"
+            ")"
+        ),
+        where_summary="blob-backed row (joined via workspace_file_blobs) with content IS NULL",
+        source_ref="migrations/versions/101_artifacts.py:163-187; src/server/database/blob_keys.py:171-172",
+        required_tables=("public.workspace_file_blobs", "public.artifact_version_files"),
+    ),
+    StrictConsumerSpec(
+        name="drive_contents",
+        table="public.drive_contents",
+        mode="indexed_exists",
+        exists_sql=(
+            "SELECT EXISTS (SELECT 1 FROM drive_contents WHERE blob_user_id IS NOT NULL LIMIT 1)"
+        ),
+        where_summary="blob_user_id IS NOT NULL (partial index)",
+        source_ref="migrations/versions/150_drive.py:156-184; src/server/database/blob_keys.py:173-174",
+    ),
+    StrictConsumerSpec(
+        name="user_skills",
+        table="public.user_skills",
+        mode="indexed_exists",
+        exists_sql=(
+            "SELECT EXISTS (SELECT 1 FROM user_skills WHERE archive_key IS NOT NULL LIMIT 1)"
+        ),
+        where_summary="archive_key IS NOT NULL (partial index)",
+        source_ref="migrations/versions/026_user_skills.py:56-120; src/server/services/skill_archive_storage.py:54-65,94-117",
+    ),
+    StrictConsumerSpec(
+        name="org_library_items",
+        table="public.org_library_items",
+        mode="indexed_exists",
+        exists_sql=(
+            "SELECT EXISTS (SELECT 1 FROM org_library_items WHERE kind = 'skill' AND archive_key IS NOT NULL LIMIT 1)"
+        ),
+        where_summary="kind = 'skill' AND archive_key IS NOT NULL (partial index)",
+        source_ref="migrations/versions/140_org_library_skills.py:35-59; src/server/services/skill_archive_storage.py:67-91",
+    ),
+    # --- Full-table batched PK scans (8-13) ---
+    _build_batched_bool_spec(
+        name="chat_attachments",
+        table="public.chat_attachments",
+        table_ident="chat_attachments",
+        pk_columns=("attachment_id",),
+        hit_expr="object_key IS NOT NULL AND cleaned_at IS NULL",
+        where_summary="full-table batched scan: object_key IS NOT NULL AND cleaned_at IS NULL (inline rows excluded)",
+        source_ref="migrations/versions/123_chat_attachments.py:49-117; src/server/services/chat_attachments.py:365-379",
+    ),
+    _build_batched_bool_spec(
+        name="provenance_result_bodies",
+        table="public.provenance_result_bodies",
+        table_ident="provenance_result_bodies",
+        pk_columns=("result_sha256",),
+        hit_expr="object_key IS NOT NULL AND object_key <> ''",
+        where_summary="full-table batched scan: object_key IS NOT NULL AND object_key <> ''",
+        source_ref="migrations/versions/015_add_provenance_result_bodies.py:38-58; src/server/database/provenance_bodies.py:107-115",
+    ),
+    _build_batched_bool_spec(
+        name="memo_binaries",
+        table="public.store",
+        table_ident="store",
+        pk_columns=("prefix", "key"),
+        hit_expr=(
+            "prefix LIKE '%%.memos' AND value ? 'binary_ref' "
+            "AND jsonb_typeof(value -> 'binary_ref') = 'object' "
+            "AND COALESCE(value -> 'binary_ref' ->> 'key', '') <> ''"
+        ),
+        where_summary="full-table batched scan: store memo namespaces with non-empty binary_ref.key",
+        source_ref="migrations/versions/001_initial_schema.py:535-549; src/ptc_agent/agent/backends/langgraph_store.py:175-176; src/server/app/memo.py:566-575",
+    ),
+    _build_batched_bool_spec(
+        name="response_images_turns",
+        table="public.conversation_responses",
+        table_ident="conversation_responses",
+        pk_columns=("conversation_response_id",),
+        hit_expr=(
+            "replay_facts IS NOT NULL AND replay_facts ? 'images' "
+            "AND jsonb_typeof(replay_facts -> 'images') = 'object' "
+            "AND replay_facts -> 'images' <> '{}'::jsonb "
+            "AND EXISTS (SELECT 1 FROM jsonb_each_text(replay_facts -> 'images') AS kv "
+            "WHERE kv.value LIKE '%%response-images/%%')"
+        ),
+        where_summary="full-table batched scan: replay_facts->'images' values referencing response-images/",
+        source_ref="migrations/versions/065_replay_facts.py:25-28; src/server/services/history/replay/facts.py:48-49,181; src/ptc_agent/agent/middleware/image_capture.py:88-91",
+    ),
+    _build_batched_bool_spec(
+        name="response_images_subagents",
+        table="public.subagent_runs",
+        table_ident="subagent_runs",
+        pk_columns=("task_run_id",),
+        hit_expr=(
+            "replay_facts IS NOT NULL AND replay_facts ? 'images' "
+            "AND jsonb_typeof(replay_facts -> 'images') = 'object' "
+            "AND replay_facts -> 'images' <> '{}'::jsonb "
+            "AND EXISTS (SELECT 1 FROM jsonb_each_text(replay_facts -> 'images') AS kv "
+            "WHERE kv.value LIKE '%%response-images/%%')"
+        ),
+        where_summary="full-table batched scan: subagent_runs replay_facts->'images' referencing response-images/",
+        source_ref="migrations/versions/065_replay_facts.py:29-31; src/server/services/history/replay/facts.py:64-65; src/ptc_agent/agent/middleware/image_capture.py:88-91",
+    ),
+    _build_batched_bool_spec(
+        name="chat_attachment_history",
+        table="public.conversation_queries",
+        table_ident="conversation_queries",
+        pk_columns=("conversation_query_id",),
+        hit_expr=(
+            "metadata IS NOT NULL AND metadata ? 'attachments' "
+            "AND jsonb_typeof(metadata -> 'attachments') = 'array' "
+            "AND EXISTS (SELECT 1 FROM jsonb_array_elements(metadata -> 'attachments') AS att "
+            "WHERE COALESCE(att ->> 'url', '') LIKE '%%/attachments/%%')"
+        ),
+        where_summary="full-table batched scan: metadata->'attachments' url containing '/attachments/'",
+        source_ref="migrations/versions/001_initial_schema.py:309-329; src/server/utils/multimodal_context.py:171-196; src/server/handlers/chat/ptc_run.py:641-658",
+    ),
+    # --- Structurally verified widget consumers (14-16) ---
+    StrictConsumerSpec(
+        name="widgets_turn_slices",
+        table="public.turn_slices",
+        mode="turn_slices",
+        pk_columns=("conversation_response_id",),
+        where_summary=(
+            "full-table batched scan: candidate pre-filter position('\"data_ref\"' in lines)>0, "
+            "structurally verified as artifact/html_widget without inlined data and non-empty data_ref.key"
+        ),
+        source_ref="migrations/versions/064_turn_slices.py:27-47; src/server/services/history/replay/lines.py:38-42; src/server/services/history/replay/widgets.py:15-39",
+    ),
+    StrictConsumerSpec(
+        name="widgets_checkpoint_blobs",
+        table="public.checkpoint_blobs",
+        mode="checkpoint_blobs",
+        pk_columns=("thread_id", "checkpoint_ns", "channel", "version"),
+        where_summary=(
+            "full-table batched scan: candidate pre-filter channel='messages' with b'data_ref', "
+            "deserialized via JsonPlusSerializer and structurally verified on ShowWidget ToolMessage.artifact.data_ref.key"
+        ),
+        source_ref="src/ptc_agent/agent/tools/show_widget.py:272-305; src/server/services/history/projector.py:495-516; src/server/services/history/replay/widgets.py:19-39",
+    ),
+    StrictConsumerSpec(
+        name="widgets_checkpoint_writes",
+        table="public.checkpoint_writes",
+        mode="checkpoint_writes",
+        pk_columns=("thread_id", "checkpoint_ns", "checkpoint_id", "task_id", "idx"),
+        where_summary=(
+            "full-table batched scan: candidate pre-filter channel='messages' with b'data_ref', "
+            "deserialized via JsonPlusSerializer and structurally verified on ShowWidget ToolMessage.artifact.data_ref.key"
+        ),
+        source_ref="src/server/database/thread_fork.py:14-16; src/ptc_agent/agent/tools/show_widget.py:272-305; src/server/services/history/projector.py:495-516",
+    ),
+    # --- Avatars: recorded object key = hit; URL-shape-only = suspected warning (17) ---
+    StrictConsumerSpec(
+        name="users_avatars",
+        table="public.users",
+        mode="users_avatars",
+        pk_columns=("user_id",),
+        where_summary=(
+            "full-table batched scan: confirmed hit ONLY on upload-recorded object key column; "
+            "site-shaped avatar_url without recorded object key emits suspected WARNING only"
+        ),
+        source_ref="migrations/versions/001_initial_schema.py:77-94; src/server/app/users.py:407,1172-1182",
+    ),
+)
+
+
+def _emit_progress(
+    stream: TextIO | None,
+    consumer: StrictConsumerSpec,
+    scanned: int,
+    started: float,
+    *,
+    status: str = "scanning",
+) -> None:
+    if stream is None:
+        return
+    elapsed = time.monotonic() - started
+    stream.write(
+        f"[storage_refs] {status}: {consumer.name} ({consumer.table}) "
+        f"scanned={scanned} elapsed={elapsed:.2f}s\n"
+    )
+    stream.flush()
+
+
+async def _detect_avatar_object_key_column(cur: Any) -> str | None:
+    """Return the recorded avatar object-key column on ``public.users``, if any."""
+    await cur.execute(
+        "SELECT attname FROM pg_attribute "
+        "WHERE attrelid = to_regclass('public.users') "
+        "AND attnum > 0 AND NOT attisdropped "
+        "AND attname = ANY(%s) ORDER BY attnum ASC LIMIT 1",
+        (list(_AVATAR_OBJECT_KEY_COLUMNS),),
+    )
+    row = await cur.fetchone()
+    val = _extract_first_value(row)
+    return str(val) if isinstance(val, str) and val in _AVATAR_OBJECT_KEY_COLUMNS else None
+
+
+async def _run_strict_single_consumer(
+    conn: Any,
+    consumer: StrictConsumerSpec,
+    *,
+    batch_size: int,
+    batch_timeout: str,
+    progress_stream: TextIO | None,
+    target_logger: logging.Logger,
+    env: Mapping[str, str] | None,
+    serde: Any | None,
+    stop_on_hit: bool,
+) -> ConsumerCheckOutcome:
+    started = time.monotonic()
+    scanned = 0
+    hits = 0
+    suspected = 0
+
+    try:
+        # Check required tables exist first
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT set_config('statement_timeout', %s, true)",
+                    (batch_timeout,),
+                )
+                missing = await _check_tables_exist(cur, consumer.tables_to_check())
+                if missing is not None:
+                    elapsed_ms = (time.monotonic() - started) * 1000.0
+                    target_logger.info(
+                        "Strict main-storage check skipped %s: table %s does not exist",
+                        consumer.name,
+                        missing,
+                    )
+                    return ConsumerCheckOutcome(
+                        name=consumer.name,
+                        table=consumer.table,
+                        has_references=False,
+                        skipped_missing_table=True,
+                        elapsed_ms=elapsed_ms,
+                    )
+
+        if consumer.mode == "indexed_exists":
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT set_config('statement_timeout', %s, true)",
+                        (batch_timeout,),
+                    )
+                    await cur.execute(consumer.exists_sql)
+                    row = await cur.fetchone()
+                    found = bool(_extract_first_value(row))
+            scanned = 1 if found else 0
+            hits = 1 if found else 0
+            _emit_progress(
+                progress_stream,
+                consumer,
+                scanned,
+                started,
+                status="hit" if found else "clean",
+            )
+            return ConsumerCheckOutcome(
+                name=consumer.name,
+                table=consumer.table,
+                has_references=found,
+                hit_count=hits,
+                scanned_rows=scanned,
+                elapsed_ms=(time.monotonic() - started) * 1000.0,
+            )
+
+        if consumer.mode == "batched_bool":
+            pk_len = len(consumer.pk_columns)
+            cursor_pk: tuple[Any, ...] | None = None
+            while True:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "SELECT set_config('statement_timeout', %s, true)",
+                            (batch_timeout,),
+                        )
+                        if cursor_pk is None:
+                            await cur.execute(consumer.batch_sql_first, (batch_size,))
+                        else:
+                            await cur.execute(consumer.batch_sql_next, (*cursor_pk, batch_size))
+                        rows = await cur.fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    vals = _extract_tuple(row, pk_len + 1)
+                    scanned += 1
+                    if bool(vals[pk_len]):
+                        hits += 1
+                        if stop_on_hit:
+                            _emit_progress(progress_stream, consumer, scanned, started, status="hit")
+                            return ConsumerCheckOutcome(
+                                name=consumer.name,
+                                table=consumer.table,
+                                has_references=True,
+                                hit_count=hits,
+                                scanned_rows=scanned,
+                                elapsed_ms=(time.monotonic() - started) * 1000.0,
+                            )
+                cursor_pk = _extract_tuple(rows[-1], pk_len)
+                _emit_progress(progress_stream, consumer, scanned, started)
+                if len(rows) < batch_size:
+                    break
+            _emit_progress(
+                progress_stream,
+                consumer,
+                scanned,
+                started,
+                status="hit" if hits else "clean",
+            )
+            return ConsumerCheckOutcome(
+                name=consumer.name,
+                table=consumer.table,
+                has_references=hits > 0,
+                hit_count=hits,
+                scanned_rows=scanned,
+                elapsed_ms=(time.monotonic() - started) * 1000.0,
+            )
+
+        if consumer.mode == "turn_slices":
+            cursor_id: Any = None
+            sql_first = (
+                "SELECT conversation_response_id, "
+                "CASE WHEN lines IS NOT NULL AND position('\"data_ref\"' in lines) > 0 "
+                "THEN lines ELSE NULL END AS candidate_lines "
+                "FROM turn_slices ORDER BY conversation_response_id ASC LIMIT %s"
+            )
+            sql_next = (
+                "SELECT conversation_response_id, "
+                "CASE WHEN lines IS NOT NULL AND position('\"data_ref\"' in lines) > 0 "
+                "THEN lines ELSE NULL END AS candidate_lines "
+                "FROM turn_slices WHERE conversation_response_id > %s "
+                "ORDER BY conversation_response_id ASC LIMIT %s"
+            )
+            while True:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "SELECT set_config('statement_timeout', %s, true)",
+                            (batch_timeout,),
+                        )
+                        if cursor_id is None:
+                            await cur.execute(sql_first, (batch_size,))
+                        else:
+                            await cur.execute(sql_next, (cursor_id, batch_size))
+                        rows = await cur.fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    row_id, candidate_lines = _extract_tuple(row, 2)
+                    scanned += 1
+                    if candidate_lines is not None and turn_slice_has_widget_data_ref(candidate_lines):
+                        hits += 1
+                        if stop_on_hit:
+                            _emit_progress(progress_stream, consumer, scanned, started, status="hit")
+                            return ConsumerCheckOutcome(
+                                name=consumer.name,
+                                table=consumer.table,
+                                has_references=True,
+                                hit_count=hits,
+                                scanned_rows=scanned,
+                                elapsed_ms=(time.monotonic() - started) * 1000.0,
+                            )
+                cursor_id = _extract_tuple(rows[-1], 1)[0]
+                _emit_progress(progress_stream, consumer, scanned, started)
+                if len(rows) < batch_size:
+                    break
+            _emit_progress(
+                progress_stream,
+                consumer,
+                scanned,
+                started,
+                status="hit" if hits else "clean",
+            )
+            return ConsumerCheckOutcome(
+                name=consumer.name,
+                table=consumer.table,
+                has_references=hits > 0,
+                hit_count=hits,
+                scanned_rows=scanned,
+                elapsed_ms=(time.monotonic() - started) * 1000.0,
+            )
+
+        if consumer.mode in ("checkpoint_blobs", "checkpoint_writes"):
+            table_ident = "checkpoint_blobs" if consumer.mode == "checkpoint_blobs" else "checkpoint_writes"
+            pk_cols = consumer.pk_columns
+            pk_len = len(pk_cols)
+            pk_select = ", ".join(pk_cols)
+            order_by = ", ".join(f"{c} ASC" for c in pk_cols)
+            placeholders = ", ".join(["%s"] * pk_len)
+            cand_cond = (
+                "channel = 'messages' AND blob IS NOT NULL "
+                "AND position(convert_to('data_ref', 'UTF8') in blob) > 0"
+            )
+            sql_first = (
+                f"SELECT {pk_select}, "
+                f"CASE WHEN {cand_cond} THEN type ELSE NULL END AS cand_type, "
+                f"CASE WHEN {cand_cond} THEN blob ELSE NULL END AS cand_blob "
+                f"FROM {table_ident} ORDER BY {order_by} LIMIT %s"
+            )
+            sql_next = (
+                f"SELECT {pk_select}, "
+                f"CASE WHEN {cand_cond} THEN type ELSE NULL END AS cand_type, "
+                f"CASE WHEN {cand_cond} THEN blob ELSE NULL END AS cand_blob "
+                f"FROM {table_ident} WHERE ({pk_select}) > ({placeholders}) "
+                f"ORDER BY {order_by} LIMIT %s"
+            )
+            cursor_pk = None
+            while True:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "SELECT set_config('statement_timeout', %s, true)",
+                            (batch_timeout,),
+                        )
+                        if cursor_pk is None:
+                            await cur.execute(sql_first, (batch_size,))
+                        else:
+                            await cur.execute(sql_next, (*cursor_pk, batch_size))
+                        rows = await cur.fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    vals = _extract_tuple(row, pk_len + 2)
+                    cand_type = vals[pk_len]
+                    cand_blob = vals[pk_len + 1]
+                    scanned += 1
+                    if cand_blob is not None and decode_and_check_checkpoint_widget_ref(
+                        cand_type, cand_blob, serde=serde
+                    ):
+                        hits += 1
+                        if stop_on_hit:
+                            _emit_progress(progress_stream, consumer, scanned, started, status="hit")
+                            return ConsumerCheckOutcome(
+                                name=consumer.name,
+                                table=consumer.table,
+                                has_references=True,
+                                hit_count=hits,
+                                scanned_rows=scanned,
+                                elapsed_ms=(time.monotonic() - started) * 1000.0,
+                            )
+                cursor_pk = _extract_tuple(rows[-1], pk_len)
+                _emit_progress(progress_stream, consumer, scanned, started)
+                if len(rows) < batch_size:
+                    break
+            _emit_progress(
+                progress_stream,
+                consumer,
+                scanned,
+                started,
+                status="hit" if hits else "clean",
+            )
+            return ConsumerCheckOutcome(
+                name=consumer.name,
+                table=consumer.table,
+                has_references=hits > 0,
+                hit_count=hits,
+                scanned_rows=scanned,
+                elapsed_ms=(time.monotonic() - started) * 1000.0,
+            )
+
+        if consumer.mode == "users_avatars":
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT set_config('statement_timeout', %s, true)",
+                        (batch_timeout,),
+                    )
+                    key_col = await _detect_avatar_object_key_column(cur)
+
+            if key_col is not None:
+                sql_first = (
+                    f"SELECT user_id, {key_col}, avatar_url "
+                    "FROM users ORDER BY user_id ASC LIMIT %s"
+                )
+                sql_next = (
+                    f"SELECT user_id, {key_col}, avatar_url "
+                    "FROM users WHERE user_id > %s ORDER BY user_id ASC LIMIT %s"
+                )
+            else:
+                sql_first = (
+                    "SELECT user_id, NULL::text, avatar_url "
+                    "FROM users ORDER BY user_id ASC LIMIT %s"
+                )
+                sql_next = (
+                    "SELECT user_id, NULL::text, avatar_url "
+                    "FROM users WHERE user_id > %s ORDER BY user_id ASC LIMIT %s"
+                )
+
+            cursor_uid: str | None = None
+            while True:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "SELECT set_config('statement_timeout', %s, true)",
+                            (batch_timeout,),
+                        )
+                        if cursor_uid is None:
+                            await cur.execute(sql_first, (batch_size,))
+                        else:
+                            await cur.execute(sql_next, (cursor_uid, batch_size))
+                        rows = await cur.fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    uid, obj_key, avatar_url = _extract_tuple(row, 3)
+                    scanned += 1
+                    if isinstance(obj_key, str) and obj_key.strip():
+                        hits += 1
+                        if stop_on_hit:
+                            _emit_progress(progress_stream, consumer, scanned, started, status="hit")
+                            return ConsumerCheckOutcome(
+                                name=consumer.name,
+                                table=consumer.table,
+                                has_references=True,
+                                hit_count=hits,
+                                suspected_count=suspected,
+                                scanned_rows=scanned,
+                                elapsed_ms=(time.monotonic() - started) * 1000.0,
+                            )
+                    elif is_site_avatar_url(avatar_url, env=env):
+                        suspected += 1
+                cursor_uid = str(_extract_tuple(rows[-1], 1)[0])
+                _emit_progress(progress_stream, consumer, scanned, started)
+                if len(rows) < batch_size:
+                    break
+
+            if suspected > 0:
+                target_logger.warning(
+                    "Suspected main-bucket avatar reference(s) in %s: %d row(s) have "
+                    "site-shaped avatar_url without a recorded upload object key "
+                    "(warning only; not counted as confirmed reference)",
+                    consumer.table,
+                    suspected,
+                )
+                if progress_stream is not None:
+                    progress_stream.write(
+                        f"[storage_refs] WARNING: {consumer.name} ({consumer.table}) "
+                        f"has {suspected} suspected site-shaped avatar_url row(s) "
+                        "(no recorded object key; not counted as confirmed hit)\n"
+                    )
+                    progress_stream.flush()
+
+            _emit_progress(
+                progress_stream,
+                consumer,
+                scanned,
+                started,
+                status="hit" if hits else ("suspected" if suspected else "clean"),
+            )
+            return ConsumerCheckOutcome(
+                name=consumer.name,
+                table=consumer.table,
+                has_references=hits > 0,
+                hit_count=hits,
+                suspected_count=suspected,
+                scanned_rows=scanned,
+                elapsed_ms=(time.monotonic() - started) * 1000.0,
+            )
+
+        raise ValueError(f"Unknown strict consumer mode: {consumer.mode!r}")
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        err_text = f"{type(exc).__name__}: {exc}"
+        target_logger.error(
+            "Strict main-storage check failed for %s (%s): %s",
+            consumer.name,
+            consumer.table,
+            err_text,
+        )
+        return ConsumerCheckOutcome(
+            name=consumer.name,
+            table=consumer.table,
+            has_references=False,
+            hit_count=hits,
+            suspected_count=suspected,
+            scanned_rows=scanned,
+            error=err_text,
+            elapsed_ms=elapsed_ms,
+        )
+
+
+@dataclass(frozen=True)
+class StrictCheckReport:
+    """Aggregate report returned by :func:`run_strict_main_bucket_check`."""
+
+    exit_code: int
+    outcomes: list[ConsumerCheckOutcome]
+    total_elapsed_ms: float
+    stopped_early: bool = False
+    interrupted: bool = False
+
+    @property
+    def confirmed_hits(self) -> list[str]:
+        return [o.name for o in self.outcomes if o.has_references]
+
+    @property
+    def suspected_warnings(self) -> dict[str, int]:
+        return {o.name: o.suspected_count for o in self.outcomes if o.suspected_count > 0}
+
+    @property
+    def errors(self) -> list[str]:
+        return [o.name for o in self.outcomes if o.error]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "exit_code": self.exit_code,
+            "stopped_early": self.stopped_early,
+            "interrupted": self.interrupted,
+            "total_elapsed_ms": round(self.total_elapsed_ms, 2),
+            "hits": self.confirmed_hits,
+            "suspected": self.suspected_warnings,
+            "errors": self.errors,
+            "consumers": [o.to_dict() for o in self.outcomes],
+        }
+
+
+async def run_strict_main_bucket_check(
+    *,
+    conn: Any,
+    consumers: tuple[StrictConsumerSpec, ...] = STRICT_MAIN_BUCKET_CONSUMERS,
+    batch_size: int = STRICT_BATCH_SIZE,
+    batch_timeout: str = STRICT_BATCH_TIMEOUT,
+    stop_on_hit: bool = True,
+    progress_stream: TextIO | None = None,
+    target_logger: logging.Logger | None = None,
+    env: Mapping[str, str] | None = None,
+    serde: Any | None = None,
+) -> StrictCheckReport:
+    """Execute full batched verification across all main-bucket consumers.
+
+    Exit codes:
+    - ``0`` (:data:`EXIT_CLEAN`): no confirmed main-bucket references found.
+    - ``1`` (:data:`EXIT_REFERENCES_FOUND`): at least one confirmed reference found.
+    - ``2`` (:data:`EXIT_CHECK_FAILED`): any check error or interruption.
+    """
+    log = target_logger or logger
+    total_start = time.monotonic()
+    outcomes: list[ConsumerCheckOutcome] = []
+    stopped_early = False
+    effective_batch = max(1, int(batch_size))
+
+    for consumer in consumers:
+        outcome = await _run_strict_single_consumer(
+            conn,
+            consumer,
+            batch_size=effective_batch,
+            batch_timeout=batch_timeout,
+            progress_stream=progress_stream,
+            target_logger=log,
+            env=env,
+            serde=serde,
+            stop_on_hit=stop_on_hit,
+        )
+        outcomes.append(outcome)
+        if outcome.error:
+            total_ms = (time.monotonic() - total_start) * 1000.0
+            return StrictCheckReport(
+                exit_code=EXIT_CHECK_FAILED,
+                outcomes=outcomes,
+                total_elapsed_ms=total_ms,
+                stopped_early=len(outcomes) < len(consumers),
+            )
+        if outcome.has_references and stop_on_hit:
+            stopped_early = len(outcomes) < len(consumers)
+            break
+
+    total_ms = (time.monotonic() - total_start) * 1000.0
+    if any(o.error for o in outcomes):
+        code = EXIT_CHECK_FAILED
+    elif any(o.has_references for o in outcomes):
+        code = EXIT_REFERENCES_FOUND
+    else:
+        code = EXIT_CLEAN
+    return StrictCheckReport(
+        exit_code=code,
+        outcomes=outcomes,
+        total_elapsed_ms=total_ms,
+        stopped_early=stopped_early,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Operator CLI (`python -m src.dalton.storage_refs check --strict`)
+# ---------------------------------------------------------------------------
 
 
 async def _open_cli_readonly_connection() -> Any:
@@ -721,38 +1456,142 @@ async def _open_cli_readonly_connection() -> Any:
     return conn
 
 
-async def _run_cli_probe() -> int:
-    conn = await _open_cli_readonly_connection()
+async def _run_cli_check(
+    *,
+    strict: bool,
+    batch_size: int,
+    batch_timeout: str,
+    stop_on_hit: bool,
+    progress_stream: TextIO | None,
+) -> int:
+    conn: Any | None = None
     try:
+        conn = await _open_cli_readonly_connection()
+        if strict:
+            report = await run_strict_main_bucket_check(
+                conn=conn,
+                batch_size=batch_size,
+                batch_timeout=batch_timeout,
+                stop_on_hit=stop_on_hit,
+                progress_stream=progress_stream,
+            )
+            print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+            return report.exit_code
         outcomes, total_ms = await probe_main_bucket_references(conn=conn)
+        hits = [o.name for o in outcomes if o.has_references]
+        errors = [o.name for o in outcomes if o.error]
+        exit_code = (
+            EXIT_CHECK_FAILED
+            if errors
+            else (EXIT_REFERENCES_FOUND if hits else EXIT_CLEAN)
+        )
+        payload = {
+            "exit_code": exit_code,
+            "total_elapsed_ms": round(total_ms, 2),
+            "hits": hits,
+            "errors": errors,
+            "consumers": [o.to_dict() for o in outcomes],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return exit_code
+    except KeyboardInterrupt:
+        if progress_stream is not None:
+            progress_stream.write("[storage_refs] interrupted; aborting check\n")
+            progress_stream.flush()
+        return EXIT_CHECK_FAILED
+    except Exception as exc:
+        err_msg = f"{type(exc).__name__}: {exc}"
+        logger.error("storage_refs CLI failed: %s", err_msg)
+        if progress_stream is not None:
+            progress_stream.write(f"[storage_refs] ERROR: {err_msg}\n")
+            progress_stream.flush()
+        return EXIT_CHECK_FAILED
     finally:
-        await conn.close()
-    payload = {
-        "total_elapsed_ms": round(total_ms, 2),
-        "hits": [o.name for o in outcomes if o.has_references],
-        "errors": [o.name for o in outcomes if o.error],
-        "consumers": [o.to_dict() for o in outcomes],
-    }
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 1 if payload["errors"] else 0
+        if conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m src.dalton.storage_refs",
         description=(
-            "Read-only main-bucket consumer reference probe (does not print object keys)."
+            "Read-only main-bucket consumer reference audit (does not print object keys). "
+            "Run `check --strict` and verify exit code 0 before disabling the main bucket."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    check_p = sub.add_parser(
+        "check",
+        help=(
+            "Audit main-bucket consumer tables. Pass `--strict` for batched full-table "
+            "structural verification (exit 0=clean, 1=references found, 2=check failed)."
+        ),
+    )
+    check_p.add_argument(
+        "--strict",
+        action="store_true",
+        help="Run batched full-table structural verification across all 17 consumers.",
+    )
+    check_p.add_argument(
+        "--batch-size",
+        type=int,
+        default=STRICT_BATCH_SIZE,
+        help=f"Rows per keyset batch during --strict scans (default: {STRICT_BATCH_SIZE}).",
+    )
+    check_p.add_argument(
+        "--batch-timeout",
+        default=STRICT_BATCH_TIMEOUT,
+        help=f"PostgreSQL statement_timeout per batch (default: {STRICT_BATCH_TIMEOUT}).",
+    )
+    check_p.add_argument(
+        "--no-fail-fast",
+        action="store_true",
+        help="Continue scanning remaining consumers after a confirmed hit.",
+    )
+    check_p.add_argument(
+        "--quiet-progress",
+        action="store_true",
+        help="Suppress per-batch progress output on stderr.",
+    )
+
     sub.add_parser(
         "probe",
-        help="Check each main-bucket consumer table for existing object references.",
+        help="Run the fast indexed startup advisory probes (exit 0=clean, 1=hits, 2=error).",
     )
+
     args = parser.parse_args(argv)
+    if args.command == "check":
+        progress = None if args.quiet_progress else sys.stderr
+        try:
+            return asyncio.run(
+                _run_cli_check(
+                    strict=bool(args.strict),
+                    batch_size=args.batch_size,
+                    batch_timeout=args.batch_timeout,
+                    stop_on_hit=not args.no_fail_fast,
+                    progress_stream=progress,
+                )
+            )
+        except KeyboardInterrupt:
+            return EXIT_CHECK_FAILED
     if args.command == "probe":
-        return asyncio.run(_run_cli_probe())
-    return 1
+        try:
+            return asyncio.run(
+                _run_cli_check(
+                    strict=False,
+                    batch_size=STRICT_BATCH_SIZE,
+                    batch_timeout=STARTUP_STATEMENT_TIMEOUT,
+                    stop_on_hit=False,
+                    progress_stream=sys.stderr,
+                )
+            )
+        except KeyboardInterrupt:
+            return EXIT_CHECK_FAILED
+    return EXIT_CHECK_FAILED
 
 
 if __name__ == "__main__":

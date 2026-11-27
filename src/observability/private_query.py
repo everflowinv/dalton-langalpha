@@ -45,6 +45,10 @@ def _as_a_path(query: str) -> str:
 
 
 def is_private(path: str, query: str) -> bool:
+    # DALTON-HOOK(workspace-file-download-ticket): drop entire query on download-ticket redemption route
+    from src.dalton.download_ticket import is_download_ticket_path
+    if is_download_ticket_path(path):
+        return True
     mount, folders = _markers()
     # Anywhere in the path, so a server mounted under a root path matches
     # too; anywhere in the decoded query, so any spelling of the folder does.

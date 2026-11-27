@@ -24,6 +24,9 @@
 # Note: After modifying `.env`, recreate the backend container (重建后端容器, e.g.
 # `deploy_main.sh --recreate` or `docker compose ... up -d --no-deps backend`);
 # `docker restart` does not reload `env_file`.
+# Before disabling the main bucket (`STORAGE_PROVIDER=none` or empty bucket),
+# operators MUST run `python -m src.dalton.storage_refs check --strict` and
+# verify exit code 0 (关闭主桶前必须先跑这条命令且退出码为 0).
 #
 # Credentials are read strictly from environment variables and are never printed
 # or passed on process command lines.

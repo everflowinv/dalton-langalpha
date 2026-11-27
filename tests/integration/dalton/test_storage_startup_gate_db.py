@@ -1,4 +1,4 @@
-"""Real PostgreSQL integration tests for the storage-off startup reference gate (§6.1 #2).
+"""Real PostgreSQL integration tests for warning-only startup check and strict CLI.
 
 Uses the isolated ``_test`` database configured by ``tests/integration/conftest.py``
 and ``tests/integration/dalton/conftest.py`` (never connects to production or reads
@@ -8,6 +8,9 @@ and ``tests/integration/dalton/conftest.py`` (never connects to production or re
 from __future__ import annotations
 
 import hashlib
+import io
+import json
+import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -18,10 +21,11 @@ os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 
 import psycopg
 import pytest
+from langchain_core.messages import HumanMessage, ToolMessage
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from psycopg.rows import dict_row
 
 from src.dalton import storage_refs
-from src.dalton.profile import DaltonStartupConfigError
 from src.server.database import pool as db_pool_mod
 
 pytestmark = [pytest.mark.integration]
@@ -49,28 +53,31 @@ async def _seed_user_and_workspace(
             VALUES (%s, %s, %s, NOW(), NOW())
             ON CONFLICT (user_id) DO NOTHING
             """,
-            (uid, f"{uid}@test.local", "Gate Test User"),
+            (uid, f"{uid}@test.local", "Storage Refs Test User"),
         )
         await cur.execute(
             """
             INSERT INTO workspaces (workspace_id, user_id, name, created_at, updated_at)
             VALUES (%s::uuid, %s, %s, NOW(), NOW())
             """,
-            (ws_id, uid, f"gate-ws-{ws_id[:8]}"),
+            (ws_id, uid, f"refs-ws-{ws_id[:8]}"),
         )
     return uid, ws_id
 
 
 @pytest.mark.asyncio
-async def test_all_main_bucket_probes_valid_sql_and_gate_behavior_real_pg(
-    disable_dotenv_loading, test_db_pool, test_db_uri, dalton_schema
+async def test_startup_warning_and_strict_check_real_pg(
+    disable_dotenv_loading, test_db_pool, test_db_uri, dalton_schema, caplog
 ):
-    """Run every probe SQL against migrated real Postgres and test gate pass/fail rows."""
+    """Verify startup warning-only behavior and strict full-table CLI verification on real Postgres."""
     uid: str | None = None
     ws_id: str | None = None
     inline_att_id = str(uuid.uuid4())
     obj_att_id = str(uuid.uuid4())
     ptr_file_id = str(uuid.uuid4())
+    thread_id = str(uuid.uuid4())
+    resp_id = str(uuid.uuid4())
+    serde = JsonPlusSerializer()
 
     async with await psycopg.AsyncConnection.connect(
         test_db_uri, autocommit=True, row_factory=dict_row
@@ -83,34 +90,7 @@ async def test_all_main_bucket_probes_valid_sql_and_gate_behavior_real_pg(
                 patch.object(db_pool_mod, "get_or_create_pool", return_value=test_db_pool),
                 patch.object(storage_refs, "is_storage_enabled", return_value=False),
             ):
-                # 1. Every registered probe executes with zero SQL errors, all tables exist,
-                # and EXPLAIN (with seqscan disabled) confirms every probe uses an index.
-                outcomes, total_ms = await storage_refs.probe_main_bucket_references()
-                assert total_ms >= 0.0
-                assert len(outcomes) == len(storage_refs.MAIN_BUCKET_CONSUMER_PROBES)
-                for outcome in outcomes:
-                    assert outcome.error is None, (
-                        f"Probe {outcome.name} failed SQL execution: {outcome.error}"
-                    )
-                    assert outcome.skipped_missing_table is False, (
-                        f"Probe {outcome.name} table missing on migrated DB: {outcome.table}"
-                    )
-
-                plans = await storage_refs.explain_main_bucket_probes(
-                    conn,
-                    disable_seqscan=True,
-                    env={"STORAGE_PUBLIC_URL_BASE": "https://app.example.com/storage"},
-                )
-                assert set(plans.keys()) == {p.name for p in storage_refs.MAIN_BUCKET_CONSUMER_PROBES}
-                for name, plan_text in plans.items():
-                    assert "Seq Scan" not in plan_text, (
-                        f"Probe {name} fell back to Seq Scan:\n{plan_text}"
-                    )
-                    assert "Index" in plan_text, (
-                        f"Probe {name} did not use an index:\n{plan_text}"
-                    )
-
-                # Clean test tables from any prior test artifacts before checking empty-DB pass.
+                # Clean leftover rows from prior runs before asserting clean baseline.
                 async with conn.cursor() as cur:
                     await cur.execute(
                         "DELETE FROM workspace_files WHERE blob_sha256 IS NOT NULL OR pack_sha256 IS NOT NULL"
@@ -120,11 +100,19 @@ async def test_all_main_bucket_probes_valid_sql_and_gate_behavior_real_pg(
                         "DELETE FROM chat_attachments WHERE object_key IS NOT NULL"
                     )
 
-                # 2. Clean DB passes startup gate.
-                gate_outcomes = await storage_refs.enforce_storage_off_startup_gate()
-                assert all(not o.has_references for o in gate_outcomes)
+                # 1. Startup advisory probes execute with zero SQL errors and all tables present.
+                outcomes, total_ms = await storage_refs.probe_main_bucket_references()
+                assert total_ms >= 0.0
+                assert len(outcomes) == len(storage_refs.STARTUP_MAIN_BUCKET_PROBES)
+                for outcome in outcomes:
+                    assert outcome.error is None, (
+                        f"Startup probe {outcome.name} failed SQL execution: {outcome.error}"
+                    )
+                    assert outcome.skipped_missing_table is False, (
+                        f"Startup probe {outcome.name} table missing: {outcome.table}"
+                    )
 
-                # 3. Pre-upgrade inline chat_attachment (object_key IS NULL) still passes gate.
+                # 2. Clean DB + pre-upgrade inline chat_attachment -> startup clean, strict CLI exit 0.
                 expires = datetime.now(timezone.utc) + timedelta(hours=1)
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -138,10 +126,22 @@ async def test_all_main_bucket_probes_valid_sql_and_gate_behavior_real_pg(
                         """,
                         (inline_att_id, uid, b"hello", expires),
                     )
-                gate_outcomes_inline = await storage_refs.enforce_storage_off_startup_gate()
-                assert all(not o.has_references for o in gate_outcomes_inline)
+                startup_clean = await storage_refs.warn_main_bucket_references_on_startup()
+                assert all(not o.has_references for o in startup_clean)
 
-                # 4. Pointer row in workspace_files causes startup gate refusal.
+                progress_buf = io.StringIO()
+                strict_clean = await storage_refs.run_strict_main_bucket_check(
+                    conn=conn,
+                    batch_size=50,
+                    progress_stream=progress_buf,
+                    env={"STORAGE_PUBLIC_URL_BASE": "https://app.example.com/storage"},
+                )
+                assert strict_clean.exit_code == storage_refs.EXIT_CLEAN
+                assert strict_clean.errors == []
+                assert strict_clean.confirmed_hits == []
+
+                # 3. Pointer row in workspace_files -> startup logs WARNING only (never raises),
+                #    strict CLI returns exit code 1 (stop-on-hit).
                 digest = hashlib.sha256(b"pointer-payload").hexdigest()
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -155,19 +155,32 @@ async def test_all_main_bucket_probes_valid_sql_and_gate_behavior_real_pg(
                         """,
                         (ptr_file_id, ws_id, digest, digest),
                     )
-                with pytest.raises(DaltonStartupConfigError) as exc_ws:
-                    await storage_refs.enforce_storage_off_startup_gate()
-                assert storage_refs.STORAGE_OFF_GATE_ERROR_PREFIX in str(exc_ws.value)
-                assert "workspace_files" in str(exc_ws.value)
+                caplog.clear()
+                with caplog.at_level(logging.WARNING, logger="src.dalton.storage_refs"):
+                    startup_warn = await storage_refs.warn_main_bucket_references_on_startup()
+                ws_out = next(o for o in startup_warn if o.name == "workspace_files")
+                assert ws_out.has_references is True
+                assert ws_out.hit_count >= 1
+                warn_text = "\n".join(
+                    r.message for r in caplog.records if r.levelno == logging.WARNING
+                )
+                assert "public.workspace_files" in warn_text
+                assert "ptr.bin" not in warn_text
+                assert digest not in warn_text
 
-                # Remove workspace_files pointer row so only chat_attachments is tested next.
+                strict_ws = await storage_refs.run_strict_main_bucket_check(
+                    conn=conn, batch_size=50
+                )
+                assert strict_ws.exit_code == storage_refs.EXIT_REFERENCES_FOUND
+                assert "workspace_files" in strict_ws.confirmed_hits
+
                 async with conn.cursor() as cur:
                     await cur.execute(
                         "DELETE FROM workspace_files WHERE workspace_file_id = %s::uuid",
                         (ptr_file_id,),
                     )
 
-                # 5. Object-backed chat_attachments row (object_key IS NOT NULL) refuses startup.
+                # 4. Object-backed chat_attachments row -> startup warns (no raise), strict CLI exits 1.
                 async with conn.cursor() as cur:
                     await cur.execute(
                         """
@@ -180,10 +193,13 @@ async def test_all_main_bucket_probes_valid_sql_and_gate_behavior_real_pg(
                         """,
                         (obj_att_id, uid, f"attachments/{obj_att_id}/obj.pdf", expires),
                     )
-                with pytest.raises(DaltonStartupConfigError) as exc_att:
-                    await storage_refs.enforce_storage_off_startup_gate()
-                assert storage_refs.STORAGE_OFF_GATE_ERROR_PREFIX in str(exc_att.value)
-                assert "chat_attachments" in str(exc_att.value)
+                startup_att = await storage_refs.warn_main_bucket_references_on_startup()
+                assert any(o.name == "chat_attachments" and o.has_references for o in startup_att)
+                strict_att = await storage_refs.run_strict_main_bucket_check(
+                    conn=conn, batch_size=50
+                )
+                assert strict_att.exit_code == storage_refs.EXIT_REFERENCES_FOUND
+                assert "chat_attachments" in strict_att.confirmed_hits
 
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -191,7 +207,7 @@ async def test_all_main_bucket_probes_valid_sql_and_gate_behavior_real_pg(
                         (obj_att_id,),
                     )
 
-                # 6. External avatar URL passes gate; site avatar URL refuses gate.
+                # 5. Site-shaped avatar_url without recorded object key -> suspected WARNING only, exit 0.
                 site_env = {
                     "STORAGE_PUBLIC_URL_BASE": "https://app.example.com/storage",
                     "STORAGE_KEY_PREFIX": "staging",
@@ -199,19 +215,16 @@ async def test_all_main_bucket_probes_valid_sql_and_gate_behavior_real_pg(
                 async with conn.cursor() as cur:
                     await cur.execute(
                         "UPDATE users SET avatar_url = %s WHERE user_id = %s",
-                        ("https://lh3.googleusercontent.com/avatars/ext.png", uid),
-                    )
-                ext_outcomes = await storage_refs.enforce_storage_off_startup_gate(env=site_env)
-                assert all(not o.has_references for o in ext_outcomes)
-
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "UPDATE users SET avatar_url = %s WHERE user_id = %s",
                         (f"https://app.example.com/storage/staging/avatars/{uid}.png", uid),
                     )
-                with pytest.raises(DaltonStartupConfigError) as exc_avatar:
-                    await storage_refs.enforce_storage_off_startup_gate(env=site_env)
-                assert "users_avatars" in str(exc_avatar.value)
+                caplog.clear()
+                with caplog.at_level(logging.WARNING, logger="src.dalton.storage_refs"):
+                    strict_avatar = await storage_refs.run_strict_main_bucket_check(
+                        conn=conn, batch_size=50, env=site_env
+                    )
+                assert strict_avatar.exit_code == storage_refs.EXIT_CLEAN
+                assert strict_avatar.confirmed_hits == []
+                assert strict_avatar.suspected_warnings.get("users_avatars", 0) >= 1
 
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -219,48 +232,113 @@ async def test_all_main_bucket_probes_valid_sql_and_gate_behavior_real_pg(
                         (uid,),
                     )
 
-                # 7. Unsliced widget data_ref in checkpoint_writes refuses gate.
-                thread_id = str(uuid.uuid4())
-                try:
-                    async with conn.cursor() as cur:
-                        await cur.execute(
-                            """
-                            INSERT INTO conversation_threads (
-                                conversation_thread_id, workspace_id, thread_index,
-                                current_status, created_at, updated_at
-                            )
-                            VALUES (%s::uuid, %s::uuid, 1, 'idle', NOW(), NOW())
-                            """,
-                            (thread_id, ws_id),
+                # 6. Plain message text mentioning data_ref & widgets/ in checkpoint_writes + turn_slices
+                #    does NOT false-positive (exit 0); real ShowWidget ToolMessage artifact exits 1.
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO conversation_threads (
+                            conversation_thread_id, workspace_id, thread_index,
+                            current_status, created_at, updated_at
                         )
-                        await cur.execute(
-                            """
-                            INSERT INTO checkpoint_writes (
-                                thread_id, checkpoint_ns, checkpoint_id, task_id,
-                                idx, channel, type, blob
-                            )
-                            VALUES (%s, '', 'cp-1', 't-1', 0, 'messages', 'msgpack', %s)
-                            """,
-                            (
-                                thread_id,
-                                b'{"data_ref":{"key":"widgets/' + thread_id.encode() + b'/abc.json"}}',
-                            ),
+                        VALUES (%s::uuid, %s::uuid, 1, 'idle', NOW(), NOW())
+                        """,
+                        (thread_id, ws_id),
+                    )
+                    await cur.execute(
+                        """
+                        INSERT INTO conversation_responses (
+                            conversation_response_id, conversation_thread_id,
+                            turn_index, status, created_at
                         )
-                    with pytest.raises(DaltonStartupConfigError) as exc_cw:
-                        await storage_refs.enforce_storage_off_startup_gate()
-                    assert "widgets_checkpoint_writes" in str(exc_cw.value)
-                finally:
-                    async with conn.cursor() as cur:
-                        await cur.execute(
-                            "DELETE FROM checkpoint_writes WHERE thread_id = %s",
-                            (thread_id,),
+                        VALUES (%s::uuid, %s::uuid, 1, 'completed', NOW())
+                        """,
+                        (resp_id, thread_id),
+                    )
+                    plain_msg = HumanMessage(
+                        content='Please inspect {"data_ref":{"key":"widgets/t1/fake.json"}} in code'
+                    )
+                    p_type, p_blob = serde.dumps_typed([plain_msg])
+                    await cur.execute(
+                        """
+                        INSERT INTO checkpoint_writes (
+                            thread_id, checkpoint_ns, checkpoint_id, task_id,
+                            idx, channel, type, blob
                         )
-                        await cur.execute(
-                            "DELETE FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
-                            (thread_id,),
+                        VALUES (%s, '', 'cp-plain', 't-plain', 0, 'messages', %s, %s)
+                        """,
+                        (thread_id, p_type, p_blob),
+                    )
+                    plain_line = "message_chunk\t\t" + json.dumps(
+                        {"content": '{"data_ref":{"key":"widgets/t1/fake.json"}}'}
+                    )
+                    await cur.execute(
+                        """
+                        INSERT INTO turn_slices (
+                            conversation_response_id, conversation_thread_id,
+                            turn_index, lines, slice_version
                         )
+                        VALUES (%s::uuid, %s::uuid, 1, %s, 1)
+                        """,
+                        (resp_id, thread_id, plain_line),
+                    )
+
+                strict_plain = await storage_refs.run_strict_main_bucket_check(
+                    conn=conn, batch_size=50
+                )
+                assert strict_plain.exit_code == storage_refs.EXIT_CLEAN
+                assert strict_plain.confirmed_hits == []
+
+                # Now insert a real ShowWidget ToolMessage with data_ref.key -> exit 1!
+                widget_msg = ToolMessage(
+                    content="Widget rendered: chart",
+                    tool_call_id="call_widget_1",
+                    name="ShowWidget",
+                    artifact={
+                        "type": "html_widget",
+                        "html": "<div>chart</div>",
+                        "data_ref": {
+                            "key": f"widgets/{thread_id}/abc123.json",
+                            "sha256": "abc123",
+                            "size": 4096,
+                        },
+                    },
+                )
+                w_type, w_blob = serde.dumps_typed([widget_msg])
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO checkpoint_writes (
+                            thread_id, checkpoint_ns, checkpoint_id, task_id,
+                            idx, channel, type, blob
+                        )
+                        VALUES (%s, '', 'cp-widget', 't-widget', 0, 'messages', %s, %s)
+                        """,
+                        (thread_id, w_type, w_blob),
+                    )
+                strict_widget = await storage_refs.run_strict_main_bucket_check(
+                    conn=conn, batch_size=50
+                )
+                assert strict_widget.exit_code == storage_refs.EXIT_REFERENCES_FOUND
+                assert "widgets_checkpoint_writes" in strict_widget.confirmed_hits
         finally:
             async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM turn_slices WHERE conversation_response_id = %s::uuid",
+                    (resp_id,),
+                )
+                await cur.execute(
+                    "DELETE FROM checkpoint_writes WHERE thread_id = %s",
+                    (thread_id,),
+                )
+                await cur.execute(
+                    "DELETE FROM conversation_responses WHERE conversation_response_id = %s::uuid",
+                    (resp_id,),
+                )
+                await cur.execute(
+                    "DELETE FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
+                    (thread_id,),
+                )
                 await cur.execute(
                     "DELETE FROM chat_attachments WHERE attachment_id IN (%s::uuid, %s::uuid)",
                     (inline_att_id, obj_att_id),
