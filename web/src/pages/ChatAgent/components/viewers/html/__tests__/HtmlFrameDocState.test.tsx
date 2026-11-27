@@ -64,7 +64,8 @@ vi.mock('@/hooks/useArtifact', async (importOriginal) => {
       record: workspaceId ? { artifact_id: 'art-1', code: 'code123', url: '/a/code123' } : undefined,
       error: null,
     }),
-    useArtifactByPath: (_workspaceId: string | null | undefined, path: string | null | undefined) => {
+    useArtifactRecord: (_workspaceId: string | null | undefined, target: { kind: string; path: string } | null) => {
+      const path = target?.path;
       if (!path) return { data: undefined };
       const mapped = hoisted.artifactsByPath[path];
       return {

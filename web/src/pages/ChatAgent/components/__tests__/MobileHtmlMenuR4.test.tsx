@@ -46,9 +46,9 @@ vi.mock('../artifactComments/sendContext', async (importOriginal) => {
   return {
     ...actual,
     useArtifactCommentSender: () => ({
-      besideThreadId: commentSenderState.besideThreadId,
-      sendToThread: vi.fn(),
-      startThread: vi.fn(),
+      beside: commentSenderState.besideThreadId ? { threadId: commentSenderState.besideThreadId } : null,
+      running: false,
+      send: vi.fn(),
     }),
   };
 });
