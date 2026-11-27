@@ -1512,7 +1512,13 @@ def test_persist_recovery_bin_atomic_and_manifest_tamper_detection(tmp_path: Pat
     repo = tmp_path / "repo"
     (repo / "scripts" / "dalton" / "ops" / "prod").mkdir(parents=True)
     (repo / "scripts" / "dalton" / "research_runtime").mkdir(parents=True)
-    for f in ("switch_research_host.sh", "_research_host_handoff_lib.sh", "wait_backend_idle.sh", "preflight.py"):
+    for f in (
+        "rollback_research_host.sh",
+        "snapshot_research_host.sh",
+        "_research_host_handoff_lib.sh",
+        "wait_backend_idle.sh",
+        "preflight.py",
+    ):
         (repo / "scripts" / "dalton" / "ops" / "prod" / f).write_bytes((PROD_OPS / f).read_bytes())
     (repo / "scripts" / "dalton" / "research_runtime" / "guidepoint_lock.py").write_bytes(
         (SCRIPTS_DALTON / "research_runtime" / "guidepoint_lock.py").read_bytes()
@@ -1542,7 +1548,8 @@ def test_persist_recovery_bin_atomic_and_manifest_tamper_detection(tmp_path: Pat
     assert stat.S_IMODE(rec_dir.stat().st_mode) == 0o700
     manifest = json.loads((rec_dir / "recovery-manifest.json").read_text(encoding="utf-8"))
     assert set(manifest["files"].keys()) == {
-        "switch_research_host.sh",
+        "rollback_research_host.sh",
+        "snapshot_research_host.sh",
         "_research_host_handoff_lib.sh",
         "wait_backend_idle.sh",
         "preflight.py",
@@ -2412,7 +2419,13 @@ def test_persist_recovery_bin_atomic_symlink_swap_and_failure_preserves_previous
     repo = tmp_path / "repo"
     (repo / "scripts" / "dalton" / "ops" / "prod").mkdir(parents=True)
     (repo / "scripts" / "dalton" / "research_runtime").mkdir(parents=True)
-    for f in ("switch_research_host.sh", "_research_host_handoff_lib.sh", "wait_backend_idle.sh", "preflight.py"):
+    for f in (
+        "rollback_research_host.sh",
+        "snapshot_research_host.sh",
+        "_research_host_handoff_lib.sh",
+        "wait_backend_idle.sh",
+        "preflight.py",
+    ):
         (repo / "scripts" / "dalton" / "ops" / "prod" / f).write_bytes((PROD_OPS / f).read_bytes())
     (repo / "scripts" / "dalton" / "research_runtime" / "guidepoint_lock.py").write_bytes(
         (SCRIPTS_DALTON / "research_runtime" / "guidepoint_lock.py").read_bytes()
@@ -2549,7 +2562,13 @@ def test_recovery_manifest_requires_exact_five_files_and_trusted_entry_and_same_
     repo = tmp_path / "repo"
     (repo / "scripts" / "dalton" / "ops" / "prod").mkdir(parents=True)
     (repo / "scripts" / "dalton" / "research_runtime").mkdir(parents=True)
-    for f in ("switch_research_host.sh", "_research_host_handoff_lib.sh", "wait_backend_idle.sh", "preflight.py"):
+    for f in (
+        "rollback_research_host.sh",
+        "snapshot_research_host.sh",
+        "_research_host_handoff_lib.sh",
+        "wait_backend_idle.sh",
+        "preflight.py",
+    ):
         (repo / "scripts" / "dalton" / "ops" / "prod" / f).write_bytes((PROD_OPS / f).read_bytes())
     (repo / "scripts" / "dalton" / "research_runtime" / "guidepoint_lock.py").write_bytes(
         (SCRIPTS_DALTON / "research_runtime" / "guidepoint_lock.py").read_bytes()
@@ -3791,7 +3810,13 @@ def test_publish_recovery_bin_fsyncs_before_swap_and_rolls_back_on_post_swap_fsy
     gp_lock_src = repo / "scripts" / "dalton" / "research_runtime" / "guidepoint_lock.py"
     src_dir.mkdir(parents=True)
     gp_lock_src.parent.mkdir(parents=True)
-    for f in ("switch_research_host.sh", "_research_host_handoff_lib.sh", "wait_backend_idle.sh", "preflight.py"):
+    for f in (
+        "rollback_research_host.sh",
+        "snapshot_research_host.sh",
+        "_research_host_handoff_lib.sh",
+        "wait_backend_idle.sh",
+        "preflight.py",
+    ):
         (src_dir / f).write_bytes((PROD_OPS / f).read_bytes())
     gp_lock_src.write_bytes((SCRIPTS_DALTON / "research_runtime" / "guidepoint_lock.py").read_bytes())
 

@@ -1821,6 +1821,12 @@ import sys
 rel_dir, keep_raw, cur_id, prev_id = sys.argv[1:5]
 keep = max(1, int(keep_raw))
 pinned = {x for x in (cur_id, prev_id) if x}
+protected = set()
+pin_dir = os.path.join(rel_dir, ".pinned-releases")
+if os.path.isdir(pin_dir):
+    for pin_name in os.listdir(pin_dir):
+        if pin_name and not pin_name.startswith("."):
+            protected.add(pin_name)
 
 dirs = []
 for name in os.listdir(rel_dir):
@@ -1838,6 +1844,7 @@ for _mtime, name, _full in dirs:
     if len(kept) >= keep:
         break
     kept.add(name)
+kept.update(protected)
 
 for _mtime, name, full in dirs:
     if name not in kept:

@@ -152,7 +152,8 @@ _EXEMPT_ACTIONS: frozenset[str] = frozenset(
 )
 
 RECOVERY_REQUIRED_FILES: tuple[str, ...] = (
-    "switch_research_host.sh",
+    "rollback_research_host.sh",
+    "snapshot_research_host.sh",
     "_research_host_handoff_lib.sh",
     "wait_backend_idle.sh",
     "preflight.py",
@@ -1271,16 +1272,21 @@ def _check_stage_a_plists(cfg: PreflightConfig) -> dict[str, str]:
     )
     all_errors.extend(e2)
 
-    host_data, e3 = _inspect_plist_file(
-        cfg.plist_dir / "com.dalton.research-host.plist",
-        expected_label="com.dalton.research-host",
-        cfg=cfg,
-        require_venv_python=True,
-        require_bridge_env_match=False,
-        require_ownership_match=True,
-        require_research_host_startup=True,
-    )
-    all_errors.extend(e3)
+    host_plist_path, hp_err = cfg.resolve_research_host_plist("stage-a")
+    host_data: dict[str, Any] | None = None
+    if hp_err or host_plist_path is None:
+        all_errors.append(hp_err or f"missing plist: {cfg.plist_dir / 'com.dalton.research-host.plist'}")
+    else:
+        host_data, e3 = _inspect_plist_file(
+            host_plist_path,
+            expected_label="com.dalton.research-host",
+            cfg=cfg,
+            require_venv_python=True,
+            require_bridge_env_match=False,
+            require_ownership_match=True,
+            require_research_host_startup=True,
+        )
+        all_errors.extend(e3)
 
     if proxy_data and host_data:
         p_ev = proxy_data.get("EnvironmentVariables")
@@ -2927,7 +2933,8 @@ def publish_recovery_bin_atomic(
     os.chmod(snapshots_root, 0o700)
 
     src_map: dict[str, tuple[Path, int]] = {
-        "switch_research_host.sh": (src_dir / "switch_research_host.sh", 0o700),
+        "rollback_research_host.sh": (src_dir / "rollback_research_host.sh", 0o700),
+        "snapshot_research_host.sh": (src_dir / "snapshot_research_host.sh", 0o700),
         "_research_host_handoff_lib.sh": (src_dir / "_research_host_handoff_lib.sh", 0o600),
         "wait_backend_idle.sh": (src_dir / "wait_backend_idle.sh", 0o700),
         "preflight.py": (src_dir / "preflight.py", 0o700),
@@ -3098,7 +3105,7 @@ def cmd_manifest_write(args: argparse.Namespace) -> int:
     requested = list(args.files)
     if set(requested) != set(RECOVERY_REQUIRED_FILES) or len(requested) != len(RECOVERY_REQUIRED_FILES):
         print(
-            f"ERROR: recovery manifest must cover the exact required 5-file set "
+            f"ERROR: recovery manifest must cover the exact required {len(RECOVERY_REQUIRED_FILES)}-file set "
             f"{list(RECOVERY_REQUIRED_FILES)}, got {requested}",
             file=sys.stderr,
         )
@@ -3277,8 +3284,13 @@ def cmd_guard_check(args: argparse.Namespace) -> int:
 
 def cmd_compose_args(args: argparse.Namespace) -> int:
     repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
+    repo_env_file = Path(args.repo_env).expanduser().resolve() if getattr(args, "repo_env", None) else None
     docker_bin = os.environ.get("DOCKER_BIN", "docker")
-    c_args, _, err = resolve_compose_args(repo_root, docker_bin=docker_bin)
+    c_args, _, err = resolve_compose_args(
+        repo_root,
+        repo_env_file=repo_env_file,
+        docker_bin=docker_bin,
+    )
     if err is not None:
         print(f"ERROR: {err}", file=sys.stderr)
         return 1
@@ -3482,6 +3494,12 @@ def _build_preflight_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 SNAPSHOT_MANIFEST_NAME = "snapshot-manifest.json"
+SNAPSHOT_MANDATORY_EXISTING_KEYS: tuple[str, ...] = (
+    "repo_env",
+    "plist_proxy",
+    "plist_bridge",
+    "guidepoint_tokens",
+)
 SNAPSHOT_RESERVED_DIRS: frozenset[str] = frozenset(
     {
         "recovery-bin",
@@ -3601,42 +3619,35 @@ def _resolve_snapshot_sources(
     bridge_plist = eff_plist_dir / "com.dalton.researchdata-bridge.plist"
     rh_plist = eff_plist_dir / "com.dalton.research-host.plist"
 
-    proxy_env_vars: dict[str, str] = {}
-    if proxy_plist.is_file():
-        loaded, _err = _load_plist_env_vars_strict(proxy_plist)
-        if loaded:
-            proxy_env_vars = loaded
-    rh_env_vars: dict[str, str] = {}
-    if rh_plist.is_file():
-        loaded, _err = _load_plist_env_vars_strict(rh_plist)
-        if loaded:
-            rh_env_vars = loaded
-
-    if tokens_file is not None:
+    # Reuse preflight's legacy proxy path resolver (including guidepoint_mcp.env overrides)
+    # whenever tokens_file or guidepoint_env is not explicitly overridden.
+    eff_gp_env: Path
+    eff_tokens: Path
+    if tokens_file is not None and guidepoint_env is not None:
         eff_tokens = tokens_file.expanduser().resolve()
-    elif str(os.environ.get("GUIDEPOINT_TOKENS_FILE") or "").strip():
-        eff_tokens = Path(os.environ["GUIDEPOINT_TOKENS_FILE"]).expanduser().resolve()
-    elif proxy_env_vars.get("GUIDEPOINT_TOKENS_FILE"):
-        eff_tokens = Path(proxy_env_vars["GUIDEPOINT_TOKENS_FILE"]).expanduser().resolve()
-    elif rh_env_vars.get("GUIDEPOINT_TOKENS_FILE"):
-        eff_tokens = Path(rh_env_vars["GUIDEPOINT_TOKENS_FILE"]).expanduser().resolve()
-    else:
-        rhome = (
-            proxy_env_vars.get("DALTON_RESEARCH_HOME")
-            or rh_env_vars.get("DALTON_RESEARCH_HOME")
-            or str(os.environ.get("DALTON_RESEARCH_HOME") or "").strip()
-            or str(home_abs / "Library" / "Application Support" / "Everflow" / "research")
-        )
-        eff_tokens = (Path(rhome).expanduser().resolve() / "config" / "guidepoint_mcp_tokens.json")
-
-    if guidepoint_env is not None:
         eff_gp_env = guidepoint_env.expanduser().resolve()
-    elif str(os.environ.get("GUIDEPOINT_ENV_FILE") or "").strip():
-        eff_gp_env = Path(os.environ["GUIDEPOINT_ENV_FILE"]).expanduser().resolve()
-    elif proxy_env_vars.get("GUIDEPOINT_ENV_FILE"):
-        eff_gp_env = Path(proxy_env_vars["GUIDEPOINT_ENV_FILE"]).expanduser().resolve()
     else:
-        eff_gp_env = eff_tokens.parent / "guidepoint_mcp.env"
+        bse_mod = _import_bridge_subprocess_env(repo_abs)
+        gl_mod = _import_guidepoint_lock(repo_abs)
+        bridge_vals = _parse_simple_env_file(eff_bridge_env)
+        resolved_proxy = bse_mod.resolve_legacy_proxy_effective_paths(
+            repo_root=repo_abs,
+            home_dir=home_abs,
+            existing_proxy_plist_path=proxy_plist,
+            bridge_env_vals=bridge_vals,
+            guidepoint_env_path=guidepoint_env,
+        )
+        eff_proxy_env = dict(resolved_proxy.get("effective_env") or {"HOME": str(home_abs)})
+        eff_gp_env = (
+            guidepoint_env.expanduser().resolve()
+            if guidepoint_env is not None
+            else Path(str(resolved_proxy["guidepoint_env_file"])).expanduser().resolve()
+        )
+        eff_tokens = (
+            tokens_file.expanduser().resolve()
+            if tokens_file is not None
+            else gl_mod.resolve_guidepoint_tokens_file(environ=eff_proxy_env)
+        )
 
     eff_web_cur = (
         _abs_no_deref(web_releases_current)
@@ -3718,6 +3729,8 @@ def verify_cutover_snapshot(snapshot_dir: Path | str) -> list[str]:
             continue
         fp = snap_path / rel
         if not existed:
+            if key in SNAPSHOT_MANDATORY_EXISTING_KEYS:
+                errors.append(f"mandatory rollback file {key} marked existed=false in manifest")
             if fp.exists() or fp.is_symlink():
                 errors.append(f"entry {key} marked existed=false but file present: {rel}")
             continue
@@ -3806,6 +3819,22 @@ def create_cutover_snapshot(
         web_releases_current=web_releases_current,
     )
 
+    missing_mandatory: list[str] = []
+    for req_key in SNAPSHOT_MANDATORY_EXISTING_KEYS:
+        req_path = sources[req_key]
+        if not req_path.is_file():
+            missing_mandatory.append(f"{req_key} ({req_path})")
+    if missing_mandatory:
+        raise FileNotFoundError(
+            "refusing to publish incomplete snapshot; missing mandatory file(s): "
+            + ", ".join(missing_mandatory)
+        )
+    tok_ok, _tok_ts, tok_reason = _inspect_guidepoint_tokens_file(sources["guidepoint_tokens"])
+    if not tok_ok:
+        raise ValueError(
+            f"refusing to publish snapshot with invalid Guidepoint tokens file ({sources['guidepoint_tokens']}): {tok_reason}"
+        )
+
     tmp_dir = Path(tempfile.mkdtemp(prefix=".snapshot.tmp.", dir=str(parent_dir)))
     renamed = False
     try:
@@ -3833,7 +3862,8 @@ def create_cutover_snapshot(
             rel = _snapshot_entry_rel_path(key)
             if src.is_file():
                 raw = src.read_bytes()
-                src_mode = stat.S_IMODE(src.stat().st_mode)
+                st_src = src.stat()
+                src_mode = stat.S_IMODE(st_src.st_mode)
                 dst = tmp_dir / rel
                 fd = os.open(str(dst), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 closed = False
@@ -3859,6 +3889,7 @@ def create_cutover_snapshot(
                     "source_path": str(src),
                     "existed": True,
                     "mode": f"{src_mode:04o}",
+                    "mtime": float(st_src.st_mtime),
                     "size": len(raw),
                     "sha256": _sha256_file(dst),
                 }
@@ -3868,6 +3899,7 @@ def create_cutover_snapshot(
                     "source_path": str(src),
                     "existed": False,
                     "mode": None,
+                    "mtime": None,
                     "size": 0,
                     "sha256": None,
                 }
@@ -3884,6 +3916,30 @@ def create_cutover_snapshot(
             "link_target": web_target,
             "resolved_target": web_resolved,
         }
+        if web_is_symlink and web_exists and web_cur.resolve().is_dir():
+            rel_resolved = web_cur.resolve()
+            rel_id = ""
+            if rel_resolved.parent == web_cur.parent.resolve():
+                rel_id = rel_resolved.name
+            elif web_target and "/" not in web_target and not web_target.startswith("."):
+                rel_id = web_target
+            if rel_id:
+                pin_dir = web_cur.parent / ".pinned-releases"
+                pin_dir.mkdir(parents=True, exist_ok=True)
+                pin_file = pin_dir / rel_id
+                pin_payload = {
+                    "release_id": rel_id,
+                    "pinned_by": "cutover_snapshot",
+                    "snapshot_id": final_dir.name,
+                    "created_at": now_utc.isoformat(),
+                }
+                _atomic_write_text(
+                    pin_file,
+                    json.dumps(pin_payload, ensure_ascii=False, indent=2) + "\n",
+                    mode=0o644,
+                )
+                web_meta["release_id"] = rel_id
+                web_meta["pin_file"] = str(pin_file)
         ver_src = web_cur / "version.json" if web_exists and web_cur.is_dir() else None
         if ver_src is not None and ver_src.is_file():
             ver_rel = "files/web_release_version.json"
@@ -3954,6 +4010,39 @@ def create_cutover_snapshot(
         raise
 
 
+def _inspect_guidepoint_tokens_file(
+    path: Path,
+    *,
+    fallback_mtime: float | None = None,
+) -> tuple[bool, float | None, str]:
+    """Validate Guidepoint token JSON and return `(ok, freshness_ts, reason)`.
+
+    Freshness uses numeric `obtained_at` when present and positive, falling back to
+    `fallback_mtime` (snapshot manifest source mtime) or filesystem mtime.
+    """
+    if not path.is_file():
+        return False, None, "file missing"
+    try:
+        raw_obj = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return False, None, f"unreadable or invalid JSON ({type(exc).__name__})"
+    if not isinstance(raw_obj, dict):
+        return False, None, "JSON root is not an object"
+    if not str(raw_obj.get("access_token") or "").strip():
+        return False, None, "missing access_token"
+    if not str(raw_obj.get("refresh_token") or "").strip():
+        return False, None, "missing refresh_token"
+    obtained = raw_obj.get("obtained_at")
+    if isinstance(obtained, (int, float)) and not isinstance(obtained, bool) and float(obtained) > 0:
+        return True, float(obtained), "obtained_at"
+    if isinstance(fallback_mtime, (int, float)) and not isinstance(fallback_mtime, bool):
+        return True, float(fallback_mtime), "manifest_mtime"
+    try:
+        return True, float(path.stat().st_mtime), "mtime"
+    except OSError:
+        return True, None, "no_timestamp"
+
+
 def find_latest_cutover_snapshot(repo_root: Path) -> tuple[Path | None, str | None]:
     """Locate the newest valid cutover snapshot under `<repo>/var/dalton/cutover-snapshots/`."""
     snapshots_root = repo_root.expanduser().resolve() / "var" / "dalton" / "cutover-snapshots"
@@ -3982,11 +4071,16 @@ def find_latest_cutover_snapshot(repo_root: Path) -> tuple[Path | None, str | No
         return None, f"no valid cutover snapshots found under {snapshots_root}"
 
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    latest = candidates[0][2]
-    errs = verify_cutover_snapshot(latest)
-    if errs:
-        return None, f"latest snapshot {latest} failed integrity verification: {'; '.join(errs)}"
-    return latest, None
+    failures: list[str] = []
+    for _created_at, _name, cand in candidates:
+        errs = verify_cutover_snapshot(cand)
+        if not errs:
+            return cand, None
+        failures.append(f"{cand.name}: {'; '.join(errs)}")
+    return None, (
+        f"no valid cutover snapshots found under {snapshots_root} "
+        f"(skipped {len(failures)} invalid snapshot(s): {' | '.join(failures[:3])})"
+    )
 
 
 def restore_cutover_snapshot(
@@ -3994,7 +4088,13 @@ def restore_cutover_snapshot(
     *,
     dry_run: bool = False,
 ) -> list[str]:
-    """Atomically restore all files and `web/releases/current` pointer from a verified snapshot."""
+    """Atomically restore config/plists/journal/web release from a verified snapshot.
+
+    Preserves newer valid `guidepoint_mcp_tokens.json` on disk (comparing `obtained_at`,
+    falling back to mtime) so rotated refresh tokens are never overwritten; only restores
+    the snapshot token file when the live file is missing, corrupted, or strictly older.
+    Fails closed if the snapshot's `web/releases/current` target release directory is missing.
+    """
     snap_path = Path(snapshot_dir).expanduser().resolve()
     errs = verify_cutover_snapshot(snap_path)
     if errs:
@@ -4023,6 +4123,45 @@ def restore_cutover_snapshot(
         info = files_meta[key]
         target = Path(str(info["source_path"])).expanduser()
         existed = bool(info["existed"])
+        if key == "guidepoint_tokens":
+            live_ok, live_ts, live_src = _inspect_guidepoint_tokens_file(target)
+            snap_fp = snap_path / str(info["rel_path"])
+            snap_mtime_meta = info.get("mtime")
+            snap_ok, snap_ts, snap_src = (
+                _inspect_guidepoint_tokens_file(
+                    snap_fp,
+                    fallback_mtime=float(snap_mtime_meta)
+                    if isinstance(snap_mtime_meta, (int, float)) and not isinstance(snap_mtime_meta, bool)
+                    else None,
+                )
+                if existed
+                else (False, None, "absent")
+            )
+            if live_ok and (not snap_ok or snap_ts is None or live_ts is None or live_ts >= snap_ts):
+                actions.append(
+                    f"keep-live guidepoint_tokens: {target} "
+                    f"(live {live_src}={live_ts} >= snapshot {snap_src}={snap_ts})"
+                )
+                continue
+            if not existed:
+                raise RuntimeError(
+                    f"live guidepoint_tokens invalid ({live_src}) and snapshot has no fallback copy"
+                )
+            mode_str = str(info.get("mode") or "0600")
+            try:
+                mode_val = int(mode_str, 8)
+            except ValueError:
+                mode_val = 0o600
+            reason = (
+                f"fallback: live invalid/missing ({live_src})"
+                if not live_ok
+                else f"snapshot newer ({snap_src}={snap_ts} > live {live_src}={live_ts})"
+            )
+            actions.append(f"restore guidepoint_tokens: {snap_fp.name} -> {target} (mode {mode_val:04o}; {reason})")
+            if not dry_run:
+                _write_bytes_atomic(target, snap_fp.read_bytes(), mode=mode_val)
+            continue
+
         if existed:
             src_fp = snap_path / str(info["rel_path"])
             mode_str = str(info.get("mode") or "0600")
@@ -4052,26 +4191,25 @@ def restore_cutover_snapshot(
                 if os.path.isabs(link_target)
                 else (cur_path.parent / link_target)
             )
-            if resolved_check.exists():
-                actions.append(f"restore web_releases_current: {cur_path} -> {link_target}")
-                if not dry_run:
-                    cur_path.parent.mkdir(parents=True, exist_ok=True)
-                    tmp_link = cur_path.parent / f".current.restore.{os.getpid()}.{secrets.token_hex(4)}"
-                    try:
-                        os.symlink(link_target, tmp_link)
-                        os.replace(tmp_link, cur_path)
-                        _fsync_dir(cur_path.parent, strict=True)
-                    except BaseException:
-                        try:
-                            if tmp_link.is_symlink():
-                                tmp_link.unlink()
-                        except OSError:
-                            pass
-                        raise
-            else:
-                actions.append(
-                    f"skip web_releases_current: target {link_target} not present on disk"
+            if not resolved_check.is_dir():
+                raise RuntimeError(
+                    f"cannot restore web_releases_current: target release directory missing: {resolved_check}"
                 )
+            actions.append(f"restore web_releases_current: {cur_path} -> {link_target}")
+            if not dry_run:
+                cur_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_link = cur_path.parent / f".current.restore.{os.getpid()}.{secrets.token_hex(4)}"
+                try:
+                    os.symlink(link_target, tmp_link)
+                    os.replace(tmp_link, cur_path)
+                    _fsync_dir(cur_path.parent, strict=True)
+                except BaseException:
+                    try:
+                        if tmp_link.is_symlink():
+                            tmp_link.unlink()
+                    except OSError:
+                        pass
+                    raise
     return actions
 
 
@@ -4299,13 +4437,78 @@ def build_legacy_bridge_probe_rpc(
     }
 
 
+def _decode_mcp_json_or_sse(raw_body: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """Decode MCP JSON-RPC payload from either direct JSON or `text/event-stream` SSE.
+
+    Matches Guidepoint client JSON/SSE decoding (`host_connectors/guidepoint.py` / `gp_search.py`),
+    supporting direct JSON objects as well as single- or multi-event SSE `data:` streams.
+    """
+    if isinstance(raw_body, dict):
+        return raw_body, None
+    if not isinstance(raw_body, str):
+        return None, f"expected JSON object or SSE string response, got {type(raw_body).__name__}"
+    stripped = raw_body.lstrip()
+    if not stripped:
+        return None, "empty response body"
+    if stripped.startswith("{"):
+        try:
+            obj = json.loads(stripped)
+        except ValueError as exc:
+            return None, f"invalid JSON response: {exc}"
+        if isinstance(obj, dict):
+            return obj, None
+        return None, f"expected JSON object response, got {type(obj).__name__}"
+
+    # SSE decoding: collect event-grouped multi-line `data:` blocks and individual `data:` lines.
+    event_blocks: list[str] = []
+    cur_data: list[str] = []
+    single_data_lines: list[str] = []
+    for raw_line in raw_body.splitlines():
+        line = raw_line.rstrip("\r")
+        if line == "":
+            if cur_data:
+                event_blocks.append("\n".join(cur_data))
+                cur_data = []
+            continue
+        if line.startswith("data:"):
+            payload_part = line[5:].lstrip(" ") if len(line) > 5 and line[5] == " " else line[5:].strip()
+            cur_data.append(payload_part)
+            single_data_lines.append(payload_part.strip())
+    if cur_data:
+        event_blocks.append("\n".join(cur_data))
+
+    for candidate in reversed(event_blocks):
+        text = candidate.strip()
+        if not text:
+            continue
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                return obj, None
+        except ValueError:
+            continue
+
+    for candidate in reversed(single_data_lines):
+        if not candidate:
+            continue
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                return obj, None
+        except ValueError:
+            continue
+
+    return None, "SSE response contained no valid JSON-RPC object"
+
+
 def _extract_mcp_payload(parsed: Any) -> tuple[dict[str, Any] | None, str | None]:
-    """Decode JSON-RPC MCP tools/call response payload and report any protocol/tool error."""
-    if not isinstance(parsed, dict):
-        return None, f"expected JSON object response, got {type(parsed).__name__}"
-    if "error" in parsed and parsed["error"]:
-        return None, f"jsonrpc error: {parsed['error']}"
-    result = parsed.get("result")
+    """Decode JSON-RPC MCP tools/call response payload (JSON or SSE) and report protocol/tool errors."""
+    msg, dec_err = _decode_mcp_json_or_sse(parsed)
+    if dec_err or msg is None:
+        return None, dec_err or "invalid MCP response"
+    if "error" in msg and msg["error"]:
+        return None, f"jsonrpc error: {msg['error']}"
+    result = msg.get("result")
     if not isinstance(result, dict):
         return None, "missing result object in JSON-RPC response"
     if result.get("isError") is True:
@@ -4527,12 +4730,22 @@ def cmd_probe_services(args: argparse.Namespace) -> int:
             code, body, err = _http_request("GET", f"{rh_base}/healthz", timeout_s=timeout_s)
             if err or code != 200 or not isinstance(body, dict):
                 return False, f"GET {rh_base}/healthz -> {code} ({err or 'bad response'})"
-            if body.get("ok") is False:
-                return False, "research-host /healthz ok=False"
-            gp_block = body.get("guidepoint")
-            if isinstance(gp_block, dict) and gp_block.get("owner_lock_held") is not True:
-                return False, f"research-host guidepoint.owner_lock_held={gp_block.get('owner_lock_held')!r} (expected True)"
-            return True, "research-host :8951 healthy and holds Guidepoint lock"
+            if body.get("ok") is not True:
+                return False, f"research-host /healthz ok={body.get('ok')!r} (expected True)"
+            probes_block = body.get("probes")
+            if not isinstance(probes_block, dict):
+                return False, "research-host /healthz missing probes object"
+            gp_block = probes_block.get("guidepoint")
+            if not isinstance(gp_block, dict):
+                return False, "research-host /healthz missing probes.guidepoint object"
+            if gp_block.get("owner_lock_held") is not True:
+                return (
+                    False,
+                    f"research-host probes.guidepoint.owner_lock_held={gp_block.get('owner_lock_held')!r} (expected True)",
+                )
+            if gp_block.get("standby") is True:
+                return False, "research-host probes.guidepoint.standby=True (expected False)"
+            return True, "research-host :8951 healthy and probes.guidepoint.owner_lock_held=True"
 
         def _probe_rh_wiki_search() -> tuple[bool, str]:
             if not rh_tok:
@@ -4640,6 +4853,458 @@ def cmd_probe_services(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def _check_healthz_owner_lock(target: str, body: Any) -> tuple[bool, str]:
+    """Validate Guidepoint lock ownership from a `/healthz` JSON payload."""
+    if not isinstance(body, dict):
+        return False, "healthz body is not a JSON object"
+    if body.get("ok") is not True:
+        return False, f"healthz ok={body.get('ok')!r} (expected True)"
+    if target == "research-host":
+        probes_block = body.get("probes")
+        if not isinstance(probes_block, dict):
+            return False, "healthz missing probes object"
+        gp_block = probes_block.get("guidepoint")
+        if not isinstance(gp_block, dict):
+            return False, "healthz missing probes.guidepoint object"
+        if gp_block.get("owner_lock_held") is not True:
+            return (
+                False,
+                f"probes.guidepoint.owner_lock_held={gp_block.get('owner_lock_held')!r} (expected True)",
+            )
+        if gp_block.get("standby") is True:
+            return False, "probes.guidepoint.standby=True (expected False)"
+        return True, "probes.guidepoint.owner_lock_held=True"
+    if body.get("owner_lock_held") is not True:
+        return False, f"owner_lock_held={body.get('owner_lock_held')!r} (expected True)"
+    if body.get("draining") is True:
+        return False, "draining=True (expected False)"
+    if body.get("standby") is True:
+        return False, "standby=True (expected False)"
+    return True, "owner_lock_held=True"
+
+
+def cmd_wait_owner(args: argparse.Namespace) -> int:
+    """Bounded poll on `/healthz` until the target service is healthy and holds `.guidepoint.owner.lock`."""
+    target = str(args.target)
+    default_url = "http://127.0.0.1:8951" if target == "research-host" else "http://127.0.0.1:8943"
+    base_url = str(args.url or default_url).rstrip("/")
+    timeout_s = max(0.5, float(args.timeout))
+    poll_s = max(0.05, float(args.poll_interval))
+    req_timeout = max(1.0, min(5.0, timeout_s))
+    deadline = time.monotonic() + timeout_s
+    last_reason = "no response received"
+
+    while True:
+        code, body, err = _http_request("GET", f"{base_url}/healthz", timeout_s=req_timeout)
+        if err or code != 200:
+            last_reason = f"GET {base_url}/healthz -> {code} ({err or 'unexpected status'})"
+        else:
+            ok, reason = _check_healthz_owner_lock(target, body)
+            if ok:
+                print(json.dumps(body, ensure_ascii=False, indent=2))
+                return 0
+            last_reason = reason
+        if time.monotonic() >= deadline:
+            print(
+                f"ERROR: wait-owner ({target}) timed out after {timeout_s:.1f}s: {last_reason}",
+                file=sys.stderr,
+            )
+            return 1
+        time.sleep(min(poll_s, max(0.01, deadline - time.monotonic())))
+
+
+def _resolve_tokens_path_for_ops(args: argparse.Namespace, repo_root: Path, home_dir: Path) -> Path:
+    if getattr(args, "tokens_file", None):
+        return Path(args.tokens_file).expanduser().resolve()
+    sources = _resolve_snapshot_sources(
+        repo_root=repo_root,
+        home_dir=home_dir,
+        plist_dir=Path(args.plist_dir) if getattr(args, "plist_dir", None) else None,
+        repo_env=Path(args.repo_env) if getattr(args, "repo_env", None) else None,
+        bridge_env=Path(args.bridge_env) if getattr(args, "bridge_env", None) else None,
+        research_host_env=Path(args.research_host_env) if getattr(args, "research_host_env", None) else None,
+        guidepoint_env=Path(args.guidepoint_env) if getattr(args, "guidepoint_env", None) else None,
+    )
+    return sources["guidepoint_tokens"]
+
+
+def _list_token_tmp_files(tokens_path: Path) -> list[Path]:
+    if not tokens_path.parent.is_dir():
+        return []
+    return sorted(tokens_path.parent.glob(".guidepoint_mcp_tokens.*.tmp"))
+
+
+def cmd_drain_refresher(args: argparse.Namespace) -> int:
+    """Drain the active Guidepoint token refresher cleanly before `launchctl bootout`.
+
+    1. Checks `/healthz`; if unreachable and `--allow-down`, verifies no `.guidepoint_mcp_tokens.*.tmp`
+       files remain and returns 0.
+    2. If the refresher holds the owner lock and the access token has `<= refresh_skew_s` (60s)
+       remaining, performs a controlled refresh while it is still the sole lock holder and
+       verifies the updated token landed on disk with no leftover `.tmp` files.
+    3. Sends `POST /admin/drain` (`{"drain": true}`) when the service admin token is available.
+    4. Polls `/healthz` until `in_flight == 0` AND zero `.guidepoint_mcp_tokens.*.tmp` files exist.
+    """
+    repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
+    home_dir = Path(args.home).expanduser().resolve() if args.home else Path.home().resolve()
+    target = str(args.target)
+    default_url = "http://127.0.0.1:8943" if target == "legacy" else "http://127.0.0.1:8951"
+    base_url = str(args.url or default_url).rstrip("/")
+    timeout_s = max(0.5, float(args.timeout))
+    poll_s = max(0.05, float(args.poll_interval))
+    skew_s = max(0.0, float(args.refresh_skew_s))
+    allow_down = bool(args.allow_down)
+
+    try:
+        tokens_path = _resolve_tokens_path_for_ops(args, repo_root, home_dir)
+    except Exception as exc:
+        print(f"ERROR: failed to resolve Guidepoint tokens path: {exc}", file=sys.stderr)
+        return 1
+
+    repo_env_path = Path(args.repo_env).expanduser().resolve() if args.repo_env else (repo_root / ".env")
+    rh_env_path = (
+        Path(args.research_host_env).expanduser().resolve()
+        if args.research_host_env
+        else (home_dir / ".config" / "dalton" / "research-host.env")
+    )
+    gp_env_path = (
+        Path(args.guidepoint_env).expanduser().resolve()
+        if args.guidepoint_env
+        else (tokens_path.parent / "guidepoint_mcp.env")
+    )
+    repo_vals = _parse_simple_env_file(repo_env_path)
+    rh_vals = _parse_simple_env_file(rh_env_path)
+    gp_vals = _parse_simple_env_file(gp_env_path)
+
+    deadline = time.monotonic() + timeout_s
+
+    def _wait_no_tmp() -> tuple[bool, list[Path]]:
+        while True:
+            tmps = _list_token_tmp_files(tokens_path)
+            if not tmps:
+                return True, []
+            if time.monotonic() >= deadline:
+                return False, tmps
+            time.sleep(min(poll_s, max(0.01, deadline - time.monotonic())))
+
+    code, body, err = _http_request("GET", f"{base_url}/healthz", timeout_s=min(5.0, timeout_s))
+    if err or code is None:
+        if allow_down:
+            clean, tmps = _wait_no_tmp()
+            if not clean:
+                print(
+                    f"ERROR: refresher ({target}) is down but temp token file(s) remain: {[p.name for p in tmps]}",
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "target": target,
+                        "status": "already_down",
+                        "in_flight": 0,
+                        "tmp_files": 0,
+                        "controlled_refresh": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        print(f"ERROR: cannot reach {base_url}/healthz ({err or 'unreachable'})", file=sys.stderr)
+        return 1
+    if code != 200 or not isinstance(body, dict):
+        print(f"ERROR: unexpected {base_url}/healthz response (HTTP {code})", file=sys.stderr)
+        return 1
+
+    if target == "research-host":
+        probes_b = body.get("probes")
+        gp_b = probes_b.get("guidepoint") if isinstance(probes_b, dict) else None
+        holds_lock = isinstance(gp_b, dict) and gp_b.get("owner_lock_held") is True
+    else:
+        holds_lock = body.get("owner_lock_held") is True
+
+    controlled_refresh = False
+    if holds_lock and body.get("draining") is not True and tokens_path.is_file():
+        tok_data: Any = None
+        try:
+            tok_data = json.loads(tokens_path.read_text(encoding="utf-8"))
+        except Exception:
+            # Corrupt/unreadable live token file: skip controlled refresh so rollback can
+            # still drain, stop the refresher, and fall back to the snapshot token copy.
+            tok_data = None
+        if isinstance(tok_data, dict):
+            raw_obt = tok_data.get("obtained_at")
+            raw_exp = tok_data.get("expires_in", 600)
+            if (
+                isinstance(raw_obt, (int, float))
+                and not isinstance(raw_obt, bool)
+                and isinstance(raw_exp, (int, float))
+                and not isinstance(raw_exp, bool)
+            ):
+                prev_obt = float(raw_obt)
+                remaining_s = (prev_obt + float(raw_exp)) - time.time()
+                if remaining_s <= skew_s:
+                    rem_budget = max(2.0, deadline - time.monotonic())
+                    if target == "legacy":
+                        rpc_body = json.dumps(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": 101,
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "search_library",
+                                    "arguments": {"query": "cloud", "size": 1},
+                                },
+                            }
+                        ).encode("utf-8")
+                        r_code, r_body, r_err = _http_request(
+                            "POST",
+                            f"{base_url}/mcp",
+                            headers={
+                                "Content-Type": "application/json",
+                                "Accept": "application/json, text/event-stream",
+                            },
+                            body=rpc_body,
+                            timeout_s=rem_budget,
+                        )
+                    else:
+                        rh_tok = (
+                            str(rh_vals.get("DALTON_RESEARCH_HOST_TOKEN") or "").strip()
+                            or str(repo_vals.get("DALTON_RESEARCH_HOST_TOKEN") or "").strip()
+                        )
+                        if not rh_tok:
+                            print(
+                                f"ERROR: access token TTL={remaining_s:.1f}s <= {skew_s:.0f}s "
+                                f"but missing DALTON_RESEARCH_HOST_TOKEN in {rh_env_path} for controlled refresh",
+                                file=sys.stderr,
+                            )
+                            return 1
+                        rpc_body = json.dumps(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": 102,
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "search_library",
+                                    "arguments": {"query": "cloud", "limit": 1},
+                                },
+                            }
+                        ).encode("utf-8")
+                        r_code, r_body, r_err = _http_request(
+                            "POST",
+                            f"{base_url}/mcp/guidepoint",
+                            headers={
+                                "Authorization": f"Bearer {rh_tok}",
+                                "Content-Type": "application/json",
+                            },
+                            body=rpc_body,
+                            timeout_s=rem_budget,
+                        )
+                    if r_err or r_code != 200:
+                        print(
+                            f"ERROR: controlled token refresh via {target} failed: HTTP {r_code} ({r_err or 'error'})",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    inner, m_err = _extract_mcp_payload(r_body)
+                    if m_err or inner is None or inner.get("ok") is False:
+                        print(
+                            f"ERROR: controlled token refresh via {target} returned error: {m_err or (inner or {}).get('error')}",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    clean_after, tmps_after = _wait_no_tmp()
+                    if not clean_after:
+                        print(
+                            f"ERROR: temp token file(s) still present after controlled refresh: {[p.name for p in tmps_after]}",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    tok_ok, new_ts, tok_reason = _inspect_guidepoint_tokens_file(tokens_path)
+                    if not tok_ok:
+                        print(
+                            f"ERROR: tokens file invalid after controlled refresh ({tok_reason})",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    new_data = json.loads(tokens_path.read_text(encoding="utf-8"))
+                    new_obt = float(new_data.get("obtained_at", 0) or 0)
+                    new_exp = float(new_data.get("expires_in", 600) or 600)
+                    new_rem = (new_obt + new_exp) - time.time()
+                    if new_obt <= prev_obt and new_rem <= skew_s:
+                        print(
+                            f"ERROR: controlled refresh did not persist a fresh token on disk "
+                            f"(obtained_at={new_obt}, prev={prev_obt}, remaining={new_rem:.1f}s)",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    controlled_refresh = True
+
+    # Request drain mode on the live refresher if its admin token is configured
+    admin_tok = ""
+    if target == "legacy":
+        admin_tok = str(gp_vals.get("GUIDEPOINT_PROXY_ADMIN_TOKEN") or "").strip()
+        if not admin_tok:
+            plist_dir = (
+                Path(args.plist_dir).expanduser().resolve()
+                if getattr(args, "plist_dir", None)
+                else (home_dir / "Library" / "LaunchAgents")
+            )
+            proxy_plist = plist_dir / "com.dalton.guidepoint-mcp-proxy.plist"
+            if proxy_plist.is_file():
+                p_ev, _p_err = _load_plist_env_vars_strict(proxy_plist)
+                if p_ev:
+                    admin_tok = str(p_ev.get("GUIDEPOINT_PROXY_ADMIN_TOKEN") or "").strip()
+    else:
+        admin_tok = (
+            str(rh_vals.get("DALTON_RESEARCH_ADMIN_TOKEN") or "").strip()
+            or str(repo_vals.get("DALTON_RESEARCH_ADMIN_TOKEN") or "").strip()
+        )
+
+    if admin_tok and body.get("draining") is not True:
+        d_code, d_body, d_err = _http_request(
+            "POST",
+            f"{base_url}/admin/drain",
+            headers={
+                "Authorization": f"Bearer {admin_tok}",
+                "Content-Type": "application/json",
+            },
+            body=b'{"drain": true}',
+            timeout_s=min(5.0, max(1.0, deadline - time.monotonic())),
+        )
+        if d_err or d_code != 200:
+            print(
+                f"ERROR: POST {base_url}/admin/drain failed: HTTP {d_code} ({d_err or d_body})",
+                file=sys.stderr,
+            )
+            return 1
+
+    last_detail = ""
+    while True:
+        h_code, h_body, h_err = _http_request(
+            "GET",
+            f"{base_url}/healthz",
+            timeout_s=min(5.0, max(1.0, deadline - time.monotonic())),
+        )
+        if h_err or h_code is None:
+            if allow_down:
+                clean, tmps = _wait_no_tmp()
+                if not clean:
+                    print(
+                        f"ERROR: refresher ({target}) stopped while temp token file(s) remain: {[p.name for p in tmps]}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                print(
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "target": target,
+                            "status": "stopped_clean",
+                            "in_flight": 0,
+                            "tmp_files": 0,
+                            "controlled_refresh": controlled_refresh,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 0
+            last_detail = f"GET {base_url}/healthz -> {h_code} ({h_err})"
+        elif h_code != 200 or not isinstance(h_body, dict):
+            last_detail = f"GET {base_url}/healthz -> HTTP {h_code} (invalid body)"
+        else:
+            in_flight = h_body.get("in_flight")
+            tmps = _list_token_tmp_files(tokens_path)
+            if (
+                isinstance(in_flight, int)
+                and not isinstance(in_flight, bool)
+                and in_flight == 0
+                and not tmps
+            ):
+                print(
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "target": target,
+                            "status": "drained",
+                            "draining": bool(h_body.get("draining")),
+                            "in_flight": 0,
+                            "tmp_files": 0,
+                            "controlled_refresh": controlled_refresh,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 0
+            last_detail = f"in_flight={in_flight!r}, tmp_files={[p.name for p in tmps]}"
+
+        if time.monotonic() >= deadline:
+            print(
+                f"ERROR: drain-refresher ({target}) timed out after {timeout_s:.1f}s ({last_detail})",
+                file=sys.stderr,
+            )
+            return 1
+        time.sleep(min(poll_s, max(0.01, deadline - time.monotonic())))
+
+
+def cmd_wait_lock_free(args: argparse.Namespace) -> int:
+    """Poll until `.guidepoint.owner.lock` is not held by any process (non-blocking flock probe)."""
+    repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
+    home_dir = Path(args.home).expanduser().resolve() if args.home else Path.home().resolve()
+    timeout_s = max(0.2, float(args.timeout))
+    poll_s = max(0.05, float(args.poll_interval))
+
+    try:
+        tokens_path = _resolve_tokens_path_for_ops(args, repo_root, home_dir)
+        gl = _import_guidepoint_lock(repo_root)
+        lock_file = gl.resolve_guidepoint_lock_file(tokens_path)
+    except Exception as exc:
+        print(f"ERROR: failed to resolve Guidepoint owner lock path: {exc}", file=sys.stderr)
+        return 1
+
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if not lock_file.exists():
+            print(json.dumps({"ok": True, "lock_file": str(lock_file), "free": True}, ensure_ascii=False))
+            return 0
+        fd: int | None = None
+        try:
+            fd = os.open(str(lock_file), os.O_RDWR)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            print(json.dumps({"ok": True, "lock_file": str(lock_file), "free": True}, ensure_ascii=False))
+            return 0
+        except FileNotFoundError:
+            print(json.dumps({"ok": True, "lock_file": str(lock_file), "free": True}, ensure_ascii=False))
+            return 0
+        except BlockingIOError:
+            pass
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+        if time.monotonic() >= deadline:
+            holder = ""
+            try:
+                holder = lock_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                holder = ""
+            detail = f" ({holder})" if holder else ""
+            print(
+                f"ERROR: Guidepoint owner lock {lock_file} is still held after {timeout_s:.1f}s{detail}",
+                file=sys.stderr,
+            )
+            return 1
+        time.sleep(min(poll_s, max(0.01, deadline - time.monotonic())))
+
+
 def _build_subcommand_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Shared cutover ops helpers")
     sub = p.add_subparsers(dest="subcommand", required=True)
@@ -4687,6 +5352,7 @@ def _build_subcommand_parser() -> argparse.ArgumentParser:
 
     p_ca = sub.add_parser("compose-args")
     p_ca.add_argument("--repo", required=True)
+    p_ca.add_argument("--repo-env", default=None)
     p_ca.add_argument("--json", action="store_true")
 
     p_ss = sub.add_parser("status-summary")
@@ -4769,6 +5435,40 @@ def _build_subcommand_parser() -> argparse.ArgumentParser:
     p_ps.add_argument("--skip-backend", action="store_true")
     p_ps.add_argument("--json", action="store_true")
 
+    p_wo = sub.add_parser("wait-owner")
+    p_wo.add_argument("--target", required=True, choices=("legacy", "research-host"))
+    p_wo.add_argument("--url", default=None)
+    p_wo.add_argument("--timeout", type=float, default=30.0)
+    p_wo.add_argument("--poll-interval", type=float, default=0.5)
+
+    p_dr = sub.add_parser("drain-refresher")
+    p_dr.add_argument("--repo", required=True)
+    p_dr.add_argument("--home", default=None)
+    p_dr.add_argument("--target", required=True, choices=("legacy", "research-host"))
+    p_dr.add_argument("--url", default=None)
+    p_dr.add_argument("--plist-dir", default=None)
+    p_dr.add_argument("--repo-env", default=None)
+    p_dr.add_argument("--bridge-env", default=None)
+    p_dr.add_argument("--research-host-env", default=None)
+    p_dr.add_argument("--guidepoint-env", default=None)
+    p_dr.add_argument("--tokens-file", default=None)
+    p_dr.add_argument("--timeout", type=float, default=30.0)
+    p_dr.add_argument("--poll-interval", type=float, default=0.5)
+    p_dr.add_argument("--refresh-skew-s", type=float, default=60.0)
+    p_dr.add_argument("--allow-down", action="store_true")
+
+    p_wl = sub.add_parser("wait-lock-free")
+    p_wl.add_argument("--repo", required=True)
+    p_wl.add_argument("--home", default=None)
+    p_wl.add_argument("--plist-dir", default=None)
+    p_wl.add_argument("--repo-env", default=None)
+    p_wl.add_argument("--bridge-env", default=None)
+    p_wl.add_argument("--research-host-env", default=None)
+    p_wl.add_argument("--guidepoint-env", default=None)
+    p_wl.add_argument("--tokens-file", default=None)
+    p_wl.add_argument("--timeout", type=float, default=15.0)
+    p_wl.add_argument("--poll-interval", type=float, default=0.2)
+
     return p
 
 
@@ -4792,6 +5492,9 @@ _SUBCOMMANDS = frozenset(
         "gate-set",
         "gate-verify",
         "probe-services",
+        "wait-owner",
+        "drain-refresher",
+        "wait-lock-free",
     }
 )
 
@@ -4836,6 +5539,12 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_gate_verify(ns)
         if ns.subcommand == "probe-services":
             return cmd_probe_services(ns)
+        if ns.subcommand == "wait-owner":
+            return cmd_wait_owner(ns)
+        if ns.subcommand == "drain-refresher":
+            return cmd_drain_refresher(ns)
+        if ns.subcommand == "wait-lock-free":
+            return cmd_wait_lock_free(ns)
         return 2
 
     ns = _build_preflight_parser().parse_args(args_list)

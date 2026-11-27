@@ -6,7 +6,7 @@
 #   - rh_acquire_ops_lock / rh_release_ops_lock: non-blocking flock on FD 8
 #     (keeps FD 9 free for deploy_main.sh's deploy lock); verifies kernel flock
 #   - rh_persist_recovery_bin / rh_verify_recovery_manifest: atomic sibling
-#     symlink swap with fsync + trusted 5-file manifest SHA-256 verification
+#     symlink swap with fsync + trusted 6-file manifest SHA-256 verification
 #   - rh_journal_set: atomic handoff-journal.json update via preflight.py + guidepoint_lock
 #   - rh_require_change_allowed / rh_require_no_incomplete_journal: change guards
 #   - rh_gate_status / rh_gate_set / rh_gate_verify: maintenance admission gate helpers
@@ -143,7 +143,7 @@ rh_persist_recovery_bin() {
   local src_dir="${RH_REPO_ROOT}/scripts/dalton/ops/prod"
   local gp_lock_src="${RH_REPO_ROOT}/scripts/dalton/research_runtime/guidepoint_lock.py"
 
-  if [[ ! -f "${src_dir}/switch_research_host.sh" ]]; then
+  if [[ ! -f "${src_dir}/rollback_research_host.sh" ]]; then
     src_dir="${RH_LIB_DIR}"
   fi
   if [[ ! -f "${gp_lock_src}" && -f "${RH_LIB_DIR}/guidepoint_lock.py" ]]; then
@@ -230,7 +230,7 @@ rh_require_no_incomplete_journal() {
     if [[ "${op}" == "deploy" ]]; then
       echo "ERROR: incomplete handoff-journal.json (operation=deploy, completed=false). Run deploy_main.sh --recover-deploy first." >&2
     else
-      echo "ERROR: incomplete handoff-journal.json (operation=${op:-unknown}, completed=false). Run bash ${RH_REPO_ROOT}/scripts/dalton/ops/prod/rollback_research_host.sh first." >&2
+      echo "ERROR: incomplete handoff-journal.json (operation=${op:-unknown}, completed=false). Run bash ${RH_RECOVERY_BIN_DIR}/rollback_research_host.sh (or ${RH_REPO_ROOT}/scripts/dalton/ops/prod/rollback_research_host.sh) first." >&2
     fi
     return 1
   fi
@@ -354,6 +354,28 @@ rh_snapshot_restore() {
 rh_probe_services() {
   rh_paths
   PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" probe-services \
+    --repo "${RH_REPO_ROOT}" \
+    --home "${RH_HOME}" \
+    "$@"
+}
+
+rh_wait_owner() {
+  rh_paths
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" wait-owner \
+    "$@"
+}
+
+rh_drain_refresher() {
+  rh_paths
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" drain-refresher \
+    --repo "${RH_REPO_ROOT}" \
+    --home "${RH_HOME}" \
+    "$@"
+}
+
+rh_wait_lock_free() {
+  rh_paths
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" wait-lock-free \
     --repo "${RH_REPO_ROOT}" \
     --home "${RH_HOME}" \
     "$@"
