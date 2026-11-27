@@ -19,20 +19,24 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
 import re
 import secrets
+import threading
 import time
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from psycopg.rows import dict_row
@@ -68,7 +72,7 @@ _ACL_UNSUPPORTED_CODES = frozenset(
 _optional_bearer = HTTPBearer(auto_error=False)
 
 class NoStorePublicAPIRoute(APIRoute):
-    """Ensure every public share response and HTTPException carries ``Cache-Control: no-store``."""
+    """Ensure every public share response, HTTPException, and 422 validation error carries ``Cache-Control: no-store``."""
 
     def get_route_handler(self):
         original = super().get_route_handler()
@@ -84,6 +88,12 @@ class NoStorePublicAPIRoute(APIRoute):
                     detail=exc.detail,
                     headers=hdrs,
                 ) from None
+            except RequestValidationError as exc:
+                return JSONResponse(
+                    status_code=422,
+                    content={"detail": jsonable_encoder(exc.errors())},
+                    headers={"Cache-Control": "no-store"},
+                )
             resp.headers["Cache-Control"] = "no-store"
             return resp
 
@@ -164,6 +174,249 @@ def is_acl_not_supported_error(exc: BaseException) -> bool:
         or ("bucket does not allow acls" in low)
         or ("acl" in low and "not supported" in low)
     )
+
+
+_BUCKET_ACL_CACHE_LOCK = threading.Lock()
+_BUCKET_ACL_SUPPORT_CACHE: dict[tuple[str, str], bool] = {}
+_OWNERSHIP_FALLBACK_CODES = frozenset(
+    {
+        "OwnershipControlsNotFoundError",
+        "NoSuchOwnershipControls",
+        "NotImplemented",
+        "MethodNotAllowed",
+        "InvalidRequest",
+    }
+)
+
+
+def _bucket_acl_cache_key(bucket_name: str, endpoint_url: str | None) -> tuple[str, str]:
+    return (
+        str(endpoint_url or "").strip().lower().rstrip("/"),
+        str(bucket_name or "").strip(),
+    )
+
+
+def reset_bucket_acl_cache_for_test() -> None:
+    """Clear cached bucket ACL support probes (test helper)."""
+    with _BUCKET_ACL_CACHE_LOCK:
+        _BUCKET_ACL_SUPPORT_CACHE.clear()
+
+
+def mark_bucket_acl_unsupported(
+    bucket_name: str, *, endpoint_url: str | None = None
+) -> None:
+    """Remember that ``bucket_name`` rejected object-level ACLs (e.g. ``BucketOwnerEnforced``)."""
+    if not bucket_name:
+        return
+    with _BUCKET_ACL_CACHE_LOCK:
+        _BUCKET_ACL_SUPPORT_CACHE[_bucket_acl_cache_key(bucket_name, endpoint_url)] = False
+
+
+def bucket_supports_object_acl(
+    client: Any,
+    bucket_name: str,
+    *,
+    endpoint_url: str | None = None,
+) -> bool:
+    """Determine before presigning whether ``bucket_name`` accepts object-level ACLs.
+
+    Returns False for explicitly disabled ACLs, R2 endpoints, cached ACL-unsupported
+    buckets, or S3 buckets whose ``GetBucketOwnershipControls`` reports
+    ``BucketOwnerEnforced``.
+    """
+    if _is_object_acl_disabled(endpoint_url=endpoint_url):
+        return False
+    cache_key = _bucket_acl_cache_key(bucket_name, endpoint_url)
+    with _BUCKET_ACL_CACHE_LOCK:
+        cached = _BUCKET_ACL_SUPPORT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    probe = getattr(client, "get_bucket_ownership_controls", None)
+    if not callable(probe) or not bucket_name:
+        return True
+
+    try:
+        resp = probe(Bucket=bucket_name)
+        rules = (
+            (resp.get("OwnershipControls") or {}).get("Rules")
+            if isinstance(resp, Mapping)
+            else None
+        ) or ()
+        for rule in rules:
+            ownership = str((rule or {}).get("ObjectOwnership") or "").strip()
+            if ownership == "BucketOwnerEnforced":
+                with _BUCKET_ACL_CACHE_LOCK:
+                    _BUCKET_ACL_SUPPORT_CACHE[cache_key] = False
+                return False
+            if ownership in ("BucketOwnerPreferred", "ObjectWriter"):
+                with _BUCKET_ACL_CACHE_LOCK:
+                    _BUCKET_ACL_SUPPORT_CACHE[cache_key] = True
+                return True
+        with _BUCKET_ACL_CACHE_LOCK:
+            _BUCKET_ACL_SUPPORT_CACHE[cache_key] = True
+        return True
+    except Exception as exc:
+        if is_acl_not_supported_error(exc):
+            with _BUCKET_ACL_CACHE_LOCK:
+                _BUCKET_ACL_SUPPORT_CACHE[cache_key] = False
+            return False
+        resp_map = getattr(exc, "response", None)
+        code = (
+            str((resp_map.get("Error") or {}).get("Code") or "")
+            if isinstance(resp_map, Mapping)
+            else ""
+        )
+        if code in _OWNERSHIP_FALLBACK_CODES:
+            with _BUCKET_ACL_CACHE_LOCK:
+                _BUCKET_ACL_SUPPORT_CACHE[cache_key] = True
+            return True
+        logger.debug(
+            "Could not query bucket ownership controls for %s (%s); defaulting to ACL enabled",
+            bucket_name,
+            code or type(exc).__name__,
+        )
+        return True
+
+
+def s3_put_object_with_private_acl(
+    client: Any,
+    *,
+    bucket: str,
+    key: str,
+    body: Any,
+    content_type: str,
+    endpoint_url: str | None = None,
+) -> Any:
+    """Thin-hook helper for upstream ``s3_compatible`` uploads with private ACL & fallback."""
+    acl_kwargs = storage_private_acl_kwargs(key, provider="s3", endpoint_url=endpoint_url)
+    if acl_kwargs and not bucket_supports_object_acl(
+        client, bucket, endpoint_url=endpoint_url
+    ):
+        acl_kwargs = {}
+    put_args: dict[str, Any] = {
+        "Bucket": bucket,
+        "Key": key,
+        "Body": body,
+        "ContentType": content_type,
+        **acl_kwargs,
+    }
+    try:
+        return client.put_object(**put_args)
+    except Exception as exc:
+        if acl_kwargs and is_acl_not_supported_error(exc):
+            mark_bucket_acl_unsupported(bucket, endpoint_url=endpoint_url)
+            put_args.pop("ACL", None)
+            if hasattr(body, "seek"):
+                body.seek(0)
+            return client.put_object(**put_args)
+        raise
+
+
+def s3_create_multipart_with_private_acl(
+    client: Any,
+    *,
+    bucket: str,
+    key: str,
+    content_type: str,
+    endpoint_url: str | None = None,
+) -> dict[str, Any]:
+    """Thin-hook helper for upstream ``s3_compatible.open_multipart_upload``."""
+    acl_kwargs = storage_private_acl_kwargs(key, provider="s3", endpoint_url=endpoint_url)
+    if acl_kwargs and not bucket_supports_object_acl(
+        client, bucket, endpoint_url=endpoint_url
+    ):
+        acl_kwargs = {}
+    params: dict[str, Any] = {
+        "Bucket": bucket,
+        "Key": key,
+        "ContentType": content_type,
+        **acl_kwargs,
+    }
+    try:
+        return client.create_multipart_upload(**params)
+    except Exception as exc:
+        if acl_kwargs and is_acl_not_supported_error(exc):
+            mark_bucket_acl_unsupported(bucket, endpoint_url=endpoint_url)
+            params.pop("ACL", None)
+            return client.create_multipart_upload(**params)
+        raise
+
+
+def s3_presign_put_with_private_acl(
+    client: Any,
+    *,
+    bucket: str,
+    key: str,
+    checksum_b64: str,
+    content_length: int,
+    content_type: str,
+    expires_in: int,
+    endpoint_url: str | None = None,
+) -> tuple[str, dict[str, str]]:
+    """Presign S3 single PUT after probing bucket ACL mode (omits ACL on ``BucketOwnerEnforced``)."""
+    acl_kwargs = storage_private_acl_kwargs(key, provider="s3", endpoint_url=endpoint_url)
+    if acl_kwargs and not bucket_supports_object_acl(
+        client, bucket, endpoint_url=endpoint_url
+    ):
+        acl_kwargs = {}
+    params: dict[str, Any] = {
+        "Bucket": bucket,
+        "Key": key,
+        "ContentLength": content_length,
+        "ContentType": content_type,
+        "ChecksumSHA256": checksum_b64,
+        **acl_kwargs,
+    }
+    url = client.generate_presigned_url(
+        "put_object",
+        Params=params,
+        ExpiresIn=expires_in,
+    )
+    headers: dict[str, str] = {
+        "Content-Type": content_type,
+        "x-amz-checksum-sha256": checksum_b64,
+    }
+    if acl_kwargs.get("ACL"):
+        headers["x-amz-acl"] = str(acl_kwargs["ACL"])
+    return url, headers
+
+
+def oss_put_object_with_private_acl(
+    client: Any,
+    request_cls: Any,
+    *,
+    bucket: str,
+    full_object_key: str,
+    logical_key: str,
+    body: Any,
+    content_type: str,
+) -> Any:
+    """Thin-hook helper for upstream ``oss_uploader`` with private ACL & ACL-unsupported fallback."""
+    acl_kwargs = storage_private_acl_kwargs(logical_key, provider="oss")
+    try:
+        return client.put_object(
+            request_cls(
+                bucket=bucket,
+                key=full_object_key,
+                body=body,
+                content_type=content_type,
+                **acl_kwargs,
+            )
+        )
+    except Exception as exc:
+        if acl_kwargs and is_acl_not_supported_error(exc):
+            if hasattr(body, "seek"):
+                body.seek(0)
+            return client.put_object(
+                request_cls(
+                    bucket=bucket,
+                    key=full_object_key,
+                    body=body,
+                    content_type=content_type,
+                )
+            )
+        raise
 
 
 def to_private_media_key(key: str) -> str:
@@ -250,6 +503,120 @@ def _norm_prefix(raw: str | None) -> str:
     return f"{cleaned}/" if cleaned else ""
 
 
+def _is_ip_or_local_host(host: str) -> bool:
+    cleaned = (host or "").strip().lower().strip("[]")
+    if not cleaned:
+        return False
+    if cleaned == "localhost" or cleaned.endswith(".localhost"):
+        return True
+    try:
+        ipaddress.ip_address(cleaned)
+        return True
+    except ValueError:
+        return False
+
+
+def format_storage_endpoint_base(
+    *,
+    provider: str,
+    endpoint_url: str,
+    bucket_name: str,
+    region: str,
+    addressing_style: str = "virtual",
+) -> str:
+    """Construct the base object URL for ``endpoint_url`` matching S3/OSS addressing rules."""
+    ep = (endpoint_url or "").strip().rstrip("/")
+    bucket = (bucket_name or "").strip()
+    if provider == "oss":
+        if not ep:
+            return ""
+        if "://" in ep:
+            scheme, rest = ep.split("://", 1)
+            return (
+                ep
+                if rest.lower().startswith(f"{bucket.lower()}.")
+                else f"{scheme}://{bucket}.{rest}"
+            )
+        return f"https://{bucket}.{ep}"
+
+    if not ep:
+        return f"https://{bucket}.s3.{region or 'us-east-1'}.amazonaws.com"
+
+    style = (addressing_style or "virtual").strip().lower()
+    parsed = urlsplit(ep if "://" in ep else f"https://{ep}")
+    host = parsed.hostname or ""
+    if style == "path" or _is_ip_or_local_host(host):
+        return f"{ep}/{bucket}"
+    if "://" in ep:
+        scheme, rest = ep.split("://", 1)
+        return (
+            ep
+            if rest.lower().startswith(f"{bucket.lower()}.")
+            else f"{scheme}://{bucket}.{rest}"
+        )
+    return f"https://{bucket}.{ep}"
+
+
+def build_storage_object_urls(target: ActiveStorageTarget, key: str) -> list[str]:
+    """Build all anonymous probe URLs for ``key``: origin, independent signing endpoint, and public/CDN bases."""
+    urls: list[str] = []
+    quoted = quote(key.lstrip("/"), safe="/")
+
+    def _add_base(base: str) -> None:
+        clean_base = (base or "").strip().rstrip("/")
+        if not clean_base:
+            return
+        u = f"{clean_base}/{quoted}"
+        if u not in urls:
+            urls.append(u)
+
+    # 1. Primary origin endpoint
+    origin_base = format_storage_endpoint_base(
+        provider=target.provider,
+        endpoint_url=target.endpoint_url,
+        bucket_name=target.bucket_name,
+        region=target.region,
+        addressing_style=target.addressing_style,
+    )
+    _add_base(origin_base)
+    if target.provider == "s3" and target.endpoint_url and target.addressing_style == "auto":
+        _add_base(
+            format_storage_endpoint_base(
+                provider="s3",
+                endpoint_url=target.endpoint_url,
+                bucket_name=target.bucket_name,
+                region=target.region,
+                addressing_style="path",
+            )
+        )
+        _add_base(
+            format_storage_endpoint_base(
+                provider="s3",
+                endpoint_url=target.endpoint_url,
+                bucket_name=target.bucket_name,
+                region=target.region,
+                addressing_style="virtual",
+            )
+        )
+
+    # 2. Independent signing / browser endpoint (if distinct from origin)
+    if target.signing_endpoint_url and target.signing_endpoint_url.rstrip("/") != target.endpoint_url.rstrip("/"):
+        signing_base = format_storage_endpoint_base(
+            provider=target.provider,
+            endpoint_url=target.signing_endpoint_url,
+            bucket_name=target.bucket_name,
+            region=target.region,
+            addressing_style=target.addressing_style,
+        )
+        _add_base(signing_base)
+
+    # 3. Configured public URL bases / CDN domains / runtime default public base
+    for base in target.public_url_bases:
+        _add_base(base)
+
+    return urls
+
+
 def _resolve_upstream_runtime_config() -> dict[str, Any] | None:
     """Resolve active upstream storage config mirroring ``src/utils/storage`` & ``s3_client.py``."""
     from src.utils.storage import _load_storage_setting
@@ -277,18 +644,23 @@ def _resolve_upstream_runtime_config() -> dict[str, Any] | None:
             return None
         endpoint = (os.getenv("OSS_ENDPOINT") or "").strip().rstrip("/")
         region = (os.getenv("OSS_REGION") or "").strip()
-        if endpoint:
-            if "://" in endpoint:
-                scheme, rest = endpoint.split("://", 1)
-                public_base = (
-                    endpoint
-                    if rest.lower().startswith(f"{bucket.lower()}.")
-                    else f"{scheme}://{bucket}.{rest}"
-                )
-            else:
-                public_base = f"https://{bucket}.{endpoint}"
-        else:
-            public_base = ""
+        explicit_pub = (
+            os.getenv("OSS_PUBLIC_URL_BASE")
+            or os.getenv("STORAGE_PUBLIC_URL_BASE")
+            or ""
+        ).strip().rstrip("/")
+        public_bases: list[str] = []
+        if explicit_pub:
+            public_bases.append(explicit_pub)
+        default_oss_base = format_storage_endpoint_base(
+            provider="oss",
+            endpoint_url=endpoint,
+            bucket_name=bucket,
+            region=region,
+            addressing_style="virtual",
+        )
+        if default_oss_base and default_oss_base not in public_bases:
+            public_bases.append(default_oss_base)
         return {
             "provider": "oss",
             "bucket_name": bucket,
@@ -299,7 +671,7 @@ def _resolve_upstream_runtime_config() -> dict[str, Any] | None:
             "access_key_id": (os.getenv("OSS_ACCESS_KEY_ID") or "").strip(),
             "secret_access_key": (os.getenv("OSS_ACCESS_KEY_SECRET") or "").strip(),
             "key_prefix": key_prefix,
-            "public_url_base": public_base.rstrip("/"),
+            "public_url_bases": public_bases,
         }
 
     # S3-compatible (STORAGE_* with legacy S3_* / AWS_* fallback, matching s3_client.py)
@@ -309,25 +681,29 @@ def _resolve_upstream_runtime_config() -> dict[str, Any] | None:
     region = (os.getenv("STORAGE_REGION") or os.getenv("S3_REGION") or "us-east-1").strip()
     endpoint = (os.getenv("STORAGE_ENDPOINT_URL") or os.getenv("S3_ENDPOINT_URL") or "").strip().rstrip("/")
     browser_ep = (os.getenv("STORAGE_BROWSER_ENDPOINT_URL") or "").strip().rstrip("/")
-    public_base = (os.getenv("STORAGE_PUBLIC_URL_BASE") or os.getenv("S3_PUBLIC_URL_BASE") or "").strip().rstrip("/")
+    explicit_pub = (os.getenv("STORAGE_PUBLIC_URL_BASE") or os.getenv("S3_PUBLIC_URL_BASE") or "").strip().rstrip("/")
     style = (os.getenv("STORAGE_ADDRESSING_STYLE") or "virtual").strip().lower()
     if style not in ("virtual", "path", "auto"):
         style = "virtual"
-    if not public_base:
-        if endpoint:
-            if style == "path":
-                public_base = f"{endpoint}/{bucket}"
-            elif "://" in endpoint:
-                scheme, rest = endpoint.split("://", 1)
-                public_base = (
-                    endpoint
-                    if rest.lower().startswith(f"{bucket.lower()}.")
-                    else f"{scheme}://{bucket}.{rest}"
-                )
-            else:
-                public_base = f"https://{bucket}.{endpoint}"
-        else:
-            public_base = f"https://{bucket}.s3.{region}.amazonaws.com"
+    public_bases = []
+    if explicit_pub:
+        public_bases.append(explicit_pub)
+    else:
+        # Match actual runtime URL generator (s3_client.StorageConfig.get_public_url_base)
+        # while also deriving custom-endpoint base via actual addressing style.
+        ep_base = format_storage_endpoint_base(
+            provider="s3",
+            endpoint_url=endpoint,
+            bucket_name=bucket,
+            region=region,
+            addressing_style=style,
+        )
+        if ep_base:
+            public_bases.append(ep_base)
+        if not endpoint:
+            aws_base = f"https://{bucket}.s3.{region}.amazonaws.com"
+            if aws_base not in public_bases:
+                public_bases.append(aws_base)
     return {
         "provider": "s3",
         "bucket_name": bucket,
@@ -342,7 +718,7 @@ def _resolve_upstream_runtime_config() -> dict[str, Any] | None:
             os.getenv("STORAGE_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY") or ""
         ).strip(),
         "key_prefix": key_prefix,
-        "public_url_base": public_base.rstrip("/"),
+        "public_url_bases": public_bases,
     }
 
 
@@ -379,13 +755,14 @@ def resolve_active_storage_targets() -> list[ActiveStorageTarget]:
         secret_access_key: str,
         key_prefix: str,
         sensitive_subprefixes: tuple[str, ...],
-        public_url_base: str,
+        public_url_bases: Iterable[str],
     ) -> None:
         if not bucket_name:
             return
         k = _dedup_bucket_key(provider, endpoint_url, bucket_name)
         pref = _norm_prefix(key_prefix)
         full_sensitive = [f"{pref}{sub}" for sub in sensitive_subprefixes]
+        clean_bases = [b.rstrip("/") for b in public_url_bases if b and b.strip()]
         entry = merged.get(k)
         if entry is None:
             merged[k] = {
@@ -400,7 +777,7 @@ def resolve_active_storage_targets() -> list[ActiveStorageTarget]:
                 "roles": [role],
                 "key_prefixes": [pref],
                 "sensitive_prefixes": list(full_sensitive),
-                "public_url_bases": [public_url_base] if public_url_base else [],
+                "public_url_bases": list(dict.fromkeys(clean_bases)),
             }
         else:
             if role not in entry["roles"]:
@@ -410,8 +787,22 @@ def resolve_active_storage_targets() -> list[ActiveStorageTarget]:
             for sp in full_sensitive:
                 if sp not in entry["sensitive_prefixes"]:
                     entry["sensitive_prefixes"].append(sp)
-            if public_url_base and public_url_base not in entry["public_url_bases"]:
-                entry["public_url_bases"].append(public_url_base)
+            if signing_endpoint_url and signing_endpoint_url != entry["endpoint_url"]:
+                if not entry["signing_endpoint_url"] or entry["signing_endpoint_url"] == entry["endpoint_url"]:
+                    entry["signing_endpoint_url"] = signing_endpoint_url
+                else:
+                    extra_sign = format_storage_endpoint_base(
+                        provider=provider,
+                        endpoint_url=signing_endpoint_url,
+                        bucket_name=bucket_name,
+                        region=region,
+                        addressing_style=addressing_style,
+                    )
+                    if extra_sign and extra_sign not in entry["public_url_bases"]:
+                        entry["public_url_bases"].append(extra_sign)
+            for pb in clean_bases:
+                if pb not in entry["public_url_bases"]:
+                    entry["public_url_bases"].append(pb)
 
     # 1. Upstream primary bucket
     up = _resolve_upstream_runtime_config()
@@ -439,22 +830,36 @@ def resolve_active_storage_targets() -> list[ActiveStorageTarget]:
                 "attachments/",
                 "widgets/",
             ),
-            public_url_base=up["public_url_base"],
+            public_url_bases=up["public_url_bases"],
         )
 
     # 2. Dalton chat-upload & channel-snapshot bucket
     if chat_store.is_chat_upload_storage_configured():
         ep = chat_store._endpoint_url()
+        signing_ep = chat_store.signing_endpoint_url()
         bucket = chat_store._bucket_name()
+        region = chat_store._region()
         style = chat_store._addressing_style()
-        pub_base = f"{ep}/{bucket}" if ep and style == "path" else ep
+        chat_bases: list[str] = []
+        explicit_chat_pub = (os.getenv("DALTON_CHAT_UPLOAD_STORAGE_PUBLIC_URL_BASE") or "").strip().rstrip("/")
+        if explicit_chat_pub:
+            chat_bases.append(explicit_chat_pub)
+        chat_ep_base = format_storage_endpoint_base(
+            provider="s3",
+            endpoint_url=ep,
+            bucket_name=bucket,
+            region=region,
+            addressing_style=style,
+        )
+        if chat_ep_base and chat_ep_base not in chat_bases:
+            chat_bases.append(chat_ep_base)
         _register(
             role="chat_upload",
             provider="s3",
             bucket_name=bucket,
             endpoint_url=ep,
-            signing_endpoint_url=chat_store.signing_endpoint_url(),
-            region=chat_store._region(),
+            signing_endpoint_url=signing_ep,
+            region=region,
             addressing_style=style,
             access_key_id=chat_store._access_key_id(),
             secret_access_key=chat_store._secret_access_key(),
@@ -464,22 +869,36 @@ def resolve_active_storage_targets() -> list[ActiveStorageTarget]:
                 "channel-snapshots/",
                 "chat-uploads/",
             ),
-            public_url_base=pub_base.rstrip("/") if pub_base else "",
+            public_url_bases=chat_bases,
         )
 
     # 3. Independent transcription ASR bucket (always evaluated independently)
     if asr_store.is_transcription_storage_configured():
         ep = asr_store._endpoint_url()
+        signing_ep = asr_store.signing_endpoint_url()
         bucket = asr_store._bucket_name()
+        region = asr_store._region()
         style = asr_store._addressing_style()
-        pub_base = f"{ep}/{bucket}" if ep and style == "path" else ep
+        asr_bases: list[str] = []
+        explicit_asr_pub = (os.getenv("DALTON_ASR_STORAGE_PUBLIC_URL_BASE") or "").strip().rstrip("/")
+        if explicit_asr_pub:
+            asr_bases.append(explicit_asr_pub)
+        asr_ep_base = format_storage_endpoint_base(
+            provider="s3",
+            endpoint_url=ep,
+            bucket_name=bucket,
+            region=region,
+            addressing_style=style,
+        )
+        if asr_ep_base and asr_ep_base not in asr_bases:
+            asr_bases.append(asr_ep_base)
         _register(
             role="transcription",
             provider="s3",
             bucket_name=bucket,
             endpoint_url=ep,
-            signing_endpoint_url=asr_store.signing_endpoint_url(),
-            region=asr_store._region(),
+            signing_endpoint_url=signing_ep,
+            region=region,
             addressing_style=style,
             access_key_id=asr_store._access_key_id(),
             secret_access_key=asr_store._secret_access_key(),
@@ -488,7 +907,7 @@ def resolve_active_storage_targets() -> list[ActiveStorageTarget]:
                 "transcriptions/",
                 "uploads/",
             ),
-            public_url_base=pub_base.rstrip("/") if pub_base else "",
+            public_url_bases=asr_bases,
         )
 
     return [
@@ -716,6 +1135,8 @@ def verify_owner_media_token(
     if len(parts) != 2 or not parts[0] or not parts[1]:
         raise HTTPException(status_code=401, detail="Invalid media token")
     p_b64, s_b64 = parts
+    if not p_b64.isascii() or not s_b64.isascii():
+        raise HTTPException(status_code=401, detail="Invalid media token")
     expected = hmac.new(_media_hmac_key(), p_b64.encode("ascii"), hashlib.sha256).digest()
     try:
         supplied = _b64u_decode(s_b64)
@@ -768,6 +1189,8 @@ def verify_public_media_ref(media_ref: str, *, expected_thread_id: str) -> dict[
     if len(parts) != 2 or not parts[0] or not parts[1]:
         raise HTTPException(status_code=404, detail="Media not found", headers=_no_store)
     p_b64, s_b64 = parts
+    if not p_b64.isascii() or not s_b64.isascii():
+        raise HTTPException(status_code=404, detail="Media not found", headers=_no_store)
     expected = hmac.new(_media_hmac_key(), p_b64.encode("ascii"), hashlib.sha256).digest()
     try:
         supplied = _b64u_decode(s_b64)
@@ -904,32 +1327,62 @@ def extract_upstream_key_from_url(url: str) -> str | None:
 
 
 async def _fetch_ready_chat_uploads(
-    workspace_id: str, upload_ids: Iterable[str]
+    workspace_id: str,
+    upload_ids: Iterable[str],
+    *,
+    allowed_user_ids: Iterable[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     ids = list({str(u).strip() for u in upload_ids if str(u or "").strip()})
     if not ids or not workspace_id:
         return {}
+    users_filter: list[str] | None = None
+    if allowed_user_ids is not None:
+        users_filter = sorted({str(u).strip() for u in allowed_user_ids if str(u or "").strip()})
+        if not users_filter:
+            return {}
     from src.server.database.pool import get_db_connection
 
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                SELECT upload_id::text AS upload_id,
-                       workspace_id::text AS workspace_id,
-                       object_key,
-                       safe_filename,
-                       mime_type,
-                       state,
-                       cleaned_at
-                FROM dalton_chat_file_uploads
-                WHERE workspace_id = %s::uuid
-                  AND upload_id = ANY(%s::uuid[])
-                  AND state = 'ready'
-                  AND cleaned_at IS NULL
-                """,
-                (str(workspace_id), ids),
-            )
+            if users_filter is not None:
+                await cur.execute(
+                    """
+                    SELECT upload_id,
+                           user_id,
+                           workspace_id,
+                           object_key,
+                           safe_filename,
+                           mime_type,
+                           state,
+                           cleaned_at
+                    FROM dalton_chat_file_uploads
+                    WHERE workspace_id = %s
+                      AND upload_id = ANY(%s::text[])
+                      AND user_id = ANY(%s::text[])
+                      AND state = 'ready'
+                      AND cleaned_at IS NULL
+                    """,
+                    (str(workspace_id), ids, users_filter),
+                )
+            else:
+                await cur.execute(
+                    """
+                    SELECT upload_id,
+                           user_id,
+                           workspace_id,
+                           object_key,
+                           safe_filename,
+                           mime_type,
+                           state,
+                           cleaned_at
+                    FROM dalton_chat_file_uploads
+                    WHERE workspace_id = %s
+                      AND upload_id = ANY(%s::text[])
+                      AND state = 'ready'
+                      AND cleaned_at IS NULL
+                    """,
+                    (str(workspace_id), ids),
+                )
             rows = await cur.fetchall()
     return {str(r["upload_id"]): dict(r) for r in rows}
 
@@ -942,14 +1395,40 @@ def _is_safe_object_key(key: str) -> bool:
     return all(p and p not in (".", "..") for p in parts)
 
 
-def _allowed_storage_origins() -> set[str]:
+def _allowed_storage_origins() -> set[str] | None:
+    """Return all configured storage origins, or ``None`` if target resolution failed."""
     origins: set[str] = set()
     try:
         targets = resolve_active_storage_targets()
     except Exception:
-        return origins
+        logger.debug("Storage target origin resolution failed; failing closed", exc_info=True)
+        return None
     for t in targets:
-        for raw_u in (t.endpoint_url, t.signing_endpoint_url, *t.public_url_bases):
+        formatted_origin = format_storage_endpoint_base(
+            provider=t.provider,
+            endpoint_url=t.endpoint_url,
+            bucket_name=t.bucket_name,
+            region=t.region,
+            addressing_style=t.addressing_style,
+        )
+        formatted_signing = (
+            format_storage_endpoint_base(
+                provider=t.provider,
+                endpoint_url=t.signing_endpoint_url,
+                bucket_name=t.bucket_name,
+                region=t.region,
+                addressing_style=t.addressing_style,
+            )
+            if t.signing_endpoint_url
+            else ""
+        )
+        for raw_u in (
+            t.endpoint_url,
+            t.signing_endpoint_url,
+            formatted_origin,
+            formatted_signing,
+            *t.public_url_bases,
+        ):
             if not raw_u:
                 continue
             cand = raw_u if "://" in raw_u else f"https://{raw_u}"
@@ -964,10 +1443,10 @@ def _allowed_storage_origins() -> set[str]:
 
 
 def _is_url_from_configured_storage(url: str) -> bool:
-    """Return True if ``url`` matches a configured storage origin (or no storage origins are configured)."""
+    """Return True iff ``url`` matches a non-empty configured storage origin (fail closed)."""
     origins = _allowed_storage_origins()
     if not origins:
-        return True
+        return False
     norm = _normalize_origin_str(url)
     return bool(norm and norm in origins)
 
@@ -983,32 +1462,134 @@ def _is_thread_prefixed_upstream_key(thread_id: str, key: str) -> bool:
     return False
 
 
+@dataclass
+class ThreadMediaRegistry:
+    """Authoritative thread-scoped media registry shared by both issuance and serving."""
+
+    attachment_keys: set[str] = field(default_factory=set)
+    attachment_ids: set[str] = field(default_factory=set)
+    upload_id_owners: dict[str, set[str]] = field(default_factory=dict)
+    captured_image_keys: set[str] = field(default_factory=set)
+
+
+def _register_attachment_mapping(
+    att: Any,
+    registry: ThreadMediaRegistry,
+    *,
+    allowed_users: set[str],
+) -> None:
+    if not isinstance(att, Mapping):
+        return
+    raw_url = att.get("url")
+    if isinstance(raw_url, str) and raw_url.strip():
+        k = extract_upstream_key_from_url(raw_url)
+        if k and _is_safe_object_key(k):
+            registry.attachment_keys.add(strip_private_media_prefix(k))
+    raw_att_id = att.get("attachment_id") or att.get("id")
+    if isinstance(raw_att_id, str) and raw_att_id.strip():
+        registry.attachment_ids.add(raw_att_id.strip())
+    raw_uid = att.get("upload_id")
+    if isinstance(raw_uid, str) and raw_uid.strip() and allowed_users:
+        registry.upload_id_owners.setdefault(raw_uid.strip(), set()).update(allowed_users)
+
+
+def _register_steering_messages_into_registry(
+    messages: Any,
+    registry: ThreadMediaRegistry,
+    *,
+    default_owner_id: str | None,
+) -> None:
+    if not isinstance(messages, list):
+        return
+    for msg in messages:
+        if not isinstance(msg, Mapping):
+            continue
+        msg_user = str(msg.get("user_id") or default_owner_id or "").strip()
+        allowed = {msg_user} if msg_user else set()
+        for att in msg.get("attachments") or ():
+            _register_attachment_mapping(att, registry, allowed_users=allowed)
+        meta = msg.get("metadata")
+        if isinstance(meta, Mapping):
+            for att in meta.get("attachments") or ():
+                _register_attachment_mapping(att, registry, allowed_users=allowed)
+
+
+def _collect_thread_media_registry(
+    thread_id: str,
+    *,
+    owner_id: str | None = None,
+    queries: Iterable[Mapping[str, Any]] | None = None,
+    responses_by_turn: Mapping[Any, Mapping[str, Any]] | None = None,
+    run_facts: Iterable[Mapping[str, Any]] | None = None,
+    items: Iterable[Mapping[str, Any]] | None = None,
+) -> ThreadMediaRegistry:
+    """Assemble the complete trusted object registry for ``thread_id``."""
+    registry = ThreadMediaRegistry()
+    clean_owner = str(owner_id or "").strip() or None
+
+    for q in queries or ():
+        if not isinstance(q, Mapping):
+            continue
+        q_user = str(q.get("user_id") or clean_owner or "").strip()
+        allowed = {q_user} if q_user else set()
+        meta = q.get("metadata")
+        if isinstance(meta, Mapping):
+            for att in meta.get("attachments") or ():
+                _register_attachment_mapping(att, registry, allowed_users=allowed)
+
+    for container in (
+        *(responses_by_turn.values() if isinstance(responses_by_turn, Mapping) else ()),
+        *(run_facts or ()),
+    ):
+        if not isinstance(container, Mapping):
+            continue
+        facts = container.get("replay_facts") if "replay_facts" in container else container
+        if not isinstance(facts, Mapping):
+            continue
+        imgs = facts.get("images")
+        img_urls = imgs.values() if isinstance(imgs, Mapping) else (imgs if isinstance(imgs, list) else ())
+        for u in img_urls:
+            if not isinstance(u, str) or not u.strip():
+                continue
+            k = extract_upstream_key_from_url(u)
+            if k and _is_safe_object_key(k):
+                cleaned = strip_private_media_prefix(k)
+                if cleaned.startswith(f"response-images/{thread_id}/"):
+                    registry.captured_image_keys.add(cleaned)
+        # Archived legacy steering_delivered messages (if present in replay_facts.archive)
+        archive = facts.get("archive")
+        if isinstance(archive, list):
+            for ev in archive:
+                if isinstance(ev, Mapping) and ev.get("event") == "steering_delivered":
+                    ev_data = ev.get("data")
+                    if isinstance(ev_data, Mapping):
+                        _register_steering_messages_into_registry(
+                            ev_data.get("messages"),
+                            registry,
+                            default_owner_id=clean_owner,
+                        )
+
+    for item in items or ():
+        if not isinstance(item, Mapping):
+            continue
+        if item.get("event") == "steering_delivered":
+            data = item.get("data")
+            if isinstance(data, Mapping):
+                _register_steering_messages_into_registry(
+                    data.get("messages"),
+                    registry,
+                    default_owner_id=clean_owner,
+                )
+
+    return registry
+
+
 def _extract_registered_query_attachment_keys_and_ids(
     queries: Iterable[Mapping[str, Any]],
 ) -> tuple[set[str], set[str], set[str]]:
     """Return ``(normalized_keys, attachment_ids, upload_ids)`` from persisted query metadata."""
-    keys: set[str] = set()
-    att_ids: set[str] = set()
-    upload_ids: set[str] = set()
-    for q in queries:
-        meta = q.get("metadata") if isinstance(q, Mapping) else None
-        if not isinstance(meta, Mapping):
-            continue
-        for att in meta.get("attachments") or ():
-            if not isinstance(att, Mapping):
-                continue
-            raw_url = att.get("url")
-            if isinstance(raw_url, str) and raw_url.strip():
-                k = extract_upstream_key_from_url(raw_url)
-                if k and _is_safe_object_key(k):
-                    keys.add(strip_private_media_prefix(k))
-            raw_att_id = att.get("attachment_id") or att.get("id")
-            if isinstance(raw_att_id, str) and raw_att_id.strip():
-                att_ids.add(raw_att_id.strip())
-            raw_uid = att.get("upload_id")
-            if isinstance(raw_uid, str) and raw_uid.strip():
-                upload_ids.add(raw_uid.strip())
-    return keys, att_ids, upload_ids
+    reg = _collect_thread_media_registry("", owner_id="__any__", queries=queries)
+    return reg.attachment_keys, reg.attachment_ids, set(reg.upload_id_owners)
 
 
 async def _load_thread_query_metadata_rows(thread_id: str) -> list[dict[str, Any]]:
@@ -1029,27 +1610,108 @@ async def _load_thread_query_metadata_rows(thread_id: str) -> list[dict[str, Any
             return [dict(r) for r in await cur.fetchall()]
 
 
+async def _load_thread_media_registry_from_db(
+    thread_id: str,
+    *,
+    owner_id: str | None = None,
+) -> ThreadMediaRegistry | None:
+    """Load the authoritative thread media registry from DB for serving-time verification.
+
+    Returns ``None`` on DB failure so callers fail closed.
+    """
+    from src.server.database.pool import get_db_connection
+    from src.server.services.history.replay import lines as replay_lines
+
+    queries: list[dict[str, Any]] = []
+    responses_by_turn: dict[Any, dict[str, Any]] = {}
+    run_facts: list[dict[str, Any]] = []
+    steering_items: list[dict[str, Any]] = []
+
+    try:
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT metadata
+                    FROM conversation_queries
+                    WHERE conversation_thread_id = %s::uuid
+                      AND metadata IS NOT NULL
+                    """,
+                    (str(thread_id),),
+                )
+                queries = [dict(r) for r in await cur.fetchall()]
+
+                await cur.execute(
+                    """
+                    SELECT turn_index, replay_facts
+                    FROM conversation_responses
+                    WHERE conversation_thread_id = %s::uuid
+                      AND replay_facts IS NOT NULL
+                    """,
+                    (str(thread_id),),
+                )
+                for r in await cur.fetchall():
+                    responses_by_turn[r.get("turn_index")] = dict(r)
+
+                await cur.execute(
+                    """
+                    SELECT replay_facts
+                    FROM subagent_runs
+                    WHERE thread_id = %s::uuid
+                      AND replay_facts IS NOT NULL
+                    """,
+                    (str(thread_id),),
+                )
+                run_facts = [dict(r) for r in await cur.fetchall()]
+
+                await cur.execute(
+                    """
+                    SELECT lines
+                    FROM turn_slices
+                    WHERE conversation_thread_id = %s::uuid
+                      AND lines IS NOT NULL
+                    """,
+                    (str(thread_id),),
+                )
+                for r in await cur.fetchall():
+                    raw_lines = r.get("lines")
+                    if not isinstance(raw_lines, str) or "steering_delivered" not in raw_lines:
+                        continue
+                    for ln in replay_lines.decode(raw_lines):
+                        if ln.event == "steering_delivered":
+                            steering_items.append(ln.item())
+    except Exception:
+        logger.debug("Failed loading thread media registry for %s", thread_id, exc_info=True)
+        return None
+
+    return _collect_thread_media_registry(
+        thread_id,
+        owner_id=owner_id,
+        queries=queries,
+        responses_by_turn=responses_by_turn,
+        run_facts=run_facts,
+        items=steering_items,
+    )
+
+
 async def _verify_staged_attachment_owner(
     attachment_id: str,
     cleaned_key: str,
     *,
     owner_id: str | None = None,
 ) -> bool:
-    """If a ``chat_attachments`` DB row exists for ``attachment_id``, verify key & owner match."""
+    """Verify staged ``chat_attachments`` key & owner match (fail closed when pool is closed/errors)."""
     try:
         from src.server.database.chat_attachments import get_attachment
 
         row = await get_attachment(attachment_id)
-    except RuntimeError as exc:
-        if "pool is not open" in str(exc).lower():
-            return True
-        return False
     except Exception:
+        logger.debug("Staged attachment owner check failed for %s", attachment_id, exc_info=True)
         return False
 
     if row is None:
         # Legacy inline/migrated attachment without a chat_attachments staging row:
-        # thread query metadata membership was already verified by caller.
+        # thread query/steering registry membership was already verified by caller.
         return True
     row_key = strip_private_media_prefix(str(row.get("object_key") or ""))
     if row_key and row_key != cleaned_key:
@@ -1065,6 +1727,7 @@ async def _is_attachment_bound_to_thread(
     *,
     owner_id: str | None = None,
     queries: Iterable[Mapping[str, Any]] | None = None,
+    registry: ThreadMediaRegistry | None = None,
 ) -> bool:
     """Verify an ``attachments/*`` object key is bound to ``thread_id`` (fail closed)."""
     if not thread_id or not _is_safe_object_key(key):
@@ -1080,16 +1743,18 @@ async def _is_attachment_bound_to_thread(
         return False
     att_id = parts[1]
 
-    if queries is None:
-        try:
-            query_rows = await _load_thread_query_metadata_rows(thread_id)
-        except Exception:
-            logger.debug("Attachment thread binding check failed for thread %s", thread_id, exc_info=True)
-            return False
+    if registry is not None:
+        reg_keys = registry.attachment_keys
+        reg_att_ids = registry.attachment_ids
+    elif queries is not None:
+        reg_keys, reg_att_ids, _ = _extract_registered_query_attachment_keys_and_ids(queries)
     else:
-        query_rows = list(queries)
+        loaded = await _load_thread_media_registry_from_db(thread_id, owner_id=owner_id)
+        if loaded is None:
+            return False
+        reg_keys = loaded.attachment_keys
+        reg_att_ids = loaded.attachment_ids
 
-    reg_keys, reg_att_ids, _ = _extract_registered_query_attachment_keys_and_ids(query_rows)
     if cleaned not in reg_keys and att_id not in reg_att_ids:
         return False
 
@@ -1100,23 +1765,23 @@ async def _is_chat_upload_bound_to_thread(
     thread_id: str,
     upload_id: str,
     *,
+    owner_id: str | None = None,
     queries: Iterable[Mapping[str, Any]] | None = None,
-) -> bool:
-    """Verify a Dalton ``chat_upload`` ``upload_id`` is registered on ``thread_id`` (fail closed)."""
+    registry: ThreadMediaRegistry | None = None,
+) -> set[str]:
+    """Return allowed uploader ``user_id``s if ``upload_id`` is registered on ``thread_id``; empty set otherwise."""
     uid = str(upload_id or "").strip()
     if not thread_id or not uid:
-        return False
-    if queries is None:
-        try:
-            query_rows = await _load_thread_query_metadata_rows(thread_id)
-        except Exception:
-            logger.debug("Chat upload thread binding check failed for thread %s", thread_id, exc_info=True)
-            return False
-    else:
-        query_rows = list(queries)
-
-    _, _, reg_upload_ids = _extract_registered_query_attachment_keys_and_ids(query_rows)
-    return uid in reg_upload_ids
+        return set()
+    if registry is not None:
+        return set(registry.upload_id_owners.get(uid) or ())
+    if queries is not None:
+        reg = _collect_thread_media_registry(thread_id, owner_id=owner_id, queries=queries)
+        return set(reg.upload_id_owners.get(uid) or ())
+    loaded = await _load_thread_media_registry_from_db(thread_id, owner_id=owner_id)
+    if loaded is None:
+        return set()
+    return set(loaded.upload_id_owners.get(uid) or ())
 
 
 async def resolve_thread_media_bindings(
@@ -1129,13 +1794,16 @@ async def resolve_thread_media_bindings(
 ) -> dict[str, tuple[str, str]]:
     """Collect verified URL/upload_id -> ``(backend, ref_id)`` bindings for a thread's media.
 
-    Only signs media demonstrably registered to ``thread``:
-    - Persisted ``queries[*].metadata.attachments`` URLs (verified storage origin + thread/attachment binding)
-    - Persisted ``queries[*].metadata.attachments[*].upload_id`` (verified in ``dalton_chat_file_uploads``)
-    - Server-captured assistant images under ``response-images/{thread_id}/...`` (from ``replay_facts.images``
-      or assistant ``message_chunk`` content, verified against configured storage origins)
+    Uses the same authoritative ``ThreadMediaRegistry`` as ``_serve_media_payload``:
+    - Persisted ``queries[*].metadata.attachments`` and ``steering_delivered`` ``messages[]``
+      attachments (verified storage origin + thread/attachment binding + staged owner check)
+    - Persisted ``upload_id``s verified in ``dalton_chat_file_uploads`` for BOTH ``workspace_id``
+      AND matching ``user_id`` (fail closed when owner is missing or mismatched)
+    - Server-recorded captured images under ``response-images/{thread_id}/...`` strictly from
+      ``replay_facts.images`` (``conversation_responses`` and ``subagent_runs``)
 
-    Never signs arbitrary URLs pasted into user message text or foreign ``attachments/`` / ``widgets/`` keys.
+    Never signs unregistered capture images from assistant free text, arbitrary URLs from user
+    text, foreign ``attachments/`` / ``widgets/`` keys, or cross-user ``upload_id``s.
     """
     thread_id = str(
         thread.get("conversation_thread_id") or thread.get("thread_id") or ""
@@ -1144,11 +1812,26 @@ async def resolve_thread_media_bindings(
         return {}
     owner_id = str(thread.get("user_id") or thread.get("owner_id") or "").strip() or None
     query_list = list(queries)
+    item_list = list(items)
+
+    registry = _collect_thread_media_registry(
+        thread_id,
+        owner_id=owner_id,
+        queries=query_list,
+        responses_by_turn=responses_by_turn,
+        run_facts=run_facts,
+        items=item_list,
+    )
 
     bindings: dict[str, tuple[str, str]] = {}
-    upload_ids: set[str] = set()
 
-    async def _register_upstream_url(u: Any, *, allow_staged_attachment: bool) -> None:
+    async def _register_upstream_url(
+        u: Any,
+        *,
+        allow_staged_attachment: bool,
+        require_captured_registry: bool = False,
+        att_owner_id: str | None = None,
+    ) -> None:
         if not isinstance(u, str) or not u.strip():
             return
         if not _is_url_from_configured_storage(u):
@@ -1157,7 +1840,13 @@ async def resolve_thread_media_bindings(
         if not key or not _is_safe_object_key(key):
             return
         cleaned = strip_private_media_prefix(key)
-        if cleaned.startswith("response-images/") or cleaned.startswith("widgets/"):
+        if cleaned.startswith("response-images/"):
+            if _is_thread_prefixed_upstream_key(thread_id, key) and (
+                not require_captured_registry or cleaned in registry.captured_image_keys
+            ):
+                bindings[u] = ("upstream", key)
+            return
+        if cleaned.startswith("widgets/"):
             if _is_thread_prefixed_upstream_key(thread_id, key):
                 bindings[u] = ("upstream", key)
             return
@@ -1165,23 +1854,51 @@ async def resolve_thread_media_bindings(
             if cleaned.startswith(f"attachments/{thread_id}/"):
                 bindings[u] = ("upstream", key)
             elif allow_staged_attachment and await _is_attachment_bound_to_thread(
-                thread_id, key, owner_id=owner_id, queries=query_list
+                thread_id,
+                key,
+                owner_id=att_owner_id or owner_id,
+                registry=registry,
             ):
                 bindings[u] = ("upstream", key)
 
     # 1. Server-registered query attachments (persisted in conversation_queries)
     for q in query_list:
-        meta = q.get("metadata") if isinstance(q, Mapping) else None
+        if not isinstance(q, Mapping):
+            continue
+        q_owner = str(q.get("user_id") or owner_id or "").strip() or None
+        meta = q.get("metadata")
         if isinstance(meta, Mapping):
             for att in meta.get("attachments") or ():
-                if not isinstance(att, Mapping):
-                    continue
-                if att.get("url"):
-                    await _register_upstream_url(att["url"], allow_staged_attachment=True)
-                if att.get("upload_id"):
-                    upload_ids.add(str(att["upload_id"]))
+                if isinstance(att, Mapping) and att.get("url"):
+                    await _register_upstream_url(
+                        att["url"], allow_staged_attachment=True, att_owner_id=q_owner
+                    )
 
-    # 2. Server-recorded captured sandbox images in replay_facts
+    # 2. Server-registered steering_delivered messages[] attachments
+    for item in item_list:
+        if not isinstance(item, Mapping) or item.get("event") != "steering_delivered":
+            continue
+        data = item.get("data")
+        if not isinstance(data, Mapping) or not isinstance(data.get("messages"), list):
+            continue
+        for msg in data["messages"]:
+            if not isinstance(msg, Mapping):
+                continue
+            m_owner = str(msg.get("user_id") or owner_id or "").strip() or None
+            for att in msg.get("attachments") or ():
+                if isinstance(att, Mapping) and att.get("url"):
+                    await _register_upstream_url(
+                        att["url"], allow_staged_attachment=True, att_owner_id=m_owner
+                    )
+            meta = msg.get("metadata")
+            if isinstance(meta, Mapping):
+                for att in meta.get("attachments") or ():
+                    if isinstance(att, Mapping) and att.get("url"):
+                        await _register_upstream_url(
+                            att["url"], allow_staged_attachment=True, att_owner_id=m_owner
+                        )
+
+    # 3. Server-recorded captured sandbox images in replay_facts ONLY (never free-text scan)
     for container in (
         *(responses_by_turn.values() if isinstance(responses_by_turn, Mapping) else ()),
         *(run_facts or ()),
@@ -1194,42 +1911,57 @@ async def resolve_thread_media_bindings(
         imgs = facts.get("images")
         img_urls = imgs.values() if isinstance(imgs, Mapping) else (imgs if isinstance(imgs, list) else ())
         for u in img_urls:
-            await _register_upstream_url(u, allow_staged_attachment=False)
+            await _register_upstream_url(
+                u, allow_staged_attachment=False, require_captured_registry=True
+            )
 
-    # 3. Replay items: assistant message_chunk may embed thread-scoped response-images/{thread_id}/...
-    #    User messages & steering free text are NEVER scanned for arbitrary URLs.
-    for item in items:
-        if not isinstance(item, Mapping):
-            continue
-        event_type = item.get("event")
-        data = item.get("data")
-        if not isinstance(data, Mapping):
-            continue
-        if event_type == "message_chunk":
-            role = data.get("role")
-            if role in (None, "", "assistant"):
-                content = data.get("content")
-                if isinstance(content, str) and (
-                    "response-images/" in content or "private-media/" in content
-                ):
-                    for m in re.finditer(r"https?://[^\s\"'<>)]+", content):
-                        u = m.group(0)
-                        k = extract_upstream_key_from_url(u)
-                        if k and strip_private_media_prefix(k).startswith(
-                            f"response-images/{thread_id}/"
-                        ):
-                            await _register_upstream_url(u, allow_staged_attachment=False)
-
+    # 4. Persisted chat_upload IDs verified against workspace_id AND uploader/owner user_id
     ws_id = str(thread.get("workspace_id") or "")
-    if upload_ids and ws_id:
-        try:
-            ready_map = await _fetch_ready_chat_uploads(ws_id, upload_ids)
-            for uid in ready_map:
-                bindings[f"upload_id:{uid}"] = ("chat_upload", uid)
-        except Exception:
-            logger.debug("Could not resolve chat upload bindings for thread", exc_info=True)
+    if registry.upload_id_owners and ws_id:
+        all_allowed_users = {
+            u for users in registry.upload_id_owners.values() for u in users if u
+        }
+        if all_allowed_users:
+            try:
+                ready_map = await _fetch_ready_chat_uploads(
+                    ws_id,
+                    registry.upload_id_owners.keys(),
+                    allowed_user_ids=all_allowed_users,
+                )
+                for uid, row in ready_map.items():
+                    row_user = str(row.get("user_id") or "").strip()
+                    expected_users = registry.upload_id_owners.get(uid) or set()
+                    if row_user and row_user in expected_users:
+                        bindings[f"upload_id:{uid}"] = ("chat_upload", uid)
+            except Exception:
+                logger.debug("Could not resolve chat upload bindings for thread", exc_info=True)
 
     return bindings
+
+
+def _rewrite_attachment_list(
+    atts: list[Any],
+    url_map: Mapping[str, str],
+    upload_id_map: Mapping[str, str],
+) -> tuple[list[Any], bool]:
+    new_atts: list[Any] = []
+    att_changed = False
+    for att in atts:
+        if not isinstance(att, dict):
+            new_atts.append(att)
+            continue
+        att_copy = dict(att)
+        old_u = att_copy.get("url")
+        if isinstance(old_u, str) and old_u in url_map:
+            att_copy["url"] = url_map[old_u]
+            att_changed = True
+        elif not att_copy.get("url") and att_copy.get("upload_id"):
+            uid = str(att_copy["upload_id"])
+            if uid in upload_id_map:
+                att_copy["url"] = upload_id_map[uid]
+                att_changed = True
+        new_atts.append(att_copy)
+    return new_atts, att_changed
 
 
 def _rewrite_item_urls(
@@ -1258,25 +1990,60 @@ def _rewrite_item_urls(
 
     meta = new_data.get("metadata")
     if isinstance(meta, dict) and isinstance(meta.get("attachments"), list):
-        new_atts = []
-        att_changed = False
-        for att in meta["attachments"]:
-            if not isinstance(att, dict):
-                new_atts.append(att)
-                continue
-            att_copy = dict(att)
-            old_u = att_copy.get("url")
-            if isinstance(old_u, str) and old_u in url_map:
-                att_copy["url"] = url_map[old_u]
-                att_changed = True
-            elif not att_copy.get("url") and att_copy.get("upload_id"):
-                uid = str(att_copy["upload_id"])
-                if uid in upload_id_map:
-                    att_copy["url"] = upload_id_map[uid]
-                    att_changed = True
-            new_atts.append(att_copy)
+        new_atts, att_changed = _rewrite_attachment_list(
+            meta["attachments"], url_map, upload_id_map
+        )
         if att_changed:
             new_data["metadata"] = {**meta, "attachments": new_atts}
+            changed = True
+
+    if isinstance(new_data.get("attachments"), list):
+        new_top_atts, top_changed = _rewrite_attachment_list(
+            new_data["attachments"], url_map, upload_id_map
+        )
+        if top_changed:
+            new_data["attachments"] = new_top_atts
+            changed = True
+
+    # Rewrite interstitial steering_delivered messages[] using the exact same logic
+    if isinstance(new_data.get("messages"), list):
+        new_msgs: list[Any] = []
+        msgs_changed = False
+        for msg in new_data["messages"]:
+            if not isinstance(msg, dict):
+                new_msgs.append(msg)
+                continue
+            msg_copy = dict(msg)
+            m_changed = False
+            m_content = msg_copy.get("content")
+            if isinstance(m_content, str) and url_map:
+                updated_mc = m_content
+                for old_url, new_url in url_map.items():
+                    if old_url in updated_mc:
+                        updated_mc = updated_mc.replace(old_url, new_url)
+                if updated_mc != m_content:
+                    msg_copy["content"] = updated_mc
+                    m_changed = True
+            if isinstance(msg_copy.get("attachments"), list):
+                rewritten_m_atts, r_changed = _rewrite_attachment_list(
+                    msg_copy["attachments"], url_map, upload_id_map
+                )
+                if r_changed:
+                    msg_copy["attachments"] = rewritten_m_atts
+                    m_changed = True
+            m_meta = msg_copy.get("metadata")
+            if isinstance(m_meta, dict) and isinstance(m_meta.get("attachments"), list):
+                rewritten_mm_atts, rm_changed = _rewrite_attachment_list(
+                    m_meta["attachments"], url_map, upload_id_map
+                )
+                if rm_changed:
+                    msg_copy["metadata"] = {**m_meta, "attachments": rewritten_mm_atts}
+                    m_changed = True
+            if m_changed:
+                msgs_changed = True
+            new_msgs.append(msg_copy)
+        if msgs_changed:
+            new_data["messages"] = new_msgs
             changed = True
 
     if changed:
@@ -1435,6 +2202,11 @@ async def _serve_media_payload(
         if cleaned.startswith("response-images/"):
             if not cleaned.startswith(f"response-images/{thread_id}/"):
                 raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
+            registry = await _load_thread_media_registry_from_db(
+                thread_id, owner_id=thread_owner_id or None
+            )
+            if registry is None or cleaned not in registry.captured_image_keys:
+                raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
         elif cleaned.startswith("widgets/"):
             if not cleaned.startswith(f"widgets/{thread_id}/"):
                 raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
@@ -1456,12 +2228,16 @@ async def _serve_media_payload(
     if backend == "chat_upload":
         from src.dalton import chat_upload_storage as chat_store
 
-        bound = await _is_chat_upload_bound_to_thread(thread_id, ref_id)
-        if not bound:
+        allowed_users = await _is_chat_upload_bound_to_thread(
+            thread_id, ref_id, owner_id=thread_owner_id or None
+        )
+        if not allowed_users:
             raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
-        ready = await _fetch_ready_chat_uploads(workspace_id, [ref_id])
+        ready = await _fetch_ready_chat_uploads(
+            workspace_id, [ref_id], allowed_user_ids=allowed_users
+        )
         row = ready.get(str(ref_id))
-        if row is None:
+        if row is None or str(row.get("user_id") or "").strip() not in allowed_users:
             raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
         resolved_key = await asyncio.to_thread(
             chat_store.resolve_existing_chat_upload_key, str(row["object_key"])

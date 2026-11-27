@@ -239,17 +239,14 @@ async def update_thread_share(
     if isinstance(existing_perms, str):
         existing_perms = json.loads(existing_perms)
 
-    # DALTON-HOOK(share-redaction): merge permissions and collapse allow_download=False whenever allow_files is False
-    from src.dalton.share_redaction import normalize_merged_share_permissions
+    # DALTON-HOOK(share-redaction): prepare normalized permissions and atomic JSONB patch via Dalton helper
+    from src.dalton.share_redaction import (
+        apply_thread_share_update,
+        normalize_merged_share_permissions,
+        prepare_share_permissions_update,
+    )
 
-    if effective_req_permissions is not None and effective_req_permissions.model_fields_set:
-        merged = normalize_merged_share_permissions(existing_perms, effective_req_permissions)
-        kwargs["share_permissions"] = merged
-        effective_perms = merged
-    else:
-        effective_perms = normalize_merged_share_permissions(existing_perms, None)
-        if existing_perms.get("allow_download") and not existing_perms.get("allow_files"):
-            kwargs["share_permissions"] = effective_perms
+    effective_perms, perms_patch = prepare_share_permissions_update(existing_perms, effective_req_permissions)
 
     # DALTON-HOOK(monitors): block public shared-thread file exposure by non-admins
     if request.is_shared and (
@@ -257,7 +254,7 @@ async def update_thread_share(
     ):
         await _require_admin_for_share_files(x_user_id)
 
-    updated = await update_thread_sharing(thread_id, **kwargs)
+    updated = await apply_thread_share_update(update_thread_sharing, thread_id, is_shared=request.is_shared, shared_at=kwargs.get("shared_at"), effective_perms=effective_perms, patch=perms_patch)
     if not updated:
         raise HTTPException(status_code=404, detail="Thread not found")
     _record_share_change(x_user_id, thread_id, thread, updated)
@@ -273,6 +270,8 @@ async def update_thread_share(
     perms = updated.get("share_permissions") or {}
     if isinstance(perms, str):
         perms = json.loads(perms)
+    # DALTON-HOOK(share-redaction): normalize response permissions so allow_files=false always shows allow_download=false
+    perms = normalize_merged_share_permissions(perms, None)
 
     return ThreadShareResponse(
         is_shared=updated["is_shared"],
@@ -310,14 +309,12 @@ async def get_thread_share(
     if isinstance(perms, str):
         perms = json.loads(perms)
 
-    # DALTON-HOOK(share-redaction): only scan DB rows when panel explicitly asks for include_summary=true
-    summary_obj: ShareRedactionSummary | None = None
-    if include_summary:
-        from src.dalton.share_redaction import summarize_thread_share_redaction
+    # DALTON-HOOK(share-redaction): normalize stored permissions & load DB-only summary only when requested
+    from src.dalton.share_redaction import maybe_summarize_thread_share_redaction, normalize_merged_share_permissions
 
-        summary_obj = ShareRedactionSummary(
-            **(await summarize_thread_share_redaction(thread_id))
-        )
+    perms = normalize_merged_share_permissions(perms, None)
+    summary_dict = await maybe_summarize_thread_share_redaction(thread_id, include_summary)
+    summary_obj = ShareRedactionSummary(**summary_dict) if summary_dict is not None else None
 
     return ThreadShareResponse(
         is_shared=is_shared,

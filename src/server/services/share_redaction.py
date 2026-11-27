@@ -294,19 +294,9 @@ class ShareRedaction:
             data = without_keys(data, {"report_source"})
             if isinstance(data.get("messages"), list):
                 # DALTON-HOOK(share-redaction): replace order/wakeup steer prompt prose with fixed notice even on allow_files=true
-                rebuilt_msgs = []
-                for m in data["messages"]:
-                    if isinstance(m, dict) and "wakeup" in m:
-                        rebuilt_msgs.append(
-                            {
-                                **m,
-                                "content": "[定时唤醒触发]",
-                                "wakeup": without_keys(m["wakeup"], _WAKEUP_ORDER_KEYS),
-                            }
-                        )
-                    else:
-                        rebuilt_msgs.append(m)
-                data["messages"] = rebuilt_msgs
+                from src.dalton.share_redaction import redact_rich_steering_wakeup_messages
+
+                data["messages"] = redact_rich_steering_wakeup_messages(data["messages"], _WAKEUP_ORDER_KEYS)
         if event_type in _ERROR_TEXT_EVENTS:
             data.pop("error", None)
         if event_type == "tool_calls":

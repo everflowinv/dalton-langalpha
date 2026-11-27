@@ -317,29 +317,11 @@ def _project_ai_message(
     # A compaction before this call: live, its signal fires before the call
     # streams, so the notice sits between the calls it fell between.
     events.extend(_stamped_summary(message, agent))
-    # DALTON-HOOK(share-redaction): split mixed-phase AIMessage blocks via Dalton pure helper
-    from src.dalton.history_phase import build_ai_phase_text_specs
+    # DALTON-HOOK(share-redaction): delegate phase-split & depth-aware thinking strip to Dalton pure helper
+    from src.dalton.history_phase import build_ai_phase_events
 
     tool_calls = _filter_tool_calls(message.tool_calls or [])
-    text_specs, reasoning = build_ai_phase_text_specs(
-        message.content,
-        is_close_out=is_close_out_reply(message),
-        has_tool_calls=bool(tool_calls),
-    )
-
-    if reasoning:
-        events.append(
-            HistoryEvent("reasoning-signal", agent, message_id, {"signal": "start"})
-        )
-        events.append(
-            HistoryEvent("reasoning", agent, message_id, {"content": reasoning})
-        )
-        events.append(
-            HistoryEvent("reasoning-signal", agent, message_id, {"signal": "complete"})
-        )
-
-    for text_data in text_specs:
-        events.append(HistoryEvent("text", agent, message_id, text_data))
+    events.extend(build_ai_phase_events(message.content, agent=agent, message_id=message_id, is_close_out=is_close_out_reply(message), has_tool_calls=bool(tool_calls), event_cls=HistoryEvent))
 
     if tool_calls:
         for tool_call in tool_calls:

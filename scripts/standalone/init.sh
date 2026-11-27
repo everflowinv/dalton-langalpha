@@ -9,9 +9,9 @@
 #   3. Create/update .env (strictly mode 0600) from .env.core.example, configuring
 #      DOMAIN, authentication mode, edge TLS mode, trusted proxy settings, and
 #      COMPOSE_FILE:
-#        - Loopback HTTP (default)  -> DALTON_AUTH_MODE=oss, DALTON_TLS_MODE=loopback (127.0.0.1:8088 only)
-#        - Loopback internal CA     -> DALTON_AUTH_MODE=oss, DALTON_TLS_MODE=internal (127.0.0.1:18080/18443)
-#        - Loopback custom cert     -> DALTON_AUTH_MODE=oss, DALTON_TLS_MODE=custom   (127.0.0.1:18080/18443)
+#        - Loopback HTTP (default)  -> DALTON_AUTH_MODE=local, DALTON_TLS_MODE=loopback (127.0.0.1:8088 only)
+#        - Loopback internal CA     -> DALTON_AUTH_MODE=local, DALTON_TLS_MODE=internal (127.0.0.1:18080/18443)
+#        - Loopback custom cert     -> DALTON_AUTH_MODE=local, DALTON_TLS_MODE=custom   (127.0.0.1:18080/18443)
 #        - Public / LAN domain      -> DALTON_AUTH_MODE=local & VITE_DALTON_AUTH=local,
 #                                      auto / internal / custom TLS on TCP 80 & 443
 #   4. Generate all required secrets with `openssl rand -hex 32` without overwriting

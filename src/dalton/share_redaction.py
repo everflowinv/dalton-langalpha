@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from html import escape as html_escape
@@ -173,15 +174,35 @@ _HOST_PATH_RE = re.compile(
     r"|/mnt/livefs(?:/[^\s\"'<>)\]}（）「」『』【】，《》。；：！？]*)?)"
 )
 
-_RELATIVE_WS_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9_.:/@-])(?:"
-    r"\.\.?/[A-Za-z0-9_.@+-][A-Za-z0-9_./@+-]*"
-    r"|(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.(?:"
+_PATH_SEG_CHAR = r"A-Za-z0-9_.@+\-\u4e00-\u9fff\u3400-\u4dbf"
+_COMMON_WS_DIRS = (
+    r"reports?|docs?|out|output|outputs|results?|data|datasets?|charts?|figures?|"
+    r"images?|imgs?|files?|uploads?|attachments?|artifacts?|workspace|work|tmp|temp|"
+    r"scripts?|src|libs?|apps?|web|tests?|notes?|memos?|drafts?|models?|logs?|"
+    r"configs?|bin|dist|build|assets?|public|private|skills?|prompts?|templates?|"
+    r"migrations?|notebooks?|exports?|downloads?|snapshots?|archive|backups?|"
+    r"报告|文档|数据|图表|输出|附件|目录|资料"
+)
+_KNOWN_NOEXT_FILES = (
+    r"README|LICENSE|Makefile|Dockerfile|CHANGELOG|NOTICE|AUTHORS|Procfile|"
+    r"Jenkinsfile|Vagrantfile|Caddyfile|Gemfile|Rakefile|Justfile|Taskfile|"
+    r"CODEOWNERS|TODO|\.env(?:\.[A-Za-z0-9_.-]+)?|\.gitignore|\.dockerignore"
+)
+_KNOWN_EXTS = (
     r"pdf|md|markdown|txt|csv|tsv|json|jsonl|ya?ml|toml|ini|cfg|conf|env|xml|html?|css|scss|"
     r"js|jsx|ts|tsx|mjs|cjs|py|pyc|sh|bash|zsh|sql|db|sqlite|parquet|feather|arrow|"
     r"xlsx?|docx?|pptx?|rtf|png|jpe?g|gif|svg|webp|bmp|ico|avif|mp3|mp4|wav|m4a|webm|"
     r"zip|tar|gz|tgz|bz2|7z|rar|log|out|err|tex|bib|r|rmd|ipynb|go|rs|java|c|cc|cpp|h|hpp|rb|php|swift|kt"
-    r")(?![A-Za-z0-9_/-])"
+)
+_DATE_SLASH_RE = re.compile(r"^\d{2,4}/\d{1,2}/\d{1,4}$")
+
+_RELATIVE_WS_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.:/@-])(?:"
+    rf"\.\.?/[{_PATH_SEG_CHAR}][{_PATH_SEG_CHAR}/]*"
+    rf"|(?:[{_PATH_SEG_CHAR}]+/)+[{_PATH_SEG_CHAR}]+\.(?:{_KNOWN_EXTS})(?![A-Za-z0-9_/-])"
+    rf"|(?:{_COMMON_WS_DIRS})/(?:[{_PATH_SEG_CHAR}]+/)*[{_PATH_SEG_CHAR}]+(?![A-Za-z0-9_/-])"
+    rf"|(?:[{_PATH_SEG_CHAR}]+/)+(?:{_KNOWN_NOEXT_FILES})(?![A-Za-z0-9_/-])"
+    rf"|(?:[{_PATH_SEG_CHAR}]+/){{2,}}[{_PATH_SEG_CHAR}]+(?![A-Za-z0-9_/-])"
     r")",
     re.IGNORECASE,
 )
@@ -216,6 +237,17 @@ def mark_cold_projection_miss() -> None:
         flag[0] = True
 
 
+@contextmanager
+def track_cold_projection_miss() -> Iterator[list[bool]]:
+    """Context manager yielding ``[hit_cold_bool]`` set to True when ``cold.project_stale`` runs."""
+    flag = [False]
+    token = _COLD_PROJECTION_HIT.set(flag)
+    try:
+        yield flag
+    finally:
+        _COLD_PROJECTION_HIT.reset(token)
+
+
 def normalize_merged_share_permissions(
     existing_perms: Mapping[str, Any] | None,
     incoming_perms: Any | None,
@@ -224,7 +256,8 @@ def normalize_merged_share_permissions(
 
     Unified AU1 rule: whenever effective ``allow_files`` is False, ``allow_download`` is
     forced to False. Partial updates (audience-only, download-only, or omitting ``allow_files``)
-    never flip ``allow_files`` from False to True.
+    never flip ``allow_files`` from False to True, while submitting ``allow_download=True`` on a
+    thread that already has ``allow_files=True`` preserves ``allow_download=True``.
     """
     merged: dict[str, Any] = (
         dict(existing_perms) if isinstance(existing_perms, Mapping) else {}
@@ -233,10 +266,113 @@ def normalize_merged_share_permissions(
         fields_set = getattr(incoming_perms, "model_fields_set", None)
         if fields_set:
             merged.update(incoming_perms.model_dump(exclude_unset=True))
+        elif isinstance(incoming_perms, Mapping) and incoming_perms:
+            merged.update(incoming_perms)
     if not merged.get("allow_files"):
         merged["allow_files"] = False
         merged["allow_download"] = False
     return merged
+
+
+def prepare_share_permissions_update(
+    existing_perms: Mapping[str, Any] | None,
+    incoming_perms: Any | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Return ``(effective_perms, atomic_patch)`` for ``POST /threads/{id}/share``.
+
+    ``atomic_patch`` contains ONLY the fields explicitly supplied by the request
+    (or ``{}`` when repairing a legacy conflicting row with ``allow_files=False,
+    allow_download=True``), so concurrent partial updates merge atomically in SQL
+    without overwriting sibling keys changed by another request.
+    """
+    existing = dict(existing_perms) if isinstance(existing_perms, Mapping) else {}
+    fields_set = getattr(incoming_perms, "model_fields_set", None) if incoming_perms is not None else None
+    if fields_set:
+        patch = dict(incoming_perms.model_dump(exclude_unset=True))
+        effective = normalize_merged_share_permissions(existing, patch)
+        return effective, patch
+    effective = normalize_merged_share_permissions(existing, None)
+    if existing.get("allow_download") and not existing.get("allow_files"):
+        return effective, {}
+    return effective, None
+
+
+def append_atomic_share_permissions_set(
+    sets: list[str],
+    params: list[Any],
+    patch: Mapping[str, Any],
+    json_wrapper: Any,
+) -> None:
+    """Append an atomic PostgreSQL JSONB merge + normalization clause onto ``sets``/``params``."""
+    sets.append(
+        "share_permissions = CASE "
+        "WHEN COALESCE((COALESCE(share_permissions, '{}'::jsonb) || %s::jsonb)->>'allow_files', 'false') = 'true' "
+        "THEN COALESCE(share_permissions, '{}'::jsonb) || %s::jsonb "
+        "ELSE (COALESCE(share_permissions, '{}'::jsonb) || %s::jsonb) "
+        "|| '{\"allow_files\": false, \"allow_download\": false}'::jsonb "
+        "END"
+    )
+    wrapped = json_wrapper(dict(patch))
+    params.extend([wrapped, wrapped, wrapped])
+
+
+async def apply_thread_share_update(
+    update_fn: Any,
+    thread_id: str,
+    *,
+    is_shared: bool,
+    shared_at: Any | None,
+    effective_perms: Mapping[str, Any],
+    patch: Mapping[str, Any] | None,
+) -> Any:
+    """Invoke ``update_thread_sharing`` using atomic SQL JSONB patch merge whenever supported."""
+    from src.server.database.conversation.threads_write import (
+        update_thread_sharing as real_update_thread_sharing,
+    )
+
+    kwargs: dict[str, Any] = {"is_shared": is_shared}
+    if shared_at is not None:
+        kwargs["shared_at"] = shared_at
+    if patch is not None:
+        if update_fn is real_update_thread_sharing or getattr(
+            update_fn, "_supports_atomic_share_patch", False
+        ):
+            kwargs["share_permissions_patch"] = dict(patch)
+        else:
+            kwargs["share_permissions"] = dict(effective_perms)
+    return await update_fn(thread_id, **kwargs)
+
+
+async def maybe_summarize_thread_share_redaction(
+    thread_id: str,
+    include_summary: bool,
+) -> dict[str, int] | None:
+    """Return DB-only redaction summary iff ``include_summary`` is requested."""
+    if not include_summary:
+        return None
+    return await summarize_thread_share_redaction(thread_id)
+
+
+def redact_rich_steering_wakeup_messages(
+    messages: list[Any],
+    wakeup_order_keys: frozenset[str],
+) -> list[Any]:
+    """Replace wakeup steer prompt prose with fixed notice even on ``allow_files=True`` shares."""
+    from src.server.services.share_redaction import without_keys
+
+    rebuilt_msgs: list[Any] = []
+    for m in messages:
+        if isinstance(m, dict) and "wakeup" in m:
+            rebuilt_msgs.append(
+                {
+                    **m,
+                    "content": WAKEUP_FIXED_NOTICE,
+                    "wakeup": without_keys(m["wakeup"], wakeup_order_keys),
+                }
+            )
+        else:
+            rebuilt_msgs.append(m)
+    return rebuilt_msgs
 
 
 @dataclass(frozen=True)
@@ -885,7 +1021,7 @@ def scrub_protected_references(
             if s >= us and e <= ue:
                 return m.group(0)
         core, tail = _split_trailing_punct(m.group(0))
-        if not core:
+        if not core or _DATE_SLASH_RE.fullmatch(core):
             return m.group(0)
         return "[redacted-path]" + tail
 
@@ -2376,6 +2512,7 @@ async def _load_thread_protected_urls_map(
 
     queries_by_tid: dict[str, list[dict[str, Any]]] = {}
     responses_by_tid: dict[str, dict[Any, dict[str, Any]]] = {}
+    run_facts_by_tid: dict[str, list[dict[str, Any]]] = {}
     try:
         async with get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -2404,6 +2541,19 @@ async def _load_thread_protected_urls_map(
                 for row in await cur.fetchall():
                     tid = str(row["thread_id"])
                     responses_by_tid.setdefault(tid, {})[row.get("turn_index")] = dict(row)
+
+                await cur.execute(
+                    """
+                    SELECT thread_id::text AS thread_id, replay_facts
+                    FROM subagent_runs
+                    WHERE thread_id = ANY(%s::uuid[])
+                      AND replay_facts IS NOT NULL
+                    """,
+                    (ids,),
+                )
+                for row in await cur.fetchall():
+                    tid = str(row["thread_id"])
+                    run_facts_by_tid.setdefault(tid, []).append(dict(row))
     except RuntimeError as exc:
         if "pool is not open" in str(exc).lower():
             return {}
@@ -2416,6 +2566,7 @@ async def _load_thread_protected_urls_map(
         urls = collect_thread_protected_urls(
             queries_by_tid.get(tid),
             responses_by_tid.get(tid),
+            run_facts_by_tid.get(tid),
         )
         if urls:
             out[tid] = urls
@@ -2454,17 +2605,18 @@ async def redact_org_library_rows(
         return []
 
     thread_rows_input = [r for r in rows if r.get("kind") == "thread"]
-    if not thread_rows_input:
-        return [dict(r) for r in rows]
 
     item_ids = [str(r["item_id"]) for r in thread_rows_input if r.get("item_id")]
     thread_ids = [str(r["thread_id"]) for r in thread_rows_input if r.get("thread_id")]
 
-    meta_map, threads_map, protected_urls_map = await asyncio.gather(
-        get_org_library_title_meta_map(item_ids),
-        _load_threads_for_redaction(thread_ids),
-        _load_thread_protected_urls_map(thread_ids),
-    )
+    if thread_ids or item_ids:
+        meta_map, threads_map, protected_urls_map = await asyncio.gather(
+            get_org_library_title_meta_map(item_ids),
+            _load_threads_for_redaction(thread_ids),
+            _load_thread_protected_urls_map(thread_ids),
+        )
+    else:
+        meta_map, threads_map, protected_urls_map = {}, {}, {}
 
     eff_cache: dict[str, EffectiveSharePermissions] = {}
     for tid in thread_ids:
@@ -2478,7 +2630,11 @@ async def redact_org_library_rows(
     result: list[dict[str, Any]] = []
     for row in rows:
         copied = dict(row)
-        if copied.get("kind") != "thread":
+        kind = copied.get("kind")
+        if kind != "thread":
+            if kind == "skill":
+                copied["title"] = clean_org_library_title(copied.get("title"))
+            copied["summary"] = clean_org_library_summary(copied.get("summary"))
             result.append(copied)
             continue
 

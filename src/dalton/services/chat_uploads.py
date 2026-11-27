@@ -2898,6 +2898,10 @@ async def build_chat_upload_history_metadata(
         ):
             out.append(_row_to_history_attachment(row))
         else:
+            # Never persist unverified or foreign upload_id into conversation history
+            # metadata; cross-user / cross-workspace uploads are rejected.
+            if user_id is not None or row is not None:
+                continue
             mime_hint = str(item.get("mime_type") or "").strip()
             src_kind = str(item.get("source_kind") or "").strip()
             att_type = (
@@ -2914,7 +2918,6 @@ async def build_chat_upload_history_metadata(
                 "type": att_type,
                 "size": int(item.get("size") or 0),
                 "status": "uploaded",
-                "upload_id": raw_id,
             }
             if mime_hint:
                 entry["mime_type"] = mime_hint
