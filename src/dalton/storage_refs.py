@@ -121,7 +121,10 @@ def site_avatar_url_rules(
     rules: list[tuple[str, str, str]] = []
     seen: set[tuple[str, str]] = set()
     for raw_base in candidates:
-        parsed = urlsplit(raw_base.rstrip("/"))
+        try:
+            parsed = urlsplit(raw_base.rstrip("/"))
+        except ValueError:
+            continue
         if not parsed.scheme or not parsed.netloc:
             continue
         origin = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
@@ -143,7 +146,10 @@ def is_site_avatar_url(
     raw = (avatar_url or "").strip()
     if not raw:
         return False
-    parsed = urlsplit(raw)
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return False
     if not parsed.scheme or not parsed.netloc:
         return False
     origin = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
@@ -271,6 +277,83 @@ def _get_checkpoint_serde() -> Any:
     return _CHECKPOINT_SERDE
 
 
+def _captured_images_map_has_ref(captured: Any) -> bool:
+    """Return True iff a ``captured_images`` or ``image_capture.props.path_to_url`` map names response-images/."""
+    if not isinstance(captured, dict):
+        return False
+    return any(
+        bool(k) and isinstance(v, str) and "response-images/" in v
+        for k, v in captured.items()
+    )
+
+
+def checkpoint_value_has_captured_images(value: Any) -> bool:
+    """Return True iff a deserialized ``messages`` checkpoint value has ``AIMessage.response_metadata.captured_images``.
+
+    Matches ``ptc_agent.agent.middleware.image_capture.recorded_images`` and
+    ``replay.turn.project_turn`` / ``replay.run_lane._run_items``: inspects ONLY
+    ``AIMessage.response_metadata["captured_images"]`` (never message text).
+    """
+    if value is None:
+        return False
+
+    if type(value).__name__ == "_DeltaSnapshot" and hasattr(value, "value"):
+        return checkpoint_value_has_captured_images(value.value)
+
+    if isinstance(value, (list, tuple)):
+        return any(checkpoint_value_has_captured_images(item) for item in value)
+
+    msg_type = getattr(value, "type", None)
+    if msg_type in ("ai", "AIMessageChunk") and hasattr(value, "response_metadata"):
+        meta = getattr(value, "response_metadata", None)
+        if isinstance(meta, dict):
+            return _captured_images_map_has_ref(meta.get("captured_images"))
+        return False
+
+    if isinstance(value, dict):
+        if value.get("type") in ("ai", "AIMessageChunk") and isinstance(
+            value.get("response_metadata"), dict
+        ):
+            return _captured_images_map_has_ref(
+                value["response_metadata"].get("captured_images")
+            )
+        if (
+            value.get("lc") == 1
+            and value.get("type") == "constructor"
+            and isinstance(value.get("id"), list)
+            and value["id"]
+            and value["id"][-1] in ("AIMessage", "AIMessageChunk")
+            and isinstance(value.get("kwargs"), dict)
+        ):
+            meta = value["kwargs"].get("response_metadata")
+            if isinstance(meta, dict):
+                return _captured_images_map_has_ref(meta.get("captured_images"))
+
+    return False
+
+
+def checkpoint_value_has_image_capture_ui(value: Any) -> bool:
+    """Return True iff a deserialized ``ui`` checkpoint value has a legacy ``image_capture`` record.
+
+    Matches ``replay.turn._collect_image_url_map`` (``turn.py:31,232-240``).
+    """
+    if value is None:
+        return False
+
+    if type(value).__name__ == "_DeltaSnapshot" and hasattr(value, "value"):
+        return checkpoint_value_has_image_capture_ui(value.value)
+
+    if isinstance(value, (list, tuple)):
+        return any(checkpoint_value_has_image_capture_ui(item) for item in value)
+
+    if isinstance(value, dict) and value.get("name") == "image_capture":
+        props = value.get("props")
+        if isinstance(props, dict):
+            return _captured_images_map_has_ref(props.get("path_to_url"))
+
+    return False
+
+
 def decode_and_check_checkpoint_widget_ref(
     blob_type: str | None,
     blob: bytes | bytearray | memoryview | None,
@@ -286,6 +369,51 @@ def decode_and_check_checkpoint_widget_ref(
     ser = serde if serde is not None else _get_checkpoint_serde()
     value = ser.loads_typed((blob_type, raw))
     return checkpoint_value_has_widget_data_ref(value)
+
+
+def decode_and_check_checkpoint_ref(
+    blob_type: str | None,
+    blob: bytes | bytearray | memoryview | None,
+    *,
+    channel: str | None = None,
+    serde: Any | None = None,
+) -> bool:
+    """Deserialize one candidate checkpoint row and verify widget ``data_ref`` or response-image refs.
+
+    Covers every main-bucket reference replay reads from checkpoints:
+    - ``channel == "messages"``: ``ShowWidget`` ``ToolMessage.artifact.data_ref.key``
+      and ``AIMessage.response_metadata["captured_images"]``
+    - ``channel == "ui"``: legacy ``image_capture`` UI records (``props.path_to_url``)
+    """
+    if not blob_type or blob_type == "empty" or blob is None:
+        return False
+    raw = bytes(blob)
+    has_data_ref = b"data_ref" in raw
+    has_captured = b"captured_images" in raw
+    has_ui_capture = b"image_capture" in raw
+
+    if channel == "messages":
+        if not (has_data_ref or has_captured):
+            return False
+    elif channel == "ui":
+        if not has_ui_capture:
+            return False
+    elif not (has_data_ref or has_captured or has_ui_capture):
+        return False
+
+    ser = serde if serde is not None else _get_checkpoint_serde()
+    value = ser.loads_typed((blob_type, raw))
+    if channel == "ui":
+        return checkpoint_value_has_image_capture_ui(value)
+    if channel == "messages":
+        return (has_data_ref and checkpoint_value_has_widget_data_ref(value)) or (
+            has_captured and checkpoint_value_has_captured_images(value)
+        )
+    return (
+        (has_data_ref and checkpoint_value_has_widget_data_ref(value))
+        or (has_captured and checkpoint_value_has_captured_images(value))
+        or (has_ui_capture and checkpoint_value_has_image_capture_ui(value))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -325,9 +453,10 @@ STARTUP_MAIN_BUCKET_PROBES: tuple[StartupConsumerProbe, ...] = (
         table="public.workspace_files",
         count_sql=(
             "SELECT COUNT(*) FROM ("
-            f"SELECT workspace_file_id FROM workspace_files WHERE blob_sha256 IS NOT NULL LIMIT {STARTUP_COUNT_CAP} "
+            f"(SELECT workspace_file_id FROM workspace_files WHERE blob_sha256 IS NOT NULL LIMIT {STARTUP_COUNT_CAP}) "
             "UNION "
-            f"SELECT workspace_file_id FROM workspace_files WHERE pack_sha256 IS NOT NULL LIMIT {STARTUP_COUNT_CAP}"
+            f"(SELECT workspace_file_id FROM workspace_files WHERE pack_sha256 IS NOT NULL LIMIT {STARTUP_COUNT_CAP}) "
+            f"LIMIT {STARTUP_COUNT_CAP}"
             ") sub"
         ),
         where_summary=f"blob_sha256 IS NOT NULL OR pack_sha256 IS NOT NULL (partial indexes, capped at {STARTUP_COUNT_CAP})",
@@ -834,14 +963,29 @@ STRICT_MAIN_BUCKET_CONSUMERS: tuple[StrictConsumerSpec, ...] = (
         table_ident="conversation_responses",
         pk_columns=("conversation_response_id",),
         hit_expr=(
-            "replay_facts IS NOT NULL AND replay_facts ? 'images' "
+            "replay_facts IS NOT NULL AND ("
+            "(replay_facts ? 'images' "
             "AND jsonb_typeof(replay_facts -> 'images') = 'object' "
             "AND replay_facts -> 'images' <> '{}'::jsonb "
             "AND EXISTS (SELECT 1 FROM jsonb_each_text(replay_facts -> 'images') AS kv "
-            "WHERE kv.value LIKE '%%response-images/%%')"
+            "WHERE kv.value LIKE '%%response-images/%%')) "
+            "OR (replay_facts ? 'legacy' "
+            "AND jsonb_typeof(replay_facts -> 'legacy') = 'object' "
+            "AND (replay_facts -> 'legacy') ? 'images' "
+            "AND jsonb_typeof(replay_facts -> 'legacy' -> 'images') = 'object' "
+            "AND replay_facts -> 'legacy' -> 'images' <> '{}'::jsonb "
+            "AND EXISTS (SELECT 1 FROM jsonb_each_text(replay_facts -> 'legacy' -> 'images') AS kv "
+            "WHERE kv.value LIKE '%%response-images/%%'))"
+            ")"
         ),
-        where_summary="full-table batched scan: replay_facts->'images' values referencing response-images/",
-        source_ref="migrations/versions/065_replay_facts.py:25-28; src/server/services/history/replay/facts.py:48-49,181; src/ptc_agent/agent/middleware/image_capture.py:88-91",
+        where_summary=(
+            "full-table batched scan: replay_facts->'images' or replay_facts->'legacy'->'images' "
+            "values referencing response-images/"
+        ),
+        source_ref=(
+            "migrations/versions/065_replay_facts.py:25-28; src/server/services/history/replay/facts.py:48-49,181; "
+            "src/server/services/history/replay/legacy.py:97,228; src/ptc_agent/agent/middleware/image_capture.py:88-91"
+        ),
     ),
     _build_batched_bool_spec(
         name="response_images_subagents",
@@ -890,10 +1034,16 @@ STRICT_MAIN_BUCKET_CONSUMERS: tuple[StrictConsumerSpec, ...] = (
         mode="checkpoint_blobs",
         pk_columns=("thread_id", "checkpoint_ns", "channel", "version"),
         where_summary=(
-            "full-table batched scan: candidate pre-filter channel='messages' with b'data_ref', "
-            "deserialized via JsonPlusSerializer and structurally verified on ShowWidget ToolMessage.artifact.data_ref.key"
+            "full-table batched scan: candidate pre-filter channel='messages' (b'data_ref' or b'captured_images') "
+            "and channel='ui' (b'image_capture'), deserialized via JsonPlusSerializer and structurally verified "
+            "on ShowWidget ToolMessage.artifact.data_ref.key, AIMessage.response_metadata.captured_images, "
+            "and legacy image_capture UI records"
         ),
-        source_ref="src/ptc_agent/agent/tools/show_widget.py:272-305; src/server/services/history/projector.py:495-516; src/server/services/history/replay/widgets.py:19-39",
+        source_ref=(
+            "src/ptc_agent/agent/tools/show_widget.py:272-305; src/server/services/history/projector.py:495-516; "
+            "src/server/services/history/replay/widgets.py:19-39; src/server/services/history/replay/turn.py:31,148-155,232-240; "
+            "src/server/services/history/replay/run_lane.py:142-144; src/ptc_agent/agent/middleware/image_capture.py:52-62"
+        ),
     ),
     StrictConsumerSpec(
         name="widgets_checkpoint_writes",
@@ -901,10 +1051,16 @@ STRICT_MAIN_BUCKET_CONSUMERS: tuple[StrictConsumerSpec, ...] = (
         mode="checkpoint_writes",
         pk_columns=("thread_id", "checkpoint_ns", "checkpoint_id", "task_id", "idx"),
         where_summary=(
-            "full-table batched scan: candidate pre-filter channel='messages' with b'data_ref', "
-            "deserialized via JsonPlusSerializer and structurally verified on ShowWidget ToolMessage.artifact.data_ref.key"
+            "full-table batched scan: candidate pre-filter channel='messages' (b'data_ref' or b'captured_images') "
+            "and channel='ui' (b'image_capture'), deserialized via JsonPlusSerializer and structurally verified "
+            "on ShowWidget ToolMessage.artifact.data_ref.key, AIMessage.response_metadata.captured_images, "
+            "and legacy image_capture UI records"
         ),
-        source_ref="src/server/database/thread_fork.py:14-16; src/ptc_agent/agent/tools/show_widget.py:272-305; src/server/services/history/projector.py:495-516",
+        source_ref=(
+            "src/server/database/thread_fork.py:14-16; src/ptc_agent/agent/tools/show_widget.py:272-305; "
+            "src/server/services/history/projector.py:495-516; src/server/services/history/replay/turn.py:31,148-155,232-240; "
+            "src/server/services/history/replay/run_lane.py:142-144; src/ptc_agent/agent/middleware/image_capture.py:52-62"
+        ),
     ),
     # --- Avatars: recorded object key = hit; URL-shape-only = suspected warning (17) ---
     StrictConsumerSpec(
@@ -1146,19 +1302,26 @@ async def _run_strict_single_consumer(
             order_by = ", ".join(f"{c} ASC" for c in pk_cols)
             placeholders = ", ".join(["%s"] * pk_len)
             cand_cond = (
-                "channel = 'messages' AND blob IS NOT NULL "
-                "AND position(convert_to('data_ref', 'UTF8') in blob) > 0"
+                "blob IS NOT NULL AND ("
+                "(channel = 'messages' AND ("
+                "position(convert_to('data_ref', 'UTF8') in blob) > 0 "
+                "OR position(convert_to('captured_images', 'UTF8') in blob) > 0"
+                ")) OR ("
+                "channel = 'ui' AND position(convert_to('image_capture', 'UTF8') in blob) > 0"
+                "))"
             )
             sql_first = (
                 f"SELECT {pk_select}, "
                 f"CASE WHEN {cand_cond} THEN type ELSE NULL END AS cand_type, "
-                f"CASE WHEN {cand_cond} THEN blob ELSE NULL END AS cand_blob "
+                f"CASE WHEN {cand_cond} THEN blob ELSE NULL END AS cand_blob, "
+                f"CASE WHEN {cand_cond} THEN channel ELSE NULL END AS cand_channel "
                 f"FROM {table_ident} ORDER BY {order_by} LIMIT %s"
             )
             sql_next = (
                 f"SELECT {pk_select}, "
                 f"CASE WHEN {cand_cond} THEN type ELSE NULL END AS cand_type, "
-                f"CASE WHEN {cand_cond} THEN blob ELSE NULL END AS cand_blob "
+                f"CASE WHEN {cand_cond} THEN blob ELSE NULL END AS cand_blob, "
+                f"CASE WHEN {cand_cond} THEN channel ELSE NULL END AS cand_channel "
                 f"FROM {table_ident} WHERE ({pk_select}) > ({placeholders}) "
                 f"ORDER BY {order_by} LIMIT %s"
             )
@@ -1178,12 +1341,18 @@ async def _run_strict_single_consumer(
                 if not rows:
                     break
                 for row in rows:
-                    vals = _extract_tuple(row, pk_len + 2)
-                    cand_type = vals[pk_len]
-                    cand_blob = vals[pk_len + 1]
+                    row_vals = tuple(row.values()) if isinstance(row, dict) else tuple(row)
+                    cand_type = row_vals[pk_len]
+                    cand_blob = row_vals[pk_len + 1]
+                    if len(row_vals) > pk_len + 2:
+                        cand_channel = row_vals[pk_len + 2]
+                    elif consumer.mode == "checkpoint_blobs":
+                        cand_channel = row_vals[2]
+                    else:
+                        cand_channel = None
                     scanned += 1
-                    if cand_blob is not None and decode_and_check_checkpoint_widget_ref(
-                        cand_type, cand_blob, serde=serde
+                    if cand_blob is not None and decode_and_check_checkpoint_ref(
+                        cand_type, cand_blob, channel=cand_channel, serde=serde
                     ):
                         hits += 1
                         if stop_on_hit:

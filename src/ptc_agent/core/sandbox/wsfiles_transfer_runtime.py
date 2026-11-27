@@ -325,18 +325,18 @@ class _Exclusions:
         self._prot: dict[str, bool] = {}
 
     def _has_prot(self, path: str | None, rel: str) -> bool:
-        if not path or path in self._prot:
-            return self._prot.get(path or "", False)
-        with os.scandir(path) as it:
-            for c in it:
-                with contextlib.suppress(FileNotFoundError):
+        if not path or path in self._prot: return self._prot.get(path or "", False)
+        try:
+            with os.scandir(path) as it:
+                for c in it:
                     if c.is_dir(follow_symlinks=False) and (c.name == ".git" or c.name in self.whole or f"{rel}/{c.name}" == "work/uploads" or (c.name not in self.dir_names and f"{rel}/{c.name}" not in self.rel_dirs and not f"{rel}/{c.name}".startswith(self.rel_dir_prefixes) and self._has_prot(c.path, f"{rel}/{c.name}"))):
                         return self._prot.setdefault(path, True)
+        except FileNotFoundError as exc:
+            raise OSError(errno.EAGAIN, str(exc)) from exc
         return self._prot.setdefault(path, False)
 
     def _left_out_by_glob(self, rel: str, child: Any = None, *, is_dir: bool = False) -> bool:
-        parts = rel.split("/")
-        return bool(self.rel_globs) and ".git" not in parts and rel != "work/uploads" and not rel.startswith("work/uploads/") and not (is_dir and rel == "work") and any(fnmatch.fnmatchcase("/".join(parts[: i + 1]), p) for i in range(len(parts)) for p in self.rel_globs) and not (is_dir and self._has_prot(getattr(child, "path", None), rel))
+        return bool(self.rel_globs) and ".git" not in (ps := rel.split("/")) and rel != "work/uploads" and not rel.startswith("work/uploads/") and not (is_dir and rel == "work") and any(fnmatch.fnmatchcase("/".join(ps[: i + 1]), p) for i in range(len(ps)) for p in self.rel_globs) and not (is_dir and self._has_prot(getattr(child, "path", None), rel))
 
     def _left_out_by_copy(self, child: Any, rel: str) -> bool:
         full = self.tail_base + rel

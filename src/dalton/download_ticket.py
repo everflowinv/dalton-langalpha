@@ -304,8 +304,22 @@ async def maybe_attach_backup_download_ticket(
 # ---------------------------------------------------------------------------
 
 DOWNLOAD_TICKET_ROUTE_PATH = "/api/v1/dalton/workspace-files/download"
-_URL_WITH_QUERY_RE = re.compile(r"[^\s\"'<>#]+\?[^\s\"'<>#]*")
+_URL_WITH_QUERY_RE = re.compile(r"[^\s]+\?[^\s]*")
 _MULTI_SLASH_RE = re.compile(r"/+")
+
+
+def strip_download_ticket_target(target: str) -> str:
+    """Truncate a structured request target or URL at the first ``?`` when it hits the redemption route.
+
+    Unlike regex token matching, this cuts at the very first ``?`` regardless of
+    raw quotes, angle brackets, hashes, or other characters inside the query string.
+    """
+    if not isinstance(target, str) or "?" not in target:
+        return target
+    path_part, _sep, _query_part = target.partition("?")
+    if not any(ch.isspace() for ch in path_part) and is_download_ticket_path(path_part):
+        return path_part
+    return target
 
 
 def _decode_percent_layers(text: str) -> str:
@@ -357,19 +371,27 @@ def _redact_encoded_dl_token_params(query: str) -> str:
 def redact_dl_token_in_text(text: str) -> str:
     """Drop the entire query string on the download-ticket redemption route.
 
-    For any token ``<path>?<query>`` where ``<path>`` targets
-    :data:`DOWNLOAD_TICKET_ROUTE_PATH` (including percent-encoded path or
-    query-parameter names such as ``?%64l_token=...``), drops ``?<query>``
-    completely. For unrelated URLs, falls back to masking any plain or
-    percent-encoded ``dl_token`` parameter value.
+    - If ``text`` is itself a structured request target / URL (no whitespace before
+      the first ``?``) targeting :data:`DOWNLOAD_TICKET_ROUTE_PATH`, truncates
+      directly at the first ``?`` (even when the query contains raw quotes, ``#``,
+      ``<``, ``>``, or spaces).
+    - For multi-token log lines, matches non-whitespace ``<path>?<query>`` tokens
+      and drops the entire ``?<query>`` (including raw quotes in query values) on
+      the redemption route; for unrelated URLs, masks plain or percent-encoded
+      ``dl_token`` parameter values.
     """
     if not isinstance(text, str) or "?" not in text:
         return text
 
+    stripped = strip_download_ticket_target(text)
+    if stripped != text:
+        return stripped
+
     def _replace(match: re.Match[str]) -> str:
         token = match.group(0)
         path_part, _sep, query_part = token.partition("?")
-        if is_download_ticket_path(path_part):
+        clean_path = path_part.lstrip("\"'<(")
+        if is_download_ticket_path(clean_path):
             return path_part
         redacted_query = _redact_encoded_dl_token_params(query_part)
         return token if redacted_query == query_part else f"{path_part}?{redacted_query}"
@@ -389,7 +411,9 @@ class RedactDownloadTicketLogFilter(logging.Filter):
             new_args = []
             for item in args:
                 if isinstance(item, str) and "?" in item:
-                    cleaned = redact_dl_token_in_text(item)
+                    cleaned = strip_download_ticket_target(item)
+                    if cleaned == item:
+                        cleaned = redact_dl_token_in_text(item)
                     new_args.append(cleaned)
                     if cleaned != item:
                         mutated = True
@@ -400,7 +424,10 @@ class RedactDownloadTicketLogFilter(logging.Filter):
         elif isinstance(args, dict) and args:
             for k, v in list(args.items()):
                 if isinstance(v, str) and "?" in v:
-                    args[k] = redact_dl_token_in_text(v)
+                    cleaned = strip_download_ticket_target(v)
+                    if cleaned == v:
+                        cleaned = redact_dl_token_in_text(v)
+                    args[k] = cleaned
         return True
 
 

@@ -2858,3 +2858,477 @@ class TestStep2Round3Fixes:
             download_ticket.verify_download_ticket("非ASCII.sig")
         assert exc_non_ascii.value.status_code == 401
         assert exc_non_ascii.value.detail == download_ticket.INVALID_DOWNLOAD_TICKET_DETAIL
+
+
+class TestStep2Round4Fixes:
+    """Targeted regression tests for the 6 Codex round-3 review fixes."""
+
+    def test_r4_workspace_files_startup_union_branches_parenthesized(self) -> None:
+        """Both UNION branches of ``workspace_files`` startup probe must be parenthesized before LIMIT."""
+        ws_probe = next(
+            p for p in storage_refs.STARTUP_MAIN_BUCKET_PROBES if p.name == "workspace_files"
+        )
+        cap = storage_refs.STARTUP_COUNT_CAP
+        assert (
+            f"(SELECT workspace_file_id FROM workspace_files WHERE blob_sha256 IS NOT NULL LIMIT {cap})"
+            in ws_probe.count_sql
+        )
+        assert (
+            f"(SELECT workspace_file_id FROM workspace_files WHERE pack_sha256 IS NOT NULL LIMIT {cap})"
+            in ws_probe.count_sql
+        )
+        assert ") UNION (" in ws_probe.count_sql
+
+    def test_r4_strict_cli_detects_checkpoint_captured_images_and_legacy_image_capture_ui(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """``check --strict`` returns 1 when response images exist ONLY in checkpoint
+        ``AIMessage.response_metadata.captured_images`` or legacy ``ui`` ``image_capture`` records,
+        while ignoring plain message text containing those strings (exit 0).
+        """
+        from langchain_core.messages import AIMessage, HumanMessage
+        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+        from langgraph.checkpoint.serde.types import _DeltaSnapshot
+
+        serde = JsonPlusSerializer()
+
+        # Plain text mentioning captured_images / image_capture / response-images/ must NOT trigger
+        plain_human = HumanMessage(
+            content='{"captured_images":{"charts/a.png":"https://cdn.example.com/response-images/t1/0123456789abcdef/a.png"}}'
+        )
+        plain_ai = AIMessage(
+            content="Discussing image_capture and captured_images response-images/t1/a.png"
+        )
+        plain_type, plain_blob = serde.dumps_typed(_DeltaSnapshot([plain_human, plain_ai]))
+
+        # Real captured_images ONLY in AIMessage.response_metadata (no replay_facts.images)
+        captured_ai = AIMessage(
+            id="ai-cap-1",
+            content="Here is the chart: ![rev](charts/rev.png)",
+            response_metadata={
+                "captured_images": {
+                    "charts/rev.png": "https://cdn.example.com/response-images/t1/0123456789abcdef/rev.png"
+                }
+            },
+        )
+        cap_type, cap_blob = serde.dumps_typed(_DeltaSnapshot([captured_ai]))
+
+        # Legacy image_capture UI record in channel='ui'
+        ui_record = [
+            {
+                "id": "ui-cap-1",
+                "name": "image_capture",
+                "props": {
+                    "path_to_url": {
+                        "charts/legacy.png": "https://cdn.example.com/response-images/t2/fedcba9876543210/legacy.png"
+                    }
+                },
+            }
+        ]
+        ui_type, ui_blob = serde.dumps_typed(ui_record)
+
+        # Unrelated UI record must NOT trigger
+        other_ui_type, other_ui_blob = serde.dumps_typed(
+            [{"id": "ui-other", "name": "model_fallback", "props": {"reason": "rate_limit"}}]
+        )
+
+        # Also verify response_images_turns SQL covers replay_facts->'legacy'->'images'
+        turns_spec = next(
+            c for c in storage_refs.STRICT_MAIN_BUCKET_CONSUMERS if c.name == "response_images_turns"
+        )
+        assert "replay_facts -> 'legacy' -> 'images'" in turns_spec.batch_sql_first
+
+        def _make_handler(
+            *,
+            blob_rows: list[tuple[Any, ...]] | None = None,
+            write_rows: list[tuple[Any, ...]] | None = None,
+        ) -> Any:
+            b_rows = list(blob_rows or [])
+            w_rows = list(write_rows or [])
+
+            def _handler(sql: str, params: Any = None) -> Any:
+                if sql.startswith("SET SESSION"):
+                    return None
+                if sql.startswith("SELECT set_config"):
+                    return ("30s",)
+                if sql.startswith("SELECT to_regclass"):
+                    return (params[0],)
+                if "FROM pg_attribute" in sql:
+                    return None
+                if sql.startswith("SELECT EXISTS"):
+                    return (False,)
+                if "FROM checkpoint_blobs" in sql:
+                    assert "captured_images" in sql and "image_capture" in sql
+                    limit = int(params[-1])
+                    if "WHERE (" in sql:
+                        cursor = tuple(params[:-1])
+                        return [r for r in b_rows if r[:4] > cursor][:limit]
+                    return b_rows[:limit]
+                if "FROM checkpoint_writes" in sql:
+                    assert "captured_images" in sql and "image_capture" in sql
+                    limit = int(params[-1])
+                    if "WHERE (" in sql:
+                        cursor = tuple(params[:-1])
+                        return [r for r in w_rows if r[:5] > cursor][:limit]
+                    return w_rows[:limit]
+                return []
+
+            return _handler
+
+        # Case 1: Plain text + unrelated UI record -> exit 0
+        conn_clean = _FakeCliConn(
+            _make_handler(
+                blob_rows=[
+                    ("t-1", "", "messages", "v1", plain_type, plain_blob, "messages"),
+                    ("t-1", "", "ui", "v1", other_ui_type, other_ui_blob, "ui"),
+                ],
+                write_rows=[
+                    ("t-1", "", "cp1", "task1", 0, plain_type, plain_blob, "messages"),
+                ],
+            )
+        )
+        with patch.object(
+            storage_refs,
+            "open_session_connection",
+            create_autospec(storage_refs.open_session_connection, return_value=conn_clean),
+        ):
+            rc_clean = storage_refs.main(["check", "--strict"])
+        capsys.readouterr()
+        assert rc_clean == 0
+
+        # Case 2: Reference ONLY in checkpoint_blobs AIMessage.response_metadata.captured_images -> exit 1
+        conn_cap_blob = _FakeCliConn(
+            _make_handler(
+                blob_rows=[
+                    ("t-2", "", "messages", "v1", cap_type, cap_blob, "messages"),
+                ]
+            )
+        )
+        with patch.object(
+            storage_refs,
+            "open_session_connection",
+            create_autospec(storage_refs.open_session_connection, return_value=conn_cap_blob),
+        ):
+            rc_cap_blob = storage_refs.main(["check", "--strict"])
+        rep_cap_blob = json.loads(capsys.readouterr().out)
+        assert rc_cap_blob == 1
+        assert rep_cap_blob["hits"] == ["widgets_checkpoint_blobs"]
+
+        # Case 3: Reference ONLY in checkpoint_writes AIMessage.response_metadata.captured_images -> exit 1
+        conn_cap_write = _FakeCliConn(
+            _make_handler(
+                write_rows=[
+                    ("t-3", "", "cp1", "task1", 0, cap_type, cap_blob, "messages"),
+                ]
+            )
+        )
+        with patch.object(
+            storage_refs,
+            "open_session_connection",
+            create_autospec(storage_refs.open_session_connection, return_value=conn_cap_write),
+        ):
+            rc_cap_write = storage_refs.main(["check", "--strict"])
+        rep_cap_write = json.loads(capsys.readouterr().out)
+        assert rc_cap_write == 1
+        assert rep_cap_write["hits"] == ["widgets_checkpoint_writes"]
+
+        # Case 4: Reference ONLY in legacy ui image_capture record -> exit 1
+        conn_ui = _FakeCliConn(
+            _make_handler(
+                blob_rows=[
+                    ("t-4", "", "ui", "v1", ui_type, ui_blob, "ui"),
+                ]
+            )
+        )
+        with patch.object(
+            storage_refs,
+            "open_session_connection",
+            create_autospec(storage_refs.open_session_connection, return_value=conn_ui),
+        ):
+            rc_ui = storage_refs.main(["check", "--strict"])
+        rep_ui = json.loads(capsys.readouterr().out)
+        assert rc_ui == 1
+        assert rep_ui["hits"] == ["widgets_checkpoint_blobs"]
+
+    @pytest.mark.asyncio
+    async def test_r4_malformed_avatar_url_treated_as_no_shape_evidence_not_exit_2(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A single malformed ``users.avatar_url`` must be treated as no shape evidence
+        rather than raising ``ValueError`` from ``urlsplit`` and turning the whole audit into exit 2.
+        """
+        site_env = {
+            "STORAGE_PUBLIC_URL_BASE": "https://app.example.com/storage",
+            "STORAGE_KEY_PREFIX": "prod",
+        }
+        malformed_urls = [
+            "https://[invalid/avatars/u-bad.png",
+            "http://[::1/avatars/u-bad2.png",
+            "https://bad[host]/storage/prod/avatars/u-bad3.png",
+        ]
+        for bad_url in malformed_urls:
+            assert storage_refs.is_site_avatar_url(bad_url, env=site_env) is False
+
+        # Malformed STORAGE_PUBLIC_URL_BASE also does not crash rule parsing
+        assert storage_refs.site_avatar_url_rules(env={"STORAGE_PUBLIC_URL_BASE": "https://[bad"}) == []
+
+        avatar_spec = tuple(
+            c for c in storage_refs.STRICT_MAIN_BUCKET_CONSUMERS if c.name == "users_avatars"
+        )
+
+        def _handler(sql: str, params: Any = None) -> Any:
+            if sql.startswith("SELECT set_config"):
+                return ("30s",)
+            if sql.startswith("SELECT to_regclass"):
+                return (params[0],)
+            if "FROM pg_attribute" in sql:
+                return None
+            if "FROM users" in sql:
+                if "WHERE user_id >" in sql:
+                    return []
+                return [
+                    ("u-bad-1", None, "https://[invalid/avatars/u-bad.png"),
+                    ("u-bad-2", None, "http://[::1/avatars/u-bad2.png"),
+                    ("u-site", None, "https://app.example.com/storage/prod/avatars/u-site.png"),
+                    ("u-ext", None, "https://lh3.googleusercontent.com/a/ext.png"),
+                ]
+            return []
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="src.dalton.storage_refs"):
+            report = await storage_refs.run_strict_main_bucket_check(
+                conn=_FakeProbeConn(_handler),
+                consumers=avatar_spec,
+                env=site_env,
+            )
+
+        assert report.exit_code == storage_refs.EXIT_CLEAN
+        assert report.errors == []
+        assert report.confirmed_hits == []
+        assert report.suspected_warnings == {"users_avatars": 1}
+
+    @pytest.mark.asyncio
+    async def test_r4_glob_ancestor_dir_vanished_mid_probe_preserves_manifest_and_git_rows(
+        self, tmp_path: Any
+    ) -> None:
+        """``FileNotFoundError`` during ``_has_prot`` (ancestor or nested subdir briefly renamed/removed)
+        is converted into a non-ENOENT read error so ``backup.sync_to_db`` keeps every manifest row
+        and never prunes existing ``.git`` rows.
+        """
+        import errno as errno_mod
+        import os as os_mod
+
+        ws_dir = tmp_path / "ws"
+        (ws_dir / "projects" / "myrepo" / ".git").mkdir(parents=True)
+        (ws_dir / "projects" / "myrepo" / ".git" / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+        (ws_dir / "projects" / "outer" / "renamed_sub" / ".git").mkdir(parents=True)
+        (ws_dir / "projects" / "outer" / "renamed_sub" / ".git" / "HEAD").write_bytes(
+            b"ref: refs/heads/dev\n"
+        )
+        (ws_dir / "notes.txt").write_bytes(b"keep-me")
+
+        real_scandir = os_mod.scandir
+        vanished_nested = str(ws_dir / "projects" / "outer" / "renamed_sub")
+        vanished_top = str(ws_dir / "projects" / "myrepo")
+
+        def _vanish_nested(path: Any = ".") -> Any:
+            if str(path) == vanished_nested:
+                raise FileNotFoundError(errno_mod.ENOENT, "No such file or directory", str(path))
+            return real_scandir(path)
+
+        # Subcase 1: Nested subdir vanishes mid-probe -> scan records EAGAIN (not swallowed / not ENOENT)
+        with patch.object(transfer_rt.os, "scandir", side_effect=_vanish_nested):
+            scan_out = transfer_rt.scan(
+                {
+                    "root": str(ws_dir),
+                    "whole_dir_names": [".git"],
+                    "exclude_rel_globs": ["projects/*"],
+                }
+            )
+            sweep_out = transfer_rt.sweep(
+                {
+                    "whole_dir_names": [".git"],
+                    "exclude_rel_globs": ["projects/*"],
+                    "projects": [
+                        {
+                            "key": "ws-vanish",
+                            "root": str(ws_dir),
+                            "mark": {
+                                "ns": 9_999_999_999_999_999_999,
+                                "boot_id": transfer_rt._boot_id(),
+                                "offset_ns": transfer_rt._clock_offset_ns(),
+                            },
+                        }
+                    ],
+                }
+            )
+
+        assert any(
+            e["path"] == "projects/outer" and e["errno"] == errno_mod.EAGAIN
+            for e in scan_out["errors"]
+        )
+        assert "ws-vanish" in sweep_out["changed"]
+
+        # Feed into backup.sync_to_db: delete_removed_files MUST NOT run; existing .git rows preserved
+        scan_entries = [
+            ScanEntry(
+                path=e["path"],
+                kind=e["kind"],
+                size=e["size"],
+                mtime_ns=e["mtime_ns"],
+                mode=e["mode"],
+                sha256=e["sha256"],
+                symlink_target=e["symlink_target"],
+                is_binary=e.get("is_binary"),
+            )
+            for e in scan_out["entries"]
+        ]
+        scan_result = ScanResult(
+            entries=scan_entries,
+            oversized=[],
+            errors=scan_out["errors"],
+            hashed=len(scan_entries),
+            reused=0,
+        )
+        existing = {
+            "projects/outer/renamed_sub/.git/HEAD": {
+                "kind": "file",
+                "file_size": len(b"ref: refs/heads/dev\n"),
+                "content_hash": _sha(b"ref: refs/heads/dev\n"),
+                "mtime_ns": 1_700_000_000_000_000_000,
+                "permissions": "0644",
+                "blob_sha256": None,
+                "pack_sha256": None,
+                "pack_offset": None,
+                "is_binary": False,
+            },
+            "notes.txt": {
+                "kind": "file",
+                "file_size": len(b"keep-me"),
+                "content_hash": _sha(b"keep-me"),
+                "mtime_ns": 1_700_000_000_000_000_000,
+                "permissions": "0644",
+                "blob_sha256": None,
+                "pack_sha256": None,
+                "pack_offset": None,
+                "is_binary": False,
+            },
+        }
+        layout = SandboxLayout.for_root("/workspace").for_workspace("ws-vanish")
+        sandbox = _FakeSandbox(
+            {"notes.txt": b"keep-me"}, working_dir="/workspace", dir_name="ws-vanish"
+        )
+        mock_delete_removed = create_autospec(backup.delete_removed_files, return_value=0)
+
+        @asynccontextmanager
+        async def _noop_lock(*_a: Any, **_kw: Any):
+            yield NoDbConn()
+
+        clock = datetime(2026, 11, 27, 12, 0, 0, tzinfo=timezone.utc)
+        with (
+            patch.object(backup, "workspace_sync_lock", _noop_lock),
+            patch.object(backup, "manifest_clock", create_autospec(backup.manifest_clock, return_value=clock)),
+            patch.object(backup, "get_file_metadata_for_sync", create_autospec(backup.get_file_metadata_for_sync, return_value=existing)),
+            patch.object(backup, "files_restore_incomplete", create_autospec(backup.files_restore_incomplete, return_value=False)),
+            patch.object(backup, "delete_removed_files", mock_delete_removed),
+            patch.object(backup, "get_workspace_total_size", create_autospec(backup.get_workspace_total_size, return_value=0)),
+            patch.object(backup, "bulk_upsert_files", create_autospec(wf_db.bulk_upsert_files, return_value=0)),
+            patch.object(blobs, "bulk_upsert_files", create_autospec(wf_db.bulk_upsert_files, return_value=0)),
+            patch.object(backup, "bulk_update_file_stamps", create_autospec(backup.bulk_update_file_stamps, return_value=None)),
+            patch.object(backup, "is_storage_enabled", return_value=False),
+            patch.object(backup, "scan_workspace", create_autospec(backup.scan_workspace, return_value=scan_result)),
+        ):
+            sync_res = await backup.sync_to_db("ws-vanish", sandbox, layout=layout)
+
+        mock_delete_removed.assert_not_awaited()
+        assert sync_res.deleted == 0
+        assert sync_res.pruned is False
+        assert any(
+            u.path == "projects/outer" and u.reason == "unreadable" for u in sync_res.unsaved
+        )
+
+        # Subcase 2: Top matched ancestor dir vanishes right at os.scandir -> also records EAGAIN
+        def _vanish_top(path: Any = ".") -> Any:
+            if str(path) == vanished_top:
+                raise FileNotFoundError(errno_mod.ENOENT, "No such file or directory", str(path))
+            return real_scandir(path)
+
+        with patch.object(transfer_rt.os, "scandir", side_effect=_vanish_top):
+            scan_top = transfer_rt.scan(
+                {
+                    "root": str(ws_dir),
+                    "whole_dir_names": [".git"],
+                    "exclude_rel_globs": ["projects/*"],
+                }
+            )
+        assert any(
+            e["path"] == "projects/myrepo" and e["errno"] == errno_mod.EAGAIN
+            for e in scan_top["errors"]
+        )
+
+    def test_r4_download_ticket_raw_quote_query_truncated_at_first_question_mark(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Query values containing raw quotes (``, ', <, >, #) before ``dl_token`` must be
+        truncated directly at the first ``?`` so no filter leaks the trailing ticket into logs.
+        """
+        from src.dalton.auth.dispatch import SensitiveQueryLogFilter
+        from src.observability.private_query import AccessLogQueryFilter
+
+        monkeypatch.setenv("JWT_SIGNING_SECRET", "r" * 40)
+        tok = download_ticket.issue_download_ticket(
+            user_id="u-quote",
+            workspace_id="ws-quote",
+            path="reports/quoted.parquet",
+            backup_ok=True,
+        )
+        assert tok is not None
+
+        tricky_targets = [
+            f'/api/v1/dalton/workspace-files/download?a=1"2&dl_token={tok}',
+            f'/api/v1/dalton/workspace-files/download?x="quoted"&%64l_token={tok}&tail=1',
+            f"/api/v1/dalton/workspace-files/download?a='1'#frag&dl_token={tok}",
+            f'/api/v1/dalton/workspace-files/%64ownload?q=<tag>"x"&dl_token={tok}',
+        ]
+
+        # 1. Chained filter pipeline (exact order used on uvicorn.access) & each filter solo
+        pipeline = (
+            download_ticket.RedactDownloadTicketLogFilter(),
+            AccessLogQueryFilter(),
+            SensitiveQueryLogFilter(),
+        )
+        for target in tricky_targets:
+            expected_path = target.partition("?")[0]
+
+            # Chained execution on one LogRecord
+            rec_chain = logging.LogRecord(
+                "uvicorn.access",
+                logging.INFO,
+                __file__,
+                1,
+                '%s - "%s %s HTTP/%s" %d',
+                ("127.0.0.1:50000", "GET", target, "1.1", 200),
+                None,
+            )
+            for flt in pipeline:
+                assert flt.filter(rec_chain) is True
+            assert rec_chain.args[2] == expected_path
+            formatted = rec_chain.getMessage()
+            assert tok not in formatted
+            assert "?" not in formatted
+            assert "dl_token" not in formatted
+
+            # Pre-formatted msg string (embedded in quotes)
+            rec_msg = logging.LogRecord(
+                "uvicorn.access",
+                logging.INFO,
+                __file__,
+                1,
+                f'127.0.0.1:50000 - "GET {target} HTTP/1.1" 200',
+                None,
+                None,
+            )
+            assert download_ticket.RedactDownloadTicketLogFilter().filter(rec_msg) is True
+            assert tok not in rec_msg.msg
+            assert "?" not in rec_msg.msg
+            assert expected_path in rec_msg.msg

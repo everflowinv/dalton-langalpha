@@ -21,7 +21,7 @@ os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 
 import psycopg
 import pytest
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from psycopg.rows import dict_row
 
@@ -241,7 +241,7 @@ async def test_startup_warning_and_strict_check_real_pg(
                             conversation_thread_id, workspace_id, thread_index,
                             current_status, created_at, updated_at
                         )
-                        VALUES (%s::uuid, %s::uuid, 1, 'idle', NOW(), NOW())
+                        VALUES (%s::uuid, %s::uuid, 1, 'completed', NOW(), NOW())
                         """,
                         (thread_id, ws_id),
                     )
@@ -276,11 +276,12 @@ async def test_startup_warning_and_strict_check_real_pg(
                         """
                         INSERT INTO turn_slices (
                             conversation_response_id, conversation_thread_id,
-                            turn_index, lines, slice_version
+                            input_checkpoint_id, tail_checkpoint_id,
+                            slice_key, slice_codec, slice, lines_key, lines
                         )
-                        VALUES (%s::uuid, %s::uuid, 1, %s, 1)
+                        VALUES (%s::uuid, %s::uuid, 'cp-in', 'cp-tail', 'k1', %s, %s, 'lk1', %s)
                         """,
-                        (resp_id, thread_id, plain_line),
+                        (resp_id, thread_id, p_type, p_blob, plain_line),
                     )
 
                 strict_plain = await storage_refs.run_strict_main_bucket_check(
@@ -346,6 +347,176 @@ async def test_startup_warning_and_strict_check_real_pg(
                 await cur.execute(
                     "DELETE FROM workspace_files WHERE workspace_file_id = %s::uuid",
                     (ptr_file_id,),
+                )
+                if ws_id:
+                    await cur.execute(
+                        "DELETE FROM workspaces WHERE workspace_id = %s::uuid",
+                        (ws_id,),
+                    )
+                if uid:
+                    await cur.execute("DELETE FROM users WHERE user_id = %s", (uid,))
+
+
+@pytest.mark.asyncio
+async def test_r4_startup_union_captured_images_and_malformed_avatar_real_pg(
+    disable_dotenv_loading, test_db_pool, test_db_uri, dalton_schema
+):
+    """Real PostgreSQL verification for round-4 fixes:
+    1. ``workspace_files`` startup UNION probe executes cleanly with both blob and pack rows.
+    2. ``check --strict`` detects response images stored ONLY in checkpoint ``captured_images``
+       and legacy ``image_capture`` UI records (exit 1), even with ``replay_facts`` empty.
+    3. Malformed ``users.avatar_url`` does not fail strict audit with exit 2.
+    """
+    uid: str | None = None
+    ws_id: str | None = None
+    f_blob_id = str(uuid.uuid4())
+    f_pack_id = str(uuid.uuid4())
+    f_both_id = str(uuid.uuid4())
+    thread_id = str(uuid.uuid4())
+    serde = JsonPlusSerializer()
+
+    async with await psycopg.AsyncConnection.connect(
+        test_db_uri, autocommit=True, row_factory=dict_row
+    ) as conn:
+        await _assert_connected_to_test_db(conn)
+        uid, ws_id = await _seed_user_and_workspace(conn)
+
+        try:
+            with (
+                patch.object(db_pool_mod, "get_or_create_pool", return_value=test_db_pool),
+                patch.object(storage_refs, "is_storage_enabled", return_value=False),
+            ):
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "DELETE FROM workspace_files WHERE blob_sha256 IS NOT NULL OR pack_sha256 IS NOT NULL"
+                    )
+                    await cur.execute("DELETE FROM workspace_file_blobs")
+
+                # 1. Startup UNION probe on real PG with blob-only, pack-only, and both-set rows
+                d1 = hashlib.sha256(b"blob-only").hexdigest()
+                d2 = hashlib.sha256(b"pack-only").hexdigest()
+                d3 = hashlib.sha256(b"both-set").hexdigest()
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO workspace_files (
+                            workspace_file_id, workspace_id, file_path, file_name,
+                            file_size, content_hash, blob_sha256, pack_sha256, is_binary, kind
+                        )
+                        VALUES
+                            (%s::uuid, %s::uuid, 'a.bin', 'a.bin', 9, %s, %s, NULL, TRUE, 'file'),
+                            (%s::uuid, %s::uuid, 'b.bin', 'b.bin', 9, %s, NULL, %s, TRUE, 'file'),
+                            (%s::uuid, %s::uuid, 'c.bin', 'c.bin', 8, %s, %s, %s, TRUE, 'file')
+                        """,
+                        (
+                            f_blob_id, ws_id, d1, d1,
+                            f_pack_id, ws_id, d2, d2,
+                            f_both_id, ws_id, d3, d3, d3,
+                        ),
+                    )
+
+                outcomes, _ms = await storage_refs.probe_main_bucket_references(conn=conn)
+                ws_out = next(o for o in outcomes if o.name == "workspace_files")
+                assert ws_out.error is None, f"workspace_files UNION probe failed: {ws_out.error}"
+                assert ws_out.has_references is True
+                assert ws_out.hit_count == 3
+
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "DELETE FROM workspace_files WHERE workspace_file_id IN (%s::uuid, %s::uuid, %s::uuid)",
+                        (f_blob_id, f_pack_id, f_both_id),
+                    )
+
+                # 2. Malformed avatar_url does NOT make strict audit return exit 2
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE users SET avatar_url = %s WHERE user_id = %s",
+                        ("https://[invalid/avatars/u.png", uid),
+                    )
+                malformed_report = await storage_refs.run_strict_main_bucket_check(
+                    conn=conn,
+                    batch_size=50,
+                    env={"STORAGE_PUBLIC_URL_BASE": "https://app.example.com/storage"},
+                )
+                assert malformed_report.exit_code == storage_refs.EXIT_CLEAN
+                assert malformed_report.errors == []
+
+                # 3. Reference ONLY in checkpoint_blobs AIMessage.response_metadata.captured_images -> exit 1
+                cap_msg = AIMessage(
+                    id="ai-pg-cap",
+                    content="See ![plot](charts/plot.png)",
+                    response_metadata={
+                        "captured_images": {
+                            "charts/plot.png": f"https://app.example.com/storage/response-images/{thread_id}/0123456789abcdef/plot.png"
+                        }
+                    },
+                )
+                c_type, c_blob = serde.dumps_typed([cap_msg])
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO checkpoint_blobs (
+                            thread_id, checkpoint_ns, channel, version, type, blob
+                        )
+                        VALUES (%s, '', 'messages', 'v-cap-1', %s, %s)
+                        """,
+                        (thread_id, c_type, c_blob),
+                    )
+                cap_report = await storage_refs.run_strict_main_bucket_check(
+                    conn=conn, batch_size=50
+                )
+                assert cap_report.exit_code == storage_refs.EXIT_REFERENCES_FOUND
+                assert "widgets_checkpoint_blobs" in cap_report.confirmed_hits
+
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "DELETE FROM checkpoint_blobs WHERE thread_id = %s",
+                        (thread_id,),
+                    )
+
+                # 4. Reference ONLY in checkpoint_writes legacy image_capture UI record -> exit 1
+                ui_type, ui_blob = serde.dumps_typed(
+                    [
+                        {
+                            "id": "ui-pg-1",
+                            "name": "image_capture",
+                            "props": {
+                                "path_to_url": {
+                                    "charts/old.png": f"https://app.example.com/storage/response-images/{thread_id}/fedcba9876543210/old.png"
+                                }
+                            },
+                        }
+                    ]
+                )
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO checkpoint_writes (
+                            thread_id, checkpoint_ns, checkpoint_id, task_id,
+                            idx, channel, type, blob
+                        )
+                        VALUES (%s, '', 'cp-ui-1', 't-ui-1', 0, 'ui', %s, %s)
+                        """,
+                        (thread_id, ui_type, ui_blob),
+                    )
+                ui_report = await storage_refs.run_strict_main_bucket_check(
+                    conn=conn, batch_size=50
+                )
+                assert ui_report.exit_code == storage_refs.EXIT_REFERENCES_FOUND
+                assert "widgets_checkpoint_writes" in ui_report.confirmed_hits
+        finally:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM checkpoint_writes WHERE thread_id = %s",
+                    (thread_id,),
+                )
+                await cur.execute(
+                    "DELETE FROM checkpoint_blobs WHERE thread_id = %s",
+                    (thread_id,),
+                )
+                await cur.execute(
+                    "DELETE FROM workspace_files WHERE workspace_file_id IN (%s::uuid, %s::uuid, %s::uuid)",
+                    (f_blob_id, f_pack_id, f_both_id),
                 )
                 if ws_id:
                     await cur.execute(
