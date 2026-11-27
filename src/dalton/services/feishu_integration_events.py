@@ -148,13 +148,18 @@ def verify_and_decode_feishu_event(
     Reads credentials exclusively via ``get_credential_group("feishu_event")``.
     """
     cred = get_credential_group("feishu_event")
-    if not cred.ready:
+    encrypt_key = (
+        str(cred.values.get(FEISHU_ENCRYPT_KEY) or "").strip() if cred.ready else ""
+    )
+    verification_token = (
+        str(cred.values.get(FEISHU_VERIFICATION_TOKEN_KEY) or "").strip()
+        if cred.ready
+        else ""
+    )
+    if not encrypt_key or not verification_token:
         raise FeishuEventNotConfiguredError(
-            "管理员尚未配置飞书事件验签凭据（Encrypt Key / Verification Token）。"
+            "管理员需同时配置飞书事件验签双键（Encrypt Key 与 Verification Token）后方可启用公开事件入口。"
         )
-
-    encrypt_key = cred.values.get(FEISHU_ENCRYPT_KEY)
-    verification_token = cred.values.get(FEISHU_VERIFICATION_TOKEN_KEY)
 
     try:
         envelope = json.loads(raw_body.decode("utf-8"))
@@ -172,12 +177,6 @@ def verify_and_decode_feishu_event(
         )
 
     if "encrypt" in envelope:
-        if not encrypt_key:
-            raise FeishuEventAuthError(
-                "encrypt_key_not_configured",
-                "Encrypted Feishu event received without configured Encrypt Key.",
-                status_code=400,
-            )
         enc_val = envelope.get("encrypt")
         if not isinstance(enc_val, str) or not enc_val.strip():
             raise FeishuEventAuthError(
@@ -192,8 +191,9 @@ def verify_and_decode_feishu_event(
     is_url_verification = str(payload.get("type") or "").strip() == "url_verification"
 
     # Official Feishu URL verification handshake does NOT send X-Lark-Signature headers;
-    # normal event callbacks MUST verify timestamp, nonce, 5-minute window, and signature.
-    if encrypt_key and not is_url_verification:
+    # all real event callbacks unconditionally enforce timestamp, nonce, 5-minute window,
+    # signature (Encrypt Key), AND Verification Token.
+    if not is_url_verification:
         lower_headers = {str(k).lower(): str(v) for k, v in headers.items()}
         ts_raw = lower_headers.get("x-lark-request-timestamp", "").strip()
         nonce = lower_headers.get("x-lark-request-nonce", "").strip()
@@ -234,21 +234,20 @@ def verify_and_decode_feishu_event(
                 status_code=401,
             )
 
-    if verification_token:
-        header_obj = payload.get("header")
-        body_token = (
-            header_obj.get("token")
-            if isinstance(header_obj, Mapping) and header_obj.get("token")
-            else payload.get("token")
+    header_obj = payload.get("header")
+    body_token = (
+        header_obj.get("token")
+        if isinstance(header_obj, Mapping) and header_obj.get("token")
+        else payload.get("token")
+    )
+    if not isinstance(body_token, str) or not hmac.compare_digest(
+        body_token.strip(), verification_token
+    ):
+        raise FeishuEventAuthError(
+            "invalid_verification_token",
+            "Feishu event verification token mismatch.",
+            status_code=401,
         )
-        if not isinstance(body_token, str) or not hmac.compare_digest(
-            body_token.strip(), verification_token
-        ):
-            raise FeishuEventAuthError(
-                "invalid_verification_token",
-                "Feishu event verification token mismatch.",
-                status_code=401,
-            )
 
     return payload
 

@@ -8,6 +8,7 @@ Follows unidirectional lock ordering (§4.2(2)(3)):
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -36,6 +37,7 @@ from src.dalton.integrations.constants import (
     GOOGLE_GMAIL_DRAFT_SCOPES,
     get_connector_spec,
 )
+from src.dalton.integrations.lock_guard import track_advisory_lock
 from src.dalton.services.integration_revoke import RemoteRevoker, process_revoke
 from src.dalton.services.purge_fence import merge_turn_range
 from src.server.database.encryption import get_encryption_key
@@ -285,7 +287,9 @@ async def sync_google_sibling_rows_tx(
                     preferences = %(preferences)s,
                     token_generation = token_generation + 1,
                     refresh_inflight_gen = NULL,
+                    refresh_attempt_gen = refresh_attempt_gen + 1,
                     refresh_started_at = NULL,
+                    refresh_inflight_until = NULL,
                     status = %(status)s,
                     needs_reauth_at = CASE WHEN %(status)s = 'needs_reauth'
                                            THEN COALESCE(needs_reauth_at, NOW())
@@ -400,205 +404,241 @@ async def begin_disconnect(
     lock_key = lifecycle_lock_key(user_id, provider)
     async with get_db_connection() as lock_conn:
         await lock_conn.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
+        acquired_revoke_keys: list[int] = []
         try:
-            async with get_db_connection() as tx_conn, tx_conn.transaction():
-                if event_id is not None:
-                    first_seen = await db.record_webhook_event(
-                        provider, event_id, conn=tx_conn
+            with ExitStack() as lock_stack:
+                lock_stack.enter_context(track_advisory_lock("lifecycle", lock_key))
+                # Canonical order: lifecycle -> revoke (sorted ascending).
+                # Serializes last-grant determination across Dalton members sharing the same (Google project, sub).
+                if provider == "google":
+                    revoke_keys_set: set[int] = set()
+                    pre_row = await db.get_connection(
+                        user_id, "google", service, decrypt_tokens=False, conn=lock_conn
                     )
-                    if not first_seen:
-                        raise DuplicateWebhookEventError(
-                            f"Duplicate webhook event {provider}:{event_id}"
+                    if pre_row is not None:
+                        revoke_keys_set.add(
+                            revoke_lock_key(
+                                extract_google_project(pre_row.oauth_client_id),
+                                pre_row.provider_account_id,
+                            )
                         )
-
-                async with tx_conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute(
-                        """
-                        SELECT user_id, provider, service, oauth_client_id,
-                               provider_account_id, auth_epoch, token_generation,
-                               access_token, refresh_token, status
-                        FROM dalton_user_integrations
-                        WHERE user_id = %s
-                          AND provider = %s
-                          AND service = %s
-                        FOR UPDATE
-                        """,
-                        (user_id, provider, service),
+                    pre_pendings = await db.list_pending_confirmations_for_user_provider(
+                        user_id, "google", service=service, conn=lock_conn
                     )
-                    target = await cur.fetchone()
-                    if target is None:
-                        raise IntegrationNotFoundError(
-                            f"No connection found for user={user_id} provider={provider} service={service}"
+                    for prow in pre_pendings:
+                        revoke_keys_set.add(
+                            revoke_lock_key(
+                                extract_google_project(str(prow["oauth_client_id"])),
+                                str(prow["provider_account_id"]),
+                            )
                         )
-                    target_row = dict(target)
+                    for rk in sorted(revoke_keys_set):
+                        await lock_conn.execute("SELECT pg_advisory_lock(%s)", (rk,))
+                        acquired_revoke_keys.append(rk)
+                        lock_stack.enter_context(track_advisory_lock("revoke", rk))
 
-                    if (
-                        (
-                            expected_oauth_client_id is not None
-                            and str(target_row["oauth_client_id"]) != expected_oauth_client_id
+                async with get_db_connection() as tx_conn, tx_conn.transaction():
+                    if event_id is not None:
+                        first_seen = await db.record_webhook_event(
+                            provider, event_id, conn=tx_conn
                         )
-                        or (
-                            expected_provider_account_id is not None
-                            and str(target_row["provider_account_id"])
-                            != expected_provider_account_id
+                        if not first_seen:
+                            raise DuplicateWebhookEventError(
+                                f"Duplicate webhook event {provider}:{event_id}"
+                            )
+
+                    async with tx_conn.cursor(row_factory=dict_row) as cur:
+                        await cur.execute(
+                            """
+                            SELECT user_id, provider, service, oauth_client_id,
+                                   provider_account_id, auth_epoch, token_generation,
+                                   access_token, refresh_token, status
+                            FROM dalton_user_integrations
+                            WHERE user_id = %s
+                              AND provider = %s
+                              AND service = %s
+                            FOR UPDATE
+                            """,
+                            (user_id, provider, service),
                         )
-                        or (
-                            expected_auth_epoch is not None
-                            and int(target_row["auth_epoch"]) != int(expected_auth_epoch)
+                        target = await cur.fetchone()
+                        if target is None:
+                            raise IntegrationNotFoundError(
+                                f"No connection found for user={user_id} provider={provider} service={service}"
+                            )
+                        target_row = dict(target)
+
+                        if (
+                            (
+                                expected_oauth_client_id is not None
+                                and str(target_row["oauth_client_id"]) != expected_oauth_client_id
+                            )
+                            or (
+                                expected_provider_account_id is not None
+                                and str(target_row["provider_account_id"])
+                                != expected_provider_account_id
+                            )
+                            or (
+                                expected_auth_epoch is not None
+                                and int(target_row["auth_epoch"]) != int(expected_auth_epoch)
+                            )
+                            or (
+                                expected_token_generation is not None
+                                and int(target_row["token_generation"])
+                                != int(expected_token_generation)
+                            )
+                        ):
+                            raise DisconnectTargetMismatchError(
+                                "Connection identity, epoch, or generation changed before disconnect registration."
+                            )
+
+                        if skip_if_running_ledger:
+                            existing_running = await db.has_running_local_purge_for_service(
+                                user_id,
+                                provider,
+                                service,
+                                oauth_client_id=str(target_row["oauth_client_id"]),
+                                provider_account_id=str(target_row["provider_account_id"]),
+                                min_auth_epoch_upto=int(target_row["auth_epoch"]),
+                                conn=tx_conn,
+                            )
+                            if existing_running:
+                                return existing_running[0]
+
+                        token_clear_sql = (
+                            "access_token = NULL, refresh_token = NULL, "
+                            if clear_tokens
+                            else ""
                         )
-                        or (
-                            expected_token_generation is not None
-                            and int(target_row["token_generation"])
-                            != int(expected_token_generation)
+                        err_code_sql = (
+                            "last_error_code = %(last_error_code)s, "
+                            if last_error_code is not None
+                            else ""
                         )
-                    ):
-                        raise DisconnectTargetMismatchError(
-                            "Connection identity, epoch, or generation changed before disconnect registration."
+                        await cur.execute(
+                            f"""
+                            UPDATE dalton_user_integrations
+                            SET {token_clear_sql}
+                                {err_code_sql}
+                                status = %(status)s,
+                                refresh_inflight_gen = NULL,
+                                refresh_attempt_gen = refresh_attempt_gen + 1,
+                                refresh_started_at = NULL,
+                                refresh_inflight_until = NULL,
+                                updated_at = NOW()
+                            WHERE user_id = %(user_id)s
+                              AND provider = %(provider)s
+                              AND service = %(service)s
+                            """,
+                            {
+                                "status": str(target_status),
+                                "last_error_code": last_error_code,
+                                "user_id": user_id,
+                                "provider": provider,
+                                "service": service,
+                            },
                         )
 
-                    if skip_if_running_ledger:
-                        existing_running = await db.has_running_local_purge_for_service(
+                        oauth_client_id = str(target_row["oauth_client_id"])
+                        provider_account_id = str(target_row["provider_account_id"])
+                        auth_epoch_upto = int(target_row["auth_epoch"])
+
+                        # Void any staged pending confirmations for (user_id, provider, service)
+                        # BEFORE checking remaining active/pending grants so an unconfirmed ticket
+                        # cannot suppress revocation on disconnect, and harvest its freshest token.
+                        voided_pending = await db.consume_pending_confirmations_for_user_provider(
+                            user_id, provider, service=service, conn=tx_conn
+                        )
+                        target_proj = (
+                            extract_google_project(oauth_client_id)
+                            if provider == "google"
+                            else None
+                        )
+                        override_raw_token: bytes | None = None
+                        extra_pending_revokes: list[tuple[str, str, bytes]] = []
+                        if provider == "google" and not is_revocation and remote_mode != "local_only":
+                            seen_extra: set[tuple[str, str]] = set()
+                            for prow in voided_pending:
+                                ptok = _extract_pending_raw_token(prow)
+                                if ptok is None:
+                                    continue
+                                pcid = str(prow["oauth_client_id"])
+                                psub = str(prow["provider_account_id"])
+                                pproj = extract_google_project(pcid)
+                                if pproj == target_proj and psub == provider_account_id:
+                                    override_raw_token = ptok
+                                elif (pproj, psub) not in seen_extra:
+                                    seen_extra.add((pproj, psub))
+                                    extra_pending_revokes.append((pcid, psub, ptok))
+
+                        siblings = await db.get_sibling_connections(
                             user_id,
                             provider,
-                            service,
-                            oauth_client_id=str(target_row["oauth_client_id"]),
-                            provider_account_id=str(target_row["provider_account_id"]),
-                            min_auth_epoch_upto=int(target_row["auth_epoch"]),
-                            conn=tx_conn,
-                        )
-                        if existing_running:
-                            return existing_running[0]
-
-                    token_clear_sql = (
-                        "access_token = NULL, refresh_token = NULL, "
-                        if clear_tokens
-                        else ""
-                    )
-                    err_code_sql = (
-                        "last_error_code = %(last_error_code)s, "
-                        if last_error_code is not None
-                        else ""
-                    )
-                    await cur.execute(
-                        f"""
-                        UPDATE dalton_user_integrations
-                        SET {token_clear_sql}
-                            {err_code_sql}
-                            status = %(status)s,
-                            refresh_inflight_gen = NULL,
-                            refresh_started_at = NULL,
-                            updated_at = NOW()
-                        WHERE user_id = %(user_id)s
-                          AND provider = %(provider)s
-                          AND service = %(service)s
-                        """,
-                        {
-                            "status": str(target_status),
-                            "last_error_code": last_error_code,
-                            "user_id": user_id,
-                            "provider": provider,
-                            "service": service,
-                        },
-                    )
-
-                    oauth_client_id = str(target_row["oauth_client_id"])
-                    provider_account_id = str(target_row["provider_account_id"])
-                    auth_epoch_upto = int(target_row["auth_epoch"])
-
-                    # Void any staged pending confirmations for (user_id, provider, service)
-                    # BEFORE checking remaining active/pending grants so an unconfirmed ticket
-                    # cannot suppress revocation on disconnect, and harvest its freshest token.
-                    voided_pending = await db.consume_pending_confirmations_for_user_provider(
-                        user_id, provider, service=service, conn=tx_conn
-                    )
-                    target_proj = (
-                        extract_google_project(oauth_client_id)
-                        if provider == "google"
-                        else None
-                    )
-                    override_raw_token: bytes | None = None
-                    extra_pending_revokes: list[tuple[str, str, bytes]] = []
-                    if provider == "google" and not is_revocation and remote_mode != "local_only":
-                        seen_extra: set[tuple[str, str]] = set()
-                        for prow in voided_pending:
-                            ptok = _extract_pending_raw_token(prow)
-                            if ptok is None:
-                                continue
-                            pcid = str(prow["oauth_client_id"])
-                            psub = str(prow["provider_account_id"])
-                            pproj = extract_google_project(pcid)
-                            if pproj == target_proj and psub == provider_account_id:
-                                override_raw_token = ptok
-                            elif (pproj, psub) not in seen_extra:
-                                seen_extra.add((pproj, psub))
-                                extra_pending_revokes.append((pcid, psub, ptok))
-
-                    siblings = await db.get_sibling_connections(
-                        user_id,
-                        provider,
-                        oauth_client_id,
-                        provider_account_id,
-                        exclude_service=service,
-                        active_only=True,
-                        conn=tx_conn,
-                    )
-                    has_other_active_grant = bool(siblings)
-                    if provider == "google" and not has_other_active_grant:
-                        has_other_active_grant = await db.has_active_or_pending_google_grant(
-                            target_proj or extract_google_project(oauth_client_id),
+                            oauth_client_id,
                             provider_account_id,
-                            exclude_user_id=user_id,
                             exclude_service=service,
+                            active_only=True,
                             conn=tx_conn,
                         )
-                    remote_status, enc_revoke_token = _determine_remote_revoke(
-                        provider=provider,
-                        trigger_reason=trigger_reason,
-                        remote_mode=remote_mode,
-                        has_remaining_active_sibling=has_other_active_grant,
-                        raw_refresh_token=(
-                            override_raw_token
-                            if override_raw_token is not None
-                            else target_row.get("refresh_token")
-                        ),
-                        raw_access_token=target_row.get("access_token"),
-                    )
-
-                purge_id, _ = await _lock_and_register_phase1_tx(
-                    tx_conn,
-                    user_id=user_id,
-                    provider=provider,
-                    service=service,
-                    oauth_client_id=oauth_client_id,
-                    provider_account_id=provider_account_id,
-                    auth_epoch_upto=auth_epoch_upto,
-                    trigger_reason=trigger_reason,
-                    remote_revoke_status=remote_status,
-                    encrypted_revoke_token=enc_revoke_token,
-                )
-                for pcid, psub, ptok in extra_pending_revokes:
-                    pproj = extract_google_project(pcid)
-                    if not await db.has_active_or_pending_google_grant(
-                        pproj, psub, conn=tx_conn
-                    ):
-                        await db.insert_purge_ledger(
-                            purge_id=str(uuid4()),
-                            user_id=user_id,
-                            provider="google",
-                            service=service,
-                            oauth_client_id=pcid,
-                            provider_account_id=psub,
-                            auth_epoch_upto=0,
+                        has_other_active_grant = bool(siblings)
+                        if provider == "google" and not has_other_active_grant:
+                            has_other_active_grant = await db.has_active_or_pending_google_grant(
+                                target_proj or extract_google_project(oauth_client_id),
+                                provider_account_id,
+                                exclude_user_id=user_id,
+                                exclude_service=service,
+                                conn=tx_conn,
+                            )
+                        remote_status, enc_revoke_token = _determine_remote_revoke(
+                            provider=provider,
                             trigger_reason=trigger_reason,
-                            local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
-                            purged_max_turn_by_thread={},
-                            remote_revoke_status=RemoteRevokeStatus.PENDING,
-                            encrypted_revoke_token=ptok,
-                            conn=tx_conn,
+                            remote_mode=remote_mode,
+                            has_remaining_active_sibling=has_other_active_grant,
+                            raw_refresh_token=(
+                                override_raw_token
+                                if override_raw_token is not None
+                                else target_row.get("refresh_token")
+                            ),
+                            raw_access_token=target_row.get("access_token"),
                         )
-            return purge_id
+
+                    purge_id, _ = await _lock_and_register_phase1_tx(
+                        tx_conn,
+                        user_id=user_id,
+                        provider=provider,
+                        service=service,
+                        oauth_client_id=oauth_client_id,
+                        provider_account_id=provider_account_id,
+                        auth_epoch_upto=auth_epoch_upto,
+                        trigger_reason=trigger_reason,
+                        remote_revoke_status=remote_status,
+                        encrypted_revoke_token=enc_revoke_token,
+                    )
+                    for pcid, psub, ptok in extra_pending_revokes:
+                        pproj = extract_google_project(pcid)
+                        if not await db.has_active_or_pending_google_grant(
+                            pproj, psub, conn=tx_conn
+                        ):
+                            await db.insert_purge_ledger(
+                                purge_id=str(uuid4()),
+                                user_id=user_id,
+                                provider="google",
+                                service=service,
+                                oauth_client_id=pcid,
+                                provider_account_id=psub,
+                                auth_epoch_upto=0,
+                                trigger_reason=trigger_reason,
+                                local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
+                                purged_max_turn_by_thread={},
+                                remote_revoke_status=RemoteRevokeStatus.PENDING,
+                                encrypted_revoke_token=ptok,
+                                conn=tx_conn,
+                            )
+                return purge_id
         finally:
             with anyio.CancelScope(shield=True):
+                for rk in reversed(acquired_revoke_keys):
+                    await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (rk,))
                 await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
 
 
@@ -638,275 +678,319 @@ async def begin_disconnect_all_services(
     lock_key = lifecycle_lock_key(user_id, provider)
     async with get_db_connection() as lock_conn:
         await lock_conn.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
+        acquired_revoke_keys: list[int] = []
         try:
-            async with get_db_connection() as tx_conn, tx_conn.transaction():
-                if event_id is not None:
-                    first_seen = await db.record_webhook_event(
-                        provider, event_id, conn=tx_conn
+            with ExitStack() as lock_stack:
+                lock_stack.enter_context(track_advisory_lock("lifecycle", lock_key))
+                # Canonical order: lifecycle -> revoke (sorted ascending).
+                # Serializes last-grant determination across Dalton members sharing the same (Google project, sub).
+                if provider == "google":
+                    revoke_keys_set: set[int] = set()
+                    pre_rows = await db.list_user_connections(
+                        user_id, provider="google", conn=lock_conn
                     )
-                    if not first_seen:
-                        raise DuplicateWebhookEventError(
-                            f"Duplicate webhook event {provider}:{event_id}"
+                    for r in pre_rows:
+                        revoke_keys_set.add(
+                            revoke_lock_key(
+                                extract_google_project(r.oauth_client_id),
+                                r.provider_account_id,
+                            )
                         )
-
-                async with tx_conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute(
-                        """
-                        SELECT user_id, provider, service, oauth_client_id,
-                               provider_account_id, auth_epoch,
-                               access_token, refresh_token, status
-                        FROM dalton_user_integrations
-                        WHERE user_id = %s
-                          AND provider = %s
-                        ORDER BY service ASC
-                        FOR UPDATE
-                        """,
-                        (user_id, provider),
+                    pre_pendings = await db.list_pending_confirmations_for_user_provider(
+                        user_id, "google", conn=lock_conn
                     )
-                    targets = [dict(r) for r in await cur.fetchall()]
-                    if not targets:
-                        raise IntegrationNotFoundError(
-                            f"No connection found for user={user_id} provider={provider}"
+                    for prow in pre_pendings:
+                        revoke_keys_set.add(
+                            revoke_lock_key(
+                                extract_google_project(str(prow["oauth_client_id"])),
+                                str(prow["provider_account_id"]),
+                            )
                         )
+                    for rk in sorted(revoke_keys_set):
+                        await lock_conn.execute("SELECT pg_advisory_lock(%s)", (rk,))
+                        acquired_revoke_keys.append(rk)
+                        lock_stack.enter_context(track_advisory_lock("revoke", rk))
 
-                    target_services = [str(r["service"]) for r in targets]
-                    await cur.execute(
-                        """
-                        UPDATE dalton_user_integrations
-                        SET status = %s,
-                            refresh_inflight_gen = NULL,
-                            refresh_started_at = NULL,
-                            updated_at = NOW()
-                        WHERE user_id = %s
-                          AND provider = %s
-                          AND service = ANY(%s)
-                        """,
-                        (str(target_status), user_id, provider, target_services),
-                    )
+                async with get_db_connection() as tx_conn, tx_conn.transaction():
+                    if event_id is not None:
+                        first_seen = await db.record_webhook_event(
+                            provider, event_id, conn=tx_conn
+                        )
+                        if not first_seen:
+                            raise DuplicateWebhookEventError(
+                                f"Duplicate webhook event {provider}:{event_id}"
+                            )
 
-                    # Serialize with concurrent Fork touch copy before enumerating touches
-                    await cur.execute(
-                        "SELECT pg_advisory_xact_lock(%s)",
-                        (touch_user_lock_key(user_id),),
-                    )
-
-                    # Collect unpurged touches per target connection row
-                    per_service_touches: dict[str, dict[str, tuple[int, int]]] = {}
-                    thread_touch_bounds: dict[str, tuple[int, int]] = {}
-                    for r in targets:
-                        svc = str(r["service"])
-                        epoch = int(r["auth_epoch"])
+                    async with tx_conn.cursor(row_factory=dict_row) as cur:
                         await cur.execute(
                             """
-                            SELECT thread_id::text AS thread_id,
-                                   MIN(turn_index) AS first_touched_turn_index,
-                                   MAX(turn_index) AS max_touched_turn_index
-                            FROM dalton_thread_integration_touches
+                            SELECT user_id, provider, service, oauth_client_id,
+                                   provider_account_id, auth_epoch,
+                                   access_token, refresh_token, status
+                            FROM dalton_user_integrations
                             WHERE user_id = %s
                               AND provider = %s
-                              AND service = %s
-                              AND auth_epoch <= %s
-                              AND purged_at IS NULL
-                            GROUP BY thread_id
-                            ORDER BY thread_id ASC
-                            """,
-                            (user_id, provider, svc, epoch),
-                        )
-                        svc_map: dict[str, tuple[int, int]] = {}
-                        for grp in await cur.fetchall():
-                            tid = str(grp["thread_id"])
-                            lo = int(grp["first_touched_turn_index"])
-                            hi = int(grp["max_touched_turn_index"])
-                            svc_map[tid] = (lo, hi)
-                            if tid in thread_touch_bounds:
-                                prev_lo, prev_hi = thread_touch_bounds[tid]
-                                thread_touch_bounds[tid] = (min(prev_lo, lo), max(prev_hi, hi))
-                            else:
-                                thread_touch_bounds[tid] = (lo, hi)
-                        per_service_touches[svc] = svc_map
-
-                    # Lock each affected thread ONCE, bump generation ONCE, merge closed ranges ONCE
-                    thread_purge_max: dict[str, int] = {}
-                    for tid in sorted(thread_touch_bounds.keys()):
-                        overall_lo, overall_max_touch = thread_touch_bounds[tid]
-                        await cur.execute(
-                            """
-                            SELECT personal_purged_turn_ranges
-                            FROM conversation_threads
-                            WHERE conversation_thread_id = %s::uuid
+                            ORDER BY service ASC
                             FOR UPDATE
                             """,
-                            (tid,),
+                            (user_id, provider),
                         )
-                        t_row = await cur.fetchone()
-                        if t_row is None:
-                            continue
+                        targets = [dict(r) for r in await cur.fetchall()]
+                        if not targets:
+                            raise IntegrationNotFoundError(
+                                f"No connection found for user={user_id} provider={provider}"
+                            )
 
+                        target_services = [str(r["service"]) for r in targets]
                         await cur.execute(
                             """
-                            SELECT GREATEST(
-                                COALESCE((SELECT MAX(turn_index) FROM conversation_queries WHERE conversation_thread_id = %s::uuid), -1),
-                                COALESCE((SELECT MAX(turn_index) FROM conversation_responses WHERE conversation_thread_id = %s::uuid), -1),
-                                %s
-                            ) AS max_turn
-                            """,
-                            (tid, tid, overall_max_touch),
-                        )
-                        max_row = await cur.fetchone()
-                        purge_start_max = max(
-                            overall_lo,
-                            int(max_row["max_turn"]) if max_row else overall_lo,
-                        )
-
-                        merged = merge_turn_range(
-                            t_row.get("personal_purged_turn_ranges"),
-                            overall_lo,
-                            purge_start_max,
-                        )
-                        await cur.execute(
-                            """
-                            UPDATE conversation_threads
-                            SET personal_purge_in_progress = TRUE,
-                                personal_purge_generation = personal_purge_generation + 1,
-                                personal_purged_turn_ranges = %s,
+                            UPDATE dalton_user_integrations
+                            SET status = %s,
+                                refresh_inflight_gen = NULL,
+                                refresh_attempt_gen = refresh_attempt_gen + 1,
+                                refresh_started_at = NULL,
+                                refresh_inflight_until = NULL,
                                 updated_at = NOW()
-                            WHERE conversation_thread_id = %s::uuid
+                            WHERE user_id = %s
+                              AND provider = %s
+                              AND service = ANY(%s)
                             """,
-                            (Jsonb(merged), tid),
-                        )
-                        thread_purge_max[tid] = purge_start_max
-
-                # Void all staged pending confirmations for (user_id, provider) before computing
-                # remote revokes so an unactivated Google token neither suppresses revocation nor leaks.
-                voided_all_pending = await db.consume_pending_confirmations_for_user_provider(
-                    user_id, provider, conn=tx_conn
-                )
-                pending_token_by_proj_sub: dict[tuple[str, str], tuple[str, str | None, bytes]] = {}
-                if provider == "google" and not is_revocation and remote_mode != "local_only":
-                    for prow in voided_all_pending:
-                        ptok = _extract_pending_raw_token(prow)
-                        if ptok is None:
-                            continue
-                        pcid = str(prow["oauth_client_id"])
-                        psub = str(prow["provider_account_id"])
-                        pproj = extract_google_project(pcid)
-                        pending_token_by_proj_sub[(pproj, psub)] = (
-                            pcid,
-                            str(prow["service"]) if prow.get("service") else None,
-                            ptok,
+                            (str(target_status), user_id, provider, target_services),
                         )
 
-                # Group by (oauth_client_id, provider_account_id) for deduplicated remote revocation
-                groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
-                for r in targets:
-                    gkey = (str(r["oauth_client_id"]), str(r["provider_account_id"]))
-                    groups.setdefault(gkey, []).append(r)
-
-                covered_proj_subs: set[tuple[str, str]] = set()
-                group_revoke_assignment: dict[tuple[str, str], tuple[str, RemoteRevokeStatus, bytes | None]] = {}
-                for gkey, grows in groups.items():
-                    cid_g, sub_g = gkey
-                    raw_refresh = next(
-                        (r["refresh_token"] for r in grows if r.get("refresh_token") is not None),
-                        None,
-                    )
-                    raw_access = next(
-                        (r["access_token"] for r in grows if r.get("access_token") is not None),
-                        None,
-                    )
-                    has_other_user_grant = False
-                    if provider == "google":
-                        proj_g = extract_google_project(cid_g)
-                        covered_proj_subs.add((proj_g, sub_g))
-                        if (proj_g, sub_g) in pending_token_by_proj_sub:
-                            raw_refresh = pending_token_by_proj_sub[(proj_g, sub_g)][2]
-                        has_other_user_grant = await db.has_active_or_pending_google_grant(
-                            proj_g,
-                            sub_g,
-                            exclude_user_id=user_id,
-                            conn=tx_conn,
+                        # Serialize with concurrent Fork touch copy before enumerating touches
+                        await cur.execute(
+                            "SELECT pg_advisory_xact_lock(%s)",
+                            (touch_user_lock_key(user_id),),
                         )
-                    g_status, g_token = _determine_remote_revoke(
-                        provider=provider,
-                        trigger_reason=trigger_reason,
-                        remote_mode=remote_mode,
-                        has_remaining_active_sibling=has_other_user_grant,
-                        raw_refresh_token=raw_refresh,
-                        raw_access_token=raw_access,
+
+                        # Collect unpurged touches per target connection row
+                        per_service_touches: dict[str, dict[str, tuple[int, int]]] = {}
+                        thread_touch_bounds: dict[str, tuple[int, int]] = {}
+                        for r in targets:
+                            svc = str(r["service"])
+                            epoch = int(r["auth_epoch"])
+                            await cur.execute(
+                                """
+                                SELECT thread_id::text AS thread_id,
+                                       MIN(turn_index) AS first_touched_turn_index,
+                                       MAX(turn_index) AS max_touched_turn_index
+                                FROM dalton_thread_integration_touches
+                                WHERE user_id = %s
+                                  AND provider = %s
+                                  AND service = %s
+                                  AND auth_epoch <= %s
+                                  AND purged_at IS NULL
+                                GROUP BY thread_id
+                                ORDER BY thread_id ASC
+                                """,
+                                (user_id, provider, svc, epoch),
+                            )
+                            svc_map: dict[str, tuple[int, int]] = {}
+                            for grp in await cur.fetchall():
+                                tid = str(grp["thread_id"])
+                                lo = int(grp["first_touched_turn_index"])
+                                hi = int(grp["max_touched_turn_index"])
+                                svc_map[tid] = (lo, hi)
+                                if tid in thread_touch_bounds:
+                                    prev_lo, prev_hi = thread_touch_bounds[tid]
+                                    thread_touch_bounds[tid] = (min(prev_lo, lo), max(prev_hi, hi))
+                                else:
+                                    thread_touch_bounds[tid] = (lo, hi)
+                            per_service_touches[svc] = svc_map
+
+                        # Lock each affected thread ONCE, bump generation ONCE, merge closed ranges ONCE
+                        thread_purge_max: dict[str, int] = {}
+                        for tid in sorted(thread_touch_bounds.keys()):
+                            overall_lo, overall_max_touch = thread_touch_bounds[tid]
+                            await cur.execute(
+                                """
+                                SELECT personal_purged_turn_ranges
+                                FROM conversation_threads
+                                WHERE conversation_thread_id = %s::uuid
+                                FOR UPDATE
+                                """,
+                                (tid,),
+                            )
+                            t_row = await cur.fetchone()
+                            if t_row is None:
+                                continue
+
+                            await cur.execute(
+                                """
+                                SELECT GREATEST(
+                                    COALESCE((SELECT MAX(turn_index) FROM conversation_queries WHERE conversation_thread_id = %s::uuid), -1),
+                                    COALESCE((SELECT MAX(turn_index) FROM conversation_responses WHERE conversation_thread_id = %s::uuid), -1),
+                                    %s
+                                ) AS max_turn
+                                """,
+                                (tid, tid, overall_max_touch),
+                            )
+                            max_row = await cur.fetchone()
+                            purge_start_max = max(
+                                overall_lo,
+                                int(max_row["max_turn"]) if max_row else overall_lo,
+                            )
+
+                            merged = merge_turn_range(
+                                t_row.get("personal_purged_turn_ranges"),
+                                overall_lo,
+                                purge_start_max,
+                            )
+                            await cur.execute(
+                                """
+                                UPDATE conversation_threads
+                                SET personal_purge_in_progress = TRUE,
+                                    personal_purge_generation = personal_purge_generation + 1,
+                                    personal_purged_turn_ranges = %s,
+                                    updated_at = NOW()
+                                WHERE conversation_thread_id = %s::uuid
+                                """,
+                                (Jsonb(merged), tid),
+                            )
+                            thread_purge_max[tid] = purge_start_max
+
+                    # Void all staged pending confirmations for (user_id, provider) before computing
+                    # remote revokes so an unactivated Google token neither suppresses revocation nor leaks.
+                    voided_all_pending = await db.consume_pending_confirmations_for_user_provider(
+                        user_id, provider, conn=tx_conn
                     )
-                    # Only the first service row in this (oauth_client_id, provider_account_id) group owns remote revoke
-                    owner_service = str(grows[0]["service"])
-                    group_revoke_assignment[gkey] = (owner_service, g_status, g_token)
+                    pending_token_by_proj_sub: dict[tuple[str, str], tuple[str, str | None, bytes]] = {}
+                    if provider == "google" and not is_revocation and remote_mode != "local_only":
+                        for prow in voided_all_pending:
+                            ptok = _extract_pending_raw_token(prow)
+                            if ptok is None:
+                                continue
+                            pcid = str(prow["oauth_client_id"])
+                            psub = str(prow["provider_account_id"])
+                            pproj = extract_google_project(pcid)
+                            pending_token_by_proj_sub[(pproj, psub)] = (
+                                pcid,
+                                str(prow["service"]) if prow.get("service") else None,
+                                ptok,
+                            )
 
-                purge_ids: list[str] = []
-                for r in targets:
-                    svc = str(r["service"])
-                    cid = str(r["oauth_client_id"])
-                    sub = str(r["provider_account_id"])
-                    epoch = int(r["auth_epoch"])
-                    gkey = (cid, sub)
-                    owner_svc, g_status, g_token = group_revoke_assignment[gkey]
-                    if svc == owner_svc:
-                        row_remote_status = g_status
-                        row_enc_token = g_token
-                    else:
-                        row_remote_status = RemoteRevokeStatus.NOT_APPLICABLE
-                        row_enc_token = None
+                    # Group by (google_project, sub) for Google or (oauth_client_id, sub) otherwise
+                    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+                    for r in targets:
+                        cid_r = str(r["oauth_client_id"])
+                        sub_r = str(r["provider_account_id"])
+                        gkey = (
+                            (extract_google_project(cid_r), sub_r)
+                            if provider == "google"
+                            else (cid_r, sub_r)
+                        )
+                        groups.setdefault(gkey, []).append(r)
 
-                    svc_ranges: dict[str, dict[str, int]] = {}
-                    for tid, (svc_lo, _svc_hi) in per_service_touches.get(svc, {}).items():
-                        if tid in thread_purge_max:
-                            svc_ranges[tid] = {
-                                "min_turn": svc_lo,
-                                "max_turn": thread_purge_max[tid],
-                            }
-
-                    pid = str(uuid4())
-                    await db.insert_purge_ledger(
-                        purge_id=pid,
-                        user_id=user_id,
-                        provider=provider,
-                        service=svc,
-                        oauth_client_id=cid,
-                        provider_account_id=sub,
-                        auth_epoch_upto=epoch,
-                        trigger_reason=trigger_reason,
-                        local_purge_status=LocalPurgeStatus.RUNNING,
-                        purged_max_turn_by_thread=svc_ranges,
-                        remote_revoke_status=row_remote_status,
-                        encrypted_revoke_token=row_enc_token,
-                        conn=tx_conn,
-                    )
-                    purge_ids.append(pid)
-
-                # Enqueue revocations for any voided Google pending confirmations targeting other (project, sub)
-                for (pproj, psub), (pcid, psvc, ptok) in pending_token_by_proj_sub.items():
-                    if (pproj, psub) in covered_proj_subs:
-                        continue
-                    if not await db.has_active_or_pending_google_grant(
-                        pproj, psub, exclude_user_id=user_id, conn=tx_conn
-                    ):
-                        extra_pid = str(uuid4())
-                        await db.insert_purge_ledger(
-                            purge_id=extra_pid,
-                            user_id=user_id,
-                            provider="google",
-                            service=psvc,
-                            oauth_client_id=pcid,
-                            provider_account_id=psub,
-                            auth_epoch_upto=0,
+                    covered_proj_subs: set[tuple[str, str]] = set()
+                    group_revoke_assignment: dict[tuple[str, str], tuple[str, RemoteRevokeStatus, bytes | None]] = {}
+                    for gkey, grows in groups.items():
+                        proj_or_cid, sub_g = gkey
+                        raw_refresh = next(
+                            (r["refresh_token"] for r in grows if r.get("refresh_token") is not None),
+                            None,
+                        )
+                        raw_access = next(
+                            (r["access_token"] for r in grows if r.get("access_token") is not None),
+                            None,
+                        )
+                        has_other_user_grant = False
+                        if provider == "google":
+                            covered_proj_subs.add((proj_or_cid, sub_g))
+                            if (proj_or_cid, sub_g) in pending_token_by_proj_sub:
+                                raw_refresh = pending_token_by_proj_sub[(proj_or_cid, sub_g)][2]
+                            has_other_user_grant = await db.has_active_or_pending_google_grant(
+                                proj_or_cid,
+                                sub_g,
+                                exclude_user_id=user_id,
+                                conn=tx_conn,
+                            )
+                        g_status, g_token = _determine_remote_revoke(
+                            provider=provider,
                             trigger_reason=trigger_reason,
-                            local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
-                            purged_max_turn_by_thread={},
-                            remote_revoke_status=RemoteRevokeStatus.PENDING,
-                            encrypted_revoke_token=ptok,
+                            remote_mode=remote_mode,
+                            has_remaining_active_sibling=has_other_user_grant,
+                            raw_refresh_token=raw_refresh,
+                            raw_access_token=raw_access,
+                        )
+                        owner_service = str(grows[0]["service"])
+                        group_revoke_assignment[gkey] = (owner_service, g_status, g_token)
+
+                    purge_ids: list[str] = []
+                    for r in targets:
+                        svc = str(r["service"])
+                        cid = str(r["oauth_client_id"])
+                        sub = str(r["provider_account_id"])
+                        epoch = int(r["auth_epoch"])
+                        gkey = (
+                            (extract_google_project(cid), sub)
+                            if provider == "google"
+                            else (cid, sub)
+                        )
+                        owner_svc, g_status, g_token = group_revoke_assignment[gkey]
+                        if svc == owner_svc:
+                            row_remote_status = g_status
+                            row_enc_token = g_token
+                        else:
+                            row_remote_status = RemoteRevokeStatus.NOT_APPLICABLE
+                            row_enc_token = None
+
+                        svc_ranges: dict[str, dict[str, int]] = {}
+                        for tid, (svc_lo, _svc_hi) in per_service_touches.get(svc, {}).items():
+                            if tid in thread_purge_max:
+                                svc_ranges[tid] = {
+                                    "min_turn": svc_lo,
+                                    "max_turn": thread_purge_max[tid],
+                                }
+
+                        pid = str(uuid4())
+                        await db.insert_purge_ledger(
+                            purge_id=pid,
+                            user_id=user_id,
+                            provider=provider,
+                            service=svc,
+                            oauth_client_id=cid,
+                            provider_account_id=sub,
+                            auth_epoch_upto=epoch,
+                            trigger_reason=trigger_reason,
+                            local_purge_status=LocalPurgeStatus.RUNNING,
+                            purged_max_turn_by_thread=svc_ranges,
+                            remote_revoke_status=row_remote_status,
+                            encrypted_revoke_token=row_enc_token,
                             conn=tx_conn,
                         )
-                        purge_ids.append(extra_pid)
+                        purge_ids.append(pid)
 
-            return purge_ids
+                    # Enqueue revocations for any voided Google pending confirmations targeting other (project, sub)
+                    for (pproj, psub), (pcid, psvc, ptok) in pending_token_by_proj_sub.items():
+                        if (pproj, psub) in covered_proj_subs:
+                            continue
+                        if not await db.has_active_or_pending_google_grant(
+                            pproj, psub, exclude_user_id=user_id, conn=tx_conn
+                        ):
+                            extra_pid = str(uuid4())
+                            await db.insert_purge_ledger(
+                                purge_id=extra_pid,
+                                user_id=user_id,
+                                provider="google",
+                                service=psvc,
+                                oauth_client_id=pcid,
+                                provider_account_id=psub,
+                                auth_epoch_upto=0,
+                                trigger_reason=trigger_reason,
+                                local_purge_status=LocalPurgeStatus.NOT_REQUIRED,
+                                purged_max_turn_by_thread={},
+                                remote_revoke_status=RemoteRevokeStatus.PENDING,
+                                encrypted_revoke_token=ptok,
+                                conn=tx_conn,
+                            )
+                            purge_ids.append(extra_pid)
+
+                return purge_ids
         finally:
             with anyio.CancelScope(shield=True):
+                for rk in reversed(acquired_revoke_keys):
+                    await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (rk,))
                 await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
 
 
@@ -945,10 +1029,12 @@ async def begin_feishu_webhook_revocation_batch(
 
     async with get_db_connection() as lock_conn:
         acquired_keys: list[int] = []
+        lock_stack = ExitStack()
         try:
             for lk in lock_keys:
                 await lock_conn.execute("SELECT pg_advisory_lock(%s)", (lk,))
                 acquired_keys.append(lk)
+                lock_stack.enter_context(track_advisory_lock("lifecycle", lk))
 
             async with get_db_connection() as tx_conn, tx_conn.transaction():
                 already_seen = (
@@ -1048,7 +1134,9 @@ async def begin_feishu_webhook_revocation_batch(
                                 access_token = NULL,
                                 refresh_token = NULL,
                                 refresh_inflight_gen = NULL,
+                                refresh_attempt_gen = refresh_attempt_gen + 1,
                                 refresh_started_at = NULL,
+                                refresh_inflight_until = NULL,
                                 last_error_code = 'webhook_revoked',
                                 updated_at = NOW()
                             WHERE user_id = %s
@@ -1180,6 +1268,7 @@ async def begin_feishu_webhook_revocation_batch(
 
             return "purged", purge_ids
         finally:
+            lock_stack.close()
             with anyio.CancelScope(shield=True):
                 for lk in reversed(acquired_keys):
                     await lock_conn.execute("SELECT pg_advisory_unlock(%s)", (lk,))
@@ -1203,6 +1292,7 @@ async def replace_connection_for_account_switch(
     expected_old_oauth_client_id: str | None = None,
     expected_old_provider_account_id: str | None = None,
     expected_old_auth_epoch: int | None = None,
+    consume_confirmation_hash: str | None = None,
 ) -> AccountSwitchResult:
     """Explicit account switch: block & replace in ONE transaction (§4.2(1), §4.2(3)).
 
@@ -1215,6 +1305,8 @@ async def replace_connection_for_account_switch(
     When ``expected_old_*`` are supplied, re-verifies them under the ``FOR UPDATE`` row
     lock inside the Phase 1 transaction and raises ``AccountSwitchTargetChangedError``
     on any mismatch so interleaved confirmation tickets cannot overwrite a newer account.
+    When ``consume_confirmation_hash`` is supplied, atomically consumes that pending
+    confirmation row INSIDE the activation transaction (never before).
 
     Raises ``MissingRefreshTokenOnAccountSwitchError`` if ``new_refresh_token`` is absent,
     leaving the existing connection completely untouched.
@@ -1233,213 +1325,245 @@ async def replace_connection_for_account_switch(
         new_provider_account_id,
         service if provider == "feishu" else None,
     )
-    new_revoke_key = (
-        revoke_lock_key(
-            extract_google_project(new_oauth_client_id),
-            new_provider_account_id,
-        )
-        if provider == "google"
-        else None
-    )
     async with get_db_connection() as lock_conn:
         await lock_conn.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
         refresh_locked = False
-        revoke_locked = False
+        acquired_revoke_keys: list[int] = []
         try:
-            # Canonical unidirectional lock order: lifecycle -> refresh -> revoke
-            await lock_conn.execute("SELECT pg_advisory_lock(%s)", (target_refresh_key,))
-            refresh_locked = True
-            if new_revoke_key is not None:
-                await lock_conn.execute("SELECT pg_advisory_lock(%s)", (new_revoke_key,))
-                revoke_locked = True
+            with ExitStack() as lock_stack:
+                lock_stack.enter_context(track_advisory_lock("lifecycle", lock_key))
+                # Canonical unidirectional lock order: lifecycle -> refresh -> revoke (sorted ascending)
+                await lock_conn.execute("SELECT pg_advisory_lock(%s)", (target_refresh_key,))
+                refresh_locked = True
+                lock_stack.enter_context(track_advisory_lock("refresh", target_refresh_key))
 
-            async with get_db_connection() as tx_conn, tx_conn.transaction():
-                async with tx_conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute(
-                        """
-                        SELECT user_id, provider, service, oauth_client_id,
-                               provider_account_id, auth_epoch,
-                               access_token, refresh_token, status
-                        FROM dalton_user_integrations
-                        WHERE user_id = %s
-                          AND provider = %s
-                          AND service = %s
-                        FOR UPDATE
-                        """,
-                        (user_id, provider, service),
+                if provider == "google":
+                    revoke_keys_set: set[int] = {
+                        revoke_lock_key(
+                            extract_google_project(new_oauth_client_id),
+                            new_provider_account_id,
+                        )
+                    }
+                    pre_existing = await db.get_connection(
+                        user_id, "google", service, decrypt_tokens=False, conn=lock_conn
                     )
-                    existing = await cur.fetchone()
-                    if existing is None:
-                        raise IntegrationNotFoundError(
-                            f"No connection found for account switch: user={user_id} provider={provider} service={service}"
+                    if pre_existing is not None:
+                        revoke_keys_set.add(
+                            revoke_lock_key(
+                                extract_google_project(pre_existing.oauth_client_id),
+                                pre_existing.provider_account_id,
+                            )
                         )
-                    old_client_id = str(existing["oauth_client_id"])
-                    old_sub = str(existing["provider_account_id"])
-                    old_auth_epoch = int(existing["auth_epoch"])
-                    if (
-                        (
-                            expected_old_oauth_client_id is not None
-                            and old_client_id != expected_old_oauth_client_id
-                        )
-                        or (
-                            expected_old_provider_account_id is not None
-                            and old_sub != expected_old_provider_account_id
-                        )
-                        or (
-                            expected_old_auth_epoch is not None
-                            and old_auth_epoch != int(expected_old_auth_epoch)
-                        )
-                    ):
-                        raise AccountSwitchTargetChangedError(
-                            "Existing account changed before account-switch confirmation committed."
-                        )
-                    if old_sub == new_provider_account_id:
-                        raise ValueError(
-                            "replace_connection_for_account_switch requires a different provider_account_id"
-                        )
+                    for rk in sorted(revoke_keys_set):
+                        await lock_conn.execute("SELECT pg_advisory_lock(%s)", (rk,))
+                        acquired_revoke_keys.append(rk)
+                        lock_stack.enter_context(track_advisory_lock("revoke", rk))
 
-                    siblings = await db.get_sibling_connections(
-                        user_id,
-                        provider,
-                        old_client_id,
-                        old_sub,
-                        exclude_service=service,
-                        active_only=True,
-                        conn=tx_conn,
-                    )
-                    has_other_old_grant = bool(siblings)
-                    if provider == "google" and not has_other_old_grant:
-                        has_other_old_grant = await db.has_active_or_pending_google_grant(
-                            extract_google_project(old_client_id),
-                            old_sub,
-                            exclude_user_id=user_id,
-                            exclude_service=service,
+                async with get_db_connection() as tx_conn, tx_conn.transaction():
+                    if consume_confirmation_hash is not None:
+                        consumed_conf = await db.consume_pending_confirmation(
+                            consume_confirmation_hash,
+                            user_id,
                             conn=tx_conn,
                         )
-                    remote_status, enc_revoke_token = _determine_remote_revoke(
+                        if consumed_conf is None:
+                            raise AccountSwitchTargetChangedError(
+                                "Confirmation ticket is invalid, expired, or was invalidated before activation."
+                            )
+
+                    async with tx_conn.cursor(row_factory=dict_row) as cur:
+                        await cur.execute(
+                            """
+                            SELECT user_id, provider, service, oauth_client_id,
+                                   provider_account_id, auth_epoch,
+                                   access_token, refresh_token, status
+                            FROM dalton_user_integrations
+                            WHERE user_id = %s
+                              AND provider = %s
+                              AND service = %s
+                            FOR UPDATE
+                            """,
+                            (user_id, provider, service),
+                        )
+                        existing = await cur.fetchone()
+                        if existing is None:
+                            raise IntegrationNotFoundError(
+                                f"No connection found for account switch: user={user_id} provider={provider} service={service}"
+                            )
+                        old_client_id = str(existing["oauth_client_id"])
+                        old_sub = str(existing["provider_account_id"])
+                        old_auth_epoch = int(existing["auth_epoch"])
+                        old_status = str(existing["status"])
+                        if (
+                            old_status in (
+                                IntegrationStatus.DISCONNECT_PENDING.value,
+                                IntegrationStatus.REVOKED_PURGING.value,
+                            )
+                            or (
+                                expected_old_oauth_client_id is not None
+                                and old_client_id != expected_old_oauth_client_id
+                            )
+                            or (
+                                expected_old_provider_account_id is not None
+                                and old_sub != expected_old_provider_account_id
+                            )
+                            or (
+                                expected_old_auth_epoch is not None
+                                and old_auth_epoch != int(expected_old_auth_epoch)
+                            )
+                        ):
+                            raise AccountSwitchTargetChangedError(
+                                "Existing account changed before account-switch confirmation committed."
+                            )
+                        if old_sub == new_provider_account_id:
+                            raise ValueError(
+                                "replace_connection_for_account_switch requires a different provider_account_id"
+                            )
+
+                        siblings = await db.get_sibling_connections(
+                            user_id,
+                            provider,
+                            old_client_id,
+                            old_sub,
+                            exclude_service=service,
+                            active_only=True,
+                            conn=tx_conn,
+                        )
+                        has_other_old_grant = bool(siblings)
+                        if provider == "google" and not has_other_old_grant:
+                            has_other_old_grant = await db.has_active_or_pending_google_grant(
+                                extract_google_project(old_client_id),
+                                old_sub,
+                                exclude_user_id=user_id,
+                                exclude_service=service,
+                                conn=tx_conn,
+                            )
+                        remote_status, enc_revoke_token = _determine_remote_revoke(
+                            provider=provider,
+                            trigger_reason=TriggerReason.ACCOUNT_SWITCH,
+                            remote_mode=remote_mode,
+                            has_remaining_active_sibling=has_other_old_grant,
+                            raw_refresh_token=existing.get("refresh_token"),
+                            raw_access_token=existing.get("access_token"),
+                        )
+
+                    purge_id, affected = await _lock_and_register_phase1_tx(
+                        tx_conn,
+                        user_id=user_id,
                         provider=provider,
+                        service=service,
+                        oauth_client_id=old_client_id,
+                        provider_account_id=old_sub,
+                        auth_epoch_upto=old_auth_epoch,
                         trigger_reason=TriggerReason.ACCOUNT_SWITCH,
-                        remote_mode=remote_mode,
-                        has_remaining_active_sibling=has_other_old_grant,
-                        raw_refresh_token=existing.get("refresh_token"),
-                        raw_access_token=existing.get("access_token"),
+                        remote_revoke_status=remote_status,
+                        encrypted_revoke_token=enc_revoke_token,
                     )
 
-                purge_id, affected = await _lock_and_register_phase1_tx(
-                    tx_conn,
-                    user_id=user_id,
-                    provider=provider,
-                    service=service,
-                    oauth_client_id=old_client_id,
-                    provider_account_id=old_sub,
-                    auth_epoch_upto=old_auth_epoch,
-                    trigger_reason=TriggerReason.ACCOUNT_SWITCH,
+                    # In-place replacement of the connection row in the SAME transaction
+                    async with tx_conn.cursor(row_factory=dict_row) as cur:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_user_integrations
+                            SET oauth_client_id = %(oauth_client_id)s,
+                                provider_account_id = %(provider_account_id)s,
+                                provider_union_id = %(provider_union_id)s,
+                                provider_email = %(provider_email)s,
+                                granted_scopes = %(granted_scopes)s,
+                                access_token = pgp_sym_encrypt(%(access_token)s, %(enc_key)s),
+                                refresh_token = pgp_sym_encrypt(%(refresh_token)s, %(enc_key)s),
+                                auth_epoch = nextval('dalton_integration_auth_epoch_seq'),
+                                authorized_at = NOW(),
+                                token_generation = 1,
+                                status = 'connected',
+                                refresh_inflight_gen = NULL,
+                                refresh_attempt_gen = refresh_attempt_gen + 1,
+                                refresh_started_at = NULL,
+                                refresh_inflight_until = NULL,
+                                expires_at = %(expires_at)s,
+                                needs_reauth_at = NULL,
+                                last_error_code = NULL,
+                                preferences = %(preferences)s,
+                                updated_at = NOW()
+                            WHERE user_id = %(user_id)s
+                              AND provider = %(provider)s
+                              AND service = %(service)s
+                            RETURNING auth_epoch
+                            """,
+                            {
+                                "oauth_client_id": new_oauth_client_id,
+                                "provider_account_id": new_provider_account_id,
+                                "provider_union_id": new_provider_union_id,
+                                "provider_email": new_provider_email,
+                                "granted_scopes": new_granted_scopes,
+                                "access_token": new_access_token,
+                                "refresh_token": new_refresh_token,
+                                "enc_key": enc_key,
+                                "expires_at": new_expires_at,
+                                "preferences": Jsonb(new_preferences or {}),
+                                "user_id": user_id,
+                                "provider": provider,
+                                "service": service,
+                            },
+                        )
+                        updated_row = await cur.fetchone()
+                        assert updated_row is not None
+                        new_auth_epoch = int(updated_row["auth_epoch"])
+
+                    # For Google: synchronize active sibling services already connected to the target
+                    # (new_oauth_client_id, new_provider_account_id) under the target refresh lock,
+                    # updating tokens, actual granted scopes, preferences, and status in the same tx.
+                    if provider == "google":
+                        target_siblings = await db.list_connections_by_account(
+                            user_id,
+                            "google",
+                            new_oauth_client_id,
+                            new_provider_account_id,
+                            decrypt_tokens=False,
+                            for_update=True,
+                            conn=tx_conn,
+                        )
+                        active_target_siblings = [
+                            r
+                            for r in target_siblings
+                            if r.service != service
+                            and r.status
+                            not in (
+                                IntegrationStatus.DISCONNECT_PENDING,
+                                IntegrationStatus.REVOKED_PURGING,
+                            )
+                        ]
+                        if active_target_siblings:
+                            await sync_google_sibling_rows_tx(
+                                tx_conn,
+                                user_id=user_id,
+                                oauth_client_id=new_oauth_client_id,
+                                provider_account_id=new_provider_account_id,
+                                access_token=new_access_token,
+                                refresh_token=new_refresh_token,
+                                expires_at=new_expires_at,
+                                granted_scopes=new_granted_scopes,
+                                active_siblings=active_target_siblings,
+                            )
+
+                        await db.supersede_active_revokes_for_google_project_sub_tx(
+                            extract_google_project(new_oauth_client_id),
+                            new_provider_account_id,
+                            conn=tx_conn,
+                        )
+
+                return AccountSwitchResult(
+                    purge_id=purge_id,
+                    old_auth_epoch=old_auth_epoch,
+                    new_auth_epoch=new_auth_epoch,
                     remote_revoke_status=remote_status,
-                    encrypted_revoke_token=enc_revoke_token,
+                    affected_threads=affected,
                 )
-
-                # In-place replacement of the connection row in the SAME transaction
-                async with tx_conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute(
-                        """
-                        UPDATE dalton_user_integrations
-                        SET oauth_client_id = %(oauth_client_id)s,
-                            provider_account_id = %(provider_account_id)s,
-                            provider_union_id = %(provider_union_id)s,
-                            provider_email = %(provider_email)s,
-                            granted_scopes = %(granted_scopes)s,
-                            access_token = pgp_sym_encrypt(%(access_token)s, %(enc_key)s),
-                            refresh_token = pgp_sym_encrypt(%(refresh_token)s, %(enc_key)s),
-                            auth_epoch = nextval('dalton_integration_auth_epoch_seq'),
-                            authorized_at = NOW(),
-                            token_generation = 1,
-                            status = 'connected',
-                            refresh_inflight_gen = NULL,
-                            refresh_started_at = NULL,
-                            expires_at = %(expires_at)s,
-                            needs_reauth_at = NULL,
-                            last_error_code = NULL,
-                            preferences = %(preferences)s,
-                            updated_at = NOW()
-                        WHERE user_id = %(user_id)s
-                          AND provider = %(provider)s
-                          AND service = %(service)s
-                        RETURNING auth_epoch
-                        """,
-                        {
-                            "oauth_client_id": new_oauth_client_id,
-                            "provider_account_id": new_provider_account_id,
-                            "provider_union_id": new_provider_union_id,
-                            "provider_email": new_provider_email,
-                            "granted_scopes": new_granted_scopes,
-                            "access_token": new_access_token,
-                            "refresh_token": new_refresh_token,
-                            "enc_key": enc_key,
-                            "expires_at": new_expires_at,
-                            "preferences": Jsonb(new_preferences or {}),
-                            "user_id": user_id,
-                            "provider": provider,
-                            "service": service,
-                        },
-                    )
-                    updated_row = await cur.fetchone()
-                    assert updated_row is not None
-                    new_auth_epoch = int(updated_row["auth_epoch"])
-
-                # For Google: synchronize active sibling services already connected to the target
-                # (new_oauth_client_id, new_provider_account_id) under the target refresh lock,
-                # updating tokens, actual granted scopes, preferences, and status in the same tx.
-                if provider == "google":
-                    target_siblings = await db.list_connections_by_account(
-                        user_id,
-                        "google",
-                        new_oauth_client_id,
-                        new_provider_account_id,
-                        decrypt_tokens=False,
-                        for_update=True,
-                        conn=tx_conn,
-                    )
-                    active_target_siblings = [
-                        r
-                        for r in target_siblings
-                        if r.service != service
-                        and r.status
-                        not in (
-                            IntegrationStatus.DISCONNECT_PENDING,
-                            IntegrationStatus.REVOKED_PURGING,
-                        )
-                    ]
-                    if active_target_siblings:
-                        await sync_google_sibling_rows_tx(
-                            tx_conn,
-                            user_id=user_id,
-                            oauth_client_id=new_oauth_client_id,
-                            provider_account_id=new_provider_account_id,
-                            access_token=new_access_token,
-                            refresh_token=new_refresh_token,
-                            expires_at=new_expires_at,
-                            granted_scopes=new_granted_scopes,
-                            active_siblings=active_target_siblings,
-                        )
-
-                    await db.supersede_active_revokes_for_google_project_sub_tx(
-                        extract_google_project(new_oauth_client_id),
-                        new_provider_account_id,
-                        conn=tx_conn,
-                    )
-
-            return AccountSwitchResult(
-                purge_id=purge_id,
-                old_auth_epoch=old_auth_epoch,
-                new_auth_epoch=new_auth_epoch,
-                remote_revoke_status=remote_status,
-                affected_threads=affected,
-            )
         finally:
             with anyio.CancelScope(shield=True):
-                if revoke_locked and new_revoke_key is not None:
+                for rk in reversed(acquired_revoke_keys):
                     await lock_conn.execute(
-                        "SELECT pg_advisory_unlock(%s)", (new_revoke_key,)
+                        "SELECT pg_advisory_unlock(%s)", (rk,)
                     )
                 if refresh_locked:
                     await lock_conn.execute(
@@ -1496,6 +1620,10 @@ async def finish_disconnect_locked(
         try_purge_ledger_lock,
     )
 
+    deleted_connections = 0
+    local_status = LocalPurgeStatus.RUNNING
+    final_remote_status = RemoteRevokeStatus.NOT_APPLICABLE
+
     async with try_purge_ledger_lock(purge_id) as acquired:
         if not acquired:
             logger.debug(
@@ -1507,7 +1635,6 @@ async def finish_disconnect_locked(
         if ledger is None:
             raise LookupError(f"Purge ledger {purge_id} not found")
 
-        deleted_connections = 0
         if ledger.local_purge_status == LocalPurgeStatus.RUNNING:
             await _drain_refresh_locks(
                 user_id=ledger.user_id,
@@ -1533,20 +1660,24 @@ async def finish_disconnect_locked(
 
         refreshed = await db.get_purge_ledger(purge_id, decrypt_revoke_token=False)
         assert refreshed is not None
+        local_status = refreshed.local_purge_status
         final_remote_status = refreshed.remote_revoke_status
-        if (
-            run_remote_revoke
-            and final_remote_status == RemoteRevokeStatus.PENDING
-            and revoker is not None
-        ):
-            final_remote_status = await process_revoke(purge_id, revoker)
 
-        return FinishDisconnectResult(
-            purge_id=purge_id,
-            deleted_connections=deleted_connections,
-            local_purge_status=refreshed.local_purge_status,
-            remote_revoke_status=final_remote_status,
-        )
+    # Remote revocation runs strictly OUTSIDE try_purge_ledger_lock so no PG advisory lock
+    # or dedicated session connection is ever held across external HTTP (§4.2(3)).
+    if (
+        run_remote_revoke
+        and final_remote_status == RemoteRevokeStatus.PENDING
+        and revoker is not None
+    ):
+        final_remote_status = await process_revoke(purge_id, revoker)
+
+    return FinishDisconnectResult(
+        purge_id=purge_id,
+        deleted_connections=deleted_connections,
+        local_purge_status=local_status,
+        remote_revoke_status=final_remote_status,
+    )
 
 
 async def finish_disconnect(

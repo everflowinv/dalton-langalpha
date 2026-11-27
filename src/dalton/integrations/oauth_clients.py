@@ -20,6 +20,7 @@ import httpx
 import jwt
 
 from src.dalton.integrations import constants as integration_constants
+from src.dalton.integrations.lock_guard import assert_no_advisory_lock_held
 from src.dalton.services.integration_revoke import RemoteRevoker, RevokeOutcome
 
 logger = logging.getLogger(__name__)
@@ -214,6 +215,7 @@ class GoogleOAuthClient:
         self._jwks_cache: tuple[float, dict[str, Any]] | None = None
 
     async def _post_form(self, url: str, data: dict[str, str]) -> httpx.Response:
+        assert_no_advisory_lock_held(f"google.post:{url}")
         if self._http_client is not None:
             return await self._http_client.post(
                 url,
@@ -229,6 +231,7 @@ class GoogleOAuthClient:
             )
 
     async def _get_json(self, url: str) -> httpx.Response:
+        assert_no_advisory_lock_held(f"google.get:{url}")
         if self._http_client is not None:
             return await self._http_client.get(url, timeout=_OAUTH_HTTP_TIMEOUT)
         async with httpx.AsyncClient(timeout=_OAUTH_HTTP_TIMEOUT) as client:
@@ -520,6 +523,7 @@ class FeishuOAuthClient:
         self._user_info_url = user_info_url
 
     async def _post_json(self, url: str, body: dict[str, Any]) -> httpx.Response:
+        assert_no_advisory_lock_held(f"feishu.post:{url}")
         if self._http_client is not None:
             return await self._http_client.post(
                 url,
@@ -535,6 +539,7 @@ class FeishuOAuthClient:
             )
 
     async def _get_with_bearer(self, url: str, access_token: str) -> httpx.Response:
+        assert_no_advisory_lock_held(f"feishu.get:{url}")
         headers = {"Authorization": f"Bearer {access_token}"}
         if self._http_client is not None:
             return await self._http_client.get(

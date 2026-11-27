@@ -4226,6 +4226,41 @@ async def _bind_identity_in_tx(
                 platform_tenant_key,
             ),
         )
+        if platform == "feishu":
+            # Record binding-owned Feishu App ID (from active gateway runtime or get_credential_group)
+            # inside a savepoint so pre-d06X schemas stay compatible.
+            try:
+                from src.dalton.database import user_integrations as ui_db
+                from src.dalton.deployment_credentials.catalog import FEISHU_APP_ID_KEY
+                from src.dalton.deployment_credentials.snapshot import get_credential_group
+
+                eff_app_id: str | None = None
+                has_live_gw, live_app_id = await ui_db.get_active_channel_gateway_feishu_app_id(
+                    conn=cur.connection
+                )
+                if has_live_gw and live_app_id:
+                    eff_app_id = live_app_id
+                else:
+                    fg = get_credential_group("feishu_app")
+                    if fg.ready:
+                        eff_app_id = str(fg.values.get(FEISHU_APP_ID_KEY) or "").strip() or None
+                if eff_app_id:
+                    await cur.execute("SAVEPOINT sp_dalton_feishu_app_id")
+                    try:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_identities
+                            SET feishu_app_id = %s
+                            WHERE user_id = %s AND platform = 'feishu'
+                            """,
+                            (eff_app_id, user_id),
+                        )
+                        await cur.execute("RELEASE SAVEPOINT sp_dalton_feishu_app_id")
+                    except Exception:
+                        await cur.execute("ROLLBACK TO SAVEPOINT sp_dalton_feishu_app_id")
+                        await cur.execute("RELEASE SAVEPOINT sp_dalton_feishu_app_id")
+            except Exception:
+                pass
 
     # Advance any existing session_generations rows for (platform, user_id)
     await cur.execute(

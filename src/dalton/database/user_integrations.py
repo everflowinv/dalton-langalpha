@@ -137,6 +137,14 @@ def revoke_lock_key(google_project: str, sub: str) -> int:
     )
 
 
+def google_project_coord_lock_key(google_project: str) -> int:
+    """Per-Google-Cloud-project leaf coordination lock serializing OAuth exchange registration with revoke claiming."""
+    return advisory_key(
+        "dalton_integration_google_project_coord",
+        str(google_project),
+    )
+
+
 def purge_lock_key(purge_id: str | UUID) -> int:
     """Per-ledger execution advisory lock key (mutual exclusion across workers)."""
     return advisory_key("dalton_integration_purge", str(purge_id))
@@ -190,6 +198,9 @@ class IntegrationRow:
     updated_at: datetime
     access_token: str | None = field(default=None, repr=False, compare=False)
     refresh_token: str | None = field(default=None, repr=False, compare=False)
+    refresh_attempt_gen: int = 0
+    refresh_inflight_until: datetime | None = None
+    db_now: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +248,7 @@ class OAuthStateRow:
     created_at: datetime
     code_verifier: str | None = field(default=None, repr=False, compare=False)
     browser_binding_hash: str | None = None
+    expected_provider_account_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,6 +311,9 @@ def _row_to_integration(r: dict[str, Any]) -> IntegrationRow:
         updated_at=r["updated_at"],
         access_token=r.get("decrypted_access_token"),
         refresh_token=r.get("decrypted_refresh_token"),
+        refresh_attempt_gen=int(r.get("refresh_attempt_gen") or 0),
+        refresh_inflight_until=r.get("refresh_inflight_until"),
+        db_now=r.get("db_now"),
     )
 
 
@@ -334,12 +349,13 @@ _INTEGRATION_META_COLS = """
     user_id, provider, service, oauth_client_id, provider_account_id,
     provider_union_id, provider_email, granted_scopes,
     auth_epoch, authorized_at, token_generation, status,
-    refresh_inflight_gen, refresh_started_at, expires_at,
-    last_refresh_at, needs_reauth_at, last_error_code, reauth_notified_at,
+    refresh_inflight_gen, refresh_attempt_gen, refresh_started_at, refresh_inflight_until,
+    expires_at, last_refresh_at, needs_reauth_at, last_error_code, reauth_notified_at,
     preferences,
     (access_token IS NOT NULL) AS has_access_token,
     (refresh_token IS NOT NULL) AS has_refresh_token,
-    created_at, updated_at
+    created_at, updated_at,
+    clock_timestamp() AS db_now
 """
 
 _PURGE_LEDGER_META_COLS = """
@@ -439,7 +455,9 @@ async def upsert_connection(
                     token_generation = {token_gen_expr},
                     status = EXCLUDED.status,
                     refresh_inflight_gen = NULL,
+                    refresh_attempt_gen = dalton_user_integrations.refresh_attempt_gen + 1,
                     refresh_started_at = NULL,
+                    refresh_inflight_until = NULL,
                     expires_at = EXCLUDED.expires_at,
                     needs_reauth_at = CASE
                         WHEN EXCLUDED.status = 'connected' THEN NULL
@@ -640,16 +658,18 @@ async def update_connection_status(
     status: IntegrationStatus | str,
     last_error_code: str | None = None,
     clear_tokens: bool = False,
+    clear_refresh_token_only: bool = False,
     expected_auth_epoch: int | None = None,
     conn: Any = None,
 ) -> bool:
     """Update a connection's status (optionally bounded by ``expected_auth_epoch``)."""
     status_val = str(IntegrationStatus(status))
-    token_sets = (
-        "access_token = NULL, refresh_token = NULL, "
-        if clear_tokens
-        else ""
-    )
+    if clear_tokens:
+        token_sets = "access_token = NULL, refresh_token = NULL, "
+    elif clear_refresh_token_only:
+        token_sets = "refresh_token = NULL, "
+    else:
+        token_sets = ""
     needs_reauth_expr = (
         "COALESCE(needs_reauth_at, NOW())"
         if status_val == IntegrationStatus.NEEDS_REAUTH
@@ -672,7 +692,9 @@ async def update_connection_status(
                 SET {token_sets}
                     status = %(status)s,
                     refresh_inflight_gen = NULL,
+                    refresh_attempt_gen = refresh_attempt_gen + 1,
                     refresh_started_at = NULL,
+                    refresh_inflight_until = NULL,
                     needs_reauth_at = {needs_reauth_expr},
                     last_error_code = COALESCE(%(last_error_code)s, last_error_code),
                     updated_at = NOW()
@@ -684,6 +706,50 @@ async def update_connection_status(
                 params,
             )
             return (cur.rowcount or 0) > 0
+
+
+async def release_refresh_inflight_lease(
+    user_id: str,
+    provider: str,
+    service: str,
+    *,
+    oauth_client_id: str,
+    provider_account_id: str,
+    expected_attempt_gen: int,
+    preserve_crash_marker: bool = False,
+    conn: Any = None,
+) -> None:
+    """Clear ``refresh_inflight_until`` (and optionally ``refresh_inflight_gen``) for matching ``refresh_attempt_gen``."""
+    clear_gen_sql = "" if preserve_crash_marker else "refresh_inflight_gen = NULL, refresh_started_at = NULL, "
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor() as cur:
+            if provider == "google":
+                await cur.execute(
+                    f"""
+                    UPDATE dalton_user_integrations
+                    SET {clear_gen_sql}
+                        refresh_inflight_until = NULL
+                    WHERE user_id = %s
+                      AND provider = 'google'
+                      AND oauth_client_id = %s
+                      AND provider_account_id = %s
+                      AND refresh_attempt_gen = %s
+                    """,
+                    (user_id, oauth_client_id, provider_account_id, int(expected_attempt_gen)),
+                )
+            else:
+                await cur.execute(
+                    f"""
+                    UPDATE dalton_user_integrations
+                    SET {clear_gen_sql}
+                        refresh_inflight_until = NULL
+                    WHERE user_id = %s
+                      AND provider = %s
+                      AND service = %s
+                      AND refresh_attempt_gen = %s
+                    """,
+                    (user_id, provider, service, int(expected_attempt_gen)),
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1111,6 +1177,42 @@ async def has_inflight_google_revoke_in_project(
     )
 
 
+async def has_inflight_google_revoke_for_project_sub(
+    google_project: str,
+    sub: str,
+    *,
+    exclude_purge_id: str | UUID | None = None,
+    conn: Any = None,
+) -> bool:
+    """Return True if any Google revoke ledger for ``(google_project, sub)`` holds an unexpired inflight lease."""
+    clauses = [
+        "provider = 'google'",
+        "provider_account_id = %(sub)s",
+        "remote_revoke_status IN ('pending', 'failed_retryable')",
+        "revoke_inflight_until IS NOT NULL",
+        "revoke_inflight_until > clock_timestamp()",
+    ]
+    params: dict[str, Any] = {"sub": sub}
+    if exclude_purge_id is not None:
+        clauses.append("purge_id <> %(exclude_purge_id)s::uuid")
+        params["exclude_purge_id"] = str(exclude_purge_id)
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT oauth_client_id
+                FROM dalton_integration_purge_ledger
+                WHERE {' AND '.join(clauses)}
+                """,
+                params,
+            )
+            rows = await cur.fetchall()
+    return any(
+        extract_google_project(str(r["oauth_client_id"])) == google_project
+        for r in rows
+    )
+
+
 async def finalize_revoke_attempt_tx(
     purge_id: str | UUID,
     *,
@@ -1315,6 +1417,7 @@ async def insert_oauth_state(
     return_to: str | None,
     expires_at: datetime,
     browser_binding_hash: str | None = None,
+    expected_provider_account_id: str | None = None,
     conn: Any = None,
 ) -> None:
     """Persist a 10-minute one-time OAuth state with encrypted PKCE ``code_verifier``."""
@@ -1325,13 +1428,13 @@ async def insert_oauth_state(
                 """
                 INSERT INTO dalton_user_integration_oauth_states (
                     state_hash, user_id, auth_mode, session_id, user_email,
-                    provider, service, oauth_client_id, intent,
+                    provider, service, oauth_client_id, expected_provider_account_id, intent,
                     code_verifier, requested_scopes, redirect_uri, return_to,
                     browser_binding_hash, expires_at, created_at
                 )
                 VALUES (
                     %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
                     pgp_sym_encrypt(%s, %s), %s, %s, %s,
                     %s, %s, NOW()
                 )
@@ -1345,6 +1448,7 @@ async def insert_oauth_state(
                     provider,
                     service,
                     oauth_client_id,
+                    expected_provider_account_id,
                     intent,
                     code_verifier,
                     enc_key,
@@ -1386,14 +1490,25 @@ async def peek_oauth_state(
 async def get_active_google_oauth_state_expiry(
     google_project: str,
     *,
+    sub: str | None = None,
     conn: Any = None,
 ) -> datetime | None:
-    """Return the furthest expiry among unexpired Google OAuth states OR in-flight exchanges in ``google_project`` across all users."""
+    """Return the furthest expiry blocking revocation for ``(google_project, sub)``.
+
+    - Consumed in-flight code exchanges (``consumed_at IS NOT NULL AND exchange_expires_at > clock_timestamp()``)
+      block revocations in ``google_project`` for their short exchange window.
+    - Unconsumed OAuth states (``consumed_at IS NULL AND expires_at > clock_timestamp()``)
+      match strictly by ``(google_project, expected_provider_account_id == sub)`` so opening
+      a consent screen for another account (or unknown first-connect account) never defers
+      unrelated Google accounts' revocations in the same project.
+    """
     async with get_db_connection(conn) as db_conn:
         async with db_conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
                 SELECT oauth_client_id,
+                       consumed_at,
+                       expected_provider_account_id,
                        CASE WHEN consumed_at IS NOT NULL
                             THEN exchange_expires_at
                             ELSE expires_at
@@ -1401,14 +1516,20 @@ async def get_active_google_oauth_state_expiry(
                 FROM dalton_user_integration_oauth_states
                 WHERE provider = 'google'
                   AND (
-                      (consumed_at IS NULL AND expires_at > clock_timestamp())
-                      OR (
+                      (
                           consumed_at IS NOT NULL
                           AND exchange_expires_at IS NOT NULL
                           AND exchange_expires_at > clock_timestamp()
                       )
+                      OR (
+                          consumed_at IS NULL
+                          AND expires_at > clock_timestamp()
+                          AND %(sub)s::text IS NOT NULL
+                          AND expected_provider_account_id = %(sub)s::text
+                      )
                   )
-                """
+                """,
+                {"sub": sub},
             )
             rows = await cur.fetchall()
     max_exp: datetime | None = None
@@ -1456,6 +1577,33 @@ async def delete_pending_confirmation_by_hash(
                 """,
                 (confirmation_hash, user_id),
             )
+
+
+async def list_pending_confirmations_for_user_provider(
+    user_id: str,
+    provider: str,
+    *,
+    service: str | None = None,
+    conn: Any = None,
+) -> list[dict[str, Any]]:
+    """Read metadata ``(oauth_client_id, provider_account_id, service)`` for pending confirmations owned by ``(user_id, provider[, service])``."""
+    clauses = ["user_id = %(user_id)s", "provider = %(provider)s"]
+    params: dict[str, Any] = {"user_id": user_id, "provider": provider}
+    if service is not None:
+        clauses.append("service = %(service)s")
+        params["service"] = service
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT service, oauth_client_id, provider_account_id
+                FROM dalton_user_integration_pending_confirmations
+                WHERE {' AND '.join(clauses)}
+                """,
+                params,
+            )
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
 
 
 async def consume_pending_confirmations_for_user_provider(
@@ -1517,7 +1665,7 @@ async def consume_oauth_state(
                       AND expires_at > clock_timestamp()
                     RETURNING
                         state_hash, user_id, auth_mode, session_id, user_email,
-                        provider, service, oauth_client_id, intent,
+                        provider, service, oauth_client_id, expected_provider_account_id, intent,
                         pgp_sym_decrypt(code_verifier, %(enc_key)s) AS decrypted_code_verifier,
                         requested_scopes, redirect_uri, return_to,
                         browser_binding_hash, expires_at, created_at
@@ -1538,7 +1686,7 @@ async def consume_oauth_state(
                       AND expires_at > clock_timestamp()
                     RETURNING
                         state_hash, user_id, auth_mode, session_id, user_email,
-                        provider, service, oauth_client_id, intent,
+                        provider, service, oauth_client_id, expected_provider_account_id, intent,
                         pgp_sym_decrypt(code_verifier, %(enc_key)s) AS decrypted_code_verifier,
                         requested_scopes, redirect_uri, return_to,
                         browser_binding_hash, expires_at, created_at
@@ -1570,6 +1718,7 @@ async def consume_oauth_state(
         created_at=r["created_at"],
         code_verifier=r.get("decrypted_code_verifier"),
         browser_binding_hash=r.get("browser_binding_hash"),
+        expected_provider_account_id=r.get("expected_provider_account_id"),
     )
 
 
@@ -2009,13 +2158,25 @@ async def peek_pending_confirmation(
     confirmation_hash: str,
     user_id: str,
     *,
+    decrypt_tokens: bool = False,
     conn: Any = None,
 ) -> PendingConfirmationRow | None:
-    """Non-destructively read a pending confirmation owned by ``user_id`` (no token decryption)."""
+    """Non-destructively read a pending confirmation owned by ``user_id``."""
+    params: dict[str, Any] = {"confirmation_hash": confirmation_hash, "user_id": user_id}
+    if decrypt_tokens:
+        params["enc_key"] = get_encryption_key()
+        token_cols = (
+            ", CASE WHEN access_token IS NULL THEN NULL "
+            "       ELSE pgp_sym_decrypt(access_token, %(enc_key)s) END AS decrypted_access_token"
+            ", CASE WHEN refresh_token IS NULL THEN NULL "
+            "       ELSE pgp_sym_decrypt(refresh_token, %(enc_key)s) END AS decrypted_refresh_token"
+        )
+    else:
+        token_cols = ""
     async with get_db_connection(conn) as db_conn:
         async with db_conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
+                f"""
                 SELECT
                     confirmation_hash, user_id, provider, service,
                     oauth_client_id, provider_account_id, provider_union_id,
@@ -2025,12 +2186,13 @@ async def peek_pending_confirmation(
                     expected_old_provider_account_id,
                     expected_old_auth_epoch,
                     preferences, confirm_expires_at, created_at
+                    {token_cols}
                 FROM dalton_user_integration_pending_confirmations
                 WHERE confirmation_hash = %(confirmation_hash)s
                   AND user_id = %(user_id)s
                   AND confirm_expires_at > clock_timestamp()
                 """,
-                {"confirmation_hash": confirmation_hash, "user_id": user_id},
+                params,
             )
             row = await cur.fetchone()
     if row is None:
@@ -2051,8 +2213,8 @@ async def peek_pending_confirmation(
         preferences=dict(r.get("preferences") or {}),
         confirm_expires_at=r["confirm_expires_at"],
         created_at=r["created_at"],
-        access_token=None,
-        refresh_token=None,
+        access_token=r.get("decrypted_access_token") if decrypt_tokens else None,
+        refresh_token=r.get("decrypted_refresh_token") if decrypt_tokens else None,
         expected_old_oauth_client_id=r.get("expected_old_oauth_client_id"),
         expected_old_provider_account_id=r.get("expected_old_provider_account_id"),
         expected_old_auth_epoch=(
@@ -2174,6 +2336,44 @@ async def delete_expired_oauth_states_and_confirmations(
         return await _run(db_conn)
 
 
+async def get_channel_feishu_binding(
+    user_id: str,
+    *,
+    conn: Any = None,
+) -> tuple[str | None, str | None]:
+    """Look up ``(open_id, feishu_app_id)`` for ``user_id``'s bound Feishu channel identity (§4.3 item 2).
+
+    Returns ``(None, None)`` when no binding or channel table exists, and ``(open_id, None)``
+    for legacy bindings created before ``feishu_app_id`` was tracked.
+    """
+    try:
+        async with get_db_connection(conn) as db_conn:
+            async with db_conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT platform_user_id, feishu_app_id
+                    FROM dalton_channel_identities
+                    WHERE user_id = %s
+                      AND platform = 'feishu'
+                    LIMIT 1
+                    """,
+                    (user_id,),
+                )
+                row = await cur.fetchone()
+        if not row or not row[0]:
+            return None, None
+        open_id = str(row[0]).strip() or None
+        app_id = str(row[1]).strip() if len(row) > 1 and row[1] else None
+        return open_id, app_id or None
+    except Exception:
+        # Fallback for schemas without feishu_app_id column or without channel_gateway tables
+        try:
+            open_id = await get_channel_feishu_open_id(user_id, conn=conn)
+            return open_id, None
+        except Exception:
+            return None, None
+
+
 async def get_channel_feishu_open_id(
     user_id: str,
     *,
@@ -2204,16 +2404,21 @@ async def get_channel_feishu_open_id(
 
 async def read_health_sweep_state(
     *,
+    for_update: bool = False,
     conn: Any = None,
 ) -> dict[str, Any] | None:
     """Read the singleton 12-hour health sweep coordination row."""
+    lock_clause = " FOR UPDATE" if for_update else ""
     async with get_db_connection(conn) as db_conn:
         async with db_conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
-                SELECT last_started_at, last_completed_at, last_worker_id, clock_timestamp() AS db_now
+                f"""
+                SELECT sweep_gen, inflight_until,
+                       last_started_at, last_completed_at, last_worker_id,
+                       clock_timestamp() AS db_now
                 FROM dalton_integration_health_sweep_state
                 WHERE singleton = TRUE
+                {lock_clause}
                 """
             )
             row = await cur.fetchone()
@@ -2225,22 +2430,38 @@ async def update_health_sweep_state(
     started: bool = False,
     completed: bool = False,
     worker_id: str | None = None,
+    claim_lease_seconds: int | None = None,
+    expected_sweep_gen: int | None = None,
+    clear_inflight: bool = False,
     conn: Any = None,
-) -> None:
-    """Update ``last_started_at`` / ``last_completed_at`` on the singleton sweep coordination row."""
+) -> int | None:
+    """Update health sweep coordination state, optionally claiming or finalizing a monotonic ``sweep_gen`` lease."""
     sets = ["updated_at = NOW()"]
     params: dict[str, Any] = {}
     if started:
         sets.append("last_started_at = NOW()")
     if completed:
         sets.append("last_completed_at = NOW()")
+        sets.append("inflight_until = NULL")
+    if clear_inflight and not completed:
+        sets.append("inflight_until = NULL")
+    if claim_lease_seconds is not None:
+        sets.append("sweep_gen = sweep_gen + 1")
+        sets.append("inflight_until = clock_timestamp() + make_interval(secs => %(lease_s)s)")
+        params["lease_s"] = int(claim_lease_seconds)
     if worker_id is not None:
         sets.append("last_worker_id = %(worker_id)s")
         params["worker_id"] = worker_id
+
+    where_extra = ""
+    if expected_sweep_gen is not None:
+        where_extra = " AND sweep_gen = %(expected_sweep_gen)s"
+        params["expected_sweep_gen"] = int(expected_sweep_gen)
+
     async with get_db_connection(conn) as db_conn:
         async with db_conn.cursor() as cur:
             await cur.execute(
-                f"""
+                """
                 INSERT INTO dalton_integration_health_sweep_state (singleton)
                 VALUES (TRUE)
                 ON CONFLICT DO NOTHING
@@ -2251,9 +2472,13 @@ async def update_health_sweep_state(
                 UPDATE dalton_integration_health_sweep_state
                 SET {', '.join(sets)}
                 WHERE singleton = TRUE
+                  {where_extra}
+                RETURNING sweep_gen
                 """,
                 params,
             )
+            row = await cur.fetchone()
+    return int(row[0]) if row is not None else None
 
 
 async def list_orphaned_revoked_purging_connections(

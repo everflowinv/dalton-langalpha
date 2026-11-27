@@ -556,9 +556,9 @@ async def test_phase1_crash_resume_dual_gen_bump_and_unblock_on_local_commit(gws
     assert ledger.remote_revoke_status == RemoteRevokeStatus.PENDING
     assert ledger.next_retry_at is not None
 
-    # Initial pending revoke is immediately claimable by list_due_remote_revokes()
-    due_immediately = await ui_db.list_due_remote_revokes()
-    assert any(r.purge_id == purge_id for r in due_immediately)
+    # Local-first invariant: while local_purge_status='running', list_due_remote_revokes() MUST NOT claim it
+    due_while_running = await ui_db.list_due_remote_revokes()
+    assert not any(r.purge_id == purge_id for r in due_while_running)
 
     # Startup resume picks up running ledger (with empty hook_outbox) and finishes local purge + unblocks thread
     resumed = await run_startup_personal_purge_resume()
@@ -579,6 +579,10 @@ async def test_phase1_crash_resume_dual_gen_bump_and_unblock_on_local_commit(gws
     assert ledger2.local_purge_status == LocalPurgeStatus.COMPLETED
     assert ledger2.remote_revoke_status == RemoteRevokeStatus.PENDING  # remote independent
     assert await ui_db.get_connection(uid, "google", "calendar") is None
+
+    # Once local purge completes, initial pending revoke is immediately claimable by list_due_remote_revokes()
+    due_after_local = await ui_db.list_due_remote_revokes()
+    assert any(r.purge_id == purge_id for r in due_after_local)
 
     # Legacy pending row with next_retry_at IS NULL is also claimed by list_due_remote_revokes()
     async with gws_live_pool.connection() as conn:
@@ -761,22 +765,35 @@ async def test_revoke_state_machine_outcomes_supersede_and_lock_mutual_exclusion
         nonlocal call_count
         call_count += 1
         entered.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), timeout=10.0)
         return RevokeOutcome.SUCCEEDED
 
     revoker = create_autospec(RemoteRevoker, instance=True)
     revoker.revoke.side_effect = _slow_revoke
 
     t1 = asyncio.create_task(process_revoke(ledger.purge_id, revoker))
-    await entered.wait()
-    t2 = asyncio.create_task(process_revoke(ledger.purge_id, revoker))
-    await asyncio.sleep(0.05)
-    release.set()
-    s1, s2 = await asyncio.gather(t1, t2)
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=10.0)
+        # Under 3-step no-lock-across-HTTP, t2 sees t1's active inflight lease,
+        # does NOT block on an advisory lock or issue a duplicate HTTP call, and returns PENDING.
+        t2 = asyncio.create_task(process_revoke(ledger.purge_id, revoker))
+        s2 = await asyncio.wait_for(t2, timeout=10.0)
+        assert s2 == RemoteRevokeStatus.PENDING
+        assert call_count == 1
+        release.set()
+        s1 = await asyncio.wait_for(t1, timeout=10.0)
+    finally:
+        release.set()
+        if not t1.done():
+            t1.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await t1
 
     assert s1 == RemoteRevokeStatus.SUCCEEDED
-    assert s2 == RemoteRevokeStatus.SUCCEEDED
-    assert call_count == 1  # Mutual exclusion guaranteed single upstream call!
+    assert call_count == 1  # Single upstream call guaranteed!
+    # Follow-up call after t1 commits sees SUCCEEDED without calling upstream again
+    assert await process_revoke(ledger.purge_id, revoker) == RemoteRevokeStatus.SUCCEEDED
+    assert call_count == 1
     done = await ui_db.get_purge_ledger(ledger.purge_id, decrypt_revoke_token=True)
     assert done is not None and done.revoke_token is None and done.remote_completed_at is not None
 
@@ -1511,16 +1528,16 @@ async def test_purge_ledger_mutex_concurrent_finish_disconnect_runs_once(gws_liv
         nonlocal run_calls
         run_calls += 1
         entered.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), timeout=10.0)
         return await real_run(*args, **kwargs)
 
     with patch.object(purge_mod, "run_local_purge", autospec=True, side_effect=_gated_run):
         t1 = asyncio.create_task(finish_disconnect_locked(purge_id))
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), timeout=10.0)
         t2 = asyncio.create_task(finish_disconnect_locked(purge_id))
-        res2 = await t2
+        res2 = await asyncio.wait_for(t2, timeout=10.0)
         release.set()
-        res1 = await t1
+        res1 = await asyncio.wait_for(t1, timeout=10.0)
 
     assert run_calls == 1
     assert res1 is not None and res1.local_purge_status == LocalPurgeStatus.COMPLETED
@@ -2062,20 +2079,20 @@ async def test_replay_generation_captured_before_reads_rejects_interleaved_proje
         assert rows is not None
         assert rows.expected_purge_gen == 0
         rows_read_ready.set()
-        await purge_finished.wait()
+        await asyncio.wait_for(purge_finished.wait(), timeout=10.0)
         await replay_mod.project_turns(rows, end_cp, turn_indexes=[0])
         assert await slices_db.get_turn_lines([r0]) == {}
         await replay_mod.build_replay_page(rows, end_cp, persist=True)
         assert await slices_db.get_turn_lines([r0]) == {}
 
     async def _purge_task() -> None:
-        await rows_read_ready.wait()
+        await asyncio.wait_for(rows_read_ready.wait(), timeout=10.0)
         purge_id = await begin_disconnect(uid, "feishu", "calendar")
         await finish_disconnect(purge_id)
         assert await read_expected_purge_generation(tid) == 2
         purge_finished.set()
 
-    await asyncio.gather(_replay_reader_task(), _purge_task())
+    await asyncio.wait_for(asyncio.gather(_replay_reader_task(), _purge_task()), timeout=15.0)
 
 
 # ---------------------------------------------------------------------------
@@ -2132,11 +2149,11 @@ async def test_fork_race_purge_completes_before_fork_lock_and_fork_commits_befor
     async def _gated_take_snapshot(*args, **kwargs):
         res = await real_take_snapshot(*args, **kwargs)
         snap_done.set()
-        await purge_done.wait()
+        await asyncio.wait_for(purge_done.wait(), timeout=10.0)
         return res
 
     async def _purge_while_fork_paused() -> None:
-        await snap_done.wait()
+        await asyncio.wait_for(snap_done.wait(), timeout=10.0)
         pid = await begin_disconnect(uid_a, "feishu", "calendar")
         await finish_disconnect(pid)
         purge_done.set()
@@ -2144,8 +2161,11 @@ async def test_fork_race_purge_completes_before_fork_lock_and_fork_commits_befor
     with patch.object(forks_svc, "take_snapshot", autospec=True, side_effect=_gated_take_snapshot):
         purge_t = asyncio.create_task(_purge_while_fork_paused())
         with pytest.raises(ForkRefused) as exc_fork_a:
-            await forks_svc.fork_thread(ForkRequest(source_thread_id=tid_a, cut=ThroughTurn(0), user_id=uid_a))
-        await purge_t
+            await asyncio.wait_for(
+                forks_svc.fork_thread(ForkRequest(source_thread_id=tid_a, cut=ThroughTurn(0), user_id=uid_a)),
+                timeout=15.0,
+            )
+        await asyncio.wait_for(purge_t, timeout=10.0)
 
     assert exc_fork_a.value.status_code == 409
     assert exc_fork_a.value.detail["code"] == PURGE_IN_PROGRESS_CODE
@@ -2207,13 +2227,13 @@ async def test_fork_race_purge_completes_before_fork_lock_and_fork_commits_befor
     async def _gated_write_thread(*args, **kwargs):
         await real_write_thread(*args, **kwargs)
         fork_locked.set()
-        await release_fork.wait()
+        await asyncio.wait_for(release_fork.wait(), timeout=10.0)
 
     with patch.object(forks_svc, "_write_thread", autospec=True, side_effect=_gated_write_thread):
         fork_task = asyncio.create_task(
             forks_svc.fork_thread(ForkRequest(source_thread_id=tid_b, cut=ThroughTurn(0), user_id=uid_b))
         )
-        await fork_locked.wait()
+        await asyncio.wait_for(fork_locked.wait(), timeout=10.0)
 
         # Start Phase 1 on another connection while Fork holds user shared lock -> must block!
         phase1_task = asyncio.create_task(begin_disconnect(uid_b, "feishu", "calendar"))
@@ -2222,8 +2242,8 @@ async def test_fork_race_purge_completes_before_fork_lock_and_fork_commits_befor
 
         # Let Fork commit -> Phase 1 unblocks and enumerates the newly forked thread's touches!
         release_fork.set()
-        fork_res = await fork_task
-        purge_id_b = await phase1_task
+        fork_res = await asyncio.wait_for(fork_task, timeout=10.0)
+        purge_id_b = await asyncio.wait_for(phase1_task, timeout=10.0)
 
     ledger_b = await ui_db.get_purge_ledger(purge_id_b)
     assert ledger_b is not None

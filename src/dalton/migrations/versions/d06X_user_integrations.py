@@ -72,7 +72,9 @@ def upgrade() -> None:
                 )
             ),
             refresh_inflight_gen BIGINT NULL,
+            refresh_attempt_gen BIGINT NOT NULL DEFAULT 0,
             refresh_started_at  TIMESTAMPTZ NULL,
+            refresh_inflight_until TIMESTAMPTZ NULL,
             expires_at          TIMESTAMPTZ NULL,
             last_refresh_at     TIMESTAMPTZ NULL,
             needs_reauth_at     TIMESTAMPTZ NULL,
@@ -116,6 +118,7 @@ def upgrade() -> None:
             provider         TEXT NOT NULL CHECK (provider IN ('google', 'feishu')),
             service          TEXT NOT NULL CHECK (service IN ('calendar', 'mail')),
             oauth_client_id  TEXT NOT NULL,
+            expected_provider_account_id TEXT NULL,
             intent           TEXT NOT NULL DEFAULT 'connect' CHECK (
                 intent IN ('connect', 'switch_account', 'reauth')
             ),
@@ -369,6 +372,8 @@ def upgrade() -> None:
         """
         CREATE TABLE IF NOT EXISTS dalton_integration_health_sweep_state (
             singleton         BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+            sweep_gen         BIGINT NOT NULL DEFAULT 0,
+            inflight_until    TIMESTAMPTZ NULL,
             last_started_at   TIMESTAMPTZ NULL,
             last_completed_at TIMESTAMPTZ NULL,
             last_worker_id    TEXT NULL,
@@ -398,10 +403,34 @@ def upgrade() -> None:
         """
     )
 
+    # 10. Track binding-owned Feishu App ID on dalton_channel_identities when channel gateway tables exist
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF to_regclass('public.dalton_channel_identities') IS NOT NULL THEN
+                ALTER TABLE dalton_channel_identities
+                    ADD COLUMN IF NOT EXISTS feishu_app_id TEXT NULL;
+            END IF;
+        END $$;
+        """
+    )
+
 
 def downgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '5s'")
 
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF to_regclass('public.dalton_channel_identities') IS NOT NULL THEN
+                ALTER TABLE dalton_channel_identities
+                    DROP COLUMN IF EXISTS feishu_app_id;
+            END IF;
+        END $$;
+        """
+    )
     op.execute("DROP TABLE IF EXISTS dalton_integration_gateway_runtime")
     op.execute("DROP TABLE IF EXISTS dalton_integration_health_sweep_state")
 

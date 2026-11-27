@@ -582,6 +582,11 @@ def get_connector_providers_summary() -> dict[str, dict[str, Any]]:
     g_uri_ok, g_uri_reason = google_redirect_uri_eligible(public_url)
     f_group = get_credential_group("feishu_app")
     f_event = get_credential_group("feishu_event")
+    f_event_dual_ready = bool(
+        f_event.ready
+        and str(f_event.values.get("DALTON_FEISHU_ENCRYPT_KEY") or "").strip()
+        and str(f_event.values.get("DALTON_FEISHU_VERIFICATION_TOKEN") or "").strip()
+    )
 
     return {
         "google": {
@@ -595,7 +600,7 @@ def get_connector_providers_summary() -> dict[str, dict[str, Any]]:
         "feishu": {
             "credentials_ready": bool(f_group.ready),
             "source": f_group.source,
-            "event_credentials_ready": bool(f_event.ready),
+            "event_credentials_ready": f_event_dual_ready,
             "public_url_configured": bool(public_url),
             "encryption_configured": enc_ok,
             "ready": bool(f_group.ready and bool(public_url) and enc_ok),

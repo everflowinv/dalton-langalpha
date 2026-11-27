@@ -41,6 +41,7 @@ from src.dalton.database.user_integrations import (
     purge_lock_key,
     purge_thread_lock_key,
 )
+from src.dalton.integrations.lock_guard import track_advisory_lock
 from src.llms.reasoning_payload import REASONING_KWARG_KEYS
 from src.server.database import pool as db_pool
 from src.server.database import session_lock
@@ -1656,8 +1657,13 @@ async def _resolve_thread_ranges(
 @asynccontextmanager
 async def try_purge_ledger_lock(purge_id: str) -> AsyncIterator[bool]:
     """Acquire the per-ledger advisory lock on a dedicated out-of-pool session."""
-    async with session_lock.try_own_session_lock(purge_lock_key(purge_id)) as acquired:
-        yield acquired
+    lock_key = purge_lock_key(purge_id)
+    async with session_lock.try_own_session_lock(lock_key) as acquired:
+        if acquired:
+            with track_advisory_lock("purge_ledger", lock_key):
+                yield True
+        else:
+            yield False
 
 
 @asynccontextmanager
@@ -1683,7 +1689,8 @@ async def acquire_purge_thread_lock(
                     f"Timed out waiting for purge thread lock on thread={thread_id} after {timeout_s:.1f}s"
                 )
             await asyncio.sleep(min(poll_interval_s, remaining))
-        yield
+        with track_advisory_lock("purge_thread", lock_key):
+            yield
     finally:
         await session_lock.await_settled(asyncio.ensure_future(conn.close()))
 
