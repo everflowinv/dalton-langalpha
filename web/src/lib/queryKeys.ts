@@ -495,10 +495,12 @@ export const queryKeys = {
     marketBrief: () => [...queryKeys.insights.all, 'market-brief'],
   },
   // DALTON-HOOK(query-keys): Dalton native-model sync, budget, and coverage board query keys
-  // DALTON-HOOK(standalone-core): runtime capabilities query key
+    // DALTON-HOOK(standalone-core): runtime capabilities query key
+    // DALTON-HOOK(deployment-credentials): deployment-level integration credentials query key
   dalton: {
     all:             ['dalton'],
     capabilities:    () => [...queryKeys.dalton.all, 'capabilities'],
+    deploymentSettings: () => [...queryKeys.dalton.all, 'deployment-settings'],
     nativeModelsStatus: () => [...queryKeys.dalton.all, 'native-models', 'status'],
     providersStatus: () => [...queryKeys.dalton.all, 'providers', 'status'],
     modelsAvailable: () => [...queryKeys.dalton.all, 'models', 'available'],

@@ -29,6 +29,7 @@ export interface DaltonSettingVisibilityContext {
   weixinAllowExternal?: boolean;
   capabilities?: ReadonlySet<CapabilityId>;
   capabilitiesLoading?: boolean;
+  isSingleUserOss?: boolean;
 }
 
 export interface UserSharingSettingsResponse {

@@ -1298,6 +1298,7 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         # --- deployment_credentials/router.py (shared Core & Everflow admin settings) ---
         ("deployment_credentials/router.py", "get_deployment_settings_endpoint"): CORE_CAPABILITY,
         ("deployment_credentials/router.py", "put_deployment_settings_endpoint"): CORE_CAPABILITY,
+        ("deployment_credentials/router.py", "test_deployment_settings_endpoint"): CORE_CAPABILITY,
     }
 )
 

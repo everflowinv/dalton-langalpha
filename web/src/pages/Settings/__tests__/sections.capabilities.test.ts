@@ -260,4 +260,51 @@ describe('Settings sections & search capability gating', () => {
       expect(settingSearchText(notifyEntry!, tZh, ctx).toLowerCase()).not.toContain('微信');
     }
   });
+
+  it('gates deploymentCredentials by admin tier in multi-user mode, allows OSS static view, and keeps Core search neutral', () => {
+    // Multi-user admin sees deploymentCredentials
+    expect(sectionShown('deploymentCredentials', coreAdminCtx)).toBe(true);
+
+    // Multi-user non-admin (internal / external / null) cannot see deploymentCredentials
+    for (const tier of ['internal', 'external', null] as const) {
+      const nonAdminCtx: DaltonSettingVisibilityContext = {
+        ...coreAdminCtx,
+        callerTier: tier,
+        isSingleUserOss: false,
+      };
+      expect(sectionShown('deploymentCredentials', nonAdminCtx)).toBe(false);
+      const anchors = new Set(searchableSettings(false, nonAdminCtx).map((e) => e.anchor));
+      expect(anchors.has('dalton-deployment-credentials')).toBe(false);
+    }
+
+    // Passwordless OSS single-user mode allows opening the static guidance view even with null callerTier
+    const ossCtx: DaltonSettingVisibilityContext = {
+      ...coreAdminCtx,
+      callerTier: null,
+      isSingleUserOss: true,
+    };
+    expect(sectionShown('deploymentCredentials', ossCtx)).toBe(true);
+
+    // Core default search text for dalton-deployment-credentials omits proprietary channel terms
+    const coreEntries = searchableSettings(false, coreAdminCtx);
+    const credEntry = coreEntries.find((e) => e.anchor === 'dalton-deployment-credentials');
+    expect(credEntry).toBeDefined();
+    const coreCredText = settingSearchText(credEntry!, tZh, coreAdminCtx).toLowerCase();
+    expect(coreCredText).toContain('google');
+    expect(coreCredText).toContain('集成凭据');
+    for (const forbidden of ['飞书', 'feishu', '微信', 'weixin', 'wechat', 'discord', 'everflow']) {
+      expect(coreCredText).not.toContain(forbidden);
+    }
+
+    // Enabling channel_feishu dynamically appends Feishu search tokens without Discord/WeChat
+    const feishuCtx: DaltonSettingVisibilityContext = {
+      ...coreAdminCtx,
+      capabilities: new Set<CapabilityId>(['company_wiki', 'channel_feishu']),
+    };
+    const feishuCredText = settingSearchText(credEntry!, tZh, feishuCtx).toLowerCase();
+    expect(feishuCredText).toContain('飞书');
+    expect(feishuCredText).toContain('feishu');
+    expect(feishuCredText).not.toContain('discord');
+    expect(feishuCredText).not.toContain('微信');
+  });
 });

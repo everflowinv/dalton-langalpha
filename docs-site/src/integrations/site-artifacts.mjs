@@ -118,11 +118,13 @@ async function collectFrontendHelpLinks(repoRoot, basePath) {
   const supportLinksPath = path.join(repoRoot, 'web', 'src', 'config', 'supportLinks.ts');
   const claudeCodePath = path.join(repoRoot, 'web', 'src', 'lib', 'claudeCode.ts');
   const accountMenuPath = path.join(repoRoot, 'web', 'src', 'components', 'Sidebar', 'AccountMenu.tsx');
+  const deploymentCredsPath = path.join(repoRoot, 'web', 'src', 'lib', 'dalton', 'deploymentCredentials.ts');
 
-  const [supportLinksSrc, claudeCodeSrc, accountMenuSrc] = await Promise.all([
+  const [supportLinksSrc, claudeCodeSrc, accountMenuSrc, deploymentCredsSrc] = await Promise.all([
     fs.readFile(supportLinksPath, 'utf-8'),
     fs.readFile(claudeCodePath, 'utf-8'),
     fs.readFile(accountMenuPath, 'utf-8'),
+    fs.readFile(deploymentCredsPath, 'utf-8'),
   ]);
 
   const docsUrlMatch = supportLinksSrc.match(/DOCS_URL\b[^=]*=\s*isDaltonBuild\s*\?\s*['"]([^'"]+)['"]/);
@@ -142,7 +144,7 @@ async function collectFrontendHelpLinks(repoRoot, basePath) {
 
   const targets = new Set([`${docsUrl}/`, claudeDocsUrl]);
 
-  for (const src of [supportLinksSrc, claudeCodeSrc, accountMenuSrc]) {
+  for (const src of [supportLinksSrc, claudeCodeSrc, accountMenuSrc, deploymentCredsSrc]) {
     for (const m of src.matchAll(/`([^`]*\$\{(?:DOCS_URL|CLAUDE_CODE_DOCS_URL)\}[^`]*)`/g)) {
       targets.add(
         m[1]

@@ -40,6 +40,8 @@ import './Settings.css';
 
 // A self-hosted server's own settings, which a hosted build never opens.
 const ServerPanel = lazy(() => import('./panels/ServerPanel'));
+// DALTON-HOOK(deployment-credentials): lazy-load deployment credentials panel to protect first-load bundle budget
+const DaltonDeploymentCredentialsPanel = lazy(() => import('./panels/dalton/DaltonDeploymentCredentialsPanel'));
 
 /** A section's rows while the account is read on a cold load: a name and a
  *  line under it on the left, the control on the right, as the rows lay theirs
@@ -78,6 +80,8 @@ function SectionBody({ section }: { section: Section }) {
     case 'teamModels': return <DaltonTeamModelsPanel />;
     case 'teamMembers': return <DaltonTeamMembersPanel />;
     case 'teamChannels': return <DaltonTeamOpsPanel />;
+    // DALTON-HOOK(deployment-credentials): render lazy deployment credentials panel
+    case 'deploymentCredentials': return <Suspense fallback={<SettingsSkeleton />}><DaltonDeploymentCredentialsPanel /></Suspense>;
     // DALTON-HOOK(hide-trading): Dalton hides live brokerage trading section
     case 'trading': return <AccountPanel />;
     // DALTON-HOOK(hide-experiments): Dalton hides experimental labs section
@@ -113,12 +117,15 @@ function Settings() {
 
   // DALTON-HOOK(settings-reorg): hold skeleton while tier/coverage permission resolves; redirect unauthorized direct visits cleanly using unified visibility
   // DALTON-HOOK(standalone-core): hold lightweight skeleton only during Core build initial capability fetch
-  const awaitingTier = Boolean(requestedMeta?.minTier && daltonVisibility.callerTierPending);
+  // DALTON-HOOK(deployment-credentials): allow single-user OSS mode to open static guidance page without redirect
+  const allowOssDeploymentCredentials = requestedSection === 'deploymentCredentials' && daltonVisibility.isSingleUserOss === true;
+  const awaitingTier = Boolean(requestedMeta?.minTier && !allowOssDeploymentCredentials && daltonVisibility.callerTierPending);
   const awaitingCoverage = Boolean(requestedMeta?.coverageUnitsOnly && daltonVisibility.coverageUnitsPending);
   const awaitingCapabilities = Boolean(daltonVisibility.capabilitiesLoading);
   const unauthorizedDaltonAuth = Boolean(requestedMeta?.daltonAuthOnly && !isDaltonAuth);
   const unauthorizedTier = Boolean(
     requestedMeta?.minTier &&
+    !allowOssDeploymentCredentials &&
     !daltonVisibility.callerTierPending &&
     !tierSatisfies(daltonVisibility.callerTier, requestedMeta.minTier),
   );

@@ -26,6 +26,7 @@ from src.dalton.deployment_credentials.catalog import (
     get_field_specs,
     group_keys,
 )
+from src.dalton.deployment_credentials.probes import ProbeTarget, run_credential_probe
 from src.dalton.deployment_credentials.redirect_uri import google_redirect_uri_eligible
 from src.dalton.deployment_credentials.snapshot import (
     CredentialSource,
@@ -60,7 +61,7 @@ def _require_dalton_enabled() -> None:
         raise HTTPException(status_code=404, detail={"code": "dalton_disabled"})
 
 
-_REQUEST_MODEL_FIELDS: frozenset[str] = frozenset({"expected_revision", "values"})
+_REQUEST_MODEL_FIELDS: frozenset[str] = frozenset({"expected_revision", "values", "target"})
 
 
 def _sanitize_request_validation_error(exc: RequestValidationError) -> list[dict[str, str]]:
@@ -167,6 +168,15 @@ class DeploymentSettingsUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_revision: int | None = None
+    values: dict[str, Any] = Field(default_factory=dict)
+
+
+class DeploymentSettingsTestRequest(BaseModel):
+    """Payload for ``POST /api/v1/dalton/deployment-settings/test``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target: ProbeTarget
     values: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -322,5 +332,24 @@ async def put_deployment_settings_endpoint(
             "pending_apply": result.pending_apply,
             "warnings": list(result.warnings),
         },
+        headers=_NO_STORE_HEADERS,
+    )
+
+
+@router.post("/test")
+async def test_deployment_settings_endpoint(
+    body: DeploymentSettingsTestRequest,
+    user_id: AdminSessionUserId,
+) -> JSONResponse:
+    """Run a live official-endpoint credential probe without logging or returning secrets."""
+    _ = user_id
+    probe_result = await run_credential_probe(
+        body.target,
+        body.values,
+        profile=resolve_profile(),
+    )
+    return JSONResponse(
+        status_code=200,
+        content=probe_result.to_dict(),
         headers=_NO_STORE_HEADERS,
     )
