@@ -35,6 +35,7 @@ import {
   type WatchlistTier,
 } from '@/lib/dalton/watchlist';
 import { TermChange } from '@/pages/ChatAgent/components/charts/TermCard';
+import { ExtendedHours, formatExtendedQuotePrice } from '@/components/dalton/ExtendedHours';
 import {
   buildCoverageRowsForCompanies,
   coverageQuoteRow,
@@ -295,8 +296,12 @@ export function CoverageWatchlistRowItem({
   const hasQuote = !item.is_private && item.quoteAvailable !== false;
   const code = quoteCurrency(item.currency, item.symbol, item.assetClass);
   const quoteDisplay = deriveQuoteDisplay(item, marketStatus);
+  const extType = quoteDisplay.session === 'regular' ? null : quoteDisplay.session;
+  const extLabel = extType === 'pre' ? 'PM' : extType === 'post' ? 'AH' : null;
   const mainPrice = quoteDisplay.mainPrice;
   const mainChangePct = quoteDisplay.mainChangePct;
+  const extDisplayPrice = quoteDisplay.extPrice;
+  const extPct = quoteDisplay.extChangePct;
 
   return (
     <motion.tr
@@ -344,6 +349,15 @@ export function CoverageWatchlistRowItem({
           <TermChange value={roundQuote2(Number(mainChangePct))} />
         ) : (
           <span className="term-t3">{DASH}</span>
+        )}
+        {hasQuote && extType && extLabel && extDisplayPrice != null && extPct != null && (
+          <span className="block">
+            <ExtendedHours
+              label={extLabel}
+              price={formatExtendedQuotePrice(extDisplayPrice, code, locale, item.places)}
+              pct={roundQuote2(Number(extPct))}
+            />
+          </span>
         )}
       </td>
     </motion.tr>

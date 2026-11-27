@@ -1,4 +1,5 @@
 // DALTON-HOOK(extended-hours-quotes): Single shared quote display derivation and 2-decimal formatters across Dashboard, MarketView, and agent exports.
+import { isUSEquity } from '@/lib/bars/exchanges';
 import { grouped2 } from '@/lib/format';
 import { getExtendedHoursInfo } from './extendedHoursCore';
 
@@ -109,8 +110,9 @@ export function deriveQuoteDisplay(
           ? { market: 'extended-hours', afterHours: true, earlyHours: false }
           : null;
 
-  const info = getExtendedHoursInfo(effectiveStatus ?? null, row ?? null);
-  const extType = (row?.extType !== undefined ? row.extType : info.extType) ?? null;
+  const isUs = isUSEquity(row?.symbol);
+  const info = isUs ? getExtendedHoursInfo(effectiveStatus ?? null, row ?? null) : null;
+  const extType = isUs ? ((row?.extType !== undefined ? row.extType : info?.extType) ?? null) : null;
   const session: 'regular' | 'pre' | 'post' = extType ?? 'regular';
 
   const rowPrice = row?.price ?? null;
@@ -157,8 +159,8 @@ export function deriveQuoteDisplay(
     };
   }
 
-  const prevClose = info.prevClose ?? row?.fallbackPreviousClose ?? null;
-  const regularClose = info.regularClose ?? null;
+  const prevClose = info?.prevClose ?? row?.fallbackPreviousClose ?? null;
+  const regularClose = info?.regularClose ?? null;
   const regChangeField = row?.regularTradingChange ?? row?.regular_trading_change ?? null;
   const regChangePctField =
     row?.regularTradingChangePercent ?? row?.regular_trading_change_percent ?? null;
@@ -188,10 +190,10 @@ export function deriveQuoteDisplay(
   // In after-hours (`post`), require `regularClose` as the session anchor; do not accept
   // a post-market price synthesized against `prevClose` when `regularClose` is missing.
   const hasPostAnchor = session !== 'post' || regularClose != null;
-  const extAnchor = hasPostAnchor ? (info.extAnchor ?? null) : null;
-  const baseExtPrice = hasPostAnchor ? (row?.extPrice ?? info.extPrice ?? null) : null;
-  const baseExtChange = hasPostAnchor ? (row?.extChange ?? info.extChange ?? null) : null;
-  const baseExtPct = hasPostAnchor ? (row?.extPct ?? info.extPct ?? null) : null;
+  const extAnchor = hasPostAnchor ? (info?.extAnchor ?? null) : null;
+  const baseExtPrice = hasPostAnchor ? (row?.extPrice ?? info?.extPrice ?? null) : null;
+  const baseExtChange = hasPostAnchor ? (row?.extChange ?? info?.extChange ?? null) : null;
+  const baseExtPct = hasPostAnchor ? (row?.extPct ?? info?.extPct ?? null) : null;
 
   const extPrice = hasPostAnchor ? (tickPrice ?? baseExtPrice) : null;
   const extChange = hasPostAnchor

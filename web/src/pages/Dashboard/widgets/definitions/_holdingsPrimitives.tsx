@@ -26,26 +26,9 @@ import {
   normalizePortfolioCurrency,
 } from '../../utils/portfolioSummary';
 import { RowExtraContextMenu } from '../../components/dalton/RowExtraContextMenu'; // DALTON-HOOK(watchlist)
+import { ExtendedHours } from '@/components/dalton/ExtendedHours'; // DALTON-HOOK(watchlist)
 
 type MarketStatusData = MarketStatusInput;
-/** The pre- or after-hours move under a row's change: `AH 199.10 ▲ 0.34%`. */
-function ExtendedHours({
-  label,
-  price,
-  pct,
-}: {
-  label: string;
-  price: string;
-  pct: number;
-}) {
-  return (
-    <span className="dash-ext">
-      <span className="term-label">{label}</span>
-      {price}
-      <TermChange value={pct} />
-    </span>
-  );
-}
 
 /** The watchlist's table: a row per symbol, its last price and the day's move. */
 export function WatchlistTable({ children }: { children: ReactNode }) {
