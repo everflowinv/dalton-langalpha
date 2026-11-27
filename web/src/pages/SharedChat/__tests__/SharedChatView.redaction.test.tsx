@@ -388,8 +388,8 @@ describe('SharedChatView redaction, paging, downgrade, and regression', () => {
 
       expect(onPermissionForbidden).toHaveBeenCalledTimes(1);
       expect(revokeSpy).toHaveBeenCalledWith('tok-downgrade');
+      expect(await screen.findByText('Chart')).toBeInTheDocument();
       expect(container.querySelectorAll('img')).toHaveLength(0);
-      expect(screen.getByText('Chart')).toBeInTheDocument();
     } finally {
       globalThis.fetch = originalFetch;
       revokeSpy.mockRestore();
@@ -709,5 +709,178 @@ describe('SharedChatView redaction, paging, downgrade, and regression', () => {
     expect(await screen.findByText('Widget summary below.')).toBeInTheDocument();
     expect(screen.getByText(/Interactive widget hidden|交互组件已隐藏/)).toBeInTheDocument();
     expect(container.querySelectorAll('iframe')).toHaveLength(0);
+  });
+
+  it('aborts deliverable-card download when unmounting during path resolution without calling downloadSharedFile', async () => {
+    let resolveSignal: AbortSignal | undefined;
+    let rejectResolve!: (err: unknown) => void;
+    h.resolveSharedFileMock.mockImplementationOnce((_token, _candidates, _recentWrites, opts) => {
+      resolveSignal = opts?.signal;
+      return new Promise((_resolve, reject) => {
+        rejectResolve = reject;
+      });
+    });
+
+    h.replayMock.mockImplementationOnce(async (_token, onEvent) => {
+      onEvent?.({ event: 'user_message', turn_index: 0, content: 'Generate report' });
+      onEvent?.({
+        event: 'message_chunk',
+        turn_index: 0,
+        role: 'assistant',
+        content_type: 'text',
+        content: 'Built [the report](results/report.md).',
+      });
+      onEvent?.({ event: 'replay_done', thread_id: 'thread-1' });
+    });
+
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const { container, unmount } = renderWithProviders(
+        <SharedChatView
+          shareToken="tok-card-unmount"
+          metadata={makeMetadata(true, { permissions: { allow_files: true, allow_download: true } })}
+        />,
+      );
+
+      expect(await screen.findByText('report.md')).toBeInTheDocument();
+      fireEvent.pointerDown(container.querySelector('.turn-file-more') as HTMLElement, { button: 0, ctrlKey: false });
+      const downloadItem = await screen.findByRole('menuitem', { name: /Download|下载/ });
+      fireEvent.click(downloadItem);
+
+      await waitFor(() => expect(h.resolveSharedFileMock).toHaveBeenCalledTimes(1));
+      expect(resolveSignal).toBeDefined();
+      expect(resolveSignal!.aborted).toBe(false);
+
+      // Leave the page while path resolution is still in flight
+      unmount();
+      expect(resolveSignal!.aborted).toBe(true);
+
+      // Even after the aborted resolve rejects with AbortError, downloadSharedFile must never run
+      rejectResolve(new DOMException('Aborted', 'AbortError'));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(h.downloadSharedFileMock).not.toHaveBeenCalled();
+      expect(h.toastSpy).not.toHaveBeenCalled();
+      expect(consoleErrorSpy).not.toHaveBeenCalled();
+    } finally {
+      consoleErrorSpy.mockRestore();
+    }
+  });
+
+  it('aborts deliverable-card download when allow_files downgrades during path resolution without acquiring a new epoch', async () => {
+    let resolveSignal: AbortSignal | undefined;
+    let rejectResolve!: (err: unknown) => void;
+    h.resolveSharedFileMock.mockImplementationOnce((_token, _candidates, _recentWrites, opts) => {
+      resolveSignal = opts?.signal;
+      return new Promise((_resolve, reject) => {
+        rejectResolve = reject;
+      });
+    });
+
+    h.replayMock
+      .mockImplementationOnce(async (_token, onEvent) => {
+        onEvent?.({ event: 'user_message', turn_index: 0, content: 'Generate report' });
+        onEvent?.({
+          event: 'message_chunk',
+          turn_index: 0,
+          role: 'assistant',
+          content_type: 'text',
+          content: 'Built [the report](results/report.md).',
+        });
+        onEvent?.({ event: 'replay_done', thread_id: 'thread-1' });
+      })
+      .mockImplementationOnce(async (_token, onEvent) => {
+        onEvent?.({ event: 'user_message', turn_index: 0, content: 'Generate report' });
+        onEvent?.({
+          event: 'message_chunk',
+          turn_index: 0,
+          role: 'assistant',
+          content_type: 'text',
+          content: 'Redacted report summary.',
+        });
+        onEvent?.({ event: 'replay_done', thread_id: 'thread-1' });
+      });
+
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const { container, rerender } = renderWithProviders(
+        <SharedChatView
+          shareToken="tok-card-downgrade"
+          metadata={makeMetadata(true, { permissions: { allow_files: true, allow_download: true } })}
+        />,
+      );
+
+      expect(await screen.findByText('report.md')).toBeInTheDocument();
+      fireEvent.pointerDown(container.querySelector('.turn-file-more') as HTMLElement, { button: 0, ctrlKey: false });
+      const downloadItem = await screen.findByRole('menuitem', { name: /Download|下载/ });
+      fireEvent.click(downloadItem);
+
+      await waitFor(() => expect(h.resolveSharedFileMock).toHaveBeenCalledTimes(1));
+      expect(resolveSignal).toBeDefined();
+      expect(resolveSignal!.aborted).toBe(false);
+
+      // Downgrade allow_files while resolveSharedFile is in flight (rotates fileEpochRef to a new epoch)
+      rerender(<SharedChatView shareToken="tok-card-downgrade" metadata={makeMetadata(false)} />);
+
+      await waitFor(() => expect(screen.getByText('Redacted report summary.')).toBeInTheDocument());
+      expect(resolveSignal!.aborted).toBe(true);
+
+      // Resolve rejects with AbortError; card download must NOT fall back to original path or grab the new epoch
+      rejectResolve(new DOMException('Aborted', 'AbortError'));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(h.downloadSharedFileMock).not.toHaveBeenCalled();
+      expect(screen.queryByTestId('file-panel')).not.toBeInTheDocument();
+      expect(h.toastSpy).not.toHaveBeenCalled();
+      expect(consoleErrorSpy).not.toHaveBeenCalled();
+    } finally {
+      consoleErrorSpy.mockRestore();
+    }
+  });
+
+  it('reuses the exact same AbortSignal across deliverable-card resolve and download', async () => {
+    let resolveSignal: AbortSignal | undefined;
+    let downloadSignal: AbortSignal | undefined;
+    h.resolveSharedFileMock.mockImplementationOnce(async (_token, _candidates, _recentWrites, opts) => {
+      resolveSignal = opts?.signal;
+      return { status: 'resolved', path: 'work/report.md', matches: ['work/report.md'] };
+    });
+    h.downloadSharedFileMock.mockImplementationOnce(async (_token, _path, opts) => {
+      downloadSignal = opts?.signal;
+    });
+
+    h.replayMock.mockImplementationOnce(async (_token, onEvent) => {
+      onEvent?.({ event: 'user_message', turn_index: 0, content: 'Generate report' });
+      onEvent?.({
+        event: 'message_chunk',
+        turn_index: 0,
+        role: 'assistant',
+        content_type: 'text',
+        content: 'Built [the report](results/report.md).',
+      });
+      onEvent?.({ event: 'replay_done', thread_id: 'thread-1' });
+    });
+
+    const { container } = renderWithProviders(
+      <SharedChatView
+        shareToken="tok-card-same-epoch"
+        metadata={makeMetadata(true, { permissions: { allow_files: true, allow_download: true } })}
+      />,
+    );
+
+    expect(await screen.findByText('report.md')).toBeInTheDocument();
+    fireEvent.pointerDown(container.querySelector('.turn-file-more') as HTMLElement, { button: 0, ctrlKey: false });
+    const downloadItem = await screen.findByRole('menuitem', { name: /Download|下载/ });
+    fireEvent.click(downloadItem);
+
+    await waitFor(() => expect(h.downloadSharedFileMock).toHaveBeenCalledTimes(1));
+    expect(resolveSignal).toBeInstanceOf(AbortSignal);
+    expect(downloadSignal).toBe(resolveSignal);
   });
 });

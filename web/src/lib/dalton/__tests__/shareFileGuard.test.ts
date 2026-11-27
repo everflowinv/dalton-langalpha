@@ -5,16 +5,20 @@ import {
   advanceShareRevalidationGate,
   classifyShareForbidden,
   clearSharedFileBodies,
+  createAbortError,
   createShareFileEpoch,
   createShareRevalidationGate,
   getStaleThreadFilesGate,
   isShareDowngradeActive,
+  isShareDownloadHandled,
   isSharedFileBodyQueryKey,
   isShareRevalidated,
+  runGuardedShareCardDownload,
   runGuardedShareFileRead,
   shouldUnmountShareView,
   type ShareForbiddenSource,
 } from '../shareFileGuard';
+import { downloadTarget } from '@/pages/ChatAgent/utils/fileRefResolver';
 
 describe('shareFileGuard', () => {
   it('classifies all six 403 sources into files vs download', () => {
@@ -184,5 +188,118 @@ describe('shareFileGuard', () => {
     expect(
       getStaleThreadFilesGate({ kind: 'thread', permissions: { allow_files: true } }, { isFetching: false, isError: true }, true),
     ).toBe('allow');
+  });
+
+  it('marks download 403 and AbortError as handled while leaving other 403/500 errors unhandled', async () => {
+    const epoch = createShareFileEpoch();
+    const onFilesForbidden = vi.fn<() => void>();
+    const onDownloadForbidden = vi.fn<() => void>();
+    const download403 = Object.freeze(Object.assign(new Error('File download not permitted'), { response: { status: 403 } }));
+    const read403 = Object.assign(new Error('File access not permitted'), { response: { status: 403 } });
+    const server500 = Object.assign(new Error('Internal error'), { response: { status: 500 } });
+
+    await expect(
+      runGuardedShareFileRead({
+        epoch,
+        source: 'download',
+        read: async () => {
+          throw download403;
+        },
+        onFilesForbidden,
+        onDownloadForbidden,
+      }),
+    ).rejects.toBe(download403);
+
+    expect(isShareDownloadHandled(download403)).toBe(true);
+    expect(isShareDownloadHandled(createAbortError())).toBe(true);
+
+    await expect(
+      runGuardedShareFileRead({
+        epoch,
+        source: 'read',
+        read: async () => {
+          throw read403;
+        },
+        onFilesForbidden,
+        onDownloadForbidden,
+      }),
+    ).rejects.toBe(read403);
+
+    expect(isShareDownloadHandled(read403)).toBe(false);
+    expect(isShareDownloadHandled(server500)).toBe(false);
+  });
+
+  it('runGuardedShareCardDownload shares one epoch across resolve and save and aborts on revoke or resolve 403', async () => {
+    // 1. Happy path shares the exact same AbortSignal across both steps
+    const okEpoch = createShareFileEpoch();
+    const signals: AbortSignal[] = [];
+    const resolveOk = vi.fn<
+      (candidates: string[], recentWrites: string[], signal: AbortSignal) => Promise<{ status: string; path?: string | null }>
+    >(async (_c, _w, signal) => {
+      signals.push(signal);
+      return { status: 'resolved', path: 'work/report.md' };
+    });
+    const downloadOk = vi.fn<(resolvedPath: string, signal: AbortSignal) => Promise<void>>(async (_p, signal) => {
+      signals.push(signal);
+    });
+
+    await expect(
+      runGuardedShareCardDownload({
+        epoch: okEpoch,
+        path: 'report.md',
+        recentWrites: [],
+        resolveTarget: downloadTarget,
+        resolveFile: resolveOk,
+        downloadFile: downloadOk,
+        onFilesForbidden: vi.fn<() => void>(),
+        onDownloadForbidden: vi.fn<() => void>(),
+      }),
+    ).resolves.toBe('saved');
+    expect(signals).toHaveLength(2);
+    expect(signals[0]).toBe(okEpoch.signal);
+    expect(signals[1]).toBe(okEpoch.signal);
+
+    // 2. Revoking during resolve aborts cleanly without entering downloadFile
+    const revokedEpoch = createShareFileEpoch();
+    let resolveLate!: (val: { status: string; path?: string | null }) => void;
+    const downloadNever = vi.fn<(resolvedPath: string, signal: AbortSignal) => Promise<void>>();
+    const pending = runGuardedShareCardDownload({
+      epoch: revokedEpoch,
+      path: 'report.md',
+      recentWrites: [],
+      resolveTarget: downloadTarget,
+      resolveFile: () =>
+        new Promise((resolve) => {
+          resolveLate = resolve;
+        }),
+      downloadFile: downloadNever,
+      onFilesForbidden: vi.fn<() => void>(),
+      onDownloadForbidden: vi.fn<() => void>(),
+    });
+    revokedEpoch.revoke();
+    resolveLate({ status: 'resolved', path: 'work/report.md' });
+    await expect(pending).resolves.toBe('aborted');
+    expect(downloadNever).not.toHaveBeenCalled();
+
+    // 3. Resolve returning 403 revokes epoch via onFilesForbidden and never falls through to downloadFile
+    const forbiddenEpoch = createShareFileEpoch();
+    const onFilesForbidden = vi.fn<() => void>(() => forbiddenEpoch.revoke());
+    const downloadAfter403 = vi.fn<(resolvedPath: string, signal: AbortSignal) => Promise<void>>();
+    await expect(
+      runGuardedShareCardDownload({
+        epoch: forbiddenEpoch,
+        path: 'report.md',
+        recentWrites: [],
+        resolveTarget: downloadTarget,
+        resolveFile: async () => {
+          throw Object.assign(new Error('Forbidden'), { response: { status: 403 } });
+        },
+        downloadFile: downloadAfter403,
+        onFilesForbidden,
+        onDownloadForbidden: vi.fn<() => void>(),
+      }),
+    ).resolves.toBe('aborted');
+    expect(onFilesForbidden).toHaveBeenCalledTimes(1);
+    expect(downloadAfter403).not.toHaveBeenCalled();
   });
 });

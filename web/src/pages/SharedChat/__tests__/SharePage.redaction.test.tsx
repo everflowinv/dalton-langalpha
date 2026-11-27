@@ -54,6 +54,8 @@ vi.mock('../api', async (importOriginal) => {
 });
 
 import SharePage from '../SharePage';
+// Pre-load the real SharedChatView module so React.lazy resolves immediately under cold/parallel Vitest workers
+import '../SharedChatView';
 
 const TOKEN = 'tok-page-revocation';
 

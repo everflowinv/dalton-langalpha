@@ -45,6 +45,8 @@ import {
   clearSharedFileBodies,
   createShareFileEpoch,
   isShareDowngradeActive,
+  isShareDownloadHandled,
+  runGuardedShareCardDownload,
   runGuardedShareFileRead,
   type ShareDowngradeRecord,
   type ShareFileEpoch,
@@ -469,12 +471,12 @@ export default function SharedChatView({
       replayAbortRef.current?.abort();
       olderAbortRef.current?.abort();
       filesAbortRef.current?.abort();
-      rotateFileEpoch();
+      fileEpochRef.current.revoke();
       revokeSharedImageScope(shareToken);
       if (accessRef.current !== shareToken) revokeSharedImageScope(accessRef.current);
       void clearSharedFileBodies(queryClient);
     };
-  }, [shareToken, queryClient, rotateFileEpoch]);
+  }, [shareToken, queryClient]);
 
   // Replay the conversation (re-runs on shareToken change or allow_files downgrade)
   // DALTON-HOOK(share-redaction): abortable paginated replay with history_page & steering_delivered support
@@ -706,23 +708,26 @@ export default function SharedChatView({
           // it here would look the name up in the wrong place and save whatever
           // namesake it found, so the click goes where an unplaceable one goes.
           if (fileWorkspaceId) return void handleOpenFile(path, fileWorkspaceId);
+          // DALTON-HOOK(share-redaction): capture one file epoch across resolve and save so unmount/downgrade aborts both steps
+          const epoch = fileEpochRef.current;
           try {
-            // The same lookup opening the card takes, so one card cannot open
-            // a report and then fail to save it.
-            // DALTON-HOOK(share-redaction): guard deliverable-card resolve and download with file epoch and source-classified 403 handling
-            const target = await downloadTarget(
+            const outcome = await runGuardedShareCardDownload({
+              epoch,
               path,
-              (candidates, recentWrites) =>
-                guardFileRead('resolve', (signal) => resolveSharedFile(access, candidates, recentWrites, { signal })),
-              getRecentWritePaths(),
-            );
+              recentWrites: getRecentWritePaths(),
+              resolveTarget: downloadTarget,
+              resolveFile: (candidates, recentWrites, signal) =>
+                resolveSharedFile(access, candidates, recentWrites, { signal }),
+              downloadFile: (resolvedPath, signal) => downloadSharedFile(access, resolvedPath, { signal }),
+              onFilesForbidden: handleForbiddenDowngrade,
+              onDownloadForbidden: handleDownloadForbidden,
+            });
             // Namesakes the lookup could not pick between leave nothing to
             // save, so the click lands on the panel that asks, exactly as Open
             // does with the same answer.
-            if (!target.placed) return void handleOpenFile(path, fileWorkspaceId);
-            await guardFileRead('download', (signal) => downloadSharedFile(access, target.path, { signal }));
+            if (outcome === 'unplaced') return void handleOpenFile(path, fileWorkspaceId);
           } catch (err: unknown) {
-            if ((err as { name?: string })?.name === 'AbortError' || apiErrorStatus(err) === 403) return;
+            if (isShareDownloadHandled(err) || apiErrorStatus(err) === 403) return;
             console.error('[SharedChatView] Download failed:', err);
             // A reader on a shared link has no other way to learn the save did
             // not happen: there is no panel error to fall back on here.
@@ -730,7 +735,7 @@ export default function SharedChatView({
           }
         }
       : undefined,
-  }), [handleOpenFile, handleOpenChart, canDownload, access, getRecentWritePaths, guardFileRead, t]);
+  }), [handleOpenFile, handleOpenChart, canDownload, access, getRecentWritePaths, handleForbiddenDowngrade, handleDownloadForbidden, t]);
 
   // Deep link: `?file=<path>` opens that report directly once metadata + file
   // permission are known. One-shot — the share-link target from §1.3b.

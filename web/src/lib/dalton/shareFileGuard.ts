@@ -57,6 +57,31 @@ export function createShareFileEpoch(): ShareFileEpoch {
   };
 }
 
+const handledShareDownloadErrors = new WeakSet<object>();
+
+/**
+ * Mark an error as an already-handled shared-download refusal (toast shown +
+ * metadata revalidation triggered) without mutating the error object.
+ */
+export function markShareDownloadForbiddenHandled<T>(err: T): T {
+  if (err && typeof err === 'object') {
+    handledShareDownloadErrors.add(err);
+  }
+  return err;
+}
+
+/**
+ * Return true when a shared-file download error was already handled (a
+ * download-only 403 refusal or an AbortError from unmount/downgrade) and
+ * callers such as FilePanel should stop the download without overwriting an
+ * open preview or showing a duplicate failure toast.
+ */
+export function isShareDownloadHandled(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  if ((err as { name?: string }).name === 'AbortError') return true;
+  return handledShareDownloadErrors.has(err);
+}
+
 export interface RunGuardedShareFileReadOptions<T> {
   epoch: ShareFileEpoch;
   source: ShareForbiddenSource;
@@ -99,9 +124,77 @@ export async function runGuardedShareFileRead<T>({
     if (status === 403) {
       if (classifyShareForbidden(source) === 'download') {
         onDownloadForbidden();
+        markShareDownloadForbiddenHandled(err);
       } else {
         onFilesForbidden();
       }
+    }
+    throw err;
+  }
+}
+
+export interface RunGuardedShareCardDownloadOptions {
+  epoch: ShareFileEpoch;
+  path: string;
+  recentWrites: readonly string[];
+  resolveTarget: (
+    path: string,
+    resolve: (candidates: string[], recentWrites: string[]) => Promise<{ status: string; path?: string | null }>,
+    recentWrites: readonly string[],
+  ) => Promise<{ path: string; placed: boolean }>;
+  resolveFile: (
+    candidates: string[],
+    recentWrites: string[],
+    signal: AbortSignal,
+  ) => Promise<{ status: string; path?: string | null }>;
+  downloadFile: (resolvedPath: string, signal: AbortSignal) => Promise<void>;
+  onFilesForbidden: () => void;
+  onDownloadForbidden: () => void;
+}
+
+/**
+ * Run a two-step deliverable-card download (resolve + save) bound to one
+ * captured `ShareFileEpoch`. If the epoch is revoked (unmount or permission
+ * downgrade) before or during either step, the operation terminates as
+ * `'aborted'` without entering the save step or opening the file panel.
+ */
+export async function runGuardedShareCardDownload({
+  epoch,
+  path,
+  recentWrites,
+  resolveTarget,
+  resolveFile,
+  downloadFile,
+  onFilesForbidden,
+  onDownloadForbidden,
+}: RunGuardedShareCardDownloadOptions): Promise<'saved' | 'unplaced' | 'aborted'> {
+  if (!epoch.isCurrent()) return 'aborted';
+  try {
+    const target = await resolveTarget(
+      path,
+      (candidates, writes) =>
+        runGuardedShareFileRead({
+          epoch,
+          source: 'resolve',
+          read: (signal) => resolveFile(candidates, writes, signal),
+          onFilesForbidden,
+          onDownloadForbidden,
+        }),
+      recentWrites,
+    );
+    if (!epoch.isCurrent()) return 'aborted';
+    if (!target.placed) return 'unplaced';
+    await runGuardedShareFileRead({
+      epoch,
+      source: 'download',
+      read: (signal) => downloadFile(target.path, signal),
+      onFilesForbidden,
+      onDownloadForbidden,
+    });
+    return 'saved';
+  } catch (err: unknown) {
+    if (!epoch.isCurrent() || (err as { name?: string })?.name === 'AbortError') {
+      return 'aborted';
     }
     throw err;
   }
