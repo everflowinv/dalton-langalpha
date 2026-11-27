@@ -2797,6 +2797,8 @@ async def test_r6_small_pool_size_2_saturated_concurrency_no_deadlock_db(
     rm_commands: list[str] = []
     fake_sandbox = create_autospec(PTCSandbox, instance=True)
     fake_sandbox.working_dir = "/workspace"
+    # autospec does not create attributes assigned only in __init__; SandboxBackend reads it.
+    fake_sandbox._work_dir = "/workspace"
 
     async def _slow_bash(**kwargs: Any) -> dict[str, Any]:
         assert held_advisory_locks() == ()
@@ -3433,6 +3435,7 @@ async def test_r7_calendar_disconnect_and_mail_confirmation_expiry_dual_conn_no_
 
 async def test_r8_core_direct_callback_rejects_409_during_cleanup_and_reconnects_after_db(
     gws_live_pool: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Real PG (Round 8 Decision 1): core direct callback rejects with retryable 409 ('上一次断开还在清理，请稍后重新连接') without draining 2A or erasing pending revoke tokens when (a) sole Google auth has pending revoke + unstarted 2A, (b) in-flight Google revoke claims execution before final tx (rolling back and revoking the in-memory new token), or (c) a background worker holds the 2A lease; once both clear, reconnect succeeds and atomically supersedes any pending revoke."""
     from src.dalton.services.user_integrations_lifecycle import (
@@ -3540,6 +3543,13 @@ async def test_r8_core_direct_callback_rejects_409_during_cleanup_and_reconnects
 
     # (c) Final-tx race: 2A is complete, but an in-flight revoke claims execution during exchange_code
     # -> final tx rolls back with 409, old pending token stays intact, and in-memory new token is queued/revoked!
+    # Scenario (c) isolates the callback's final-tx race: keep the old revoke PENDING by
+    # skipping the pre-auth revoke coordination (it would otherwise process the old token).
+    monkeypatch.setattr(
+        oauth_mod,
+        "_coordinate_pre_auth_google_revokes",
+        create_autospec(oauth_mod._coordinate_pre_auth_google_revokes, return_value=None),
+    )
     st_c = await start_oauth_authorization(
         user_id=uid, provider="google", service="calendar", auth_mode="oss"
     )
