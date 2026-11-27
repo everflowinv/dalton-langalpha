@@ -188,12 +188,25 @@ def _clean_env_and_snapshot(monkeypatch: pytest.MonkeyPatch) -> Any:
     ) -> None:
         return None
 
+    async def _default_has_running_local_purge_for_service(
+        user_id: str,
+        provider: str,
+        service: str,
+        *,
+        oauth_client_id: str | None = None,
+        provider_account_id: str | None = None,
+        min_auth_epoch_upto: int | None = None,
+        conn: Any = None,
+    ) -> list[str]:
+        return []
+
     monkeypatch.setattr(db, "has_other_user_google_account_claim", _default_has_other_user_claim)
     monkeypatch.setattr(db, "has_any_active_google_grant_in_project", _default_has_any_active_in_project)
     monkeypatch.setattr(db, "peek_oauth_state_voided", _default_peek_oauth_state_voided)
     monkeypatch.setattr(db, "void_oauth_states_for_user_provider", _default_void_oauth_states)
     monkeypatch.setattr(db, "consume_active_oauth_intent_tx", _default_consume_active_intent)
     monkeypatch.setattr(db, "has_inflight_google_revoke_for_project_sub", _default_has_inflight_sub)
+    monkeypatch.setattr(db, "has_running_local_purge_for_service", _default_has_running_local_purge_for_service)
     monkeypatch.setattr(db, "renew_health_sweep_lease", _default_renew_sweep_lease)
     monkeypatch.setattr(db, "peek_oauth_state", _default_peek_oauth_state)
     monkeypatch.setattr(db, "delete_oauth_state", _default_delete_oauth_state)
@@ -5159,102 +5172,109 @@ class TestRound7ReviewFixes:
         insert_spy.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_r7_item4_core_direct_callback_consumes_intent_before_draining_running_purge(
+    async def test_r8_item1_core_direct_callback_rejects_409_during_cleanup_and_supersedes_atomically(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Grok Med #1: core direct commit verifies & consumes OAuth intent + exchange lease FIRST before entering 2A purge drain."""
+        """Round 8 Decision 1: core direct callback NEVER drains 2A in callback; rejects with retryable 409 both at entry and in the single final tx (rolling back without superseding old revokes and revoking the in-memory new token), and atomically supersedes+activates when clear."""
         _install_saved_credentials()
         fake_ctx, _ = _make_fake_lock_pool()
         monkeypatch.setattr(oauth_mod, "get_db_connection", fake_ctx)
+        monkeypatch.setattr(db, "peek_oauth_state", create_autospec(db.peek_oauth_state, return_value=(LOCAL_DEV_USER_ID, "111222333-abc.apps.googleusercontent.com")))
+        monkeypatch.setattr(db, "has_inflight_google_revoke_in_project", create_autospec(db.has_inflight_google_revoke_in_project, return_value=False))
+        monkeypatch.setattr(db, "consume_oauth_state", create_autospec(db.consume_oauth_state, return_value=_make_state_row()))
+        monkeypatch.setattr(db, "delete_oauth_state", create_autospec(db.delete_oauth_state, return_value=None))
         monkeypatch.setattr(db, "peek_oauth_state_voided", create_autospec(db.peek_oauth_state_voided, return_value=False))
         monkeypatch.setattr(db, "get_connection", create_autospec(db.get_connection, return_value=None))
-        monkeypatch.setattr(db, "has_inflight_google_revoke_for_project_sub", create_autospec(db.has_inflight_google_revoke_for_project_sub, return_value=False))
         monkeypatch.setattr(db, "has_other_user_google_account_claim", create_autospec(db.has_other_user_google_account_claim, return_value=False))
-        monkeypatch.setattr(db, "supersede_active_revokes_for_google_project_sub_tx", create_autospec(db.supersede_active_revokes_for_google_project_sub_tx, return_value=0))
         monkeypatch.setattr(db, "list_connections_by_account", create_autospec(db.list_connections_by_account, return_value=[]))
 
-        # (a) Lease already expired -> rejects BEFORE touching running purge!
         wait_spy = create_autospec(oauth_mod._wait_for_running_service_purge, return_value=None)
-        consume_intent_spy = create_autospec(
-            db.consume_active_oauth_intent_tx, return_value=("lease_expired", None)
-        )
+        supersede_spy = create_autospec(db.supersede_active_revokes_for_google_project_sub_tx, return_value=1)
+        upsert_spy = create_autospec(db.upsert_connection, return_value=_make_integration_row(provider_account_id="sub-direct"))
+        revoke_abandoned_spy = create_autospec(oauth_mod._revoke_abandoned_google_token, return_value=None)
         monkeypatch.setattr(oauth_mod, "_wait_for_running_service_purge", wait_spy)
-        monkeypatch.setattr(db, "consume_active_oauth_intent_tx", consume_intent_spy)
-        with pytest.raises(oauth_mod.OAuthExchangeLeaseExpiredError):
-            await oauth_mod._finalize_connection(
-                user_id=LOCAL_DEV_USER_ID,
-                provider="google",
-                service="calendar",
-                oauth_client_id="111222333-abc.apps.googleusercontent.com",
-                provider_account_id="sub-direct",
-                provider_union_id=None,
-                provider_email="d@example.com",
-                granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
-                access_token="at-1",
-                refresh_token="rt-1",
-                expires_at=datetime.now(UTC) + timedelta(hours=1),
-                preferences={},
-                allow_account_switch=False,
-                consume_state_hash="state-hash-expired",
-            )
-        wait_spy.assert_not_awaited()
+        monkeypatch.setattr(db, "supersede_active_revokes_for_google_project_sub_tx", supersede_spy)
+        monkeypatch.setattr(db, "upsert_connection", upsert_spy)
+        monkeypatch.setattr(oauth_mod, "_revoke_abandoned_google_token", revoke_abandoned_spy)
 
-        # (b) Valid intent + running purge -> consumes intent FIRST, stages internal guard, drains purge, then commits via guard!
+        g_client = create_autospec(GoogleOAuthClient, instance=True)
+        g_client.exchange_code.return_value = OAuthTokenResponse(
+            access_token="at-1",
+            refresh_token="rt-new-mem",
+            expires_in=3600,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            scope=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+            id_token="id.1",
+        )
+        g_client.verify_id_token.return_value = GoogleIdTokenClaims(
+            sub="sub-direct",
+            email="d@example.com",
+            email_verified=True,
+            aud="111222333-abc.apps.googleusercontent.com",
+            iss="https://accounts.google.com",
+            exp=int(time.time()) + 3600,
+        )
+
+        # (a) Entry rejection: running 2A purge exists at callback entry -> 409 BEFORE exchange_code, no drain, no supersede
+        has_running_spy = create_autospec(
+            db.has_running_local_purge_for_service, return_value=[str(uuid.uuid4())]
+        )
+        has_inflight_spy = create_autospec(
+            db.has_inflight_google_revoke_for_project_sub, return_value=False
+        )
+        monkeypatch.setattr(db, "has_running_local_purge_for_service", has_running_spy)
+        monkeypatch.setattr(db, "has_inflight_google_revoke_for_project_sub", has_inflight_spy)
+        with pytest.raises(oauth_mod.DisconnectCleanupInProgressError) as exc_entry:
+            await handle_oauth_callback(
+                provider="google", code="c-entry", state="s-entry", google_client=g_client
+            )
+        assert exc_entry.value.status_code == 409
+        assert str(exc_entry.value) == "上一次断开还在清理，请稍后重新连接"
+        g_client.exchange_code.assert_not_awaited()
+        wait_spy.assert_not_awaited()
+        supersede_spy.assert_not_awaited()
+        upsert_spy.assert_not_awaited()
+
+        # (b) Final-tx recheck: clear at entry, but in-flight revoke appears before final tx -> 409, NO supersede, revokes in-memory new token
+        has_running_spy.return_value = []
+        has_inflight_spy.return_value = True
+        with pytest.raises(oauth_mod.DisconnectCleanupInProgressError) as exc_final:
+            await handle_oauth_callback(
+                provider="google", code="c-final", state="s-final", google_client=g_client
+            )
+        assert exc_final.value.status_code == 409
+        assert str(exc_final.value) == "上一次断开还在清理，请稍后重新连接"
+        wait_spy.assert_not_awaited()
+        supersede_spy.assert_not_awaited()
+        upsert_spy.assert_not_awaited()
+        revoke_abandoned_spy.assert_awaited_once()
+        assert revoke_abandoned_spy.await_args.kwargs["token"] == "rt-new-mem"
+
+        # (c) Both clear -> single final tx supersedes old revokes and upserts connection atomically
+        revoke_abandoned_spy.reset_mock()
         events: list[str] = []
 
-        async def _consume_intent(*_a: Any, **_kw: Any) -> tuple[str, None]:
-            events.append("consume_intent")
-            return ("ok", None)
-
-        async def _insert_guard(**kw: Any) -> None:
-            assert kw["preferences"] == {"_internal_commit_guard": True}
-            events.append("stage_internal_guard")
-
-        async def _wait_purge(*_a: Any, **_kw: Any) -> None:
-            events.append("drain_running_purge")
-
-        async def _consume_guard(*_a: Any, **_kw: Any) -> Any:
-            events.append("consume_internal_guard")
-            return object()
+        async def _sup(*_a: Any, **_kw: Any) -> int:
+            events.append("supersede")
+            return 1
 
         saved_row = _make_integration_row(provider_account_id="sub-direct")
 
-        async def _upsert(**_kw: Any) -> IntegrationRow:
-            events.append("upsert_connection")
+        async def _ups(**_kw: Any) -> IntegrationRow:
+            events.append("upsert")
             return saved_row
 
-        consume_intent_spy.side_effect = _consume_intent
-        wait_spy.side_effect = _wait_purge
-        monkeypatch.setattr(db, "has_running_local_purge_for_service", create_autospec(db.has_running_local_purge_for_service, return_value=[str(uuid.uuid4())]))
-        monkeypatch.setattr(db, "insert_pending_confirmation", create_autospec(db.insert_pending_confirmation, side_effect=_insert_guard))
-        monkeypatch.setattr(db, "consume_pending_confirmation", create_autospec(db.consume_pending_confirmation, side_effect=_consume_guard))
-        monkeypatch.setattr(db, "upsert_connection", create_autospec(db.upsert_connection, side_effect=_upsert))
-
-        row, pid = await oauth_mod._finalize_connection(
-            user_id=LOCAL_DEV_USER_ID,
-            provider="google",
-            service="calendar",
-            oauth_client_id="111222333-abc.apps.googleusercontent.com",
-            provider_account_id="sub-direct",
-            provider_union_id=None,
-            provider_email="d@example.com",
-            granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
-            access_token="at-1",
-            refresh_token="rt-1",
-            expires_at=datetime.now(UTC) + timedelta(hours=1),
-            preferences={},
-            allow_account_switch=False,
-            consume_state_hash="state-hash-valid",
+        has_inflight_spy.return_value = False
+        supersede_spy.side_effect = _sup
+        upsert_spy.side_effect = _ups
+        cb = await handle_oauth_callback(
+            provider="google", code="c-ok", state="s-ok", google_client=g_client
         )
-        assert row is saved_row
-        assert pid is None
-        assert events == [
-            "consume_intent",
-            "stage_internal_guard",
-            "drain_running_purge",
-            "consume_internal_guard",
-            "upsert_connection",
-        ]
+        assert cb.status == "connected"
+        assert cb.connection is saved_row
+        assert events == ["supersede", "upsert"]
+        wait_spy.assert_not_awaited()
+        revoke_abandoned_spy.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_r7_item5_purge_redis_calls_run_strictly_outside_ledger_lock(

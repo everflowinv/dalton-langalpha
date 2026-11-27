@@ -331,9 +331,6 @@ async def sync_google_sibling_rows_tx(
 
 
 def _extract_pending_raw_token(row: dict[str, Any]) -> bytes | None:
-    prefs = row.get("preferences") or {}
-    if isinstance(prefs, dict) and prefs.get("_internal_commit_guard"):
-        return None
     if row.get("refresh_token") is not None:
         return bytes(row["refresh_token"])
     if row.get("access_token") is not None:

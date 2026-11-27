@@ -1505,17 +1505,76 @@ async def _delete_redis_keys(keys: list[str]) -> int:
 # ---------------------------------------------------------------------------
 
 
-async def _purge_conversation_cards_for_thread(
+@dataclass(slots=True)
+class _ConversationCardDigestPlan:
+    """Deferred conversation archive digest redraw plan collected inside the thread tx."""
+
+    thread_id: str
+    card_ids: list[str]
+    affected_dates: list[str]
+    retracted_stubs: list[dict[str, Any]]
+
+
+async def _verify_purge_attempt_and_thread_blocked_tx(
+    conn: Any,
+    *,
+    purge_id: str,
+    claimed_attempt_gen: int | None,
+    thread_id: str | None = None,
+) -> bool:
+    """Verify inside an open App DB transaction that ``purge_id`` is still ``running`` at
+    ``claimed_attempt_gen`` (``FOR SHARE``) and, when ``thread_id`` is provided, that
+    ``conversation_threads.personal_purge_in_progress`` is still ``TRUE`` (``FOR SHARE``).
+    """
+    async with conn.cursor(row_factory=dict_row) as cur:
+        if claimed_attempt_gen is not None:
+            await cur.execute(
+                """
+                SELECT local_purge_status, local_purge_attempt_gen
+                FROM dalton_integration_purge_ledger
+                WHERE purge_id = %s::uuid
+                FOR SHARE
+                """,
+                (str(purge_id),),
+            )
+            lrow = await cur.fetchone()
+            if (
+                lrow is None
+                or str(lrow["local_purge_status"]) != LocalPurgeStatus.RUNNING.value
+                or int(lrow["local_purge_attempt_gen"]) != int(claimed_attempt_gen)
+            ):
+                return False
+
+        if thread_id is not None:
+            await cur.execute(
+                """
+                SELECT personal_purge_in_progress
+                FROM conversation_threads
+                WHERE conversation_thread_id = %s::uuid
+                FOR SHARE
+                """,
+                (str(thread_id),),
+            )
+            trow = await cur.fetchone()
+            if trow is None or not bool(trow.get("personal_purge_in_progress")):
+                return False
+
+    return True
+
+
+async def _collect_conversation_card_purge_plan(
     conn: Any,
     thread_id: str,
-    user_id: str,
-) -> int:
-    """Fallback scan ``dalton_conversation_cards`` for ``thread_id``; delete & re-render digests if found."""
+) -> _ConversationCardDigestPlan | None:
+    """Register historical archived cards for ``thread_id`` as ``retracted`` inside the
+    thread transaction and return the digest locations to redraw AFTER releasing all
+    advisory locks and DB connections.
+    """
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute("SELECT to_regclass('public.dalton_conversation_cards') AS tbl")
         tbl = await cur.fetchone()
         if not tbl or not tbl.get("tbl"):
-            return 0
+            return None
 
         await cur.execute(
             """
@@ -1528,38 +1587,23 @@ async def _purge_conversation_cards_for_thread(
         )
         matched = [dict(r) for r in await cur.fetchall()]
         if not matched:
-            return 0
+            return None
 
         card_ids = [str(r["card_id"]) for r in matched]
         affected_dates = sorted(
             {str(r["date_et"])[:10] for r in matched if r.get("date_et") is not None}
         )
+        # Mark matched cards retracted inside the transaction without touching sandboxes;
+        # final DELETE happens in a short transaction strictly after sandbox redraw succeeds.
         await cur.execute(
-            "DELETE FROM dalton_conversation_cards WHERE card_id = ANY(%s::text[])",
+            """
+            UPDATE dalton_conversation_cards
+            SET status = 'retracted'
+            WHERE card_id = ANY(%s::text[])
+            """,
             (card_ids,),
         )
-        deleted_count = int(cur.rowcount or 0)
 
-        # Fetch remaining cards for affected dates so digests are re-rendered without deleted cards
-        remaining: list[dict[str, Any]] = []
-        if affected_dates:
-            await cur.execute(
-                """
-                SELECT card_id, source_type, agent, session_id, session_key, generation,
-                       channel, chat_type, event_ids, seq_range, ts, date_et, speaker,
-                       speaker_role, tickers, entities, sectors, topic_label, type, claim,
-                       figures, quote, quote_event_id, cited_sources, confidence, status,
-                       supersedes, extractor_model, prompt_version, content_hash,
-                       search_text, rendered_locations, files_written_at, created_at
-                FROM dalton_conversation_cards
-                WHERE date_et::text = ANY(%s::text[])
-                """,
-                (affected_dates,),
-            )
-            remaining = [dict(r) for r in await cur.fetchall()]
-
-    # Append retracted stubs carrying deleted cards' historical rendered_locations so
-    # render_and_write_conversation_digests removes stale workspace markdown files.
     retracted_stubs = [
         {
             "card_id": str(r["card_id"]),
@@ -1571,17 +1615,55 @@ async def _purge_conversation_cards_for_thread(
         for r in matched
         if r.get("rendered_locations")
     ]
+    return _ConversationCardDigestPlan(
+        thread_id=thread_id,
+        card_ids=card_ids,
+        affected_dates=affected_dates,
+        retracted_stubs=retracted_stubs,
+    )
+
+
+async def _execute_conversation_card_digest_redraw(
+    plan: _ConversationCardDigestPlan,
+    *,
+    user_id: str,
+) -> None:
+    """Re-render / remove archived conversation Markdown digests strictly OUTSIDE all
+    PostgreSQL advisory locks and open DB transactions.
+    """
+    assert_no_advisory_lock_held("purge.render_conversation_digests")
+    remaining: list[dict[str, Any]] = []
+    if plan.affected_dates:
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT card_id, source_type, agent, session_id, session_key, generation,
+                           channel, chat_type, event_ids, seq_range, ts, date_et, speaker,
+                           speaker_role, tickers, entities, sectors, topic_label, type, claim,
+                           figures, quote, quote_event_id, cited_sources, confidence, status,
+                           supersedes, extractor_model, prompt_version, content_hash,
+                           search_text, rendered_locations, files_written_at, created_at
+                    FROM dalton_conversation_cards
+                    WHERE date_et::text = ANY(%s::text[])
+                      AND NOT (card_id = ANY(%s::text[]))
+                    """,
+                    (plan.affected_dates, plan.card_ids),
+                )
+                remaining = [dict(r) for r in await cur.fetchall()]
+
     from src.dalton.conversations.render import (
         render_and_write_conversation_digests,
     )
 
+    # Pass conn=None so render.py acquires and releases its own short DB connections
+    # and NEVER holds an open pool connection across sandbox I/O.
     await render_and_write_conversation_digests(
-        [*remaining, *retracted_stubs],
-        target_dates=affected_dates,
+        [*remaining, *plan.retracted_stubs],
+        target_dates=plan.affected_dates,
         user_id=user_id,
-        conn=conn,
+        conn=None,
     )
-    return deleted_count
 
 
 async def _purge_store_memories_for_thread(cp_conn: Any, thread_id: str) -> int:
@@ -1748,6 +1830,8 @@ async def run_local_purge(
 
 async def _purge_single_thread_layers(
     *,
+    purge_id: str,
+    claimed_attempt_gen: int | None,
     tid: str,
     min_turn: int,
     max_turn: int,
@@ -1759,9 +1843,25 @@ async def _purge_single_thread_layers(
     all_suffix_run_ids: list[str],
     blobs_to_release: list[tuple[str, str]],
     redis_keys_to_delete: list[str],
-) -> None:
-    """Execute per-thread Layer 1, 2a, 2b, 3a, 4, 5a, 5b reads and commits under the thread purge lock."""
-    async with get_db_connection() as conn:
+    card_digest_plans: list[_ConversationCardDigestPlan],
+) -> bool:
+    """Execute per-thread Layer 1, 2a, 2b, 3a, 4, 5a (plan registration), 5b under the
+    thread purge lock.
+
+    Re-verifies ``local_purge_attempt_gen`` and ``personal_purge_in_progress = TRUE``
+    inside every destructive write phase's transaction so a stale worker resuming after
+    a lease takeover and thread unblock NEVER mutates or deletes new-turn data.
+    Returns ``False`` if superseded/unblocked (caller must abort immediately).
+    """
+    _ = user_id  # retained for signature clarity; card digest redraw runs unlocked in caller
+    async with get_db_connection() as conn, conn.transaction():
+        if not await _verify_purge_attempt_and_thread_blocked_tx(
+            conn,
+            purge_id=purge_id,
+            claimed_attempt_gen=claimed_attempt_gen,
+            thread_id=tid,
+        ):
+            return False
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 "SELECT workspace_id::text AS workspace_id FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
@@ -1823,6 +1923,14 @@ async def _purge_single_thread_layers(
     # Layer 1a: Checkpoints + Layer 5b BaseStore memories (on checkpointer DB)
     if cp_serde is not None:
         if isinstance(cp_pool, AsyncConnectionPool):
+            async with get_db_connection() as vconn, vconn.transaction():
+                if not await _verify_purge_attempt_and_thread_blocked_tx(
+                    vconn,
+                    purge_id=purge_id,
+                    claimed_attempt_gen=claimed_attempt_gen,
+                    thread_id=tid,
+                ):
+                    return False
             async with cp_pool.connection() as cp_conn, cp_conn.transaction():
                 report.checkpoints_updated += await _purge_thread_checkpoints(
                     cp_conn,
@@ -1840,6 +1948,13 @@ async def _purge_single_thread_layers(
         else:
             # Same DB fallback (e.g. when checkpointer shares app DB pool in tests)
             async with get_db_connection() as app_cp_conn, app_cp_conn.transaction():
+                if not await _verify_purge_attempt_and_thread_blocked_tx(
+                    app_cp_conn,
+                    purge_id=purge_id,
+                    claimed_attempt_gen=claimed_attempt_gen,
+                    thread_id=tid,
+                ):
+                    return False
                 async with app_cp_conn.cursor(row_factory=dict_row) as cur:
                     await cur.execute("SELECT to_regclass('public.checkpoints') AS tbl")
                     has_cp = await cur.fetchone()
@@ -1861,8 +1976,15 @@ async def _purge_single_thread_layers(
                     app_cp_conn, tid
                 )
 
-    # App DB Layers 1b, 2a, 3a, 4, 5a
+    # App DB Layers 1b, 2a, 3a, 4, 5a (plan registration only — no sandbox I/O in tx)
     async with get_db_connection() as conn, conn.transaction():
+        if not await _verify_purge_attempt_and_thread_blocked_tx(
+            conn,
+            purge_id=purge_id,
+            claimed_attempt_gen=claimed_attempt_gen,
+            thread_id=tid,
+        ):
+            return False
         async with conn.cursor(row_factory=dict_row) as cur:
             # Layer 1b: conversation_queries.content
             await cur.execute(
@@ -2087,10 +2209,11 @@ async def _purge_single_thread_layers(
             )
             report.search_rows_cleared += max(cleared_here, int(cur.rowcount or 0))
 
-        # Layer 5a: dalton_conversation_cards fallback cleanup
-        report.cards_deleted += await _purge_conversation_cards_for_thread(
-            conn, tid, user_id
-        )
+        # Layer 5a: dalton_conversation_cards fallback registration (sandbox digest redraw
+        # runs strictly AFTER releasing thread advisory lock and DB connection)
+        card_plan = await _collect_conversation_card_purge_plan(conn, tid)
+        if card_plan is not None:
+            card_digest_plans.append(card_plan)
 
     # Collect Layer 2c Redis keys for this thread
     redis_keys_to_delete.extend(
@@ -2098,6 +2221,7 @@ async def _purge_single_thread_layers(
             tid, suffix_run_ids, suffix_task_ids, suffix_task_run_ids
         )
     )
+    return True
 
 
 async def _run_local_purge_body(
@@ -2131,11 +2255,12 @@ async def _run_local_purge_body(
                 tid, min_turn=lo, max_turn=hi, timeout_s=cancel_drain_timeout_s
             )
 
-        # Collect per-thread suffix run_ids, task_ids, workspace_ids
+        # Collect per-thread suffix run_ids, task_ids, workspace_ids, deferred card digest plans
         all_suffix_run_ids: list[str] = []
         thread_workspace_ids: dict[str, str | None] = {}
         blobs_to_release: list[tuple[str, str]] = []
         redis_keys_to_delete: list[str] = []
+        card_digest_plans: list[_ConversationCardDigestPlan] = []
 
         cp_pool = None
         cp_serde = None
@@ -2149,18 +2274,20 @@ async def _run_local_purge_body(
                 )
 
         for tid in target_thread_ids:
-            if claimed_attempt_gen is not None:
-                if not await db.renew_local_purge_attempt(
-                    purge_id,
-                    expected_attempt_gen=claimed_attempt_gen,
-                    lease_seconds=lease_seconds,
-                ):
-                    completed_or_superseded = True
-                    report.skipped = True
-                    return report
             min_turn, max_turn = thread_ranges[tid]
             async with acquire_purge_thread_lock(tid, timeout_s=cancel_drain_timeout_s):
-                await _purge_single_thread_layers(
+                if claimed_attempt_gen is not None:
+                    if not await db.renew_local_purge_attempt(
+                        purge_id,
+                        expected_attempt_gen=claimed_attempt_gen,
+                        lease_seconds=lease_seconds,
+                    ):
+                        completed_or_superseded = True
+                        report.skipped = True
+                        return report
+                still_active = await _purge_single_thread_layers(
+                    purge_id=purge_id,
+                    claimed_attempt_gen=claimed_attempt_gen,
                     tid=tid,
                     min_turn=min_turn,
                     max_turn=max_turn,
@@ -2172,7 +2299,45 @@ async def _run_local_purge_body(
                     all_suffix_run_ids=all_suffix_run_ids,
                     blobs_to_release=blobs_to_release,
                     redis_keys_to_delete=redis_keys_to_delete,
+                    card_digest_plans=card_digest_plans,
                 )
+                if still_active is False:
+                    completed_or_superseded = True
+                    report.skipped = True
+                    return report
+
+        # Layer 5a completion: redraw / delete archived conversation Markdown digests
+        # strictly OUTSIDE all advisory locks and DB connections, then mark deleted in
+        # a short transaction after re-verifying attempt generation and thread block.
+        for plan in card_digest_plans:
+            if claimed_attempt_gen is not None:
+                if not await db.renew_local_purge_attempt(
+                    purge_id,
+                    expected_attempt_gen=claimed_attempt_gen,
+                    lease_seconds=lease_seconds,
+                ):
+                    completed_or_superseded = True
+                    report.skipped = True
+                    return report
+            await _execute_conversation_card_digest_redraw(
+                plan, user_id=ledger.user_id
+            )
+            async with get_db_connection() as card_conn, card_conn.transaction():
+                if not await _verify_purge_attempt_and_thread_blocked_tx(
+                    card_conn,
+                    purge_id=purge_id,
+                    claimed_attempt_gen=claimed_attempt_gen,
+                    thread_id=plan.thread_id,
+                ):
+                    completed_or_superseded = True
+                    report.skipped = True
+                    return report
+                async with card_conn.cursor() as cur:
+                    await cur.execute(
+                        "DELETE FROM dalton_conversation_cards WHERE card_id = ANY(%s::text[])",
+                        (plan.card_ids,),
+                    )
+                    report.cards_deleted += int(cur.rowcount or 0)
 
         # Layer 2c: Delete Redis event stream & meta keys strictly OUTSIDE all PG
         # advisory locks and dedicated session connections (renewing durable lease first).
@@ -2194,7 +2359,25 @@ async def _run_local_purge_body(
         if blobs_to_release:
             from src.server.database.workspace_file_blobs import release_blob
 
-            async with get_db_connection() as blob_conn:
+            if claimed_attempt_gen is not None:
+                if not await db.renew_local_purge_attempt(
+                    purge_id,
+                    expected_attempt_gen=claimed_attempt_gen,
+                    lease_seconds=lease_seconds,
+                ):
+                    completed_or_superseded = True
+                    report.skipped = True
+                    return report
+            async with get_db_connection() as blob_conn, blob_conn.transaction():
+                if not await _verify_purge_attempt_and_thread_blocked_tx(
+                    blob_conn,
+                    purge_id=purge_id,
+                    claimed_attempt_gen=claimed_attempt_gen,
+                    thread_id=None,
+                ):
+                    completed_or_superseded = True
+                    report.skipped = True
+                    return report
                 for b_user_id, b_sha in set(blobs_to_release):
                     try:
                         async with blob_conn.cursor(row_factory=dict_row) as cur:
@@ -2223,12 +2406,23 @@ async def _run_local_purge_body(
                         )
 
         # Layer 6a: Delete approvals for disconnected service + ALL services in suffix runs
-        report.approvals_deleted = await db.delete_approvals_for_disconnect(
-            user_id=ledger.user_id,
-            provider=ledger.provider,
-            service=ledger.service,
-            thread_run_ids=list(dict.fromkeys(all_suffix_run_ids)),
-        )
+        async with get_db_connection() as appr_conn, appr_conn.transaction():
+            if not await _verify_purge_attempt_and_thread_blocked_tx(
+                appr_conn,
+                purge_id=purge_id,
+                claimed_attempt_gen=claimed_attempt_gen,
+                thread_id=None,
+            ):
+                completed_or_superseded = True
+                report.skipped = True
+                return report
+            report.approvals_deleted = await db.delete_approvals_for_disconnect(
+                user_id=ledger.user_id,
+                provider=ledger.provider,
+                service=ledger.service,
+                thread_run_ids=list(dict.fromkeys(all_suffix_run_ids)),
+                conn=appr_conn,
+            )
 
         # Layer 6b: Tracker calendar extension point (Step 4) or reconcile flag
         tracker_reconcile_needed = False

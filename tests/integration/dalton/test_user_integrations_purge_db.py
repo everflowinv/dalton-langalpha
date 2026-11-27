@@ -186,6 +186,8 @@ async def _open_wired_live_pool(
         if name.startswith(("src.", "ptc_agent."))
         and getattr(module, "get_db_connection", None) is _pool_gdc
     }
+    from src.dalton.conversations import render as conv_render_mod
+
     holders.update(
         {
             pool_mod,
@@ -194,6 +196,7 @@ async def _open_wired_live_pool(
             revoke_mod,
             lifecycle_mod,
             purge_mod,
+            conv_render_mod,
             tt_db,
             blobs_db,
             forks_svc,

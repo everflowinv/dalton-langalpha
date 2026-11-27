@@ -970,7 +970,10 @@ async def test_tracker_reconcile_needed_without_handler_and_with_handler(monkeyp
     )
     fake_conn = _FakeConn(
         _FakeCursor(
-            fetchone_seq=[{"local_purge_status": "running", "local_purge_attempt_gen": 1}],
+            fetchone_seq=[
+                {"local_purge_status": "running", "local_purge_attempt_gen": 1},
+                {"local_purge_status": "running", "local_purge_attempt_gen": 1},
+            ],
             fetchall_seq=[[]],
         )
     )
@@ -1007,7 +1010,10 @@ async def test_tracker_reconcile_needed_without_handler_and_with_handler(monkeyp
     try:
         fake_conn2 = _FakeConn(
             _FakeCursor(
-                fetchone_seq=[{"local_purge_status": "running", "local_purge_attempt_gen": 1}],
+                fetchone_seq=[
+                    {"local_purge_status": "running", "local_purge_attempt_gen": 1},
+                    {"local_purge_status": "running", "local_purge_attempt_gen": 1},
+                ],
                 fetchall_seq=[[]],
             )
         )
@@ -1549,26 +1555,42 @@ async def test_purge_mutex_incomplete_layers_all_services_guard_and_resume_loop(
         with pytest.raises(RuntimeError, match="Checkpointer"):
             await purge_mod.run_local_purge(pid)
 
-    # Conversation digest re-render failure propagates instead of being swallowed
+    # Conversation digest plan collects locations inside tx WITHOUT calling sandbox renderer;
+    # redraw runs strictly outside advisory locks and propagates failures instead of swallowing.
+    from src.dalton.integrations.lock_guard import advisory_lock_http_guard, track_advisory_lock
+
     card_conn = _FakeConn(
         _FakeCursor(
             fetchone_seq=[{"tbl": "dalton_conversation_cards"}],
             fetchall_seq=[
                 [{"card_id": "c1", "date_et": "2026-11-26", "rendered_locations": [{"workspace_id": "w1", "path": "a.md"}], "tickers": []}],
-                [],
             ],
         )
     )
-    with patch.object(
-        render_mod,
-        "render_and_write_conversation_digests",
-        create_autospec(
-            render_mod.render_and_write_conversation_digests,
-            side_effect=RuntimeError("render boom"),
-        ),
+    render_spy = create_autospec(
+        render_mod.render_and_write_conversation_digests,
+        side_effect=RuntimeError("render boom"),
+    )
+    read_conn = _FakeConn(_FakeCursor(fetchall_seq=[[]]))
+
+    @asynccontextmanager
+    async def _read_remaining_conn(_conn=None):
+        yield read_conn
+
+    with (
+        patch.object(render_mod, "render_and_write_conversation_digests", render_spy),
+        patch.object(purge_mod, "get_db_connection", _read_remaining_conn),
     ):
+        plan = await purge_mod._collect_conversation_card_purge_plan(card_conn, tid)
+        assert plan is not None
+        assert plan.card_ids == ["c1"]
+        render_spy.assert_not_awaited()
+        with advisory_lock_http_guard(True):
+            with track_advisory_lock("purge_thread", 123):
+                with pytest.raises(RuntimeError, match="advisory lock"):
+                    await purge_mod._execute_conversation_card_digest_redraw(plan, user_id="u1")
         with pytest.raises(RuntimeError, match="render boom"):
-            await purge_mod._purge_conversation_cards_for_thread(card_conn, tid, "u1")
+            await purge_mod._execute_conversation_card_digest_redraw(plan, user_id="u1")
 
     # Background resume loop scans immediately on start and exits cleanly on cancel
     scan_ran = asyncio.Event()
@@ -1824,10 +1846,20 @@ async def test_partial_failures_decode_and_same_db_missing_checkpoints():
         purged_max_turn_by_thread={tid: {"min_turn": 0, "max_turn": 0}},
     )
     # fetchall sequence: touches=[], live_runs=[], suffix_tasks=[], all_responses=[]
-    # fetchone sequence: thread_key lock=(True,), workspace_id={"workspace_id": None}, to_regclass={"tbl": None}
+    # fetchone sequence: thread_key lock=(True,),
+    #   Phase 0 guard (ledger, thread), workspace_id={"workspace_id": None},
+    #   Phase 1 guard (ledger, thread), to_regclass={"tbl": None}
     no_cp_conn = _FakeConn(
         _FakeCursor(
-            fetchone_seq=[(True,), {"workspace_id": None}, {"tbl": None}],
+            fetchone_seq=[
+                (True,),
+                {"local_purge_status": "running", "local_purge_attempt_gen": 1},
+                {"personal_purge_in_progress": True},
+                {"workspace_id": None},
+                {"local_purge_status": "running", "local_purge_attempt_gen": 1},
+                {"personal_purge_in_progress": True},
+                {"tbl": None},
+            ],
             fetchall_seq=[[], [], [], []],
         )
     )
@@ -2383,3 +2415,118 @@ async def test_cancel_and_drain_succeeds_under_single_slot_pool_for_settled_suba
     ):
         await purge_mod._cancel_and_drain_thread(tid, min_turn=0, max_turn=2, timeout_s=0.05)
     assert session_conn_held.closed is True
+
+
+@pytest.mark.asyncio
+async def test_r8_purge_attempt_gen_and_thread_blocked_recheck_aborts_stale_worker():
+    """Round 8 Decision 2 & 3: inside each destructive phase tx after acquiring thread lock,
+    _purge_single_thread_layers re-verifies local_purge_attempt_gen and personal_purge_in_progress,
+    aborting without issuing any destructive DELETE/UPDATE when superseded or unblocked;
+    render.py also enforces assert_no_advisory_lock_held before sandbox calls.
+    """
+    from src.dalton.conversations import render as render_mod
+    from src.dalton.integrations.lock_guard import advisory_lock_http_guard, track_advisory_lock
+
+    pid = str(uuid.uuid4())
+    tid = str(uuid.uuid4())
+
+    # (a) Phase 0 passes (gen=1, blocked=True), Phase 2 App DB destructive tx sees gen=2 (taken over!) -> aborts with ZERO DELETE/UPDATE
+    cursor = _FakeCursor(
+        fetchone_seq=[
+            {"local_purge_status": "running", "local_purge_attempt_gen": 1},
+            {"personal_purge_in_progress": True},
+            {"workspace_id": None},
+            {"local_purge_status": "running", "local_purge_attempt_gen": 2},  # superseded!
+        ],
+        fetchall_seq=[[]],
+    )
+    conn = _FakeConn(cursor)
+
+    @asynccontextmanager
+    async def _get_conn(_c=None):
+        yield conn
+
+    report = purge_mod.LocalPurgeReport(purge_id=pid)
+    with patch.object(purge_mod, "get_db_connection", _get_conn):
+        ok = await purge_mod._purge_single_thread_layers(
+            purge_id=pid,
+            claimed_attempt_gen=1,
+            tid=tid,
+            min_turn=0,
+            max_turn=0,
+            user_id="u1",
+            cp_pool=None,
+            cp_serde=None,
+            report=report,
+            thread_workspace_ids={},
+            all_suffix_run_ids=[],
+            blobs_to_release=[],
+            redis_keys_to_delete=[],
+            card_digest_plans=[],
+        )
+    assert ok is False
+    destructive_sql = [
+        sql for sql, _ in cursor.executed
+        if any(tok in sql.upper() for tok in ("DELETE FROM", "UPDATE CONVERSATION_", "UPDATE HOOK_OUTBOX", "UPDATE THREAD_SEARCH"))
+    ]
+    assert destructive_sql == []
+
+    # (b) Phase 2 sees matching gen=1 but personal_purge_in_progress=False (already unblocked!) -> aborts with ZERO DELETE/UPDATE
+    cursor2 = _FakeCursor(
+        fetchone_seq=[
+            {"local_purge_status": "running", "local_purge_attempt_gen": 1},
+            {"personal_purge_in_progress": True},
+            {"workspace_id": None},
+            {"local_purge_status": "running", "local_purge_attempt_gen": 1},
+            {"personal_purge_in_progress": False},  # already unblocked!
+        ],
+        fetchall_seq=[[]],
+    )
+    conn2 = _FakeConn(cursor2)
+
+    @asynccontextmanager
+    async def _get_conn2(_c=None):
+        yield conn2
+
+    with patch.object(purge_mod, "get_db_connection", _get_conn2):
+        ok2 = await purge_mod._purge_single_thread_layers(
+            purge_id=pid,
+            claimed_attempt_gen=1,
+            tid=tid,
+            min_turn=0,
+            max_turn=0,
+            user_id="u1",
+            cp_pool=None,
+            cp_serde=None,
+            report=report,
+            thread_workspace_ids={},
+            all_suffix_run_ids=[],
+            blobs_to_release=[],
+            redis_keys_to_delete=[],
+            card_digest_plans=[],
+        )
+    assert ok2 is False
+    destructive_sql2 = [
+        sql for sql, _ in cursor2.executed
+        if any(tok in sql.upper() for tok in ("DELETE FROM", "UPDATE CONVERSATION_", "UPDATE HOOK_OUTBOX", "UPDATE THREAD_SEARCH"))
+    ]
+    assert destructive_sql2 == []
+
+    # (c) render.py refuses sandbox write/remove if an advisory lock is held
+    class _StubBackend:
+        async def awrite_text(self, path: str, text: str) -> bool:
+            return True
+
+        async def aexecute(self, cmd: str) -> SimpleNamespace:
+            return SimpleNamespace(exit_code=0)
+
+    stub_be = _StubBackend()
+    with advisory_lock_http_guard(True), track_advisory_lock("purge_thread", 99):
+        with pytest.raises(RuntimeError, match="advisory lock"):
+            await render_mod.write_conversation_file_to_backend(
+                None, "research/topics/conversations/2026-11-26.md", "# hi", backend=stub_be
+            )
+        with pytest.raises(RuntimeError, match="advisory lock"):
+            await render_mod.remove_conversation_file_from_backend(
+                None, "research/topics/conversations/2026-11-26.md", backend=stub_be
+            )

@@ -2735,6 +2735,114 @@ async def test_r6_small_pool_size_2_saturated_concurrency_no_deadlock_db(
             ).fetchone()
             assert brow is not None and brow[0] is not None
 
+    # Part 3 (Round 8 Decision 3 / Codex High #4): TWO concurrent 2A purges hitting
+    # historical archived conversation cards on max_size=2 pool! Sandbox session lookup,
+    # workspace lookup (get_workspace), rm -f, and delete_file_rows run strictly OUTSIDE
+    # thread advisory locks and App DB transactions so two slow concurrent purges NEVER timeout.
+    from types import SimpleNamespace
+
+    from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+    from src.dalton.integrations.lock_guard import (
+        advisory_lock_http_guard,
+        held_advisory_locks,
+    )
+    from src.server.services.workspace_manager import WorkspaceManager
+    from tests.integration.dalton.test_user_integrations_purge_db import (
+        _seed_conversation_card,
+    )
+
+    card_pids: list[str] = []
+    card_ids: list[str] = []
+    for idx in (1, 2):
+        c_uid, c_wid, c_tid = await _seed_user_ws_thread(
+            small_pool, user_id=f"u-r8-pool2-card-{idx}"
+        )
+        c_run_id = await _seed_turn(
+            small_pool, thread_id=c_tid, turn_index=0, user_text=f"card turn {idx}"
+        )
+        c_conn = await db.upsert_connection(
+            user_id=c_uid,
+            provider="feishu",
+            service="calendar",
+            oauth_client_id="cli_db_test_1",
+            provider_account_id=f"ou-card-{idx}",
+            granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
+            access_token=f"at-c-{idx}",
+            refresh_token=f"rt-c-{idx}",
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+        await db.record_touch(
+            thread_id=c_tid,
+            response_id=c_run_id,
+            provider="feishu",
+            service="calendar",
+            auth_epoch=c_conn.auth_epoch,
+            turn_index=0,
+            user_id=c_uid,
+            provider_account_id=f"ou-card-{idx}",
+        )
+        cid_val = f"card-r8-pool2-{idx}"
+        await _seed_conversation_card(
+            small_pool,
+            card_id=cid_val,
+            thread_id=c_tid,
+            workspace_id=c_wid,
+            claim=f"archived card secret {idx}",
+        )
+        card_ids.append(cid_val)
+        card_pids.append(
+            await begin_disconnect(c_uid, "feishu", "calendar", remote_mode="local_only")
+        )
+
+    rm_commands: list[str] = []
+    fake_sandbox = create_autospec(PTCSandbox, instance=True)
+    fake_sandbox.working_dir = "/workspace"
+
+    async def _slow_bash(**kwargs: Any) -> dict[str, Any]:
+        assert held_advisory_locks() == ()
+        await asyncio.sleep(0.15)
+        rm_commands.append(str(kwargs.get("command") or ""))
+        return {"stdout": "", "stderr": "", "exit_code": 0}
+
+    fake_sandbox.execute_bash_command.side_effect = _slow_bash
+
+    fake_wm = create_autospec(WorkspaceManager, instance=True)
+
+    async def _slow_session(workspace_id: str, user_id: str | None = None) -> Any:
+        _ = (workspace_id, user_id)
+        assert held_advisory_locks() == ()
+        await asyncio.sleep(0.15)
+        return SimpleNamespace(sandbox=fake_sandbox)
+
+    fake_wm.get_session_for_workspace.side_effect = _slow_session
+    monkeypatch.setattr(
+        WorkspaceManager,
+        "get_instance",
+        classmethod(lambda cls, **_kw: fake_wm),
+    )
+
+    with advisory_lock_http_guard(True):
+        card_purge_res = await asyncio.wait_for(
+            asyncio.gather(
+                finish_disconnect(card_pids[0], revoker=None),
+                finish_disconnect(card_pids[1], revoker=None),
+            ),
+            timeout=10.0,
+        )
+    assert all(
+        r is not None and r.local_purge_status == LocalPurgeStatus.COMPLETED
+        for r in card_purge_res
+    )
+    assert len(rm_commands) == 2
+    async with small_pool.connection() as conn:
+        rem_cards = await (
+            await conn.execute(
+                "SELECT COUNT(*) FROM dalton_conversation_cards WHERE card_id = ANY(%s::text[])",
+                (card_ids,),
+            )
+        ).fetchone()
+    assert rem_cards == (0,)
+
 
 async def test_r6_health_sweep_lease_expiry_takeover_stops_old_worker_db(
     gws_live_pool: Any,
@@ -3323,129 +3431,342 @@ async def test_r7_calendar_disconnect_and_mail_confirmation_expiry_dual_conn_no_
     assert pending_b is not None and pending_b[0] >= 1
 
 
-async def test_r7_core_direct_callback_consumes_intent_before_draining_running_purge_db(
+async def test_r8_core_direct_callback_rejects_409_during_cleanup_and_reconnects_after_db(
     gws_live_pool: Any,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Real PG (Grok Med #1): when a prior 2A purge ledger is still running with an idle lock, core direct callback verifies & consumes the OAuth intent + exchange lease FIRST so draining a purge longer than exchange_lease_seconds still commits cleanly, whereas a voided intent aborts without running the purge."""
-    from src.dalton.services import user_integrations_lifecycle as lc_mod
+    """Real PG (Round 8 Decision 1): core direct callback rejects with retryable 409 ('上一次断开还在清理，请稍后重新连接') without draining 2A or erasing pending revoke tokens when (a) sole Google auth has pending revoke + unstarted 2A, (b) in-flight Google revoke claims execution before final tx (rolling back and revoking the in-memory new token), or (c) a background worker holds the 2A lease; once both clear, reconnect succeeds and atomically supersedes any pending revoke."""
+    from src.dalton.services.user_integrations_lifecycle import (
+        begin_disconnect,
+        finish_disconnect_locked,
+    )
 
-    _ = gws_live_pool
+    pool = gws_live_pool
     uid = LOCAL_DEV_USER_ID
-    client_id = "888999000-r7core.apps.googleusercontent.com"
+    client_id = "888999000-r8core.apps.googleusercontent.com"
+    sub = "sub-r8-sole-google"
     _install_creds(google_client_id=client_id)
 
-    # (a) Running purge ledger with idle lock that takes 1.3s (> exchange_lease_seconds=1)
-    old_purge = await db.insert_purge_ledger(
-        purge_id=str(uuid.uuid4()),
+    # Seed sole Google calendar authorization and begin disconnect (creates running 2A + pending revoke with old token)
+    await db.upsert_connection(
         user_id=uid,
         provider="google",
         service="calendar",
         oauth_client_id=client_id,
-        provider_account_id="sub-r7-old",
-        auth_epoch_upto=1,
-        trigger_reason=TriggerReason.USER_DISCONNECT,
-        local_purge_status=LocalPurgeStatus.RUNNING,
-        purged_max_turn_by_thread={},
-        remote_revoke_status=RemoteRevokeStatus.NOT_APPLICABLE,
-    )
-
-    real_finish = lc_mod.finish_disconnect_locked
-
-    async def _slow_finish_locked(pid: str, **kw: Any) -> Any:
-        await asyncio.sleep(1.3)
-        return await real_finish(pid, **kw)
-
-    monkeypatch.setattr(oauth_mod, "finish_disconnect_locked", _slow_finish_locked)
-
-    st = await start_oauth_authorization(
-        user_id=uid, provider="google", service="calendar", auth_mode="oss"
-    )
-    g_client = create_autospec(GoogleOAuthClient, instance=True)
-    g_client.exchange_code.return_value = OAuthTokenResponse(
-        access_token="at-r7-core-ok",
-        refresh_token="rt-r7-core-ok",
-        expires_in=3600,
+        provider_account_id=sub,
+        granted_scopes=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+        access_token="at-r8-old-sole",
+        refresh_token="rt-r8-old-sole",
         expires_at=datetime.now(UTC) + timedelta(hours=1),
-        scope=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
-        id_token="id.r7core",
     )
-    g_client.verify_id_token.return_value = GoogleIdTokenClaims(
-        sub="sub-r7-core-ok",
-        email="coreok@example.com",
-        email_verified=True,
-        aud=client_id,
-        iss="https://accounts.google.com",
-        exp=int(time.time()) + 3600,
-    )
+    old_purge_id = await begin_disconnect(uid, "google", "calendar")
+    old_before = await db.get_purge_ledger(old_purge_id, decrypt_revoke_token=True)
+    assert old_before is not None
+    assert old_before.local_purge_status == LocalPurgeStatus.RUNNING
+    assert old_before.remote_revoke_status == RemoteRevokeStatus.PENDING
+    assert old_before.revoke_token == "rt-r8-old-sole"
+
     rev = create_autospec(RemoteRevoker, instance=True)
     rev.revoke.return_value = RevokeOutcome.SUCCEEDED
 
-    cb = await handle_oauth_callback(
-        provider="google",
-        code="c-r7-core",
-        state=st.state,
-        google_client=g_client,
-        revoker=rev,
-        exchange_lease_seconds=1,
-        exchange_timeout_seconds=10.0,
-    )
-    assert cb.status == "connected"
-    assert cb.connection is not None and cb.connection.provider_account_id == "sub-r7-core-ok"
-    rev.revoke.assert_not_awaited()
-    old_after = await db.get_purge_ledger(old_purge.purge_id)
-    assert old_after is not None and old_after.local_purge_status == LocalPurgeStatus.COMPLETED
-
-    # (b) Voided intent + running purge -> aborts IMMEDIATELY without draining the running purge
-    running_void_purge = await db.insert_purge_ledger(
-        purge_id=str(uuid.uuid4()),
-        user_id=uid,
-        provider="google",
-        service="mail",
-        oauth_client_id=client_id,
-        provider_account_id="sub-r7-void",
-        auth_epoch_upto=1,
-        trigger_reason=TriggerReason.USER_DISCONNECT,
-        local_purge_status=LocalPurgeStatus.RUNNING,
-        purged_max_turn_by_thread={},
-        remote_revoke_status=RemoteRevokeStatus.NOT_APPLICABLE,
-    )
-    st_void = await start_oauth_authorization(
-        user_id=uid, provider="google", service="mail", auth_mode="oss"
-    )
-
-    async def _void_during_exchange(**_k: Any) -> OAuthTokenResponse:
-        await db.void_oauth_states_for_user_provider(uid, "google", service="mail")
-        return OAuthTokenResponse(
-            access_token="at-void",
-            refresh_token="rt-void",
+    def _make_g_client(new_rt: str) -> Any:
+        gc = create_autospec(GoogleOAuthClient, instance=True)
+        gc.exchange_code.return_value = OAuthTokenResponse(
+            access_token="at-r8-new",
+            refresh_token=new_rt,
             expires_in=3600,
             expires_at=datetime.now(UTC) + timedelta(hours=1),
-            scope=" ".join(GOOGLE_GMAIL_MIN_SCOPES),
-            id_token="id.void",
+            scope=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+            id_token="id.r8core",
+        )
+        gc.verify_id_token.return_value = GoogleIdTokenClaims(
+            sub=sub,
+            email="sole@example.com",
+            email_verified=True,
+            aud=client_id,
+            iss="https://accounts.google.com",
+            exp=int(time.time()) + 3600,
+        )
+        return gc
+
+    # (a) Sole Google auth + pending revoke ledger + running/pending 2A -> 409 AND old token still in ledger!
+    st_a = await start_oauth_authorization(
+        user_id=uid, provider="google", service="calendar", auth_mode="oss"
+    )
+    g_a = _make_g_client("rt-r8-never-exchanged")
+    with pytest.raises(oauth_mod.DisconnectCleanupInProgressError) as exc_a:
+        await handle_oauth_callback(
+            provider="google",
+            code="c-r8-a",
+            state=st_a.state,
+            google_client=g_a,
+            revoker=rev,
+        )
+    assert exc_a.value.status_code == 409
+    assert str(exc_a.value) == "上一次断开还在清理，请稍后重新连接"
+    g_a.exchange_code.assert_not_awaited()
+    old_after_a = await db.get_purge_ledger(old_purge_id, decrypt_revoke_token=True)
+    assert old_after_a is not None
+    assert old_after_a.local_purge_status == LocalPurgeStatus.RUNNING
+    assert old_after_a.remote_revoke_status == RemoteRevokeStatus.PENDING
+    assert old_after_a.revoke_token == "rt-r8-old-sole"
+
+    # (b) Background worker holds the 2A durable lease -> 409 AND old token still in ledger!
+    worker_gen = await db.claim_local_purge_attempt(old_purge_id, lease_seconds=60)
+    assert worker_gen is not None
+    st_b = await start_oauth_authorization(
+        user_id=uid, provider="google", service="calendar", auth_mode="oss"
+    )
+    g_b = _make_g_client("rt-r8-worker-lease")
+    with pytest.raises(oauth_mod.DisconnectCleanupInProgressError) as exc_b:
+        await handle_oauth_callback(
+            provider="google",
+            code="c-r8-b",
+            state=st_b.state,
+            google_client=g_b,
+            revoker=rev,
+        )
+    assert exc_b.value.status_code == 409
+    assert str(exc_b.value) == "上一次断开还在清理，请稍后重新连接"
+    old_after_b = await db.get_purge_ledger(old_purge_id, decrypt_revoke_token=True)
+    assert old_after_b is not None
+    assert old_after_b.local_purge_status == LocalPurgeStatus.RUNNING
+    assert old_after_b.remote_revoke_status == RemoteRevokeStatus.PENDING
+    assert old_after_b.revoke_token == "rt-r8-old-sole"
+
+    # Release worker lease & complete 2A local purge (keeping remote_revoke_status = PENDING)
+    await db.release_local_purge_attempt(old_purge_id, expected_attempt_gen=worker_gen)
+    fin = await finish_disconnect_locked(old_purge_id, revoker=None, run_remote_revoke=False)
+    assert fin is not None and fin.local_purge_status == LocalPurgeStatus.COMPLETED
+
+    # (c) Final-tx race: 2A is complete, but an in-flight revoke claims execution during exchange_code
+    # -> final tx rolls back with 409, old pending token stays intact, and in-memory new token is queued/revoked!
+    st_c = await start_oauth_authorization(
+        user_id=uid, provider="google", service="calendar", auth_mode="oss"
+    )
+    g_c = _make_g_client("rt-r8-abandoned-new")
+
+    async def _exchange_while_revoke_starts(**_k: Any) -> OAuthTokenResponse:
+        async with pool.connection() as conn, conn.transaction():
+            gen_r = await db.claim_revoke_attempt_tx(
+                old_purge_id, lease_seconds=60, conn=conn
+            )
+            assert gen_r is not None
+        return OAuthTokenResponse(
+            access_token="at-r8-abandoned",
+            refresh_token="rt-r8-abandoned-new",
+            expires_in=3600,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            scope=" ".join(GOOGLE_CALENDAR_MIN_SCOPES),
+            id_token="id.r8c",
         )
 
-    g_void = create_autospec(GoogleOAuthClient, instance=True)
-    g_void.exchange_code.side_effect = _void_during_exchange
-    g_void.verify_id_token.return_value = GoogleIdTokenClaims(
-        sub="sub-r7-void-new",
-        email="void@example.com",
-        email_verified=True,
-        aud=client_id,
-        iss="https://accounts.google.com",
-        exp=int(time.time()) + 3600,
+    g_c.exchange_code.side_effect = _exchange_while_revoke_starts
+    with pytest.raises(oauth_mod.DisconnectCleanupInProgressError) as exc_c:
+        await handle_oauth_callback(
+            provider="google",
+            code="c-r8-c",
+            state=st_c.state,
+            google_client=g_c,
+            revoker=rev,
+        )
+    assert exc_c.value.status_code == 409
+    assert str(exc_c.value) == "上一次断开还在清理，请稍后重新连接"
+    old_after_c = await db.get_purge_ledger(old_purge_id, decrypt_revoke_token=True)
+    assert old_after_c is not None
+    assert old_after_c.remote_revoke_status == RemoteRevokeStatus.PENDING
+    assert old_after_c.revoke_token == "rt-r8-old-sole"
+    assert await db.get_connection(uid, "google", "calendar") is None
+    # Verify the abandoned in-memory new token was recorded for remote revocation
+    async with pool.connection() as conn:
+        abandoned_rows = await (
+            await conn.execute(
+                """
+                SELECT purge_id::text
+                FROM dalton_integration_purge_ledger
+                WHERE user_id = %s
+                  AND provider = 'google'
+                  AND trigger_reason = 'callback_disconnect_cleanup_in_progress'
+                """,
+                (uid,),
+            )
+        ).fetchall()
+    assert len(abandoned_rows) == 1
+
+    # Clear in-flight revoke lease (both 2A completed & no in-flight revoke) -> reconnect succeeds!
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE dalton_integration_purge_ledger SET revoke_inflight_until = NULL WHERE provider = 'google' AND user_id = %s",
+            (uid,),
+        )
+    st_d = await start_oauth_authorization(
+        user_id=uid, provider="google", service="calendar", auth_mode="oss"
     )
-    cb_void = await handle_oauth_callback(
+    g_d = _make_g_client("rt-r8-final-ok")
+    cb_ok = await handle_oauth_callback(
         provider="google",
-        code="c-void",
-        state=st_void.state,
-        google_client=g_void,
+        code="c-r8-d",
+        state=st_d.state,
+        google_client=g_d,
         revoker=rev,
     )
-    assert cb_void.status == "error"
-    assert cb_void.error_code == "connection_disconnected_during_callback"
-    still_running = await db.get_purge_ledger(running_void_purge.purge_id)
-    assert still_running is not None and still_running.local_purge_status == LocalPurgeStatus.RUNNING
+    assert cb_ok.status == "connected"
+    assert cb_ok.connection is not None
+    assert cb_ok.connection.provider_account_id == sub
+    assert cb_ok.connection.status == IntegrationStatus.CONNECTED
+    old_after_d = await db.get_purge_ledger(old_purge_id, decrypt_revoke_token=True)
+    assert old_after_d is not None
+    assert old_after_d.remote_revoke_status == RemoteRevokeStatus.SUPERSEDED
+    assert old_after_d.revoke_token is None
+
+
+async def test_r8_purge_stale_worker_after_takeover_and_new_turn_preserves_new_data_db(
+    gws_live_pool: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real PG (Round 8 Decision 2 / Codex High #3): when Worker 1 pauses before acquiring the thread lock until its durable lease expires, Worker 2 takes over, completes 2A purge, unblocks the thread, and a new turn writes a transcript + pending steer; resuming Worker 1 re-verifies attempt_gen & thread block inside destructive phases and leaves ALL new-turn data untouched."""
+    from contextlib import asynccontextmanager
+    from psycopg.types.json import Jsonb
+
+    from src.dalton.services import integration_data_purge as purge_mod
+    from src.dalton.services.purge_fence import save_stored_transcript_fenced
+    from src.dalton.services.user_integrations_lifecycle import (
+        begin_disconnect,
+        finish_disconnect_locked,
+    )
+    from src.server.database import thread_transcripts as tt_db
+    from tests.integration.dalton.test_user_integrations_purge_db import (
+        _seed_user_ws_thread,
+    )
+
+    pool = gws_live_pool
+    uid, _, tid = await _seed_user_ws_thread(pool, user_id="u-r8-stale-worker")
+    run0_id = await _seed_turn(pool, thread_id=tid, turn_index=0, user_text="turn 0 secret")
+
+    conn_row = await db.upsert_connection(
+        user_id=uid,
+        provider="feishu",
+        service="calendar",
+        oauth_client_id="cli_db_test_1",
+        provider_account_id="ou-r8-stale",
+        granted_scopes=" ".join(FEISHU_CALENDAR_SCOPES),
+        access_token="at-r8-s",
+        refresh_token="rt-r8-s",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    await db.record_touch(
+        thread_id=tid,
+        response_id=run0_id,
+        provider="feishu",
+        service="calendar",
+        auth_epoch=conn_row.auth_epoch,
+        turn_index=0,
+        user_id=uid,
+        provider_account_id="ou-r8-stale",
+    )
+    purge_id = await begin_disconnect(uid, "feishu", "calendar", remote_mode="local_only")
+
+    real_acq_thread = purge_mod.acquire_purge_thread_lock
+    w1_paused = asyncio.Event()
+    w1_release = asyncio.Event()
+    acq_calls = 0
+
+    @asynccontextmanager
+    async def _pausing_thread_lock(thread_id: str, **kw: Any) -> Any:
+        nonlocal acq_calls
+        acq_calls += 1
+        if acq_calls == 1:
+            # Pause Worker 1 RIGHT BEFORE acquiring the thread lock (after lease claim)
+            w1_paused.set()
+            await asyncio.wait_for(w1_release.wait(), timeout=10.0)
+        async with real_acq_thread(thread_id, **kw):
+            yield
+
+    monkeypatch.setattr(purge_mod, "acquire_purge_thread_lock", _pausing_thread_lock)
+
+    w1_task = asyncio.create_task(finish_disconnect_locked(purge_id, revoker=None))
+    try:
+        await asyncio.wait_for(w1_paused.wait(), timeout=10.0)
+
+        # Expire Worker 1's durable lease -> Worker 2 takes over, purges Turn 0, and unblocks thread
+        async with pool.connection() as conn:
+            await conn.execute(
+                "UPDATE dalton_integration_purge_ledger SET local_purge_inflight_until = clock_timestamp() - INTERVAL '1 second' WHERE purge_id = %s::uuid",
+                (purge_id,),
+            )
+        w2_res = await asyncio.wait_for(
+            finish_disconnect_locked(purge_id, revoker=None), timeout=10.0
+        )
+        assert w2_res is not None
+        assert w2_res.local_purge_status == LocalPurgeStatus.COMPLETED
+
+        # Thread is now unblocked (generation == 2); write brand-new Turn 1 data (query, transcript, pending steer)
+        run1_id = await _seed_turn(
+            pool, thread_id=tid, turn_index=1, user_text="new turn 1 after unblock"
+        )
+        new_tr = tt_db.StoredTranscript("fp-new-1", "cp-new-1", '{"segments": ["turn1"]}', files={})
+        saved_tr = await save_stored_transcript_fenced(
+            tid, "", uid, new_tr, {}, expected_purge_gen=2
+        )
+        assert saved_tr is True
+        new_steer_id = str(uuid.uuid4())
+        async with pool.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO hook_outbox (
+                    hook_outbox_id, run_id, conversation_thread_id, hook_type,
+                    payload, idempotency_key, status
+                )
+                VALUES (%s::uuid, %s::uuid, %s::uuid, 'steer', %s, %s, 'pending')
+                """,
+                (
+                    new_steer_id,
+                    run1_id,
+                    tid,
+                    Jsonb({"content": "new turn 1 pending steer"}),
+                    f"ik-r8-stale-{new_steer_id}",
+                ),
+            )
+
+        # Resume stale Worker 1 -> MUST detect superseded attempt_gen / unblocked thread and abort!
+        w1_release.set()
+        await asyncio.wait_for(w1_task, timeout=10.0)
+    finally:
+        w1_release.set()
+        if not w1_task.done():
+            w1_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await w1_task
+
+    # Verify ALL new Turn 1 data is completely preserved!
+    async with pool.connection() as conn:
+        tr_cnt = await (
+            await conn.execute(
+                "SELECT COUNT(*) FROM thread_transcripts WHERE conversation_thread_id = %s::uuid",
+                (tid,),
+            )
+        ).fetchone()
+        steer_row = await (
+            await conn.execute(
+                "SELECT status, payload->>'content' FROM hook_outbox WHERE hook_outbox_id = %s::uuid",
+                (new_steer_id,),
+            )
+        ).fetchone()
+        q1_row = await (
+            await conn.execute(
+                "SELECT content FROM conversation_queries WHERE conversation_thread_id = %s::uuid AND turn_index = 1",
+                (tid,),
+            )
+        ).fetchone()
+        t_row = await (
+            await conn.execute(
+                "SELECT personal_purge_in_progress, personal_purge_generation FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
+                (tid,),
+            )
+        ).fetchone()
+    assert tr_cnt == (1,)
+    assert steer_row == ("pending", "new turn 1 pending steer")
+    assert q1_row == ("new turn 1 after unblock",)
+    assert t_row == (False, 2)
 
 
 async def test_r7_purge_redis_outside_ledger_lock_and_attempt_gen_takeover_db(
@@ -3468,12 +3789,13 @@ async def test_r7_purge_redis_outside_ledger_lock_and_attempt_gen_takeover_db(
 
     pool = gws_live_pool
     uid, _, tid = await _seed_user_ws_thread(pool, user_id="u-r7-redis-purge")
-    run_id = await _seed_turn(pool, thread_id=tid, turn_index=0, user_text="redis purge turn")
-    async with pool.connection() as conn:
-        await conn.execute(
-            "UPDATE conversation_responses SET status = 'in_progress' WHERE conversation_response_id = %s::uuid",
-            (run_id,),
-        )
+    run_id = await _seed_turn(
+        pool,
+        thread_id=tid,
+        turn_index=0,
+        user_text="redis purge turn",
+        status="in_progress",
+    )
 
     conn_row = await db.upsert_connection(
         user_id=uid,

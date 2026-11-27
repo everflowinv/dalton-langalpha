@@ -2602,9 +2602,6 @@ async def delete_expired_oauth_states_and_confirmations(
         for r in expired_confirms:
             if str(r.get("provider") or "") != "google":
                 continue
-            prefs = r.get("preferences") or {}
-            if isinstance(prefs, dict) and prefs.get("_internal_commit_guard"):
-                continue
             raw_tok = (
                 bytes(r["refresh_token"])
                 if r.get("refresh_token") is not None
@@ -2927,7 +2924,6 @@ async def has_any_active_google_grant_in_project(
                 FROM dalton_user_integration_pending_confirmations
                 WHERE provider = 'google'
                   AND confirm_expires_at > clock_timestamp()
-                  AND COALESCE((preferences->>'_internal_commit_guard')::boolean, FALSE) = FALSE
                 """
             )
             return any(
@@ -3025,7 +3021,6 @@ async def has_active_or_pending_google_grant(
                 "provider = 'google'",
                 "provider_account_id = %(sub)s",
                 "confirm_expires_at > clock_timestamp()",
-                "COALESCE((preferences->>'_internal_commit_guard')::boolean, FALSE) = FALSE",
             ]
             pend_params: dict[str, Any] = {"sub": sub}
             if exclude_confirmation_hash is not None:
