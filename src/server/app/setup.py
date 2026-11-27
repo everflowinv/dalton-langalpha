@@ -173,6 +173,8 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # Copies what Home's stand-in wrote into Home once Home's computer is
     # back; a per-user advisory lock and a guarded watermark dedup it.
     ("HomeHandbackSweeper", "src.server.services.home_handback"),
+    # DALTON-HOOK(deployment-credentials): scrub legacy dedicated Feishu keys from running sandboxes' vault files.
+    ("SandboxFeishuVaultScrubber", "src.dalton.deployment_credentials.sandbox_scrub"),
 )
 
 

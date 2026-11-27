@@ -1256,14 +1256,44 @@ def get_dalton_transcription_ticket_hmac_key() -> bytes | None:
     ).digest()
 
 
+SERVER_ONLY_CREDENTIAL_ENV_NAMES: frozenset[str] = frozenset(
+    {
+        "INTERNAL_SERVICE_TOKEN",
+        "DALTON_BRIDGE_ADMIN_TOKEN",
+        "DALTON_GOOGLE_OAUTH_CLIENT_SECRET",
+        "DALTON_FEISHU_APP_SECRET",
+        "DALTON_FEISHU_ENCRYPT_KEY",
+        "DALTON_FEISHU_VERIFICATION_TOKEN",
+        "DALTON_DISCORD_BOT_TOKEN",
+        "AUTOMATION_WEBHOOK_SECRET",
+        "PLUGIN_MARKETPLACE_TOKEN",
+        "APNS_PRIVATE_KEY",
+        "BYOK_ENCRYPTION_KEY",
+        "JWT_SIGNING_SECRET",
+        "BOOTSTRAP_SETUP_TOKEN",
+    }
+)
+
+SERVER_ONLY_SECRET_MIN_SUBSTRING_LEN: int = 16
+
+
+def is_server_only_credential_env_name(name: str) -> bool:
+    """Return True when ``name`` matches a server-only credential env var."""
+    if not isinstance(name, str):
+        return False
+    return name.strip() in SERVER_ONLY_CREDENTIAL_ENV_NAMES
+
+
 def managed_secret_token_values() -> tuple[str, ...]:
-    """Non-empty values of the management tokens and deployment secrets that must never leak.
+    """Non-empty values of the management tokens and server-only secrets that must never leak.
 
     Includes ``DALTON_BRIDGE_ADMIN_TOKEN``, ``INTERNAL_SERVICE_TOKEN``,
     ``DALTON_TRANSCRIPTION_TICKET_SECRET``, ``DALTON_TRANSCRIPTION_TOKEN``,
-    ``DALTON_RESEARCH_ADMIN_TOKEN``, and active Batch 1 deployment credential secrets
+    ``DALTON_RESEARCH_ADMIN_TOKEN``, active Batch 1 deployment credential secrets
     meeting ``MIN_REDACT_SECRET_LEN`` (environment, saved snapshot, and Vault fallback
-    via ``active_deployment_secret_values``) so short values stay out of substring filters.
+    via ``active_deployment_secret_values``), and remaining configured values in
+    ``SERVER_ONLY_CREDENTIAL_ENV_NAMES`` meeting ``SERVER_ONLY_SECRET_MIN_SUBSTRING_LEN``
+    so short values stay out of substring filters.
     """
     values: list[str] = []
     seen: set[str] = set()
@@ -1287,6 +1317,11 @@ def managed_secret_token_values() -> tuple[str, ...]:
                 values.append(raw)
     except Exception:
         pass
+    for env_name in sorted(SERVER_ONLY_CREDENTIAL_ENV_NAMES):
+        raw = os.getenv(env_name, "").strip()
+        if len(raw) >= SERVER_ONLY_SECRET_MIN_SUBSTRING_LEN and raw not in seen:
+            seen.add(raw)
+            values.append(raw)
     return tuple(values)
 
 
@@ -1374,17 +1409,15 @@ def sanitize_sandbox_env_vars(
     env_vars: dict[str, str],
     servers: Any = None,
 ) -> dict[str, str]:
-    """Strip any sandbox environment variable whose key or value contains a
-    management token (``DALTON_BRIDGE_ADMIN_TOKEN`` or, by value whatever the
-    key names it, ``INTERNAL_SERVICE_TOKEN``) and mark any MCP server carrying
-    one as unavailable (``enabled = False``). Each token is checked only when
-    set in the environment.
+    """Strip server-only credential env vars by key name and scrub any sandbox
+    environment variable whose key or value contains a managed secret token,
+    marking any MCP server carrying one as unavailable (``enabled = False``).
     """
     tokens = managed_secret_token_values()
-    if not tokens:
-        return env_vars
 
     def _leaks(text: Any) -> bool:
+        if not tokens:
+            return False
         s = str(text)
         return any(t in s for t in tokens)
 
@@ -1392,20 +1425,16 @@ def sanitize_sandbox_env_vars(
         for server in servers:
             srv_name = getattr(server, "name", None) or "<unknown>"
             leaked = False
-            srv_url = getattr(server, "url", None)
-            if isinstance(srv_url, str) and _leaks(srv_url):
-                leaked = True
-            srv_cmd = getattr(server, "command", None)
-            if isinstance(srv_cmd, str) and _leaks(srv_cmd):
-                leaked = True
-            for arg_val in getattr(server, "args", None) or ():
-                if _leaks(arg_val):
-                    leaked = True
-            for hk, hv in (getattr(server, "headers", None) or {}).items():
-                if _leaks(hk) or _leaks(hv):
-                    leaked = True
             for ek, ev in (getattr(server, "env", None) or {}).items():
-                if _leaks(ek) or _leaks(ev):
+                if is_server_only_credential_env_name(str(ek)):
+                    leaked = True
+                    env_vars.pop(str(ek), None)
+                    logger.warning(
+                        "Removed server-only credential env var and marked server unavailable: server=%s item=env.%s",
+                        srv_name,
+                        ek,
+                    )
+                elif _leaks(ek) or _leaks(ev):
                     leaked = True
                     env_vars.pop(str(ek), None)
                     logger.warning(
@@ -1413,6 +1442,19 @@ def sanitize_sandbox_env_vars(
                         srv_name,
                         ek,
                     )
+            if tokens:
+                srv_url = getattr(server, "url", None)
+                if isinstance(srv_url, str) and _leaks(srv_url):
+                    leaked = True
+                srv_cmd = getattr(server, "command", None)
+                if isinstance(srv_cmd, str) and _leaks(srv_cmd):
+                    leaked = True
+                for arg_val in getattr(server, "args", None) or ():
+                    if _leaks(arg_val):
+                        leaked = True
+                for hk, hv in (getattr(server, "headers", None) or {}).items():
+                    if _leaks(hk) or _leaks(hv):
+                        leaked = True
             if leaked:
                 try:
                     server.enabled = False
@@ -1420,7 +1462,13 @@ def sanitize_sandbox_env_vars(
                     pass
 
     for k, v in list(env_vars.items()):
-        if _leaks(k) or _leaks(v):
+        if is_server_only_credential_env_name(str(k)):
+            env_vars.pop(k, None)
+            logger.warning(
+                "Removed server-only credential env var from sandbox env: item=%s",
+                k,
+            )
+        elif _leaks(k) or _leaks(v):
             env_vars.pop(k, None)
             logger.warning(
                 "Removed sandbox env var containing a management token: item=%s",

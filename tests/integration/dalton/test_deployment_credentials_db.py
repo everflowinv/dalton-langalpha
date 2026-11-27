@@ -19,6 +19,7 @@ import psycopg
 import pytest
 from psycopg import errors as pg_errors
 
+from src.dalton.deployment_credentials import sandbox_scrub_store as dc_scrub_store
 from src.dalton.deployment_credentials import snapshot as dc_snapshot
 from src.dalton.deployment_credentials import store as dc_store
 from src.dalton.deployment_credentials.store import (
@@ -32,7 +33,7 @@ from src.server.services.setup_settings import follow as setup_follow
 from tests.integration.dalton._db_guard import extract_effective_test_db_name
 
 # Loaded before patched_get_db_connection sweeps sys.modules so store uses test_db_pool.
-_POOL_HOLDERS = (dc_store,)
+_POOL_HOLDERS = (dc_store, dc_scrub_store)
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="session")]
 
@@ -363,3 +364,110 @@ async def test_corrupt_ciphertext_savepoint_isolation_and_incomplete_pair_drop(
     assert rows["DALTON_FEISHU_APP_ID"] == "f-good-id"
     assert rows["DALTON_FEISHU_APP_SECRET"] == "test-secret-not-real-good-f"
     assert rows["DALTON_FEISHU_VERIFICATION_TOKEN"] == "test-secret-not-real-good-vt"
+
+
+async def test_sandbox_feishu_vault_scrub_store_transitions_concurrency_and_ref_change(
+    dalton_schema,
+    patched_get_db_connection,
+    test_db_uri: str,
+) -> None:
+    """Verify dalton_sandbox_feishu_vault_scrub transitions, concurrent attempt_count, and provider_ref re-list."""
+    import uuid
+
+    extract_effective_test_db_name(test_db_uri, source="test_db_uri")
+    user_id = f"scrub-db-user-{uuid.uuid4().hex[:8]}"
+    cid_running = str(uuid.uuid4())
+    cid_stopped = str(uuid.uuid4())
+
+    async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as conn:
+        await conn.execute(
+            "INSERT INTO users (user_id, name) VALUES (%s, %s)",
+            (user_id, user_id),
+        )
+        await conn.execute(
+            "INSERT INTO computers (computer_id, user_id, kind, status, provider_ref, root_dir) "
+            "VALUES (%s::uuid, %s, 'docker', 'running', 'sb-scrub-1', '/home/workspace')",
+            (cid_running, user_id),
+        )
+        await conn.execute(
+            "INSERT INTO computers (computer_id, user_id, kind, status, provider_ref, root_dir) "
+            "VALUES (%s::uuid, %s, 'docker', 'stopped', 'sb-scrub-stopped-1', '/home/workspace')",
+            (cid_stopped, user_id),
+        )
+
+    try:
+        # 1. Non-running computer is listed and marked deferred_stopped.
+        non_running = await dc_scrub_store.list_non_running_uncleaned_computer_ids()
+        assert cid_stopped in non_running
+        assert cid_running not in non_running
+
+        marked = await dc_scrub_store.mark_deferred_stopped([cid_stopped])
+        assert marked == 1
+        st_stopped = await dc_scrub_store.get_scrub_state(cid_stopped)
+        assert st_stopped is not None
+        assert st_stopped["status"] == "deferred_stopped"
+        assert st_stopped["attempt_count"] == 0
+
+        # 2. Running uncleaned computer is returned by list_running_uncleaned.
+        running_rows = await dc_scrub_store.list_running_uncleaned(limit=50)
+        assert any(r["computer_id"] == cid_running for r in running_rows)
+        assert all(r["computer_id"] != cid_stopped for r in running_rows)
+
+        # 3. Two concurrent mark_failed calls increment attempt_count atomically in SQL.
+        await asyncio.gather(
+            dc_scrub_store.mark_failed(cid_running, "sb-scrub-1", "TimeoutError"),
+            dc_scrub_store.mark_failed(cid_running, "sb-scrub-1", "ConnectionError"),
+        )
+        st_failed = await dc_scrub_store.get_scrub_state(cid_running)
+        assert st_failed is not None
+        assert st_failed["status"] == "failed"
+        assert st_failed["attempt_count"] == 2
+        assert st_failed["last_error"] in ("TimeoutError", "ConnectionError")
+        assert st_failed["cleaned_at"] is None
+
+        # Still listed while status='failed'.
+        running_after_fail = await dc_scrub_store.list_running_uncleaned(limit=50)
+        assert any(r["computer_id"] == cid_running for r in running_after_fail)
+
+        # 4. Transition failed -> cleaned excludes the computer for matching provider_ref.
+        await dc_scrub_store.mark_cleaned(cid_running, "sb-scrub-1")
+        st_clean = await dc_scrub_store.get_scrub_state(cid_running)
+        assert st_clean is not None
+        assert st_clean["status"] == "cleaned"
+        assert st_clean["attempt_count"] == 3
+        assert st_clean["last_error"] is None
+        assert st_clean["cleaned_at"] is not None
+
+        running_after_clean = await dc_scrub_store.list_running_uncleaned(limit=50)
+        assert all(r["computer_id"] != cid_running for r in running_after_clean)
+
+        # 5. Changing computers.provider_ref causes list_running_uncleaned to re-list it.
+        async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as conn:
+            await conn.execute(
+                "UPDATE computers SET provider_ref = 'sb-scrub-2' WHERE computer_id = %s::uuid",
+                (cid_running,),
+            )
+        running_after_recreate = await dc_scrub_store.list_running_uncleaned(limit=50)
+        matched = [r for r in running_after_recreate if r["computer_id"] == cid_running]
+        assert len(matched) == 1
+        assert matched[0]["provider_ref"] == "sb-scrub-2"
+
+        # Transition deferred_stopped -> failed -> cleaned on cid_stopped.
+        await dc_scrub_store.mark_failed(cid_stopped, "sb-scrub-stopped-1", "VaultScrubIOError")
+        await dc_scrub_store.mark_cleaned(cid_stopped, "sb-scrub-stopped-1")
+        st_stopped_clean = await dc_scrub_store.get_scrub_state(cid_stopped)
+        assert st_stopped_clean is not None
+        assert st_stopped_clean["status"] == "cleaned"
+        assert st_stopped_clean["attempt_count"] == 2
+        assert st_stopped_clean["last_error"] is None
+    finally:
+        async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as conn:
+            await conn.execute(
+                "DELETE FROM dalton_sandbox_feishu_vault_scrub WHERE computer_id = ANY(%s::uuid[])",
+                ([cid_running, cid_stopped],),
+            )
+            await conn.execute(
+                "DELETE FROM computers WHERE computer_id = ANY(%s::uuid[])",
+                ([cid_running, cid_stopped],),
+            )
+            await conn.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
