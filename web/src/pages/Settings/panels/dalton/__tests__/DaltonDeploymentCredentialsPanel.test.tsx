@@ -583,10 +583,14 @@ describe('DaltonDeploymentCredentialsPanel', () => {
     });
     fireEvent.click(screen.getByTestId('test-google-oauth-btn'));
     await screen.findByTestId('google-oauth-probe-result');
-    expect(mocks.testMock).toHaveBeenCalledWith('google_oauth', {
-      DALTON_GOOGLE_OAUTH_CLIENT_ID: 'google-client-id-1',
-      DALTON_GOOGLE_OAUTH_CLIENT_SECRET: null,
-    });
+    expect(mocks.testMock).toHaveBeenCalledWith(
+      'google_oauth',
+      {
+        DALTON_GOOGLE_OAUTH_CLIENT_ID: 'google-client-id-1',
+        DALTON_GOOGLE_OAUTH_CLIENT_SECRET: null,
+      },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
 
     // 2) 409 revision_conflict & 409 env_locked
     mocks.updateMock.mockRejectedValueOnce(
@@ -620,10 +624,14 @@ describe('DaltonDeploymentCredentialsPanel', () => {
     fireEvent.click(screen.getByTestId('test-google-oauth-btn'));
     const probeOk = await screen.findByTestId('google-oauth-probe-result');
     expect(probeOk.textContent).toContain('凭据有效');
-    expect(mocks.testMock).toHaveBeenLastCalledWith('google_oauth', {
-      DALTON_GOOGLE_OAUTH_CLIENT_ID: 'google-client-id-1',
-      DALTON_GOOGLE_OAUTH_CLIENT_SECRET: 'test-secret-not-real-google-0001',
-    });
+    expect(mocks.testMock).toHaveBeenLastCalledWith(
+      'google_oauth',
+      {
+        DALTON_GOOGLE_OAUTH_CLIENT_ID: 'google-client-id-1',
+        DALTON_GOOGLE_OAUTH_CLIENT_SECRET: 'test-secret-not-real-google-0001',
+      },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
 
     fireEvent.change(screen.getByTestId('input-google-client-id'), {
       target: { value: 'google-client-id-2' },
@@ -667,5 +675,150 @@ describe('DaltonDeploymentCredentialsPanel', () => {
     expect(parsedTimeout.isTimeout).toBe(true);
     expect(parsedTimeout.isNetworkError).toBe(false);
     expect(PROBE_REQUEST_TIMEOUT_MS).toBeGreaterThanOrEqual(10_000);
+  });
+
+  it('locks group inputs while probing and discards late probe responses after draft change or refresh', async () => {
+    await i18n.changeLanguage('zh-CN');
+    mocks.fetchMock
+      .mockResolvedValueOnce(makeResponse({ revision: 5 }))
+      .mockResolvedValueOnce(makeResponse({ revision: 5 }));
+
+    renderPanel();
+    await screen.findByTestId('google-oauth-card');
+
+    const googleIdInput = screen.getByTestId('input-google-client-id');
+    const googleSecretInput = screen.getByTestId('input-google-client-secret');
+    const feishuIdInput = screen.getByTestId('input-feishu-app-id');
+    const feishuSecretInput = screen.getByTestId('input-feishu-app-secret');
+
+    fireEvent.change(googleIdInput, { target: { value: 'google-client-id-live' } });
+    fireEvent.change(googleSecretInput, { target: { value: 'test-secret-not-real-0001' } });
+
+    let resolveGoogleProbe!: (value: Awaited<ReturnType<typeof testDeploymentCredentials>>) => void;
+    let googleProbeSignal: AbortSignal | undefined;
+    mocks.testMock.mockImplementationOnce(
+      (_target, _values, opts) =>
+        new Promise((resolve) => {
+          googleProbeSignal = opts?.signal;
+          resolveGoogleProbe = resolve;
+        }),
+    );
+
+    fireEvent.click(screen.getByTestId('test-google-oauth-btn'));
+
+    // While probing Google OAuth, Google inputs & save button are locked; Feishu inputs remain editable
+    expect(googleIdInput).toBeDisabled();
+    expect(googleSecretInput).toBeDisabled();
+    expect(screen.getByTestId('save-google-oauth-btn')).toBeDisabled();
+    expect(screen.getByTestId('test-google-oauth-btn')).toBeDisabled();
+    expect(screen.getByTestId('test-feishu-app-btn')).toBeDisabled();
+    expect(feishuIdInput).not.toBeDisabled();
+
+    // Even if a draft change fires while the request is in flight, the probe epoch advances and aborts the flight
+    fireEvent.change(googleSecretInput, { target: { value: 'test-secret-not-real-0002' } });
+    expect(googleProbeSignal?.aborted).toBe(true);
+    expect(googleIdInput).not.toBeDisabled();
+
+    // Late resolution from the superseded probe is discarded instead of stamping "凭据有效" onto the new draft
+    resolveGoogleProbe({
+      ok: true,
+      network_reachable: true,
+      credentials_valid: true,
+      verdict: 'valid',
+      detail_code: 'invalid_grant_verified',
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(screen.queryByTestId('google-oauth-probe-result')).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain('test-secret-not-real-0001');
+    expect(document.body.textContent).not.toContain('test-secret-not-real-0002');
+
+    // Feishu app probe locks Feishu inputs and discards late response when Refresh is clicked in flight
+    fireEvent.change(feishuIdInput, { target: { value: 'cli_probe_lock_001' } });
+    fireEvent.change(feishuSecretInput, { target: { value: 'test-secret-not-real-0003' } });
+
+    let resolveFeishuProbe!: (value: Awaited<ReturnType<typeof testDeploymentCredentials>>) => void;
+    let feishuProbeSignal: AbortSignal | undefined;
+    mocks.testMock.mockImplementationOnce(
+      (_target, _values, opts) =>
+        new Promise((resolve) => {
+          feishuProbeSignal = opts?.signal;
+          resolveFeishuProbe = resolve;
+        }),
+    );
+
+    fireEvent.click(screen.getByTestId('test-feishu-app-btn'));
+    expect(feishuIdInput).toBeDisabled();
+    expect(feishuSecretInput).toBeDisabled();
+    expect(screen.getByTestId('save-feishu-app-btn')).toBeDisabled();
+
+    fireEvent.click(screen.getByTestId('deployment-credentials-refresh'));
+    expect(feishuProbeSignal?.aborted).toBe(true);
+
+    resolveFeishuProbe({
+      ok: true,
+      network_reachable: true,
+      credentials_valid: true,
+      verdict: 'valid',
+      detail_code: 'feishu_token_ok',
+    });
+    await waitFor(() => {
+      expect(mocks.fetchMock).toHaveBeenCalledTimes(2);
+    });
+    expect(screen.queryByTestId('feishu-app-probe-result')).not.toBeInTheDocument();
+    expect(feishuIdInput).not.toBeDisabled();
+  });
+
+  it('clears prior green probe verdict after same-revision Vault refresh and displays accurate Feishu events URL guidance', async () => {
+    await i18n.changeLanguage('zh-CN');
+    const vaultResp = makeResponse({
+      revision: 7,
+      fields: makeBaseFields({
+        DALTON_FEISHU_APP_ID: {
+          source: 'vault_readonly',
+          readonly: true,
+          configured: true,
+          value: 'cli_vault_same_rev_001',
+        },
+        DALTON_FEISHU_APP_SECRET: {
+          source: 'vault_readonly',
+          readonly: true,
+          configured: true,
+        },
+      }),
+    });
+    // Both initial load and post-Vault-rotation refresh return the same deployment revision v7
+    mocks.fetchMock.mockResolvedValueOnce(vaultResp).mockResolvedValueOnce({ ...vaultResp });
+    mocks.testMock.mockResolvedValueOnce({
+      ok: true,
+      network_reachable: true,
+      credentials_valid: true,
+      verdict: 'valid',
+      detail_code: 'feishu_token_ok',
+    });
+
+    renderPanel();
+    await screen.findByTestId('feishu-credentials-card');
+
+    // Bilingual guidance tells admins to register the Events URL only after event subscriptions launch
+    const zhHint = screen.getByTestId('feishu-callback-availability-hint');
+    expect(zhHint.textContent).toContain('事件订阅上线后');
+    expect(zhHint.textContent).toContain('保存事件验签凭据');
+
+    await i18n.changeLanguage('en-US');
+    const enHint = await screen.findByTestId('feishu-callback-availability-hint');
+    expect(enHint.textContent).toContain('after event subscriptions go live');
+
+    await i18n.changeLanguage('zh-CN');
+    fireEvent.click(screen.getByTestId('test-feishu-app-btn'));
+    const greenBadge = await screen.findByTestId('feishu-app-probe-result');
+    expect(greenBadge.textContent).toContain('凭据有效');
+
+    // Vault key rotated out-of-band without incrementing deployment revision -> Refresh must clear old green badge
+    fireEvent.click(screen.getByTestId('deployment-credentials-refresh'));
+    await waitFor(() => {
+      expect(mocks.fetchMock).toHaveBeenCalledTimes(2);
+    });
+    expect(screen.queryByTestId('feishu-app-probe-result')).not.toBeInTheDocument();
   });
 });

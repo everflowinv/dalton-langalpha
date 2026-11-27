@@ -840,6 +840,7 @@ for (const [label, text] of [['core', coreOut], ['everflow', efOut]]) {
     'Public Suffix',
     'http://localhost',
     'DALTON_AUTH_MODE=local',
+    '事件订阅上线后再登记请求地址',
   ]) {
     if (!text.includes(required)) {
       throw new Error(`${label} admin-integrations.mdx missing required content: ${required}`);

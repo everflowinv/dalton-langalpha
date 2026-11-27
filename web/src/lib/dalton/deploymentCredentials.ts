@@ -109,15 +109,71 @@ export async function testDeploymentCredentials(
   values: Record<string, string | null> = {},
   options: { timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<DeploymentCredentialProbeResponse> {
-  const { data } = await api.post<DeploymentCredentialProbeResponse>(
+  const timeoutMs = options.timeoutMs ?? PROBE_REQUEST_TIMEOUT_MS;
+  const ctrl = new AbortController();
+  const callerSignal = options.signal;
+  let timedOut = false;
+
+  const onCallerAbort = () => ctrl.abort();
+  if (callerSignal?.aborted) {
+    ctrl.abort();
+  } else {
+    callerSignal?.addEventListener('abort', onCallerAbort, { once: true });
+  }
+
+  if (ctrl.signal.aborted) {
+    callerSignal?.removeEventListener('abort', onCallerAbort);
+    throw new ApiError('canceled', 'ERR_CANCELED');
+  }
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  // Enforce a single end-to-end budget from click across token lookup, HTTP send, 401 refresh, and replay.
+  const abortPromise = new Promise<never>((_resolve, reject) => {
+    ctrl.signal.addEventListener(
+      'abort',
+      () => {
+        reject(
+          timedOut
+            ? new ApiError(`timeout of ${timeoutMs}ms exceeded`, 'ECONNABORTED')
+            : new ApiError('canceled', 'ERR_CANCELED'),
+        );
+      },
+      { once: true },
+    );
+  });
+
+  if (timeoutMs > 0) {
+    timer = setTimeout(() => {
+      timedOut = true;
+      ctrl.abort();
+    }, timeoutMs);
+  }
+
+  // Share the abort controller so `api.post` cancels active HTTP sends and suppresses late 401 replays.
+  const requestPromise = api.post<DeploymentCredentialProbeResponse>(
     `${DEPLOYMENT_SETTINGS_ENDPOINT}/test`,
     { target, values },
     {
-      timeout: options.timeoutMs ?? PROBE_REQUEST_TIMEOUT_MS,
-      signal: options.signal,
+      timeout: timeoutMs,
+      signal: ctrl.signal,
     },
   );
-  return data;
+  // Absorb late rejections from an abandoned auth refresh once the total deadline has settled the caller.
+  requestPromise.catch(() => undefined);
+
+  try {
+    const { data } = await Promise.race([requestPromise, abortPromise]);
+    return data;
+  } catch (err) {
+    if (timedOut) {
+      throw new ApiError(`timeout of ${timeoutMs}ms exceeded`, 'ECONNABORTED');
+    }
+    throw err;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    callerSignal?.removeEventListener('abort', onCallerAbort);
+  }
 }
 
 /** Extract structured error codes from a failed deployment settings API call without leaking input values. */

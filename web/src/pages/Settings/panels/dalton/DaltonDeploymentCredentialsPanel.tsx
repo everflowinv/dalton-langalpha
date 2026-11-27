@@ -1,4 +1,4 @@
-import { useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Check, Copy, ExternalLink, FlaskConical, ShieldAlert } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -484,13 +484,6 @@ export default function DaltonDeploymentCredentialsPanel() {
   const canFetchSettings =
     !isOssMode && identity.status === 'ready' && identity.isAdmin;
 
-  const settingsQuery = useQuery<DeploymentSettingsResponse>({
-    queryKey: queryKeys.dalton.deploymentSettings(),
-    queryFn: fetchDeploymentSettings,
-    enabled: canFetchSettings,
-    retry: false,
-  });
-
   // Draft values keyed by env name (inputs always stay unprefilled; drafts hold only user edits).
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   // Each edited group records the revision active when editing began so concurrent saves never bypass 409.
@@ -503,12 +496,75 @@ export default function DaltonDeploymentCredentialsPanel() {
     showRefresh?: boolean;
   } | null>(null);
   const [probeResults, setProbeResults] = useState<
-    Partial<Record<ProbeTarget, { revision: number; result: DeploymentCredentialProbeResponse }>>
+    Partial<
+      Record<
+        ProbeTarget,
+        { revision: number; snapshotSeq: number; result: DeploymentCredentialProbeResponse }
+      >
+    >
   >({});
   const [probeErrors, setProbeErrors] = useState<
-    Partial<Record<ProbeTarget, { revision: number; text: string }>>
+    Partial<Record<ProbeTarget, { revision: number; snapshotSeq: number; text: string }>>
   >({});
   const [probingTarget, setProbingTarget] = useState<ProbeTarget | null>(null);
+  // Monotonic per-group epoch ensures any edit, discard, rebase, or refresh supersedes in-flight probes.
+  const probeEpochRef = useRef<Record<ProbeTarget, number>>({
+    google_oauth: 0,
+    feishu_app: 0,
+  });
+  const probeAbortRef = useRef<Partial<Record<ProbeTarget, AbortController>>>({});
+  // Monotonic fetch sequence expires prior probe verdicts on every refresh even when server revision is unchanged (e.g. Vault rotation).
+  const snapshotSeqRef = useRef(0);
+  const [snapshotSeq, setSnapshotSeq] = useState(0);
+
+  const invalidateProbeForGroup = (group: EditableGroup) => {
+    if (group !== 'google_oauth' && group !== 'feishu_app') return;
+    probeEpochRef.current[group] += 1;
+    const activeController = probeAbortRef.current[group];
+    if (activeController) {
+      delete probeAbortRef.current[group];
+      activeController.abort();
+    }
+    setProbingTarget((cur) => (cur === group ? null : cur));
+    setProbeResults((prev) => {
+      if (!prev[group]) return prev;
+      const next = { ...prev };
+      delete next[group];
+      return next;
+    });
+    setProbeErrors((prev) => {
+      if (!prev[group]) return prev;
+      const next = { ...prev };
+      delete next[group];
+      return next;
+    });
+  };
+
+  const invalidateAllProbes = () => {
+    invalidateProbeForGroup('google_oauth');
+    invalidateProbeForGroup('feishu_app');
+  };
+
+  useEffect(() => {
+    const activeProbes = probeAbortRef.current;
+    return () => {
+      activeProbes.google_oauth?.abort();
+      activeProbes.feishu_app?.abort();
+    };
+  }, []);
+
+  const settingsQuery = useQuery<DeploymentSettingsResponse>({
+    queryKey: queryKeys.dalton.deploymentSettings(),
+    queryFn: async () => {
+      const res = await fetchDeploymentSettings();
+      snapshotSeqRef.current += 1;
+      setSnapshotSeq(snapshotSeqRef.current);
+      invalidateAllProbes();
+      return res;
+    },
+    enabled: canFetchSettings,
+    retry: false,
+  });
 
   const saveMutation = useMutation({
     mutationFn: (payload: Parameters<typeof updateDeploymentSettings>[0]) =>
@@ -532,6 +588,9 @@ export default function DaltonDeploymentCredentialsPanel() {
           }
           return next;
         });
+        for (const grp of touchedGroups) {
+          invalidateProbeForGroup(grp);
+        }
       }
       if (res.pending_apply) {
         setStatusNotice({
@@ -632,23 +691,6 @@ export default function DaltonDeploymentCredentialsPanel() {
 
   const getDraftValue = (name: string): string => drafts[name] ?? '';
 
-  const clearProbeStateForGroup = (group: EditableGroup) => {
-    if (group === 'google_oauth' || group === 'feishu_app') {
-      setProbeResults((prev) => {
-        if (!prev[group]) return prev;
-        const next = { ...prev };
-        delete next[group];
-        return next;
-      });
-      setProbeErrors((prev) => {
-        if (!prev[group]) return prev;
-        const next = { ...prev };
-        delete next[group];
-        return next;
-      });
-    }
-  };
-
   const setDraft = (name: string, val: string) => {
     const group = FIELD_TO_GROUP[name];
     setDrafts((prev) => ({ ...prev, [name]: val }));
@@ -656,7 +698,7 @@ export default function DaltonDeploymentCredentialsPanel() {
       setDraftBaseRevisions((prev) =>
         prev[group] === undefined ? { ...prev, [group]: data.revision } : prev,
       );
-      clearProbeStateForGroup(group);
+      invalidateProbeForGroup(group);
     }
   };
 
@@ -678,12 +720,12 @@ export default function DaltonDeploymentCredentialsPanel() {
       delete next[group];
       return next;
     });
-    clearProbeStateForGroup(group);
+    invalidateProbeForGroup(group);
   };
 
   const rebaselineGroupDraft = (group: EditableGroup) => {
     setDraftBaseRevisions((prev) => ({ ...prev, [group]: data.revision }));
-    clearProbeStateForGroup(group);
+    invalidateProbeForGroup(group);
   };
 
   const googleDraftStale = isGroupDraftStale('google_oauth');
@@ -707,7 +749,7 @@ export default function DaltonDeploymentCredentialsPanel() {
 
   const handleClearGoogle = () => {
     setStatusNotice(null);
-    clearProbeStateForGroup('google_oauth');
+    invalidateProbeForGroup('google_oauth');
     saveMutation.mutate({
       expected_revision: draftBaseRevisions.google_oauth ?? data.revision,
       values: { [GOOGLE_ID_KEY]: null, [GOOGLE_SECRET_KEY]: null },
@@ -731,7 +773,7 @@ export default function DaltonDeploymentCredentialsPanel() {
 
   const handleClearFeishuApp = () => {
     setStatusNotice(null);
-    clearProbeStateForGroup('feishu_app');
+    invalidateProbeForGroup('feishu_app');
     saveMutation.mutate({
       expected_revision: draftBaseRevisions.feishu_app ?? data.revision,
       values: { [FEISHU_APP_ID_KEY]: null, [FEISHU_APP_SECRET_KEY]: null },
@@ -762,8 +804,32 @@ export default function DaltonDeploymentCredentialsPanel() {
 
   const handleRunProbe = async (target: ProbeTarget) => {
     const requestRevision = data.revision;
+    const requestSnapshotSeq = snapshotSeqRef.current;
+    // Stamp each probe with a monotonic group epoch so stale results after edits, discards, or refreshes are ignored.
+    const runEpoch = probeEpochRef.current[target] + 1;
+    probeEpochRef.current[target] = runEpoch;
+    probeAbortRef.current[target]?.abort();
+    const controller = new AbortController();
+    probeAbortRef.current[target] = controller;
+
     setProbingTarget(target);
-    clearProbeStateForGroup(target);
+    setProbeResults((prev) => {
+      if (!prev[target]) return prev;
+      const next = { ...prev };
+      delete next[target];
+      return next;
+    });
+    setProbeErrors((prev) => {
+      if (!prev[target]) return prev;
+      const next = { ...prev };
+      delete next[target];
+      return next;
+    });
+
+    const isCurrentProbe = () =>
+      probeEpochRef.current[target] === runEpoch &&
+      snapshotSeqRef.current === requestSnapshotSeq;
+
     try {
       const probePayload =
         target === 'google_oauth'
@@ -781,22 +847,36 @@ export default function DaltonDeploymentCredentialsPanel() {
               feishuSecretField,
               drafts,
             );
-      const res = await testDeploymentCredentials(target, probePayload);
+      const res = await testDeploymentCredentials(target, probePayload, {
+        signal: controller.signal,
+      });
+      if (!isCurrentProbe()) return;
       setProbeResults((prev) => ({
         ...prev,
-        [target]: { revision: requestRevision, result: res },
+        [target]: {
+          revision: requestRevision,
+          snapshotSeq: requestSnapshotSeq,
+          result: res,
+        },
       }));
     } catch (err) {
+      if (!isCurrentProbe()) return;
       const parsed = parseDeploymentSettingsError(err);
       setProbeErrors((prev) => ({
         ...prev,
         [target]: {
           revision: requestRevision,
+          snapshotSeq: requestSnapshotSeq,
           text: formatProbeErrorMessage(parsed, t),
         },
       }));
     } finally {
-      setProbingTarget(null);
+      if (probeAbortRef.current[target] === controller) {
+        delete probeAbortRef.current[target];
+      }
+      if (probeEpochRef.current[target] === runEpoch) {
+        setProbingTarget((cur) => (cur === target ? null : cur));
+      }
     }
   };
 
@@ -825,21 +905,27 @@ export default function DaltonDeploymentCredentialsPanel() {
   };
 
   const isZh = i18n.language.startsWith('zh');
-  // Probe outputs automatically expire whenever the server revision advances.
+  const googleProbing = probingTarget === 'google_oauth';
+  const feishuAppProbing = probingTarget === 'feishu_app';
+  // Probe outputs expire whenever the server revision advances or a fresh settings snapshot is fetched.
   const googleProbe =
-    probeResults.google_oauth?.revision === data.revision
+    probeResults.google_oauth?.revision === data.revision &&
+    probeResults.google_oauth?.snapshotSeq === snapshotSeq
       ? probeResults.google_oauth.result
       : undefined;
   const googleProbeError =
-    probeErrors.google_oauth?.revision === data.revision
+    probeErrors.google_oauth?.revision === data.revision &&
+    probeErrors.google_oauth?.snapshotSeq === snapshotSeq
       ? probeErrors.google_oauth.text
       : undefined;
   const feishuProbe =
-    probeResults.feishu_app?.revision === data.revision
+    probeResults.feishu_app?.revision === data.revision &&
+    probeResults.feishu_app?.snapshotSeq === snapshotSeq
       ? probeResults.feishu_app.result
       : undefined;
   const feishuProbeError =
-    probeErrors.feishu_app?.revision === data.revision
+    probeErrors.feishu_app?.revision === data.revision &&
+    probeErrors.feishu_app?.snapshotSeq === snapshotSeq
       ? probeErrors.feishu_app.text
       : undefined;
 
@@ -904,6 +990,7 @@ export default function DaltonDeploymentCredentialsPanel() {
             <DaltonRefreshButton
               onClick={() => {
                 setStatusNotice(null);
+                invalidateAllProbes();
                 void settingsQuery.refetch();
               }}
               busy={settingsQuery.isFetching}
@@ -948,6 +1035,7 @@ export default function DaltonDeploymentCredentialsPanel() {
                     className="h-7 text-xs"
                     onClick={() => {
                       setStatusNotice(null);
+                      invalidateAllProbes();
                       void settingsQuery.refetch();
                     }}
                   >
@@ -1032,7 +1120,7 @@ export default function DaltonDeploymentCredentialsPanel() {
                 id={`${baseId}-google-id`}
                 type="text"
                 value={getDraftValue(GOOGLE_ID_KEY)}
-                disabled={googleReadonly || saveMutation.isPending}
+                disabled={googleReadonly || googleProbing || saveMutation.isPending}
                 onChange={(e) => setDraft(GOOGLE_ID_KEY, e.target.value)}
                 placeholder={resolveFieldPlaceholder(googleIdField, {
                   readonly: googleReadonly,
@@ -1063,7 +1151,7 @@ export default function DaltonDeploymentCredentialsPanel() {
                 id={`${baseId}-google-secret`}
                 type="password"
                 value={getDraftValue(GOOGLE_SECRET_KEY)}
-                disabled={googleReadonly || saveMutation.isPending}
+                disabled={googleReadonly || googleProbing || saveMutation.isPending}
                 onChange={(e) => setDraft(GOOGLE_SECRET_KEY, e.target.value)}
                 placeholder={resolveFieldPlaceholder(googleSecretField, {
                   readonly: googleReadonly,
@@ -1081,7 +1169,7 @@ export default function DaltonDeploymentCredentialsPanel() {
             <Button
               type="button"
               size="sm"
-              disabled={googleReadonly || googleDraftStale || saveMutation.isPending}
+              disabled={googleReadonly || googleDraftStale || googleProbing || saveMutation.isPending}
               onClick={handleSaveGoogle}
               data-testid="save-google-oauth-btn"
             >
@@ -1108,7 +1196,7 @@ export default function DaltonDeploymentCredentialsPanel() {
                 type="button"
                 variant="ghost"
                 size="sm"
-                disabled={googleDraftStale || saveMutation.isPending}
+                disabled={googleDraftStale || googleProbing || saveMutation.isPending}
                 onClick={handleClearGoogle}
                 data-testid="clear-google-oauth-btn"
               >
@@ -1214,7 +1302,7 @@ export default function DaltonDeploymentCredentialsPanel() {
                   id={`${baseId}-feishu-id`}
                   type="text"
                   value={getDraftValue(FEISHU_APP_ID_KEY)}
-                  disabled={feishuAppReadonly || saveMutation.isPending}
+                  disabled={feishuAppReadonly || feishuAppProbing || saveMutation.isPending}
                   onChange={(e) => setDraft(FEISHU_APP_ID_KEY, e.target.value)}
                   placeholder={resolveFieldPlaceholder(feishuIdField, {
                     readonly: feishuAppReadonly,
@@ -1245,7 +1333,7 @@ export default function DaltonDeploymentCredentialsPanel() {
                   id={`${baseId}-feishu-secret`}
                   type="password"
                   value={getDraftValue(FEISHU_APP_SECRET_KEY)}
-                  disabled={feishuAppReadonly || saveMutation.isPending}
+                  disabled={feishuAppReadonly || feishuAppProbing || saveMutation.isPending}
                   onChange={(e) => setDraft(FEISHU_APP_SECRET_KEY, e.target.value)}
                   placeholder={resolveFieldPlaceholder(feishuSecretField, {
                     readonly: feishuAppReadonly,
@@ -1263,7 +1351,12 @@ export default function DaltonDeploymentCredentialsPanel() {
               <Button
                 type="button"
                 size="sm"
-                disabled={feishuAppReadonly || feishuAppDraftStale || saveMutation.isPending}
+                disabled={
+                  feishuAppReadonly ||
+                  feishuAppDraftStale ||
+                  feishuAppProbing ||
+                  saveMutation.isPending
+                }
                 onClick={handleSaveFeishuApp}
                 data-testid="save-feishu-app-btn"
               >
@@ -1294,7 +1387,7 @@ export default function DaltonDeploymentCredentialsPanel() {
                   type="button"
                   variant="ghost"
                   size="sm"
-                  disabled={feishuAppDraftStale || saveMutation.isPending}
+                  disabled={feishuAppDraftStale || feishuAppProbing || saveMutation.isPending}
                   onClick={handleClearFeishuApp}
                   data-testid="clear-feishu-app-btn"
                 >

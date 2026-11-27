@@ -285,4 +285,30 @@ describe('localAuth HTTP client', () => {
     );
     expect(sseCalls).toHaveLength(1);
   });
+
+  it('aborts a hung localRefresh fetch once timeoutMs elapses', async () => {
+    vi.useFakeTimers();
+    try {
+      let capturedSignal: AbortSignal | undefined;
+      fetchMock.mockImplementationOnce(
+        (_url, init) =>
+          new Promise((_resolve, reject) => {
+            capturedSignal = init?.signal ?? undefined;
+            init?.signal?.addEventListener('abort', () =>
+              reject(new DOMException('aborted', 'AbortError')),
+            );
+          }),
+      );
+
+      const refreshPromise = localRefresh(true, { timeoutMs: 120 });
+      const settled = refreshPromise.catch((err) => err);
+      await vi.advanceTimersByTimeAsync(120);
+
+      const err = await settled;
+      expect(capturedSignal?.aborted).toBe(true);
+      expect(err).toBeInstanceOf(DOMException);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

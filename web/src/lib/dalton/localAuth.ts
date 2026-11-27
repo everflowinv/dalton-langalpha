@@ -140,23 +140,49 @@ export async function localLogin(
   return (await res.json()) as LocalLoginResponse;
 }
 
+/** Upper bound for a single local refresh request so a hung gateway cannot stall 401 retries indefinitely. */
+export const LOCAL_REFRESH_TIMEOUT_MS = 10_000;
+
 /**
  * Rotate the HttpOnly refresh cookie and return a fresh short-lived access token.
  * Returns `null` when the backend responds 401 (no active cookie or revoked session).
  * Retries once briefly if a sibling tab hit the concurrent refresh grace window (409).
  */
-export async function localRefresh(retryOnConflict = true): Promise<LocalRefreshResponse | null> {
-  const res = await fetch(`${baseURL}/api/v1/dalton/auth/local/refresh`, {
-    method: 'POST',
-    credentials: 'include',
-    headers: { Accept: 'application/json' },
-  });
+export async function localRefresh(
+  retryOnConflict = true,
+  options: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<LocalRefreshResponse | null> {
+  const timeoutMs = options.timeoutMs ?? LOCAL_REFRESH_TIMEOUT_MS;
+  const ctrl = new AbortController();
+  const externalSignal = options.signal;
+  const onExternalAbort = () => ctrl.abort();
+  if (externalSignal?.aborted) {
+    ctrl.abort();
+  } else {
+    externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
+  }
+  const timer = timeoutMs > 0 ? setTimeout(() => ctrl.abort(), timeoutMs) : undefined;
+  let res: Response;
+  try {
+    res = await fetch(`${baseURL}/api/v1/dalton/auth/local/refresh`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { Accept: 'application/json' },
+      signal: ctrl.signal,
+    });
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    externalSignal?.removeEventListener('abort', onExternalAbort);
+  }
   if (res.status === 401) {
     return null;
   }
   if (res.status === 409 && retryOnConflict) {
     await new Promise((resolve) => setTimeout(resolve, 150));
-    return localRefresh(false);
+    if (externalSignal?.aborted) {
+      throw new DOMException('aborted', 'AbortError');
+    }
+    return localRefresh(false, options);
   }
   if (!res.ok) {
     const detail = await readErrorMessage(res, `Session refresh failed (${res.status})`);

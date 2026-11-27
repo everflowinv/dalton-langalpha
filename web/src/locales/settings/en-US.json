@@ -608,7 +608,7 @@
       "vaultErrorPlaceholder": "—",
       "personalConnectorComingSoonBadge": "Personal connector coming soon",
       "googleCallbackComingSoonHint": "Pre-register the callback URL below in Google Cloud Console and verify/save client credentials now; member-side personal calendar and mail authorization will go live with the personal connector release.",
-      "feishuCallbackComingSoonHint": "Pre-register the callback and event URLs below in Feishu Open Platform and verify/save credentials now; member-side personal calendar authorization and event callbacks will go live with the personal connector release.",
+      "feishuCallbackComingSoonHint": "You can pre-register the OAuth Redirect URI below in Feishu Open Platform, save event verification keys, and test app credentials now; register the Event Subscription URL after event subscriptions go live, as Feishu immediately validates the endpoint upon saving.",
       "comingSoonBadge": "Coming soon",
       "switchGoogleCalendarLabel": "Google Personal Calendar & Mail",
       "switchGoogleCalendarDesc": "Personal calendar and mail connector is coming soon; administrators can save and verify Google client credentials above in advance.",

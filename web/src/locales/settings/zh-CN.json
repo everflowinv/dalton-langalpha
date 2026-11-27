@@ -690,7 +690,7 @@
       "vaultErrorPlaceholder": "—",
       "personalConnectorComingSoonBadge": "个人连接器即将推出",
       "googleCallbackComingSoonHint": "可先将下方回调地址预先登记到 Google Cloud Console 并完成凭据校验与保存；成员端个人日历与邮箱授权流程将随个人连接器模块上线。",
-      "feishuCallbackComingSoonHint": "可先将下方回调与事件地址预先登记到飞书开放平台并完成凭据校验与保存；成员端个人日历授权与事件回调将随个人连接器模块上线。",
+      "feishuCallbackComingSoonHint": "当前可先在飞书开放平台登记下方的授权回调地址（Redirect URI），并在本页保存事件验签凭据及测试应用双键；事件订阅请求地址（Events URL）会在保存时立即触发飞书连通校验，待事件订阅上线后再到飞书开放平台登记请求地址。",
       "comingSoonBadge": "即将推出",
       "switchGoogleCalendarLabel": "Google 个人日历与邮箱连接器",
       "switchGoogleCalendarDesc": "个人日历与邮箱连接器即将推出；管理员可先在上方保存并验证 Google 客户端凭据。",

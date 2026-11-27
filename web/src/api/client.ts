@@ -317,7 +317,8 @@ async function request<T>(method: string, url: string, data: unknown, config: Re
     } catch {
       /* proceed without auth */
     }
-    if (!sameSession()) throw new ApiError('canceled', 'ERR_CANCELED');
+    // DALTON-HOOK(deployment-credentials): stop aborted requests before sending or replaying
+    if (!sameSession() || config.signal?.aborted) throw new ApiError('canceled', 'ERR_CANCELED');
 
     try {
       return await send(method, target, headers, body, config);
@@ -343,7 +344,8 @@ async function request<T>(method: string, url: string, data: unknown, config: Re
       // previous user's URL and body, so a replay stamped with the new user's
       // token is their mutation written to the new account.
       const sameAccount = () => sameSession() && (sentAs === undefined || sentAs === authGeneration());
-      if (!sameAccount()) throw e;
+      // DALTON-HOOK(deployment-credentials): skip refresh and replay once the caller signal has aborted
+      if (!sameAccount() || config.signal?.aborted) throw e;
       retried = true;
       let token: string | null = null;
       try {
@@ -354,7 +356,8 @@ async function request<T>(method: string, url: string, data: unknown, config: Re
       } catch {
         /* refresh failed: reject with the original error */
       }
-      if (!token || !sameAccount()) throw e;
+      // DALTON-HOOK(deployment-credentials): skip late 401 replay once the caller signal has aborted
+      if (!token || !sameAccount() || config.signal?.aborted) throw e;
       headers.Authorization = `Bearer ${token}`;
       return attempt();
     }
