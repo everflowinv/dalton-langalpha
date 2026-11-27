@@ -2,7 +2,7 @@ import React, { useState, useMemo, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { Plus, Layers, Search, MessageSquare, AlertTriangle, RefreshCw } from 'lucide-react';
+import { Plus, Layers, Search, MessageSquare, AlertTriangle, RefreshCw, Sliders } from 'lucide-react';
 import type { ComposerScope } from '@/components/ui/chat-input.types';
 import type { Workspace } from '@/types/api';
 import { useToast } from '@/components/ui/use-toast';
@@ -36,7 +36,8 @@ import { WatchlistColumnPicker } from './WatchlistColumnPicker';
 import { WatchlistAddModal } from './WatchlistAddModal';
 import { WatchlistFullTable, type WatchlistSortField } from './WatchlistFullTable';
 
-const STORAGE_COLS_KEY = 'dalton:watchlist:visibleColumns:v1';
+const STORAGE_COLS_KEY = 'dalton:watchlist:visibleColumns:v2';
+const LEGACY_STORAGE_COLS_KEY = 'dalton:watchlist:visibleColumns:v1';
 const SESSION_FILTER_KEY = 'dalton:watchlist:tierFilter:v1';
 const SESSION_VIEW_STATE_KEY = 'dalton:watchlist:viewState:v1';
 
@@ -72,13 +73,32 @@ interface PendingConfirmAction {
 
 function loadSavedColumns(): WatchlistColumnKey[] {
   try {
-    const raw = localStorage.getItem(STORAGE_COLS_KEY);
-    if (!raw) return [...DEFAULT_WATCHLIST_COLUMNS];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [...DEFAULT_WATCHLIST_COLUMNS];
     const allowed = new Set<string>(BATCH1_WATCHLIST_COLUMNS);
-    const valid = parsed.filter((k): k is WatchlistColumnKey => typeof k === 'string' && allowed.has(k));
-    return valid.length > 0 ? valid : [...DEFAULT_WATCHLIST_COLUMNS];
+    const parseColumns = (raw: string | null): WatchlistColumnKey[] | null => {
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return null;
+      const valid = parsed.filter(
+        (k): k is WatchlistColumnKey => typeof k === 'string' && allowed.has(k),
+      );
+      return valid.length > 0 ? valid : null;
+    };
+
+    const current = parseColumns(localStorage.getItem(STORAGE_COLS_KEY));
+    if (current) return current;
+
+    // Migrate Batch-1 users' saved column preferences from v1 to v2 without losing selections
+    const legacy = parseColumns(localStorage.getItem(LEGACY_STORAGE_COLS_KEY));
+    if (legacy) {
+      try {
+        localStorage.setItem(STORAGE_COLS_KEY, JSON.stringify(legacy));
+      } catch {
+        // ignore storage write errors
+      }
+      return legacy;
+    }
+
+    return [...DEFAULT_WATCHLIST_COLUMNS];
   } catch {
     return [...DEFAULT_WATCHLIST_COLUMNS];
   }
@@ -474,6 +494,21 @@ export function WatchlistWorkspace({
             )}
 
             <WatchlistColumnPicker visibleColumns={visibleColumns} onChange={handleColumnsChange} />
+
+            <button
+              type="button"
+              data-testid="watchlist-tier-policies-link"
+              onClick={() => navigate('/settings?tab=coverage#dalton-tier-policies')}
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md text-xs font-medium border hover:bg-(--color-bg-hover)"
+              style={{
+                backgroundColor: 'var(--color-bg-card)',
+                borderColor: 'var(--color-border-muted)',
+                color: 'var(--color-text-secondary)',
+              }}
+            >
+              <Sliders className="h-3.5 w-3.5" />
+              <span>{t('marketView:watchlist.tierPoliciesAction')}</span>
+            </button>
 
             <button
               type="button"

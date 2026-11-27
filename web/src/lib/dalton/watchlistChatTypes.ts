@@ -40,6 +40,26 @@ export interface WatchlistProposalAffectedWorkspace {
   task_changes?: WatchlistProposalWorkspaceTaskChange[];
 }
 
+export interface WatchlistProposalPolicySnapshot {
+  tier?: string;
+  policy_version?: number;
+  watch_enabled?: boolean;
+  watch_cron?: string;
+  delta_enabled?: boolean;
+  delta_cron?: string;
+  delta_timezone?: string;
+  move_enabled?: boolean;
+  move_threshold_pct?: number;
+  earnings_stages?: string[];
+}
+
+export interface WatchlistProposalPolicyDiff {
+  tier?: string;
+  before?: WatchlistProposalPolicySnapshot;
+  after?: WatchlistProposalPolicySnapshot;
+  changed_fields?: string[];
+}
+
 export interface WatchlistProposalState {
   status: 'pending' | 'submitting' | 'approved' | 'rejected' | 'failed';
   actionType: WatchlistProposalActionType;
@@ -63,6 +83,7 @@ export interface WatchlistProposalState {
     preserved_handoff_count?: number;
   };
   preserve_workspace_notice?: string | null;
+  policy_diff?: WatchlistProposalPolicyDiff | null;
   group_id?: string | null;
   group_label?: string | null;
   tool_call_id?: string;

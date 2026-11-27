@@ -304,7 +304,7 @@ function LocationProbe() {
   const nav = useNavigate();
   return (
     <div>
-      <span data-testid="loc-display">{loc.pathname + loc.search}</span>
+      <span data-testid="loc-display">{loc.pathname + loc.search + loc.hash}</span>
       <button type="button" data-testid="history-back" onClick={() => nav(-1)}>back</button>
       <button type="button" data-testid="history-forward" onClick={() => nav(1)}>forward</button>
     </div>
@@ -322,6 +322,7 @@ function renderAt(initialEntries: string[], marketStatus: MarketStatusInput = nu
         <LocationProbe />
         <Routes>
           <Route path="/market" element={<MarketView />} />
+          <Route path="/settings" element={<div data-testid="settings-route" />} />
           <Route path="/chat/*" element={<div data-testid="chat-route" />} />
         </Routes>
       </MemoryRouter>
@@ -525,6 +526,219 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
       action: 'add',
       snapshot_id: 'snap-uuid-123',
     });
+  });
+
+  it('b2: toolbar Tier Policies button navigates to /settings?tab=coverage#dalton-tier-policies and renders all 7 valuation states', async () => {
+    const prevSummary = mocks.watchlistSummary;
+    const prevMetrics = mocks.watchlistMetrics;
+    (mocks as unknown as Record<string, unknown>).watchlistSummary = {
+      ok: true,
+      core: [
+        { ticker: 'NVDA', name: 'NVIDIA', tier: 'core', is_private: false },
+        { ticker: 'LOSS', name: 'Loss Co', tier: 'core', is_private: false },
+        { ticker: 'XYZADR', name: 'Unverified ADR', tier: 'core', is_private: false },
+        { ticker: 'STALECO', name: 'Stale Co', tier: 'core', is_private: false },
+        { ticker: 'LIMIT429', name: 'Rate Limited', tier: 'core', is_private: false },
+        { ticker: 'NOCOV', name: 'No Coverage', tier: 'core', is_private: false },
+        { ticker: 'SPCX', name: 'SpaceX', tier: 'core', is_private: true },
+      ],
+      watch: [],
+      radar: [],
+      groups: [],
+      stale_tickers: [],
+      counts: { core: 7, watch: 0, radar: 0, total: 7, groups: 0 },
+      pending_reconcile_count: 0,
+    };
+    (mocks as unknown as Record<string, unknown>).watchlistMetrics = {
+      ok: true,
+      pending_symbols: [],
+      as_of: '2026-11-26T12:00:00Z',
+      items: {
+        NVDA: {
+          ticker: 'NVDA', is_private: false, status: 'ok', price: 135, currency: 'USD',
+          chg_1d: 1, chg_1w: 2, chg_1m: 3, chg_3m: 4, chg_ytd: 5, chg_1y: 10,
+          high_52w: 150, low_52w: 90, position_52w: 75, rsi_14d: 60, rsi_30d: 58,
+          vol_ratio_5_20: 1.1, market_cap: 3e12, next_earnings: '2026-12-01',
+          pe_fy1: 30.0, pe_fy2: 24.5, eps_growth_fy2: 22.4,
+          valuation: {
+            fy1_eps: 4.5, fy2_eps: 5.51, fy1_end: '2027-01-31', fy2_end: '2028-01-31',
+            estimate_currency: 'USD', quote_currency: 'USD', shares_per_quote_unit: 1,
+            unit_verified: true, analyst_count: 42, provider: 'yfinance', as_of: '2026-11-26T12:00:00Z',
+            status: 'ok', pe_fy1: 30.0, pe_fy2: 24.5, eps_growth_fy2: 22.4,
+            pe_fy1_status: 'ok', pe_fy2_status: 'ok', eps_growth_fy2_status: 'ok',
+          },
+        },
+        LOSS: {
+          ticker: 'LOSS', is_private: false, status: 'ok', price: 20, currency: 'USD',
+          chg_1d: -1, chg_1w: 0, chg_1m: 0, chg_3m: 0, chg_ytd: 0, chg_1y: 0,
+          high_52w: 30, low_52w: 10, position_52w: 50, rsi_14d: 45, rsi_30d: 45,
+          vol_ratio_5_20: 1, market_cap: 1e9, next_earnings: null,
+          pe_fy1: null, pe_fy2: null, eps_growth_fy2: null,
+          valuation: {
+            fy1_eps: -1.5, fy2_eps: -0.5, fy1_end: '2026-12-31', fy2_end: '2027-12-31',
+            estimate_currency: 'USD', quote_currency: 'USD', shares_per_quote_unit: 1,
+            unit_verified: true, analyst_count: 5, provider: 'yfinance', as_of: '2026-11-26T12:00:00Z',
+            status: 'loss', pe_fy1: null, pe_fy2: null, eps_growth_fy2: null,
+            pe_fy1_status: 'loss', pe_fy2_status: 'loss', eps_growth_fy2_status: 'loss',
+          },
+        },
+        XYZADR: {
+          ticker: 'XYZADR', is_private: false, status: 'ok', price: 25, currency: 'USD',
+          chg_1d: 0, chg_1w: 0, chg_1m: 0, chg_3m: 0, chg_ytd: 0, chg_1y: 0,
+          high_52w: 30, low_52w: 20, position_52w: 50, rsi_14d: 50, rsi_30d: 50,
+          vol_ratio_5_20: 1, market_cap: 5e9, next_earnings: null,
+          pe_fy1: null, pe_fy2: null, eps_growth_fy2: null,
+          valuation: {
+            fy1_eps: 10, fy2_eps: 12, fy1_end: '2026-12-31', fy2_end: '2027-12-31',
+            estimate_currency: 'JPY', quote_currency: 'USD', shares_per_quote_unit: null,
+            unit_verified: false, analyst_count: 3, provider: 'yfinance', as_of: '2026-11-26T12:00:00Z',
+            status: 'unit_unverified', pe_fy1: null, pe_fy2: null, eps_growth_fy2: null,
+            pe_fy1_status: 'unit_unverified', pe_fy2_status: 'unit_unverified', eps_growth_fy2_status: 'unit_unverified',
+          },
+        },
+        STALECO: {
+          ticker: 'STALECO', is_private: false, status: 'ok', price: 100, currency: 'USD',
+          chg_1d: 0, chg_1w: 0, chg_1m: 0, chg_3m: 0, chg_ytd: 0, chg_1y: 0,
+          high_52w: 110, low_52w: 90, position_52w: 50, rsi_14d: 50, rsi_30d: 50,
+          vol_ratio_5_20: 1, market_cap: 5e9, next_earnings: null,
+          pe_fy1: 18.2, pe_fy2: 15.6, eps_growth_fy2: 16.7,
+          valuation: {
+            fy1_eps: 5.5, fy2_eps: 6.4, fy1_end: '2026-12-31', fy2_end: '2027-12-31',
+            estimate_currency: 'USD', quote_currency: 'USD', shares_per_quote_unit: 1,
+            unit_verified: true, analyst_count: 10, provider: 'yfinance', as_of: '2026-11-20T00:00:00Z',
+            status: 'stale', pe_fy1: 18.2, pe_fy2: 15.6, eps_growth_fy2: 16.7,
+            pe_fy1_status: 'stale', pe_fy2_status: 'stale', eps_growth_fy2_status: 'stale',
+          },
+        },
+        LIMIT429: {
+          ticker: 'LIMIT429', is_private: false, status: 'ok', price: 50, currency: 'USD',
+          chg_1d: 0, chg_1w: 0, chg_1m: 0, chg_3m: 0, chg_ytd: 0, chg_1y: 0,
+          high_52w: 60, low_52w: 40, position_52w: 50, rsi_14d: 50, rsi_30d: 50,
+          vol_ratio_5_20: 1, market_cap: 5e9, next_earnings: null,
+          pe_fy1: null, pe_fy2: null, eps_growth_fy2: null,
+          valuation: {
+            fy1_eps: null, fy2_eps: null, fy1_end: null, fy2_end: null,
+            estimate_currency: null, quote_currency: 'USD', shares_per_quote_unit: null,
+            unit_verified: false, analyst_count: null, provider: null, as_of: null,
+            status: 'rate_limited', pe_fy1: null, pe_fy2: null, eps_growth_fy2: null,
+            pe_fy1_status: 'rate_limited', pe_fy2_status: 'rate_limited', eps_growth_fy2_status: 'rate_limited',
+          },
+        },
+        NOCOV: {
+          ticker: 'NOCOV', is_private: false, status: 'ok', price: 12, currency: 'HKD',
+          chg_1d: 0, chg_1w: 0, chg_1m: 0, chg_3m: 0, chg_ytd: 0, chg_1y: 0,
+          high_52w: 15, low_52w: 10, position_52w: 40, rsi_14d: 50, rsi_30d: 50,
+          vol_ratio_5_20: 1, market_cap: 1e9, next_earnings: null,
+          pe_fy1: null, pe_fy2: null, eps_growth_fy2: null,
+          valuation: {
+            fy1_eps: null, fy2_eps: null, fy1_end: null, fy2_end: null,
+            estimate_currency: null, quote_currency: 'HKD', shares_per_quote_unit: null,
+            unit_verified: false, analyst_count: null, provider: 'yfinance', as_of: null,
+            status: 'no_coverage', pe_fy1: null, pe_fy2: null, eps_growth_fy2: null,
+            pe_fy1_status: 'no_coverage', pe_fy2_status: 'no_coverage', eps_growth_fy2_status: 'no_coverage',
+          },
+        },
+        SPCX: {
+          ticker: 'SPCX', is_private: true, status: 'unlisted', price: null, currency: null,
+          chg_1d: null, chg_1w: null, chg_1m: null, chg_3m: null, chg_ytd: null, chg_1y: null,
+          high_52w: null, low_52w: null, position_52w: null, rsi_14d: null, rsi_30d: null,
+          vol_ratio_5_20: null, market_cap: null, next_earnings: null,
+          pe_fy1: null, pe_fy2: null, eps_growth_fy2: null,
+          valuation: {
+            fy1_eps: null, fy2_eps: null, fy1_end: null, fy2_end: null,
+            estimate_currency: null, quote_currency: null, shares_per_quote_unit: null,
+            unit_verified: false, analyst_count: null, provider: null, as_of: null,
+            status: 'unlisted', pe_fy1: null, pe_fy2: null, eps_growth_fy2: null,
+          },
+        },
+      },
+    };
+
+    try {
+      renderAt(['/market']);
+      await waitFor(() => expect(screen.getByTestId('watchlist-row-NVDA')).toBeTruthy());
+
+      // Assert EVERY ONE of the 7 valuation states on its actual rendered table cell:
+      // 1. ok
+      const nvdaRow = screen.getByTestId('watchlist-row-NVDA');
+      const okCells = nvdaRow.querySelectorAll('[data-valuation-status="ok"]');
+      expect(okCells.length).toBeGreaterThanOrEqual(2);
+      expect(okCells[0].textContent).toContain('30.0x');
+      expect(okCells[1].textContent).toContain('24.5x');
+
+      // 2. loss (NM)
+      const lossCell = screen.getByTestId('watchlist-row-LOSS').querySelector('[data-valuation-status="loss"]');
+      expect(lossCell).toBeTruthy();
+      expect(lossCell?.textContent).toBe('NM');
+
+      // 3. unit_unverified
+      const unverifiedCell = screen
+        .getByTestId('watchlist-row-XYZADR')
+        .querySelector('[data-valuation-status="unit_unverified"]');
+      expect(unverifiedCell).toBeTruthy();
+      expect(unverifiedCell?.textContent).toBe('—');
+
+      // 4. stale
+      const staleCell = screen
+        .getByTestId('watchlist-row-STALECO')
+        .querySelector('[data-valuation-status="stale"]');
+      expect(staleCell).toBeTruthy();
+      expect(staleCell?.textContent).toContain('18.2x');
+
+      // 5. rate_limited
+      const rateLimitedCell = screen
+        .getByTestId('watchlist-row-LIMIT429')
+        .querySelector('[data-valuation-status="rate_limited"]');
+      expect(rateLimitedCell).toBeTruthy();
+
+      // 6. no_coverage
+      const noCovCell = screen
+        .getByTestId('watchlist-row-NOCOV')
+        .querySelector('[data-valuation-status="no_coverage"]');
+      expect(noCovCell).toBeTruthy();
+      expect(noCovCell?.textContent).toBe('—');
+
+      // 7. unlisted (real is_private row reaches valuation unlisted branch!)
+      const unlistedCells = screen
+        .getByTestId('watchlist-row-SPCX')
+        .querySelectorAll('[data-valuation-status="unlisted"]');
+      expect(unlistedCells.length).toBeGreaterThanOrEqual(2);
+      expect(unlistedCells[0].textContent).toMatch(/未上市|Unlisted/);
+
+      // Click Tier Policies shortcut -> navigates to /settings?tab=coverage#dalton-tier-policies
+      fireEvent.click(screen.getByTestId('watchlist-tier-policies-link'));
+      await waitFor(() => {
+        expect(screen.getByTestId('loc-display').textContent).toBe(
+          '/settings?tab=coverage#dalton-tier-policies',
+        );
+      });
+    } finally {
+      (mocks as unknown as Record<string, unknown>).watchlistSummary = prevSummary;
+      (mocks as unknown as Record<string, unknown>).watchlistMetrics = prevMetrics;
+    }
+  });
+
+  it('b2: migrates saved Batch-1 v1 column preferences into v2 without losing user selections', async () => {
+    localStorage.removeItem('dalton:watchlist:visibleColumns:v2');
+    localStorage.setItem(
+      'dalton:watchlist:visibleColumns:v1',
+      JSON.stringify(['tier', 'price', 'rsi_14d', 'market_cap']),
+    );
+    try {
+      renderAt(['/market']);
+      await waitFor(() => expect(screen.getByTestId('watchlist-row-NVDA')).toBeTruthy());
+      const migrated = JSON.parse(
+        localStorage.getItem('dalton:watchlist:visibleColumns:v2') || '[]',
+      );
+      expect(migrated).toEqual(['tier', 'price', 'rsi_14d', 'market_cap']);
+      // Batch-1 selected columns stay rendered (e.g. market_cap header is present, while unselected chg_3m is omitted)
+      const headerRow = screen.getByRole('table').querySelector('thead');
+      expect(headerRow?.textContent).toMatch(/市值|Mkt Cap|Market Cap/);
+      expect(headerRow?.textContent).not.toContain('3M');
+    } finally {
+      localStorage.removeItem('dalton:watchlist:visibleColumns:v1');
+      localStorage.removeItem('dalton:watchlist:visibleColumns:v2');
+    }
   });
 
   it('uses the same Tailwind font-size class as row text for the tier badge at mobile width (non-select)', () => {

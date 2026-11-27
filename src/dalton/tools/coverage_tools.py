@@ -19,7 +19,11 @@ from src.dalton.coverage import (
     list_user_coverage_summary,
     preview_coverage_group,
 )
-from src.dalton.watchlist.policies import get_user_tier_policies
+from src.dalton.watchlist.policies import (
+    DEFAULT_TIER_POLICIES,
+    get_tier_policy_presets,
+    get_user_tier_policies,
+)
 from src.dalton.watchlist.service import (
     WatchlistMutationService,
     WatchlistScopeChangedError,
@@ -47,6 +51,8 @@ _VALID_ACTIONS = frozenset(
         "remove_group",
         "update_tags",
         "get_tier_policy",
+        "set_tier_policy",
+        "reset_tier_policy",
     }
 )
 
@@ -82,6 +88,7 @@ def _build_confirm_card_payload(
         "affected_workspaces": list(snapshot.get("affected_workspaces") or []),
         "task_summary": dict(snapshot.get("task_summary") or {}),
         "preserve_workspace_notice": snapshot.get("preserve_workspace_notice"),
+        "policy_diff": snapshot.get("policy_diff"),
         "group_id": snapshot.get("group_id"),
         "group_label": snapshot.get("group_label"),
     }
@@ -97,6 +104,7 @@ def build_coverage_tools(*, role: str = "chief_of_staff") -> list[BaseTool]:
         action: str,
         tickers: list[str] | str | None = None,
         tier: str = "watch",
+        policy: dict[str, Any] | None = None,
         label: str | None = None,
         criteria: dict[str, Any] | None = None,
         default_tier: str | None = None,
@@ -108,23 +116,24 @@ def build_coverage_tools(*, role: str = "chief_of_staff") -> list[BaseTool]:
         state: Annotated[dict[str, Any] | None, InjectedState] = None,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
     ) -> Command:
-        """查看或维护当前用户个人的三档股票观察名单（核心 core / 跟踪 watch / 雷达 radar）、动态规则组与各档默认监控策略。
+        """查看或维护当前用户个人的三档股票观察名单（核心 core / 跟踪 watch / 雷达 radar）、动态规则组与各档监控策略。
 
         操作说明：
         - 查询名单（`list`）、预览规则组（`preview_group`）、查看各档策略（`get_tier_policy`）、更新标签（`update_tags`）以及点名新增不超过 5 只且不改变已有分档的股票（`add`）直接执行。
-        - 批量新增超过 5 只股票、添加动态规则组（`add_group`）、调整股票分档（`set_tier` 或 `add` 命中已在其他分档的股票）、删除股票或规则组（`remove` / `remove_group`）会弹出确认卡片，由用户在网页端确认后按快照执行；若确认前名单或策略已变化，则中止并提示重新发起。
+        - 批量新增超过 5 只股票、添加动态规则组（`add_group`）、调整股票分档（`set_tier` 或 `add` 命中已在其他分档的股票）、删除股票或规则组（`remove` / `remove_group`）、修改或重置分档监控策略（`set_tier_policy` / `reset_tier_policy`）均会弹出确认卡片，由用户在网页端确认后按服务端快照执行；若确认前名单或策略已变化，则中止并提示重新发起。
         - 用户按条件描述一类股票时（如「美股半导体大票」），先调用 `preview_group` 展示候选列表，再调用 `add_group`。
 
         Args:
-            action: 可选 `"list"`、`"add"`、`"remove"`、`"set_tier"`、`"preview_group"`、`"add_group"`、`"remove_group"`、`"update_tags"` 或 `"get_tier_policy"`。
+            action: 可选 `"list"`、`"add"`、`"remove"`、`"set_tier"`、`"preview_group"`、`"add_group"`、`"remove_group"`、`"update_tags"`、`"get_tier_policy"`、`"set_tier_policy"` 或 `"reset_tier_policy"`。
             tickers: 股票代码列表或逗号分隔字符串（如 `["NVDA", "TSM"]` 或 `"0700.HK, 9988.HK"`），用于 `add`、`remove`、`set_tier`、`update_tags`。
-            tier: 目标分档，可选 `"core"`（核心）、`"watch"`（跟踪，默认）或 `"radar"`（雷达，仅观察与财报日历，默认不开启后台研究任务）。
+            tier: 目标分档，可选 `"core"`（核心）、`"watch"`（跟踪，默认）或 `"radar"`（雷达，仅观察与财报日历，默认不开启后台研究任务）；用于 `add`、`set_tier`、`set_tier_policy`、`reset_tier_policy`。
+            policy: 分档监控策略配置字典（仅用于 `set_tier_policy`，支持部分字段更新）：`watch_enabled`（盘中盯盘开关）、`watch_cron`（盘中盯盘 5 段 Cron 定时时间表达式，相邻间隔须 ≥ 30 分钟）、`delta_enabled`（论点增量开关）、`delta_cron`（论点增量 5 段 Cron，每日最多 1 次且相邻间隔 ≥ 23 小时）、`delta_timezone`（论点增量时区，默认 `Asia/Shanghai`）、`move_enabled`（涨跌异动快评开关）、`move_threshold_pct`（异动阈值 1.0–30.0）、`earnings_stages`（财报自动写稿阶段列表，如 `["tm3", "t0", "tp1"]` 或 `[]`）。
             label: 规则组名称（用于 `preview_group`、`add_group`，也可用于 `remove_group` 按名称匹配）。
             criteria: 规则组筛选条件字典，支持 `country`、`exchange`、`sector`、`industry`、`market_cap_min`、`market_cap_max`、`limit`、`include`、`exclude`。
             default_tier: 规则组新纳入股票的默认分档（`"core"` / `"watch"` / `"radar"`，默认 `"watch"`）。
             group_id: 规则组 ID 或名称（用于 `remove_group`）。
             tags: 个人标签字符串列表（用于 `update_tags`）。
-            override_user_pause: 调档开启任务时是否同时恢复用户手动暂停的任务，默认 `False`。
+            override_user_pause: 调档或调整策略开启任务时是否同时恢复用户手动暂停的任务，默认 `False`。
 
         Returns:
             包含名单摘要、规则组预览、各档策略或变更结果的 JSON 载荷。完成名单变更后，询问用户是否通过 `dalton_system_jobs(action="run_now", key="dalton-earnings-calendar")` 立即刷新个人财报日历。
@@ -150,7 +159,7 @@ def build_coverage_tools(*, role: str = "chief_of_staff") -> list[BaseTool]:
         if act not in _VALID_ACTIONS:
             return error_command(
                 f"不支持的 action `{action}`，可选值："
-                "list, add, remove, set_tier, preview_group, add_group, remove_group, update_tags, get_tier_policy。",
+                "list, add, remove, set_tier, preview_group, add_group, remove_group, update_tags, get_tier_policy, set_tier_policy, reset_tier_policy。",
                 tool_call_id,
                 ok=False,
                 code="invalid_action",
@@ -173,6 +182,8 @@ def build_coverage_tools(*, role: str = "chief_of_staff") -> list[BaseTool]:
                             "success": True,
                             "user_id": user_id,
                             "policies": {t: p.to_dict() for t, p in policies.items()},
+                            "defaults": {t: p.to_dict() for t, p in DEFAULT_TIER_POLICIES.items()},
+                            "presets": get_tier_policy_presets(),
                         }
                     ),
                     tool_call_id,
@@ -231,11 +242,19 @@ def build_coverage_tools(*, role: str = "chief_of_staff") -> list[BaseTool]:
                         ok=False,
                         code="missing_group_id",
                     )
+                if act == "set_tier_policy" and not isinstance(policy, dict):
+                    return error_command(
+                        "执行 set_tier_policy 时必须提供 policy 配置字典。",
+                        tool_call_id,
+                        ok=False,
+                        code="missing_policy",
+                    )
                 snap = await service.preview_mutation(
                     user_id,
                     action=act,
                     tickers=tickers,
                     tier=tier,
+                    policy=policy,
                     label=label,
                     criteria=criteria,
                     default_tier=default_tier,

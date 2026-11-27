@@ -461,6 +461,53 @@ describe('WatchlistConfirmCard & interrupt bucket 4-state lifecycle', () => {
     });
   });
 
+  it('renders before -> after policy_diff on watchlist_tier_policy confirmation card', () => {
+    const onApprove = vi.fn();
+    render(
+      <WatchlistConfirmCard
+        onApprove={onApprove}
+        proposalData={{
+          status: 'pending',
+          actionType: 'watchlist_tier_policy',
+          name: '确认修改 核心 (Core) 监控策略',
+          description: '更新核心监控策略',
+          policy_diff: {
+            tier: 'core',
+            before: {
+              watch_enabled: true,
+              watch_cron: '*/30 6-20 * * 1-5',
+              delta_enabled: true,
+              delta_cron: '0 11 * * 2-6',
+              delta_timezone: 'Asia/Shanghai',
+              move_enabled: true,
+              move_threshold_pct: 4,
+              earnings_stages: ['tm3', 't0', 'tp1'],
+            },
+            after: {
+              watch_enabled: true,
+              watch_cron: '0 6-20 * * 1-5',
+              delta_enabled: true,
+              delta_cron: '0 11 * * 2-6',
+              delta_timezone: 'Asia/Shanghai',
+              move_enabled: true,
+              move_threshold_pct: 6,
+              earnings_stages: ['tm3', 't0'],
+            },
+            changed_fields: ['watch_cron', 'move_threshold_pct', 'earnings_stages'],
+          },
+          affected_workspaces: [
+            { ticker: 'NVDA', workspace_id: 'ws-nvda', task_changes: [{ name: 'dalton-nvda-watch', change: 'update' }] },
+          ],
+          task_summary: { update_count: 2 },
+        }}
+      />,
+    );
+
+    expect(screen.getByText(/\*\/30 6-20 \* \* 1-5 → 0 6-20 \* \* 1-5/)).toBeTruthy();
+    expect(screen.getByText(/±4% → ±6%/)).toBeTruthy();
+    expect(screen.getByText(/tm3, t0, tp1 → tm3, t0/)).toBeTruthy();
+  });
+
   it.each([
     {
       label: 'create arrives first, archive arrives last -> click create then archive',
