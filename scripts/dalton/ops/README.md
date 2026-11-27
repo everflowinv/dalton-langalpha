@@ -112,6 +112,11 @@ bash scripts/dalton/ops/dalton_data_backup.sh
      ```bash
      bash scripts/dalton/ops/prod/wait_backend_idle.sh
      ```
+   - 先卸载后端看门狗，否则它每 60 秒探测一次 `/health`，连续 3 次失败就会把刚停下的后端拉起来（Everflow 生产）：
+     ```bash
+     launchctl bootout gui/$(id -u)/com.dalton.backend-watchdog
+     ```
+     配置切换完成、`/health` 恢复正常后再装回：`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dalton.backend-watchdog.plist`。
    - 暂停会向主桶写入数据的定时/后台任务与外部写流量，并停止后端写入进程（例如 `docker compose stop backend`，或停止运行中的 `server.py` 进程；**保持 PostgreSQL 运行**供只读核验连接）。
 2. **关于 `DALTON_WSFILES_WRITE_INLINE_ONLY=1` 的作用边界**：
    - 若只想提前将新的普通工作区文件（非 Git、且 `<= 100 MiB`）改写回数据库内联而不停服，可在环境变量中设置 `DALTON_WSFILES_WRITE_INLINE_ONLY=1`（或在 `src/dalton/dalton.yaml` 中设置 `workspace_files.write_inline_only: true`）并重启/重建后端。
