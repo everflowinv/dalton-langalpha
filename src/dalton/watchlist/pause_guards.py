@@ -62,24 +62,30 @@ def resolve_paused_once_schedule_at(row: Mapping[str, Any] | None) -> datetime |
 def apply_manual_pause_metadata(
     row: Mapping[str, Any] | None,
     effective_kwargs: dict[str, Any],
+    *,
+    from_locked_row: bool = False,
 ) -> None:
     """Persist ``metadata.paused_by_user = True`` and clear ``next_run_at`` on manual pause of Dalton tasks.
 
     For one-time (``once``) Dalton tasks, preserves the original scheduled timestamp in
     ``metadata.once_schedule_at`` before setting ``next_run_at = None`` so paused rows never
     keep a dangling schedule while still allowing future manual resume if not yet expired.
+
+    Always derives ``metadata`` strictly from ``row['metadata']`` rather than merging any
+    stale pre-lock snapshot from ``effective_kwargs['metadata']`` so concurrent updates
+    (such as AD5 ``report_profile`` confirmation) are preserved under ``FOR UPDATE``.
     """
     if not is_dalton_managed_automation(row):
+        if from_locked_row:
+            effective_kwargs.pop("metadata", None)
         return
     base_meta: dict[str, Any] = {}
     if isinstance(row, Mapping) and isinstance(row.get("metadata"), Mapping):
         base_meta.update(dict(row["metadata"]))
-    if isinstance(effective_kwargs.get("metadata"), Mapping):
-        base_meta.update(dict(effective_kwargs["metadata"]))
     base_meta["paused_by_user"] = True
     if isinstance(row, Mapping) and str(row.get("trigger_type") or "").strip().lower() == "once":
         orig_when = row.get("next_run_at")
-        if orig_when is not None and not str(base_meta.get("once_schedule_at") or "").strip():
+        if orig_when is not None:
             if isinstance(orig_when, datetime):
                 dt = orig_when if orig_when.tzinfo is not None else orig_when.replace(tzinfo=timezone.utc)
                 base_meta["once_schedule_at"] = dt.isoformat()

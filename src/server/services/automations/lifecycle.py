@@ -1228,7 +1228,7 @@ def apply_locked_pause_schedule(
     # DALTON-HOOK(watchlist): persist paused_by_user on locked manual pause of Dalton-managed automations
     from src.dalton.watchlist.pause_guards import apply_manual_pause_metadata
 
-    apply_manual_pause_metadata(locked_row, effective_kwargs)
+    apply_manual_pause_metadata(locked_row, effective_kwargs, from_locked_row=True)
 
 
 def _replaced_by_tracker_refusal(row: Any) -> AutomationRefusal | None:
@@ -1757,6 +1757,9 @@ async def pause_automation(
         )
 
     update_kwargs = pause_update_fields(current)
+    # DALTON-HOOK(watchlist): defer pause metadata write to _reconcile_locked_pause so pre-lock
+    # metadata copy cannot overwrite concurrent metadata updates (e.g. report_profile confirmation).
+    update_kwargs.pop("metadata", None)
 
     # DALTON-HOOK(company-automations): reconcile locked pause state and record pause history
     async def _reconcile_locked_pause(

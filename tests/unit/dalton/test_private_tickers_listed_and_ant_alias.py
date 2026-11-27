@@ -68,6 +68,77 @@ def test_move_quant_allows_spcx_and_ant_as_listed_us_tickers() -> None:
     assert "ANTHROPIC" not in mq.PRIVATE_TICKERS
 
 
+def test_move_quant_blocks_openai_fallback_and_coverage_private_in_extended_session(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """OPENAI retains fallback private guard, coverage is_private=true blocks pre/post before yfinance,
+    and SPCX/ANT continue to pass."""
+    import sys
+    import types
+
+    mq = _load_module(
+        "test_move_quant_private_extended",
+        "plugins/dalton/skills/dalton-stock-move/scripts/move_quant.py",
+    )
+
+    # Fallback set keeps OPENAI only (SPCX and ANT stay allowed)
+    assert mq.PRIVATE_TICKERS == {"OPENAI"}
+    ok_openai, reason_openai = mq.supports_extended_session("OPENAI")
+    assert ok_openai is False
+    assert reason_openai and "OPENAI" in reason_openai
+    for sym in ("SPCX", "ANT"):
+        ok_sym, reason_sym = mq.supports_extended_session(sym)
+        assert ok_sym is True, f"{sym} should stay allowed, got {reason_sym}"
+
+    # Fake yfinance that fails loudly if download() is ever reached for private tickers
+    download_calls: list[Any] = []
+
+    def _forbidden_download(*args: Any, **kwargs: Any) -> Any:
+        download_calls.append((args, kwargs))
+        raise AssertionError("yf.download must not be called for private tickers")
+
+    fake_yf = types.ModuleType("yfinance")
+    fake_yf.download = _forbidden_download  # type: ignore[attr-defined]
+    fake_yf.Ticker = lambda _sym: types.SimpleNamespace(info={})  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
+
+    cov_path = tmp_path / "coverage.yaml"
+    cov_path.write_text(
+        """
+companies:
+  - ticker: STRIPE
+    name: Stripe
+    tier: Watch
+    is_private: true
+    peer_group: payments
+  - ticker: SPCX
+    name: SpaceX
+    tier: Core
+    peer_group: space
+  - ticker: ANT
+    name: Anthropic
+    tier: Core
+    peer_group: ai
+""",
+        encoding="utf-8",
+    )
+
+    # 1) Coverage-marked private ticker is blocked in run_analyze pre/post before yf.download
+    res_cov = mq.run_analyze("STRIPE", session="pre", coverage_path=str(cov_path))
+    assert res_cov["ok"] is False
+    assert res_cov["unsupported_session"] is True
+    assert "STRIPE" in (res_cov.get("error") or "")
+
+    # 2) OPENAI fallback is blocked in run_analyze pre/post even without coverage entry
+    res_openai = mq.run_analyze("OPENAI", session="post", coverage_path=str(cov_path))
+    assert res_openai["ok"] is False
+    assert res_openai["unsupported_session"] is True
+    assert "OPENAI" in (res_openai.get("error") or "")
+
+    assert download_calls == []
+
+
 def test_weekly_review_screen_movers_does_not_skip_spcx_or_anthropic_by_hardcode(
     tmp_path: Path,
 ) -> None:

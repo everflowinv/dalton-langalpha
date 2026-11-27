@@ -10,10 +10,6 @@ from typing import Any, Mapping, Sequence
 
 from psycopg.rows import dict_row
 
-from src.dalton.coverage.models import (
-    extract_row_group_ids,
-    extract_row_stale_group_ids,
-)
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
@@ -443,6 +439,11 @@ async def mark_coverage_rows_group_stale(
     cleaned_set = set(cleaned)
 
     async def _run_in_tx(c: Any) -> list[str]:
+        from src.dalton.coverage.models import (
+            extract_row_group_ids,
+            extract_row_stale_group_ids,
+        )
+
         await acquire_coverage_advisory_lock(c, uid)
         rows = await list_coverage_rows(uid, conn=c)
         by_ticker = {str(r["ticker"]).strip().upper(): r for r in rows if r.get("ticker")}
@@ -665,6 +666,8 @@ def compute_exclusive_group_deletion_tickers(
     rows: Sequence[Mapping[str, Any]],
 ) -> list[str]:
     """Return sorted tickers that would be exclusively deleted when ``group_id`` is removed."""
+    from src.dalton.coverage.models import extract_row_group_ids
+
     gid = str(group_id or "").strip()
     if not gid:
         return []
@@ -699,6 +702,11 @@ async def delete_coverage_group_and_exclusive_members(
         return {"deleted": False, "group_id": gid, "removed_tickers": []}
 
     async def _run_in_tx(c: Any) -> dict[str, Any]:
+        from src.dalton.coverage.models import (
+            extract_row_group_ids,
+            extract_row_stale_group_ids,
+        )
+
         await acquire_coverage_advisory_lock(c, uid)
         existing_groups = await list_coverage_groups(uid, conn=c)
         valid_other_group_ids = {

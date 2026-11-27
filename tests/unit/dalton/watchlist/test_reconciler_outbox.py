@@ -3053,3 +3053,96 @@ async def test_r8_core_to_watch_preview_and_reconcile_agree_on_recheck(
     assert rec_radar["ok"] is True
     assert infra.automations[earn_ids["dalton-nvda-earn-fy26q4-recheck"]]["status"] == "paused"
     assert infra.automations[earn_ids["dalton-nvda-earn-fy26q4-t0"]]["status"] == "paused"
+
+
+@pytest.mark.asyncio
+async def test_pause_automation_interleaved_with_report_profile_confirmation_preserves_latest_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pausing an automation while AD5 delivery confirmation commits a new report_profile
+    must write paused_by_user and once_schedule_at on top of the row-locked metadata,
+    never overwriting report_profile with the pre-lock copy."""
+    from src.dalton.services.company_automations import get_current_history_context
+    from src.server.services.automations import lifecycle as lifecycle_mod
+
+    old_when = datetime.now(UTC) + timedelta(days=3)
+    new_when = datetime.now(UTC) + timedelta(days=7)
+    stale_pre_lock = {
+        "automation_id": "auto-race-1",
+        "user_id": "u-race",
+        "name": "dalton-nvda-earn-fy26q4-t0",
+        "trigger_type": "once",
+        "status": "active",
+        "timezone": "UTC",
+        "next_run_at": old_when,
+        "config_version": 2,
+        "metadata": {
+            "ticker": "NVDA",
+            "dalton_managed": True,
+            "report_profile": {"mode": "email", "targets": ["old@example.com"]},
+        },
+    }
+    fresh_locked_row = {
+        **stale_pre_lock,
+        "next_run_at": new_when,
+        "config_version": 3,
+        "metadata": {
+            "ticker": "NVDA",
+            "dalton_managed": True,
+            "report_profile": {"mode": "feishu", "targets": ["oc_confirmed_group"]},
+        },
+    }
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_update_automation(
+        automation_id: str,
+        user_id: str,
+        *,
+        conn: Any = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        captured["raw_kwargs"] = dict(kwargs)
+        effective_kwargs = dict(kwargs)
+        hist_ctx = get_current_history_context()
+        assert hist_ctx is not None and hist_ctx.locked_row_reconciler is not None
+        await hist_ctx.locked_row_reconciler(fresh_locked_row, effective_kwargs, conn)
+        captured["effective_kwargs"] = effective_kwargs
+        return {**fresh_locked_row, **effective_kwargs}
+
+    monkeypatch.setattr(
+        lifecycle_mod.auto_db,
+        "get_automation",
+        create_autospec(lifecycle_mod.auto_db.get_automation, return_value=stale_pre_lock),
+    )
+    monkeypatch.setattr(
+        lifecycle_mod.auto_db,
+        "update_automation",
+        create_autospec(lifecycle_mod.auto_db.update_automation, side_effect=_fake_update_automation),
+    )
+
+    result = await lifecycle_mod.pause_automation("auto-race-1", "u-race")
+    assert result is not None
+    # Pre-lock metadata copy is not passed into update_automation
+    assert "metadata" not in captured["raw_kwargs"]
+    # Locked reconciler writes pause markers & latest schedule on top of locked_row's report_profile
+    eff = captured["effective_kwargs"]
+    assert eff["status"] == "paused"
+    assert eff["next_run_at"] is None
+    assert eff["metadata"]["paused_by_user"] is True
+    assert eff["metadata"]["once_schedule_at"] == new_when.isoformat()
+    assert eff["metadata"]["report_profile"] == {
+        "mode": "feishu",
+        "targets": ["oc_confirmed_group"],
+    }
+
+    # Direct defense-in-depth: even if effective_kwargs already carries pre-lock metadata from
+    # pause_update_fields(stale_pre_lock), apply_locked_pause_schedule uses locked_row's metadata.
+    direct_kwargs = lifecycle_mod.pause_update_fields(stale_pre_lock)
+    lifecycle_mod.apply_locked_pause_schedule(fresh_locked_row, direct_kwargs)
+    assert direct_kwargs["metadata"]["report_profile"] == {
+        "mode": "feishu",
+        "targets": ["oc_confirmed_group"],
+    }
+    assert direct_kwargs["metadata"]["paused_by_user"] is True
+    assert direct_kwargs["metadata"]["once_schedule_at"] == new_when.isoformat()

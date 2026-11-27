@@ -1751,6 +1751,7 @@ async def schedule_dalton_automation_helper(
                 if resolved_action == "pause":
                     new_status = "paused"
                     update_fields = pause_update_fields(candidate_row)
+                    update_fields.pop("metadata", None)
                 else:
                     new_status = "active"
                     update_fields = resume_update_fields(candidate_row)

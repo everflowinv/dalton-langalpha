@@ -1715,8 +1715,14 @@ async def test_round6_item1_item2_schedule_helper_pause_resume_lifecycle_and_rep
     monkeypatch.setattr(sched_mod, "user_automations_lock", _lock)
 
     async def _fake_update(aid, uid, **kw):
+        from src.dalton.services.company_automations import get_current_history_context
+
         row = dict(rows_by_id[aid])
-        row.update({k: v for k, v in kw.items() if k in ("status", "next_run_at", "failure_count", "disable_reason", "metadata")})
+        eff = dict(kw)
+        hist_ctx = get_current_history_context()
+        if hist_ctx is not None and hist_ctx.locked_row_reconciler is not None:
+            await hist_ctx.locked_row_reconciler(row, eff, kw.get("conn"))
+        row.update({k: v for k, v in eff.items() if k in ("status", "next_run_at", "failure_count", "disable_reason", "metadata")})
         rows_by_id[aid] = row
         return row
 
