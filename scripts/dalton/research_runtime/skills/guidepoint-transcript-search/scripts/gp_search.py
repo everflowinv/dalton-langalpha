@@ -4,6 +4,7 @@
 Used by skills/subagents that need Guidepoint expert-transcript search from bash.
 The proxy (LaunchAgent ai.openclaw.guidepoint-mcp-proxy) handles OAuth token refresh.
 """
+import http.client
 import argparse
 import json
 import os
@@ -185,7 +186,7 @@ def cmd_self_test(args):
     deadline_mono = time.monotonic() + eff_timeout_s
     try:
         result, sid = mcp_session(deadline_mono=deadline_mono)
-    except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+    except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.HTTPException) as e:
         print(f"FAIL: proxy unreachable at {_resolve_base_url()} ({e})")
         print("Hint: launchctl kickstart -k gui/$UID/com.dalton.guidepoint-mcp-proxy")
         return 1

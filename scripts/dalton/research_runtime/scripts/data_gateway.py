@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+import http.client
 import urllib.request
 import urllib.error
 from datetime import date, datetime, timezone
@@ -447,7 +448,7 @@ def native_request(route, args, execute_request=False):
         payload = message["result"]
         ok = not payload.get("isError", False)
         return {"ok": ok, "status": "ok" if ok else "error", "data": payload, **result}
-    except (OSError, ValueError, KeyError, IndexError) as exc:
+    except (OSError, ValueError, KeyError, IndexError, http.client.HTTPException) as exc:
         return {"ok": False, "status": "error", "error": type(exc).__name__,
                 "hint": "检查原有本地 MCP 服务及登录状态；本入口未切换数据源。", **result}
 
