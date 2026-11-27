@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import inspect
 import logging
-import os
 import posixpath
 import re
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,16 @@ _MISSING_APPROVED_PAYLOAD_ERROR = (
     "question from checkpoint); nothing was dispatched. Please retry the approval."
 )
 
-_CLOSING_TAG_RE = re.compile(r"</\s*user_verbatim_request\s*>", re.IGNORECASE)
+_CLOSING_TAG_INNER = r"/\s*user_verbatim_request\s*"
+_CLOSING_TAG_OR_ESCAPED_RE = re.compile(
+    rf"(?:<(?P<raw>{_CLOSING_TAG_INNER})>|&(?P<amps>(?:amp;)*)lt;(?P<esc>{_CLOSING_TAG_INNER})&gt;)",
+    re.IGNORECASE,
+)
+_ESCAPED_CLOSING_TAG_RE = re.compile(
+    rf"&(?P<amps>(?:amp;)*)lt;(?P<inner>{_CLOSING_TAG_INNER})&gt;",
+    re.IGNORECASE,
+)
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]+://")
 _SYSTEM_REMINDER_RE = re.compile(
     r"\s*<system-reminder>.*?</system-reminder>\s*",
     re.DOTALL | re.IGNORECASE,
@@ -36,21 +45,48 @@ _SYSTEM_REMINDER_RE = re.compile(
 
 
 def _escape_closing_tag(text: str) -> str:
-    """Escape any closing ``</user_verbatim_request>`` tag inside verbatim text."""
-    return _CLOSING_TAG_RE.sub("&lt;/user_verbatim_request&gt;", text)
+    """Reversibly escape any closing ``</user_verbatim_request>`` variant while
+    preserving original casing and whitespace."""
+    def _repl(m: re.Match[str]) -> str:
+        raw = m.group("raw")
+        if raw is not None:
+            return f"&lt;{raw}&gt;"
+        return f"&amp;{m.group('amps')}lt;{m.group('esc')}&gt;"
+
+    return _CLOSING_TAG_OR_ESCAPED_RE.sub(_repl, text)
+
+
+def _unescape_closing_tag(text: str) -> str:
+    """Inverse of :func:`_escape_closing_tag`, restoring original casing and whitespace."""
+    def _repl(m: re.Match[str]) -> str:
+        amps = m.group("amps")
+        inner = m.group("inner")
+        if not amps:
+            return f"<{inner}>"
+        return f"&{amps[4:]}lt;{inner}&gt;"
+
+    return _ESCAPED_CLOSING_TAG_RE.sub(_repl, text)
 
 
 def _basename_only(raw_name: Any) -> str | None:
-    """Return ONLY the filename component (no directory/URL), or None."""
+    """Return ONLY the filename component (no directory/URL), or None.
+
+    Distinguishes explicit URLs (``scheme://...`` — stripping scheme/host/query/
+    fragment before taking basename) from local paths and real filenames (which
+    preserve ``#``, ``?``, and other valid filename characters).
+    """
     if not isinstance(raw_name, str):
         return None
     cleaned = raw_name.strip()
     if not cleaned:
         return None
-    # Strip query/fragment if a URL slipped through, then take basename across POSIX & Windows separators.
-    no_query = cleaned.split("?", 1)[0].split("#", 1)[0].rstrip("/\\")
-    base = posixpath.basename(no_query.replace("\\", "/"))
-    base = os.path.basename(base)
+    if _URL_SCHEME_RE.match(cleaned):
+        parsed = urlsplit(cleaned)
+        path_part = unquote(parsed.path).replace("\\", "/").rstrip("/")
+        base = posixpath.basename(path_part)
+        return base or None
+    norm = cleaned.replace("\\", "/").rstrip("/")
+    base = posixpath.basename(norm)
     return base or None
 
 

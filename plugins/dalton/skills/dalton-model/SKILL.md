@@ -75,7 +75,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - 检查只对本轮改动单元格、转实际值列、新增期间列与预测区做判定，结果分为「本轮可修 / 基线遗留 / 缺证据 / 不适用」四类，仅「本轮可修」交回建模方定点修改，最多两轮。定点修改必须以当前候选为基础应用增量（切勿把增量计划重新应用到起点原模型）：
      1) 对当前候选重提指纹：`python3 .agents/skills/dalton-model/scripts/model_fingerprint.py <当前候选路径> --ticker <TICKER> --out <R>/model_dump/<TICKER>-fix<N>-fingerprint.json`；
      2) 以当前候选同时作为 `--baseline` 与 `--out` 执行增量修改：`python3 .agents/skills/dalton-model/scripts/model_edit.py apply --baseline <当前候选路径> --ticker <TICKER> --plan <fix_plan.json> --out <当前候选路径> --in-place --workspace-dir . --fingerprint <R>/model_dump/<TICKER>-fix<N>-fingerprint.json --prior-coord-map <R>/model_dump/coord_map.json --coord-map-out <R>/model_dump/coord_map.json --expected-baseline-sha256 <当前候选64位SHA-256> --mode <build|update>`；
-     3) 按最新模型哈希重跑 `model_consensus.py diff` 刷新 `consensus-diff.md/.json`，再用 `model_check.py check --mode <build|update> --fix-round <1|2>` 复查。
+     3) 按最新模型哈希重跑 `python3 .agents/skills/dalton-model/scripts/model_consensus.py diff --model <当前候选路径> --ticker <TICKER> --research-dir <R> --consensus <consensus.json>` 刷新 `consensus-diff.md/.json`，再用与本步首查同一组完整参数执行复查（仅递增 `--fix-round`）：`python3 .agents/skills/dalton-model/scripts/model_check.py check --workspace . --ticker <TICKER> --research-dir <R> --candidate <当前候选路径> --baseline <起点模型> --fingerprint <fingerprint.json> --coord-map <R>/model_dump/coord_map.json --workflow company-model --mode <build|update> --fix-round <1|2>`。
    - 凡盘上存在可读候选模型，无论零问题通过（`pass`）还是两轮后留有未决项或检查/复算超时降级（`delivered_with_open_issues`），均生成终态账本并顺畅交付。
 
 ### 工作流关闭时的手动降级路径

@@ -1964,6 +1964,91 @@ async def _resolve_model_ledger_run_context(
     )
 
 
+async def _resolve_full_coverage_expected_mode(
+    backend: Any,
+    workflow: str,
+    params: dict[str, Any],
+    expected_run_id: str | None,
+    thread_id: str | None,
+    is_manual_path: bool,
+) -> tuple[str | None, list[str]]:
+    """Resolve effective modeling mode (``build`` / ``update``) for ``full-coverage``.
+
+    For a workflow run, reads the last ``status == "ok"`` dispatch of ``建模准备``
+    from this run's journal so a tampered ``model-verification.json`` cannot
+    downgrade a ``build`` run to ``update``. For a manual run, derives the mode
+    only from explicit caller params (``mode`` or non-empty ``model_path``).
+    """
+    if workflow != "full-coverage":
+        return None, []
+    if is_manual_path:
+        raw_mode = params.get("mode")
+        if isinstance(raw_mode, str) and raw_mode.strip().lower() in ("build", "update"):
+            return raw_mode.strip().lower(), []
+        raw_mp = params.get("model_path")
+        if isinstance(raw_mp, str) and raw_mp.strip():
+            return "update", []
+        return None, []
+    if not expected_run_id:
+        return None, []
+    try:
+        journals = await _locate_run_journals(
+            backend, workflow, expected_run_id, thread_id
+        )
+    except _CannotVerify as error:
+        return None, [f"无法读取完整覆盖本次运行的建模准备记录（{error}），无法核对建模模式。"]
+    if not journals:
+        return None, [
+            "完整覆盖本次运行缺少建模准备记录（journal/建模准备.json），无法核对终态建模模式。"
+        ]
+    ordered = sorted(
+        journals,
+        key=lambda p: (0 if p.endswith("/journal/建模准备.json") else 1, p),
+    )
+    prep_records: list[tuple[float, int, dict[str, Any]]] = []
+    for path in ordered:
+        is_prep_file = path.endswith("/journal/建模准备.json")
+        if not is_prep_file and prep_records:
+            break
+        status, text = await _read_text_diagnosed(backend, path)
+        if status == "error":
+            if is_prep_file:
+                return None, [f"完整覆盖建模准备日志读取失败（{path}），无法核对建模模式，请重试。"]
+            continue
+        if status == "missing" or text is None:
+            continue
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            if is_prep_file:
+                return None, [f"完整覆盖建模准备日志不可解析（{path}），无法核对建模模式。"]
+            continue
+        if not isinstance(doc, dict):
+            if is_prep_file:
+                return None, [f"完整覆盖建模准备日志结构异常（{path}），无法核对建模模式。"]
+            continue
+        for entry in doc.get("dispatches") or []:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("label") or "") != "建模准备":
+                continue
+            if entry.get("status") == "ok" and isinstance(entry.get("result"), dict):
+                prep_records.append(
+                    (float(entry.get("recorded_at") or 0), int(entry.get("seq") or 0), entry)
+                )
+    if not prep_records:
+        return None, [
+            "完整覆盖本次运行缺少有效的「建模准备」成功派发记录，无法核对终态建模模式。"
+        ]
+    prep_records.sort(key=lambda item: (item[0], item[1]))
+    raw_prep_mode = prep_records[-1][2]["result"].get("mode")
+    if isinstance(raw_prep_mode, str) and raw_prep_mode.strip().lower() in ("build", "update"):
+        return raw_prep_mode.strip().lower(), []
+    return None, [
+        f"完整覆盖本次运行「建模准备」记录的模式无效（{raw_prep_mode!r}，期望 'build' 或 'update'），无法核对终态建模模式。"
+    ]
+
+
 async def _check_model_verification_ledger(
     backend: Any,
     workflow: str,
@@ -1972,28 +2057,46 @@ async def _check_model_verification_ledger(
     run_id: str | None,
     thread_id: str | None,
     since_epoch: int | None,
-) -> tuple[str | None, bool, list[str]]:
-    """Verify ``model-verification.json`` ``run_id`` / ``manual=true`` & freshness (§3.2)."""
+) -> tuple[str | None, bool, str | None, list[str]]:
+    """Verify ``model-verification.json`` ``run_id`` / ``manual=true`` / mode & freshness (§3.2)."""
     expected_run_id, is_manual_path, ctx_errors = await _resolve_model_ledger_run_context(
         backend, workflow, params, run_id, thread_id
     )
     errors = list(ctx_errors)
+    expected_mode, mode_errors = await _resolve_full_coverage_expected_mode(
+        backend,
+        workflow,
+        params,
+        expected_run_id if not ctx_errors else None,
+        thread_id,
+        is_manual_path,
+    )
+    errors.extend(mode_errors)
 
     status, text = await _read_text_diagnosed(backend, ledger_path)
     if status == "error" or text is None:
         errors.append(f"模型核验账本读取失败（{ledger_path}），无法核对 run_id，请重试。")
-        return expected_run_id, is_manual_path, errors
+        return expected_run_id, is_manual_path, expected_mode, errors
     if status == "missing":
         errors.append(f"缺少模型核验账本（{ledger_path}）。")
-        return expected_run_id, is_manual_path, errors
+        return expected_run_id, is_manual_path, expected_mode, errors
     try:
         doc = json.loads(text)
     except ValueError:
         errors.append(f"模型核验账本不是合法 JSON（{ledger_path}），请重新生成。")
-        return expected_run_id, is_manual_path, errors
+        return expected_run_id, is_manual_path, expected_mode, errors
     if not isinstance(doc, dict):
         errors.append(f"模型核验账本结构异常（{ledger_path}），应为 JSON 对象。")
-        return expected_run_id, is_manual_path, errors
+        return expected_run_id, is_manual_path, expected_mode, errors
+
+    if expected_mode is not None:
+        ledger_mode = str(doc.get("mode") or "").strip().lower()
+        if ledger_mode != expected_mode:
+            errors.append(
+                f"模型核验账本（{ledger_path}）的模式（{ledger_mode or '缺失'!r}）"
+                f"与本次运行建模准备模式（{expected_mode!r}）不一致；"
+                "请按实际建模模式重新执行检查并生成终态账本。"
+            )
 
     ledger_run_id = doc.get("run_id")
     if expected_run_id is not None:
@@ -2023,7 +2126,7 @@ async def _check_model_verification_ledger(
                     "请重新运行 model_check.py 生成本轮账本。"
                 )
 
-    return expected_run_id, is_manual_path, errors
+    return expected_run_id, is_manual_path, expected_mode, errors
 
 
 async def _check_stages(
@@ -2068,8 +2171,9 @@ async def _check_stages(
             draft_path = resolved[draft_path]
         ledger_expected_run_id: str | None = None
         ledger_is_manual = False
+        ledger_expected_mode: str | None = None
         if stage_ledger_path is not None and not stage_missing:
-            ledger_expected_run_id, ledger_is_manual, ledger_errors = (
+            ledger_expected_run_id, ledger_is_manual, ledger_expected_mode, ledger_errors = (
                 await _check_model_verification_ledger(
                     backend,
                     contract["name"],
@@ -2095,6 +2199,8 @@ async def _check_stages(
             if "model_check.py verify-done" in command:
                 if "--expected-workflow" not in command:
                     command = f"{command} --expected-workflow {shlex.quote(contract['name'])}"
+                if ledger_expected_mode and "--expected-mode" not in command:
+                    command = f"{command} --expected-mode {shlex.quote(ledger_expected_mode)}"
                 if ledger_expected_run_id and "--expected-run-id" not in command:
                     command = f"{command} --expected-run-id {shlex.quote(ledger_expected_run_id)}"
                 elif ledger_is_manual and "--manual" not in command:

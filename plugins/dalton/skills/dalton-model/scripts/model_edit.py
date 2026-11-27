@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import copy
+import errno
 import hashlib
 import importlib.util
 import json
@@ -79,6 +80,115 @@ def _load_module(mod_name: str, path: Path) -> Any:
     sys.modules[mod_name] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def _resolve_and_validate_output_path(
+    *,
+    output_path: str | Path | None,
+    workspace_dir: str | Path | None,
+    base: Path,
+    ticker: str,
+    naming_mode: str,
+    in_place: bool,
+) -> tuple[Path, Path | None]:
+    """Resolve ``cand`` and verify its real path resides under workspace ``model/``."""
+    if workspace_dir is not None:
+        ws_root = Path(workspace_dir).expanduser().resolve()
+        model_root: Path | None = (ws_root / "model").resolve()
+    elif base.parent.name == "model":
+        ws_root = base.parent.parent.resolve()
+        model_root = (ws_root / "model").resolve()
+    else:
+        ws_root = base.parent.parent.resolve()
+        model_root = None
+
+    if output_path is not None:
+        p_out = Path(output_path).expanduser()
+        if p_out.is_absolute():
+            raw_cand = p_out
+            cand = p_out.resolve()
+        elif workspace_dir is not None:
+            cand_cwd = p_out.resolve()
+            if cand_cwd.is_relative_to(ws_root):
+                raw_cand = p_out
+                cand = cand_cwd
+            else:
+                raw_cand = ws_root / p_out
+                cand = raw_cand.resolve()
+        else:
+            raw_cand = p_out
+            cand = p_out.resolve()
+        if not in_place and raw_cand.is_symlink():
+            raise ValueError(f"Refusing to overwrite symlink output path: {raw_cand}")
+    elif in_place:
+        cand = base
+    else:
+        cand = next_model_output_path(
+            ws_root,
+            ticker,
+            baseline_path=base,
+            naming_mode=naming_mode,
+        ).resolve()
+
+    if cand.suffix.lower() != ".xlsx":
+        raise ValueError(f"Refusing non-.xlsx output path: {cand}")
+    if model_root is not None:
+        if cand == model_root or not cand.is_relative_to(model_root):
+            raise ValueError(
+                f"Refusing output path outside workspace model/: {cand} (expected under {model_root})"
+            )
+    elif "model" not in cand.parent.parts:
+        raise ValueError(f"Refusing output path outside model/: {cand}")
+
+    return cand, model_root
+
+
+def _atomic_publish_workbook(
+    src: Path,
+    dst: Path,
+    *,
+    in_place: bool,
+    model_root: Path | None = None,
+) -> None:
+    """Publish staged workbook ``src`` to ``dst``.
+
+    When ``in_place`` is False, atomically refuses to overwrite any existing
+    file (including a concurrent writer or symlink) via ``os.link`` +
+    ``os.unlink`` (with ``O_CREAT | O_EXCL`` fallback when hard links are
+    unsupported by the filesystem).
+    """
+    real_parent = dst.parent.resolve()
+    real_dst = real_parent / dst.name
+    if model_root is not None and (real_dst == model_root or not real_dst.is_relative_to(model_root)):
+        src.unlink(missing_ok=True)
+        raise ValueError(
+            f"Refusing output path outside workspace model/: {real_dst} (expected under {model_root})"
+        )
+    if in_place:
+        os.replace(src, dst)
+        return
+    try:
+        os.link(src, dst)
+    except FileExistsError as exc:
+        src.unlink(missing_ok=True)
+        raise ValueError(f"Refusing to overwrite existing model version: {dst}") from exc
+    except OSError as exc:
+        if exc.errno not in (errno.EPERM, errno.EXDEV, errno.ENOTSUP, errno.EOPNOTSUPP):
+            raise
+        try:
+            fd = os.open(str(dst), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError as fe:
+            src.unlink(missing_ok=True)
+            raise ValueError(f"Refusing to overwrite existing model version: {dst}") from fe
+        try:
+            with os.fdopen(fd, "wb") as fout, src.open("rb") as fin:
+                shutil.copyfileobj(fin, fout)
+        except Exception:
+            dst.unlink(missing_ok=True)
+            raise
+        src.unlink(missing_ok=True)
+    else:
+        src.unlink(missing_ok=True)
 
 
 def _sha256_text(text: str) -> str:
@@ -820,25 +930,29 @@ def apply_edit_plan(
             "Refusing --skip-recalc on default-template / build mode: recalculation is required so formulas do not ship with empty cached values"
         )
 
-    if output_path is not None:
-        cand = Path(output_path).expanduser().resolve()
-    elif in_place:
-        cand = base
-    else:
-        ws_root = Path(workspace_dir).expanduser().resolve() if workspace_dir else base.parent.parent
-        cand = next_model_output_path(
-            ws_root,
-            ticker,
-            baseline_path=base,
-            naming_mode=fp.get("naming_mode", "auto"),
-        )
+    cand, model_root = _resolve_and_validate_output_path(
+        output_path=output_path,
+        workspace_dir=workspace_dir,
+        base=base,
+        ticker=ticker,
+        naming_mode=fp.get("naming_mode", "auto"),
+        in_place=in_place,
+    )
     if cand == base and not in_place:
         raise ValueError("Refusing to overwrite read-only baseline workbook in place")
     if prior_coord_map is not None:
         orig_base_raw = prior_coord_map.get("baseline_path")
         if orig_base_raw and Path(str(orig_base_raw)).expanduser().resolve() == cand:
             raise ValueError("Refusing to overwrite original read-only baseline workbook in place")
+    if not in_place and (cand.exists() or cand.is_symlink()):
+        raise ValueError(f"Refusing to overwrite existing model version: {cand}")
     cand.parent.mkdir(parents=True, exist_ok=True)
+    # Re-verify real path after directory creation in case an intermediate component was a symlink.
+    real_cand = cand.parent.resolve() / cand.name
+    if model_root is not None and (real_cand == model_root or not real_cand.is_relative_to(model_root)):
+        raise ValueError(
+            f"Refusing output path outside workspace model/: {real_cand} (expected under {model_root})"
+        )
 
     tk = ticker.strip().upper()
     non_target_sheets: set[str] = {
@@ -1179,7 +1293,7 @@ def apply_edit_plan(
                 post_coord_map_sha256=pre_recalc_cm_sha,
             )
 
-    os.replace(editing_tmp, cand)
+    _atomic_publish_workbook(editing_tmp, cand, in_place=in_place, model_root=model_root)
 
     ok_read, read_msg = model_readable.check_workbook_readable(cand)
     if not ok_read:

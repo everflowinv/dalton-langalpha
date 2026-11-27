@@ -1139,7 +1139,7 @@ class DiskHost(ScriptedHost):
             else:
                 nxt, _ = self._latest_disk_model()
             return {"files": [rec_path], "summary": f"bound {nxt}", "next_path": nxt}
-        if label in ("核验候选落盘", "核验联动候选落盘") and label not in self.by_label:
+        if label in ("核验候选落盘", "核验联动候选落盘", "核验当前模型落盘") and label not in self.by_label:
             m_cand = re.search(r"核验候选模型 (\S+?\.xlsx)", prompt)
             rel = m_cand.group(1) if m_cand else ""
             p = self.workspace / rel if rel else None
@@ -1281,6 +1281,14 @@ class DiskHost(ScriptedHost):
                     "consensus_diff_generated": True,
                 }
             if mode == "unusable":
+                # Simulate neither new candidate nor current fallback ledger being usable.
+                self.by_label["写入降级账本"] = {
+                    "files": [],
+                    "summary": "unusable candidate",
+                    "final_status": "failed_unusable",
+                    "model_sha256": None,
+                    "run_id": "run-disk-1",
+                }
                 return {
                     "files": [cur],
                     "summary": "unusable",

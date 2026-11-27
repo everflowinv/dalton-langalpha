@@ -8190,11 +8190,11 @@ async def test_p0b_r4_full_coverage_build_mode_propagates_to_report_revision_and
         read_assembled_workflow_file,
     )
 
-    # 1. Verify SKILL.md manual range checks explicitly include `--mode <build|update>`
+    # 1. Verify SKILL.md manual range checks explicitly include `--mode <build|update>` with full params
     skill_text = (REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-model" / "SKILL.md").read_text(encoding="utf-8")
     assert "model_check.py check --workspace . --ticker <TICKER>" in skill_text
     assert "--workflow company-model --mode <build|update> --fix-round <0|1|2>" in skill_text
-    assert "model_check.py check --mode <build|update> --fix-round <1|2>" in skill_text
+    assert "--workflow company-model --mode <build|update> --fix-round <1|2>" in skill_text
     assert "model_check.py write-ledger" in skill_text and "--mode <build|update>" in skill_text
 
     # 2. Full-coverage build-mode run enters report revision -> reviseModelForReport receives mode="build",
@@ -8519,7 +8519,8 @@ async def test_p0b_r4_path_binding_gate_old_path_rejection_and_split_disk_eviden
     assert res_pt["failedStages"] == ["recalc"], f"Disk-confirmed diff & report sync must NOT be marked failed: {res_pt['failedStages']}"
     assert "模型联动差异刷新" in lbls_pt and "模型联动报告同步" in lbls_pt
 
-    # --- Case 4: Child spoofs `changed=true` returning OLD path v02 while pre-bound v03 does NOT exist -> rejected! ---
+    # --- Case 4: Child spoofs `changed=true` returning OLD path v02 while pre-bound v03 does NOT exist ->
+    # MUST NOT treat old path as new candidate AND MUST NOT abort workflow; writes fallback ledger on readable v02! ---
     def _h_rev_old_path_spoof(lbl: str, prompt: str) -> Any:
         if lbl == "计算联动新路径":
             return {"files": [f"{r_rel}/model_dump/rev-planned.json"], "summary": "v03", "next_path": "model/PDD-model-v03.xlsx"}
@@ -8528,11 +8529,25 @@ async def test_p0b_r4_path_binding_gate_old_path_rejection_and_split_disk_eviden
         if lbl == "核验联动候选落盘":
             assert "model/PDD-model-v03.xlsx" in prompt
             return {"path": "model/PDD-model-v03.xlsx", "exists": False, "readable": False, "model_sha256": None}
-        raise AssertionError(f"Must NOT continue after old-path spoof: {lbl}")
+        if lbl == "写入降级账本":
+            assert '--candidate "model/PDD-model-v02.xlsx"' in prompt
+            assert '--failed-stages "report_revision"' in prompt
+            return {
+                "files": [f"{r_rel}/model_dump/model-verification.json", f"{r_rel}/model_dump/remaining-issues.md"],
+                "summary": "fb on readable v02",
+                "final_status": "delivered_with_open_issues",
+                "model_sha256": v2_sha,
+                "run_id": "run-rev-r4",
+            }
+        raise AssertionError(f"Must NOT continue diff/sync after missing new candidate: {lbl}")
 
     res_sp, lbls_sp = await _run_rev(_h_rev_old_path_spoof)
-    assert res_sp["ok"] is False and res_sp["status"] == "failed_unusable"
-    assert res_sp["modelPath"] is None
+    assert res_sp["ok"] is True and res_sp["status"] == "delivered_with_open_issues"
+    assert res_sp["changed"] is False
+    assert res_sp["modelPath"] == "model/PDD-model-v02.xlsx"
+    assert res_sp["modelSha256"] == v2_sha
+    assert res_sp["failedStages"] == ["report_revision"]
+    assert "写入降级账本" in lbls_sp
     assert "模型联动差异刷新" not in lbls_sp
 
     # --- Case 5: Diff fails (not on disk), Report sync succeeds on disk -> ONLY consensus fails, report_sync passes ---
@@ -9107,3 +9122,667 @@ async def test_p0b_r4_cos_hitl_reuses_settled_payload_and_refuses_dispatch_on_mi
     rej_content = str(reject_cmd.update["messages"][0].content)
     assert "declined" in rej_content.lower()
     assert post_spy.call_count == 0
+
+
+# ===========================================================================
+# P0-b Round 5 narrowed fixes (Items 1-6)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_p0b_r5_1_revise_model_probes_prebound_first_disk_checks_unchanged_and_degrades_on_missing_new(
+    tmp_path: Path,
+) -> None:
+    """R5 #1:
+    1) Pre-bound path is probed BEFORE trusting `changed=false`: if v03 is readable on disk
+       while child reported `changed=false`, workflow proceeds on v03;
+    2) When `changed=false` and v03 is absent, parent probes current v02 on disk and uses
+       real disk SHA-256 (never child self-reported SHA);
+    3) When child reports `changed=true` but pre-bound v03 is absent/unreadable, workflow
+       writes fallback ledger on readable v02 (`delivered_with_open_issues`, `ok=True`) and
+       continues report revision instead of aborting."""
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
+        WorkflowHost,
+        WorkflowLimits,
+        run_workflow_script,
+    )
+    from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
+        read_assembled_workflow_file,
+    )
+
+    stages_src = (REPO_ROOT / "workflows" / "_shared" / "modeling_stages.js").read_text(encoding="utf-8")
+    rev_harness_js = f"{stages_src}\nreturn await reviseModelForReport(args)\n"
+
+    ws = tmp_path / "ws_r5_1"
+    r_rel = "research/2026-11-27-deep-FY26Q3"
+    (ws / r_rel / "model_dump").mkdir(parents=True, exist_ok=True)
+    v2 = ws / "model" / "PDD-model-v02.xlsx"
+    v3 = ws / "model" / "PDD-model-v03.xlsx"
+    v2_sha = _write_simple_valid_model(v2)
+    v3_sha = _write_simple_valid_model(v3)
+    assert v2_sha and v3_sha
+
+    rev_args = {
+        "workspaceDir": ".",
+        "ticker": "PDD",
+        "researchDir": r_rel,
+        "progressPath": f"{r_rel}/.progress.json",
+        "workflow": "earnings-deep-update",
+        "mode": "update",
+        "currentModelPath": "model/PDD-model-v02.xlsx",
+        "currentModelSha256": v2_sha,
+        "currentStatus": "pass",
+        "currentArtifacts": [],
+        "consensusPath": "data/consensus/snap.json",
+        "priorFailedStages": [],
+        "runId": "run-r5-1",
+        "reportPath": "drafts/2026-11-27-deep-FY26Q3.md",
+        "reviewFeedback": {"verdict": "revise", "must_fix": ["update assumption"]},
+        "phaseLabel": "审稿",
+    }
+
+    async def _run_rev(handler: Any) -> tuple[Any, list[str]]:
+        lbls: list[str] = []
+        spec_host = create_autospec(WorkflowHost, instance=True)
+
+        async def _agent(prompt: str, opts: dict[str, Any]) -> Any:
+            lbl = str(opts.get("label") or "")
+            lbls.append(lbl)
+            return handler(lbl, prompt)
+
+        spec_host.agent.side_effect = _agent
+        spec_host.phase.side_effect = lambda _t: None
+        spec_host.log.side_effect = lambda _m: None
+        out = await run_workflow_script(rev_harness_js, rev_args, spec_host, WorkflowLimits(memory_limit_mb=64, cpu_budget_s=10.0))
+        assert out.status == "completed", out.error
+        return out.result, lbls
+
+    # Case A: Child reports changed=false, but pre-bound v03 IS readable on disk -> must proceed on v03!
+    def _h_false_but_published(lbl: str, prompt: str) -> Any:
+        if lbl == "计算联动新路径":
+            return {"files": [f"{r_rel}/model_dump/rev-planned.json"], "summary": "v03", "next_path": "model/PDD-model-v03.xlsx"}
+        if lbl == "模型联动修订":
+            return {"files": ["model/PDD-model-v02.xlsx"], "summary": "claimed unchanged", "changed": False, "model_path": "model/PDD-model-v02.xlsx", "model_sha256": "a" * 64}
+        if lbl == "核验联动候选落盘":
+            assert "model/PDD-model-v03.xlsx" in prompt
+            return {"path": "model/PDD-model-v03.xlsx", "exists": True, "readable": True, "model_sha256": v3_sha}
+        if lbl == "模型联动差异刷新":
+            return {"files": [f"{r_rel}/model_dump/consensus-diff.md", f"{r_rel}/model_dump/consensus-diff.json"], "summary": "diff", "consensus_diff_generated": True}
+        if lbl == "核验差异表落盘":
+            return {"path": f"{r_rel}/model_dump/consensus-diff.json", "json_ok": True, "md_ok": True, "matched": True}
+        if lbl == "模型联动报告同步":
+            return {"files": ["drafts/2026-11-27-deep-FY26Q3.md"], "summary": "sync", "report_sha256": "b" * 64}
+        if lbl == "核验报告同步落盘":
+            return {"path": "drafts/2026-11-27-deep-FY26Q3.md", "exists": True, "synced": True, "report_sha256": "c" * 64}
+        if lbl == "模型联动修订检查":
+            assert '--candidate "model/PDD-model-v03.xlsx"' in prompt
+            assert '--failed-stages "recalc"' in prompt
+            return {
+                "files": [f"{r_rel}/model_dump/model-check.md", f"{r_rel}/model_dump/model-verification.json", f"{r_rel}/model_dump/remaining-issues.md"],
+                "summary": "delivered",
+                "readable": True,
+                "final_status": "delivered_with_open_issues",
+                "model_sha256": v3_sha,
+                "actionable_count": 0,
+                "actionable_issues": [],
+                "missing_required_sheets": [],
+                "remaining_issues_path": f"{r_rel}/model_dump/remaining-issues.md",
+            }
+        raise AssertionError(lbl)
+
+    res_a, lbls_a = await _run_rev(_h_false_but_published)
+    assert res_a["ok"] is True and res_a["changed"] is True
+    assert res_a["modelPath"] == "model/PDD-model-v03.xlsx"
+    assert res_a["modelSha256"] == v3_sha
+    assert "核验联动候选落盘" in lbls_a and "模型联动修订检查" in lbls_a
+
+    # Case B: Child reports changed=false with spoofed SHA, v03 absent -> parent probes current v02 on disk & ignores self-reported SHA!
+    spoof_sha = "f" * 64
+
+    def _h_false_real_disk_sha(lbl: str, prompt: str) -> Any:
+        if lbl == "计算联动新路径":
+            return {"files": [f"{r_rel}/model_dump/rev-planned.json"], "summary": "v03", "next_path": "model/PDD-model-v03.xlsx"}
+        if lbl == "模型联动修订":
+            return {"files": ["model/PDD-model-v02.xlsx"], "summary": "no change", "changed": False, "model_path": "model/PDD-model-v02.xlsx", "model_sha256": spoof_sha}
+        if lbl == "核验联动候选落盘":
+            return {"path": "model/PDD-model-v03.xlsx", "exists": False, "readable": False, "model_sha256": None}
+        if lbl == "核验当前模型落盘":
+            assert "model/PDD-model-v02.xlsx" in prompt
+            return {"path": "model/PDD-model-v02.xlsx", "exists": True, "readable": True, "model_sha256": v2_sha}
+        raise AssertionError(lbl)
+
+    res_b, lbls_b = await _run_rev(_h_false_real_disk_sha)
+    assert res_b["ok"] is True and res_b["changed"] is False
+    assert res_b["modelPath"] == "model/PDD-model-v02.xlsx"
+    assert res_b["modelSha256"] == v2_sha and res_b["modelSha256"] != spoof_sha
+    assert "核验联动候选落盘" in lbls_b and "核验当前模型落盘" in lbls_b
+
+    # Case C: End-to-end earnings-deep-update workflow: child claims changed=true without v03 on disk ->
+    # writes real fallback ledger on v02 (`delivered_with_open_issues`) and report revision (`修订 1`) CONTINUES!
+    v3.unlink()
+    deep_script = read_assembled_workflow_file(REPO_ROOT / "workflows" / "earnings-deep-update" / "workflow.js")
+    deep_params = {
+        "ticker": "PDD",
+        "company": "PDD Holdings",
+        "quarter": "FY26Q3",
+        "workspace_dir": ".",
+        "release_date": "2026-11-27",
+        "model_path": "model/PDD-model-v02.xlsx",
+        "preview_predictions": None,
+        "progress_path": f"{r_rel}/.progress.json",
+    }
+    nine_items = [{"check": i, "result": "pass", "reason": "ok", "lines": "L1"} for i in range(1, 10)]
+    seen_deep_labels: list[str] = []
+    spec_host_deep = create_autospec(WorkflowHost, instance=True)
+
+    async def _deep_agent(prompt: str, opts: dict[str, Any]) -> Any:
+        lbl = str(opts.get("label") or "")
+        seen_deep_labels.append(lbl)
+        if lbl == "八节点评":
+            return {"files": ["drafts/2026-11-27-deep-FY26Q3.md"], "summary": "draft", "sha256": "1" * 64}
+        if lbl == "产物核验":
+            paths = [ln[2:].strip() for ln in prompt.splitlines() if ln.startswith("- ") and "|" not in ln]
+            return {"files": [f"{p}|{'e' * 64}" for p in paths]}
+        if lbl == "建模准备":
+            return {"files": [f"{r_rel}/mapping.md"], "summary": "prep", "mode": "update", "baseline_path": "model/PDD-model-v01.xlsx", "planned_output_path": "model/PDD-model-v02.xlsx"}
+        if lbl == "读取运行ID":
+            return {"run_id": "run-r5-deep"}
+        if lbl == "模型构建与落盘":
+            return {"files": ["model/PDD-model-v02.xlsx"], "summary": "v02", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": v2_sha, "recalc_status": "ok"}
+        if lbl == "一致预期对照":
+            return {"files": ["model/PDD-model-v02.xlsx", f"{r_rel}/model_dump/consensus-diff.md", f"{r_rel}/model_dump/consensus-diff.json"], "summary": "cons", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": v2_sha, "consensus_diff_generated": True}
+        if lbl == "模型本轮范围检查":
+            return {"files": [f"{r_rel}/model_dump/model-check.md", f"{r_rel}/model_dump/model-verification.json"], "summary": "pass", "readable": True, "final_status": "pass", "model_sha256": v2_sha, "actionable_count": 0, "missing_required_sheets": []}
+        if lbl == "模型变动拆解":
+            return {"files": [f"{r_rel}/model-delta.md"], "summary": "delta"}
+        if lbl == "校准与对账":
+            return {"files": [f"{r_rel}/reconcile.md"], "summary": "cal", "sha256": "2" * 64}
+        if lbl == "语言审查 1":
+            return {"files": ["drafts/2026-11-27-deep-FY26Q3.md"], "summary": "lang1", "sha256": "3" * 64}
+        if lbl == "审稿":
+            return {"verdict": "revise", "summary": "adjust model", "must_fix": ["fix eps"], "items": nine_items}
+        if lbl == "计算联动新路径":
+            return {"files": [f"{r_rel}/model_dump/rev-planned.json"], "summary": "v03", "next_path": "model/PDD-model-v03.xlsx"}
+        if lbl == "模型联动修订":
+            return {"files": ["model/PDD-model-v02.xlsx"], "summary": "claimed changed without v03", "changed": True, "model_path": "model/PDD-model-v03.xlsx", "model_sha256": "e" * 64, "recalc_status": "ok"}
+        if lbl == "核验联动候选落盘":
+            return {"path": "model/PDD-model-v03.xlsx", "exists": False, "readable": False, "model_sha256": None}
+        if lbl == "写入降级账本":
+            fb = mchk.write_fallback_ledger(
+                workspace_dir=ws,
+                ticker="PDD",
+                research_dir=ws / r_rel,
+                candidate_path=v2,
+                baseline_path=v2,
+                kind="report_revision",
+                failed_stages=["report_revision"],
+                run_id="run-r5-deep",
+                workflow="earnings-deep-update",
+                mode="update",
+            )
+            return {
+                "files": [f"{r_rel}/model_dump/model-verification.json", f"{r_rel}/model_dump/remaining-issues.md"],
+                "summary": "fallback written",
+                "final_status": fb["final_status"],
+                "model_sha256": fb["model_sha256"],
+                "run_id": "run-r5-deep",
+            }
+        if lbl == "修订 1":
+            return {"files": ["drafts/2026-11-27-deep-FY26Q3.md"], "summary": "revised report", "sha256": "4" * 64}
+        if lbl == "复审 1":
+            return {"verdict": "pass", "summary": "ok", "must_fix": [], "items": nine_items}
+        if lbl == "笔记语言审查":
+            return {"files": [f"{r_rel}/reconcile.md"], "summary": "notes ok"}
+        if lbl == "语言审查 2":
+            return {"files": ["drafts/2026-11-27-deep-FY26Q3.md"], "summary": "lang2", "sha256": "4" * 64}
+        if lbl == "知识层修订草案":
+            return {"files": [f"{r_rel}/knowledge-revision.json"], "summary": "kr"}
+        return {"files": [], "summary": "ok"}
+
+    spec_host_deep.agent.side_effect = _deep_agent
+    spec_host_deep.phase.side_effect = lambda _t: None
+    spec_host_deep.log.side_effect = lambda _m: None
+    deep_out = await run_workflow_script(deep_script, deep_params, spec_host_deep, WorkflowLimits(memory_limit_mb=64, cpu_budget_s=10.0))
+    assert deep_out.status == "completed", deep_out.error
+    assert "写入降级账本" in seen_deep_labels
+    assert "修订 1" in seen_deep_labels and "复审 1" in seen_deep_labels, seen_deep_labels
+    assert deep_out.result["ok"] is True, deep_out.result
+    assert deep_out.result["model_status"] == "delivered_with_open_issues"
+    assert deep_out.result["model_file"] == "model/PDD-model-v02.xlsx"
+
+
+@pytest.mark.asyncio
+async def test_p0b_r5_2_report_sync_probe_executes_real_command_and_requires_report_body(
+    tmp_path: Path,
+) -> None:
+    """R5 #2: Report sync disk probe executes the REAL read-only python command from
+    the prompt (never hand-fabricated probe results). Updating only `.memo-model.json`
+    or `model-delta.md` while leaving report body without `model:` link or new path
+    MUST return `synced=False` and record `report_sync`."""
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
+        WorkflowHost,
+        WorkflowLimits,
+        run_workflow_script,
+    )
+
+    stages_src = (REPO_ROOT / "workflows" / "_shared" / "modeling_stages.js").read_text(encoding="utf-8")
+    rev_harness_js = f"{stages_src}\nreturn await reviseModelForReport(args)\n"
+
+    ws = tmp_path / "ws_r5_2"
+    r_rel = "research/2026-11-27-fc"
+    (ws / r_rel / "model_dump").mkdir(parents=True, exist_ok=True)
+    (ws / "drafts").mkdir(parents=True, exist_ok=True)
+    v2 = ws / "model" / "PDD-model-v02.xlsx"
+    v3 = ws / "model" / "PDD-model-v03.xlsx"
+    v2_sha = _write_simple_valid_model(v2)
+    v3_sha = _write_simple_valid_model(v3)
+    memo_p = ws / "drafts" / "2026-11-27-memo.md"
+    meta_p = ws / r_rel / ".memo-model.json"
+    delta_p = ws / r_rel / "model-delta.md"
+
+    def _run_real_probe_from_prompt(prompt: str) -> dict[str, Any]:
+        m = re.search(r"```bash\n(.*?)\n```", prompt, re.DOTALL)
+        assert m, f"Missing bash command block in prompt:\n{prompt}"
+        proc = subprocess.run(
+            ["bash", "-c", m.group(1)],
+            cwd=ws,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, f"Probe command failed: {proc.stderr}\n{proc.stdout}"
+        return json.loads(proc.stdout.strip())
+
+    async def _run_case(body_text: str, meta_doc: dict[str, str], delta_text: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        memo_p.write_text(body_text, encoding="utf-8")
+        meta_p.write_text(json.dumps(meta_doc), encoding="utf-8")
+        delta_p.write_text(delta_text, encoding="utf-8")
+        probe_out_holder: list[dict[str, Any]] = []
+
+        rev_args = {
+            "workspaceDir": ".",
+            "ticker": "PDD",
+            "researchDir": r_rel,
+            "progressPath": f"{r_rel}/.progress.json",
+            "workflow": "full-coverage",
+            "mode": "update",
+            "currentModelPath": "model/PDD-model-v02.xlsx",
+            "currentModelSha256": v2_sha,
+            "currentStatus": "pass",
+            "currentArtifacts": [],
+            "consensusPath": "data/consensus/snap.json",
+            "priorFailedStages": [],
+            "runId": "run-r5-2",
+            "reportPath": "drafts/2026-11-27-memo.md",
+            "extraSyncPaths": [f"{r_rel}/.memo-model.json", f"{r_rel}/model-delta.md"],
+            "reviewFeedback": {"verdict": "revise", "must_fix": ["sync"]},
+            "phaseLabel": "修订",
+        }
+        spec_host = create_autospec(WorkflowHost, instance=True)
+
+        async def _agent(prompt: str, opts: dict[str, Any]) -> Any:
+            lbl = str(opts.get("label") or "")
+            if lbl == "计算联动新路径":
+                return {"files": [f"{r_rel}/model_dump/rev-planned.json"], "summary": "v03", "next_path": "model/PDD-model-v03.xlsx"}
+            if lbl == "模型联动修订":
+                return {"files": ["model/PDD-model-v03.xlsx"], "summary": "v03", "changed": True, "model_path": "model/PDD-model-v03.xlsx", "model_sha256": v3_sha, "recalc_status": "ok"}
+            if lbl == "核验联动候选落盘":
+                return {"path": "model/PDD-model-v03.xlsx", "exists": True, "readable": True, "model_sha256": v3_sha}
+            if lbl == "模型联动差异刷新":
+                return {"files": [f"{r_rel}/model_dump/consensus-diff.md", f"{r_rel}/model_dump/consensus-diff.json"], "summary": "diff", "consensus_diff_generated": True}
+            if lbl == "核验差异表落盘":
+                return {"path": f"{r_rel}/model_dump/consensus-diff.json", "json_ok": True, "md_ok": True, "matched": True}
+            if lbl == "模型联动报告同步":
+                return {"files": ["drafts/2026-11-27-memo.md", f"{r_rel}/.memo-model.json"], "summary": "sync attempt", "report_sha256": "0" * 64}
+            if lbl == "核验报告同步落盘":
+                real_probe = _run_real_probe_from_prompt(prompt)
+                probe_out_holder.append(real_probe)
+                return real_probe
+            if lbl == "模型联动修订检查":
+                has_rs = "report_sync" in prompt
+                return {
+                    "files": [f"{r_rel}/model_dump/model-check.md", f"{r_rel}/model_dump/model-verification.json", f"{r_rel}/model_dump/remaining-issues.md"],
+                    "summary": "chk",
+                    "readable": True,
+                    "final_status": "delivered_with_open_issues" if has_rs else "pass",
+                    "model_sha256": v3_sha,
+                    "actionable_count": 0,
+                    "actionable_issues": [],
+                    "missing_required_sheets": [],
+                    "remaining_issues_path": f"{r_rel}/model_dump/remaining-issues.md" if has_rs else None,
+                }
+            raise AssertionError(lbl)
+
+        spec_host.agent.side_effect = _agent
+        spec_host.phase.side_effect = lambda _t: None
+        spec_host.log.side_effect = lambda _m: None
+        out = await run_workflow_script(rev_harness_js, rev_args, spec_host, WorkflowLimits(memory_limit_mb=64, cpu_budget_s=10.0))
+        assert out.status == "completed", out.error
+        assert len(probe_out_holder) == 1
+        return out.result, probe_out_holder[0]
+
+    # 1. Extras updated to v03, report body STILL stale (no model: link and no v03 path) -> synced=False!
+    res_stale, probe_stale = await _run_case(
+        body_text="# 备忘录\n正文仍引用旧模型 model/PDD-model-v02.xlsx，未同步更新。\n",
+        meta_doc={"path": "model/PDD-model-v03.xlsx", "sha256": v3_sha},
+        delta_text="新模型为 model/PDD-model-v03.xlsx，EPS 上调。\n",
+    )
+    assert probe_stale["synced"] is False, probe_stale
+    assert "report_sync" in res_stale["failedStages"]
+
+    # 2. Report body updated with model: link to v03, but .memo-model.json still stale -> synced=False!
+    res_meta_stale, probe_meta_stale = await _run_case(
+        body_text="# 备忘录\n目标价见 model:model/PDD-model-v03.xlsx!Valuation!C12。\n",
+        meta_doc={"path": "model/PDD-model-v02.xlsx", "sha256": v2_sha},
+        delta_text="新模型为 model/PDD-model-v03.xlsx。\n",
+    )
+    assert probe_meta_stale["synced"] is False, probe_meta_stale
+    assert "report_sync" in res_meta_stale["failedStages"]
+
+    # 3. Both report body (model: link to v03) and extras synced -> synced=True with real SHA!
+    res_link_ok, probe_link_ok = await _run_case(
+        body_text="# 备忘录\n目标价见 model:model/PDD-model-v03.xlsx!Valuation!C12。\n",
+        meta_doc={"path": "model/PDD-model-v03.xlsx", "sha256": v3_sha},
+        delta_text="新模型为 model:model/PDD-model-v03.xlsx!Facts!A1。\n",
+    )
+    assert probe_link_ok["synced"] is True, probe_link_ok
+    assert probe_link_ok["report_sha256"] == mfp.file_sha256(memo_p)
+    assert "report_sync" not in res_link_ok["failedStages"]
+
+    # 4. Report body contains new path string directly (no model: link) and extras synced -> synced=True!
+    res_path_ok, probe_path_ok = await _run_case(
+        body_text="# 备忘录\n估值已切换至 model/PDD-model-v03.xlsx。\n",
+        meta_doc={"path": "model/PDD-model-v03.xlsx", "sha256": v3_sha},
+        delta_text="新模型为 model/PDD-model-v03.xlsx。\n",
+    )
+    assert probe_path_ok["synced"] is True, probe_path_ok
+    assert "report_sync" not in res_path_ok["failedStages"]
+
+
+@pytest.mark.asyncio
+async def test_p0b_r5_3_output_path_restricted_to_workspace_model_and_atomic_no_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R5 #3:
+    1) JS `_mValidModelOutPath` accepts only relative paths under `model/*.xlsx`;
+    2) `model_edit.apply_edit_plan` verifies real path resides under `<workspace>/model/`
+       (rejecting sibling dirs, traversal, and symlinks escaping `model/`);
+    3) Non-in-place publish atomically refuses to overwrite an existing version file
+       both pre-edit AND if created concurrently right before publish."""
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
+        WorkflowHost,
+        WorkflowLimits,
+        run_workflow_script,
+    )
+
+    stages_src = (REPO_ROOT / "workflows" / "_shared" / "modeling_stages.js").read_text(encoding="utf-8")
+    js_check = (
+        f"{stages_src}\n"
+        "return {\n"
+        "  ok: _mValidModelOutPath('model/PDD-model-v02.xlsx', 'model/PDD-model-v01.xlsx', '.'),\n"
+        "  outside_drafts: _mValidModelOutPath('drafts/PDD-model-v02.xlsx', 'model/PDD-model-v01.xlsx', '.'),\n"
+        "  outside_root: _mValidModelOutPath('PDD-model-v02.xlsx', 'model/PDD-model-v01.xlsx', '.'),\n"
+        "  traversal: _mValidModelOutPath('model/../drafts/PDD-model-v02.xlsx', 'model/PDD-model-v01.xlsx', '.'),\n"
+        "  same_base: _mValidModelOutPath('model/PDD-model-v01.xlsx', 'model/PDD-model-v01.xlsx', '.'),\n"
+        "}\n"
+    )
+    spec_host = create_autospec(WorkflowHost, instance=True)
+    js_out = await run_workflow_script(js_check, {}, spec_host, WorkflowLimits(memory_limit_mb=64, cpu_budget_s=5.0))
+    assert js_out.status == "completed", js_out.error
+    assert js_out.result["ok"] == "model/PDD-model-v02.xlsx"
+    assert js_out.result["outside_drafts"] is None
+    assert js_out.result["outside_root"] is None
+    assert js_out.result["traversal"] is None
+    assert js_out.result["same_base"] is None
+
+    ws = tmp_path / "ws_r5_3"
+    base = ws / "model" / "PDD-model-v01.xlsx"
+    _write_simple_valid_model(base)
+    fp = mfp.build_fingerprint(base, ticker="PDD")
+    plan = {"cell_edits": [{"sheet": "Model - PDD", "cell": "E2", "value": 1230}]}
+
+    # 2a. Outside workspace model/ (drafts/ or sibling path) -> rejected
+    with pytest.raises(ValueError, match="outside workspace model/"):
+        medit.apply_edit_plan(
+            baseline_path=base,
+            ticker="PDD",
+            plan=plan,
+            output_path=ws / "drafts" / "PDD-model-v02.xlsx",
+            workspace_dir=ws,
+            fingerprint=fp,
+            skip_recalc=True,
+        )
+
+    # 2b. Symlink directory inside model/ pointing outside workspace -> rejected
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    evil_link = ws / "model" / "escape"
+    evil_link.symlink_to(outside_dir)
+    with pytest.raises(ValueError, match="outside workspace model/"):
+        medit.apply_edit_plan(
+            baseline_path=base,
+            ticker="PDD",
+            plan=plan,
+            output_path=evil_link / "PDD-model-v02.xlsx",
+            workspace_dir=ws,
+            fingerprint=fp,
+            skip_recalc=True,
+        )
+
+    # 3a. Already-existing version file -> rejected before publish and untouched
+    existing_v2 = ws / "model" / "PDD-model-v02.xlsx"
+    existing_v2_sha = _write_simple_valid_model(existing_v2)
+    with pytest.raises(ValueError, match="existing model version"):
+        medit.apply_edit_plan(
+            baseline_path=base,
+            ticker="PDD",
+            plan=plan,
+            output_path=existing_v2,
+            workspace_dir=ws,
+            fingerprint=fp,
+            skip_recalc=True,
+        )
+    assert mfp.file_sha256(existing_v2) == existing_v2_sha
+
+    # 3b. Concurrent creation AFTER pre-edit check, right before publish -> atomic os.link refuses overwrite!
+    raced_v3 = ws / "model" / "PDD-model-v03.xlsx"
+    orig_restore = medit.model_xlsx_hooks.restore_donor_cache
+    raced_sentinel_sha: list[str] = []
+
+    def _restore_with_concurrent_writer(*args: Any, **kwargs: Any) -> Any:
+        res = orig_restore(*args, **kwargs)
+        raced_sentinel_sha.append(_write_simple_valid_model(raced_v3))
+        return res
+
+    monkeypatch.setattr(
+        medit.model_xlsx_hooks,
+        "restore_donor_cache",
+        create_autospec(orig_restore, side_effect=_restore_with_concurrent_writer),
+    )
+    with pytest.raises(ValueError, match="existing model version"):
+        medit.apply_edit_plan(
+            baseline_path=base,
+            ticker="PDD",
+            plan=plan,
+            output_path=raced_v3,
+            workspace_dir=ws,
+            fingerprint=fp,
+            skip_recalc=True,
+        )
+    assert raced_sentinel_sha and mfp.file_sha256(raced_v3) == raced_sentinel_sha[0]
+
+
+def test_p0b_r5_4_verify_done_expected_mode_rejects_tampered_full_coverage_ledger(
+    tmp_path: Path,
+) -> None:
+    """R5 #4 (CLI + Python): Full-coverage verify-done accepts `--expected-mode` and
+    rejects a ledger whose `mode` was tampered from `build` to `update` even when
+    the workbook has all 4 update sheets (still missing build-only sheets)."""
+    ws = tmp_path / "ws_r5_4"
+    rdir = ws / "research" / "2026-11-27-fc"
+    v1 = ws / "model" / "PDD-model-v01.xlsx"
+    _write_simple_valid_model(v1)
+    wb = openpyxl.load_workbook(v1)
+    for sh in ("README & Changelog", "Facts", "Guidance vs Actual", "Street vs House", "Checks"):
+        if sh not in wb.sheetnames:
+            wb.create_sheet(sh)["A1"] = sh
+    wb.save(v1)
+    wb.close()
+
+    # Write a clean update-mode ledger on this 4-sheet workbook (passes without expected_mode)
+    mchk.write_fallback_ledger(
+        workspace_dir=ws,
+        ticker="PDD",
+        research_dir=rdir,
+        candidate_path=v1,
+        kind="modeling",
+        failed_stages=["check", "consensus"],
+        run_id="run-r5-4",
+        workflow="full-coverage",
+        mode="update",
+    )
+    vd_without_mode = mchk.verify_done(
+        workspace_dir=ws,
+        ticker="PDD",
+        research_dir=rdir,
+        expected_run_id="run-r5-4",
+        expected_workflow="full-coverage",
+    )
+    assert vd_without_mode["ok"] is True, vd_without_mode["errors"]
+
+    # With expected_mode="build" (from this run's prepare step), MUST fail both mode mismatch AND missing build sheets!
+    vd_with_build = mchk.verify_done(
+        workspace_dir=ws,
+        ticker="PDD",
+        research_dir=rdir,
+        expected_run_id="run-r5-4",
+        expected_workflow="full-coverage",
+        expected_mode="build",
+    )
+    assert vd_with_build["ok"] is False
+    assert any("mode mismatch" in e for e in vd_with_build["errors"]), vd_with_build["errors"]
+    assert any("full-coverage (build)" in e and "DCF" in e for e in vd_with_build["errors"]), vd_with_build["errors"]
+
+    # CLI --expected-mode build returns non-zero exit code
+    rc = mchk.main(
+        [
+            "verify-done",
+            "--workspace",
+            str(ws),
+            "--ticker",
+            "PDD",
+            "--research-dir",
+            str(rdir),
+            "--expected-run-id",
+            "run-r5-4",
+            "--expected-workflow",
+            "full-coverage",
+            "--expected-mode",
+            "build",
+        ]
+    )
+    assert rc != 0
+
+
+def test_p0b_r5_5_manual_commands_consistent_complete_with_workflow_and_mode() -> None:
+    """R5 #5: Manual check, re-check, and fallback ledger commands across dalton-model,
+    rollforward.md, dalton-full-coverage, and dalton-earnings-deep are complete commands
+    with explicit `--workflow` and `--mode`, leaving no bare fragments."""
+    model_skill = (REPO_ROOT / "plugins/dalton/skills/dalton-model/SKILL.md").read_text(encoding="utf-8")
+    rollforward = (REPO_ROOT / "plugins/dalton/skills/dalton-model/references/rollforward.md").read_text(encoding="utf-8")
+    fc_skill = (REPO_ROOT / "plugins/dalton/skills/dalton-full-coverage/SKILL.md").read_text(encoding="utf-8")
+    deep_skill = (REPO_ROOT / "plugins/dalton/skills/dalton-earnings-deep/SKILL.md").read_text(encoding="utf-8")
+
+    # 1. No bare fragment re-check commands remain
+    assert "`model_check.py check --fix-round <1|2>`" not in rollforward
+    assert "`model_check.py check --mode <build|update> --fix-round <1|2>`" not in model_skill
+
+    # 2. dalton-model SKILL.md & rollforward.md share full parameter set with explicit --mode
+    for doc_name, doc_text, mode_tok in (
+        ("dalton-model/SKILL.md", model_skill, "--mode <build|update>"),
+        ("rollforward.md", rollforward, "--mode update"),
+    ):
+        chk_cmds = re.findall(r"`(python3 \.agents/skills/dalton-model/scripts/model_check\.py check [^`]+)`", doc_text)
+        assert len(chk_cmds) >= 2, (doc_name, chk_cmds)
+        for cmd in chk_cmds:
+            for flag in ("--workspace", "--ticker", "--research-dir", "--candidate", "--baseline", "--fingerprint", "--coord-map", "--workflow company-model", mode_tok, "--fix-round"):
+                assert flag in cmd, (doc_name, flag, cmd)
+
+    # 3. full-coverage & earnings-deep manual commands explicitly specify their own --workflow and --mode
+    for doc_name, doc_text, wf_flag, mode_flag in (
+        ("dalton-full-coverage/SKILL.md", fc_skill, "--workflow full-coverage", "--mode <build|update>"),
+        ("dalton-earnings-deep/SKILL.md", deep_skill, "--workflow earnings-deep-update", "--mode update"),
+    ):
+        chk_cmds = re.findall(r"`(python3 \.agents/skills/dalton-model/scripts/model_check\.py check [^`]+)`", doc_text)
+        wl_cmds = re.findall(r"`(python3 \.agents/skills/dalton-model/scripts/model_check\.py write-ledger [^`]+)`", doc_text)
+        assert len(chk_cmds) >= 3, (doc_name, chk_cmds)
+        assert len(wl_cmds) >= 1, (doc_name, wl_cmds)
+        for cmd in chk_cmds:
+            for flag in ("--workspace", "--ticker", "--research-dir", "--candidate", wf_flag, mode_flag):
+                assert flag in cmd, (doc_name, flag, cmd)
+        for cmd in wl_cmds:
+            for flag in ("--workspace", "--ticker", "--research-dir", "--candidate", "--failed-stages", wf_flag, mode_flag):
+                assert flag in cmd, (doc_name, flag, cmd)
+
+
+def test_p0b_r5_6_cos_verbatim_filename_special_chars_and_reversible_tag_escape() -> None:
+    """R5 #6:
+    1) `_basename_only` preserves `#` and `?` in real filenames/local paths while still
+       stripping scheme/host/query/fragment from URLs;
+    2) `_escape_closing_tag` / `_unescape_closing_tag` is strictly reversible and preserves
+       original casing and whitespace."""
+    from types import SimpleNamespace
+    from src.dalton.cos_verbatim import (
+        COS_TURN_VERBATIM_CONFIG_KEY,
+        _basename_only,
+        _escape_closing_tag,
+        _unescape_closing_tag,
+        append_verbatim_user_request,
+        capture_turn_verbatim_request,
+    )
+
+    # 1. Real filenames & local paths preserve `#` and `?`; URLs strip query & fragment
+    assert _basename_only("Q3#final.xlsx") == "Q3#final.xlsx"
+    assert _basename_only("/tmp/uploads/Q3#final.xlsx") == "Q3#final.xlsx"
+    assert _basename_only("work/uploads/rev?v2#1.xlsx") == "rev?v2#1.xlsx"
+    assert _basename_only(r"C:\Users\analyst\Q3#final?draft.xlsx") == "Q3#final?draft.xlsx"
+    assert _basename_only("https://cdn.example.com/path/Q3_Release.pdf?token=secret#page=2") == "Q3_Release.pdf"
+    assert _basename_only("s3://bucket/folder/Q3%23final.xlsx?X-Amz-Signature=abc") == "Q3#final.xlsx"
+
+    # 2. Reversible closing-tag escaping preserves casing, whitespace, and literal entities
+    samples = [
+        "原文 </user_verbatim_request> 结束",
+        "大写 </USER_VERBATIM_REQUEST> 与空格 </  User_Verbatim_Request\t > 保留",
+        "混合字面量 &lt;/User_Verbatim_Request&gt; 与 &amp;lt;/user_verbatim_request&gt; 与 </USER_VERBATIM_REQUEST >",
+    ]
+    for s in samples:
+        escaped = _escape_closing_tag(s)
+        assert not re.search(r"</\s*user_verbatim_request\s*>", escaped, re.IGNORECASE), escaped
+        assert _unescape_closing_tag(escaped) == s
+
+    assert "&lt;/USER_VERBATIM_REQUEST&gt;" in _escape_closing_tag("</USER_VERBATIM_REQUEST>")
+    assert "&lt;/  User_Verbatim_Request\t &gt;" in _escape_closing_tag("</  User_Verbatim_Request\t >")
+
+    # 3. End-to-end capture + append preserves attachment `#`/`?` and tag casing/spaces
+    req = SimpleNamespace(
+        hitl_response=None,
+        report_source=None,
+        wakeup=None,
+        market_target=None,
+        origin=None,
+        additional_context=[
+            SimpleNamespace(type="chat_upload", name="/tmp/uploads/Q3#final.xlsx"),
+            SimpleNamespace(type="file", name="work/notes?v2.pdf"),
+            SimpleNamespace(type="file", name="https://cdn.example.com/a/Deck.pdf?token=secret"),
+        ],
+    )
+    raw = "保留 </  USER_VERBATIM_REQUEST > 原样"
+    cap = capture_turn_verbatim_request(request=req, raw_messages=[{"role": "user", "content": raw}])
+    assert cap is not None
+    assert cap["attachments"] == ["Q3#final.xlsx", "notes?v2.pdf", "Deck.pdf"]
+    out = append_verbatim_user_request("更新模型", config={"configurable": {COS_TURN_VERBATIM_CONFIG_KEY: cap}})
+    assert out.count("</user_verbatim_request>") == 1
+    assert "&lt;/  USER_VERBATIM_REQUEST &gt;" in out
+    assert "Attachments: Q3#final.xlsx, notes?v2.pdf, Deck.pdf" in out
+    assert "token=secret" not in out

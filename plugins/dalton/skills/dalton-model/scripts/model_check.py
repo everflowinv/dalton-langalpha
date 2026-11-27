@@ -3313,6 +3313,7 @@ def verify_done(
     research_dir: str | Path,
     expected_run_id: str | None = None,
     expected_workflow: str | None = None,
+    expected_mode: str | None = None,
     manual: bool = False,
 ) -> dict[str, Any]:
     """Authoritative 4-point closure verifier reading ``<R>/model_dump/model-verification.json`` (§3.2)."""
@@ -3343,6 +3344,15 @@ def verify_done(
         errors.append(
             f"ticker mismatch: expected {want_tk!r}, ledger has {ledger_tk!r}"
         )
+    want_mode = str(expected_mode or "").strip().lower()
+    ledger_mode = str(ledger.get("mode") or "").strip().lower()
+    if want_mode:
+        if want_mode not in ("build", "update"):
+            errors.append(f"invalid expected_mode: {want_mode!r} (expected 'build' or 'update')")
+        elif ledger_mode != want_mode:
+            errors.append(
+                f"mode mismatch: expected {want_mode!r}, ledger has {ledger_mode or '<missing>'!r}"
+            )
 
     # 1. run_id & manual downgrade check
     ledger_run_id = ledger.get("run_id")
@@ -3548,9 +3558,12 @@ def verify_done(
 
         # Full-coverage required worksheet gate: independently re-read candidate workbook on disk
         if effective_wf == "full-coverage" and final_model_p is not None and final_model_p.is_file():
-            fc_mode = str(ledger.get("mode") or "").strip().lower()
-            if fc_mode not in ("build", "update"):
-                fc_mode = "build" if not ledger.get("baseline_path") else "update"
+            if want_mode in ("build", "update"):
+                fc_mode = want_mode
+            else:
+                fc_mode = ledger_mode
+                if fc_mode not in ("build", "update"):
+                    fc_mode = "build" if not ledger.get("baseline_path") else "update"
             ok_sh, sh_names, sh_err = _read_workbook_sheet_names(final_model_p)
             if not ok_sh:
                 errors.append(f"full-coverage final model sheets unreadable on disk: {sh_err}")
@@ -3620,6 +3633,7 @@ def main(argv: list[str] | None = None) -> int:
     p_vd.add_argument("--research-dir", required=True)
     p_vd.add_argument("--expected-run-id", default=None)
     p_vd.add_argument("--expected-workflow", default=None)
+    p_vd.add_argument("--expected-mode", default=None, choices=["build", "update"])
     p_vd.add_argument("--manual", action="store_true")
 
     args = parser.parse_args(argv)
@@ -3685,6 +3699,7 @@ def main(argv: list[str] | None = None) -> int:
             research_dir=args.research_dir,
             expected_run_id=args.expected_run_id,
             expected_workflow=args.expected_workflow,
+            expected_mode=args.expected_mode,
             manual=args.manual,
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))

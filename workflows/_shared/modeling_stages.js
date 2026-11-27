@@ -207,12 +207,16 @@ const _MODEL_REPORT_SYNC_PROBE_SCHEMA = {
 }
 
 function _mValidModelOutPath(p, baselinePath, workspaceDir) {
-  const norm = _mNormPath(p, workspaceDir)
-  if (!norm) return null
-  if (norm.startsWith('/') || norm.split('/').includes('..')) return null
+  const raw = _mNormPath(p, workspaceDir)
+  if (!raw) return null
+  const norm = raw.replace(/\\/g, '/')
+  if (norm.startsWith('/')) return null
+  const parts = norm.split('/')
+  if (parts.some((seg) => !seg || seg === '.' || seg === '..')) return null
+  if (parts[0] !== 'model' || parts.length < 2) return null
   if (!/\.xlsx$/i.test(norm)) return null
   const normBase = _mNormPath(baselinePath, workspaceDir)
-  if (normBase && norm === normBase) return null
+  if (normBase && norm === normBase.replace(/\\/g, '/')) return null
   return norm
 }
 
@@ -387,7 +391,7 @@ async function _mProbeReportSyncOnDisk(reportPath, nextModelPath, nextModelSha, 
     `if ex:`,
     `    txt = rp.read_text(encoding='utf-8', errors='replace')`,
     `    refs = [r.lstrip('./') for r in re.findall(r'model:([^\\s!#]+\\.xlsx)[!#]', txt, re.I)]`,
-    `    report_ok = all(r == mp for r in refs) and (bool(refs) or (mp in txt) or bool(extras))`,
+    `    report_ok = all(r == mp for r in refs) and (bool(refs) or (mp in txt))`,
     `    extras_ok = True`,
     `    for ep_s in extras:`,
     `        ep = pathlib.Path(ep_s)`,
@@ -1363,12 +1367,53 @@ async function reviseModelForReport(ctx) {
     schema: _MODEL_REV_EDIT_SCHEMA,
   })
 
-  if (editRes && !editRes.changed) {
+  // 父流程始终先按预绑路径 plannedNextPath 独立实测盘上可读性与 SHA-256，再判断是否发生改动；
+  // 绝不信任子任务回传的旧路径或自报哈希。
+  let nextPath = null
+  let nextSha = null
+  const diskProbe = await _mProbeCandidateOnDisk(plannedNextPath, W, phaseLabel, '核验联动候选落盘')
+  if (diskProbe.readable && diskProbe.model_sha256) {
+    nextPath = plannedNextPath
+    nextSha = diskProbe.model_sha256
+    if (!editRes || !editRes.changed || editRes.recalc_status === 'recalc_failed') {
+      _mPushUnique(failedStages, 'recalc')
+    }
+    if (!editRes) {
+      log(`[modeling] 报告联动改模派发未回传，但预绑新候选 ${nextPath} 已落盘且可读，按已确认新候选继续`)
+    } else if (!editRes.changed) {
+      log(`[modeling] 报告联动改模回报 changed=false，但预绑新候选 ${nextPath} 已落盘且可读，按已确认新候选继续`)
+    }
+  } else if (editRes && !editRes.changed && !diskProbe.exists) {
+    // 预绑路径未生成新文件且子任务声称未改：仍须读盘实测当前模型可读性与哈希，绝不采用自报哈希
+    const curProbe = await _mProbeCandidateOnDisk(currentModelPath, W, phaseLabel, '核验当前模型落盘')
+    if (!curProbe.readable || !curProbe.model_sha256) {
+      return {
+        ok: false,
+        changed: false,
+        modelPath: null,
+        modelSha256: null,
+        reportSha256: null,
+        status: 'failed_unusable',
+        openIssues: ['报告联动改模未产出新版本，且当前模型在盘上不可读'],
+        artifacts: currentArtifacts,
+        failedStages: [...carriedNoteFailures, 'report_revision'],
+        remainingIssuesPath: null,
+        runId,
+      }
+    }
+    if (currentModelSha && curProbe.model_sha256 !== currentModelSha) {
+      _mPushUnique(failedStages, 'report_revision')
+      return await fallbackOnCurrent(
+        failedStages,
+        '报告联动改模声称未改，但当前模型盘上哈希与改前不一致，已对当前可读模型补写降级账本',
+        '当前模型盘上哈希与改前不一致'
+      )
+    }
     return {
       ok: true,
       changed: false,
       modelPath: currentModelPath,
-      modelSha256: _mValidSha(editRes.model_sha256) || currentModelSha,
+      modelSha256: curProbe.model_sha256,
       reportSha256: null,
       status: currentStatus,
       openIssues: [],
@@ -1377,43 +1422,29 @@ async function reviseModelForReport(ctx) {
       remainingIssuesPath: currentStatus === 'delivered_with_open_issues' ? remPath : null,
       runId,
     }
-  }
-
-  // 父流程始终按预绑路径 plannedNextPath 独立实测盘上可读性与 SHA-256，绝不信任子任务回传的旧路径或自报哈希
-  let nextPath = null
-  let nextSha = null
-  const diskProbe = await _mProbeCandidateOnDisk(plannedNextPath, W, phaseLabel, '核验联动候选落盘')
-  if (diskProbe.readable && diskProbe.model_sha256) {
-    nextPath = plannedNextPath
-    nextSha = diskProbe.model_sha256
-    if (!editRes || editRes.recalc_status === 'recalc_failed') {
-      _mPushUnique(failedStages, 'recalc')
-    }
-    if (!editRes) {
-      log(`[modeling] 报告联动改模派发未回传，但预绑新候选 ${nextPath} 已落盘且可读，按已确认新候选继续`)
-    }
   } else if (!editRes) {
     _mPushUnique(failedStages, 'report_revision')
     return await fallbackOnCurrent(
       failedStages,
-      '报告联动改模落盘子任务超时或返回空且预绑路径未见新候选落盘，已保留当前可读模型并补写降级账本',
+      '报告联动改模落盘子任务超时或返回空且预绑路径未见可读新候选，已保留当前可读模型并补写降级账本',
       '报告联动改模落盘子任务超时或返回空'
     )
+  } else if (!editRes.changed && diskProbe.exists) {
+    _mPushUnique(failedStages, 'report_revision')
+    return await fallbackOnCurrent(
+      failedStages,
+      '报告联动改模回报未改但预绑路径存在不可读文件，已保留当前可读模型并补写降级账本',
+      '报告联动改模在预绑输出路径留下不可读文件'
+    )
   } else {
-    // editRes.changed === true，但预绑新路径盘上不可读或不存在（例如子任务回传了旧路径）：拒绝把旧路径当新候选
-    return {
-      ok: false,
-      changed: true,
-      modelPath: null,
-      modelSha256: null,
-      reportSha256: null,
-      status: 'failed_unusable',
-      openIssues: ['报告联动改模未在预绑输出路径产出可读新候选模型'],
-      artifacts: currentArtifacts,
-      failedStages: [...carriedNoteFailures, 'report_revision'],
-      remainingIssuesPath: null,
-      runId,
-    }
+    // editRes.changed === true，但预绑新路径盘上不可读或不存在（例如子任务回传了旧路径或写失败）：
+    // 绝不把旧路径当新候选，也不终止流程；对当前可读模型补写降级账本，终态为带问题交付，报告修订继续。
+    _mPushUnique(failedStages, 'report_revision')
+    return await fallbackOnCurrent(
+      failedStages,
+      '报告联动改模声称已改但预绑输出路径未产出可读新候选，已保留当前可读模型并补写降级账本',
+      '报告联动改模未在预绑输出路径产出可读新候选模型'
+    )
   }
 
   // -------------------------------------------------------------------------

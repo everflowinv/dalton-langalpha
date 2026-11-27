@@ -6214,6 +6214,7 @@ class _FcRunHost:
                 {
                     "schema_version": 2,
                     "workflow": "full-coverage",
+                    "mode": "build",
                     "ticker": "META",
                     "run_id": "task-run-1",
                     "final_status": "pass",
@@ -6379,6 +6380,25 @@ async def test_full_coverage_workflow_run_satisfies_check_done(
     assert host.review_sha == memo_sha
     files[".agents/threads/short-1/workflows/task-run-1/status.json"] = json.dumps(
         {"run_id": "task-run-1", "name": "full-coverage", "status": "completed", "updated_at": 2.0}
+    )
+    files[".agents/threads/short-1/workflows/task-run-1/journal/建模准备.json"] = json.dumps(
+        {
+            "label": "建模准备",
+            "dispatches": [
+                {
+                    "label": "建模准备",
+                    "status": "ok",
+                    "seq": 3,
+                    "recorded_at": 1.5,
+                    "result": {
+                        "files": ["research/2026-10-23-fc/model_dump/META-fingerprint.json"],
+                        "summary": "指纹提取完成",
+                        "mode": "build",
+                    },
+                }
+            ],
+        },
+        ensure_ascii=False,
     )
     files[".agents/threads/short-1/workflows/task-run-1/journal/独立审稿.json"] = json.dumps(
         {
@@ -7983,3 +8003,153 @@ async def test_p0b_r4_deep_update_args_json_empty_missing_fields_type_or_mismatc
     # 5. Complete, correctly typed, consistent args.json without model_path passes cleanly
     res_valid = await _check(params_no_model)
     assert res_valid["done"] is True, res_valid["missing"]
+
+
+@pytest.mark.asyncio
+async def test_p0b_r5_full_coverage_verify_done_enforces_prepare_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R5 #4: `dalton_check_done` for `full-coverage` extracts the effective mode from
+    this run's `建模准备` journal dispatch, passes `--expected-mode` to `model_check.py verify-done`,
+    and rejects a tampered `mode=update` ledger (and 4-sheet workbook) on a `build` run."""
+    import importlib.util
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import openpyxl
+
+    scripts_src = Path(__file__).resolve().parents[3] / "plugins" / "dalton" / "skills" / "dalton-model" / "scripts"
+    ws = tmp_path / "ws_fc_mode_r5"
+    dst_scripts = ws / ".agents" / "skills" / "dalton-model" / "scripts"
+    dst_scripts.mkdir(parents=True, exist_ok=True)
+    for py_f in scripts_src.glob("*.py"):
+        shutil.copy2(py_f, dst_scripts / py_f.name)
+
+    if str(scripts_src) not in sys.path:
+        sys.path.insert(0, str(scripts_src))
+    spec = importlib.util.spec_from_file_location("_mchk_r5_cd", scripts_src / "model_check.py")
+    assert spec and spec.loader
+    mchk_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mchk_mod)
+
+    # Create a 4-sheet update workbook (missing build-only sheets like DCF / Scenarios)
+    r_rel = "research/2026-10-23-fc"
+    xlsx_p = ws / "model" / "META-model-v01.xlsx"
+    xlsx_p.parent.mkdir(parents=True, exist_ok=True)
+    wb = openpyxl.Workbook()
+    wb.active.title = "README & Changelog"
+    wb.active["A1"] = "v01"
+    for sh in ("Facts", "Guidance vs Actual", "Street vs House", "Checks"):
+        wb.create_sheet(sh)["A1"] = sh
+    wb.save(xlsx_p)
+    wb.close()
+
+    # Write a ledger whose mode was tampered to "update" (so without --expected-mode it passes!)
+    mchk_mod.write_fallback_ledger(
+        workspace_dir=ws,
+        ticker="META",
+        research_dir=ws / r_rel,
+        candidate_path=xlsx_p,
+        kind="modeling",
+        failed_stages=["check", "consensus"],
+        run_id="run-fc-r5-build",
+        workflow="full-coverage",
+        mode="update",
+    )
+    ledger_text = (ws / r_rel / "model_dump" / "model-verification.json").read_text(encoding="utf-8")
+
+    memo_text = "# 深度备忘录\n" + "核心分析内容。" * 150
+    memo_sha = _draft_hash(memo_text)
+    run_prefix = ".agents/threads/short-fc/workflows/run-fc-r5-build"
+    base_files = {
+        f"{r_rel}/facts.md": "<!-- FACTS-LEDGER\n{}\n-->\n" + "底表" * 300,
+        f"{r_rel}/questions.md": "# 12 问\n" + "问题" * 150,
+        f"{r_rel}/ea.md": "A" * 250 + "\n<!-- 完成 -->",
+        f"{r_rel}/eb.md": "B" * 250 + "\n<!-- 完成 -->",
+        f"{r_rel}/ec.md": "C" * 250 + "\n<!-- 完成 -->",
+        f"{r_rel}/ed.md": "D" * 250 + "\n<!-- 完成 -->",
+        f"{r_rel}/model_dump/model-verification.json": ledger_text,
+        "model/META-model-v01.xlsx": "x" * 1200,
+        "drafts/2026-10-23-memo.md": memo_text,
+        "drafts/2026-10-23-memo.audit.md": f"# 数字核验报告\n- **草稿哈希**：`{memo_sha[:16]}…`\n",
+        f"{r_rel}/knowledge-revision.json": json.dumps({"thesis": {"ops": [{"op": "set", "value": "x" * 40}]}}),
+        f"{run_prefix}/status.json": json.dumps(
+            {"run_id": "run-fc-r5-build", "name": "full-coverage", "status": "completed", "updated_at": 2.0}
+        ),
+        f"{run_prefix}/journal/建模准备.json": json.dumps(
+            {
+                "label": "建模准备",
+                "dispatches": [
+                    {
+                        "label": "建模准备",
+                        "status": "ok",
+                        "seq": 3,
+                        "recorded_at": 1.2,
+                        "result": {"files": ["fp.json"], "summary": "build mode", "mode": "build"},
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        f"{run_prefix}/journal/独立审稿.json": json.dumps(
+            {
+                "label": "独立审稿",
+                "dispatches": [
+                    {
+                        "label": "独立审稿",
+                        "status": "ok",
+                        "seq": 9,
+                        "recorded_at": 1.9,
+                        "draft_sha256": memo_sha,
+                        "result": {"verdict": "pass", "summary": "ok", "items": _nine_items(), "must_fix": []},
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    }
+
+    seen_verify_cmds: list[str] = []
+    run_env = {**os.environ, "PATH": f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}"}
+    backend = _make_backend(base_files)
+    backend.workspace_dir = str(ws)
+    orig_exec = backend.aexecute.side_effect
+
+    async def _exec_real_verify_done(command: str, *, timeout: int | None = None) -> Any:
+        if "model_check.py verify-done" in command:
+            seen_verify_cmds.append(command)
+            proc = subprocess.run(
+                ["bash", "-c", command.replace("python3 ", f"{sys.executable} ")],
+                cwd=ws,
+                env=run_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            class _Resp:
+                def __init__(self, out: str, rc: int) -> None:
+                    self.output = out
+                    self.exit_code = rc
+
+            return _Resp(proc.stdout + proc.stderr, proc.returncode)
+        return await orig_exec(command, timeout=timeout)
+
+    backend.aexecute.side_effect = _exec_real_verify_done
+    _patch_knowledge(monkeypatch, ["company", "thesis", "debate", "drivers", "management", "models"])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED")])
+
+    res = await run_check_done(
+        workflow="full-coverage",
+        params={"ticker": "META", "workspace_dir": ".", "as_of": "2026-10-23"},
+        backend=backend,
+        workspace_id=WS,
+        run_id="run-fc-r5-build",
+        thread_id="short-fc",
+    )
+    assert seen_verify_cmds and "--expected-mode build" in seen_verify_cmds[0], seen_verify_cmds
+    assert res["done"] is False
+    assert any("模式" in m and "不一致" in m for m in res["missing"]), res["missing"]
+    assert any("mode mismatch" in m or "DCF" in m for m in res["missing"]), res["missing"]
