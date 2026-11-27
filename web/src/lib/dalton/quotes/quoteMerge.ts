@@ -186,6 +186,12 @@ export function mergeRestQuoteRow(
   const incomingRecord = incoming as Record<string, unknown>;
   const incomingIsRegularOnly = incomingRecord.regular_only === true;
   const prevHasLiveWs = prev.live_tick_at != null;
+  // Exempt only regular-only snapshots without a trusted regular trade time (e.g. a
+  // pre-market fallback carrying yesterday's close). Intraday regular-only snapshots
+  // with `regular_as_of` still compare by trade time like any other REST row.
+  const incomingRegularUntimed =
+    incomingIsRegularOnly &&
+    parsePriceTimestampMs(incoming.regular_as_of ?? incomingRecord.regular_as_of) == null;
 
   const existingCand = quotePriceCandidateForCache(prev);
   const incomingCand = quotePriceCandidateForCache(incoming);
@@ -194,7 +200,7 @@ export function mergeRestQuoteRow(
   // Regular-only REST snapshots (e.g. Yahoo/FMP fallback carrying yesterday's close)
   // never participate in newer-timestamp replacement against a live WS print.
   if (
-    !(incomingIsRegularOnly && prevHasLiveWs) &&
+    !(incomingRegularUntimed && prevHasLiveWs) &&
     shouldPreferIncomingPrice(existingCand, incomingCand, tieBreaker)
   ) {
     return incoming;
@@ -259,8 +265,11 @@ export function mergeWsQuoteRow(
   fields: WsQuoteFields,
 ): QuoteRow {
   const wsTs = parsePriceTimestampMs(fields.timestamp) ?? Date.now();
+  const prevRecordWs = prev as Record<string, unknown>;
   const prevIsRegularOnly =
-    (prev as Record<string, unknown>).regular_only === true && prev.live_tick_at == null;
+    prevRecordWs.regular_only === true &&
+    prev.live_tick_at == null &&
+    parsePriceTimestampMs(prev.regular_as_of ?? prevRecordWs.regular_as_of) == null;
   const existingCand = quotePriceCandidateForCache(prev);
   const incomingCand: PricedCandidate = {
     price: Number.isFinite(fields.price) ? fields.price : null,

@@ -37,6 +37,7 @@ export interface PortfolioRow {
   previousClose?: number | null;
   // DALTON-HOOK(extended-hours-quotes): Extended-hours and regular-session fields for accurate card display.
   regularClose?: number | null;
+  regularOnly?: boolean | null;
   regularTradingChange?: number | null;
   regularTradingChangePercent?: number | null;
   earlyTradingChange?: number | null;
@@ -143,6 +144,7 @@ export function usePortfolioData() {
         previousClose: p.previousClose ?? null,
         // DALTON-HOOK(extended-hours-quotes): Forward extended-hours and regular-close fields from StockPrice.
         regularClose: p.regularClose ?? null,
+        regularOnly: p.regularOnly ?? null,
         regularTradingChange: p.regularTradingChange ?? null,
         regularTradingChangePercent: p.regularTradingChangePercent ?? null,
         earlyTradingChange: p.earlyTradingChange ?? null,

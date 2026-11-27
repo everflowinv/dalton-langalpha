@@ -1136,6 +1136,33 @@ describe('watchlist pending-only subset polling', () => {
     expect(unprintedPre.extChangePct).toBeNull();
   });
 
+  it('r7 lead: intraday regular_only snapshot with regular_as_of still replaces an older WS print (102 -> 104)', () => {
+    const T_830 = 1_792_672_200_000; // 08:30 ET
+    const T_935 = 1_792_676_100_000; // 09:35 ET
+    const prev = {
+      symbol: 'GOOG',
+      source: 'ws',
+      price: 102,
+      as_of: T_830,
+      live_tick_at: T_830,
+      currency: 'USD',
+    } as QuoteRow;
+    const incoming = {
+      symbol: 'GOOG',
+      source: 'yahoo',
+      price: 104,
+      as_of: T_935,
+      regular_as_of: T_935,
+      regular_only: true,
+      currency: 'USD',
+    } as unknown as QuoteRow;
+    expect(mergeRestQuoteRow(prev, incoming).price).toBe(104);
+
+    // Untimed regular-only fallback (yesterday's close, no regular_as_of) still never overwrites the WS print.
+    const untimed = { ...incoming, price: 100, regular_as_of: undefined } as unknown as QuoteRow;
+    expect(mergeRestQuoteRow(prev, untimed).price).toBe(102);
+  });
+
   it('r7: REST regular_only Yahoo snapshot (8:31) and SnapshotData-serialized Yahoo PM row never overwrite 8:30 WS trade (102)', async () => {
     const T_prev_close = 1_792_612_800_000; // yesterday 16:00 ET
     const T_830 = 1_792_672_200_000; // today 08:30 ET
