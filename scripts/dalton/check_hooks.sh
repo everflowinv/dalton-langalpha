@@ -560,6 +560,10 @@ ALLOWED_HOOKS=(
   # BY4: sandbox-side runtime staged-file flock claim/release in wsfiles_transfer_runtime.py
   # (standalone script copied into sandboxes; cannot import src.dalton).
   "by4-relay-guard"
+  # Modeling v2 P0-a: thin upstream delegates in xlsx insert.py (preserve <calcPr>) and
+  # recalc.py (pre-recalc donor cache restore + selective non-error LibreOffice writeback).
+  "xlsx-preserve-calcpr"
+  "xlsx-recalc-keep-cache"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -521,7 +521,18 @@ def scan_errors(path: Path, formulas: dict[tuple[str, str], str]) -> list[dict]:
     return found
 
 
-def recalculate(src: Path, timeout: int, flags: set[str]) -> dict:
+def _dalton_xlsx_hooks():  # DALTON-HOOK(xlsx-recalc-keep-cache)
+    import runpy
+    p = next(c for b in (Path(__file__).resolve().parents[2], *Path(__file__).resolve().parents[4:5]) for c in (b / "dalton-model/scripts/model_xlsx_hooks.py", b / "dalton/skills/dalton-model/scripts/model_xlsx_hooks.py") if c.is_file())
+    return runpy.run_path(str(p))
+
+def restore_donor_cache(target_path: Path, spec: dict) -> dict:  # DALTON-HOOK(xlsx-recalc-keep-cache)
+    return _dalton_xlsx_hooks()["restore_donor_cache"](target_path, spec, recalc_mod=sys.modules[__name__])
+
+
+def recalculate(src: Path, timeout: int, flags: set[str], keep_cache_spec: dict | None = None) -> dict:
+    if keep_cache_spec is not None or "--restore-donor-only" in flags:  # DALTON-HOOK(xlsx-recalc-keep-cache)
+        return _dalton_xlsx_hooks()["recalculate_keep_cache"](sys.modules[__name__], src, timeout, flags, keep_cache_spec)
     formulas, names, linked_part = collect_formulas(src)
     linked_cells = external_references(formulas)
     linked_names = external_names(names)
@@ -596,6 +607,8 @@ def main(argv: list[str]) -> None:
     if "-h" in argv or "--help" in argv:
         print(__doc__.strip())
         sys.exit(0)
+    if any(a.startswith("--keep-cache-spec=") or a == "--restore-donor-only" for a in argv):  # DALTON-HOOK(xlsx-recalc-keep-cache)
+        return _dalton_xlsx_hooks()["recalc_main_keep_cache"](sys.modules[__name__], argv)
     args = [a for a in argv if not a.startswith("--")]
     flags = {a for a in argv if a.startswith("--")}
     unknown = sorted(flags.difference(FLAGS))
