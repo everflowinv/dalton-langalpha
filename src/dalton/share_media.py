@@ -1944,7 +1944,7 @@ async def _load_thread_media_registry_from_db(
                           ON r.conversation_response_id = ts.conversation_response_id
                         WHERE ts.conversation_thread_id = %s::uuid
                           AND ts.lines IS NOT NULL
-                          AND position('"steering_delivered"' in ts.lines) > 0
+                          AND position('steering_delivered' in ts.lines) > 0
                           AND r.turn_index = ANY(%s::int[])
                         """,
                         (str(thread_id), turns),
@@ -1956,7 +1956,7 @@ async def _load_thread_media_registry_from_db(
                         FROM turn_slices
                         WHERE conversation_thread_id = %s::uuid
                           AND lines IS NOT NULL
-                          AND position('"steering_delivered"' in lines) > 0
+                          AND position('steering_delivered' in lines) > 0
                         """,
                         (str(thread_id),),
                     )

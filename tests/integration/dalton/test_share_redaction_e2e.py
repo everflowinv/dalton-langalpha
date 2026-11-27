@@ -955,6 +955,7 @@ async def test_e2e_b6_r5_omit_permissions_preserves_concurrent_revocation_real_p
 ) -> None:
     """AU1 r5 #2 (Real PG): Interleaving revocation with an omit-permissions share update keeps allow_files=False."""
     from src.server.database.conversation import threads_write
+    from src.server.models.conversation import SharePermissions
 
     user_id = str(seed_user["user_id"])
     workspace_id = str(seed_workspace["workspace_id"])
@@ -987,8 +988,9 @@ async def test_e2e_b6_r5_omit_permissions_preserves_concurrent_revocation_real_p
 
     # Request B concurrently revokes file access (allow_files=False).
     effective_b, patch_b = share_redaction.prepare_share_permissions_update(
-        stale_existing, {"allow_files": False}
+        stale_existing, SharePermissions(allow_files=False)
     )
+    assert patch_b == {"allow_files": False}
     revoked = await share_redaction.apply_thread_share_update(
         threads_write.update_thread_sharing,
         tid,
@@ -1036,10 +1038,16 @@ async def test_e2e_b6_r5_paginated_replay_media_issuance_and_two_gets_real_pg(
     seed_user: dict[str, Any],
     seed_workspace: dict[str, Any],
 ) -> None:
-    """AU1 r5 #3 (Real PG): Paginated replay SQL joins turn_slices -> conversation_responses, issues controlled media refs, and both media GETs return 200."""
+    """AU1 r5 #3 (Real PG): Paginated replay SQL joins turn_slices -> conversation_responses, issues controlled media refs, and all media GETs return 200."""
     import re
     from src.server.services.history.replay import lines as replay_lines
+    from src.utils import storage as storage_mod
 
+    monkeypatch.setattr(
+        storage_mod,
+        "load_agent_config",
+        create_autospec(storage_mod.load_agent_config, return_value={}),
+    )
     monkeypatch.setenv("DALTON_MEDIA_SIGNING_SECRET", "r5-real-pg-media-secret-32-bytes!")
     monkeypatch.setenv("STORAGE_PUBLIC_URL_BASE", "https://cdn.pg.example")
     monkeypatch.setenv("STORAGE_PROVIDER", "s3")
@@ -1112,7 +1120,7 @@ async def test_e2e_b6_r5_paginated_replay_media_issuance_and_two_gets_real_pg(
                 INSERT INTO conversation_responses
                     (conversation_response_id, conversation_thread_id, turn_index, status,
                      metadata, replay_facts, created_at)
-                VALUES (%s::uuid, %s::uuid, 1, 'completed', %s::jsonb, %s::jsonb, NOW())
+                VALUES (%s::uuid, %s::uuid, 1, 'in_progress', %s::jsonb, %s::jsonb, NOW())
                 """,
                 (
                     rid,
@@ -1120,6 +1128,14 @@ async def test_e2e_b6_r5_paginated_replay_media_issuance_and_two_gets_real_pg(
                     json.dumps({"user_id": user_id}),
                     json.dumps({"images": {"c1": img_url}}),
                 ),
+            )
+            await cur.execute(
+                """
+                UPDATE conversation_responses
+                SET status = 'completed'
+                WHERE conversation_response_id = %s::uuid
+                """,
+                (rid,),
             )
             await cur.execute(
                 """
@@ -1174,17 +1190,20 @@ async def test_e2e_b6_r5_paginated_replay_media_issuance_and_two_gets_real_pg(
     assert bindings[steer_url] == ("upstream", steer_key)
 
     rewritten = share_media.rewrite_items_for_public_media(
-        page_items, thread_id=tid, share_token=tok, bindings=bindings
+        [*page_items, steer_line.item()], thread_id=tid, share_token=tok, bindings=bindings
     )
     att_controlled = rewritten[0]["data"]["metadata"]["attachments"][0]["url"]
     img_controlled_match = re.search(r"(/api/v1/public/shared/[^\s)]+)", rewritten[1]["data"]["content"])
+    steer_controlled = rewritten[2]["data"]["messages"][0]["attachments"][0]["url"]
     assert att_controlled.startswith(f"/api/v1/public/shared/{tok}/media/")
     assert img_controlled_match is not None
     img_controlled = img_controlled_match.group(1)
+    assert steer_controlled.startswith(f"/api/v1/public/shared/{tok}/media/")
 
     stored_blobs = {
         img_key: b"\x89PNG-CHART-BYTES",
         att_key: b"%PDF-1.7-SPACE-CHINESE",
+        steer_key: b"\x89PNG-STEER-BYTES",
     }
 
     def _fake_read(key: str, *, reader: Any = None) -> bytes | None:
@@ -1212,11 +1231,14 @@ async def test_e2e_b6_r5_paginated_replay_media_issuance_and_two_gets_real_pg(
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
         r_att = await client.get(att_controlled)
         r_img = await client.get(img_controlled)
+        r_steer = await client.get(steer_controlled)
 
     assert r_att.status_code == 200
     assert r_att.content == b"%PDF-1.7-SPACE-CHINESE"
     assert r_img.status_code == 200
     assert r_img.content == b"\x89PNG-CHART-BYTES"
+    assert r_steer.status_code == 200
+    assert r_steer.content == b"\x89PNG-STEER-BYTES"
 
 
 @pytest.mark.asyncio

@@ -50,7 +50,7 @@ def _strip_blockquote_prefix(line: str) -> tuple[int, str]:
     """Strip leading CommonMark blockquote markers ``>`` from ``line``.
 
     Returns ``(quote_depth, remainder)``. Each blockquote marker allows up to 3
-    leading spaces, a ``>``, and an optional single space after ``>``.
+    leading spaces, a ``>``, and an optional single space or tab after ``>``.
     """
     pos = 0
     n = len(line)
@@ -62,7 +62,7 @@ def _strip_blockquote_prefix(line: str) -> tuple[int, str]:
         if pos + sp < n and line[pos + sp] == ">":
             pos += sp + 1
             depth += 1
-            if pos < n and line[pos] == " ":
+            if pos < n and line[pos] in (" ", "\t"):
                 pos += 1
         else:
             break

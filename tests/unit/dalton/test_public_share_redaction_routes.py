@@ -2792,7 +2792,7 @@ async def test_r4_replay_media_prod_sql_row_shapes_owner_rich_colleague_and_fail
         None, prod_rows, page_lines, thread_id=tid, viewer_id=owner_uid
     )
     assert any(
-        'position(\'"steering_delivered"\' in ts.lines) > 0' in s
+        "position('steering_delivered' in ts.lines) > 0" in s
         and "JOIN conversation_responses" in s
         for s in executed_sqls
     )
@@ -3379,6 +3379,47 @@ async def test_r5_cross_phase_prefix_and_blockquote_fence_thinking_absent_across
             ("SECRET_SINGLE_TOP", "SECRET_SINGLE_BQ", "SECRET_SINGLE_TAIL"),
             "Public Answer Three.",
         ),
+        (
+            "blockquote_tab_tilde_fence_cross_phase",
+            [
+                {
+                    "type": "text",
+                    "text": (
+                        "Checking tab fence.\n"
+                        "<thinking>SECRET_BQTAB_TOP\n"
+                        ">\t~~~\n"
+                        ">\tSECRET_BQTAB_INSIDE_FENCE </thinking>\n"
+                        ">\t~~~\n"
+                        "SECRET_BQTAB_AFTER_FENCE "
+                    ),
+                    "phase": "commentary",
+                },
+                {
+                    "type": "text",
+                    "text": "SECRET_BQTAB_IN_FINAL</thinking>Public Answer Four.",
+                    "phase": "final_answer",
+                },
+            ],
+            (
+                "SECRET_BQTAB_TOP",
+                "SECRET_BQTAB_INSIDE_FENCE",
+                "SECRET_BQTAB_AFTER_FENCE",
+                "SECRET_BQTAB_IN_FINAL",
+            ),
+            "Public Answer Four.",
+        ),
+        (
+            "blockquote_tab_tilde_fence_opening_single_phase",
+            (
+                "<thinking>SECRET_SINGLE_TAB_TOP\n"
+                ">\t~~~\n"
+                ">\tSECRET_SINGLE_TAB_BQ </thinking>\n"
+                ">\t~~~\n"
+                "SECRET_SINGLE_TAB_TAIL</thinking>Public Answer Five."
+            ),
+            ("SECRET_SINGLE_TAB_TOP", "SECRET_SINGLE_TAB_BQ", "SECRET_SINGLE_TAB_TAIL"),
+            "Public Answer Five.",
+        ),
     ]
 
     app = FastAPI()
@@ -3676,6 +3717,21 @@ async def test_r5_paginated_media_registry_sql_joins_conversation_responses(
     assert "conversation_response_id" in q
     assert "r.turn_index = ANY" in q
     assert "turn_slices.turn_index" not in q
+    assert "position('steering_delivered' in ts.lines) > 0" in q
+    assert '"steering_delivered"' not in q
+
+    sql_calls.clear()
+    reg_full = await share_media._load_thread_media_registry_from_db(
+        "11111111-1111-4111-8111-111111111111",
+        owner_id="u1",
+        turn_indices=None,
+    )
+    assert reg_full is not None
+    full_slice_queries = [s for s in sql_calls if "FROM turn_slices" in s]
+    assert len(full_slice_queries) == 1
+    q_full = full_slice_queries[0]
+    assert "position('steering_delivered' in lines) > 0" in q_full
+    assert '"steering_delivered"' not in q_full
 
 
 @pytest.mark.asyncio
