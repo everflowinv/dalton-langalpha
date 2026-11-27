@@ -161,6 +161,8 @@ def build_directory(
     header: dict[str, Any] | None = None,
     previous: dict[str, Any] | None = None,
     window: Window,
+    # DALTON-HOOK(personal-integrations): 1-based first segment tainted by persisted personal-integration touch
+    first_personal_segment: int | None = None,
 ) -> Directory:
     """Render the segments that changed since ``previous``, the manifest the
     stored copy was rendered with, and carry the rest over from it.
@@ -178,6 +180,11 @@ def build_directory(
     fork point) shares its numbering, not its turns. Raises
     ``EarlierTurnsMissing`` when ``previous`` does not hold them.
     """
+    # DALTON-HOOK(personal-integrations): propagate personal-integration taint across multi-turn segments
+    from src.dalton.services.personal_integration_trace import (
+        run_contains_personal_integration_tool,
+    )
+
     held: list[Any] = []
     if previous and previous.get("schema") == SCHEMA_VERSION:
         held = previous.get("segments") or []
@@ -186,6 +193,7 @@ def build_directory(
     rendered: dict[str, bytes] = {}
     shape = through = ""
     base = window.runs
+    personal_tainted = False
     if base:
         carried = held[:base]
         if (
@@ -200,18 +208,46 @@ def build_directory(
         entries.extend(carried)
         # The key chains through every turn before it, the trimmed ones too.
         shape, through = carried[-1]["shape"], window.digest
+        # DALTON-HOOK(personal-integrations): propagate personal-integration taint from carried turns and DB first touch
+        personal_tainted = bool(carried[-1].get("personal_tainted")) or (
+            first_personal_segment is not None and first_personal_segment <= base
+        )
     for number, run in enumerate(split_runs(messages), start=base + 1):
-        shape = segment_shape(number, run, unit=unit, previous=shape, tool_names=names)
+        seg_tainted = personal_tainted or (
+            first_personal_segment is not None and number >= first_personal_segment
+        )
+        seg_has_personal_tool = run_contains_personal_integration_tool(run)
+        shape = segment_shape(
+            number,
+            run,
+            unit=unit,
+            previous=shape,
+            tool_names=names,
+            personal_tainted=seg_tainted,
+        )
         through = extend(through, run)
         entry = held[number - 1] if number <= len(held) else None
         if not _reusable(entry, unit, number, shape):
-            segment = render_segment(number, run, unit=unit, tool_names=names)
+            segment = render_segment(
+                number,
+                run,
+                unit=unit,
+                tool_names=names,
+                initially_tainted=seg_tainted,
+            )
             entry = _entry(segment, unit, shape, through)
+            if seg_tainted or seg_has_personal_tool:
+                entry["personal_tainted"] = True
             rendered[entry["file"]] = segment.data
         elif entry.get("through") != through:
             # Its render reads the same in messages that differ where no
             # render looks (reasoning, say), or it predates the field.
             entry = {**entry, "through": through}
+            if seg_tainted or seg_has_personal_tool:
+                entry["personal_tainted"] = True
+        personal_tainted = seg_tainted or seg_has_personal_tool or bool(
+            entry.get("personal_tainted")
+        )
         entries.append(entry)
     manifest = {"schema": SCHEMA_VERSION, **(header or {}), "segments": entries}
     return Directory(

@@ -530,6 +530,10 @@ export interface I6AuthorizeAndClaimResponse {
   topic_initiator_platform_user_id?: string | null;
   topic_canonical_scope_key?: string | null;
   dm_recipient_platform_user_id?: string | null;
+  has_personal_integration_data?: boolean;
+  personal_private_redirect_notice?: boolean;
+  forced_text?: string | null;
+  redirect_dm_address?: string | null;
   prior_run_files?: Array<{
     workspace_id?: string | null;
     path: string;
@@ -867,6 +871,7 @@ export interface RecoverAutomationRunRow {
   run_id?: string | null;
   chart_snapshots?: ChartSnapshotItem[];
   outbound_blocked?: boolean;
+  has_personal_integration_data?: boolean;
   automation_name: string;
   entries: string[];
   status: "registered" | "finishing" | "finished";
@@ -921,6 +926,7 @@ export interface I8AutomationRunFinishResponse {
   run_id?: string | null;
   chart_snapshots?: ChartSnapshotItem[];
   outbound_blocked?: boolean;
+  has_personal_integration_data?: boolean;
   automation_name: string;
   finish_status: string | null;
   final_text: string | null;

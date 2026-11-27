@@ -37,35 +37,151 @@ def redact_personal_tool_args(args: Any) -> dict[str, Any]:
     return out
 
 
+def _tool_calls_contain_personal(tool_calls: Any) -> bool:
+    if not isinstance(tool_calls, (list, tuple)):
+        return False
+    for tc in tool_calls:
+        if isinstance(tc, Mapping):
+            if is_personal_integration_tool(tc.get("name")):
+                return True
+            fn = tc.get("function")
+            if isinstance(fn, Mapping) and is_personal_integration_tool(fn.get("name")):
+                return True
+        else:
+            if is_personal_integration_tool(getattr(tc, "name", None)):
+                return True
+    return False
+
+
+def _content_blocks_contain_personal_tool(content: Any) -> bool:
+    if not isinstance(content, (list, tuple)):
+        return False
+    for block in content:
+        if isinstance(block, Mapping):
+            if block.get("type") in ("tool_use", "tool_call") and is_personal_integration_tool(
+                block.get("name")
+            ):
+                return True
+    return False
+
+
 def _message_obj_is_personal_tool(msg: Any) -> bool:
     if isinstance(msg, Mapping):
         if is_personal_integration_tool(msg.get("name")):
+            return True
+        if _tool_calls_contain_personal(msg.get("tool_calls")):
+            return True
+        if _content_blocks_contain_personal_tool(msg.get("content")):
+            return True
+        add_kw = msg.get("additional_kwargs")
+        if isinstance(add_kw, Mapping) and _tool_calls_contain_personal(add_kw.get("tool_calls")):
             return True
         kwargs = msg.get("kwargs")
         if isinstance(kwargs, Mapping):
             if is_personal_integration_tool(kwargs.get("name")):
                 return True
-            tcs = kwargs.get("tool_calls")
-            if isinstance(tcs, list):
-                for tc in tcs:
-                    if isinstance(tc, Mapping) and is_personal_integration_tool(tc.get("name")):
-                        return True
-        tcs_top = msg.get("tool_calls")
-        if isinstance(tcs_top, list):
-            for tc in tcs_top:
-                if isinstance(tc, Mapping) and is_personal_integration_tool(tc.get("name")):
-                    return True
+            if _tool_calls_contain_personal(kwargs.get("tool_calls")):
+                return True
+            if _content_blocks_contain_personal_tool(kwargs.get("content")):
+                return True
+            kw_add = kwargs.get("additional_kwargs")
+            if isinstance(kw_add, Mapping) and _tool_calls_contain_personal(
+                kw_add.get("tool_calls")
+            ):
+                return True
         return False
 
     name = getattr(msg, "name", None)
     if is_personal_integration_tool(name):
         return True
-    tool_calls = getattr(msg, "tool_calls", None)
-    if isinstance(tool_calls, list):
-        for tc in tool_calls:
-            if isinstance(tc, Mapping) and is_personal_integration_tool(tc.get("name")):
+    if _tool_calls_contain_personal(getattr(msg, "tool_calls", None)):
+        return True
+    if _content_blocks_contain_personal_tool(getattr(msg, "content", None)):
+        return True
+    add_kw = getattr(msg, "additional_kwargs", None)
+    if isinstance(add_kw, Mapping) and _tool_calls_contain_personal(add_kw.get("tool_calls")):
+        return True
+    return False
+
+
+def llm_outputs_contain_personal_tool_call(outputs: Any) -> bool:
+    """Return True iff serialized LLM outputs invoke any personal-integration tool."""
+    if not isinstance(outputs, Mapping):
+        return False
+    gens = outputs.get("generations")
+    if not isinstance(gens, (list, tuple)):
+        return False
+    for group in gens:
+        if not isinstance(group, (list, tuple)):
+            continue
+        for gen in group:
+            if not isinstance(gen, Mapping):
+                continue
+            if _message_obj_is_personal_tool(gen.get("message")):
                 return True
     return False
+
+
+def run_contains_personal_integration_tool(messages: Any) -> bool:
+    """Return True iff any message in a turn invokes or returns from a personal-integration tool."""
+    if not isinstance(messages, (list, tuple)):
+        return False
+    return any(_message_obj_is_personal_tool(m) for m in messages)
+
+
+async def read_thread_first_personal_segment(
+    thread_id: str | None,
+    *,
+    is_task: bool = False,
+    conn: Any = None,
+) -> int | None:
+    """Return the 1-based transcript segment number from which redaction applies, or ``None``.
+
+    Uses persisted ``conversation_threads.has_personal_integration_data`` and the
+    earliest ``turn_index`` in ``dalton_thread_integration_touches`` so later turns
+    and task transcripts never leak personal calendar/mail content.
+    """
+    from src.dalton.settings import is_dalton_enabled
+    from src.server.database.pool import get_db_connection
+    from src.server.utils.pg_sanitize import normalize_uuid
+
+    if not is_dalton_enabled():
+        return None
+    tid = normalize_uuid(thread_id) if thread_id else None
+    if tid is None:
+        return None
+    try:
+        async with get_db_connection(conn) as db_conn:
+            async with db_conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT COALESCE(has_personal_integration_data, FALSE)
+                    FROM conversation_threads
+                    WHERE conversation_thread_id = %s::uuid
+                    """,
+                    (tid,),
+                )
+                row = await cur.fetchone()
+                if not row or not bool(row[0]):
+                    return None
+                if is_task:
+                    return 1
+                await cur.execute(
+                    """
+                    SELECT MIN(turn_index)
+                    FROM dalton_thread_integration_touches
+                    WHERE thread_id = %s::uuid
+                    """,
+                    (tid,),
+                )
+                t_row = await cur.fetchone()
+                if t_row is not None and t_row[0] is not None:
+                    return max(1, int(t_row[0]) + 1)
+                return 1
+    except RuntimeError as exc:
+        if "pool is not open" in str(exc).lower():
+            return None
+        raise
 
 
 def messages_contain_personal_integration_data(value: Any) -> bool:
@@ -154,6 +270,22 @@ def redact_langsmith_tool_inputs(inputs: Any, tool_name: str | None = None) -> d
     }
 
 
+def redact_langsmith_generic_tool_inputs(
+    inputs: Any, tool_name: str | None = None
+) -> dict[str, Any]:
+    """Redact inputs of ANY subsequent tool run once a trace holds personal integration data."""
+    if not isinstance(inputs, Mapping):
+        return {
+            "tool": tool_name or "tool",
+            "input": REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER,
+            "redacted": True,
+        }
+    return {
+        **{str(k): REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER for k in inputs.keys()},
+        "redacted": True,
+    }
+
+
 def redact_langsmith_tool_outputs(outputs: Any) -> dict[str, Any]:
     """Redact outputs of a personal-integration tool run before LangSmith export."""
     _ = outputs
@@ -232,11 +364,15 @@ __all__ = [
     "PERSONAL_INTEGRATION_TOOL_NAMES",
     "REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER",
     "is_personal_integration_tool",
+    "llm_outputs_contain_personal_tool_call",
     "messages_contain_personal_integration_data",
+    "read_thread_first_personal_segment",
     "redact_langsmith_chain_payload",
+    "redact_langsmith_generic_tool_inputs",
     "redact_langsmith_llm_inputs",
     "redact_langsmith_llm_outputs",
     "redact_langsmith_tool_inputs",
     "redact_langsmith_tool_outputs",
     "redact_personal_tool_args",
+    "run_contains_personal_integration_tool",
 ]

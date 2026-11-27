@@ -1344,6 +1344,15 @@ async def astream_ptc_workflow(
             is_dalton_sharing_auth_enabled as _is_colleague_sharing_auth_enabled,
         )
 
+        # DALTON-HOOK(personal-integrations): pre-seed thread personal privacy flag from DB for LangSmith tracer redaction across turns
+        from src.dalton.services.personal_integration_guard import (
+            is_thread_personal_private,
+        )
+
+        thread_is_personal_private = await is_thread_personal_private(
+            thread_id, meta=prior_thread
+        )
+
         # DALTON-HOOK(colleague-dispatch): stamp turn_admitted_workspace_id and workspace_owner_id in configurable
         extra_configurable = {
             **(extra_configurable or {}),
@@ -1351,6 +1360,11 @@ async def astream_ptc_workflow(
             "workspace_owner_id": workspace_owner_id,
             "origin_channel": origin_channel,
             **({"tail_turn_no_new_work": True} if tail_turn_no_new_work else {}),
+            **(
+                {"has_personal_integration_data": True}
+                if thread_is_personal_private
+                else {}
+            ),
             # DALTON-HOOK(agent-switch-model): forward retried_origin into configurable for switch_thread_model
             **({"retried_origin": retried_origin} if retried_origin else {}),
             # DALTON-HOOK(colleague-access): forward agent_role and initial cross-user analyst outbound guard flag

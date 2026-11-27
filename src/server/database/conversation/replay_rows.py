@@ -113,6 +113,8 @@ async def get_replay_thread_data(thread_id: str) -> ThreadRows | None:
             await cur.execute(
                 """SELECT conversation_thread_id, workspace_id, current_status,
                           thread_index, latest_checkpoint_id, created_at, updated_at,
+                          -- DALTON-HOOK(personal-integrations): replay persisted first-touch privacy notice on its owning turn
+                          metadata->'personal_first_touch_event' AS personal_first_touch_event,
                           (SELECT r.conversation_response_id
                            FROM conversation_responses r
                            WHERE r.conversation_thread_id = t.conversation_thread_id

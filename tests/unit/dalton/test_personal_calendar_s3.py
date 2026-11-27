@@ -820,6 +820,11 @@ async def test_dalton_calendar_unconnected_returns_readable_guidance(
         lambda: frozenset({CapabilityId.GOOGLE_CALENDAR}),
     )
     monkeypatch.setattr(
+        cal_tools_mod,
+        "get_connector_providers_summary",
+        lambda: {"google": {"ready": True}, "feishu": {"ready": True}},
+    )
+    monkeypatch.setattr(
         cal_tools_mod.db,
         "list_user_connections",
         create_autospec(db_mod.list_user_connections, return_value=[]),
@@ -1113,6 +1118,11 @@ async def test_dalton_calendar_write_l1_and_l2_attendees_hitl_confirmation_flow(
         cal_tools_mod.db,
         "mark_action_approval_status",
         create_autospec(db_mod.mark_action_approval_status, return_value=True),
+    )
+    monkeypatch.setattr(
+        cal_tools_mod.db,
+        "update_action_approval_state",
+        create_autospec(db_mod.update_action_approval_state, return_value=True),
     )
     monkeypatch.setattr(
         cal_tools_mod,

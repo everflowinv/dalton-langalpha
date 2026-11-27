@@ -1108,6 +1108,9 @@ def build_graph_config(
         configurable[JOB_ENV_KEY] = job_env
     if extra_configurable:
         configurable.update(extra_configurable)
+    # DALTON-HOOK(personal-integrations): mirror DB-backed thread privacy flag into LangSmith metadata so with_run_tracer pre-arms redaction
+    if configurable.get("has_personal_integration_data"):
+        langsmith_metadata["has_personal_integration_data"] = True
     if skill_contexts:
         configurable["skill_contexts"] = skill_contexts
         if skill_dirs:

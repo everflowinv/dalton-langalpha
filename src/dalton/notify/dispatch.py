@@ -6632,6 +6632,32 @@ async def on_automation_settled(
         if not targets:
             return False
 
+        from src.dalton.services.personal_integration_guard import (
+            PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE,
+            is_thread_personal_private,
+        )
+
+        is_personal_private_thread = bool(
+            thread_id and await is_thread_personal_private(str(thread_id))
+        )
+        group_redirect_targets: set[str] = set()
+        if is_personal_private_thread:
+            rewritten_targets: list[str] = []
+            seen_targets: set[str] = set()
+            for tgt in targets:
+                ch, cleaned_tgt = _split_target_channel(tgt)
+                is_group_tgt = ":" in cleaned_tgt and not cleaned_tgt.lower().endswith(":@me")
+                if is_group_tgt:
+                    dm_tgt = ch
+                    if dm_tgt not in seen_targets and is_channel_target_enabled(dm_tgt):
+                        rewritten_targets.append(dm_tgt)
+                        seen_targets.add(dm_tgt)
+                    group_redirect_targets.add(cleaned_tgt)
+                if cleaned_tgt not in seen_targets:
+                    rewritten_targets.append(cleaned_tgt)
+                    seen_targets.add(cleaned_tgt)
+            targets = rewritten_targets
+
         if classification is None:
             auto_name = str(automation.get("name") or "").strip() or "定时任务"
             classification = NotifyClassification(
@@ -6737,10 +6763,18 @@ async def on_automation_settled(
             for tgt in targets:
                 ch, cleaned_tgt = _split_target_channel(tgt)
                 target_via_gateway = cleaned_tgt.startswith("weixin:") or via_gateway
-                target_payload = {
-                    **base_payload_record,
-                    "transport": "gateway" if target_via_gateway else "bridge",
-                }
+                if cleaned_tgt in group_redirect_targets:
+                    target_payload = {
+                        **base_payload_record,
+                        "text": PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE,
+                        "card": None,
+                        "transport": "gateway" if target_via_gateway else "bridge",
+                    }
+                else:
+                    target_payload = {
+                        **base_payload_record,
+                        "transport": "gateway" if target_via_gateway else "bridge",
+                    }
                 if target_via_gateway:
                     claim_res = await claim_target_delivery_with_attempt(
                         execution_id,
@@ -6793,11 +6827,14 @@ async def on_automation_settled(
                         target=cleaned_tgt,
                     )
                 else:
+                    is_group_redirect = cleaned_tgt in group_redirect_targets
                     bridge_res = await _invoke_post_notify(
                         post_notify_fn,
                         [cleaned_tgt],
-                        message_text,
-                        card_dict,
+                        PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE
+                        if is_group_redirect
+                        else message_text,
+                        None if is_group_redirect else card_dict,
                     )
             except asyncio.CancelledError:
                 if target_via_gateway:

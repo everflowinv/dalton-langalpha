@@ -43,6 +43,25 @@ import {
   personalChannelBindingsUrl,
 } from "./commands.js";
 
+export const PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE =
+  "本次结果含个人日历内容，已发送到你的私聊";
+
+function isDmTargetAddress(address: string | null | undefined): boolean {
+  const cleaned = (address ?? "").trim().toLowerCase();
+  return cleaned.endsWith(":@me");
+}
+
+function platformFromAddress(address: string | null | undefined): ChannelPlatform | null {
+  const prefix = (address ?? "").split(":", 1)[0]?.trim().toLowerCase() ?? "";
+  if (prefix === "feishu" || prefix === "discord" || prefix === "weixin") {
+    return prefix;
+  }
+  if (prefix === "wechat") {
+    return "weixin";
+  }
+  return null;
+}
+
 export class AgentRoutesHandler {
   private readonly backend: BackendClient;
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
@@ -873,6 +892,10 @@ export class AgentRoutesHandler {
           runId: claimed.data.run_id ?? null,
           initialSnapshots: claimed.data.chart_snapshots,
           outboundBlocked: claimed.data.outbound_blocked,
+          hasPersonalIntegrationData: Boolean(
+            claimed.data.has_personal_integration_data ||
+              body.has_personal_integration_data,
+          ),
           automationName: claimed.data.automation_name,
           finishStatus:
             (body.status ??
@@ -914,6 +937,7 @@ export class AgentRoutesHandler {
     runId?: string | null;
     initialSnapshots?: ChartSnapshotItem[];
     outboundBlocked?: boolean;
+    hasPersonalIntegrationData?: boolean;
     automationName: string;
     finishStatus: AgentAutomationRunFinishRequest["status"];
     finalText: string | null;
@@ -941,6 +965,7 @@ export class AgentRoutesHandler {
       runId?: string | null;
       initialSnapshots?: ChartSnapshotItem[];
       outboundBlocked?: boolean;
+      hasPersonalIntegrationData?: boolean;
       automationName: string;
       finishStatus: AgentAutomationRunFinishRequest["status"];
       finalText: string | null;
@@ -1100,6 +1125,106 @@ export class AgentRoutesHandler {
         );
       };
 
+      const hasPersonalIntegrationData = Boolean(params.hasPersonalIntegrationData);
+      const dmRedirectOutcomeByPlatform = new Map<
+        string,
+        { ok: boolean; error: string | null }
+      >();
+
+      const redirectPersonalTargetToDmAndNotifyGroup = async (
+        t: AutomationRunTargetRecord,
+      ): Promise<AutomationRunTargetRecord> => {
+        const plat = platformFromAddress(t.address);
+        if (!plat || !t.address) {
+          return {
+            ...t,
+            reached: false,
+            via: null,
+            error: "Cannot redirect personal calendar result: unsupported target platform.",
+          };
+        }
+        const dmAddress = `${plat}:@me`;
+        let dmOutcome = dmRedirectOutcomeByPlatform.get(plat);
+        if (!dmOutcome) {
+          let dmOk = false;
+          let dmErr: string | null = null;
+          if (truncatedFinalText.length > 0) {
+            const dmRes = await this.deliveryService.executeDelivery({
+              deliveryKey: `automation:${executionId}:${plat}:personal_dm`,
+              kind: "automation",
+              userId,
+              threadId,
+              executionId,
+              target: dmAddress,
+              text: truncatedFinalText,
+            });
+            dmOk = dmRes.status === "sent" || dmRes.status === "partial";
+            if (!dmOk) {
+              dmErr =
+                dmRes.message ||
+                "Failed to deliver personal calendar result to verified 1:1 DM.";
+            } else {
+              await deliverAutomationChartsForTarget({
+                ...t,
+                entry: `${plat}:personal_dm`,
+                address: dmAddress,
+              });
+            }
+          } else {
+            const chartsOk = await deliverAutomationChartsForTarget({
+              ...t,
+              entry: `${plat}:personal_dm`,
+              address: dmAddress,
+            });
+            dmOk = chartsOk;
+            if (!dmOk) {
+              dmErr = "Automation completed without deliverable personal content.";
+            }
+          }
+          dmOutcome = { ok: dmOk, error: dmErr };
+          dmRedirectOutcomeByPlatform.set(plat, dmOutcome);
+        }
+
+        if (!dmOutcome.ok) {
+          return {
+            ...t,
+            reached: false,
+            via: null,
+            error:
+              dmOutcome.error ||
+              "Failed to deliver personal calendar result to verified 1:1 DM.",
+          };
+        }
+
+        // Send ONLY the sanitized redirect notice to the group/channel (zero calendar text, zero charts/files).
+        const noticeRes = await this.deliveryService.executeDelivery({
+          deliveryKey: `automation:${executionId}:${t.entry}:personal_redirect_notice`,
+          kind: "automation",
+          userId,
+          threadId,
+          executionId,
+          target: t.address,
+          text: PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE,
+        });
+        if (noticeRes.status === "sent" || noticeRes.status === "partial") {
+          return {
+            ...t,
+            address: noticeRes.address ?? t.address,
+            reached: true,
+            via: "fallback",
+            error: null,
+          };
+        }
+        return {
+          ...t,
+          reached: false,
+          via: null,
+          error:
+            noticeRes.message ||
+            "Personal calendar result sent to DM, but group redirect notice failed.",
+        };
+      };
+
       for (const t of targets) {
         if (!t.ok || !t.address) {
           results.push({
@@ -1112,6 +1237,12 @@ export class AgentRoutesHandler {
         }
 
         if (finishStatus === "completed") {
+          const targetIsGroup = !isDmTargetAddress(t.address);
+          if (hasPersonalIntegrationData && targetIsGroup) {
+            results.push(await redirectPersonalTargetToDmAndNotifyGroup(t));
+            continue;
+          }
+
           if (t.agent_sent) {
             await deliverAutomationChartsForTarget(t);
             results.push({
@@ -1133,6 +1264,14 @@ export class AgentRoutesHandler {
               target: t.address,
               text: truncatedFinalText,
             });
+
+            if (
+              deliveryRes.code === "personal_integration_private_only" &&
+              targetIsGroup
+            ) {
+              results.push(await redirectPersonalTargetToDmAndNotifyGroup(t));
+              continue;
+            }
 
             if (
               deliveryRes.status === "sent" ||

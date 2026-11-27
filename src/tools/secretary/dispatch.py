@@ -363,7 +363,7 @@ async def dispatch(
     if not dispatch_ok:
         return error_command(
             dispatch_err
-            or "当前对话包含个人日历/邮箱私密数据，仅可向本人完全私密的自有工作区派发任务。",
+            or "当前对话包含个人日历/邮箱私密数据，不支持转派到其他工作区或线程；请直接在当前私密对话中继续处理。",
             tool_call_id,
         )
     if workspace is not None and (away := await _unreachable_computer(workspace_id)):

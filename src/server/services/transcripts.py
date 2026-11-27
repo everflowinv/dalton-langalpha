@@ -153,6 +153,8 @@ class _Job:
     run: TaskRun | None = None
     # DALTON-HOOK(personal-integrations): purge generation read before checkpoints for FOR SHARE writeback fence
     expected_purge_gen: int | None = None
+    # DALTON-HOOK(personal-integrations): 1-based first segment tainted by personal-integration data across turns
+    first_personal_segment: int | None = None
 
     def render(self, *, inline: bool, full: bool = False) -> _Rendered:
         """The copy, each file named by digest. Only the segments that changed
@@ -168,6 +170,7 @@ class _Job:
             header=self.header,
             previous=None if full else load_manifest(self.previous),
             window=self.window,
+            first_personal_segment=self.first_personal_segment,
         )
         copy = StoredTranscript(
             self.fingerprint, self.checkpoint_id, directory.manifest, run=self.run
@@ -297,9 +300,13 @@ async def _render_own(
     """Render the thread's own agent from its checkpoint and store it:
     whether the save landed. None when it stands down, the stored copy being
     newer or the checkpoint empty."""
-    # DALTON-HOOK(personal-integrations): capture purge generation before reading checkpoint state
+    # DALTON-HOOK(personal-integrations): capture purge generation and first personal-touch segment before reading checkpoint state
+    from src.dalton.services.personal_integration_trace import (
+        read_thread_first_personal_segment,
+    )
     from src.dalton.services.purge_fence import read_expected_purge_generation
     expected_purge_gen = await read_expected_purge_generation(thread.thread_id)
+    first_personal_segment = await read_thread_first_personal_segment(thread.thread_id)
     state = await reader.aget_state(thread.thread_id, thread.checkpoint_id)
     rendered_at = (state.config or {}).get("configurable", {}).get("checkpoint_id")
     if own is not None and _newer(own.checkpoint_id, rendered_at):
@@ -319,6 +326,7 @@ async def _render_own(
         own.manifest if own is not None else None,
         Window.of(values),
         expected_purge_gen=expected_purge_gen,
+        first_personal_segment=first_personal_segment,
     )
     return await _render_and_save(target, job)
 
@@ -331,9 +339,15 @@ async def _render_task(
     it has got."""
     row = thread.tasks[task_id]
     run = _task_run(task_id, row)
-    # DALTON-HOOK(personal-integrations): capture purge generation before reading task history
+    # DALTON-HOOK(personal-integrations): capture purge generation and private-thread taint before reading task history
+    from src.dalton.services.personal_integration_trace import (
+        read_thread_first_personal_segment,
+    )
     from src.dalton.services.purge_fence import read_expected_purge_generation
     expected_purge_gen = await read_expected_purge_generation(thread.thread_id)
+    first_personal_segment = await read_thread_first_personal_segment(
+        thread.thread_id, is_task=True
+    )
     history = await reader.aget_task_history(thread.thread_id, task_id)
     header = {
         "task_id": task_id,
@@ -354,6 +368,7 @@ async def _render_task(
         Window(),
         run,
         expected_purge_gen=expected_purge_gen,
+        first_personal_segment=first_personal_segment,
     )
     return await _render_and_save(target, job)
 
@@ -584,9 +599,15 @@ async def save_live(
         latest = await reader.alatest_checkpoint_id(thread_id, transcript.checkpoint_ns)
     held_at = stored.checkpoint_id if stored is not None else None
     checkpoint_id = max(filter(None, (held_at, latest)), default=None)
-    # DALTON-HOOK(personal-integrations): capture purge generation before rendering live transcript
+    # DALTON-HOOK(personal-integrations): capture purge generation and first personal-touch segment before rendering live transcript
+    from src.dalton.services.personal_integration_trace import (
+        read_thread_first_personal_segment,
+    )
     from src.dalton.services.purge_fence import read_expected_purge_generation
     expected_purge_gen = await read_expected_purge_generation(thread_id)
+    first_personal_segment = await read_thread_first_personal_segment(
+        thread_id, is_task=(transcript.task_id is not None)
+    )
     job = _Job(
         transcript,
         list(messages),
@@ -596,6 +617,7 @@ async def save_live(
         stored.manifest if stored is not None else None,
         window,
         expected_purge_gen=expected_purge_gen,
+        first_personal_segment=first_personal_segment,
     )
     rendered = await _render_job(job, inline=target.inline)
     if stored is not None and rendered.copy.manifest == stored.manifest:

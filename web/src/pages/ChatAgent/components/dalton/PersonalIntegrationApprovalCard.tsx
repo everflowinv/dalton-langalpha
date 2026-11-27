@@ -59,6 +59,19 @@ function parseInputRequests(
   return items;
 }
 
+function extractEventBound(
+  eventObj: Record<string, unknown> | null,
+  field: 'start' | 'end',
+): string | null {
+  if (!eventObj) return null;
+  const bound = eventObj[field];
+  if (!bound || typeof bound !== 'object') return null;
+  const rec = bound as Record<string, unknown>;
+  if (typeof rec.dateTime === 'string' && rec.dateTime) return rec.dateTime;
+  if (typeof rec.date === 'string' && rec.date) return rec.date;
+  return null;
+}
+
 const ACTION_TITLES: Record<string, string> = {
   dalton_calendar_create_event: '确认新建个人日程',
   dalton_calendar_update_event: '确认修改个人日程',
@@ -105,6 +118,78 @@ export function PersonalIntegrationApprovalCard({
     args.before && typeof args.before === 'object'
       ? (args.before as Record<string, unknown>)
       : null;
+  const beforeStart = extractEventBound(beforeEvent, 'start');
+  const beforeEnd = extractEventBound(beforeEvent, 'end');
+  const displayStart =
+    typeof args.start_time === 'string' && args.start_time
+      ? args.start_time
+      : actionType === 'dalton_calendar_delete_event'
+        ? beforeStart
+        : null;
+  const displayEnd =
+    typeof args.end_time === 'string' && args.end_time
+      ? args.end_time
+      : actionType === 'dalton_calendar_delete_event'
+        ? beforeEnd
+        : null;
+  const normalizedPayload =
+    args.normalized_payload && typeof args.normalized_payload === 'object'
+      ? (args.normalized_payload as Record<string, unknown>)
+      : null;
+  const hasDescriptionChange =
+    typeof args.description === 'string' ||
+    args.description_set === true ||
+    Boolean(normalizedPayload && 'description' in normalizedPayload);
+  const descriptionValue =
+    typeof args.description === 'string'
+      ? args.description
+      : typeof normalizedPayload?.description === 'string'
+        ? normalizedPayload.description
+        : '';
+  const hasLocationChange =
+    typeof args.location === 'string' ||
+    args.location_set === true ||
+    Boolean(normalizedPayload && 'location' in normalizedPayload);
+  const locationValue =
+    typeof args.location === 'string'
+      ? args.location
+      : typeof normalizedPayload?.location === 'string'
+        ? normalizedPayload.location
+        : '';
+  const remindersArray = Array.isArray(args.reminders)
+    ? args.reminders
+    : Array.isArray(normalizedPayload?.overrideReminders)
+      ? (normalizedPayload.overrideReminders as unknown[])
+      : Array.isArray(normalizedPayload?.reminders)
+        ? (normalizedPayload.reminders as unknown[])
+        : null;
+  const useDefaultReminders =
+    typeof args.use_default_reminders === 'boolean'
+      ? args.use_default_reminders
+      : typeof normalizedPayload?.useDefaultReminders === 'boolean'
+        ? normalizedPayload.useDefaultReminders
+        : null;
+  const reminderLabel = useMemo(() => {
+    if (remindersArray !== null) {
+      if (remindersArray.length === 0) {
+        return '移除全部提醒';
+      }
+      return remindersArray
+        .map((r) => {
+          const obj = r && typeof r === 'object' ? (r as Record<string, unknown>) : {};
+          const method = obj.method === 'email' ? '邮件' : '';
+          return `${method}提前 ${String(obj.minutes ?? 10)} 分钟`;
+        })
+        .join('、');
+    }
+    if (useDefaultReminders === true) {
+      return '使用日历默认提醒';
+    }
+    if (useDefaultReminders === false) {
+      return '关闭默认提醒（不提醒）';
+    }
+    return null;
+  }, [remindersArray, useDefaultReminders]);
 
   const title = ACTION_TITLES[actionType] || '确认个人日历操作';
 
@@ -252,38 +337,49 @@ export function PersonalIntegrationApprovalCard({
       {typeof args.summary === 'string' && args.summary && (
         <div className="text-sm font-medium text-(--color-text-primary)">{args.summary}</div>
       )}
-      {(typeof args.start_time === 'string' || typeof args.end_time === 'string') && (
-        <div className="text-(--color-text-secondary)">
-          时间：{String(args.start_time || '')} → {String(args.end_time || '')}
+      {(displayStart || displayEnd) && (
+        <div
+          data-testid="calendar-approval-time"
+          className="text-(--color-text-secondary)"
+        >
+          {actionType === 'dalton_calendar_delete_event' ? '原时间：' : '时间：'}
+          {String(displayStart || '')} → {String(displayEnd || '')}
           {typeof args.timezone === 'string' ? ` (${args.timezone})` : ''}
         </div>
       )}
-      {typeof args.location === 'string' && args.location && (
-        <div className="text-(--color-text-secondary)">地点：{args.location}</div>
+      {hasLocationChange && (
+        <div
+          data-testid="calendar-approval-location"
+          className="text-(--color-text-secondary)"
+        >
+          地点：{locationValue.length > 0 ? locationValue : '（清空地点）'}
+        </div>
       )}
-      {typeof args.description === 'string' && args.description.length > 0 && (
+      {hasDescriptionChange && (
         <div
           data-testid="calendar-approval-description"
           className="text-(--color-text-secondary) whitespace-pre-wrap"
         >
-          描述：{args.description}
+          描述：{descriptionValue.length > 0 ? descriptionValue : '（清空描述）'}
         </div>
       )}
-      {Array.isArray(args.reminders) && args.reminders.length > 0 && (
-        <div className="text-(--color-text-secondary)">
-          提醒：
-          {args.reminders
-            .map((r) => {
-              const obj = r && typeof r === 'object' ? (r as Record<string, unknown>) : {};
-              return `提前 ${String(obj.minutes ?? 10)} 分钟`;
-            })
-            .join('、')}
+      {reminderLabel && (
+        <div
+          data-testid="calendar-approval-reminders"
+          className="text-(--color-text-secondary)"
+        >
+          提醒：{reminderLabel}
         </div>
       )}
       {beforeEvent && (
         <div className="pt-1 border-t border-(--color-border-muted) text-(--color-text-tertiary) space-y-0.5">
           {typeof beforeEvent.summary === 'string' && (
             <div>原日程标题：{beforeEvent.summary}</div>
+          )}
+          {(beforeStart || beforeEnd) && actionType !== 'dalton_calendar_delete_event' && (
+            <div data-testid="calendar-approval-before-time">
+              原日程时间：{String(beforeStart || '')} → {String(beforeEnd || '')}
+            </div>
           )}
           {typeof beforeEvent.description === 'string' && beforeEvent.description && (
             <div className="whitespace-pre-wrap">原日程描述：{beforeEvent.description}</div>

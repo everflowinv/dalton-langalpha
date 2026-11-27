@@ -983,20 +983,13 @@ async def test_personal_thread_outbound_gates_send_message_and_delegate_to_analy
     assert artifact["code"] == "personal_integration_outbound_blocked"
     call_mock.assert_not_awaited()
 
-    # 4. delegate_to_analyst gate blocks colleague workspace and allows own double-hidden workspace
-    monkeypatch.setattr(guard_mod, "is_dalton_sharing_auth_enabled", lambda: True)
-    monkeypatch.setattr(guard_mod, "is_colleague_dispatch_enabled", lambda: True)
-    monkeypatch.setattr(guard_mod, "is_home_row", lambda ws: False)
-    monkeypatch.setattr(guard_mod, "is_home_stand_in_row", lambda ws: False)
-    monkeypatch.setattr(guard_mod, "is_holder", lambda uid: False)
-
+    # 4. delegate_to_analyst gate unconditionally refuses any delegation from a private thread
+    #    (Lead Decision #2: no flag inheritance, even to user's own double-hidden workspace)
     ok_col, err_col = await check_personal_thread_dispatch_allowed(
         source_thread_id=tid,
         caller_user_id="user-1",
         target_workspace_id=ws_colleague,
-        conn=_ScriptedConn(
-            [{"workspace_id": ws_colleague, "user_id": "colleague-2", "config": {}, "status": "running"}]
-        ),
+        conn=_ScriptedConn([]),
     )
     assert ok_col is False and err_col is not None
 
@@ -1004,16 +997,10 @@ async def test_personal_thread_outbound_gates_send_message_and_delegate_to_analy
         source_thread_id=tid,
         caller_user_id="user-1",
         target_workspace_id=ws_private,
-        conn=_ScriptedConn(
-            [
-                {"workspace_id": ws_private, "user_id": "user-1", "config": {}, "status": "running"},
-                None,
-                {"cos_access": "hidden", "web_access": "hidden"},
-                {"cos_rw_enabled": False},
-            ]
-        ),
+        conn=_ScriptedConn([]),
     )
-    assert ok_priv is True and err_priv is None
+    assert ok_priv is False and err_priv is not None
+    assert "不支持向其他工作区或线程转派任务" in err_priv
 
     # 5. End-to-end hook in src/tools/secretary/dispatch.py refuses BEFORE hitl_confirm
     monkeypatch.setattr(

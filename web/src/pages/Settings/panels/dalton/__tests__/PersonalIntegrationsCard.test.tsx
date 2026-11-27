@@ -389,4 +389,133 @@ describe('PersonalIntegrationsCard', () => {
     expect(banner).toHaveTextContent('正在后台清理相关对话个人数据');
     expect(banner).not.toHaveTextContent('已清理完成');
   });
+
+  it('uses purge.provider label (飞书 vs Google) for purge progress and polls while purge is active', async () => {
+    const feishuPurge: PersonalIntegrationPurgeLedger = {
+      purge_id: 'purge-feishu-1',
+      provider: 'feishu',
+      service: 'calendar',
+      provider_account_id: 'ou_feishu_1',
+      trigger_reason: 'user_disconnect',
+      local_purge_status: 'running',
+      remote_revoke_status: 'not_applicable',
+      retry_count: 0,
+      next_retry_at: null,
+      last_remote_error: null,
+      disconnected_at: '2026-11-27T10:00:00Z',
+      local_completed_at: null,
+      remote_completed_at: null,
+    };
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [makeConnector('feishu', 'calendar')],
+        connections: [],
+        active_purges: [feishuPurge],
+        has_personal_integrations: true,
+      },
+    });
+
+    renderCard();
+
+    const progress = await screen.findByTestId('personal-integration-purge-purge-feishu-1');
+    expect(progress).toHaveTextContent('飞书 · 日历 — 正在清理本地飞书对话个人数据');
+    expect(progress).not.toHaveTextContent('Google');
+  });
+
+  it('disconnectAllGoogleMutation reflects backend purges running/retryable status instead of hardcoding completed', async () => {
+    h.capabilities = new Set<CapabilityId>(['google_calendar', 'google_gmail']);
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [makeConnector('google', 'calendar'), makeConnector('google', 'mail')],
+        connections: [makeConnection('google', 'calendar'), makeConnection('google', 'mail')],
+        active_purges: [],
+        has_personal_integrations: true,
+      },
+    });
+    h.apiDelete.mockResolvedValue({
+      data: {
+        provider: 'google',
+        services: ['calendar', 'mail'],
+        purges: [
+          {
+            purge_id: 'p-1',
+            provider: 'google',
+            service: 'calendar',
+            local_purge_status: 'running',
+            remote_revoke_status: 'failed_retryable',
+          },
+          {
+            purge_id: 'p-2',
+            provider: 'google',
+            service: 'mail',
+            local_purge_status: 'completed',
+            remote_revoke_status: 'succeeded',
+          },
+        ],
+      },
+    });
+
+    renderCard();
+
+    expect(await screen.findByText('Google 日历')).toBeInTheDocument();
+    const disconnectBtns = screen.getAllByRole('button', { name: '断开连接' });
+    fireEvent.click(disconnectBtns[0]);
+    expect(await screen.findByTestId('disconnect-integration-dialog')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /断开全部 Google 服务并在 Google 撤销授权/ }));
+
+    await waitFor(() =>
+      expect(h.apiDelete).toHaveBeenCalledWith(
+        '/api/v1/dalton/integrations/google?mode=remote_if_sole',
+      ),
+    );
+    const banner = await screen.findByTestId('personal-integrations-banner');
+    expect(banner).toHaveTextContent('正在后台清理关联本地个人数据');
+    expect(banner).not.toHaveTextContent('已清理完成');
+  });
+
+  it('auto-refreshes open Settings page while active purge is running and stops once completed', async () => {
+    const runningPurge: PersonalIntegrationPurgeLedger = {
+      purge_id: 'purge-poll-1',
+      provider: 'feishu',
+      service: 'calendar',
+      provider_account_id: 'ou_feishu_2',
+      trigger_reason: 'user_disconnect',
+      local_purge_status: 'running',
+      remote_revoke_status: 'not_applicable',
+      retry_count: 0,
+      next_retry_at: null,
+      last_remote_error: null,
+      disconnected_at: '2026-11-27T10:00:00Z',
+      local_completed_at: null,
+      remote_completed_at: null,
+    };
+
+    const { hasPendingPersonalIntegrationWork } = await import(
+      '@/lib/dalton/personalIntegrationsApi'
+    );
+    expect(
+      hasPendingPersonalIntegrationWork({
+        connectors: [],
+        connections: [],
+        active_purges: [runningPurge],
+        has_personal_integrations: true,
+      }),
+    ).toBe(true);
+    expect(
+      hasPendingPersonalIntegrationWork({
+        connectors: [],
+        connections: [],
+        active_purges: [{ ...runningPurge, local_purge_status: 'completed' }],
+        has_personal_integrations: true,
+      }),
+    ).toBe(false);
+    expect(
+      hasPendingPersonalIntegrationWork({
+        connectors: [],
+        connections: [makeConnection('google', 'calendar', { status: 'revoked_purging' })],
+        active_purges: [],
+        has_personal_integrations: true,
+      }),
+    ).toBe(true);
+  });
 });

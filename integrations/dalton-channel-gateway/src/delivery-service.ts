@@ -465,7 +465,7 @@ export class DeliveryService {
       };
     }
 
-    const outboundText = hasNonEmptyText
+    let outboundText = hasNonEmptyText
       ? rewriteSandboxLinks(
           rawText,
           this.webBaseUrl,
@@ -473,8 +473,8 @@ export class DeliveryService {
           options.workspaceId ?? null,
         )
       : rawText;
-    const hasOutboundText = outboundText.trim().length > 0;
-    const linkOnlyFiles = options.linkOnlyFiles ?? [];
+    let hasOutboundText = outboundText.trim().length > 0;
+    let linkOnlyFiles = options.linkOnlyFiles ?? [];
 
     if (!hasOutboundText && files.length === 0 && linkOnlyFiles.length === 0) {
       return {
@@ -703,13 +703,24 @@ export class DeliveryService {
     }
 
     const isDmTarget = targetAddress.endsWith(":@me");
+    const isPersonalRedirectNotice = Boolean(
+      claim.personal_private_redirect_notice ||
+        (typeof claim.forced_text === "string" && claim.forced_text.trim().length > 0),
+    );
     const currentSessionWsId =
       (options.workspaceId ?? "").trim() ||
       (claim.workspace_id ?? "").trim() ||
       (claim.home_workspace_id ?? "").trim() ||
       null;
     const fileOutcomes: AgentSendFileOutcome[] = [];
-    let filesToSend: AgentSendFileRef[] = [...files];
+    let filesToSend: AgentSendFileRef[] = isPersonalRedirectNotice ? [] : [...files];
+    if (isPersonalRedirectNotice) {
+      outboundText =
+        (typeof claim.forced_text === "string" && claim.forced_text.trim()) ||
+        "本次结果含个人日历内容，已发送到你的私聊";
+      hasOutboundText = true;
+      linkOnlyFiles = [];
+    }
     const pendingLinkEntries: Array<{
       line: string;
       outcome: AgentSendFileOutcome;

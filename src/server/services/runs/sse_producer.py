@@ -829,6 +829,21 @@ class RunSSEProducer:
                             )
                             continue
 
+                        # DALTON-HOOK(personal-integrations): emit live first-touch privacy notice onto the turn stream
+                        if event_type == "personal_integration_notice":
+                            yield self._build_sse_event(
+                                "personal_integration_notice",
+                                {
+                                    "thread_id": self.thread_id,
+                                    "agent": "main",
+                                    "service": event_data.get("service"),
+                                    "provider": event_data.get("provider"),
+                                    "turn_index": event_data.get("turn_index"),
+                                    "message": event_data.get("message", ""),
+                                },
+                            )
+                            continue
+
                         # Check if this is an artifact event from middleware
                         # Generic handler: any event with artifact_type is emitted as artifact SSE
                         artifact_type = event_data.get("artifact_type")

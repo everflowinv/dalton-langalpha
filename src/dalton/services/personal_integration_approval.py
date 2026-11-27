@@ -314,6 +314,19 @@ async def verify_personal_integration_interrupt_resume(
             },
         )
 
+    # Check platform capability for the saved provider/service is still enabled
+    from src.dalton.capabilities import CapabilityId, effective_capabilities
+
+    _cap_map = {
+        ("google", "calendar"): CapabilityId.GOOGLE_CALENDAR,
+        ("feishu", "calendar"): CapabilityId.FEISHU_CALENDAR,
+        ("google", "mail"): CapabilityId.GOOGLE_GMAIL,
+        ("feishu", "mail"): CapabilityId.FEISHU_MAIL,
+    }
+    req_cap = _cap_map.get((row.provider, row.service))
+    if req_cap is None or req_cap not in effective_capabilities():
+        return False
+
     # Check if thread privacy surface drifted since interrupt was raised (§4.4 item 5)
     still_private = await check_thread_surface_still_private(thread_id, caller_user_id)
     if not still_private:

@@ -180,11 +180,30 @@ export async function disconnectPersonalIntegrationService(
   return data;
 }
 
+export interface DisconnectPersonalIntegrationProviderPurgeItem {
+  purge_id: string;
+  local_purge_status?: 'running' | 'completed' | 'not_required' | string;
+  remote_revoke_status?:
+    | 'pending'
+    | 'succeeded'
+    | 'failed_retryable'
+    | 'superseded'
+    | 'not_applicable'
+    | string;
+}
+
+export interface DisconnectPersonalIntegrationProviderResponse {
+  local_disconnected?: boolean;
+  local_tokens_destroyed?: boolean;
+  provider: PersonalIntegrationProvider;
+  purges: DisconnectPersonalIntegrationProviderPurgeItem[];
+}
+
 export async function disconnectPersonalIntegrationProvider(
   provider: PersonalIntegrationProvider,
   mode: 'remote_if_sole' | 'local_only' = 'remote_if_sole',
-): Promise<{ provider: PersonalIntegrationProvider; purges: unknown[] }> {
-  const { data } = await api.delete<{ provider: PersonalIntegrationProvider; purges: unknown[] }>(
+): Promise<DisconnectPersonalIntegrationProviderResponse> {
+  const { data } = await api.delete<DisconnectPersonalIntegrationProviderResponse>(
     `/api/v1/dalton/integrations/${provider}?mode=${mode}`,
   );
   return data;
@@ -205,6 +224,20 @@ const FALLBACK_QUERY_CLIENT = new QueryClient({
   },
 });
 
+export function hasPendingPersonalIntegrationWork(
+  current: PersonalIntegrationsListResponse | undefined,
+): boolean {
+  if (!current) return false;
+  return (
+    (current.active_purges ?? []).some(
+      (p) => p.local_purge_status === 'running' || p.remote_revoke_status === 'pending',
+    ) ||
+    (current.connections ?? []).some(
+      (c) => c.status === 'disconnect_pending' || c.status === 'revoked_purging',
+    )
+  );
+}
+
 export function usePersonalIntegrationsQuery(enabled = true) {
   const contextClient = useContext(QueryClientContext);
   const queryEnabled = enabled && contextClient !== undefined;
@@ -215,6 +248,8 @@ export function usePersonalIntegrationsQuery(enabled = true) {
       enabled: queryEnabled,
       retry: false,
       staleTime: 60_000,
+      refetchInterval: (query) =>
+        hasPendingPersonalIntegrationWork(query.state.data) ? 3_000 : false,
     },
     contextClient ?? FALLBACK_QUERY_CLIENT,
   );

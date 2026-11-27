@@ -25,13 +25,18 @@ from typing import Any
 
 from fastapi import HTTPException
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from src.dalton.colleague_outbound_guard import (
     OUTBOUND_GUARD_REFUSAL_MESSAGE,
     is_run_outbound_blocked,
 )
 from src.dalton.database import user_integrations as db
-from src.dalton.database.user_integrations import IntegrationStatus
+from src.dalton.database.user_integrations import (
+    IntegrationStatus,
+    lifecycle_lock_key,
+    touch_user_lock_key,
+)
 from src.dalton.services.purge_fence import (
     PURGE_IN_PROGRESS_CODE,
     PURGE_IN_PROGRESS_MESSAGE,
@@ -65,6 +70,10 @@ FIRST_TOUCH_NOTICE_GENERIC = (
 NON_PRIVATE_SURFACE_GUIDE = (
     "个人日历仅支持在私密会话中使用，请前往本人私人 Home 会话、1:1 私聊，"
     "或仅本人可见的私密工作区中操作。"
+)
+
+PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE = (
+    "本次结果含个人日历内容，已发送到你的私聊"
 )
 
 _CHANNEL_PLATFORMS: frozenset[str] = frozenset(
@@ -613,7 +622,25 @@ async def verify_personal_integration_surface(
         )
 
     async def _run(db_conn: Any) -> PersonalSurfaceVerificationResult:
+        # Serialize account-generation re-verification & touch recording with
+        # disconnect / account-switch Phase 1 using the EXACT same advisory lock
+        # ordering (`lifecycle_lock_key -> touch_user_lock_key -> conversation_threads FOR UPDATE`)
+        # inside one transaction so a concurrent disconnect can never miss a first touch.
+        needs_lifecycle_lock = (
+            record_touch_now
+            or expected_auth_epoch is not None
+            or expected_provider_account_id is not None
+        )
         async with db_conn.cursor(row_factory=dict_row) as cur:
+            if needs_lifecycle_lock:
+                await cur.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (lifecycle_lock_key(caller_user_id, provider),),
+                )
+                await cur.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (touch_user_lock_key(caller_user_id),),
+                )
             await cur.execute(
                 """
                 SELECT t.conversation_thread_id,
@@ -773,30 +800,74 @@ async def verify_personal_integration_surface(
             )
 
         notice: str | None = None
+        first_touch_event: dict[str, Any] | None = None
         if is_first_touch:
             notice = (
                 FIRST_TOUCH_NOTICE_CALENDAR
                 if service == "calendar"
                 else FIRST_TOUCH_NOTICE_GENERIC
             )
+            first_touch_event = {
+                "turn_index": int(turn_index),
+                "response_id": response_id or None,
+                "provider": provider,
+                "service": service,
+                "message": notice,
+            }
+            async with db_conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE conversation_threads
+                    SET metadata = jsonb_set(
+                            COALESCE(metadata, '{}'::jsonb),
+                            '{personal_first_touch_event}',
+                            %s::jsonb,
+                            true
+                        ),
+                        updated_at = NOW()
+                    WHERE conversation_thread_id = %s::uuid
+                      AND (metadata->'personal_first_touch_event') IS NULL
+                    """,
+                    (Jsonb(first_touch_event), thread_id),
+                )
 
-        return PersonalSurfaceVerificationResult(
-            caller_user_id=caller_user_id,
-            workspace_id=ws_id,
-            thread_id=thread_id,
-            response_id=response_id,
-            turn_index=turn_index,
-            is_first_touch=is_first_touch,
-            first_touch_notice=notice,
-            platform=verified_platform,
-            chat_type=verified_chat_type,
-            is_dm_channel=is_dm_channel,
+        return (
+            PersonalSurfaceVerificationResult(
+                caller_user_id=caller_user_id,
+                workspace_id=ws_id,
+                thread_id=thread_id,
+                response_id=response_id,
+                turn_index=turn_index,
+                is_first_touch=is_first_touch,
+                first_touch_notice=notice,
+                platform=verified_platform,
+                chat_type=verified_chat_type,
+                is_dm_channel=is_dm_channel,
+            ),
+            first_touch_event,
         )
 
     if conn is not None:
-        return await _run(conn)
-    async with get_db_connection() as db_conn, db_conn.transaction():
-        return await _run(db_conn)
+        result, ft_event = await _run(conn)
+    else:
+        async with get_db_connection() as db_conn, db_conn.transaction():
+            result, ft_event = await _run(db_conn)
+    if ft_event is not None:
+        _emit_live_first_touch_notice(ft_event)
+    return result
+
+
+def _emit_live_first_touch_notice(event_payload: Mapping[str, Any]) -> None:
+    """Emit the first-touch privacy notice onto the live LangGraph custom stream (best-effort)."""
+    try:
+        from langgraph.config import get_stream_writer
+
+        writer = get_stream_writer()
+        if callable(writer):
+            writer({"type": "personal_integration_notice", **dict(event_payload)})
+    except Exception:
+        # Outside a live LangGraph stream (e.g. unit test invoking tool directly); DB event still replays.
+        pass
 
 
 async def claim_first_touch_notice_if_needed(
@@ -927,10 +998,10 @@ async def check_personal_thread_dispatch_allowed(
 ) -> tuple[bool, str | None]:
     """Gate ``delegate_to_analyst`` when the source thread carries personal integration data.
 
-    Only verified fully private workspaces owned by ``caller_user_id`` (effective
-    ``cos_access == 'hidden'`` and ``web_access == 'hidden'``, not shared/colleague)
-    are allowed as delegation destinations.
+    Any delegation from a thread containing personal integration data is refused
+    (no privacy-flag inheritance) with a clear user-facing explanation.
     """
+    _ = target_workspace_id, target_thread_id
     if not is_dalton_enabled():
         return True, None
     src_tid = normalize_uuid(source_thread_id) if source_thread_id else None
@@ -940,54 +1011,11 @@ async def check_personal_thread_dispatch_allowed(
     if not await is_thread_personal_private(src_tid, conn=conn):
         return True, None
 
-    ws_id = normalize_uuid(target_workspace_id) if target_workspace_id else None
     refusal = (
-        "当前对话包含个人日历/邮箱私密数据，仅允许向本人完全私密（对外与对同事均隐藏）的"
-        "自有工作区派发任务；不能派发到同事工作区或非私密工作区。"
+        "当前对话包含个人日历/邮箱私密数据，不支持向其他工作区或线程转派任务；"
+        "请直接在当前私密对话中继续处理，或另开不含私密数据的研究对话后再转派。"
     )
-    if ws_id is None:
-        return False, refusal
-
-    async def _run(db_conn: Any) -> tuple[bool, str | None]:
-        async with db_conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                SELECT workspace_id, user_id, config, status
-                FROM workspaces
-                WHERE workspace_id = %s::uuid
-                """,
-                (ws_id,),
-            )
-            ws_row = await cur.fetchone()
-        if ws_row is None or str(ws_row.get("status") or "") == "deleted":
-            return False, refusal
-
-        ws_private = await _is_workspace_effectively_private_tx(
-            db_conn,
-            workspace_id=ws_id,
-            ws_owner=str(ws_row.get("user_id") or ""),
-            ws_config=ws_row.get("config"),
-            caller_user_id=uid,
-        )
-        if not ws_private:
-            return False, refusal
-
-        if target_thread_id:
-            tgt_tid = normalize_uuid(target_thread_id)
-            if tgt_tid is None:
-                return False, refusal
-            still_private = await check_thread_surface_still_private(
-                tgt_tid, uid, conn=db_conn
-            )
-            if not still_private:
-                return False, refusal
-
-        return True, None
-
-    if conn is not None:
-        return await _run(conn)
-    async with get_db_connection() as db_conn:
-        return await _run(db_conn)
+    return False, refusal
 
 
 async def check_thread_surface_still_private(
@@ -1127,6 +1155,7 @@ __all__ = [
     "FIRST_TOUCH_NOTICE_CALENDAR",
     "FIRST_TOUCH_NOTICE_GENERIC",
     "NON_PRIVATE_SURFACE_GUIDE",
+    "PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE",
     "PERSONAL_INTEGRATION_NOT_SHARABLE_CODE",
     "PERSONAL_INTEGRATION_NOT_SHARABLE_MESSAGE",
     "PersonalIntegrationNotSharableError",

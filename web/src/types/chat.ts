@@ -129,7 +129,9 @@ export type SegmentNotice =
   | ({ kind: 'planBilled' } & PlanBilled)
   /** A Claude Code turn that waited for one of its computer's CLIs: a notice
    *  line where in the reply the wait happened. */
-  | ({ kind: 'cliWait' } & CliWait);
+  | ({ kind: 'cliWait' } & CliWait)
+  // DALTON-HOOK(personal-integrations): persisted first-touch privacy notice on the turn that accessed personal calendar/mail
+  | { kind: 'personalIntegrationNotice'; service?: string; provider?: string; message: string };
 
 export interface NotificationSegment {
   type: 'notification';

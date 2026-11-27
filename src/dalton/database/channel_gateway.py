@@ -9183,6 +9183,32 @@ async def _lock_weixin_account_for_key_share_in_tx(
         )
 
 
+async def _read_thread_personal_privacy_in_tx(
+    cur: Any,
+    thread_id: str | None,
+) -> tuple[bool, str | None]:
+    """Return ``(has_personal_integration_data, owner_user_id)`` for ``thread_id`` inside an open cursor."""
+    norm = normalize_uuid(thread_id) if thread_id else None
+    if not norm:
+        return False, None
+    await cur.execute(
+        """
+        SELECT COALESCE(t.has_personal_integration_data, FALSE) AS has_personal_integration_data,
+               COALESCE(t.user_id, w.user_id) AS owner_user_id
+        FROM conversation_threads t
+        LEFT JOIN workspaces w ON w.workspace_id = t.workspace_id
+        WHERE t.conversation_thread_id = %s::uuid
+        LIMIT 1
+        """,
+        (norm,),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return False, None
+    owner = str(row.get("owner_user_id") or "").strip() or None
+    return bool(row.get("has_personal_integration_data")), owner
+
+
 async def authorize_and_claim_delivery(
     *,
     delivery_key: str,
@@ -9599,6 +9625,8 @@ async def authorize_and_claim_delivery(
                 resolved_wx_bot_id: str | None = None
                 resolved_wx_bot_gen: int | None = None
                 verified_source_row: dict[str, Any] | None = None
+                resolved_privacy_thread_id: str | None = norm_tid
+                forced_personal_redirect_notice = False
 
                 # Scenario A1: Direct notice replying to an inbound event
                 if cleaned_kind == "notice" and cleaned_inbound_mid and cleaned_platform:
@@ -9836,6 +9864,9 @@ async def authorize_and_claim_delivery(
                             "message": "Automation run belongs to another user.",
                         }
                     resolved_user_id = owner_uid
+                    auto_tid = normalize_uuid(auto_row.get("thread_id")) or norm_tid
+                    if auto_tid:
+                        resolved_privacy_thread_id = auto_tid
                     targets_list = list(auto_row.get("targets") or [])
                     matched_target: dict[str, Any] | None = None
                     for t_item in targets_list:
@@ -9851,6 +9882,31 @@ async def authorize_and_claim_delivery(
                             ).startswith(f"{cleaned_platform}:"):
                                 matched_target = t_item
                                 break
+
+                    # Allow redirecting a personal-integration thread's group/channel target
+                    # to the automation owner's verified 1:1 DM on the same platform.
+                    if matched_target is None and cleaned_target and ":" in cleaned_target:
+                        dm_plat = cleaned_target.split(":", 1)[0].strip().lower()
+                        if _is_dm_address(dm_plat, cleaned_target):
+                            has_plat_target = any(
+                                isinstance(t_item, dict)
+                                and t_item.get("ok") is True
+                                and str(t_item.get("address") or "")
+                                .strip()
+                                .lower()
+                                .startswith(f"{dm_plat}:")
+                                for t_item in targets_list
+                            )
+                            if has_plat_target:
+                                auto_is_priv, _ = await _read_thread_personal_privacy_in_tx(
+                                    cur, resolved_privacy_thread_id
+                                )
+                                if auto_is_priv:
+                                    matched_target = {
+                                        "entry": cleaned_target,
+                                        "address": f"{dm_plat}:@me",
+                                        "ok": True,
+                                    }
 
                     if not matched_target or matched_target.get("ok") is not True:
                         return {
@@ -10026,6 +10082,23 @@ async def authorize_and_claim_delivery(
                     verified_source_row = dict(source_row)
                     resolved_platform = str(source_row["platform"]).lower()
                     resolved_target_address = str(source_row["target_address"])
+                    a2_tid = normalize_uuid(source_row.get("thread_id")) or norm_tid
+                    if a2_tid:
+                        resolved_privacy_thread_id = a2_tid
+                    # Allow fallback / retry deliveries for a personal-integration thread
+                    # to redirect from a non-DM source conversation to the owner's verified 1:1 DM.
+                    if (
+                        cleaned_kind == "fallback"
+                        and cleaned_key.endswith(":personal_dm")
+                        and cleaned_target
+                        and _is_dm_address(resolved_platform, cleaned_target)
+                        and resolved_privacy_thread_id
+                    ):
+                        a2_is_priv, a2_owner = await _read_thread_personal_privacy_in_tx(
+                            cur, resolved_privacy_thread_id
+                        )
+                        if a2_is_priv and (not a2_owner or a2_owner == resolved_user_id):
+                            resolved_target_address = f"{resolved_platform}:@me"
                     resolved_thread_scope_key = (
                         str(source_row["thread_scope_key"])
                         if source_row.get("thread_scope_key")
@@ -10607,6 +10680,55 @@ async def authorize_and_claim_delivery(
                 if resolved_user_id and not str(resolved_user_id).startswith("unlinked:"):
                     reject_company_system_auth(resolved_user_id)
                 require_channel_platform_capability(resolved_platform)
+
+                # Personal integration egress guard (backend enforcement):
+                # Once a thread carries personal integration data, actual replies,
+                # automation summaries, fallbacks, and retries may ONLY go to the
+                # owner's verified 1:1 DM. Non-DM targets only permit the sanitized
+                # redirect notice (`:personal_redirect_notice`) with forced safe text.
+                if (
+                    not resolved_privacy_thread_id
+                    and isinstance(verified_source_row, dict)
+                    and verified_source_row.get("thread_id")
+                ):
+                    resolved_privacy_thread_id = normalize_uuid(
+                        verified_source_row.get("thread_id")
+                    )
+                if resolved_privacy_thread_id:
+                    (
+                        priv_thread,
+                        priv_owner,
+                    ) = await _read_thread_personal_privacy_in_tx(
+                        cur, resolved_privacy_thread_id
+                    )
+                    if priv_thread:
+                        if priv_owner and str(resolved_user_id or "").strip() != priv_owner:
+                            return {
+                                "claim_status": "denied",
+                                "status": "failed",
+                                "code": "personal_integration_private_only",
+                                "has_personal_integration_data": True,
+                                "message": "该对话包含个人日历私密数据，仅允许向创建者本人已验证的 1:1 私聊发送。",
+                            }
+                        if not _is_dm_address(
+                            str(resolved_platform or ""),
+                            str(resolved_target_address or ""),
+                        ):
+                            if cleaned_key.endswith(
+                                ":personal_redirect_notice"
+                            ) and cleaned_kind in ("automation", "fallback", "notice"):
+                                forced_personal_redirect_notice = True
+                            else:
+                                return {
+                                    "claim_status": "denied",
+                                    "status": "failed",
+                                    "code": "personal_integration_private_only",
+                                    "has_personal_integration_data": True,
+                                    "redirect_dm_address": f"{resolved_platform}:@me"
+                                    if resolved_platform
+                                    else None,
+                                    "message": "该对话包含个人日历私密数据，内容仅允许发送到本人已验证的 1:1 私聊。",
+                                }
 
                 # Multi-account Weixin authorization, source generation check, and token resolution (§3.2 #4, D18, Codex ①)
                 if resolved_platform == "weixin":
@@ -11363,6 +11485,13 @@ async def authorize_and_claim_delivery(
                     resp_claim["weixin_bot_id"] = resolved_wx_bot_id
                     resp_claim["weixin_bot_generation"] = resolved_wx_bot_gen
                     resp_claim["weixin_context_token_version"] = weixin_ctx_token_version
+                if forced_personal_redirect_notice:
+                    from src.dalton.services.personal_integration_guard import (
+                        PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE,
+                    )
+
+                    resp_claim["personal_private_redirect_notice"] = True
+                    resp_claim["forced_text"] = PERSONAL_INTEGRATION_GROUP_REDIRECT_NOTICE
                 return resp_claim
 
 
@@ -14643,6 +14772,10 @@ async def _recover_channel_state_once(
                     auto_row["chart_snapshots"] = auto_snaps
                     if auto_blocked is not None:
                         auto_row["outbound_blocked"] = auto_blocked
+                    auto_is_priv, _ = await _read_thread_personal_privacy_in_tx(
+                        cur, eff_tid
+                    )
+                    auto_row["has_personal_integration_data"] = bool(auto_is_priv)
 
                 return {
                     "mode": "startup",
@@ -14891,7 +15024,11 @@ async def register_automation_run(
                         (norm_exec_id,),
                     )
                     ins = await cur.fetchone()
-                return {"targets": list((ins or {}).get("targets") or [])}
+                reg_is_priv, _ = await _read_thread_personal_privacy_in_tx(cur, norm_tid)
+                return {
+                    "targets": list((ins or {}).get("targets") or []),
+                    "has_personal_integration_data": bool(reg_is_priv),
+                }
 
 
 async def _resolve_verified_automation_run_id(
@@ -15217,6 +15354,22 @@ async def finish_automation_run(
                 eff_thread_str = (
                     str(updated["thread_id"]) if updated.get("thread_id") else None
                 )
+                if not eff_thread_str:
+                    await cur.execute(
+                        """
+                        SELECT conversation_thread_id::text AS thread_id
+                        FROM automation_executions
+                        WHERE automation_execution_id = %s::uuid
+                        LIMIT 1
+                        """,
+                        (norm_exec_id,),
+                    )
+                    ae_row = await cur.fetchone()
+                    if ae_row and ae_row.get("thread_id"):
+                        eff_thread_str = str(ae_row["thread_id"])
+                auto_is_priv, _ = await _read_thread_personal_privacy_in_tx(
+                    cur, eff_thread_str
+                )
                 auto_chart_snapshots: list[dict[str, Any]] = []
                 auto_outbound_blocked: bool | None = None
                 if eff_thread_str and verified_run_id:
@@ -15266,6 +15419,7 @@ async def finish_automation_run(
                     "finish_status": updated.get("finish_status"),
                     "final_text": updated.get("final_text"),
                     "targets": enriched_targets,
+                    "has_personal_integration_data": bool(auto_is_priv),
                 }
 
 

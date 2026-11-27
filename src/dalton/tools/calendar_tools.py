@@ -34,7 +34,11 @@ from langchain_core.tools import BaseTool, tool
 from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
 
-from src.dalton.capabilities import CapabilityId, effective_capabilities
+from src.dalton.capabilities import (
+    CapabilityId,
+    effective_capabilities,
+    get_connector_providers_summary,
+)
 from src.dalton.database import user_integrations as db
 from src.dalton.database.user_integrations import (
     ActionApprovalRow,
@@ -223,6 +227,38 @@ def _enabled_calendar_providers() -> list[str]:
 
 def _provider_display_name(provider: str) -> str:
     return "Google 日历" if provider == "google" else "飞书日历"
+
+
+def _provider_not_ready_command(
+    providers: Sequence[str],
+    tool_call_id: str,
+) -> Command | None:
+    """Reuse backend ``ready`` summary to give admin-setup guidance when connectors are not ready."""
+    summary = get_connector_providers_summary()
+    not_ready = [p for p in providers if not bool((summary.get(p) or {}).get("ready"))]
+    if not not_ready or len(not_ready) < len(providers):
+        return None
+    names = "或".join(_provider_display_name(p) for p in not_ready)
+    missing_creds = any(
+        not bool((summary.get(p) or {}).get("credentials_ready")) for p in not_ready
+    )
+    if missing_creds:
+        msg = (
+            f"当前部署已开启{names}功能，但管理员尚未在「部署设置 → 集成凭据」完成客户端凭据配置，"
+            f"暂无法自助连接，请联系管理员完成配置后再试。"
+        )
+    else:
+        msg = (
+            f"当前部署已开启{names}功能，但管理员尚未完成公开回调地址或服务端加密配置，"
+            f"暂无法自助连接，请联系管理员完成配置后再试。"
+        )
+    return _error_command(
+        "provider_not_ready",
+        msg,
+        tool_call_id,
+        providers=list(not_ready),
+        ready=False,
+    )
 
 
 def _required_scopes_for(provider: str, action: str) -> tuple[str, ...]:
@@ -456,6 +492,11 @@ def _normalize_calendar_write_request(
         card_reminders = write_payload.get("overrideReminders")
         card_use_default_rem = write_payload.get("useDefaultReminders")
         card_attendees = write_payload.get("attendees")
+        description_set = "description" in write_payload
+        location_set = "location" in write_payload
+        reminders_set = (
+            "overrideReminders" in write_payload or "useDefaultReminders" in write_payload
+        )
     else:
         card_summary = write_payload.get("summary")
         card_description = write_payload.get("description")
@@ -466,9 +507,22 @@ def _normalize_calendar_write_request(
         card_reminders = write_payload.get("reminders")
         card_use_default_rem = None
         card_attendees = cleaned_attendees if action == "create_event" else None
+        description_set = "description" in write_payload
+        location_set = "location" in write_payload
+        reminders_set = "reminders" in write_payload
 
     if action == "delete_event" and existing_event is not None:
         card_summary = existing_event.get("summary") or ""
+        ex_start, ex_start_all_day = _event_bound_value(existing_event, "start")
+        ex_end, ex_end_all_day = _event_bound_value(existing_event, "end")
+        card_start = ex_start
+        card_end = ex_end
+        if ex_start_all_day and ex_end_all_day:
+            eff_all_day = True
+        if existing_event.get("location") is not None:
+            card_location = str(existing_event.get("location") or "")
+        if existing_event.get("description") is not None:
+            card_description = str(existing_event.get("description") or "")
 
     card_args: dict[str, Any] = {
         "provider": provider,
@@ -485,9 +539,12 @@ def _normalize_calendar_write_request(
         "timezone": tz_name,
         "all_day": eff_all_day,
         "location": card_location,
+        "location_set": location_set,
         "description": card_description,
+        "description_set": description_set,
         "reminders": card_reminders,
         "use_default_reminders": card_use_default_rem,
+        "reminders_set": reminders_set,
         "attendees": card_attendees,
         "external_attendees": ext_attendees,
         "before": dict(existing_event) if isinstance(existing_event, Mapping) else None,
@@ -601,6 +658,9 @@ async def _call_google_mcp_with_elicitation(
     tool_call_id: str,
     config: RunnableConfig | None,
     stage_prefix: str,
+    before_dispatch: Any = None,
+    on_elicitation_pause: Any = None,
+    before_resumed_call: Any = None,
 ) -> tuple[dict[str, Any] | None, Command | None]:
     """Invoke Google Calendar MCP with durable multi-round ``input_required`` elicitation (§3.1, §5.2).
 
@@ -668,9 +728,15 @@ async def _call_google_mcp_with_elicitation(
             request_state = next_state
             merged_responses = next_merged
             active_token = next_token
+            if before_resumed_call is not None:
+                recheck_err = await before_resumed_call(round_idx, active_token)
+                if recheck_err is not None:
+                    return None, recheck_err
             continue
 
         # No persisted stage row for this round -> call Google MCP
+        if before_dispatch is not None:
+            await before_dispatch()
         try:
             result = await google_client.call_mcp_tool(
                 access_token=active_token.access_token,
@@ -687,6 +753,8 @@ async def _call_google_mcp_with_elicitation(
                     "后台自动任务无法进行交互表单确认，已中止本次 Google 日历操作。",
                     tool_call_id,
                 )
+            if on_elicitation_pause is not None:
+                await on_elicitation_pause()
             approval_id = str(uuid4())
             payload_sha = canonical_payload_sha256(
                 {
@@ -772,6 +840,10 @@ async def _call_google_mcp_with_elicitation(
             request_state = next_state
             merged_responses = next_merged
             active_token = next_token
+            if before_resumed_call is not None:
+                recheck_err = await before_resumed_call(round_idx, active_token)
+                if recheck_err is not None:
+                    return None, recheck_err
 
     return None, _error_command(
         "elicitation_round_limit",
@@ -1042,13 +1114,13 @@ def create_calendar_tools(
         """读取或管理当前用户本人已连接的个人日历（支持 Google 日历与飞书日历）。
 
         使用说明：
-        - 适用场景：仅在当前用户本人的私人 Home 会话、1:1 私聊，或仅本人可见的私密工作区中使用；首次在某个对话里访问个人日历时，需将工具返回的 `first_touch_notice` 原样转告用户。
+        - 适用场景：仅在当前用户本人的私人 Home 会话、1:1 私聊，或仅本人可见的私密工作区中使用；首次在某个对话里访问个人日历时，系统会将私密提示保存为本轮会话事件并在界面展示与回放。
         - 平台选择（`provider`）：默认 `"auto"`。仅连接一个日历平台时自动选用；同时连接 Google 日历与飞书日历时，只读查询会自动合并两边结果并标注来源，写操作与按事件 ID 查询单个日程时请先向用户确认目标平台再指定 `"google"` 或 `"feishu"`。
         - 支持的动作（`action`）：
           - `"list_calendars"`：列出用户有权限查看的日历列表。
-          - `"list_events"`：查询指定时间范围（`time_min` 至 `time_max`，ISO 8601 时间格式，如 `2026-12-01T00:00:00+08:00`）内的日程，可附带 `query` 关键词筛选和 `timezone`（IANA 时区名，如 `Asia/Shanghai`、`America/New_York`）。
+          - `"list_events"`：查询指定时间范围（`time_min` 至 `time_max`，ISO 8601 时间格式，如 `2026-12-01T00:00:00+08:00`）内的日程，可附带 `query` 关键词筛选和 `timezone`（IANA 时区名，如 `Asia/Shanghai`、`America/New_York`）。若返回 `truncated=true`，说明时间窗内日程超出翻页上限未列全，需明确告知用户并建议缩小时间范围或加上关键词。
           - `"get_event"`：按 `event_id` 读取单个日程详情。
-          - `"check_availability"`：查询 `time_min` 至 `time_max` 之间的忙碌时段与长度不少于 `duration_minutes` 分钟的空闲时段。
+          - `"check_availability"`：查询 `time_min` 至 `time_max` 之间的忙碌时段与长度不少于 `duration_minutes` 分钟的空闲时段。当返回的 `availability.status` 为 `"unknown"` 时，必须明确告知用户无法确认空闲（存在需重新授权、读取失败或分页截断的日历），不要把空的 `free` 数组说成没有空档。
           - `"create_event"`：新建日程（需提供 `summary`、`start_time`、`end_time`，可选 `description`、`location`、`attendees` 邮箱列表、`reminders` 如 `[{"method": "popup", "minutes": 15}]`、`all_day`）。
           - `"update_event"`：修改已有日程（需提供 `event_id` 及待修改字段）。
           - `"delete_event"`：删除已有日程（需提供 `event_id`）。
@@ -1155,13 +1227,20 @@ def create_calendar_tools(
                         settings_path=_SETTINGS_INTEGRATIONS_PATH,
                         providers=sorted(reauth_rows),
                     )
-                avail_names = "或".join(_provider_display_name(p) for p in enabled_providers)
+                not_ready_cmd = _provider_not_ready_command(enabled_providers, tool_call_id)
+                if not_ready_cmd is not None:
+                    return not_ready_cmd
+                summary_map = get_connector_providers_summary()
+                ready_providers = [
+                    p for p in enabled_providers if bool((summary_map.get(p) or {}).get("ready"))
+                ] or enabled_providers
+                avail_names = "或".join(_provider_display_name(p) for p in ready_providers)
                 return _error_command(
                     "not_connected",
                     f"你尚未连接个人日历。前往「设置 → 集成」（{_SETTINGS_INTEGRATIONS_PATH}）连接{avail_names}后，即可在私密对话中查询和管理日程。",
                     tool_call_id,
                     settings_path=_SETTINGS_INTEGRATIONS_PATH,
-                    available_providers=enabled_providers,
+                    available_providers=ready_providers,
                 )
             if len(connected_rows) == 1:
                 target_providers = [next(iter(connected_rows.keys()))]
@@ -1190,6 +1269,9 @@ def create_calendar_tools(
                         settings_path=_SETTINGS_INTEGRATIONS_PATH,
                         provider=req_provider,
                     )
+                not_ready_cmd = _provider_not_ready_command([req_provider], tool_call_id)
+                if not_ready_cmd is not None:
+                    return not_ready_cmd
                 return _error_command(
                     "not_connected",
                     f"你尚未连接{_provider_display_name(req_provider)}。前往「设置 → 集成」（{_SETTINGS_INTEGRATIONS_PATH}）完成连接后即可使用。",
@@ -1327,8 +1409,21 @@ def create_calendar_tools(
             merged_events: list[dict[str, Any]] = []
             errors_by_provider = {}
             incomplete_providers: dict[str, str] = {}
+            truncated_providers: dict[str, str] = {}
+            reauth_gap_providers: list[str] = []
             auth_err_cmd = None
             is_availability = act == "check_availability"
+
+            # When querying with provider="auto", any connection in ``needs_reauth`` is
+            # a real coverage gap: never report ``check_availability`` as complete/free.
+            if req_provider == "auto" and reauth_rows:
+                for rp in sorted(reauth_rows):
+                    reauth_gap_providers.append(rp)
+                    incomplete_providers[rp] = "needs_reauth"
+                    errors_by_provider[rp] = (
+                        f"{_provider_display_name(rp)}授权需要重新连接，请前往「设置 → 集成」"
+                        f"（{_SETTINGS_INTEGRATIONS_PATH}）完成重新授权。"
+                    )
 
             for p in target_providers:
                 conn_row = connected_rows[p]
@@ -1354,8 +1449,8 @@ def create_calendar_tools(
                     )
                     if p == "google":
                         next_page_token: str | None = None
-                        max_pages = _MAX_AVAILABILITY_PAGES if is_availability else 1
-                        page_size = 250 if is_availability else limit
+                        max_pages = _MAX_AVAILABILITY_PAGES
+                        page_size = 250 if is_availability else max(1, min(int(limit), 250))
                         for page_idx in range(max_pages):
                             mcp_args = build_google_list_events_args(
                                 calendar_id=cal_id,
@@ -1397,54 +1492,48 @@ def create_calendar_tools(
                                 next_page_token = None
                                 break
                             next_page_token = next_tok_val
-                        if is_availability and next_page_token:
-                            incomplete_providers[p] = "pagination_truncated"
-                    else:
-                        if is_availability:
-                            f_page_token: str | None = None
-                            f_truncated = False
-                            for _page_idx in range(_MAX_AVAILABILITY_PAGES):
-                                page_res = await _feishu_cli().list_events_page(
-                                    access_token=tok.access_token,
-                                    calendar_id=cal_id,
-                                    start_time=time_min,
-                                    end_time=time_max,
-                                    tz_name=tz_name,
-                                    page_size=500,
-                                    page_token=f_page_token,
-                                )
-                                items = page_res.get("items") or []
-                                merged_events.extend(items)
-                                has_more = bool(page_res.get("has_more"))
-                                next_f_tok = str(page_res.get("page_token") or "").strip() or None
-                                if not has_more:
-                                    f_truncated = False
-                                    break
-                                if not next_f_tok:
-                                    f_truncated = True
-                                    break
-                                f_page_token = next_f_tok
-                                f_truncated = True
-                            if f_truncated:
+                        if next_page_token:
+                            truncated_providers[p] = "pagination_truncated"
+                            if is_availability:
                                 incomplete_providers[p] = "pagination_truncated"
-                        else:
-                            feishu_items = await _feishu_cli().list_events(
+                    else:
+                        f_page_token: str | None = None
+                        f_truncated = False
+                        f_page_size = 500 if is_availability else max(50, min(int(limit), 500))
+                        for _page_idx in range(_MAX_AVAILABILITY_PAGES):
+                            page_res = await _feishu_cli().list_events_page(
                                 access_token=tok.access_token,
                                 calendar_id=cal_id,
                                 start_time=time_min,
                                 end_time=time_max,
                                 tz_name=tz_name,
-                                page_size=limit,
+                                page_size=f_page_size,
+                                page_token=f_page_token,
                             )
-                            if query and query.strip():
+                            items = list(page_res.get("items") or [])
+                            if not is_availability and query and query.strip():
                                 q_low = query.strip().lower()
-                                feishu_items = [
+                                items = [
                                     ev
-                                    for ev in feishu_items
+                                    for ev in items
                                     if q_low in str(ev.get("summary") or "").lower()
                                     or q_low in str(ev.get("description") or "").lower()
                                 ]
-                            merged_events.extend(feishu_items)
+                            merged_events.extend(items)
+                            has_more = bool(page_res.get("has_more"))
+                            next_f_tok = str(page_res.get("page_token") or "").strip() or None
+                            if not has_more:
+                                f_truncated = False
+                                break
+                            if not next_f_tok:
+                                f_truncated = True
+                                break
+                            f_page_token = next_f_tok
+                            f_truncated = True
+                        if f_truncated:
+                            truncated_providers[p] = "pagination_truncated"
+                            if is_availability:
+                                incomplete_providers[p] = "pagination_truncated"
                 except GraphInterrupt:
                     raise
                 except PersonalSurfaceDeniedError as exc:
@@ -1461,7 +1550,7 @@ def create_calendar_tools(
                 ) as exc:
                     errors_by_provider[p] = str(exc)
                     incomplete_providers[p] = getattr(exc, "code", "auth_failed")
-                    if len(target_providers) == 1:
+                    if len(target_providers) == 1 and not reauth_gap_providers:
                         auth_err_cmd = _auth_error_command(
                             exc, provider=p, tool_call_id=tool_call_id
                         )
@@ -1475,7 +1564,7 @@ def create_calendar_tools(
 
             if auth_err_cmd is not None:
                 return auth_err_cmd
-            if not merged_events and errors_by_provider:
+            if not merged_events and errors_by_provider and not reauth_gap_providers:
                 return _error_command(
                     "calendar_read_failed",
                     "读取日程失败：" + "；".join(errors_by_provider.values()),
@@ -1506,9 +1595,20 @@ def create_calendar_tools(
                     availability["coverage_complete"] = False
                     availability["free"] = []
                     availability["incomplete_providers"] = reasons
-                    availability["unknown_reason"] = (
-                        "部分日历平台读取失败或分页未覆盖完整时间窗，空闲时段状态未知，不能确认空闲。"
-                    )
+                    if reauth_gap_providers:
+                        reauth_names = "、".join(
+                            _provider_display_name(rp) for rp in reauth_gap_providers
+                        )
+                        availability["reauth_providers"] = reauth_gap_providers
+                        availability["settings_path"] = _SETTINGS_INTEGRATIONS_PATH
+                        availability["unknown_reason"] = (
+                            f"{reauth_names}需要重新授权（请前往「设置 → 集成」完成重新授权），"
+                            f"空闲时段覆盖不完整，无法确认空闲。"
+                        )
+                    else:
+                        availability["unknown_reason"] = (
+                            "部分日历平台读取失败或分页未覆盖完整时间窗，空闲时段状态未知，不能确认空闲。"
+                        )
                 else:
                     availability["status"] = "complete"
                     availability["coverage_complete"] = True
@@ -1540,6 +1640,18 @@ def create_calendar_tools(
                         "timezone": tz_name,
                         "events": merged_events,
                         "count": len(merged_events),
+                        "truncated": bool(truncated_providers),
+                        **(
+                            {
+                                "truncated_providers": truncated_providers,
+                                "truncation_notice": (
+                                    "时间窗内日程超出翻页上限，当前结果未列全；"
+                                    "请缩小时间范围或补充关键词后重试。"
+                                ),
+                            }
+                            if truncated_providers
+                            else {}
+                        ),
                         **({"partial_errors": errors_by_provider} if errors_by_provider else {}),
                     },
                 ),
@@ -1815,6 +1927,8 @@ def create_calendar_tools(
 
         frozen_state: dict[str, Any] = {
             "kind": "calendar_write",
+            "write_phase": "pending_approval",
+            "idempotency_key": f"dalton-cal:{approval_id}",
             "provider": p,
             "calendar_id": cal_id,
             "action": act,
@@ -1874,13 +1988,316 @@ def create_calendar_tools(
             config=config,
             approved=approved,
             resume=resume,
-            already_executing=False,
+            write_phase="pending_approval",
             google_cli=_google_cli(),
             feishu_cli=_feishu_cli(),
             attach_notice=_attach_persisted_notice,
         )
 
     return [dalton_calendar]
+
+
+def _normalize_iso_day_window(
+    start_val: str | None,
+    end_val: str | None,
+) -> tuple[str, str]:
+    """Return a slightly widened ISO window around ``[start_val, end_val]`` for remote reconciliation."""
+    now = datetime.now(UTC)
+    parsed_start: datetime | None = None
+    parsed_end: datetime | None = None
+    for raw, is_end in ((start_val, False), (end_val, True)):
+        if not raw:
+            continue
+        s = str(raw).strip()
+        try:
+            if len(s) == 10 and s[4] == "-" and s[7] == "-":
+                dt = datetime.fromisoformat(f"{s}T00:00:00+00:00")
+            else:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=UTC)
+            if is_end:
+                parsed_end = dt
+            else:
+                parsed_start = dt
+        except ValueError:
+            continue
+    lo = (parsed_start or now) - timedelta(days=1)
+    hi = (parsed_end or (parsed_start or now) + timedelta(hours=2)) + timedelta(days=1)
+    if hi <= lo:
+        hi = lo + timedelta(days=2)
+    return lo.isoformat(), hi.isoformat()
+
+
+def _event_matches_idempotency_or_payload(
+    ev: Mapping[str, Any],
+    *,
+    idempotency_key: str,
+    summary: str | None,
+    start_time: str | None,
+    end_time: str | None,
+) -> bool:
+    """Match a remote event against an idempotency key or frozen ``(summary, start, end)``."""
+    ev_idem = str(ev.get("idempotency_key") or "").strip()
+    if ev_idem and ev_idem == idempotency_key:
+        return True
+    ext = ev.get("extendedProperties")
+    if isinstance(ext, Mapping):
+        priv = ext.get("private")
+        if isinstance(priv, Mapping):
+            if str(priv.get("dalton_idempotency_key") or "").strip() == idempotency_key:
+                return True
+    target_summary = str(summary or "").strip()
+    if not target_summary:
+        return False
+    if str(ev.get("summary") or "").strip() != target_summary:
+        return False
+    ev_start, _ = _event_bound_value(ev, "start")
+    ev_end, _ = _event_bound_value(ev, "end")
+    if start_time and ev_start and str(ev_start)[:16] != str(start_time)[:16]:
+        return False
+    if end_time and ev_end and str(ev_end)[:16] != str(end_time)[:16]:
+        return False
+    return True
+
+
+async def _reconcile_unconfirmed_calendar_write(
+    *,
+    provider: str,
+    action: str,
+    calendar_id: str,
+    event_id: str | None,
+    tz_name: str,
+    write_payload: Mapping[str, Any],
+    card_args: Mapping[str, Any],
+    pre_read_marker: str | None,
+    idempotency_key: str,
+    approval_id: str,
+    caller_user_id: str,
+    thread_id: str,
+    tool_call_id: str,
+    fresh_tok: FreshAccessToken,
+    frozen_state: Mapping[str, Any],
+    google_cli: GoogleCalendarClientProtocol,
+    feishu_cli: FeishuCalendarClientProtocol,
+    attach_notice: Any,
+) -> Command:
+    """Query remote calendar state for a ``write_dispatched_unconfirmed`` approval without re-writing."""
+    try:
+        if action == "create_event":
+            start_hint = str(card_args.get("start_time") or write_payload.get("startTime") or "")
+            end_hint = str(card_args.get("end_time") or write_payload.get("endTime") or "")
+            summary_hint = str(card_args.get("summary") or write_payload.get("summary") or "")
+            win_min, win_max = _normalize_iso_day_window(start_hint, end_hint)
+            remote_events: list[dict[str, Any]] = []
+            if provider == "google":
+                mcp_res = await google_cli.call_mcp_tool(
+                    access_token=fresh_tok.access_token,
+                    tool_name="list_events",
+                    arguments=build_google_list_events_args(
+                        calendar_id=calendar_id,
+                        time_min=win_min,
+                        time_max=win_max,
+                        tz_name=tz_name,
+                        query=summary_hint or None,
+                        limit=50,
+                    ),
+                )
+                raw_items = (mcp_res or {}).get("events") or (mcp_res or {}).get("items") or []
+                for item in raw_items:
+                    if isinstance(item, Mapping):
+                        norm = normalize_google_event(item, calendar_id=calendar_id)
+                        if item.get("idempotency_key"):
+                            norm["idempotency_key"] = item["idempotency_key"]
+                        if isinstance(item.get("extendedProperties"), Mapping):
+                            norm["extendedProperties"] = dict(item["extendedProperties"])
+                        remote_events.append(norm)
+            else:
+                page = await feishu_cli.list_events_page(
+                    access_token=fresh_tok.access_token,
+                    calendar_id=calendar_id,
+                    start_time=win_min,
+                    end_time=win_max,
+                    tz_name=tz_name,
+                    page_size=200,
+                )
+                remote_events = list(page.get("items") or [])
+
+            matched = next(
+                (
+                    ev
+                    for ev in remote_events
+                    if _event_matches_idempotency_or_payload(
+                        ev,
+                        idempotency_key=idempotency_key,
+                        summary=summary_hint,
+                        start_time=start_hint or None,
+                        end_time=end_hint or None,
+                    )
+                ),
+                None,
+            )
+            if matched is not None:
+                result_payload = {
+                    "ok": True,
+                    "action": "create_event",
+                    "provider": provider,
+                    "event": matched,
+                    "reconciled": True,
+                    "idempotency_key": idempotency_key,
+                }
+                await db.update_action_approval_state(
+                    approval_id,
+                    caller_user_id=caller_user_id,
+                    status="succeeded",
+                    elicitation_state={
+                        **dict(frozen_state),
+                        "write_phase": "succeeded",
+                        "remote_result": result_payload,
+                    },
+                )
+                return _tool_command(
+                    await attach_notice(thread_id, result_payload),
+                    tool_call_id,
+                )
+            return _error_command(
+                "write_result_unconfirmed",
+                "上次新建日程请求已发出但本地状态未确认，且远端查询暂未命中该日程；为避免重复创建未自动重发，请检查日历后再决定是否重试。",
+                tool_call_id,
+                approval_id=approval_id,
+                idempotency_key=idempotency_key,
+            )
+
+        if action == "update_event" and event_id:
+            if provider == "google":
+                raw = await google_cli.call_mcp_tool(
+                    access_token=fresh_tok.access_token,
+                    tool_name="get_event",
+                    arguments={"calendarId": calendar_id, "eventId": str(event_id)},
+                )
+                remote_ev = normalize_google_event(
+                    (raw or {}).get("event") or raw or {},
+                    calendar_id=calendar_id,
+                )
+            else:
+                remote_ev = await feishu_cli.get_event(
+                    access_token=fresh_tok.access_token,
+                    calendar_id=calendar_id,
+                    event_id=str(event_id),
+                    tz_name=tz_name,
+                )
+            remote_updated = str(remote_ev.get("updated") or "")
+            summary_matches = (
+                "summary" in write_payload
+                and str(remote_ev.get("summary") or "").strip()
+                == str(write_payload.get("summary") or "").strip()
+            )
+            if (pre_read_marker and remote_updated and remote_updated != str(pre_read_marker)) or summary_matches:
+                result_payload = {
+                    "ok": True,
+                    "action": "update_event",
+                    "provider": provider,
+                    "event": remote_ev,
+                    "reconciled": True,
+                    "idempotency_key": idempotency_key,
+                }
+                await db.update_action_approval_state(
+                    approval_id,
+                    caller_user_id=caller_user_id,
+                    status="succeeded",
+                    elicitation_state={
+                        **dict(frozen_state),
+                        "write_phase": "succeeded",
+                        "remote_result": result_payload,
+                    },
+                )
+                return _tool_command(
+                    await attach_notice(thread_id, result_payload),
+                    tool_call_id,
+                )
+            return _error_command(
+                "write_result_unconfirmed",
+                "上次修改日程请求已发出但结果未确认，为避免重复写入未自动重发，请检查日历后再决定是否重试。",
+                tool_call_id,
+                approval_id=approval_id,
+                idempotency_key=idempotency_key,
+            )
+
+        if action == "delete_event" and event_id:
+            deleted_confirmed = False
+            try:
+                if provider == "google":
+                    raw = await google_cli.call_mcp_tool(
+                        access_token=fresh_tok.access_token,
+                        tool_name="get_event",
+                        arguments={"calendarId": calendar_id, "eventId": str(event_id)},
+                    )
+                    remote_ev = normalize_google_event(
+                        (raw or {}).get("event") or raw or {},
+                        calendar_id=calendar_id,
+                    )
+                else:
+                    remote_ev = await feishu_cli.get_event(
+                        access_token=fresh_tok.access_token,
+                        calendar_id=calendar_id,
+                        event_id=str(event_id),
+                        tz_name=tz_name,
+                    )
+                if str(remote_ev.get("status") or "").strip().lower() == "cancelled":
+                    deleted_confirmed = True
+            except (GoogleCalendarAPIError, FeishuCalendarAPIError) as exc:
+                if getattr(exc, "status_code", None) in (404, 410):
+                    deleted_confirmed = True
+                else:
+                    raise
+            if deleted_confirmed:
+                result_payload = {
+                    "ok": True,
+                    "action": "delete_event",
+                    "provider": provider,
+                    "calendar_id": calendar_id,
+                    "event_id": event_id,
+                    "deleted": True,
+                    "reconciled": True,
+                    "idempotency_key": idempotency_key,
+                }
+                await db.update_action_approval_state(
+                    approval_id,
+                    caller_user_id=caller_user_id,
+                    status="succeeded",
+                    elicitation_state={
+                        **dict(frozen_state),
+                        "write_phase": "succeeded",
+                        "remote_result": result_payload,
+                    },
+                )
+                return _tool_command(
+                    await attach_notice(thread_id, result_payload),
+                    tool_call_id,
+                )
+            return _error_command(
+                "write_result_unconfirmed",
+                "上次删除日程请求已发出但结果未确认，为避免重复操作未自动重发，请检查日历后再决定是否重试。",
+                tool_call_id,
+                approval_id=approval_id,
+                idempotency_key=idempotency_key,
+            )
+    except (GoogleCalendarAPIError, FeishuCalendarAPIError, GoogleMCPElicitationRequired) as exc:
+        return _error_command(
+            "write_result_unconfirmed",
+            f"上次日程写入结果未确认，远端核实失败（{exc}）；为避免重复写入未自动重发，请检查日历后再试。",
+            tool_call_id,
+            approval_id=approval_id,
+            idempotency_key=idempotency_key,
+        )
+
+    return _error_command(
+        "write_result_unconfirmed",
+        "上次日程写入请求结果未确认，为避免重复写入已中止，请检查日历后再试。",
+        tool_call_id,
+        approval_id=approval_id,
+        idempotency_key=idempotency_key,
+    )
 
 
 async def _resume_frozen_calendar_write(
@@ -1933,6 +2350,49 @@ async def _resume_frozen_calendar_write(
     )
     approved, resume = hitl_confirm(existing_write.action_type, action_payload)
 
+    if existing_write.status == "succeeded" and isinstance(frozen.get("remote_result"), Mapping):
+        return _tool_command(
+            await attach_notice(thread_id, dict(frozen["remote_result"])),
+            tool_call_id,
+        )
+
+    persisted_phase = str(frozen.get("write_phase") or "").strip()
+    if (
+        existing_write.status == "send_ambiguous"
+        or persisted_phase == "write_dispatched_unconfirmed"
+    ):
+        # Replay any completed elicitation interrupts before reconciling so LangGraph's cursor stays aligned
+        for prefix in (
+            f"tc:{tool_call_id}:vercheck:elic:",
+            f"tc:{tool_call_id}:write:elic:",
+            f"tc:{tool_call_id}:vercheck_r",
+        ):
+            prior_elics = await db.list_action_approvals_by_stage_prefix(
+                caller_user_id, thread_id, prefix, decrypt_state=True
+            )
+            for erow in prior_elics:
+                estate = erow.elicitation_state or {}
+                epayload = _build_elicitation_hitl_payload(
+                    approval_id=erow.approval_id,
+                    caller_user_id=caller_user_id,
+                    tool_call_id=tool_call_id,
+                    confirm_token=str(estate.get("confirm_token") or ""),
+                    payload_sha=erow.payload_sha256,
+                    input_requests=erow.input_requests_map or {},
+                    mcp_tool_name=str(estate.get("mcp_tool_name") or existing_write.action_type),
+                    mcp_arguments=estate.get("mcp_arguments") or {},
+                    dm_meta=estate.get("dm_meta"),
+                )
+                hitl_confirm("dalton_google_mcp_elicitation", epayload)
+        resolved_phase = "write_dispatched_unconfirmed"
+    elif existing_write.status == "executing":
+        resolved_phase = (
+            persisted_phase if persisted_phase in ("awaiting_google_form", "write_dispatched_unconfirmed")
+            else "awaiting_google_form"
+        )
+    else:
+        resolved_phase = "pending_approval"
+
     return await _execute_confirmed_calendar_write(
         approval_row=existing_write,
         frozen_state=frozen,
@@ -1942,7 +2402,7 @@ async def _resume_frozen_calendar_write(
         config=config,
         approved=approved,
         resume=resume,
-        already_executing=(existing_write.status == "executing"),
+        write_phase=resolved_phase,
         google_cli=google_cli,
         feishu_cli=feishu_cli,
         attach_notice=attach_notice,
@@ -1959,22 +2419,24 @@ async def _execute_confirmed_calendar_write(
     config: RunnableConfig | None,
     approved: bool,
     resume: Mapping[str, Any],
-    already_executing: bool,
+    write_phase: str,
     google_cli: GoogleCalendarClientProtocol,
     feishu_cli: FeishuCalendarClientProtocol,
     attach_notice: Any,
 ) -> Command:
-    """Consume ONLY the original approval row, verify version/epoch, and execute frozen payload."""
+    """Consume ONLY the original approval row, verify capability/version/epoch, and execute frozen payload."""
     approval_id = approval_row.approval_id
-    p = str(frozen_state["provider"])
+    p = str(frozen_state.get("provider") or approval_row.provider).strip().lower()
     cal_id = str(frozen_state["calendar_id"])
     act = str(frozen_state["action"])
     event_id = frozen_state.get("event_id")
     tz_name = str(frozen_state.get("tz_name") or "Asia/Shanghai")
     write_payload = dict(frozen_state["write_payload"])
+    card_args = frozen_state.get("card_args") if isinstance(frozen_state.get("card_args"), Mapping) else {}
     frozen_attendees = frozen_state.get("attendees")
     requires_second_confirm = bool(frozen_state.get("requires_second_confirm"))
     pre_read_marker = frozen_state.get("pre_read_updated_marker")
+    idempotency_key = str(frozen_state.get("idempotency_key") or f"dalton-cal:{approval_id}")
     req_scopes = _required_scopes_for(p, act)
     desc_action = {
         "create_event": "新建日程",
@@ -1982,7 +2444,20 @@ async def _execute_confirmed_calendar_write(
         "delete_event": "删除日程",
     }[act]
 
-    if not already_executing:
+    # Re-verify platform capability against the approval's saved provider BEFORE consuming or calling APIs (Item 6)
+    if p not in _enabled_calendar_providers():
+        if approval_row.status in ("pending", "executing"):
+            await db.mark_action_approval_status(
+                approval_id, "expired", caller_user_id=caller_user_id
+            )
+        return _error_command(
+            "provider_capability_disabled",
+            f"当前部署已关闭{_provider_display_name(p)}功能，已中止本次{desc_action}操作。",
+            tool_call_id,
+            provider=p,
+        )
+
+    if write_phase == "pending_approval":
         if isinstance(resume, Mapping) and resume.get("scope_changed"):
             await db.mark_action_approval_status(
                 approval_id, "expired", caller_user_id=caller_user_id
@@ -2046,7 +2521,7 @@ async def _execute_confirmed_calendar_write(
             tool_call_id,
         )
 
-    # Acquire fresh token right before external write HTTP (outside any lock)
+    # Acquire fresh token right before external write/reconcile HTTP (outside any lock)
     try:
         fresh_tok = await ensure_fresh_access_token(
             caller_user_id,
@@ -2061,9 +2536,10 @@ async def _execute_confirmed_calendar_write(
         IntegrationNotConnectedError,
         PersonalIntegrationError,
     ) as exc:
-        await db.mark_action_approval_status(
-            approval_id, "failed", caller_user_id=caller_user_id
-        )
+        if write_phase != "write_dispatched_unconfirmed":
+            await db.mark_action_approval_status(
+                approval_id, "failed", caller_user_id=caller_user_id
+            )
         return _auth_error_command(exc, provider=p, tool_call_id=tool_call_id)
 
     if (
@@ -2079,51 +2555,7 @@ async def _execute_confirmed_calendar_write(
             tool_call_id,
         )
 
-    # Re-verify event version before executing update/delete (only before initial write execution)
-    if not already_executing and act in ("update_event", "delete_event") and pre_read_marker:
-        assert event_id is not None
-        try:
-            if p == "google":
-                latest_raw = await google_cli.call_mcp_tool(
-                    access_token=fresh_tok.access_token,
-                    tool_name="get_event",
-                    arguments={"calendarId": cal_id, "eventId": str(event_id)},
-                )
-                latest_ev = normalize_google_event(
-                    (latest_raw or {}).get("event") or latest_raw or {},
-                    calendar_id=cal_id,
-                )
-            else:
-                latest_ev = await feishu_cli.get_event(
-                    access_token=fresh_tok.access_token,
-                    calendar_id=cal_id,
-                    event_id=str(event_id),
-                    tz_name=tz_name,
-                )
-            current_marker = str(latest_ev.get("updated") or "")
-            if current_marker and current_marker != str(pre_read_marker):
-                await db.mark_action_approval_status(
-                    approval_id, "expired", caller_user_id=caller_user_id
-                )
-                return _error_command(
-                    "event_version_changed",
-                    "该日程在确认期间已被修改，已中止操作，请重新查看日程后再发起。",
-                    tool_call_id,
-                )
-        except GoogleMCPElicitationRequired:
-            # Skip optimistic re-check if Google asks for form on read
-            pass
-        except (GoogleCalendarAPIError, FeishuCalendarAPIError) as exc:
-            await db.mark_action_approval_status(
-                approval_id, "failed", caller_user_id=caller_user_id
-            )
-            return _error_command(
-                "event_version_check_failed",
-                f"执行前核对日程版本失败：{exc}",
-                tool_call_id,
-            )
-
-    # Atomically re-verify private surface & record touch with actual token generation before writing
+    # Atomically re-verify private surface & record touch with actual token generation before any remote call
     try:
         surf = await verify_personal_integration_surface(
             config,
@@ -2146,9 +2578,160 @@ async def _execute_confirmed_calendar_write(
             retry_later=exc.is_purge_wait,
         )
 
+    # State 1: Write was already dispatched, local confirmation failed -> reconcile remotely, NEVER re-write!
+    if write_phase == "write_dispatched_unconfirmed":
+        return await _reconcile_unconfirmed_calendar_write(
+            provider=p,
+            action=act,
+            calendar_id=cal_id,
+            event_id=str(event_id) if event_id else None,
+            tz_name=tz_name,
+            write_payload=write_payload,
+            card_args=card_args,
+            pre_read_marker=str(pre_read_marker) if pre_read_marker else None,
+            idempotency_key=idempotency_key,
+            approval_id=approval_id,
+            caller_user_id=caller_user_id,
+            thread_id=thread_id,
+            tool_call_id=tool_call_id,
+            fresh_tok=fresh_tok,
+            frozen_state=frozen_state,
+            google_cli=google_cli,
+            feishu_cli=feishu_cli,
+            attach_notice=attach_notice,
+        )
+
+    mutable_frozen = dict(frozen_state)
+    mutable_frozen["idempotency_key"] = idempotency_key
+
+    async def _mark_awaiting_google_form() -> None:
+        mutable_frozen["write_phase"] = "awaiting_google_form"
+        await db.update_action_approval_state(
+            approval_id,
+            caller_user_id=caller_user_id,
+            status="executing",
+            elicitation_state=mutable_frozen,
+        )
+
+    async def _mark_write_dispatched_unconfirmed() -> None:
+        mutable_frozen["write_phase"] = "write_dispatched_unconfirmed"
+        await db.update_action_approval_state(
+            approval_id,
+            caller_user_id=caller_user_id,
+            status="send_ambiguous",
+            elicitation_state=mutable_frozen,
+        )
+
+    async def _verify_event_version(
+        vercheck_prefix: str,
+        token_for_check: FreshAccessToken,
+    ) -> Command | None:
+        if act not in ("update_event", "delete_event") or not pre_read_marker:
+            return None
+        assert event_id is not None
+        try:
+            if p == "google":
+                latest_raw, vc_err = await _call_google_mcp_with_elicitation(
+                    google_client=google_cli,
+                    caller_user_id=caller_user_id,
+                    surface=surf,
+                    token=token_for_check,
+                    tool_name="get_event",
+                    arguments={"calendarId": cal_id, "eventId": str(event_id)},
+                    required_scopes=_required_scopes_for(p, "get_event"),
+                    tool_call_id=tool_call_id,
+                    config=config,
+                    stage_prefix=vercheck_prefix,
+                    on_elicitation_pause=_mark_awaiting_google_form,
+                )
+                if vc_err is not None:
+                    await db.mark_action_approval_status(
+                        approval_id, "failed", caller_user_id=caller_user_id
+                    )
+                    return vc_err
+                latest_ev = normalize_google_event(
+                    (latest_raw or {}).get("event") or latest_raw or {},
+                    calendar_id=cal_id,
+                )
+            else:
+                latest_ev = await feishu_cli.get_event(
+                    access_token=token_for_check.access_token,
+                    calendar_id=cal_id,
+                    event_id=str(event_id),
+                    tz_name=tz_name,
+                )
+            current_marker = str(latest_ev.get("updated") or "")
+            if current_marker and current_marker != str(pre_read_marker):
+                await db.mark_action_approval_status(
+                    approval_id, "expired", caller_user_id=caller_user_id
+                )
+                return _error_command(
+                    "event_version_changed",
+                    "该日程在确认期间已被修改，已中止操作，请重新查看日程后再发起。",
+                    tool_call_id,
+                )
+        except GraphInterrupt:
+            raise
+        except (GoogleCalendarAPIError, FeishuCalendarAPIError) as exc:
+            await db.mark_action_approval_status(
+                approval_id, "failed", caller_user_id=caller_user_id
+            )
+            return _error_command(
+                "event_version_check_failed",
+                f"执行前核对日程版本失败：{exc}",
+                tool_call_id,
+            )
+        return None
+
+    # Check if we already entered a write elicitation round in a previous run.
+    # If so, replay any completed initial vercheck elicitations for LangGraph cursor alignment,
+    # and run a fresh version check inside ``before_resumed_call`` right after settling the write form!
+    existing_write_elics = (
+        await db.list_action_approvals_by_stage_prefix(
+            caller_user_id,
+            thread_id,
+            f"tc:{tool_call_id}:write:elic:",
+            decrypt_state=True,
+        )
+        if p == "google" and write_phase == "awaiting_google_form"
+        else []
+    )
+    if existing_write_elics:
+        prior_vc_elics = await db.list_action_approvals_by_stage_prefix(
+            caller_user_id,
+            thread_id,
+            f"tc:{tool_call_id}:vercheck:elic:",
+            decrypt_state=True,
+        )
+        for vc_row in prior_vc_elics:
+            vc_state = vc_row.elicitation_state or {}
+            vc_payload = _build_elicitation_hitl_payload(
+                approval_id=vc_row.approval_id,
+                caller_user_id=caller_user_id,
+                tool_call_id=tool_call_id,
+                confirm_token=str(vc_state.get("confirm_token") or ""),
+                payload_sha=vc_row.payload_sha256,
+                input_requests=vc_row.input_requests_map or {},
+                mcp_tool_name=str(vc_state.get("mcp_tool_name") or "get_event"),
+                mcp_arguments=vc_state.get("mcp_arguments") or {},
+                dm_meta=vc_state.get("dm_meta"),
+            )
+            hitl_confirm("dalton_google_mcp_elicitation", vc_payload)
+    else:
+        ver_err = await _verify_event_version(f"tc:{tool_call_id}:vercheck", fresh_tok)
+        if ver_err is not None:
+            return ver_err
+
     # Execute upstream write using ONLY the frozen normalized payload
     try:
         if p == "google":
+            async def _recheck_before_resumed_write(
+                round_idx: int, resumed_tok: FreshAccessToken
+            ) -> Command | None:
+                return await _verify_event_version(
+                    f"tc:{tool_call_id}:vercheck_r{round_idx}", resumed_tok
+                )
+
             mcp_res, err_cmd = await _call_google_mcp_with_elicitation(
                 google_client=google_cli,
                 caller_user_id=caller_user_id,
@@ -2160,44 +2743,47 @@ async def _execute_confirmed_calendar_write(
                 tool_call_id=tool_call_id,
                 config=config,
                 stage_prefix=f"tc:{tool_call_id}:write",
+                before_dispatch=_mark_write_dispatched_unconfirmed,
+                on_elicitation_pause=_mark_awaiting_google_form,
+                before_resumed_call=_recheck_before_resumed_write,
             )
             if err_cmd is not None:
-                await db.mark_action_approval_status(
-                    approval_id, "failed", caller_user_id=caller_user_id
-                )
+                if mutable_frozen.get("write_phase") != "write_dispatched_unconfirmed":
+                    await db.mark_action_approval_status(
+                        approval_id, "failed", caller_user_id=caller_user_id
+                    )
                 return err_cmd
-            await db.mark_action_approval_status(
-                approval_id, "succeeded", caller_user_id=caller_user_id
-            )
             if act == "delete_event":
-                return _tool_command(
-                    await attach_notice(
-                        thread_id,
-                        {
-                            "ok": True,
-                            "action": "delete_event",
-                            "provider": "google",
-                            "calendar_id": cal_id,
-                            "event_id": event_id,
-                            "deleted": True,
-                        },
-                    ),
-                    tool_call_id,
-                )
-            raw_ev = (mcp_res or {}).get("event") or mcp_res or {}
+                result_payload: dict[str, Any] = {
+                    "ok": True,
+                    "action": "delete_event",
+                    "provider": "google",
+                    "calendar_id": cal_id,
+                    "event_id": event_id,
+                    "deleted": True,
+                }
+            else:
+                raw_ev = (mcp_res or {}).get("event") or mcp_res or {}
+                result_payload = {
+                    "ok": True,
+                    "action": act,
+                    "provider": "google",
+                    "event": normalize_google_event(raw_ev, calendar_id=cal_id),
+                }
+            mutable_frozen["write_phase"] = "succeeded"
+            mutable_frozen["remote_result"] = result_payload
+            await db.update_action_approval_state(
+                approval_id,
+                caller_user_id=caller_user_id,
+                status="succeeded",
+                elicitation_state=mutable_frozen,
+            )
             return _tool_command(
-                await attach_notice(
-                    thread_id,
-                    {
-                        "ok": True,
-                        "action": act,
-                        "provider": "google",
-                        "event": normalize_google_event(raw_ev, calendar_id=cal_id),
-                    },
-                ),
+                await attach_notice(thread_id, result_payload),
                 tool_call_id,
             )
         else:
+            await _mark_write_dispatched_unconfirmed()
             if act == "create_event":
                 ev = await feishu_cli.create_event(
                     access_token=fresh_tok.access_token,
@@ -2206,17 +2792,13 @@ async def _execute_confirmed_calendar_write(
                     attendees=frozen_attendees,
                     tz_name=tz_name,
                 )
-                await db.mark_action_approval_status(
-                    approval_id, "succeeded", caller_user_id=caller_user_id
-                )
-                return _tool_command(
-                    await attach_notice(
-                        thread_id,
-                        {"ok": True, "action": "create_event", "provider": "feishu", "event": ev},
-                    ),
-                    tool_call_id,
-                )
-            if act == "update_event":
+                result_payload = {
+                    "ok": True,
+                    "action": "create_event",
+                    "provider": "feishu",
+                    "event": ev,
+                }
+            elif act == "update_event":
                 assert event_id is not None
                 ev = await feishu_cli.update_event(
                     access_token=fresh_tok.access_token,
@@ -2225,39 +2807,42 @@ async def _execute_confirmed_calendar_write(
                     body=write_payload,
                     tz_name=tz_name,
                 )
-                await db.mark_action_approval_status(
-                    approval_id, "succeeded", caller_user_id=caller_user_id
+                result_payload = {
+                    "ok": True,
+                    "action": "update_event",
+                    "provider": "feishu",
+                    "event": ev,
+                }
+            else:
+                assert event_id is not None
+                del_res = await feishu_cli.delete_event(
+                    access_token=fresh_tok.access_token,
+                    calendar_id=cal_id,
+                    event_id=str(event_id),
+                    need_notification=requires_second_confirm,
                 )
-                return _tool_command(
-                    await attach_notice(
-                        thread_id,
-                        {"ok": True, "action": "update_event", "provider": "feishu", "event": ev},
-                    ),
-                    tool_call_id,
-                )
-            assert event_id is not None
-            del_res = await feishu_cli.delete_event(
-                access_token=fresh_tok.access_token,
-                calendar_id=cal_id,
-                event_id=str(event_id),
-                need_notification=requires_second_confirm,
-            )
-            await db.mark_action_approval_status(
-                approval_id, "succeeded", caller_user_id=caller_user_id
+                result_payload = {"ok": True, "action": "delete_event", **del_res}
+            mutable_frozen["write_phase"] = "succeeded"
+            mutable_frozen["remote_result"] = result_payload
+            await db.update_action_approval_state(
+                approval_id,
+                caller_user_id=caller_user_id,
+                status="succeeded",
+                elicitation_state=mutable_frozen,
             )
             return _tool_command(
-                await attach_notice(
-                    thread_id,
-                    {"ok": True, "action": "delete_event", **del_res},
-                ),
+                await attach_notice(thread_id, result_payload),
                 tool_call_id,
             )
     except GraphInterrupt:
         raise
     except (GoogleCalendarAPIError, FeishuCalendarAPIError) as exc:
-        await db.mark_action_approval_status(
-            approval_id, "failed", caller_user_id=caller_user_id
-        )
+        # Definite 4xx client error proves upstream did not apply; network/5xx keeps send_ambiguous!
+        status_code = getattr(exc, "status_code", None)
+        if isinstance(status_code, int) and 400 <= status_code < 500:
+            await db.mark_action_approval_status(
+                approval_id, "failed", caller_user_id=caller_user_id
+            )
         return _error_command(
             "calendar_write_failed",
             f"执行{desc_action}失败：{exc}",

@@ -399,12 +399,33 @@ export function PersonalIntegrationsCard() {
 
   const disconnectAllGoogleMutation = useMutation({
     mutationFn: () => disconnectPersonalIntegrationProvider('google', 'remote_if_sole'),
-    onSuccess: () => {
+    onSuccess: (res) => {
       setDisconnectDialog(null);
-      setBanner({
-        tone: 'success',
-        text: '已断开全部 Google 服务，并开始清理本地数据与撤销 Google 授权。',
-      });
+      const purges = Array.isArray(res?.purges) ? res.purges : [];
+      const hasRunningLocal = purges.some((p) => p.local_purge_status === 'running');
+      const hasRetryableRemote = purges.some((p) => p.remote_revoke_status === 'failed_retryable');
+      const hasPendingRemote = purges.some((p) => p.remote_revoke_status === 'pending');
+      if (hasRunningLocal) {
+        setBanner({
+          tone: 'info',
+          text: '已断开全部 Google 服务，正在后台清理关联本地个人数据，清理完成后将自动撤销 Google 授权。',
+        });
+      } else if (hasRetryableRemote) {
+        setBanner({
+          tone: 'warning',
+          text: '已断开全部 Google 服务，关联本地个人数据已清理完成，Google 远端撤销待重试。',
+        });
+      } else if (hasPendingRemote) {
+        setBanner({
+          tone: 'success',
+          text: '已断开全部 Google 服务，关联本地个人数据已清理完成，正在后台撤销 Google 授权。',
+        });
+      } else {
+        setBanner({
+          tone: 'success',
+          text: '已断开全部 Google 服务，关联本地个人数据已清理完成。',
+        });
+      }
       invalidate();
     },
     onError: (err) => {
@@ -485,7 +506,10 @@ export function PersonalIntegrationsCard() {
   const retryablePurges: PersonalIntegrationPurgeLedger[] = useMemo(
     () =>
       (data?.active_purges ?? []).filter(
-        (p) => p.remote_revoke_status === 'failed_retryable' || p.local_purge_status === 'running',
+        (p) =>
+          p.remote_revoke_status === 'failed_retryable' ||
+          p.remote_revoke_status === 'pending' ||
+          p.local_purge_status === 'running',
       ),
     [data?.active_purges],
   );
@@ -698,33 +722,42 @@ export function PersonalIntegrationsCard() {
             <div className="text-xs font-medium text-(--color-text-primary)">
               断开与远端撤销进度
             </div>
-            {retryablePurges.map((purge) => (
-              <div
-                key={purge.purge_id}
-                data-testid={`personal-integration-purge-${purge.purge_id}`}
-                className="flex flex-wrap items-center justify-between gap-2 text-xs text-(--color-text-secondary)"
-              >
-                <span>
-                  {purge.provider === 'google' ? 'Google' : '飞书'}
-                  {purge.service ? ` · ${purge.service === 'calendar' ? '日历' : '邮箱'}` : ''}
-                  {purge.local_purge_status === 'running'
-                    ? ' — 正在清理本地对话个人数据'
-                    : ' — 本地已清理，Google 远端撤销待重试'}
-                </span>
-                {purge.remote_revoke_status === 'failed_retryable' && (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    disabled={retryRevokeMutation.isPending}
-                    onClick={() => retryRevokeMutation.mutate(purge.purge_id)}
-                  >
-                    <RefreshCw className="h-3.5 w-3.5 mr-1" />
-                    重试远端撤销
-                  </Button>
-                )}
-              </div>
-            ))}
+            {retryablePurges.map((purge) => {
+              const purgeProviderLabel = purge.provider === 'google' ? 'Google' : '飞书';
+              const statusText =
+                purge.local_purge_status === 'running'
+                  ? ` — 正在清理本地${purgeProviderLabel}对话个人数据`
+                  : purge.remote_revoke_status === 'failed_retryable'
+                    ? ` — 本地已清理，${purgeProviderLabel} 远端撤销待重试`
+                    : purge.remote_revoke_status === 'pending'
+                      ? ` — 本地已清理，正在后台撤销 ${purgeProviderLabel} 授权`
+                      : ` — ${purgeProviderLabel} 本地个人数据已清理`;
+              return (
+                <div
+                  key={purge.purge_id}
+                  data-testid={`personal-integration-purge-${purge.purge_id}`}
+                  className="flex flex-wrap items-center justify-between gap-2 text-xs text-(--color-text-secondary)"
+                >
+                  <span>
+                    {purgeProviderLabel}
+                    {purge.service ? ` · ${purge.service === 'calendar' ? '日历' : '邮箱'}` : ''}
+                    {statusText}
+                  </span>
+                  {purge.remote_revoke_status === 'failed_retryable' && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={retryRevokeMutation.isPending}
+                      onClick={() => retryRevokeMutation.mutate(purge.purge_id)}
+                    >
+                      <RefreshCw className="h-3.5 w-3.5 mr-1" />
+                      重试远端撤销
+                    </Button>
+                  )}
+                </div>
+              );
+            })}
           </div>
         )}
 

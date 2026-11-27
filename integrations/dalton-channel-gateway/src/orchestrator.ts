@@ -10423,6 +10423,7 @@ export class ChannelGatewayOrchestrator {
       runId: autoRun.run_id ?? null,
       initialSnapshots: autoRun.chart_snapshots,
       outboundBlocked: autoRun.outbound_blocked,
+      hasPersonalIntegrationData: autoRun.has_personal_integration_data,
       automationName: autoRun.automation_name,
       finishStatus: autoRun.finish_status ?? "completed",
       finalText: autoRun.final_text,
@@ -10739,7 +10740,33 @@ export class ChannelGatewayOrchestrator {
         sourceGeneration: params.sourceGeneration ?? null,
         activityOrigin: params.activityOrigin ?? null,
       });
-      const settled = res.status === "sent" || res.status === "partial";
+      let finalRes = res;
+      if (
+        res.code === "personal_integration_private_only" &&
+        !params.targetAddress.trim().toLowerCase().endsWith(":@me")
+      ) {
+        finalRes = await this.deliveryService.executeDelivery({
+          deliveryKey: `${deliveryKey}:personal_dm`,
+          kind: "fallback",
+          userId: params.userId,
+          threadId: params.threadId,
+          workspaceId: sorted[0]?.workspace_id ?? null,
+          runId: params.runId,
+          platform: params.platform,
+          target: `${params.platform}:@me`,
+          inboundMessageId: params.inboundMessageId ?? null,
+          text: "",
+          files: filesToAttach,
+          linkOnlyFiles,
+          downloadMode: "deliverable",
+          linkFallbackOnDeliverableMismatch: true,
+          threadScopeKey: params.threadScopeKey ?? null,
+          sourceScopeKey: params.sourceScopeKey ?? params.threadScopeKey ?? null,
+          sourceGeneration: params.sourceGeneration ?? null,
+          activityOrigin: params.activityOrigin ?? null,
+        });
+      }
+      const settled = finalRes.status === "sent" || finalRes.status === "partial";
       if (settled) {
         if (
           this.settledDeliverableKeys.size >=
@@ -10962,7 +10989,7 @@ export class ChannelGatewayOrchestrator {
   }): Promise<boolean> {
     let needsPartialNotice = false;
     if (params.sentToCurrentCount === 0) {
-      const deliveryRes = await this.deliveryService.executeDelivery({
+      let deliveryRes = await this.deliveryService.executeDelivery({
         deliveryKey: params.fallbackDeliveryKey,
         kind: "fallback",
         userId: params.userId,
@@ -10979,6 +11006,47 @@ export class ChannelGatewayOrchestrator {
         sourceGeneration: params.sourceGeneration ?? null,
         activityOrigin: params.activityOrigin ?? null,
       });
+      if (
+        deliveryRes.code === "personal_integration_private_only" &&
+        !params.targetAddress.trim().toLowerCase().endsWith(":@me")
+      ) {
+        const dmRes = await this.deliveryService.executeDelivery({
+          deliveryKey: `${params.fallbackDeliveryKey}:personal_dm`,
+          kind: "fallback",
+          userId: params.userId,
+          threadId: params.threadId,
+          runId: params.runId,
+          platform: params.platform,
+          target: `${params.platform}:@me`,
+          inboundMessageId: params.inboundMessageId ?? null,
+          text: params.trimmedText,
+          threadScopeKey: params.threadScopeKey ?? null,
+          sourceScopeKey:
+            params.sourceScopeKey ?? params.threadScopeKey ?? null,
+          sourceGeneration: params.sourceGeneration ?? null,
+          activityOrigin: params.activityOrigin ?? null,
+        });
+        if (dmRes.status !== "sent" && dmRes.status !== "partial") {
+          return false;
+        }
+        deliveryRes = await this.deliveryService.executeDelivery({
+          deliveryKey: `${params.fallbackDeliveryKey}:personal_redirect_notice`,
+          kind: "fallback",
+          userId: params.userId,
+          threadId: params.threadId,
+          runId: params.runId,
+          platform: params.platform,
+          target: params.targetAddress,
+          inboundMessageId: params.inboundMessageId ?? null,
+          text: "本次结果含个人日历内容，已发送到你的私聊",
+          replyToMessageId: params.replyToMessageId ?? null,
+          threadScopeKey: params.threadScopeKey ?? null,
+          sourceScopeKey:
+            params.sourceScopeKey ?? params.threadScopeKey ?? null,
+          sourceGeneration: params.sourceGeneration ?? null,
+          activityOrigin: params.activityOrigin ?? null,
+        });
+      }
       if (
         deliveryRes.status !== "sent" &&
         deliveryRes.status !== "partial"

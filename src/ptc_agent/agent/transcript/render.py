@@ -154,6 +154,8 @@ def render_segment(
     *,
     unit: str = "turn",
     tool_names: dict[str, str] | None = None,
+    # DALTON-HOOK(personal-integrations): carry persistent private-thread taint across turns
+    initially_tainted: bool = False,
 ) -> Segment:
     """Render one turn.
 
@@ -173,7 +175,7 @@ def render_segment(
         redact_personal_tool_args,
     )
 
-    personal_tainted = False
+    personal_tainted = bool(initially_tainted)
 
     def emit(event: dict[str, Any], message: AnyMessage) -> None:
         segment.lines.append(
@@ -221,6 +223,12 @@ def render_segment(
             emit(event, message)
         elif isinstance(message, AIMessage):
             events: list[dict[str, Any]] = []
+            # DALTON-HOOK(personal-integrations): taint before emitting assistant prose on the first personal tool call
+            if any(
+                is_personal_integration_tool(call["name"])
+                for call in (message.tool_calls or ())
+            ):
+                personal_tainted = True
             text = visible_text(message.content, attachments=False)
             if text.strip():
                 events.append(
@@ -244,8 +252,12 @@ def render_segment(
                         "call_id": call["id"],
                         "tool": call["name"],
                         "args": redact_personal_tool_args(call.get("args", {}))
-                        if is_priv_call or personal_tainted
-                        else call.get("args", {}),
+                        if is_priv_call
+                        else (
+                            {"redacted": REDACTED_PERSONAL_INTEGRATION_PLACEHOLDER}
+                            if personal_tainted
+                            else call.get("args", {})
+                        ),
                     }
                 )
             model = answered_on(message)
@@ -302,6 +314,8 @@ def segment_shape(
     unit: str,
     previous: str,
     tool_names: dict[str, str],
+    # DALTON-HOOK(personal-integrations): include taint state in segment shape so cached turns re-render when private
+    personal_tainted: bool = False,
 ) -> str:
     """A key that changes whenever the segment's render would.
 
@@ -315,6 +329,9 @@ def segment_shape(
     segment needs.
     """
     parts = [f"{SCHEMA_VERSION}|{unit}|{number}|{previous}"]
+    # DALTON-HOOK(personal-integrations): bump segment shape when personal-integration taint applies
+    if personal_tainted:
+        parts[0] += "|pt=1"
     for message in messages:
         part = f"{type(message).__name__}|{message.id}"
         if isinstance(message, AIMessage):
