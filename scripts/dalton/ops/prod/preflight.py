@@ -40,6 +40,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 import urllib.error
 import urllib.parse
@@ -749,6 +750,7 @@ class PreflightConfig:
     research_host_url: str
     budgets_file: Path
     expect_admission: str = "any"
+    skip_budgets: bool = False
     proxy_listen_port: int = 8943
     research_host_plist: Path | None = None
     archived_plist_dir: Path | None = None
@@ -1817,15 +1819,21 @@ def _check_bridge_plist_and_budgets(cfg: PreflightConfig) -> dict[str, str]:
         )
         errors.extend(host_errors)
 
-    budget_errors = validate_timing_budgets_env(cfg.budgets_file)
-    errors.extend(budget_errors)
+    if not cfg.skip_budgets:
+        budget_errors = validate_timing_budgets_env(cfg.budgets_file)
+        errors.extend(budget_errors)
 
     if errors:
         return _result("bridge_plist_and_budgets", "fail", "; ".join(errors))
+    budget_note = (
+        "budgets check skipped for manual downtime cutover"
+        if cfg.skip_budgets
+        else "and timing-budgets.env valid"
+    )
     return _result(
         "bridge_plist_and_budgets",
         "ok",
-        f"installed bridge/proxy plists, archived research-host plist ({host_plist_path}), and timing-budgets.env valid",
+        f"installed bridge/proxy plists, archived research-host plist ({host_plist_path}), {budget_note}",
     )
 
 
@@ -3430,6 +3438,11 @@ def _build_preflight_parser() -> argparse.ArgumentParser:
         default="any",
         help="Expected backend admission gate state for --stage-a (default: any)",
     )
+    p.add_argument(
+        "--skip-budgets",
+        action="store_true",
+        help="Skip timing-budgets.env validation (for manual downtime cutover precheck)",
+    )
     p.add_argument("--repo", default=None, help="Repository root path")
     p.add_argument("--home", default=None, help="Home directory path")
     p.add_argument("--plist-dir", default=None, help="Installed LaunchAgents plist directory")
@@ -3462,6 +3475,1169 @@ def _build_preflight_parser() -> argparse.ArgumentParser:
     p.add_argument("--test-workspace-id", default="")
     p.add_argument("--keep-admission-paused", action="store_true")
     return p
+
+
+# ---------------------------------------------------------------------------
+# Manual downtime cutover helpers: atomic snapshots, gate control, live probes
+# ---------------------------------------------------------------------------
+
+SNAPSHOT_MANIFEST_NAME = "snapshot-manifest.json"
+SNAPSHOT_RESERVED_DIRS: frozenset[str] = frozenset(
+    {
+        "recovery-bin",
+        "research-host",
+        "stage-a",
+        "measure-budgets",
+        "deploy-research-host",
+    }
+)
+_SNAPSHOT_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$")
+
+
+def _import_maintenance_gate(repo_root: Path) -> Any:
+    repo_str = str(repo_root.expanduser().resolve())
+    if repo_str not in sys.path:
+        sys.path.insert(0, repo_str)
+    return importlib.import_module("src.dalton.maintenance_gate")
+
+
+def _write_bytes_atomic(dest: Path, data: bytes, *, mode: int = 0o600) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(dest.parent),
+        prefix=f".{dest.name}.",
+        suffix=".tmp",
+    )
+    tmp_path = Path(tmp_name)
+    closed = False
+    try:
+        os.fchmod(fd, mode)
+        view = memoryview(data)
+        written = 0
+        while written < len(view):
+            written += os.write(fd, view[written:])
+        os.fsync(fd)
+        os.close(fd)
+        closed = True
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, dest)
+        _fsync_dir(dest.parent, strict=True)
+    except BaseException:
+        if not closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _resolve_snapshot_sources(
+    *,
+    repo_root: Path,
+    home_dir: Path,
+    plist_dir: Path | None = None,
+    repo_env: Path | None = None,
+    bridge_env: Path | None = None,
+    research_host_env: Path | None = None,
+    guidepoint_env: Path | None = None,
+    tokens_file: Path | None = None,
+    journal_file: Path | None = None,
+    web_releases_current: Path | None = None,
+) -> dict[str, Path]:
+    repo_abs = repo_root.expanduser().resolve()
+    home_abs = home_dir.expanduser().resolve()
+    eff_plist_dir = (
+        plist_dir.expanduser().resolve()
+        if plist_dir is not None
+        else (
+            Path(os.environ["DALTON_LAUNCH_AGENTS_DIR"]).expanduser().resolve()
+            if str(os.environ.get("DALTON_LAUNCH_AGENTS_DIR") or "").strip()
+            else (home_abs / "Library" / "LaunchAgents")
+        )
+    )
+    eff_repo_env = (
+        repo_env.expanduser().resolve()
+        if repo_env is not None
+        else (
+            Path(os.environ["DALTON_REPO_ENV_FILE"]).expanduser().resolve()
+            if str(os.environ.get("DALTON_REPO_ENV_FILE") or "").strip()
+            else (repo_abs / ".env")
+        )
+    )
+    eff_bridge_env = (
+        bridge_env.expanduser().resolve()
+        if bridge_env is not None
+        else (
+            Path(os.environ["DALTON_BRIDGE_ENV_FILE"]).expanduser().resolve()
+            if str(os.environ.get("DALTON_BRIDGE_ENV_FILE") or "").strip()
+            else (home_abs / ".config" / "dalton" / "researchdata-bridge.env")
+        )
+    )
+    eff_rh_env = (
+        research_host_env.expanduser().resolve()
+        if research_host_env is not None
+        else (
+            Path(os.environ["DALTON_RESEARCH_HOST_ENV_FILE"]).expanduser().resolve()
+            if str(os.environ.get("DALTON_RESEARCH_HOST_ENV_FILE") or "").strip()
+            else (home_abs / ".config" / "dalton" / "research-host.env")
+        )
+    )
+    eff_journal = (
+        journal_file.expanduser().resolve()
+        if journal_file is not None
+        else (
+            Path(os.environ["DALTON_GUIDEPOINT_OWNERSHIP_FILE"]).expanduser().resolve()
+            if str(os.environ.get("DALTON_GUIDEPOINT_OWNERSHIP_FILE") or "").strip()
+            else (repo_abs / DEFAULT_OWNERSHIP_REL_PATH)
+        )
+    )
+
+    proxy_plist = eff_plist_dir / "com.dalton.guidepoint-mcp-proxy.plist"
+    bridge_plist = eff_plist_dir / "com.dalton.researchdata-bridge.plist"
+    rh_plist = eff_plist_dir / "com.dalton.research-host.plist"
+
+    proxy_env_vars: dict[str, str] = {}
+    if proxy_plist.is_file():
+        loaded, _err = _load_plist_env_vars_strict(proxy_plist)
+        if loaded:
+            proxy_env_vars = loaded
+    rh_env_vars: dict[str, str] = {}
+    if rh_plist.is_file():
+        loaded, _err = _load_plist_env_vars_strict(rh_plist)
+        if loaded:
+            rh_env_vars = loaded
+
+    if tokens_file is not None:
+        eff_tokens = tokens_file.expanduser().resolve()
+    elif str(os.environ.get("GUIDEPOINT_TOKENS_FILE") or "").strip():
+        eff_tokens = Path(os.environ["GUIDEPOINT_TOKENS_FILE"]).expanduser().resolve()
+    elif proxy_env_vars.get("GUIDEPOINT_TOKENS_FILE"):
+        eff_tokens = Path(proxy_env_vars["GUIDEPOINT_TOKENS_FILE"]).expanduser().resolve()
+    elif rh_env_vars.get("GUIDEPOINT_TOKENS_FILE"):
+        eff_tokens = Path(rh_env_vars["GUIDEPOINT_TOKENS_FILE"]).expanduser().resolve()
+    else:
+        rhome = (
+            proxy_env_vars.get("DALTON_RESEARCH_HOME")
+            or rh_env_vars.get("DALTON_RESEARCH_HOME")
+            or str(os.environ.get("DALTON_RESEARCH_HOME") or "").strip()
+            or str(home_abs / "Library" / "Application Support" / "Everflow" / "research")
+        )
+        eff_tokens = (Path(rhome).expanduser().resolve() / "config" / "guidepoint_mcp_tokens.json")
+
+    if guidepoint_env is not None:
+        eff_gp_env = guidepoint_env.expanduser().resolve()
+    elif str(os.environ.get("GUIDEPOINT_ENV_FILE") or "").strip():
+        eff_gp_env = Path(os.environ["GUIDEPOINT_ENV_FILE"]).expanduser().resolve()
+    elif proxy_env_vars.get("GUIDEPOINT_ENV_FILE"):
+        eff_gp_env = Path(proxy_env_vars["GUIDEPOINT_ENV_FILE"]).expanduser().resolve()
+    else:
+        eff_gp_env = eff_tokens.parent / "guidepoint_mcp.env"
+
+    eff_web_cur = (
+        _abs_no_deref(web_releases_current)
+        if web_releases_current is not None
+        else (repo_abs / "web" / "releases" / "current")
+    )
+
+    return {
+        "repo_env": eff_repo_env,
+        "bridge_env": eff_bridge_env,
+        "research_host_env": eff_rh_env,
+        "guidepoint_env": eff_gp_env,
+        "plist_proxy": proxy_plist,
+        "plist_bridge": bridge_plist,
+        "plist_research_host": rh_plist,
+        "guidepoint_tokens": eff_tokens,
+        "handoff_journal": eff_journal,
+        "web_releases_current": eff_web_cur,
+    }
+
+
+def _snapshot_entry_rel_path(key: str) -> str:
+    mapping = {
+        "repo_env": "files/repo.env",
+        "bridge_env": "files/researchdata-bridge.env",
+        "research_host_env": "files/research-host.env",
+        "guidepoint_env": "files/guidepoint_mcp.env",
+        "plist_proxy": "files/plists/com.dalton.guidepoint-mcp-proxy.plist",
+        "plist_bridge": "files/plists/com.dalton.researchdata-bridge.plist",
+        "plist_research_host": "files/plists/com.dalton.research-host.plist",
+        "guidepoint_tokens": "files/guidepoint_mcp_tokens.json",
+        "handoff_journal": "files/handoff-journal.json",
+    }
+    return mapping[key]
+
+
+def verify_cutover_snapshot(snapshot_dir: Path | str) -> list[str]:
+    """Verify a cutover snapshot directory against its `snapshot-manifest.json` SHA-256 list."""
+    snap_path = Path(snapshot_dir).expanduser().resolve()
+    if not snap_path.is_dir():
+        return [f"snapshot directory not found: {snap_path}"]
+    manifest_path = snap_path / SNAPSHOT_MANIFEST_NAME
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        return [f"missing or non-regular {SNAPSHOT_MANIFEST_NAME} in {snap_path}"]
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [f"invalid {SNAPSHOT_MANIFEST_NAME}: {exc}"]
+    if not isinstance(manifest, dict) or manifest.get("version") != 1:
+        return [f"{SNAPSHOT_MANIFEST_NAME} must be a version 1 JSON object"]
+    entries = manifest.get("files")
+    if not isinstance(entries, dict) or not entries:
+        return [f"{SNAPSHOT_MANIFEST_NAME} has no file entries"]
+
+    required_keys = {
+        "repo_env",
+        "plist_proxy",
+        "plist_bridge",
+        "plist_research_host",
+        "guidepoint_tokens",
+        "handoff_journal",
+    }
+    missing_keys = sorted(required_keys - set(entries.keys()))
+    errors: list[str] = []
+    if missing_keys:
+        errors.append(f"manifest missing required key(s): {', '.join(missing_keys)}")
+
+    for key, info in entries.items():
+        if not isinstance(info, dict):
+            errors.append(f"invalid entry metadata for {key}")
+            continue
+        rel = str(info.get("rel_path") or "")
+        existed = info.get("existed")
+        if not isinstance(existed, bool):
+            errors.append(f"entry {key} missing boolean existed flag")
+            continue
+        if not rel or rel.startswith("/") or ".." in Path(rel).parts:
+            errors.append(f"entry {key} has unsafe rel_path: {rel!r}")
+            continue
+        fp = snap_path / rel
+        if not existed:
+            if fp.exists() or fp.is_symlink():
+                errors.append(f"entry {key} marked existed=false but file present: {rel}")
+            continue
+        if fp.is_symlink() or not fp.is_file():
+            errors.append(f"missing or non-regular snapshot file for {key}: {rel}")
+            continue
+        expected_sha = str(info.get("sha256") or "")
+        if not _SHA256_HEX_RE.fullmatch(expected_sha):
+            errors.append(f"invalid sha256 in manifest for {key}")
+            continue
+        expected_size = info.get("size")
+        actual_size = fp.stat().st_size
+        if isinstance(expected_size, bool) or not isinstance(expected_size, int) or actual_size != expected_size:
+            errors.append(f"size mismatch for {key}: expected={expected_size!r} actual={actual_size}")
+        actual_sha = _sha256_file(fp)
+        if actual_sha != expected_sha:
+            errors.append(f"sha256 mismatch for {key}: expected={expected_sha[:12]} actual={actual_sha[:12]}")
+
+    web_info = manifest.get("web_releases_current")
+    if isinstance(web_info, dict) and web_info.get("version_json_rel_path"):
+        v_rel = str(web_info["version_json_rel_path"])
+        v_sha = str(web_info.get("version_json_sha256") or "")
+        v_fp = snap_path / v_rel
+        if v_fp.is_symlink() or not v_fp.is_file():
+            errors.append(f"missing web release version snapshot: {v_rel}")
+        elif not _SHA256_HEX_RE.fullmatch(v_sha) or _sha256_file(v_fp) != v_sha:
+            errors.append(f"sha256 mismatch for {v_rel}")
+
+    return errors
+
+
+def create_cutover_snapshot(
+    *,
+    repo_root: Path,
+    home_dir: Path,
+    out_dir: Path | None = None,
+    label: str = "",
+    plist_dir: Path | None = None,
+    repo_env: Path | None = None,
+    bridge_env: Path | None = None,
+    research_host_env: Path | None = None,
+    guidepoint_env: Path | None = None,
+    tokens_file: Path | None = None,
+    journal_file: Path | None = None,
+    web_releases_current: Path | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    """Atomically capture all rollback-required files and verify SHA-256 manifest."""
+    repo_abs = repo_root.expanduser().resolve()
+    home_abs = home_dir.expanduser().resolve()
+    clean_label = str(label or "").strip()
+    if clean_label and not _SNAPSHOT_LABEL_RE.fullmatch(clean_label):
+        raise ValueError(f"invalid snapshot label: {clean_label!r}")
+
+    snapshots_root = repo_abs / "var" / "dalton" / "cutover-snapshots"
+    now_utc = datetime.now(timezone.utc)
+    stamp = now_utc.strftime("%Y%m%d-%H%M%SZ")
+    snap_id = f"{stamp}-{clean_label}" if clean_label else stamp
+
+    if out_dir is not None:
+        final_dir = _abs_no_deref(out_dir)
+        parent_dir = final_dir.parent
+    else:
+        parent_dir = snapshots_root
+        final_dir = parent_dir / snap_id
+        # Avoid same-second name collisions when invoked repeatedly
+        if final_dir.exists():
+            snap_id = f"{snap_id}-{secrets.token_hex(3)}"
+            final_dir = parent_dir / snap_id
+
+    if final_dir.exists() or final_dir.is_symlink():
+        raise FileExistsError(f"target snapshot directory already exists: {final_dir}")
+
+    parent_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(parent_dir, 0o700)
+
+    sources = _resolve_snapshot_sources(
+        repo_root=repo_abs,
+        home_dir=home_abs,
+        plist_dir=plist_dir,
+        repo_env=repo_env,
+        bridge_env=bridge_env,
+        research_host_env=research_host_env,
+        guidepoint_env=guidepoint_env,
+        tokens_file=tokens_file,
+        journal_file=journal_file,
+        web_releases_current=web_releases_current,
+    )
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix=".snapshot.tmp.", dir=str(parent_dir)))
+    renamed = False
+    try:
+        os.chmod(tmp_dir, 0o700)
+        files_dir = tmp_dir / "files"
+        plists_dir = files_dir / "plists"
+        plists_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(files_dir, 0o700)
+        os.chmod(plists_dir, 0o700)
+
+        file_keys = (
+            "repo_env",
+            "bridge_env",
+            "research_host_env",
+            "guidepoint_env",
+            "plist_proxy",
+            "plist_bridge",
+            "plist_research_host",
+            "guidepoint_tokens",
+            "handoff_journal",
+        )
+        files_meta: dict[str, dict[str, Any]] = {}
+        for key in file_keys:
+            src = sources[key]
+            rel = _snapshot_entry_rel_path(key)
+            if src.is_file():
+                raw = src.read_bytes()
+                src_mode = stat.S_IMODE(src.stat().st_mode)
+                dst = tmp_dir / rel
+                fd = os.open(str(dst), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                closed = False
+                try:
+                    os.fchmod(fd, 0o600)
+                    view = memoryview(raw)
+                    written = 0
+                    while written < len(view):
+                        written += os.write(fd, view[written:])
+                    os.fsync(fd)
+                    os.close(fd)
+                    closed = True
+                except BaseException:
+                    if not closed:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                    raise
+                os.chmod(dst, 0o600)
+                files_meta[key] = {
+                    "rel_path": rel,
+                    "source_path": str(src),
+                    "existed": True,
+                    "mode": f"{src_mode:04o}",
+                    "size": len(raw),
+                    "sha256": _sha256_file(dst),
+                }
+            else:
+                files_meta[key] = {
+                    "rel_path": rel,
+                    "source_path": str(src),
+                    "existed": False,
+                    "mode": None,
+                    "size": 0,
+                    "sha256": None,
+                }
+
+        web_cur = sources["web_releases_current"]
+        web_is_symlink = web_cur.is_symlink()
+        web_exists = web_cur.exists()
+        web_target = os.readlink(web_cur) if web_is_symlink else ""
+        web_resolved = str(web_cur.resolve()) if web_exists else ""
+        web_meta: dict[str, Any] = {
+            "path": str(web_cur),
+            "exists": web_exists,
+            "is_symlink": web_is_symlink,
+            "link_target": web_target,
+            "resolved_target": web_resolved,
+        }
+        ver_src = web_cur / "version.json" if web_exists and web_cur.is_dir() else None
+        if ver_src is not None and ver_src.is_file():
+            ver_rel = "files/web_release_version.json"
+            ver_dst = tmp_dir / ver_rel
+            ver_raw = ver_src.read_bytes()
+            fd = os.open(str(ver_dst), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            closed = False
+            try:
+                os.fchmod(fd, 0o600)
+                os.write(fd, ver_raw)
+                os.fsync(fd)
+                os.close(fd)
+                closed = True
+            except BaseException:
+                if not closed:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                raise
+            web_meta["version_json_rel_path"] = ver_rel
+            web_meta["version_json_sha256"] = _sha256_file(ver_dst)
+
+        git_rc, git_out, _ = _run_cmd(["git", "-C", str(repo_abs), "rev-parse", "HEAD"], timeout_s=5.0)
+        git_head = git_out.strip() if git_rc == 0 else ""
+
+        manifest: dict[str, Any] = {
+            "version": 1,
+            "snapshot_id": final_dir.name,
+            "label": clean_label,
+            "created_at": now_utc.isoformat(),
+            "repo_root": str(repo_abs),
+            "home_dir": str(home_abs),
+            "plist_dir": str(sources["plist_proxy"].parent),
+            "git_head": git_head,
+            "files": files_meta,
+            "web_releases_current": web_meta,
+        }
+        manifest_path = tmp_dir / SNAPSHOT_MANIFEST_NAME
+        _atomic_write_text(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            mode=0o600,
+        )
+
+        # Fsync every directory level before atomic rename
+        _fsync_dir(plists_dir, strict=True)
+        _fsync_dir(files_dir, strict=True)
+        _fsync_dir(tmp_dir, strict=True)
+
+        # Verify hash manifest BEFORE publishing
+        pre_errs = verify_cutover_snapshot(tmp_dir)
+        if pre_errs:
+            raise RuntimeError("snapshot verification failed before rename: " + "; ".join(pre_errs))
+
+        os.rename(tmp_dir, final_dir)
+        renamed = True
+        _fsync_dir(parent_dir, strict=True)
+
+        # Post-rename verification on final path
+        post_errs = verify_cutover_snapshot(final_dir)
+        if post_errs:
+            raise RuntimeError("snapshot verification failed after rename: " + "; ".join(post_errs))
+        return final_dir, manifest
+    except BaseException:
+        if not renamed:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+
+def find_latest_cutover_snapshot(repo_root: Path) -> tuple[Path | None, str | None]:
+    """Locate the newest valid cutover snapshot under `<repo>/var/dalton/cutover-snapshots/`."""
+    snapshots_root = repo_root.expanduser().resolve() / "var" / "dalton" / "cutover-snapshots"
+    if not snapshots_root.is_dir():
+        return None, f"snapshots directory does not exist: {snapshots_root}"
+
+    candidates: list[tuple[str, str, Path]] = []
+    for entry in snapshots_root.iterdir():
+        if entry.name.startswith(".") or entry.name in SNAPSHOT_RESERVED_DIRS:
+            continue
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        m_path = entry / SNAPSHOT_MANIFEST_NAME
+        if not m_path.is_file():
+            continue
+        created_at = ""
+        try:
+            data = json.loads(m_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                created_at = str(data.get("created_at") or "")
+        except Exception:
+            created_at = ""
+        candidates.append((created_at, entry.name, entry))
+
+    if not candidates:
+        return None, f"no valid cutover snapshots found under {snapshots_root}"
+
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    latest = candidates[0][2]
+    errs = verify_cutover_snapshot(latest)
+    if errs:
+        return None, f"latest snapshot {latest} failed integrity verification: {'; '.join(errs)}"
+    return latest, None
+
+
+def restore_cutover_snapshot(
+    snapshot_dir: Path | str,
+    *,
+    dry_run: bool = False,
+) -> list[str]:
+    """Atomically restore all files and `web/releases/current` pointer from a verified snapshot."""
+    snap_path = Path(snapshot_dir).expanduser().resolve()
+    errs = verify_cutover_snapshot(snap_path)
+    if errs:
+        raise RuntimeError(f"refusing to restore invalid snapshot {snap_path}: " + "; ".join(errs))
+
+    manifest = json.loads((snap_path / SNAPSHOT_MANIFEST_NAME).read_text(encoding="utf-8"))
+    files_meta: dict[str, dict[str, Any]] = manifest["files"]
+    actions: list[str] = []
+
+    restore_order = (
+        "repo_env",
+        "bridge_env",
+        "research_host_env",
+        "guidepoint_env",
+        "plist_proxy",
+        "plist_bridge",
+        "plist_research_host",
+        "guidepoint_tokens",
+        "handoff_journal",
+    )
+    ordered_keys = [k for k in restore_order if k in files_meta] + [
+        k for k in sorted(files_meta.keys()) if k not in restore_order
+    ]
+
+    for key in ordered_keys:
+        info = files_meta[key]
+        target = Path(str(info["source_path"])).expanduser()
+        existed = bool(info["existed"])
+        if existed:
+            src_fp = snap_path / str(info["rel_path"])
+            mode_str = str(info.get("mode") or "0600")
+            try:
+                mode_val = int(mode_str, 8)
+            except ValueError:
+                mode_val = 0o600
+            actions.append(f"restore {key}: {src_fp.name} -> {target} (mode {mode_val:04o})")
+            if not dry_run:
+                _write_bytes_atomic(target, src_fp.read_bytes(), mode=mode_val)
+        else:
+            if target.exists() or target.is_symlink():
+                actions.append(f"remove {key}: {target} (absent in snapshot)")
+                if not dry_run:
+                    target.unlink()
+                    _fsync_dir(target.parent, strict=True)
+            else:
+                actions.append(f"keep-absent {key}: {target}")
+
+    web_info = manifest.get("web_releases_current")
+    if isinstance(web_info, dict) and web_info.get("path"):
+        cur_path = _abs_no_deref(str(web_info["path"]))
+        if web_info.get("is_symlink") and web_info.get("link_target"):
+            link_target = str(web_info["link_target"])
+            resolved_check = (
+                Path(link_target)
+                if os.path.isabs(link_target)
+                else (cur_path.parent / link_target)
+            )
+            if resolved_check.exists():
+                actions.append(f"restore web_releases_current: {cur_path} -> {link_target}")
+                if not dry_run:
+                    cur_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_link = cur_path.parent / f".current.restore.{os.getpid()}.{secrets.token_hex(4)}"
+                    try:
+                        os.symlink(link_target, tmp_link)
+                        os.replace(tmp_link, cur_path)
+                        _fsync_dir(cur_path.parent, strict=True)
+                    except BaseException:
+                        try:
+                            if tmp_link.is_symlink():
+                                tmp_link.unlink()
+                        except OSError:
+                            pass
+                        raise
+            else:
+                actions.append(
+                    f"skip web_releases_current: target {link_target} not present on disk"
+                )
+    return actions
+
+
+def cmd_snapshot_create(args: argparse.Namespace) -> int:
+    repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
+    home_dir = Path(args.home).expanduser().resolve() if args.home else Path.home().resolve()
+    try:
+        final_dir, manifest = create_cutover_snapshot(
+            repo_root=repo_root,
+            home_dir=home_dir,
+            out_dir=Path(args.out_dir) if args.out_dir else None,
+            label=str(args.label or ""),
+            plist_dir=Path(args.plist_dir) if args.plist_dir else None,
+            repo_env=Path(args.repo_env) if args.repo_env else None,
+            bridge_env=Path(args.bridge_env) if args.bridge_env else None,
+            research_host_env=Path(args.research_host_env) if args.research_host_env else None,
+            guidepoint_env=Path(args.guidepoint_env) if args.guidepoint_env else None,
+            tokens_file=Path(args.tokens_file) if args.tokens_file else None,
+            journal_file=Path(args.journal_file) if args.journal_file else None,
+            web_releases_current=Path(args.web_releases_current) if args.web_releases_current else None,
+        )
+    except Exception as exc:
+        print(f"ERROR: snapshot creation failed: {exc}", file=sys.stderr)
+        return 1
+    if args.print_path:
+        print(str(final_dir))
+        return 0
+    if args.json:
+        print(json.dumps({"snapshot_dir": str(final_dir), "manifest": manifest}, ensure_ascii=False, indent=2))
+        return 0
+    saved = [k for k, v in manifest["files"].items() if v.get("existed")]
+    absent = [k for k, v in manifest["files"].items() if not v.get("existed")]
+    print(f"SNAPSHOT_OK: {final_dir}")
+    print(f"  saved_files ({len(saved)}): {', '.join(saved) if saved else 'none'}")
+    print(f"  absent_files ({len(absent)}): {', '.join(absent) if absent else 'none'}")
+    web_info = manifest.get("web_releases_current") or {}
+    if web_info.get("is_symlink"):
+        print(f"  web_releases_current: {web_info.get('link_target')}")
+    else:
+        print(f"  web_releases_current: exists={web_info.get('exists')}")
+    print(f"  manifest: {final_dir / SNAPSHOT_MANIFEST_NAME} (SHA-256 verified)")
+    return 0
+
+
+def cmd_snapshot_verify(args: argparse.Namespace) -> int:
+    errs = verify_cutover_snapshot(Path(args.snapshot_dir))
+    if errs:
+        for e in errs:
+            print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    if args.json:
+        snap_path = Path(args.snapshot_dir).expanduser().resolve()
+        manifest = json.loads((snap_path / SNAPSHOT_MANIFEST_NAME).read_text(encoding="utf-8"))
+        print(json.dumps({"ok": True, "snapshot_dir": str(snap_path), "manifest": manifest}, ensure_ascii=False, indent=2))
+    else:
+        print(f"SNAPSHOT_VERIFY_OK: {Path(args.snapshot_dir).expanduser().resolve()}")
+    return 0
+
+
+def cmd_snapshot_latest(args: argparse.Namespace) -> int:
+    repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
+    latest, err = find_latest_cutover_snapshot(repo_root)
+    if err or latest is None:
+        print(f"ERROR: {err}", file=sys.stderr)
+        return 1
+    print(str(latest))
+    return 0
+
+
+def cmd_snapshot_restore(args: argparse.Namespace) -> int:
+    try:
+        actions = restore_cutover_snapshot(
+            Path(args.snapshot_dir),
+            dry_run=bool(args.dry_run),
+        )
+    except Exception as exc:
+        print(f"ERROR: snapshot restore failed: {exc}", file=sys.stderr)
+        return 1
+    prefix = "[DRY-RUN] " if args.dry_run else ""
+    for line in actions:
+        print(f"{prefix}{line}")
+    return 0
+
+
+def cmd_gate_status(args: argparse.Namespace) -> int:
+    repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
+    state_file = (
+        Path(args.state_file).expanduser().resolve()
+        if args.state_file
+        else (repo_root / DEFAULT_ADMISSION_REL_PATH)
+    )
+    mg = _import_maintenance_gate(repo_root)
+    st = mg.read_maintenance_state(state_file)
+    print(json.dumps({**st.to_dict(), "exists": st.exists, "state_file": str(state_file)}, ensure_ascii=False))
+    return 0
+
+
+def cmd_gate_set(args: argparse.Namespace) -> int:
+    repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
+    state_file = (
+        Path(args.state_file).expanduser().resolve()
+        if args.state_file
+        else (repo_root / DEFAULT_ADMISSION_REL_PATH)
+    )
+    mg = _import_maintenance_gate(repo_root)
+    paused_bool = args.paused == "true"
+    host_direct_bool = (
+        None if args.pause_host_direct is None else (args.pause_host_direct == "true")
+    )
+    no_db_lock = bool(args.no_db_lock) or str(os.environ.get("DALTON_MAINTENANCE_NO_DB_LOCK") or "") == "1"
+    try:
+        if no_db_lock:
+            current = mg.read_maintenance_state(state_file)
+            nxt = mg._build_next_state(
+                current,
+                paused=paused_bool,
+                allow_workspace_ids=args.allow_workspace_id,
+                pause_host_direct=host_direct_bool,
+                reason=args.reason,
+                operation=args.operation,
+            )
+            verified = mg.write_maintenance_state_atomic(nxt, state_file=state_file)
+        else:
+            verified = mg.update_maintenance_state_under_db_lock(
+                paused=paused_bool,
+                allow_workspace_ids=args.allow_workspace_id,
+                pause_host_direct=host_direct_bool,
+                reason=args.reason,
+                operation=args.operation,
+                state_file=state_file,
+                dsn=args.dsn,
+            )
+    except Exception as exc:
+        print(f"ERROR: failed to update maintenance admission gate: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(verified.to_dict(), ensure_ascii=False))
+    return 0
+
+
+def cmd_gate_verify(args: argparse.Namespace) -> int:
+    repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
+    state_file = (
+        Path(args.state_file).expanduser().resolve()
+        if args.state_file
+        else (repo_root / DEFAULT_ADMISSION_REL_PATH)
+    )
+    mg = _import_maintenance_gate(repo_root)
+    st = mg.read_maintenance_state(state_file)
+    expected_rev = int(args.expected_revision) if args.expected_revision is not None else int(st.revision)
+    expected_paused = args.expected_paused == "true"
+
+    repo_env_path = (
+        Path(args.repo_env).expanduser().resolve()
+        if args.repo_env
+        else (repo_root / ".env")
+    )
+    repo_vals = _parse_simple_env_file(repo_env_path)
+    svc_tok = (
+        str(os.environ.get("INTERNAL_SERVICE_TOKEN") or "").strip()
+        or str(repo_vals.get("INTERNAL_SERVICE_TOKEN") or "").strip()
+    )
+    docker_bin = os.environ.get("DOCKER_BIN", "docker")
+
+    def _docker_runner(d_args: list[str], timeout_s: float) -> tuple[int, str, str]:
+        return _run_cmd([docker_bin, *d_args], timeout_s=timeout_s)
+
+    def _http_requester(
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        body: bytes | None,
+        timeout_s: float,
+    ) -> tuple[int | None, dict[str, Any] | None, str]:
+        code, parsed, err = _http_request(
+            method,
+            url,
+            headers=headers,
+            body=body,
+            timeout_s=timeout_s,
+        )
+        return code, (parsed if isinstance(parsed, dict) else None), (err or "")
+
+    res = mg.verify_container_maintenance_gate(
+        expected_revision=expected_rev,
+        expected_paused=expected_paused,
+        backend_url=args.backend_url,
+        service_token=svc_tok,
+        container_name=args.container_name,
+        deadline_s=float(args.deadline_s),
+        poll_interval_s=float(args.poll_interval_s),
+        docker_runner=_docker_runner,
+        http_requester=_http_requester,
+    )
+    print(json.dumps(res.to_dict(), ensure_ascii=False))
+    if res.status == "verified":
+        return 0
+    if res.status == "unavailable" and args.allow_unavailable:
+        return 0
+    return 1
+
+
+def build_legacy_bridge_probe_rpc(
+    route: str,
+    operation: str,
+    query: str,
+    *,
+    req_id: int = 1,
+    limit: int = 1,
+) -> dict[str, Any]:
+    """Construct a JSON-RPC `tools/call` payload matching the legacy bridge route contract."""
+    return {
+        "jsonrpc": "2.0",
+        "id": int(req_id),
+        "method": "tools/call",
+        "params": {
+            "name": "research",
+            "arguments": {
+                "route": route,
+                "operation": operation,
+                "query": query,
+                "limit": int(limit),
+            },
+        },
+    }
+
+
+def _extract_mcp_payload(parsed: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """Decode JSON-RPC MCP tools/call response payload and report any protocol/tool error."""
+    if not isinstance(parsed, dict):
+        return None, f"expected JSON object response, got {type(parsed).__name__}"
+    if "error" in parsed and parsed["error"]:
+        return None, f"jsonrpc error: {parsed['error']}"
+    result = parsed.get("result")
+    if not isinstance(result, dict):
+        return None, "missing result object in JSON-RPC response"
+    if result.get("isError") is True:
+        content = result.get("content")
+        snippet = ""
+        if isinstance(content, list) and content and isinstance(content[0], dict):
+            snippet = str(content[0].get("text") or "")[:200]
+        return None, f"tool returned isError=true ({snippet})"
+    content = result.get("content")
+    if isinstance(content, list) and content and isinstance(content[0], dict):
+        text = content[0].get("text")
+        if isinstance(text, str) and text.strip():
+            try:
+                inner = json.loads(text)
+                if isinstance(inner, dict):
+                    return inner, None
+            except ValueError:
+                pass
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        return structured, None
+    return result, None
+
+
+def _run_probe_with_retries(
+    name: str,
+    fn: Callable[[], tuple[bool, str]],
+    *,
+    retries: int,
+    retry_delay: float,
+) -> dict[str, str]:
+    attempts = max(1, int(retries))
+    last_detail = ""
+    for attempt in range(1, attempts + 1):
+        ok, detail = fn()
+        if ok:
+            return {"probe": name, "status": "ok", "detail": detail}
+        last_detail = detail
+        if attempt < attempts and retry_delay > 0:
+            time.sleep(retry_delay)
+    return {"probe": name, "status": "fail", "detail": last_detail}
+
+
+def cmd_probe_services(args: argparse.Namespace) -> int:
+    repo_root = Path(args.repo).expanduser().resolve() if args.repo else _default_repo_root()
+    home_dir = Path(args.home).expanduser().resolve() if args.home else Path.home().resolve()
+    bridge_env_path = (
+        Path(args.bridge_env).expanduser().resolve()
+        if args.bridge_env
+        else (
+            (home_dir / ".config" / "dalton" / "researchdata-bridge.env")
+            if args.home
+            else (
+                Path(os.environ["DALTON_BRIDGE_ENV_FILE"]).expanduser().resolve()
+                if str(os.environ.get("DALTON_BRIDGE_ENV_FILE") or "").strip()
+                else (home_dir / ".config" / "dalton" / "researchdata-bridge.env")
+            )
+        )
+    )
+    rh_env_path = (
+        Path(args.research_host_env).expanduser().resolve()
+        if args.research_host_env
+        else (
+            (home_dir / ".config" / "dalton" / "research-host.env")
+            if args.home
+            else (
+                Path(os.environ["DALTON_RESEARCH_HOST_ENV_FILE"]).expanduser().resolve()
+                if str(os.environ.get("DALTON_RESEARCH_HOST_ENV_FILE") or "").strip()
+                else (home_dir / ".config" / "dalton" / "research-host.env")
+            )
+        )
+    )
+    repo_env_path = (
+        Path(args.repo_env).expanduser().resolve()
+        if args.repo_env
+        else (
+            (repo_root / ".env")
+            if args.repo
+            else (
+                Path(os.environ["DALTON_REPO_ENV_FILE"]).expanduser().resolve()
+                if str(os.environ.get("DALTON_REPO_ENV_FILE") or "").strip()
+                else (repo_root / ".env")
+            )
+        )
+    )
+
+    bridge_vals = _parse_simple_env_file(bridge_env_path)
+    rh_vals = _parse_simple_env_file(rh_env_path)
+    repo_vals = _parse_simple_env_file(repo_env_path)
+
+    bridge_tok = (
+        str(bridge_vals.get("DALTON_BRIDGE_TOKEN") or "").strip()
+        or str(repo_vals.get("DALTON_BRIDGE_TOKEN") or "").strip()
+    )
+    rh_tok = (
+        str(rh_vals.get("DALTON_RESEARCH_HOST_TOKEN") or "").strip()
+        or str(repo_vals.get("DALTON_RESEARCH_HOST_TOKEN") or "").strip()
+    )
+
+    timeout_s = float(args.timeout)
+    retries = int(args.retries)
+    retry_delay = float(args.retry_delay)
+    query = str(args.query or "cloud")
+    proxy_base = args.proxy_url.rstrip("/")
+    bridge_base = args.bridge_url.rstrip("/")
+    rh_base = args.research_host_url.rstrip("/")
+    backend_base = args.backend_url.rstrip("/")
+
+    results: list[dict[str, str]] = []
+
+    def _probe_backend_health() -> tuple[bool, str]:
+        code, _body, err = _http_request("GET", f"{backend_base}/health", timeout_s=timeout_s)
+        if err or code != 200:
+            return False, f"GET {backend_base}/health -> {code} ({err or 'unexpected status'})"
+        return True, f"backend /health returned 200"
+
+    if args.target == "legacy":
+        def _probe_proxy_healthz() -> tuple[bool, str]:
+            code, body, err = _http_request("GET", f"{proxy_base}/healthz", timeout_s=timeout_s)
+            if err or code != 200 or not isinstance(body, dict):
+                return False, f"GET {proxy_base}/healthz -> {code} ({err or 'bad response'})"
+            if body.get("owner_lock_held") is not True:
+                return False, f"proxy owner_lock_held={body.get('owner_lock_held')!r} (expected True)"
+            if body.get("draining") is True:
+                return False, "proxy draining=True (expected False)"
+            return True, "proxy :8943 healthy and holds .guidepoint.owner.lock"
+
+        def _probe_bridge_healthz() -> tuple[bool, str]:
+            code, body, err = _http_request("GET", f"{bridge_base}/healthz", timeout_s=timeout_s)
+            if err or code != 200 or not isinstance(body, dict):
+                return False, f"GET {bridge_base}/healthz -> {code} ({err or 'bad response'})"
+            if body.get("ok") is False:
+                return False, f"bridge /healthz ok=False"
+            return True, "legacy bridge :8960 /healthz returned 200"
+
+        def _probe_legacy_wiki_search() -> tuple[bool, str]:
+            if not bridge_tok:
+                return False, f"missing DALTON_BRIDGE_TOKEN in {bridge_env_path}"
+            rpc = json.dumps(
+                build_legacy_bridge_probe_rpc("company-wiki", "search", query, req_id=1, limit=1)
+            ).encode("utf-8")
+            code, body, err = _http_request(
+                "POST",
+                f"{bridge_base}/mcp",
+                headers={"Authorization": f"Bearer {bridge_tok}", "Content-Type": "application/json"},
+                body=rpc,
+                timeout_s=timeout_s,
+            )
+            if err or code != 200:
+                return False, f"bridge company-wiki search -> HTTP {code} ({err or 'error'})"
+            inner, m_err = _extract_mcp_payload(body)
+            if m_err or inner is None:
+                return False, f"bridge company-wiki search failed: {m_err}"
+            if inner.get("ok") is False or inner.get("error_code") == "route_migrated":
+                return False, f"bridge company-wiki search returned error: {inner.get('error_code') or inner.get('error')}"
+            return True, "legacy bridge company-wiki search succeeded"
+
+        def _probe_legacy_guidepoint() -> tuple[bool, str]:
+            if not bridge_tok:
+                return False, f"missing DALTON_BRIDGE_TOKEN in {bridge_env_path}"
+            rpc = json.dumps(
+                build_legacy_bridge_probe_rpc("guidepoint", "search_library", query, req_id=2, limit=1)
+            ).encode("utf-8")
+            code, body, err = _http_request(
+                "POST",
+                f"{bridge_base}/mcp",
+                headers={"Authorization": f"Bearer {bridge_tok}", "Content-Type": "application/json"},
+                body=rpc,
+                timeout_s=timeout_s,
+            )
+            if err or code != 200:
+                return False, f"bridge guidepoint search_library -> HTTP {code} ({err or 'error'})"
+            inner, m_err = _extract_mcp_payload(body)
+            if m_err or inner is None:
+                return False, f"bridge guidepoint search_library failed: {m_err}"
+            if inner.get("ok") is False or inner.get("error_code") == "route_migrated":
+                return False, f"bridge guidepoint search_library returned error: {inner.get('error_code') or inner.get('error')}"
+            return True, "legacy bridge guidepoint search_library succeeded"
+
+        def _probe_proxy_direct_guidepoint() -> tuple[bool, str]:
+            rpc = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "search_library",
+                        "arguments": {"query": query, "size": 1},
+                    },
+                }
+            ).encode("utf-8")
+            code, body, err = _http_request(
+                "POST",
+                f"{proxy_base}/mcp",
+                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+                body=rpc,
+                timeout_s=timeout_s,
+            )
+            if err or code != 200:
+                return False, f"proxy :8943/mcp search_library -> HTTP {code} ({err or 'error'})"
+            inner, m_err = _extract_mcp_payload(body)
+            if m_err or inner is None:
+                return False, f"proxy :8943/mcp search_library failed: {m_err}"
+            if inner.get("ok") is False:
+                return False, f"proxy :8943/mcp search_library error: {inner.get('error')}"
+            return True, "proxy :8943 direct guidepoint search_library succeeded"
+
+        probes: list[tuple[str, Callable[[], tuple[bool, str]]]] = [
+            ("proxy_healthz", _probe_proxy_healthz),
+            ("bridge_healthz", _probe_bridge_healthz),
+            ("wiki_search", _probe_legacy_wiki_search),
+            ("guidepoint_search_library", _probe_legacy_guidepoint),
+            ("proxy_guidepoint_search_library", _probe_proxy_direct_guidepoint),
+        ]
+        if not args.skip_backend:
+            probes.append(("backend_health", _probe_backend_health))
+    else:
+        def _probe_rh_healthz() -> tuple[bool, str]:
+            code, body, err = _http_request("GET", f"{rh_base}/healthz", timeout_s=timeout_s)
+            if err or code != 200 or not isinstance(body, dict):
+                return False, f"GET {rh_base}/healthz -> {code} ({err or 'bad response'})"
+            if body.get("ok") is False:
+                return False, "research-host /healthz ok=False"
+            gp_block = body.get("guidepoint")
+            if isinstance(gp_block, dict) and gp_block.get("owner_lock_held") is not True:
+                return False, f"research-host guidepoint.owner_lock_held={gp_block.get('owner_lock_held')!r} (expected True)"
+            return True, "research-host :8951 healthy and holds Guidepoint lock"
+
+        def _probe_rh_wiki_search() -> tuple[bool, str]:
+            if not rh_tok:
+                return False, f"missing DALTON_RESEARCH_HOST_TOKEN in {rh_env_path}"
+            rpc = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "search",
+                        "arguments": {"query": query, "limit": 1},
+                    },
+                }
+            ).encode("utf-8")
+            code, body, err = _http_request(
+                "POST",
+                f"{rh_base}/mcp/company-wiki",
+                headers={"Authorization": f"Bearer {rh_tok}", "Content-Type": "application/json"},
+                body=rpc,
+                timeout_s=timeout_s,
+            )
+            if err or code != 200:
+                return False, f"research-host /mcp/company-wiki search -> HTTP {code} ({err or 'error'})"
+            inner, m_err = _extract_mcp_payload(body)
+            if m_err or inner is None:
+                return False, f"research-host company-wiki search failed: {m_err}"
+            if inner.get("ok") is False:
+                return False, f"research-host company-wiki search error: {inner.get('error')}"
+            return True, "research-host /mcp/company-wiki search succeeded"
+
+        def _probe_rh_guidepoint() -> tuple[bool, str]:
+            if not rh_tok:
+                return False, f"missing DALTON_RESEARCH_HOST_TOKEN in {rh_env_path}"
+            rpc = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "search_library",
+                        "arguments": {"query": query, "limit": 1},
+                    },
+                }
+            ).encode("utf-8")
+            code, body, err = _http_request(
+                "POST",
+                f"{rh_base}/mcp/guidepoint",
+                headers={"Authorization": f"Bearer {rh_tok}", "Content-Type": "application/json"},
+                body=rpc,
+                timeout_s=timeout_s,
+            )
+            if err or code != 200:
+                return False, f"research-host /mcp/guidepoint search_library -> HTTP {code} ({err or 'error'})"
+            inner, m_err = _extract_mcp_payload(body)
+            if m_err or inner is None:
+                return False, f"research-host guidepoint search_library failed: {m_err}"
+            if inner.get("ok") is False:
+                return False, f"research-host guidepoint search_library error: {inner.get('error')}"
+            return True, "research-host /mcp/guidepoint search_library succeeded"
+
+        def _probe_legacy_route_closed() -> tuple[bool, str]:
+            if not bridge_tok:
+                return False, f"missing DALTON_BRIDGE_TOKEN in {bridge_env_path}"
+            rpc = json.dumps(
+                build_legacy_bridge_probe_rpc("company-wiki", "search", query, req_id=3, limit=1)
+            ).encode("utf-8")
+            code, body, err = _http_request(
+                "POST",
+                f"{bridge_base}/mcp",
+                headers={"Authorization": f"Bearer {bridge_tok}", "Content-Type": "application/json"},
+                body=rpc,
+                timeout_s=timeout_s,
+            )
+            if err or code is None:
+                return False, f"bridge migrated-route check failed: {err}"
+            raw_text = json.dumps(body, ensure_ascii=False) if isinstance(body, (dict, list)) else str(body)
+            if "route_migrated" in raw_text:
+                return True, "legacy bridge :8960 rejected migrated route with route_migrated"
+            return False, f"legacy bridge :8960 did not return route_migrated (HTTP {code})"
+
+        probes = [
+            ("research_host_healthz", _probe_rh_healthz),
+            ("company_wiki_search", _probe_rh_wiki_search),
+            ("guidepoint_search_library", _probe_rh_guidepoint),
+            ("legacy_route_migrated", _probe_legacy_route_closed),
+        ]
+        if not args.skip_backend:
+            probes.append(("backend_health", _probe_backend_health))
+
+    failed = False
+    for name, fn in probes:
+        res = _run_probe_with_retries(name, fn, retries=retries, retry_delay=retry_delay)
+        results.append(res)
+        if res["status"] != "ok":
+            failed = True
+
+    if args.json:
+        print(json.dumps({"ok": not failed, "target": args.target, "probes": results}, ensure_ascii=False, indent=2))
+    else:
+        for r in results:
+            tag = r["status"].upper()
+            stream = sys.stderr if r["status"] != "ok" else sys.stdout
+            print(f"[{tag}] {r['probe']}: {r['detail']}", file=stream)
+    return 1 if failed else 0
 
 
 def _build_subcommand_parser() -> argparse.ArgumentParser:
@@ -3521,6 +4697,78 @@ def _build_subcommand_parser() -> argparse.ArgumentParser:
     p_ss.add_argument("--keep-admission-paused", action="store_true")
     p_ss.add_argument("--json", action="store_true")
 
+    p_sc = sub.add_parser("snapshot-create")
+    p_sc.add_argument("--repo", required=True)
+    p_sc.add_argument("--home", default=None)
+    p_sc.add_argument("--out-dir", default=None)
+    p_sc.add_argument("--label", default="")
+    p_sc.add_argument("--plist-dir", default=None)
+    p_sc.add_argument("--repo-env", default=None)
+    p_sc.add_argument("--bridge-env", default=None)
+    p_sc.add_argument("--research-host-env", default=None)
+    p_sc.add_argument("--guidepoint-env", default=None)
+    p_sc.add_argument("--tokens-file", default=None)
+    p_sc.add_argument("--journal-file", default=None)
+    p_sc.add_argument("--web-releases-current", default=None)
+    p_sc.add_argument("--print-path", action="store_true")
+    p_sc.add_argument("--json", action="store_true")
+
+    p_sv = sub.add_parser("snapshot-verify")
+    p_sv.add_argument("--snapshot-dir", required=True)
+    p_sv.add_argument("--json", action="store_true")
+
+    p_sl = sub.add_parser("snapshot-latest")
+    p_sl.add_argument("--repo", required=True)
+
+    p_sr = sub.add_parser("snapshot-restore")
+    p_sr.add_argument("--snapshot-dir", required=True)
+    p_sr.add_argument("--dry-run", action="store_true")
+
+    p_gst = sub.add_parser("gate-status")
+    p_gst.add_argument("--repo", required=True)
+    p_gst.add_argument("--state-file", default=None)
+
+    p_gset = sub.add_parser("gate-set")
+    p_gset.add_argument("--repo", required=True)
+    p_gset.add_argument("--state-file", default=None)
+    p_gset.add_argument("--paused", required=True, choices=("true", "false"))
+    p_gset.add_argument("--pause-host-direct", default=None, choices=("true", "false"))
+    p_gset.add_argument("--allow-workspace-id", action="append", default=[])
+    p_gset.add_argument("--reason", default="")
+    p_gset.add_argument("--operation", default="")
+    p_gset.add_argument("--dsn", default=None)
+    p_gset.add_argument("--no-db-lock", action="store_true")
+
+    p_gver = sub.add_parser("gate-verify")
+    p_gver.add_argument("--repo", required=True)
+    p_gver.add_argument("--state-file", default=None)
+    p_gver.add_argument("--repo-env", default=None)
+    p_gver.add_argument("--expected-revision", type=int, default=None)
+    p_gver.add_argument("--expected-paused", default="true", choices=("true", "false"))
+    p_gver.add_argument("--backend-url", default="http://127.0.0.1:8000")
+    p_gver.add_argument("--container-name", default="dalton-langalpha-backend-1")
+    p_gver.add_argument("--deadline-s", type=float, default=30.0)
+    p_gver.add_argument("--poll-interval-s", type=float, default=1.0)
+    p_gver.add_argument("--allow-unavailable", action="store_true")
+
+    p_ps = sub.add_parser("probe-services")
+    p_ps.add_argument("--repo", required=True)
+    p_ps.add_argument("--home", default=None)
+    p_ps.add_argument("--target", required=True, choices=("legacy", "research-host"))
+    p_ps.add_argument("--backend-url", default="http://127.0.0.1:8000")
+    p_ps.add_argument("--proxy-url", default="http://127.0.0.1:8943")
+    p_ps.add_argument("--bridge-url", default="http://127.0.0.1:8960")
+    p_ps.add_argument("--research-host-url", default="http://127.0.0.1:8951")
+    p_ps.add_argument("--repo-env", default=None)
+    p_ps.add_argument("--bridge-env", default=None)
+    p_ps.add_argument("--research-host-env", default=None)
+    p_ps.add_argument("--query", default="cloud")
+    p_ps.add_argument("--timeout", type=float, default=15.0)
+    p_ps.add_argument("--retries", type=int, default=3)
+    p_ps.add_argument("--retry-delay", type=float, default=1.0)
+    p_ps.add_argument("--skip-backend", action="store_true")
+    p_ps.add_argument("--json", action="store_true")
+
     return p
 
 
@@ -3536,6 +4784,14 @@ _SUBCOMMANDS = frozenset(
         "guard-check",
         "compose-args",
         "status-summary",
+        "snapshot-create",
+        "snapshot-verify",
+        "snapshot-latest",
+        "snapshot-restore",
+        "gate-status",
+        "gate-set",
+        "gate-verify",
+        "probe-services",
     }
 )
 
@@ -3564,6 +4820,22 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_compose_args(ns)
         if ns.subcommand == "status-summary":
             return cmd_status_summary(ns)
+        if ns.subcommand == "snapshot-create":
+            return cmd_snapshot_create(ns)
+        if ns.subcommand == "snapshot-verify":
+            return cmd_snapshot_verify(ns)
+        if ns.subcommand == "snapshot-latest":
+            return cmd_snapshot_latest(ns)
+        if ns.subcommand == "snapshot-restore":
+            return cmd_snapshot_restore(ns)
+        if ns.subcommand == "gate-status":
+            return cmd_gate_status(ns)
+        if ns.subcommand == "gate-set":
+            return cmd_gate_set(ns)
+        if ns.subcommand == "gate-verify":
+            return cmd_gate_verify(ns)
+        if ns.subcommand == "probe-services":
+            return cmd_probe_services(ns)
         return 2
 
     ns = _build_preflight_parser().parse_args(args_list)
@@ -3600,6 +4872,7 @@ def main(argv: list[str] | None = None) -> int:
         research_host_url=ns.research_host_url,
         budgets_file=budgets_file,
         expect_admission=ns.expect_admission,
+        skip_budgets=bool(ns.skip_budgets),
         proxy_listen_port=int(ns.proxy_listen_port),
         research_host_plist=rh_plist,
         archived_plist_dir=archived_dir,

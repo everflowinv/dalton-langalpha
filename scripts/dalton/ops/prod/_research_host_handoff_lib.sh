@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# Shared Everflow Research Host cutover handoff library (§6.4b).
+# Shared Everflow Research Host cutover handoff library.
 #
-# Base functions (s34-r1/r2):
-#   - rh_paths: canonical cutover/recovery/lock/journal/budget paths
+# Shared functions:
+#   - rh_paths: canonical cutover/recovery/lock/journal/admission paths
 #   - rh_acquire_ops_lock / rh_release_ops_lock: non-blocking flock on FD 8
 #     (keeps FD 9 free for deploy_main.sh's deploy lock); verifies kernel flock
 #   - rh_persist_recovery_bin / rh_verify_recovery_manifest: atomic sibling
 #     symlink swap with fsync + trusted 5-file manifest SHA-256 verification
 #   - rh_journal_set: atomic handoff-journal.json update via preflight.py + guidepoint_lock
-#   - rh_require_change_allowed: unified change guard (§6.4b (8) row 2) with flock check
-#   - rh_require_no_incomplete_journal / rh_require_completed_journal_for_approval
+#   - rh_require_change_allowed / rh_require_no_incomplete_journal: change guards
+#   - rh_gate_status / rh_gate_set / rh_gate_verify: maintenance admission gate helpers
+#   - rh_snapshot_create / rh_snapshot_verify / rh_snapshot_latest / rh_snapshot_restore:
+#     atomic cutover snapshot & restore helpers backed by preflight.py
+#   - rh_probe_services: live health & MCP probes (Wiki search + Guidepoint search_library)
+#   - rh_launchd_domain / rh_launchctl_bootout / rh_launchctl_bootstrap: idempotent launchd helpers
 #
 # Compatible with macOS Bash 3.2.
 
@@ -226,7 +230,7 @@ rh_require_no_incomplete_journal() {
     if [[ "${op}" == "deploy" ]]; then
       echo "ERROR: incomplete handoff-journal.json (operation=deploy, completed=false). Run deploy_main.sh --recover-deploy first." >&2
     else
-      echo "ERROR: incomplete handoff-journal.json (operation=${op:-unknown}, completed=false). Run bash ${RH_RECOVERY_BIN_DIR}/switch_research_host.sh --recover first." >&2
+      echo "ERROR: incomplete handoff-journal.json (operation=${op:-unknown}, completed=false). Run bash ${RH_REPO_ROOT}/scripts/dalton/ops/prod/rollback_research_host.sh first." >&2
     fi
     return 1
   fi
@@ -237,11 +241,120 @@ rh_require_no_incomplete_journal() {
   return 0
 }
 
-rh_require_completed_journal_for_approval() {
-  rh_paths
-  if [[ ! -f "${RH_JOURNAL_FILE}" ]]; then
-    echo "ERROR: --approve-budgets requires existing handoff-journal.json with completed == true (missing ${RH_JOURNAL_FILE})" >&2
+rh_launchd_domain() {
+  if [[ -n "${DALTON_LAUNCHD_DOMAIN:-}" ]]; then
+    printf '%s\n' "${DALTON_LAUNCHD_DOMAIN}"
+    return 0
+  fi
+  local uid_val="${DALTON_LAUNCHD_UID:-$(id -u)}"
+  printf 'gui/%s\n' "${uid_val}"
+}
+
+rh_launchctl_bootout() {
+  local label="${1:?rh_launchctl_bootout requires launchd label}"
+  local plist_path="${2:-}"
+  local lc_bin="${LAUNCHCTL_BIN:-launchctl}"
+  local domain
+  domain="$(rh_launchd_domain)"
+
+  # Idempotent: if service is not loaded, treat bootout as already stopped.
+  if ! "${lc_bin}" print "${domain}/${label}" >/dev/null 2>&1; then
+    if ! "${lc_bin}" list 2>/dev/null | awk '{print $3}' | grep -Fxq "${label}"; then
+      return 0
+    fi
+  fi
+
+  if "${lc_bin}" bootout "${domain}/${label}" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ -n "${plist_path}" && -f "${plist_path}" ]]; then
+    if "${lc_bin}" bootout "${domain}" "${plist_path}" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  # Re-check whether the service is already gone after bootout attempt
+  if ! "${lc_bin}" print "${domain}/${label}" >/dev/null 2>&1; then
+    if ! "${lc_bin}" list 2>/dev/null | awk '{print $3}' | grep -Fxq "${label}"; then
+      return 0
+    fi
+  fi
+  echo "ERROR: failed to bootout launchd service ${domain}/${label}" >&2
+  return 1
+}
+
+rh_launchctl_bootstrap() {
+  local label="${1:?rh_launchctl_bootstrap requires launchd label}"
+  local plist_path="${2:?rh_launchctl_bootstrap requires plist path}"
+  local lc_bin="${LAUNCHCTL_BIN:-launchctl}"
+  local domain
+  domain="$(rh_launchd_domain)"
+
+  if [[ ! -f "${plist_path}" ]]; then
+    echo "ERROR: missing plist file for ${label}: ${plist_path}" >&2
     return 1
   fi
-  rh_require_no_incomplete_journal
+
+  # If already loaded, reload cleanly via bootout + bootstrap so updated plist takes effect.
+  if "${lc_bin}" print "${domain}/${label}" >/dev/null 2>&1 || \
+     "${lc_bin}" list 2>/dev/null | awk '{print $3}' | grep -Fxq "${label}"; then
+    rh_launchctl_bootout "${label}" "${plist_path}" || return 1
+  fi
+
+  "${lc_bin}" bootstrap "${domain}" "${plist_path}"
+}
+
+rh_gate_status() {
+  rh_paths
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" gate-status \
+    --repo "${RH_REPO_ROOT}" \
+    "$@"
+}
+
+rh_gate_set() {
+  rh_paths
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" gate-set \
+    --repo "${RH_REPO_ROOT}" \
+    "$@"
+}
+
+rh_gate_verify() {
+  rh_paths
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" gate-verify \
+    --repo "${RH_REPO_ROOT}" \
+    "$@"
+}
+
+rh_snapshot_create() {
+  rh_paths
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" snapshot-create \
+    --repo "${RH_REPO_ROOT}" \
+    --home "${RH_HOME}" \
+    "$@"
+}
+
+rh_snapshot_verify() {
+  rh_paths
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" snapshot-verify \
+    "$@"
+}
+
+rh_snapshot_latest() {
+  rh_paths
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" snapshot-latest \
+    --repo "${RH_REPO_ROOT}" \
+    "$@"
+}
+
+rh_snapshot_restore() {
+  rh_paths
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" snapshot-restore \
+    "$@"
+}
+
+rh_probe_services() {
+  rh_paths
+  PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" probe-services \
+    --repo "${RH_REPO_ROOT}" \
+    --home "${RH_HOME}" \
+    "$@"
 }

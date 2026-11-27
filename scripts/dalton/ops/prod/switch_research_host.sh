@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
-# Everflow Research Host cutover & rollback orchestrator (§6.4b).
+# Everflow Research Host read-only preflight check wrapper.
 #
-# Current scope (s34-r2):
-#   - Full CLI parsing & per-action flag validation for all §6.4b entrypoints
-#   - Read-only `--check` and `--switch --dry-run` (no lock, no writes, zero
-#     bytecode writes, exempt from incomplete-journal guard)
-#   - `--approve-budgets [--handoff-deadline-s N] [--stage-b-window-m M]`
-#     (rejects `--dry-run`; acquires .ops.lock; requires handoff-journal.json
-#      present with `completed == true`; validates candidate via preflight.py
-#      validate_timing_budgets_env(); atomic 0600 writeback without touching
-#      handoff-journal.json)
-#   - Unimplemented mutating entrypoints exit 2 BEFORE taking locks or writing files.
+# Automated 7-step online cutover orchestration (--prepare-stage-a,
+# --measure-budgets, --approve-budgets, --switch, --recover, --rollback) has
+# been retired in favor of the manual downtime cutover runbook and dedicated
+# snapshot / one-click rollback scripts:
+#   - Runbook:  scripts/dalton/ops/prod/RESEARCH_HOST_SWITCH_RUNBOOK.md
+#   - Snapshot: scripts/dalton/ops/prod/snapshot_research_host.sh
+#   - Rollback: scripts/dalton/ops/prod/rollback_research_host.sh
 #
 # Compatible with macOS Bash 3.2.
 
@@ -23,12 +20,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/_research_host_handoff_lib.sh"
 
 ACTION=""
-DRY_RUN=0
-KEEP_ADMISSION_PAUSED=0
-TEST_WORKSPACE_ID=""
-HANDOFF_DEADLINE_S=""
-STAGE_B_WINDOW_M=""
 REPORT_JSON=0
+SKIP_BUDGETS=0
 
 PLIST_DIR="${DALTON_LAUNCH_AGENTS_DIR:-}"
 RESEARCH_HOST_PLIST="${DALTON_RESEARCH_HOST_PLIST:-}"
@@ -41,26 +34,18 @@ BUDGETS_FILE_OVERRIDE="${DALTON_TIMING_BUDGETS_FILE:-}"
 
 usage() {
   cat <<'EOF'
-Usage: switch_research_host.sh <action> [options]
+Usage: switch_research_host.sh --check [options]
 
 Actions:
-  --prepare-stage-a                     Stage A prep & budget measurement (pending s34-r2)
-  --measure-budgets                     Standalone budget re-measurement (pending s34-r2)
-  --approve-budgets                     Confirm measured timing budgets exceeding defaults
-    [--handoff-deadline-s N]
-    [--stage-b-window-m M]
   --check                               Read-only state summary + preflight.py --switch
-  --switch                              Stage B cutover (only --dry-run enabled in this round)
-    [--test-workspace-id <uuid>]
-    [--keep-admission-paused]
-    [--dry-run]
-  --recover                             Recover incomplete operation from recovery-bin/ (pending s34-r2)
-  --rollback                            Rollback to :8943 baseline (pending s34-r2)
-    [--test-workspace-id <uuid>]
-    [--keep-admission-paused]
-    [--dry-run]
+
+Manual downtime cutover tools (automated orchestration retired):
+  Runbook:  scripts/dalton/ops/prod/RESEARCH_HOST_SWITCH_RUNBOOK.md
+  Snapshot: scripts/dalton/ops/prod/snapshot_research_host.sh
+  Rollback: scripts/dalton/ops/prod/rollback_research_host.sh
 
 Optional read-only / test overrides:
+  --skip-budgets                        Skip timing-budgets.env check (manual downtime cutover)
   --plist-dir DIR
   --research-host-plist FILE
   --archived-plist-dir DIR
@@ -74,51 +59,18 @@ Optional read-only / test overrides:
 EOF
 }
 
-set_action() {
-  local next="$1"
-  if [[ -n "${ACTION}" && "${ACTION}" != "${next}" ]]; then
-    echo "ERROR: multiple actions specified (${ACTION} and ${next})" >&2
-    exit 2
-  fi
-  ACTION="${next}"
-}
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --prepare-stage-a|--measure-budgets|--approve-budgets|--check|--switch|--recover|--rollback)
-      set_action "$1"
+    --check)
+      ACTION="--check"
       shift
       ;;
-    --dry-run)
-      DRY_RUN=1
-      shift
+    --prepare-stage-a|--measure-budgets|--approve-budgets|--switch|--recover|--rollback)
+      echo "ERROR: automated cutover action '$1' has been retired. Follow scripts/dalton/ops/prod/RESEARCH_HOST_SWITCH_RUNBOOK.md and use snapshot_research_host.sh / rollback_research_host.sh instead." >&2
+      exit 2
       ;;
-    --keep-admission-paused)
-      KEEP_ADMISSION_PAUSED=1
-      shift
-      ;;
-    --test-workspace-id)
-      TEST_WORKSPACE_ID="${2:?missing --test-workspace-id value}"
-      shift 2
-      ;;
-    --test-workspace-id=*)
-      TEST_WORKSPACE_ID="${1#--test-workspace-id=}"
-      shift
-      ;;
-    --handoff-deadline-s)
-      HANDOFF_DEADLINE_S="${2:?missing --handoff-deadline-s value}"
-      shift 2
-      ;;
-    --handoff-deadline-s=*)
-      HANDOFF_DEADLINE_S="${1#--handoff-deadline-s=}"
-      shift
-      ;;
-    --stage-b-window-m)
-      STAGE_B_WINDOW_M="${2:?missing --stage-b-window-m value}"
-      shift 2
-      ;;
-    --stage-b-window-m=*)
-      STAGE_B_WINDOW_M="${1#--stage-b-window-m=}"
+    --skip-budgets)
+      SKIP_BUDGETS=1
       shift
       ;;
     --plist-dir)
@@ -169,54 +121,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "${ACTION}" ]]; then
+if [[ "${ACTION}" != "--check" ]]; then
   usage >&2
   exit 2
 fi
-
-# Per-action flag validation BEFORE acquiring locks or writing files
-case "${ACTION}" in
-  --approve-budgets)
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-      echo "ERROR: --approve-budgets does not support --dry-run" >&2
-      exit 2
-    fi
-    if [[ "${KEEP_ADMISSION_PAUSED}" -eq 1 || -n "${TEST_WORKSPACE_ID}" ]]; then
-      echo "ERROR: --approve-budgets does not accept --keep-admission-paused or --test-workspace-id" >&2
-      exit 2
-    fi
-    ;;
-  --check)
-    if [[ "${DRY_RUN}" -eq 1 || "${KEEP_ADMISSION_PAUSED}" -eq 1 || -n "${TEST_WORKSPACE_ID}" || -n "${HANDOFF_DEADLINE_S}" || -n "${STAGE_B_WINDOW_M}" ]]; then
-      echo "ERROR: --check does not accept mutating or approval options" >&2
-      exit 2
-    fi
-    ;;
-  --switch)
-    if [[ -n "${HANDOFF_DEADLINE_S}" || -n "${STAGE_B_WINDOW_M}" ]]; then
-      echo "ERROR: --switch does not accept --handoff-deadline-s or --stage-b-window-m" >&2
-      exit 2
-    fi
-    ;;
-esac
-
-# NOTE (s34-r2 placeholder):
-# When invoked as `--recover` from the repository worktree, the next round will
-# delegate execution to `${RH_RECOVERY_BIN_DIR}/switch_research_host.sh --recover`.
-
-# Unimplemented mutating entrypoints MUST exit 2 BEFORE acquiring locks or writing files.
-case "${ACTION}" in
-  --prepare-stage-a|--measure-budgets|--recover|--rollback)
-    echo "本版本尚未实现: ${ACTION}" >&2
-    exit 2
-    ;;
-  --switch)
-    if [[ "${DRY_RUN}" -ne 1 ]]; then
-      echo "本版本尚未实现: --switch (正式执行将在下一轮实现；只读演练请加 --dry-run)" >&2
-      exit 2
-    fi
-    ;;
-esac
 
 rh_paths
 
@@ -224,7 +132,6 @@ EFF_BUDGETS_FILE="${BUDGETS_FILE_OVERRIDE:-${RH_TIMING_BUDGETS_FILE}}"
 EFF_PLIST_DIR="${PLIST_DIR:-${RH_HOME}/Library/LaunchAgents}"
 
 run_preflight_switch() {
-  local include_dry_run_plan="${1:-0}"
   local -a cmd=(
     "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" --switch
     --repo "${RH_REPO_ROOT}"
@@ -236,6 +143,9 @@ run_preflight_switch() {
     --research-host-url "${RESEARCH_HOST_URL}"
     --budgets-file "${EFF_BUDGETS_FILE}"
   )
+  if [[ "${SKIP_BUDGETS}" -eq 1 ]]; then
+    cmd+=(--skip-budgets)
+  fi
   if [[ -n "${RESEARCH_HOST_PLIST}" ]]; then
     cmd+=(--research-host-plist "${RESEARCH_HOST_PLIST}")
   fi
@@ -244,74 +154,18 @@ run_preflight_switch() {
   fi
   if [[ "${REPORT_JSON}" -eq 1 ]]; then
     cmd+=(--report-json --include-summary)
-    if [[ "${include_dry_run_plan}" -eq 1 ]]; then
-      cmd+=(--include-dry-run-plan)
-      if [[ -n "${TEST_WORKSPACE_ID}" ]]; then
-        cmd+=(--test-workspace-id "${TEST_WORKSPACE_ID}")
-      fi
-      if [[ "${KEEP_ADMISSION_PAUSED}" -eq 1 ]]; then
-        cmd+=(--keep-admission-paused)
-      fi
-    fi
   fi
   PYTHONDONTWRITEBYTECODE=1 "${cmd[@]}"
 }
 
-case "${ACTION}" in
-  --check)
-    # Strictly read-only: no lock, no journal write, exempt from completed==false guard.
-    if [[ "${REPORT_JSON}" -eq 1 ]]; then
-      run_preflight_switch 0
-      exit $?
-    fi
-    PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" status-summary \
-      --repo "${RH_REPO_ROOT}" \
-      --budgets-file "${EFF_BUDGETS_FILE}"
-    echo ""
-    run_preflight_switch 0
-    exit $?
-    ;;
-
-  --switch)
-    # DRY_RUN == 1 guaranteed here. Strictly read-only & exempt from completed==false guard.
-    if [[ "${REPORT_JSON}" -eq 1 ]]; then
-      run_preflight_switch 1
-      exit $?
-    fi
-    PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" status-summary \
-      --repo "${RH_REPO_ROOT}" \
-      --budgets-file "${EFF_BUDGETS_FILE}" \
-      --include-dry-run-plan
-    if [[ -n "${TEST_WORKSPACE_ID}" ]]; then
-      echo "  test_workspace_id:                    ${TEST_WORKSPACE_ID}"
-    fi
-    if [[ "${KEEP_ADMISSION_PAUSED}" -eq 1 ]]; then
-      echo "  keep_admission_paused:                true"
-    fi
-    echo ""
-    run_preflight_switch 1
-    exit $?
-    ;;
-
-  --approve-budgets)
-    trap rh_release_ops_lock EXIT
-    trap 'rh_release_ops_lock; exit 130' INT
-    trap 'rh_release_ops_lock; exit 143' TERM
-    rh_acquire_ops_lock "switch_research_host:--approve-budgets" || exit 1
-    rh_require_completed_journal_for_approval || exit 1
-    cmd=(
-      "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" approve-budgets
-      --repo "${RH_REPO_ROOT}"
-      --budgets-file "${EFF_BUDGETS_FILE}"
-      --lock-fd 8
-    )
-    if [[ -n "${HANDOFF_DEADLINE_S}" ]]; then
-      cmd+=(--handoff-deadline-s "${HANDOFF_DEADLINE_S}")
-    fi
-    if [[ -n "${STAGE_B_WINDOW_M}" ]]; then
-      cmd+=(--stage-b-window-m "${STAGE_B_WINDOW_M}")
-    fi
-    PYTHONDONTWRITEBYTECODE=1 "${cmd[@]}"
-    exit $?
-    ;;
-esac
+# Strictly read-only: no lock, no journal write, exempt from completed==false guard.
+if [[ "${REPORT_JSON}" -eq 1 ]]; then
+  run_preflight_switch
+  exit $?
+fi
+PYTHONDONTWRITEBYTECODE=1 "${RH_PYTHON_BIN}" -B "${RH_PREFLIGHT_PY}" status-summary \
+  --repo "${RH_REPO_ROOT}" \
+  --budgets-file "${EFF_BUDGETS_FILE}"
+echo ""
+run_preflight_switch
+exit $?

@@ -1667,7 +1667,7 @@ rh_require_change_allowed "{action}"
 
 
 # ---------------------------------------------------------------------------
-# D6: switch_research_host.sh entrypoints (unimplemented + read-only)
+# D6: switch_research_host.sh entrypoints (retired automation + read-only --check)
 # ---------------------------------------------------------------------------
 
 
@@ -1676,13 +1676,15 @@ rh_require_change_allowed "{action}"
     [
         ["--prepare-stage-a"],
         ["--measure-budgets"],
+        ["--approve-budgets"],
         ["--switch"],
+        ["--switch", "--dry-run"],
         ["--recover"],
         ["--rollback"],
         ["--rollback", "--dry-run"],
     ],
 )
-def test_switch_research_host_unimplemented_actions_exit_2_without_creating_files(
+def test_switch_research_host_retired_automation_actions_exit_2_without_creating_files(
     tmp_path: Path,
     argv: list[str],
 ) -> None:
@@ -1701,11 +1703,12 @@ def test_switch_research_host_unimplemented_actions_exit_2_without_creating_file
         check=False,
     )
     assert res.returncode == 2
-    assert "本版本尚未实现" in res.stderr
+    assert "retired" in res.stderr
+    assert "rollback_research_host.sh" in res.stderr
     assert not (repo / "var").exists()
 
 
-def test_switch_research_host_check_and_dry_run_work_with_incomplete_journal_and_no_writes(
+def test_switch_research_host_check_works_with_incomplete_journal_and_no_writes(
     tmp_path: Path,
 ) -> None:
     ctx = _setup_isolated_env(tmp_path, budgets=_make_valid_budgets_dict())
@@ -1737,27 +1740,24 @@ def test_switch_research_host_check_and_dry_run_work_with_incomplete_journal_and
         assert "completed=False" in r_chk.stdout
         assert _snapshot_var_tree() == before
 
-        r_dry = subprocess.run(
-            ["/bin/bash", str(SWITCH_SH), "--switch", "--dry-run", "--test-workspace-id", "ws-demo-1"],
+        r_skip = subprocess.run(
+            ["/bin/bash", str(SWITCH_SH), "--check", "--skip-budgets", "--report-json"],
             env=ctx["env"],
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
         )
-        assert r_dry.returncode == 0, r_dry.stdout + r_dry.stderr
-        assert "Planned 7-Step Stage B Cutover Sequence" in r_dry.stdout
-        assert "T_trigger (FORWARD_HANDOFF_BUDGET_S): 40s" in r_dry.stdout
-        assert "RECOVERY_BUDGET_S:                    35s" in r_dry.stdout
-        assert "HANDOFF_DEADLINE_S:                   90s" in r_dry.stdout
-        assert "STAGE_B_WINDOW_DEADLINE_S:            3600s" in r_dry.stdout
+        assert r_skip.returncode == 0, r_skip.stdout + r_skip.stderr
+        parsed = json.loads(r_skip.stdout)
+        assert parsed["ok"] is True
         assert _snapshot_var_tree() == before
     finally:
         ctx["cleanup"]()
 
 
 # ---------------------------------------------------------------------------
-# D7: --approve-budgets writeback & rejection byte-preservation
+# D7: preflight.py approve-budgets writeback & rejection byte-preservation
 # ---------------------------------------------------------------------------
 
 
@@ -1780,7 +1780,18 @@ def test_approve_budgets_handoff_exceeded_and_stage_b_only_exceeded_pass_preflig
         ).encode("utf-8")
         j1.write_bytes(j1_bytes)
         r = subprocess.run(
-            ["/bin/bash", str(SWITCH_SH), "--approve-budgets", "--handoff-deadline-s", "120"],
+            [
+                sys.executable,
+                "-B",
+                str(PREFLIGHT_PY),
+                "approve-budgets",
+                "--repo",
+                str(ctx1["repo"]),
+                "--budgets-file",
+                str(ctx1["budgets_file"]),
+                "--handoff-deadline-s",
+                "120",
+            ],
             env=ctx1["env"],
             capture_output=True,
             text=True,
@@ -1816,7 +1827,18 @@ def test_approve_budgets_handoff_exceeded_and_stage_b_only_exceeded_pass_preflig
         ).encode("utf-8")
         j2.write_bytes(j2_bytes)
         r = subprocess.run(
-            ["/bin/bash", str(SWITCH_SH), "--approve-budgets", "--stage-b-window-m", "75"],
+            [
+                sys.executable,
+                "-B",
+                str(PREFLIGHT_PY),
+                "approve-budgets",
+                "--repo",
+                str(ctx2["repo"]),
+                "--budgets-file",
+                str(ctx2["budgets_file"]),
+                "--stage-b-window-m",
+                "75",
+            ],
             env=ctx2["env"],
             capture_output=True,
             text=True,
@@ -1904,7 +1926,17 @@ def test_approve_budgets_rejections_leave_original_file_byte_identical(
         )
         before_bytes = ctx["budgets_file"].read_bytes()
         r = subprocess.run(
-            ["/bin/bash", str(SWITCH_SH), "--approve-budgets", *cli_args],
+            [
+                sys.executable,
+                "-B",
+                str(PREFLIGHT_PY),
+                "approve-budgets",
+                "--repo",
+                str(ctx["repo"]),
+                "--budgets-file",
+                str(ctx["budgets_file"]),
+                *cli_args,
+            ],
             env=ctx["env"],
             capture_output=True,
             text=True,
@@ -2782,7 +2814,7 @@ def test_corrupt_journal_fails_closed_and_never_overwritten(tmp_path: Path) -> N
         assert j_file.read_bytes() == bad_content
 
 
-def test_approve_budgets_requires_completed_journal_and_rejects_dry_run(tmp_path: Path) -> None:
+def test_approve_budgets_requires_completed_journal(tmp_path: Path) -> None:
     b_dict = _make_valid_budgets_dict(
         forward_budget_s=60,
         recovery_budget_s=45,
@@ -2793,24 +2825,23 @@ def test_approve_budgets_requires_completed_journal_and_rejects_dry_run(tmp_path
     try:
         before_bytes = ctx["budgets_file"].read_bytes()
         j_file = ctx["cutover_dir"] / "handoff-journal.json"
+        base_cmd = [
+            sys.executable,
+            "-B",
+            str(PREFLIGHT_PY),
+            "approve-budgets",
+            "--repo",
+            str(ctx["repo"]),
+            "--budgets-file",
+            str(ctx["budgets_file"]),
+            "--handoff-deadline-s",
+            "120",
+        ]
 
-        # 1. --approve-budgets --dry-run -> exit 2 immediately without writing
-        r_dry = subprocess.run(
-            ["/bin/bash", str(SWITCH_SH), "--approve-budgets", "--dry-run", "--handoff-deadline-s", "120"],
-            env=ctx["env"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        assert r_dry.returncode == 2
-        assert "--dry-run" in r_dry.stderr
-        assert ctx["budgets_file"].read_bytes() == before_bytes
-
-        # 2. Missing handoff-journal.json -> refused
+        # 1. Missing handoff-journal.json -> refused
         assert not j_file.exists()
         r_missing = subprocess.run(
-            ["/bin/bash", str(SWITCH_SH), "--approve-budgets", "--handoff-deadline-s", "120"],
+            base_cmd,
             env=ctx["env"],
             capture_output=True,
             text=True,
@@ -2820,10 +2851,10 @@ def test_approve_budgets_requires_completed_journal_and_rejects_dry_run(tmp_path
         assert r_missing.returncode != 0
         assert ctx["budgets_file"].read_bytes() == before_bytes
 
-        # 3. completed == false -> refused
+        # 2. completed == false -> refused
         j_file.write_text(json.dumps({"operation": "stage_a", "completed": False}), encoding="utf-8")
         r_inc = subprocess.run(
-            ["/bin/bash", str(SWITCH_SH), "--approve-budgets", "--handoff-deadline-s", "120"],
+            base_cmd,
             env=ctx["env"],
             capture_output=True,
             text=True,
@@ -2833,10 +2864,10 @@ def test_approve_budgets_requires_completed_journal_and_rejects_dry_run(tmp_path
         assert r_inc.returncode != 0
         assert ctx["budgets_file"].read_bytes() == before_bytes
 
-        # 4. Corrupt journal -> refused
+        # 3. Corrupt journal -> refused
         j_file.write_text("{corrupt", encoding="utf-8")
         r_corrupt = subprocess.run(
-            ["/bin/bash", str(SWITCH_SH), "--approve-budgets", "--handoff-deadline-s", "120"],
+            base_cmd,
             env=ctx["env"],
             capture_output=True,
             text=True,
@@ -3013,19 +3044,8 @@ def test_stage_a_terminal_layout_default_switch_check_and_dry_run_pass_and_unarc
         )
         assert r_chk.returncode == 0, r_chk.stdout + r_chk.stderr
 
-        # Default switch_research_host.sh --switch --dry-run
-        r_dry = subprocess.run(
-            ["/bin/bash", str(SWITCH_SH), "--switch", "--dry-run"],
-            env=ctx["env"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        assert r_dry.returncode == 0, r_dry.stdout + r_dry.stderr
-
-        # --report-json on both --check and --switch --dry-run emits ONE single valid JSON object
-        for argv in (["--check", "--report-json"], ["--switch", "--dry-run", "--report-json"]):
+        # --report-json on --check emits ONE single valid JSON object
+        for argv in (["--check", "--report-json"], ["--check", "--skip-budgets", "--report-json"]):
             r_json = subprocess.run(
                 ["/bin/bash", str(SWITCH_SH), *argv],
                 env=ctx["env"],

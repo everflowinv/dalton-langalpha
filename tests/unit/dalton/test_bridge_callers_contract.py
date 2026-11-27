@@ -44,6 +44,7 @@ COVERED_BRIDGE_CALLER_FILES: set[str] = {
     "plugins/dalton/skills/dalton-conventions/scripts/connector_transport.py",
     "src/dalton/data_map/health.py",
     "scripts/dalton/research_runtime/host_connectors/bridge_alphaengine_proxy.py",
+    "scripts/dalton/ops/prod/preflight.py",
 }
 
 DOCUMENTED_TOOLS_CALL_EXCEPTIONS: dict[str, str] = {
@@ -690,3 +691,20 @@ async def test_federated_alphaengine_proxy_matches_bridge_route_contract() -> No
     assert len(seen_bodies) == 1
     assert seen_headers[0]["authorization"] == "Bearer bridge-secret-tok"
     assert seen_headers[0]["x-dalton-caller-key"] == "user:alice"
+
+
+def test_preflight_probe_services_legacy_requests_match_bridge_route_contract() -> None:
+    import sys
+
+    preflight_path = REPO_ROOT / "scripts" / "dalton" / "ops" / "prod" / "preflight.py"
+    spec = importlib.util.spec_from_file_location("dalton_preflight_contract_check", preflight_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+
+    for route, op in (("company-wiki", "search"), ("guidepoint", "search_library")):
+        rpc = mod.build_legacy_bridge_probe_rpc(route, op, "cloud", req_id=1, limit=1)
+        assert rpc["method"] == "tools/call"
+        params = rpc["params"]
+        assert_valid_bridge_call(params["name"], params["arguments"])
