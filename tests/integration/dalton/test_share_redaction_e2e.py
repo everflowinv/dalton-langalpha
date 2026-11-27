@@ -30,6 +30,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 import tracemalloc
@@ -45,7 +46,6 @@ import httpx
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from pathlib import Path
-import psycopg
 import pytest
 
 from scripts.dalton.ops import privatize_shared_thread_objects as ops_script
@@ -724,10 +724,17 @@ async def test_e2e_s19_unkeyed_oss_remote_and_dev_fallback_transcription_ticket_
 @pytest.mark.asyncio
 async def test_e2e_b6_deleted_thread_org_library_and_activity_cursor_pagination(
     monkeypatch: pytest.MonkeyPatch,
-    test_db_uri: str,
+    test_db_pool: Any,
+    dalton_schema: Any,
+    patched_get_db_connection: Any,
+    seed_user: dict[str, Any],
+    seed_workspace: dict[str, Any],
 ) -> None:
-    """B6: Verify d059 tables exist in real DB and multi-page GET /activity & /org-library/service pagination."""
-    async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as conn:
+    """B6: Real DB migrations (upstream + Dalton d059), real thread insert & delete, and real SQL multi-page cursor pagination."""
+    from datetime import timedelta
+    from src.server.database import org_library as org_library_db
+
+    async with patched_get_db_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
                 """
@@ -738,186 +745,203 @@ async def test_e2e_b6_deleted_thread_org_library_and_activity_cursor_pagination(
                 ORDER BY table_name
                 """
             )
-            tables = [row[0] for row in await cur.fetchall()]
+            rows_tbl = await cur.fetchall()
+            tables = [
+                row["table_name"] if isinstance(row, dict) else row[0]
+                for row in rows_tbl
+            ]
     assert tables == ["dalton_org_library_title_meta", "dalton_storage_key_migrations"]
 
-    deleted_tid = str(uuid.uuid4())
+    user_id = str(seed_user["user_id"])
+    workspace_id = str(seed_workspace["workspace_id"])
+    org_id = f"org-b6-{uuid.uuid4().hex[:8]}"
     now = datetime.now(timezone.utc)
-    item_ids = [str(uuid.uuid4()) for _ in range(3)]
-    for iid in item_ids:
-        await share_redaction.upsert_org_library_title_meta(iid, custom_title=False)
 
-    lib_pages = {
-        None: (
-            [
-                {
-                    "item_id": item_ids[0],
-                    "org_id": "org-b6",
-                    "kind": "thread",
-                    "thread_id": deleted_tid,
-                    "publisher_id": "u1",
-                    "publisher_name": "Alice",
-                    "owner_id": "u1",
-                    "listed": True,
-                    "audience": "public",
-                    "share_token": "tok-0",
-                    "title": "SECRET_AUTO_LIB_01",
-                    "summary": "Check /api/v1/artifacts/g/v1.grant_lib_summary_01/v/1/a.html reports/财报.pdf reports/README",
-                    "published_at": now,
-                    "created_at": now,
-                    "updated_at": now,
-                },
-                {
-                    "item_id": item_ids[1],
-                    "org_id": "org-b6",
-                    "kind": "thread",
-                    "thread_id": deleted_tid,
-                    "publisher_id": "u1",
-                    "publisher_name": "Alice",
-                    "owner_id": "u1",
-                    "listed": True,
-                    "audience": "public",
-                    "share_token": "tok-1",
-                    "title": "SECRET_AUTO_LIB_02",
-                    "summary": "Check /Users/alice/ws/secret.py",
-                    "published_at": now,
-                    "created_at": now,
-                    "updated_at": now,
-                },
-            ],
-            "cur-lib-page-2",
-        ),
-        "cur-lib-page-2": (
-            [
-                {
-                    "item_id": item_ids[2],
-                    "org_id": "org-b6",
-                    "kind": "skill",
-                    "thread_id": None,
-                    "skill_name": "alpha-skill",
-                    "publisher_id": "u1",
-                    "publisher_name": "Alice",
-                    "owner_id": "u1",
-                    "listed": True,
-                    "audience": "organization",
-                    "title": "Alpha skill",
-                    "summary": "Skill notes in reports/财报.pdf",
-                    "published_at": now,
-                    "created_at": now,
-                    "updated_at": now,
-                }
-            ],
-            None,
-        ),
-    }
+    kept_tids = [str(uuid.uuid4()) for _ in range(3)]
+    deleted_tid = str(uuid.uuid4())
+    all_tids = [*kept_tids, deleted_tid]
+    published_item_ids: dict[str, str] = {}
 
-    act_pages = {
-        None: (
-            [
-                {
-                    "event_id": str(uuid.uuid4()),
-                    "org_id": "org-b6",
-                    "actor_id": "u1",
-                    "action": activity_svc.Action.LIBRARY_PUBLISHED.value,
-                    "outcome": "ok",
-                    "resource_kind": "library_item",
-                    "resource_id": item_ids[0],
-                    "workspace_id": None,
-                    "thread_id": deleted_tid,
-                    "detail": {"kind": "thread", "title": "SECRET_AUTO_LIB_01", "custom_title": False},
-                    "occurred_at": now,
-                }
-            ],
-            "cur-act-page-2",
-            True,
-        ),
-        "cur-act-page-2": (
-            [
-                {
-                    "event_id": str(uuid.uuid4()),
-                    "org_id": "org-b6",
-                    "actor_id": "u1",
-                    "action": activity_svc.Action.FILE_PUBLISHED.value,
-                    "outcome": "ok",
-                    "resource_kind": "artifact",
-                    "resource_id": str(uuid.uuid4()),
-                    "workspace_id": str(uuid.uuid4()),
-                    "thread_id": None,
-                    "detail": {"path": "reports/财报.pdf", "version": 1},
-                    "occurred_at": now,
-                }
-            ],
-            None,
-            False,
-        ),
-    }
+    async with patched_get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            for idx, tid in enumerate(all_tids):
+                tok = f"b6tok{idx}_{uuid.uuid4().hex[:8]}"
+                await cur.execute(
+                    """
+                    INSERT INTO conversation_threads
+                        (conversation_thread_id, workspace_id, user_id, title,
+                         is_shared, share_token, share_permissions, shared_at)
+                    VALUES (%s::uuid, %s::uuid, %s, %s, TRUE, %s, %s::jsonb, NOW())
+                    """,
+                    (
+                        tid,
+                        workspace_id,
+                        user_id,
+                        f"SECRET_AUTO_LIB_{idx}",
+                        tok,
+                        json.dumps({"allow_files": False, "allow_download": False, "audience": "public"}),
+                    ),
+                )
 
-    monkeypatch.setattr(
-        org_library_app.library_db,
-        "list_items",
-        create_autospec(
-            org_library_app.library_db.list_items,
-            side_effect=lambda org_id, kind=None, cursor=None, limit=50, listed_only=False: lib_pages[cursor],
-        ),
-    )
-    monkeypatch.setattr(
-        activity_app,
-        "list_for_org",
-        create_autospec(
-            activity_app.list_for_org,
-            side_effect=lambda org_id, *, cursor=None, limit=activity_app.PAGE_SIZE: act_pages[cursor],
-        ),
-    )
+    for idx, tid in enumerate(all_tids):
+        published = await org_library_db.publish(
+            org_id=org_id,
+            publisher_id=user_id,
+            kind="thread",
+            target_id=tid,
+            title=None,
+            summary=f"Check /api/v1/artifacts/g/v1.grant_lib_summary_{idx}/v/1/a.html reports/财报.pdf reports/README",
+            owner_id=user_id,
+        )
+        assert published is not None
+        item_id, _created = published
+        published_item_ids[tid] = item_id
+        await share_redaction.upsert_org_library_title_meta(item_id, custom_title=False)
+
+    # Spread published_at timestamps deterministically and insert settled (>60s old) activity_events rows.
+    async with patched_get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            for idx, tid in enumerate(all_tids):
+                await cur.execute(
+                    """
+                    UPDATE org_library_items
+                    SET published_at = %s
+                    WHERE item_id = %s::uuid
+                    """,
+                    (now - timedelta(minutes=10 - idx), published_item_ids[tid]),
+                )
+
+            # Insert 3 activity events older than SETTLE_S (60s) so real list_for_org returns them across 2+ pages.
+            act_rows = [
+                (
+                    now - timedelta(minutes=8),
+                    activity_svc.Action.LIBRARY_PUBLISHED.value,
+                    "library_item",
+                    published_item_ids[deleted_tid],
+                    None,
+                    deleted_tid,
+                    {"kind": "thread", "title": "SECRET_DELETED_THREAD_TITLE", "custom_title": False},
+                ),
+                (
+                    now - timedelta(minutes=7),
+                    activity_svc.Action.LIBRARY_PUBLISHED.value,
+                    "library_item",
+                    published_item_ids[kept_tids[0]],
+                    workspace_id,
+                    kept_tids[0],
+                    {"kind": "thread", "title": "SECRET_AUTO_LIB_0", "custom_title": False},
+                ),
+                (
+                    now - timedelta(minutes=6),
+                    activity_svc.Action.FILE_PUBLISHED.value,
+                    "artifact",
+                    str(uuid.uuid4()),
+                    workspace_id,
+                    None,
+                    {"path": "reports/财报.pdf", "version": 1},
+                ),
+            ]
+            for occurred_at, action_val, res_kind, res_id, ws_col, t_col, detail_obj in act_rows:
+                await cur.execute(
+                    """
+                    INSERT INTO activity_events
+                        (occurred_at, org_id, actor_id, action, outcome,
+                         resource_kind, resource_id, workspace_id, thread_id, detail)
+                    VALUES (%s, %s, %s, %s, 'done', %s, %s, %s::uuid, %s::uuid, %s::jsonb)
+                    """,
+                    (
+                        occurred_at,
+                        org_id,
+                        user_id,
+                        action_val,
+                        res_kind,
+                        res_id,
+                        ws_col,
+                        t_col,
+                        json.dumps(detail_obj),
+                    ),
+                )
+
+            # Physically delete one thread (cascades its org_library_items row; activity_events row remains).
+            await cur.execute(
+                "DELETE FROM conversation_threads WHERE conversation_thread_id = %s::uuid",
+                (deleted_tid,),
+            )
+
     monkeypatch.setattr(api_utils, "_SERVICE_TOKEN", "s" * 40)
 
     app = FastAPI()
     app.include_router(org_library_app.router)
     app.include_router(activity_app.router)
-    client = TestClient(app)
     svc_headers = {"X-Service-Token": "s" * 40}
 
-    # Paginate GET /api/v1/org-library/service across 2 pages
-    p1 = client.get("/api/v1/org-library/service?org_id=org-b6&limit=2", headers=svc_headers)
-    assert p1.status_code == 200
-    b1 = p1.json()
-    assert len(b1["items"]) == 2
-    assert b1["next_cursor"] == "cur-lib-page-2"
-    assert all(it["title"] == DEFAULT_SHARED_TITLE for it in b1["items"])
-    assert "grant_lib_summary_01" not in p1.text
-    assert "reports/财报.pdf" not in p1.text
-    assert "reports/README" not in p1.text
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # 1. Real SQL pagination on GET /api/v1/org-library/service (limit=2 -> 2 pages for 3 kept items)
+        p1 = await client.get(
+            f"/api/v1/org-library/service?org_id={org_id}&limit=2",
+            headers=svc_headers,
+        )
+        assert p1.status_code == 200
+        b1 = p1.json()
+        assert len(b1["items"]) == 2
+        assert b1["next_cursor"] is not None
 
-    p2 = client.get(
-        f"/api/v1/org-library/service?org_id=org-b6&limit=2&cursor={b1['next_cursor']}",
-        headers=svc_headers,
-    )
-    assert p2.status_code == 200
-    b2 = p2.json()
-    assert len(b2["items"]) == 1
-    assert b2["next_cursor"] is None
-    assert "reports/财报.pdf" not in p2.text
+        p2 = await client.get(
+            f"/api/v1/org-library/service?org_id={org_id}&limit=2&cursor={b1['next_cursor']}",
+            headers=svc_headers,
+        )
+        assert p2.status_code == 200
+        b2 = p2.json()
+        assert len(b2["items"]) == 1
+        assert b2["next_cursor"] is None
 
-    # Paginate GET /api/v1/activity across 2 pages with required ServiceCaller + org_id + items field
-    a1 = client.get("/api/v1/activity?org_id=org-b6&limit=1", headers=svc_headers)
-    assert a1.status_code == 200
-    ab1 = a1.json()
-    assert len(ab1["items"]) == 1
-    assert ab1["has_more"] is True
-    assert ab1["next_cursor"] == "cur-act-page-2"
-    assert ab1["items"][0]["detail"]["title"] == DEFAULT_SHARED_TITLE
-    assert "custom_title" not in ab1["items"][0]["detail"]
+        all_lib_items = [*b1["items"], *b2["items"]]
+        assert len(all_lib_items) == 3
+        assert {it["thread_id"] for it in all_lib_items} == set(kept_tids)
+        assert deleted_tid not in {it["thread_id"] for it in all_lib_items}
+        assert all(it["title"] == DEFAULT_SHARED_TITLE for it in all_lib_items)
+        combined_lib_text = p1.text + p2.text
+        assert "grant_lib_summary_" not in combined_lib_text
+        assert "reports/财报.pdf" not in combined_lib_text
+        assert "reports/README" not in combined_lib_text
+        assert "SECRET_AUTO_LIB_" not in combined_lib_text
 
-    a2 = client.get(
-        f"/api/v1/activity?org_id=org-b6&limit=1&cursor={ab1['next_cursor']}",
-        headers=svc_headers,
-    )
-    assert a2.status_code == 200
-    ab2 = a2.json()
-    assert len(ab2["items"]) == 1
-    assert ab2["has_more"] is False
-    assert ab2["next_cursor"] is None
-    assert ab2["items"][0]["detail"]["path"] == "[redacted-path]"
-    assert "财报.pdf" not in a2.text
+        # 2. Real SQL pagination on GET /api/v1/activity (limit=2 -> 2 pages for 3 settled events)
+        a1 = await client.get(
+            f"/api/v1/activity?org_id={org_id}&limit=2",
+            headers=svc_headers,
+        )
+        assert a1.status_code == 200
+        ab1 = a1.json()
+        assert len(ab1["items"]) == 2
+        assert ab1["has_more"] is True
+        assert ab1["next_cursor"] is not None
+
+        a2 = await client.get(
+            f"/api/v1/activity?org_id={org_id}&limit=2&cursor={ab1['next_cursor']}",
+            headers=svc_headers,
+        )
+        assert a2.status_code == 200
+        ab2 = a2.json()
+        assert len(ab2["items"]) == 1
+        assert ab2["has_more"] is False
+
+        all_act_items = [*ab1["items"], *ab2["items"]]
+        assert len(all_act_items) == 3
+        # Deleted thread's historical activity row renders generic safe title and strips custom_title
+        deleted_act = [it for it in all_act_items if it.get("thread_id") == deleted_tid]
+        assert len(deleted_act) == 1
+        assert deleted_act[0]["detail"]["title"] == DEFAULT_SHARED_TITLE
+        assert "custom_title" not in deleted_act[0]["detail"]
+        # FILE_PUBLISHED path redacted
+        file_act = [it for it in all_act_items if it["action"] == activity_svc.Action.FILE_PUBLISHED.value]
+        assert len(file_act) == 1
+        assert file_act[0]["detail"]["path"] == "[redacted-path]"
+        combined_act_text = a1.text + a2.text
+        assert "SECRET_DELETED_THREAD_TITLE" not in combined_act_text
+        assert "SECRET_AUTO_LIB_" not in combined_act_text
+        assert "财报.pdf" not in combined_act_text
 
 
 @pytest.mark.asyncio
@@ -1123,7 +1147,11 @@ def test_e2e_scheme_a_storage_targets_and_strict_403_verify(
     live_endpoint = (os.getenv("TEST_MINIO_ENDPOINT") or "").strip()
     if live_endpoint:
         targets = share_media.resolve_active_storage_targets()
-        assert targets, "TEST_MINIO_ENDPOINT is set but resolve_active_storage_targets() returned empty"
+        distinct_buckets = {t.bucket_name for t in targets if t.bucket_name}
+        assert len(distinct_buckets) >= 3, (
+            f"Expected at least 3 distinct physical buckets (primary, chat-upload, transcription), "
+            f"got {len(distinct_buckets)}: {sorted(distinct_buckets)}"
+        )
         ok, checks = ops_script.verify_storage_targets(targets=targets, probe_write=True)
         assert ok is True, f"Live Scheme A verify failed: {checks}"
         return

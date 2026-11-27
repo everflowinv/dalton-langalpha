@@ -316,6 +316,62 @@ def append_atomic_share_permissions_set(
     params.extend([wrapped, wrapped, wrapped])
 
 
+async def atomic_update_thread_sharing(
+    conversation_thread_id: str,
+    is_shared: bool,
+    *,
+    share_permissions: Mapping[str, Any] | None = None,
+    shared_at: Any | None = None,
+    share_permissions_patch: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Dalton-owned atomic JSONB merge UPDATE for ``conversation_threads`` sharing settings.
+
+    Reuses ``mint_share_code`` and returns the exact same ``RETURNING`` columns as
+    upstream ``threads_write.update_thread_sharing`` without touching upstream SQL.
+    """
+    from psycopg.types.json import Json
+
+    from src.server.database import pool
+    from src.server.database.share_codes import mint_share_code
+
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            sets = ["is_shared = %s", "updated_at = NOW()"]
+            params: list[Any] = [is_shared]
+
+            if is_shared:
+                sets.append("share_token = COALESCE(share_token, %s)")
+                params.append(mint_share_code())
+
+            if share_permissions_patch is not None:
+                append_atomic_share_permissions_set(
+                    sets, params, share_permissions_patch, Json
+                )
+            elif share_permissions is not None:
+                sets.append("share_permissions = %s")
+                params.append(Json(dict(share_permissions)))
+
+            if shared_at is not None:
+                sets.append("shared_at = %s")
+                params.append(shared_at)
+
+            params.append(conversation_thread_id)
+
+            await cur.execute(
+                f"""
+                UPDATE conversation_threads
+                SET {", ".join(sets)}
+                WHERE conversation_thread_id = %s
+                RETURNING conversation_thread_id, workspace_id, share_token,
+                          is_shared, share_permissions, shared_at,
+                          current_status, msg_type, title, created_at, updated_at
+                """,
+                tuple(params),
+            )
+            result = await cur.fetchone()
+            return dict(result) if result else None
+
+
 async def apply_thread_share_update(
     update_fn: Any,
     thread_id: str,
@@ -325,30 +381,88 @@ async def apply_thread_share_update(
     effective_perms: Mapping[str, Any],
     patch: Mapping[str, Any] | None,
 ) -> Any:
-    """Invoke ``update_thread_sharing`` using atomic SQL JSONB patch merge whenever supported."""
+    """Update thread sharing using Dalton's atomic SQL JSONB patch merge in production,
+    while honoring test monkeypatches on ``sharing.update_thread_sharing``."""
     from src.server.database.conversation.threads_write import (
-        update_thread_sharing as real_update_thread_sharing,
+        update_thread_sharing as upstream_update_thread_sharing,
     )
+
+    if update_fn is upstream_update_thread_sharing:
+        return await atomic_update_thread_sharing(
+            thread_id,
+            is_shared=is_shared,
+            shared_at=shared_at,
+            share_permissions_patch=dict(patch) if patch is not None else None,
+            share_permissions=dict(effective_perms) if patch is None else None,
+        )
 
     kwargs: dict[str, Any] = {"is_shared": is_shared}
     if shared_at is not None:
         kwargs["shared_at"] = shared_at
     if patch is not None:
-        if update_fn is real_update_thread_sharing or getattr(
-            update_fn, "_supports_atomic_share_patch", False
-        ):
+        if getattr(update_fn, "_supports_atomic_share_patch", False):
             kwargs["share_permissions_patch"] = dict(patch)
         else:
             kwargs["share_permissions"] = dict(effective_perms)
     return await update_fn(thread_id, **kwargs)
 
 
+async def apply_share_update_request(
+    thread_id: str,
+    existing_perms: Mapping[str, Any] | None,
+    effective_req_permissions: Any | None,
+    *,
+    is_shared: bool,
+    shared_at: Any | None,
+    x_user_id: str | None,
+    require_admin_fn: Any,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, int] | None]:
+    """Full AU1 orchestrator for ``POST /threads/{id}/share`` (thin-hook target for ``sharing.py``).
+
+    Merges permissions, enforces admin gate for file/download access, runs atomic
+    JSONB update, warms slices / computes DB-only summary, and normalizes response
+    permissions.
+    """
+    from fastapi import HTTPException
+
+    from src.server.app.threads import sharing as sharing_app
+
+    effective_perms, perms_patch = prepare_share_permissions_update(
+        existing_perms, effective_req_permissions
+    )
+    if is_shared and (
+        effective_perms.get("allow_files") or effective_perms.get("allow_download")
+    ):
+        await require_admin_fn(x_user_id)
+
+    updated = await apply_thread_share_update(
+        sharing_app.update_thread_sharing,
+        thread_id,
+        is_shared=is_shared,
+        shared_at=shared_at,
+        effective_perms=effective_perms,
+        patch=perms_patch,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    summary_dict = await post_update_thread_share_hook(
+        thread_id, is_shared=bool(updated.get("is_shared"))
+    )
+
+    raw_perms = updated.get("share_permissions") or {}
+    if isinstance(raw_perms, str):
+        raw_perms = json.loads(raw_perms)
+    perms = normalize_merged_share_permissions(raw_perms, None)
+    return updated, perms, summary_dict
+
+
 async def maybe_summarize_thread_share_redaction(
     thread_id: str,
-    include_summary: bool,
+    include_summary: Any,
 ) -> dict[str, int] | None:
-    """Return DB-only redaction summary iff ``include_summary`` is requested."""
-    if not include_summary:
+    """Return DB-only redaction summary iff ``include_summary`` is strictly ``True``."""
+    if include_summary is not True:
         return None
     return await summarize_thread_share_redaction(thread_id)
 
@@ -482,12 +596,9 @@ def _strip_thinking_from_plain_chunk(chunk: str, *, is_tail: bool) -> str:
             if not is_close:
                 stack.append(tag_name)
             else:
-                # Pop matching tag (or unwind inner unclosed tags to match outer).
-                if tag_name in stack:
-                    while stack:
-                        popped = stack.pop()
-                        if popped == tag_name:
-                            break
+                # Only pop when closing tag matches the top of the stack.
+                if stack and stack[-1] == tag_name:
+                    stack.pop()
                 if not stack:
                     pos = m.end()
 
@@ -610,6 +721,10 @@ def _split_code_protected_segments(text: str) -> list[tuple[str, str]]:
                 at_line_start = text[found_close - 1] == "\n"
                 i = found_close
                 continue
+            buf.append(text[i:k])
+            at_line_start = False
+            i = k
+            continue
 
         buf.append(text[i])
         at_line_start = text[i] == "\n"
@@ -746,10 +861,8 @@ def strip_inline_thinking_markers(text: str) -> str:
                 if not is_close:
                     stack.append(tag_name)
                 else:
-                    if tag_name in stack:
-                        while stack:
-                            if stack.pop() == tag_name:
-                                break
+                    if stack and stack[-1] == tag_name:
+                        stack.pop()
                     if not stack:
                         after_tags.append(("tag_break", ""))
                         pos = m.end()
@@ -2501,17 +2614,67 @@ async def _load_workspace_roots_map(
         return {}
 
 
+async def enforce_shared_file_permissions(
+    thread: Mapping[str, Any],
+    workspace: Mapping[str, Any] | None = None,
+    *,
+    require_files: bool = False,
+    require_download: bool = False,
+) -> None:
+    """Enforce effective ``allow_files`` / ``allow_download`` on shared file routes (thin-hook target for ``share_access.py``)."""
+    if not (require_files or require_download):
+        return
+    from fastapi import HTTPException
+
+    deny_headers = {"Cache-Control": "no-store", "Clear-Site-Data": '"cache"'}
+    eff = await resolve_effective_share_permissions(thread, workspace)
+    if not eff.allow_files:
+        detail = (
+            "仅管理员开启的公开对话分享允许访问工作区文件"
+            if workspace is not None
+            else "Permission 'allow_files' not granted for this shared thread"
+        )
+        raise HTTPException(status_code=403, detail=detail, headers=deny_headers)
+    if require_download and not eff.allow_download:
+        raise HTTPException(
+            status_code=403,
+            detail="Permission 'allow_download' not granted for this shared thread",
+            headers=deny_headers,
+        )
+
+
+async def prepare_public_thread_metadata(
+    thread: Mapping[str, Any],
+    response: Any,
+) -> dict[str, Any]:
+    """Compute effective permissions, cache-clearing header, and safe metadata fields for ``public.py``."""
+    eff = await resolve_effective_share_permissions(thread)
+    if not eff.allow_files and response is not None:
+        response.headers["Clear-Site-Data"] = '"cache"'
+    fields = await resolve_public_metadata_fields(thread, allow_files=eff.allow_files)
+    return {
+        **fields,
+        "allow_files": eff.allow_files,
+        "allow_download": eff.allow_download,
+    }
+
+
 async def _load_thread_protected_urls_map(
     thread_ids: Iterable[str],
-) -> dict[str, set[str]]:
-    """Batch-load each thread's registered ``protected_urls`` from the same DB sources as replay."""
+) -> dict[str, set[str]] | None:
+    """Batch-load each thread's registered ``protected_urls`` across ALL attempts.
+
+    Returns ``{}`` only when the DB pool is not open (unit tests without DB).
+    Returns ``None`` on any other DB error so callers fail closed (safe title only,
+    no summary or snippets).
+    """
     ids = list({str(tid) for tid in thread_ids if tid})
     if not ids:
         return {}
     from src.server.database.pool import get_db_connection
 
     queries_by_tid: dict[str, list[dict[str, Any]]] = {}
-    responses_by_tid: dict[str, dict[Any, dict[str, Any]]] = {}
+    responses_by_tid: dict[str, list[dict[str, Any]]] = {}
     run_facts_by_tid: dict[str, list[dict[str, Any]]] = {}
     try:
         async with get_db_connection() as conn:
@@ -2540,7 +2703,7 @@ async def _load_thread_protected_urls_map(
                 )
                 for row in await cur.fetchall():
                     tid = str(row["thread_id"])
-                    responses_by_tid.setdefault(tid, {})[row.get("turn_index")] = dict(row)
+                    responses_by_tid.setdefault(tid, []).append(dict(row))
 
                 await cur.execute(
                     """
@@ -2557,9 +2720,17 @@ async def _load_thread_protected_urls_map(
     except RuntimeError as exc:
         if "pool is not open" in str(exc).lower():
             return {}
-        raise
+        logger.warning(
+            "Failed loading protected_urls for org-library/activity redaction; failing closed",
+            exc_info=True,
+        )
+        return None
     except Exception:
-        return {}
+        logger.warning(
+            "Failed loading protected_urls for org-library/activity redaction; failing closed",
+            exc_info=True,
+        )
+        return None
 
     out: dict[str, set[str]] = {}
     for tid in ids:
@@ -2618,6 +2789,9 @@ async def redact_org_library_rows(
     else:
         meta_map, threads_map, protected_urls_map = {}, {}, {}
 
+    protected_urls_failed = protected_urls_map is None
+    safe_protected_map = protected_urls_map if protected_urls_map is not None else {}
+
     eff_cache: dict[str, EffectiveSharePermissions] = {}
     for tid in thread_ids:
         trow = threads_map.get(tid)
@@ -2642,18 +2816,23 @@ async def redact_org_library_rows(
         trow = threads_map.get(tid) if tid else None
         eff = eff_cache.get(tid, EffectiveSharePermissions(False, False))
         if not eff.allow_files:
-            roots = extract_thread_roots(trow)
-            p_urls = protected_urls_map.get(tid, ())
-            is_custom = meta_map.get(str(copied.get("item_id") or ""), False)
-            if is_custom:
-                copied["title"] = clean_org_library_title(
-                    copied.get("title"), protected_urls=p_urls, roots=roots
-                )
-            else:
+            if protected_urls_failed:
+                # Fail closed: emit only the generic safe title, omitting summary/snippets.
                 copied["title"] = DEFAULT_SHARED_TITLE
-            copied["summary"] = clean_org_library_summary(
-                copied.get("summary"), protected_urls=p_urls, roots=roots
-            )
+                copied["summary"] = ""
+            else:
+                roots = extract_thread_roots(trow)
+                p_urls = safe_protected_map.get(tid, ())
+                is_custom = meta_map.get(str(copied.get("item_id") or ""), False)
+                if is_custom:
+                    copied["title"] = clean_org_library_title(
+                        copied.get("title"), protected_urls=p_urls, roots=roots
+                    )
+                else:
+                    copied["title"] = DEFAULT_SHARED_TITLE
+                copied["summary"] = clean_org_library_summary(
+                    copied.get("summary"), protected_urls=p_urls, roots=roots
+                )
         result.append(copied)
     return result
 
@@ -2728,6 +2907,9 @@ async def redact_activity_rows(
         _load_workspace_roots_map(workspace_ids_no_thread),
     )
 
+    protected_urls_failed = protected_urls_map is None
+    safe_protected_map = protected_urls_map if protected_urls_map is not None else {}
+
     eff_cache: dict[str, EffectiveSharePermissions] = {}
     for tid in set(thread_ids):
         trow = threads_map.get(tid)
@@ -2752,7 +2934,7 @@ async def redact_activity_rows(
         wid = str(copied.get("workspace_id") or "")
         trow = threads_map.get(tid) if tid else None
         roots = extract_thread_roots(trow) if trow is not None else ws_roots_map.get(wid, ())
-        p_urls = protected_urls_map.get(tid, ())
+        p_urls = safe_protected_map.get(tid, ())
         eff = (
             eff_cache.get(tid, EffectiveSharePermissions(False, False))
             if tid
@@ -2768,6 +2950,17 @@ async def redact_activity_rows(
 
         # Always remove internal marker before returning
         detail.pop("custom_title", None)
+
+        if protected_urls_failed and tid and not eff.allow_files:
+            # Fail closed: keep only safe title (and structural kind when present), drop summary/snippets.
+            safe_detail: dict[str, Any] = {}
+            if is_library_thread:
+                safe_detail["kind"] = "thread"
+            if is_library_thread or has_thread_title:
+                safe_detail["title"] = DEFAULT_SHARED_TITLE
+            copied["detail"] = safe_detail
+            out.append(copied)
+            continue
 
         if (is_library_thread or has_thread_title) and not eff.allow_files:
             if is_custom_title:
@@ -3172,10 +3365,10 @@ def _is_main_channel(agent: Any) -> bool:
 
 def collect_thread_protected_urls(
     queries: Iterable[Mapping[str, Any]] | None = None,
-    responses_by_turn: Mapping[Any, Mapping[str, Any]] | None = None,
+    responses_by_turn: Mapping[Any, Any] | Iterable[Mapping[str, Any]] | None = None,
     run_facts: Iterable[Mapping[str, Any]] | None = None,
 ) -> set[str]:
-    """Gather all registered media/attachment/preview URLs for a thread."""
+    """Gather all registered media/attachment/preview URLs for a thread across all attempts."""
     urls: set[str] = set()
     for q in queries or ():
         meta = q.get("metadata") if isinstance(q, Mapping) else None
@@ -3183,9 +3376,20 @@ def collect_thread_protected_urls(
             for att in meta.get("attachments") or ():
                 if isinstance(att, Mapping) and att.get("url"):
                     urls.add(str(att["url"]))
-    for resp in (responses_by_turn or {}).values():
-        if not isinstance(resp, Mapping):
-            continue
+    resp_rows: list[Mapping[str, Any]] = []
+    if isinstance(responses_by_turn, Mapping):
+        for val in responses_by_turn.values():
+            if isinstance(val, Mapping):
+                resp_rows.append(val)
+            elif isinstance(val, (list, tuple)):
+                for item in val:
+                    if isinstance(item, Mapping):
+                        resp_rows.append(item)
+    elif responses_by_turn is not None:
+        for item in responses_by_turn:
+            if isinstance(item, Mapping):
+                resp_rows.append(item)
+    for resp in resp_rows:
         facts = resp.get("replay_facts")
         if isinstance(facts, Mapping):
             imgs = facts.get("images")
@@ -3502,10 +3706,78 @@ class StrictNoFilesShareRedactor:
                 ),
             }
 
+    def _apply_message_opening_thinking_scan(
+        self, cycle_body: list[tuple[str, Any]]
+    ) -> list[tuple[str, Any]]:
+        """Scan all text events per message id across all phases using ``scan_opening_thinking_spans``.
+
+        - Unclosed opening thinking block -> drops ALL text chunks of that message.
+        - Closed opening thinking block -> maps stripped spans back onto each chunk
+          so cross-phase residual text in ``final_answer`` is removed before selection.
+        """
+        from src.dalton.thinking_spans import scan_opening_thinking_spans
+
+        # Group indices of text message_chunk entries by message id (preserving order).
+        groups: dict[str, list[int]] = {}
+        for idx, (k, p) in enumerate(cycle_body):
+            if k != "message_chunk" or not isinstance(p, dict):
+                continue
+            raw_id = str(p.get("id") or "").strip()
+            group_key = raw_id if raw_id else f"__anon_{idx}"
+            groups.setdefault(group_key, []).append(idx)
+
+        replacements: dict[int, str | None] = {}
+        for indices in groups.values():
+            parts = [str(cycle_body[i][1].get("content") or "") for i in indices]
+            full_text = "".join(parts)
+            if not full_text:
+                continue
+            scan = scan_opening_thinking_spans(full_text)
+            if scan.unclosed:
+                for i in indices:
+                    replacements[i] = None
+                continue
+            if not scan.strip_spans:
+                continue
+            offset = 0
+            for i, text_part in zip(indices, parts):
+                b_start = offset
+                b_end = offset + len(text_part)
+                offset = b_end
+                cursor = b_start
+                kept: list[str] = []
+                for s_start, s_end in scan.strip_spans:
+                    if s_end <= cursor:
+                        continue
+                    if s_start >= b_end:
+                        break
+                    if s_start > cursor:
+                        kept.append(text_part[cursor - b_start : s_start - b_start])
+                    cursor = max(cursor, min(s_end, b_end))
+                if cursor < b_end:
+                    kept.append(text_part[cursor - b_start : b_end - b_start])
+                remaining = "".join(kept)
+                replacements[i] = remaining if remaining else None
+
+        if not replacements:
+            return cycle_body
+
+        filtered: list[tuple[str, Any]] = []
+        for idx, (k, p) in enumerate(cycle_body):
+            if idx not in replacements:
+                filtered.append((k, p))
+                continue
+            new_text = replacements[idx]
+            if new_text is None:
+                continue
+            filtered.append((k, {**p, "content": new_text}))
+        return filtered
+
     def _select_cycle_final_output(
         self, cycle_body: list[tuple[str, Any]]
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Select final text chunks (Case A phase-aware or Case B trailing post-tool) and widgets."""
+        cycle_body = self._apply_message_opening_thinking_scan(cycle_body)
         widgets = [p for k, p in cycle_body if k == "html_widget" and isinstance(p, dict)]
 
         last_tool_pos = -1
@@ -3902,12 +4174,12 @@ async def post_update_thread_share_hook(
 async def build_public_replay_response(
     share_token: str,
     *,
-    before_turn: int | None,
-    get_shared_thread_fn: Any,
-    get_replay_thread_data_fn: Any,
-    observe_replay_stream_fn: Any,
-    shared_user_message_fn: Any,
-    share_redaction_cls: Any,
+    before_turn: int | None = None,
+    get_shared_thread_fn: Any = None,
+    get_replay_thread_data_fn: Any = None,
+    observe_replay_stream_fn: Any = None,
+    shared_user_message_fn: Any = None,
+    share_redaction_cls: Any = None,
 ) -> Any:
     """Full AU1 public replay SSE orchestrator (thin-hook target for ``public.py``)."""
     from fastapi import HTTPException
@@ -3917,9 +4189,22 @@ async def build_public_replay_response(
         resolve_thread_media_bindings,
         rewrite_items_for_public_media,
     )
+    from src.server.app import public as public_app
     from src.server.database.pool import DATABASE_UNAVAILABLE
     from src.server.services.history.replay import finish_lines, read_replay_page
     from src.server.utils.api import database_unavailable
+
+    get_shared_thread_fn = get_shared_thread_fn or public_app.get_shared_thread
+    get_replay_thread_data_fn = (
+        get_replay_thread_data_fn or public_app.get_replay_thread_data
+    )
+    observe_replay_stream_fn = (
+        observe_replay_stream_fn or public_app.observe_replay_stream
+    )
+    shared_user_message_fn = (
+        shared_user_message_fn or public_app._shared_user_message
+    )
+    share_redaction_cls = share_redaction_cls or public_app.ShareRedaction
 
     no_store_headers = {"Cache-Control": "no-store"}
     try:
@@ -4011,12 +4296,14 @@ async def build_public_replay_response(
         )
 
     items = [line.item() for line in page.lines]
+    thread_for_media = dict(thread)
+    rows_owner = getattr(rows, "owner_id", None)
+    if rows_owner and not thread_for_media.get("user_id"):
+        thread_for_media["user_id"] = str(rows_owner)
     bindings = await resolve_thread_media_bindings(
-        thread,
+        thread_for_media,
         rows.queries,
         items,
-        responses_by_turn=rows.responses_by_turn,
-        run_facts=rows.run_facts,
     )
     items = rewrite_items_for_public_media(
         items, thread_id=thread_id, share_token=share_token, bindings=bindings

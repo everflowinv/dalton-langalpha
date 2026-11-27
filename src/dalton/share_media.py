@@ -122,15 +122,37 @@ def is_public_avatar_key(key: str) -> bool:
     return False
 
 
-def _is_object_acl_disabled(*, endpoint_url: str | None = None) -> bool:
+def _is_r2_endpoint(endpoint_url: str | None) -> bool:
+    ep = (endpoint_url or "").strip().lower()
+    return "r2.cloudflarestorage.com" in ep
+
+
+def _resolve_object_acl_config(*, endpoint_url: str | None = None) -> str:
+    """Resolve effective object ACL policy: ``'auto'``, ``'on'``, or ``'off'``.
+
+    Explicit ``DALTON_STORAGE_OBJECT_ACL=auto|on|off`` configures the mode
+    (default ``auto``). Legacy ``DALTON_STORAGE_DISABLE_OBJECT_ACL`` /
+    ``STORAGE_DISABLE_OBJECT_ACL`` remain supported and act as ``off``.
+    """
     for env_name in ("DALTON_STORAGE_DISABLE_OBJECT_ACL", "STORAGE_DISABLE_OBJECT_ACL"):
         raw = (os.getenv(env_name) or "").strip().lower()
         if raw in ("1", "true", "yes", "on"):
-            return True
-    ep = (endpoint_url or "").strip().lower()
-    if "r2.cloudflarestorage.com" in ep:
+            return "off"
+    mode = (os.getenv("DALTON_STORAGE_OBJECT_ACL") or "auto").strip().lower()
+    if mode in ("off", "0", "false", "no"):
+        return "off"
+    if mode in ("on", "1", "true", "yes"):
+        return "on"
+    return "auto"
+
+
+def _is_object_acl_disabled(*, endpoint_url: str | None = None) -> bool:
+    cfg = _resolve_object_acl_config(endpoint_url=endpoint_url)
+    if cfg == "off":
         return True
-    return False
+    if cfg == "on":
+        return False
+    return _is_r2_endpoint(endpoint_url)
 
 
 def storage_private_acl_kwargs(
@@ -212,29 +234,42 @@ def mark_bucket_acl_unsupported(
         _BUCKET_ACL_SUPPORT_CACHE[_bucket_acl_cache_key(bucket_name, endpoint_url)] = False
 
 
-def bucket_supports_object_acl(
+def probe_bucket_object_acl_mode(
     client: Any,
     bucket_name: str,
     *,
     endpoint_url: str | None = None,
-) -> bool:
-    """Determine before presigning whether ``bucket_name`` accepts object-level ACLs.
+) -> str:
+    """Determine bucket object-ACL mode: ``'supported'``, ``'disabled'``, or ``'unknown'``.
 
-    Returns False for explicitly disabled ACLs, R2 endpoints, cached ACL-unsupported
-    buckets, or S3 buckets whose ``GetBucketOwnershipControls`` reports
-    ``BucketOwnerEnforced``.
+    - ``DALTON_STORAGE_OBJECT_ACL=off`` (or legacy ``*_DISABLE_OBJECT_ACL``) -> ``'disabled'``
+    - ``DALTON_STORAGE_OBJECT_ACL=on`` -> ``'supported'``
+    - ``auto`` (default):
+      - R2 endpoints or ``BucketOwnerEnforced`` -> ``'disabled'`` (cached)
+      - ``BucketOwnerPreferred`` / ``ObjectWriter`` or ownership-controls-absent
+        legacy bucket codes -> ``'supported'`` (cached)
+      - Missing probe method, ``AccessDenied``, or other errors -> ``'unknown'``
+        (NOT cached)
     """
-    if _is_object_acl_disabled(endpoint_url=endpoint_url):
-        return False
+    cfg = _resolve_object_acl_config(endpoint_url=endpoint_url)
+    if cfg == "off":
+        return "disabled"
+    if cfg == "on":
+        return "supported"
+    if _is_r2_endpoint(endpoint_url):
+        return "disabled"
+
     cache_key = _bucket_acl_cache_key(bucket_name, endpoint_url)
     with _BUCKET_ACL_CACHE_LOCK:
         cached = _BUCKET_ACL_SUPPORT_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+    if cached is True:
+        return "supported"
+    if cached is False:
+        return "disabled"
 
     probe = getattr(client, "get_bucket_ownership_controls", None)
     if not callable(probe) or not bucket_name:
-        return True
+        return "unknown"
 
     try:
         resp = probe(Bucket=bucket_name)
@@ -248,19 +283,17 @@ def bucket_supports_object_acl(
             if ownership == "BucketOwnerEnforced":
                 with _BUCKET_ACL_CACHE_LOCK:
                     _BUCKET_ACL_SUPPORT_CACHE[cache_key] = False
-                return False
+                return "disabled"
             if ownership in ("BucketOwnerPreferred", "ObjectWriter"):
                 with _BUCKET_ACL_CACHE_LOCK:
                     _BUCKET_ACL_SUPPORT_CACHE[cache_key] = True
-                return True
-        with _BUCKET_ACL_CACHE_LOCK:
-            _BUCKET_ACL_SUPPORT_CACHE[cache_key] = True
-        return True
+                return "supported"
+        return "unknown"
     except Exception as exc:
         if is_acl_not_supported_error(exc):
             with _BUCKET_ACL_CACHE_LOCK:
                 _BUCKET_ACL_SUPPORT_CACHE[cache_key] = False
-            return False
+            return "disabled"
         resp_map = getattr(exc, "response", None)
         code = (
             str((resp_map.get("Error") or {}).get("Code") or "")
@@ -270,13 +303,26 @@ def bucket_supports_object_acl(
         if code in _OWNERSHIP_FALLBACK_CODES:
             with _BUCKET_ACL_CACHE_LOCK:
                 _BUCKET_ACL_SUPPORT_CACHE[cache_key] = True
-            return True
+            return "supported"
         logger.debug(
-            "Could not query bucket ownership controls for %s (%s); defaulting to ACL enabled",
+            "Could not determine bucket ownership controls for %s (%s); treating ACL mode as unknown",
             bucket_name,
             code or type(exc).__name__,
         )
-        return True
+        return "unknown"
+
+
+def bucket_supports_object_acl(
+    client: Any,
+    bucket_name: str,
+    *,
+    endpoint_url: str | None = None,
+) -> bool:
+    """Return True iff ``bucket_name`` is confirmed (or explicitly configured) to support object ACLs."""
+    return (
+        probe_bucket_object_acl_mode(client, bucket_name, endpoint_url=endpoint_url)
+        == "supported"
+    )
 
 
 def s3_put_object_with_private_acl(
@@ -290,8 +336,10 @@ def s3_put_object_with_private_acl(
 ) -> Any:
     """Thin-hook helper for upstream ``s3_compatible`` uploads with private ACL & fallback."""
     acl_kwargs = storage_private_acl_kwargs(key, provider="s3", endpoint_url=endpoint_url)
-    if acl_kwargs and not bucket_supports_object_acl(
-        client, bucket, endpoint_url=endpoint_url
+    if (
+        acl_kwargs
+        and probe_bucket_object_acl_mode(client, bucket, endpoint_url=endpoint_url)
+        == "disabled"
     ):
         acl_kwargs = {}
     put_args: dict[str, Any] = {
@@ -323,8 +371,10 @@ def s3_create_multipart_with_private_acl(
 ) -> dict[str, Any]:
     """Thin-hook helper for upstream ``s3_compatible.open_multipart_upload``."""
     acl_kwargs = storage_private_acl_kwargs(key, provider="s3", endpoint_url=endpoint_url)
-    if acl_kwargs and not bucket_supports_object_acl(
-        client, bucket, endpoint_url=endpoint_url
+    if (
+        acl_kwargs
+        and probe_bucket_object_acl_mode(client, bucket, endpoint_url=endpoint_url)
+        == "disabled"
     ):
         acl_kwargs = {}
     params: dict[str, Any] = {
@@ -354,12 +404,26 @@ def s3_presign_put_with_private_acl(
     expires_in: int,
     endpoint_url: str | None = None,
 ) -> tuple[str, dict[str, str]]:
-    """Presign S3 single PUT after probing bucket ACL mode (omits ACL on ``BucketOwnerEnforced``)."""
+    """Presign S3 single PUT after probing bucket ACL mode.
+
+    Omits ``ACL`` / ``x-amz-acl`` when mode is ``disabled`` or ``unknown`` (in
+    ``auto`` mode), logging a warning on ``unknown`` without caching the probe.
+    """
     acl_kwargs = storage_private_acl_kwargs(key, provider="s3", endpoint_url=endpoint_url)
-    if acl_kwargs and not bucket_supports_object_acl(
-        client, bucket, endpoint_url=endpoint_url
-    ):
-        acl_kwargs = {}
+    if acl_kwargs:
+        acl_mode = probe_bucket_object_acl_mode(
+            client, bucket, endpoint_url=endpoint_url
+        )
+        if acl_mode == "disabled":
+            acl_kwargs = {}
+        elif acl_mode == "unknown":
+            acl_kwargs = {}
+            logger.warning(
+                "Bucket object ACL mode is unknown for bucket=%s endpoint=%s; "
+                "omitting ACL from presigned PUT (set DALTON_STORAGE_OBJECT_ACL=on|off to override)",
+                bucket,
+                endpoint_url or "default",
+            )
     params: dict[str, Any] = {
         "Bucket": bucket,
         "Key": key,
@@ -652,6 +716,21 @@ def _resolve_upstream_runtime_config() -> dict[str, Any] | None:
         public_bases: list[str] = []
         if explicit_pub:
             public_bases.append(explicit_pub)
+        if endpoint:
+            try:
+                from src.utils.storage.oss_uploader import OSSConfig
+
+                ep_host = re.sub(r"^https?://", "", endpoint, flags=re.IGNORECASE)
+
+                class _EnvOSSConfig(OSSConfig):
+                    BUCKET_NAME = bucket
+                    ENDPOINT = ep_host
+
+                runtime_oss_base = _EnvOSSConfig.get_public_url_base().strip().rstrip("/")
+                if runtime_oss_base and runtime_oss_base not in public_bases:
+                    public_bases.append(runtime_oss_base)
+            except Exception:
+                logger.debug("Could not resolve runtime OSSConfig public URL base", exc_info=True)
         default_oss_base = format_storage_endpoint_base(
             provider="oss",
             endpoint_url=endpoint,
@@ -688,22 +767,28 @@ def _resolve_upstream_runtime_config() -> dict[str, Any] | None:
     public_bases = []
     if explicit_pub:
         public_bases.append(explicit_pub)
-    else:
-        # Match actual runtime URL generator (s3_client.StorageConfig.get_public_url_base)
-        # while also deriving custom-endpoint base via actual addressing style.
-        ep_base = format_storage_endpoint_base(
-            provider="s3",
-            endpoint_url=endpoint,
-            bucket_name=bucket,
-            region=region,
-            addressing_style=style,
-        )
-        if ep_base:
-            public_bases.append(ep_base)
-        if not endpoint:
-            aws_base = f"https://{bucket}.s3.{region}.amazonaws.com"
-            if aws_base not in public_bases:
-                public_bases.append(aws_base)
+    # Always include the runtime StorageConfig.get_public_url_base() result so custom
+    # S3 endpoints without explicit PUBLIC_URL_BASE still probe the AWS default host
+    # generated by runtime get_public_url().
+    from src.utils.storage.s3_client import StorageConfig
+
+    class _EnvStorageConfig(StorageConfig):
+        BUCKET_NAME = bucket
+        REGION = region
+        PUBLIC_URL_BASE = explicit_pub or None
+
+    runtime_s3_base = _EnvStorageConfig.get_public_url_base().strip().rstrip("/")
+    if runtime_s3_base and runtime_s3_base not in public_bases:
+        public_bases.append(runtime_s3_base)
+    ep_base = format_storage_endpoint_base(
+        provider="s3",
+        endpoint_url=endpoint,
+        bucket_name=bucket,
+        region=region,
+        addressing_style=style,
+    )
+    if ep_base and ep_base not in public_bases:
+        public_bases.append(ep_base)
     return {
         "provider": "s3",
         "bucket_name": bucket,
@@ -1468,8 +1553,11 @@ class ThreadMediaRegistry:
 
     attachment_keys: set[str] = field(default_factory=set)
     attachment_ids: set[str] = field(default_factory=set)
+    attachment_urls: set[str] = field(default_factory=set)
+    attachment_owners: dict[str, set[str]] = field(default_factory=dict)
     upload_id_owners: dict[str, set[str]] = field(default_factory=dict)
     captured_image_keys: set[str] = field(default_factory=set)
+    captured_image_urls: set[str] = field(default_factory=set)
 
 
 def _register_attachment_mapping(
@@ -1482,12 +1570,26 @@ def _register_attachment_mapping(
         return
     raw_url = att.get("url")
     if isinstance(raw_url, str) and raw_url.strip():
-        k = extract_upstream_key_from_url(raw_url)
+        clean_url = raw_url.strip()
+        registry.attachment_urls.add(clean_url)
+        k = extract_upstream_key_from_url(clean_url)
         if k and _is_safe_object_key(k):
-            registry.attachment_keys.add(strip_private_media_prefix(k))
+            cleaned = strip_private_media_prefix(k)
+            registry.attachment_keys.add(cleaned)
+            if allowed_users:
+                registry.attachment_owners.setdefault(cleaned, set()).update(allowed_users)
+            if cleaned.startswith("attachments/"):
+                parts = cleaned.split("/")
+                if len(parts) >= 3 and parts[1]:
+                    registry.attachment_ids.add(parts[1])
+                    if allowed_users:
+                        registry.attachment_owners.setdefault(parts[1], set()).update(allowed_users)
     raw_att_id = att.get("attachment_id") or att.get("id")
     if isinstance(raw_att_id, str) and raw_att_id.strip():
-        registry.attachment_ids.add(raw_att_id.strip())
+        clean_aid = raw_att_id.strip()
+        registry.attachment_ids.add(clean_aid)
+        if allowed_users:
+            registry.attachment_owners.setdefault(clean_aid, set()).update(allowed_users)
     raw_uid = att.get("upload_id")
     if isinstance(raw_uid, str) and raw_uid.strip() and allowed_users:
         registry.upload_id_owners.setdefault(raw_uid.strip(), set()).update(allowed_users)
@@ -1514,33 +1616,87 @@ def _register_steering_messages_into_registry(
                 _register_attachment_mapping(att, registry, allowed_users=allowed)
 
 
+def _extract_response_sender_user_id(row: Mapping[str, Any]) -> str | None:
+    direct = str(row.get("sender_user_id") or "").strip()
+    if direct:
+        return direct
+    meta = row.get("metadata")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = None
+    if isinstance(meta, Mapping):
+        uid = str(meta.get("user_id") or "").strip()
+        if uid:
+            return uid
+    return None
+
+
+def _iter_response_rows(
+    response_rows: Iterable[Mapping[str, Any]] | None,
+    responses_by_turn: Mapping[Any, Any] | None,
+) -> list[Mapping[str, Any]]:
+    out: list[Mapping[str, Any]] = []
+    if response_rows is not None:
+        for r in response_rows:
+            if isinstance(r, Mapping):
+                out.append(r)
+    if isinstance(responses_by_turn, Mapping):
+        for val in responses_by_turn.values():
+            if isinstance(val, Mapping):
+                out.append(val)
+            elif isinstance(val, (list, tuple)):
+                for item in val:
+                    if isinstance(item, Mapping):
+                        out.append(item)
+    return out
+
+
 def _collect_thread_media_registry(
     thread_id: str,
     *,
     owner_id: str | None = None,
     queries: Iterable[Mapping[str, Any]] | None = None,
-    responses_by_turn: Mapping[Any, Mapping[str, Any]] | None = None,
+    response_rows: Iterable[Mapping[str, Any]] | None = None,
+    responses_by_turn: Mapping[Any, Any] | None = None,
     run_facts: Iterable[Mapping[str, Any]] | None = None,
     items: Iterable[Mapping[str, Any]] | None = None,
 ) -> ThreadMediaRegistry:
-    """Assemble the complete trusted object registry for ``thread_id``."""
+    """Assemble the complete trusted object registry for ``thread_id`` across all attempts."""
     registry = ThreadMediaRegistry()
     clean_owner = str(owner_id or "").strip() or None
+    all_responses = _iter_response_rows(response_rows, responses_by_turn)
+
+    # Map each turn_index to the authenticated sender(s) stamped on conversation_responses.metadata->>'user_id'.
+    turn_senders: dict[Any, set[str]] = {}
+    for r in all_responses:
+        sender = _extract_response_sender_user_id(r)
+        t_idx = r.get("turn_index")
+        if sender and t_idx is not None:
+            turn_senders.setdefault(t_idx, set()).add(sender)
 
     for q in queries or ():
         if not isinstance(q, Mapping):
             continue
-        q_user = str(q.get("user_id") or clean_owner or "").strip()
-        allowed = {q_user} if q_user else set()
+        explicit_q_user = str(q.get("user_id") or "").strip()
+        if explicit_q_user:
+            allowed = {explicit_q_user}
+        else:
+            t_idx = q.get("turn_index")
+            senders = turn_senders.get(t_idx) if t_idx is not None else None
+            if senders:
+                allowed = set(senders)
+            elif clean_owner:
+                allowed = {clean_owner}
+            else:
+                allowed = set()
         meta = q.get("metadata")
         if isinstance(meta, Mapping):
             for att in meta.get("attachments") or ():
                 _register_attachment_mapping(att, registry, allowed_users=allowed)
 
-    for container in (
-        *(responses_by_turn.values() if isinstance(responses_by_turn, Mapping) else ()),
-        *(run_facts or ()),
-    ):
+    for container in (*all_responses, *(run_facts or ())):
         if not isinstance(container, Mapping):
             continue
         facts = container.get("replay_facts") if "replay_facts" in container else container
@@ -1551,11 +1707,13 @@ def _collect_thread_media_registry(
         for u in img_urls:
             if not isinstance(u, str) or not u.strip():
                 continue
-            k = extract_upstream_key_from_url(u)
+            clean_u = u.strip()
+            k = extract_upstream_key_from_url(clean_u)
             if k and _is_safe_object_key(k):
                 cleaned = strip_private_media_prefix(k)
                 if cleaned.startswith(f"response-images/{thread_id}/"):
                     registry.captured_image_keys.add(cleaned)
+                    registry.captured_image_urls.add(clean_u)
         # Archived legacy steering_delivered messages (if present in replay_facts.archive)
         archive = facts.get("archive")
         if isinstance(archive, list):
@@ -1614,65 +1772,130 @@ async def _load_thread_media_registry_from_db(
     thread_id: str,
     *,
     owner_id: str | None = None,
+    turn_indices: Iterable[int] | None = None,
 ) -> ThreadMediaRegistry | None:
-    """Load the authoritative thread media registry from DB for serving-time verification.
+    """Load the authoritative thread media registry from DB for issuance and serving.
 
+    Unions ALL attempt rows per turn (never overwriting earlier attempts), reads
+    per-turn authenticated sender from ``conversation_responses.metadata->>'user_id'``,
+    and filters ``turn_slices`` in SQL to rows containing ``steering_delivered``.
     Returns ``None`` on DB failure so callers fail closed.
     """
     from src.server.database.pool import get_db_connection
     from src.server.services.history.replay import lines as replay_lines
 
+    turns: list[int] | None = None
+    if turn_indices is not None:
+        parsed_turns = sorted({int(t) for t in turn_indices if t is not None})
+        if parsed_turns:
+            turns = parsed_turns
+
     queries: list[dict[str, Any]] = []
-    responses_by_turn: dict[Any, dict[str, Any]] = {}
+    response_rows: list[dict[str, Any]] = []
     run_facts: list[dict[str, Any]] = []
     steering_items: list[dict[str, Any]] = []
 
     try:
         async with get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    SELECT metadata
-                    FROM conversation_queries
-                    WHERE conversation_thread_id = %s::uuid
-                      AND metadata IS NOT NULL
-                    """,
-                    (str(thread_id),),
-                )
+                if turns is not None:
+                    await cur.execute(
+                        """
+                        SELECT turn_index, metadata
+                        FROM conversation_queries
+                        WHERE conversation_thread_id = %s::uuid
+                          AND metadata IS NOT NULL
+                          AND turn_index = ANY(%s::int[])
+                        """,
+                        (str(thread_id), turns),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        SELECT turn_index, metadata
+                        FROM conversation_queries
+                        WHERE conversation_thread_id = %s::uuid
+                          AND metadata IS NOT NULL
+                        """,
+                        (str(thread_id),),
+                    )
                 queries = [dict(r) for r in await cur.fetchall()]
 
-                await cur.execute(
-                    """
-                    SELECT turn_index, replay_facts
-                    FROM conversation_responses
-                    WHERE conversation_thread_id = %s::uuid
-                      AND replay_facts IS NOT NULL
-                    """,
-                    (str(thread_id),),
-                )
-                for r in await cur.fetchall():
-                    responses_by_turn[r.get("turn_index")] = dict(r)
+                if turns is not None:
+                    await cur.execute(
+                        """
+                        SELECT turn_index,
+                               replay_facts,
+                               metadata->>'user_id' AS sender_user_id
+                        FROM conversation_responses
+                        WHERE conversation_thread_id = %s::uuid
+                          AND (replay_facts IS NOT NULL OR metadata ? 'user_id')
+                          AND turn_index = ANY(%s::int[])
+                        """,
+                        (str(thread_id), turns),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        SELECT turn_index,
+                               replay_facts,
+                               metadata->>'user_id' AS sender_user_id
+                        FROM conversation_responses
+                        WHERE conversation_thread_id = %s::uuid
+                          AND (replay_facts IS NOT NULL OR metadata ? 'user_id')
+                        """,
+                        (str(thread_id),),
+                    )
+                response_rows = [dict(r) for r in await cur.fetchall()]
 
-                await cur.execute(
-                    """
-                    SELECT replay_facts
-                    FROM subagent_runs
-                    WHERE thread_id = %s::uuid
-                      AND replay_facts IS NOT NULL
-                    """,
-                    (str(thread_id),),
-                )
+                if turns is not None:
+                    await cur.execute(
+                        """
+                        SELECT s.replay_facts
+                        FROM subagent_runs s
+                        JOIN conversation_responses r
+                          ON r.conversation_response_id = s.parent_run_id
+                        WHERE s.thread_id = %s::uuid
+                          AND s.replay_facts IS NOT NULL
+                          AND r.turn_index = ANY(%s::int[])
+                        """,
+                        (str(thread_id), turns),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        SELECT replay_facts
+                        FROM subagent_runs
+                        WHERE thread_id = %s::uuid
+                          AND replay_facts IS NOT NULL
+                        """,
+                        (str(thread_id),),
+                    )
                 run_facts = [dict(r) for r in await cur.fetchall()]
 
-                await cur.execute(
-                    """
-                    SELECT lines
-                    FROM turn_slices
-                    WHERE conversation_thread_id = %s::uuid
-                      AND lines IS NOT NULL
-                    """,
-                    (str(thread_id),),
-                )
+                if turns is not None:
+                    await cur.execute(
+                        """
+                        SELECT lines
+                        FROM turn_slices
+                        WHERE conversation_thread_id = %s::uuid
+                          AND lines IS NOT NULL
+                          AND position('"steering_delivered"' in lines) > 0
+                          AND turn_index = ANY(%s::int[])
+                        """,
+                        (str(thread_id), turns),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        SELECT lines
+                        FROM turn_slices
+                        WHERE conversation_thread_id = %s::uuid
+                          AND lines IS NOT NULL
+                          AND position('"steering_delivered"' in lines) > 0
+                        """,
+                        (str(thread_id),),
+                    )
                 for r in await cur.fetchall():
                     raw_lines = r.get("lines")
                     if not isinstance(raw_lines, str) or "steering_delivered" not in raw_lines:
@@ -1688,7 +1911,7 @@ async def _load_thread_media_registry_from_db(
         thread_id,
         owner_id=owner_id,
         queries=queries,
-        responses_by_turn=responses_by_turn,
+        response_rows=response_rows,
         run_facts=run_facts,
         items=steering_items,
     )
@@ -1699,6 +1922,7 @@ async def _verify_staged_attachment_owner(
     cleaned_key: str,
     *,
     owner_id: str | None = None,
+    allowed_owner_ids: Iterable[str] | None = None,
 ) -> bool:
     """Verify staged ``chat_attachments`` key & owner match (fail closed when pool is closed/errors)."""
     try:
@@ -1716,7 +1940,10 @@ async def _verify_staged_attachment_owner(
     row_key = strip_private_media_prefix(str(row.get("object_key") or ""))
     if row_key and row_key != cleaned_key:
         return False
-    if owner_id and row.get("user_id") and str(row["user_id"]) != str(owner_id):
+    allowed_set = {str(u).strip() for u in (allowed_owner_ids or ()) if str(u or "").strip()}
+    if not allowed_set and owner_id:
+        allowed_set = {str(owner_id).strip()}
+    if allowed_set and row.get("user_id") and str(row["user_id"]).strip() not in allowed_set:
         return False
     return True
 
@@ -1726,6 +1953,7 @@ async def _is_attachment_bound_to_thread(
     key: str,
     *,
     owner_id: str | None = None,
+    allowed_owner_ids: Iterable[str] | None = None,
     queries: Iterable[Mapping[str, Any]] | None = None,
     registry: ThreadMediaRegistry | None = None,
 ) -> bool:
@@ -1743,22 +1971,43 @@ async def _is_attachment_bound_to_thread(
         return False
     att_id = parts[1]
 
-    if registry is not None:
-        reg_keys = registry.attachment_keys
-        reg_att_ids = registry.attachment_ids
+    resolved_registry = registry
+    if resolved_registry is not None:
+        reg_keys = resolved_registry.attachment_keys
+        reg_att_ids = resolved_registry.attachment_ids
     elif queries is not None:
-        reg_keys, reg_att_ids, _ = _extract_registered_query_attachment_keys_and_ids(queries)
+        resolved_registry = _collect_thread_media_registry(
+            thread_id, owner_id=owner_id, queries=queries
+        )
+        reg_keys = resolved_registry.attachment_keys
+        reg_att_ids = resolved_registry.attachment_ids
     else:
-        loaded = await _load_thread_media_registry_from_db(thread_id, owner_id=owner_id)
-        if loaded is None:
+        resolved_registry = await _load_thread_media_registry_from_db(
+            thread_id, owner_id=owner_id
+        )
+        if resolved_registry is None:
             return False
-        reg_keys = loaded.attachment_keys
-        reg_att_ids = loaded.attachment_ids
+        reg_keys = resolved_registry.attachment_keys
+        reg_att_ids = resolved_registry.attachment_ids
 
     if cleaned not in reg_keys and att_id not in reg_att_ids:
         return False
 
-    return await _verify_staged_attachment_owner(att_id, cleaned, owner_id=owner_id)
+    effective_allowed: set[str] = set()
+    if allowed_owner_ids:
+        effective_allowed.update(
+            str(u).strip() for u in allowed_owner_ids if str(u or "").strip()
+        )
+    if not effective_allowed and resolved_registry is not None:
+        effective_allowed.update(resolved_registry.attachment_owners.get(cleaned) or ())
+        effective_allowed.update(resolved_registry.attachment_owners.get(att_id) or ())
+
+    return await _verify_staged_attachment_owner(
+        att_id,
+        cleaned,
+        owner_id=owner_id,
+        allowed_owner_ids=effective_allowed or None,
+    )
 
 
 async def _is_chat_upload_bound_to_thread(
@@ -1784,6 +2033,149 @@ async def _is_chat_upload_bound_to_thread(
     return set(loaded.upload_id_owners.get(uid) or ())
 
 
+_RAW_URL_SCAN_RE = re.compile(r"https?://[^\s<>'\"`)\]]+", re.IGNORECASE)
+
+
+def _strip_configured_storage_urls_from_text(text: str) -> str:
+    if not text or "http" not in text.lower():
+        return text
+
+    def _repl(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        if _is_url_from_configured_storage(raw):
+            return "[media-unavailable]"
+        return raw
+
+    return _RAW_URL_SCAN_RE.sub(_repl, text)
+
+
+def _strip_configured_storage_urls_from_attachments(atts: list[Any]) -> tuple[list[Any], bool]:
+    out: list[Any] = []
+    changed = False
+    for att in atts:
+        if not isinstance(att, dict):
+            out.append(att)
+            continue
+        att_copy = dict(att)
+        old_u = att_copy.get("url")
+        if isinstance(old_u, str) and old_u.strip() and _is_url_from_configured_storage(old_u):
+            att_copy.pop("url", None)
+            changed = True
+        out.append(att_copy)
+    return out, changed
+
+
+def _strip_raw_storage_urls_from_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Fail-closed scrubber used when DB media registry load fails (never leaves raw object URLs)."""
+    data = item.get("data")
+    if not isinstance(data, dict):
+        return item
+    copied = dict(item)
+    new_data = dict(data)
+    changed = False
+
+    content = new_data.get("content")
+    if isinstance(content, str):
+        cleaned = _strip_configured_storage_urls_from_text(content)
+        if cleaned != content:
+            new_data["content"] = cleaned
+            changed = True
+
+    meta = new_data.get("metadata")
+    if isinstance(meta, dict) and isinstance(meta.get("attachments"), list):
+        new_atts, att_changed = _strip_configured_storage_urls_from_attachments(meta["attachments"])
+        if att_changed:
+            new_data["metadata"] = {**meta, "attachments": new_atts}
+            changed = True
+
+    if isinstance(new_data.get("attachments"), list):
+        new_top, top_changed = _strip_configured_storage_urls_from_attachments(new_data["attachments"])
+        if top_changed:
+            new_data["attachments"] = new_top
+            changed = True
+
+    if isinstance(new_data.get("messages"), list):
+        new_msgs: list[Any] = []
+        msgs_changed = False
+        for msg in new_data["messages"]:
+            if not isinstance(msg, dict):
+                new_msgs.append(msg)
+                continue
+            msg_copy = dict(msg)
+            m_changed = False
+            mc = msg_copy.get("content")
+            if isinstance(mc, str):
+                cleaned_mc = _strip_configured_storage_urls_from_text(mc)
+                if cleaned_mc != mc:
+                    msg_copy["content"] = cleaned_mc
+                    m_changed = True
+            if isinstance(msg_copy.get("attachments"), list):
+                na, ac = _strip_configured_storage_urls_from_attachments(msg_copy["attachments"])
+                if ac:
+                    msg_copy["attachments"] = na
+                    m_changed = True
+            mm = msg_copy.get("metadata")
+            if isinstance(mm, dict) and isinstance(mm.get("attachments"), list):
+                nma, mac = _strip_configured_storage_urls_from_attachments(mm["attachments"])
+                if mac:
+                    msg_copy["metadata"] = {**mm, "attachments": nma}
+                    m_changed = True
+            if m_changed:
+                msgs_changed = True
+            new_msgs.append(msg_copy)
+        if msgs_changed:
+            new_data["messages"] = new_msgs
+            changed = True
+
+    if changed:
+        copied["data"] = new_data
+        return copied
+    return item
+
+
+def _strip_raw_storage_urls_from_lines(lines: list[Any]) -> list[Any]:
+    from src.server.services.history.replay.lines import Line, line_of
+
+    out: list[Any] = []
+    for ln in lines:
+        if not isinstance(ln, Line):
+            out.append(ln)
+            continue
+        if ln.event not in ("user_message", "message_chunk", "steering_delivered"):
+            out.append(ln)
+            continue
+        if "http" not in ln.data_json.lower():
+            out.append(ln)
+            continue
+        raw_item = ln.item()
+        stripped = _strip_raw_storage_urls_from_item(raw_item)
+        out.append(line_of(stripped) if stripped is not raw_item else ln)
+    return out
+
+
+def _extract_page_turn_indices(
+    queries: Iterable[Mapping[str, Any]],
+    items: Iterable[Mapping[str, Any]],
+) -> list[int]:
+    turns: set[int] = set()
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        data = item.get("data")
+        t = data.get("turn_index") if isinstance(data, Mapping) else item.get("turn_index")
+        if isinstance(t, int) and not isinstance(t, bool):
+            turns.add(t)
+    if turns:
+        return sorted(turns)
+    for q in queries:
+        if not isinstance(q, Mapping):
+            continue
+        t = q.get("turn_index")
+        if isinstance(t, int) and not isinstance(t, bool):
+            turns.add(t)
+    return sorted(turns)
+
+
 async def resolve_thread_media_bindings(
     thread: Mapping[str, Any],
     queries: Iterable[Mapping[str, Any]],
@@ -1791,19 +2183,13 @@ async def resolve_thread_media_bindings(
     *,
     responses_by_turn: Mapping[Any, Mapping[str, Any]] | None = None,
     run_facts: Iterable[Mapping[str, Any]] | None = None,
-) -> dict[str, tuple[str, str]]:
+) -> dict[str, tuple[str, str]] | None:
     """Collect verified URL/upload_id -> ``(backend, ref_id)`` bindings for a thread's media.
 
-    Uses the same authoritative ``ThreadMediaRegistry`` as ``_serve_media_payload``:
-    - Persisted ``queries[*].metadata.attachments`` and ``steering_delivered`` ``messages[]``
-      attachments (verified storage origin + thread/attachment binding + staged owner check)
-    - Persisted ``upload_id``s verified in ``dalton_chat_file_uploads`` for BOTH ``workspace_id``
-      AND matching ``user_id`` (fail closed when owner is missing or mismatched)
-    - Server-recorded captured images under ``response-images/{thread_id}/...`` strictly from
-      ``replay_facts.images`` (``conversation_responses`` and ``subagent_runs``)
-
-    Never signs unregistered capture images from assistant free text, arbitrary URLs from user
-    text, foreign ``attachments/`` / ``widgets/`` keys, or cross-user ``upload_id``s.
+    Loads the authoritative ``ThreadMediaRegistry`` from DB via the same
+    ``_load_thread_media_registry_from_db`` loader used by ``_serve_media_payload``
+    (scoped to the page's turns when available). Returns ``None`` when the DB
+    registry fails to load so callers fail closed without emitting raw object URLs.
     """
     thread_id = str(
         thread.get("conversation_thread_id") or thread.get("thread_id") or ""
@@ -1814,14 +2200,25 @@ async def resolve_thread_media_bindings(
     query_list = list(queries)
     item_list = list(items)
 
-    registry = _collect_thread_media_registry(
+    page_turns = _extract_page_turn_indices(query_list, item_list)
+    registry = await _load_thread_media_registry_from_db(
         thread_id,
         owner_id=owner_id,
-        queries=query_list,
-        responses_by_turn=responses_by_turn,
-        run_facts=run_facts,
-        items=item_list,
+        turn_indices=page_turns or None,
     )
+    if registry is None:
+        return None
+
+    # Merge steering_delivered items from the current page (e.g., cold-projected before turn_slices persist).
+    for item in item_list:
+        if isinstance(item, Mapping) and item.get("event") == "steering_delivered":
+            data = item.get("data")
+            if isinstance(data, Mapping):
+                _register_steering_messages_into_registry(
+                    data.get("messages"),
+                    registry,
+                    default_owner_id=owner_id,
+                )
 
     bindings: dict[str, tuple[str, str]] = {}
 
@@ -1830,7 +2227,7 @@ async def resolve_thread_media_bindings(
         *,
         allow_staged_attachment: bool,
         require_captured_registry: bool = False,
-        att_owner_id: str | None = None,
+        att_owner_ids: Iterable[str] | None = None,
     ) -> None:
         if not isinstance(u, str) or not u.strip():
             return
@@ -1856,66 +2253,37 @@ async def resolve_thread_media_bindings(
             elif allow_staged_attachment and await _is_attachment_bound_to_thread(
                 thread_id,
                 key,
-                owner_id=att_owner_id or owner_id,
+                owner_id=owner_id,
+                allowed_owner_ids=att_owner_ids,
                 registry=registry,
             ):
                 bindings[u] = ("upstream", key)
 
-    # 1. Server-registered query attachments (persisted in conversation_queries)
-    for q in query_list:
-        if not isinstance(q, Mapping):
-            continue
-        q_owner = str(q.get("user_id") or owner_id or "").strip() or None
-        meta = q.get("metadata")
-        if isinstance(meta, Mapping):
-            for att in meta.get("attachments") or ():
-                if isinstance(att, Mapping) and att.get("url"):
-                    await _register_upstream_url(
-                        att["url"], allow_staged_attachment=True, att_owner_id=q_owner
-                    )
+    # 1. Server-registered query & steering attachments from the shared DB registry
+    for att_url in registry.attachment_urls:
+        k = extract_upstream_key_from_url(att_url)
+        cleaned = strip_private_media_prefix(k) if k else ""
+        att_id = cleaned.split("/")[1] if cleaned.startswith("attachments/") and len(cleaned.split("/")) >= 3 else ""
+        allowed_owners = (
+            registry.attachment_owners.get(cleaned)
+            or registry.attachment_owners.get(att_id)
+            or None
+        )
+        await _register_upstream_url(
+            att_url,
+            allow_staged_attachment=True,
+            att_owner_ids=allowed_owners,
+        )
 
-    # 2. Server-registered steering_delivered messages[] attachments
-    for item in item_list:
-        if not isinstance(item, Mapping) or item.get("event") != "steering_delivered":
-            continue
-        data = item.get("data")
-        if not isinstance(data, Mapping) or not isinstance(data.get("messages"), list):
-            continue
-        for msg in data["messages"]:
-            if not isinstance(msg, Mapping):
-                continue
-            m_owner = str(msg.get("user_id") or owner_id or "").strip() or None
-            for att in msg.get("attachments") or ():
-                if isinstance(att, Mapping) and att.get("url"):
-                    await _register_upstream_url(
-                        att["url"], allow_staged_attachment=True, att_owner_id=m_owner
-                    )
-            meta = msg.get("metadata")
-            if isinstance(meta, Mapping):
-                for att in meta.get("attachments") or ():
-                    if isinstance(att, Mapping) and att.get("url"):
-                        await _register_upstream_url(
-                            att["url"], allow_staged_attachment=True, att_owner_id=m_owner
-                        )
+    # 2. Server-recorded captured sandbox images from DB replay_facts ONLY (never free-text scan)
+    for img_url in registry.captured_image_urls:
+        await _register_upstream_url(
+            img_url,
+            allow_staged_attachment=False,
+            require_captured_registry=True,
+        )
 
-    # 3. Server-recorded captured sandbox images in replay_facts ONLY (never free-text scan)
-    for container in (
-        *(responses_by_turn.values() if isinstance(responses_by_turn, Mapping) else ()),
-        *(run_facts or ()),
-    ):
-        if not isinstance(container, Mapping):
-            continue
-        facts = container.get("replay_facts") if "replay_facts" in container else container
-        if not isinstance(facts, Mapping):
-            continue
-        imgs = facts.get("images")
-        img_urls = imgs.values() if isinstance(imgs, Mapping) else (imgs if isinstance(imgs, list) else ())
-        for u in img_urls:
-            await _register_upstream_url(
-                u, allow_staged_attachment=False, require_captured_registry=True
-            )
-
-    # 4. Persisted chat_upload IDs verified against workspace_id AND uploader/owner user_id
+    # 3. Persisted chat_upload IDs verified against workspace_id AND actual turn sender / uploader user_id
     ws_id = str(thread.get("workspace_id") or "")
     if registry.upload_id_owners and ws_id:
         all_allowed_users = {
@@ -2057,9 +2425,15 @@ def rewrite_items_for_public_media(
     *,
     thread_id: str,
     share_token: str,
-    bindings: Mapping[str, tuple[str, str]],
+    bindings: Mapping[str, tuple[str, str]] | None,
 ) -> list[dict[str, Any]]:
-    """Rewrite stored URLs and ``upload_id``-only attachments to ``/api/v1/public/shared/{token}/media/{ref}``."""
+    """Rewrite stored URLs and ``upload_id``-only attachments to ``/api/v1/public/shared/{token}/media/{ref}``.
+
+    When ``bindings is None`` (DB media registry failed to load), fails closed by
+    stripping raw configured-storage URLs without issuing any media refs.
+    """
+    if bindings is None:
+        return [_strip_raw_storage_urls_from_item(it) for it in items]
     if not bindings:
         return items
     url_map: dict[str, str] = {}
@@ -2079,13 +2453,19 @@ def rewrite_lines_for_owner_media(
     *,
     thread_id: str,
     viewer_id: str,
-    bindings: Mapping[str, tuple[str, str]],
+    bindings: Mapping[str, tuple[str, str]] | None,
     sid_hash: str = "",
     origin_hash: str = "",
 ) -> list[Any]:
-    """Rewrite stored media URLs in owner replay ``Line``s to ``/api/v1/threads/{id}/media/{token}``."""
+    """Rewrite stored media URLs in owner replay ``Line``s to ``/api/v1/threads/{id}/media/{token}``.
+
+    When ``bindings is None`` (DB media registry failed to load), fails closed by
+    stripping raw configured-storage URLs without issuing any media tokens.
+    """
     from src.server.services.history.replay.lines import Line, line_of
 
+    if bindings is None:
+        return _strip_raw_storage_urls_from_lines(lines)
     if not bindings:
         return lines
     url_map: dict[str, str] = {}
@@ -2148,9 +2528,10 @@ async def prepare_owner_replay_media(
 
     thread_dict = dict(rows.thread) if isinstance(getattr(rows, "thread", None), Mapping) else {}
     thread_dict.setdefault("conversation_thread_id", thread_id)
+    rows_owner = getattr(rows, "owner_id", None)
+    if rows_owner and not thread_dict.get("user_id"):
+        thread_dict["user_id"] = str(rows_owner)
     queries = getattr(rows, "queries", None) or ()
-    responses_by_turn = getattr(rows, "responses_by_turn", None)
-    run_facts = getattr(rows, "run_facts", None)
 
     bindings = await resolve_thread_media_bindings(
         thread_dict,
@@ -2160,10 +2541,8 @@ async def prepare_owner_replay_media(
             for ln in replay_lines
             if ln.event in ("user_message", "message_chunk", "steering_delivered")
         ],
-        responses_by_turn=responses_by_turn,
-        run_facts=run_facts,
     )
-    if bindings:
+    if bindings is None or bindings:
         replay_lines = rewrite_lines_for_owner_media(
             replay_lines,
             thread_id=thread_id,

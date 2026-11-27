@@ -7,21 +7,68 @@ from modules already included in ``projection_sources()``.
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
+from src.dalton.thinking_spans import scan_opening_thinking_spans
 from src.llms.content_utils import extract_content_with_type
 from src.server.utils.text_phase import agreed_phase, block_phase
-from src.server.utils.thinking_leak import visible_assistant_text
+from src.server.utils.thinking_leak import decide_opening
 
-_OPEN_THINK_TAG_RE = re.compile(
-    r"<\s*(thinking_mode|thinking)\s*>",
-    re.IGNORECASE,
-)
-_THINK_TAG_TOKEN_RE = re.compile(
-    r"<\s*(/)?\s*(thinking_mode|thinking)\s*>",
-    re.IGNORECASE,
-)
+
+def _subtract_spans_from_blocks(
+    text_items: list[tuple[str, str | None]],
+    strip_spans: tuple[tuple[int, int], ...],
+) -> list[tuple[str, str | None]]:
+    """Map character ranges in the concatenated message back onto individual blocks."""
+    if not strip_spans:
+        return text_items
+
+    out: list[tuple[str, str | None]] = []
+    offset = 0
+    for text_part, phase in text_items:
+        b_start = offset
+        b_end = offset + len(text_part)
+        offset = b_end
+        if not text_part:
+            continue
+
+        cursor = b_start
+        kept_slices: list[str] = []
+        for s_start, s_end in strip_spans:
+            if s_end <= cursor:
+                continue
+            if s_start >= b_end:
+                break
+            if s_start > cursor:
+                kept_slices.append(text_part[cursor - b_start : s_start - b_start])
+            cursor = max(cursor, min(s_end, b_end))
+        if cursor < b_end:
+            kept_slices.append(text_part[cursor - b_start : b_end - b_start])
+
+        remaining = "".join(kept_slices)
+        if remaining:
+            out.append((remaining, phase))
+    return out
+
+
+def _coalesce_phase_segments(
+    text_items: list[tuple[str, str | None]],
+) -> list[tuple[str, str | None]]:
+    if not text_items:
+        return []
+    phases = [p for _, p in text_items]
+    if len(set(phases)) == 1:
+        phase = agreed_phase(phases)
+        joined = "".join(t for t, _ in text_items)
+        return [(joined, phase)] if joined else []
+
+    grouped: list[tuple[list[str], str | None]] = []
+    for text_part, phase in text_items:
+        if grouped and grouped[-1][1] == phase:
+            grouped[-1][0].append(text_part)
+        else:
+            grouped.append(([text_part], phase))
+    return [("".join(parts), phase) for parts, phase in grouped if "".join(parts)]
 
 
 def _visible_assistant_text_nested(
@@ -29,68 +76,13 @@ def _visible_assistant_text_nested(
     *,
     followed_by_tool_call: bool,
 ) -> str:
-    """Strip opening thinking markers using full-message nesting depth.
-
-    Unlike streaming ``visible_assistant_text``, cold projection has the
-    complete message text: nested ``<thinking>a <thinking>b</thinking> c</thinking>``
-    blocks must close at the matching outer tag rather than truncating at the
-    first inner closer (which would otherwise leak ``c`` into ``turn_slices``
-    and public replay).
-    """
+    """Strip opening thinking markers using full-message code-aware stack scanning."""
     if not text:
         return text
-
-    size = len(text)
-    pos = 0
-    while pos < size and text[pos].isspace():
-        pos += 1
-    if pos >= size:
-        return text
-
-    if _OPEN_THINK_TAG_RE.match(text, pos) is None:
-        return visible_assistant_text(
-            text, followed_by_tool_call=followed_by_tool_call
-        )
-
-    cur = pos
-    stripped_any = False
-    while cur < size:
-        ws_end = cur
-        while ws_end < size and text[ws_end].isspace():
-            ws_end += 1
-        if ws_end >= size or _OPEN_THINK_TAG_RE.match(text, ws_end) is None:
-            break
-        stack: list[str] = []
-        matched_end: int | None = None
-        for m in _THINK_TAG_TOKEN_RE.finditer(text, ws_end):
-            is_close = bool(m.group(1))
-            tag_name = m.group(2).lower()
-            if not is_close:
-                stack.append(tag_name)
-            else:
-                if tag_name in stack:
-                    while stack:
-                        if stack.pop() == tag_name:
-                            break
-                if not stack:
-                    matched_end = m.end()
-                    break
-        if matched_end is None:
-            # Unclosed outer opening tag: never truncate at an inner closer.
-            if not stripped_any:
-                return text
-            break
-        stripped_any = True
-        cur = matched_end
-
-    if not stripped_any:
-        return text
-    if followed_by_tool_call:
-        return ""
-    rest = text[cur:]
-    if rest.lstrip().lower().startswith("need more thinking"):
-        return visible_assistant_text(rest, followed_by_tool_call=False)
-    return rest
+    segments, _ = split_content_blocks_by_phase(
+        text, followed_by_tool_call=followed_by_tool_call
+    )
+    return "".join(seg for seg, _ in segments)
 
 
 def split_content_blocks_by_phase(
@@ -100,73 +92,95 @@ def split_content_blocks_by_phase(
 ) -> tuple[list[tuple[str, str | None]], str | None]:
     """Split ``AIMessage.content`` into ``([(segment_text, segment_phase), ...], reasoning)``.
 
-    - When every non-empty text block agrees on one phase (including all ``None``),
-      joins them into a single segment with that agreed phase, preserving exact
-      behavior of ``projector.split_content_blocks``.
-    - When a single ``AIMessage`` mixes phases (e.g. ``commentary`` followed by
-      ``final_answer``), groups consecutive blocks sharing the same phase into
-      separate ordered segments so strict share redaction can drop ``commentary``
-      while keeping ``final_answer``.
+    Scans the full concatenated text of the ``AIMessage`` across all phases first
+    via ``scan_opening_thinking_spans`` so thinking blocks spanning ``commentary``
+    and ``final_answer`` (or containing inline/fenced code or mismatched inner
+    tags) are handled accurately:
+    - When an opening thinking block is unclosed, all blocks are returned
+      unchanged so strict share redaction can still recognize and drop the
+      unclosed message.
+    - When opening thinking block(s) close cleanly, the stripped character spans
+      are mapped back to the original blocks before grouping by consecutive phase.
     """
     if content is None:
         return [], None
-    if isinstance(content, str):
-        if not content:
-            return [], None
-        visible = _visible_assistant_text_nested(
-            content, followed_by_tool_call=followed_by_tool_call
-        )
-        return ([(visible, None)] if visible else []), None
 
-    blocks = content if isinstance(content, list) else [content]
     text_items: list[tuple[str, str | None]] = []
     reasonings: list[str] = []
 
-    for block in blocks:
-        if isinstance(block, str):
-            if block:
-                text_items.append((block, None))
-            continue
-        extracted, content_type = extract_content_with_type(block)
-        if not extracted:
-            continue
-        if content_type == "reasoning":
-            reasonings.append(extracted)
-        else:
-            text_items.append((extracted, block_phase(block)))
+    if isinstance(content, str):
+        if not content:
+            return [], None
+        text_items.append((content, None))
+    else:
+        blocks = content if isinstance(content, list) else [content]
+        for block in blocks:
+            if isinstance(block, str):
+                if block:
+                    text_items.append((block, None))
+                continue
+            extracted, content_type = extract_content_with_type(block)
+            if not extracted:
+                continue
+            if content_type == "reasoning":
+                reasonings.append(extracted)
+            else:
+                text_items.append((extracted, block_phase(block)))
 
     reasoning = "\n\n".join(reasonings) or None
     if not text_items:
         return [], reasoning
 
-    phases = [p for _, p in text_items]
-    distinct_phases = set(phases)
-    if len(distinct_phases) == 1:
-        phase = agreed_phase(phases)
-        joined = "".join(t for t, _ in text_items)
-        visible = _visible_assistant_text_nested(
-            joined, followed_by_tool_call=followed_by_tool_call
-        )
-        return ([(visible, phase)] if visible else []), reasoning
+    joined = "".join(t for t, _ in text_items)
+    scan = scan_opening_thinking_spans(joined)
+    if scan.unclosed:
+        # Preserve all blocks unmodified so strict share filtering sees the
+        # opening thinking tag and drops the entire unclosed message.
+        return _coalesce_phase_segments(text_items), reasoning
 
-    # Mixed phases: coalesce consecutive runs with the same phase.
-    grouped: list[tuple[list[str], str | None]] = []
-    for text_part, phase in text_items:
-        if grouped and grouped[-1][1] == phase:
-            grouped[-1][0].append(text_part)
-        else:
-            grouped.append(([text_part], phase))
+    strip_spans: list[tuple[int, int]] = list(scan.strip_spans)
+    tail_start = strip_spans[-1][1] if strip_spans else 0
+    tail_text = joined[tail_start:]
+    if tail_text:
+        opening = decide_opening(tail_text)
+        if opening is not None and opening.kind == "need":
+            strip_spans.append((tail_start, tail_start + opening.end))
 
-    segments: list[tuple[str, str | None]] = []
-    for parts, phase in grouped:
-        joined = "".join(parts)
-        visible = _visible_assistant_text_nested(
-            joined, followed_by_tool_call=followed_by_tool_call
-        )
-        if visible:
-            segments.append((visible, phase))
+    if strip_spans:
+        if followed_by_tool_call:
+            return [], reasoning
+        text_items = _subtract_spans_from_blocks(text_items, tuple(strip_spans))
 
-    return segments, reasoning
+    segments = _coalesce_phase_segments(text_items)
+    if len(segments) <= 1:
+        return segments, reasoning
+
+    # When a message has multiple phase segments and did not open with a
+    # message-level thinking block (e.g. plain commentary followed by a
+    # final_answer segment that itself opens with <thinking>...</thinking>),
+    # strip closed opening thinking blocks on each subsequent phase segment too.
+    final_segments: list[tuple[str, str | None]] = []
+    for seg_text, seg_phase in segments:
+        seg_scan = scan_opening_thinking_spans(seg_text)
+        if seg_scan.unclosed:
+            final_segments.append((seg_text, seg_phase))
+            continue
+        seg_spans = list(seg_scan.strip_spans)
+        seg_tail_start = seg_spans[-1][1] if seg_spans else 0
+        seg_tail = seg_text[seg_tail_start:]
+        if seg_tail:
+            seg_opening = decide_opening(seg_tail)
+            if seg_opening is not None and seg_opening.kind == "need":
+                seg_spans.append((seg_tail_start, seg_tail_start + seg_opening.end))
+        if seg_spans:
+            if followed_by_tool_call:
+                continue
+            stripped = seg_text[seg_spans[-1][1] :]
+            if stripped:
+                final_segments.append((stripped, seg_phase))
+        elif seg_text:
+            final_segments.append((seg_text, seg_phase))
+    return final_segments, reasoning
 
 
 def build_ai_phase_text_specs(

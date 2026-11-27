@@ -31,13 +31,13 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Response
 
 from src.dalton.share_media import NoStorePublicAPIRoute  # DALTON-HOOK(share-redaction)
-from src.observability import observe_replay_stream
+from src.observability import observe_replay_stream  # noqa: F401
 
 from src.server.app.share_access import (  # DALTON-HOOK(monitors): enforce admin file access on shared threads
     LINK_NOT_FOUND,
     LinkAccess,
     get_permissions,
-    get_shared_thread,
+    get_shared_thread,  # noqa: F401
     resolve_link,
 )
 from src.server.database.conversation import get_thread_by_share_token
@@ -54,7 +54,7 @@ from src.server.app.share_files import share_files_router
 from src.server.app.workspace_sandbox import owner_preview, with_preview_path
 from src.server.database import artifacts as artifacts_db
 from src.server.database.artifacts import Artifact, Version
-from src.server.database.conversation.replay_rows import get_replay_thread_data
+from src.server.database.conversation.replay_rows import get_replay_thread_data  # noqa: F401
 from src.server.database.share_links import KIND_APP
 from src.server.services.artifacts import grants as artifact_grants
 from src.server.services.file_grants import grant_prefix, mint_file_grant, seconds_left
@@ -256,17 +256,9 @@ async def get_shared_thread_metadata(
         return await _link_metadata(access, viewer.user_id, path)
 
     # DALTON-HOOK(share-redaction): compute authoritative effective permissions & safe metadata fields
-    from src.dalton.share_redaction import (
-        resolve_effective_share_permissions,
-        resolve_public_metadata_fields,
-    )
+    from src.dalton.share_redaction import prepare_public_thread_metadata
 
-    eff = await resolve_effective_share_permissions(thread)
-    allow_files = eff.allow_files
-    allow_download = eff.allow_download
-    if not allow_files:
-        response.headers["Clear-Site-Data"] = '"cache"'
-    meta_fields = await resolve_public_metadata_fields(thread, allow_files=allow_files)
+    meta_fields = await prepare_public_thread_metadata(thread, response)
     members = (
         {
             "audience": ORGANIZATION,
@@ -299,8 +291,8 @@ async def get_shared_thread_metadata(
         "dir_name": meta_fields["dir_name"],
         # DALTON-HOOK(monitors): masked allow_files / allow_download for non-admin historical shares
         "permissions": {
-            "allow_files": allow_files,
-            "allow_download": allow_download,
+            "allow_files": meta_fields["allow_files"],
+            "allow_download": meta_fields["allow_download"],
         },
     }
 
@@ -343,15 +335,7 @@ async def replay_shared_thread(
     # DALTON-HOOK(share-redaction): delegate public replay SSE pipeline to Dalton orchestrator
     from src.dalton.share_redaction import build_public_replay_response
 
-    return await build_public_replay_response(
-        share_token,
-        before_turn=before_turn,
-        get_shared_thread_fn=get_shared_thread,
-        get_replay_thread_data_fn=get_replay_thread_data,
-        observe_replay_stream_fn=observe_replay_stream,
-        shared_user_message_fn=_shared_user_message,
-        share_redaction_cls=ShareRedaction,
-    )
+    return await build_public_replay_response(share_token, before_turn=before_turn)
 
 
 def _shared_user_message(redaction: ShareRedaction, data: dict[str, Any]) -> dict[str, Any]:

@@ -8,6 +8,7 @@ anyone)."""
 
 import json
 from datetime import datetime, timezone
+from typing import Annotated  # DALTON-HOOK(share-redaction)
 
 
 from fastapi import HTTPException, Query
@@ -30,7 +31,7 @@ from src.dalton.settings import (
 )
 from src.server.database.conversation import (
     get_thread_by_id,
-    update_thread_sharing,
+    update_thread_sharing,  # noqa: F401
 )
 from src.server.services import activity
 from src.server.services.activity import Action
@@ -239,39 +240,16 @@ async def update_thread_share(
     if isinstance(existing_perms, str):
         existing_perms = json.loads(existing_perms)
 
-    # DALTON-HOOK(share-redaction): prepare normalized permissions and atomic JSONB patch via Dalton helper
-    from src.dalton.share_redaction import (
-        apply_thread_share_update,
-        normalize_merged_share_permissions,
-        prepare_share_permissions_update,
+    # DALTON-HOOK(share-redaction): merge permissions, enforce admin gate, atomically update & warm/summarize
+    from src.dalton.share_redaction import apply_share_update_request
+
+    updated, perms, summary_dict = await apply_share_update_request(
+        thread_id, existing_perms, effective_req_permissions,
+        is_shared=request.is_shared, shared_at=kwargs.get("shared_at"),
+        x_user_id=x_user_id, require_admin_fn=_require_admin_for_share_files,
     )
-
-    effective_perms, perms_patch = prepare_share_permissions_update(existing_perms, effective_req_permissions)
-
-    # DALTON-HOOK(monitors): block public shared-thread file exposure by non-admins
-    if request.is_shared and (
-        effective_perms.get("allow_files") or effective_perms.get("allow_download")
-    ):
-        await _require_admin_for_share_files(x_user_id)
-
-    updated = await apply_thread_share_update(update_thread_sharing, thread_id, is_shared=request.is_shared, shared_at=kwargs.get("shared_at"), effective_perms=effective_perms, patch=perms_patch)
-    if not updated:
-        raise HTTPException(status_code=404, detail="Thread not found")
     _record_share_change(x_user_id, thread_id, thread, updated)
-
-    # DALTON-HOOK(share-redaction): warm raw turn_slices in background on share enable & compute DB-only summary
-    from src.dalton.share_redaction import post_update_thread_share_hook
-
-    summary_dict = await post_update_thread_share_hook(
-        thread_id, is_shared=bool(updated.get("is_shared"))
-    )
-
     share_token = updated.get("share_token")
-    perms = updated.get("share_permissions") or {}
-    if isinstance(perms, str):
-        perms = json.loads(perms)
-    # DALTON-HOOK(share-redaction): normalize response permissions so allow_files=false always shows allow_download=false
-    perms = normalize_merged_share_permissions(perms, None)
 
     return ThreadShareResponse(
         is_shared=updated["is_shared"],
@@ -288,7 +266,7 @@ async def get_thread_share(
     thread_id: str,
     x_user_id: CurrentUserId,
     # DALTON-HOOK(share-redaction): on-demand DB-only summary when share panel opens
-    include_summary: bool = Query(False),
+    include_summary: Annotated[bool, Query()] = False,
 ):
     """Get current share status and permissions for a thread."""
     owner_id = (await _authorize_thread_share(thread_id, x_user_id)).owner_id

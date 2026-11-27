@@ -925,8 +925,6 @@ async def update_thread_sharing(
     is_shared: bool,
     share_permissions: Optional[Dict[str, Any]] = None,
     shared_at: Optional[datetime] = None,
-    # DALTON-HOOK(share-redaction): atomic JSONB patch merge to prevent concurrent partial-update races
-    share_permissions_patch: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Update sharing settings for a thread.
@@ -951,12 +949,7 @@ async def update_thread_sharing(
                     sets.append("share_token = COALESCE(share_token, %s)")
                     params.append(mint_share_code())
 
-                # DALTON-HOOK(share-redaction): atomic JSONB merge & allow_files->allow_download collapse
-                if share_permissions_patch is not None:
-                    from src.dalton.share_redaction import append_atomic_share_permissions_set
-
-                    append_atomic_share_permissions_set(sets, params, share_permissions_patch, Json)
-                elif share_permissions is not None:
+                if share_permissions is not None:
                     sets.append("share_permissions = %s")
                     params.append(Json(share_permissions))
 

@@ -9,21 +9,55 @@ rejected with BadDigest) before these were written; they pin the parameters.
 from __future__ import annotations
 
 import base64
-from unittest.mock import MagicMock, patch
+from typing import Any
+from unittest.mock import create_autospec, patch
 
 import src.utils.storage as storage
+from src.dalton import share_media  # DALTON-HOOK(share-redaction)
 from src.utils.storage import s3_compatible
 
 SHA = "a" * 64
 
 
-def test_presign_binds_digest_length_and_type():
-    client = MagicMock()
+class _PresignS3ClientSpec:
+    def generate_presigned_url(
+        self,
+        ClientMethod: str,
+        Params: dict[str, Any] | None = None,
+        ExpiresIn: int = 3600,
+    ) -> str:
+        raise NotImplementedError
+
+    def get_bucket_ownership_controls(self, *, Bucket: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+
+def test_presign_binds_digest_length_and_type(monkeypatch):
+    monkeypatch.delenv("DALTON_STORAGE_DISABLE_OBJECT_ACL", raising=False)
+    monkeypatch.delenv("STORAGE_DISABLE_OBJECT_ACL", raising=False)
+    monkeypatch.setenv("DALTON_STORAGE_OBJECT_ACL", "auto")
+    monkeypatch.setattr(
+        s3_compatible.StorageConfig, "ENDPOINT_URL", "https://s3.us-east-1.amazonaws.com"
+    )
+    monkeypatch.setattr(s3_compatible.StorageConfig, "BUCKET_NAME", "test-bucket")
+    share_media.reset_bucket_acl_cache_for_test()
+
+    client = create_autospec(_PresignS3ClientSpec, instance=True)
+    client.get_bucket_ownership_controls.return_value = {
+        "OwnershipControls": {"Rules": [{"ObjectOwnership": "ObjectWriter"}]}
+    }
     client.generate_presigned_url.return_value = "https://store/blobs/x?sig"
-    with patch.object(s3_compatible, "_get_client", return_value=client):
-        out = s3_compatible.get_signed_upload_url(
-            f"blobs/{SHA}", sha256_hex=SHA, content_length=12, content_type="application/octet-stream", expires_in=600
-        )
+    try:
+        with patch.object(s3_compatible, "_get_client", return_value=client):
+            out = s3_compatible.get_signed_upload_url(
+                f"blobs/{SHA}",
+                sha256_hex=SHA,
+                content_length=12,
+                content_type="application/octet-stream",
+                expires_in=600,
+            )
+    finally:
+        share_media.reset_bucket_acl_cache_for_test()
     assert out is not None
     url, headers = out
     assert url == "https://store/blobs/x?sig"

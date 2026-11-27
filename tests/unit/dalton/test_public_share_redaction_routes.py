@@ -779,7 +779,8 @@ async def test_ops_script_verify_and_warm(monkeypatch: pytest.MonkeyPatch) -> No
 
     async def _fake_read_replay(rows, **kwargs):
         if rows.thread_id == shared_tid_cold:
-            share_redaction.mark_cold_projection_miss()
+            if kwargs.get("persist", True):
+                share_redaction.mark_cold_projection_miss()
             return ReplayPage(lines=[], first_turn_index=0, has_more=False), "checkpoint"
         if rows.thread_id == shared_tid_warm:
             return ReplayPage(lines=[], first_turn_index=0, has_more=False), "checkpoint"
@@ -816,11 +817,13 @@ async def test_ops_script_verify_and_warm(monkeypatch: pytest.MonkeyPatch) -> No
     warm_res = await ops_script.warm_shared_slices(limit_threads=10, concurrency=2)
     assert lifecycle == ["open_pools", "close_pools"]
     assert warm_res["warmed"] == 1
+    assert warm_res["persist_failed"] == 0
     assert warm_res["cache_hit"] == 1
     assert warm_res["stub"] == 1
     assert warm_res["failed"] == 0
-    assert read_warm_spy.await_count == 3
-    assert all(call.kwargs["persist"] is True for call in read_warm_spy.await_args_list)
+    assert read_warm_spy.await_count == 4
+    assert sum(1 for call in read_warm_spy.await_args_list if call.kwargs["persist"] is True) == 3
+    assert sum(1 for call in read_warm_spy.await_args_list if call.kwargs["persist"] is False) == 1
 
 
 @pytest.mark.asyncio
@@ -1272,9 +1275,27 @@ async def test_controlled_media_thread_binding_blocks_unbound_objects(
         },
     ]
 
+    orig_load_reg = share_media._load_thread_media_registry_from_db
+    reg_for_sign = share_media._collect_thread_media_registry(
+        tid,
+        owner_id="user-owner",
+        queries=queries,
+        responses_by_turn=responses_by_turn,
+        items=items,
+    )
+    monkeypatch.setattr(
+        share_media,
+        "_load_thread_media_registry_from_db",
+        create_autospec(
+            orig_load_reg,
+            return_value=reg_for_sign,
+        ),
+    )
+
     bindings = await share_media.resolve_thread_media_bindings(
         thread, queries, items, responses_by_turn=responses_by_turn
     )
+    assert bindings is not None
     assert own_att_url in bindings
     assert own_img_url in bindings
     assert unregistered_img_url not in bindings
@@ -1292,7 +1313,7 @@ async def test_controlled_media_thread_binding_blocks_unbound_objects(
         share_media,
         "_load_thread_media_registry_from_db",
         create_autospec(
-            share_media._load_thread_media_registry_from_db,
+            orig_load_reg,
             return_value=trusted_registry,
         ),
     )
@@ -1650,7 +1671,6 @@ async def test_concurrent_share_permissions_partial_update_and_download_only(
     import psycopg
     from src.server.app.threads import sharing as threads_sharing
     from src.server.database import pool as db_pool
-    from src.server.database.conversation import threads_write
     from src.server.services.shared_workspaces.access import Access
 
     tid = str(uuid.uuid4())
@@ -1697,9 +1717,10 @@ async def test_concurrent_share_permissions_partial_update_and_download_only(
                 db_row["share_permissions"] = dict(kwargs["share_permissions"])
             return {**db_row, "share_permissions": dict(db_row["share_permissions"])}
 
-    upd_mock = create_autospec(threads_sharing.update_thread_sharing, side_effect=_atomic_update_thread)
-    upd_mock._supports_atomic_share_patch = True  # type: ignore[attr-defined]
-
+    orig_atomic_update = share_redaction.atomic_update_thread_sharing
+    upd_mock = create_autospec(
+        orig_atomic_update, side_effect=_atomic_update_thread
+    )
     orig_get_thread = threads_sharing.get_thread_by_id
     monkeypatch.setattr(
         threads_sharing,
@@ -1711,7 +1732,7 @@ async def test_concurrent_share_permissions_partial_update_and_download_only(
         "get_thread_by_id",
         create_autospec(orig_get_thread, side_effect=_stale_get_thread),
     )
-    monkeypatch.setattr(threads_sharing, "update_thread_sharing", upd_mock)
+    monkeypatch.setattr(share_redaction, "atomic_update_thread_sharing", upd_mock)
     monkeypatch.setattr(
         threads_sharing,
         "_require_admin_for_share_files",
@@ -1799,7 +1820,7 @@ async def test_concurrent_share_permissions_partial_update_and_download_only(
         assert db_row["share_permissions"]["allow_download"] is True
         assert r_dl_true.json()["permissions"]["allow_download"] is True
 
-    # Verify threads_write.update_thread_sharing actually issues the atomic JSONB CASE SQL
+    # Verify Dalton's atomic_update_thread_sharing actually issues the atomic JSONB CASE SQL
     executed_sql: list[str] = []
     sql_cur = create_autospec(psycopg.AsyncCursor, instance=True)
     sql_cur.__aenter__.return_value = sql_cur
@@ -1814,7 +1835,7 @@ async def test_concurrent_share_permissions_partial_update_and_download_only(
         yield sql_conn
 
     monkeypatch.setattr(db_pool, "get_db_connection", _fake_conn)
-    await threads_write.update_thread_sharing(
+    await orig_atomic_update(
         tid, is_shared=True, share_permissions_patch={"audience": "organization"}
     )
     assert executed_sql
@@ -1907,17 +1928,18 @@ async def test_cross_user_upload_id_rejected_at_ingest_issuance_and_serving(
     queries = [
         {"metadata": {"attachments": [{"upload_id": victim_uid}, {"upload_id": own_uid}]}},
     ]
-    bindings = await share_media.resolve_thread_media_bindings(thread, queries, [])
-    assert f"upload_id:{victim_uid}" not in bindings
-    assert f"upload_id:{own_uid}" in bindings
-
-    # Read side refuses victim_uid with 404
     reg = share_media._collect_thread_media_registry(tid, owner_id="user-attacker", queries=queries)
     monkeypatch.setattr(
         share_media,
         "_load_thread_media_registry_from_db",
         create_autospec(share_media._load_thread_media_registry_from_db, return_value=reg),
     )
+    bindings = await share_media.resolve_thread_media_bindings(thread, queries, [])
+    assert bindings is not None
+    assert f"upload_id:{victim_uid}" not in bindings
+    assert f"upload_id:{own_uid}" in bindings
+
+    # Read side refuses victim_uid with 404
     with pytest.raises(HTTPException) as exc:
         await share_media._serve_media_payload(
             thread_id=tid,
@@ -2025,7 +2047,14 @@ async def test_media_registry_fail_closed_steering_and_subagent_protected_urls(
             },
         }
     ]
+    reg_steer = share_media._collect_thread_media_registry(tid, owner_id="u1", items=items)
+    monkeypatch.setattr(
+        share_media,
+        "_load_thread_media_registry_from_db",
+        create_autospec(share_media._load_thread_media_registry_from_db, return_value=reg_steer),
+    )
     bindings = await share_media.resolve_thread_media_bindings(thread, [], items)
+    assert bindings is not None
     assert steer_att_url in bindings
     assert staged_att_url in bindings
     assert f"upload_id:{own_steer_uid}" in bindings
@@ -2194,7 +2223,9 @@ async def test_warm_shared_slices_independent_pool_lifecycle(
     monkeypatch.setattr(setup, "checkpointer", None)
 
     # 1. Checkpointer open failure MUST close the already-opened app pool
-    fake_cp = SimpleNamespace(name="cp")
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    fake_cp = create_autospec(AsyncPostgresSaver, instance=True)
     monkeypatch.setattr(cp_mod, "get_checkpointer", lambda **kw: fake_cp)
     monkeypatch.setattr(
         cp_mod,
@@ -2218,3 +2249,1029 @@ async def test_warm_shared_slices_independent_pool_lifecycle(
         await ops_script._close_cli_pools(conv_pool, fake_cp, True, True)
     conv_pool.close.assert_awaited_once()
     assert setup.checkpointer is None
+
+
+# =============================================================================
+# AU1 r4 REGRESSION TESTS (Items 1-5, 8-10)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_r4_thinking_spans_mismatched_code_cross_phase_and_unclosed_cold_to_cached_sse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AU1 r4 #1: Cold projection -> turn_slices -> cache-hit public SSE for (a) mismatched nested, (b) backtick/fence closer, (c) cross-phase, and unclosed message."""
+    import httpx
+    from langchain_core.messages import AIMessage, HumanMessage
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+    from src.server.database.conversation import replay_rows as replay_rows_mod
+    from src.server.database.conversation import turn_slices as slices_db
+    from src.server.services.history import replay as replay_mod
+    from src.server.services.history import slices as slices_mod
+    from src.server.services.history.reader import CheckpointHistoryReader, TurnAnchor
+
+    cases = [
+        (
+            "a_mismatched_balanced",
+            "<thinking>A<thinking_mode>B</thinking> LEAK</thinking_mode></thinking>答案A",
+            "答案A",
+            ("LEAK", "B"),
+            False,
+        ),
+        (
+            "a_mismatched_unclosed_outer",
+            "<thinking>A<thinking_mode>B</thinking> LEAK</thinking_mode>",
+            None,
+            ("LEAK", "B"),
+            True,
+        ),
+        (
+            "b_backtick_and_fence_closer",
+            "<thinking>用 `</thinking>` 和\n```\n</thinking>\n```\n结束 SECRET</thinking>答案B",
+            "答案B",
+            ("SECRET",),
+            False,
+        ),
+        (
+            "c_cross_phase",
+            [
+                {"type": "text", "text": "<thinking>SECRET跨阶段 ", "phase": "commentary"},
+                {"type": "text", "text": "B</thinking>答案C", "phase": "final_answer"},
+            ],
+            "答案C",
+            ("SECRET", "B"),
+            False,
+        ),
+        (
+            "d_unclosed_cross_phase",
+            [
+                {"type": "text", "text": "<thinking>SECRET_UNCLOSED_1 ", "phase": "commentary"},
+                {"type": "text", "text": "SECRET_UNCLOSED_2", "phase": "final_answer"},
+            ],
+            None,
+            ("SECRET_UNCLOSED_1", "SECRET_UNCLOSED_2"),
+            True,
+        ),
+    ]
+
+    app = FastAPI()
+    app.include_router(public_app.router)
+    transport = httpx.ASGITransport(app=app)
+
+    orig_get_turn_lines = slices_db.get_turn_lines
+    orig_get_turn_slices = slices_db.get_turn_slices
+    orig_upsert_turn_slices = slices_db.upsert_turn_slices
+    orig_update_turns = slices_db.update_turns
+    orig_pub_get_shared = public_app.get_shared_thread
+    orig_access_get_shared = share_access.get_shared_thread
+    orig_get_replay_data = public_app.get_replay_thread_data
+
+    for case_name, ai_content, expected_answer, forbidden_tokens, expect_unclosed in cases:
+        tid = str(uuid.uuid4())
+        rid = str(uuid.uuid4())
+        share_token = f"tok-r4-{case_name}"
+        fake_thread = {
+            "conversation_thread_id": tid,
+            "workspace_id": str(uuid.uuid4()),
+            "user_id": "u1",
+            "owner_id": "u1",
+            "title": f"Case {case_name}",
+            "share_token": share_token,
+            "is_shared": True,
+            "share_permissions": {"allow_files": False, "allow_download": False},
+            "latest_checkpoint_id": "cp-tail-0",
+        }
+        rows = replay_rows_mod.ThreadRows(
+            thread_id=tid,
+            owner_id="u1",
+            thread=fake_thread,
+            queries=[
+                {
+                    "conversation_query_id": str(uuid.uuid4()),
+                    "turn_index": 0,
+                    "type": "initial",
+                    "content": "请总结要点",
+                    "metadata": {},
+                }
+            ],
+            responses_by_turn={
+                0: {
+                    "conversation_response_id": rid,
+                    "turn_index": 0,
+                    "status": "completed",
+                    "replay_facts": {},
+                }
+            },
+            usages=[],
+            provenance=[],
+            run_facts=[],
+            open_runs={},
+            failed_steers=[],
+        )
+        anchor = TurnAnchor(
+            turn_ordinal=0,
+            input_checkpoint_id="cp-in-0",
+            tail_checkpoint_id="cp-tail-0",
+            turn_index=0,
+            end_checkpoint_id="cp-tail-0",
+        )
+        fake_slice = slices_mod.TurnSlice(
+            anchor=anchor,
+            messages=[
+                HumanMessage(id="h-0", content="请总结要点"),
+                AIMessage(id=f"ai-{case_name}", content=ai_content),
+            ],
+        )
+
+        reader_stub = create_autospec(CheckpointHistoryReader, instance=True)
+        reader_stub.serde = JsonPlusSerializer()
+        reader_stub.aget_turn_anchors.return_value = ([anchor], "cp-tail-0")
+        reader_stub.aget_turn_slices.return_value = [fake_slice]
+        reader_stub.aget_tip_interrupts.return_value = []
+        monkeypatch.setattr(
+            CheckpointHistoryReader,
+            "get_instance",
+            classmethod(lambda cls, _r=reader_stub: _r),
+        )
+
+        stored_slices: dict[str, slices_db.StoredSlice] = {}
+
+        async def _get_turn_lines(rids: list[str], _store=stored_slices) -> dict[str, slices_db.StoredSlice]:
+            return {r: _store[r] for r in rids if r in _store}
+
+        async def _get_turn_slices(rids: list[str], _store=stored_slices) -> dict[str, slices_db.StoredSlice]:
+            return {r: _store[r] for r in rids if r in _store}
+
+        async def _upsert_turn_slices(turn_rows: list[slices_db.TurnRow], _store=stored_slices) -> None:
+            for tr in turn_rows:
+                _store[tr.response_id] = tr.slice
+
+        async def _update_turns(updates: list[slices_db.TurnUpdate], _store=stored_slices) -> None:
+            for u in updates:
+                cur = _store.get(u.response_id)
+                if cur is not None:
+                    _store[u.response_id] = cur._replace(
+                        lines_key=u.lines_key or cur.lines_key,
+                        lines=u.lines or cur.lines,
+                    )
+
+        monkeypatch.setattr(
+            slices_db, "get_turn_lines", create_autospec(orig_get_turn_lines, side_effect=_get_turn_lines)
+        )
+        monkeypatch.setattr(
+            slices_db, "get_turn_slices", create_autospec(orig_get_turn_slices, side_effect=_get_turn_slices)
+        )
+        monkeypatch.setattr(
+            slices_db, "upsert_turn_slices", create_autospec(orig_upsert_turn_slices, side_effect=_upsert_turn_slices)
+        )
+        monkeypatch.setattr(
+            slices_db, "update_turns", create_autospec(orig_update_turns, side_effect=_update_turns)
+        )
+        monkeypatch.setattr(
+            public_app, "get_shared_thread", create_autospec(orig_pub_get_shared, return_value=fake_thread)
+        )
+        monkeypatch.setattr(
+            share_access, "get_shared_thread", create_autospec(orig_access_get_shared, return_value=fake_thread)
+        )
+        monkeypatch.setattr(
+            public_app, "get_replay_thread_data", create_autospec(orig_get_replay_data, return_value=rows)
+        )
+
+        # 1. Real cold projection persists turn_slices row
+        page_cold, src_cold = await replay_mod.read_replay_page(rows, persist=True)
+        assert src_cold == "checkpoint"
+        assert rid in stored_slices and stored_slices[rid].lines
+        stored_lines_str = stored_slices[rid].lines
+        if not expect_unclosed:
+            for tok in forbidden_tokens:
+                assert tok not in stored_lines_str, f"{case_name}: {tok} leaked into turn_slices"
+        else:
+            # Unclosed messages remain untouched in turn_slices so strict SSE can recognize & drop them
+            assert "<thinking>" in stored_lines_str
+
+        # 2. Public SSE hits warm turn_slices cache (ZERO additional checkpoint slice reads)
+        fetches_before_sse = reader_stub.aget_turn_slices.call_count
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(f"/api/v1/public/shared/{share_token}/replay")
+        assert resp.status_code == 200
+        assert reader_stub.aget_turn_slices.call_count == fetches_before_sse
+        sse_body = resp.text
+
+        for tok in forbidden_tokens:
+            assert tok not in sse_body, f"{case_name}: {tok} leaked into public SSE"
+        if expected_answer is not None:
+            assert expected_answer in sse_body, f"{case_name}: missing {expected_answer} in SSE"
+        else:
+            # Unclosed message emits no assistant answer text from the AI message itself
+            assert f"ai-{case_name}" not in sse_body
+
+
+def test_r4_verify_checks_runtime_default_s3_public_base_and_empty_enabled_storage_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AU1 r4 #2: --verify probes runtime StorageConfig.get_public_url_base() even with custom S3 endpoint, and fails when storage is enabled but targets empty."""
+    import src.utils.storage as storage_mod
+
+    for var in (
+        "STORAGE_PROVIDER",
+        "STORAGE_BUCKET_NAME",
+        "STORAGE_ENDPOINT_URL",
+        "STORAGE_BROWSER_ENDPOINT_URL",
+        "STORAGE_PUBLIC_URL_BASE",
+        "STORAGE_REGION",
+        "STORAGE_ADDRESSING_STYLE",
+        "STORAGE_KEY_PREFIX",
+        "S3_BUCKET_NAME",
+        "S3_ENDPOINT_URL",
+        "S3_PUBLIC_URL_BASE",
+        "S3_REGION",
+        "OSS_BUCKET_NAME",
+        "OSS_ENDPOINT",
+        "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME",
+        "DALTON_ASR_STORAGE_BUCKET_NAME",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    monkeypatch.setenv("STORAGE_PROVIDER", "s3")
+    monkeypatch.setenv("STORAGE_BUCKET_NAME", "custom-ep-bucket")
+    monkeypatch.setenv("STORAGE_REGION", "ap-southeast-1")
+    monkeypatch.setenv("STORAGE_ENDPOINT_URL", "https://custom-s3.internal.example")
+
+    targets = share_media.resolve_active_storage_targets()
+    assert len(targets) == 1
+    aws_default_base = "https://custom-ep-bucket.s3.ap-southeast-1.amazonaws.com"
+    assert aws_default_base in targets[0].public_url_bases
+
+    # Only the AWS default URL returns 200 while the custom endpoint returns 403 -> MUST FAIL
+    def _only_aws_default_200(url: str, timeout_s: float = 10.0) -> tuple[int, str]:
+        if url.startswith(aws_default_base + "/"):
+            return 200, "OK"
+        return 403, "Forbidden"
+
+    ok, checks = ops_script.verify_storage_targets(
+        targets=targets,
+        probe_write=False,
+        http_get_fn=_only_aws_default_200,
+        find_existing_fn=lambda t, p: [f"{p}sample.bin"] if p == "private-media/" else [f"{p}x.bin"],
+    )
+    assert ok is False
+    assert any(not c.ok and c.url.startswith(aws_default_base + "/") and c.status_code == 200 for c in checks)
+
+    # Runtime storage enabled (per src.utils.storage) but resolve_active_storage_targets returns [] -> MUST FAIL
+    orig_is_enabled = storage_mod.is_storage_enabled
+    monkeypatch.setattr(
+        ops_script,
+        "resolve_active_storage_targets",
+        create_autospec(ops_script.resolve_active_storage_targets, return_value=[]),
+    )
+    monkeypatch.setattr(
+        storage_mod,
+        "is_storage_enabled",
+        create_autospec(orig_is_enabled, return_value=True),
+    )
+    ok_empty_enabled, checks_empty_enabled = ops_script.verify_storage_targets()
+    assert ok_empty_enabled is False
+    assert checks_empty_enabled and checks_empty_enabled[0].ok is False
+
+    # Runtime storage disabled + empty targets -> still passes
+    monkeypatch.setattr(
+        storage_mod,
+        "is_storage_enabled",
+        create_autospec(orig_is_enabled, return_value=False),
+    )
+    ok_empty_disabled, checks_empty_disabled = ops_script.verify_storage_targets()
+    assert ok_empty_disabled is True
+    assert checks_empty_disabled == []
+
+
+@pytest.mark.asyncio
+async def test_r4_replay_media_prod_sql_row_shapes_owner_rich_colleague_and_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AU1 r4 #3: Prod SQL row shapes (no replay_facts on responses_by_turn, no user_id on queries/rows.thread) sign & serve 200 for captured img, upload_id, and colleague attachments, while rejecting stranger upload_id and failing closed on DB error."""
+    from contextlib import asynccontextmanager
+    import re
+    import httpx
+    import psycopg
+    from src.dalton import chat_upload_storage as chat_store
+    from src.server.database import chat_attachments as att_db
+    from src.server.database import pool as db_pool
+    from src.server.database.conversation import replay_rows as replay_rows_mod
+    from src.server.services.history import replay as replay_mod
+    from src.server.services.history.replay.lines import line_of
+
+    tid = str(uuid.uuid4())
+    ws_id = str(uuid.uuid4())
+    owner_uid = "user-owner-1"
+    colleague_uid = "user-colleague-2"
+    stranger_uid = "user-stranger-9"
+
+    cap_img_url = f"https://cdn.prod.example/private-media/response-images/{tid}/t0/chart.png"
+    colleague_att_url = "https://cdn.prod.example/private-media/attachments/att-colleague-1/deck.png"
+    owner_upload_id = str(uuid.uuid4())
+    colleague_upload_id = str(uuid.uuid4())
+    stranger_upload_id = str(uuid.uuid4())
+
+    # Production SQL row shapes:
+    # - rows.thread has NO user_id (owner_id is separate on ThreadRows)
+    # - rows.queries has NO user_id column
+    # - rows.responses_by_turn uses _LIGHT_RESPONSE_COLUMNS (NO replay_facts)
+    prod_thread_summary = {
+        "conversation_thread_id": tid,
+        "workspace_id": ws_id,
+        "current_status": "completed",
+        "thread_index": 1,
+        "latest_checkpoint_id": "cp-1",
+    }
+    prod_queries = [
+        {
+            "conversation_query_id": str(uuid.uuid4()),
+            "turn_index": 0,
+            "type": "initial",
+            "content": "owner query",
+            "metadata": {
+                "attachments": [
+                    {"upload_id": owner_upload_id, "name": "owner_big.pdf"},
+                    {"upload_id": stranger_upload_id, "name": "stranger_big.pdf"},
+                ]
+            },
+        },
+        {
+            "conversation_query_id": str(uuid.uuid4()),
+            "turn_index": 1,
+            "type": "follow_up",
+            "content": "colleague query",
+            "metadata": {
+                "attachments": [
+                    {"url": colleague_att_url, "name": "deck.png"},
+                    {"upload_id": colleague_upload_id, "name": "colleague_big.pdf"},
+                ]
+            },
+        },
+    ]
+    prod_responses_by_turn = {
+        0: {"conversation_response_id": str(uuid.uuid4()), "turn_index": 0, "status": "completed"},
+        1: {"conversation_response_id": str(uuid.uuid4()), "turn_index": 1, "status": "completed"},
+    }
+    prod_rows = replay_rows_mod.ThreadRows(
+        thread_id=tid,
+        owner_id=owner_uid,
+        thread=prod_thread_summary,
+        queries=prod_queries,
+        responses_by_turn=prod_responses_by_turn,
+        usages=[],
+        provenance=[],
+        run_facts=[],
+        open_runs={},
+    )
+
+    page_lines = [
+        line_of(
+            {
+                "event": "user_message",
+                "data": {
+                    "turn_index": 0,
+                    "content": "owner query",
+                    "metadata": prod_queries[0]["metadata"],
+                },
+            }
+        ),
+        line_of(
+            {
+                "event": "message_chunk",
+                "data": {
+                    "turn_index": 0,
+                    "role": "assistant",
+                    "content": f"Chart: ![c]({cap_img_url})",
+                },
+            }
+        ),
+        line_of(
+            {
+                "event": "user_message",
+                "data": {
+                    "turn_index": 1,
+                    "content": "colleague query",
+                    "metadata": prod_queries[1]["metadata"],
+                },
+            }
+        ),
+    ]
+
+    executed_sqls: list[str] = []
+
+    def _make_db_conn():
+        state = {"step": 0}
+        cur = create_autospec(psycopg.AsyncCursor, instance=True)
+        cur.__aenter__.return_value = cur
+        cur.__aexit__.return_value = False
+
+        async def _exec(sql: Any, params: Any = None) -> None:
+            sql_s = str(sql)
+            executed_sqls.append(sql_s)
+            if "FROM conversation_queries" in sql_s:
+                state["step"] = 1
+            elif "FROM conversation_responses" in sql_s:
+                state["step"] = 2
+            elif "FROM subagent_runs" in sql_s:
+                state["step"] = 3
+            elif "FROM turn_slices" in sql_s:
+                state["step"] = 4
+
+        async def _fetchall() -> list[dict[str, Any]]:
+            if state["step"] == 1:
+                return [
+                    {"turn_index": 0, "metadata": prod_queries[0]["metadata"]},
+                    {"turn_index": 1, "metadata": prod_queries[1]["metadata"]},
+                ]
+            if state["step"] == 2:
+                return [
+                    {
+                        "turn_index": 0,
+                        "replay_facts": {"images": {"/w/chart.png": cap_img_url}},
+                        "sender_user_id": owner_uid,
+                    },
+                    {
+                        "turn_index": 1,
+                        "replay_facts": None,
+                        "sender_user_id": colleague_uid,
+                    },
+                ]
+            return []
+
+        cur.execute.side_effect = _exec
+        cur.fetchall.side_effect = _fetchall
+        conn = create_autospec(psycopg.AsyncConnection, instance=True)
+        conn.cursor.return_value = cur
+        return conn
+
+    @asynccontextmanager
+    async def _fake_conn():
+        yield _make_db_conn()
+
+    monkeypatch.setattr(db_pool, "get_db_connection", _fake_conn)
+    monkeypatch.setattr(
+        share_media,
+        "_allowed_storage_origins",
+        create_autospec(share_media._allowed_storage_origins, return_value={"https://cdn.prod.example"}),
+    )
+    monkeypatch.setattr(
+        att_db,
+        "get_attachment",
+        create_autospec(
+            att_db.get_attachment,
+            return_value={
+                "object_key": "attachments/att-colleague-1/deck.png",
+                "user_id": colleague_uid,
+            },
+        ),
+    )
+
+    upload_rows = {
+        owner_upload_id: {
+            "upload_id": owner_upload_id,
+            "user_id": owner_uid,
+            "workspace_id": ws_id,
+            "object_key": f"private-media/chat-uploads/{ws_id}/{owner_upload_id}/owner_big.pdf",
+            "safe_filename": "owner_big.pdf",
+            "mime_type": "application/pdf",
+        },
+        colleague_upload_id: {
+            "upload_id": colleague_upload_id,
+            "user_id": colleague_uid,
+            "workspace_id": ws_id,
+            "object_key": f"private-media/chat-uploads/{ws_id}/{colleague_upload_id}/colleague_big.pdf",
+            "safe_filename": "colleague_big.pdf",
+            "mime_type": "application/pdf",
+        },
+        stranger_upload_id: {
+            "upload_id": stranger_upload_id,
+            "user_id": stranger_uid,
+            "workspace_id": ws_id,
+            "object_key": f"private-media/chat-uploads/{ws_id}/{stranger_upload_id}/stranger_big.pdf",
+            "safe_filename": "stranger_big.pdf",
+            "mime_type": "application/pdf",
+        },
+    }
+
+    async def _fake_fetch_ready(
+        workspace_id: str, upload_ids: Any, *, allowed_user_ids: Any = None
+    ) -> dict[str, dict[str, Any]]:
+        allowed = set(allowed_user_ids or ())
+        return {
+            uid: row
+            for uid, row in upload_rows.items()
+            if uid in set(upload_ids)
+            and row["workspace_id"] == workspace_id
+            and (allowed_user_ids is None or row["user_id"] in allowed)
+        }
+
+    monkeypatch.setattr(
+        share_media,
+        "_fetch_ready_chat_uploads",
+        create_autospec(share_media._fetch_ready_chat_uploads, side_effect=_fake_fetch_ready),
+    )
+    monkeypatch.setattr(
+        share_media,
+        "read_controlled_object_bytes",
+        create_autospec(share_media.read_controlled_object_bytes, return_value=b"PNG_BYTES"),
+    )
+    monkeypatch.setattr(
+        chat_store,
+        "resolve_existing_chat_upload_key",
+        create_autospec(chat_store.resolve_existing_chat_upload_key, side_effect=lambda k: k),
+    )
+    monkeypatch.setattr(
+        chat_store,
+        "iter_stored_object_chunks",
+        create_autospec(chat_store.iter_stored_object_chunks, side_effect=lambda k: iter([b"PDF_BYTES"])),
+    )
+
+    # 1. Owner replay path: signs captured image, owner upload_id, colleague staged att & upload_id; leaves ZERO raw URLs
+    rewritten_owner_lines, _cookies = await share_media.prepare_owner_replay_media(
+        None, prod_rows, page_lines, thread_id=tid, viewer_id=owner_uid
+    )
+    assert any('position(\'"steering_delivered"\' in lines) > 0' in s for s in executed_sqls)
+    owner_joined = "\n".join(ln.data_json for ln in rewritten_owner_lines)
+    assert "cdn.prod.example" not in owner_joined
+    owner_items = [ln.item() for ln in rewritten_owner_lines]
+    # Turn 0: owner upload signed, stranger upload NOT signed
+    t0_atts = owner_items[0]["data"]["metadata"]["attachments"]
+    assert t0_atts[0]["url"].startswith(f"/api/v1/threads/{tid}/media/")
+    assert "url" not in t0_atts[1]
+    # Turn 0 assistant: captured image signed
+    assert f"/api/v1/threads/{tid}/media/" in owner_items[1]["data"]["content"]
+    # Turn 1: colleague staged att and colleague upload_id both signed
+    t1_atts = owner_items[2]["data"]["metadata"]["attachments"]
+    assert t1_atts[0]["url"].startswith(f"/api/v1/threads/{tid}/media/")
+    assert t1_atts[1]["url"].startswith(f"/api/v1/threads/{tid}/media/")
+
+    # Serve EVERY signed owner token -> 200 OK
+    for signed_url in (
+        t0_atts[0]["url"],
+        t1_atts[0]["url"],
+        t1_atts[1]["url"],
+    ):
+        tok = signed_url.rsplit("/", 1)[-1]
+        claims = share_media.verify_owner_media_token(tok, expected_thread_id=tid)
+        assert claims["vid"] == owner_uid
+        resp = await share_media._serve_media_payload(
+            thread_id=tid,
+            workspace_id=ws_id,
+            thread_owner_id=owner_uid,
+            backend=claims["b"],
+            ref_id=claims["ref"],
+            cache_control="private, no-store",
+        )
+        assert resp.status_code == 200
+
+    # Captured image token also serves 200 OK
+    m_cap = re.search(rf"/api/v1/threads/{re.escape(tid)}/media/([^)\s\"']+)", owner_items[1]["data"]["content"])
+    assert m_cap is not None
+    cap_claims = share_media.verify_owner_media_token(
+        m_cap.group(1), expected_thread_id=tid
+    )
+    assert cap_claims["vid"] == owner_uid
+    cap_resp = await share_media._serve_media_payload(
+        thread_id=tid,
+        workspace_id=ws_id,
+        thread_owner_id=owner_uid,
+        backend=cap_claims["b"],
+        ref_id=cap_claims["ref"],
+        cache_control="private, no-store",
+    )
+    assert cap_resp.status_code == 200
+
+    # Stranger upload_id rejected on read side with 404
+    with pytest.raises(HTTPException) as exc_stranger:
+        await share_media._serve_media_payload(
+            thread_id=tid,
+            workspace_id=ws_id,
+            thread_owner_id=owner_uid,
+            backend="chat_upload",
+            ref_id=stranger_upload_id,
+            cache_control="no-store",
+        )
+    assert exc_stranger.value.status_code == 404
+
+    # 2. Rich share replay path (allow_files=True): also leaves ZERO raw object URLs
+    rich_thread = {
+        **prod_thread_summary,
+        "share_token": "tok-rich-prod",
+        "is_shared": True,
+        "share_permissions": {"allow_files": True, "allow_download": False},
+    }
+    monkeypatch.setattr(
+        public_app, "get_shared_thread", create_autospec(public_app.get_shared_thread, return_value=rich_thread)
+    )
+    monkeypatch.setattr(
+        public_app, "get_replay_thread_data", create_autospec(public_app.get_replay_thread_data, return_value=prod_rows)
+    )
+    monkeypatch.setattr(
+        share_redaction,
+        "resolve_effective_share_permissions",
+        create_autospec(
+            share_redaction.resolve_effective_share_permissions,
+            return_value=share_redaction.EffectiveSharePermissions(True, False),
+        ),
+    )
+    page_obj = replay_mod.ReplayPage(lines=page_lines, first_turn_index=0, has_more=False)
+    monkeypatch.setattr(
+        replay_mod,
+        "read_replay_page",
+        create_autospec(replay_mod.read_replay_page, return_value=(page_obj, "cache")),
+    )
+    monkeypatch.setattr(
+        replay_mod,
+        "finish_lines",
+        create_autospec(replay_mod.finish_lines, return_value=None),
+    )
+
+    app = FastAPI()
+    app.include_router(public_app.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        rich_resp = await client.get("/api/v1/public/shared/tok-rich-prod/replay")
+    assert rich_resp.status_code == 200
+    assert "cdn.prod.example" not in rich_resp.text
+    assert "/api/v1/public/shared/tok-rich-prod/media/" in rich_resp.text
+
+    # 3. DB registry load failure -> signs nothing AND strips raw object URLs (never leaks raw URL)
+    monkeypatch.setattr(
+        share_media,
+        "_load_thread_media_registry_from_db",
+        create_autospec(share_media._load_thread_media_registry_from_db, return_value=None),
+    )
+    fail_lines, _ = await share_media.prepare_owner_replay_media(
+        None, prod_rows, page_lines, thread_id=tid, viewer_id=owner_uid
+    )
+    fail_joined = "\n".join(ln.data_json for ln in fail_lines)
+    assert "cdn.prod.example" not in fail_joined
+    assert f"/api/v1/threads/{tid}/media/" not in fail_joined
+
+
+@pytest.mark.asyncio
+async def test_r4_multi_attempt_union_and_protected_urls_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AU1 r4 #4: Multiple attempts on the same turn are unioned across media registry & protected_urls; DB error on protected_urls fails closed (no summary)."""
+    from contextlib import asynccontextmanager
+    import psycopg
+    from src.server.database import pool as db_pool
+
+    tid = str(uuid.uuid4())
+    img1 = f"https://cdn.retry.example/private-media/response-images/{tid}/a1/img1.png"
+    img2 = f"https://cdn.retry.example/private-media/response-images/{tid}/a2/img2.png"
+
+    def _make_multi_attempt_conn():
+        state = {"table": ""}
+        cur = create_autospec(psycopg.AsyncCursor, instance=True)
+        cur.__aenter__.return_value = cur
+        cur.__aexit__.return_value = False
+
+        async def _exec(sql: Any, params: Any = None) -> None:
+            s = str(sql)
+            if "FROM conversation_responses" in s:
+                state["table"] = "responses"
+            else:
+                state["table"] = "other"
+
+        async def _fetchall() -> list[dict[str, Any]]:
+            if state["table"] == "responses":
+                return [
+                    {
+                        "thread_id": tid,
+                        "turn_index": 0,
+                        "replay_facts": {"images": {"/w/1.png": img1}},
+                        "sender_user_id": "u1",
+                    },
+                    {
+                        "thread_id": tid,
+                        "turn_index": 0,
+                        "replay_facts": {"images": {"/w/2.png": img2}},
+                        "sender_user_id": "u1",
+                    },
+                ]
+            return []
+
+        cur.execute.side_effect = _exec
+        cur.fetchall.side_effect = _fetchall
+        conn = create_autospec(psycopg.AsyncConnection, instance=True)
+        conn.cursor.return_value = cur
+        return conn
+
+    @asynccontextmanager
+    async def _fake_conn():
+        yield _make_multi_attempt_conn()
+
+    monkeypatch.setattr(db_pool, "get_db_connection", _fake_conn)
+    monkeypatch.setattr(
+        share_media,
+        "_allowed_storage_origins",
+        create_autospec(share_media._allowed_storage_origins, return_value={"https://cdn.retry.example"}),
+    )
+
+    # 1. Media registry unions BOTH attempts on turn 0 (issuance + serving)
+    reg = await share_media._load_thread_media_registry_from_db(tid, owner_id="u1")
+    assert reg is not None
+    assert f"response-images/{tid}/a1/img1.png" in reg.captured_image_keys
+    assert f"response-images/{tid}/a2/img2.png" in reg.captured_image_keys
+
+    bindings = await share_media.resolve_thread_media_bindings(
+        {"conversation_thread_id": tid, "user_id": "u1"}, [], []
+    )
+    assert bindings is not None
+    assert img1 in bindings
+    assert img2 in bindings
+
+    # 2. _load_thread_protected_urls_map unions BOTH attempts on turn 0
+    p_map = await share_redaction._load_thread_protected_urls_map([tid])
+    assert p_map is not None
+    assert img1 in p_map[tid]
+    assert img2 in p_map[tid]
+
+    # 3. When _load_thread_protected_urls_map fails with a real DB error -> fail closed (safe title only, NO summary)
+    @asynccontextmanager
+    async def _boom_conn():
+        raise RuntimeError("database connection reset")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(db_pool, "get_db_connection", _boom_conn)
+    assert await share_redaction._load_thread_protected_urls_map([tid]) is None
+
+    monkeypatch.setattr(
+        share_redaction,
+        "get_org_library_title_meta_map",
+        create_autospec(share_redaction.get_org_library_title_meta_map, return_value={"item-1": True}),
+    )
+    monkeypatch.setattr(
+        share_redaction,
+        "_load_threads_for_redaction",
+        create_autospec(
+            share_redaction._load_threads_for_redaction,
+            return_value={
+                tid: {
+                    "conversation_thread_id": tid,
+                    "share_permissions": {"allow_files": False, "allow_download": False},
+                }
+            },
+        ),
+    )
+    redacted_lib = await share_redaction.redact_org_library_rows(
+        [
+            {
+                "item_id": "item-1",
+                "kind": "thread",
+                "thread_id": tid,
+                "title": "Secret Custom Title",
+                "summary": f"Contains sensitive URL {img1}",
+            }
+        ]
+    )
+    assert redacted_lib[0]["title"] == share_redaction.DEFAULT_SHARED_TITLE
+    assert redacted_lib[0]["summary"] == ""
+
+
+def test_r4_bucket_acl_unknown_access_denied_and_explicit_on_off_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AU1 r4 #5: AccessDenied on GetBucketOwnershipControls omits ACL on presigned PUT (no cache + warning); DALTON_STORAGE_OBJECT_ACL=on/off overrides."""
+    from botocore.exceptions import ClientError
+
+    class _S3PresignProbeSpec:
+        def generate_presigned_url(
+            self, ClientMethod: str, Params: dict[str, Any] | None = None, ExpiresIn: int = 3600
+        ) -> str:
+            raise NotImplementedError
+
+        def get_bucket_ownership_controls(self, *, Bucket: str) -> dict[str, Any]:
+            raise NotImplementedError
+
+    monkeypatch.delenv("DALTON_STORAGE_DISABLE_OBJECT_ACL", raising=False)
+    monkeypatch.delenv("STORAGE_DISABLE_OBJECT_ACL", raising=False)
+    share_media.reset_bucket_acl_cache_for_test()
+
+    access_denied = ClientError(
+        {"Error": {"Code": "AccessDenied", "Message": "Access Denied"}},
+        "GetBucketOwnershipControls",
+    )
+
+    try:
+        # 1. auto + AccessDenied -> omits ACL & x-amz-acl, does NOT cache, emits warning
+        monkeypatch.setenv("DALTON_STORAGE_OBJECT_ACL", "auto")
+        client = create_autospec(_S3PresignProbeSpec, instance=True)
+        client.get_bucket_ownership_controls.side_effect = access_denied
+        client.generate_presigned_url.return_value = "https://s3.example/presigned"
+        with caplog.at_level("WARNING", logger="src.dalton.share_media"):
+            url, headers = share_media.s3_presign_put_with_private_acl(
+                client,
+                bucket="min-perm-bucket",
+                key="blobs/abc",
+                checksum_b64="AAAA",
+                content_length=10,
+                content_type="application/octet-stream",
+                expires_in=300,
+                endpoint_url="https://s3.example",
+            )
+        assert url == "https://s3.example/presigned"
+        params = client.generate_presigned_url.call_args.kwargs["Params"]
+        assert "ACL" not in params
+        assert "x-amz-acl" not in headers
+        assert any("unknown" in rec.message.lower() for rec in caplog.records)
+        # Unknown MUST NOT be cached: a second call probes again
+        assert client.get_bucket_ownership_controls.call_count == 1
+        share_media.s3_presign_put_with_private_acl(
+            client,
+            bucket="min-perm-bucket",
+            key="blobs/abc",
+            checksum_b64="AAAA",
+            content_length=10,
+            content_type="application/octet-stream",
+            expires_in=300,
+            endpoint_url="https://s3.example",
+        )
+        assert client.get_bucket_ownership_controls.call_count == 2
+
+        # 2. DALTON_STORAGE_OBJECT_ACL=on -> ALWAYS attaches ACL & x-amz-acl
+        monkeypatch.setenv("DALTON_STORAGE_OBJECT_ACL", "on")
+        client_on = create_autospec(_S3PresignProbeSpec, instance=True)
+        client_on.get_bucket_ownership_controls.side_effect = access_denied
+        client_on.generate_presigned_url.return_value = "https://s3.example/presigned-on"
+        _, headers_on = share_media.s3_presign_put_with_private_acl(
+            client_on,
+            bucket="min-perm-bucket",
+            key="blobs/abc",
+            checksum_b64="AAAA",
+            content_length=10,
+            content_type="application/octet-stream",
+            expires_in=300,
+            endpoint_url="https://s3.example",
+        )
+        assert client_on.generate_presigned_url.call_args.kwargs["Params"]["ACL"] == "private"
+        assert headers_on["x-amz-acl"] == "private"
+
+        # 3. DALTON_STORAGE_OBJECT_ACL=off -> NEVER attaches ACL or x-amz-acl
+        monkeypatch.setenv("DALTON_STORAGE_OBJECT_ACL", "off")
+        client_off = create_autospec(_S3PresignProbeSpec, instance=True)
+        client_off.generate_presigned_url.return_value = "https://s3.example/presigned-off"
+        _, headers_off = share_media.s3_presign_put_with_private_acl(
+            client_off,
+            bucket="min-perm-bucket",
+            key="blobs/abc",
+            checksum_b64="AAAA",
+            content_length=10,
+            content_type="application/octet-stream",
+            expires_in=300,
+            endpoint_url="https://s3.example",
+        )
+        assert "ACL" not in client_off.generate_presigned_url.call_args.kwargs["Params"]
+        assert "x-amz-acl" not in headers_off
+    finally:
+        share_media.reset_bucket_acl_cache_for_test()
+
+
+def test_r4_historical_url_strips_credentials_and_rejects_grant_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AU1 r4 #9: --historical-url strips userinfo/query/fragment before anonymous GET, redacts output (text & JSON), and rejects grant-path URLs."""
+    probed_urls: list[str] = []
+
+    def _fake_get(url: str, timeout_s: float = 10.0) -> tuple[int, str]:
+        probed_urls.append(url)
+        return 403, "Forbidden"
+
+    s3_signed = "https://alice:topsecret@bucket.s3.us-east-1.amazonaws.com/blobs/u1/doc.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=SECRET_AWS_SIG_999#frag"
+    oss_signed = "https://bucket.oss-cn-hangzhou.aliyuncs.com/memo/u1/a.pdf?OSSAccessKeyId=SECRET_OSS_AK_888&Signature=SECRET_OSS_SIG_777"
+    grant_url = "https://app.example/api/v1/artifacts/g/v1.SECRET_GRANT_TICKET_666/v/1/index.html"
+
+    ok, checks = ops_script.verify_storage_targets(
+        targets=[],
+        known_historical_urls=[s3_signed, oss_signed, grant_url],
+        http_get_fn=_fake_get,
+    )
+    assert ok is False  # grant_url rejected as invalid input
+    assert probed_urls == [
+        "https://bucket.s3.us-east-1.amazonaws.com/blobs/u1/doc.pdf",
+        "https://bucket.oss-cn-hangzhou.aliyuncs.com/memo/u1/a.pdf",
+    ]
+    assert checks[0].ok is True
+    assert checks[0].url == "https://bucket.s3.us-east-1.amazonaws.com/blobs/u1/doc.pdf?<redacted>"
+    assert checks[1].ok is True
+    assert checks[1].url == "https://bucket.oss-cn-hangzhou.aliyuncs.com/memo/u1/a.pdf?<redacted>"
+    assert checks[2].ok is False
+    assert checks[2].status_code is None
+    assert "SECRET_GRANT_TICKET_666" not in checks[2].url
+
+    # Verify CLI --json and text outputs never contain any signature/key/userinfo
+    monkeypatch.setattr(
+        ops_script,
+        "resolve_active_storage_targets",
+        create_autospec(ops_script.resolve_active_storage_targets, return_value=[]),
+    )
+    monkeypatch.setattr(
+        ops_script,
+        "_is_runtime_storage_enabled",
+        create_autospec(ops_script._is_runtime_storage_enabled, return_value=False),
+    )
+    monkeypatch.setattr(
+        ops_script,
+        "_http_anonymous_get_status",
+        create_autospec(ops_script._http_anonymous_get_status, side_effect=_fake_get),
+    )
+    rc_json = ops_script.main(
+        ["--verify", "--no-probe-write", "--json", "--historical-url", s3_signed, "--historical-url", oss_signed]
+    )
+    assert rc_json == 0
+    json_out = capsys.readouterr().out
+    for secret in ("SECRET_AWS_SIG_999", "SECRET_OSS_AK_888", "SECRET_OSS_SIG_777", "alice:topsecret"):
+        assert secret not in json_out
+    assert "?<redacted>" in json_out
+
+    rc_text = ops_script.main(
+        ["--verify", "--no-probe-write", "--historical-url", s3_signed, "--historical-url", oss_signed]
+    )
+    assert rc_text == 0
+    text_out = capsys.readouterr().out
+    for secret in ("SECRET_AWS_SIG_999", "SECRET_OSS_AK_888", "SECRET_OSS_SIG_777", "alice:topsecret"):
+        assert secret not in text_out
+    assert "?<redacted>" in text_out
+
+
+@pytest.mark.asyncio
+async def test_r4_warm_shared_slices_persist_failed_and_cancel_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AU1 r4 #10: Swallowed cache write is counted as persist_failed (not warmed); CancelledError during checkpointer open closes app pool."""
+    from contextlib import asynccontextmanager
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    import psycopg
+    from psycopg_pool import AsyncConnectionPool
+    from src.server.app import setup
+    from src.server.database import pool as db_pool
+    from src.server.database.conversation import replay_rows as replay_rows_mod
+    from src.server.services.history import replay as replay_mod
+    from src.server.utils import checkpointer as cp_mod
+
+    # 1. CancelledError while opening checkpointer MUST close already-opened app pool
+    conv_pool = create_autospec(AsyncConnectionPool, instance=True)
+    conv_pool.closed = True
+    monkeypatch.setattr(db_pool, "get_or_create_pool", lambda: conv_pool)
+    monkeypatch.setattr(setup, "checkpointer", None)
+    fake_cp = create_autospec(AsyncPostgresSaver, instance=True)
+    monkeypatch.setattr(cp_mod, "get_checkpointer", lambda **kw: fake_cp)
+    monkeypatch.setattr(
+        cp_mod,
+        "open_checkpointer_pool",
+        create_autospec(cp_mod.open_checkpointer_pool, side_effect=asyncio.CancelledError()),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await ops_script._ensure_cli_pools_open()
+    conv_pool.open.assert_awaited_once()
+    conv_pool.close.assert_awaited_once()
+
+    # 2. Swallowed turn_slices persist -> follow-up persist=False still hits cold projection -> persist_failed=1, warmed=0
+    tid = str(uuid.uuid4())
+    cur = create_autospec(psycopg.AsyncCursor, instance=True)
+    cur.__aenter__.return_value = cur
+    cur.__aexit__.return_value = False
+    cur.fetchall.return_value = [{"thread_id": tid}]
+    conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    conn.cursor.return_value = cur
+
+    @asynccontextmanager
+    async def _fake_conn():
+        yield conn
+
+    monkeypatch.setattr(db_pool, "get_db_connection", _fake_conn)
+    fake_rows = replay_rows_mod.ThreadRows(
+        thread_id=tid,
+        owner_id="u1",
+        thread={"conversation_thread_id": tid},
+        queries=[],
+        responses_by_turn={},
+        usages=[],
+        provenance=[],
+        run_facts=[],
+    )
+    monkeypatch.setattr(
+        replay_rows_mod,
+        "get_replay_thread_data",
+        create_autospec(replay_rows_mod.get_replay_thread_data, return_value=fake_rows),
+    )
+
+    async def _always_cold_read(
+        rows: Any, *, before_turn: Any = None, limit: int = 200, budget: Any = None, persist: bool = True
+    ):
+        share_redaction.mark_cold_projection_miss()
+        return replay_mod.ReplayPage(lines=[], first_turn_index=0, has_more=False), "checkpoint"
+
+    monkeypatch.setattr(
+        replay_mod,
+        "read_replay_page",
+        create_autospec(replay_mod.read_replay_page, side_effect=_always_cold_read),
+    )
+    res = await ops_script.warm_shared_slices(manage_pools=False)
+    assert res["persist_failed"] == 1
+    assert res["warmed"] == 0
+    assert res["cache_hit"] == 0

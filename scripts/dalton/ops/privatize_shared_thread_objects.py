@@ -40,6 +40,7 @@ import logging
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from typing import Any
@@ -52,6 +53,7 @@ from src.dalton.share_media import (
     resolve_active_storage_targets,
 )
 from src.dalton.share_redaction import (
+    _GRANT_PATH_RE,
     PUBLIC_SHARE_MAX_TURNS,
     get_public_share_page_budget,
     track_cold_projection_miss,
@@ -219,6 +221,56 @@ def _coerce_discovered_keys(raw: Any) -> list[str]:
     return out
 
 
+def _is_runtime_storage_enabled() -> bool:
+    """Check whether runtime object storage is enabled per ``src.utils.storage``."""
+    try:
+        import src.utils.storage as storage_mod
+
+        return bool(storage_mod.is_storage_enabled())
+    except Exception:
+        return False
+
+
+def _sanitize_historical_url(raw_url: str) -> tuple[str | None, str, str | None]:
+    """Validate and strip credentials from a ``--historical-url`` input.
+
+    Returns ``(probe_url, display_url, error_detail)``:
+    - Strips userinfo, query string, and fragment before anonymous GET probing.
+    - Rejects URLs whose path matches an authorization grant (``_GRANT_PATH_RE``)
+      without issuing any HTTP request.
+    - ``display_url`` replaces stripped query/fragment with ``?<redacted>`` and
+      never includes userinfo or grant tokens.
+    """
+    parsed = urllib.parse.urlsplit(raw_url)
+    scheme = (parsed.scheme or "").lower()
+    host = parsed.hostname or ""
+    if scheme not in ("http", "https") or not host:
+        return None, "<invalid-url>", "invalid historical URL: expected http(s) URL with host"
+
+    host_fmt = f"[{host}]" if ":" in host else host
+    try:
+        port = parsed.port
+    except ValueError:
+        return None, "<invalid-url>", "invalid historical URL: malformed port"
+    clean_netloc = f"{host_fmt}:{port}" if port is not None else host_fmt
+    path = parsed.path or "/"
+    had_query_or_frag = bool(parsed.query or parsed.fragment)
+
+    if _GRANT_PATH_RE.search(path):
+        redacted_display = f"{scheme}://{clean_netloc}/<redacted-grant>"
+        if had_query_or_frag:
+            redacted_display = f"{redacted_display}?<redacted>"
+        return (
+            None,
+            redacted_display,
+            "invalid historical URL: path contains authorization grant ticket",
+        )
+
+    probe_url = f"{scheme}://{clean_netloc}{path}"
+    display_url = f"{probe_url}?<redacted>" if had_query_or_frag else probe_url
+    return probe_url, display_url, None
+
+
 def verify_storage_targets(
     *,
     targets: list[ActiveStorageTarget] | None = None,
@@ -235,6 +287,7 @@ def verify_storage_targets(
 
     Hardened AU1 rules:
     - Never accepts HTTP 404 or HTTP 200 as pass.
+    - Fails if runtime object storage is enabled but zero targets are resolved.
     - Listing failure fails verification immediately (never treated as empty prefix).
     - Samples multiple existing objects per sensitive prefix; every sampled object
       must return 403 (never 200) across origin, signing/browser endpoint, and CDN.
@@ -248,9 +301,25 @@ def verify_storage_targets(
     results: list[ProbeCheckResult] = []
     all_ok = True
 
-    if not resolved and not known_historical_urls:
-        logger.info("No active object storage targets configured; nothing to verify.")
-        return True, []
+    if not resolved:
+        if targets is None and _is_runtime_storage_enabled():
+            all_ok = False
+            results.append(
+                ProbeCheckResult(
+                    bucket="<unresolved>",
+                    roles=("primary",),
+                    prefix="",
+                    url="<unresolved-storage-target>",
+                    status_code=None,
+                    ok=False,
+                    detail="runtime object storage is enabled but resolve_active_storage_targets() returned no targets",
+                )
+            )
+            if not known_historical_urls:
+                return False, results
+        elif not known_historical_urls:
+            logger.info("No active object storage targets configured; nothing to verify.")
+            return True, []
 
     run_nonce = uuid.uuid4().hex[:12]
 
@@ -370,7 +439,22 @@ def verify_storage_targets(
         hist_url = str(raw_hist_url or "").strip()
         if not hist_url:
             continue
-        status_code, detail = getter(hist_url, timeout_s=timeout_s)
+        probe_url, display_url, err_detail = _sanitize_historical_url(hist_url)
+        if probe_url is None:
+            all_ok = False
+            results.append(
+                ProbeCheckResult(
+                    bucket="historical-url",
+                    roles=("historical",),
+                    prefix="historical",
+                    url=display_url,
+                    status_code=None,
+                    ok=False,
+                    detail=err_detail or "invalid historical URL",
+                )
+            )
+            continue
+        status_code, detail = getter(probe_url, timeout_s=timeout_s)
         ok = status_code == 403
         if not ok:
             all_ok = False
@@ -379,7 +463,7 @@ def verify_storage_targets(
                 bucket="historical-url",
                 roles=("historical",),
                 prefix="historical",
-                url=hist_url,
+                url=display_url,
                 status_code=status_code,
                 ok=ok,
                 detail=detail,
@@ -406,6 +490,7 @@ async def _ensure_cli_pools_open() -> tuple[Any, Any, bool, bool]:
 
     cp = setup.checkpointer
     if cp is None:
+        cp_ready = False
         try:
             cp = get_checkpointer(
                 memory_type=os.getenv("MEMORY_DB_TYPE", "postgres"),
@@ -419,16 +504,16 @@ async def _ensure_cli_pools_open() -> tuple[Any, Any, bool, bool]:
             setup.checkpointer = cp
             CheckpointHistoryReader.reset_instance()
             opened_checkpointer = True
-        except Exception:
-            if opened_app_pool:
+            cp_ready = True
+        finally:
+            if not cp_ready and opened_app_pool:
                 try:
                     await conv_pool.close()
                 except Exception:
                     logger.warning(
-                        "Failed to close app DB pool after checkpointer init error",
+                        "Failed to close app DB pool after checkpointer init failure/cancellation",
                         exc_info=True,
                     )
-            raise
     return conv_pool, cp, opened_app_pool, opened_checkpointer
 
 
@@ -503,13 +588,14 @@ async def warm_shared_slices(
 
         sem = asyncio.Semaphore(max(1, int(concurrency)))
         warmed = 0
+        persist_failed = 0
         cache_hit = 0
         stub = 0
         skipped = 0
         failed = 0
 
         async def _warm_one(tid: str) -> None:
-            nonlocal warmed, cache_hit, stub, skipped, failed
+            nonlocal warmed, persist_failed, cache_hit, stub, skipped, failed
             async with sem:
                 try:
                     rows = await get_replay_thread_data(tid)
@@ -526,7 +612,18 @@ async def warm_shared_slices(
                     if source == "stub":
                         stub += 1
                     elif cold_flag[0]:
-                        warmed += 1
+                        # Verify the projected page actually persisted into turn_slices.
+                        with track_cold_projection_miss() as verify_cold_flag:
+                            _verify_page, verify_source = await read_replay_page(
+                                rows,
+                                limit=PUBLIC_SHARE_MAX_TURNS,
+                                budget=budget,
+                                persist=False,
+                            )
+                        if verify_source == "stub" or verify_cold_flag[0]:
+                            persist_failed += 1
+                        else:
+                            warmed += 1
                     else:
                         cache_hit += 1
                 except Exception as exc:
@@ -538,6 +635,7 @@ async def warm_shared_slices(
             "lines_epoch": epoch,
             "total_shared_threads": len(thread_ids),
             "warmed": warmed,
+            "persist_failed": persist_failed,
             "cache_hit": cache_hit,
             "stub": stub,
             "skipped": skipped,
@@ -631,7 +729,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         summary["warm_shared_slices"] = warm_res
-        if warm_res["failed"] > 0:
+        if warm_res["failed"] > 0 or warm_res.get("persist_failed", 0) > 0:
             exit_code = 1
 
     if args.verify:
@@ -657,7 +755,8 @@ def main(argv: list[str] | None = None) -> int:
             w = summary["warm_shared_slices"]
             print(
                 f"[warm-shared-slices] epoch={w['lines_epoch']} total={w['total_shared_threads']} "
-                f"warmed={w['warmed']} cache_hit={w['cache_hit']} stub={w['stub']} "
+                f"warmed={w['warmed']} persist_failed={w.get('persist_failed', 0)} "
+                f"cache_hit={w['cache_hit']} stub={w['stub']} "
                 f"skipped={w['skipped']} failed={w['failed']}"
             )
         if "verify" in summary:

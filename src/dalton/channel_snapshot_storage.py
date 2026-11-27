@@ -172,9 +172,9 @@ def put_snapshot_bytes(
     full_key = _upload_store.resolve_full_key(snapshot_key)
     client = _upload_store._get_client()
     from src.dalton.share_media import (
-        bucket_supports_object_acl,
         is_acl_not_supported_error,
         mark_bucket_acl_unsupported,
+        probe_bucket_object_acl_mode,
         storage_private_acl_kwargs,
     )
 
@@ -182,7 +182,10 @@ def put_snapshot_bytes(
     acl_kwargs = storage_private_acl_kwargs(
         snapshot_key, provider="s3", endpoint_url=ep
     )
-    if acl_kwargs and not bucket_supports_object_acl(client, bucket, endpoint_url=ep):
+    if (
+        acl_kwargs
+        and probe_bucket_object_acl_mode(client, bucket, endpoint_url=ep) == "disabled"
+    ):
         acl_kwargs = {}
     put_kwargs: dict[str, Any] = {
         "Bucket": bucket,
