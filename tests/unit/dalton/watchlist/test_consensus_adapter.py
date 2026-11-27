@@ -8,6 +8,7 @@ Standalone Core acceptance with zero private service calls.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from datetime import date, timedelta
 from typing import Any
@@ -1059,13 +1060,16 @@ def test_single_year_fmp_fill_never_resurrects_excluded_fiscal_year() -> None:
 async def test_adr_azn_direct_ordinary_share_smfg_1_2_and_unverified_omitted() -> None:
     """AZN is removed (direct NYSE ordinary share since 2026-02-02), SMFG uses 1.2 (since 2026-10-01), unverified ADRs show unit_unverified."""
     assert "AZN" not in consensus_mod.VERIFIED_ADR_SHARES_PER_UNIT
+    assert "AZN" not in consensus_mod.KNOWN_ADR_SYMBOLS
     assert "SMFG" in consensus_mod.VERIFIED_ADR_SHARES_PER_UNIT
+    assert "SMFG" in consensus_mod.KNOWN_ADR_SYMBOLS
     smfg_entry = consensus_mod.VERIFIED_ADR_SHARES_PER_UNIT["SMFG"]
     assert smfg_entry.shares_per_adr == 1.2
     assert smfg_entry.underlying_currency == "JPY"
     assert smfg_entry.effective_date == "2026-10-01"
     assert smfg_entry.source.strip()
     assert "SHEL" not in consensus_mod.VERIFIED_ADR_SHARES_PER_UNIT
+    assert "SHEL" in consensus_mod.KNOWN_ADR_SYMBOLS
 
     records = {
         # AZN direct NYSE ordinary shares (not ADR) -> 1:1, NO 0.5x scaling!
@@ -1096,7 +1100,7 @@ async def test_adr_azn_direct_ordinary_share_smfg_1_2_and_unverified_omitted() -
             quote_type="EQUITY",
             security_name="Sumitomo Mitsui Financial Group, Inc. ADR",
         ),
-        # Removed/unverified ADR -> unit_unverified (`—`)
+        # Removed/unverified ADR with plain corporate name (no ADR wording!) -> unit_unverified (`—`)
         "SHEL": consensus_mod.RawConsensusRecord(
             symbol="SHEL",
             fy1_eps=7.0,
@@ -1108,7 +1112,7 @@ async def test_adr_azn_direct_ordinary_share_smfg_1_2_and_unverified_omitted() -
             analyst_count=18,
             provider="yfinance",
             quote_type="EQUITY",
-            security_name="Shell plc Sponsored ADR",
+            security_name="Shell plc",
         ),
     }
 
@@ -1479,3 +1483,478 @@ async def test_yahoo_ticker_mapping_and_canonical_cache_dedup(
     v_dash = await adapter.get_valuation("BRK-B", latest_price=420.0, quote_currency="USD")
     assert seen_yf_symbols == ["600519.SS", "BRK-B"]
     assert v_dash["pe_fy1"] == 6.0
+
+
+@pytest.mark.asyncio
+async def test_known_adr_identity_separate_from_verified_ratio_shel_plain_name_unverified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Known ADR identity is stored separately from verified ratios; SHEL ('Shell plc', USD/USD) and ratio-removed ADRs stay unit_unverified."""
+    assert "SHEL" in consensus_mod.KNOWN_ADR_SYMBOLS
+    assert "SHEL" not in consensus_mod.VERIFIED_ADR_SHARES_PER_UNIT
+
+    # Even if a ticker's ratio is deleted from VERIFIED_ADR_SHARES_PER_UNIT, KNOWN_ADR_SYMBOLS preserves ADR identity.
+    monkeypatch.delitem(consensus_mod.VERIFIED_ADR_SHARES_PER_UNIT, "TM")
+    assert "TM" in consensus_mod.KNOWN_ADR_SYMBOLS
+
+    records = {
+        "SHEL": consensus_mod.RawConsensusRecord(
+            symbol="SHEL",
+            fy1_eps=7.0,
+            fy2_eps=7.5,
+            fy1_end="2026-12-31",
+            fy2_end="2027-12-31",
+            estimate_currency="USD",
+            quote_currency="USD",
+            analyst_count=18,
+            provider="yfinance",
+            quote_type="EQUITY",
+            security_name="Shell plc",
+        ),
+        "TM": consensus_mod.RawConsensusRecord(
+            symbol="TM",
+            fy1_eps=15.0,
+            fy2_eps=16.0,
+            fy1_end="2027-03-31",
+            fy2_end="2028-03-31",
+            estimate_currency="USD",
+            quote_currency="USD",
+            analyst_count=18,
+            provider="yfinance",
+            quote_type="EQUITY",
+            security_name="Toyota Motor Corporation",
+        ),
+    }
+    adapter = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda s: records.get(s),
+        today_fn=lambda: date(2026, 11, 26),
+    )
+
+    shel = await adapter.get_valuation("SHEL", latest_price=70.0, quote_currency="USD")
+    assert shel["status"] == "unit_unverified"
+    assert shel["unit_verified"] is False
+    assert shel["pe_fy1"] is None
+
+    tm = await adapter.get_valuation("TM", latest_price=180.0, quote_currency="USD")
+    assert tm["status"] == "unit_unverified"
+    assert tm["unit_verified"] is False
+    assert tm["pe_fy1"] is None
+
+
+@pytest.mark.asyncio
+async def test_singleflight_lease_renewed_across_slot_queue_blocks_second_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Singleflight lock is renewed while waiting for a semaphore slot (>3s equivalent of 15s lease) and during upstream fetch so another worker never sends a duplicate request."""
+    fake_redis, _kv, locks = _make_ttl_redis_mock()
+    monkeypatch.setattr(
+        consensus_mod,
+        "_get_redis_cache_client",
+        create_autospec(consensus_mod._get_redis_cache_client, return_value=fake_redis),
+    )
+    # Scale 15s lease / 12s hard deadline / >3s queue wait to fast test durations with exact same overrun ratio:
+    # initial lease=240ms, queue wait=260ms (>100% of initial lease, well past 3s/15s=20%), request=200ms -> total 460ms >> 240ms.
+    monkeypatch.setattr(consensus_mod, "_REDIS_INFLIGHT_LOCK_TTL_MS", 240)
+    monkeypatch.setattr(consensus_mod, "_REDIS_INFLIGHT_WAIT_SECONDS", 0.15)
+    monkeypatch.setattr(consensus_mod, "_REDIS_INFLIGHT_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(consensus_mod, "_REDIS_SEM_WAIT_TIMEOUT_SECONDS", 2.0)
+    monkeypatch.setattr(consensus_mod, "_REDIS_SEM_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(consensus_mod, "_UPSTREAM_SLOT_HARD_TIMEOUT_SECONDS", 1.5)
+
+    # Occupy all 8 Redis semaphore slots so Worker 1 must wait in the queue past the initial inflight lease TTL
+    far_exp = time.monotonic() + 30.0
+    for i in range(consensus_mod.MAX_CONSENSUS_CONCURRENCY):
+        locks[f"{consensus_mod._REDIS_SEM_KEY_PREFIX}{i}"] = (far_exp, f"busy-other-{i}")
+
+    fetch_started = asyncio.Event()
+    release_fetch = asyncio.Event()
+    fetch_calls = {"n": 0}
+
+    async def _slow_yf(sym: str) -> consensus_mod.RawConsensusRecord:
+        fetch_calls["n"] += 1
+        fetch_started.set()
+        await release_fetch.wait()
+        return consensus_mod.RawConsensusRecord(
+            symbol=sym,
+            fy1_eps=5.0,
+            fy2_eps=6.0,
+            fy1_end="2027-12-31",
+            fy2_end="2028-12-31",
+            estimate_currency="USD",
+            quote_currency="USD",
+            provider="yfinance",
+        )
+
+    adapter_w1 = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=_slow_yf,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+    adapter_w2 = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=_slow_yf,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+
+    sym_key = consensus_mod._consensus_cache_key("QWAIT")
+    inflight_key = f"{sym_key}:inflight"
+
+    w1_task = asyncio.create_task(adapter_w1.get_valuation("QWAIT", latest_price=100.0, quote_currency="USD"))
+
+    # Keep all 8 slots full past the initial 240ms inflight lease (equivalent to >3s queue wait on 15s lease)
+    await asyncio.sleep(0.28)
+    assert not fetch_started.is_set()
+    assert inflight_key in locks
+    assert fake_redis.extend_lock.call_count >= 2
+
+    # Free one slot so Worker 1 enters the upstream request
+    locks.pop(f"{consensus_mod._REDIS_SEM_KEY_PREFIX}0", None)
+    await asyncio.wait_for(fetch_started.wait(), timeout=1.0)
+
+    # Simulate a second worker process attempting to fetch the same symbol while Worker 1 is past initial lease
+    consensus_mod._INFLIGHT_CONSENSUS.clear()
+    consensus_mod._CONSENSUS_CACHE.clear()
+    w2_res = await adapter_w2.get_valuation("QWAIT", latest_price=100.0, quote_currency="USD")
+    assert fetch_calls["n"] == 1  # Worker 2 did NOT send a duplicate upstream request!
+    assert w2_res["status"] == "loading"
+
+    # Let Worker 1 finish and verify clean result + released lock
+    release_fetch.set()
+    w1_res = await w1_task
+    assert w1_res["status"] == "ok"
+    assert w1_res["pe_fy1"] == 20.0
+    assert fetch_calls["n"] == 1
+    assert inflight_key not in locks
+
+
+@pytest.mark.asyncio
+async def test_yfinance_to_thread_timeout_keeps_slot_held_until_thread_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a yfinance worker thread exceeds timeout, the caller stops waiting but the semaphore slot stays held (and renewed) until the thread exits."""
+    fake_redis, _kv, locks = _make_ttl_redis_mock()
+    monkeypatch.setattr(
+        consensus_mod,
+        "_get_redis_cache_client",
+        create_autospec(consensus_mod._get_redis_cache_client, return_value=fake_redis),
+    )
+    monkeypatch.setattr(consensus_mod, "CONSENSUS_FETCH_TIMEOUT_SECONDS", 0.08)
+    monkeypatch.setattr(consensus_mod, "_UPSTREAM_SLOT_HARD_TIMEOUT_SECONDS", 0.14)
+    monkeypatch.setattr(consensus_mod, "_REDIS_SEM_LEASE_MS", 180)
+
+    thread_entered = threading.Event()
+    release_thread = threading.Event()
+
+    def _blocking_yf_sync(
+        symbol: str,
+        *,
+        today: date | None = None,
+        last_reported_fy_end: str | None = None,
+    ) -> tuple[consensus_mod.RawConsensusRecord | None, bool]:
+        _ = (today, last_reported_fy_end)
+        thread_entered.set()
+        release_thread.wait(timeout=5.0)
+        return (
+            consensus_mod.RawConsensusRecord(
+                symbol=symbol,
+                fy1_eps=5.0,
+                fy1_end="2027-12-31",
+                estimate_currency="USD",
+                quote_currency="USD",
+                provider="yfinance",
+            ),
+            False,
+        )
+
+    monkeypatch.setattr(
+        consensus_mod,
+        "_fetch_yfinance_consensus_result_sync",
+        create_autospec(
+            consensus_mod._fetch_yfinance_consensus_result_sync,
+            side_effect=_blocking_yf_sync,
+        ),
+    )
+
+    adapter = consensus_mod.WatchlistConsensusAdapter(today_fn=lambda: date(2026, 11, 26))
+    try:
+        res = await adapter.get_valuation("SLOWTH", latest_price=100.0, quote_currency="USD")
+        assert thread_entered.is_set()
+        assert res["status"] == "no_coverage"
+
+        # Immediately after caller timeout, thread is still running -> BOTH Redis slot and local semaphore stay held!
+        sem_slots = [k for k in locks if k.startswith(consensus_mod._REDIS_SEM_KEY_PREFIX)]
+        assert len(sem_slots) == 1
+        local_sem = consensus_mod._get_consensus_semaphore()
+        assert local_sem._value == consensus_mod.MAX_CONSENSUS_CONCURRENCY - 1
+
+        # Even past the initial 180ms Redis slot lease, renewal keeps the slot held while thread is still alive
+        await asyncio.sleep(0.24)
+        sem_slots_after_lease = [k for k in locks if k.startswith(consensus_mod._REDIS_SEM_KEY_PREFIX)]
+        assert len(sem_slots_after_lease) == 1
+        assert local_sem._value == consensus_mod.MAX_CONSENSUS_CONCURRENCY - 1
+    finally:
+        release_thread.set()
+
+    # Wait explicitly for deferred slot-release tasks to finish after the thread exits
+    if consensus_mod._PENDING_SLOT_RELEASES:
+        await asyncio.gather(*list(consensus_mod._PENDING_SLOT_RELEASES))
+
+    assert [k for k in locks if k.startswith(consensus_mod._REDIS_SEM_KEY_PREFIX)] == []
+    assert consensus_mod._get_consensus_semaphore()._value == consensus_mod.MAX_CONSENSUS_CONCURRENCY
+
+
+@pytest.mark.asyncio
+async def test_concurrent_workers_reread_shared_cooldown_before_upstream_consensus_and_fx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When two workers warm up concurrently and Worker 1 writes failure/429 cooldown, Worker 2 re-reads shared cooldown after acquiring lock and makes ZERO upstream requests (consensus + FX)."""
+    fake_redis, _kv, _locks = _make_ttl_redis_mock()
+    monkeypatch.setattr(
+        consensus_mod,
+        "_get_redis_cache_client",
+        create_autospec(consensus_mod._get_redis_cache_client, return_value=fake_redis),
+    )
+    monkeypatch.setattr(consensus_mod, "_REDIS_INFLIGHT_POLL_SECONDS", 0.01)
+
+    # 1. Consensus concurrent warmup: Worker 1 fails -> writes shared cooldown -> Worker 2 does NOT call upstream!
+    c_entered = asyncio.Event()
+    c_release = asyncio.Event()
+    c_calls = {"n": 0}
+
+    async def _failing_yf(_sym: str) -> consensus_mod.RawConsensusRecord:
+        c_calls["n"] += 1
+        c_entered.set()
+        await c_release.wait()
+        raise consensus_mod.ConsensusRateLimitError("HTTP 429")
+
+    adapter_w1 = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=_failing_yf,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+    adapter_w2 = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=_failing_yf,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+
+    adapter_w1.schedule_warmup("CDW1")
+    w1_task = consensus_mod._INFLIGHT_WARMUP["CDW1"]
+    await asyncio.wait_for(c_entered.wait(), timeout=1.0)
+
+    # Simulate a second worker process (separate in-process maps, shared Redis)
+    consensus_mod._INFLIGHT_WARMUP.clear()
+    consensus_mod._INFLIGHT_CONSENSUS.clear()
+    consensus_mod._CONSENSUS_ERROR_COOLDOWN.clear()
+    adapter_w2.schedule_warmup("CDW1")
+    w2_task = consensus_mod._INFLIGHT_WARMUP["CDW1"]
+
+    await asyncio.sleep(0.03)
+    c_release.set()
+    await asyncio.gather(w1_task, w2_task)
+    assert c_calls["n"] == 1
+
+    # Direct get_valuation on Worker 2 also respects shared rate_limited cooldown with ZERO upstream calls
+    consensus_mod._CONSENSUS_ERROR_COOLDOWN.clear()
+    val_w2 = await adapter_w2.get_valuation("CDW1", latest_price=100.0, quote_currency="USD")
+    assert c_calls["n"] == 1
+    assert val_w2["status"] == "rate_limited"
+
+    # 2. FX concurrent fetch: Worker 1 fails with 429 -> writes shared FX cooldown -> Worker 2 re-reads and does NOT call upstream!
+    fx_entered = asyncio.Event()
+    fx_release = asyncio.Event()
+    fx_calls = {"n": 0}
+
+    async def _failing_fx(src: str, dst: str) -> float | None:
+        _ = (src, dst)
+        fx_calls["n"] += 1
+        fx_entered.set()
+        await fx_release.wait()
+        raise consensus_mod.ConsensusRateLimitError("FX 429")
+
+    fx_w1 = consensus_mod.WatchlistConsensusAdapter(
+        fx_fetcher=_failing_fx,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+    fx_w2 = consensus_mod.WatchlistConsensusAdapter(
+        fx_fetcher=_failing_fx,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+
+    fx_task1 = asyncio.create_task(fx_w1._fetch_spot_fx_rate_with_status("JPY", "USD"))
+    await asyncio.wait_for(fx_entered.wait(), timeout=1.0)
+
+    consensus_mod._INFLIGHT_FX.clear()
+    consensus_mod._FX_ERROR_COOLDOWN.clear()
+    fx_task2 = asyncio.create_task(fx_w2._fetch_spot_fx_rate_with_status("JPY", "USD"))
+
+    await asyncio.sleep(0.03)
+    fx_release.set()
+    r1, r2 = await asyncio.gather(fx_task1, fx_task2)
+    assert fx_calls["n"] == 1
+    assert r1 == (None, False, True, False)
+    assert r2 == (None, False, True, False)
+
+
+@pytest.mark.asyncio
+async def test_short_cooldown_for_empty_missing_currency_partial_429_and_undated_fy_not_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty results, temporarily missing currency, and partial results after FMP 429 use short cooldown (no 12h cache) while preserving available year; undated FYs are never fresh."""
+    import pandas as pd
+    import yfinance as yf
+    import src.data_client.yfinance.yahoo as yahoo_mod
+
+    # 1. Ordinary empty result (no EPS, no error, no rollover) -> short cooldown, NO 12h cache
+    fmp_empty = create_autospec(FMPClient, instance=True)
+    fmp_empty.get_analyst_estimates.return_value = []
+    adapter_empty = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda s: consensus_mod.RawConsensusRecord(
+            symbol=s, quote_currency="USD", provider="yfinance"
+        ),
+        fmp_client=fmp_empty,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+    empty_val = await adapter_empty.get_valuation("EMPTYCO", latest_price=50.0, quote_currency="USD")
+    assert empty_val["status"] == "no_coverage"
+    assert consensus_mod._consensus_cache_key("EMPTYCO") not in consensus_mod._CONSENSUS_CACHE
+    assert await consensus_mod._read_consensus_cooldown("EMPTYCO") == "empty"
+    cached_empty, needs_warm_empty = await adapter_empty.get_cached_valuation(
+        "EMPTYCO", latest_price=50.0, quote_currency="USD"
+    )
+    assert cached_empty is not None and cached_empty["status"] == "no_coverage"
+    assert needs_warm_empty is False
+
+    # 2. Temporarily missing currency (FMP income statement fails non-429) -> short cooldown, NO 12h cache, unit_unverified displayed
+    fmp_no_inc = create_autospec(FMPClient, instance=True)
+    fmp_no_inc.get_analyst_estimates.return_value = [
+        {"date": "2027-12-31", "epsAvg": 25.0, "numAnalystsEps": 30},
+    ]
+    fmp_no_inc.get_income_statement.side_effect = RuntimeError("FMP income 503")
+    fmp_no_inc.get_profile.return_value = [
+        {"symbol": "NOCCY", "currency": "HKD", "companyName": "NoCcy Corp", "isAdr": False}
+    ]
+    adapter_no_ccy = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda _s: None,
+        fmp_client=fmp_no_inc,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+    no_ccy_val = await adapter_no_ccy.get_valuation("NOCCY", latest_price=100.0, quote_currency="HKD")
+    assert no_ccy_val["status"] == "unit_unverified"
+    assert no_ccy_val["estimate_currency"] is None
+    assert consensus_mod._consensus_cache_key("NOCCY") not in consensus_mod._CONSENSUS_CACHE
+    assert await consensus_mod._read_consensus_cooldown("NOCCY") == "missing_currency"
+    cached_no_ccy, needs_warm_no_ccy = await adapter_no_ccy.get_cached_valuation(
+        "NOCCY", latest_price=100.0, quote_currency="HKD"
+    )
+    assert cached_no_ccy is not None and cached_no_ccy["status"] == "unit_unverified"
+    assert needs_warm_no_ccy is False
+
+    # 3. Partial result (Yahoo FY1 OK, missing FY2, FMP hits 429) -> short cooldown, NO 12h cache, FY1 still shown normally!
+    fmp_429 = create_autospec(FMPClient, instance=True)
+    fmp_429.get_analyst_estimates.side_effect = FmpQuotaExhausted()
+    adapter_partial = consensus_mod.WatchlistConsensusAdapter(
+        yfinance_fetcher=lambda s: consensus_mod.RawConsensusRecord(
+            symbol=s,
+            fy1_eps=4.5,
+            fy2_eps=None,
+            fy1_end="2027-01-31",
+            fy2_end="2028-01-31",
+            estimate_currency="USD",
+            quote_currency="USD",
+            analyst_count=35,
+            provider="yfinance",
+        ),
+        fmp_client=fmp_429,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+    part_val = await adapter_partial.get_valuation("PART429", latest_price=135.0, quote_currency="USD")
+    assert part_val["status"] == "ok"
+    assert part_val["pe_fy1"] == 30.0
+    assert part_val["pe_fy2"] is None
+    assert consensus_mod._consensus_cache_key("PART429") not in consensus_mod._CONSENSUS_CACHE
+    assert await consensus_mod._read_consensus_cooldown("PART429") == "partial_rate_limited"
+
+    # During short cooldown, cached view still displays FY1 normally without looping warmup
+    cached_part, needs_warm_part = await adapter_partial.get_cached_valuation(
+        "PART429", latest_price=135.0, quote_currency="USD"
+    )
+    assert cached_part is not None and cached_part["status"] == "ok"
+    assert cached_part["pe_fy1"] == 30.0
+    assert cached_part["pe_fy2"] is None
+    assert needs_warm_part is False
+
+    # Once short cooldown expires, cached view requests warmup again so missing FY2 can retry
+    consensus_mod._CONSENSUS_ERROR_COOLDOWN.clear()
+    cached_after_cd, needs_warm_after_cd = await adapter_partial.get_cached_valuation(
+        "PART429", latest_price=135.0, quote_currency="USD"
+    )
+    assert cached_after_cd is None
+    assert needs_warm_after_cd is True
+
+    # 4. Undated fiscal years are never treated as fresh:
+    # 4a) Yahoo 0y has EPS but no endDate while +1y has a valid endDate -> undated 0y dropped, +1y becomes FY1, FMP fills FY2
+    fake_ticker = create_autospec(yf.Ticker, instance=True)
+    fake_ticker.earnings_estimate = pd.DataFrame(
+        {"avg": [4.0, 5.5], "numberOfAnalysts": [30, 28]},
+        index=["0y", "+1y"],
+    )
+    fake_ticker._analysis = type(
+        "_A",
+        (),
+        {
+            "_earnings_trend": [
+                {"period": "0y"},  # missing endDate!
+                {"period": "+1y", "endDate": "2027-12-31"},
+            ]
+        },
+    )()
+    fake_ticker.info = {
+        "currency": "USD",
+        "financialCurrency": "USD",
+        "quoteType": "EQUITY",
+        "longName": "Undated ZeroY Corp",
+    }
+    monkeypatch.setattr(
+        yahoo_mod,
+        "yahoo_ticker",
+        create_autospec(yahoo_mod.yahoo_ticker, return_value=fake_ticker),
+    )
+
+    fmp_fill = create_autospec(FMPClient, instance=True)
+    fmp_fill.get_analyst_estimates.return_value = [
+        {"date": "2027-12-31", "epsAvg": 5.4, "numAnalystsEps": 28},
+        {"date": "2028-12-31", "epsAvg": 7.0, "numAnalystsEps": 25},
+    ]
+    fmp_fill.get_income_statement.return_value = [
+        {"date": "2025-12-31", "reportedCurrency": "USD"}
+    ]
+    fmp_fill.get_profile.return_value = [
+        {"symbol": "UNDAT", "currency": "USD", "companyName": "Undated ZeroY Corp", "isAdr": False}
+    ]
+    adapter_undated = consensus_mod.WatchlistConsensusAdapter(
+        fmp_client=fmp_fill,
+        today_fn=lambda: date(2026, 11, 26),
+    )
+    undated_val = await adapter_undated.get_valuation("UNDAT", latest_price=110.0, quote_currency="USD")
+    assert undated_val["status"] == "ok"
+    assert undated_val["fy1_end"] == "2027-12-31"
+    assert undated_val["fy1_eps"] == 5.5
+    assert undated_val["fy2_end"] == "2028-12-31"
+    assert undated_val["fy2_eps"] == 7.0
+    assert undated_val["provider"] == "yfinance+fmp"
+
+    # 4b) Cached record lacking fy1_end is NEVER considered fresh!
+    undated_key = consensus_mod._consensus_cache_key("NOCUTOFF")
+    consensus_mod._CONSENSUS_CACHE[undated_key] = (
+        time.time(),
+        consensus_mod.RawConsensusRecord(
+            symbol="NOCUTOFF",
+            fy1_eps=5.0,
+            fy1_end=None,
+            estimate_currency="USD",
+            quote_currency="USD",
+            provider="yfinance",
+        ).to_dict(),
+    )
+    cached_rec, is_fresh = await consensus_mod._read_consensus_cache(
+        "NOCUTOFF", today=date(2026, 11, 26)
+    )
+    assert cached_rec is not None
+    assert is_fresh is False

@@ -17,6 +17,7 @@ Design invariants:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import math
@@ -159,6 +160,51 @@ VERIFIED_ADR_SHARES_PER_UNIT: dict[str, VerifiedAdrRatio] = {
     ),
 }
 
+# Separate ADR identity registry from verified ratio table:
+# Removing a ratio from VERIFIED_ADR_SHARES_PER_UNIT MUST NOT drop its ADR identity;
+# any known ADR without a verified ratio renders `unit_unverified` instead of assuming 1:1.
+# Tickers that transitioned to direct ordinary-share US listings (e.g. AZN on 2026-02-02) are excluded.
+KNOWN_ADR_SYMBOLS: frozenset[str] = frozenset(VERIFIED_ADR_SHARES_PER_UNIT.keys()) | frozenset(
+    {
+        "TCOM",
+        "NIO",
+        "XPEV",
+        "LI",
+        "BEKE",
+        "BILI",
+        "TME",
+        "ZTO",
+        "VIPS",
+        "UMC",
+        "ASX",
+        "SAP",
+        "GSK",
+        "SNY",
+        "MUFG",
+        "MFG",
+        "SHEL",
+        "BP",
+        "HSBC",
+        "UL",
+        "DEO",
+        "BTI",
+        "RIO",
+        "BHP",
+        "VALE",
+        "PBR",
+        "ITUB",
+        "INFY",
+        "WIT",
+        "HDB",
+        "IBN",
+        "ARM",
+        "SE",
+        "BUD",
+        "ERIC",
+        "NOK",
+    }
+)
+
 _ADR_NAME_TOKENS: tuple[str, ...] = (
     " ADR",
     " ADS",
@@ -177,13 +223,17 @@ _SUBUNIT_CURRENCIES: dict[str, tuple[str, float]] = {
 }
 
 _CONSENSUS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-_CONSENSUS_ERROR_COOLDOWN: dict[str, tuple[float, str]] = {}
+_CONSENSUS_ERROR_COOLDOWN: dict[str, tuple[float, str, dict[str, Any] | None]] = {}
 _FX_CACHE: dict[str, tuple[float, float]] = {}
 _FX_ERROR_COOLDOWN: dict[str, tuple[float, str]] = {}
 _INFLIGHT_CONSENSUS: dict[str, asyncio.Task[dict[str, Any]]] = {}
 _INFLIGHT_FX: dict[str, asyncio.Task[float | None]] = {}
 _INFLIGHT_WARMUP: dict[str, asyncio.Task[None]] = {}
 _CONSENSUS_SEMAPHORE: asyncio.Semaphore | None = None
+_CURRENT_UPSTREAM_SLOT: contextvars.ContextVar[_UpstreamSlotLease | None] = (
+    contextvars.ContextVar("_CURRENT_UPSTREAM_SLOT", default=None)
+)
+_PENDING_SLOT_RELEASES: set[asyncio.Task[None]] = set()
 CONSENSUS_ERROR_COOLDOWN_SECONDS = 60.0
 
 
@@ -197,6 +247,22 @@ class _ConsensusSingleflightBusyError(RuntimeError):
 
 class _ConsensusEmptyCooldownError(RuntimeError):
     """Raised when upstream returned only rolled-past/unusable estimates and entered cooldown."""
+
+
+class _ConsensusCooldownHitError(RuntimeError):
+    """Raised when a worker re-reads an active shared cooldown before issuing an upstream request."""
+
+    def __init__(
+        self,
+        err_kind: str,
+        *,
+        cached_dict: dict[str, Any] | None = None,
+        cached_fx: float | None = None,
+    ) -> None:
+        super().__init__(f"Active shared cooldown ({err_kind})")
+        self.err_kind = err_kind
+        self.cached_dict = cached_dict
+        self.cached_fx = cached_fx
 
 
 def _canonical_symbol(symbol: str) -> str:
@@ -223,6 +289,7 @@ def _get_consensus_semaphore() -> asyncio.Semaphore:
 
 
 def _clear_consensus_cache_for_tests() -> None:
+    global _CONSENSUS_SEMAPHORE
     _CONSENSUS_CACHE.clear()
     _CONSENSUS_ERROR_COOLDOWN.clear()
     _FX_CACHE.clear()
@@ -230,6 +297,7 @@ def _clear_consensus_cache_for_tests() -> None:
     _INFLIGHT_CONSENSUS.clear()
     _INFLIGHT_FX.clear()
     _INFLIGHT_WARMUP.clear()
+    _CONSENSUS_SEMAPHORE = None
 
 
 def _utc_today() -> date:
@@ -523,8 +591,8 @@ def _is_adr_security(
         return True
     if row_adr_ratio is not None:
         return True
-    sym = str(symbol or "").strip().upper()
-    if sym in VERIFIED_ADR_SHARES_PER_UNIT:
+    sym = _canonical_symbol(symbol)
+    if sym in KNOWN_ADR_SYMBOLS or sym in VERIFIED_ADR_SHARES_PER_UNIT:
         return True
     qt = str(quote_type or "").strip().upper()
     if "ADR" in qt or qt in ("DR", "DEPOSITARY_RECEIPT"):
@@ -704,15 +772,24 @@ def _fx_cooldown_redis_key(fx_key: str) -> str:
     return f"{fx_key}:cd"
 
 
-async def _write_consensus_cooldown(symbol: str, err_kind: str) -> None:
+async def _write_consensus_cooldown(
+    symbol: str,
+    err_kind: str,
+    *,
+    record_dict: Mapping[str, Any] | None = None,
+) -> None:
     sym = _canonical_symbol(symbol)
-    _CONSENSUS_ERROR_COOLDOWN[sym] = (time.monotonic(), err_kind)
+    rec_copy = dict(record_dict) if record_dict is not None else None
+    _CONSENSUS_ERROR_COOLDOWN[sym] = (time.monotonic(), err_kind, rec_copy)
     redis_client = await _get_redis_cache_client()
     if redis_client is not None:
         try:
+            payload: dict[str, Any] = {"kind": err_kind}
+            if rec_copy is not None:
+                payload["record"] = rec_copy
             await redis_client.set(
                 _consensus_cooldown_redis_key(sym),
-                json.dumps({"kind": err_kind}),
+                json.dumps(payload, ensure_ascii=False, default=str),
                 ttl=int(CONSENSUS_ERROR_COOLDOWN_SECONDS),
             )
         except Exception:
@@ -730,12 +807,14 @@ async def _clear_consensus_cooldown(symbol: str) -> None:
             pass
 
 
-async def _read_consensus_cooldown(symbol: str) -> str | None:
+async def _read_consensus_cooldown_entry(
+    symbol: str,
+) -> tuple[str | None, dict[str, Any] | None]:
     sym = _canonical_symbol(symbol)
     cd = _CONSENSUS_ERROR_COOLDOWN.get(sym)
     if cd is not None:
         if (time.monotonic() - cd[0]) < CONSENSUS_ERROR_COOLDOWN_SECONDS:
-            return cd[1]
+            return cd[1], (dict(cd[2]) if isinstance(cd[2], dict) else None)
         _CONSENSUS_ERROR_COOLDOWN.pop(sym, None)
     redis_client = await _get_redis_cache_client()
     if redis_client is not None:
@@ -743,10 +822,16 @@ async def _read_consensus_cooldown(symbol: str) -> str | None:
             raw = await redis_client.get(_consensus_cooldown_redis_key(sym))
             parsed: Any = json.loads(raw) if isinstance(raw, str) and raw else raw
             if isinstance(parsed, dict) and isinstance(parsed.get("kind"), str):
-                return parsed["kind"]
+                rec_val = parsed.get("record")
+                return parsed["kind"], (dict(rec_val) if isinstance(rec_val, dict) else None)
         except Exception:
             pass
-    return None
+    return None, None
+
+
+async def _read_consensus_cooldown(symbol: str) -> str | None:
+    kind, _ = await _read_consensus_cooldown_entry(symbol)
+    return kind
 
 
 async def _write_fx_cooldown(fx_key: str, err_kind: str) -> None:
@@ -803,53 +888,219 @@ async def _get_redis_cache_client() -> Any:
     return None
 
 
-@asynccontextmanager
-async def _acquire_upstream_slot() -> AsyncIterator[None]:
-    """Acquire a cross-process Redis semaphore slot (8-way instance-wide, §6.2) with local fallback."""
-    local_sem = _get_consensus_semaphore()
-    async with local_sem:
-        redis_client = await _get_redis_cache_client()
-        acquire_lock = getattr(redis_client, "acquire_lock", None) if redis_client is not None else None
-        release_lock = getattr(redis_client, "release_lock", None) if redis_client is not None else None
-        if not callable(acquire_lock) or not callable(release_lock):
-            yield
+def _start_lock_renewer(
+    redis_client: Any,
+    key: str,
+    token: str,
+    ttl_ms: int,
+) -> asyncio.Task[None] | None:
+    """Periodically renew a held Redis lock while queuing or executing upstream calls."""
+    extend_lock = getattr(redis_client, "extend_lock", None) if redis_client is not None else None
+    if not callable(extend_lock):
+        return None
+    interval = max(0.01, (ttl_ms / 1000.0) / 3.0)
+
+    async def _renew_loop() -> None:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                ok = await extend_lock(key, token, ttl_ms)
+                if ok is False:
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+    return asyncio.create_task(_renew_loop())
+
+
+async def _release_redis_lock_safely(
+    redis_client: Any,
+    key: str | None,
+    token: str,
+    renew_task: asyncio.Task[None] | None,
+) -> None:
+    if renew_task is not None and not renew_task.done():
+        renew_task.cancel()
+        try:
+            await renew_task
+        except BaseException:
+            pass
+    if key is not None and redis_client is not None:
+        release_lock = getattr(redis_client, "release_lock", None)
+        if callable(release_lock):
+            try:
+                await release_lock(key, token)
+            except Exception:
+                pass
+
+
+class _UpstreamSlotLease:
+    """Holds both in-process and Redis semaphore slots until every spawned blocking thread finishes."""
+
+    def __init__(
+        self,
+        *,
+        local_sem: asyncio.Semaphore,
+        redis_client: Any,
+        slot_key: str | None,
+        token: str,
+        renew_task: asyncio.Task[None] | None,
+    ) -> None:
+        self._local_sem = local_sem
+        self._redis_client = redis_client
+        self._slot_key = slot_key
+        self._token = token
+        self._renew_task = renew_task
+        self._thread_futs: list[asyncio.Future[None]] = []
+        self._released = False
+
+    def track_thread(self, thread_done: asyncio.Future[None]) -> None:
+        self._thread_futs.append(thread_done)
+
+    async def _release_now(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        try:
+            await _release_redis_lock_safely(
+                self._redis_client, self._slot_key, self._token, self._renew_task
+            )
+        finally:
+            self._local_sem.release()
+
+    async def release_or_defer(self) -> None:
+        pending = [f for f in self._thread_futs if not f.done()]
+        if not pending:
+            await self._release_now()
             return
 
-        token = uuid.uuid4().hex
-        acquired_slot_key: str | None = None
+        # A timed-out blocking thread (e.g. yfinance) is still executing in the thread pool.
+        # Keep the slot (and its Redis lease renewal) held until the thread actually returns.
+        async def _wait_and_release() -> None:
+            try:
+                await asyncio.gather(*pending, return_exceptions=True)
+            finally:
+                await self._release_now()
+
+        task = asyncio.create_task(_wait_and_release())
+        _PENDING_SLOT_RELEASES.add(task)
+        task.add_done_callback(_PENDING_SLOT_RELEASES.discard)
+
+
+async def _run_blocking_holding_slot(
+    fn: Callable[..., Any],
+    *args: Any,
+    timeout: float,
+    **kwargs: Any,
+) -> Any:
+    """Run blocking *fn* in a worker thread with a caller wait timeout, keeping the active slot until the thread returns."""
+    loop = asyncio.get_running_loop()
+    result_fut: asyncio.Future[Any] = loop.create_future()
+    thread_done: asyncio.Future[None] = loop.create_future()
+
+    def _finish(val: Any, exc: BaseException | None) -> None:
+        if not thread_done.done():
+            thread_done.set_result(None)
+        if not result_fut.done():
+            if exc is not None:
+                result_fut.set_exception(exc)
+            else:
+                result_fut.set_result(val)
+
+    def _runner() -> None:
+        try:
+            val = fn(*args, **kwargs)
+        except BaseException as exc:
+            try:
+                loop.call_soon_threadsafe(_finish, None, exc)
+            except RuntimeError:
+                pass
+        else:
+            try:
+                loop.call_soon_threadsafe(_finish, val, None)
+            except RuntimeError:
+                pass
+
+    slot = _CURRENT_UPSTREAM_SLOT.get()
+    if slot is not None:
+        slot.track_thread(thread_done)
+
+    loop.run_in_executor(None, _runner)
+
+    try:
+        return await asyncio.wait_for(asyncio.shield(result_fut), timeout=timeout)
+    except BaseException:
+        def _consume_exc(f: asyncio.Future[Any]) -> None:
+            if not f.cancelled():
+                _ = f.exception()
+
+        result_fut.add_done_callback(_consume_exc)
+        raise
+
+
+@asynccontextmanager
+async def _acquire_upstream_slot() -> AsyncIterator[_UpstreamSlotLease]:
+    """Acquire a cross-process Redis semaphore slot (8-way instance-wide, §6.2) with local fallback."""
+    local_sem = _get_consensus_semaphore()
+    await asyncio.wait_for(local_sem.acquire(), timeout=_REDIS_SEM_WAIT_TIMEOUT_SECONDS)
+
+    redis_client = await _get_redis_cache_client()
+    acquire_lock = getattr(redis_client, "acquire_lock", None) if redis_client is not None else None
+    release_lock = getattr(redis_client, "release_lock", None) if redis_client is not None else None
+
+    token = uuid.uuid4().hex
+    acquired_slot_key: str | None = None
+    renew_task: asyncio.Task[None] | None = None
+
+    if callable(acquire_lock) and callable(release_lock):
         deadline = time.monotonic() + _REDIS_SEM_WAIT_TIMEOUT_SECONDS
         offset = random.randrange(MAX_CONSENSUS_CONCURRENCY)
-
-        while True:
-            redis_unavailable = False
-            for idx in range(MAX_CONSENSUS_CONCURRENCY):
-                slot_idx = (offset + idx) % MAX_CONSENSUS_CONCURRENCY
-                slot_key = f"{_REDIS_SEM_KEY_PREFIX}{slot_idx}"
-                try:
-                    ok = await acquire_lock(slot_key, token, _REDIS_SEM_LEASE_MS)
-                except Exception:
-                    ok = None
-                if ok is True:
-                    acquired_slot_key = slot_key
-                    break
-                if ok is None:
-                    # Redis unavailable or errored -> degrade gracefully to local semaphore
-                    redis_unavailable = True
-                    break
-            if acquired_slot_key is not None or redis_unavailable:
-                break
-            if time.monotonic() >= deadline:
-                raise TimeoutError("Timed out waiting for cross-process consensus semaphore slot")
-            await asyncio.sleep(_REDIS_SEM_POLL_SECONDS)
-
         try:
-            yield
-        finally:
-            if acquired_slot_key is not None:
-                try:
-                    await release_lock(acquired_slot_key, token)
-                except Exception:
-                    pass
+            while True:
+                redis_unavailable = False
+                for idx in range(MAX_CONSENSUS_CONCURRENCY):
+                    slot_idx = (offset + idx) % MAX_CONSENSUS_CONCURRENCY
+                    slot_key = f"{_REDIS_SEM_KEY_PREFIX}{slot_idx}"
+                    try:
+                        ok = await acquire_lock(slot_key, token, _REDIS_SEM_LEASE_MS)
+                    except Exception:
+                        ok = None
+                    if ok is True:
+                        acquired_slot_key = slot_key
+                        break
+                    if ok is None:
+                        # Redis unavailable or errored -> degrade gracefully to local semaphore
+                        redis_unavailable = True
+                        break
+                if acquired_slot_key is not None or redis_unavailable:
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Timed out waiting for cross-process consensus semaphore slot")
+                await asyncio.sleep(_REDIS_SEM_POLL_SECONDS)
+        except BaseException:
+            local_sem.release()
+            raise
+
+        if acquired_slot_key is not None:
+            renew_task = _start_lock_renewer(
+                redis_client, acquired_slot_key, token, _REDIS_SEM_LEASE_MS
+            )
+
+    lease = _UpstreamSlotLease(
+        local_sem=local_sem,
+        redis_client=redis_client,
+        slot_key=acquired_slot_key,
+        token=token,
+        renew_task=renew_task,
+    )
+    ctx_token = _CURRENT_UPSTREAM_SLOT.set(lease)
+    try:
+        yield lease
+    finally:
+        _CURRENT_UPSTREAM_SLOT.reset(ctx_token)
+        await lease.release_or_defer()
 
 
 def _is_record_rolled_past_fy(
@@ -858,15 +1109,28 @@ def _is_record_rolled_past_fy(
     today: date,
     last_reported_fy_end: str | None = None,
 ) -> bool:
-    """Return True if a cached record's FY1 end date has rolled past ``today`` or ``last_reported_fy_end``."""
-    fy1_end_str = str(record_dict.get("fy1_end") or "").strip()[:10]
-    fy1_dt = _parse_iso_date(fy1_end_str)
-    if fy1_dt is None:
-        return False
-    if fy1_dt < today:
+    """Return True if a cached record has missing FY end date(s) or rolled past ``today`` / ``last_reported_fy_end``."""
+    fy1_eps = _finite_float(record_dict.get("fy1_eps"))
+    fy2_eps = _finite_float(record_dict.get("fy2_eps"))
+    fy1_dt = _parse_iso_date(str(record_dict.get("fy1_end") or "").strip()[:10])
+    fy2_dt = _parse_iso_date(str(record_dict.get("fy2_end") or "").strip()[:10])
+
+    # Any fiscal year with EPS but no end date (or a record with no FY end date at all) is never fresh.
+    if fy1_eps is not None and fy1_dt is None:
         return True
-    cutoff = _parse_iso_date(last_reported_fy_end or record_dict.get("last_reported_fy_end"))
-    if cutoff is not None and fy1_dt <= cutoff:
+    if fy2_eps is not None and fy2_dt is None:
+        return True
+    if fy1_dt is None and fy2_dt is None:
+        return True
+
+    cutoff = _max_iso_date(last_reported_fy_end, record_dict.get("last_reported_fy_end"))
+    if fy1_dt is not None and not _is_eligible_fy_end(
+        fy1_dt.isoformat(), today=today, last_reported_fy_end=cutoff
+    ):
+        return True
+    if fy2_dt is not None and not _is_eligible_fy_end(
+        fy2_dt.isoformat(), today=today, last_reported_fy_end=cutoff
+    ):
         return True
     return False
 
@@ -1066,7 +1330,6 @@ def _filter_consensus_record_fiscal_years(
     eff_reported = _max_iso_date(last_reported_fy_end, record.last_reported_fy_end)
     dropped_any = False
     kept_dated: list[tuple[str, float | None]] = []
-    kept_undated: list[float | None] = []
 
     for end_raw, eps_val in ((record.fy1_end, record.fy1_eps), (record.fy2_end, record.fy2_eps)):
         parsed = _parse_iso_date(end_raw)
@@ -1077,12 +1340,11 @@ def _filter_consensus_record_fiscal_years(
             else:
                 dropped_any = True
         elif eps_val is not None:
-            kept_undated.append(eps_val)
+            # Fiscal year without an end date cannot be verified as fresh; leave missing for dated fallback.
+            dropped_any = True
 
     kept_dated.sort(key=lambda item: item[0])
-    slots: list[tuple[str | None, float | None]] = list(kept_dated) + [
-        (None, eps) for eps in kept_undated
-    ]
+    slots: list[tuple[str | None, float | None]] = list(kept_dated)
     new_fy1_end, new_fy1_eps = slots[0] if len(slots) >= 1 else (None, None)
     new_fy2_end, new_fy2_eps = slots[1] if len(slots) >= 2 else (None, None)
 
@@ -1168,10 +1430,9 @@ def _fetch_yfinance_consensus_result_sync(
     info_reported_fy_end = _epoch_to_iso_date(info.get("lastFiscalYearEnd"))
     eff_reported_fy_end = _max_iso_date(last_reported_fy_end, info_reported_fy_end)
 
-    # Unified FY filter BEFORE assigning FY1/FY2: keep only end_date >= today and > last_reported_fy_end.
+    # Unified FY filter BEFORE assigning FY1/FY2: keep only dated rows with end_date >= today and > last_reported_fy_end.
     dropped_rolled_fy = False
     eligible_dated: list[tuple[str, float | None, int | None]] = []
-    eligible_undated: list[tuple[None, float | None, int | None]] = []
 
     for period_key in ("0y", "+1y"):
         row = rows.get(period_key) or {}
@@ -1190,12 +1451,11 @@ def _fetch_yfinance_consensus_result_sync(
             else:
                 dropped_rolled_fy = True
         elif eps_val is not None:
-            eligible_undated.append((None, eps_val, analysts))
+            # Rows lacking an endDate are never treated as fresh FY1/FY2; leave missing for dated fallback.
+            dropped_rolled_fy = True
 
     eligible_dated.sort(key=lambda item: item[0])
-    eligible_slots: list[tuple[str | None, float | None, int | None]] = list(eligible_dated) + list(
-        eligible_undated
-    )
+    eligible_slots: list[tuple[str | None, float | None, int | None]] = list(eligible_dated)
 
     fy1_end, fy1_eps, fy1_analysts = eligible_slots[0] if len(eligible_slots) >= 1 else (None, None, None)
     fy2_end, fy2_eps, fy2_analysts = eligible_slots[1] if len(eligible_slots) >= 2 else (None, None, None)
@@ -1401,8 +1661,8 @@ def _merge_partial_consensus_record(
             cand_end = str(matched_row.get("date"))[:10]
             cand_analysts = _fmp_row_analysts(matched_row)
         elif fy1_end is None:
-            # No target FY1 end from primary: accept eligible fallback FY1 strictly earlier than primary FY2
-            fb1_ok = fallback.fy1_end is None or _is_eligible_fy_end(
+            # No target FY1 end from primary: accept eligible dated fallback FY1 strictly earlier than primary FY2
+            fb1_ok = fallback.fy1_end is not None and _is_eligible_fy_end(
                 fallback.fy1_end, today=ref_today, last_reported_fy_end=eff_reported
             )
             if (
@@ -1410,7 +1670,6 @@ def _merge_partial_consensus_record(
                 and fallback.fy1_eps is not None
                 and (
                     fy2_end is None
-                    or fallback.fy1_end is None
                     or (
                         fallback.fy1_end < fy2_end
                         and not _dates_match_fiscal_year(fallback.fy1_end, fy2_end)
@@ -1443,11 +1702,11 @@ def _merge_partial_consensus_record(
             cand_end = str(matched_row.get("date"))[:10]
             cand_analysts = _fmp_row_analysts(matched_row)
         elif fy2_end is None:
-            # No target FY2 end from primary: pick eligible fallback FY2 (or FY1) strictly after primary FY1
-            fb2_ok = fallback.fy2_end is None or _is_eligible_fy_end(
+            # No target FY2 end from primary: pick eligible dated fallback FY2 (or FY1) strictly after primary FY1
+            fb2_ok = fallback.fy2_end is not None and _is_eligible_fy_end(
                 fallback.fy2_end, today=ref_today, last_reported_fy_end=eff_reported
             )
-            fb1_ok = fallback.fy1_end is None or _is_eligible_fy_end(
+            fb1_ok = fallback.fy1_end is not None and _is_eligible_fy_end(
                 fallback.fy1_end, today=ref_today, last_reported_fy_end=eff_reported
             )
             if (
@@ -1455,9 +1714,9 @@ def _merge_partial_consensus_record(
                 and fallback.fy2_eps is not None
                 and (
                     fy1_end is None
-                    or fallback.fy2_end is None
                     or (
-                        fallback.fy2_end > fy1_end
+                        fallback.fy2_end is not None
+                        and fallback.fy2_end > fy1_end
                         and not _dates_match_fiscal_year(fallback.fy2_end, fy1_end)
                     )
                 )
@@ -1816,14 +2075,12 @@ class WatchlistConsensusAdapter:
             res = self._yfinance_fetcher(symbol)
             rec = await res if asyncio.iscoroutine(res) else res
             return rec, False
-        return await asyncio.wait_for(
-            asyncio.to_thread(
-                _fetch_yfinance_consensus_result_sync,
-                symbol,
-                today=self._today(),
-                last_reported_fy_end=last_reported_fy_end,
-            ),
+        return await _run_blocking_holding_slot(
+            _fetch_yfinance_consensus_result_sync,
+            symbol,
             timeout=CONSENSUS_FETCH_TIMEOUT_SECONDS,
+            today=self._today(),
+            last_reported_fy_end=last_reported_fy_end,
         )
 
     async def _fetch_from_fmp_with_rows(
@@ -1994,6 +2251,11 @@ class WatchlistConsensusAdapter:
                 return (cached, True, False, False) if cached is not None else (None, False, False, False)
             except _ConsensusSingleflightBusyError:
                 return (cached, True, False, False) if cached is not None else (None, False, False, True)
+            except _ConsensusCooldownHitError as cd_exc:
+                fallback_fx = cd_exc.cached_fx if cd_exc.cached_fx is not None else cached
+                if fallback_fx is not None:
+                    return fallback_fx, True, False, False
+                return None, False, (cd_exc.err_kind == "rate_limited"), False
             except ConsensusRateLimitError:
                 return (cached, True, False, False) if cached is not None else (None, False, True, False)
             except Exception:
@@ -2042,22 +2304,42 @@ class WatchlistConsensusAdapter:
                         r_cached, r_fresh = await _read_fx_cache(src, dst)
                         if r_cached is not None and r_fresh:
                             return r_cached
+                        fx_cd = await _read_fx_cooldown(cache_key)
+                        if fx_cd is not None:
+                            raise _ConsensusCooldownHitError(fx_cd, cached_fx=r_cached)
                         raise _ConsensusSingleflightBusyError(
                             f"Another worker still holds FX singleflight lock for {src}->{dst}"
                         )
 
+            inflight_renew_task: asyncio.Task[None] | None = None
             try:
+                if held_inflight_lock and redis_client is not None:
+                    inflight_renew_task = _start_lock_renewer(
+                        redis_client, inflight_key, lock_token, _REDIS_INFLIGHT_LOCK_TTL_MS
+                    )
+
+                # Re-read cache and shared cooldown AFTER acquiring singleflight lock, BEFORE slot/upstream!
+                r_cached, r_fresh = await _read_fx_cache(src, dst)
+                if r_cached is not None and r_fresh:
+                    return r_cached
+                fx_cd = await _read_fx_cooldown(cache_key)
+                if fx_cd is not None:
+                    raise _ConsensusCooldownHitError(fx_cd, cached_fx=r_cached)
+
                 async with _acquire_upstream_slot():
-                    async def _do_fx_upstream() -> Any:
-                        if self._fx_fetcher is not None:
+                    fx_timeout = min(
+                        CONSENSUS_FETCH_TIMEOUT_SECONDS, _UPSTREAM_SLOT_HARD_TIMEOUT_SECONDS
+                    )
+                    if self._fx_fetcher is not None:
+                        async def _do_fx_injected() -> Any:
                             res = self._fx_fetcher(src, dst)
                             return await res if asyncio.iscoroutine(res) else res
-                        return await asyncio.to_thread(_fetch_yfinance_fx_sync, src, dst)
 
-                    rate_val = await asyncio.wait_for(
-                        _do_fx_upstream(),
-                        timeout=min(CONSENSUS_FETCH_TIMEOUT_SECONDS, _UPSTREAM_SLOT_HARD_TIMEOUT_SECONDS),
-                    )
+                        rate_val = await asyncio.wait_for(_do_fx_injected(), timeout=fx_timeout)
+                    else:
+                        rate_val = await _run_blocking_holding_slot(
+                            _fetch_yfinance_fx_sync, src, dst, timeout=fx_timeout
+                        )
                     pos = _positive_float(rate_val)
                     if pos is not None:
                         await _clear_fx_cooldown(cache_key)
@@ -2065,7 +2347,7 @@ class WatchlistConsensusAdapter:
                         return pos
                     await _write_fx_cooldown(cache_key, "empty")
                     return None
-            except _ConsensusSingleflightBusyError:
+            except (_ConsensusSingleflightBusyError, _ConsensusCooldownHitError):
                 raise
             except Exception as exc:
                 if _is_rate_limit_exception(exc):
@@ -2074,11 +2356,10 @@ class WatchlistConsensusAdapter:
                 await _write_fx_cooldown(cache_key, "error")
                 raise
             finally:
-                if held_inflight_lock and redis_client is not None:
-                    try:
-                        await redis_client.release_lock(inflight_key, lock_token)
-                    except Exception:
-                        pass
+                if held_inflight_lock:
+                    await _release_redis_lock_safely(
+                        redis_client, inflight_key, lock_token, inflight_renew_task
+                    )
 
         task = asyncio.create_task(_load_fx())
         _INFLIGHT_FX[cache_key] = task
@@ -2095,6 +2376,11 @@ class WatchlistConsensusAdapter:
             return (cached, True, False, False) if cached is not None else (None, False, False, False)
         except _ConsensusSingleflightBusyError:
             return (cached, True, False, False) if cached is not None else (None, False, False, True)
+        except _ConsensusCooldownHitError as cd_exc:
+            fallback_fx = cd_exc.cached_fx if cd_exc.cached_fx is not None else cached
+            if fallback_fx is not None:
+                return fallback_fx, True, False, False
+            return None, False, (cd_exc.err_kind == "rate_limited"), False
         except ConsensusRateLimitError:
             return (cached, True, False, False) if cached is not None else (None, False, True, False)
         except Exception:
@@ -2132,6 +2418,13 @@ class WatchlistConsensusAdapter:
                 if cached_dict is not None:
                     return RawConsensusRecord.from_dict(cached_dict), True, False, False
                 return None, False, False, True
+            except _ConsensusCooldownHitError as cd_exc:
+                fallback_cached = (
+                    cd_exc.cached_dict if cd_exc.cached_dict is not None else cached_dict
+                )
+                if fallback_cached is not None:
+                    return RawConsensusRecord.from_dict(fallback_cached), True, False, False
+                return None, False, (cd_exc.err_kind == "rate_limited"), False
             except ConsensusRateLimitError:
                 if cached_dict is not None:
                     return RawConsensusRecord.from_dict(cached_dict), True, False, False
@@ -2189,16 +2482,40 @@ class WatchlistConsensusAdapter:
                         )
                         if r_cached is not None and r_fresh:
                             return r_cached
+                        cd_kind, cd_rec = await _read_consensus_cooldown_entry(sym)
+                        if cd_kind is not None:
+                            if cd_rec is not None:
+                                return cd_rec
+                            raise _ConsensusCooldownHitError(cd_kind, cached_dict=r_cached)
                         raise _ConsensusSingleflightBusyError(
                             f"Another worker still holds consensus singleflight lock for {sym}"
                         )
 
+            inflight_renew_task: asyncio.Task[None] | None = None
             try:
+                if held_inflight_lock and redis_client is not None:
+                    inflight_renew_task = _start_lock_renewer(
+                        redis_client, inflight_key, lock_token, _REDIS_INFLIGHT_LOCK_TTL_MS
+                    )
+
+                # Re-read cache and shared cooldown AFTER acquiring singleflight lock, BEFORE slot/upstream!
+                r_cached, r_fresh = await _read_consensus_cache(
+                    sym, today=ref_today, last_reported_fy_end=last_reported_fy_end
+                )
+                if r_cached is not None and r_fresh:
+                    return r_cached
+                cd_kind, cd_rec = await _read_consensus_cooldown_entry(sym)
+                if cd_kind is not None:
+                    if cd_rec is not None:
+                        return cd_rec
+                    raise _ConsensusCooldownHitError(cd_kind, cached_dict=r_cached)
+
                 async with _acquire_upstream_slot():
                     async def _do_consensus_upstream() -> dict[str, Any]:
                         rate_limited = False
                         had_transient_error = False
                         had_rolled_past_fy = False
+                        fmp_missing_currency = False
                         rec: RawConsensusRecord | None = None
 
                         # 1. Public primary: yfinance (filtered by unified FY eligibility rule)
@@ -2240,6 +2557,9 @@ class WatchlistConsensusAdapter:
                                 if fmp_rolled_only:
                                     had_rolled_past_fy = True
                                 if fmp_rec is not None:
+                                    fmp_ccy, _ = _normalize_currency(fmp_rec.estimate_currency)
+                                    if fmp_ccy is None:
+                                        fmp_missing_currency = True
                                     if rec is None or (
                                         rec.fy1_eps is None and rec.fy2_eps is None
                                     ):
@@ -2271,31 +2591,25 @@ class WatchlistConsensusAdapter:
                         )
 
                         # Decide degradation strictly by whether usable EPS exists (fixes Yahoo empty record + FMP 429)
-                        if not has_usable_eps and rate_limited:
-                            await _write_consensus_cooldown(sym, "rate_limited")
-                            raise ConsensusRateLimitError(
-                                f"Rate limited fetching consensus for {sym}"
-                            )
-
-                        if not has_usable_eps and had_transient_error:
-                            await _write_consensus_cooldown(sym, "error")
-                            raise RuntimeError(f"Transient consensus fetch failure for {sym}")
-
-                        if not has_usable_eps and had_rolled_past_fy:
-                            # Never write a rolled-past record back to cache as a fresh success!
+                        if not has_usable_eps:
+                            if rate_limited:
+                                await _write_consensus_cooldown(sym, "rate_limited")
+                                raise ConsensusRateLimitError(
+                                    f"Rate limited fetching consensus for {sym}"
+                                )
+                            if had_transient_error:
+                                await _write_consensus_cooldown(sym, "error")
+                                raise RuntimeError(f"Transient consensus fetch failure for {sym}")
+                            # Ordinary empty or rolled-past-only result -> short cooldown, NEVER 12h success cache!
                             await _write_consensus_cooldown(sym, "empty")
-                            raise _ConsensusEmptyCooldownError(
+                            reason = (
                                 f"Only rolled-past fiscal years available for {sym}"
+                                if had_rolled_past_fy
+                                else f"No usable consensus EPS available for {sym}"
                             )
+                            raise _ConsensusEmptyCooldownError(reason)
 
-                        if rec is None:
-                            rec = RawConsensusRecord(
-                                symbol=sym,
-                                quote_currency=infer_quote_currency(sym),
-                                provider="yfinance",
-                                as_of=datetime.now(timezone.utc).isoformat(),
-                            )
-
+                        assert rec is not None
                         rec_dict = rec.to_dict()
                         final_reported = _max_iso_date(
                             last_reported_fy_end, rec.last_reported_fy_end
@@ -2305,8 +2619,30 @@ class WatchlistConsensusAdapter:
                         ):
                             await _write_consensus_cooldown(sym, "empty")
                             raise _ConsensusEmptyCooldownError(
-                                f"Refusing to cache rolled-past FY record for {sym}"
+                                f"Refusing to cache rolled-past or undated FY record for {sym}"
                             )
+
+                        # Temporarily missing reporting currency -> short cooldown (no 12h cache), still display unit_unverified.
+                        est_ccy, _ = _normalize_currency(rec.estimate_currency)
+                        if est_ccy is None:
+                            await _write_consensus_cooldown(
+                                sym, "missing_currency", record_dict=rec_dict
+                            )
+                            return rec_dict
+
+                        # Partial result where FMP single-year fill failed (429 / transient error / missing currency)
+                        # -> short cooldown (no 12h cache) while preserving the available year for display!
+                        is_partial = rec.fy1_eps is None or rec.fy2_eps is None
+                        if is_partial and (
+                            rate_limited or had_transient_error or fmp_missing_currency
+                        ):
+                            partial_kind = (
+                                "partial_rate_limited" if rate_limited else "partial_error"
+                            )
+                            await _write_consensus_cooldown(
+                                sym, partial_kind, record_dict=rec_dict
+                            )
+                            return rec_dict
 
                         await _clear_consensus_cooldown(sym)
                         await _write_consensus_cache(sym, rec_dict)
@@ -2317,7 +2653,12 @@ class WatchlistConsensusAdapter:
                         _do_consensus_upstream(),
                         timeout=_UPSTREAM_SLOT_HARD_TIMEOUT_SECONDS,
                     )
-            except (_ConsensusSingleflightBusyError, ConsensusRateLimitError, _ConsensusEmptyCooldownError):
+            except (
+                _ConsensusSingleflightBusyError,
+                _ConsensusCooldownHitError,
+                ConsensusRateLimitError,
+                _ConsensusEmptyCooldownError,
+            ):
                 raise
             except Exception as exc:
                 if _is_rate_limit_exception(exc):
@@ -2326,11 +2667,10 @@ class WatchlistConsensusAdapter:
                 await _write_consensus_cooldown(sym, "error")
                 raise
             finally:
-                if held_inflight_lock and redis_client is not None:
-                    try:
-                        await redis_client.release_lock(inflight_key, lock_token)
-                    except Exception:
-                        pass
+                if held_inflight_lock:
+                    await _release_redis_lock_safely(
+                        redis_client, inflight_key, lock_token, inflight_renew_task
+                    )
 
         task = asyncio.create_task(_load())
         _INFLIGHT_CONSENSUS[cache_key] = task
@@ -2347,6 +2687,13 @@ class WatchlistConsensusAdapter:
             if cached_dict is not None:
                 return RawConsensusRecord.from_dict(cached_dict), True, False, False
             return None, False, False, True
+        except _ConsensusCooldownHitError as cd_exc:
+            fallback_cached = (
+                cd_exc.cached_dict if cd_exc.cached_dict is not None else cached_dict
+            )
+            if fallback_cached is not None:
+                return RawConsensusRecord.from_dict(fallback_cached), True, False, False
+            return None, False, (cd_exc.err_kind == "rate_limited"), False
         except ConsensusRateLimitError:
             if cached_dict is not None:
                 return RawConsensusRecord.from_dict(cached_dict), True, False, False
@@ -2423,26 +2770,35 @@ class WatchlistConsensusAdapter:
             sym, today=self._today(), last_reported_fy_end=explicit_reported
         )
         if cached_dict is None:
-            err_kind = await _read_consensus_cooldown(sym)
+            err_kind, cd_rec = await _read_consensus_cooldown_entry(sym)
             if err_kind is not None:
-                return (
-                    _compute_valuation_from_record(
-                        None,
-                        symbol=sym,
-                        latest_price=latest_price,
-                        quote_currency_override=quote_currency,
-                        coverage_row=coverage_row,
-                        is_private=False,
-                        is_rate_limited=(err_kind == "rate_limited"),
-                    ),
-                    False,
-                )
-            return None, True
-
-        consensus_needs_warmup = False
-        if not is_fresh:
-            consensus_cd = await _read_consensus_cooldown(sym)
-            consensus_needs_warmup = consensus_cd is None
+                if cd_rec is not None:
+                    cached_dict = cd_rec
+                    is_fresh = True
+                    consensus_needs_warmup = False
+                else:
+                    return (
+                        _compute_valuation_from_record(
+                            None,
+                            symbol=sym,
+                            latest_price=latest_price,
+                            quote_currency_override=quote_currency,
+                            coverage_row=coverage_row,
+                            is_private=False,
+                            is_rate_limited=(err_kind == "rate_limited"),
+                        ),
+                        False,
+                    )
+            else:
+                return None, True
+        else:
+            consensus_needs_warmup = False
+            if not is_fresh:
+                consensus_cd, cd_rec = await _read_consensus_cooldown_entry(sym)
+                consensus_needs_warmup = consensus_cd is None
+                if cd_rec is not None:
+                    cached_dict = cd_rec
+                    is_fresh = True
 
         rec = RawConsensusRecord.from_dict(cached_dict)
 
@@ -2557,6 +2913,7 @@ __all__ = [
     "CONSENSUS_STALE_TTL_SECONDS",
     "ConsensusRateLimitError",
     "FX_CACHE_TTL_SECONDS",
+    "KNOWN_ADR_SYMBOLS",
     "MAX_CONSENSUS_CONCURRENCY",
     "VALUATION_STATUSES",
     "VERIFIED_ADR_SHARES_PER_UNIT",
