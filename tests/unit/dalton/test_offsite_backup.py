@@ -882,7 +882,7 @@ def test_db_offsite_helpers_and_weekly_excludes_postgres() -> None:
     )[0] is False
 
     # B3 weekly script streams directly via rclone rcat/moveto, excludes Postgres, and never uses --size-only.
-    weekly_src = (OPS_DIR / "dalton_data_backup.sh").read_text(encoding="utf-8")
+    weekly_src = (OPS_DIR / "prod" / "data_backup.sh").read_text(encoding="utf-8")
     assert "latest-pg-dump" not in weekly_src
     assert "pg-backup.ref" not in weekly_src
     assert "--size-only" not in weekly_src
@@ -2899,7 +2899,7 @@ def test_config_and_data_var_excludes_match_env_example() -> None:
     assert "run-secrets" in backup_lib.DEFAULT_DATA_VAR_EXCLUDES
 
     cfg_sh = (OPS_DIR / "dalton_config_git_backup.sh").read_text(encoding="utf-8")
-    data_sh = (OPS_DIR / "dalton_data_backup.sh").read_text(encoding="utf-8")
+    data_sh = (OPS_DIR / "prod" / "data_backup.sh").read_text(encoding="utf-8")
     env_ex = (OPS_DIR / "offsite-backup.env.example").read_text(encoding="utf-8")
 
     m_cfg_sh = re.search(

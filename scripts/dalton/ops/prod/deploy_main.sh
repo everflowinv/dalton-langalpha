@@ -3870,8 +3870,10 @@ revert_deploy() {
   fi
 }
 
-# Last backup-log line if it is an ' ok ' dump at most $2 minutes old (relative to $3, epoch
-# seconds); prints nothing and returns 1 otherwise. Log line: "YYYY-mm-dd HH:MM:SS ok  <size> <path>".
+# Last backup-log line if it is an ' ok ' dump/backup-set at most $2 minutes old (relative to $3,
+# epoch seconds); prints nothing and returns 1 otherwise.
+# Accepts both legacy ("YYYY-mm-dd HH:MM:SS ok  <size> <path>") and consistent backup-set
+# ("YYYY-mm-dd HH:MM:SS ok  <size> <path> set=<id>") formats.
 recent_ok_backup() {
   local log="$1" max_min="$2" now="$3" line ts epoch
   line=$(tail -1 "$log" 2>/dev/null) || return 1
@@ -3880,6 +3882,17 @@ recent_ok_backup() {
   epoch=$(date -j -f '%Y-%m-%d %H:%M:%S' "$ts" +%s 2>/dev/null || date -d "$ts" +%s 2>/dev/null) || return 1
   [ -n "$epoch" ] && [ "$epoch" -le "$now" ] && [ $(( now - epoch )) -le $(( max_min * 60 )) ] || return 1
   printf '%s\n' "$line"
+}
+
+# True when a dalton-pg-backup.log line represents a completed backup result (ok or failure),
+# ignoring intermediate progress lines prefixed with "[backup]".
+_is_terminal_pg_backup_line() {
+  local line="$1"
+  [ -n "$line" ] || return 1
+  case "$line" in
+    "[backup]"*) return 1 ;;
+    *) return 0 ;;
+  esac
 }
 
 # Prefer repo .venv/bin/python; fall back to python3 on PATH when absent.
@@ -4697,7 +4710,13 @@ run_deploy_main() {
     else
       [ -n "$REUSE_BACKUP_MIN" ] && echo "backup: cannot reuse (migrations to deploy or no ok dump within ${REUSE_BACKUP_MIN} min); taking a fresh one"
       launchctl kickstart "gui/$(id -u)/com.dalton.pg-backup"
-      for i in $(seq 1 360); do [ "$(tail -1 "$LOG" 2>/dev/null)" != "$before" ] && break; sleep 5; done  # 30 min: dumps of a 7.5G db take over 10 min
+      for i in $(seq 1 360); do
+        cur_bak_line="$(tail -1 "$LOG" 2>/dev/null)"
+        if [ "$cur_bak_line" != "$before" ] && _is_terminal_pg_backup_line "$cur_bak_line"; then
+          break
+        fi
+        sleep 5
+      done  # 30 min: dumps of a large db + object mirror sync
       after=$(tail -1 "$LOG"); echo "backup: $after"
       case "$after" in *" ok "*) [ "$after" != "$before" ] || { echo "no fresh backup, abort"; release_deploy_lock || true; exit 1; };; *) echo "backup failed, abort"; release_deploy_lock || true; exit 1;; esac
       DEPLOY_BACKUP_STATUS="fresh"

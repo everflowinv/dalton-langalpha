@@ -1261,6 +1261,7 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("transcriptions.py", "get_transcription_result_endpoint"): CapabilityId.TRANSCRIPTION,
         ("transcriptions.py", "get_transcription_raw_result_endpoint"): CapabilityId.TRANSCRIPTION,
         ("transcriptions.py", "retry_transcription_endpoint"): CapabilityId.TRANSCRIPTION,
+        ("transcriptions.py", "resubmit_transcription_endpoint"): CapabilityId.TRANSCRIPTION,
         ("transcriptions.py", "cancel_transcription_endpoint"): CapabilityId.TRANSCRIPTION,
         # --- oauth_native.py ---
         ("oauth_native.py", "muse_device_initiate"): CapabilityId.NATIVE_OAUTH_SYNC,

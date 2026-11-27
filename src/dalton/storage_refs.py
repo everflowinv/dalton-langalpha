@@ -40,12 +40,15 @@ import logging
 import os
 import re
 import sys
+import tarfile
 import time
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, TextIO
 from urllib.parse import urlsplit
 
+from src.dalton.storage_keys import storage_user_id
 from src.server.database.pool import get_db_connection, open_session_connection
 from src.utils.storage import is_storage_enabled
 
@@ -1993,7 +1996,1636 @@ async def run_strict_main_bucket_check(
 
 
 # ---------------------------------------------------------------------------
-# Operator CLI (`python -m src.dalton.storage_refs check --strict`)
+# Full-consumer snapshot enumeration & backup reconciliation (§3.1, §2.1 step 4)
+# ---------------------------------------------------------------------------
+
+_SKILL_CONTENT_HASH_RE = re.compile(r"^sha256:([0-9a-f]{64})$")
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+TERMINAL_ASR_ARCHIVE_STATUSES: frozenset[str] = frozenset(
+    {"succeeded", "failed", "cancelled", "indeterminate"}
+)
+ACTIVE_OR_SUBMITTED_ASR_STATUSES: frozenset[str] = frozenset(
+    {
+        "queued",
+        "downloading",
+        "probing",
+        "splitting",
+        "submitting",
+        "transcribing",
+        "assembling",
+        "succeeded",
+        "indeterminate",
+    }
+)
+
+
+def parse_skill_content_hash(content_hash: str | None) -> str:
+    """Validate a skill archive ``content_hash`` (``sha256:<64 hex>``) and return the hex digest.
+
+    Raises ``ValueError`` when the ``sha256:`` prefix is missing or the digest is malformed.
+    """
+    raw = str(content_hash or "").strip()
+    match = _SKILL_CONTENT_HASH_RE.fullmatch(raw)
+    if not match:
+        raise ValueError(
+            f"Invalid skill archive content_hash (expected 'sha256:<64 lowercase hex>'): {content_hash!r}"
+        )
+    return match.group(1)
+
+
+def _apply_bucket_prefix(object_key: str, key_prefix: str) -> str:
+    cleaned_key = str(object_key or "").strip().lstrip("/")
+    cleaned_prefix = str(key_prefix or "").strip().strip("/")
+    if not cleaned_prefix:
+        return cleaned_key
+    prefix_slash = f"{cleaned_prefix}/"
+    if cleaned_key.startswith(prefix_slash):
+        return cleaned_key
+    return f"{prefix_slash}{cleaned_key}"
+
+
+def _extract_widget_data_refs_from_turn_slice(lines_text: str | None) -> list[dict[str, Any]]:
+    if not lines_text or '"data_ref"' not in lines_text:
+        return []
+    refs: list[dict[str, Any]] = []
+    for raw in lines_text.split("\n"):
+        if "\t" not in raw:
+            continue
+        parts = raw.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        event, _flags, data_json = parts
+        if event != "artifact":
+            continue
+        try:
+            data = json.loads(data_json)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict) or data.get("artifact_type") != "html_widget":
+            continue
+        payload = data.get("payload")
+        if _widget_payload_has_data_ref(payload):
+            refs.append(dict(payload["data_ref"]))
+    return refs
+
+
+def _extract_widget_data_refs_from_checkpoint(value: Any) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    if value is None:
+        return refs
+    if type(value).__name__ == "_DeltaSnapshot" and hasattr(value, "value"):
+        return _extract_widget_data_refs_from_checkpoint(value.value)
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            refs.extend(_extract_widget_data_refs_from_checkpoint(item))
+        return refs
+    msg_type = getattr(value, "type", None)
+    if msg_type == "tool" and hasattr(value, "artifact"):
+        art = getattr(value, "artifact", None)
+        if _is_show_widget_tool_artifact(getattr(value, "name", None), art):
+            refs.append(dict(art["data_ref"]))
+        return refs
+    if isinstance(value, dict):
+        if value.get("type") == "tool" and "artifact" in value:
+            art = value.get("artifact")
+            if _is_show_widget_tool_artifact(value.get("name"), art):
+                refs.append(dict(art["data_ref"]))
+            return refs
+        if (
+            value.get("lc") == 1
+            and value.get("type") == "constructor"
+            and isinstance(value.get("id"), list)
+            and value["id"]
+            and value["id"][-1] == "ToolMessage"
+            and isinstance(value.get("kwargs"), dict)
+        ):
+            kw = value["kwargs"]
+            art = kw.get("artifact")
+            if _is_show_widget_tool_artifact(kw.get("name"), art):
+                refs.append(dict(art["data_ref"]))
+    return refs
+
+
+def extract_avatar_object_key(
+    avatar_url: str | None, *, env: Mapping[str, str] | None = None
+) -> str | None:
+    """Return logical ``avatars/<name>.<ext>`` key if ``avatar_url`` matches this site."""
+    raw = (avatar_url or "").strip()
+    if not raw or not is_site_avatar_url(raw, env=env):
+        return None
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return None
+    path = parsed.path or ""
+    for _rule_origin, full_prefix, _path_ere in site_avatar_url_rules(env=env):
+        if path.startswith(full_prefix):
+            tail = path[len(full_prefix) :]
+            if _AVATAR_KEY_TAIL_RE.match(tail):
+                return f"avatars/{tail}"
+    return None
+
+
+def extract_response_image_object_key(
+    url: str | None, *, env: Mapping[str, str] | None = None
+) -> str | None:
+    """Return logical ``response-images/...`` key if ``url`` points to this site's main bucket."""
+    raw = (url or "").strip()
+    if not raw or not is_main_bucket_response_image_url(raw, env=env):
+        return None
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return None
+    path = parsed.path or ""
+    rules = site_response_image_url_rules(env=env)
+    for rule_origin, full_prefix in rules:
+        if parsed.scheme:
+            origin = _origin_from_split(parsed)
+            if rule_origin != origin:
+                continue
+        if path.startswith(full_prefix):
+            tail = path[len(full_prefix) :]
+            if _is_valid_response_image_tail(tail, require_hash=False):
+                return f"response-images/{tail}"
+    key_prefix = _normalize_storage_key_prefix(env)
+    for prefix in (f"/{key_prefix}response-images/", f"/storage/{key_prefix}response-images/"):
+        if path.startswith(prefix):
+            tail = path[len(prefix) :]
+            if _is_valid_response_image_tail(tail, require_hash=True):
+                return f"response-images/{tail}"
+    return None
+
+
+def _extract_response_image_keys_from_map(
+    captured: Any, *, env: Mapping[str, str] | None = None
+) -> list[str]:
+    if not isinstance(captured, dict):
+        return []
+    keys: list[str] = []
+    for k, v in captured.items():
+        if k and isinstance(v, str):
+            obj_key = extract_response_image_object_key(v, env=env)
+            if obj_key:
+                keys.append(obj_key)
+    return keys
+
+
+def _extract_response_image_keys_from_text(
+    text: str, *, env: Mapping[str, str] | None = None
+) -> list[str]:
+    if not text or "response-images/" not in text:
+        return []
+    keys: list[str] = []
+    for match in _MARKDOWN_IMAGE_OR_LINK_RE.finditer(text):
+        target = _extract_markdown_target_url(match.group(3))
+        obj_key = extract_response_image_object_key(target, env=env)
+        if obj_key:
+            keys.append(obj_key)
+    for match in _HTML_IMG_SRC_RE.finditer(text):
+        src = match.group(1) or match.group(2) or match.group(3) or ""
+        obj_key = extract_response_image_object_key(src, env=env)
+        if obj_key:
+            keys.append(obj_key)
+    return keys
+
+
+def _extract_response_image_keys_from_replay_facts(
+    replay_facts: Any,
+    *,
+    include_legacy: bool = True,
+    env: Mapping[str, str] | None = None,
+) -> list[str]:
+    facts = replay_facts
+    if isinstance(facts, str):
+        try:
+            facts = json.loads(facts)
+        except (ValueError, TypeError):
+            return []
+    if not isinstance(facts, dict):
+        return []
+    keys: list[str] = []
+    keys.extend(_extract_response_image_keys_from_map(facts.get("images"), env=env))
+    if include_legacy:
+        legacy_obj = facts.get("legacy")
+        if isinstance(legacy_obj, dict):
+            keys.extend(_extract_response_image_keys_from_map(legacy_obj.get("images"), env=env))
+            verbatim = legacy_obj.get("verbatim")
+            if isinstance(verbatim, list):
+                grouped_texts: dict[tuple[Any, Any], list[str]] = {}
+                for stored in verbatim:
+                    if not isinstance(stored, dict):
+                        continue
+                    event = stored.get("event")
+                    data = stored.get("data")
+                    if not isinstance(data, dict):
+                        continue
+                    if event == "message_chunk":
+                        content_type = data.get("content_type")
+                        content = data.get("content")
+                        if content_type in ("text", None) and isinstance(content, str) and content:
+                            grouped_texts.setdefault(
+                                (data.get("agent"), data.get("id")), []
+                            ).append(content)
+                    elif event == "image_capture" or data.get("name") == "image_capture":
+                        props = data.get("props")
+                        if isinstance(props, dict):
+                            keys.extend(
+                                _extract_response_image_keys_from_map(
+                                    props.get("path_to_url"), env=env
+                                )
+                            )
+                        keys.extend(
+                            _extract_response_image_keys_from_map(
+                                data.get("path_to_url"), env=env
+                            )
+                        )
+                for pieces in grouped_texts.values():
+                    keys.extend(
+                        _extract_response_image_keys_from_text("".join(pieces), env=env)
+                    )
+    return keys
+
+
+def _extract_response_image_keys_from_checkpoint(
+    value: Any, *, channel: str | None = None, env: Mapping[str, str] | None = None
+) -> list[str]:
+    keys: list[str] = []
+    if value is None:
+        return keys
+    if type(value).__name__ == "_DeltaSnapshot" and hasattr(value, "value"):
+        return _extract_response_image_keys_from_checkpoint(
+            value.value, channel=channel, env=env
+        )
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            keys.extend(
+                _extract_response_image_keys_from_checkpoint(item, channel=channel, env=env)
+            )
+        return keys
+    if channel != "ui":
+        msg_type = getattr(value, "type", None)
+        if msg_type in ("ai", "AIMessageChunk") and hasattr(value, "response_metadata"):
+            meta = getattr(value, "response_metadata", None)
+            if isinstance(meta, dict):
+                keys.extend(
+                    _extract_response_image_keys_from_map(
+                        meta.get("captured_images"), env=env
+                    )
+                )
+        elif isinstance(value, dict):
+            if value.get("type") in ("ai", "AIMessageChunk") and isinstance(
+                value.get("response_metadata"), dict
+            ):
+                keys.extend(
+                    _extract_response_image_keys_from_map(
+                        value["response_metadata"].get("captured_images"), env=env
+                    )
+                )
+            elif (
+                value.get("lc") == 1
+                and value.get("type") == "constructor"
+                and isinstance(value.get("id"), list)
+                and value["id"]
+                and value["id"][-1] in ("AIMessage", "AIMessageChunk")
+                and isinstance(value.get("kwargs"), dict)
+            ):
+                meta = value["kwargs"].get("response_metadata")
+                if isinstance(meta, dict):
+                    keys.extend(
+                        _extract_response_image_keys_from_map(
+                            meta.get("captured_images"), env=env
+                        )
+                    )
+    if channel != "messages":
+        if isinstance(value, dict) and value.get("name") == "image_capture":
+            props = value.get("props")
+            if isinstance(props, dict):
+                keys.extend(
+                    _extract_response_image_keys_from_map(props.get("path_to_url"), env=env)
+                )
+    return keys
+
+
+def extract_attachment_object_key(
+    url_or_key: str | None, *, env: Mapping[str, str] | None = None
+) -> str | None:
+    """Extract logical ``attachments/...`` (or ``private-media/attachments/...``) key from a stored attachment URL."""
+    raw = (url_or_key or "").strip()
+    if not raw:
+        return None
+    if raw.startswith(("attachments/", "private-media/attachments/")):
+        return raw.lstrip("/")
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return None
+    path = parsed.path or ""
+    key_prefix = _normalize_storage_key_prefix(env)
+    for marker in (
+        f"/{key_prefix}private-media/attachments/",
+        "/private-media/attachments/",
+        f"/{key_prefix}attachments/",
+        "/attachments/",
+    ):
+        idx = path.find(marker)
+        if idx >= 0:
+            tail = path[idx + len(marker) :].strip("/")
+            if not tail or ".." in tail.split("/"):
+                return None
+            if "private-media/attachments/" in marker:
+                return f"private-media/attachments/{tail}"
+            return f"attachments/{tail}"
+    return None
+
+
+@dataclass(frozen=True)
+class ObjectReference:
+    """One live object-storage reference enumerated from a PostgreSQL snapshot."""
+
+    consumer: str
+    bucket_role: str  # "main" | "chat_upload" | "asr"
+    object_key: str
+    row_id: str
+    expected_size: int | None = None
+    expected_sha256: str | None = None
+    check_mode: str = "strict"  # "strict" | "exists_only" | "exists_warn_size" | "invalid"
+    invalid_reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "consumer": self.consumer,
+            "bucket_role": self.bucket_role,
+            "object_key": self.object_key,
+            "row_id": self.row_id,
+            "expected_size": self.expected_size,
+            "expected_sha256": self.expected_sha256,
+            "check_mode": self.check_mode,
+            "invalid_reason": self.invalid_reason,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ObjectReference:
+        return cls(
+            consumer=str(data["consumer"]),
+            bucket_role=str(data["bucket_role"]),
+            object_key=str(data.get("object_key") or ""),
+            row_id=str(data.get("row_id") or ""),
+            expected_size=(
+                int(data["expected_size"]) if data.get("expected_size") is not None else None
+            ),
+            expected_sha256=(
+                str(data["expected_sha256"]) if data.get("expected_sha256") is not None else None
+            ),
+            check_mode=str(data.get("check_mode") or "strict"),
+            invalid_reason=(
+                str(data["invalid_reason"]) if data.get("invalid_reason") is not None else None
+            ),
+        )
+
+
+@dataclass
+class SnapshotRefInventory:
+    """All live object references and terminal ASR job IDs captured under one DB snapshot."""
+
+    references: list[ObjectReference] = field(default_factory=list)
+    terminal_asr_job_ids: list[str] = field(default_factory=list)
+    succeeded_asr_job_ids: list[str] = field(default_factory=list)
+    skipped_pending: dict[str, int] = field(default_factory=dict)
+    skipped_missing_tables: list[str] = field(default_factory=list)
+
+    def keys_by_bucket_role(self) -> dict[str, set[str]]:
+        out: dict[str, set[str]] = {"main": set(), "chat_upload": set(), "asr": set()}
+        for ref in self.references:
+            if ref.object_key:
+                out.setdefault(ref.bucket_role, set()).add(ref.object_key)
+        return out
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "references": [r.to_dict() for r in self.references],
+            "terminal_asr_job_ids": list(self.terminal_asr_job_ids),
+            "succeeded_asr_job_ids": list(self.succeeded_asr_job_ids),
+            "skipped_pending": dict(self.skipped_pending),
+            "skipped_missing_tables": list(self.skipped_missing_tables),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SnapshotRefInventory:
+        return cls(
+            references=[
+                ObjectReference.from_dict(item)
+                for item in (data.get("references") or [])
+                if isinstance(item, Mapping)
+            ],
+            terminal_asr_job_ids=[str(x) for x in (data.get("terminal_asr_job_ids") or [])],
+            succeeded_asr_job_ids=[str(x) for x in (data.get("succeeded_asr_job_ids") or [])],
+            skipped_pending={
+                str(k): int(v) for k, v in (data.get("skipped_pending") or {}).items()
+            },
+            skipped_missing_tables=[str(x) for x in (data.get("skipped_missing_tables") or [])],
+        )
+
+
+@dataclass(frozen=True)
+class ReconcileIssue:
+    """One error or warning emitted by backup-set reconciliation."""
+
+    consumer: str
+    code: str
+    row_id: str
+    object_key: str
+    detail: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "consumer": self.consumer,
+            "code": self.code,
+            "row_id": self.row_id,
+            "object_key": self.object_key,
+            "detail": self.detail,
+        }
+
+
+@dataclass(frozen=True)
+class ReconcileReport:
+    """Outcome of reconciling a snapshot reference inventory against archived objects & ASR jobs."""
+
+    ok: bool
+    checked_refs: int
+    checked_asr_jobs: int
+    errors: tuple[ReconcileIssue, ...] = ()
+    warnings: tuple[ReconcileIssue, ...] = ()
+    skipped_pending: dict[str, int] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "checked_refs": self.checked_refs,
+            "checked_asr_jobs": self.checked_asr_jobs,
+            "error_count": len(self.errors),
+            "warning_count": len(self.warnings),
+            "skipped_pending": dict(self.skipped_pending),
+            "errors": [e.to_dict() for e in self.errors],
+            "warnings": [w.to_dict() for w in self.warnings],
+        }
+
+
+def _blob_storage_key_safe(user_id: str, sha256: str) -> tuple[str | None, str | None]:
+    try:
+        mapped = storage_user_id(str(user_id))
+    except Exception as exc:
+        return None, f"invalid storage_user_id for {user_id!r}: {exc}"
+    clean_sha = str(sha256 or "").strip().lower()
+    if not _SHA256_HEX_RE.fullmatch(clean_sha):
+        return None, f"invalid sha256 digest: {sha256!r}"
+    return f"blobs/{mapped}/{clean_sha}", None
+
+
+async def _table_exists(cur: Any, table: str) -> bool:
+    await cur.execute("SELECT to_regclass(%s)", (table,))
+    row = await cur.fetchone()
+    return _extract_first_value(row) is not None
+
+
+async def enumerate_snapshot_refs(
+    conn: Any,
+    *,
+    env: Mapping[str, str] | None = None,
+    serde: Any | None = None,
+    include_main: bool = True,
+    include_aux: bool = True,
+) -> SnapshotRefInventory:
+    """Enumerate all live object references and terminal ASR job IDs inside the caller's DB snapshot.
+
+    Runs directly on ``conn`` without committing or rolling back the caller's
+    ``REPEATABLE READ READ ONLY`` transaction.
+    """
+    inv = SnapshotRefInventory()
+    blob_registry: dict[tuple[str, str], int] = {}
+
+    async with conn.cursor() as cur:
+        # 1. workspace_file_blobs (live rows: condemned_at IS NULL)
+        has_blobs = await _table_exists(cur, "public.workspace_file_blobs")
+        if include_main:
+            if has_blobs:
+                await cur.execute(
+                    "SELECT user_id, sha256, byte_len FROM workspace_file_blobs "
+                    "WHERE condemned_at IS NULL"
+                )
+                for row in await cur.fetchall():
+                    uid, sha, byte_len = _extract_tuple(row, 3)
+                    uid_s = str(uid)
+                    sha_s = str(sha).strip().lower()
+                    blen = int(byte_len)
+                    blob_registry[(uid_s, sha_s)] = blen
+                    key, err = _blob_storage_key_safe(uid_s, sha_s)
+                    if err or not key:
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="workspace_file_blobs",
+                                bucket_role="main",
+                                object_key="",
+                                row_id=f"{uid_s}:{sha_s}",
+                                check_mode="invalid",
+                                invalid_reason=err,
+                            )
+                        )
+                    else:
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="workspace_file_blobs",
+                                bucket_role="main",
+                                object_key=key,
+                                row_id=f"{uid_s}:{sha_s}",
+                                expected_size=blen,
+                                expected_sha256=sha_s,
+                                check_mode="strict",
+                            )
+                        )
+            else:
+                inv.skipped_missing_tables.append("public.workspace_file_blobs")
+
+            # 2. workspace_files (blob_sha256 and pack_sha256)
+            has_ws_files = await _table_exists(cur, "public.workspace_files")
+            has_workspaces = await _table_exists(cur, "public.workspaces")
+            if has_ws_files and has_workspaces:
+                await cur.execute(
+                    "SELECT f.workspace_file_id, w.user_id, f.file_size, "
+                    "f.blob_sha256, f.pack_sha256, f.pack_offset "
+                    "FROM workspace_files f "
+                    "JOIN workspaces w ON w.workspace_id = f.workspace_id "
+                    "WHERE f.blob_sha256 IS NOT NULL OR f.pack_sha256 IS NOT NULL"
+                )
+                pack_rows_needed: dict[tuple[str, str], list[tuple[str, int, int | None]]] = {}
+                for row in await cur.fetchall():
+                    wf_id, uid, file_size, blob_sha, pack_sha, pack_offset = _extract_tuple(row, 6)
+                    uid_s = str(uid)
+                    fsize = int(file_size or 0)
+                    if blob_sha is not None:
+                        bsha = str(blob_sha).strip().lower()
+                        key, err = _blob_storage_key_safe(uid_s, bsha)
+                        if err or not key:
+                            inv.references.append(
+                                ObjectReference(
+                                    consumer="workspace_files",
+                                    bucket_role="main",
+                                    object_key="",
+                                    row_id=str(wf_id),
+                                    check_mode="invalid",
+                                    invalid_reason=err,
+                                )
+                            )
+                        else:
+                            inv.references.append(
+                                ObjectReference(
+                                    consumer="workspace_files",
+                                    bucket_role="main",
+                                    object_key=key,
+                                    row_id=str(wf_id),
+                                    expected_size=fsize,
+                                    expected_sha256=bsha,
+                                    check_mode="strict",
+                                )
+                            )
+                    if pack_sha is not None:
+                        psha = str(pack_sha).strip().lower()
+                        poff = int(pack_offset) if pack_offset is not None else None
+                        pack_rows_needed.setdefault((uid_s, psha), []).append(
+                            (str(wf_id), fsize, poff)
+                        )
+
+                # Resolve pack byte_len from live blob_registry (or condemned row if present)
+                for (uid_s, psha), members in pack_rows_needed.items():
+                    pack_byte_len = blob_registry.get((uid_s, psha))
+                    if pack_byte_len is None and has_blobs:
+                        await cur.execute(
+                            "SELECT byte_len FROM workspace_file_blobs "
+                            "WHERE user_id = %s AND sha256 = %s",
+                            (uid_s, psha),
+                        )
+                        brow = await cur.fetchone()
+                        if brow is not None:
+                            pack_byte_len = int(_extract_first_value(brow))
+                    key, err = _blob_storage_key_safe(uid_s, psha)
+                    if err or not key:
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="workspace_files_pack",
+                                bucket_role="main",
+                                object_key="",
+                                row_id=f"{uid_s}:{psha}",
+                                check_mode="invalid",
+                                invalid_reason=err,
+                            )
+                        )
+                        continue
+                    if pack_byte_len is None:
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="workspace_files_pack",
+                                bucket_role="main",
+                                object_key=key,
+                                row_id=f"{uid_s}:{psha}",
+                                check_mode="invalid",
+                                invalid_reason=(
+                                    f"pack_sha256 {psha} for user {uid_s} has no "
+                                    "workspace_file_blobs registry row"
+                                ),
+                            )
+                        )
+                        continue
+                    inv.references.append(
+                        ObjectReference(
+                            consumer="workspace_files_pack",
+                            bucket_role="main",
+                            object_key=key,
+                            row_id=f"{uid_s}:{psha}",
+                            expected_size=pack_byte_len,
+                            expected_sha256=psha,
+                            check_mode="strict",
+                        )
+                    )
+                    for wf_id, fsize, poff in members:
+                        if poff is None or poff < 0 or fsize < 0 or (poff + fsize) > pack_byte_len:
+                            inv.references.append(
+                                ObjectReference(
+                                    consumer="workspace_files_pack_member",
+                                    bucket_role="main",
+                                    object_key=key,
+                                    row_id=wf_id,
+                                    check_mode="invalid",
+                                    invalid_reason=(
+                                        f"pack member slice out of bounds: "
+                                        f"pack_offset={poff}, file_size={fsize}, "
+                                        f"pack_byte_len={pack_byte_len}"
+                                    ),
+                                )
+                            )
+            else:
+                if not has_ws_files:
+                    inv.skipped_missing_tables.append("public.workspace_files")
+                if not has_workspaces:
+                    inv.skipped_missing_tables.append("public.workspaces")
+
+            # 3. thread_transcript_files (content IS NULL)
+            if await _table_exists(cur, "public.thread_transcript_files"):
+                await cur.execute(
+                    "SELECT conversation_thread_id, path, user_id, sha256, byte_len "
+                    "FROM thread_transcript_files WHERE content IS NULL"
+                )
+                for row in await cur.fetchall():
+                    tid, path, uid, sha, byte_len = _extract_tuple(row, 5)
+                    uid_s = str(uid)
+                    sha_s = str(sha).strip().lower()
+                    key, err = _blob_storage_key_safe(uid_s, sha_s)
+                    if err or not key:
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="thread_transcript_files",
+                                bucket_role="main",
+                                object_key="",
+                                row_id=f"{tid}:{path}",
+                                check_mode="invalid",
+                                invalid_reason=err,
+                            )
+                        )
+                    else:
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="thread_transcript_files",
+                                bucket_role="main",
+                                object_key=key,
+                                row_id=f"{tid}:{path}",
+                                expected_size=int(byte_len),
+                                expected_sha256=sha_s,
+                                check_mode="strict",
+                            )
+                        )
+            else:
+                inv.skipped_missing_tables.append("public.thread_transcript_files")
+
+            # 4. artifact_version_files (content IS NULL)
+            if await _table_exists(cur, "public.artifact_version_files"):
+                await cur.execute(
+                    "SELECT artifact_id, seq, path, user_id, sha256, byte_len "
+                    "FROM artifact_version_files WHERE content IS NULL"
+                )
+                for row in await cur.fetchall():
+                    aid, seq, path, uid, sha, byte_len = _extract_tuple(row, 6)
+                    uid_s = str(uid)
+                    sha_s = str(sha).strip().lower()
+                    key, err = _blob_storage_key_safe(uid_s, sha_s)
+                    if err or not key:
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="artifact_version_files",
+                                bucket_role="main",
+                                object_key="",
+                                row_id=f"{aid}:{seq}:{path}",
+                                check_mode="invalid",
+                                invalid_reason=err,
+                            )
+                        )
+                    else:
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="artifact_version_files",
+                                bucket_role="main",
+                                object_key=key,
+                                row_id=f"{aid}:{seq}:{path}",
+                                expected_size=int(byte_len),
+                                expected_sha256=sha_s,
+                                check_mode="strict",
+                            )
+                        )
+            else:
+                inv.skipped_missing_tables.append("public.artifact_version_files")
+
+            # 5. drive_contents (blob_user_id IS NOT NULL) & drive_uploads pending count
+            if await _table_exists(cur, "public.drive_contents"):
+                await cur.execute(
+                    "SELECT space_id, sha256, byte_len, blob_user_id "
+                    "FROM drive_contents WHERE blob_user_id IS NOT NULL"
+                )
+                for row in await cur.fetchall():
+                    sid, sha, byte_len, buid = _extract_tuple(row, 4)
+                    uid_s = str(buid)
+                    sha_s = str(sha).strip().lower()
+                    key, err = _blob_storage_key_safe(uid_s, sha_s)
+                    if err or not key:
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="drive_contents",
+                                bucket_role="main",
+                                object_key="",
+                                row_id=f"{sid}:{sha_s}",
+                                check_mode="invalid",
+                                invalid_reason=err,
+                            )
+                        )
+                    else:
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="drive_contents",
+                                bucket_role="main",
+                                object_key=key,
+                                row_id=f"{sid}:{sha_s}",
+                                expected_size=int(byte_len),
+                                expected_sha256=sha_s,
+                                check_mode="strict",
+                            )
+                        )
+            else:
+                inv.skipped_missing_tables.append("public.drive_contents")
+
+            if await _table_exists(cur, "public.drive_uploads"):
+                await cur.execute(
+                    "SELECT COUNT(*) FROM drive_uploads WHERE state IN ('uploading', 'verifying')"
+                )
+                cnt = int(_extract_first_value(await cur.fetchone()) or 0)
+                if cnt:
+                    inv.skipped_pending["drive_uploads"] = cnt
+
+            # 6. provenance_result_bodies (mutable key: check exists, warn on size mismatch)
+            if await _table_exists(cur, "public.provenance_result_bodies"):
+                await cur.execute(
+                    "SELECT result_sha256, object_key, byte_len "
+                    "FROM provenance_result_bodies "
+                    "WHERE object_key IS NOT NULL AND object_key <> ''"
+                )
+                for row in await cur.fetchall():
+                    rsha, okey, byte_len = _extract_tuple(row, 3)
+                    inv.references.append(
+                        ObjectReference(
+                            consumer="provenance_result_bodies",
+                            bucket_role="main",
+                            object_key=str(okey).strip().lstrip("/"),
+                            row_id=str(rsha),
+                            expected_size=int(byte_len) if byte_len is not None else None,
+                            check_mode="exists_warn_size",
+                        )
+                    )
+            else:
+                inv.skipped_missing_tables.append("public.provenance_result_bodies")
+
+            # 7. Memos in store (binary_ref.key -> exists_only)
+            if await _table_exists(cur, "public.store"):
+                await cur.execute(
+                    "SELECT prefix, key, value -> 'binary_ref' ->> 'key' "
+                    "FROM store "
+                    "WHERE prefix LIKE '%%.memos' AND value ? 'binary_ref' "
+                    "AND jsonb_typeof(value -> 'binary_ref') = 'object' "
+                    "AND COALESCE(value -> 'binary_ref' ->> 'key', '') <> ''"
+                )
+                for row in await cur.fetchall():
+                    pref, skey, bkey = _extract_tuple(row, 3)
+                    inv.references.append(
+                        ObjectReference(
+                            consumer="memo_binaries",
+                            bucket_role="main",
+                            object_key=str(bkey).strip().lstrip("/"),
+                            row_id=f"{pref}:{skey}",
+                            check_mode="exists_only",
+                        )
+                    )
+            else:
+                inv.skipped_missing_tables.append("public.store")
+
+            # 8. user_skills (archive_key + content_hash with mandatory 'sha256:' prefix)
+            if await _table_exists(cur, "public.user_skills"):
+                await cur.execute(
+                    "SELECT user_skill_id, archive_key, content_hash "
+                    "FROM user_skills "
+                    "WHERE archive_key IS NOT NULL AND archive_key <> ''"
+                )
+                for row in await cur.fetchall():
+                    skill_id, akey, chash = _extract_tuple(row, 3)
+                    clean_key = str(akey).strip().lstrip("/")
+                    try:
+                        expected_hex = parse_skill_content_hash(chash)
+                    except ValueError as exc:
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="user_skills",
+                                bucket_role="main",
+                                object_key=clean_key,
+                                row_id=str(skill_id),
+                                check_mode="invalid",
+                                invalid_reason=str(exc),
+                            )
+                        )
+                    else:
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="user_skills",
+                                bucket_role="main",
+                                object_key=clean_key,
+                                row_id=str(skill_id),
+                                expected_sha256=expected_hex,
+                                check_mode="strict",
+                            )
+                        )
+            else:
+                inv.skipped_missing_tables.append("public.user_skills")
+
+            # 9. org_library_items (kind = 'skill', archive_key + content_hash 'sha256:<hex>')
+            if await _table_exists(cur, "public.org_library_items"):
+                await cur.execute(
+                    "SELECT item_id, archive_key, content_hash "
+                    "FROM org_library_items "
+                    "WHERE kind = 'skill' AND archive_key IS NOT NULL AND archive_key <> ''"
+                )
+                for row in await cur.fetchall():
+                    item_id, akey, chash = _extract_tuple(row, 3)
+                    clean_key = str(akey).strip().lstrip("/")
+                    try:
+                        expected_hex = parse_skill_content_hash(chash)
+                    except ValueError as exc:
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="org_library_items",
+                                bucket_role="main",
+                                object_key=clean_key,
+                                row_id=str(item_id),
+                                check_mode="invalid",
+                                invalid_reason=str(exc),
+                            )
+                        )
+                    else:
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="org_library_items",
+                                bucket_role="main",
+                                object_key=clean_key,
+                                row_id=str(item_id),
+                                expected_sha256=expected_hex,
+                                check_mode="strict",
+                            )
+                        )
+            else:
+                inv.skipped_missing_tables.append("public.org_library_items")
+
+            # 10. Widgets (turn_slices, checkpoint_blobs, checkpoint_writes)
+            if await _table_exists(cur, "public.turn_slices"):
+                await cur.execute(
+                    "SELECT conversation_response_id, lines FROM turn_slices "
+                    "WHERE lines IS NOT NULL AND position('\"data_ref\"' in lines) > 0"
+                )
+                for row in await cur.fetchall():
+                    rid, lines_txt = _extract_tuple(row, 2)
+                    for ref in _extract_widget_data_refs_from_turn_slice(lines_txt):
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="widgets_turn_slices",
+                                bucket_role="main",
+                                object_key=str(ref["key"]).strip().lstrip("/"),
+                                row_id=str(rid),
+                                expected_size=(
+                                    int(ref["size"]) if ref.get("size") is not None else None
+                                ),
+                                expected_sha256=(
+                                    str(ref["sha256"]).strip().lower()
+                                    if ref.get("sha256")
+                                    else None
+                                ),
+                                check_mode="strict",
+                            )
+                        )
+            else:
+                inv.skipped_missing_tables.append("public.turn_slices")
+
+            for cp_table, pk_expr in (
+                ("checkpoint_blobs", "thread_id || ':' || channel || ':' || version"),
+                (
+                    "checkpoint_writes",
+                    "thread_id || ':' || checkpoint_id || ':' || task_id || ':' || idx",
+                ),
+            ):
+                if await _table_exists(cur, f"public.{cp_table}"):
+                    await cur.execute(
+                        f"SELECT {pk_expr} AS row_id, channel, type, blob FROM {cp_table} "
+                        "WHERE blob IS NOT NULL AND ("
+                        "(channel = 'messages' AND ("
+                        "position(convert_to('data_ref', 'UTF8') in blob) > 0 "
+                        "OR position(convert_to('captured_images', 'UTF8') in blob) > 0"
+                        ")) OR ("
+                        "channel = 'ui' AND position(convert_to('image_capture', 'UTF8') in blob) > 0"
+                        "))"
+                    )
+                    ser = serde if serde is not None else _get_checkpoint_serde()
+                    for row in await cur.fetchall():
+                        row_id, ch, btype, blob = _extract_tuple(row, 4)
+                        if not btype or btype == "empty" or blob is None:
+                            continue
+                        raw_bytes = bytes(blob)
+                        try:
+                            value = ser.loads_typed((btype, raw_bytes))
+                        except Exception:
+                            continue
+                        if ch == "messages" and b"data_ref" in raw_bytes:
+                            for ref in _extract_widget_data_refs_from_checkpoint(value):
+                                inv.references.append(
+                                    ObjectReference(
+                                        consumer=f"widgets_{cp_table}",
+                                        bucket_role="main",
+                                        object_key=str(ref["key"]).strip().lstrip("/"),
+                                        row_id=str(row_id),
+                                        expected_size=(
+                                            int(ref["size"])
+                                            if ref.get("size") is not None
+                                            else None
+                                        ),
+                                        expected_sha256=(
+                                            str(ref["sha256"]).strip().lower()
+                                            if ref.get("sha256")
+                                            else None
+                                        ),
+                                        check_mode="strict",
+                                    )
+                                )
+                        if (ch == "messages" and b"captured_images" in raw_bytes) or (
+                            ch == "ui" and b"image_capture" in raw_bytes
+                        ):
+                            for img_key in _extract_response_image_keys_from_checkpoint(
+                                value, channel=ch, env=env
+                            ):
+                                inv.references.append(
+                                    ObjectReference(
+                                        consumer=f"response_images_{cp_table}",
+                                        bucket_role="main",
+                                        object_key=img_key,
+                                        row_id=str(row_id),
+                                        check_mode="exists_only",
+                                    )
+                                )
+                else:
+                    inv.skipped_missing_tables.append(f"public.{cp_table}")
+
+            # 11. Users avatars (recorded object key or site-shaped avatar_url -> exists_only)
+            if await _table_exists(cur, "public.users"):
+                key_col = await _detect_avatar_object_key_column(cur)
+                if key_col is not None:
+                    await cur.execute(
+                        f"SELECT user_id, {key_col}, avatar_url FROM users "
+                        f"WHERE ({key_col} IS NOT NULL AND {key_col} <> '') "
+                        "OR (avatar_url IS NOT NULL AND avatar_url <> '')"
+                    )
+                else:
+                    await cur.execute(
+                        "SELECT user_id, NULL::text, avatar_url FROM users "
+                        "WHERE avatar_url IS NOT NULL AND avatar_url <> ''"
+                    )
+                for row in await cur.fetchall():
+                    uid, recorded_key, avatar_url = _extract_tuple(row, 3)
+                    obj_key = (
+                        str(recorded_key).strip().lstrip("/")
+                        if isinstance(recorded_key, str) and recorded_key.strip()
+                        else extract_avatar_object_key(avatar_url, env=env)
+                    )
+                    if obj_key:
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="users_avatars",
+                                bucket_role="main",
+                                object_key=obj_key,
+                                row_id=str(uid),
+                                check_mode="exists_only",
+                            )
+                        )
+            else:
+                inv.skipped_missing_tables.append("public.users")
+
+            # 12. Response images in conversation_responses & subagent_runs
+            if await _table_exists(cur, "public.conversation_responses"):
+                await cur.execute(
+                    "SELECT conversation_response_id, replay_facts FROM conversation_responses "
+                    "WHERE replay_facts IS NOT NULL AND ("
+                    "(replay_facts ? 'images' AND position('response-images/' in (replay_facts -> 'images')::text) > 0) "
+                    "OR (replay_facts ? 'legacy' AND position('response-images/' in (replay_facts -> 'legacy')::text) > 0)"
+                    ")"
+                )
+                for row in await cur.fetchall():
+                    rid, rfacts = _extract_tuple(row, 2)
+                    for img_key in _extract_response_image_keys_from_replay_facts(
+                        rfacts, include_legacy=True, env=env
+                    ):
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="response_images_turns",
+                                bucket_role="main",
+                                object_key=img_key,
+                                row_id=str(rid),
+                                check_mode="exists_only",
+                            )
+                        )
+            else:
+                inv.skipped_missing_tables.append("public.conversation_responses")
+
+            if await _table_exists(cur, "public.subagent_runs"):
+                await cur.execute(
+                    "SELECT task_run_id, replay_facts FROM subagent_runs "
+                    "WHERE replay_facts IS NOT NULL AND replay_facts ? 'images' "
+                    "AND position('response-images/' in (replay_facts -> 'images')::text) > 0"
+                )
+                for row in await cur.fetchall():
+                    rid, rfacts = _extract_tuple(row, 2)
+                    for img_key in _extract_response_image_keys_from_replay_facts(
+                        rfacts, include_legacy=False, env=env
+                    ):
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="response_images_subagents",
+                                bucket_role="main",
+                                object_key=img_key,
+                                row_id=str(rid),
+                                check_mode="exists_only",
+                            )
+                        )
+            else:
+                inv.skipped_missing_tables.append("public.subagent_runs")
+
+            # 13. chat_attachments (only cleaned_at IS NULL AND state = 'ready' AND object_key IS NOT NULL)
+            if await _table_exists(cur, "public.chat_attachments"):
+                await cur.execute(
+                    "SELECT attachment_id, state, object_key, size "
+                    "FROM chat_attachments WHERE cleaned_at IS NULL"
+                )
+                pending_att = 0
+                for row in await cur.fetchall():
+                    aid, st, okey, sz = _extract_tuple(row, 4)
+                    st_s = str(st or "")
+                    if st_s == "uploading":
+                        pending_att += 1
+                        continue
+                    if st_s != "ready":
+                        continue
+                    if not isinstance(okey, str) or not okey.strip():
+                        # Pre-upgrade inline attachment (object_key IS NULL): exempt!
+                        continue
+                    inv.references.append(
+                        ObjectReference(
+                            consumer="chat_attachments",
+                            bucket_role="main",
+                            object_key=okey.strip().lstrip("/"),
+                            row_id=str(aid),
+                            expected_size=int(sz) if sz is not None else None,
+                            check_mode="strict",
+                        )
+                    )
+                if pending_att:
+                    inv.skipped_pending["chat_attachments"] = pending_att
+            else:
+                inv.skipped_missing_tables.append("public.chat_attachments")
+
+            # 14. conversation_queries attachment history (attachments/* -> exists_only)
+            if await _table_exists(cur, "public.conversation_queries"):
+                await cur.execute(
+                    "SELECT conversation_query_id, metadata -> 'attachments' "
+                    "FROM conversation_queries "
+                    "WHERE metadata IS NOT NULL AND metadata ? 'attachments' "
+                    "AND jsonb_typeof(metadata -> 'attachments') = 'array'"
+                )
+                for row in await cur.fetchall():
+                    qid, atts = _extract_tuple(row, 2)
+                    if isinstance(atts, str):
+                        try:
+                            atts = json.loads(atts)
+                        except (ValueError, TypeError):
+                            atts = []
+                    if not isinstance(atts, list):
+                        continue
+                    for item in atts:
+                        if not isinstance(item, dict):
+                            continue
+                        obj_key = extract_attachment_object_key(
+                            item.get("object_key") or item.get("url"), env=env
+                        )
+                        if obj_key:
+                            inv.references.append(
+                                ObjectReference(
+                                    consumer="chat_attachment_history",
+                                    bucket_role="main",
+                                    object_key=obj_key,
+                                    row_id=str(qid),
+                                    check_mode="exists_only",
+                                )
+                            )
+            else:
+                inv.skipped_missing_tables.append("public.conversation_queries")
+
+        if include_aux:
+            # 15. dalton_chat_file_uploads (aux / chat_upload bucket)
+            if await _table_exists(cur, "public.dalton_chat_file_uploads"):
+                await cur.execute(
+                    "SELECT upload_id, state, object_key, size_bytes, actual_sha256 "
+                    "FROM dalton_chat_file_uploads WHERE cleaned_at IS NULL"
+                )
+                pending_chat = 0
+                for row in await cur.fetchall():
+                    uid, st, okey, sz, sha = _extract_tuple(row, 5)
+                    st_s = str(st or "")
+                    if st_s in ("uploading", "completing"):
+                        pending_chat += 1
+                        continue
+                    if st_s != "ready":
+                        continue
+                    inv.references.append(
+                        ObjectReference(
+                            consumer="dalton_chat_file_uploads",
+                            bucket_role="chat_upload",
+                            object_key=str(okey or "").strip().lstrip("/"),
+                            row_id=str(uid),
+                            expected_size=int(sz) if sz is not None else None,
+                            expected_sha256=(
+                                str(sha).strip().lower() if isinstance(sha, str) and sha.strip() else None
+                            ),
+                            check_mode="strict",
+                        )
+                    )
+                if pending_chat:
+                    inv.skipped_pending["dalton_chat_file_uploads"] = pending_chat
+            else:
+                inv.skipped_missing_tables.append("public.dalton_chat_file_uploads")
+
+            # 16. dalton_transcription_jobs (aux / asr bucket + terminal job IDs)
+            if await _table_exists(cur, "public.dalton_transcription_jobs"):
+                await cur.execute(
+                    "SELECT job_id, status, source_object_key, source_size_bytes, "
+                    "source_sha256, usage FROM dalton_transcription_jobs "
+                    "ORDER BY created_at ASC, job_id ASC"
+                )
+                pending_asr = 0
+                for row in await cur.fetchall():
+                    jid, st, okey, sz, sha, usage = _extract_tuple(row, 6)
+                    jid_s = str(jid)
+                    st_s = str(st or "").strip().lower()
+                    if isinstance(usage, str):
+                        try:
+                            usage = json.loads(usage)
+                        except (ValueError, TypeError):
+                            usage = {}
+                    upload_meta = (
+                        usage.get("upload")
+                        if isinstance(usage, dict) and isinstance(usage.get("upload"), dict)
+                        else {}
+                    )
+                    upload_completed = upload_meta.get("completed") is True
+
+                    if st_s in TERMINAL_ASR_ARCHIVE_STATUSES:
+                        inv.terminal_asr_job_ids.append(jid_s)
+                    if st_s == "succeeded":
+                        inv.succeeded_asr_job_ids.append(jid_s)
+
+                    if st_s == "awaiting_upload" and not upload_completed:
+                        pending_asr += 1
+                        continue
+                    if st_s in ACTIVE_OR_SUBMITTED_ASR_STATUSES or (
+                        st_s == "awaiting_upload" and upload_completed
+                    ):
+                        inv.references.append(
+                            ObjectReference(
+                                consumer="dalton_transcription_jobs",
+                                bucket_role="asr",
+                                object_key=str(okey or "").strip().lstrip("/"),
+                                row_id=jid_s,
+                                expected_size=int(sz) if sz is not None else None,
+                                expected_sha256=(
+                                    str(sha).strip().lower()
+                                    if isinstance(sha, str) and sha.strip()
+                                    else None
+                                ),
+                                check_mode="strict",
+                            )
+                        )
+                if pending_asr:
+                    inv.skipped_pending["dalton_transcription_jobs"] = pending_asr
+            else:
+                inv.skipped_missing_tables.append("public.dalton_transcription_jobs")
+
+            # 17. Channel chart snapshots (conversation_responses.metadata->'chart_snapshots')
+            if await _table_exists(cur, "public.conversation_responses"):
+                await cur.execute(
+                    "SELECT conversation_response_id, metadata -> 'chart_snapshots' "
+                    "FROM conversation_responses "
+                    "WHERE metadata IS NOT NULL AND metadata ? 'chart_snapshots' "
+                    "AND jsonb_typeof(metadata -> 'chart_snapshots') = 'array'"
+                )
+                pending_snaps = 0
+                for row in await cur.fetchall():
+                    rid, snaps = _extract_tuple(row, 2)
+                    if isinstance(snaps, str):
+                        try:
+                            snaps = json.loads(snaps)
+                        except (ValueError, TypeError):
+                            snaps = []
+                    if not isinstance(snaps, list):
+                        continue
+                    for item in snaps:
+                        if not isinstance(item, dict):
+                            continue
+                        st_s = str(item.get("status") or "").strip().lower()
+                        if st_s == "pending":
+                            pending_snaps += 1
+                            continue
+                        if st_s != "ready":
+                            continue
+                        skey = str(item.get("snapshot_key") or "").strip().lstrip("/")
+                        if skey:
+                            inv.references.append(
+                                ObjectReference(
+                                    consumer="channel_snapshots",
+                                    bucket_role="chat_upload",
+                                    object_key=skey,
+                                    row_id=f"{rid}:{item.get('layer_id', '')}",
+                                    check_mode="exists_only",
+                                )
+                            )
+                if pending_snaps:
+                    inv.skipped_pending["channel_snapshots"] = pending_snaps
+
+    return inv
+
+
+def _index_manifest_objects(
+    manifest_objects: Mapping[tuple[str, str], Mapping[str, Any]] | Sequence[Mapping[str, Any]],
+) -> dict[tuple[str, str], Mapping[str, Any]]:
+    if isinstance(manifest_objects, Mapping):
+        return {
+            (str(k[0]), str(k[1]).lstrip("/")): v
+            for k, v in manifest_objects.items()
+        }
+    indexed: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for entry in manifest_objects:
+        if not isinstance(entry, Mapping):
+            continue
+        bucket = str(entry.get("bucket") or "")
+        key = str(entry.get("key") or "").lstrip("/")
+        if bucket and key:
+            indexed[(bucket, key)] = entry
+    return indexed
+
+
+def _read_asr_archive_json(
+    archive_members: Mapping[str, bytes] | None,
+    asr_dir: Path | None,
+    rel_path: str,
+) -> tuple[bool, Any | None, str | None]:
+    """Return ``(exists, parsed_json_or_none, error_detail)`` for a path inside ASR jobs archive or dir."""
+    norm = rel_path.lstrip("./")
+    raw: bytes | None = None
+    if archive_members is not None:
+        if norm not in archive_members:
+            return False, None, f"missing {norm} in asr-jobs archive"
+        raw = archive_members[norm]
+    elif asr_dir is not None:
+        fpath = asr_dir / norm
+        if not fpath.is_file():
+            return False, None, f"missing {norm} in {asr_dir}"
+        try:
+            raw = fpath.read_bytes()
+        except OSError as exc:
+            return False, None, f"unreadable {norm}: {exc}"
+    else:
+        return False, None, "neither asr_jobs_archive nor asr_jobs_dir was provided"
+
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        return True, None, f"invalid JSON in {norm}: {exc}"
+    return True, parsed, None
+
+
+def _load_tar_members_bytes(tar_path: Path) -> dict[str, bytes]:
+    members: dict[str, bytes] = {}
+    with tarfile.open(tar_path, "r:*") as tf:
+        for member in tf.getmembers():
+            if not member.isfile():
+                continue
+            norm = member.name.lstrip("./")
+            fh = tf.extractfile(member)
+            if fh is not None:
+                members[norm] = fh.read()
+    return members
+
+
+def reconcile_inventory_against_manifest(
+    inventory: SnapshotRefInventory,
+    manifest_objects: Mapping[tuple[str, str], Mapping[str, Any]] | Sequence[Mapping[str, Any]],
+    *,
+    bucket_targets: Mapping[str, tuple[str, str]],
+    asr_jobs_archive: Path | None = None,
+    asr_jobs_dir: Path | None = None,
+    source_asr_jobs_dir: Path | None = None,
+    require_raw_response_job_ids: set[str] | frozenset[str] | None = None,
+    target_logger: logging.Logger | None = None,
+) -> ReconcileReport:
+    """Reconcile all snapshot consumer references against the archived object manifest & ASR jobs archive.
+
+    Follows the §3.1 reconciliation matrix:
+    - Strict consumers verify existence, size (when specified), and ``archived_sha256``.
+    - Skill archives (``user_skills`` / ``org_library_items``) validate ``sha256:<hex>`` prefix.
+    - ``provenance_result_bodies`` checks existence only; size mismatch logs WARNING and passes.
+    - ``succeeded`` ASR jobs check ``<job_id>/state.json`` (status='succeeded'), ``result.json``,
+      and ``raw_response.json`` whenever the job writes it.
+    """
+    log = target_logger or logger
+    index = _index_manifest_objects(manifest_objects)
+    errors: list[ReconcileIssue] = []
+    warnings: list[ReconcileIssue] = []
+    checked_refs = 0
+
+    for ref in inventory.references:
+        checked_refs += 1
+        if ref.check_mode == "invalid":
+            errors.append(
+                ReconcileIssue(
+                    consumer=ref.consumer,
+                    code="invalid_reference",
+                    row_id=ref.row_id,
+                    object_key=ref.object_key,
+                    detail=ref.invalid_reason or "invalid reference metadata",
+                )
+            )
+            continue
+
+        target = bucket_targets.get(ref.bucket_role)
+        if target is None or not target[0]:
+            errors.append(
+                ReconcileIssue(
+                    consumer=ref.consumer,
+                    code="unconfigured_bucket_role",
+                    row_id=ref.row_id,
+                    object_key=ref.object_key,
+                    detail=f"No bucket configured for role {ref.bucket_role!r}",
+                )
+            )
+            continue
+
+        bucket_name, key_prefix = target
+        full_key = _apply_bucket_prefix(ref.object_key, key_prefix)
+        entry = index.get((bucket_name, full_key))
+        if entry is None:
+            errors.append(
+                ReconcileIssue(
+                    consumer=ref.consumer,
+                    code="missing_object",
+                    row_id=ref.row_id,
+                    object_key=f"{bucket_name}/{full_key}",
+                    detail="Referenced object is missing from backup manifest",
+                )
+            )
+            continue
+
+        if ref.check_mode == "exists_only":
+            continue
+
+        actual_size = entry.get("size")
+        actual_sha = str(entry.get("archived_sha256") or entry.get("sha256") or "").strip().lower()
+
+        if ref.check_mode == "exists_warn_size":
+            if (
+                ref.expected_size is not None
+                and actual_size is not None
+                and int(actual_size) != int(ref.expected_size)
+            ):
+                issue = ReconcileIssue(
+                    consumer=ref.consumer,
+                    code="mutable_size_drift",
+                    row_id=ref.row_id,
+                    object_key=f"{bucket_name}/{full_key}",
+                    detail=(
+                        f"Mutable object size differs from DB byte_len "
+                        f"(manifest={actual_size}, db={ref.expected_size}); continuing"
+                    ),
+                )
+                warnings.append(issue)
+                log.warning(
+                    "[storage_refs] WARNING %s row=%s key=%s: %s",
+                    issue.consumer,
+                    issue.row_id,
+                    issue.object_key,
+                    issue.detail,
+                )
+            continue
+
+        # Strict mode
+        if ref.expected_size is not None:
+            if actual_size is None or int(actual_size) != int(ref.expected_size):
+                errors.append(
+                    ReconcileIssue(
+                        consumer=ref.consumer,
+                        code="size_mismatch",
+                        row_id=ref.row_id,
+                        object_key=f"{bucket_name}/{full_key}",
+                        detail=f"Object size mismatch (manifest={actual_size}, expected={ref.expected_size})",
+                    )
+                )
+        if ref.expected_sha256 is not None:
+            if actual_sha != ref.expected_sha256.lower():
+                errors.append(
+                    ReconcileIssue(
+                        consumer=ref.consumer,
+                        code="sha256_mismatch",
+                        row_id=ref.row_id,
+                        object_key=f"{bucket_name}/{full_key}",
+                        detail=(
+                            f"Object SHA-256 mismatch "
+                            f"(archived_sha256={actual_sha!r}, expected={ref.expected_sha256.lower()!r})"
+                        ),
+                    )
+                )
+
+    # Reconcile succeeded ASR jobs archive contents
+    checked_asr_jobs = 0
+    if inventory.succeeded_asr_job_ids:
+        archive_members: dict[str, bytes] | None = None
+        if asr_jobs_archive is not None:
+            if not asr_jobs_archive.is_file():
+                errors.append(
+                    ReconcileIssue(
+                        consumer="dalton_transcription_jobs_archive",
+                        code="missing_asr_archive",
+                        row_id="*",
+                        object_key=str(asr_jobs_archive),
+                        detail="Succeeded ASR jobs exist but asr-jobs archive is missing",
+                    )
+                )
+            else:
+                try:
+                    archive_members = _load_tar_members_bytes(asr_jobs_archive)
+                except Exception as exc:
+                    errors.append(
+                        ReconcileIssue(
+                            consumer="dalton_transcription_jobs_archive",
+                            code="corrupt_asr_archive",
+                            row_id="*",
+                            object_key=str(asr_jobs_archive),
+                            detail=f"Failed reading asr-jobs archive: {exc}",
+                        )
+                    )
+
+        if archive_members is not None or asr_jobs_dir is not None:
+            req_raw_ids = set(require_raw_response_job_ids or ())
+            for job_id in inventory.succeeded_asr_job_ids:
+                checked_asr_jobs += 1
+                ok_state, state_obj, state_err = _read_asr_archive_json(
+                    archive_members, asr_jobs_dir, f"{job_id}/state.json"
+                )
+                if not ok_state or not isinstance(state_obj, dict):
+                    errors.append(
+                        ReconcileIssue(
+                            consumer="dalton_transcription_jobs_archive",
+                            code="missing_or_invalid_state_json",
+                            row_id=job_id,
+                            object_key=f"{job_id}/state.json",
+                            detail=state_err or "state.json is not a JSON object",
+                        )
+                    )
+                elif str(state_obj.get("status") or "").strip().lower() != "succeeded":
+                    errors.append(
+                        ReconcileIssue(
+                            consumer="dalton_transcription_jobs_archive",
+                            code="state_status_mismatch",
+                            row_id=job_id,
+                            object_key=f"{job_id}/state.json",
+                            detail=(
+                                f"Expected state.json status='succeeded', "
+                                f"got {state_obj.get('status')!r}"
+                            ),
+                        )
+                    )
+
+                ok_res, res_obj, res_err = _read_asr_archive_json(
+                    archive_members, asr_jobs_dir, f"{job_id}/result.json"
+                )
+                if not ok_res or not isinstance(res_obj, dict):
+                    errors.append(
+                        ReconcileIssue(
+                            consumer="dalton_transcription_jobs_archive",
+                            code="missing_or_invalid_result_json",
+                            row_id=job_id,
+                            object_key=f"{job_id}/result.json",
+                            detail=res_err or "result.json is not a JSON object",
+                        )
+                    )
+                    continue
+
+                raw_filename = str(res_obj.get("raw_response_file") or "").strip()
+                expect_raw = bool(
+                    raw_filename
+                    or job_id in req_raw_ids
+                    or (
+                        source_asr_jobs_dir is not None
+                        and (source_asr_jobs_dir / job_id / "raw_response.json").is_file()
+                    )
+                )
+                if expect_raw:
+                    raw_rel = f"{job_id}/{raw_filename or 'raw_response.json'}"
+                    ok_raw, raw_obj, raw_err = _read_asr_archive_json(
+                        archive_members, asr_jobs_dir, raw_rel
+                    )
+                    if not ok_raw or not isinstance(raw_obj, dict):
+                        errors.append(
+                            ReconcileIssue(
+                                consumer="dalton_transcription_jobs_archive",
+                                code="missing_or_invalid_raw_response_json",
+                                row_id=job_id,
+                                object_key=raw_rel,
+                                detail=raw_err or "raw_response.json is not a JSON object",
+                            )
+                        )
+        elif asr_jobs_archive is None and asr_jobs_dir is None:
+            errors.append(
+                ReconcileIssue(
+                    consumer="dalton_transcription_jobs_archive",
+                    code="missing_asr_archive",
+                    row_id="*",
+                    object_key="asr-jobs",
+                    detail="Succeeded ASR jobs exist but no asr-jobs archive or directory was provided",
+                )
+            )
+
+    return ReconcileReport(
+        ok=len(errors) == 0,
+        checked_refs=checked_refs,
+        checked_asr_jobs=checked_asr_jobs,
+        errors=tuple(errors),
+        warnings=tuple(warnings),
+        skipped_pending=dict(inventory.skipped_pending),
+    )
+
+
+def resolve_bucket_targets_from_env(
+    env: Mapping[str, str] | None = None,
+) -> dict[str, tuple[str, str]]:
+    """Resolve ``bucket_role -> (bucket_name, key_prefix)`` from environment variables."""
+    from src.dalton.storage_config import resolve as resolve_storage_config
+
+    em = os.environ if env is None else env
+    cfg = resolve_storage_config(env=em)
+    targets: dict[str, tuple[str, str]] = {}
+    if cfg.is_storage_enabled and cfg.bucket_name:
+        main_prefix = _normalize_storage_key_prefix(em).rstrip("/")
+        targets["main"] = (cfg.bucket_name, main_prefix)
+
+    asr_bucket = (em.get("DALTON_ASR_STORAGE_BUCKET_NAME") or "").strip()
+    asr_prefix = (em.get("DALTON_ASR_STORAGE_KEY_PREFIX") or "").strip().strip("/")
+    if asr_bucket:
+        targets["asr"] = (asr_bucket, asr_prefix)
+
+    chat_bucket = (em.get("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME") or "").strip()
+    chat_prefix = (em.get("DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX") or "").strip().strip("/")
+    if chat_bucket:
+        targets["chat_upload"] = (chat_bucket, chat_prefix)
+    elif asr_bucket:
+        targets["chat_upload"] = (asr_bucket, asr_prefix)
+    return targets
+
+
+# ---------------------------------------------------------------------------
+# Operator CLI (`python -m src.dalton.storage_refs check --strict | reconcile`)
 # ---------------------------------------------------------------------------
 
 
@@ -2116,6 +3748,59 @@ def main(argv: list[str] | None = None) -> int:
         help="Run the fast indexed startup advisory probes (exit 0=clean, 1=hits, 2=error).",
     )
 
+    reconcile_p = sub.add_parser(
+        "reconcile",
+        help=(
+            "Reconcile snapshot consumer references (from --refs-json or live DB) against "
+            "a backup object manifest JSON and optional asr-jobs archive/dir."
+        ),
+    )
+    reconcile_p.add_argument(
+        "--manifest",
+        required=True,
+        help="Path to object manifest JSON (containing 'objects' list with bucket, key, size, archived_sha256).",
+    )
+    reconcile_p.add_argument(
+        "--refs-json",
+        default="",
+        help="Optional pre-exported SnapshotRefInventory JSON; if omitted, enumerates from DB.",
+    )
+    reconcile_p.add_argument(
+        "--asr-archive",
+        default="",
+        help="Optional path to asr-jobs tar.gz archive for verifying succeeded ASR jobs.",
+    )
+    reconcile_p.add_argument(
+        "--asr-dir",
+        default="",
+        help="Optional path to extracted asr_jobs directory for verifying succeeded ASR jobs.",
+    )
+    reconcile_p.add_argument(
+        "--source-asr-dir",
+        default="",
+        help="Optional source asr_jobs directory to detect which jobs produced raw_response.json.",
+    )
+    reconcile_p.add_argument(
+        "--main-bucket",
+        default="",
+        help="Override main bucket name (default: resolved from env).",
+    )
+    reconcile_p.add_argument(
+        "--main-prefix",
+        default="",
+        help="Override main bucket key prefix.",
+    )
+    reconcile_p.add_argument(
+        "--aux-bucket",
+        default="",
+        help="Override aux (asr/chat_upload) bucket name (default: resolved from env).",
+    )
+    reconcile_p.add_argument(
+        "--aux-prefix",
+        default="",
+        help="Override aux bucket key prefix.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "check":
         progress = None if args.quiet_progress else sys.stderr
@@ -2143,6 +3828,48 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         except KeyboardInterrupt:
+            return EXIT_CHECK_FAILED
+    if args.command == "reconcile":
+        try:
+            manifest_data = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+            objects = (
+                manifest_data.get("objects")
+                if isinstance(manifest_data, dict)
+                else manifest_data
+            )
+            if not isinstance(objects, list):
+                raise ValueError("manifest JSON must contain an 'objects' list")
+            if args.refs_json:
+                refs_data = json.loads(Path(args.refs_json).read_text(encoding="utf-8"))
+                inventory = SnapshotRefInventory.from_dict(refs_data)
+            else:
+                async def _enum() -> SnapshotRefInventory:
+                    conn = await _open_cli_readonly_connection()
+                    try:
+                        return await enumerate_snapshot_refs(conn)
+                    finally:
+                        await conn.close()
+
+                inventory = asyncio.run(_enum())
+
+            targets = resolve_bucket_targets_from_env()
+            if args.main_bucket:
+                targets["main"] = (args.main_bucket, args.main_prefix.strip("/"))
+            if args.aux_bucket:
+                targets["asr"] = (args.aux_bucket, args.aux_prefix.strip("/"))
+                targets["chat_upload"] = (args.aux_bucket, args.aux_prefix.strip("/"))
+            report = reconcile_inventory_against_manifest(
+                inventory,
+                objects,
+                bucket_targets=targets,
+                asr_jobs_archive=Path(args.asr_archive) if args.asr_archive else None,
+                asr_jobs_dir=Path(args.asr_dir) if args.asr_dir else None,
+                source_asr_jobs_dir=Path(args.source_asr_dir) if args.source_asr_dir else None,
+            )
+            print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+            return EXIT_CLEAN if report.ok else EXIT_REFERENCES_FOUND
+        except Exception as exc:
+            print(f"[storage_refs] ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
             return EXIT_CHECK_FAILED
     return EXIT_CHECK_FAILED
 

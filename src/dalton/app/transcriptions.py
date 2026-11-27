@@ -26,6 +26,7 @@ from src.dalton.services.transcriptions import (
     is_transcription_enabled,
     is_transcription_ticket_token,
     prepare_transcription_job,
+    resubmit_transcription_job,
     retry_transcription_job,
     sign_transcription_upload_part,
     start_transcription_upload,
@@ -490,6 +491,25 @@ async def retry_transcription_endpoint(
         expected_job_id=job_id,
     )
     return await retry_transcription_job(
+        job_id=job_id,
+        caller_user_id=caller_user_id,
+    )
+
+
+@router.post("/{job_id}/resubmit")
+@handle_api_exceptions("resubmit transcription job", logger)
+async def resubmit_transcription_endpoint(
+    job_id: str,
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
+) -> dict[str, Any]:
+    caller_user_id, _ticket_claims = await _resolve_caller_and_ticket(
+        request,
+        credentials,
+        required_op="resubmit",
+        expected_job_id=job_id,
+    )
+    return await resubmit_transcription_job(
         job_id=job_id,
         caller_user_id=caller_user_id,
     )
