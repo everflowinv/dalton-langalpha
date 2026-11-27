@@ -1,0 +1,32 @@
+# Everflow-only data-task scripts excluded from Standalone Core releases
+# (scripts/standalone/package_release.sh) and skipped by
+# scripts/dalton/seed_openclaw_data.sh when src.dalton.profile resolves to "core".
+#
+# Paths are relative to scripts/dalton/data_assets/. Blank lines and '#' comments
+# are ignored. Everflow deployments install all assets as usual.
+
+# Bloomberg terminal integration (Windows SSH / Tailscale + BBG CSV/XLSX parser)
+scripts/bbg_export_to_csv.py
+scripts/bbg_remote_refresh.sh
+
+# Everflow OpenClaw cron dispatcher & internal channel/mirror helpers
+scripts/cron_command_tasks.py
+scripts/eve_tracking_mirror.py
+scripts/feishu_send_card.py
+scripts/sentiment_dashboard_cos_upload.py
+scripts/sentiment_dashboard_digest.sh
+
+# Everflow internal watchlists, Gmail/AlphaEngine/GS Prime feeds & Discord/Feishu digests
+scripts/e_watch_monitor.py
+scripts/etf_monthly_flows_tracker.py
+scripts/fde_hiring_discord_digest.py
+scripts/fde_hiring_weekly_report.sh
+scripts/gs_pb_weekly.py
+scripts/megacap_relative_signal_monitor.py
+scripts/pt_watchlist_monitor.py
+scripts/semi_bottom_checklist.py
+scripts/semi_rescue_alert.py
+scripts/softbank_nav_monitor.py
+scripts/token_weekly_usage_tracker.py
+scripts/tsmc_adr_premium.py
+scripts/update_gs_prime_positioning.py

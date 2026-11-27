@@ -60,6 +60,7 @@ from src.dalton.data_jobs.notification_payloads import (
     prepare_t27_run_outbox,
 )
 from src.dalton.data_jobs.runner_wrapper import (
+    DEFAULT_WORKSPACE_DIR,
     EXIT_CODE_NO_OUTPUT_TIMEOUT,
     EXIT_CODE_TOTAL_TIMEOUT,
     atomic_write_json,
@@ -1060,7 +1061,7 @@ async def claim_next_queued_run(
             generation=int(claimed_generation),
             runner=runner,
             command_argv=[str(a) for a in raw_argv],
-            workdir=str(cand.get("workdir") or "/Users/everflow/.openclaw/workspace"),
+            workdir=str(cand.get("workdir") or DEFAULT_WORKSPACE_DIR),
             timeout_seconds=cand.get("timeout_seconds"),
             no_output_timeout_seconds=cand.get("no_output_timeout_seconds"),
             required_secrets=[str(s) for s in raw_secrets],

@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from typing import Any
 from unittest.mock import create_autospec
 from uuid import uuid4
 
@@ -312,7 +313,9 @@ async def test_host_run_rejects_t34_drift_and_mirror_before_launch(
         root = tmp_path / f"reject-{index}"
         status, body = await _call(root, _host_body(f"reject-{index}", **extra))
         assert status == 400
-        assert body == {"ok": False, "rejected": True, "error": "host_command_rejected"}
+        assert body["ok"] is False
+        assert body["rejected"] is True
+        assert body["error"] == "host_command_rejected"
         assert launched == []
         assert not (root / ".dalton-runs").exists()
 
@@ -456,6 +459,31 @@ def test_seed_deploys_kweb_data_assets_without_legacy_source_sync(tmp_path: Path
     assert "skills/kweb-dashboard/scripts/kweb_dashboard_cli.py" in dry.stdout
     assert not dst.exists()
 
+    preflight_cfg = dst / "config" / "data_tasks.env"
+    preflight_cfg.parent.mkdir(parents=True, exist_ok=True)
+    preflight_cfg.write_text(
+        "\n".join(
+            [
+                "DALTON_DATA_TASK_BBG_HOST=bbg@test.example",
+                "DALTON_DATA_TASK_BBG_CSV_REMOTE=C:/test/bbg.csv",
+                "DALTON_DATA_TASK_BBG_XLSX_REMOTE=C:/test/bbg.xlsx",
+                "DALTON_DATA_TASK_BBG_REFRESH_CMD=cmd /c test.bat",
+                "DALTON_DATA_TASK_FEISHU_TRACKING_CHAT_ID=oc_placeholder_tracking",
+                "DALTON_DATA_TASK_FEISHU_SEMI_CHAT_ID=oc_placeholder_semi",
+                "DALTON_DATA_TASK_FEISHU_ASIA_TARGET=chat:oc_placeholder_asia",
+                "DALTON_DATA_TASK_FEISHU_MEGACAP_TARGET=oc_placeholder_megacap",
+                "DALTON_DATA_TASK_FEISHU_SENTIMENT_CHAT_ID=oc_placeholder_sentiment",
+                "DALTON_DATA_TASK_FEISHU_A_SHARE_DM_TARGET=user:ou_placeholder_ashare",
+                "DALTON_DATA_TASK_DISCORD_DM_TARGET=user:100000000000000001",
+                "DALTON_DATA_TASK_DISCORD_DEV_CHANNEL=channel:100000000000000002",
+                "DALTON_DATA_TASK_DISCORD_SEMI_BOTTOM_CHANNEL=channel:100000000000000003",
+                "DALTON_SEC_USER_AGENT=TestBot test@example.com",
+                "DALTON_DATA_TASK_GS_PB_PYTHON=/opt/test/gs-pb/bin/python",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     apply = subprocess.run(
         ["bash", str(script_path), "--apply", "--target", str(dst)],
         capture_output=True,
@@ -467,8 +495,15 @@ def test_seed_deploys_kweb_data_assets_without_legacy_source_sync(tmp_path: Path
     assert (dst / "skills/kweb-dashboard/SKILL.md").is_file()
 
 
-def test_none_payload_source_ignores_stdout_trigger_fields(tmp_path: Path) -> None:
+def test_none_payload_source_ignores_stdout_trigger_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """``none`` does not turn stdout into an outbox. Other sources still do."""
+    monkeypatch.setenv("DALTON_DATA_TASK_DISCORD_DEV_CHANNEL", "channel:100000000000000002")
+    monkeypatch.setenv("DALTON_DATA_TASK_DISCORD_SEMI_BOTTOM_CHANNEL", "channel:100000000000000003")
+    monkeypatch.setenv("DALTON_DATA_TASK_DISCORD_DM_TARGET", "user:100000000000000001")
+    monkeypatch.setenv("DALTON_DATA_TASK_FEISHU_A_SHARE_DM_TARGET", "user:ou_placeholder_ashare")
     none_jobs = {
         "bbg-data-pull-asia",  # T1
         "cn-leverage-daily",  # T5

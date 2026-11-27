@@ -167,7 +167,7 @@ def extract_all_json_objects(text: str) -> list[dict[str, Any]]:
 
 
 def resolve_data_root_path(raw_path: str | Path, data_root: Path) -> Path:
-    """Map a container workspace path (`/Users/everflow/.openclaw/workspace/...`) into ``data_root``."""
+    """Map a container workspace path (``DEFAULT_WORKSPACE_DIR`` prefix) into ``data_root``."""
     raw_str = str(raw_path).strip()
     ws_prefix = DEFAULT_WORKSPACE_DIR.rstrip("/") + "/"
     if raw_str.startswith(ws_prefix):

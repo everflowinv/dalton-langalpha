@@ -6,10 +6,71 @@
 #
 # 卡片里的每个数字都来自 build 落下的 signals.json，不另取行情：卡片和线上页面因此同源，
 # 对不上就是 build 的问题，不会是文案漂移。任何一步失败就非零退出，绝不发半份卡片。
+#
+# 配置项（优先读环境变量，其次读 $DALTON_DATA_TASKS_CONFIG 或 <runtime_workspace>/config/data_tasks.env）：
+#   DALTON_DATA_TASK_FEISHU_SENTIMENT_CHAT_ID  飞书接收群 chat_id（兼容 DALTON_SENTIMENT_DIGEST_CHAT_ID / SENTIMENT_DIGEST_CHAT_ID；必填）
+#   DALTON_DATA_TASK_WORKSPACE                 数据任务工作目录（兼容 DALTON_WORKSPACE / OPENCLAW_WORKSPACE / WORKDIR；默认当前运行目录 $PWD）
 set -euo pipefail
 
-WS=/Users/everflow/.openclaw/workspace
-CHAT_ID="${SENTIMENT_DIGEST_CHAT_ID:-oc_a6b59323f034cb246c80e1b3684e71d1}"
+RUNTIME_PWD="${PWD}"
+BOOT_CFG="${DALTON_DATA_TASKS_CONFIG:-$RUNTIME_PWD/config/data_tasks.env}"
+
+_read_cfg_key() {
+  local key="$1" file="$2" line lhs val last_val="" found=0
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if [[ "$line" == export\ * ]]; then
+      line="${line#export }"
+      line="${line#"${line%%[![:space:]]*}"}"
+    fi
+    [[ "$line" == *=* ]] || continue
+    lhs="${line%%=*}"
+    lhs="${lhs%"${lhs##*[![:space:]]}"}"
+    if [[ "$lhs" == "$key" ]]; then
+      val="${line#*=}"
+      val="${val#"${val%%[![:space:]]*}"}"
+      val="${val%"${val##*[![:space:]]}"}"
+      if [[ ${#val} -ge 2 ]]; then
+        if [[ "${val:0:1}" == '"' && "${val: -1}" == '"' ]]; then
+          val="${val:1:${#val}-2}"
+        elif [[ "${val:0:1}" == "'" && "${val: -1}" == "'" ]]; then
+          val="${val:1:${#val}-2}"
+        fi
+      fi
+      last_val="$val"
+      found=1
+    fi
+  done < "$file"
+  if [[ "$found" -eq 1 ]]; then
+    printf '%s' "$last_val"
+  fi
+}
+
+_read_first_cfg_key() {
+  local file="$1"
+  shift
+  local k val
+  for k in "$@"; do
+    val="$(_read_cfg_key "$k" "$file")"
+    if [[ -n "$val" ]]; then
+      printf '%s' "$val"
+      return 0
+    fi
+  done
+}
+
+WS="${DALTON_DATA_TASK_WORKSPACE:-${DALTON_WORKSPACE:-${OPENCLAW_WORKSPACE:-${WORKDIR:-$(_read_first_cfg_key "$BOOT_CFG" "DALTON_DATA_TASK_WORKSPACE" "DALTON_WORKSPACE")}}}}"
+WS="${WS:-$RUNTIME_PWD}"
+
+CFG_FILE="${DALTON_DATA_TASKS_CONFIG:-$WS/config/data_tasks.env}"
+CHAT_ID="${DALTON_DATA_TASK_FEISHU_SENTIMENT_CHAT_ID:-${DALTON_SENTIMENT_DIGEST_CHAT_ID:-${SENTIMENT_DIGEST_CHAT_ID:-$(_read_first_cfg_key "$CFG_FILE" "DALTON_DATA_TASK_FEISHU_SENTIMENT_CHAT_ID" "DALTON_SENTIMENT_DIGEST_CHAT_ID" "SENTIMENT_DIGEST_CHAT_ID")}}}"
+if [[ -z "$CHAT_ID" ]]; then
+  echo "ERROR: 未配置 DALTON_DATA_TASK_FEISHU_SENTIMENT_CHAT_ID（兼容 DALTON_SENTIMENT_DIGEST_CHAT_ID；请设置环境变量或在 config/data_tasks.env 中配置）" >&2
+  exit 1
+fi
 OUT="$WS/temp/sentiment-dashboard"
 cd "$WS"
 mkdir -p "$OUT"

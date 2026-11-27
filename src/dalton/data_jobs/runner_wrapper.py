@@ -5,7 +5,7 @@ Responsibilities:
   in-memory redaction table;
 - Export ``DALTON_NO_DIRECT_SEND=1``, ``DALTON_NOTIFY_DRY_RUN=1|0``, ``DALTON_COS_UPLOAD_MODE``,
   ``DALTON_OUTBOX_FILE`` (pointing to container-internal ``tmpfs`` at ``/run/dalton-outbox/outbox.json``),
-  ``HOME=/Users/everflow``, ``TZ=America/New_York``, and ``PATH`` while stripping ``/app`` from
+  ``HOME`` (``DEFAULT_CONTAINER_HOME``), ``TZ=America/New_York``, and ``PATH`` while stripping ``/app`` from
   ``PYTHONPATH`` for the business child process;
 - Stream and redact child stdout/stderr BEFORE writing to the wrapper's own stdout/stderr;
 - Enforce total timeout (default 1800s when unset) and no-output timeout (when configured),
@@ -39,9 +39,12 @@ from src.dalton.data_jobs.safe_fs import (
     safe_atomic_write_bytes,
     safe_unlink_contained_regular_file,
 )
+from src.dalton.data_jobs.task_config import (
+    DEFAULT_CONTAINER_HOME,
+    DEFAULT_WORKSPACE_DIR,
+)
 from src.dalton.settings import managed_secret_token_values, redact_managed_tokens
 
-DEFAULT_WORKSPACE_DIR = "/Users/everflow/.openclaw/workspace"
 DEFAULT_SECRETS_DIR = "/run/dalton-secrets"
 DEFAULT_TMPFS_OUTBOX_DIR = "/run/dalton-outbox"
 CHILD_SITE_DIR = Path(__file__).resolve().parent / "child_site"
@@ -319,7 +322,7 @@ def build_child_env(
         else str(Path(outbox_tmp_dir) / "outbox.json")
     )
 
-    env["HOME"] = "/Users/everflow"
+    env["HOME"] = DEFAULT_CONTAINER_HOME
     env["OPENCLAW_WORKSPACE"] = str(workspace_dir)
     env["WORKDIR"] = str(workspace_dir)
     env["TZ"] = "America/New_York"
@@ -371,6 +374,7 @@ def persist_redacted_outbox(
     stdout_text: str = "",
     explicit_payload: Any = None,
     workspace_dir: Path | str | None = None,
+    config_workspace_dir: Path | str | None = None,
 ) -> dict[str, Any] | None:
     """Redact in memory and atomically write the outbox payload to ``outbox_path`` (§4.4.3, §5.1.3).
 
@@ -447,11 +451,17 @@ def persist_redacted_outbox(
 
     from src.dalton.data_jobs.batch3_messages import SUPPRESS_OUTBOX, adjust_batch3_payload
 
+    effective_cfg_ws = (
+        Path(config_workspace_dir)
+        if config_workspace_dir is not None
+        else (Path(workspace_dir) if workspace_dir is not None else None)
+    )
     adjusted = adjust_batch3_payload(
         job_key=str(job_key),
         payload=raw_payload if isinstance(raw_payload, dict) else None,
         stdout_text=stdout_text,
         workspace_dir=Path(workspace_dir) if workspace_dir is not None else None,
+        config_workspace_dir=effective_cfg_ws,
         run_artifacts_dir=outbox_path.parent,
     )
     if adjusted is SUPPRESS_OUTBOX:
@@ -699,6 +709,7 @@ async def run_wrapped_command(
                 redactor=redactor,
                 stdout_text=redacted_stdout,
                 workspace_dir=workspace_dir if exit_code == 0 else None,
+                config_workspace_dir=workspace_dir,
             )
         except (DataTaskNotificationPrepError, DataTaskNotificationError, SafeFsError) as prep_exc:
             redacted_err = redactor.redact_text(

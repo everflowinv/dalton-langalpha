@@ -279,6 +279,22 @@ def test_manifest_matches_baseline_and_approved_changes() -> None:
                 list(entry.command_argv)
                 == ["sh", "-c", entry.command]
             )
+        elif code in {"T1", "T29"}:
+            # AT3: relative scripts/ path (bbg_remote_refresh.sh is versioned in data_assets/scripts/).
+            assert entry.command == "bash scripts/bbg_remote_refresh.sh"
+            assert list(entry.command_argv) == ["sh", "-c", "bash scripts/bbg_remote_refresh.sh"]
+        elif code in {"T5", "T7", "T8", "T28"}:
+            # AT3 R4: relative workspace skills/ path instead of hardcoded host prefix.
+            expected_rel = str(base["command"]).replace("/Users/everflow/.openclaw/workspace/", "")
+            assert entry.command == expected_rel
+            assert list(entry.command_argv) == ["sh", "-c", expected_rel]
+        elif code == "T10":
+            # AT3 R4: workspace variable instead of hardcoded host prefix.
+            expected_t10 = str(base["command"]).replace(
+                "cd /Users/everflow/.openclaw/workspace", 'cd "${WORKDIR:-$PWD}"'
+            )
+            assert entry.command == expected_t10
+            assert list(entry.command_argv) == ["bash", "-c", expected_t10]
         else:
             assert entry.command == base["command"]
         assert "-lc" not in entry.command_argv, f"{code} must not use login shell (-lc)"
@@ -6606,6 +6622,31 @@ def test_pr11_seed_openclaw_data_script_dry_run_and_apply_exclusions(
     extra_target_file.write_text("preserved", encoding="utf-8")
 
     # 2. --apply installs data assets and the launcher while preserving existing files.
+    preflight_cfg = dst_dir / "config" / "data_tasks.env"
+    preflight_cfg.parent.mkdir(parents=True, exist_ok=True)
+    preflight_cfg.write_text(
+        "\n".join(
+            [
+                "DALTON_DATA_TASK_BBG_HOST=bbg@test.example",
+                "DALTON_DATA_TASK_BBG_CSV_REMOTE=C:/test/bbg.csv",
+                "DALTON_DATA_TASK_BBG_XLSX_REMOTE=C:/test/bbg.xlsx",
+                "DALTON_DATA_TASK_BBG_REFRESH_CMD=cmd /c test.bat",
+                "DALTON_DATA_TASK_FEISHU_TRACKING_CHAT_ID=oc_placeholder_tracking",
+                "DALTON_DATA_TASK_FEISHU_SEMI_CHAT_ID=oc_placeholder_semi",
+                "DALTON_DATA_TASK_FEISHU_ASIA_TARGET=chat:oc_placeholder_asia",
+                "DALTON_DATA_TASK_FEISHU_MEGACAP_TARGET=oc_placeholder_megacap",
+                "DALTON_DATA_TASK_FEISHU_SENTIMENT_CHAT_ID=oc_placeholder_sentiment",
+                "DALTON_DATA_TASK_FEISHU_A_SHARE_DM_TARGET=user:ou_placeholder_ashare",
+                "DALTON_DATA_TASK_DISCORD_DM_TARGET=user:100000000000000001",
+                "DALTON_DATA_TASK_DISCORD_DEV_CHANNEL=channel:100000000000000002",
+                "DALTON_DATA_TASK_DISCORD_SEMI_BOTTOM_CHANNEL=channel:100000000000000003",
+                "DALTON_SEC_USER_AGENT=TestBot test@example.com",
+                "DALTON_DATA_TASK_GS_PB_PYTHON=/opt/test/gs-pb/bin/python",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     apply_res = subprocess.run(
         [
             "bash",
@@ -8176,6 +8217,31 @@ def test_seed_openclaw_data_applies_cos_upload_overlay_and_preserves_send_protec
     assert "scripts/sentiment_dashboard_cos_upload.py" in dry_res.stdout
     assert "scripts/feishu_send_card.py" in dry_res.stdout
 
+    preflight_cfg = dst_dir / "config" / "data_tasks.env"
+    preflight_cfg.parent.mkdir(parents=True, exist_ok=True)
+    preflight_cfg.write_text(
+        "\n".join(
+            [
+                "DALTON_DATA_TASK_BBG_HOST=bbg@test.example",
+                "DALTON_DATA_TASK_BBG_CSV_REMOTE=C:/test/bbg.csv",
+                "DALTON_DATA_TASK_BBG_XLSX_REMOTE=C:/test/bbg.xlsx",
+                "DALTON_DATA_TASK_BBG_REFRESH_CMD=cmd /c test.bat",
+                "DALTON_DATA_TASK_FEISHU_TRACKING_CHAT_ID=oc_placeholder_tracking",
+                "DALTON_DATA_TASK_FEISHU_SEMI_CHAT_ID=oc_placeholder_semi",
+                "DALTON_DATA_TASK_FEISHU_ASIA_TARGET=chat:oc_placeholder_asia",
+                "DALTON_DATA_TASK_FEISHU_MEGACAP_TARGET=oc_placeholder_megacap",
+                "DALTON_DATA_TASK_FEISHU_SENTIMENT_CHAT_ID=oc_placeholder_sentiment",
+                "DALTON_DATA_TASK_FEISHU_A_SHARE_DM_TARGET=user:ou_placeholder_ashare",
+                "DALTON_DATA_TASK_DISCORD_DM_TARGET=user:100000000000000001",
+                "DALTON_DATA_TASK_DISCORD_DEV_CHANNEL=channel:100000000000000002",
+                "DALTON_DATA_TASK_DISCORD_SEMI_BOTTOM_CHANNEL=channel:100000000000000003",
+                "DALTON_SEC_USER_AGENT=TestBot test@example.com",
+                "DALTON_DATA_TASK_GS_PB_PYTHON=/opt/test/gs-pb/bin/python",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     apply_res = subprocess.run(
         ["bash", str(seed_script), "--apply", "--target", str(dst_dir)],
         capture_output=True,

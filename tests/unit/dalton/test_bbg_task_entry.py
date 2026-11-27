@@ -73,6 +73,9 @@ def test_bbg_uses_task_workspace_and_python(tmp_path, conversion_succeeds):
         "PATH": f"{commands}{os.pathsep}{os.environ['PATH']}",
         "OPENCLAW_WORKSPACE": str(workspace),
         "DALTON_PYTHON_BIN": str(python),
+        "DALTON_DATA_TASK_BBG_HOST": "bbg@bbg.example",
+        "DALTON_DATA_TASK_BBG_CSV_REMOTE": "C:/test/output/bbg_data_latest.csv",
+        "DALTON_DATA_TASK_BBG_XLSX_REMOTE": "C:/test/data.xlsx",
         "TEST_WORKSPACE": str(workspace),
         "TEST_TRANSFERS": str(transfers),
         "TEST_PYTHON_CALLS": str(python_calls),
@@ -99,7 +102,7 @@ def test_bbg_uses_task_workspace_and_python(tmp_path, conversion_succeeds):
         (foreign_temp / name).write_text("preserved\n")
     altered_entry = tmp_path / "fixed-workspace.sh"
     altered_entry.write_text(ENTRY.read_text().replace(
-        'WORKSPACE="${OPENCLAW_WORKSPACE:-/Users/everflow/.openclaw/workspace}"',
+        'WORKSPACE="${WORKSPACE:-$RUNTIME_PWD}"',
         f"WORKSPACE={shlex.quote(str(foreign_workspace))}",
     ))
     rejected = subprocess.run(

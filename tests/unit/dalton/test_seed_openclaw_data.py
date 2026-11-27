@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -6,6 +7,37 @@ import unittest
 
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts/dalton/seed_openclaw_data.sh"
 DATA_ASSETS_DIR = Path(__file__).resolve().parents[3] / "scripts/dalton/data_assets"
+
+_EVERFLOW_PREFLIGHT_PLACEHOLDERS = {
+    "DALTON_DATA_TASK_BBG_HOST": "bbg@test.example",
+    "DALTON_DATA_TASK_BBG_CSV_REMOTE": "C:/test/bbg.csv",
+    "DALTON_DATA_TASK_BBG_XLSX_REMOTE": "C:/test/bbg.xlsx",
+    "DALTON_DATA_TASK_BBG_REFRESH_CMD": "cmd /c test.bat",
+    "DALTON_DATA_TASK_FEISHU_TRACKING_CHAT_ID": "oc_placeholder_tracking",
+    "DALTON_DATA_TASK_FEISHU_SEMI_CHAT_ID": "oc_placeholder_semi",
+    "DALTON_DATA_TASK_FEISHU_ASIA_TARGET": "chat:oc_placeholder_asia",
+    "DALTON_DATA_TASK_FEISHU_MEGACAP_TARGET": "oc_placeholder_megacap",
+    "DALTON_DATA_TASK_FEISHU_SENTIMENT_CHAT_ID": "oc_placeholder_sentiment",
+    "DALTON_DATA_TASK_FEISHU_A_SHARE_DM_TARGET": "user:ou_placeholder_ashare",
+    "DALTON_DATA_TASK_DISCORD_DM_TARGET": "user:100000000000000001",
+    "DALTON_DATA_TASK_DISCORD_DEV_CHANNEL": "channel:100000000000000002",
+    "DALTON_DATA_TASK_DISCORD_SEMI_BOTTOM_CHANNEL": "channel:100000000000000003",
+    "DALTON_SEC_USER_AGENT": "TestBot test@example.com",
+    "DALTON_DATA_TASK_GS_PB_PYTHON": "/opt/test/gs-pb/bin/python",
+}
+
+
+def _write_preflight_config(target: Path) -> None:
+    cfg = target / "config" / "data_tasks.env"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(
+        "\n".join(f"{k}={v}" for k, v in _EVERFLOW_PREFLIGHT_PLACEHOLDERS.items()) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _seed_env() -> dict[str, str]:
+    return dict(os.environ)
 
 
 class SeedOpenClawDataTests(unittest.TestCase):
@@ -18,10 +50,12 @@ class SeedOpenClawDataTests(unittest.TestCase):
             launcher = target / "state/sentiment-dashboard/cos-venv/bin/python"
             launcher.parent.mkdir(parents=True)
             launcher.symlink_to(interpreter)
+            _write_preflight_config(target)
 
             for _ in range(2):
                 result = subprocess.run(
                     ["bash", str(SCRIPT), "--apply", "--target", str(target)],
+                    env=_seed_env(),
                     capture_output=True, text=True, check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -68,9 +102,11 @@ class SeedOpenClawDataTests(unittest.TestCase):
             (target / "skills/kweb-dashboard/scripts/kweb_dashboard_cli.py").write_text(
                 "# stale kweb cli\n", encoding="utf-8"
             )
+            _write_preflight_config(target)
 
             result = subprocess.run(
                 ["bash", str(SCRIPT), "--apply", "--target", str(target)],
+                env=_seed_env(),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -125,8 +161,10 @@ class SeedOpenClawDataTests(unittest.TestCase):
             self.assertIn("skills/model-usage-cost/scripts/antigravity_series.py", dry.stdout)
             self.assertIn("skills/model-usage-cost/references/antigravity_series.json", dry.stdout)
 
+            _write_preflight_config(target)
             applied = subprocess.run(
                 ["bash", str(SCRIPT), "--apply", "--target", str(target)],
+                env=_seed_env(),
                 capture_output=True,
                 text=True,
                 check=False,
