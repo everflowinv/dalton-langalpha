@@ -3115,6 +3115,7 @@ export class ChannelGatewayOrchestrator {
       workspace_id: resolved.workspace_id,
       platform: event.platform,
       turn_platform: event.platform,
+      chat_type: event.chatType, // DALTON-HOOK(personal-integrations)
       surface_rules: buildSurfaceRules(event.platform),
       steer_only: false,
       hitl_response: hitlResponse,
@@ -3210,6 +3211,7 @@ export class ChannelGatewayOrchestrator {
       workspace_id: resolved.workspace_id,
       platform: event.platform,
       turn_platform: event.platform,
+      chat_type: event.chatType, // DALTON-HOOK(personal-integrations)
       surface_rules: buildSurfaceRules(event.platform),
       steer_only: false,
       hitl_response: hitlResponse,
@@ -3649,6 +3651,7 @@ export class ChannelGatewayOrchestrator {
       request_key: requestKey,
       platform: event.platform,
       turn_platform: event.platform,
+      chat_type: event.chatType, // DALTON-HOOK(personal-integrations)
       surface_rules: buildSurfaceRules(event.platform),
     });
 
@@ -3736,6 +3739,7 @@ export class ChannelGatewayOrchestrator {
       external_thread_id: targetThreadId ? undefined : resolved.external_thread_id,
       platform: event.platform,
       turn_platform: event.platform,
+      chat_type: event.chatType, // DALTON-HOOK(personal-integrations)
       surface_rules: buildSurfaceRules(event.platform),
       ...(steerOnly ? { steer_only: true } : {}),
     };

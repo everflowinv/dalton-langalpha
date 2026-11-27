@@ -261,6 +261,14 @@ export function PersonalIntegrationApprovalCard({
       {typeof args.location === 'string' && args.location && (
         <div className="text-(--color-text-secondary)">地点：{args.location}</div>
       )}
+      {typeof args.description === 'string' && args.description.length > 0 && (
+        <div
+          data-testid="calendar-approval-description"
+          className="text-(--color-text-secondary) whitespace-pre-wrap"
+        >
+          描述：{args.description}
+        </div>
+      )}
       {Array.isArray(args.reminders) && args.reminders.length > 0 && (
         <div className="text-(--color-text-secondary)">
           提醒：
@@ -272,9 +280,14 @@ export function PersonalIntegrationApprovalCard({
             .join('、')}
         </div>
       )}
-      {beforeEvent && typeof beforeEvent.summary === 'string' && (
-        <div className="pt-1 border-t border-(--color-border-muted) text-(--color-text-tertiary)">
-          原日程标题：{beforeEvent.summary}
+      {beforeEvent && (
+        <div className="pt-1 border-t border-(--color-border-muted) text-(--color-text-tertiary) space-y-0.5">
+          {typeof beforeEvent.summary === 'string' && (
+            <div>原日程标题：{beforeEvent.summary}</div>
+          )}
+          {typeof beforeEvent.description === 'string' && beforeEvent.description && (
+            <div className="whitespace-pre-wrap">原日程描述：{beforeEvent.description}</div>
+          )}
         </div>
       )}
       {externalAttendees.length > 0 && (

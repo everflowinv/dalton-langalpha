@@ -98,6 +98,9 @@ function statusBadgeMeta(
   if (connector && !connector.credentials_ready) {
     return { label: '待配置凭据', tone: 'neutral' };
   }
+  if (connector && !connector.ready) {
+    return { label: '待完成环境配置', tone: 'warning' };
+  }
   return { label: '可连接', tone: 'neutral' };
 }
 
@@ -347,23 +350,37 @@ export function PersonalIntegrationsCard() {
       );
       return { res, prevStatus: vars.connection.status, provider: vars.connection.provider };
     },
-    onSuccess: ({ prevStatus, provider }) => {
+    onSuccess: ({ res, prevStatus, provider }) => {
       setDisconnectDialog(null);
+      const localPurgeStatus = res.local_purge_status;
       if (provider === 'feishu') {
         const ambiguousNote =
           prevStatus === 'refresh_ambiguous'
             ? ' 此前连接处于待确认刷新状态，飞书侧可能留存最长 30 天刷新令牌，建议前往飞书客户端移除应用授权。'
             : '';
+        const purgeSentence =
+          localPurgeStatus === 'running'
+            ? '已在本地断开飞书连接，正在后台清理相关对话个人数据。'
+            : localPurgeStatus === 'completed' || localPurgeStatus === 'not_required'
+              ? '已在本地断开飞书连接，相关对话个人数据已清理完成。'
+              : '已在本地断开飞书连接并启动关联对话个人数据清理。';
         setBanner({
           tone: 'info',
           text:
-            '已在本地断开飞书连接并清理相关对话个人数据。短期访问令牌最长在 7,200 秒内自然失效，可随时在飞书客户端移除应用授权。' +
+            purgeSentence +
+            '短期访问令牌最长在 7,200 秒内自然失效，可随时在飞书客户端移除应用授权。' +
             ambiguousNote,
         });
       } else {
+        const googleText =
+          localPurgeStatus === 'running'
+            ? '已断开连接，正在后台清理关联对话个人数据。'
+            : localPurgeStatus === 'completed' || localPurgeStatus === 'not_required'
+              ? '已断开连接，关联个人数据已清理完成。'
+              : '已断开连接并启动关联个人数据清理。';
         setBanner({
           tone: 'success',
-          text: '已断开连接并启动关联个人数据清理。',
+          text: googleText,
         });
       }
       invalidate();
@@ -474,8 +491,13 @@ export function PersonalIntegrationsCard() {
   );
 
   const privacyUrl = resolvePrivacyPolicyUrl(profile);
+  const hasExistingHistory = Boolean(
+    data?.has_personal_integrations ||
+      (data?.connections?.length ?? 0) > 0 ||
+      (data?.active_purges?.length ?? 0) > 0,
+  );
 
-  if (!anyCapEnabled && !data?.has_personal_integrations && !isLoading) {
+  if (!anyCapEnabled && !hasExistingHistory && !isLoading) {
     return null;
   }
 
@@ -517,7 +539,8 @@ export function PersonalIntegrationsCard() {
                 disconnectServiceMutation.isPending ||
                 disconnectAllGoogleMutation.isPending;
               const credsReady = row.connector ? row.connector.credentials_ready : true;
-              const canConnect = row.capOn && credsReady;
+              const isReady = row.connector ? row.connector.ready : true;
+              const canConnect = row.capOn && isReady;
               const googleSiblings =
                 conn?.provider === 'google'
                   ? (data?.connections ?? []).filter(
@@ -578,9 +601,11 @@ export function PersonalIntegrationsCard() {
                       </div>
                     )}
 
-                    {!conn && !credsReady && row.capOn && (
+                    {!conn && !isReady && row.capOn && (
                       <p className="text-xs text-(--color-text-tertiary)">
-                        管理员在「部署设置 → 集成凭据」完成配置后即可连接。
+                        {!credsReady
+                          ? '管理员在「部署设置 → 集成凭据」完成配置后即可连接。'
+                          : '管理员完成公开回调地址与服务端加密配置后即可连接。'}
                       </p>
                     )}
                   </div>

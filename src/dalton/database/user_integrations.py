@@ -3542,3 +3542,163 @@ async def mark_action_approval_status(
         return await _run(conn)
     async with get_db_connection() as db_conn, db_conn.transaction():
         return await _run(db_conn)
+
+
+async def get_action_approval_by_stage_key(
+    caller_user_id: str,
+    thread_id: str | UUID,
+    stage_key: str,
+    *,
+    decrypt_state: bool = True,
+    conn: Any = None,
+) -> ActionApprovalRow | None:
+    """Fetch the latest approval row for ``(caller_user_id, thread_id, idempotent_message_id)``."""
+    tid = str(thread_id)
+    enc_key = get_encryption_key() if decrypt_state else None
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            if decrypt_state and enc_key is not None:
+                await cur.execute(
+                    """
+                    SELECT approval_id, caller_user_id, thread_id, run_id, interrupt_id,
+                           action_type, provider, service, provider_account_id,
+                           auth_epoch, token_generation, payload_sha256,
+                           input_requests_map, idempotent_message_id, status,
+                           expires_at, consumed_at, created_at,
+                           (encrypted_elicitation_state IS NOT NULL) AS has_elicitation_state,
+                           CASE WHEN encrypted_elicitation_state IS NOT NULL
+                                THEN pgp_sym_decrypt(encrypted_elicitation_state, %s)
+                                ELSE NULL END AS decrypted_elicitation_state
+                    FROM dalton_integration_action_approvals
+                    WHERE caller_user_id = %s
+                      AND thread_id = %s::uuid
+                      AND idempotent_message_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (enc_key, caller_user_id, tid, stage_key),
+                )
+            else:
+                await cur.execute(
+                    """
+                    SELECT approval_id, caller_user_id, thread_id, run_id, interrupt_id,
+                           action_type, provider, service, provider_account_id,
+                           auth_epoch, token_generation, payload_sha256,
+                           input_requests_map, idempotent_message_id, status,
+                           expires_at, consumed_at, created_at,
+                           (encrypted_elicitation_state IS NOT NULL) AS has_elicitation_state
+                    FROM dalton_integration_action_approvals
+                    WHERE caller_user_id = %s
+                      AND thread_id = %s::uuid
+                      AND idempotent_message_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (caller_user_id, tid, stage_key),
+                )
+            row = await cur.fetchone()
+    return _row_to_action_approval(dict(row)) if row is not None else None
+
+
+async def list_action_approvals_by_stage_prefix(
+    caller_user_id: str,
+    thread_id: str | UUID,
+    stage_prefix: str,
+    *,
+    decrypt_state: bool = True,
+    conn: Any = None,
+) -> list[ActionApprovalRow]:
+    """List approval rows whose ``idempotent_message_id`` starts with ``stage_prefix``, oldest first."""
+    tid = str(thread_id)
+    enc_key = get_encryption_key() if decrypt_state else None
+    like_pattern = f"{stage_prefix}%"
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            if decrypt_state and enc_key is not None:
+                await cur.execute(
+                    """
+                    SELECT approval_id, caller_user_id, thread_id, run_id, interrupt_id,
+                           action_type, provider, service, provider_account_id,
+                           auth_epoch, token_generation, payload_sha256,
+                           input_requests_map, idempotent_message_id, status,
+                           expires_at, consumed_at, created_at,
+                           (encrypted_elicitation_state IS NOT NULL) AS has_elicitation_state,
+                           CASE WHEN encrypted_elicitation_state IS NOT NULL
+                                THEN pgp_sym_decrypt(encrypted_elicitation_state, %s)
+                                ELSE NULL END AS decrypted_elicitation_state
+                    FROM dalton_integration_action_approvals
+                    WHERE caller_user_id = %s
+                      AND thread_id = %s::uuid
+                      AND idempotent_message_id LIKE %s
+                    ORDER BY created_at ASC
+                    """,
+                    (enc_key, caller_user_id, tid, like_pattern),
+                )
+            else:
+                await cur.execute(
+                    """
+                    SELECT approval_id, caller_user_id, thread_id, run_id, interrupt_id,
+                           action_type, provider, service, provider_account_id,
+                           auth_epoch, token_generation, payload_sha256,
+                           input_requests_map, idempotent_message_id, status,
+                           expires_at, consumed_at, created_at,
+                           (encrypted_elicitation_state IS NOT NULL) AS has_elicitation_state
+                    FROM dalton_integration_action_approvals
+                    WHERE caller_user_id = %s
+                      AND thread_id = %s::uuid
+                      AND idempotent_message_id LIKE %s
+                    ORDER BY created_at ASC
+                    """,
+                    (caller_user_id, tid, like_pattern),
+                )
+            rows = await cur.fetchall()
+    return [_row_to_action_approval(dict(r)) for r in rows]
+
+
+async def update_action_approval_state(
+    approval_id: str | UUID,
+    *,
+    caller_user_id: str,
+    status: str | None = None,
+    elicitation_state: dict[str, Any] | None = None,
+    conn: Any = None,
+) -> bool:
+    """Update ``status`` and/or encrypted ``elicitation_state`` on an existing approval row."""
+    import json as _json
+
+    aid = str(approval_id)
+    enc_key = get_encryption_key() if elicitation_state is not None else None
+    state_json = (
+        _json.dumps(elicitation_state, ensure_ascii=False, separators=(",", ":"))
+        if elicitation_state is not None
+        else None
+    )
+
+    async def _run(db_conn: Any) -> bool:
+        sets: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            sets.append("status = %s")
+            params.append(status)
+        if state_json is not None and enc_key is not None:
+            sets.append("encrypted_elicitation_state = pgp_sym_encrypt(%s, %s)")
+            params.extend([state_json, enc_key])
+        if not sets:
+            return False
+        params.extend([aid, caller_user_id])
+        async with db_conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                UPDATE dalton_integration_action_approvals
+                SET {", ".join(sets)}
+                WHERE approval_id = %s::uuid
+                  AND caller_user_id = %s
+                """,
+                tuple(params),
+            )
+            return bool(cur.rowcount)
+
+    if conn is not None:
+        return await _run(conn)
+    async with get_db_connection() as db_conn, db_conn.transaction():
+        return await _run(db_conn)

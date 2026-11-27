@@ -220,7 +220,8 @@ class AgentInputs:
                     thread_id,
                     identity.sender,
                 )
-                if identity.shared and thread_id
+                # DALTON-HOOK(personal-integrations): also allow creator-verified ThreadHistory for personal-integration threads excluded from shared mount
+                if thread_id and (identity.shared or identity.sender)
                 else None
             ),
             member_context=member_context,

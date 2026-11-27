@@ -349,6 +349,23 @@ async def dispatch(
                 tool_call_id,
             )
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
+    # DALTON-HOOK(personal-integrations): gate delegate_to_analyst when source thread holds personal integration data
+    from src.dalton.services.personal_integration_guard import (
+        check_personal_thread_dispatch_allowed,
+    )
+
+    dispatch_ok, dispatch_err = await check_personal_thread_dispatch_allowed(
+        source_thread_id=configurable.get("thread_id"),
+        caller_user_id=user_id,
+        target_workspace_id=workspace_id,
+        target_thread_id=thread_id if is_continuation else None,
+    )
+    if not dispatch_ok:
+        return error_command(
+            dispatch_err
+            or "当前对话包含个人日历/邮箱私密数据，仅可向本人完全私密的自有工作区派发任务。",
+            tool_call_id,
+        )
     if workspace is not None and (away := await _unreachable_computer(workspace_id)):
         # Its files are on that computer, so its analyst cannot run anywhere
         # else; refused before the card, so nothing is approved and dropped.

@@ -565,13 +565,19 @@ def build_google_event_write_args(
         args["description"] = description
     if location is not None:
         args["location"] = location.strip()
-    if start_time is not None and end_time is not None:
+    if start_time is not None:
         if all_day:
             args["startTime"] = start_time[:10]
-            args["endTime"] = end_time[:10]
             args["allDay"] = True
         else:
             args["startTime"] = format_local_datetime_for_tz(start_time, tz_name)
+            args["timeZone"] = tz_name or "UTC"
+            args["allDay"] = False
+    if end_time is not None:
+        if all_day:
+            args["endTime"] = end_time[:10]
+            args["allDay"] = True
+        else:
             args["endTime"] = format_local_datetime_for_tz(end_time, tz_name)
             args["timeZone"] = tz_name or "UTC"
             args["allDay"] = False

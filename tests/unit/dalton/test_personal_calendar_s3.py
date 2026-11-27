@@ -71,6 +71,7 @@ from src.server.models.chat import (
     HITLResponse,
     serialize_hitl_response_map,
 )
+from src.tools.secretary._commands import hitl_confirm as real_hitl_confirm
 
 
 class _ScriptedCursor:
@@ -870,6 +871,24 @@ async def test_dalton_calendar_dual_provider_read_merges_with_labels_and_write_a
             }
         ]
     )
+    f_cli.list_events_page = AsyncMock(
+        return_value={
+            "items": [
+                {
+                    "provider": "feishu",
+                    "provider_label": "[飞书日历]",
+                    "calendar_id": "primary",
+                    "event_id": "f-ev-1",
+                    "summary": "飞书周会",
+                    "start": {"dateTime": "2026-12-02T10:00:00+08:00"},
+                    "end": {"dateTime": "2026-12-02T11:00:00+08:00"},
+                    "status": "confirmed",
+                }
+            ],
+            "has_more": False,
+            "page_token": None,
+        }
+    )
 
     monkeypatch.setattr(
         cal_tools_mod,
@@ -883,6 +902,11 @@ async def test_dalton_calendar_dual_provider_read_merges_with_labels_and_write_a
             db_mod.list_user_connections,
             return_value=[_sample_conn(provider="google"), _sample_conn(provider="feishu")],
         ),
+    )
+    monkeypatch.setattr(
+        cal_tools_mod.db,
+        "get_action_approval_by_stage_key",
+        create_autospec(db_mod.get_action_approval_by_stage_key, return_value=None),
     )
     surf_calls = 0
 
@@ -900,6 +924,14 @@ async def test_dalton_calendar_dual_provider_read_merges_with_labels_and_write_a
         )
 
     monkeypatch.setattr(cal_tools_mod, "verify_personal_integration_surface", _fake_surface)
+    monkeypatch.setattr(
+        cal_tools_mod,
+        "claim_first_touch_notice_if_needed",
+        create_autospec(
+            guard_mod.claim_first_touch_notice_if_needed,
+            side_effect=[FIRST_TOUCH_NOTICE_CALENDAR, None, None],
+        ),
+    )
 
     async def _fake_token(user_id: str, provider: str, service: str, **kwargs: Any) -> FreshAccessToken:
         return _sample_token(provider=provider)
@@ -1072,25 +1104,46 @@ async def test_dalton_calendar_write_l1_and_l2_attendees_hitl_confirmation_flow(
 
     monkeypatch.setattr(cal_tools_mod.db, "create_action_approval", _fake_create_approval)
     monkeypatch.setattr(cal_tools_mod.db, "consume_action_approval", _fake_consume)
-    monkeypatch.setattr(cal_tools_mod.db, "mark_action_approval_status", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        cal_tools_mod.db,
+        "get_action_approval_by_stage_key",
+        create_autospec(db_mod.get_action_approval_by_stage_key, return_value=None),
+    )
+    monkeypatch.setattr(
+        cal_tools_mod.db,
+        "mark_action_approval_status",
+        create_autospec(db_mod.mark_action_approval_status, return_value=True),
+    )
+    monkeypatch.setattr(
+        cal_tools_mod,
+        "claim_first_touch_notice_if_needed",
+        create_autospec(guard_mod.claim_first_touch_notice_if_needed, return_value=None),
+    )
 
     captured_requests: list[dict[str, Any]] = []
 
-    def _fake_hitl_confirm(*, description: str, action_requests: list[dict[str, Any]]) -> dict[str, Any]:
-        req = action_requests[0]
+    def _fake_hitl_confirm(action_type: str, payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        req = {"type": action_type, **payload}
         captured_requests.append(req)
-        return {
-            "decisions": [
-                {
-                    "type": "approve",
-                    "confirm_token": req["confirm_token"],
-                    "second_confirm_acknowledged": True,
-                    "confirmed_payload_sha256": req["payload_sha256"],
-                }
-            ]
-        }
+        return (
+            True,
+            {
+                "decisions": [
+                    {
+                        "type": "approve",
+                        "confirm_token": req["confirm_token"],
+                        "second_confirm_acknowledged": True,
+                        "confirmed_payload_sha256": req["payload_sha256"],
+                    }
+                ]
+            },
+        )
 
-    monkeypatch.setattr(cal_tools_mod, "hitl_confirm", _fake_hitl_confirm)
+    monkeypatch.setattr(
+        cal_tools_mod,
+        "hitl_confirm",
+        create_autospec(real_hitl_confirm, side_effect=_fake_hitl_confirm),
+    )
 
     tool_obj = create_calendar_tools(feishu_client=f_cli)[0]
     cfg = {"configurable": {"user_id": "user-1", "thread_id": tid, "run_id": rid}}
@@ -1252,37 +1305,65 @@ async def test_dalton_calendar_google_mcp_multi_round_elicitation_accept_and_dec
     monkeypatch.setattr(cal_tools_mod.db, "create_action_approval", _store)
     monkeypatch.setattr(
         cal_tools_mod.db,
+        "get_action_approval_by_stage_key",
+        create_autospec(db_mod.get_action_approval_by_stage_key, return_value=None),
+    )
+    monkeypatch.setattr(
+        cal_tools_mod.db,
         "consume_action_approval",
         AsyncMock(side_effect=lambda aid, uid, **kw: stored.get(aid)),
     )
-    monkeypatch.setattr(cal_tools_mod.db, "mark_action_approval_status", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        cal_tools_mod.db,
+        "update_action_approval_state",
+        create_autospec(db_mod.update_action_approval_state, return_value=True),
+    )
+    monkeypatch.setattr(
+        cal_tools_mod.db,
+        "mark_action_approval_status",
+        create_autospec(db_mod.mark_action_approval_status, return_value=True),
+    )
+    monkeypatch.setattr(
+        cal_tools_mod,
+        "claim_first_touch_notice_if_needed",
+        create_autospec(guard_mod.claim_first_touch_notice_if_needed, return_value=None),
+    )
 
-    round_answers = [
-        {
-            "decisions": [
-                {
-                    "type": "approve",
-                    "elicitation_responses": {
-                        "step_one": {"action": "accept", "content": {"step_one": "ALLOW_ONCE"}}
-                    },
-                }
-            ]
-        },
-        {
-            "decisions": [
-                {
-                    "type": "approve",
-                    "elicitation_responses": {
-                        "step_two": {"action": "accept", "content": {"step_two": "CONFIRM"}}
-                    },
-                }
-            ]
-        },
+    round_answers: list[tuple[bool, dict[str, Any]]] = [
+        (
+            True,
+            {
+                "decisions": [
+                    {
+                        "type": "approve",
+                        "elicitation_responses": {
+                            "step_one": {"action": "accept", "content": {"step_one": "ALLOW_ONCE"}}
+                        },
+                    }
+                ]
+            },
+        ),
+        (
+            True,
+            {
+                "decisions": [
+                    {
+                        "type": "approve",
+                        "elicitation_responses": {
+                            "step_two": {"action": "accept", "content": {"step_two": "CONFIRM"}}
+                        },
+                    }
+                ]
+            },
+        ),
     ]
     monkeypatch.setattr(
         cal_tools_mod,
         "hitl_confirm",
-        lambda *, description, action_requests: round_answers.pop(0),
+        create_autospec(
+            real_hitl_confirm,
+            side_effect=lambda action_type, payload: round_answers.pop(0),
+        ),
     )
 
     tool_obj = create_calendar_tools(google_client=g_cli)[0]
@@ -1332,14 +1413,20 @@ async def test_dalton_calendar_google_mcp_multi_round_elicitation_accept_and_dec
     monkeypatch.setattr(
         cal_tools_mod,
         "hitl_confirm",
-        lambda *, description, action_requests: {
-            "decisions": [
+        create_autospec(
+            real_hitl_confirm,
+            return_value=(
+                False,
                 {
-                    "type": "reject",
-                    "elicitation_responses": {"approval_choice": {"action": "decline"}},
-                }
-            ]
-        },
+                    "decisions": [
+                        {
+                            "type": "reject",
+                            "elicitation_responses": {"approval_choice": {"action": "decline"}},
+                        }
+                    ]
+                },
+            ),
+        ),
     )
     dec_cmd = await tool_obj.coroutine(
         action="list_events",

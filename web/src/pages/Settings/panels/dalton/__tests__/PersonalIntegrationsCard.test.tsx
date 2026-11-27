@@ -8,19 +8,16 @@ import type {
   PersonalIntegrationConnection,
   PersonalIntegrationConnectorInfo,
   PersonalIntegrationPurgeLedger,
-  PersonalIntegrationsListResponse,
 } from '@/lib/dalton/personalIntegrationsApi';
 import { PersonalIntegrationsCard } from '../PersonalIntegrationsCard';
 
 const h = vi.hoisted(() => ({
   profile: 'everflow' as 'everflow' | 'core',
   capabilities: new Set<CapabilityId>(['google_calendar', 'feishu_calendar']),
-  fetchList: vi.fn<() => Promise<PersonalIntegrationsListResponse>>(),
-  authorize: vi.fn(),
-  confirm: vi.fn(),
-  disconnectService: vi.fn(),
-  disconnectProvider: vi.fn(),
-  retryRevoke: vi.fn(),
+  apiGet: vi.fn(),
+  apiPost: vi.fn(),
+  apiDelete: vi.fn(),
+  apiPatch: vi.fn(),
 }));
 
 vi.mock('@/hooks/useLocale', () => ({
@@ -50,16 +47,19 @@ vi.mock('@/hooks/useCapabilities', async (importOriginal) => {
   };
 });
 
-vi.mock('@/lib/dalton/personalIntegrationsApi', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/lib/dalton/personalIntegrationsApi')>();
+// Mock strictly at the HTTP client boundary so real personalIntegrationsApi functions,
+// real usePersonalIntegrationsQuery React Query hook, rendering, and disconnect flows all run together.
+vi.mock('@/api/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/api/client')>();
   return {
     ...actual,
-    fetchPersonalIntegrations: () => h.fetchList(),
-    authorizePersonalIntegration: (...args: unknown[]) => h.authorize(...args),
-    confirmPersonalIntegration: (...args: unknown[]) => h.confirm(...args),
-    disconnectPersonalIntegrationService: (...args: unknown[]) => h.disconnectService(...args),
-    disconnectPersonalIntegrationProvider: (...args: unknown[]) => h.disconnectProvider(...args),
-    retryPersonalIntegrationRevoke: (...args: unknown[]) => h.retryRevoke(...args),
+    api: {
+      ...actual.api,
+      get: (...args: unknown[]) => h.apiGet(...args),
+      post: (...args: unknown[]) => h.apiPost(...args),
+      delete: (...args: unknown[]) => h.apiDelete(...args),
+      patch: (...args: unknown[]) => h.apiPatch(...args),
+    },
   };
 });
 
@@ -162,21 +162,25 @@ describe('PersonalIntegrationsCard', () => {
       local_completed_at: '2026-11-27T10:01:00Z',
       remote_completed_at: null,
     };
-    h.fetchList.mockResolvedValue({
-      connectors: [
-        makeConnector('google', 'calendar'),
-        makeConnector('feishu', 'calendar', { credentials_ready: false, ready: false }),
-      ],
-      connections: [
-        makeConnection('google', 'calendar', {
-          status: 'needs_reauth',
-          last_error_code: 'missing_required_scopes',
-        }),
-      ],
-      active_purges: [purge],
-      has_personal_integrations: true,
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [
+          makeConnector('google', 'calendar'),
+          makeConnector('feishu', 'calendar', { credentials_ready: false, ready: false }),
+        ],
+        connections: [
+          makeConnection('google', 'calendar', {
+            status: 'needs_reauth',
+            last_error_code: 'missing_required_scopes',
+          }),
+        ],
+        active_purges: [purge],
+        has_personal_integrations: true,
+      },
     });
-    h.retryRevoke.mockResolvedValue({ purge: { ...purge, remote_revoke_status: 'succeeded' } });
+    h.apiPost.mockResolvedValue({
+      data: { purge: { ...purge, remote_revoke_status: 'succeeded' } },
+    });
 
     renderCard();
 
@@ -187,7 +191,11 @@ describe('PersonalIntegrationsCard', () => {
     expect(screen.getByText('隐私权政策')).toHaveAttribute('href', '/help/everflow/privacy/');
 
     fireEvent.click(screen.getByRole('button', { name: /重试远端撤销/ }));
-    await waitFor(() => expect(h.retryRevoke).toHaveBeenCalledWith('purge-1'));
+    await waitFor(() =>
+      expect(h.apiPost).toHaveBeenCalledWith(
+        '/api/v1/dalton/integrations/purges/purge-1/retry-revoke',
+      ),
+    );
   });
 
   it('handles pre-redirect and post-callback 409 account switch confirmation dialog', async () => {
@@ -196,13 +204,15 @@ describe('PersonalIntegrationsCard', () => {
       '',
       '/settings?tab=integrations&integration_status=account_switch_confirmation_required&provider=google&service=calendar#confirmation_token=ctok-99',
     );
-    h.fetchList.mockResolvedValue({
-      connectors: [makeConnector('google', 'calendar')],
-      connections: [makeConnection('google', 'calendar')],
-      active_purges: [],
-      has_personal_integrations: true,
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [makeConnector('google', 'calendar')],
+        connections: [makeConnection('google', 'calendar')],
+        active_purges: [],
+        has_personal_integrations: true,
+      },
     });
-    h.confirm
+    h.apiPost
       .mockRejectedValueOnce(
         new ApiError('conflict', 'ERR_BAD_REQUEST', {
           status: 409,
@@ -218,15 +228,16 @@ describe('PersonalIntegrationsCard', () => {
         }),
       )
       .mockResolvedValueOnce({
-        status: 'connected',
-        provider: 'google',
-        service: 'calendar',
-        connection: makeConnection('google', 'calendar', { provider_email: 'new@gmail.com' }),
+        data: {
+          status: 'connected',
+          provider: 'google',
+          service: 'calendar',
+          connection: makeConnection('google', 'calendar', { provider_email: 'new@gmail.com' }),
+        },
       });
 
     renderCard();
 
-    // Dialog opens with old and new account emails, and fragment token was scrubbed from URL
     expect(await screen.findByTestId('confirm-account-switch-dialog')).toBeInTheDocument();
     expect(screen.getByText(/old@gmail.com/)).toBeInTheDocument();
     expect(screen.getByText(/new@gmail.com/)).toBeInTheDocument();
@@ -234,7 +245,7 @@ describe('PersonalIntegrationsCard', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '确认换账号' }));
     await waitFor(() =>
-      expect(h.confirm).toHaveBeenLastCalledWith({
+      expect(h.apiPost).toHaveBeenLastCalledWith('/api/v1/dalton/integrations/confirm', {
         confirmation_token: 'ctok-99',
         confirm_account_switch: true,
         cancel: false,
@@ -245,52 +256,65 @@ describe('PersonalIntegrationsCard', () => {
   it('shows disconnect options for historical connections after capability is disabled in Core', async () => {
     h.profile = 'core';
     h.capabilities = new Set<CapabilityId>(['company_wiki']);
-    h.fetchList.mockResolvedValue({
-      connectors: [makeConnector('google', 'calendar', { enabled: false })],
-      connections: [makeConnection('google', 'calendar')],
-      active_purges: [],
-      has_personal_integrations: true,
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [makeConnector('google', 'calendar', { enabled: false, ready: false })],
+        connections: [makeConnection('google', 'calendar')],
+        active_purges: [],
+        has_personal_integrations: true,
+      },
     });
-    h.disconnectService.mockResolvedValue({
-      local_disconnected: true,
-      local_tokens_destroyed: true,
-      provider: 'google',
-      service: 'calendar',
+    h.apiDelete.mockResolvedValue({
+      data: {
+        local_disconnected: true,
+        local_tokens_destroyed: true,
+        local_purge_status: 'completed',
+        provider: 'google',
+        service: 'calendar',
+      },
     });
 
     renderCard();
 
     expect(await screen.findByText('历史连接')).toBeInTheDocument();
-    // Core profile hides Everflow privacy policy link when VITE_PRIVACY_POLICY_URL is unset
     expect(screen.queryByText('隐私权政策')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '断开连接' }));
     expect(await screen.findByTestId('disconnect-integration-dialog')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /断开并在 Google 撤销授权/ }));
     await waitFor(() =>
-      expect(h.disconnectService).toHaveBeenCalledWith('google', 'calendar', 'remote_if_sole'),
+      expect(h.apiDelete).toHaveBeenCalledWith(
+        '/api/v1/dalton/integrations/google/calendar?mode=remote_if_sole',
+      ),
+    );
+    expect(await screen.findByTestId('personal-integrations-banner')).toHaveTextContent(
+      '关联个人数据已清理完成',
     );
   });
 
   it('shows Gmail partial grant badge and pre-switch warning modal', async () => {
     h.capabilities = new Set<CapabilityId>(['google_calendar', 'google_gmail']);
-    h.fetchList.mockResolvedValue({
-      connectors: [makeConnector('google', 'calendar'), makeConnector('google', 'mail')],
-      connections: [
-        makeConnection('google', 'calendar'),
-        makeConnection('google', 'mail', {
-          granted_scopes: ['https://www.googleapis.com/auth/gmail.readonly'],
-        }),
-      ],
-      active_purges: [],
-      has_personal_integrations: true,
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [makeConnector('google', 'calendar'), makeConnector('google', 'mail')],
+        connections: [
+          makeConnection('google', 'calendar'),
+          makeConnection('google', 'mail', {
+            granted_scopes: ['https://www.googleapis.com/auth/gmail.readonly'],
+          }),
+        ],
+        active_purges: [],
+        has_personal_integrations: true,
+      },
     });
-    h.authorize.mockResolvedValue({
-      authorize_url: '',
-      provider: 'google',
-      service: 'calendar',
-      intent: 'switch_account',
-      expires_in: 600,
+    h.apiPost.mockResolvedValue({
+      data: {
+        authorize_url: '',
+        provider: 'google',
+        service: 'calendar',
+        intent: 'switch_account',
+        expires_in: 600,
+      },
     });
 
     renderCard();
@@ -302,10 +326,67 @@ describe('PersonalIntegrationsCard', () => {
     expect(screen.getByText(/换账号会清除旧账号在对话中留下的个人数据/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '继续选择新账号' }));
     await waitFor(() =>
-      expect(h.authorize).toHaveBeenCalledWith('google', 'calendar', {
+      expect(h.apiPost).toHaveBeenCalledWith('/api/v1/dalton/integrations/google/calendar/authorize', {
         switch_account: true,
         return_to: '/settings?tab=integrations',
       }),
     );
+  });
+
+  it('disables connect button using backend ready (including callback/encryption readiness)', async () => {
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [
+          makeConnector('google', 'calendar', { credentials_ready: true, ready: false }),
+          makeConnector('feishu', 'calendar', { credentials_ready: true, ready: true }),
+        ],
+        connections: [],
+        active_purges: [],
+        has_personal_integrations: false,
+      },
+    });
+
+    renderCard();
+
+    const googleRow = await screen.findByTestId('personal-integration-row-google-calendar');
+    expect(googleRow).toHaveTextContent('待完成环境配置');
+    expect(googleRow).toHaveTextContent('公开回调地址与服务端加密配置');
+    const googleConnectBtn = googleRow.querySelector('button');
+    expect(googleConnectBtn).toBeDisabled();
+
+    const feishuRow = screen.getByTestId('personal-integration-row-feishu-calendar');
+    const feishuConnectBtn = feishuRow.querySelector('button');
+    expect(feishuConnectBtn).not.toBeDisabled();
+  });
+
+  it('reports running purge progress accurately when Feishu disconnect returns local_purge_status=running', async () => {
+    h.apiGet.mockResolvedValue({
+      data: {
+        connectors: [makeConnector('feishu', 'calendar')],
+        connections: [makeConnection('feishu', 'calendar')],
+        active_purges: [],
+        has_personal_integrations: true,
+      },
+    });
+    h.apiDelete.mockResolvedValue({
+      data: {
+        local_disconnected: true,
+        local_tokens_destroyed: true,
+        local_purge_status: 'running',
+        provider: 'feishu',
+        service: 'calendar',
+      },
+    });
+
+    renderCard();
+
+    expect(await screen.findByText('飞书日历')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '断开连接' }));
+    expect(await screen.findByTestId('disconnect-integration-dialog')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '确认断开' }));
+
+    const banner = await screen.findByTestId('personal-integrations-banner');
+    expect(banner).toHaveTextContent('正在后台清理相关对话个人数据');
+    expect(banner).not.toHaveTextContent('已清理完成');
   });
 });

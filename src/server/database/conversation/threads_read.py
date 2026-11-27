@@ -792,6 +792,7 @@ async def list_computer_threads(
               AND si.workspace_id = {stand_in_id_sql("si.user_id")}
               AND h.status <> 'deleted'
               AND h.computer_id IS DISTINCT FROM si.computer_id
+              AND NOT COALESCE(t.has_personal_integration_data, FALSE)  -- DALTON-HOOK(personal-integrations)
         ),
         digest AS (
             SELECT encode(sha256(convert_to(coalesce(string_agg(

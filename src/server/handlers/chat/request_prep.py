@@ -1079,6 +1079,13 @@ def build_graph_config(
         # Only a turn a wakeup started may end without a reply. The type is
         # server-only, so no client can claim it.
         "wake_turn": request.query_type == WAKE_QUERY_TYPE,
+        # DALTON-HOOK(personal-integrations): pass request_key & external_thread_id so private-surface guard resolves authoritative channel records
+        **({"request_key": request.request_key} if request.request_key else {}),
+        **(
+            {"external_thread_id": request.external_thread_id}
+            if request.external_thread_id
+            else {}
+        ),
     }
     # DALTON-HOOK(payoff-assessment): this turn's automation identity, for
     # tools that gate on WHO is running. The thread's stored origin must never

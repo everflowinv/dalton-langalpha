@@ -9,6 +9,7 @@ validation, and 1:1 DM deep-link notification helpers.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 import hashlib
 import hmac
 import json
@@ -294,6 +295,10 @@ async def verify_personal_integration_interrupt_resume(
         return False
     if row.status != "pending":
         return False
+    if row.expires_at is not None:
+        exp = row.expires_at if row.expires_at.tzinfo is not None else row.expires_at.replace(tzinfo=UTC)
+        if exp <= datetime.now(UTC):
+            return False
 
     # Verify confirm_token matches
     expected_token = str(action_req.get("confirm_token") or "").strip()

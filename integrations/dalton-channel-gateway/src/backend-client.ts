@@ -1157,6 +1157,7 @@ export interface ThreadMessageDispatchPayload {
   external_thread_id?: string | null;
   platform?: string | null;
   turn_platform?: string | null;
+  chat_type?: "dm" | "group" | null; // DALTON-HOOK(personal-integrations)
   surface_rules?: string | null;
   steer_only?: boolean;
   hitl_response?: Record<string, { decisions: Array<Record<string, unknown>> }>;
@@ -1173,6 +1174,7 @@ export interface ThreadRetryPayload {
   checkpoint_id?: string | null;
   platform?: string | null;
   turn_platform?: string | null;
+  chat_type?: "dm" | "group" | null; // DALTON-HOOK(personal-integrations)
   surface_rules?: string | null;
 }
 

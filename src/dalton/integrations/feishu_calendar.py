@@ -121,15 +121,18 @@ def build_feishu_event_body(
         body["description"] = description
     if location is not None:
         body["location"] = {"name": location.strip()}
-    if start_time is not None and end_time is not None:
+    if start_time is not None:
         if all_day:
             body["start_time"] = {"date": start_time[:10]}
-            body["end_time"] = {"date": end_time[:10]}
         else:
             body["start_time"] = {
                 "timestamp": _iso_to_unix_str(start_time, tz_name),
                 "timezone": tz_name or "UTC",
             }
+    if end_time is not None:
+        if all_day:
+            body["end_time"] = {"date": end_time[:10]}
+        else:
             body["end_time"] = {
                 "timestamp": _iso_to_unix_str(end_time, tz_name),
                 "timezone": tz_name or "UTC",
@@ -168,6 +171,18 @@ class FeishuCalendarClientProtocol(Protocol):
         page_size: int = 50,
         page_token: str | None = None,
     ) -> list[dict[str, Any]]: ...
+
+    async def list_events_page(
+        self,
+        *,
+        access_token: str,
+        calendar_id: str,
+        start_time: str,
+        end_time: str,
+        tz_name: str = "UTC",
+        page_size: int = 50,
+        page_token: str | None = None,
+    ) -> dict[str, Any]: ...
 
     async def get_event(
         self,
@@ -306,7 +321,7 @@ class FeishuCalendarClient:
                 )
         return calendars
 
-    async def list_events(
+    async def list_events_page(
         self,
         *,
         access_token: str,
@@ -316,7 +331,7 @@ class FeishuCalendarClient:
         tz_name: str = "UTC",
         page_size: int = 50,
         page_token: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "start_time": _iso_to_unix_str(start_time, tz_name),
             "end_time": _iso_to_unix_str(end_time, tz_name),
@@ -332,11 +347,40 @@ class FeishuCalendarClient:
             params=params,
         )
         items = data.get("items") or []
-        return [
+        normalized = [
             normalize_feishu_event(item, calendar_id=calendar_id, tz_name=tz_name)
             for item in items
             if isinstance(item, Mapping)
         ]
+        next_token = str(data.get("page_token") or "").strip() or None
+        has_more = bool(data.get("has_more")) or bool(next_token)
+        return {
+            "items": normalized,
+            "has_more": has_more,
+            "page_token": next_token,
+        }
+
+    async def list_events(
+        self,
+        *,
+        access_token: str,
+        calendar_id: str,
+        start_time: str,
+        end_time: str,
+        tz_name: str = "UTC",
+        page_size: int = 50,
+        page_token: str | None = None,
+    ) -> list[dict[str, Any]]:
+        page = await self.list_events_page(
+            access_token=access_token,
+            calendar_id=calendar_id,
+            start_time=start_time,
+            end_time=end_time,
+            tz_name=tz_name,
+            page_size=page_size,
+            page_token=page_token,
+        )
+        return list(page.get("items") or [])
 
     async def get_event(
         self,

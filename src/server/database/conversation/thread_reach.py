@@ -28,8 +28,9 @@ def served_on_computer_sql(thread: str) -> str:
     there, where no person asks: every thread of a personal workspace, and a
     shared workspace's once shared with it. The workspace's own row decides
     which kind it is."""
-    return f"""({thread}.workspace_shared_at IS NOT NULL OR NOT EXISTS (
-        SELECT 1 FROM shared_workspaces s WHERE s.workspace_id = {thread}.workspace_id))"""
+    # DALTON-HOOK(personal-integrations): exclude personal-integration threads from shared computer transcript mount
+    return f"""(NOT COALESCE({thread}.has_personal_integration_data, FALSE) AND ({thread}.workspace_shared_at IS NOT NULL OR NOT EXISTS (
+        SELECT 1 FROM shared_workspaces s WHERE s.workspace_id = {thread}.workspace_id)))"""
 
 
 def reaches_sql(thread: str, user: str) -> str:
@@ -131,9 +132,14 @@ async def private_to(thread_id: str, *, conn=None) -> Optional[str]:
         return None
     async with pool.get_db_connection(conn) as conn:
         async with conn.cursor() as cur:
+            # DALTON-HOOK(personal-integrations): resolve creator for personal-integration threads excluded from shared computer mount
             await cur.execute(
-                "SELECT created_by FROM conversation_threads"
-                " WHERE conversation_thread_id = %s AND workspace_shared_at IS NULL",
+                "SELECT CASE WHEN COALESCE(t.has_personal_integration_data, FALSE)"
+                "            THEN COALESCE(t.created_by, t.user_id, w.user_id)"
+                "            ELSE t.created_by END"
+                " FROM conversation_threads t"
+                " JOIN workspaces w ON w.workspace_id = t.workspace_id"
+                " WHERE t.conversation_thread_id = %s AND t.workspace_shared_at IS NULL",
                 (thread_id,),
             )
             row = await cur.fetchone()

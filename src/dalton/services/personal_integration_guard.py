@@ -143,6 +143,8 @@ def extract_surface_context(config: Mapping[str, Any] | None) -> dict[str, Any]:
         or surface_map.get("chat_type")
         or ""
     ).strip().lower() or None
+    request_key = str(cfg.get("request_key") or "").strip() or None
+    external_thread_id = str(cfg.get("external_thread_id") or "").strip() or None
     raw_turn_index = cfg.get("turn_index")
     turn_index: int | None = None
     if isinstance(raw_turn_index, int) and not isinstance(raw_turn_index, bool):
@@ -156,15 +158,296 @@ def extract_surface_context(config: Mapping[str, Any] | None) -> dict[str, Any]:
         "agent_role": agent_role,
         "platform": platform,
         "chat_type": chat_type,
+        "request_key": request_key,
+        "external_thread_id": external_thread_id,
         "turn_index": turn_index,
     }
 
 
-def _is_channel_platform(platform: str | None) -> bool:
+def _base_platform(platform: str | None) -> str | None:
     if not platform:
-        return False
+        return None
     base = platform.split(":", 1)[0].strip().lower()
-    return base in _CHANNEL_PLATFORMS
+    return base or None
+
+
+def _is_channel_platform(platform: str | None) -> bool:
+    base = _base_platform(platform)
+    return bool(base and base in _CHANNEL_PLATFORMS)
+
+
+def _is_dm_channel_address(platform: str | None, address: str | None) -> bool:
+    """Return True iff ``address`` is a verified 1:1 DM target for ``platform``."""
+    plat = _base_platform(platform)
+    addr = str(address or "").strip()
+    if not plat or not addr:
+        return False
+    low = addr.lower()
+    if low == f"{plat}:@me":
+        return True
+    if plat == "weixin":
+        # Weixin only supports 1:1 DM; accept ``weixin:@me`` or ``weixin:<account>:<peer>``
+        return low.startswith("weixin:") and ":group:" not in low and ":chat:" not in low
+    return low.startswith(f"{plat}:dm:")
+
+
+def _is_non_dm_channel_external_id(external_id: str | None) -> bool:
+    """Return True if ``conversation_threads.external_id`` names a channel group/channel."""
+    raw = str(external_id or "").strip()
+    if not raw or ":" not in raw:
+        return False
+    prefix, rest = raw.split(":", 1)
+    if prefix.strip().lower() not in _CHANNEL_PLATFORMS:
+        return False
+    rest_low = rest.strip().lower()
+    return not (rest_low.startswith("dm:") or rest_low.startswith("@me"))
+
+
+async def _lookup_server_channel_record_tx(
+    conn: Any,
+    *,
+    caller_user_id: str,
+    thread_id: str,
+    response_id: str,
+    request_key: str | None,
+    external_thread_id: str | None,
+) -> dict[str, Any] | None:
+    """Read authoritative server-side channel record for this turn/thread (never trusts gateway defaults)."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        norm_rk = normalize_uuid(request_key) if request_key else None
+        if norm_rk is not None:
+            await cur.execute(
+                """
+                SELECT dalton_user_id, platform, chat_type,
+                       chat_address AS target_address,
+                       thread_scope_key, external_thread_id,
+                       thread_id, run_id
+                FROM dalton_channel_inbound_events
+                WHERE request_key = %s::uuid
+                   OR retry_request_key = %s::uuid
+                   OR resubmitted_request_key = %s::uuid
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (norm_rk, norm_rk, norm_rk),
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                return {**dict(row), "_source_table": "inbound_events"}
+
+        if response_id:
+            await cur.execute(
+                """
+                SELECT dalton_user_id, platform, chat_type,
+                       chat_address AS target_address,
+                       thread_scope_key, external_thread_id,
+                       thread_id, run_id
+                FROM dalton_channel_inbound_events
+                WHERE run_id = %s AND thread_id = %s::uuid
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (response_id, thread_id),
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                return {**dict(row), "_source_table": "inbound_events"}
+
+        await cur.execute(
+            """
+            SELECT dalton_user_id, platform, chat_type,
+                   chat_address AS target_address,
+                   thread_scope_key, external_thread_id,
+                   thread_id, run_id
+            FROM dalton_channel_inbound_events
+            WHERE thread_id = %s::uuid
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (thread_id,),
+        )
+        row = await cur.fetchone()
+        if row is not None:
+            return {**dict(row), "_source_table": "inbound_events"}
+
+        if external_thread_id:
+            await cur.execute(
+                """
+                SELECT dalton_user_id, platform, chat_type,
+                       chat_address AS target_address,
+                       thread_scope_key, external_thread_id,
+                       thread_id, run_id
+                FROM dalton_channel_inbound_events
+                WHERE external_thread_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (external_thread_id,),
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                return {**dict(row), "_source_table": "inbound_events"}
+
+        if response_id:
+            await cur.execute(
+                """
+                SELECT dalton_user_id, platform, target_address,
+                       thread_id, run_id
+                FROM dalton_channel_background_runs
+                WHERE run_id = %s AND thread_id = %s::uuid
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (response_id, thread_id),
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                return {**dict(row), "_source_table": "background_runs"}
+
+        await cur.execute(
+            """
+            SELECT dalton_user_id, platform, target_address,
+                   scope_key AS thread_scope_key, thread_id
+            FROM dalton_channel_thread_watches
+            WHERE thread_id = %s::uuid
+            LIMIT 1
+            """,
+            (thread_id,),
+        )
+        row = await cur.fetchone()
+        if row is not None:
+            return {**dict(row), "_source_table": "thread_watches"}
+
+    return None
+
+
+async def _verify_bound_channel_identity_tx(
+    conn: Any,
+    *,
+    caller_user_id: str,
+    platform: str,
+    expected_platform_user_id: str | None = None,
+) -> bool:
+    """Verify ``caller_user_id`` has an active server-side binding on ``platform``."""
+    base_plat = _base_platform(platform)
+    if not base_plat:
+        return False
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT platform_user_id
+            FROM dalton_channel_identities
+            WHERE user_id = %s AND platform = %s
+            LIMIT 1
+            """,
+            (caller_user_id, base_plat),
+        )
+        ident = await cur.fetchone()
+    if ident is None:
+        return False
+    bound_puid = str(ident.get("platform_user_id") or "").strip()
+    if not bound_puid:
+        return False
+    if expected_platform_user_id and bound_puid != expected_platform_user_id:
+        return False
+    return True
+
+
+async def _verify_channel_dm_surface_tx(
+    conn: Any,
+    *,
+    caller_user_id: str,
+    thread_id: str,
+    response_id: str,
+    request_key: str | None,
+    external_thread_id: str | None,
+    platform: str | None,
+) -> tuple[str, str]:
+    """Verify from authoritative server-side channel records that this channel turn is caller's 1:1 DM.
+
+    Fail-closed: missing record, group/channel chat_type, non-DM scope/address,
+    owner mismatch, or missing channel identity binding all deny access.
+    Returns ``(verified_platform, "dm")``.
+    """
+    expected_plat = _base_platform(platform)
+    rec = await _lookup_server_channel_record_tx(
+        conn,
+        caller_user_id=caller_user_id,
+        thread_id=thread_id,
+        response_id=response_id,
+        request_key=request_key,
+        external_thread_id=external_thread_id,
+    )
+    if rec is None:
+        raise PersonalSurfaceDeniedError(
+            "non_private_surface",
+            NON_PRIVATE_SURFACE_GUIDE,
+        )
+
+    rec_user = str(rec.get("dalton_user_id") or "").strip()
+    rec_plat = _base_platform(str(rec.get("platform") or ""))
+    if not rec_user or rec_user != caller_user_id or not rec_plat:
+        raise PersonalSurfaceDeniedError(
+            "non_private_surface",
+            NON_PRIVATE_SURFACE_GUIDE,
+        )
+    if expected_plat and rec_plat != expected_plat:
+        raise PersonalSurfaceDeniedError(
+            "non_private_surface",
+            NON_PRIVATE_SURFACE_GUIDE,
+        )
+
+    src_table = str(rec.get("_source_table") or "")
+    scope_key = str(rec.get("thread_scope_key") or "").strip()
+    target_address = str(rec.get("target_address") or "").strip()
+
+    if src_table == "inbound_events":
+        rec_chat_type = str(rec.get("chat_type") or "").strip().lower()
+        if rec_chat_type != "dm":
+            raise PersonalSurfaceDeniedError(
+                "non_private_surface",
+                NON_PRIVATE_SURFACE_GUIDE,
+            )
+        if scope_key and not scope_key.lower().startswith("dm:"):
+            raise PersonalSurfaceDeniedError(
+                "non_private_surface",
+                NON_PRIVATE_SURFACE_GUIDE,
+            )
+        if not _is_dm_channel_address(rec_plat, target_address):
+            raise PersonalSurfaceDeniedError(
+                "non_private_surface",
+                NON_PRIVATE_SURFACE_GUIDE,
+            )
+    else:
+        if scope_key and not scope_key.lower().startswith("dm:"):
+            raise PersonalSurfaceDeniedError(
+                "non_private_surface",
+                NON_PRIVATE_SURFACE_GUIDE,
+            )
+        if not _is_dm_channel_address(rec_plat, target_address):
+            raise PersonalSurfaceDeniedError(
+                "non_private_surface",
+                NON_PRIVATE_SURFACE_GUIDE,
+            )
+
+    expected_puid: str | None = None
+    if scope_key.lower().startswith("dm:"):
+        tail = scope_key[3:].strip()
+        if tail:
+            expected_puid = tail.split(":", 1)[0].strip() or None
+
+    bound_ok = await _verify_bound_channel_identity_tx(
+        conn,
+        caller_user_id=caller_user_id,
+        platform=rec_plat,
+        expected_platform_user_id=expected_puid,
+    )
+    if not bound_ok:
+        raise PersonalSurfaceDeniedError(
+            "non_private_surface",
+            NON_PRIVATE_SURFACE_GUIDE,
+        )
+    return rec_plat, "dm"
 
 
 async def _is_workspace_effectively_private_tx(
@@ -280,14 +563,17 @@ async def verify_personal_integration_surface(
     service: str,
     auth_epoch: int | None = None,
     provider_account_id: str | None = None,
+    expected_auth_epoch: int | None = None,
+    expected_provider_account_id: str | None = None,
     record_touch_now: bool = True,
     conn: Any = None,
 ) -> PersonalSurfaceVerificationResult:
-    """Verify the current turn runs on a private surface and atomically record the touch (§4.4).
+    """Verify the current turn runs on a private surface and optionally record the touch (§4.4).
 
     Acquires ``FOR UPDATE`` on ``conversation_threads`` and ``FOR SHARE`` on
     ``workspaces`` inside a short transaction that commits BEFORE any external HTTP
-    call runs.
+    call runs. Channel turns are verified strictly against authoritative server-side
+    channel records and bound identities (never trusting missing gateway fields).
     """
     ctx = extract_surface_context(config)
     caller_user_id = ctx["caller_user_id"]
@@ -296,6 +582,8 @@ async def verify_personal_integration_surface(
     agent_role = ctx["agent_role"]
     platform = ctx["platform"]
     chat_type = ctx["chat_type"]
+    request_key = ctx["request_key"]
+    external_thread_id = ctx["external_thread_id"]
 
     if not caller_user_id:
         raise PersonalSurfaceDeniedError(
@@ -316,14 +604,13 @@ async def verify_personal_integration_surface(
                 OUTBOUND_GUARD_REFUSAL_MESSAGE,
             )
 
-    # Channel surface check: allow 1:1 DM only; reject groups/channels (§4.4 item 2.3)
+    # Early fail-closed rejection when an explicit non-DM chat_type is present
     is_channel = _is_channel_platform(platform)
-    if chat_type == "group" or (is_channel and chat_type not in (None, "dm")):
+    if chat_type is not None and chat_type != "dm":
         raise PersonalSurfaceDeniedError(
             "non_private_surface",
             NON_PRIVATE_SURFACE_GUIDE,
         )
-    is_dm_channel = bool(is_channel and chat_type == "dm")
 
     async def _run(db_conn: Any) -> PersonalSurfaceVerificationResult:
         async with db_conn.cursor(row_factory=dict_row) as cur:
@@ -332,6 +619,7 @@ async def verify_personal_integration_surface(
                 SELECT t.conversation_thread_id,
                        t.workspace_id,
                        COALESCE(t.user_id, w.user_id) AS thread_owner,
+                       t.external_id AS thread_external_id,
                        t.is_shared,
                        t.workspace_shared_at,
                        t.has_personal_integration_data,
@@ -358,12 +646,37 @@ async def verify_personal_integration_surface(
         ws_id = str(row["workspace_id"])
         thread_owner = str(row["thread_owner"] or "").strip()
         ws_owner = str(row["ws_owner"] or "").strip()
+        thread_external_id = str(row.get("thread_external_id") or "").strip() or None
 
         if thread_owner != caller_user_id:
             raise PersonalSurfaceDeniedError(
                 "non_private_surface",
                 NON_PRIVATE_SURFACE_GUIDE,
             )
+
+        # Reject channel group/channel threads even if accessed later without platform
+        if _is_non_dm_channel_external_id(thread_external_id) or _is_non_dm_channel_external_id(
+            external_thread_id
+        ):
+            raise PersonalSurfaceDeniedError(
+                "non_private_surface",
+                NON_PRIVATE_SURFACE_GUIDE,
+            )
+
+        verified_platform = platform
+        verified_chat_type = chat_type
+        is_dm_channel = False
+        if is_channel or chat_type == "dm":
+            verified_platform, verified_chat_type = await _verify_channel_dm_surface_tx(
+                db_conn,
+                caller_user_id=caller_user_id,
+                thread_id=thread_id,
+                response_id=response_id,
+                request_key=request_key,
+                external_thread_id=external_thread_id or thread_external_id,
+                platform=platform,
+            )
+            is_dm_channel = True
 
         if bool(row.get("personal_purge_in_progress")):
             raise PersonalSurfaceDeniedError(
@@ -393,6 +706,26 @@ async def verify_personal_integration_surface(
                 PURGE_IN_PROGRESS_MESSAGE,
                 is_purge_wait=True,
             )
+
+        # Atomic account generation re-verification when recording touch after token acquisition
+        if expected_auth_epoch is not None or expected_provider_account_id is not None:
+            if (
+                conn_row is None
+                or conn_row.status
+                not in (IntegrationStatus.CONNECTED, IntegrationStatus.REFRESH_AMBIGUOUS)
+                or (
+                    expected_auth_epoch is not None
+                    and int(conn_row.auth_epoch) != int(expected_auth_epoch)
+                )
+                or (
+                    expected_provider_account_id is not None
+                    and str(conn_row.provider_account_id) != str(expected_provider_account_id)
+                )
+            ):
+                raise PersonalSurfaceDeniedError(
+                    "connection_changed",
+                    "日历连接状态或绑定账号已变更，已中止本次操作，请重试。",
+                )
 
         if bool(row.get("is_shared")) or row.get("workspace_shared_at") is not None:
             raise PersonalSurfaceDeniedError(
@@ -455,14 +788,205 @@ async def verify_personal_integration_surface(
             turn_index=turn_index,
             is_first_touch=is_first_touch,
             first_touch_notice=notice,
-            platform=platform,
-            chat_type=chat_type,
+            platform=verified_platform,
+            chat_type=verified_chat_type,
             is_dm_channel=is_dm_channel,
         )
 
     if conn is not None:
         return await _run(conn)
     async with get_db_connection() as db_conn, db_conn.transaction():
+        return await _run(db_conn)
+
+
+async def claim_first_touch_notice_if_needed(
+    thread_id: str,
+    *,
+    service: str = "calendar",
+    conn: Any = None,
+) -> str | None:
+    """Persist and deduplicate the first-touch privacy notice per thread.
+
+    Called once a personal integration call actually produces a result for the
+    thread so failed/interrupted first calls do not drop the notice and later
+    calls in the same thread do not repeat it.
+    """
+    tid = normalize_uuid(thread_id)
+    if tid is None:
+        return None
+
+    async def _run(db_conn: Any) -> str | None:
+        async with db_conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE conversation_threads
+                SET metadata = jsonb_set(
+                        COALESCE(metadata, '{}'::jsonb),
+                        '{personal_first_touch_notice_shown}',
+                        'true'::jsonb,
+                        true
+                    ),
+                    updated_at = NOW()
+                WHERE conversation_thread_id = %s::uuid
+                  AND COALESCE(has_personal_integration_data, FALSE) = TRUE
+                  AND COALESCE((metadata->>'personal_first_touch_notice_shown')::boolean, FALSE) = FALSE
+                RETURNING conversation_thread_id
+                """,
+                (tid,),
+            )
+            claimed = await cur.fetchone()
+        if claimed is None:
+            return None
+        return (
+            FIRST_TOUCH_NOTICE_CALENDAR
+            if service == "calendar"
+            else FIRST_TOUCH_NOTICE_GENERIC
+        )
+
+    if conn is not None:
+        return await _run(conn)
+    async with get_db_connection() as db_conn, db_conn.transaction():
+        return await _run(db_conn)
+
+
+async def check_personal_thread_send_allowed(
+    *,
+    thread_id: str | None,
+    caller_user_id: str | None,
+    run_id: str | None = None,
+    target: str | None = None,
+    turn_platform: str | None = None,
+    conn: Any = None,
+) -> tuple[bool, str | None]:
+    """Gate ``send_message`` when the source thread carries personal integration data.
+
+    Only verified 1:1 DM destinations owned by ``caller_user_id`` are allowed;
+    any group chat, Discord channel, or unverified destination is refused.
+    """
+    if not is_dalton_enabled():
+        return True, None
+    tid = normalize_uuid(thread_id) if thread_id else None
+    uid = str(caller_user_id or "").strip()
+    if tid is None or not uid:
+        return True, None
+    if not await is_thread_personal_private(tid, conn=conn):
+        return True, None
+
+    cleaned_target = str(target or "").strip()
+    refusal = (
+        "当前对话包含个人日历/邮箱私密数据，仅允许向本人已验证的 1:1 私聊发送消息，"
+        "不能发送到群聊、频道或未验证目标。"
+    )
+
+    async def _run(db_conn: Any) -> tuple[bool, str | None]:
+        if cleaned_target:
+            if ":" not in cleaned_target:
+                return False, refusal
+            plat_prefix = _base_platform(cleaned_target.split(":", 1)[0])
+            if not plat_prefix or plat_prefix not in _CHANNEL_PLATFORMS:
+                return False, refusal
+            if not _is_dm_channel_address(plat_prefix, cleaned_target):
+                return False, refusal
+            bound_ok = await _verify_bound_channel_identity_tx(
+                db_conn,
+                caller_user_id=uid,
+                platform=plat_prefix,
+            )
+            if not bound_ok:
+                return False, refusal
+            return True, None
+
+        # No explicit target -> sending to current conversation; verify it is caller's 1:1 DM
+        try:
+            await _verify_channel_dm_surface_tx(
+                db_conn,
+                caller_user_id=uid,
+                thread_id=tid,
+                response_id=str(run_id or "").strip(),
+                request_key=None,
+                external_thread_id=None,
+                platform=turn_platform,
+            )
+            return True, None
+        except PersonalSurfaceDeniedError:
+            return False, refusal
+
+    if conn is not None:
+        return await _run(conn)
+    async with get_db_connection() as db_conn:
+        return await _run(db_conn)
+
+
+async def check_personal_thread_dispatch_allowed(
+    *,
+    source_thread_id: str | None,
+    caller_user_id: str | None,
+    target_workspace_id: str | None,
+    target_thread_id: str | None = None,
+    conn: Any = None,
+) -> tuple[bool, str | None]:
+    """Gate ``delegate_to_analyst`` when the source thread carries personal integration data.
+
+    Only verified fully private workspaces owned by ``caller_user_id`` (effective
+    ``cos_access == 'hidden'`` and ``web_access == 'hidden'``, not shared/colleague)
+    are allowed as delegation destinations.
+    """
+    if not is_dalton_enabled():
+        return True, None
+    src_tid = normalize_uuid(source_thread_id) if source_thread_id else None
+    uid = str(caller_user_id or "").strip()
+    if src_tid is None or not uid:
+        return True, None
+    if not await is_thread_personal_private(src_tid, conn=conn):
+        return True, None
+
+    ws_id = normalize_uuid(target_workspace_id) if target_workspace_id else None
+    refusal = (
+        "当前对话包含个人日历/邮箱私密数据，仅允许向本人完全私密（对外与对同事均隐藏）的"
+        "自有工作区派发任务；不能派发到同事工作区或非私密工作区。"
+    )
+    if ws_id is None:
+        return False, refusal
+
+    async def _run(db_conn: Any) -> tuple[bool, str | None]:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT workspace_id, user_id, config, status
+                FROM workspaces
+                WHERE workspace_id = %s::uuid
+                """,
+                (ws_id,),
+            )
+            ws_row = await cur.fetchone()
+        if ws_row is None or str(ws_row.get("status") or "") == "deleted":
+            return False, refusal
+
+        ws_private = await _is_workspace_effectively_private_tx(
+            db_conn,
+            workspace_id=ws_id,
+            ws_owner=str(ws_row.get("user_id") or ""),
+            ws_config=ws_row.get("config"),
+            caller_user_id=uid,
+        )
+        if not ws_private:
+            return False, refusal
+
+        if target_thread_id:
+            tgt_tid = normalize_uuid(target_thread_id)
+            if tgt_tid is None:
+                return False, refusal
+            still_private = await check_thread_surface_still_private(
+                tgt_tid, uid, conn=db_conn
+            )
+            if not still_private:
+                return False, refusal
+
+        return True, None
+
+    if conn is not None:
+        return await _run(conn)
+    async with get_db_connection() as db_conn:
         return await _run(db_conn)
 
 
@@ -609,7 +1133,10 @@ __all__ = [
     "PersonalSurfaceDeniedError",
     "PersonalSurfaceVerificationResult",
     "assert_thread_sharable_tx",
+    "check_personal_thread_dispatch_allowed",
+    "check_personal_thread_send_allowed",
     "check_thread_surface_still_private",
+    "claim_first_touch_notice_if_needed",
     "enforce_personal_thread_owner_only",
     "extract_surface_context",
     "is_thread_personal_private",
