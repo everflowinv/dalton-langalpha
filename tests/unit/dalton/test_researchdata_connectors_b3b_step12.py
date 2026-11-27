@@ -1774,7 +1774,10 @@ def test_r2_item4_proxy_8943_relay_enforces_total_deadline_on_slow_chunked_body(
                 )
                 t0 = time.monotonic()
                 with proxy_mod.urllib.request.urlopen(http_req, timeout=5.0) as client_resp:
-                    received_bytes = client_resp.read()
+                    try:
+                        received_bytes = client_resp.read()
+                    except http.client.IncompleteRead as exc:
+                        received_bytes = exc.partial
                 elapsed = time.monotonic() - t0
                 assert elapsed < 3.2, f"Slow chunked relay exceeded total deadline: {elapsed:.2f}s"
                 assert chunks_sent < 10
@@ -4255,17 +4258,19 @@ def test_r5_item1_proxy_8943_normal_response_larger_than_queue_completes_before_
         cli.settimeout(5.0)
         cli.sendall(raw_http_req)
         cli.shutdown(socket.SHUT_WR)
-        received = bytearray()
+        resp_box: dict[str, Any] = {}
 
         def _client_reader() -> None:
             # Brief initial pause lets upstream fill all 4 queue slots and hit EOF before consumer drains
             time.sleep(0.08)
             try:
-                while True:
-                    chunk = cli.recv(8192)
-                    if not chunk:
-                        break
-                    received.extend(chunk)
+                resp = http.client.HTTPResponse(cli)
+                resp.begin()
+                resp_box["status"] = resp.status
+                resp_box["te"] = resp.getheader("Transfer-Encoding")
+                resp_box["body"] = resp.read()
+            except Exception as exc:
+                resp_box["error"] = exc
             finally:
                 cli.close()
 
@@ -4283,10 +4288,10 @@ def test_r5_item1_proxy_8943_normal_response_larger_than_queue_completes_before_
         reader.join(timeout=3.0)
 
         assert elapsed < 2.0, f"Normal >64KiB response stalled toward 10s deadline: {elapsed:.2f}s"
-        raw_resp = bytes(received)
-        head, _, body_out = raw_resp.partition(b"\r\n\r\n")
-        assert b"200 OK" in head, f"Unexpected status head: {head!r} body={body_out[:200]!r}"
-        assert body_out == big_payload
+        assert "error" not in resp_box, f"Unexpected client read error: {resp_box.get('error')!r}"
+        assert resp_box.get("status") == 200, f"Unexpected status: {resp_box!r}"
+        assert str(resp_box.get("te") or "").lower() == "chunked"
+        assert resp_box.get("body") == big_payload
         deadline_wait = time.monotonic() + 1.0
         while proxy_mod.health_payload()["in_flight"] != 0 and time.monotonic() < deadline_wait:
             time.sleep(0.01)
@@ -5085,3 +5090,615 @@ async def test_r5_item5_task_steer_full_computer_backoff_uses_effective_attempts
     assert await _run_case(attempts=8, reschedules=6) == 2 * task_steer._ROOM_WAIT_S
     # Combined maintenance reschedules (6) + waited (2) at claim #9: effective_attempts == 1 -> 1 * _ROOM_WAIT_S
     assert await _run_case(attempts=9, reschedules=6, waited=2) == task_steer._ROOM_WAIT_S
+
+
+@pytest.mark.enable_socket
+def test_r6_item1_proxy_8943_upstream_midstream_disconnect_fails_client_not_complete_200(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r6 Item 1: upstream mid-stream disconnect (truncated Content-Length, unfinished chunked, or immediate drop) surfaces an error (IncompleteRead or 502) to the HTTP/1.1 client rather than a complete 200."""
+    import http.client
+    import threading
+
+    _clean_cap_env(monkeypatch)
+    gp_lock_mod = _load_script_module(
+        "_test_r6_gp_lock_item1", RESEARCH_RUNTIME_DIR / "guidepoint_lock.py"
+    )
+    proxy_mod = _load_script_module(
+        "_test_r6_gp_proxy_item1", RESEARCH_RUNTIME_DIR / "scripts" / "guidepoint_mcp_proxy.py"
+    )
+
+    journal_file = tmp_path / "handoff-journal.json"
+    token_file = tmp_path / "config" / "guidepoint_mcp_tokens.json"
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_text(
+        json.dumps(
+            {
+                "access_token": "tok-r6-trunc",
+                "refresh_token": "ref-r6-trunc",
+                "obtained_at": time.time(),
+                "expires_in": 600,
+            }
+        ),
+        encoding="utf-8",
+    )
+    gp_lock_mod.set_target_owner(gp_lock_mod.OWNER_LEGACY_PROXY, ownership_file=journal_file)
+    monkeypatch.setenv("DALTON_GUIDEPOINT_OWNERSHIP_FILE", str(journal_file))
+    monkeypatch.setenv("GUIDEPOINT_TOKENS_FILE", str(token_file))
+
+    req_body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "search_library", "arguments": {"query": "cloud", "timeout": 5}},
+        }
+    ).encode("utf-8")
+    raw_http_req = (
+        b"POST /mcp HTTP/1.1\r\n"
+        b"Host: 127.0.0.1:8943\r\n"
+        b"Content-Type: application/json\r\n"
+        + f"Content-Length: {len(req_body)}\r\n\r\n".encode("ascii")
+        + req_body
+    )
+
+    orig_urlopen = proxy_mod.urllib.request.urlopen
+    proxy_mod.initialize_runtime(ownership_file=journal_file, token_store=token_file)
+    try:
+        def _run_disconnect_scenario(raw_chunks: list[tuple[float, bytes]]) -> dict[str, Any]:
+            def _fake_urlopen(
+                url: Any,
+                data: Any = None,
+                timeout: Any = socket._GLOBAL_DEFAULT_TIMEOUT,
+                *,
+                context: Any = None,
+            ) -> Any:
+                _ = (url, data, context)
+                up_cli, up_srv = socket.socketpair()
+                up_cli.settimeout(float(timeout) if isinstance(timeout, (int, float)) else 5.0)
+
+                def _serve_broken() -> None:
+                    try:
+                        for delay_s, piece in raw_chunks:
+                            if delay_s > 0:
+                                time.sleep(delay_s)
+                            up_srv.sendall(piece)
+                    except OSError:
+                        pass
+                    finally:
+                        try:
+                            up_srv.close()
+                        except OSError:
+                            pass
+
+                threading.Thread(target=_serve_broken, daemon=True).start()
+                resp = http.client.HTTPResponse(up_cli)
+                resp.begin()
+                return resp
+
+            monkeypatch.setattr(
+                proxy_mod.urllib.request,
+                "urlopen",
+                create_autospec(orig_urlopen, side_effect=_fake_urlopen),
+            )
+            cli, srv = socket.socketpair()
+            cli.settimeout(5.0)
+            cli.sendall(raw_http_req)
+            cli.shutdown(socket.SHUT_WR)
+            outcome: dict[str, Any] = {}
+
+            def _read_downstream() -> None:
+                try:
+                    resp = http.client.HTTPResponse(cli)
+                    resp.begin()
+                    outcome["status"] = resp.status
+                    outcome["te"] = resp.getheader("Transfer-Encoding")
+                    outcome["body"] = resp.read()
+                except Exception as exc:
+                    outcome["error"] = exc
+                finally:
+                    cli.close()
+
+            reader = threading.Thread(target=_read_downstream, daemon=True)
+            reader.start()
+            try:
+                proxy_mod.ProxyHandler(srv, ("127.0.0.1", 0), None)
+            finally:
+                try:
+                    srv.close()
+                except OSError:
+                    pass
+            reader.join(timeout=3.0)
+            dl = time.monotonic() + 1.0
+            while proxy_mod.health_payload()["in_flight"] != 0 and time.monotonic() < dl:
+                time.sleep(0.01)
+            assert proxy_mod.health_payload()["in_flight"] == 0
+            return outcome
+
+        # Case A: Content-Length declares 4096 bytes, upstream sends 24 bytes and disconnects mid-stream
+        out_cl = _run_disconnect_scenario(
+            [
+                (
+                    0.0,
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: 4096\r\n\r\n"
+                    b'{"jsonrpc":"2.0","part":',
+                ),
+                (0.05, b""),
+            ]
+        )
+        assert (
+            isinstance(out_cl.get("error"), http.client.IncompleteRead)
+            or out_cl.get("status") == 502
+        ), f"Truncated Content-Length returned as complete 200: {out_cl!r}"
+
+        # Case B: Chunked response sends one chunk then disconnects without terminating 0\r\n\r\n
+        out_chunked = _run_disconnect_scenario(
+            [
+                (
+                    0.0,
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Transfer-Encoding: chunked\r\n\r\n"
+                    b"10\r\n0123456789abcdef\r\n",
+                ),
+                (0.05, b""),
+            ]
+        )
+        assert (
+            isinstance(out_chunked.get("error"), http.client.IncompleteRead)
+            or out_chunked.get("status") == 502
+        ), f"Truncated chunked stream returned as complete 200: {out_chunked!r}"
+
+        # Case C: Upstream sends 200 OK with Content-Length: 1024 then drops immediately with 0 bytes
+        out_empty_trunc = _run_disconnect_scenario(
+            [
+                (
+                    0.0,
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: 1024\r\n\r\n",
+                ),
+            ]
+        )
+        assert (
+            isinstance(out_empty_trunc.get("error"), http.client.IncompleteRead)
+            or out_empty_trunc.get("status") == 502
+        ), f"Immediate disconnect after 200 headers returned as complete empty 200: {out_empty_trunc!r}"
+    finally:
+        proxy_mod.release_owner_lock()
+
+
+@pytest.mark.enable_socket
+def test_r6_item2_proxy_8943_dns_block_returns_504_on_time_with_zero_inflight_and_preserves_tls_sni(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r6 Item 2: blocked DNS resolves in an isolated thread before in_flight is incremented, returns 504 on deadline with in_flight==0, and successful resolution connects via resolved IP while preserving TLS SNI."""
+    import ssl
+    import threading
+
+    _clean_cap_env(monkeypatch)
+    gp_lock_mod = _load_script_module(
+        "_test_r6_gp_lock_item2", RESEARCH_RUNTIME_DIR / "guidepoint_lock.py"
+    )
+    proxy_mod = _load_script_module(
+        "_test_r6_gp_proxy_item2", RESEARCH_RUNTIME_DIR / "scripts" / "guidepoint_mcp_proxy.py"
+    )
+
+    journal_file = tmp_path / "handoff-journal.json"
+    token_file = tmp_path / "config" / "guidepoint_mcp_tokens.json"
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_text(
+        json.dumps(
+            {
+                "access_token": "tok-r6-dns",
+                "refresh_token": "ref-r6-dns",
+                "obtained_at": time.time(),
+                "expires_in": 600,
+            }
+        ),
+        encoding="utf-8",
+    )
+    gp_lock_mod.set_target_owner(gp_lock_mod.OWNER_LEGACY_PROXY, ownership_file=journal_file)
+    monkeypatch.setenv("DALTON_GUIDEPOINT_OWNERSHIP_FILE", str(journal_file))
+    monkeypatch.setenv("GUIDEPOINT_TOKENS_FILE", str(token_file))
+    monkeypatch.setenv("GUIDEPOINT_CLIENT_ID", "cid-r6-dns")
+    monkeypatch.setenv("GUIDEPOINT_CLIENT_SECRET", "csec-r6-dns")
+
+    req_body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "search_library", "arguments": {"query": "semis", "timeout": 0.4}},
+        }
+    ).encode("utf-8")
+    raw_http_req = (
+        b"POST /mcp HTTP/1.1\r\n"
+        b"Host: 127.0.0.1:8943\r\n"
+        b"X-Dalton-Request-Timeout-Ms: 400\r\n"
+        b"Content-Type: application/json\r\n"
+        + f"Content-Length: {len(req_body)}\r\n\r\n".encode("ascii")
+        + req_body
+    )
+
+    proxy_mod.initialize_runtime(ownership_file=journal_file, token_store=token_file)
+    orig_getaddrinfo = socket.getaddrinfo
+    dns_release_a = threading.Event()
+    dns_release_b = threading.Event()
+    try:
+        # Part A: Blocked UPSTREAM DNS -> 504 on time, in_flight == 0 both during & immediately after
+        dns_entered_a = threading.Event()
+        inflight_during_dns_a: list[int] = []
+
+        def _blocked_upstream_dns(
+            host: Any,
+            port: Any,
+            family: int = 0,
+            type: int = 0,
+            proto: int = 0,
+            flags: int = 0,
+        ) -> list[Any]:
+            _ = (family, type, proto, flags)
+            if host == "guidepoint-slow-dns.example":
+                inflight_during_dns_a.append(proxy_mod.health_payload()["in_flight"])
+                dns_entered_a.set()
+                dns_release_a.wait(timeout=10.0)
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", int(port)))]
+            return orig_getaddrinfo(host, port, family, type, proto, flags)
+
+        monkeypatch.setattr(
+            proxy_mod.socket,
+            "getaddrinfo",
+            create_autospec(orig_getaddrinfo, side_effect=_blocked_upstream_dns),
+        )
+        monkeypatch.setattr(proxy_mod, "UPSTREAM", "https://guidepoint-slow-dns.example/mcp")
+
+        cli_a, srv_a = socket.socketpair()
+        cli_a.settimeout(4.0)
+        cli_a.sendall(raw_http_req)
+        cli_a.shutdown(socket.SHUT_WR)
+        rec_a = bytearray()
+
+        def _drain_a() -> None:
+            try:
+                while True:
+                    part = cli_a.recv(4096)
+                    if not part:
+                        break
+                    rec_a.extend(part)
+            finally:
+                cli_a.close()
+
+        ta = threading.Thread(target=_drain_a, daemon=True)
+        ta.start()
+        t0_a = time.monotonic()
+        try:
+            proxy_mod.ProxyHandler(srv_a, ("127.0.0.1", 0), None)
+        finally:
+            try:
+                srv_a.close()
+            except OSError:
+                pass
+        elapsed_a = time.monotonic() - t0_a
+        ta.join(timeout=2.0)
+
+        assert dns_entered_a.is_set(), "getaddrinfo was never invoked for UPSTREAM"
+        assert elapsed_a < 1.8, f"Blocked upstream DNS exceeded 0.4s deadline: {elapsed_a:.2f}s"
+        assert b"504" in bytes(rec_a)
+        assert b"upstream_timeout" in bytes(rec_a)
+        # Critical: DNS ran BEFORE in_flight increment, so in_flight is 0 even while DNS thread is still blocked!
+        assert inflight_during_dns_a == [0]
+        assert proxy_mod.health_payload()["in_flight"] == 0
+        dns_release_a.set()
+
+        # Part B: Blocked TOKEN_URL DNS when token is expired -> 504 on time, in_flight == 0 immediately
+        proxy_mod._tokens["obtained_at"] = 1.0
+        dns_entered_b = threading.Event()
+        inflight_during_dns_b: list[int] = []
+
+        def _blocked_token_dns(
+            host: Any,
+            port: Any,
+            family: int = 0,
+            type: int = 0,
+            proto: int = 0,
+            flags: int = 0,
+        ) -> list[Any]:
+            _ = (family, type, proto, flags)
+            if host == "auth0-slow-dns.example":
+                inflight_during_dns_b.append(proxy_mod.health_payload()["in_flight"])
+                dns_entered_b.set()
+                dns_release_b.wait(timeout=10.0)
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", int(port)))]
+            return orig_getaddrinfo(host, port, family, type, proto, flags)
+
+        monkeypatch.setattr(
+            proxy_mod.socket,
+            "getaddrinfo",
+            create_autospec(orig_getaddrinfo, side_effect=_blocked_token_dns),
+        )
+        monkeypatch.setattr(proxy_mod, "TOKEN_URL", "https://auth0-slow-dns.example/oauth/token")
+
+        cli_b, srv_b = socket.socketpair()
+        cli_b.settimeout(4.0)
+        cli_b.sendall(raw_http_req)
+        cli_b.shutdown(socket.SHUT_WR)
+        rec_b = bytearray()
+
+        def _drain_b() -> None:
+            try:
+                while True:
+                    part = cli_b.recv(4096)
+                    if not part:
+                        break
+                    rec_b.extend(part)
+            finally:
+                cli_b.close()
+
+        tb = threading.Thread(target=_drain_b, daemon=True)
+        tb.start()
+        t0_b = time.monotonic()
+        try:
+            proxy_mod.ProxyHandler(srv_b, ("127.0.0.1", 0), None)
+        finally:
+            try:
+                srv_b.close()
+            except OSError:
+                pass
+        elapsed_b = time.monotonic() - t0_b
+        tb.join(timeout=2.0)
+
+        assert dns_entered_b.is_set(), "getaddrinfo was never invoked for expired TOKEN_URL"
+        assert elapsed_b < 1.8, f"Blocked token DNS exceeded 0.4s deadline: {elapsed_b:.2f}s"
+        assert b"504" in bytes(rec_b)
+        assert inflight_during_dns_b == [0]
+        assert proxy_mod.health_payload()["in_flight"] == 0
+        dns_release_b.set()
+
+        # Part C: Successful DNS resolution connects directly to resolved IP (no second getaddrinfo)
+        # while preserving TLS SNI (`server_hostname` == original hostname).
+        proxy_mod._tokens["obtained_at"] = time.time()
+        dns_calls_c: list[tuple[Any, Any]] = []
+        connect_addrs_c: list[Any] = []
+        sni_hostnames_c: list[str | None] = []
+        orig_socket_cls = socket.socket
+
+        def _resolved_dns_c(
+            host: Any,
+            port: Any,
+            family: int = 0,
+            type: int = 0,
+            proto: int = 0,
+            flags: int = 0,
+        ) -> list[Any]:
+            _ = (family, type, proto, flags)
+            dns_calls_c.append((host, int(port)))
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", int(port)))]
+
+        def _fake_sock_factory(
+            family: int = socket.AF_INET,
+            type: int = socket.SOCK_STREAM,
+            proto: int = 0,
+            fileno: Any = None,
+        ) -> Any:
+            if fileno is not None:
+                return orig_socket_cls(family, type, proto, fileno)
+            fake_sock = create_autospec(orig_socket_cls, instance=True)
+            fake_sock.connect.side_effect = lambda addr: connect_addrs_c.append(addr)
+            return fake_sock
+
+        def _fake_wrap_socket(
+            self_ctx: Any,
+            sock: Any,
+            server_side: bool = False,
+            do_handshake_on_connect: bool = True,
+            suppress_ragged_eofs: bool = True,
+            server_hostname: Any = None,
+            session: Any = None,
+        ) -> Any:
+            _ = (self_ctx, sock, server_side, do_handshake_on_connect, suppress_ragged_eofs, session)
+            sni_hostnames_c.append(server_hostname)
+            raise ssl.SSLError("stop after verifying SNI")
+
+        cli_c, srv_c = socket.socketpair()
+        cli_c.settimeout(4.0)
+        cli_c.sendall(raw_http_req)
+        cli_c.shutdown(socket.SHUT_WR)
+
+        monkeypatch.setattr(
+            proxy_mod.socket,
+            "getaddrinfo",
+            create_autospec(orig_getaddrinfo, side_effect=_resolved_dns_c),
+        )
+        monkeypatch.setattr(
+            proxy_mod.socket,
+            "socket",
+            create_autospec(orig_socket_cls, side_effect=_fake_sock_factory),
+        )
+        monkeypatch.setattr(
+            ssl.SSLContext,
+            "wrap_socket",
+            create_autospec(ssl.SSLContext.wrap_socket, side_effect=_fake_wrap_socket),
+        )
+        monkeypatch.setattr(proxy_mod, "UPSTREAM", "https://clapi.guidepoint.example:8443/mcp")
+
+        rec_c = bytearray()
+
+        def _drain_c() -> None:
+            try:
+                while True:
+                    part = cli_c.recv(4096)
+                    if not part:
+                        break
+                    rec_c.extend(part)
+            finally:
+                cli_c.close()
+
+        tc = threading.Thread(target=_drain_c, daemon=True)
+        tc.start()
+        try:
+            proxy_mod.ProxyHandler(srv_c, ("127.0.0.1", 0), None)
+        finally:
+            try:
+                srv_c.close()
+            except OSError:
+                pass
+        tc.join(timeout=2.0)
+
+        assert dns_calls_c == [("clapi.guidepoint.example", 8443)]
+        assert connect_addrs_c == [("127.0.0.1", 8443)]
+        assert sni_hostnames_c == ["clapi.guidepoint.example"]
+        assert b"502" in bytes(rec_c)
+        assert proxy_mod.health_payload()["in_flight"] == 0
+    finally:
+        dns_release_a.set()
+        dns_release_b.set()
+        proxy_mod.release_owner_lock()
+
+
+def test_r6_item3_host_direct_yaml_capabilities_with_and_without_pyyaml_and_requirements(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r6 Item 3: market-digest requirements declares PyYAML; both inline-flow `capabilities: {sales_notes: false}` and comment-bearing `capabilities: # ...` disable sales-notes with AND without PyYAML; unparseable fallback syntax fails closed instead of defaulting open."""
+    _clean_cap_env(monkeypatch)
+
+    # 1. Verify market-digest requirements.txt declares PyYAML
+    req_file = RESEARCH_RUNTIME_DIR / "skills" / "market-digest" / "requirements.txt"
+    req_lines = [
+        line.strip().lower()
+        for line in req_file.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert any(line.startswith("pyyaml") for line in req_lines), (
+        f"PyYAML missing from {req_file}: {req_lines!r}"
+    )
+
+    # 2. Build an isolated mini-repo tree mirroring `src/dalton/` + `scripts/dalton/research_runtime/scripts/research_library.py`
+    fake_repo = tmp_path / "repo"
+    (fake_repo / "src" / "dalton").mkdir(parents=True)
+    (fake_repo / "src" / "__init__.py").write_text("", encoding="utf-8")
+    (fake_repo / "src" / "dalton" / "__init__.py").write_text("", encoding="utf-8")
+    for fname in ("profile.py", "capabilities.py", "config_env.py"):
+        shutil.copy2(REPO_ROOT / "src" / "dalton" / fname, fake_repo / "src" / "dalton" / fname)
+    shutil.copy2(
+        REPO_ROOT / "src" / "dalton" / "dalton.core.yaml",
+        fake_repo / "src" / "dalton" / "dalton.core.yaml",
+    )
+    rl_dst = fake_repo / "scripts" / "dalton" / "research_runtime" / "scripts" / "research_library.py"
+    rl_dst.parent.mkdir(parents=True)
+    shutil.copy2(RESEARCH_RUNTIME_DIR / "scripts" / "research_library.py", rl_dst)
+    shutil.copy2(
+        RESEARCH_RUNTIME_DIR / "scripts" / "research_images.py",
+        rl_dst.parent / "research_images.py",
+    )
+
+    # Create a PYTHONPATH shim that blocks `import yaml` to simulate a host venv without PyYAML
+    no_yaml_shim = tmp_path / "no_yaml_shim"
+    no_yaml_shim.mkdir()
+    (no_yaml_shim / "sitecustomize.py").write_text(
+        "import importlib.abc, sys\n"
+        "class _BlockYaml(importlib.abc.MetaPathFinder):\n"
+        "    def find_spec(self, fullname, path, target=None):\n"
+        "        if fullname == 'yaml' or fullname.startswith('yaml.'):\n"
+        "            raise ImportError('simulated missing PyYAML')\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, _BlockYaml())\n",
+        encoding="utf-8",
+    )
+
+    def _probe_host_direct(yaml_text: str, *, with_pyyaml: bool) -> dict[str, Any]:
+        (fake_repo / "src" / "dalton" / "dalton.yaml").write_text(yaml_text, encoding="utf-8")
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(tmp_path),
+            "APP_ENV": "dalton",
+            "DALTON_PROFILE": "everflow",
+            "PYTHON_DOTENV_DISABLED": "1",
+        }
+        if not with_pyyaml:
+            env["PYTHONPATH"] = str(no_yaml_shim)
+
+        # Probe resolved sources directly AND invoke the real CLI on sales-notes
+        code = (
+            "import importlib.util, json, sys\n"
+            "has_yaml = True\n"
+            "try:\n"
+            "    import yaml\n"
+            "except ImportError:\n"
+            "    has_yaml = False\n"
+            f"spec = importlib.util.spec_from_file_location('rl', {str(rl_dst)!r})\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "print(json.dumps({'has_yaml': has_yaml, 'enabled': mod._enabled_library_sources(None)}))\n"
+        )
+        probe_res = subprocess.run(
+            [sys.executable, "-c", code],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        probe_data = json.loads(probe_res.stdout)
+
+        cli_res = subprocess.run(
+            [sys.executable, str(rl_dst), "sales-notes", "--operation=list"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        return {
+            "has_yaml": probe_data["has_yaml"],
+            "enabled": probe_data["enabled"],
+            "cli_rc": cli_res.returncode,
+            "cli_out": json.loads(cli_res.stdout),
+        }
+
+    # Form 1: inline flow mapping `capabilities: {sales_notes: false}`
+    yaml_flow = "enabled: true\ncapabilities: {sales_notes: false}\n"
+    for with_yaml in (True, False):
+        res = _probe_host_direct(yaml_flow, with_pyyaml=with_yaml)
+        assert res["has_yaml"] is with_yaml
+        assert "sales-notes" not in res["enabled"], f"flow form leaked sales-notes (yaml={with_yaml}): {res}"
+        assert "company-wiki" in res["enabled"], f"flow form unexpectedly dropped company-wiki (yaml={with_yaml}): {res}"
+        assert res["cli_rc"] != 0
+        assert res["cli_out"]["ok"] is False
+        assert "capability_disabled" in str(res["cli_out"].get("error") or "")
+
+    # Form 2: block mapping with trailing inline comments on `capabilities:` and entries
+    yaml_commented = (
+        "enabled: true # active\n"
+        "capabilities: # deployment capability overrides\n"
+        "  sales_notes: false # disable sales notes\n"
+    )
+    for with_yaml in (True, False):
+        res = _probe_host_direct(yaml_commented, with_pyyaml=with_yaml)
+        assert res["has_yaml"] is with_yaml
+        assert "sales-notes" not in res["enabled"], f"commented form leaked sales-notes (yaml={with_yaml}): {res}"
+        assert "company-wiki" in res["enabled"], f"commented form unexpectedly dropped company-wiki (yaml={with_yaml}): {res}"
+        assert res["cli_rc"] != 0
+        assert res["cli_out"]["ok"] is False
+        assert "capability_disabled" in str(res["cli_out"].get("error") or "")
+
+    # Form 3: complex multi-line flow mapping — PyYAML parses it (`sales-notes` off),
+    # fallback without PyYAML cannot reliably parse it and MUST fail closed (`[]`, never default-open!)
+    yaml_complex = "enabled: true\ncapabilities: {\n  sales_notes: false\n}\n"
+    res_complex_yaml = _probe_host_direct(yaml_complex, with_pyyaml=True)
+    assert res_complex_yaml["has_yaml"] is True
+    assert "sales-notes" not in res_complex_yaml["enabled"]
+    assert res_complex_yaml["cli_rc"] != 0
+
+    res_complex_fallback = _probe_host_direct(yaml_complex, with_pyyaml=False)
+    assert res_complex_fallback["has_yaml"] is False
+    assert res_complex_fallback["enabled"] == [], (
+        f"Unparseable capabilities syntax without PyYAML must fail closed ([]): {res_complex_fallback}"
+    )
+    assert res_complex_fallback["cli_rc"] != 0
+    assert "capability_disabled" in str(res_complex_fallback["cli_out"].get("error") or "")

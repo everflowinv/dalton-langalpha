@@ -30,6 +30,7 @@ import urllib.parse
 import urllib.request
 
 _ORIG_URLOPEN = urllib.request.urlopen
+_SOCKET_TYPE = socket.socket
 
 _RUNTIME_DIR = str(Path(__file__).resolve().parent.parent)
 if _RUNTIME_DIR not in sys.path:
@@ -171,6 +172,19 @@ def _resolve_nonblocking_chunk_reader(stream):
     return stream.read
 
 
+def _is_truncated_http_stream(stream) -> bool:
+    """Return True when an HTTPResponse hit EOF with unread Content-Length or unfinished chunking."""
+    for obj in (stream, getattr(stream, "fp", None)):
+        if obj is None:
+            continue
+        if getattr(obj, "chunked", False) and getattr(obj, "chunk_left", None) is not None:
+            return True
+        length = getattr(obj, "length", None)
+        if isinstance(length, int) and length > 0:
+            return True
+    return False
+
+
 def _read_stream_with_deadline(stream, *, deadline_mono: float) -> bytes:
     """Read an entire HTTP response body while enforcing an absolute monotonic deadline."""
     raw_sock = _extract_raw_socket(stream)
@@ -207,6 +221,8 @@ def _read_stream_with_deadline(stream, *, deadline_mono: float) -> bytes:
         except (TimeoutError, socket.timeout) as exc:
             raise TimeoutError("Guidepoint response body read timed out") from exc
         if not chunk:
+            if _is_truncated_http_stream(stream):
+                raise http.client.IncompleteRead(bytes(buf))
             break
         buf.extend(chunk)
         if time.monotonic() >= deadline_mono:
@@ -219,7 +235,7 @@ def _close_resource_forcefully(obj) -> None:
     if obj is None:
         return
     socks = []
-    if isinstance(obj, socket.socket):
+    if isinstance(obj, _SOCKET_TYPE):
         socks.append(obj)
     conn_sock = getattr(obj, "sock", None)
     if conn_sock is not None:
@@ -256,6 +272,71 @@ def _abort_active_resources(resources: list, lock: threading.Lock) -> None:
         _close_resource_forcefully(res)
 
 
+def _parse_url_host_port(url: str) -> tuple[str, int] | None:
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname
+    if not host:
+        return None
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme.lower() == "https" else 80
+    return host, int(port)
+
+
+def _resolve_host_with_deadline(
+    host: str,
+    port: int,
+    *,
+    deadline_mono: float,
+    timeout_message: str = "Guidepoint upstream DNS resolution timed out",
+    cancelled: threading.Event | None = None,
+) -> list:
+    """Resolve `(host, port)` in an isolated daemon thread bounded by `deadline_mono`.
+
+    Called before `_in_flight` is incremented so a blocked `getaddrinfo()` returns
+    504 on time without pinning `_in_flight` or stalling maintenance drain.
+    """
+    if cancelled is not None and cancelled.is_set():
+        raise TimeoutError(timeout_message)
+    rem = deadline_mono - time.monotonic()
+    if rem <= 0.0:
+        raise TimeoutError(timeout_message)
+
+    done = threading.Event()
+    result: dict = {}
+
+    def _dns_worker() -> None:
+        try:
+            infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+            if not infos:
+                result["error"] = OSError("getaddrinfo returns an empty list")
+            else:
+                result["infos"] = infos
+        except BaseException as exc:
+            result["error"] = exc
+        finally:
+            done.set()
+
+    dns_thread = threading.Thread(target=_dns_worker, daemon=True)
+    dns_thread.start()
+
+    while True:
+        if cancelled is not None and cancelled.is_set():
+            raise TimeoutError(timeout_message)
+        wait_rem = deadline_mono - time.monotonic()
+        if wait_rem <= 0.0:
+            raise TimeoutError(timeout_message)
+        step = min(0.05, wait_rem) if cancelled is not None else wait_rem
+        if done.wait(timeout=max(0.0, step)):
+            break
+        if cancelled is None:
+            raise TimeoutError(timeout_message)
+
+    if "error" in result:
+        raise result["error"]
+    return result["infos"]
+
+
 def _open_upstream_tracked(
     req: urllib.request.Request,
     *,
@@ -264,8 +345,9 @@ def _open_upstream_tracked(
     active_lock: threading.Lock,
     deadline_mono: float | None = None,
     cancelled: threading.Event | None = None,
+    resolved_addrs: dict[tuple[str, int], list] | None = None,
 ):
-    """Open an upstream request while enforcing `min(timeout_s, remaining)` across connect, TLS handshake, and reads."""
+    """Open an upstream request while enforcing `min(timeout_s, remaining)` across DNS, connect, TLS handshake, and reads."""
     orig_timeout = max(0.01, float(timeout_s))
     if deadline_mono is not None:
         rem_now = deadline_mono - time.monotonic()
@@ -300,11 +382,20 @@ def _open_upstream_tracked(
             rem_dns = _remaining_timeout(
                 self.timeout if isinstance(self.timeout, (int, float)) else orig_timeout
             )
-            _ = rem_dns
+            key = (self.host, int(self.port))
+            infos = resolved_addrs.get(key) if resolved_addrs else None
+            if infos is None:
+                dns_deadline = time.monotonic() + rem_dns
+                if deadline_mono is not None:
+                    dns_deadline = min(dns_deadline, deadline_mono)
+                infos = _resolve_host_with_deadline(
+                    self.host,
+                    int(self.port),
+                    deadline_mono=dns_deadline,
+                    timeout_message="Guidepoint upstream DNS resolution timed out",
+                    cancelled=cancelled,
+                )
             err: BaseException | None = None
-            infos = socket.getaddrinfo(self.host, self.port, 0, socket.SOCK_STREAM)
-            if not infos:
-                raise OSError("getaddrinfo returns an empty list")
             for af, socktype, proto, _canonname, sa in infos:
                 rem_conn = _remaining_timeout(
                     self.timeout if isinstance(self.timeout, (int, float)) else orig_timeout
@@ -410,6 +501,7 @@ def _fetch_body_with_hard_deadline(
     open_timeout_s: float | None = None,
     on_worker_start=None,
     on_worker_done=None,
+    resolved_addrs: dict[tuple[str, int], list] | None = None,
 ) -> bytes:
     """Run an HTTP request + body read in a worker thread under a single absolute deadline."""
     rem = deadline_mono - time.monotonic()
@@ -441,6 +533,7 @@ def _fetch_body_with_hard_deadline(
                 active_lock=active_lock,
                 deadline_mono=deadline_mono,
                 cancelled=cancelled,
+                resolved_addrs=resolved_addrs,
             )
             with active_lock:
                 active_resources.append(resp)
@@ -483,6 +576,7 @@ def do_refresh(
     deadline_mono: float | None = None,
     on_worker_start=None,
     on_worker_done=None,
+    resolved_addrs: dict[tuple[str, int], list] | None = None,
 ) -> None:
     client_id = os.environ["GUIDEPOINT_CLIENT_ID"]
     client_secret = os.environ["GUIDEPOINT_CLIENT_SECRET"]
@@ -516,6 +610,7 @@ def do_refresh(
         open_timeout_s=explicit_open_timeout,
         on_worker_start=on_worker_start,
         on_worker_done=on_worker_done,
+        resolved_addrs=resolved_addrs,
     )
     new_tokens = json.loads(raw_body.decode("utf-8"))
     new_tokens.setdefault("refresh_token", _tokens["refresh_token"])
@@ -531,6 +626,7 @@ def ensure_fresh_token(
     deadline_mono: float | None = None,
     on_worker_start=None,
     on_worker_done=None,
+    resolved_addrs: dict[tuple[str, int], list] | None = None,
 ) -> str:
     if _standby or not _owner_lock_held():
         raise GuidepointStandbyError("lock_not_acquired")
@@ -561,6 +657,7 @@ def ensure_fresh_token(
                     timeout_s=float(timeout_s),
                     on_worker_start=on_worker_start,
                     on_worker_done=on_worker_done,
+                    resolved_addrs=resolved_addrs,
                 )
             else:
                 do_refresh(
@@ -568,6 +665,7 @@ def ensure_fresh_token(
                     deadline_mono=eff_deadline,
                     on_worker_start=on_worker_start,
                     on_worker_done=on_worker_done,
+                    resolved_addrs=resolved_addrs,
                 )
         return _tokens["access_token"]
     finally:
@@ -778,6 +876,93 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     },
                 )
                 return
+
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length) if length else None
+        eff_timeout_s, fwd_body = _resolve_proxy_timeout_and_body(self.headers, body)
+        deadline_mono = time.monotonic() + eff_timeout_s
+
+        # Resolve DNS in an isolated daemon thread BEFORE incrementing `_in_flight`:
+        # if `getaddrinfo()` stalls past the deadline, return 504 immediately and
+        # keep `_in_flight` untouched so maintenance drain is never blocked.
+        resolved_addrs: dict[tuple[str, int], list] = {}
+        if urllib.request.urlopen is _ORIG_URLOPEN:
+            needs_refresh = time.time() > (
+                _tokens.get("obtained_at", 0)
+                + _tokens.get("expires_in", 600)
+                - REFRESH_SKEW_SECONDS
+            )
+            if needs_refresh:
+                tok_hp = _parse_url_host_port(TOKEN_URL)
+                if tok_hp is not None:
+                    try:
+                        resolved_addrs[tok_hp] = _resolve_host_with_deadline(
+                            tok_hp[0],
+                            tok_hp[1],
+                            deadline_mono=deadline_mono,
+                            timeout_message=f"token refresh timed out after {eff_timeout_s:.1f}s",
+                        )
+                    except (TimeoutError, socket.timeout):
+                        self._send_json(
+                            504,
+                            {
+                                "ok": False,
+                                "status": "timeout",
+                                "error_code": "upstream_timeout",
+                                "error": f"token refresh timed out after {eff_timeout_s:.1f}s",
+                            },
+                        )
+                        return
+                    except Exception as e:
+                        self._send_json(502, {"ok": False, "error": f"token refresh failed: {e}"})
+                        return
+            up_hp = _parse_url_host_port(UPSTREAM)
+            if up_hp is not None and up_hp not in resolved_addrs:
+                try:
+                    resolved_addrs[up_hp] = _resolve_host_with_deadline(
+                        up_hp[0],
+                        up_hp[1],
+                        deadline_mono=deadline_mono,
+                        timeout_message=f"upstream timed out after {eff_timeout_s:.1f}s",
+                    )
+                except (TimeoutError, socket.timeout):
+                    self._send_json(
+                        504,
+                        {
+                            "ok": False,
+                            "status": "timeout",
+                            "error_code": "upstream_timeout",
+                            "error": f"upstream timed out after {eff_timeout_s:.1f}s",
+                        },
+                    )
+                    return
+                except Exception as e:
+                    self._send_json(502, {"ok": False, "error": f"upstream error: {e}"})
+                    return
+
+        with _state_lock:
+            if _draining:
+                self._send_json(
+                    503,
+                    {
+                        "ok": False,
+                        "status": "draining",
+                        "error_code": "service_draining",
+                        "error": "Guidepoint proxy is draining.",
+                    },
+                )
+                return
+            if _standby or not _owner_lock_held():
+                self._send_json(
+                    503,
+                    {
+                        "ok": False,
+                        "status": "standby",
+                        "error_code": "lock_not_acquired",
+                        "error": "Guidepoint proxy is in standby (lock_not_acquired).",
+                    },
+                )
+                return
             _in_flight += 1
 
         # Both the main handler and any spawned upstream/refresh worker must exit
@@ -804,16 +989,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     _in_flight = max(0, _in_flight - 1)
 
         try:
-            length = int(self.headers.get("Content-Length", 0) or 0)
-            body = self.rfile.read(length) if length else None
-            eff_timeout_s, fwd_body = _resolve_proxy_timeout_and_body(self.headers, body)
-            deadline_mono = time.monotonic() + eff_timeout_s
-
             try:
                 access_token = ensure_fresh_token(
                     deadline_mono=deadline_mono,
                     on_worker_start=_acquire_owner,
                     on_worker_done=_release_owner,
+                    resolved_addrs=resolved_addrs or None,
                 )
             except GuidepointStandbyError:
                 self._send_json(
@@ -874,6 +1055,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             cancelled = threading.Event()
             headers_ready = threading.Event()
             upstream_done = threading.Event()
+            upstream_failed = threading.Event()
             active_lock = threading.Lock()
             active_resources: list = []
             chunk_queue: queue.Queue = queue.Queue(maxsize=4)
@@ -897,6 +1079,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
             def _upstream_worker() -> None:
                 stream = None
+                clean_eof = False
+                body_error: BaseException | None = None
                 try:
                     rem_open = deadline_mono - time.monotonic()
                     if rem_open <= 0.0 or cancelled.is_set():
@@ -911,6 +1095,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             active_lock=active_lock,
                             deadline_mono=deadline_mono,
                             cancelled=cancelled,
+                            resolved_addrs=resolved_addrs or None,
                         )
                         status = resp.status
                         resp_headers = list(resp.headers.items())
@@ -940,6 +1125,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     while not cancelled.is_set():
                         rem_read = deadline_mono - time.monotonic()
                         if rem_read <= 0.0:
+                            body_error = TimeoutError(
+                                f"upstream timed out after {eff_timeout_s:.1f}s"
+                            )
                             break
                         if raw_sock is not None and hasattr(raw_sock, "settimeout"):
                             target_t = (
@@ -953,27 +1141,56 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                                 pass
                         try:
                             chunk = read_fn(4096)
-                        except (TimeoutError, socket.timeout, OSError):
+                        except (TimeoutError, socket.timeout, OSError, http.client.HTTPException) as exc:
+                            body_error = exc
                             break
                         if not chunk:
+                            if _is_truncated_http_stream(stream):
+                                body_error = http.client.IncompleteRead(b"")
+                            else:
+                                clean_eof = True
                             break
                         if cancelled.is_set() or time.monotonic() >= deadline_mono:
+                            body_error = TimeoutError(
+                                f"upstream timed out after {eff_timeout_s:.1f}s"
+                            )
                             break
                         if not _enqueue(("data", chunk)):
+                            body_error = TimeoutError(
+                                f"upstream timed out after {eff_timeout_s:.1f}s"
+                            )
                             break
                 except Exception as exc:
                     if not headers_ready.is_set():
                         meta["error"] = exc
                         headers_ready.set()
+                    else:
+                        body_error = exc
                 finally:
                     if stream is not None:
                         _close_resource_forcefully(stream)
                     _abort_active_resources(active_resources, active_lock)
-                    upstream_done.set()
-                    try:
-                        chunk_queue.put_nowait(("eof", None))
-                    except queue.Full:
-                        pass
+                    if clean_eof and not cancelled.is_set() and body_error is None:
+                        upstream_done.set()
+                        try:
+                            chunk_queue.put_nowait(("eof", None))
+                        except queue.Full:
+                            pass
+                    else:
+                        if body_error is None:
+                            if cancelled.is_set() or time.monotonic() >= deadline_mono:
+                                body_error = TimeoutError(
+                                    f"upstream timed out after {eff_timeout_s:.1f}s"
+                                )
+                            else:
+                                body_error = OSError("upstream response stream ended unexpectedly")
+                        meta.setdefault("body_error", body_error)
+                        upstream_failed.set()
+                        upstream_done.set()
+                        try:
+                            chunk_queue.put_nowait(("error", body_error))
+                        except queue.Full:
+                            pass
                     _release_owner()
 
             worker = threading.Thread(target=_upstream_worker, daemon=True)
@@ -1020,9 +1237,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     meta["headers"],
                     chunk_queue,
                     upstream_done=upstream_done,
+                    upstream_failed=upstream_failed,
                     deadline_mono=deadline_mono,
                     abort_upstream=_abort_upstream,
                     eff_timeout_s=eff_timeout_s,
+                    meta=meta,
                 )
             finally:
                 _abort_upstream()
@@ -1036,10 +1255,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         chunk_queue: queue.Queue,
         *,
         upstream_done: threading.Event,
+        upstream_failed: threading.Event | None = None,
         deadline_mono: float,
         abort_upstream,
         eff_timeout_s: float,
+        meta: dict | None = None,
     ) -> None:
+        failed_ev = upstream_failed if upstream_failed is not None else threading.Event()
         rem_hdr = deadline_mono - time.monotonic()
         if rem_hdr <= 0.0:
             abort_upstream()
@@ -1053,6 +1275,29 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 },
             )
             return
+        if failed_ev.is_set():
+            abort_upstream()
+            body_err = meta.get("body_error") if isinstance(meta, dict) else None
+            if isinstance(body_err, (TimeoutError, socket.timeout)):
+                self._send_json(
+                    504,
+                    {
+                        "ok": False,
+                        "status": "timeout",
+                        "error_code": "upstream_timeout",
+                        "error": f"upstream timed out after {eff_timeout_s:.1f}s",
+                    },
+                )
+            else:
+                self._send_json(
+                    502,
+                    {
+                        "ok": False,
+                        "error_code": "upstream_stream_error",
+                        "error": f"upstream body read failed: {body_err}",
+                    },
+                )
+            return
         self.close_connection = True
         sock = getattr(self, "connection", None)
         if sock is not None and hasattr(sock, "settimeout"):
@@ -1060,12 +1305,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 sock.settimeout(max(0.01, rem_hdr))
             except Exception:
                 pass
+        use_chunked = not (
+            int(status) in (204, 304)
+            or (100 <= int(status) < 200)
+            or str(getattr(self, "command", "")).upper() == "HEAD"
+        )
         try:
             self.send_response(status)
             for k, v in headers:
                 if k.lower() in HOP_BY_HOP or k.lower() == "content-length":
                     continue
                 self.send_header(k, v)
+            if use_chunked:
+                self.send_header("Transfer-Encoding", "chunked")
             self.send_header("Connection", "close")
             self.end_headers()
         except (TimeoutError, socket.timeout, BrokenPipeError, ConnectionResetError, OSError):
@@ -1073,35 +1325,70 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._close_downstream_forcefully()
             return
 
+        if not use_chunked:
+            return
+
+        stream_ok = False
         while True:
+            if failed_ev.is_set():
+                abort_upstream()
+                self._close_downstream_forcefully()
+                return
             try:
                 kind, payload = chunk_queue.get_nowait()
             except queue.Empty:
+                if failed_ev.is_set():
+                    abort_upstream()
+                    self._close_downstream_forcefully()
+                    return
                 if upstream_done.is_set():
                     try:
                         kind, payload = chunk_queue.get_nowait()
                     except queue.Empty:
+                        if failed_ev.is_set():
+                            abort_upstream()
+                            self._close_downstream_forcefully()
+                            return
+                        stream_ok = True
                         break
                 else:
                     rem = deadline_mono - time.monotonic()
                     if rem <= 0.0:
                         abort_upstream()
                         self._close_downstream_forcefully()
-                        break
+                        return
                     try:
                         kind, payload = chunk_queue.get(timeout=min(0.05, rem))
                     except queue.Empty:
                         continue
-            if kind != "data":
+            if kind == "eof":
+                if failed_ev.is_set():
+                    abort_upstream()
+                    self._close_downstream_forcefully()
+                    return
+                stream_ok = True
                 break
+            if kind != "data":
+                abort_upstream()
+                self._close_downstream_forcefully()
+                return
             if time.monotonic() >= deadline_mono:
                 abort_upstream()
                 self._close_downstream_forcefully()
-                break
-            if not self._write_bytes_with_deadline(payload, deadline_mono=deadline_mono):
+                return
+            frame = f"{len(payload):x}\r\n".encode("ascii") + payload + b"\r\n"
+            if not self._write_bytes_with_deadline(frame, deadline_mono=deadline_mono):
                 abort_upstream()
                 self._close_downstream_forcefully()
-                break
+                return
+
+        if stream_ok and not failed_ev.is_set():
+            if not self._write_bytes_with_deadline(b"0\r\n\r\n", deadline_mono=deadline_mono):
+                abort_upstream()
+                self._close_downstream_forcefully()
+        else:
+            abort_upstream()
+            self._close_downstream_forcefully()
 
     def _relay(
         self,
@@ -1123,17 +1410,26 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 sock.settimeout(max(0.01, rem_hdr))
             except Exception:
                 pass
+        use_chunked = not (
+            int(status) in (204, 304)
+            or (100 <= int(status) < 200)
+            or str(getattr(self, "command", "")).upper() == "HEAD"
+        )
         try:
             self.send_response(status)
             for k, v in headers:
                 if k.lower() in HOP_BY_HOP or k.lower() == "content-length":
                     continue
                 self.send_header(k, v)
+            if use_chunked:
+                self.send_header("Transfer-Encoding", "chunked")
             self.send_header("Connection", "close")
             self.end_headers()
         except (TimeoutError, socket.timeout, BrokenPipeError, ConnectionResetError, OSError):
             _close_resource_forcefully(body_stream)
             self._close_downstream_forcefully()
+            return
+        if not use_chunked:
             return
         raw_sock = _extract_raw_socket(body_stream)
         orig_sock_timeout: float | None = None
@@ -1145,13 +1441,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 orig_sock_timeout = None
         read_fn = _resolve_nonblocking_chunk_reader(body_stream)
+        clean_eof = False
         while True:
             if deadline_mono is not None:
                 rem = deadline_mono - time.monotonic()
                 if rem <= 0.0:
                     _close_resource_forcefully(body_stream)
                     self._close_downstream_forcefully()
-                    break
+                    return
                 if raw_sock is not None and hasattr(raw_sock, "settimeout"):
                     target_timeout = rem if orig_sock_timeout is None else min(orig_sock_timeout, rem)
                     try:
@@ -1160,20 +1457,30 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         pass
             try:
                 chunk = read_fn(4096)
-            except (TimeoutError, socket.timeout, OSError):
+            except (TimeoutError, socket.timeout, OSError, http.client.HTTPException):
                 _close_resource_forcefully(body_stream)
                 self._close_downstream_forcefully()
-                break
+                return
             if not chunk:
+                if _is_truncated_http_stream(body_stream):
+                    _close_resource_forcefully(body_stream)
+                    self._close_downstream_forcefully()
+                    return
+                clean_eof = True
                 break
             if deadline_mono is not None and time.monotonic() >= deadline_mono:
                 _close_resource_forcefully(body_stream)
                 self._close_downstream_forcefully()
-                break
-            if not self._write_bytes_with_deadline(chunk, deadline_mono=deadline_mono):
+                return
+            frame = f"{len(chunk):x}\r\n".encode("ascii") + chunk + b"\r\n"
+            if not self._write_bytes_with_deadline(frame, deadline_mono=deadline_mono):
                 _close_resource_forcefully(body_stream)
                 self._close_downstream_forcefully()
-                break
+                return
+        if clean_eof:
+            if not self._write_bytes_with_deadline(b"0\r\n\r\n", deadline_mono=deadline_mono):
+                _close_resource_forcefully(body_stream)
+                self._close_downstream_forcefully()
 
     def do_GET(self) -> None:
         path = self._path_only()

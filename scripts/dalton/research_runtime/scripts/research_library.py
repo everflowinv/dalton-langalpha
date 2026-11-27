@@ -72,6 +72,128 @@ def _parse_dotenv_stdlib(path: Path, base_env: dict[str, str]) -> dict[str, str]
     return resolved
 
 
+_YAML_SIMPLE_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _strip_yaml_inline_comment(value: str) -> str:
+    """Strip an unquoted YAML `# ...` comment (at index 0 or following whitespace)."""
+    in_single = False
+    in_double = False
+    for idx, ch in enumerate(value):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single and (idx == 0 or value[idx - 1] != "\\"):
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            if idx == 0 or value[idx - 1] in (" ", "\t"):
+                return value[:idx].strip()
+    return value.strip()
+
+
+def _unquote_yaml_simple_key(raw_key: str) -> str:
+    key = raw_key.strip()
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in ("'", '"'):
+        key = key[1:-1].strip()
+    if not _YAML_SIMPLE_KEY_RE.fullmatch(key):
+        raise ValueError(f"Unparseable YAML key without PyYAML: {raw_key!r}")
+    return key.lower()
+
+
+def _parse_yaml_strict_bool(raw_val: str) -> bool:
+    norm = _strip_yaml_inline_comment(raw_val).lower()
+    if norm == "true":
+        return True
+    if norm == "false":
+        return False
+    raise ValueError(f"Unparseable YAML boolean without PyYAML: {raw_val!r}")
+
+
+def _parse_yaml_flow_capabilities(flow_text: str) -> dict[str, bool]:
+    """Strictly parse a single-line YAML flow mapping like `{sales_notes: false}`; raise on anything ambiguous."""
+    stripped = flow_text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        raise ValueError(f"Unsupported capabilities flow syntax without PyYAML: {flow_text!r}")
+    inner = stripped[1:-1].strip()
+    if not inner:
+        return {}
+    if any(ch in inner for ch in ("{", "}", "[", "]", "&", "*", "!", "\n")):
+        raise ValueError(f"Complex capabilities flow syntax requires PyYAML: {flow_text!r}")
+    out: dict[str, bool] = {}
+    for raw_entry in inner.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        if entry.count(":") != 1:
+            raise ValueError(f"Unparseable capabilities flow entry without PyYAML: {entry!r}")
+        raw_k, raw_v = entry.split(":", 1)
+        out[_unquote_yaml_simple_key(raw_k)] = _parse_yaml_strict_bool(raw_v)
+    return out
+
+
+def _read_yaml_top_and_capabilities_fallback(text: str) -> tuple[bool | None, dict[str, bool]]:
+    """Fail-closed stdlib YAML subset parser used only when PyYAML is absent.
+
+    Handles top-level `enabled:` and `capabilities:` (block mapping with optional trailing
+    comments or single-line flow mapping `{k: bool}`). Any syntax that cannot be reliably
+    parsed raises `ValueError` so host-direct callers fail closed (`[]`) rather than
+    falling back to Everflow defaults.
+    """
+    enabled_val: bool | None = None
+    caps_out: dict[str, bool] = {}
+    in_caps = False
+    seen_caps = False
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        leading_ws = raw_line[: len(raw_line) - len(raw_line.lstrip(" \t"))]
+        if "\t" in leading_ws:
+            raise ValueError("Tab indentation in YAML requires PyYAML")
+        indent = len(leading_ws)
+        if indent == 0:
+            in_caps = False
+            if stripped in ("---", "..."):
+                continue
+            if stripped.startswith(("{", "[", "?", "<<:", "&", "*", "!")):
+                raise ValueError(f"Unsupported top-level YAML construct without PyYAML: {stripped!r}")
+            if ":" not in stripped:
+                continue
+            raw_k, raw_rest = stripped.split(":", 1)
+            key_clean = raw_k.strip()
+            if len(key_clean) >= 2 and key_clean[0] == key_clean[-1] and key_clean[0] in ("'", '"'):
+                key_clean = key_clean[1:-1].strip()
+            key_lower = key_clean.lower()
+            if key_lower == "enabled":
+                enabled_val = _parse_yaml_strict_bool(raw_rest)
+            elif key_lower == "capabilities":
+                if seen_caps:
+                    raise ValueError("Duplicate capabilities key in YAML requires PyYAML")
+                seen_caps = True
+                rest_clean = _strip_yaml_inline_comment(raw_rest)
+                if not rest_clean:
+                    in_caps = True
+                elif rest_clean.lower() in ("null", "~"):
+                    in_caps = False
+                elif rest_clean.startswith("{"):
+                    caps_out.update(_parse_yaml_flow_capabilities(rest_clean))
+                    in_caps = False
+                else:
+                    raise ValueError(
+                        f"Unsupported capabilities value without PyYAML: {raw_rest!r}"
+                    )
+        elif in_caps:
+            line_clean = _strip_yaml_inline_comment(stripped)
+            if not line_clean:
+                continue
+            if ":" not in line_clean or line_clean.startswith(("-", "<<:", "&", "*", "!", "{", "[")):
+                raise ValueError(
+                    f"Unsupported capabilities block entry without PyYAML: {stripped!r}"
+                )
+            raw_k, raw_v = line_clean.split(":", 1)
+            caps_out[_unquote_yaml_simple_key(raw_k)] = _parse_yaml_strict_bool(raw_v)
+    return enabled_val, caps_out
+
+
 def _read_yaml_top_and_capabilities(path: Path) -> tuple[bool | None, dict[str, bool]]:
     """Read optional top-level `enabled:` and `capabilities:` booleans without importing src.config."""
     if not path.is_file():
@@ -79,44 +201,28 @@ def _read_yaml_top_and_capabilities(path: Path) -> tuple[bool | None, dict[str, 
     text = path.read_text(encoding="utf-8")
     try:
         import yaml  # type: ignore[import-untyped]
-
-        data = yaml.safe_load(text)
-        if not isinstance(data, dict):
-            return None, {}
-        enabled = data.get("enabled") if isinstance(data.get("enabled"), bool) else None
-        caps_raw = data.get("capabilities")
-        caps: dict[str, bool] = {}
-        if isinstance(caps_raw, dict):
-            for k, v in caps_raw.items():
-                if isinstance(k, str) and isinstance(v, bool):
-                    caps[k.strip().lower()] = v
-        return enabled, caps
     except ImportError:
-        pass
-    enabled_val: bool | None = None
-    caps_out: dict[str, bool] = {}
-    in_caps = False
-    for raw_line in text.splitlines():
-        stripped = raw_line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        indent = len(raw_line) - len(raw_line.lstrip(" "))
-        if indent == 0:
-            in_caps = stripped == "capabilities:"
-            if stripped.startswith("enabled:"):
-                raw_v = stripped.split(":", 1)[1].split("#", 1)[0].strip().lower()
-                if raw_v == "true":
-                    enabled_val = True
-                elif raw_v == "false":
-                    enabled_val = False
-        elif in_caps and indent >= 2 and ":" in stripped:
-            k, v = stripped.split(":", 1)
-            v_norm = v.split("#", 1)[0].strip().lower()
-            if v_norm == "true":
-                caps_out[k.strip().lower()] = True
-            elif v_norm == "false":
-                caps_out[k.strip().lower()] = False
-    return enabled_val, caps_out
+        return _read_yaml_top_and_capabilities_fallback(text)
+
+    data = yaml.safe_load(text)
+    if data is None:
+        return None, {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected YAML mapping in {path}")
+    raw_enabled = data.get("enabled")
+    if raw_enabled is not None and not isinstance(raw_enabled, bool):
+        raise ValueError(f"Invalid non-boolean 'enabled' in {path}")
+    enabled = raw_enabled if isinstance(raw_enabled, bool) else None
+    caps_raw = data.get("capabilities")
+    if caps_raw is not None and not isinstance(caps_raw, dict):
+        raise ValueError(f"Invalid non-mapping 'capabilities' in {path}")
+    caps: dict[str, bool] = {}
+    if isinstance(caps_raw, dict):
+        for k, v in caps_raw.items():
+            if not isinstance(k, str) or not isinstance(v, bool):
+                raise ValueError(f"Invalid capability entry {k!r}={v!r} in {path}")
+            caps[k.strip().lower()] = v
+    return enabled, caps
 
 
 def _resolve_host_direct_library_sources() -> list[str]:
