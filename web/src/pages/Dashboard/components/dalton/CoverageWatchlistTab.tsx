@@ -11,7 +11,7 @@ import { AlertTriangle, ArrowRight, BookmarkPlus } from 'lucide-react';
 import { AnimatePresence, motion } from '@/lib/framer';
 import { TWEEN } from '@/lib/motion';
 import { TickerLabel } from '@/components/TickerLogo';
-import { ContextMenuGroup, ContextMenuItem } from '@/components/ui/context-menu';
+import { ContextMenuGroup, ContextMenuItem, ContextMenuSeparator } from '@/components/ui/context-menu';
 import { useToast } from '@/components/ui/use-toast';
 import { apiErrorDetailMessage, apiErrorStatus } from '@/api/errors';
 import { isDaltonBuild } from '@/config/brand';
@@ -447,8 +447,9 @@ export function CoverageWatchlistTabPanel({
 }
 
 interface PendingTierChange {
+  action: 'add' | 'set_tier';
   symbol: string;
-  currentTier: WatchlistTier;
+  currentTier: WatchlistTier | null;
   nextTier: WatchlistTier;
   preview: WatchlistPreviewResponse;
 }
@@ -512,7 +513,13 @@ export function useQuickAddToCoverage(coverage: UseCoverageWatchlistDataResult) 
             });
             return;
           }
-          setPendingTierChange({ symbol, currentTier: existing.tier, nextTier: tier, preview });
+          setPendingTierChange({
+            action: 'set_tier',
+            symbol,
+            currentTier: existing.tier,
+            nextTier: tier,
+            preview,
+          });
         } catch (err) {
           toast({
             variant: 'destructive',
@@ -523,11 +530,20 @@ export function useQuickAddToCoverage(coverage: UseCoverageWatchlistDataResult) 
       }
 
       try {
-        await mutateWatchlist({
+        const res = await mutateWatchlist({
           action: 'add',
           tickers: [symbol],
           tier,
         });
+        const addedCount = res?.added_tickers?.length ?? res?.added?.length ?? 0;
+        if (!res?.ok || addedCount === 0) {
+          const notFound = res?.not_found?.length ? ` (${res.not_found.join(', ')})` : '';
+          toast({
+            variant: 'destructive',
+            title: `${t('dashboard:widgets.portfolioWatchlist.quickAddFailed')}${notFound}`,
+          });
+          return;
+        }
         if (queryClient) {
           await queryClient.invalidateQueries({ queryKey: queryKeys.dalton.watchlist() });
         }
@@ -540,19 +556,53 @@ export function useQuickAddToCoverage(coverage: UseCoverageWatchlistDataResult) 
         });
       } catch (err) {
         if (apiErrorStatus(err) === 409) {
-          // Ticker may already exist on server; fall back to preview + confirm
+          // Preview with the original `add` action first so paused-task workspaces are NOT dropped.
+          // Only switch to `set_tier` if the server confirms the ticker is already in the roster.
           try {
-            const preview = await previewWatchlistMutation({
-              action: 'set_tier',
+            const addPreview = await previewWatchlistMutation({
+              action: 'add',
               tickers: [symbol],
               tier,
             });
-            if (preview.ok && preview.snapshot_id) {
+            const oldTier = addPreview.affected_tickers?.[0]?.old_tier as WatchlistTier | null | undefined;
+            if (oldTier) {
+              if (oldTier === tier) {
+                if (queryClient) {
+                  await queryClient.invalidateQueries({ queryKey: queryKeys.dalton.watchlist() });
+                }
+                coverage.refetch?.();
+                toast({
+                  title: t('dashboard:widgets.portfolioWatchlist.alreadyInCoverage', {
+                    symbol,
+                    tier: tierLabel,
+                  }),
+                });
+                return;
+              }
+              const setTierPreview = await previewWatchlistMutation({
+                action: 'set_tier',
+                tickers: [symbol],
+                tier,
+              });
+              if (setTierPreview.ok && setTierPreview.snapshot_id) {
+                setModalError(null);
+                setPendingTierChange({
+                  action: 'set_tier',
+                  symbol,
+                  currentTier: oldTier,
+                  nextTier: tier,
+                  preview: setTierPreview,
+                });
+                return;
+              }
+            } else if (addPreview.ok && addPreview.snapshot_id) {
+              setModalError(null);
               setPendingTierChange({
+                action: 'add',
                 symbol,
-                currentTier: (preview.affected_tickers?.[0]?.old_tier as WatchlistTier) || 'watch',
+                currentTier: null,
                 nextTier: tier,
-                preview,
+                preview: addPreview,
               });
               return;
             }
@@ -566,7 +616,7 @@ export function useQuickAddToCoverage(coverage: UseCoverageWatchlistDataResult) 
         });
       }
     },
-    [existingByTicker, queryClient, t, toast],
+    [coverage, existingByTicker, queryClient, t, toast],
   );
 
   const handleConfirmTierChange = useCallback(async () => {
@@ -574,10 +624,19 @@ export function useQuickAddToCoverage(coverage: UseCoverageWatchlistDataResult) 
     setSubmitting(true);
     setModalError(null);
     try {
-      await mutateWatchlist({
-        action: 'set_tier',
+      const res = await mutateWatchlist({
+        action: pendingTierChange.action,
         snapshot_id: pendingTierChange.preview.snapshot_id,
       });
+      const affectedCount =
+        pendingTierChange.action === 'add'
+          ? (res?.added_tickers?.length ?? res?.added?.length ?? 0)
+          : (res?.updated?.length ?? 0);
+      if (!res?.ok || affectedCount === 0) {
+        const notFound = res?.not_found?.length ? ` (${res.not_found.join(', ')})` : '';
+        setModalError(`${t('dashboard:widgets.portfolioWatchlist.quickAddFailed')}${notFound}`);
+        return;
+      }
       if (queryClient) {
         await queryClient.invalidateQueries({ queryKey: queryKeys.dalton.watchlist() });
       }
@@ -600,26 +659,29 @@ export function useQuickAddToCoverage(coverage: UseCoverageWatchlistDataResult) 
     } finally {
       setSubmitting(false);
     }
-  }, [pendingTierChange, queryClient, t, toast]);
+  }, [coverage, pendingTierChange, queryClient, t, toast]);
 
   const renderMenuItems = useCallback(
-    (symbol: string): ReactNode => {
+    (symbol: string, withSeparator = false): ReactNode => {
       if (!isDaltonBuild || !symbol) return null;
       return (
-        <ContextMenuGroup>
-          {WATCHLIST_TIERS.map((tier) => (
-            <ContextMenuItem
-              key={tier}
-              data-testid={`quick-add-coverage-${symbol.toUpperCase()}-${tier}`}
-              onSelect={() => void handleAdd(symbol, tier)}
-            >
-              <BookmarkPlus className="h-3.5 w-3.5" />
-              {t('dashboard:widgets.portfolioWatchlist.addToCoverageTier', {
-                tier: t(TIER_I18N_KEY[tier]),
-              })}
-            </ContextMenuItem>
-          ))}
-        </ContextMenuGroup>
+        <>
+          <ContextMenuGroup>
+            {WATCHLIST_TIERS.map((tier) => (
+              <ContextMenuItem
+                key={tier}
+                data-testid={`quick-add-coverage-${symbol.toUpperCase()}-${tier}`}
+                onSelect={() => void handleAdd(symbol, tier)}
+              >
+                <BookmarkPlus className="h-3.5 w-3.5" />
+                {t('dashboard:widgets.portfolioWatchlist.addToCoverageTier', {
+                  tier: t(TIER_I18N_KEY[tier]),
+                })}
+              </ContextMenuItem>
+            ))}
+          </ContextMenuGroup>
+          {withSeparator && <ContextMenuSeparator />}
+        </>
       );
     },
     [handleAdd, t],
@@ -659,7 +721,9 @@ export function useQuickAddToCoverage(coverage: UseCoverageWatchlistDataResult) 
             {pendingTierChange.symbol}
           </span>
           <span style={{ color: 'var(--color-text-secondary)' }}>
-            {t(TIER_I18N_KEY[pendingTierChange.currentTier])} → {t(TIER_I18N_KEY[pendingTierChange.nextTier])}
+            {pendingTierChange.currentTier
+              ? `${t(TIER_I18N_KEY[pendingTierChange.currentTier])} → ${t(TIER_I18N_KEY[pendingTierChange.nextTier])}`
+              : `+ ${t(TIER_I18N_KEY[pendingTierChange.nextTier])}`}
           </span>
         </div>
         {modalError && (

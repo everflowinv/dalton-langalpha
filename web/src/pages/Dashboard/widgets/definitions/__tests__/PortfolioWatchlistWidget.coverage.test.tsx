@@ -9,12 +9,14 @@ import {
   useCoverageWatchlistData,
   type CoverageWatchlistRow,
 } from '../../../hooks/useCoverageWatchlistData';
+import type { mutateWatchlist, previewWatchlistMutation } from '@/lib/dalton/watchlist';
 import { PortfolioWatchlistConfigSchema } from '../../framework/configSchemas';
 
 const mocks = vi.hoisted(() => ({
   useQuotesCalls: [] as string[][],
-  mutateWatchlistMock: vi.fn(),
-  previewWatchlistMutationMock: vi.fn(),
+  mutateWatchlistMock: vi.fn<typeof mutateWatchlist>(),
+  previewWatchlistMutationMock: vi.fn<typeof previewWatchlistMutation>(),
+  toastMock: vi.fn(),
   personalSummary: {
     ok: true,
     core: [] as Array<{ ticker: string; name: string; tier: 'core'; is_private?: boolean; is_pinned?: boolean }>,
@@ -37,12 +39,17 @@ vi.mock('@/config/brand', () => ({
   faviconHref: () => '/logo-favicon.svg',
 }));
 
+vi.mock('@/components/ui/use-toast', () => ({
+  useToast: () => ({ toast: mocks.toastMock }),
+}));
+
 vi.mock('@/lib/dalton/watchlist', async (importActual) => {
   const actual = await importActual<typeof import('@/lib/dalton/watchlist')>();
   return {
     ...actual,
-    mutateWatchlist: (...args: unknown[]) => mocks.mutateWatchlistMock(...args),
-    previewWatchlistMutation: (...args: unknown[]) => mocks.previewWatchlistMutationMock(...args),
+    mutateWatchlist: (...args: Parameters<typeof mutateWatchlist>) => mocks.mutateWatchlistMock(...args),
+    previewWatchlistMutation: (...args: Parameters<typeof previewWatchlistMutation>) =>
+      mocks.previewWatchlistMutationMock(...args),
     usePersonalWatchlist: () => ({
       data: mocks.personalSummary,
       isLoading: false,
@@ -344,5 +351,99 @@ describe('Dashboard PortfolioWatchlistWidget coverage tab & 50-quote cap', () =>
     });
     expect(onPortfolioDelete).not.toHaveBeenCalled();
     expect(onPortfolioEdit).not.toHaveBeenCalled();
+  });
+
+  it('b2-r2: 409 on quick-add previews & commits as `add` for non-roster ticker, uses `set_tier` only if already in roster, and does not toast success on ok:false', async () => {
+    mocks.toastMock.mockReset();
+    mocks.mutateWatchlistMock.mockReset();
+    mocks.previewWatchlistMutationMock.mockReset();
+
+    mocks.dashboardCtx = {
+      ...mocks.dashboardCtx,
+      watchlist: {
+        rows: [
+          {
+            watchlist_item_id: 'wl-1',
+            symbol: 'READD',
+            price: 100,
+            change: 1,
+            changePercent: 1.0,
+            currency: 'USD',
+            quoteAvailable: true,
+          },
+          {
+            watchlist_item_id: 'wl-2',
+            symbol: 'BADSYM',
+            price: 10,
+            change: 0,
+            changePercent: 0,
+            currency: 'USD',
+            quoteAvailable: true,
+          },
+        ],
+        loading: false,
+        loaded: true,
+      },
+      watchlistHandlers: { onAdd: vi.fn(), onDelete: vi.fn() },
+    };
+
+    // Case 1: Re-adding a previously removed ticker with paused workspace tasks -> 409 -> previews as `add` (old_tier=null) and commits as `add`!
+    const err409 = Object.assign(new Error('409'), { response: { status: 409 } });
+    mocks.mutateWatchlistMock
+      .mockRejectedValueOnce(err409)
+      .mockResolvedValueOnce({ ok: true, added_tickers: ['READD'] });
+    mocks.previewWatchlistMutationMock.mockResolvedValueOnce({
+      ok: true,
+      action: 'watchlist_set_tier',
+      raw_action: 'add',
+      snapshot_id: 'snap-add-readd',
+      requires_confirmation: true,
+      target_tickers: ['READD'],
+      target_tier: 'core',
+      affected_tickers: [{ ticker: 'READD', name: 'Readd Corp', old_tier: null, new_tier: 'core' }],
+      affected_workspaces: [],
+      task_summary: { resume_count: 1 },
+      card_title: '确认加入 READD',
+      card_description: '将恢复已暂停的任务',
+    });
+
+    renderWidget({ defaultTab: 'watchlist', valuesHidden: false });
+    fireEvent.contextMenu(screen.getByText('READD'));
+    fireEvent.click(await screen.findByTestId('quick-add-coverage-READD-core'));
+
+    // Preview was called with original action 'add' (NOT 'set_tier')!
+    await waitFor(() => {
+      expect(mocks.previewWatchlistMutationMock).toHaveBeenCalledWith({
+        action: 'add',
+        tickers: ['READD'],
+        tier: 'core',
+      });
+    });
+
+    // Confirm modal commits with action: 'add' + snapshot_id
+    const confirmBtn = await screen.findByRole('button', { name: /完成|Done/i });
+    fireEvent.click(confirmBtn);
+    await waitFor(() => {
+      expect(mocks.mutateWatchlistMock).toHaveBeenLastCalledWith({
+        action: 'add',
+        snapshot_id: 'snap-add-readd',
+      });
+    });
+
+    // Case 2: HTTP 200 with ok:false & empty added_tickers -> destructive toast, NOT success!
+    mocks.toastMock.mockReset();
+    mocks.mutateWatchlistMock.mockResolvedValueOnce({
+      ok: false,
+      added: [],
+      added_tickers: [],
+      not_found: ['BADSYM'],
+    });
+    fireEvent.contextMenu(screen.getByText('BADSYM'));
+    fireEvent.click(await screen.findByTestId('quick-add-coverage-BADSYM-watch'));
+    await waitFor(() => {
+      expect(mocks.toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ variant: 'destructive' }),
+      );
+    });
   });
 });

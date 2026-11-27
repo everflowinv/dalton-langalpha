@@ -281,7 +281,7 @@ function PortfolioWatchlistWidget({
                         item={row}
                         marketStatus={dashboard.marketStatus}
                         onDelete={watchlistHandlers.onDelete}
-                        extraMenuItems={quickAddCoverage.renderMenuItems(row.symbol)} // DALTON-HOOK(watchlist)
+                        extraMenuItems={quickAddCoverage.renderMenuItems(row.symbol, Boolean(row.watchlist_item_id))} // DALTON-HOOK(watchlist)
                         attach={
                           <RowAttachButton
                             instanceId={instance.id}
@@ -317,7 +317,7 @@ function PortfolioWatchlistWidget({
                         valuesHidden={valuesHidden}
                         onEdit={portfolioHandlers.onEdit}
                         onDelete={portfolioHandlers.onDelete}
-                        extraMenuItems={quickAddCoverage.renderMenuItems(row.symbol)} // DALTON-HOOK(watchlist)
+                        extraMenuItems={quickAddCoverage.renderMenuItems(row.symbol, Boolean(row.user_portfolio_id))} // DALTON-HOOK(watchlist)
                         attach={
                           <RowAttachButton
                             instanceId={instance.id}

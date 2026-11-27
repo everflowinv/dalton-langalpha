@@ -34,6 +34,7 @@ import { WatchlistAddModal } from './WatchlistAddModal';
 import { WatchlistFullTable, type WatchlistSortField } from './WatchlistFullTable';
 
 const STORAGE_COLS_KEY = 'dalton:watchlist:visibleColumns:v2';
+const LEGACY_STORAGE_COLS_KEY = 'dalton:watchlist:visibleColumns:v1';
 const SESSION_FILTER_KEY = 'dalton:watchlist:tierFilter:v1';
 const SESSION_VIEW_STATE_KEY = 'dalton:watchlist:viewState:v1';
 
@@ -69,13 +70,32 @@ interface PendingConfirmAction {
 
 function loadSavedColumns(): WatchlistColumnKey[] {
   try {
-    const raw = localStorage.getItem(STORAGE_COLS_KEY);
-    if (!raw) return [...DEFAULT_WATCHLIST_COLUMNS];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [...DEFAULT_WATCHLIST_COLUMNS];
     const allowed = new Set<string>(BATCH1_WATCHLIST_COLUMNS);
-    const valid = parsed.filter((k): k is WatchlistColumnKey => typeof k === 'string' && allowed.has(k));
-    return valid.length > 0 ? valid : [...DEFAULT_WATCHLIST_COLUMNS];
+    const parseColumns = (raw: string | null): WatchlistColumnKey[] | null => {
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return null;
+      const valid = parsed.filter(
+        (k): k is WatchlistColumnKey => typeof k === 'string' && allowed.has(k),
+      );
+      return valid.length > 0 ? valid : null;
+    };
+
+    const current = parseColumns(localStorage.getItem(STORAGE_COLS_KEY));
+    if (current) return current;
+
+    // Migrate Batch-1 users' saved column preferences from v1 to v2 without losing selections
+    const legacy = parseColumns(localStorage.getItem(LEGACY_STORAGE_COLS_KEY));
+    if (legacy) {
+      try {
+        localStorage.setItem(STORAGE_COLS_KEY, JSON.stringify(legacy));
+      } catch {
+        // ignore storage write errors
+      }
+      return legacy;
+    }
+
+    return [...DEFAULT_WATCHLIST_COLUMNS];
   } catch {
     return [...DEFAULT_WATCHLIST_COLUMNS];
   }

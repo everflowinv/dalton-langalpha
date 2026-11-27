@@ -611,17 +611,55 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
     };
 
     try {
-      const { container } = renderAt(['/market']);
+      renderAt(['/market']);
       await waitFor(() => expect(screen.getByTestId('watchlist-row-NVDA')).toBeTruthy());
 
-      // Valuation cells render ok, loss (NM), unit_unverified, stale, rate_limited, no_coverage, unlisted
-      expect(screen.getByTestId('watchlist-row-NVDA').textContent).toContain('30.0x');
-      expect(screen.getByTestId('watchlist-row-NVDA').textContent).toContain('24.5x');
-      expect(screen.getByTestId('watchlist-row-LOSS').textContent).toContain('NM');
-      expect(container.querySelector('[data-valuation-status="unit_unverified"]')).toBeTruthy();
-      expect(container.querySelector('[data-valuation-status="stale"]')).toBeTruthy();
-      expect(container.querySelector('[data-valuation-status="rate_limited"]')).toBeTruthy();
-      expect(container.querySelector('[data-valuation-status="no_coverage"]')).toBeTruthy();
+      // Assert EVERY ONE of the 7 valuation states on its actual rendered table cell:
+      // 1. ok
+      const nvdaRow = screen.getByTestId('watchlist-row-NVDA');
+      const okCells = nvdaRow.querySelectorAll('[data-valuation-status="ok"]');
+      expect(okCells.length).toBeGreaterThanOrEqual(2);
+      expect(okCells[0].textContent).toContain('30.0x');
+      expect(okCells[1].textContent).toContain('24.5x');
+
+      // 2. loss (NM)
+      const lossCell = screen.getByTestId('watchlist-row-LOSS').querySelector('[data-valuation-status="loss"]');
+      expect(lossCell).toBeTruthy();
+      expect(lossCell?.textContent).toBe('NM');
+
+      // 3. unit_unverified
+      const unverifiedCell = screen
+        .getByTestId('watchlist-row-XYZADR')
+        .querySelector('[data-valuation-status="unit_unverified"]');
+      expect(unverifiedCell).toBeTruthy();
+      expect(unverifiedCell?.textContent).toBe('—');
+
+      // 4. stale
+      const staleCell = screen
+        .getByTestId('watchlist-row-STALECO')
+        .querySelector('[data-valuation-status="stale"]');
+      expect(staleCell).toBeTruthy();
+      expect(staleCell?.textContent).toContain('18.2x');
+
+      // 5. rate_limited
+      const rateLimitedCell = screen
+        .getByTestId('watchlist-row-LIMIT429')
+        .querySelector('[data-valuation-status="rate_limited"]');
+      expect(rateLimitedCell).toBeTruthy();
+
+      // 6. no_coverage
+      const noCovCell = screen
+        .getByTestId('watchlist-row-NOCOV')
+        .querySelector('[data-valuation-status="no_coverage"]');
+      expect(noCovCell).toBeTruthy();
+      expect(noCovCell?.textContent).toBe('—');
+
+      // 7. unlisted (real is_private row reaches valuation unlisted branch!)
+      const unlistedCells = screen
+        .getByTestId('watchlist-row-SPCX')
+        .querySelectorAll('[data-valuation-status="unlisted"]');
+      expect(unlistedCells.length).toBeGreaterThanOrEqual(2);
+      expect(unlistedCells[0].textContent).toMatch(/未上市|Unlisted/);
 
       // Click Tier Policies shortcut -> navigates to /settings?tab=coverage#dalton-tier-policies
       fireEvent.click(screen.getByTestId('watchlist-tier-policies-link'));
@@ -633,6 +671,29 @@ describe('MarketView personal watchlist route & deep-link navigation', () => {
     } finally {
       (mocks as unknown as Record<string, unknown>).watchlistSummary = prevSummary;
       (mocks as unknown as Record<string, unknown>).watchlistMetrics = prevMetrics;
+    }
+  });
+
+  it('b2: migrates saved Batch-1 v1 column preferences into v2 without losing user selections', async () => {
+    localStorage.removeItem('dalton:watchlist:visibleColumns:v2');
+    localStorage.setItem(
+      'dalton:watchlist:visibleColumns:v1',
+      JSON.stringify(['tier', 'price', 'rsi_14d', 'market_cap']),
+    );
+    try {
+      renderAt(['/market']);
+      await waitFor(() => expect(screen.getByTestId('watchlist-row-NVDA')).toBeTruthy());
+      const migrated = JSON.parse(
+        localStorage.getItem('dalton:watchlist:visibleColumns:v2') || '[]',
+      );
+      expect(migrated).toEqual(['tier', 'price', 'rsi_14d', 'market_cap']);
+      // Batch-1 selected columns stay rendered (e.g. market_cap header is present, while unselected chg_3m is omitted)
+      const headerRow = screen.getByRole('table').querySelector('thead');
+      expect(headerRow?.textContent).toMatch(/市值|Mkt Cap|Market Cap/);
+      expect(headerRow?.textContent).not.toContain('3M');
+    } finally {
+      localStorage.removeItem('dalton:watchlist:visibleColumns:v1');
+      localStorage.removeItem('dalton:watchlist:visibleColumns:v2');
     }
   });
 });

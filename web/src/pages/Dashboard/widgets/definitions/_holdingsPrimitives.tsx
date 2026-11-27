@@ -16,7 +16,6 @@ import {
   ContextMenuTrigger,
   ContextMenuContent,
   ContextMenuItem,
-  ContextMenuSeparator, // DALTON-HOOK(watchlist)
 } from '@/components/ui/context-menu';
 import { TermChange, TermKV } from '@/pages/ChatAgent/components/charts/TermCard';
 import type { WatchlistRow } from '../../hooks/useWatchlistData';
@@ -151,24 +150,22 @@ export function WatchlistRowItem({ item, marketStatus, onDelete, attach, extraMe
     </motion.tr>
   );
 
-  // DALTON-HOOK(watchlist): allow extra context-menu items (e.g. one-click add to personal watchlist)
-  if (hasId || extraMenuItems) {
+  if (hasId) {
     return (
       <ContextMenu>
         <ContextMenuTrigger asChild>{row}</ContextMenuTrigger>
         <ContextMenuContent>
-          {extraMenuItems}
-          {extraMenuItems && hasId && <ContextMenuSeparator />}
-          {hasId && (
-            <ContextMenuItem variant="destructive" onSelect={() => onDelete?.(String(item.watchlist_item_id))}>
-              <Trash2 className="h-3.5 w-3.5" />
-              {t('dashboard:widgets.holdings.delete')}
-            </ContextMenuItem>
-          )}
+          {extraMenuItems /* DALTON-HOOK(watchlist) */}
+          <ContextMenuItem variant="destructive" onSelect={() => onDelete?.(String(item.watchlist_item_id))}>
+            <Trash2 className="h-3.5 w-3.5" />
+            {t('dashboard:widgets.holdings.delete')}
+          </ContextMenuItem>
         </ContextMenuContent>
       </ContextMenu>
     );
   }
+  // DALTON-HOOK(watchlist): allow extra context-menu items on rows without an id
+  if (extraMenuItems) return <ContextMenu><ContextMenuTrigger asChild>{row}</ContextMenuTrigger><ContextMenuContent>{extraMenuItems}</ContextMenuContent></ContextMenu>;
   return row;
 }
 
@@ -262,30 +259,26 @@ export function PortfolioRowItem({
     </motion.tr>
   );
 
-  // DALTON-HOOK(watchlist): allow extra context-menu items on portfolio rows
-  if (hasId || extraMenuItems) {
+  if (hasId) {
     return (
       <ContextMenu>
         <ContextMenuTrigger asChild>{row}</ContextMenuTrigger>
         <ContextMenuContent>
-          {extraMenuItems}
-          {extraMenuItems && hasId && <ContextMenuSeparator />}
-          {hasId && (
-            <>
-              <ContextMenuItem onSelect={() => onEdit?.(item)}>
-                <Pencil className="h-3.5 w-3.5" />
-                {t('dashboard:widgets.holdings.edit')}
-              </ContextMenuItem>
-              <ContextMenuItem variant="destructive" onSelect={() => onDelete?.(String(item.user_portfolio_id))}>
-                <Trash2 className="h-3.5 w-3.5" />
-                {t('dashboard:widgets.holdings.delete')}
-              </ContextMenuItem>
-            </>
-          )}
+          {extraMenuItems /* DALTON-HOOK(watchlist) */}
+          <ContextMenuItem onSelect={() => onEdit?.(item)}>
+            <Pencil className="h-3.5 w-3.5" />
+            {t('dashboard:widgets.holdings.edit')}
+          </ContextMenuItem>
+          <ContextMenuItem variant="destructive" onSelect={() => onDelete?.(String(item.user_portfolio_id))}>
+            <Trash2 className="h-3.5 w-3.5" />
+            {t('dashboard:widgets.holdings.delete')}
+          </ContextMenuItem>
         </ContextMenuContent>
       </ContextMenu>
     );
   }
+  // DALTON-HOOK(watchlist): allow extra context-menu items on rows without an id
+  if (extraMenuItems) return <ContextMenu><ContextMenuTrigger asChild>{row}</ContextMenuTrigger><ContextMenuContent>{extraMenuItems}</ContextMenuContent></ContextMenu>;
   return row;
 }
 

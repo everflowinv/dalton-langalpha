@@ -121,6 +121,7 @@ async def test_metrics_service_skips_private_and_enriches_earnings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     metrics_mod._clear_metrics_cache_for_tests()
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
     monkeypatch.setattr(
         consensus_mod,
         "_fetch_yfinance_consensus_sync",
@@ -211,6 +212,7 @@ async def test_r4_metrics_no_empty_bar_cache_progressive_warmup_and_watchlist_co
     """r2 Codex P1/P2: empty bars are never cached; progressive non-blocking return warms bars in background;
     WatchlistContext validates in AdditionalContext and is stripped on shared workspaces AND shared threads."""
     metrics_mod._clear_metrics_cache_for_tests()
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
     monkeypatch.setattr(
         consensus_mod,
         "_fetch_yfinance_consensus_sync",

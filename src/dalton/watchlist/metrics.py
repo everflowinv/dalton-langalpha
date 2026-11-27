@@ -617,10 +617,11 @@ class WatchlistMetricsService:
                     )
                     if needs_val_warmup:
                         pending_valuation_symbols.append(sym)
-                        last_fy_end = (
-                            str(extra_earn.get("last_fiscal_year_end") or "").strip()[:10] or None
+                        self._consensus.schedule_warmup(
+                            sym,
+                            quote_currency=metric.get("currency"),
+                            coverage_row=row,
                         )
-                        self._consensus.schedule_warmup(sym, last_reported_fy_end=last_fy_end)
 
             status = (
                 "ok"

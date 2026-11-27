@@ -1208,46 +1208,140 @@ async def test_r7_reconciler_fallback_query_savepoint_commits_pause_real_pg(
 async def test_tier_policy_upsert_reset_monotonic_version_and_scope_changed_real_db(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Real-PG Batch-2 test: upsert/reset bumps policy_version monotonically (1->2->3) and rejects stale snapshots."""
-    async with _isolated_db() as iso_dsn:
+    """Real-PG Batch-2 test: direct upsert/reset + full preview->confirm write path against real PostgreSQL."""
+    from src.dalton.database import coverage as coverage_db
+    from src.dalton.watchlist import policies as policies_mod
+    from src.dalton.watchlist import reconciler as reconciler_mod
+    from src.dalton.watchlist import service as service_mod
 
-        @asynccontextmanager
-        async def _connect_iso(conn: Any = None) -> Any:
-            if conn is not None:
-                yield conn
-                return
-            async with await psycopg.AsyncConnection.connect(iso_dsn) as aconn:
-                yield aconn
+    with _isolated_pg_database(PG_DSN) as iso_dsn:
+        env = _alembic_env_for_dsn(iso_dsn)
+        _run_alembic(["upgrade", "head"], env=env, dalton=False)
+        _run_alembic(["upgrade", "head"], env=env, dalton=True)
 
-        monkeypatch.setattr(policies_mod, "get_db_connection", _connect_iso)
-        monkeypatch.setattr(coverage_db, "get_db_connection", _connect_iso)
+        async with _isolated_pool(iso_dsn, max_size=4) as _pool:
+            uid = f"u-pol-{uuid.uuid4().hex[:8]}"
+            default_core = await policies_mod.get_user_tier_policy(uid, "core")
+            assert default_core.policy_version == 1
+            assert default_core.watch_cron == policies_mod.WATCH_CRON_CORE_DEFAULT
 
-        uid = f"u-pol-{uuid.uuid4().hex[:8]}"
-        default_core = await policies_mod.get_user_tier_policy(uid, "core")
-        assert default_core.policy_version == 1
-        assert default_core.watch_cron == policies_mod.WATCH_CRON_CORE_DEFAULT
+            # 1. Direct upsert bumps policy_version 1 -> 2 using mutable patch fields only
+            updated = await policies_mod.upsert_tier_policy(
+                uid,
+                "core",
+                policy={
+                    **default_core.to_patch_dict(),
+                    "watch_cron": "0 6-20 * * 1-5",
+                    "move_threshold_pct": 6.0,
+                },
+            )
+            assert updated.policy_version == 2
+            assert updated.watch_cron == "0 6-20 * * 1-5"
+            assert updated.move_threshold_pct == 6.0
 
-        # First custom upsert bumps policy_version 1 -> 2
-        updated = await policies_mod.upsert_tier_policy(
-            uid,
-            "core",
-            policy={
-                **default_core.to_dict(),
-                "watch_cron": "0 6-20 * * 1-5",
-                "move_threshold_pct": 6.0,
-            },
-        )
-        assert updated.policy_version == 2
-        assert updated.watch_cron == "0 6-20 * * 1-5"
-        assert updated.move_threshold_pct == 6.0
+            # 2. Reset writes default values while bumping policy_version 2 -> 3 (never regresses!)
+            reset_pol = await policies_mod.reset_tier_policy_row(uid, "core")
+            assert reset_pol.policy_version == 3
+            assert reset_pol.watch_cron == policies_mod.WATCH_CRON_CORE_DEFAULT
+            assert reset_pol.move_threshold_pct == 4.0
 
-        # Reset writes default values while bumping policy_version 2 -> 3 (never regresses!)
-        reset_pol = await policies_mod.reset_tier_policy_row(uid, "core")
-        assert reset_pol.policy_version == 3
-        assert reset_pol.watch_cron == policies_mod.WATCH_CRON_CORE_DEFAULT
-        assert reset_pol.move_threshold_pct == 4.0
+            reloaded = await policies_mod.get_user_tier_policy(uid, "core")
+            assert reloaded.policy_version == 3
+            assert reloaded.watch_cron == policies_mod.WATCH_CRON_CORE_DEFAULT
 
-        # Re-read from Postgres confirms persisted v3
-        reloaded = await policies_mod.get_user_tier_policy(uid, "core")
-        assert reloaded.policy_version == 3
-        assert reloaded.watch_cron == policies_mod.WATCH_CRON_CORE_DEFAULT
+            # 3. Full confirmation path against real PostgreSQL (NO mock on upsert_tier_policy or snapshots!)
+            monkeypatch.setattr(
+                service_mod,
+                "_user_workspace_tickers",
+                create_autospec(service_mod._user_workspace_tickers, return_value={}),
+            )
+            monkeypatch.setattr(
+                service_mod,
+                "list_all_user_automations",
+                create_autospec(service_mod.list_all_user_automations, return_value=[]),
+            )
+            monkeypatch.setattr(
+                service_mod,
+                "ensure_user_earnings_calendar_automation",
+                create_autospec(
+                    service_mod.ensure_user_earnings_calendar_automation,
+                    return_value={"action": "exists"},
+                ),
+            )
+            fake_reconciler = create_autospec(reconciler_mod.TierPolicyReconciler, instance=True)
+            fake_reconciler.reconcile_job.return_value = {
+                "status": "completed",
+                "yaml_synced": True,
+                "failed_items": [],
+            }
+            svc = service_mod.WatchlistMutationService(reconciler=fake_reconciler)
+
+            # Seed one core row so roster hash & target_tickers exercise real coverage rows
+            async with coverage_db.get_db_connection() as conn, conn.transaction():
+                await coverage_db.upsert_coverage_rows(
+                    uid,
+                    [
+                        {
+                            "ticker": "NVDA",
+                            "name": "NVIDIA",
+                            "tier": "core",
+                            "market": "US",
+                            "source": "ui",
+                            "is_private": False,
+                        }
+                    ],
+                    conn=conn,
+                )
+
+            preview = await svc.preview_mutation(
+                uid,
+                action="set_tier_policy",
+                tier="core",
+                policy={"watch_cron": "0 6-20 * * 1-5", "move_threshold_pct": 8.0},
+            )
+            assert preview["ok"] is True
+            assert preview["snapshot_id"] is not None
+            assert preview["expected_policy_version"] == 3
+
+            commit_res = await svc.execute_mutation(
+                uid,
+                action="set_tier_policy",
+                tier="core",
+                snapshot_id=preview["snapshot_id"],
+                expected_policy_version=preview["expected_policy_version"],
+                expected_roster_hash=preview["expected_roster_hash"],
+            )
+            assert commit_res["ok"] is True
+            assert commit_res["policy"]["policy_version"] == 4
+            assert commit_res["policy"]["watch_cron"] == "0 6-20 * * 1-5"
+            assert commit_res["policy"]["move_threshold_pct"] == 8.0
+
+            persisted = await policies_mod.get_user_tier_policy(uid, "core")
+            assert persisted.policy_version == 4
+            assert persisted.move_threshold_pct == 8.0
+
+            # Reusing the consumed snapshot must fail with WatchlistScopeChangedError and leave DB unchanged
+            with pytest.raises(service_mod.WatchlistScopeChangedError):
+                await svc.execute_mutation(
+                    uid,
+                    action="set_tier_policy",
+                    tier="core",
+                    snapshot_id=preview["snapshot_id"],
+                )
+
+            # Confirm-path reset_tier_policy bumps version 4 -> 5 via real upsert_tier_policy
+            reset_preview = await svc.preview_mutation(uid, action="reset_tier_policy", tier="core")
+            assert reset_preview["ok"] is True
+            assert reset_preview["snapshot_id"] is not None
+            reset_commit = await svc.execute_mutation(
+                uid,
+                action="reset_tier_policy",
+                tier="core",
+                snapshot_id=reset_preview["snapshot_id"],
+                expected_policy_version=reset_preview["expected_policy_version"],
+                expected_roster_hash=reset_preview["expected_roster_hash"],
+            )
+            assert reset_commit["ok"] is True
+            assert reset_commit["policy"]["policy_version"] == 5
+            assert reset_commit["policy"]["watch_cron"] == policies_mod.WATCH_CRON_CORE_DEFAULT
+            assert reset_commit["policy"]["move_threshold_pct"] == 4.0

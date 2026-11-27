@@ -36,6 +36,7 @@ from src.dalton.watchlist.policies import (
     bump_user_roster_revision,
     consume_confirm_snapshot,
     diff_tier_policies,
+    extract_tier_policy_patch,
     get_confirm_snapshot,
     get_default_tier_policy,
     get_user_roster_state,
@@ -853,7 +854,14 @@ class WatchlistMutationService:
                 "prevalidated": prevalidated if act in ("add", "add_group") else None,
                 "resolve_membership_delta": resolve_membership_delta if act == "resolve_group" else None,
                 "proposed_policy": (
-                    proposed_tier_policy.to_dict() if proposed_tier_policy is not None else None
+                    proposed_tier_policy.to_patch_dict()
+                    if proposed_tier_policy is not None
+                    else None
+                ),
+                "proposed_policy_snapshot": (
+                    proposed_tier_policy.to_dict()
+                    if proposed_tier_policy is not None
+                    else None
                 ),
                 "policy_diff": policy_diff,
             }
@@ -1707,10 +1715,11 @@ class WatchlistMutationService:
             elif act in ("set_tier_policy", "reset_tier_policy"):
                 assert eff_tier is not None and eff_proposed_policy is not None
                 before_pol = live_policies.get(eff_tier, get_default_tier_policy(eff_tier))
+                policy_patch = extract_tier_policy_patch(eff_proposed_policy)
                 updated_pol = await upsert_tier_policy(
                     uid,
                     eff_tier,
-                    policy=eff_proposed_policy,
+                    policy=policy_patch,
                     conn=conn,
                 )
                 target_versions[eff_tier] = updated_pol.policy_version

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import math
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, TypedDict
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
@@ -64,6 +66,34 @@ TIER_POLICY_MUTABLE_FIELDS: tuple[str, ...] = (
 )
 
 
+class TierPolicyPatch(TypedDict, total=False):
+    """Mutable fields accepted by ``validate_tier_policy_update`` and ``upsert_tier_policy``."""
+
+    watch_enabled: bool
+    watch_cron: str
+    delta_enabled: bool
+    delta_cron: str
+    delta_timezone: str
+    move_enabled: bool
+    move_threshold_pct: float
+    earnings_stages: list[str]
+
+
+class TierPolicySnapshot(TypedDict):
+    """Full serialized snapshot of a resolved tier policy (includes metadata fields)."""
+
+    tier: str
+    watch_enabled: bool
+    watch_cron: str
+    delta_enabled: bool
+    delta_cron: str
+    delta_timezone: str
+    move_enabled: bool
+    move_threshold_pct: float
+    earnings_stages: list[str]
+    policy_version: int
+
+
 @dataclass(frozen=True)
 class TierPolicy:
     """Resolved monitoring policy for one personal watchlist tier."""
@@ -79,11 +109,27 @@ class TierPolicy:
     earnings_stages: tuple[str, ...]
     policy_version: int = 1
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> TierPolicySnapshot:
         raw = asdict(self)
         raw["earnings_stages"] = list(self.earnings_stages)
         raw["move_threshold_pct"] = float(self.move_threshold_pct)
-        return raw
+        return raw  # type: ignore[return-value]
+
+    def to_patch_dict(self) -> TierPolicyPatch:
+        """Return only mutable policy fields (excludes snapshot metadata ``tier`` / ``policy_version``)."""
+        full = self.to_dict()
+        return {k: full[k] for k in TIER_POLICY_MUTABLE_FIELDS}  # type: ignore[return-value]
+
+
+def extract_tier_policy_patch(policy: TierPolicy | Mapping[str, Any]) -> TierPolicyPatch:
+    """Extract only ``TIER_POLICY_MUTABLE_FIELDS`` from a ``TierPolicy`` or snapshot mapping."""
+    if isinstance(policy, TierPolicy):
+        return policy.to_patch_dict()
+    if not isinstance(policy, Mapping):
+        raise ValueError("policy 必须为策略配置对象。")
+    return {
+        k: policy[k] for k in TIER_POLICY_MUTABLE_FIELDS if k in policy
+    }  # type: ignore[return-value]
 
 
 DEFAULT_TIER_POLICIES: dict[str, TierPolicy] = {
@@ -216,20 +262,33 @@ def _validate_5field_cron(expr: str, field_name: str) -> str:
     return cleaned
 
 
+def _utc_now() -> datetime:
+    """Injectable UTC clock used as the start of the 370-day Cron validation window."""
+    return datetime.now(UTC)
+
+
 def _iter_cron_datetimes(
     expr: str,
     tz_name: str,
     *,
     start_utc: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
     horizon_days: int = CRON_VALIDATION_HORIZON_DAYS,
 ) -> list[datetime]:
     try:
         tz = ZoneInfo(tz_name)
     except Exception as exc:
         raise ValueError(f"无效时区：{tz_name!r}") from exc
-    base_utc = start_utc or datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+    if start_utc is not None:
+        base_utc = start_utc
+    elif clock is not None:
+        base_utc = clock()
+    else:
+        base_utc = _utc_now()
     if base_utc.tzinfo is None:
         base_utc = base_utc.replace(tzinfo=UTC)
+    else:
+        base_utc = base_utc.astimezone(UTC)
     base_local = base_utc.astimezone(tz)
     end_utc = base_utc + timedelta(days=horizon_days)
     it = croniter(expr, base_local)
@@ -253,11 +312,12 @@ def validate_watch_cron(
     *,
     timezones: Sequence[str] = ("America/New_York", "Asia/Shanghai"),
     start_utc: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> str:
     """Validate 5-field watch cron across market timezones (including DST): Δt >= 30 min."""
     cleaned = _validate_5field_cron(expr, "watch_cron")
     for tz_name in timezones:
-        fires = _iter_cron_datetimes(cleaned, tz_name, start_utc=start_utc)
+        fires = _iter_cron_datetimes(cleaned, tz_name, start_utc=start_utc, clock=clock)
         if not fires:
             raise ValueError(f"watch_cron 在未来 {CRON_VALIDATION_HORIZON_DAYS} 天内无触发时间（时区 {tz_name}）。")
         prev_utc: datetime | None = None
@@ -278,11 +338,12 @@ def validate_delta_cron(
     timezone_name: str = DELTA_TIMEZONE_DEFAULT,
     *,
     start_utc: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> tuple[str, str]:
     """Validate 5-field delta cron in ``timezone_name`` (DST-aware): max 1/local-day and Δt >= 23h."""
     cleaned = _validate_5field_cron(expr, "delta_cron")
     tz_clean = str(timezone_name or DELTA_TIMEZONE_DEFAULT).strip() or DELTA_TIMEZONE_DEFAULT
-    fires = _iter_cron_datetimes(cleaned, tz_clean, start_utc=start_utc)
+    fires = _iter_cron_datetimes(cleaned, tz_clean, start_utc=start_utc, clock=clock)
     if not fires:
         raise ValueError(f"delta_cron 在未来 {CRON_VALIDATION_HORIZON_DAYS} 天内无触发时间（时区 {tz_clean}）。")
     seen_local_days: set[str] = set()
@@ -304,13 +365,16 @@ def validate_delta_cron(
 
 
 def validate_move_threshold_pct(value: Any) -> float:
-    """Validate price move threshold percentage in [1.0, 30.0]."""
+    """Validate finite price move threshold percentage in [1.0, 30.0]."""
     if isinstance(value, bool):
         raise ValueError("异动涨跌幅阈值必须为数值（1.0%–30.0%）。")
     try:
-        pct = round(float(value), 2)
+        raw_num = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError("异动涨跌幅阈值必须为数值（1.0%–30.0%）。") from exc
+    if not math.isfinite(raw_num):
+        raise ValueError("异动涨跌幅阈值必须为有限数值（1.0%–30.0%）。")
+    pct = round(raw_num, 2)
     if pct < MOVE_THRESHOLD_MIN_PCT or pct > MOVE_THRESHOLD_MAX_PCT:
         raise ValueError("异动涨跌幅阈值须介于 1.0% 至 30.0% 之间。")
     return pct
@@ -546,7 +610,7 @@ async def upsert_tier_policy(
     if isinstance(policy, TierPolicy):
         validated = validate_tier_policy_update(
             get_default_tier_policy(norm_tier),
-            {k: policy.to_dict()[k] for k in TIER_POLICY_MUTABLE_FIELDS},
+            policy.to_patch_dict(),
         )
     else:
         validated = validate_tier_policy_update(get_default_tier_policy(norm_tier), policy)

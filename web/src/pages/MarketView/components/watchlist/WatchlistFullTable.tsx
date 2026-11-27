@@ -218,7 +218,7 @@ export function WatchlistFullTable({
       );
     }
 
-    if (isUnlisted) {
+    if (isUnlisted && col !== 'pe_fy1' && col !== 'pe_fy2' && col !== 'eps_growth_fy2') {
       return (
         <td
           key={col}
@@ -265,8 +265,9 @@ export function WatchlistFullTable({
 
     if (col === 'pe_fy1' || col === 'pe_fy2' || col === 'eps_growth_fy2') {
       const valMeta = m?.valuation;
-      const cellStatus: ValuationStatus | undefined =
-        col === 'pe_fy1'
+      const cellStatus: ValuationStatus | undefined = isUnlisted
+        ? 'unlisted'
+        : col === 'pe_fy1'
           ? (valMeta?.pe_fy1_status ?? valMeta?.status)
           : col === 'pe_fy2'
             ? (valMeta?.pe_fy2_status ?? valMeta?.status)
@@ -300,7 +301,7 @@ export function WatchlistFullTable({
             className="px-2.5 py-2 text-right text-xs tabular-nums whitespace-nowrap"
             style={{ color: 'var(--color-text-tertiary)' }}
           >
-            {DASH}
+            {t('marketView:watchlist.unlisted')}
           </td>
         );
       }
