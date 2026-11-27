@@ -85,6 +85,7 @@ LIBRARY_SOURCES = {"company-wiki", "sales-notes", "tmtb", "funda-ai", "all"}
 CN_HK_SINGLE_DAY_DEFAULT_MAX_PAGES = 5
 CN_HK_MAX_PAGES_LIMIT = 20
 CN_HK_MAX_START_PAGE = 200
+CN_HK_MAX_DEADLINE_S = 600.0
 # AlphaEngine 业绩会 ASR 稿类型；roic.ai 自 2026-08 整站 403，已停用。
 TRANSCRIPT_TYPE_ID = "IND_SECOND_5FA442AE"
 CALL_TITLE = re.compile(r"(?:\b[1-4]Q|\bQ[1-4])\s*'?(?:FY)?\s*\d{2,4}|\bFY\s?'?\d{2,4}|\bearnings\b|业绩.{0,6}会|电话会|说明会", re.I)
@@ -246,14 +247,24 @@ def build_command(route, args):
             require(args, "ticker", "start", "end")
             if args.query:
                 raise ValueError("cn-hk filings 不接受 query；使用 ticker/start/end")
-            allowed_filings_params = {"max_pages", "start_page"}
+            allowed_filings_params = {"max_pages", "start_page", "deadline_s"}
             if set(extra) - allowed_filings_params:
-                raise ValueError("cn-hk filings params 仅支持 ['max_pages', 'start_page']")
+                raise ValueError("cn-hk filings params 仅支持 ['max_pages', 'start_page', 'deadline_s']")
             for key, max_val in (("max_pages", CN_HK_MAX_PAGES_LIMIT), ("start_page", CN_HK_MAX_START_PAGE)):
                 if key in extra and extra[key] is not None:
                     val = extra[key]
                     if type(val) is not int or not 1 <= val <= max_val:
                         raise ValueError(f"{key} 须为范围内的正整数")
+            deadline_s = extra.get("deadline_s")
+            if deadline_s is not None:
+                import math
+                if (
+                    isinstance(deadline_s, bool)
+                    or not isinstance(deadline_s, (int, float))
+                    or not math.isfinite(float(deadline_s))
+                    or not 0 < float(deadline_s) <= CN_HK_MAX_DEADLINE_S
+                ):
+                    raise ValueError("deadline_s 须为范围内的正数")
             max_pages = extra.get("max_pages")
             if max_pages is None:
                 if args.start == args.end:
@@ -271,6 +282,11 @@ def build_command(route, args):
             ]
             if start_page > 1:
                 filings_cmd += ["--start-page", str(start_page)]
+            if deadline_s is not None:
+                eff_deadline = float(deadline_s)
+                if getattr(args, "timeout", None):
+                    eff_deadline = min(eff_deadline, float(args.timeout))
+                filings_cmd += ["--deadline-s", f"{eff_deadline:g}"]
             return filings_cmd
         if any(v is not None for v in extra.values()):
             raise ValueError(f"cn-hk {operation} params 仅支持 []")
@@ -597,6 +613,8 @@ def execute(cmd, timeout):
             "max_pages",
             "page_size",
             "total_count",
+            "page_error",
+            "deadline_reached",
         ):
             if key in payload:
                 out[key] = payload[key]

@@ -1956,7 +1956,8 @@ async def test_probe_cnhk_filings_full_contract(
         start: str,
         end: str,
         limit: int = 50,
-        timeout_s: float = 8.0,
+        timeout_s: Optional[float] = None,
+        deadline_s: Optional[float] = None,
     ) -> dict[str, Any]:
         queried_windows.append((start, end))
         if (start, end) == ("2026-10-19", "2026-10-22"):
@@ -2025,7 +2026,8 @@ async def test_probe_cnhk_filings_full_contract(
     assert split_state["cnhk_probe_unresolved_truncated_dates"] == ["2026-10-19"]
     assert any("cnhk_probe_truncated_dates" in r.message for r in caplog.records)
 
-    # If a sub-window fails during recursive split, watermark must NOT advance
+    # If a sub-window fails during recursive split, watermark stops before the failed gap
+    # while preserving already-fetched rows and marking degraded + partial.
     def _partial_fail_bridge(
         *,
         bridge_url: str,
@@ -2033,7 +2035,8 @@ async def test_probe_cnhk_filings_full_contract(
         start: str,
         end: str,
         limit: int = 50,
-        timeout_s: float = 8.0,
+        timeout_s: Optional[float] = None,
+        deadline_s: Optional[float] = None,
     ) -> dict[str, Any]:
         if (start, end) == ("2026-10-19", "2026-10-22"):
             return {
@@ -2054,9 +2057,11 @@ async def test_probe_cnhk_filings_full_contract(
         now=shanghai_morning_dt,
         limit=2,
     )
-    assert part_sigs == []
+    assert len(part_sigs) == 2
     assert part_state["cnhk_probe_degraded"] is True
-    assert part_state["last_cnhk_check_date"] == "2026-10-19"
+    assert part_state["cnhk_probe_partial"] is True
+    # Left [2026-10-19..2026-10-20] completed cleanly; watermark stops right before failed [2026-10-21..2026-10-22]
+    assert part_state["last_cnhk_check_date"] == "2026-10-20"
 
     # 8. Total time budget (25s) during recursive window split: advances watermark only to contiguous completed prefix end
     assert cnhk_mod.CNHK_PROBE_TOTAL_BUDGET_S == 25.0
@@ -2073,7 +2078,8 @@ async def test_probe_cnhk_filings_full_contract(
         start: str,
         end: str,
         limit: int = 50,
-        timeout_s: float = 8.0,
+        timeout_s: Optional[float] = None,
+        deadline_s: Optional[float] = None,
     ) -> dict[str, Any]:
         nonlocal fake_now_s
         budget_queried_windows.append((start, end))
@@ -2135,7 +2141,8 @@ async def test_probe_cnhk_filings_full_contract(
         start: str,
         end: str,
         limit: int = 50,
-        timeout_s: float = 8.0,
+        timeout_s: Optional[float] = None,
+        deadline_s: Optional[float] = None,
     ) -> dict[str, Any]:
         nonlocal fake_now_s
         fake_now_s += 26.0  # Exceeds 25s budget on the initial parent query
@@ -6057,36 +6064,10 @@ async def test_cnhk_31_filings_detected_as_truncated_across_script_and_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """生产传 limit=50、公告脚本每页 30 条时，31 条公告仍返回分页未完成标记，探针与预检识别截断且不推进水位。"""
-    import importlib.util
-    import sys
-    import types
-    from pathlib import Path
-
     from src.dalton.autonomy.probes import cnhk as cnhk_mod
 
-    script_path = (
-        Path(__file__).resolve().parents[3]
-        / "scripts"
-        / "dalton"
-        / "research_runtime"
-        / "skills"
-        / "cn-hk-findata"
-        / "fetch_announcements.py"
-    )
-    # Stub optional OCR/PDF libraries if absent in unit-test venv; fetch_announcements itself only uses requests.
-    for mod_name in ("fitz", "pytesseract", "PIL", "PIL.Image", "pypdf"):
-        if mod_name not in sys.modules:
-            stub = types.ModuleType(mod_name)
-            if mod_name == "PIL":
-                stub.Image = types.ModuleType("PIL.Image")
-            if mod_name == "pypdf":
-                stub.PdfReader = object
-            monkeypatch.setitem(sys.modules, mod_name, stub)
-
-    spec = importlib.util.spec_from_file_location("test_fetch_announcements_mod", script_path)
-    assert spec is not None and spec.loader is not None
-    fa_mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(fa_mod)
+    fa_mod, _dg_mod = _load_cnhk_runtime_modules(monkeypatch)
+    real_resp_cls = fa_mod.requests.Response
 
     ts_ms = int(datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
     thirty_items = [
@@ -6098,26 +6079,18 @@ async def test_cnhk_31_filings_detected_as_truncated_across_script_and_probe(
         for i in range(1, 31)
     ]
 
-    class _FakeResp:
-        def __init__(self, payload: Any) -> None:
-            self._payload = payload
-
-        def raise_for_status(self) -> None:
-            return None
-
-        def json(self) -> Any:
-            return self._payload
-
-    def _fake_post(url: str, data: dict[str, Any] | None = None, headers: Any = None, timeout: int = 20) -> Any:
+    def _fake_post(url: str, data: dict[str, Any] | None = None, headers: Any = None, timeout: float = 20) -> Any:
+        resp = create_autospec(real_resp_cls, instance=True)
+        resp.raise_for_status.return_value = None
         if "topSearch" in url:
-            return _FakeResp([{"orgId": "9900000700"}])
-        return _FakeResp(
-            {
-                "announcements": thirty_items,
-                "hasMore": True,
-                "totalAnnouncement": 31,
-            }
-        )
+            resp.json.return_value = [{"orgId": "9900000700"}]
+            return resp
+        resp.json.return_value = {
+            "announcements": thirty_items,
+            "hasMore": True,
+            "totalAnnouncement": 31,
+        }
+        return resp
 
     post_mock = create_autospec(fa_mod.requests.post, side_effect=_fake_post)
     monkeypatch.setattr(fa_mod.requests, "post", post_mock)
@@ -6307,37 +6280,27 @@ def _load_cnhk_runtime_modules(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, An
     import types
 
     repo_root = Path(__file__).resolve().parents[3]
-    for mod_name in ("fitz", "pytesseract", "PIL", "PIL.Image", "pypdf"):
-        if mod_name not in sys.modules:
-            stub = types.ModuleType(mod_name)
-            if mod_name == "PIL":
-                stub.Image = types.ModuleType("PIL.Image")
-            if mod_name == "pypdf":
-                stub.PdfReader = object
-            monkeypatch.setitem(sys.modules, mod_name, stub)
+    runtime_root = repo_root / "scripts" / "dalton" / "research_runtime"
+    # Pin research_runtime source root so dynamic import of data_gateway is isolated from env overrides.
+    monkeypatch.setenv("DALTON_RESEARCH_CODE", str(runtime_root))
+    monkeypatch.delenv("DALTON_OCW_ROOT", raising=False)
 
-    fa_path = (
-        repo_root
-        / "scripts"
-        / "dalton"
-        / "research_runtime"
-        / "skills"
-        / "cn-hk-findata"
-        / "fetch_announcements.py"
-    )
+    # Stub only absent optional OCR modules via create_autospec (PIL and pypdf are installed in .venv).
+    for mod_name in ("fitz", "pytesseract"):
+        if mod_name not in sys.modules and importlib.util.find_spec(mod_name) is None:
+            monkeypatch.setitem(
+                sys.modules,
+                mod_name,
+                create_autospec(types.ModuleType, instance=True),
+            )
+
+    fa_path = runtime_root / "skills" / "cn-hk-findata" / "fetch_announcements.py"
     fa_spec = importlib.util.spec_from_file_location("test_cnhk_fetch_announcements_pag", fa_path)
     assert fa_spec is not None and fa_spec.loader is not None
     fa_mod = importlib.util.module_from_spec(fa_spec)
     fa_spec.loader.exec_module(fa_mod)
 
-    dg_path = (
-        repo_root
-        / "scripts"
-        / "dalton"
-        / "research_runtime"
-        / "scripts"
-        / "data_gateway.py"
-    )
+    dg_path = runtime_root / "scripts" / "data_gateway.py"
     dg_spec = importlib.util.spec_from_file_location("test_cnhk_data_gateway_pag", dg_path)
     assert dg_spec is not None and dg_spec.loader is not None
     dg_mod = importlib.util.module_from_spec(dg_spec)
@@ -6929,3 +6892,742 @@ async def test_cnhk_data_gateway_completeness_passthrough_and_preflight_resume_w
     assert "cnhk_probe_unresolved_truncated_dates" not in persisted_state
     assert "cnhk_probe_partial" not in persisted_state
     assert doubles["logs"][-1]["decision"] == "wake"
+
+
+@pytest.mark.asyncio
+async def test_cnhk_page2_error_preserves_page1_resumes_and_backoffs_on_repeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第 2 页抛错时保留第 1 页信号、续采停在第 2 页、水位不前进；同页连错触发退避；恢复后取完、推进水位且不重复唤醒。"""
+    import requests as req_mod
+    import subprocess
+
+    from src.dalton.autonomy.probes import cnhk as cnhk_mod
+
+    fa_mod, dg_mod = _load_cnhk_runtime_modules(monkeypatch)
+    real_requests_post = fa_mod.requests.post
+    real_resp_cls = fa_mod.requests.Response
+    real_popen = subprocess.Popen
+    ts_ms = int(datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+
+    # 35 filings on 2026-10-22: page 1 has P1 #1 + 29 routine; page 2 has 4 routine + P1 #35
+    all_35 = [
+        {
+            "announcementTitle": "2026年第三季度业绩公告",
+            "announcementTime": ts_ms - 1000,
+            "adjunctUrl": "finalpage/2026-10-22/001.PDF",
+        }
+    ] + [
+        {
+            "announcementTitle": f"例行公告-{i:03d}",
+            "announcementTime": ts_ms - i * 1000,
+            "adjunctUrl": f"finalpage/2026-10-22/{i:03d}.PDF",
+        }
+        for i in range(2, 35)
+    ] + [
+        {
+            "announcementTitle": "正面盈利预告",
+            "announcementTime": ts_ms - 35 * 1000,
+            "adjunctUrl": "finalpage/2026-10-22/035.PDF",
+        }
+    ]
+
+    # 1. Verify fetch_announcements catches network error, non-2xx, and JSON decode failure on page 2
+    for err_kind in ("connection", "http_503", "bad_json"):
+        def _err_post(
+            url: str,
+            data: dict[str, Any] | None = None,
+            headers: Any = None,
+            timeout: float = 20,
+            _kind: str = err_kind,
+        ) -> Any:
+            resp = create_autospec(real_resp_cls, instance=True)
+            resp.raise_for_status.return_value = None
+            if "topSearch" in url:
+                resp.json.return_value = [{"orgId": "9900000700"}]
+                return resp
+            page_num = int((data or {}).get("pageNum", 1))
+            if page_num == 1:
+                resp.json.return_value = {
+                    "announcements": all_35[:30],
+                    "hasMore": True,
+                    "totalAnnouncement": len(all_35),
+                }
+                return resp
+            if _kind == "connection":
+                raise req_mod.ConnectionError("cninfo reset")
+            if _kind == "http_503":
+                resp.raise_for_status.side_effect = req_mod.HTTPError("503 Service Unavailable")
+                return resp
+            resp.json.side_effect = json.JSONDecodeError("Expecting value", "<html>", 0)
+            return resp
+
+        monkeypatch.setattr(
+            fa_mod.requests,
+            "post",
+            create_autospec(real_requests_post, side_effect=_err_post),
+        )
+        out = fa_mod.fetch_announcements(
+            "00700",
+            limit=50,
+            max_pages=5,
+            date_from="2026-10-22",
+            date_to="2026-10-22",
+        )
+        assert out["ok"] is True
+        assert out["count"] == 30
+        assert out["pagination_complete"] is False
+        assert out["has_more"] is True
+        assert out["next_page"] == 2
+        assert out["page_error"]
+
+    # 2. End-to-end across preflight:
+    #    Round 1: page 1 ok (P1 #1 wakes + degraded_sources=['cnhk']), page 2 raises HTTPError -> resume=2, watermark stays 2026-10-21
+    #    Round 2: page 2 fails again (Timeout) -> keeps resume=2, watermark stays 2026-10-21, triggers existing backoff
+    #    Round 3: backoff expired, page 2 recovers -> wakes ONLY on P1 #35 (no duplicate P1 #1), advances watermark to 2026-10-22
+    #    Round 4: quiet, no duplicate wake
+    from src.dalton.database import watch as watch_db_mod
+    from src.dalton.autonomy import preflight as preflight_mod
+
+    real_upsert_signal = watch_db_mod.upsert_signal
+    real_claim_signals = watch_db_mod.claim_signals_woken
+    real_list_unwoken = watch_db_mod.list_unwoken_signals
+    real_resolve_signals = watch_db_mod.resolve_signals
+    real_triage = preflight_mod._triage_signals_with_llm
+
+    doubles = _install_company_preflight_doubles(monkeypatch)
+    # Use persistent signal store across preflight rounds so claimed/resolved signals are deduped cleanly
+    saved_signals: dict[tuple[str, str], dict[str, Any]] = {}
+
+    async def _upsert_signal(**kwargs: Any) -> tuple[dict[str, Any], bool]:
+        pair = (str(kwargs["probe"]), str(kwargs["signal_key"]))
+        if pair not in saved_signals:
+            saved_signals[pair] = {
+                "signal_id": f"sig-{len(saved_signals) + 1}",
+                "probe": kwargs["probe"],
+                "signal_key": kwargs["signal_key"],
+                "priority": kwargs["priority"],
+                "summary": kwargs["summary"],
+                "payload": kwargs["payload"],
+                "woken": False,
+                "resolved": False,
+            }
+        row = saved_signals[pair]
+        return row, (not row["woken"] and not row["resolved"])
+
+    async def _claim_signals(signal_ids: list[str], execution_id: str, **kwargs: Any) -> list[dict[str, Any]]:
+        claimed: list[dict[str, Any]] = []
+        for row in saved_signals.values():
+            if row["signal_id"] in signal_ids and not row["woken"] and not row["resolved"]:
+                row["woken"] = True
+                claimed.append({"signal_id": row["signal_id"]})
+        return claimed
+
+    async def _resolve_signals(signal_ids: list[str], **kwargs: Any) -> int:
+        cnt = 0
+        for row in saved_signals.values():
+            if row["signal_id"] in signal_ids:
+                row["resolved"] = True
+                cnt += 1
+        return cnt
+
+    async def _list_unwoken(workspace_id: str, ticker: str) -> list[dict[str, Any]]:
+        return [r for r in saved_signals.values() if not r["woken"] and not r["resolved"]]
+
+    async def _skip_all_triage(**kw: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+        return [], list(kw.get("signals") or []), "triage_skip"
+
+    monkeypatch.setattr(watch_db_mod, "upsert_signal", create_autospec(real_upsert_signal, side_effect=_upsert_signal))
+    monkeypatch.setattr(watch_db_mod, "claim_signals_woken", create_autospec(real_claim_signals, side_effect=_claim_signals))
+    monkeypatch.setattr(watch_db_mod, "resolve_signals", create_autospec(real_resolve_signals, side_effect=_resolve_signals))
+    monkeypatch.setattr(watch_db_mod, "list_unwoken_signals", create_autospec(real_list_unwoken, side_effect=_list_unwoken))
+    monkeypatch.setattr(
+        preflight_mod,
+        "_triage_signals_with_llm",
+        create_autospec(real_triage, side_effect=_skip_all_triage),
+    )
+
+    page2_mode = {"state": "fail_r1"}
+
+    def _round_post(url: str, data: dict[str, Any] | None = None, headers: Any = None, timeout: float = 20) -> Any:
+        resp = create_autospec(real_resp_cls, instance=True)
+        resp.raise_for_status.return_value = None
+        if "topSearch" in url:
+            resp.json.return_value = [{"orgId": "9900000700"}]
+            return resp
+        req_data = data or {}
+        if "2026-10-22" not in str(req_data.get("seDate") or ""):
+            resp.json.return_value = {"announcements": [], "hasMore": False, "totalAnnouncement": 0}
+            return resp
+        page_num = int(req_data.get("pageNum", 1))
+        if page_num == 1:
+            resp.json.return_value = {
+                "announcements": all_35[:30],
+                "hasMore": True,
+                "totalAnnouncement": len(all_35),
+            }
+            return resp
+        if page2_mode["state"] == "fail_r1":
+            resp.raise_for_status.side_effect = req_mod.HTTPError("502 Bad Gateway")
+            return resp
+        if page2_mode["state"] == "fail_r2":
+            raise req_mod.Timeout("read timed out")
+        resp.json.return_value = {
+            "announcements": all_35[30:],
+            "hasMore": False,
+            "totalAnnouncement": len(all_35),
+        }
+        return resp
+
+    monkeypatch.setattr(
+        fa_mod.requests,
+        "post",
+        create_autospec(real_requests_post, side_effect=_round_post),
+    )
+
+    async def _bridge_through_gateway(**kwargs: Any) -> dict[str, Any]:
+        script_out = fa_mod.fetch_announcements(
+            kwargs["ticker"],
+            limit=kwargs["limit"],
+            max_pages=kwargs.get("max_pages") or 5,
+            date_from=kwargs["start"],
+            date_to=kwargs["end"],
+            start_page=kwargs.get("start_page") or 1,
+            deadline_s=kwargs.get("deadline_s"),
+        )
+        fake_proc = create_autospec(real_popen, instance=True)
+        fake_proc.returncode = 0
+        fake_proc.communicate.return_value = (json.dumps(script_out, ensure_ascii=False), "")
+        monkeypatch.setattr(dg_mod.subprocess, "Popen", create_autospec(real_popen, return_value=fake_proc))
+        return dg_mod.execute(["fake-cmd"], timeout=30)
+
+    monkeypatch.setattr(
+        cnhk_mod,
+        "_query_bridge_cnhk_filings",
+        create_autospec(cnhk_mod._query_bridge_cnhk_filings, side_effect=_bridge_through_gateway),
+    )
+
+    persisted_state: dict[str, Any] = {}
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    async def _cnhk_runner(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        sigs, st = await cnhk_mod.probe_cnhk_filings(
+            ticker="0700.HK",
+            watch_state=dict(kwargs.get("watch_state") or {}),
+            allow_network=True,
+            today=date(2026, 10, 22),
+            now=datetime(2026, 10, 22, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+            limit=50,
+        )
+        persisted_state.clear()
+        persisted_state.update(st)
+        return sigs, st
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_cnhk_runner)
+
+    # Round 1: page 1 P1 wakes; page 2 fails -> resume at page 2, watermark stays 2026-10-21, degraded_sources=['cnhk']
+    res_r1 = await preflight_check(
+        _company_watch_automation(),
+        "exec-cnhk-p2err-r1",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override={"last_cnhk_check_date": "2026-10-21"},
+    )
+    assert res_r1.should_wake is True
+    assert res_r1.decision == "wake"
+    assert [s["payload"]["title"] for s in res_r1.signals] == ["2026年第三季度业绩公告"]
+    assert res_r1.degraded_sources == ["cnhk"]
+    assert {"degraded_sources": ["cnhk"]} in doubles["logs"][-1]["signals"]
+    assert persisted_state["last_cnhk_check_date"] == "2026-10-21"
+    assert persisted_state["cnhk_probe_resume_pages"] == {"2026-10-22": 2}
+    assert persisted_state["cnhk_probe_degraded"] is False
+
+    # Round 2: page 2 fails AGAIN -> triggers backoff, preserves resume_pages={2026-10-22: 2}, watermark stays 2026-10-21
+    page2_mode["state"] = "fail_r2"
+    r2_state_in = copy.deepcopy(doubles["states"][-1])
+    res_r2 = await preflight_check(
+        _company_watch_automation(),
+        "exec-cnhk-p2err-r2",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override=r2_state_in,
+    )
+    assert res_r2.should_wake is False
+    assert res_r2.degraded_sources == ["cnhk"]
+    saved_after_r2 = copy.deepcopy(doubles["states"][-1])
+    assert saved_after_r2["cnhk_probe_degraded"] is True
+    assert saved_after_r2["cnhk_probe_resume_pages"] == {"2026-10-22": 2}
+    assert saved_after_r2["last_cnhk_check_date"] == "2026-10-21"
+    in_bo, _ = is_in_backoff(saved_after_r2, "cnhk")
+    assert in_bo is True
+
+    # Round 3: expire backoff, page 2 recovers -> wakes ONLY on page 2 P1, advances watermark, clears backoff & resume
+    page2_mode["state"] = "ok"
+    r3_state_in = copy.deepcopy(saved_after_r2)
+    r3_state_in["probe_backoff"]["cnhk"]["not_before"] = "2020-01-01T00:00:00+00:00"
+    res_r3 = await preflight_check(
+        _company_watch_automation(),
+        "exec-cnhk-p2err-r3",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override=r3_state_in,
+    )
+    assert res_r3.should_wake is True
+    assert [s["payload"]["title"] for s in res_r3.signals] == ["正面盈利预告"]
+    assert res_r3.degraded_sources == []
+    saved_after_r3 = copy.deepcopy(doubles["states"][-1])
+    assert saved_after_r3["last_cnhk_check_date"] == "2026-10-22"
+    assert "cnhk_probe_resume_pages" not in saved_after_r3
+    assert "cnhk_probe_partial" not in saved_after_r3
+    assert "cnhk" not in saved_after_r3.get("probe_backoff", {})
+
+    # Round 4: no duplicate wakes
+    res_r4 = await preflight_check(
+        _company_watch_automation(),
+        "exec-cnhk-p2err-r4",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override=copy.deepcopy(saved_after_r3),
+    )
+    assert res_r4.should_wake is False
+    assert res_r4.reason == "no_new_signals"
+
+
+@pytest.mark.asyncio
+async def test_cnhk_deadline_propagates_and_stops_after_one_page_then_resumes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """期限从探针透传至桥/网关/脚本；期限只够一页时返回第 1 页 + next_page=2，下一轮续采完成。"""
+    import argparse
+    import io
+    import subprocess
+    import urllib.request
+
+    from src.dalton.autonomy.probes import cnhk as cnhk_mod
+
+    fa_mod, dg_mod = _load_cnhk_runtime_modules(monkeypatch)
+    real_requests_post = fa_mod.requests.post
+    real_resp_cls = fa_mod.requests.Response
+    real_popen = subprocess.Popen
+    cn_hk_route = next(r for r in dg_mod.catalog()["routes"] if r["id"] == "cn-hk")
+    ts_ms = int(datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+
+    # 1. Verify _fetch_bridge_route_sync sends params.deadline_s and sets HTTP timeout = deadline_s + headroom
+    captured_urlopen: dict[str, Any] = {}
+
+    def _fake_urlopen(req: Any, timeout: float = 0.0) -> Any:
+        captured_urlopen["timeout"] = timeout
+        captured_urlopen["body"] = json.loads(req.data.decode("utf-8"))
+        resp_body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": "1",
+                "result": {"content": [{"type": "text", "text": json.dumps({"ok": True, "rows": []})}]},
+            }
+        ).encode("utf-8")
+        cm = create_autospec(io.BytesIO, instance=True)
+        cm.__enter__.return_value = cm
+        cm.__exit__.return_value = False
+        cm.read.return_value = resp_body
+        return cm
+
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        create_autospec(urllib.request.urlopen, side_effect=_fake_urlopen),
+    )
+    sync_out = cnhk_mod._fetch_bridge_route_sync(
+        bridge_url="http://127.0.0.1:8960/mcp/tok",
+        ticker="00700",
+        start="2026-10-22",
+        end="2026-10-22",
+        limit=50,
+        deadline_s=5.0,
+    )
+    assert sync_out["ok"] is True
+    assert captured_urlopen["body"]["params"]["arguments"]["params"]["deadline_s"] == 5.0
+    assert captured_urlopen["timeout"] == pytest.approx(5.0 + cnhk_mod.CNHK_PROBE_HTTP_TIMEOUT_MARGIN_S)
+
+    # 2. Verify data_gateway.build_command forwards --deadline-s and rejects invalid values
+    def _ns(params_obj: Any = None, timeout: int = 60) -> argparse.Namespace:
+        return argparse.Namespace(
+            operation="filings",
+            ticker="00700",
+            query=None,
+            series=None,
+            concept=None,
+            item=None,
+            document=None,
+            form=None,
+            dataset=None,
+            start="2026-10-22",
+            end="2026-10-22",
+            as_of=None,
+            vintage=None,
+            limit=50,
+            timeout=timeout,
+            params_json=json.dumps(params_obj) if params_obj is not None else None,
+        )
+
+    cmd_dl = dg_mod.build_command(cn_hk_route, _ns({"deadline_s": 5.0}))
+    assert cmd_dl[cmd_dl.index("--deadline-s") + 1] == "5"
+    with pytest.raises(ValueError, match="deadline_s"):
+        dg_mod.build_command(cn_hk_route, _ns({"deadline_s": 0}))
+    with pytest.raises(ValueError, match="deadline_s"):
+        dg_mod.build_command(cn_hk_route, _ns({"deadline_s": True}))
+
+    # 3. Single day with 35 filings and a deadline allowing only 1 page (5.0s; page 1 takes 4.8s -> stops before page 2)
+    all_35 = [
+        {
+            "announcementTitle": f"例行公告-{i:03d}",
+            "announcementTime": ts_ms - i * 1000,
+            "adjunctUrl": f"finalpage/2026-10-22/{i:03d}.PDF",
+        }
+        for i in range(1, 36)
+    ]
+
+    page_timeouts_seen: list[float] = []
+    pages_requested_per_round: list[list[int]] = []
+
+    async def _bridge_with_deadline(**kwargs: Any) -> dict[str, Any]:
+        req_dl = kwargs.get("deadline_s")
+        assert req_dl is not None and req_dl > 0
+        cmd = dg_mod.build_command(
+            cn_hk_route,
+            _ns(
+                {
+                    **({"start_page": kwargs["start_page"]} if kwargs.get("start_page") else {}),
+                    "deadline_s": req_dl,
+                }
+            ),
+        )
+        cmd_dl_val = float(cmd[cmd.index("--deadline-s") + 1])
+        cmd_start_page = int(cmd[cmd.index("--start-page") + 1]) if "--start-page" in cmd else 1
+        cmd_max_pages = int(cmd[cmd.index("--max-pages") + 1])
+
+        fake_t = [100.0]
+        round_pages: list[int] = []
+
+        def _script_clock() -> float:
+            return fake_t[0]
+
+        def _timed_post(url: str, data: dict[str, Any] | None = None, headers: Any = None, timeout: float = 20) -> Any:
+            resp = create_autospec(real_resp_cls, instance=True)
+            resp.raise_for_status.return_value = None
+            if "topSearch" in url:
+                resp.json.return_value = [{"orgId": "9900000700"}]
+                return resp
+            req_data = data or {}
+            if "2026-10-22" not in str(req_data.get("seDate") or ""):
+                resp.json.return_value = {"announcements": [], "hasMore": False, "totalAnnouncement": 0}
+                return resp
+            page_num = int(req_data.get("pageNum", 1))
+            round_pages.append(page_num)
+            page_timeouts_seen.append(float(timeout))
+            # Each page takes 4.8s; with 5.0s deadline, 0.2s remains (<= 0.5s margin) -> stops after 1 page.
+            fake_t[0] += 4.8
+            off = (page_num - 1) * 30
+            chunk = all_35[off : off + 30]
+            resp.json.return_value = {
+                "announcements": chunk,
+                "hasMore": (off + len(chunk)) < len(all_35),
+                "totalAnnouncement": len(all_35),
+            }
+            return resp
+
+        monkeypatch.setattr(fa_mod.requests, "post", create_autospec(real_requests_post, side_effect=_timed_post))
+        script_out = fa_mod.fetch_announcements(
+            kwargs["ticker"],
+            limit=kwargs["limit"],
+            max_pages=cmd_max_pages,
+            date_from=kwargs["start"],
+            date_to=kwargs["end"],
+            start_page=cmd_start_page,
+            deadline_s=cmd_dl_val,
+            clock=_script_clock,
+        )
+        if kwargs["start"] == kwargs["end"] == "2026-10-22":
+            pages_requested_per_round.append(round_pages)
+        fake_proc = create_autospec(real_popen, instance=True)
+        fake_proc.returncode = 0
+        fake_proc.communicate.return_value = (json.dumps(script_out, ensure_ascii=False), "")
+        monkeypatch.setattr(dg_mod.subprocess, "Popen", create_autospec(real_popen, return_value=fake_proc))
+        return dg_mod.execute(cmd, timeout=30)
+
+    monkeypatch.setattr(
+        cnhk_mod,
+        "_query_bridge_cnhk_filings",
+        create_autospec(cnhk_mod._query_bridge_cnhk_filings, side_effect=_bridge_with_deadline),
+    )
+
+    now_et = datetime(2026, 10, 22, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+    st: dict[str, Any] = {"last_cnhk_check_date": "2026-10-21"}
+    s1, st = await probe_cnhk_filings(
+        ticker="0700.HK",
+        watch_state=st,
+        allow_network=True,
+        today=date(2026, 10, 22),
+        now=now_et,
+        limit=50,
+        request_deadline_s=5.0,
+    )
+    assert len(s1) == 30
+    assert st["cnhk_probe_partial"] is True
+    assert st["cnhk_probe_degraded"] is False
+    assert st["cnhk_probe_resume_pages"] == {"2026-10-22": 2}
+    assert st["last_cnhk_check_date"] == "2026-10-21"
+    # Verify per-page timeout was clamped to min(20, remaining) <= 5.0
+    assert page_timeouts_seen and all(0 < t <= 5.0 for t in page_timeouts_seen)
+
+    s2, st = await probe_cnhk_filings(
+        ticker="0700.HK",
+        watch_state=st,
+        allow_network=True,
+        today=date(2026, 10, 22),
+        now=now_et,
+        limit=50,
+        request_deadline_s=5.0,
+    )
+    assert len(s2) == 5
+    assert st["last_cnhk_check_date"] == "2026-10-22"
+    assert "cnhk_probe_partial" not in st
+    assert "cnhk_probe_resume_pages" not in st
+    assert pages_requested_per_round == [[1], [2]]
+    assert len({s.payload["title"] for s in [*s1, *s2]}) == 35
+
+
+@pytest.mark.asyncio
+async def test_cnhk_window_split_one_side_failure_preserves_other_side_and_watermark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """按日对半拆分时，一侧失败不丢掉另一侧已取到的行和续采位置；连续水位停在缺口之前，缺口之后日期可独立出信号。"""
+    from src.dalton.autonomy.probes import cnhk as cnhk_mod
+
+    real_query_bridge = cnhk_mod._query_bridge_cnhk_filings
+    now_et = datetime(2026, 10, 22, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+
+    # Case A: Left side fails ([10-19..10-20] fails), Right side succeeds with P1 on 10-22 and resume page on 10-21
+    async def _left_fails_right_ok(**kwargs: Any) -> dict[str, Any]:
+        s, e = kwargs["start"], kwargs["end"]
+        if (s, e) == ("2026-10-19", "2026-10-22"):
+            return {
+                "ok": True,
+                "rows": [
+                    {"date": "2026-10-22", "title": "例行父窗1", "pdf_link": "http://cninfo/p1"},
+                    {"date": "2026-10-21", "title": "例行父窗2", "pdf_link": "http://cninfo/p2"},
+                ],
+            }
+        if (s, e) == ("2026-10-19", "2026-10-20"):
+            return {"ok": False, "error": "left_timeout"}
+        if (s, e) == ("2026-10-21", "2026-10-22"):
+            return {
+                "ok": True,
+                "rows": [
+                    {"date": "2026-10-21", "title": "21日公告1", "pdf_link": "http://cninfo/21a"},
+                    {"date": "2026-10-22", "title": "2026年第三季度业绩公告", "pdf_link": "http://cninfo/22p1"},
+                ],
+            }
+        if (s, e) == ("2026-10-21", "2026-10-21"):
+            return {
+                "ok": True,
+                "rows": [{"date": "2026-10-21", "title": "21日公告1", "pdf_link": "http://cninfo/21a"}],
+                "pagination_complete": False,
+                "has_more": True,
+                "truncated": True,
+                "next_page": 2,
+            }
+        if (s, e) == ("2026-10-22", "2026-10-22"):
+            return {
+                "ok": True,
+                "rows": [{"date": "2026-10-22", "title": "2026年第三季度业绩公告", "pdf_link": "http://cninfo/22p1"}],
+                "pagination_complete": True,
+                "has_more": False,
+            }
+        return {"ok": True, "rows": [], "pagination_complete": True}
+
+    monkeypatch.setattr(
+        cnhk_mod,
+        "_query_bridge_cnhk_filings",
+        create_autospec(real_query_bridge, side_effect=_left_fails_right_ok),
+    )
+
+    sigs_a, st_a = await probe_cnhk_filings(
+        ticker="0700.HK",
+        watch_state={"last_cnhk_check_date": "2026-10-19"},
+        allow_network=True,
+        today=date(2026, 10, 22),
+        now=now_et,
+        limit=2,
+    )
+    titles_a = {s.payload["title"] for s in sigs_a}
+    assert "2026年第三季度业绩公告" in titles_a
+    assert "21日公告1" in titles_a
+    # Right side's resume cursor is preserved even though Left failed
+    assert st_a["cnhk_probe_resume_pages"] == {"2026-10-21": 2}
+    # Watermark stays before the failed left gap
+    assert st_a["last_cnhk_check_date"] == "2026-10-19"
+    assert st_a["cnhk_probe_degraded"] is True
+    assert st_a["cnhk_probe_partial"] is True
+
+    # Case B: Left side succeeds (10-19 complete, 10-20 partial with resume=2), Right side fails ([10-21..10-22])
+    async def _left_ok_right_fails(**kwargs: Any) -> dict[str, Any]:
+        s, e = kwargs["start"], kwargs["end"]
+        if (s, e) == ("2026-10-19", "2026-10-22"):
+            return {
+                "ok": True,
+                "rows": [
+                    {"date": "2026-10-19", "title": "19日例行", "pdf_link": "http://cninfo/19"},
+                    {"date": "2026-10-20", "title": "20日业绩预告", "pdf_link": "http://cninfo/20"},
+                ],
+            }
+        if (s, e) == ("2026-10-19", "2026-10-20"):
+            return {
+                "ok": True,
+                "rows": [
+                    {"date": "2026-10-19", "title": "19日例行", "pdf_link": "http://cninfo/19"},
+                    {"date": "2026-10-20", "title": "20日业绩预告", "pdf_link": "http://cninfo/20"},
+                ],
+            }
+        if (s, e) == ("2026-10-19", "2026-10-19"):
+            return {
+                "ok": True,
+                "rows": [{"date": "2026-10-19", "title": "19日例行", "pdf_link": "http://cninfo/19"}],
+                "pagination_complete": True,
+                "has_more": False,
+            }
+        if (s, e) == ("2026-10-20", "2026-10-20"):
+            return {
+                "ok": True,
+                "rows": [{"date": "2026-10-20", "title": "20日业绩预告", "pdf_link": "http://cninfo/20"}],
+                "pagination_complete": False,
+                "has_more": True,
+                "truncated": True,
+                "next_page": 2,
+            }
+        return {"ok": False, "error": "right_503"}
+
+    monkeypatch.setattr(
+        cnhk_mod,
+        "_query_bridge_cnhk_filings",
+        create_autospec(real_query_bridge, side_effect=_left_ok_right_fails),
+    )
+
+    sigs_b, st_b = await probe_cnhk_filings(
+        ticker="0700.HK",
+        watch_state={},
+        allow_network=True,
+        today=date(2026, 10, 22),
+        now=now_et,
+        limit=2,
+    )
+    titles_b = {s.payload["title"] for s in sigs_b}
+    assert "19日例行" in titles_b
+    assert "20日业绩预告" in titles_b
+    # Left's resume page for 2026-10-20 is preserved; watermark advances only to 2026-10-19 (before 10-20 gap)
+    assert st_b["cnhk_probe_resume_pages"] == {"2026-10-20": 2}
+    assert st_b["last_cnhk_check_date"] == "2026-10-19"
+    assert st_b["cnhk_probe_degraded"] is True
+    assert st_b["cnhk_probe_partial"] is True
+
+
+@pytest.mark.asyncio
+async def test_preflight_cnhk_incomplete_pagination_carries_degraded_sources_on_triage_skip_and_p1_wake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """分页未完成时，「新公告分诊后全部跳过」与「有 P1 正常唤醒」两条路径的结果和日志都带 degraded_sources=['cnhk']。"""
+    from src.dalton.autonomy import preflight as preflight_mod
+    from src.dalton.autonomy.probes import cnhk as cnhk_mod
+
+    real_query_bridge = cnhk_mod._query_bridge_cnhk_filings
+    real_triage = preflight_mod._triage_signals_with_llm
+
+    async def _skip_all_triage(**kw: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+        return [], list(kw.get("signals") or []), "triage_skip"
+
+    doubles = _install_company_preflight_doubles(monkeypatch)
+    monkeypatch.setattr(
+        preflight_mod,
+        "_triage_signals_with_llm",
+        create_autospec(real_triage, side_effect=_skip_all_triage),
+    )
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    # Path A: Incomplete pagination + new P2 filings only -> triage skips all -> result & log carry degraded_sources
+    async def _partial_p2_bridge(**kwargs: Any) -> dict[str, Any]:
+        if kwargs["start"] == kwargs["end"] == "2026-10-21":
+            return {"ok": True, "rows": [], "pagination_complete": True, "has_more": False}
+        return {
+            "ok": True,
+            "rows": [{"date": "2026-10-22", "title": "例行公告-01", "pdf_link": "http://cninfo/p2"}],
+            "pagination_complete": False,
+            "has_more": True,
+            "truncated": True,
+            "next_page": 2,
+        }
+
+    monkeypatch.setattr(
+        cnhk_mod,
+        "_query_bridge_cnhk_filings",
+        create_autospec(real_query_bridge, side_effect=_partial_p2_bridge),
+    )
+
+    async def _cnhk_runner(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return await cnhk_mod.probe_cnhk_filings(
+            ticker="0700.HK",
+            watch_state=dict(kwargs.get("watch_state") or {}),
+            allow_network=True,
+            today=date(2026, 10, 22),
+            now=datetime(2026, 10, 22, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+            limit=50,
+        )
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_cnhk_runner)
+
+    res_triage_skip = await preflight_check(
+        _company_watch_automation(),
+        "exec-cnhk-triage-skip-degraded",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override={"last_cnhk_check_date": "2026-10-21"},
+    )
+    assert res_triage_skip.should_wake is False
+    assert res_triage_skip.decision == "skip"
+    assert res_triage_skip.degraded_sources == ["cnhk"]
+    assert {"degraded_sources": ["cnhk"]} in doubles["logs"][-1]["signals"]
+
+    # Path B: Incomplete pagination + new P1 filing -> normal wake -> result & wake log carry degraded_sources
+    async def _partial_p1_bridge(**kwargs: Any) -> dict[str, Any]:
+        if kwargs["start"] == kwargs["end"] == "2026-10-21":
+            return {"ok": True, "rows": [], "pagination_complete": True, "has_more": False}
+        return {
+            "ok": True,
+            "rows": [{"date": "2026-10-22", "title": "2026年第三季度业绩公告", "pdf_link": "http://cninfo/p1"}],
+            "pagination_complete": False,
+            "has_more": True,
+            "truncated": True,
+            "next_page": 2,
+        }
+
+    monkeypatch.setattr(
+        cnhk_mod,
+        "_query_bridge_cnhk_filings",
+        create_autospec(real_query_bridge, side_effect=_partial_p1_bridge),
+    )
+
+    res_p1_wake = await preflight_check(
+        _company_watch_automation(),
+        "exec-cnhk-p1-wake-degraded",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override={"last_cnhk_check_date": "2026-10-21"},
+    )
+    assert res_p1_wake.should_wake is True
+    assert res_p1_wake.decision == "wake"
+    assert len(res_p1_wake.signals) == 1
+    assert res_p1_wake.degraded_sources == ["cnhk"]
+    assert doubles["logs"][-1]["decision"] == "wake"
+    assert {"degraded_sources": ["cnhk"]} in doubles["logs"][-1]["signals"]

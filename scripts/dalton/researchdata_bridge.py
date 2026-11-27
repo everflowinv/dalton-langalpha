@@ -2411,7 +2411,7 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "search": "ask",
         },
         "accepted_params": ["ticker", "query", "start", "end", "limit", "params"],
-        "accepted_nested_params": ["max_pages", "start_page"],
+        "accepted_nested_params": ["max_pages", "start_page", "deadline_s"],
         "required_params": {
             "filings": ["ticker", "start", "end"],
             "ask": ["query"],
@@ -4438,7 +4438,7 @@ def _normalize_and_validate_call_args(
                 "unsupported_parameters": cn_hk_refused,
                 "error": (
                     f"[参数错误] cn-hk operation='{eff_op}' 不接受 {cn_hk_refused}："
-                    "filings 用 ticker/start/end（可选 params.max_pages/start_page）；quote 只用 ticker（当前报价，没有历史日期）；"
+                    "filings 用 ticker/start/end（可选 params.max_pages/start_page/deadline_s）；quote 只用 ticker（当前报价，没有历史日期）；"
                     "自然语言问题用 operation='ask'，公司和日期写进 query。"
                 ),
                 "normalized_params": norm_view,
@@ -4458,6 +4458,25 @@ def _normalize_and_validate_call_args(
                         "error_category": "参数错误",
                         "error": f"[参数错误] cn-hk filings 的 params.{cn_pk} 须为 1–{cn_max} 的正整数（当前为 {cn_pv!r}）。",
                         "hint": f"请将 params.{cn_pk} 设为 1–{cn_max} 的整数，或省略该参数。",
+                        "normalized_params": norm_view,
+                    }
+            cn_dl = normalized["params"].get("deadline_s")
+            if cn_dl is not None:
+                if (
+                    isinstance(cn_dl, bool)
+                    or not isinstance(cn_dl, (int, float))
+                    or not math.isfinite(float(cn_dl))
+                    or not 0 < float(cn_dl) <= 600
+                ):
+                    return normalized, norm_view, {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "invalid_nested_param_value",
+                        "error_category": "参数错误",
+                        "error": f"[参数错误] cn-hk filings 的 params.deadline_s 须为 0–600 之间的正数（当前为 {cn_dl!r}）。",
+                        "hint": "请将 params.deadline_s 设为 0–600 之间的正数（秒），或省略该参数。",
                         "normalized_params": norm_view,
                     }
         missing_req: list[str] = []

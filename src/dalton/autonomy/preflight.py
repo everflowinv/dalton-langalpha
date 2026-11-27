@@ -910,10 +910,14 @@ def _merge_wake_results(
     signals: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     incomplete: list[str] = []
+    degraded: list[str] = []
     for item in wakes:
         for probe_name in item.incomplete_probes:
             if probe_name not in incomplete:
                 incomplete.append(probe_name)
+        for src_name in item.degraded_sources:
+            if src_name not in degraded:
+                degraded.append(src_name)
         for sig in item.signals:
             pair = (str(sig.get("probe") or ""), str(sig.get("signal_key") or ""))
             if not pair[1] or pair in seen:
@@ -931,6 +935,7 @@ def _merge_wake_results(
             signals=signals,
         ),
         incomplete_probes=incomplete,
+        degraded_sources=degraded,
     )
 
 
@@ -1098,6 +1103,7 @@ def _build_wake_preflight_result(
     ticker: Optional[str],
     signals: list[dict[str, Any]],
     group_refresh_summary: Optional[str] = None,
+    degraded_sources: Optional[list[str]] = None,
 ) -> PreflightResult:
     """Build a waking ``PreflightResult`` and its ``wake_context`` consistently."""
     wake_ctx = format_wake_directive(
@@ -1116,6 +1122,7 @@ def _build_wake_preflight_result(
         reason=f"{len(signals)}_signals",
         signals=signals,
         wake_context=wake_ctx,
+        degraded_sources=list(degraded_sources or []),
     )
 
 
@@ -1324,8 +1331,9 @@ async def _conclude_preflight(
             effective_candidates.append(cand)
     candidate_signals = effective_candidates
 
+    degraded_sources = _degraded_sources_of(probe_progress)
+
     if not candidate_signals:
-        degraded_sources = _degraded_sources_of(probe_progress)
         skip_reason = "sources_degraded" if degraded_sources else "no_new_signals"
         log_signals = [{"degraded_sources": degraded_sources}] if degraded_sources else []
         if persist and not _wake_already_committed(probe_progress):
@@ -1400,7 +1408,14 @@ async def _conclude_preflight(
     woke_signals = direct_signals + triage_kept
 
     if not woke_signals:
-        skip_reason = triage_reason if triage_candidates else "no_new_signals"
+        skip_reason = (
+            triage_reason
+            if triage_candidates
+            else ("sources_degraded" if degraded_sources else "no_new_signals")
+        )
+        log_signals = list(triage_skipped)
+        if degraded_sources:
+            log_signals.append({"degraded_sources": degraded_sources})
         if persist and not _wake_already_committed(probe_progress):
             try:
                 await watch_db.insert_preflight_log(
@@ -1409,7 +1424,7 @@ async def _conclude_preflight(
                     workspace_id=workspace_id,
                     decision="skip",
                     reason=skip_reason,
-                    signals=triage_skipped,
+                    signals=log_signals,
                 )
             except Exception as e:
                 logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
@@ -1419,6 +1434,7 @@ async def _conclude_preflight(
             reason=skip_reason,
             signals=[],
             wake_context=None,
+            degraded_sources=degraded_sources,
         )
 
     # Atomically claim unwoken signals (A10): filter out any signal already claimed by a concurrent execution
@@ -1666,6 +1682,7 @@ async def _conclude_preflight(
         ticker=ticker,
         signals=woke_signals,
         group_refresh_summary=group_refresh_summary,
+        degraded_sources=degraded_sources,
     )
     _remember_wake(probe_progress, result, name=name, ticker=ticker)
     if persist and stale_signals:
@@ -2345,6 +2362,9 @@ async def _log_wake_result(
 ) -> None:
     """Write the wake log. A failure only warns; the wake itself still stands."""
     try:
+        log_signals = list(result.signals)
+        if result.degraded_sources:
+            log_signals.append({"degraded_sources": list(result.degraded_sources)})
         # DALTON-HOOK(preflight): persist complete wake_context (with optional coverage_group_refresh block)
         await watch_db.insert_preflight_log(
             automation_id=automation_id,
@@ -2352,7 +2372,7 @@ async def _log_wake_result(
             workspace_id=workspace_id,
             decision=_allowed_decision(result.decision),
             reason=str(result.reason or ""),
-            signals=list(result.signals),
+            signals=log_signals,
             wake_context=result.wake_context,
         )
     except Exception as e:

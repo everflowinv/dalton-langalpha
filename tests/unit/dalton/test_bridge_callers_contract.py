@@ -206,6 +206,16 @@ def test_cnhk_probe_request_matches_bridge_route_contract() -> None:
     assert arguments_pag["params"] == {"start_page": 2, "max_pages": 3}
     assert_valid_bridge_call(tool_name_pag, arguments_pag)
 
+    tool_name_dl, arguments_dl = build_cnhk_filings_request(
+        ticker="00700",
+        start="2026-10-22",
+        end="2026-10-22",
+        limit=50,
+        deadline_s=8.0,
+    )
+    assert arguments_dl["params"] == {"deadline_s": 8.0}
+    assert_valid_bridge_call(tool_name_dl, arguments_dl)
+
     _, _, err_quote_params = _normalize_and_validate_call_args(
         "finance",
         {"route": "cn-hk", "operation": "quote", "ticker": "00700", "params": {"max_pages": 2}},
@@ -226,6 +236,21 @@ def test_cnhk_probe_request_matches_bridge_route_contract() -> None:
     )
     assert err_bad_pages is not None
     assert err_bad_pages["error_code"] == "invalid_nested_param_value"
+
+    for bad_deadline in (0, -1, 601, True, "8"):
+        _, _, err_bad_dl = _normalize_and_validate_call_args(
+            "finance",
+            {
+                "route": "cn-hk",
+                "operation": "filings",
+                "ticker": "00700",
+                "start": "2026-10-22",
+                "end": "2026-10-22",
+                "params": {"deadline_s": bad_deadline},
+            },
+        )
+        assert err_bad_dl is not None
+        assert err_bad_dl["error_code"] == "invalid_nested_param_value"
 
 
 def test_cn_price_fallback_quote_request_matches_bridge_route_contract() -> None:

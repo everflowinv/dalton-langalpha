@@ -1399,6 +1399,7 @@ def main():
     for flag in ["--limit", "--max-pages", "--start-page", "--date-from", "--date-to", "--max-chars", "--window", "--max-matches",
                  "--facts-limit", "--report-index", "--read-report-index", "--extract-financials-index"]:
         parser.add_argument(flag, type=int if "index" in flag or "limit" in flag or "page" in flag or "chars" in flag or "window" in flag or "matches" in flag else str, default=None)
+    parser.add_argument("--deadline-s", type=float, default=None)
     for flag in ["--search-text", "--facts-metric", "--report-keyword", "--read-report-keyword",
                  "--extract-financials-keyword", "--ocr-fallback"]:
         parser.add_argument(flag, type=str, default=None)

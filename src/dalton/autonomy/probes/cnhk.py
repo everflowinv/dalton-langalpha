@@ -20,7 +20,9 @@ from src.dalton.autonomy.probes import ProbeSignal
 logger = logging.getLogger(__name__)
 
 ET_TZ = ZoneInfo("America/New_York")
-CNHK_PROBE_STEP_TIMEOUT_S: float = 10.0
+CNHK_PROBE_REQUEST_DEADLINE_S: float = 8.0
+CNHK_PROBE_HTTP_TIMEOUT_MARGIN_S: float = 2.0
+CNHK_PROBE_STEP_TIMEOUT_S: float = CNHK_PROBE_REQUEST_DEADLINE_S + CNHK_PROBE_HTTP_TIMEOUT_MARGIN_S + 1.0
 CNHK_PROBE_TOTAL_BUDGET_S: float = 25.0
 DEFAULT_INITIAL_LOOKBACK_DAYS: int = 3
 CNHK_FILINGS_QUERY_LIMIT: int = 50
@@ -204,6 +206,7 @@ def build_cnhk_filings_request(
     *,
     start_page: Optional[int] = None,
     max_pages: Optional[int] = None,
+    deadline_s: Optional[float] = None,
 ) -> tuple[str, dict[str, Any]]:
     """Build the bridge tool name and arguments for CN/HK CNINFO filings probe."""
     arguments: dict[str, Any] = {
@@ -214,11 +217,13 @@ def build_cnhk_filings_request(
         "end": end,
         "limit": limit,
     }
-    params: dict[str, int] = {}
+    params: dict[str, Any] = {}
     if start_page is not None and int(start_page) > 1:
         params["start_page"] = int(start_page)
     if max_pages is not None and int(max_pages) >= 1:
         params["max_pages"] = int(max_pages)
+    if deadline_s is not None and not isinstance(deadline_s, bool) and float(deadline_s) > 0:
+        params["deadline_s"] = round(min(float(deadline_s), 600.0), 3)
     if params:
         arguments["params"] = params
     return ("finance", arguments)
@@ -231,9 +236,10 @@ def _fetch_bridge_route_sync(
     start: str,
     end: str,
     limit: int = 50,
-    timeout_s: float = 8.0,
+    timeout_s: Optional[float] = None,
     start_page: Optional[int] = None,
     max_pages: Optional[int] = None,
+    deadline_s: Optional[float] = None,
 ) -> dict[str, Any]:
     """Call local researchdata bridge ``finance(route='cn-hk', operation='filings')`` synchronously."""
     global _LAST_UNCONFIGURED_WARN_AT
@@ -248,6 +254,19 @@ def _fetch_bridge_route_sync(
             )
         return {"ok": False, "error": "bridge_unconfigured"}
 
+    eff_deadline_s = (
+        float(deadline_s)
+        if (deadline_s is not None and not isinstance(deadline_s, bool) and float(deadline_s) > 0)
+        else CNHK_PROBE_REQUEST_DEADLINE_S
+    )
+    min_http_timeout_s = eff_deadline_s + CNHK_PROBE_HTTP_TIMEOUT_MARGIN_S
+    if timeout_s is None:
+        eff_timeout_s = min_http_timeout_s
+    elif deadline_s is not None:
+        eff_timeout_s = max(float(timeout_s), min_http_timeout_s)
+    else:
+        eff_timeout_s = float(timeout_s)
+
     tool_name, arguments = build_cnhk_filings_request(
         ticker=ticker,
         start=start,
@@ -255,6 +274,7 @@ def _fetch_bridge_route_sync(
         limit=limit,
         start_page=start_page,
         max_pages=max_pages,
+        deadline_s=eff_deadline_s,
     )
     payload = {
         "jsonrpc": "2.0",
@@ -272,7 +292,7 @@ def _fetch_bridge_route_sync(
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+    with urllib.request.urlopen(req, timeout=eff_timeout_s) as resp:
         raw = json.loads(resp.read().decode("utf-8", errors="replace"))
 
     if not isinstance(raw, dict):
@@ -313,17 +333,27 @@ async def _query_bridge_cnhk_filings(
     allow_network: bool = True,
     start_page: Optional[int] = None,
     max_pages: Optional[int] = None,
+    deadline_s: Optional[float] = None,
 ) -> dict[str, Any]:
     """Query CNINFO filings for A-share and HK ``ticker`` via researchdata bridge in a worker thread."""
     if not allow_network:
         return {"ok": True, "rows": []}
     bridge_url = _resolve_bridge_url()
+    eff_deadline_s = (
+        float(deadline_s)
+        if (deadline_s is not None and not isinstance(deadline_s, bool) and float(deadline_s) > 0)
+        else CNHK_PROBE_REQUEST_DEADLINE_S
+    )
+    http_timeout_s = eff_deadline_s + CNHK_PROBE_HTTP_TIMEOUT_MARGIN_S
+    step_timeout_s = http_timeout_s + 1.0
     fetch_kwargs: dict[str, Any] = {
         "bridge_url": bridge_url,
         "ticker": ticker,
         "start": start,
         "end": end,
         "limit": limit,
+        "timeout_s": http_timeout_s,
+        "deadline_s": round(eff_deadline_s, 3),
     }
     if start_page is not None and int(start_page) > 1:
         fetch_kwargs["start_page"] = int(start_page)
@@ -335,7 +365,7 @@ async def _query_bridge_cnhk_filings(
                 _fetch_bridge_route_sync,
                 **fetch_kwargs,
             ),
-            timeout=CNHK_PROBE_STEP_TIMEOUT_S,
+            timeout=step_timeout_s,
         )
     except Exception as exc:
         logger.warning(
@@ -355,6 +385,8 @@ class _FilingsPageInfo:
     is_truncated: bool
     pagination_complete: Optional[bool]
     next_page: Optional[int]
+    page_error: Optional[str] = None
+    pages_fetched: Optional[int] = None
 
 
 def _parse_positive_int(val: Any) -> Optional[int]:
@@ -365,6 +397,23 @@ def _parse_positive_int(val: Any) -> Optional[int]:
     if isinstance(val, str) and val.strip().isdigit():
         parsed = int(val.strip())
         return parsed if parsed >= 1 else None
+    return None
+
+
+def _parse_non_negative_int(val: Any) -> Optional[int]:
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val if val >= 0 else None
+    if isinstance(val, str) and val.strip().isdigit():
+        return int(val.strip())
+    return None
+
+
+def _extract_page_error(container: dict[str, Any]) -> Optional[str]:
+    raw_err = container.get("page_error")
+    if isinstance(raw_err, str) and raw_err.strip():
+        return raw_err.strip()
     return None
 
 
@@ -415,7 +464,7 @@ def _response_indicates_truncation(container: dict[str, Any], row_count: int) ->
 
 
 def _extract_filings_page_info(raw_resp: Any) -> _FilingsPageInfo:
-    """Unwrap bridge response into rows, truncation flag, completeness, and resume page."""
+    """Unwrap bridge response into rows, truncation flag, completeness, resume page, and page error."""
     if isinstance(raw_resp, list):
         return _FilingsPageInfo(
             is_ok=True,
@@ -423,15 +472,19 @@ def _extract_filings_page_info(raw_resp: Any) -> _FilingsPageInfo:
             is_truncated=False,
             pagination_complete=None,
             next_page=None,
+            page_error=None,
+            pages_fetched=None,
         )
     if not isinstance(raw_resp, dict):
-        return _FilingsPageInfo(False, [], False, None, None)
+        return _FilingsPageInfo(False, [], False, None, None, page_error="invalid_response")
     if raw_resp.get("ok") is False or raw_resp.get("isError") is True:
-        return _FilingsPageInfo(False, [], False, None, None)
+        err_msg = str(raw_resp.get("error") or raw_resp.get("page_error") or "bridge_error").strip()
+        return _FilingsPageInfo(False, [], False, None, None, page_error=err_msg or "bridge_error")
     inner = raw_resp.get("data")
     if isinstance(inner, dict):
         if inner.get("ok") is False or inner.get("isError") is True:
-            return _FilingsPageInfo(False, [], False, None, None)
+            err_msg = str(inner.get("error") or inner.get("page_error") or "bridge_error").strip()
+            return _FilingsPageInfo(False, [], False, None, None, page_error=err_msg or "bridge_error")
         candidates = (
             inner.get("rows")
             or inner.get("filings")
@@ -440,8 +493,14 @@ def _extract_filings_page_info(raw_resp: Any) -> _FilingsPageInfo:
             or inner.get("data")
         )
         rows = [x for x in candidates if isinstance(x, dict)] if isinstance(candidates, list) else []
-        truncated = _response_indicates_truncation(inner, len(rows)) or _response_indicates_truncation(
-            raw_resp, len(rows)
+        page_error = _extract_page_error(inner) or _extract_page_error(raw_resp)
+        pages_fetched = _parse_non_negative_int(inner.get("pages_fetched"))
+        if pages_fetched is None:
+            pages_fetched = _parse_non_negative_int(raw_resp.get("pages_fetched"))
+        truncated = (
+            bool(page_error)
+            or _response_indicates_truncation(inner, len(rows))
+            or _response_indicates_truncation(raw_resp, len(rows))
         )
         explicit_complete = _extract_explicit_pagination_complete(inner)
         if explicit_complete is None:
@@ -457,6 +516,8 @@ def _extract_filings_page_info(raw_resp: Any) -> _FilingsPageInfo:
             is_truncated=truncated,
             pagination_complete=pagination_complete,
             next_page=next_page if truncated else None,
+            page_error=page_error,
+            pages_fetched=pages_fetched,
         )
     candidates = (
         raw_resp.get("rows")
@@ -466,7 +527,9 @@ def _extract_filings_page_info(raw_resp: Any) -> _FilingsPageInfo:
         or (raw_resp.get("data") if isinstance(raw_resp.get("data"), list) else None)
     )
     rows = [x for x in candidates if isinstance(x, dict)] if isinstance(candidates, list) else []
-    truncated = _response_indicates_truncation(raw_resp, len(rows))
+    page_error = _extract_page_error(raw_resp)
+    pages_fetched = _parse_non_negative_int(raw_resp.get("pages_fetched"))
+    truncated = bool(page_error) or _response_indicates_truncation(raw_resp, len(rows))
     explicit_complete = _extract_explicit_pagination_complete(raw_resp)
     pagination_complete = False if truncated else explicit_complete
     next_page = _parse_positive_int(raw_resp.get("next_page"))
@@ -476,6 +539,8 @@ def _extract_filings_page_info(raw_resp: Any) -> _FilingsPageInfo:
         is_truncated=truncated,
         pagination_complete=pagination_complete,
         next_page=next_page if truncated else None,
+        page_error=page_error,
+        pages_fetched=pages_fetched,
     )
 
 
@@ -509,22 +574,27 @@ async def _fetch_window_filings_recursive(
     limit: int,
     allow_network: bool,
     truncated_dates: list[str],
+    failed_dates: list[str],
     resume_pages: dict[str, int],
     clock: Callable[[], float],
     deadline: float,
     max_pages: Optional[int] = None,
+    request_deadline_s: float = CNHK_PROBE_REQUEST_DEADLINE_S,
 ) -> tuple[bool, bool, Optional[date], list[dict[str, Any]]]:
     """Fetch filings for ``[win_start, win_end]``, recursively halving the window when saturated or truncated.
 
-    Returns ``(is_ok, is_complete, contiguous_completed_end, rows)``.
-    A single day that reports incomplete pagination (e.g. page budget exhausted) records its resume page
-    in ``resume_pages`` and is NOT counted as complete until a later round finishes its remaining pages.
-    Before issuing each request, checks remaining time budget against ``deadline``.
+    Returns ``(had_error, is_complete, contiguous_completed_end, rows)``.
+    A single day that reports incomplete pagination (budget/deadline exhausted or a mid-pagination
+    page error) records its resume page in ``resume_pages`` and preserves all fetched rows.
+    If the same page fails with zero forward progress (or a sub-window fails outright), ``had_error``
+    is set so backoff runs, while the sibling half of a date split still keeps its rows and resume
+    state and contiguous watermarks stop strictly before the gap.
     """
     start_s = win_start.isoformat()
     end_s = win_end.isoformat()
-    if clock() >= deadline:
-        return True, False, None, []
+    remaining_s = deadline - clock()
+    if remaining_s <= 0:
+        return False, False, None, []
 
     is_single_day = win_start >= win_end
     has_pending_resume = (not is_single_day) and any(
@@ -539,12 +609,14 @@ async def _fetch_window_filings_recursive(
         start_page = resume_pages.get(start_s, 1) if is_single_day else 1
         if not isinstance(start_page, int) or isinstance(start_page, bool) or start_page < 1:
             start_page = 1
+        req_deadline_s = round(min(request_deadline_s, remaining_s), 3)
         query_kwargs: dict[str, Any] = {
             "ticker": cn_code,
             "start": start_s,
             "end": end_s,
             "limit": limit,
             "allow_network": allow_network,
+            "deadline_s": req_deadline_s,
         }
         if is_single_day and start_page > 1:
             query_kwargs["start_page"] = start_page
@@ -560,49 +632,74 @@ async def _fetch_window_filings_recursive(
                 end_s,
                 exc,
             )
-            return False, False, None, []
+            if start_s not in failed_dates:
+                failed_dates.append(start_s)
+            return True, False, None, []
 
         page_info = _extract_filings_page_info(raw_resp)
         if not page_info.is_ok:
-            return False, False, None, []
+            if start_s not in failed_dates:
+                failed_dates.append(start_s)
+            return True, False, None, []
 
         rows = page_info.rows
-        is_incomplete = page_info.is_truncated or (
-            page_info.pagination_complete is not True
-            and limit > 0
-            and len(rows) >= limit
+        is_incomplete = (
+            page_info.is_truncated
+            or bool(page_info.page_error)
+            or (
+                page_info.pagination_complete is not True
+                and limit > 0
+                and len(rows) >= limit
+            )
         )
         if not is_incomplete:
             if is_single_day:
                 resume_pages.pop(start_s, None)
-            return True, True, win_end, rows
+            return False, True, win_end, rows
 
         if is_single_day:
             next_page = page_info.next_page
-            if next_page is not None and next_page > start_page:
-                resume_pages[start_s] = next_page
+            no_progress_error = bool(page_info.page_error) and (
+                (page_info.pages_fetched is not None and page_info.pages_fetched == 0)
+                or (next_page is not None and next_page <= start_page)
+            )
+            if next_page is not None and next_page >= 2:
+                if next_page > start_page or start_s not in resume_pages:
+                    resume_pages[start_s] = next_page
             logger.warning(
                 "[DALTON_CNHK_PROBE] single-day filings window incomplete "
-                "(len=%d, limit=%d, truncated=%s, start_page=%d, next_page=%s) "
+                "(len=%d, limit=%d, truncated=%s, start_page=%d, next_page=%s, page_error=%s) "
                 "for %s on %s; recording in cnhk_probe_truncated_dates and leaving day unscanned.",
                 len(rows),
                 limit,
                 page_info.is_truncated,
                 start_page,
                 next_page,
+                page_info.page_error,
                 norm_ticker,
                 start_s,
             )
             if start_s not in truncated_dates:
                 truncated_dates.append(start_s)
-            return True, False, None, rows
+            if no_progress_error and start_s not in failed_dates:
+                failed_dates.append(start_s)
+            return no_progress_error, False, None, rows
+
+        # Multi-day query that failed on its very first page with zero rows: do not hammer with splits.
+        if page_info.page_error and (
+            (page_info.pages_fetched is not None and page_info.pages_fetched == 0)
+            or not rows
+        ):
+            if start_s not in failed_dates:
+                failed_dates.append(start_s)
+            return True, False, None, []
 
         should_split = True
 
     if should_split:
         mid_days = (win_end - win_start).days // 2
         mid_date = win_start + timedelta(days=mid_days)
-        ok_left, comp_left, end_left, left_rows = await _fetch_window_filings_recursive(
+        err_left, comp_left, end_left, left_rows = await _fetch_window_filings_recursive(
             cn_code=cn_code,
             norm_ticker=norm_ticker,
             win_start=win_start,
@@ -610,19 +707,19 @@ async def _fetch_window_filings_recursive(
             limit=limit,
             allow_network=allow_network,
             truncated_dates=truncated_dates,
+            failed_dates=failed_dates,
             resume_pages=resume_pages,
             clock=clock,
             deadline=deadline,
             max_pages=max_pages,
+            request_deadline_s=request_deadline_s,
         )
-        if not ok_left:
-            return False, False, None, []
         if not comp_left and clock() >= deadline:
             # Keep the parent window's rows too: they are real filings already fetched, and the
             # seen-hash dedupe downstream drops any overlap. The watermark still stops at end_left.
-            return True, False, end_left, [*rows, *left_rows]
+            return err_left, False, end_left, [*rows, *left_rows]
 
-        ok_right, comp_right, end_right, right_rows = await _fetch_window_filings_recursive(
+        err_right, comp_right, end_right, right_rows = await _fetch_window_filings_recursive(
             cn_code=cn_code,
             norm_ticker=norm_ticker,
             win_start=mid_date + timedelta(days=1),
@@ -630,33 +727,26 @@ async def _fetch_window_filings_recursive(
             limit=limit,
             allow_network=allow_network,
             truncated_dates=truncated_dates,
+            failed_dates=failed_dates,
             resume_pages=resume_pages,
             clock=clock,
             deadline=deadline,
             max_pages=max_pages,
+            request_deadline_s=request_deadline_s,
         )
-        if not ok_right:
-            return False, False, None, []
+        had_error = err_left or err_right
+        keep_parent = had_error or (not comp_right and clock() >= deadline)
+        combined_rows = [*rows, *left_rows, *right_rows] if keep_parent else [*left_rows, *right_rows]
         if not comp_left:
-            # Left half had a truncated day (or incomplete prefix); still return right half's rows
-            # so newer filings are not starved, but hold contiguous watermark at end_left.
-            combined_rows = (
-                [*rows, *left_rows, *right_rows]
-                if (not comp_right and clock() >= deadline)
-                else [*left_rows, *right_rows]
-            )
-            return True, False, end_left, combined_rows
+            # Left half had a gap (truncation, budget exhaustion, or failure); still return right
+            # half's rows so newer filings are not starved, but hold contiguous watermark at end_left.
+            return had_error, False, end_left, combined_rows
         if not comp_right:
-            combined_rows = (
-                [*rows, *left_rows, *right_rows]
-                if clock() >= deadline
-                else [*left_rows, *right_rows]
-            )
-            return True, False, (end_right if end_right is not None else mid_date), combined_rows
+            return had_error, False, (end_right if end_right is not None else mid_date), combined_rows
 
-        return True, True, win_end, [*left_rows, *right_rows]
+        return had_error, True, win_end, [*left_rows, *right_rows]
 
-    return True, True, win_end, rows
+    return False, True, win_end, rows
 
 
 async def probe_cnhk_filings(
@@ -672,6 +762,7 @@ async def probe_cnhk_filings(
     max_pages: Optional[int] = None,
     clock: Callable[[], float] = time.monotonic,
     total_budget_s: float = CNHK_PROBE_TOTAL_BUDGET_S,
+    request_deadline_s: float = CNHK_PROBE_REQUEST_DEADLINE_S,
 ) -> tuple[list[ProbeSignal], dict[str, Any]]:
     """Check CNINFO filings via researchdata bridge (`cn-hk` / `filings`) for A-share and HK tickers."""
     state = dict(watch_state or {})
@@ -723,34 +814,50 @@ async def probe_cnhk_filings(
 
     end_str = end_date.isoformat()
     truncated_dates: list[str] = []
+    failed_dates: list[str] = []
+    had_error = False
     is_complete = True
     completed_end_date: Optional[date] = end_date
 
     raw_data = filings_override if filings_override is not None else state.get("cnhk_filings_mock")
     if raw_data is not None:
         page_info = _extract_filings_page_info(raw_data)
-        is_ok = page_info.is_ok
         rows = page_info.rows
-        is_incomplete = page_info.is_truncated or (
-            page_info.pagination_complete is not True
-            and limit > 0
-            and len(rows) >= limit
-        )
-        if is_ok and is_incomplete:
+        if not page_info.is_ok:
+            had_error = True
             is_complete = False
             completed_end_date = None
-            if end_str not in truncated_dates:
-                truncated_dates.append(end_str)
-            cur_start = working_resume_pages.get(end_str, 1)
-            if page_info.next_page is not None and page_info.next_page > cur_start:
-                working_resume_pages[end_str] = page_info.next_page
-        elif is_ok:
-            working_resume_pages.pop(end_str, None)
+        else:
+            is_incomplete = (
+                page_info.is_truncated
+                or bool(page_info.page_error)
+                or (
+                    page_info.pagination_complete is not True
+                    and limit > 0
+                    and len(rows) >= limit
+                )
+            )
+            if is_incomplete:
+                is_complete = False
+                completed_end_date = None
+                if end_str not in truncated_dates:
+                    truncated_dates.append(end_str)
+                cur_start = working_resume_pages.get(end_str, 1)
+                if page_info.next_page is not None and page_info.next_page >= 2:
+                    if page_info.next_page > cur_start or end_str not in working_resume_pages:
+                        working_resume_pages[end_str] = page_info.next_page
+                if page_info.page_error and (
+                    (page_info.pages_fetched is not None and page_info.pages_fetched == 0)
+                    or (page_info.next_page is not None and page_info.next_page <= cur_start)
+                ):
+                    had_error = True
+            else:
+                working_resume_pages.pop(end_str, None)
     else:
         if not allow_network:
             return [], state
         deadline = clock() + total_budget_s
-        is_ok, is_complete, completed_end_date, rows = await _fetch_window_filings_recursive(
+        had_error, is_complete, completed_end_date, rows = await _fetch_window_filings_recursive(
             cn_code=cn_code,
             norm_ticker=norm_ticker,
             win_start=start_date,
@@ -758,17 +865,27 @@ async def probe_cnhk_filings(
             limit=limit,
             allow_network=allow_network,
             truncated_dates=truncated_dates,
+            failed_dates=failed_dates,
             resume_pages=working_resume_pages,
             clock=clock,
             deadline=deadline,
             max_pages=max_pages,
+            request_deadline_s=request_deadline_s,
         )
 
-    if not is_ok:
+    # Pure total failure (no rows, no completed prefix, no truncated/resume progress):
+    # keep existing watch_state untouched except marking cnhk_probe_degraded=True.
+    if (
+        had_error
+        and not rows
+        and completed_end_date is None
+        and not truncated_dates
+        and not working_resume_pages
+    ):
         state["cnhk_probe_degraded"] = True
         return [], state
 
-    state["cnhk_probe_degraded"] = False
+    state["cnhk_probe_degraded"] = bool(had_error)
     resolved_until: Optional[date] = end_date if is_complete else completed_end_date
     next_unresolved: list[str] = []
     for d in prev_unresolved_dates:
@@ -777,6 +894,7 @@ async def probe_cnhk_filings(
             resolved_until is not None
             and start_date <= d <= resolved_until
             and ds not in truncated_dates
+            and ds not in failed_dates
             and ds not in working_resume_pages
         ):
             continue
@@ -785,20 +903,24 @@ async def probe_cnhk_filings(
     for ds in truncated_dates:
         if ds not in next_unresolved:
             next_unresolved.append(ds)
+    for ds in failed_dates:
+        if ds not in next_unresolved:
+            next_unresolved.append(ds)
     for ds in sorted(working_resume_pages):
         if ds not in next_unresolved:
             next_unresolved.append(ds)
 
     if not is_complete:
         state["cnhk_probe_partial"] = True
-        if truncated_dates:
+        if truncated_dates or failed_dates:
             logger.warning(
-                "[DALTON_CNHK_PROBE] filings window incomplete due to truncation for %s (%s..%s); "
-                "truncated_dates=%s resume_pages=%s contiguous_end=%s, marking cnhk_probe_partial=True.",
+                "[DALTON_CNHK_PROBE] filings window incomplete for %s (%s..%s); "
+                "truncated_dates=%s failed_dates=%s resume_pages=%s contiguous_end=%s, marking cnhk_probe_partial=True.",
                 norm_ticker,
                 start_date.isoformat(),
                 end_str,
                 truncated_dates,
+                failed_dates,
                 working_resume_pages,
                 completed_end_date.isoformat() if completed_end_date else None,
             )
@@ -812,7 +934,9 @@ async def probe_cnhk_filings(
                 end_str,
                 completed_end_date.isoformat() if completed_end_date else None,
             )
-        if completed_end_date is not None:
+        if completed_end_date is not None and (
+            last_check_date is None or completed_end_date > last_check_date
+        ):
             state["last_cnhk_check_date"] = completed_end_date.isoformat()
     else:
         state.pop("cnhk_probe_partial", None)

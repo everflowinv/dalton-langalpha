@@ -3,8 +3,10 @@ import argparse
 import datetime as dt
 import io
 import json
+import math
 import re
 import tempfile
+import time
 from pathlib import Path
 
 import fitz
@@ -82,17 +84,27 @@ def classify_title(title: str) -> str:
     return "other"
 
 
-def get_org_id(stock_code: str, headers: dict) -> str:
-    r = requests.post(SEARCH_URL, data={"keyWord": stock_code, "maxNum": 10}, headers=headers, timeout=15)
+CNINFO_MAX_PAGE_SIZE = 30
+DEFAULT_SINGLE_DAY_MAX_PAGES = 5
+CNINFO_PAGE_TIMEOUT_S = 20.0
+CNINFO_ORG_ID_TIMEOUT_S = 15.0
+CNINFO_DEADLINE_MARGIN_S = 0.5
+
+
+def _summarize_page_error(exc: Exception) -> str:
+    name = type(exc).__name__
+    msg = " ".join(str(exc).split())
+    summary = f"{name}: {msg}" if msg else name
+    return summary[:160]
+
+
+def get_org_id(stock_code: str, headers: dict, timeout: float = CNINFO_ORG_ID_TIMEOUT_S) -> str:
+    r = requests.post(SEARCH_URL, data={"keyWord": stock_code, "maxNum": 10}, headers=headers, timeout=timeout)
     r.raise_for_status()
     data = r.json()
     if not isinstance(data, list) or not data:
         return ""
     return str(data[0].get("orgId", "") or "")
-
-
-CNINFO_MAX_PAGE_SIZE = 30
-DEFAULT_SINGLE_DAY_MAX_PAGES = 5
 
 
 def fetch_announcements(
@@ -102,6 +114,8 @@ def fetch_announcements(
     date_from: str = "",
     date_to: str = "",
     start_page: int = 1,
+    deadline_s: float | None = None,
+    clock=time.monotonic,
 ):
     stock_code = normalize_ticker(ticker)
     market = resolve_market(stock_code)
@@ -111,9 +125,23 @@ def fetch_announcements(
         "X-Requested-With": "XMLHttpRequest",
     }
 
+    deadline_at = None
+    stop_margin_s = 0.0
+    if deadline_s is not None and not isinstance(deadline_s, bool):
+        eff_deadline_s = float(deadline_s)
+        if math.isfinite(eff_deadline_s) and eff_deadline_s > 0:
+            deadline_at = clock() + eff_deadline_s
+            stop_margin_s = min(CNINFO_DEADLINE_MARGIN_S, eff_deadline_s * 0.1)
+
     org_id = ""
     try:
-        org_id = get_org_id(stock_code, headers)
+        if deadline_at is None:
+            org_id = get_org_id(stock_code, headers, timeout=CNINFO_ORG_ID_TIMEOUT_S)
+        else:
+            rem_for_org = deadline_at - clock()
+            if rem_for_org > 0:
+                org_timeout = min(CNINFO_ORG_ID_TIMEOUT_S, min(5.0, rem_for_org * 0.4))
+                org_id = get_org_id(stock_code, headers, timeout=org_timeout)
     except Exception:
         org_id = ""
 
@@ -134,8 +162,27 @@ def fetch_announcements(
     total_count = None
     has_more = False
     next_page = None
+    page_error = None
+    deadline_reached = False
 
     for page in range(start_page, end_page + 1):
+        if deadline_at is not None:
+            remaining = deadline_at - clock()
+            if pages_fetched > 0 and remaining <= stop_margin_s:
+                has_more = True
+                next_page = page
+                deadline_reached = True
+                break
+            if remaining <= 0:
+                has_more = True
+                next_page = page
+                deadline_reached = True
+                page_error = "deadline_exceeded"
+                break
+            req_timeout = min(CNINFO_PAGE_TIMEOUT_S, remaining)
+        else:
+            req_timeout = CNINFO_PAGE_TIMEOUT_S
+
         payload = {
             "pageNum": page,
             "pageSize": page_size,
@@ -153,9 +200,18 @@ def fetch_announcements(
             "isHLtitle": "true",
         }
 
-        r = requests.post(ANN_URL, data=payload, headers=headers, timeout=20)
-        r.raise_for_status()
-        data = r.json()
+        try:
+            r = requests.post(ANN_URL, data=payload, headers=headers, timeout=req_timeout)
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, dict):
+                raise ValueError(f"invalid_json_type:{type(data).__name__}")
+        except (requests.RequestException, ValueError) as exc:
+            has_more = True
+            next_page = page
+            page_error = _summarize_page_error(exc)
+            break
+
         pages_fetched += 1
         last_page = page
         raw_has_more = data.get("hasMore")
@@ -254,6 +310,10 @@ def fetch_announcements(
     }
     if total_count is not None:
         result["total_count"] = total_count
+    if page_error is not None:
+        result["page_error"] = page_error
+    if deadline_reached:
+        result["deadline_reached"] = True
     return result
 
 
@@ -418,7 +478,12 @@ def self_test(ticker: str = "00700"):
     checks = []
     try:
         out = fetch_announcements(ticker=ticker, limit=1)
-        checks.append({"name": "api.connectivity", "ok": bool(out.get("ok")), "count": out.get("count", 0)})
+        conn_ok = bool(out.get("ok")) and not out.get("page_error")
+        check = {"name": "api.connectivity", "ok": conn_ok, "count": out.get("count", 0)}
+        if out.get("page_error"):
+            check["error"] = out["page_error"]
+            check["hint"] = error_hint(str(out["page_error"]))
+        checks.append(check)
     except Exception as e:
         checks.append({"name": "api.connectivity", "ok": False, "error": str(e), "hint": error_hint(str(e))})
 
@@ -459,6 +524,7 @@ def main():
     parser.add_argument("--limit", type=int, default=10, help="Number of filings to return")
     parser.add_argument("--max-pages", type=int, default=None, help="How many pages to crawl from Cninfo (default: 5 for single-day, 1 otherwise)")
     parser.add_argument("--start-page", type=int, default=1, help="1-based start page for Cninfo pagination")
+    parser.add_argument("--deadline-s", type=float, default=None, help="Total time budget in seconds for paginated announcement fetch")
     parser.add_argument("--date-from", type=str, default="", help="Start date YYYY-MM-DD (optional)")
     parser.add_argument("--date-to", type=str, default="", help="End date YYYY-MM-DD (optional)")
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
@@ -516,6 +582,7 @@ def main():
             date_from=args.date_from,
             date_to=args.date_to,
             start_page=args.start_page,
+            deadline_s=args.deadline_s,
         )
 
         if args.facts_metric:
