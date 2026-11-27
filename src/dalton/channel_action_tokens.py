@@ -154,6 +154,7 @@ class _ResumeInboundLockSetChanged(Exception):
 # Deterministic concurrency test hooks (always None in production).
 _after_preview_hook: Callable[[str], Awaitable[None]] | None = None
 _before_7b0_lock_hook: Callable[[str], Awaitable[None]] | None = None
+_after_7b0_lock_hook: Callable[[str], Awaitable[None]] | None = None
 _after_7a_inbound_lock_hook: Callable[[str], Awaitable[None]] | None = None
 _after_7b2_lock_hook: Callable[[str], Awaitable[None]] | None = None
 
@@ -757,18 +758,21 @@ async def set_interrupt_runtime_config(
     bt2_link_recovery_enabled: bool | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
-    """Path A (Lock Order ⑫ branch 1): update ONLY the single-row 7b-0 barrier table.
+    """Path A (Lock Order ⑫ branch 1): update ONLY ``interactive_actions_enabled`` on
+    the single-row Level 7b-0 barrier table.
 
-    Preserves all existing ``dalton_channel_action_tokens`` and BT2 switches untouched
-    when toggling ``interactive_actions_enabled`` alone. If all three switches are
-    explicitly set to ``False``, delegates to ``enter_interrupt_drain_mode`` (Path B).
+    ``interrupt_ledger_enabled`` and ``bt2_link_recovery_enabled`` are strictly
+    rejected on Path A and may only be changed through ``enter_interrupt_drain_mode``
+    (Path B / ``mode='enter_drain'``). Existing tokens and BT2 settings stay untouched.
     """
-    if (
-        interactive_actions_enabled is False
-        and interrupt_ledger_enabled is False
-        and bt2_link_recovery_enabled is False
-    ):
-        return await enter_interrupt_drain_mode(conn=conn)
+    if interrupt_ledger_enabled is not None or bt2_link_recovery_enabled is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "drain_mode_required",
+                "message": "interrupt_ledger_enabled and bt2_link_recovery_enabled can only be modified via enter_drain (enter_interrupt_drain_mode).",
+            },
+        )
 
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
@@ -781,17 +785,7 @@ async def set_interrupt_runtime_config(
                     if interactive_actions_enabled is None
                     else bool(interactive_actions_enabled)
                 )
-                new_ledger = (
-                    current["db_interrupt_ledger_enabled"]
-                    if interrupt_ledger_enabled is None
-                    else bool(interrupt_ledger_enabled)
-                )
-                new_bt2 = (
-                    current["db_bt2_link_recovery_enabled"]
-                    if bt2_link_recovery_enabled is None
-                    else bool(bt2_link_recovery_enabled)
-                )
-                if not new_ledger and new_interactive:
+                if not current["db_interrupt_ledger_enabled"] and new_interactive:
                     raise HTTPException(
                         status_code=400,
                         detail={
@@ -803,8 +797,6 @@ async def set_interrupt_runtime_config(
                     """
                     UPDATE dalton_channel_interrupt_runtime_config
                     SET interactive_actions_enabled = %s,
-                        interrupt_ledger_enabled = %s,
-                        bt2_link_recovery_enabled = %s,
                         config_revision = config_revision + 1,
                         updated_at = NOW()
                     WHERE singleton_id = 1
@@ -814,7 +806,7 @@ async def set_interrupt_runtime_config(
                               bt2_link_recovery_enabled,
                               updated_at
                     """,
-                    (new_interactive, new_ledger, new_bt2),
+                    (new_interactive,),
                 )
                 upd = dict(await cur.fetchone())
                 return {
@@ -2605,12 +2597,21 @@ async def consume_channel_action_token(
     atomic resume contention (Lock Order ④)."""
     eff_hash = hash_approval_nonce(approval_nonce)
 
-    # Read-only lookup of authoritative platform BEFORE epoch parsing
+    # Read-only lookup of authoritative platform & immutable origin session/group keys BEFORE epoch parsing
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
-                SELECT token_hash, platform, thread_id::text AS thread_id, run_id, interrupt_id
+                SELECT token_hash,
+                       platform,
+                       dalton_user_id,
+                       origin_chat_type,
+                       origin_chat_address,
+                       origin_scope_key,
+                       session_generation,
+                       thread_id::text AS thread_id,
+                       run_id,
+                       interrupt_id
                 FROM dalton_channel_action_tokens
                 WHERE token_hash = %s
                 """,
@@ -2634,6 +2635,10 @@ async def consume_channel_action_token(
     thread_id = str(pre["thread_id"])
     run_id = str(pre["run_id"])
     interrupt_id = str(pre["interrupt_id"])
+    pre_uid = str(pre.get("dalton_user_id") or "").strip()
+    pre_origin_ct = str(pre.get("origin_chat_type") or "").strip().lower()
+    pre_origin_addr = str(pre.get("origin_chat_address") or "").strip()
+    pre_origin_scope = str(pre.get("origin_scope_key") or "").strip()
 
     # Unlocked checkpoint read outside the write transaction
     live_pending_by_id, live_snapshots = await load_live_pending_interrupts(thread_id)
@@ -2673,10 +2678,38 @@ async def consume_channel_action_token(
                         enforce_post_lease_for_non_weixin=False,
                     )
 
+                    # Level 2: group chat advisory lock when origin is a group chat (Lock Order ④)
+                    if pre_origin_ct == "group" and pre_origin_addr:
+                        norm_grp_addr = cg_db._normalize_topic_chat_address(
+                            auth_platform, pre_origin_addr
+                        )
+                        if norm_grp_addr:
+                            await cg_db._acquire_group_chat_lock(
+                                cur, auth_platform, norm_grp_addr
+                            )
+
                     # Level 3a: Weixin accounts FOR KEY SHARE
                     locked_wx_aids = await _acquire_weixin_account_key_share_in_tx(
                         cur, preview_wx_aids
                     )
+
+                    # Level 6: lock session_generations FOR UPDATE BEFORE Level 7a (Lock Order ④)
+                    locked_sg_row: dict[str, Any] | None = None
+                    if pre_origin_scope and pre_uid:
+                        await cur.execute(
+                            """
+                            SELECT generation
+                            FROM dalton_channel_session_generations
+                            WHERE platform = %s
+                              AND scope_key = %s
+                              AND dalton_user_id = %s
+                            FOR UPDATE
+                            """,
+                            (auth_platform, pre_origin_scope, pre_uid),
+                        )
+                        fetched_sg = await cur.fetchone()
+                        if fetched_sg is not None:
+                            locked_sg_row = dict(fetched_sg)
 
                     # Level 7a: old inbound_events FOR UPDATE + immediate Weixin lock-set check
                     locked_inbounds = await _lock_inbound_events_and_verify_weixin_set_in_tx(
@@ -2689,6 +2722,8 @@ async def consume_channel_action_token(
                     rt_cfg = await read_effective_interrupt_runtime_config_in_tx(
                         cur, for_update=False
                     )
+                    if _after_7b0_lock_hook is not None:
+                        await _after_7b0_lock_hook("consume")
 
                     # Level 7b-1: interrupt advisory lock
                     await _acquire_hitl_resume_lock_in_tx(
@@ -3000,18 +3035,8 @@ async def consume_channel_action_token(
                                 },
                             )
                         else:
-                            await cur.execute(
-                                """
-                                SELECT generation
-                                FROM dalton_channel_session_generations
-                                WHERE platform = %s
-                                  AND scope_key = %s
-                                  AND dalton_user_id = %s
-                                """,
-                                (auth_platform, str(tok_dict["origin_scope_key"]), uid),
-                            )
-                            sg_row = await cur.fetchone()
-                            if sg_row is not None and int(sg_row["generation"]) != int(tok_dict["session_generation"]):
+                            # Use Level 6 FOR UPDATE locked session_generations row (acquired before Level 7a)
+                            if locked_sg_row is not None and int(locked_sg_row["generation"]) != int(tok_dict["session_generation"]):
                                 raise HTTPException(
                                     status_code=409,
                                     detail={"code": "session_generation_superseded", "can_patch_terminal": False},
@@ -3429,6 +3454,8 @@ async def claim_channel_text_interrupt_resume(
                     rt_cfg = await read_effective_interrupt_runtime_config_in_tx(
                         cur, for_update=False
                     )
+                    if _after_7b0_lock_hook is not None:
+                        await _after_7b0_lock_hook("claim_text")
                     if not rt_cfg["interrupt_ledger_enabled"]:
                         # Rollback implicitly (no writes done) and fall back to legacy_direct
                         return {

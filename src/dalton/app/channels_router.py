@@ -1645,10 +1645,19 @@ async def internal_interrupt_runtime_config_endpoint(
         cleaned_mode = str(body.mode or "").strip().lower()
         if cleaned_mode == "enter_drain":
             return await cat_svc.enter_interrupt_drain_mode()
+        if (
+            body.interrupt_ledger_enabled is not None
+            or body.bt2_link_recovery_enabled is not None
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "drain_mode_required",
+                    "message": "Only interactive_actions_enabled may be changed outside mode='enter_drain'.",
+                },
+            )
         return await cat_svc.set_interrupt_runtime_config(
             interactive_actions_enabled=body.interactive_actions_enabled,
-            interrupt_ledger_enabled=body.interrupt_ledger_enabled,
-            bt2_link_recovery_enabled=body.bt2_link_recovery_enabled,
         )
     except HTTPException as exc:
         return _handle_structured_http_error(exc)

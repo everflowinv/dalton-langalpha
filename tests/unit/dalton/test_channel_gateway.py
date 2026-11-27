@@ -1425,6 +1425,17 @@ class InMemoryChannelStore:
                     and str(r.get("weixin_account_id")) not in excluded
                 ]
                 return matches[:1]
+            if "WHERE thread_id = %s AND weixin_account_id IS NOT NULL" in norm:
+                tid = str(params[0])
+                excluded = {str(x) for x in (params[1] or [])} if len(params) > 1 else set()
+                r = self.thread_watches.get(tid)
+                if (
+                    r
+                    and r.get("weixin_account_id") is not None
+                    and str(r.get("weixin_account_id")) not in excluded
+                ):
+                    return [{"?column?": 1}]
+                return []
             if "WHERE thread_id = %s" in norm:
                 tid = str(params[0])
                 r = self.thread_watches.get(tid)
