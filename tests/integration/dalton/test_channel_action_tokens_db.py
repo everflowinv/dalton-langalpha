@@ -65,6 +65,53 @@ def _assert_not_lock_or_constraint_error(exc: BaseException) -> None:
     ), f"Unexpected PostgreSQL error: {type(exc).__name__}: {exc}"
 
 
+async def _wait_for_pg_lock_wait(
+    pool: AsyncConnectionPool,
+    query_pattern: str,
+    *,
+    timeout: float = _SYNC_TIMEOUT,
+) -> dict[str, Any]:
+    """Open a separate connection and poll ``pg_stat_activity`` + ``pg_locks`` until a
+    backend in this test database is genuinely blocked with ``wait_event_type = 'Lock'``
+    on a query matching ``query_pattern``."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    async with pool.connection() as obs_conn:
+        async with obs_conn.cursor() as obs_cur:
+            while True:
+                await obs_cur.execute(
+                    """
+                    SELECT a.pid,
+                           a.wait_event_type,
+                           a.wait_event,
+                           a.query,
+                           pg_blocking_pids(a.pid) AS blockers
+                    FROM pg_stat_activity a
+                    WHERE a.datname = current_database()
+                      AND a.pid <> pg_backend_pid()
+                      AND a.state = 'active'
+                      AND a.wait_event_type = 'Lock'
+                      AND a.query ILIKE %s
+                      AND cardinality(pg_blocking_pids(a.pid)) > 0
+                      AND EXISTS (
+                          SELECT 1
+                          FROM pg_locks l
+                          WHERE l.pid = a.pid
+                            AND NOT l.granted
+                      )
+                    LIMIT 1
+                    """,
+                    (query_pattern,),
+                )
+                row = await obs_cur.fetchone()
+                if row is not None:
+                    return dict(row)
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out waiting for PostgreSQL Lock wait matching {query_pattern!r}"
+                    )
+                await asyncio.sleep(0.02)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures: live-loop AsyncConnectionPool + real pgcrypto Weixin + lease lifecycle
 # ---------------------------------------------------------------------------
@@ -261,7 +308,10 @@ async def pg_b3_env(
         cat._before_7b0_lock_hook = None
         cat._after_7b0_lock_hook = None
         cat._after_7a_inbound_lock_hook = None
+        cat._before_7b2_lock_hook = None
         cat._after_7b2_lock_hook = None
+        cg_db._after_recover_3a_lock_hook = None
+        wx_db._after_unbind_3a_lock_hook = None
         try:
             if epoch is not None:
                 await wx_db.release_gateway_lease(instance_id=instance_id, epoch=epoch)
@@ -630,24 +680,44 @@ async def test_d058_real_db_upgrade_downgrade_roundtrip_and_constraints(pg_b3_en
                     (tid, uid, str(uuid4())),
                 )
 
-    # FK behavior: fk_dalton_interrupt_resumes_wx_account ON DELETE SET NULL
+    # FK behavior: fk_dalton_interrupt_resumes_wx_account ON DELETE SET NULL + CHECK verification
     wx_aid = await _seed_weixin_account(pool, uid=uid, prefix=pg_b3_env["prefix"])
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
+            # CHECK 5 (d058:229-233): formal channel_text row (legacy_direct=FALSE) without
+            # inbound_message_id MUST be rejected by dalton_channel_interrupt_resumes_check.
+            with pytest.raises(psycopg.errors.CheckViolation):
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_interrupt_resumes (
+                        thread_id, run_id, interrupt_id, settled_via, settled_by_user_id,
+                        platform, weixin_account_id, request_key, resume_payload,
+                        resume_status, requires_gateway_ack, delivery_settled, lease_expires_at
+                    )
+                    VALUES (
+                        %s::uuid, 'r-fk-bad', 'i-fk-bad', 'channel_text', %s,
+                        'weixin', %s::uuid, %s::uuid, '{}'::jsonb,
+                        'pending_dispatch', TRUE, FALSE, NOW() + INTERVAL '90 seconds'
+                    )
+                    """,
+                    (tid, uid, wx_aid, str(uuid4())),
+                )
+
+            # Valid formal channel_text resume row (platform='weixin', inbound_message_id set)
             await cur.execute(
                 """
                 INSERT INTO dalton_channel_interrupt_resumes (
                     thread_id, run_id, interrupt_id, settled_via, settled_by_user_id,
-                    platform, weixin_account_id, request_key, resume_payload,
+                    platform, inbound_message_id, weixin_account_id, request_key, resume_payload,
                     resume_status, requires_gateway_ack, delivery_settled, lease_expires_at
                 )
                 VALUES (
                     %s::uuid, 'r-fk', 'i-fk', 'channel_text', %s,
-                    'weixin', %s::uuid, %s::uuid, '{}'::jsonb,
+                    'weixin', %s, %s::uuid, %s::uuid, '{}'::jsonb,
                     'pending_dispatch', TRUE, FALSE, NOW() + INTERVAL '90 seconds'
                 )
                 """,
-                (tid, uid, wx_aid, str(uuid4())),
+                (tid, uid, f"{pg_b3_env['prefix']}_fk_mid", wx_aid, str(uuid4())),
             )
             await cur.execute(
                 "DELETE FROM dalton_channel_weixin_accounts WHERE account_id = %s::uuid",
@@ -845,16 +915,18 @@ async def test_pg_interleaving_02_new_claim_text_takeover_both_pk_orders_and_old
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("contender", ["web", "consume"])
+@pytest.mark.parametrize("order", ["contender_first", "ack_first"])
 async def test_pg_interleaving_03_web_and_consume_takeover_old_channel_text_and_old_ack(
-    pg_b3_env, monkeypatch: pytest.MonkeyPatch, contender: str
+    pg_b3_env, monkeypatch: pytest.MonkeyPatch, contender: str, order: str
 ) -> None:
     """Interleaving ③: BOTH web AND button ``consume`` takeover of expired ``channel_text``
-    concurrent with old ``ack``, synchronized at preview barrier with strict assertions."""
+    concurrent with old ``ack``, fixing BOTH commit orders (contender_first / ack_first)
+    after synchronized preview with strict assertions."""
     pool, uid, tid, epoch = pg_b3_env["pool"], pg_b3_env["uid"], pg_b3_env["tid"], pg_b3_env["epoch"]
     scope = f"dm:{pg_b3_env['feishu_puid']}"
-    old_mid = f"{pg_b3_env['prefix']}_m03_{contender}"
-    run_id = f"run-03-{contender}"
-    int_id = f"int-03-{contender}"
+    old_mid = f"{pg_b3_env['prefix']}_m03_{contender}_{order}"
+    run_id = f"run-03-{contender}-{order}"
+    int_id = f"int-03-{contender}-{order}"
     action_req = {"type": "ask_user_question", "question": "Proceed?"}
     _patch_live_checkpoint(monkeypatch, interrupt_id=int_id, action_req=action_req)
     await _seed_session_and_inbound(
@@ -863,6 +935,7 @@ async def test_pg_interleaving_03_web_and_consume_takeover_old_channel_text_and_
     )
 
     nonce: str | None = None
+    token_hash: str | None = None
     if contender == "consume":
         minted = await cat.mint_channel_action_token(
             platform="feishu", dalton_user_id=uid, initiator_platform_user_id=pg_b3_env["feishu_puid"],
@@ -872,12 +945,13 @@ async def test_pg_interleaving_03_web_and_consume_takeover_old_channel_text_and_
             gateway_epoch=epoch,
         )
         nonce = minted["approval_nonce"]
+        token_hash = minted["token_hash"]
         await cat.bind_channel_action_card(
             approval_nonce=nonce, phase="prepare_send", gateway_epoch=epoch
         )
         await cat.bind_channel_action_card(
             approval_nonce=nonce, phase="confirm_bound",
-            card_channel_id="oc_dm_03", card_message_id="om_card_03", gateway_epoch=epoch,
+            card_channel_id="oc_dm_03", card_message_id=f"om_card_03_{order}", gateway_epoch=epoch,
         )
 
     c_old = await cat.claim_channel_text_interrupt_resume(
@@ -886,7 +960,7 @@ async def test_pg_interleaving_03_web_and_consume_takeover_old_channel_text_and_
         resume_payload={"hitl_response": {int_id: {"answer": "old"}}},
         gateway_epoch=epoch,
     )
-    # For consume takeover test, re-arm token as unconsumed so consume can take over the expired claim
+    # Expire old lease; for consume re-arm token as unconsumed so consume can take over the expired claim
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -909,15 +983,27 @@ async def test_pg_interleaving_03_web_and_consume_takeover_old_channel_text_and_
 
     contender_previewed = asyncio.Event()
     ack_previewed = asyncio.Event()
+    first_tx_done = asyncio.Event()
+    contender_preview_count = 0
+    ack_preview_count = 0
     target_op = "claim_web" if contender == "web" else "consume"
 
     async def _hook(op: str) -> None:
+        nonlocal contender_preview_count, ack_preview_count
         if op == target_op:
-            contender_previewed.set()
-            await asyncio.wait_for(ack_previewed.wait(), timeout=_SYNC_TIMEOUT)
+            contender_preview_count += 1
+            if contender_preview_count == 1:
+                contender_previewed.set()
+                await asyncio.wait_for(ack_previewed.wait(), timeout=_SYNC_TIMEOUT)
+                if order == "ack_first":
+                    await asyncio.wait_for(first_tx_done.wait(), timeout=_SYNC_TIMEOUT)
         elif op == "ack_origin":
-            ack_previewed.set()
-            await asyncio.wait_for(contender_previewed.wait(), timeout=_SYNC_TIMEOUT)
+            ack_preview_count += 1
+            if ack_preview_count == 1:
+                ack_previewed.set()
+                await asyncio.wait_for(contender_previewed.wait(), timeout=_SYNC_TIMEOUT)
+                if order == "contender_first":
+                    await asyncio.wait_for(first_tx_done.wait(), timeout=_SYNC_TIMEOUT)
 
     cat._after_preview_hook = _hook
 
@@ -932,11 +1018,13 @@ async def test_pg_interleaving_03_web_and_consume_takeover_old_channel_text_and_
             return await cat.consume_channel_action_token(
                 approval_nonce=nonce, decision="approve",
                 clicker_platform_user_id=pg_b3_env["feishu_puid"],
-                channel_id="oc_dm_03", message_id="om_card_03", answer_text="button",
+                channel_id="oc_dm_03", message_id=f"om_card_03_{order}", answer_text="button",
                 gateway_epoch=epoch,
             )
         finally:
             contender_previewed.set()
+            if order == "contender_first":
+                first_tx_done.set()
 
     async def _run_old_ack():
         try:
@@ -947,38 +1035,75 @@ async def test_pg_interleaving_03_web_and_consume_takeover_old_channel_text_and_
             )
         finally:
             ack_previewed.set()
+            if order == "ack_first":
+                first_tx_done.set()
 
     c_res, ack_res = await asyncio.gather(_run_contender(), _run_old_ack(), return_exceptions=True)
 
     for item in (c_res, ack_res):
         if isinstance(item, Exception):
             _assert_not_lock_or_constraint_error(item)
-            assert isinstance(item, HTTPException) and item.status_code == 409, f"Unexpected error: {item!r}"
 
-    # Contender takes over cleanly (old inbound marked completed, resume settled_via web/channel_button)
-    assert isinstance(c_res, dict) and c_res["ok"] is True
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "SELECT settled_via, inbound_message_id FROM dalton_channel_interrupt_resumes WHERE thread_id = %s::uuid AND run_id = %s AND interrupt_id = %s",
+                """
+                SELECT claim_id::text AS claim_id, settled_via, inbound_message_id
+                FROM dalton_channel_interrupt_resumes
+                WHERE thread_id = %s::uuid AND run_id = %s AND interrupt_id = %s
+                """,
                 (tid, run_id, int_id),
             )
             r_row = await cur.fetchone()
-            assert r_row["settled_via"] == ("web" if contender == "web" else "channel_button")
-            assert r_row["inbound_message_id"] is None
             await cur.execute(
                 "SELECT status FROM dalton_channel_inbound_events WHERE platform = 'feishu' AND message_id = %s",
                 (old_mid,),
             )
-            assert (await cur.fetchone())["status"] == "completed"
+            inb_row = await cur.fetchone()
+            tok_row = None
+            if token_hash is not None:
+                await cur.execute(
+                    "SELECT consumed_at, consumed_via FROM dalton_channel_action_tokens WHERE token_hash = %s",
+                    (token_hash,),
+                )
+                tok_row = await cur.fetchone()
+
+    if order == "contender_first":
+        assert isinstance(c_res, dict) and c_res["ok"] is True
+        assert r_row is not None
+        assert r_row["settled_via"] == ("web" if contender == "web" else "channel_button")
+        assert r_row["inbound_message_id"] is None
+        assert r_row["claim_id"] == c_res["claim_id"]
+        assert inb_row is not None and inb_row["status"] == "completed"
+        assert isinstance(ack_res, HTTPException) and ack_res.status_code == 409
+        assert ack_res.detail["code"] == "interrupt_claim_mismatch"
+    else:
+        assert isinstance(ack_res, dict) and ack_res["ok"] is True
+        assert isinstance(c_res, HTTPException) and c_res.status_code == 409
+        if contender == "web":
+            assert c_res.detail["code"] == "already_settled_in_channel"
+        else:
+            # ack renewed lease -> consume takeover denied at channel_action_tokens.py:3184-3193
+            # before token consumption; resume is still pending_dispatch (delivery_settled=False)
+            assert c_res.detail["code"] == "already_settled"
+            assert c_res.detail["can_patch_terminal"] is False
+            assert c_res.detail["patch_ack_mode"] is None
+            assert tok_row is not None and tok_row["consumed_at"] is None
+        assert r_row is not None
+        assert r_row["claim_id"] == c_old["claim_id"]
+        assert r_row["settled_via"] == "channel_text"
+        assert r_row["inbound_message_id"] == old_mid
+        assert inb_row is not None and inb_row["status"] == "hitl_claimed"
 
 
 @pytest.mark.asyncio
 async def test_pg_interleaving_04_claim_text_and_recover_startup_and_interrupt_resumes(
     pg_b3_env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Interleaving ④: claim-text holding 7b-2 lock + concurrent /internal/recover
-    (startup & interrupt_resumes) verifying SKIP LOCKED does not block or deadlock."""
+    """Interleaving ④: claim-text pauses AFTER first INSERT into ``dalton_channel_interrupt_resumes``
+    (before commit) AND again while holding ``FOR UPDATE`` on the committed 7b-2 row; concurrent
+    ``/internal/recover`` (``startup`` & ``interrupt_resumes``) MUST skip the locked row via
+    ``SKIP LOCKED``, exclude it from responses, and leave it unmodified."""
     pool, uid, tid, epoch = pg_b3_env["pool"], pg_b3_env["uid"], pg_b3_env["tid"], pg_b3_env["epoch"]
     scope = f"dm:{pg_b3_env['feishu_puid']}"
     mid = f"{pg_b3_env['prefix']}_m04"
@@ -988,17 +1113,26 @@ async def test_pg_interleaving_04_claim_text_and_recover_startup_and_interrupt_r
         chat_address="feishu:@me", tid=tid, run_id="run-04", interrupt_id="int-04",
     )
 
-    holding_7b2 = asyncio.Event()
-    recover_done = asyncio.Event()
+    def _has_row(rec: dict[str, Any]) -> bool:
+        return any(
+            str(r.get("thread_id")) == tid
+            and str(r.get("run_id")) == "run-04"
+            and str(r.get("interrupt_id")) == "int-04"
+            for r in (rec.get("interrupt_resumes") or [])
+        )
 
-    async def _hook_7b2(op: str) -> None:
-        if op == "claim_text":
-            holding_7b2.set()
-            await asyncio.wait_for(recover_done.wait(), timeout=_SYNC_TIMEOUT)
+    # Phase A: pause AFTER first INSERT into dalton_channel_interrupt_resumes, BEFORE commit
+    inserted_uncommitted = asyncio.Event()
+    phase_a_recovers_done = asyncio.Event()
 
-    cat._after_7b2_lock_hook = _hook_7b2
+    async def _hook_after_insert(op: str) -> None:
+        if op == "claim_text_after_insert":
+            inserted_uncommitted.set()
+            await asyncio.wait_for(phase_a_recovers_done.wait(), timeout=_SYNC_TIMEOUT)
 
-    async def _run_claim():
+    cat._after_7b2_lock_hook = _hook_after_insert
+
+    async def _run_first_claim():
         try:
             return await cat.claim_channel_text_interrupt_resume(
                 platform="feishu", message_id=mid, dalton_user_id=uid, scope_key=scope, generation=1,
@@ -1007,30 +1141,102 @@ async def test_pg_interleaving_04_claim_text_and_recover_startup_and_interrupt_r
                 gateway_epoch=epoch,
             )
         finally:
-            holding_7b2.set()
+            inserted_uncommitted.set()
 
-    async def _run_recovers():
+    async def _run_phase_a_recovers():
         try:
-            await asyncio.wait_for(holding_7b2.wait(), timeout=_SYNC_TIMEOUT)
-            return await asyncio.gather(
-                cg_db.recover_channel_state(mode="startup", gateway_epoch=epoch, require_gateway_epoch=True),
-                cg_db.recover_channel_state(mode="interrupt_resumes", gateway_epoch=epoch, require_gateway_epoch=True),
+            await asyncio.wait_for(inserted_uncommitted.wait(), timeout=_SYNC_TIMEOUT)
+            rec_start = await cg_db.recover_channel_state(
+                mode="startup", gateway_epoch=epoch, require_gateway_epoch=True
+            )
+            rec_ir = await cg_db.recover_channel_state(
+                mode="interrupt_resumes", gateway_epoch=epoch, require_gateway_epoch=True
+            )
+            return rec_start, rec_ir
+        finally:
+            phase_a_recovers_done.set()
+
+    claim_res, (rec_start_a, rec_ir_a) = await asyncio.gather(_run_first_claim(), _run_phase_a_recovers())
+    assert claim_res["ok"] is True
+    assert rec_start_a["mode"] == "startup"
+    assert rec_ir_a["mode"] == "interrupt_resumes"
+    assert not _has_row(rec_start_a), "startup recover must not return uncommitted inserted resume row"
+    assert not _has_row(rec_ir_a), "interrupt_resumes recover must not return uncommitted inserted resume row"
+
+    # Phase B: now the 7b-2 row is committed; hold FOR UPDATE on it in claim-text and verify SKIP LOCKED skips it
+    holding_committed_7b2 = asyncio.Event()
+    phase_b_recovers_done = asyncio.Event()
+
+    async def _hook_committed_7b2(op: str) -> None:
+        if op == "claim_text":
+            holding_committed_7b2.set()
+            await asyncio.wait_for(phase_b_recovers_done.wait(), timeout=_SYNC_TIMEOUT)
+
+    cat._after_7b2_lock_hook = _hook_committed_7b2
+
+    async def _run_replay_claim():
+        try:
+            return await cat.claim_channel_text_interrupt_resume(
+                platform="feishu", message_id=mid, dalton_user_id=uid, scope_key=scope, generation=1,
+                thread_id=tid, run_id="run-04", interrupt_id="int-04",
+                resume_payload={"hitl_response": {"int-04": {"answer": "yes"}}},
+                gateway_epoch=epoch,
             )
         finally:
-            recover_done.set()
+            holding_committed_7b2.set()
 
-    claim_res, (rec_start, rec_ir) = await asyncio.gather(_run_claim(), _run_recovers())
-    assert claim_res["ok"] is True
-    assert rec_start["mode"] == "startup"
-    assert rec_ir["mode"] == "interrupt_resumes"
+    async def _run_phase_b_recovers():
+        try:
+            await asyncio.wait_for(holding_committed_7b2.wait(), timeout=_SYNC_TIMEOUT)
+            rec_start = await cg_db.recover_channel_state(
+                mode="startup", gateway_epoch=epoch, require_gateway_epoch=True
+            )
+            rec_ir = await cg_db.recover_channel_state(
+                mode="interrupt_resumes", gateway_epoch=epoch, require_gateway_epoch=True
+            )
+            return rec_start, rec_ir
+        finally:
+            phase_b_recovers_done.set()
+
+    replay_res, (rec_start_b, rec_ir_b) = await asyncio.gather(_run_replay_claim(), _run_phase_b_recovers())
+    cat._after_7b2_lock_hook = None
+    assert replay_res["ok"] is True and replay_res.get("idempotent_replay") is True
+    assert not _has_row(rec_start_b), "startup SKIP LOCKED must skip row locked FOR UPDATE by claim-text"
+    assert not _has_row(rec_ir_b), "interrupt_resumes SKIP LOCKED must skip row locked FOR UPDATE by claim-text"
+
+    # Verify DB row committed cleanly and unmodified, and is returned once lock is released
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT claim_id::text AS claim_id, resume_status, inbound_message_id
+                FROM dalton_channel_interrupt_resumes
+                WHERE thread_id = %s::uuid AND run_id = 'run-04' AND interrupt_id = 'int-04'
+                """,
+                (tid,),
+            )
+            r_row = await cur.fetchone()
+            assert r_row is not None
+            assert r_row["claim_id"] == claim_res["claim_id"]
+            assert r_row["resume_status"] == "pending_dispatch"
+            assert r_row["inbound_message_id"] == mid
+
+    rec_after = await cg_db.recover_channel_state(
+        mode="interrupt_resumes", gateway_epoch=epoch, require_gateway_epoch=True
+    )
+    assert _has_row(rec_after), "interrupt_resumes should return committed row once lock is released"
 
 
 @pytest.mark.asyncio
-async def test_pg_interleaving_05_recover_and_unbind_weixin_account(pg_b3_env) -> None:
-    """Interleaving ⑤: /internal/recover (startup, interrupt_resumes, AND watch_reconnect
-    with a real background run to backfill!) + real decrypting unbind_weixin_account.
-
-    Unbind MUST succeed (``ok=True``) and zero deadlocks occur across all four paths."""
+@pytest.mark.parametrize("order", ["recover_first", "unbind_first"])
+async def test_pg_interleaving_05_recover_and_unbind_weixin_account(
+    pg_b3_env, order: str
+) -> None:
+    """Interleaving ⑤: deterministically fix BOTH lock orders between ``/internal/recover``
+    (holding 3a ``FOR KEY SHARE`` -> backfilling wakeup row into ``dalton_channel_background_runs``)
+    and ``unbind_weixin_account`` (holding 3a ``FOR UPDATE`` -> deleting account).
+    Both orders MUST actually backfill the wakeup row (verified via row count), succeed on unbind,
+    and leave ``weixin_account_id IS NULL``."""
     pool, uid, tid, epoch = pg_b3_env["pool"], pg_b3_env["uid"], pg_b3_env["tid"], pg_b3_env["epoch"]
     aid = await _seed_weixin_account(pool, uid=uid, prefix=pg_b3_env["prefix"])
     wx_uid = f"wx_{pg_b3_env['prefix']}@im.wechat"
@@ -1070,11 +1276,71 @@ async def test_pg_interleaving_05_recover_and_unbind_weixin_account(pg_b3_env) -
                 (bg_rid, tid),
             )
 
-    rec_start, rec_ir, rec_watch, unbind_res = await asyncio.gather(
+    if order == "recover_first":
+        recover_holds_3a = asyncio.Event()
+        release_recover = asyncio.Event()
+
+        async def _rec_3a_hook(mode_name: str) -> None:
+            if mode_name == "watch_reconnect":
+                recover_holds_3a.set()
+                await asyncio.wait_for(release_recover.wait(), timeout=_SYNC_TIMEOUT)
+
+        cg_db._after_recover_3a_lock_hook = _rec_3a_hook
+        rec_watch_task = asyncio.create_task(
+            cg_db.recover_channel_state(
+                mode="watch_reconnect", thread_id=tid, gateway_epoch=epoch, require_gateway_epoch=True
+            )
+        )
+        try:
+            await asyncio.wait_for(recover_holds_3a.wait(), timeout=_SYNC_TIMEOUT)
+            unbind_task = asyncio.create_task(
+                wx_db.unbind_weixin_account(
+                    account_id=aid, operator_user_id=uid, action="member_unbind"
+                )
+            )
+            wait_row = await _wait_for_pg_lock_wait(pool, "%dalton_channel_weixin_accounts%")
+            assert wait_row["wait_event_type"] == "Lock"
+            assert not unbind_task.done()
+        finally:
+            release_recover.set()
+        rec_watch, unbind_res = await asyncio.wait_for(
+            asyncio.gather(rec_watch_task, unbind_task), timeout=_SYNC_TIMEOUT
+        )
+        cg_db._after_recover_3a_lock_hook = None
+    else:
+        unbind_holds_3a = asyncio.Event()
+        release_unbind = asyncio.Event()
+
+        async def _unbind_3a_hook(_op: str) -> None:
+            unbind_holds_3a.set()
+            await asyncio.wait_for(release_unbind.wait(), timeout=_SYNC_TIMEOUT)
+
+        wx_db._after_unbind_3a_lock_hook = _unbind_3a_hook
+        unbind_task = asyncio.create_task(
+            wx_db.unbind_weixin_account(
+                account_id=aid, operator_user_id=uid, action="member_unbind"
+            )
+        )
+        try:
+            await asyncio.wait_for(unbind_holds_3a.wait(), timeout=_SYNC_TIMEOUT)
+            rec_watch_task = asyncio.create_task(
+                cg_db.recover_channel_state(
+                    mode="watch_reconnect", thread_id=tid, gateway_epoch=epoch, require_gateway_epoch=True
+                )
+            )
+            wait_row = await _wait_for_pg_lock_wait(pool, "%dalton_channel_weixin_accounts%")
+            assert wait_row["wait_event_type"] == "Lock"
+            assert not rec_watch_task.done()
+        finally:
+            release_unbind.set()
+        unbind_res, rec_watch = await asyncio.wait_for(
+            asyncio.gather(unbind_task, rec_watch_task), timeout=_SYNC_TIMEOUT
+        )
+        wx_db._after_unbind_3a_lock_hook = None
+
+    rec_start, rec_ir = await asyncio.gather(
         cg_db.recover_channel_state(mode="startup", gateway_epoch=epoch, require_gateway_epoch=True),
         cg_db.recover_channel_state(mode="interrupt_resumes", gateway_epoch=epoch, require_gateway_epoch=True),
-        cg_db.recover_channel_state(mode="watch_reconnect", thread_id=tid, gateway_epoch=epoch, require_gateway_epoch=True),
-        wx_db.unbind_weixin_account(account_id=aid, operator_user_id=uid, action="member_unbind"),
     )
     assert rec_start["mode"] == "startup"
     assert rec_ir["mode"] == "interrupt_resumes"
@@ -1082,9 +1348,23 @@ async def test_pg_interleaving_05_recover_and_unbind_weixin_account(pg_b3_env) -
     assert unbind_res["ok"] is True
     assert unbind_res["deleted_account"] is True
 
-    # Verify Weixin account deleted and watch's weixin_account_id set NULL
+    # Verify backfill genuinely inserted the wakeup row in dalton_channel_background_runs,
+    # Weixin account was deleted, and both watch & background_run FKs are NULL!
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT COUNT(*) AS cnt, MAX(weixin_account_id::text) AS wx_aid
+                FROM dalton_channel_background_runs
+                WHERE thread_id = %s::uuid AND run_id = %s
+                """,
+                (tid, bg_rid),
+            )
+            bg_row = await cur.fetchone()
+            assert bg_row is not None and int(bg_row["cnt"]) == 1, (
+                f"Expected wakeup background_run row to be backfilled for order={order}, got {bg_row!r}"
+            )
+            assert bg_row["wx_aid"] is None
             await cur.execute(
                 "SELECT 1 FROM dalton_channel_weixin_accounts WHERE account_id = %s::uuid",
                 (aid,),
@@ -1171,10 +1451,15 @@ async def test_pg_interleaving_07_three_terminal_race_consume_claim_text_web_and
     pool, uid, tid, epoch = pg_b3_env["pool"], pg_b3_env["uid"], pg_b3_env["tid"], pg_b3_env["epoch"]
     scope = f"dm:{pg_b3_env['feishu_puid']}"
     mid = f"{pg_b3_env['prefix']}_m07"
+    mid2 = f"{pg_b3_env['prefix']}_m07_p2"
     action_req = {"type": "ask_user_question", "question": "Proceed?"}
     _patch_live_checkpoint(monkeypatch, interrupt_id="int-07", action_req=action_req)
     await _seed_session_and_inbound(
         pool, platform="feishu", message_id=mid, uid=uid, scope_key=scope,
+        chat_address="feishu:@me", tid=tid, run_id="run-07", interrupt_id="int-07",
+    )
+    await _seed_session_and_inbound(
+        pool, platform="feishu", message_id=mid2, uid=uid, scope_key=scope,
         chat_address="feishu:@me", tid=tid, run_id="run-07", interrupt_id="int-07",
     )
     minted = await cat.mint_channel_action_token(
@@ -1190,6 +1475,21 @@ async def test_pg_interleaving_07_three_terminal_race_consume_claim_text_web_and
     await cat.bind_channel_action_card(
         approval_nonce=minted["approval_nonce"], phase="confirm_bound",
         card_channel_id="oc_dm_07", card_message_id="om_card_07", gateway_epoch=epoch,
+    )
+    # Second bound card token used as losing button contender in Phase 2 regardless of Phase 1 winner
+    minted2 = await cat.mint_channel_action_token(
+        platform="feishu", dalton_user_id=uid, initiator_platform_user_id=pg_b3_env["feishu_puid"],
+        origin_chat_type="dm", origin_chat_address="feishu:@me", origin_scope_key=scope,
+        session_generation=1, thread_id=tid, run_id="run-07", interrupt_id="int-07",
+        interrupt_value={"kind": "ask_user_question", "action_requests": [action_req]},
+        gateway_epoch=epoch,
+    )
+    await cat.bind_channel_action_card(
+        approval_nonce=minted2["approval_nonce"], phase="prepare_send", gateway_epoch=epoch
+    )
+    await cat.bind_channel_action_card(
+        approval_nonce=minted2["approval_nonce"], phase="confirm_bound",
+        card_channel_id="oc_dm_07", card_message_id="om_card_07_2", gateway_epoch=epoch,
     )
 
     arrived = 0
@@ -1265,35 +1565,95 @@ async def test_pg_interleaving_07_three_terminal_race_consume_claim_text_web_and
     assert isinstance(start_bogus, HTTPException) and start_bogus.status_code == 409
     assert start_bogus.detail["code"] == "interrupt_claim_lost"
 
-    # Now race winner's real START `_on_start` concurrently with a late claim_web attempt
+    # Phase 2: true concurrent race — winner's START holds 0c (conversation_threads FOR UPDATE)
+    # and pauses BEFORE 7b-2 while ALL THREE losing contenders (button, text, web) request concurrently!
     win = winners[0]
     admitted_rid = str(uuid4())
-    cat._after_preview_hook = None
+    start_before_7b2 = asyncio.Event()
+    losers_entered = asyncio.Event()
+    losers_previewed = 0
+
+    async def _phase2_before_7b2(op: str) -> None:
+        if op == "admit_on_start":
+            start_before_7b2.set()
+            await asyncio.wait_for(losers_entered.wait(), timeout=_SYNC_TIMEOUT)
+
+    async def _phase2_loser_preview(op: str) -> None:
+        nonlocal losers_previewed
+        if op in ("consume", "claim_text", "claim_web") and not losers_entered.is_set():
+            losers_previewed += 1
+            if losers_previewed >= 3:
+                losers_entered.set()
+
+    cat._before_7b2_lock_hook = _phase2_before_7b2
+    cat._after_preview_hook = _phase2_loser_preview
 
     async def _real_start():
-        async with pool.connection() as conn:
-            async with conn.transaction():
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "SELECT conversation_thread_id FROM conversation_threads WHERE conversation_thread_id = %s::uuid FOR UPDATE",
-                        (tid,),
-                    )
-                    return await cat.admit_interrupt_resume_in_start_tx(
-                        cur, thread_id=tid, run_id="run-07", interrupt_id="int-07",
-                        claim_id=win["claim_id"], request_key=win["request_key"],
-                        admitted_run_id=admitted_rid,
-                    )
+        try:
+            async with pool.connection() as conn:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "SELECT conversation_thread_id FROM conversation_threads WHERE conversation_thread_id = %s::uuid FOR UPDATE",
+                            (tid,),
+                        )
+                        return await cat.admit_interrupt_resume_in_start_tx(
+                            cur, thread_id=tid, run_id="run-07", interrupt_id="int-07",
+                            claim_id=win["claim_id"], request_key=win["request_key"],
+                            admitted_run_id=admitted_rid,
+                        )
+        finally:
+            start_before_7b2.set()
 
-    start_res, late_web = await asyncio.gather(
-        _real_start(),
-        cat.claim_web_interrupt_resume(
-            thread_id=tid, run_id="run-07", interrupt_id="int-07", user_id=uid,
-            resume_payload={"hitl_response": {"int-07": {"answer": "late-web"}}},
-        ),
-        return_exceptions=True,
-    )
-    assert isinstance(start_res, dict) and start_res["admitted"] is True
-    assert isinstance(late_web, HTTPException) and late_web.status_code == 409
+    async def _phase2_loser(coro):
+        await asyncio.wait_for(start_before_7b2.wait(), timeout=_SYNC_TIMEOUT)
+        try:
+            return await coro
+        finally:
+            if losers_previewed >= 3:
+                losers_entered.set()
+
+    try:
+        start_res, late_btn, late_txt, late_web = await asyncio.gather(
+            _real_start(),
+            _phase2_loser(
+                cat.consume_channel_action_token(
+                    approval_nonce=minted2["approval_nonce"], decision="approve",
+                    clicker_platform_user_id=pg_b3_env["feishu_puid"],
+                    channel_id="oc_dm_07", message_id="om_card_07_2", answer_text="late-btn",
+                    gateway_epoch=epoch,
+                )
+            ),
+            _phase2_loser(
+                cat.claim_channel_text_interrupt_resume(
+                    platform="feishu", message_id=mid2, dalton_user_id=uid, scope_key=scope, generation=1,
+                    thread_id=tid, run_id="run-07", interrupt_id="int-07",
+                    resume_payload={"hitl_response": {"int-07": {"answer": "late-txt"}}},
+                    gateway_epoch=epoch,
+                )
+            ),
+            _phase2_loser(
+                cat.claim_web_interrupt_resume(
+                    thread_id=tid, run_id="run-07", interrupt_id="int-07", user_id=uid,
+                    resume_payload={"hitl_response": {"int-07": {"answer": "late-web"}}},
+                )
+            ),
+            return_exceptions=True,
+        )
+    finally:
+        losers_entered.set()
+        cat._before_7b2_lock_hook = None
+        cat._after_preview_hook = None
+
+    assert start_res is None, f"admit_interrupt_resume_in_start_tx returns None on success, got {start_res!r}"
+    for loser in (late_btn, late_txt, late_web):
+        assert isinstance(loser, HTTPException), f"Expected 409 HTTPException, got {loser!r}"
+        _assert_not_lock_or_constraint_error(loser)
+        assert loser.status_code == 409
+    assert late_btn.detail["code"] == "already_settled"
+    assert late_txt.detail["code"] == "already_settled"
+    assert late_web.detail["code"] == "already_settled_in_channel"
+
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -1491,31 +1851,46 @@ async def test_pg_interleaving_09_web_takeover_and_new_claim_text(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ["account_preexists", "account_seeded_after_preview"])
 async def test_pg_interleaving_10_weixin_ack_claim_text_recovery_with_backfill_weixin_account_and_unbind(
-    pg_b3_env, monkeypatch: pytest.MonkeyPatch
+    pg_b3_env, monkeypatch: pytest.MonkeyPatch, variant: str
 ) -> None:
-    """Interleaving ⑩: Weixin inbound previewed with ``weixin_account_id = NULL``, concurrently
-    backfilled before 7a lock -> claim-text rolls back & retries before locking ``thread_watches``;
-    followed by concurrent Weixin ``ack`` + ``RecoveryScanner`` + real decrypting ``unbind_weixin_account``."""
+    """Interleaving ⑩: two variants for Weixin inbound previewed with ``weixin_account_id = NULL``
+    and backfilled before 7a lock:
+      (a) ``account_preexists``: user's Weixin account already exists at preview -> preview includes it
+          in 3a lock set -> succeeds on first attempt (``preview_attempts == 1``), zero deadlocks.
+      (b) ``account_seeded_after_preview``: user has NO account at preview -> ``_after_preview_hook``
+          seeds the account and backfills inbound -> 7a inbound check detects unlocked account and
+          rolls back BEFORE ``_after_7a_inbound_lock_hook`` / ``thread_watches`` -> retries
+          (``preview_attempts >= 2``, ``after_7a_inbound_calls == 1``) and succeeds.
+    Both variants then run concurrent Weixin ``ack`` + ``RecoveryScanner`` + real ``unbind_weixin_account``."""
     pool, uid, tid, epoch = pg_b3_env["pool"], pg_b3_env["uid"], pg_b3_env["tid"], pg_b3_env["epoch"]
-    aid = await _seed_weixin_account(pool, uid=uid, prefix=pg_b3_env["prefix"])
-    mid = f"{pg_b3_env['prefix']}_wx10"
+    aid: str | None = (
+        await _seed_weixin_account(pool, uid=uid, prefix=pg_b3_env["prefix"])
+        if variant == "account_preexists"
+        else None
+    )
+    mid = f"{pg_b3_env['prefix']}_wx10_{variant}"
     scope = f"dm:wx_{pg_b3_env['prefix']}@im.wechat"
-    _patch_live_checkpoint(monkeypatch, interrupt_id="int-10")
+    run_id = f"run-10-{variant}"
+    int_id = f"int-10-{variant}"
+    _patch_live_checkpoint(monkeypatch, interrupt_id=int_id)
     await _seed_session_and_inbound(
         pool, platform="weixin", message_id=mid, uid=uid, scope_key=scope,
-        chat_address="weixin:@me", tid=tid, run_id="run-10", interrupt_id="int-10",
+        chat_address="weixin:@me", tid=tid, run_id=run_id, interrupt_id=int_id,
         weixin_account_id=None, weixin_bot_gen=1,
     )
 
-    # Phase A: Prove preview with NULL weixin_account_id -> backfill -> immediate rollback & retry before thread_watches!
     preview_attempts = 0
+    after_7a_inbound_calls = 0
 
     async def _backfill_hook(op: str) -> None:
-        nonlocal preview_attempts
+        nonlocal preview_attempts, aid
         if op == "claim_text":
             preview_attempts += 1
             if preview_attempts == 1:
+                if aid is None:
+                    aid = await _seed_weixin_account(pool, uid=uid, prefix=pg_b3_env["prefix"])
                 async with pool.connection() as c2:
                     async with c2.cursor() as cur2:
                         await cur2.execute(
@@ -1527,16 +1902,33 @@ async def test_pg_interleaving_10_weixin_ack_claim_text_recovery_with_backfill_w
                             (aid, mid),
                         )
 
+    async def _after_7a_hook(op: str) -> None:
+        nonlocal after_7a_inbound_calls
+        if op == "claim_text":
+            after_7a_inbound_calls += 1
+
     cat._after_preview_hook = _backfill_hook
+    cat._after_7a_inbound_lock_hook = _after_7a_hook
     claimed = await cat.claim_channel_text_interrupt_resume(
         platform="weixin", message_id=mid, dalton_user_id=uid, scope_key=scope, generation=1,
-        thread_id=tid, run_id="run-10", interrupt_id="int-10",
-        resume_payload={"hitl_response": {"int-10": {"answer": "1"}}},
+        thread_id=tid, run_id=run_id, interrupt_id=int_id,
+        resume_payload={"hitl_response": {int_id: {"answer": "1"}}},
         gateway_epoch=epoch,
     )
-    assert claimed["ok"] is True
-    assert preview_attempts >= 2, "Expected rollback & retry when weixin_account_id was backfilled before 7a lock"
     cat._after_preview_hook = None
+    cat._after_7a_inbound_lock_hook = None
+    assert claimed["ok"] is True
+    assert aid is not None
+    if variant == "account_preexists":
+        assert preview_attempts == 1
+        assert after_7a_inbound_calls == 1
+    else:
+        assert preview_attempts >= 2, (
+            "Expected rollback & retry when account was absent at preview and backfilled before 7a lock"
+        )
+        # Attempt 1 rolled back inside _lock_inbound_events_and_verify_weixin_set_in_tx BEFORE
+        # _after_7a_inbound_lock_hook (and before locking thread_watches); only attempt 2 passed 7a-1!
+        assert after_7a_inbound_calls == 1
 
     # Phase B: Concurrent Weixin ack + RecoveryScanner + real unbind_weixin_account
     ack_previewed = asyncio.Event()
@@ -1550,7 +1942,7 @@ async def test_pg_interleaving_10_weixin_ack_claim_text_recovery_with_backfill_w
     async def _run_ack():
         try:
             return await cat.ack_channel_interrupt_resume(
-                thread_id=tid, run_id="run-10", interrupt_id="int-10",
+                thread_id=tid, run_id=run_id, interrupt_id=int_id,
                 claim_id=claimed["claim_id"], outcome="retry_scheduled", error="net",
                 gateway_epoch=epoch,
             )
@@ -1580,33 +1972,35 @@ async def test_pg_interleaving_10_weixin_ack_claim_text_recovery_with_backfill_w
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("i6_format", ["bt2_files", "legacy_links"])
 async def test_pg_interleaving_11_cross_worker_7b0_for_share_with_i6_files_and_drain_barrier_repeatable_read(
-    pg_b3_env, monkeypatch: pytest.MonkeyPatch
+    pg_b3_env, monkeypatch: pytest.MonkeyPatch, i6_format: str
 ) -> None:
-    """Interleaving ⑪:
+    """Interleaving ⑪ (both BT2 file-carrying I-6 AND legacy-format ``deliverables-links:<run_id>``):
     1. Contrast Path A button-only toggle (does NOT expire tokens or flip BT2).
-    2. Prove ``enter_interrupt_drain_mode`` (``7b-0 FOR UPDATE``) genuinely WAITS for
-       an in-flight file-carrying ``I-6`` that ALREADY HOLDS ``7b-0 FOR SHARE``!
-    3. Verify §5.4 ``REPEATABLE READ`` SQL counts ``pending_link_recoveries >= 1`` for
-       the pre-drain enrolled source row BEFORE settling, blocks post-drain ``I-6``
-       (``bt2_enrolled = False`` & ``bt2_drain_disabled``), and drops to ``0 / 0``
-       after the enrolled source row settles!"""
+    2. Prove via ``pg_stat_activity`` + ``pg_locks`` (``wait_event_type = 'Lock'``) that
+       ``enter_interrupt_drain_mode`` (``7b-0 FOR UPDATE``) genuinely WAITS for the in-flight
+       I-6 holding ``7b-0 FOR SHARE``.
+    3. Verify post-drain I-6 is blocked (``bt2_drain_disabled`` with ZERO rows inserted for
+       parent / legacy links) and §5.4 ``REPEATABLE READ`` counts drop to ``(0, 0)`` after drain."""
     pool, uid, tid, epoch = pg_b3_env["pool"], pg_b3_env["uid"], pg_b3_env["tid"], pg_b3_env["epoch"]
     pfx = pg_b3_env["prefix"]
     scope = f"dm:{pg_b3_env['feishu_puid']}"
-    mid = f"{pfx}_m11"
+    mid = f"{pfx}_m11_{i6_format}"
+    run_id = f"run-11-{i6_format}"
+    int_id = f"int-11-{i6_format}"
     action_req = {"type": "ask_user_question", "question": "Proceed?"}
-    _patch_live_checkpoint(monkeypatch, interrupt_id="int-11", action_req=action_req)
+    _patch_live_checkpoint(monkeypatch, interrupt_id=int_id, action_req=action_req)
     await _seed_session_and_inbound(
         pool, platform="feishu", message_id=mid, uid=uid, scope_key=scope,
-        chat_address="feishu:@me", tid=tid, run_id="run-11", interrupt_id="int-11",
+        chat_address="feishu:@me", tid=tid, run_id=run_id, interrupt_id=int_id,
     )
 
     # 1) Contrast Path A: toggle interactive_actions_enabled=False -> preserves bound token & BT2=True
     minted = await cat.mint_channel_action_token(
         platform="feishu", dalton_user_id=uid, initiator_platform_user_id=pg_b3_env["feishu_puid"],
         origin_chat_type="dm", origin_chat_address="feishu:@me", origin_scope_key=scope,
-        session_generation=1, thread_id=tid, run_id="run-11", interrupt_id="int-11",
+        session_generation=1, thread_id=tid, run_id=run_id, interrupt_id=int_id,
         interrupt_value={"kind": "ask_user_question", "action_requests": [action_req]},
         gateway_epoch=epoch,
     )
@@ -1615,7 +2009,7 @@ async def test_pg_interleaving_11_cross_worker_7b0_for_share_with_i6_files_and_d
     )
     await cat.bind_channel_action_card(
         approval_nonce=minted["approval_nonce"], phase="confirm_bound",
-        card_channel_id="oc_dm_11", card_message_id="om_card_11", gateway_epoch=epoch,
+        card_channel_id="oc_dm_11", card_message_id=f"om_card_11_{i6_format}", gateway_epoch=epoch,
     )
     btn_off = await cat.set_interrupt_runtime_config(interactive_actions_enabled=False)
     assert btn_off["interactive_actions_enabled"] is False
@@ -1628,38 +2022,59 @@ async def test_pg_interleaving_11_cross_worker_7b0_for_share_with_i6_files_and_d
     holding_share = asyncio.Event()
     release_share = asyncio.Event()
     first_i6 = True
+    expected_hook_op = "i6_files" if i6_format == "bt2_files" else "i6_links_legacy"
 
     async def _after_7b0_hook(op: str) -> None:
         nonlocal first_i6
-        if op == "i6_files" and first_i6:
+        if op == expected_hook_op and first_i6:
             first_i6 = False
             holding_share.set()
             await asyncio.wait_for(release_share.wait(), timeout=_SYNC_TIMEOUT)
 
     cat._after_7b0_lock_hook = _after_7b0_hook
-    pre_key = f"tool:run-11:{pfx}_pre"
 
-    i6_pre_task = asyncio.create_task(
-        cg_db.authorize_and_claim_delivery(
-            delivery_key=pre_key,
-            kind="agent_send",
-            user_id=uid,
-            thread_id=tid,
-            run_id="run-11",
-            target="feishu:@me",
-            requested_files=[{"workspace_id": pg_b3_env["ws_id"], "path": "pre.pdf"}],
-            gateway_epoch=epoch,
-            require_gateway_epoch=True,
+    if i6_format == "bt2_files":
+        pre_key = f"tool:{run_id}:{pfx}_pre"
+        i6_pre_task = asyncio.create_task(
+            cg_db.authorize_and_claim_delivery(
+                delivery_key=pre_key,
+                kind="agent_send",
+                user_id=uid,
+                thread_id=tid,
+                run_id=run_id,
+                target="feishu:@me",
+                requested_files=[{"workspace_id": pg_b3_env["ws_id"], "path": "pre.pdf"}],
+                gateway_epoch=epoch,
+                require_gateway_epoch=True,
+            )
         )
-    )
+    else:
+        # Legacy-format deliverables-links:<run_id> without any new BT2 fields
+        pre_key = f"deliverables-links:{run_id}-{pfx}-pre"
+        i6_pre_task = asyncio.create_task(
+            cg_db.authorize_and_claim_delivery(
+                delivery_key=pre_key,
+                kind="fallback",
+                user_id=uid,
+                thread_id=tid,
+                run_id=run_id,
+                gateway_epoch=epoch,
+                require_gateway_epoch=True,
+            )
+        )
 
     try:
         await asyncio.wait_for(holding_share.wait(), timeout=_SYNC_TIMEOUT)
         # Start enter_interrupt_drain_mode (7b-0 FOR UPDATE) while I-6 #1 holds 7b-0 FOR SHARE!
         drain_task = asyncio.create_task(cat.enter_interrupt_drain_mode())
-        await asyncio.sleep(0.25)
-        # PROVE drain waits for the already-holding 7b-0 FOR SHARE transaction!
-        assert not drain_task.done(), "enter_interrupt_drain_mode MUST block while I-6 holds 7b-0 FOR SHARE"
+        # Poll pg_stat_activity + pg_locks on a separate connection to PROVE drain is waiting on 7b-0 Lock!
+        lock_wait_row = await _wait_for_pg_lock_wait(
+            pool, "%dalton_channel_interrupt_runtime_config%"
+        )
+        assert lock_wait_row["wait_event_type"] == "Lock"
+        assert not drain_task.done(), (
+            "enter_interrupt_drain_mode MUST block while I-6 holds 7b-0 FOR SHARE"
+        )
     finally:
         release_share.set()
 
@@ -1669,37 +2084,79 @@ async def test_pg_interleaving_11_cross_worker_7b0_for_share_with_i6_files_and_d
     cat._after_7b0_lock_hook = None
 
     assert i6_pre["claim_status"] == "claimed"
-    assert i6_pre["bt2_enrolled"] is True
     assert drain_res["interactive_actions_enabled"] is False
     assert drain_res["interrupt_ledger_enabled"] is False
     assert drain_res["bt2_link_recovery_enabled"] is False
     assert drain_res["expired_bound_tokens"] >= 1
 
-    # 3) Post-drain I-6 #2 reads bt2_link_recovery_enabled=FALSE -> bt2_enrolled=False & parent refused!
-    post_key = f"tool:run-11:{pfx}_post"
-    i6_post = await cg_db.authorize_and_claim_delivery(
-        delivery_key=post_key,
-        kind="agent_send",
-        user_id=uid,
-        thread_id=tid,
-        run_id="run-11",
-        target="feishu:@me",
-        requested_files=[{"workspace_id": pg_b3_env["ws_id"], "path": "post.pdf"}],
-        gateway_epoch=epoch,
-        require_gateway_epoch=True,
-    )
-    assert i6_post["claim_status"] == "claimed"
-    assert i6_post["bt2_enrolled"] is False
+    # 3) Post-drain I-6 #2 blocked by bt2_link_recovery_enabled = FALSE with ZERO new parent rows!
+    if i6_format == "bt2_files":
+        assert i6_pre["bt2_enrolled"] is True
+        post_key = f"tool:{run_id}:{pfx}_post"
+        i6_post = await cg_db.authorize_and_claim_delivery(
+            delivery_key=post_key,
+            kind="agent_send",
+            user_id=uid,
+            thread_id=tid,
+            run_id=run_id,
+            target="feishu:@me",
+            requested_files=[{"workspace_id": pg_b3_env["ws_id"], "path": "post.pdf"}],
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
+        assert i6_post["claim_status"] == "claimed"
+        assert i6_post["bt2_enrolled"] is False
 
-    denied_p = await cg_db.authorize_and_claim_delivery(
-        delivery_key=f"deliverables-links:{post_key}",
-        kind="fallback",
-        source_delivery_key=post_key,
-        gateway_epoch=epoch,
-        require_gateway_epoch=True,
-    )
-    assert denied_p["claim_status"] == "denied"
-    assert denied_p["code"] == "bt2_drain_disabled"
+        denied_parent_key = f"deliverables-links:{post_key}"
+        denied_p = await cg_db.authorize_and_claim_delivery(
+            delivery_key=denied_parent_key,
+            kind="fallback",
+            source_delivery_key=post_key,
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
+        assert denied_p["claim_status"] == "denied"
+        assert denied_p["code"] == "bt2_drain_disabled"
+    else:
+        # Verify pre-drain legacy row stayed legacy (bt2_enrolled=FALSE, claim_attempt_id=NULL, lease=NULL)
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT bt2_enrolled, claim_attempt_id, claim_lease_expires_at
+                    FROM dalton_channel_deliveries
+                    WHERE delivery_key = %s
+                    """,
+                    (pre_key,),
+                )
+                pre_row = await cur.fetchone()
+                assert pre_row is not None
+                assert pre_row["bt2_enrolled"] is False
+                assert pre_row["claim_attempt_id"] is None
+                assert pre_row["claim_lease_expires_at"] is None
+
+        denied_parent_key = f"deliverables-links:{run_id}-{pfx}-post"
+        denied_p = await cg_db.authorize_and_claim_delivery(
+            delivery_key=denied_parent_key,
+            kind="fallback",
+            user_id=uid,
+            thread_id=tid,
+            run_id=run_id,
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
+        assert denied_p["claim_status"] == "denied"
+        assert denied_p["status"] == "failed"
+        assert denied_p["code"] == "bt2_drain_disabled"
+
+    # Verify ZERO rows were inserted for the post-drain denied parent key
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM dalton_channel_deliveries WHERE delivery_key = %s",
+                (denied_parent_key,),
+            )
+            assert await cur.fetchone() is None
 
     async def _run_repeatable_read_counts() -> tuple[int, int]:
         async with pool.connection() as conn:
@@ -1826,25 +2283,34 @@ async def test_pg_interleaving_11_cross_worker_7b0_for_share_with_i6_files_and_d
                     counts = await cur.fetchone()
                     return int(counts["remaining_drain_items"]), int(counts["pending_link_recoveries"])
 
-    # 4) Verify counts are > 0 BEFORE draining (both expired bound token late_patch AND pre-drain enrolled BT2 source!)
+    # 4) Verify counts are > 0 BEFORE draining
     rem_before, bt2_before = await _run_repeatable_read_counts()
     assert rem_before >= 1, f"Expected remaining_drain_items >= 1 for late_patch token, got {rem_before}"
-    assert bt2_before >= 1, f"Expected pending_link_recoveries >= 1 for pre-drain enrolled source, got {bt2_before}"
+    assert bt2_before >= 1, f"Expected pending_link_recoveries >= 1 for pre-drain row, got {bt2_before}"
 
-    # 5) Settle the expired late-patch token AND the pre-drain enrolled source -> counts MUST drop to 0 / 0!
+    # 5) Settle the expired late-patch token AND the pre-drain delivery -> counts MUST drop to 0 / 0!
     await cat.ack_channel_interrupt_resume(
         late_card_results=[{"token_hash": minted["token_hash"], "patch_status": "patched"}],
         gateway_epoch=epoch,
     )
-    await cg_db.update_delivery_progress(
-        delivery_key=pre_key,
-        status="sent",
-        delivery_attempt=i6_pre["delivery_attempt"],
-        claim_attempt_id=i6_pre["claim_attempt_id"],
-        files_status=[{"workspace_id": pg_b3_env["ws_id"], "path": "pre.pdf", "status": "sent"}],
-        gateway_epoch=epoch,
-        require_gateway_epoch=True,
-    )
+    if i6_format == "bt2_files":
+        await cg_db.update_delivery_progress(
+            delivery_key=pre_key,
+            status="sent",
+            delivery_attempt=i6_pre["delivery_attempt"],
+            claim_attempt_id=i6_pre["claim_attempt_id"],
+            files_status=[{"workspace_id": pg_b3_env["ws_id"], "path": "pre.pdf", "status": "sent"}],
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
+    else:
+        await cg_db.update_delivery_progress(
+            delivery_key=pre_key,
+            status="sent",
+            delivery_attempt=i6_pre["delivery_attempt"],
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
 
     rem_after, bt2_after = await _run_repeatable_read_counts()
     assert rem_after == 0, f"Expected remaining_drain_items == 0 after drain, got {rem_after}"

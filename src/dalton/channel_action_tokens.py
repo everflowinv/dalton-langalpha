@@ -156,6 +156,7 @@ _after_preview_hook: Callable[[str], Awaitable[None]] | None = None
 _before_7b0_lock_hook: Callable[[str], Awaitable[None]] | None = None
 _after_7b0_lock_hook: Callable[[str], Awaitable[None]] | None = None
 _after_7a_inbound_lock_hook: Callable[[str], Awaitable[None]] | None = None
+_before_7b2_lock_hook: Callable[[str], Awaitable[None]] | None = None
 _after_7b2_lock_hook: Callable[[str], Awaitable[None]] | None = None
 
 
@@ -1680,6 +1681,48 @@ async def mint_channel_action_token(
                     enforce_post_lease_for_non_weixin=False,
                 )
 
+                # Level 2: group chat advisory lock when origin is a group chat (Lock Order ④)
+                cleaned_origin_addr = str(origin_chat_address or "").strip()
+                if cleaned_origin_ct == "group" and cleaned_origin_addr:
+                    norm_grp_addr = cg_db._normalize_topic_chat_address(
+                        cleaned_plat, cleaned_origin_addr
+                    )
+                    if norm_grp_addr:
+                        await cg_db._acquire_group_chat_lock(
+                            cur, cleaned_plat, norm_grp_addr
+                        )
+
+                # Level 6: lock session_generations FOR UPDATE BEFORE Level 7b-0 (Lock Order ④)
+                cleaned_origin_scope = str(origin_scope_key or "").strip()
+                cleaned_uid = str(dalton_user_id or "").strip()
+                locked_sg_row: dict[str, Any] | None = None
+                if cleaned_origin_scope and cleaned_uid:
+                    await cur.execute(
+                        """
+                        SELECT generation
+                        FROM dalton_channel_session_generations
+                        WHERE platform = %s
+                          AND scope_key = %s
+                          AND dalton_user_id = %s
+                        FOR UPDATE
+                        """,
+                        (cleaned_plat, cleaned_origin_scope, cleaned_uid),
+                    )
+                    fetched_sg = await cur.fetchone()
+                    if fetched_sg is not None:
+                        locked_sg_row = dict(fetched_sg)
+                if (
+                    locked_sg_row is not None
+                    and int(locked_sg_row["generation"]) != int(session_generation)
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "session_generation_superseded",
+                            "message": "Session generation does not match current generation.",
+                        },
+                    )
+
                 # Level 7b-0: runtime config FOR SHARE
                 if _before_7b0_lock_hook is not None:
                     await _before_7b0_lock_hook("mint")
@@ -2171,7 +2214,9 @@ async def inspect_discord_gate_token(
         async with owned_conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
-                SELECT token_hash, platform, thread_id::text AS thread_id, run_id, interrupt_id
+                SELECT token_hash, platform, dalton_user_id,
+                       origin_chat_type, origin_chat_address, origin_scope_key,
+                       thread_id::text AS thread_id, run_id, interrupt_id
                 FROM dalton_channel_action_tokens
                 WHERE token_hash = %s
                 """,
@@ -2188,6 +2233,10 @@ async def inspect_discord_gate_token(
     )
     parsed_epoch = _parse_epoch_strict(gateway_epoch, required=require_gateway_epoch)
     enabled_platforms = set(get_enabled_channel_platforms())
+    pre_uid = str(pre.get("dalton_user_id") or "").strip()
+    pre_origin_ct = str(pre.get("origin_chat_type") or "").strip().lower()
+    pre_origin_addr = str(pre.get("origin_chat_address") or "").strip()
+    pre_origin_scope = str(pre.get("origin_scope_key") or "").strip()
 
     # Pre-read live checkpoint outside the write transaction
     live_pending_by_id, _ = await load_live_pending_interrupts(str(pre["thread_id"]))
@@ -2201,6 +2250,7 @@ async def inspect_discord_gate_token(
                 await cur.execute("SET LOCAL lock_timeout = '2s'")
                 await cur.execute("SET LOCAL statement_timeout = '2s'")
 
+                # Level 0b-2: gateway_lease FOR SHARE
                 await wx_db.verify_gateway_epoch_in_tx(
                     cur,
                     parsed_epoch,
@@ -2208,6 +2258,36 @@ async def inspect_discord_gate_token(
                     platform="discord",
                     enforce_post_lease_for_non_weixin=False,
                 )
+
+                # Level 2: group chat advisory lock when origin is a group chat (Lock Order ④)
+                if pre_origin_ct == "group" and pre_origin_addr:
+                    norm_grp_addr = cg_db._normalize_topic_chat_address(
+                        "discord", pre_origin_addr
+                    )
+                    if norm_grp_addr:
+                        await cg_db._acquire_group_chat_lock(
+                            cur, "discord", norm_grp_addr
+                        )
+
+                # Level 6: lock session_generations FOR UPDATE BEFORE Level 7b-0 (Lock Order ④)
+                locked_sg_row: dict[str, Any] | None = None
+                if pre_origin_scope and pre_uid:
+                    await cur.execute(
+                        """
+                        SELECT generation
+                        FROM dalton_channel_session_generations
+                        WHERE platform = %s
+                          AND scope_key = %s
+                          AND dalton_user_id = %s
+                        FOR UPDATE
+                        """,
+                        ("discord", pre_origin_scope, pre_uid),
+                    )
+                    fetched_sg = await cur.fetchone()
+                    if fetched_sg is not None:
+                        locked_sg_row = dict(fetched_sg)
+
+                # Level 7b-0: runtime config FOR SHARE
                 if _before_7b0_lock_hook is not None:
                     await _before_7b0_lock_hook("inspect_gate")
                 rt_cfg = await read_effective_interrupt_runtime_config_in_tx(cur, for_update=False)
@@ -2417,6 +2497,14 @@ async def inspect_discord_gate_token(
                         raise HTTPException(
                             status_code=403,
                             detail={"code": "group_not_deliverable", "message": grp_err, "can_patch_terminal": False},
+                        )
+                    if (
+                        locked_sg_row is not None
+                        and int(locked_sg_row["generation"]) != int(tok_dict["session_generation"])
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail={"code": "session_generation_superseded", "can_patch_terminal": False},
                         )
                     if str(tok_dict["interrupt_id"]) not in live_pending_by_id:
                         raise HTTPException(
@@ -3719,6 +3807,8 @@ async def claim_channel_text_interrupt_resume(
                             raise _ResumeInboundLockSetChanged(
                                 f"claim_text: insert rowcount={cur.rowcount}"
                             )
+                        if _after_7b2_lock_hook is not None:
+                            await _after_7b2_lock_hook("claim_text_after_insert")
                     else:
                         r_st = str(resume_row["resume_status"])
                         lease_dt = _coerce_utc(resume_row.get("lease_expires_at"))
@@ -5125,6 +5215,8 @@ async def admit_interrupt_resume_in_start_tx(
                 (norm_tid,),
             )
 
+    if _before_7b2_lock_hook is not None:
+        await _before_7b2_lock_hook("admit_on_start")
     await _acquire_hitl_resume_lock_in_tx(
         cur, thread_id=norm_tid, run_id=str(run_id), interrupt_id=str(interrupt_id)
     )
@@ -5446,6 +5538,7 @@ async def reconcile_stale_interrupt_resumes(
                         SELECT delivery_key, claim_attempt_id
                         FROM dalton_channel_deliveries
                         WHERE status = 'in_flight'
+                          AND claim_attempt_id IS NOT NULL
                           AND claim_lease_expires_at IS NOT NULL
                           AND claim_lease_expires_at < NOW()
                           AND (delivery_key LIKE 'deliverables-links:%%' OR bt2_enrolled = TRUE)
@@ -5459,10 +5552,7 @@ async def reconcile_stale_interrupt_resumes(
                     FROM target
                     WHERE d.delivery_key = target.delivery_key
                       AND d.status = 'in_flight'
-                      AND (
-                          (target.claim_attempt_id IS NULL AND d.claim_attempt_id IS NULL)
-                          OR d.claim_attempt_id = target.claim_attempt_id
-                      )
+                      AND d.claim_attempt_id = target.claim_attempt_id
                     """
                 )
                 stats["bt2_lease_reclaimed"] = int(cur.rowcount or 0)

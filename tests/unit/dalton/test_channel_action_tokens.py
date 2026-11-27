@@ -260,9 +260,16 @@ class _FakeCursorState:
         if "FROM DALTON_CHANNEL_IDENTITIES" in norm:
             if len(p) == 1:
                 uid = str(p[0])
-                self._all = [
-                    dict(v) for (u, _), v in self.db.identities.items() if u == uid
-                ]
+                if "PLATFORM = 'DISCORD'" in norm:
+                    row = self.db.identities.get((uid, "discord"))
+                    self._one = dict(row) if row else None
+                elif "PLATFORM = 'FEISHU'" in norm:
+                    row = self.db.identities.get((uid, "feishu"))
+                    self._one = dict(row) if row else None
+                else:
+                    self._all = [
+                        dict(v) for (u, _), v in self.db.identities.items() if u == uid
+                    ]
             else:
                 uid, plat = str(p[0]), str(p[1])
                 row = self.db.identities.get((uid, plat))
@@ -378,6 +385,22 @@ class _FakeCursorState:
                 self._one = self._all[0] if self._all else None
             return
         if "UPDATE DALTON_CHANNEL_BACKGROUND_RUNS" in norm:
+            if "SENT_TO_CURRENT_COUNT = SENT_TO_CURRENT_COUNT + 1" in norm:
+                if "WHERE THREAD_ID = %S::UUID AND RUN_ID = %S" in norm:
+                    tid_q, rid_q = str(p[0]), str(p[1])
+                    row = self.db.background_runs.get(rid_q)
+                    if row and str(row.get("thread_id") or "") == tid_q:
+                        row["sent_to_current_count"] = int(row.get("sent_to_current_count") or 0) + 1
+                        self._one = {"sent_to_current_count": row["sent_to_current_count"]}
+                        self.rowcount = 1
+                elif "WHERE RUN_ID = %S" in norm:
+                    rid_q = str(p[0])
+                    row = self.db.background_runs.get(rid_q)
+                    if row:
+                        row["sent_to_current_count"] = int(row.get("sent_to_current_count") or 0) + 1
+                        self._one = {"sent_to_current_count": row["sent_to_current_count"]}
+                        self.rowcount = 1
+                return
             if "SET FALLBACK_PENDING = FALSE" in norm:
                 if "WHERE THREAD_ID = %S::UUID AND RUN_ID = %S" in norm:
                     tid_q, rid_q = str(p[0]), str(p[1])
@@ -444,6 +467,20 @@ class _FakeCursorState:
                 ]
                 self._all = matches
                 self._one = matches[0] if matches else None
+            elif "WHERE DALTON_USER_ID = %S AND RUN_ID = %S" in norm:
+                uid_q, rid_q = str(p[0]), str(p[1])
+                tid_q = str(p[2]) if len(p) > 2 else None
+                matches = [
+                    dict(r)
+                    for r in self.db.inbounds.values()
+                    if r.get("dalton_user_id") == uid_q
+                    and r.get("run_id") == rid_q
+                    and (tid_q is None or str(r.get("thread_id") or "") == tid_q)
+                ]
+                for m in matches:
+                    m.setdefault("target_address", m.get("chat_address"))
+                self._all = matches
+                self._one = matches[0] if matches else None
             elif "RAW_PAYLOAD->>'CHAT_ID'" in norm:
                 uid = str(p[0])
                 for r in self.db.inbounds.values():
@@ -456,6 +493,22 @@ class _FakeCursorState:
                 self._all = [dict(v) for v in self.db.inbounds.values()]
             return
         if "UPDATE DALTON_CHANNEL_INBOUND_EVENTS" in norm:
+            if "SENT_TO_CURRENT_COUNT = SENT_TO_CURRENT_COUNT + 1" in norm:
+                if "WHERE PLATFORM = %S AND MESSAGE_ID = %S" in norm:
+                    plat, mid = str(p[0]), str(p[1])
+                    r = self.db.inbounds.get((plat, mid))
+                    if r:
+                        r["sent_to_current_count"] = int(r.get("sent_to_current_count") or 0) + 1
+                        self._one = {"sent_to_current_count": r["sent_to_current_count"]}
+                        self.rowcount = 1
+                elif "WHERE RUN_ID = %S" in norm:
+                    rid = str(p[0])
+                    for r in self.db.inbounds.values():
+                        if r.get("run_id") == rid:
+                            r["sent_to_current_count"] = int(r.get("sent_to_current_count") or 0) + 1
+                            self._one = {"sent_to_current_count": r["sent_to_current_count"]}
+                            self.rowcount += 1
+                return
             if "SET FALLBACK_PENDING = FALSE, RAW_PAYLOAD =" in norm and "WHERE PLATFORM = %S AND MESSAGE_ID = %S AND RUN_ID = %S" in norm:
                 err_code, plat, mid, rid = str(p[0]), str(p[1]), str(p[2]), str(p[3])
                 r = self.db.inbounds.get((plat, mid))
@@ -1108,6 +1161,7 @@ class _FakeCursorState:
             if "WHERE STATUS = 'IN_FLIGHT'" in norm:
                 plats = set(p[0]) if p else {"feishu", "discord", "weixin"}
                 excl_in_lease_bt2 = "CLAIM_LEASE_EXPIRES_AT >= NOW()" in norm
+                req_claim_aid = "CLAIM_ATTEMPT_ID IS NOT NULL" in norm
                 out_inflight = []
                 for k, v in sorted(self.db.deliveries.items()):
                     if v.get("status") != "in_flight" or v.get("platform") not in plats:
@@ -1115,7 +1169,8 @@ class _FakeCursorState:
                     if excl_in_lease_bt2:
                         is_bt2_row = k.startswith("deliverables-links:") or bool(v.get("bt2_enrolled"))
                         lease_exp = v.get("claim_lease_expires_at")
-                        if is_bt2_row and lease_exp is not None and lease_exp >= self.db.now:
+                        has_aid = (not req_claim_aid) or (v.get("claim_attempt_id") is not None)
+                        if is_bt2_row and has_aid and lease_exp is not None and lease_exp >= self.db.now:
                             continue
                     out_inflight.append({"delivery_key": k})
                 self._all = out_inflight
@@ -1205,6 +1260,30 @@ class _FakeCursorState:
                     "claim_attempt_id": aid, "claim_gateway_epoch": ep,
                     "claim_lease_expires_at": self.db.now + timedelta(seconds=int(lsec)),
                 }
+            else:
+                # Ordinary / legacy delivery upsert (bt2_enrolled=False, claim_attempt_id=None, claim_lease_expires_at=None)
+                (
+                    _, kind, uid, tid, rid, exec_id, is_cur, has_txt, plat, taddr, tchunks,
+                    scope, gen, act_o, wx_aid, wx_bid, wx_gen, wx_rec, pdm, _replay
+                ) = p
+                next_att = 1 if existing is None else int(existing["delivery_attempt"]) + 1
+                self.db.deliveries[dk] = {
+                    "delivery_key": dk, "kind": kind, "user_id": uid, "thread_id": tid,
+                    "run_id": rid, "execution_id": exec_id, "is_current": is_cur,
+                    "has_non_empty_text": has_txt, "platform": plat, "target_address": taddr,
+                    "status": "in_flight", "total_chunks": tchunks, "sent_chunks": 0,
+                    "platform_message_ids": [], "files_status": [],
+                    "error_code": None, "error_message": None,
+                    "source_scope_key": scope, "source_generation": gen, "activity_origin": act_o,
+                    "delivery_attempt": next_att,
+                    "weixin_account_id": wx_aid, "weixin_bot_id": wx_bid,
+                    "weixin_bot_generation": wx_gen, "weixin_recipient_id": wx_rec,
+                    "dm_recipient_platform_user_id": pdm,
+                    "bt2_enrolled": False, "source_delivery_key": None,
+                    "deliverable_manifest": None, "authorized_target_meta": None,
+                    "claim_attempt_id": None, "claim_gateway_epoch": None,
+                    "claim_lease_expires_at": None,
+                }
             self.rowcount = 1
             return
 
@@ -1282,10 +1361,12 @@ class _FakeCursorState:
 
         if "WITH TARGET AS ( SELECT DELIVERY_KEY" in norm:
             if "ATTEMPT_LEASE_EXPIRED" in norm:
+                req_aid = "CLAIM_ATTEMPT_ID IS NOT NULL" in norm
                 cnt = 0
                 for d in self.db.deliveries.values():
                     if (
                         d.get("status") == "in_flight"
+                        and ((not req_aid) or d.get("claim_attempt_id") is not None)
                         and d.get("claim_lease_expires_at") is not None
                         and d["claim_lease_expires_at"] < self.db.now
                         and (d["delivery_key"].startswith("deliverables-links:") or d.get("bt2_enrolled"))
@@ -2990,6 +3071,7 @@ async def test_r2_recover_gates_card_targets_on_origin_channel_rows_and_preserve
         "user_id": uid,
         "status": "in_flight",
         "bt2_enrolled": True,
+        "claim_attempt_id": str(uuid4()),
         "claim_lease_expires_at": db.now + timedelta(seconds=120),
     }
     db.deliveries["deliverables-links:tool:run-s:expired"] = {
@@ -2998,6 +3080,7 @@ async def test_r2_recover_gates_card_targets_on_origin_channel_rows_and_preserve
         "user_id": uid,
         "status": "in_flight",
         "bt2_enrolled": True,
+        "claim_attempt_id": str(uuid4()),
         "claim_lease_expires_at": db.now - timedelta(seconds=10),
     }
     db.deliveries["fallback:run-s:body"] = {
@@ -3618,3 +3701,763 @@ async def test_r2_unit_db_transaction_rollback_semantics() -> None:
     # Transaction rolled back -> runtime_config restored to True!
     assert db.runtime_config["interactive_actions_enabled"] is True
     assert db.runtime_config["config_revision"] == 1
+
+
+# ===========================================================================
+# r3 UNIT TESTS: Items 1–6
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_r3_item1_legacy_deliverables_links_barrier_and_bt2_enrolled_protection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r3 Item 1: legacy-format ``deliverables-links:<run_id>`` (no new BT2 fields)
+    1) Denied with ``bt2_drain_disabled`` & zero rows written when ``bt2_link_recovery_enabled == False``
+       (reading 7b-0 FOR SHARE after 7a-4 with ``i6_links_legacy`` hooks);
+    2) Matches main-branch behavior when barrier is open (``bt2_enrolled=False``,
+       ``claim_attempt_id=None``, ``claim_lease_expires_at=None``);
+    3) Never overwrites an existing ``bt2_enrolled = TRUE`` row via ordinary I-6 ON CONFLICT."""
+    db = _InMemoryBatch3DB()
+    tid = str(uuid4())
+    uid = "u-alice"
+    _install_db(monkeypatch, db)
+    db.identities[(uid, "feishu")] = {
+        "user_id": uid,
+        "platform": "feishu",
+        "platform_user_id": "ou_alice",
+    }
+    db.session_generations[("feishu", "dm:ou_alice", uid)] = {"generation": 1}
+    db.inbounds[("feishu", "om_leg_1")] = {
+        "platform": "feishu",
+        "message_id": "om_leg_1",
+        "dalton_user_id": uid,
+        "chat_type": "dm",
+        "chat_address": "feishu:@me",
+        "thread_scope_key": "dm:ou_alice",
+        "session_generation": 1,
+        "thread_id": tid,
+        "run_id": "run-leg-1",
+        "status": "streaming",
+        "fallback_pending": True,
+        "raw_payload": {"platform_user_id": "ou_alice"},
+    }
+
+    # (a) Barrier closed -> legacy deliverables-links denied with ZERO rows written
+    hook_ops: list[str] = []
+
+    async def _before_hook(op: str) -> None:
+        hook_ops.append(f"before:{op}")
+
+    async def _after_hook(op: str) -> None:
+        hook_ops.append(f"after:{op}")
+
+    cat._before_7b0_lock_hook = _before_hook
+    cat._after_7b0_lock_hook = _after_hook
+    try:
+        db.runtime_config["bt2_link_recovery_enabled"] = False
+        db.sql_log.clear()
+        denied = await cg_db.authorize_and_claim_delivery(
+            delivery_key="deliverables-links:run-leg-1",
+            kind="fallback",
+            user_id=uid,
+            thread_id=tid,
+            run_id="run-leg-1",
+            gateway_epoch=1,
+            require_gateway_epoch=True,
+        )
+        assert denied["claim_status"] == "denied"
+        assert denied["status"] == "failed"
+        assert denied["code"] == "bt2_drain_disabled"
+        assert "deliverables-links:run-leg-1" not in db.deliveries
+        assert hook_ops == ["before:i6_links_legacy", "after:i6_links_legacy"]
+        idx_7a4 = next(
+            i for i, s in enumerate(db.sql_log)
+            if "FROM DALTON_CHANNEL_DELIVERIES" in s and "FOR UPDATE" in s
+        )
+        idx_7b0 = next(
+            i for i, s in enumerate(db.sql_log)
+            if "FROM DALTON_CHANNEL_INTERRUPT_RUNTIME_CONFIG" in s and "FOR SHARE" in s
+        )
+        assert idx_7a4 < idx_7b0
+
+        # (b) Barrier open -> legacy row created identically to main branch
+        db.runtime_config["bt2_link_recovery_enabled"] = True
+        claimed = await cg_db.authorize_and_claim_delivery(
+            delivery_key="deliverables-links:run-leg-1",
+            kind="fallback",
+            user_id=uid,
+            thread_id=tid,
+            run_id="run-leg-1",
+            gateway_epoch=1,
+            require_gateway_epoch=True,
+        )
+        assert claimed["claim_status"] == "claimed"
+        leg_row = db.deliveries["deliverables-links:run-leg-1"]
+        assert leg_row["bt2_enrolled"] is False
+        assert leg_row["claim_attempt_id"] is None
+        assert leg_row["claim_lease_expires_at"] is None
+    finally:
+        cat._before_7b0_lock_hook = None
+        cat._after_7b0_lock_hook = None
+
+    # (c) Legacy request hitting bt2_enrolled=TRUE parent rows MUST NOT modify them
+    for key, st, err, exp_claim_status in [
+        ("deliverables-links:run-bt2-sent", "sent", None, "already_completed"),
+        ("deliverables-links:run-bt2-termfail", "failed", "not_allowed", "already_completed"),
+        ("deliverables-links:run-bt2-retryfail", "failed", "timeout", "in_flight_or_unknown"),
+        ("deliverables-links:run-bt2-inflight", "in_flight", None, "in_flight_or_unknown"),
+    ]:
+        db.deliveries[key] = {
+            "delivery_key": key,
+            "kind": "fallback",
+            "user_id": uid,
+            "thread_id": tid,
+            "run_id": "run-leg-1",
+            "is_current": True,
+            "platform": "feishu",
+            "target_address": "feishu:@me",
+            "status": st,
+            "error_code": err,
+            "delivery_attempt": 2,
+            "sent_chunks": 0,
+            "files_status": [],
+            "bt2_enrolled": True,
+            "claim_attempt_id": str(uuid4()),
+            "claim_lease_expires_at": db.now + timedelta(seconds=180),
+        }
+        res = await cg_db.authorize_and_claim_delivery(
+            delivery_key=key,
+            kind="fallback",
+            user_id=uid,
+            thread_id=tid,
+            run_id="run-leg-1",
+            gateway_epoch=1,
+            require_gateway_epoch=True,
+        )
+        assert res["claim_status"] == exp_claim_status
+        # Row MUST remain completely unmodified (no ON CONFLICT rewrite!)
+        assert db.deliveries[key]["status"] == st
+        assert db.deliveries[key]["delivery_attempt"] == 2
+        assert db.deliveries[key]["bt2_enrolled"] is True
+
+
+@pytest.mark.asyncio
+async def test_r3_item2_legacy_links_no_lease_and_startup_recovery_vs_bt2_in_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r3 Item 2:
+    - Legacy ``deliverables-links:`` row (``claim_attempt_id IS NULL``) updated via I-7 keeps
+      ``claim_lease_expires_at = None``;
+    - ``startup`` recovery marks freshly updated legacy ``in_flight`` row as ``unknown / gateway_restarted``;
+    - In-lease BT2 row (``claim_attempt_id IS NOT NULL``) stays ``in_flight`` during ``startup``;
+    - ``RecoveryScanner`` Step 3b only reclaims rows with ``claim_attempt_id IS NOT NULL``."""
+    db = _InMemoryBatch3DB()
+    tid = str(uuid4())
+    uid = "u-alice"
+    _install_db(monkeypatch, db)
+
+    legacy_key = "deliverables-links:run-legacy-item2"
+    bt2_key = "deliverables-links:run-bt2-item2"
+    bt2_aid = str(uuid4())
+    db.deliveries[legacy_key] = {
+        "delivery_key": legacy_key,
+        "kind": "fallback",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-legacy-item2",
+        "is_current": True,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "in_flight",
+        "delivery_attempt": 1,
+        "sent_chunks": 0,
+        "total_chunks": 1,
+        "platform_message_ids": [],
+        "files_status": [],
+        "bt2_enrolled": False,
+        "claim_attempt_id": None,
+        "claim_lease_expires_at": None,
+    }
+    db.deliveries[bt2_key] = {
+        "delivery_key": bt2_key,
+        "kind": "fallback",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-bt2-item2",
+        "is_current": True,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "in_flight",
+        "delivery_attempt": 1,
+        "sent_chunks": 0,
+        "total_chunks": 1,
+        "platform_message_ids": [],
+        "files_status": [],
+        "bt2_enrolled": True,
+        "claim_attempt_id": bt2_aid,
+        "claim_lease_expires_at": db.now + timedelta(seconds=180),
+    }
+
+    # I-7 progress update on legacy links row MUST keep claim_lease_expires_at = None!
+    upd = await cg_db.update_delivery_progress(
+        delivery_key=legacy_key,
+        status="in_flight",
+        files_status=[{"workspace_id": "ws1", "path": "a.pdf", "status": "linked"}],
+        delivery_attempt=1,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert upd["ok"] is True
+    assert db.deliveries[legacy_key]["claim_lease_expires_at"] is None
+
+    # startup marks legacy row unknown/gateway_restarted while keeping in-lease BT2 row in_flight
+    rec = await cg_db.recover_channel_state(
+        mode="startup", gateway_epoch=1, require_gateway_epoch=True
+    )
+    assert rec["mode"] == "startup"
+    assert db.deliveries[legacy_key]["status"] == "unknown"
+    assert db.deliveries[legacy_key]["error_code"] == "gateway_restarted"
+    assert db.deliveries[bt2_key]["status"] == "in_flight"
+
+    # RecoveryScanner Step 3b MUST require claim_attempt_id IS NOT NULL
+    db.deliveries["deliverables-links:legacy-null-aid-expired"] = {
+        "delivery_key": "deliverables-links:legacy-null-aid-expired",
+        "kind": "fallback",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-leg-exp",
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "in_flight",
+        "delivery_attempt": 1,
+        "bt2_enrolled": False,
+        "claim_attempt_id": None,
+        "claim_lease_expires_at": db.now - timedelta(seconds=60),
+    }
+    db.sql_log.clear()
+    await cat.reconcile_stale_interrupt_resumes()
+    step3b_sql = next(s for s in db.sql_log if "ATTEMPT_LEASE_EXPIRED" in s)
+    assert "CLAIM_ATTEMPT_ID IS NOT NULL" in step3b_sql
+    assert db.deliveries["deliverables-links:legacy-null-aid-expired"]["status"] == "in_flight"
+
+
+@pytest.mark.asyncio
+async def test_r3_item3_i7_sent_to_current_count_lock_order_and_run_id_drift_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r3 Item 3:
+    1) I-7 incrementing ``sent_to_current_count`` acquires locks in strict Lock Order ②:
+       ``7a-1 inbound_events FOR UPDATE -> 7a-3 background_runs FOR UPDATE -> 7a-4 deliveries FOR UPDATE``;
+    2) If ``run_id`` drifts between unlocked pre-read and 7a-4 delivery lock, I-7 rolls back and retries."""
+    db = _InMemoryBatch3DB()
+    tid = str(uuid4())
+    uid = "u-alice"
+    _install_db(monkeypatch, db)
+
+    db.inbounds[("feishu", "om_i7_1")] = {
+        "platform": "feishu",
+        "message_id": "om_i7_1",
+        "dalton_user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-i7-ord",
+        "status": "streaming",
+        "fallback_pending": True,
+        "sent_to_current_count": 0,
+    }
+    db.background_runs["run-i7-ord"] = {
+        "thread_id": tid,
+        "run_id": "run-i7-ord",
+        "dalton_user_id": uid,
+        "platform": "feishu",
+        "status": "streaming",
+        "fallback_pending": True,
+        "sent_to_current_count": 0,
+    }
+    db.deliveries["fallback:run-i7-ord"] = {
+        "delivery_key": "fallback:run-i7-ord",
+        "kind": "fallback",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-i7-ord",
+        "is_current": True,
+        "has_non_empty_text": True,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "in_flight",
+        "delivery_attempt": 1,
+        "sent_chunks": 0,
+        "total_chunks": 1,
+        "platform_message_ids": [],
+        "files_status": [],
+    }
+
+    db.sql_log.clear()
+    res = await cg_db.update_delivery_progress(
+        delivery_key="fallback:run-i7-ord",
+        status="sent",
+        sent_chunks=1,
+        delivery_attempt=1,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert res["ok"] is True
+    assert res["sent_to_current_count"] == 1
+    assert db.inbounds[("feishu", "om_i7_1")]["sent_to_current_count"] == 1
+    assert db.background_runs["run-i7-ord"]["sent_to_current_count"] == 1
+
+    idx_inb = next(
+        i for i, s in enumerate(db.sql_log)
+        if "FROM DALTON_CHANNEL_INBOUND_EVENTS" in s and "FOR UPDATE" in s
+    )
+    idx_bg = next(
+        i for i, s in enumerate(db.sql_log)
+        if "FROM DALTON_CHANNEL_BACKGROUND_RUNS" in s and "FOR UPDATE" in s
+    )
+    idx_del = next(
+        i for i, s in enumerate(db.sql_log)
+        if "FROM DALTON_CHANNEL_DELIVERIES" in s and "FOR UPDATE" in s
+    )
+    assert idx_inb < idx_bg < idx_del
+
+    # (b) Simulate run_id drifting between pre-read and 7a-4 lock -> rolls back and retries!
+    db.inbounds[("feishu", "om_old")] = {
+        "platform": "feishu",
+        "message_id": "om_old",
+        "dalton_user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-drift-old",
+        "status": "streaming",
+        "fallback_pending": True,
+        "sent_to_current_count": 0,
+    }
+    db.inbounds[("feishu", "om_new")] = {
+        "platform": "feishu",
+        "message_id": "om_new",
+        "dalton_user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-drift-new",
+        "status": "streaming",
+        "fallback_pending": True,
+        "sent_to_current_count": 0,
+    }
+    db.deliveries["fallback:run-drift"] = {
+        "delivery_key": "fallback:run-drift",
+        "kind": "fallback",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-drift-old",
+        "is_current": True,
+        "has_non_empty_text": True,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "in_flight",
+        "delivery_attempt": 1,
+        "sent_chunks": 0,
+        "total_chunks": 1,
+        "platform_message_ids": [],
+        "files_status": [],
+    }
+
+    orig_preread = cg_db._preread_i7_origin_rows
+    preread_calls = 0
+
+    async def _drifting_preread(dk: str, *, is_bt2_parent_key: bool, conn: Any = None):
+        nonlocal preread_calls
+        preread_calls += 1
+        out = await orig_preread(dk, is_bt2_parent_key=is_bt2_parent_key, conn=conn)
+        if preread_calls == 1:
+            # Mutate run_id AFTER pre-read and BEFORE write transaction locks delivery row
+            db.deliveries["fallback:run-drift"]["run_id"] = "run-drift-new"
+        return out
+
+    monkeypatch.setattr(cg_db, "_preread_i7_origin_rows", _drifting_preread)
+    res_drift = await cg_db.update_delivery_progress(
+        delivery_key="fallback:run-drift",
+        status="sent",
+        sent_chunks=1,
+        delivery_attempt=1,
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert res_drift["ok"] is True
+    assert preread_calls == 2, f"Expected retry after run_id drift, got {preread_calls} preread calls"
+    assert db.inbounds[("feishu", "om_old")]["sent_to_current_count"] == 0
+    assert db.inbounds[("feishu", "om_new")]["sent_to_current_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_r3_item4_bt2_item_requires_parent_manifest_and_inherits_parent_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r3 Item 4:
+    1) ``:item:`` child with missing parent row returns ``bt2_parent_missing`` & zero writes;
+    2) ``:item:`` child absent from parent's ``deliverable_manifest`` returns ``bt2_parent_missing`` & zero writes;
+    3) ``:item:`` child strictly inherits parent row's user/platform/target metadata, ignoring conflicting caller args."""
+    db = _InMemoryBatch3DB()
+    tid = str(uuid4())
+    uid = "u-alice"
+    _install_db(monkeypatch, db)
+    db.identities[(uid, "feishu")] = {
+        "user_id": uid,
+        "platform": "feishu",
+        "platform_user_id": "ou_alice",
+    }
+    db.chat_bindings[("feishu", "feishu:oc_parent_grp")] = {
+        "platform": "feishu",
+        "chat_address": "feishu:oc_parent_grp",
+        "workspace_id": None,
+    }
+    db.user_settings[uid] = {
+        "user_id": uid,
+        "apps": {
+            "feishu": {
+                "chats": {"feishu:oc_parent_grp": {"name": "ParentGrp"}},
+                "agent_messages": {"enabled": True, "allowed": ["feishu:oc_parent_grp"]},
+            }
+        },
+    }
+
+    # (a) Missing parent row -> bt2_parent_missing, zero writes even with requested_files & target!
+    orphan_item = "deliverables-links:tool:r4:orphan:item:aaaa1111"
+    r_orphan = await cg_db.authorize_and_claim_delivery(
+        delivery_key=orphan_item,
+        kind="fallback",
+        user_id=uid,
+        thread_id=tid,
+        run_id="r4",
+        platform="feishu",
+        target="feishu:oc_parent_grp",
+        requested_files=[{"workspace_id": "ws1", "path": "a.pdf"}],
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_orphan["claim_status"] == "denied"
+    assert r_orphan["status"] == "failed"
+    assert r_orphan["code"] == "bt2_parent_missing"
+    assert orphan_item not in db.deliveries
+
+    # (b) Parent exists, but item_key is NOT in parent's deliverable_manifest -> bt2_parent_missing, zero writes
+    parent_key = "deliverables-links:tool:r4:p1"
+    valid_manifest = cg_db.build_bt2_deliverable_manifest(
+        [{"workspace_id": "ws1", "path": "allowed.pdf"}], parent_key
+    )
+    valid_item_key = valid_manifest[0]["item_key"]
+    db.deliveries[parent_key] = {
+        "delivery_key": parent_key,
+        "kind": "fallback",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "r4",
+        "is_current": False,
+        "platform": "feishu",
+        "target_address": "feishu:oc_parent_grp",
+        "status": "in_flight",
+        "delivery_attempt": 1,
+        "bt2_enrolled": True,
+        "source_delivery_key": "tool:r4:p1",
+        "deliverable_manifest": valid_manifest,
+        "authorized_target_meta": {
+            "auth_mode": "explicit_target",
+            "platform": "feishu",
+            "target_address": "feishu:oc_parent_grp",
+            "is_current": False,
+        },
+        "claim_attempt_id": str(uuid4()),
+        "claim_lease_expires_at": db.now + timedelta(seconds=180),
+    }
+
+    wrong_item = f"{parent_key}:item:not_in_manifest"
+    r_missing_entry = await cg_db.authorize_and_claim_delivery(
+        delivery_key=wrong_item,
+        kind="fallback",
+        user_id=uid,
+        platform="feishu",
+        target="feishu:oc_parent_grp",
+        requested_files=[{"workspace_id": "ws1", "path": "evil.pdf"}],
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_missing_entry["claim_status"] == "denied"
+    assert r_missing_entry["status"] == "failed"
+    assert r_missing_entry["code"] == "bt2_parent_missing"
+    assert wrong_item not in db.deliveries
+
+    # (c) Valid item_key with conflicting caller user_id / platform / target -> parent wins!
+    r_valid = await cg_db.authorize_and_claim_delivery(
+        delivery_key=valid_item_key,
+        kind="fallback",
+        user_id="u-spoofed",
+        platform="discord",
+        target="discord:999/888",
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r_valid["claim_status"] == "claimed"
+    assert r_valid["platform"] == "feishu"
+    assert r_valid["target_address"] == "feishu:oc_parent_grp"
+    assert db.deliveries[valid_item_key]["user_id"] == uid
+    assert db.deliveries[valid_item_key]["platform"] == "feishu"
+    assert db.deliveries[valid_item_key]["target_address"] == "feishu:oc_parent_grp"
+
+
+@pytest.mark.asyncio
+async def test_r3_item5_non_current_sent_delivery_does_not_clear_fallback_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r3 Item 5: a ``sent`` non-links delivery with ``is_current = FALSE`` (e.g. explicit file
+    sent to another chat) MUST NOT satisfy ``has_sent_non_links`` or clear ``fallback_pending``."""
+    db = _InMemoryBatch3DB()
+    tid = str(uuid4())
+    uid = "u-alice"
+    _install_db(monkeypatch, db)
+    db.identities[(uid, "feishu")] = {
+        "user_id": uid,
+        "platform": "feishu",
+        "platform_user_id": "ou_alice",
+    }
+    db.user_settings[uid] = {
+        "user_id": uid,
+        "apps": {"feishu": {"agent_messages": {"enabled": False, "allowed": []}}},
+    }
+    db.inbounds[("feishu", "om_nc")] = {
+        "platform": "feishu",
+        "message_id": "om_nc",
+        "dalton_user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-nc",
+        "status": "streaming",
+        "fallback_pending": True,
+        "sent_to_current_count": 0,
+        "raw_payload": {},
+    }
+    db.background_runs["run-nc"] = {
+        "thread_id": tid,
+        "run_id": "run-nc",
+        "dalton_user_id": uid,
+        "platform": "feishu",
+        "status": "streaming",
+        "fallback_pending": True,
+        "sent_to_current_count": 0,
+    }
+    # Explicit file sent to ANOTHER chat (is_current=False, status='sent')
+    db.deliveries["tool:run-nc:other_chat"] = {
+        "delivery_key": "tool:run-nc:other_chat",
+        "kind": "agent_send",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-nc",
+        "is_current": False,
+        "has_non_empty_text": False,
+        "platform": "feishu",
+        "target_address": "feishu:oc_other",
+        "status": "sent",
+        "delivery_attempt": 1,
+    }
+    db.deliveries["deliverables-links:tool:run-nc:other_chat"] = {
+        "delivery_key": "deliverables-links:tool:run-nc:other_chat",
+        "kind": "fallback",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-nc",
+        "is_current": False,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "unknown",
+        "delivery_attempt": 1,
+        "bt2_enrolled": True,
+        "dm_recipient_platform_user_id": "ou_alice",
+        "deliverable_manifest": [
+            {"item_key": "deliverables-links:tool:run-nc:other_chat:item:h1", "workspace_id": "ws1", "path": "a.pdf"}
+        ],
+        "authorized_target_meta": {
+            "auth_mode": "explicit_target",
+            "platform": "feishu",
+            "target_address": "feishu:@me",
+            "is_current": False,
+            "link_dm_recipient_open_id": "ou_alice",
+        },
+    }
+
+    # Settling the explicit parent MUST NOT clear fallback_pending when only is_current=False sent exists!
+    r1 = await cg_db.authorize_and_claim_delivery(
+        delivery_key="deliverables-links:tool:run-nc:other_chat",
+        kind="fallback",
+        attempt_id=str(uuid4()),
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r1["claim_status"] == "denied"
+    assert db.inbounds[("feishu", "om_nc")]["fallback_pending"] is True
+    assert db.background_runs["run-nc"]["fallback_pending"] is True
+
+    # Once an is_current=True body delivery is 'sent', settling clears fallback_pending!
+    db.deliveries["fallback:run-nc:body"] = {
+        "delivery_key": "fallback:run-nc:body",
+        "kind": "fallback",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-nc",
+        "is_current": True,
+        "has_non_empty_text": True,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "sent",
+        "delivery_attempt": 1,
+    }
+    db.deliveries["deliverables-links:tool:run-nc:c2"] = {
+        "delivery_key": "deliverables-links:tool:run-nc:c2",
+        "kind": "fallback",
+        "user_id": uid,
+        "thread_id": tid,
+        "run_id": "run-nc",
+        "is_current": False,
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "unknown",
+        "delivery_attempt": 1,
+        "bt2_enrolled": True,
+        "dm_recipient_platform_user_id": "ou_alice",
+        "deliverable_manifest": [
+            {"item_key": "deliverables-links:tool:run-nc:c2:item:h2", "workspace_id": "ws1", "path": "b.pdf"}
+        ],
+        "authorized_target_meta": {
+            "auth_mode": "explicit_target",
+            "platform": "feishu",
+            "target_address": "feishu:@me",
+            "is_current": False,
+            "link_dm_recipient_open_id": "ou_alice",
+        },
+    }
+    r2 = await cg_db.authorize_and_claim_delivery(
+        delivery_key="deliverables-links:tool:run-nc:c2",
+        kind="fallback",
+        attempt_id=str(uuid4()),
+        gateway_epoch=1,
+        require_gateway_epoch=True,
+    )
+    assert r2["claim_status"] == "denied"
+    assert db.inbounds[("feishu", "om_nc")]["fallback_pending"] is False
+    assert db.background_runs["run-nc"]["fallback_pending"] is False
+
+
+@pytest.mark.asyncio
+async def test_r3_item6_mint_and_inspect_gate_lock_order_and_generation_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r3 Item 6: Lock Order ④ for ``mint`` and ``inspect-gate``:
+    1) Level 2 (group advisory lock) and Level 6 (``session_generations FOR UPDATE``) execute
+       strictly BEFORE Level 7b-0 (``interrupt_runtime_config FOR SHARE``);
+    2) ``mint`` rejects mismatched ``session_generation`` with HTTP 409 ``session_generation_superseded``."""
+    db = _InMemoryBatch3DB()
+    tid = str(uuid4())
+    uid = "u-alice"
+    action_req = {"type": "delete_thread", "thread_id": tid}
+    _install_db(
+        monkeypatch,
+        db,
+        pending_interrupts={
+            "int-l6": {
+                "id": "int-l6",
+                "value": {"kind": "hitl_confirm", "action_requests": [action_req]},
+            }
+        },
+    )
+    db.identities[(uid, "discord")] = {
+        "user_id": uid,
+        "platform": "discord",
+        "platform_user_id": "dc_alice",
+    }
+    db.chat_bindings[("discord", "discord:g1/ch1")] = {
+        "platform": "discord",
+        "chat_address": "discord:g1/ch1",
+        "workspace_id": None,
+    }
+    db.user_settings[uid] = {
+        "user_id": uid,
+        "apps": {"discord": {"chats": {"discord:g1/ch1": {"name": "Research"}}}},
+    }
+    db.session_generations[("discord", "chat:g1/ch1:topic:m1", uid)] = {"generation": 2}
+
+    # (a) mint rejects mismatched session_generation (req=1 vs DB=2) with 409 session_generation_superseded
+    with pytest.raises(HTTPException) as exc_gen:
+        await cat.mint_channel_action_token(
+            platform="discord",
+            dalton_user_id=uid,
+            initiator_platform_user_id="dc_alice",
+            origin_chat_type="group",
+            origin_chat_address="discord:g1/ch1",
+            origin_scope_key="chat:g1/ch1:topic:m1",
+            session_generation=1,
+            thread_id=tid,
+            run_id="run-l6",
+            interrupt_id="int-l6",
+            interrupt_value={"kind": "hitl_confirm", "action_requests": [action_req]},
+            gateway_epoch=1,
+        )
+    assert exc_gen.value.status_code == 409
+    assert exc_gen.value.detail["code"] == "session_generation_superseded"
+    assert len(db.tokens) == 0
+
+    # (b) Matching session_generation=2 succeeds and acquires Level 2 -> Level 6 -> Level 7b-0 in order!
+    db.sql_log.clear()
+    minted = await cat.mint_channel_action_token(
+        platform="discord",
+        dalton_user_id=uid,
+        initiator_platform_user_id="dc_alice",
+        origin_chat_type="group",
+        origin_chat_address="discord:g1/ch1",
+        origin_scope_key="chat:g1/ch1:topic:m1",
+        session_generation=2,
+        thread_id=tid,
+        run_id="run-l6",
+        interrupt_id="int-l6",
+        interrupt_value={"kind": "hitl_confirm", "action_requests": [action_req]},
+        gateway_epoch=1,
+    )
+    assert minted["ok"] is True
+    m_l2 = next(i for i, s in enumerate(db.sql_log) if "PG_ADVISORY_XACT_LOCK" in s)
+    m_l6 = next(
+        i for i, s in enumerate(db.sql_log)
+        if "FROM DALTON_CHANNEL_SESSION_GENERATIONS" in s and "FOR UPDATE" in s
+    )
+    m_7b0 = next(
+        i for i, s in enumerate(db.sql_log)
+        if "FROM DALTON_CHANNEL_INTERRUPT_RUNTIME_CONFIG" in s and "FOR SHARE" in s
+    )
+    assert m_l2 < m_l6 < m_7b0
+
+    await cat.bind_channel_action_card(
+        approval_nonce=minted["approval_nonce"],
+        phase="prepare_send",
+        send_reconcile_meta={"target_channel_id": "ch1"},
+        gateway_epoch=1,
+    )
+    await cat.bind_channel_action_card(
+        approval_nonce=minted["approval_nonce"],
+        phase="confirm_bound",
+        card_channel_id="ch1",
+        card_message_id="msg_l6",
+        gateway_epoch=1,
+    )
+
+    # (c) inspect-gate acquires Level 2 -> Level 6 -> Level 7b-0 in strict order!
+    db.sql_log.clear()
+    gate_res = await cat.inspect_discord_gate_token(
+        approval_nonce=minted["approval_nonce"],
+        clicker_platform_user_id="dc_alice",
+        channel_id="ch1",
+        message_id="msg_l6",
+        gateway_epoch=1,
+    )
+    assert gate_res["ok"] is True
+    g_l2 = next(i for i, s in enumerate(db.sql_log) if "PG_ADVISORY_XACT_LOCK" in s)
+    g_l6 = next(
+        i for i, s in enumerate(db.sql_log)
+        if "FROM DALTON_CHANNEL_SESSION_GENERATIONS" in s and "FOR UPDATE" in s
+    )
+    g_7b0 = next(
+        i for i, s in enumerate(db.sql_log)
+        if "FROM DALTON_CHANNEL_INTERRUPT_RUNTIME_CONFIG" in s and "FOR SHARE" in s
+    )
+    assert g_l2 < g_l6 < g_7b0

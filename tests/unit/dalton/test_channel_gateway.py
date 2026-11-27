@@ -518,6 +518,19 @@ class InMemoryChannelStore:
                     return [{"thread_id": r["thread_id"]}]
             return []
 
+        if (
+            "SELECT" in norm
+            and "FROM dalton_channel_inbound_events WHERE run_id = %s" in norm
+            and "COALESCE(MAX(" not in norm
+        ):
+            rid = str(params[0])
+            only_fb = "fallback_pending = TRUE" in norm
+            return [
+                dict(r)
+                for _, r in sorted(self.inbound_events.items())
+                if r.get("run_id") == rid and (not only_fb or r.get("fallback_pending"))
+            ]
+
         if "SELECT run_id FROM dalton_channel_inbound_events WHERE thread_id = %s AND status IN" in norm:
             tid = str(params[0])
             for r in reversed(list(self.inbound_events.values())):
@@ -549,6 +562,10 @@ class InMemoryChannelStore:
             row = self.inbound_events.get((plat, mid))
             if not row:
                 return []
+            if "SET sent_to_current_count = sent_to_current_count + 1" in norm:
+                row["sent_to_current_count"] = int(row.get("sent_to_current_count") or 0) + 1
+                row["updated_at"] = now
+                return [{"sent_to_current_count": row["sent_to_current_count"]}]
             if "SET status = 'ignored', raw_payload = %s" in norm:
                 row["status"] = "ignored"
                 val = params[0].obj if hasattr(params[0], "obj") else params[0]
@@ -1542,6 +1559,19 @@ class InMemoryChannelStore:
                     for r in self.background_runs.values()
                     if r.get("fallback_pending")
                 ]
+            if "WHERE thread_id = %s::uuid AND run_id = %s" in norm:
+                tid_q, rid_q = str(params[0]), str(params[1])
+                r = self.background_runs.get(rid_q)
+                if r and str(r.get("thread_id") or "") == tid_q:
+                    return [dict(r)]
+                return []
+            if "WHERE run_id = %s" in norm:
+                rid_q = str(params[0])
+                only_fb = "fallback_pending = TRUE" in norm
+                r = self.background_runs.get(rid_q)
+                if r and (not only_fb or r.get("fallback_pending")):
+                    return [dict(r)]
+                return []
             if "WHERE" in norm:
                 p_idx = 0
                 uid_filter = None
@@ -1781,6 +1811,13 @@ class InMemoryChannelStore:
             return []
 
         if "UPDATE dalton_channel_background_runs SET sent_to_current_count = sent_to_current_count + 1" in norm:
+            if "WHERE thread_id = %s::uuid AND run_id = %s" in norm:
+                tid_q, rid = str(params[0]), str(params[1])
+                r = self.background_runs.get(rid)
+                if r and str(r.get("thread_id") or "") == tid_q:
+                    r["sent_to_current_count"] = int(r.get("sent_to_current_count") or 0) + 1
+                    return [{"sent_to_current_count": r["sent_to_current_count"]}]
+                return []
             rid = str(params[0])
             r = self.background_runs.get(rid)
             if r:
