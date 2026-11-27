@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, type MouseEvent } from 'react'; // DALTON-HOOK(dialog-focus-return): a click's control, kept for focus to return to
 import { SwapCell } from '@/components/ui/crossfade';
 import { useLastShape } from '@/lib/lastShape';
 import { useParams } from 'react-router';
@@ -79,6 +79,12 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
   const queryClient = useQueryClient();
   const now = useNow();
   const [isModalOpen, setIsModalOpen] = useState(false);
+  // DALTON-HOOK(dialog-focus-return): the control that opened the dialog, so focus comes back to it on close
+  const [createOpener, setCreateOpener] = useState<HTMLElement | null>(null);
+  const openCreateModal = (e: MouseEvent<HTMLButtonElement>) => {
+    setCreateOpener(e.currentTarget);
+    setIsModalOpen(true);
+  };
   const [searchQuery, setSearchQuery] = useState('');
   const [computerFilter, setComputerFilter] = useState<string>(ALL_COMPUTERS);
   // Most recent first until the user picks another order, and then theirs on
@@ -293,7 +299,8 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
     // A user with nothing but Home is welcomed, not shown a search box.
     if (!hasUserWorkspaces) {
       return (
-        <GalleryEmptyState isFiltered={false} onNewWorkspace={() => setIsModalOpen(true)} />
+        // DALTON-HOOK(dialog-focus-return): the button's click names it, for focus to return to
+        <GalleryEmptyState isFiltered={false} onNewWorkspace={openCreateModal} />
       );
     }
     if (visibleWorkspaces.length === 0) {
@@ -303,7 +310,7 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
             isFiltered
             query={searchQuery.trim()}
             onClearSearch={() => setSearchQuery('')}
-            onNewWorkspace={() => setIsModalOpen(true)}
+            onNewWorkspace={openCreateModal}
           />
         </div>
       );
@@ -364,7 +371,7 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
               <h1 className="title-font text-[length:var(--cs-text-title,1.5rem)] leading-8 font-semibold tracking-[var(--cs-title-track,-0.01em)]" style={{ color: 'var(--color-text-primary)' }}>
                 {t('workspace.workspaces')}
               </h1>
-              <GalleryActions onNewWorkspace={() => setIsModalOpen(true)} />
+              <GalleryActions onNewWorkspace={openCreateModal} /> {/* DALTON-HOOK(dialog-focus-return) */}
             </div>
           </header>
 
@@ -379,7 +386,7 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
                 {/* -mr-2: the icon, not the button's pad, lines up with the column's edge. */}
                 <PaletteSearchButton className="-my-1 -mr-2" />
               </div>
-              <GalleryActions stacked onNewWorkspace={() => setIsModalOpen(true)} />
+              <GalleryActions stacked onNewWorkspace={openCreateModal} />
             </div>
 
             <SharedGoneNotice className="mb-4" />
@@ -472,6 +479,7 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
       {/* Create Workspace Modal */}
       <CreateWorkspaceModal
         isOpen={isModalOpen}
+        returnFocusTo={createOpener}
         onClose={() => setIsModalOpen(false)}
         onCreate={createWorkspace}
         onComplete={(ws) => onWorkspaceSelect(ws.workspace_id, ws.name)}

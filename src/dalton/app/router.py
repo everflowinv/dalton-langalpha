@@ -42,6 +42,7 @@ from src.dalton.services.provider_status import (
     probe_provider,
 )
 from src.dalton.settings import get_dalton_settings, is_dalton_enabled
+from src.server.dependencies.principal import CurrentPrincipal
 from src.server.utils.api import CurrentUserId, handle_api_exceptions
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,7 @@ class DaltonAutomationWriteRequest(BaseModel):
 class WorkspaceTrackingUpdateRequest(BaseModel):
     enabled: bool
     tier: str | None = None
+    override_pause_versions: dict[str, int] | None = None
 
 
 class WorkspaceSharingUpdateRequest(BaseModel):
@@ -116,13 +118,17 @@ class SystemJobToggleRequest(BaseModel):
 
 class CoverageMutateRequest(BaseModel):
     action: str
-    tickers: list[str] | str
-    tier: str = "watch"
+    tickers: list[str] | str | None = None
+    tier: str | None = None
+    snapshot_id: str | None = None
+    override_user_pause: bool | None = None
 
 
 class CoverageGroupPreviewRequest(BaseModel):
     label: str = "未命名规则组"
     criteria: dict[str, Any] = Field(default_factory=dict)
+    default_tier: str = "watch"
+    auto_refresh: bool = True
 
 
 class CoverageGroupCreateRequest(BaseModel):
@@ -130,6 +136,7 @@ class CoverageGroupCreateRequest(BaseModel):
     criteria: dict[str, Any] = Field(default_factory=dict)
     default_tier: str = "watch"
     auto_refresh: bool = True
+    snapshot_id: str | None = None
 
 
 class EarningsCalendarMirrorRequest(BaseModel):
@@ -2333,7 +2340,9 @@ async def update_workspace_tracking_endpoint(
                     owner_id,
                     workspace_id,
                     tier=body.tier,
-                    force=True,
+                    force=bool(body.override_pause_versions),
+                    respect_user_pause=True,
+                    override_pause_versions=body.override_pause_versions,
                 )
             else:
                 res = await disable_tracking(owner_id, workspace_id)
@@ -2691,32 +2700,55 @@ async def mutate_user_coverage_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     _require_dalton_enabled()
-    from src.dalton.coverage import (
-        CoverageDataSourceError,
-        add_user_coverage_tickers,
-        remove_user_coverage_tickers,
+    from src.dalton.coverage import CoverageDataSourceError
+    from src.dalton.watchlist.service import (
+        WatchlistMutationService,
+        WatchlistScopeChangedError,
     )
 
     uid = str(user_id).strip()
     act = str(body.action or "").strip().lower()
-    tickers = _parse_tickers_payload(body.tickers)
-    if not tickers:
+    tickers = _parse_tickers_payload(body.tickers) if body.tickers is not None else []
+    if not tickers and not body.snapshot_id:
         raise HTTPException(status_code=400, detail="tickers is required")
 
+    svc = WatchlistMutationService()
     try:
         if act == "add":
-            return await add_user_coverage_tickers(
+            return await svc.execute_mutation(
                 uid,
-                tickers,
-                tier=body.tier or "watch",
+                action="add",
+                snapshot_id=body.snapshot_id,
+                tickers=tickers or None,
+                tier=body.tier if body.tier is not None else (None if body.snapshot_id else "watch"),
+                override_user_pause=body.override_user_pause,
                 source="ui",
             )
         if act == "remove":
-            return await remove_user_coverage_tickers(uid, tickers)
+            return await svc.execute_mutation(
+                uid,
+                action="remove",
+                snapshot_id=body.snapshot_id,
+                tickers=tickers or None,
+                source="ui",
+            )
         if act == "set_tier":
-            from src.dalton.autonomy.tracking import set_tier_and_resync
-
-            return await set_tier_and_resync(uid, tickers, tier=body.tier or "watch")
+            res = await svc.execute_mutation(
+                uid,
+                action="set_tier",
+                snapshot_id=body.snapshot_id,
+                tickers=tickers or None,
+                tier=body.tier if body.tier is not None else (None if body.snapshot_id else "watch"),
+                override_user_pause=body.override_user_pause,
+                source="ui",
+            )
+            res.setdefault("delta_schedule", [])
+            return res
+    except WatchlistScopeChangedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
     except CoverageDataSourceError as exc:
         raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
     except ValueError as exc:
@@ -2754,14 +2786,28 @@ async def preview_user_coverage_group_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     _require_dalton_enabled()
-    from src.dalton.coverage import CoverageDataSourceError, preview_coverage_group
+    from src.dalton.coverage import CoverageDataSourceError
+    from src.dalton.watchlist.service import WatchlistMutationService
 
-    _ = user_id
+    uid = str(user_id).strip()
     try:
-        return await preview_coverage_group(
+        preview = await WatchlistMutationService().preview_mutation(
+            uid,
+            action="add_group",
             label=body.label,
             criteria=body.criteria,
+            default_tier=body.default_tier,
+            auto_refresh=body.auto_refresh,
         )
+        companies = list((preview.get("prevalidated") or {}).values())
+        return {
+            **preview,
+            "label": preview.get("group_label") or body.label,
+            "criteria": preview.get("criteria") if preview.get("criteria") is not None else body.criteria,
+            "matched_tickers": list(preview.get("target_tickers") or []),
+            "companies": companies,
+            "rejected": list(preview.get("not_found") or []),
+        }
     except CoverageDataSourceError as exc:
         raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
     except ValueError as exc:
@@ -2776,6 +2822,7 @@ async def create_user_coverage_group_endpoint(
 ) -> dict[str, Any]:
     _require_dalton_enabled()
     from src.dalton.coverage import CoverageDataSourceError, add_coverage_group
+    from src.dalton.watchlist.service import WatchlistScopeChangedError
 
     try:
         return await add_coverage_group(
@@ -2784,7 +2831,13 @@ async def create_user_coverage_group_endpoint(
             criteria=body.criteria,
             default_tier=body.default_tier,
             auto_refresh=body.auto_refresh,
+            snapshot_id=body.snapshot_id,
         )
+    except WatchlistScopeChangedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
     except CoverageDataSourceError as exc:
         raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
     except ValueError as exc:
@@ -2796,11 +2849,23 @@ async def create_user_coverage_group_endpoint(
 async def delete_user_coverage_group_endpoint(
     group_id: str,
     user_id: CurrentUserId,
+    snapshot_id: str | None = Query(default=None),
 ) -> dict[str, Any]:
     _require_dalton_enabled()
     from src.dalton.coverage import remove_coverage_group
+    from src.dalton.watchlist.service import WatchlistScopeChangedError
 
-    res = await remove_coverage_group(str(user_id).strip(), group_id)
+    try:
+        res = await remove_coverage_group(
+            str(user_id).strip(),
+            group_id,
+            snapshot_id=snapshot_id,
+        )
+    except WatchlistScopeChangedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
     if not res.get("ok") or res.get("deleted") is False:
         raise HTTPException(status_code=404, detail=str(res.get("error") or "Group not found"))
     return res
@@ -2811,12 +2876,24 @@ async def delete_user_coverage_group_endpoint(
 async def resolve_user_coverage_group_endpoint(
     group_id: str,
     user_id: CurrentUserId,
+    snapshot_id: str | None = Query(default=None),
 ) -> dict[str, Any]:
     _require_dalton_enabled()
     from src.dalton.coverage import CoverageDataSourceError, resolve_coverage_group
+    from src.dalton.watchlist.service import WatchlistScopeChangedError
 
     try:
-        res = await resolve_coverage_group(str(user_id).strip(), group_id)
+        res = await resolve_coverage_group(
+            str(user_id).strip(),
+            group_id,
+            snapshot_id=snapshot_id,
+            allow_internal=False,
+        )
+    except WatchlistScopeChangedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
     except CoverageDataSourceError as exc:
         raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
     except ValueError as exc:
@@ -3216,6 +3293,241 @@ async def dalton_notify_discord_channel_verify_endpoint(
         "channel_id": cleaned_id,
         "channel_name": channel_name,
         "detail": None,
+    }
+
+
+class ReportDeliveryConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: str = Field(..., description="'create' or 'update'")
+    automation_id: str | None = Field(default=None)
+    name: str | None = Field(default=None)
+    instruction: str | None = Field(default=None)
+    report_profile: dict[str, Any]
+    expected_config_version: int | None = Field(default=None)
+
+
+def _allowed_same_origin_set_for_confirm(http_request: Request) -> set[str]:
+    from src.dalton.auth.tokens import _allowed_cookie_origins, _normalize_origin
+
+    allowed = set(_allowed_cookie_origins(http_request))
+    url = getattr(http_request, "url", None)
+    if url is not None:
+        scheme = getattr(url, "scheme", None)
+        netloc = getattr(url, "netloc", None)
+        if scheme and netloc:
+            norm = _normalize_origin(f"{scheme}://{netloc}")
+            if norm:
+                allowed.add(norm)
+    return allowed
+
+
+def _require_web_session_for_report_delivery_confirm(
+    principal: Any, http_request: Request
+) -> None:
+    from src.dalton.auth.tokens import _normalize_origin
+    from src.dalton.services.report_delivery import check_verifiable_web_login_session
+
+    ok_session, reason = check_verifiable_web_login_session(principal, http_request)
+    if not ok_session:
+        raise HTTPException(
+            status_code=403,
+            detail=reason or "仅允许可验证的网页登录会话签发或预检定时报告外发确认凭据。",
+        )
+    sec_fetch_site = str(http_request.headers.get("sec-fetch-site") or "").strip().lower()
+    if sec_fetch_site != "same-origin":
+        raise HTTPException(
+            status_code=403,
+            detail="仅允许同源浏览器请求（Sec-Fetch-Site: same-origin）签发或预检定时报告外发确认凭据。",
+        )
+    raw_origin = str(http_request.headers.get("origin") or "").strip()
+    norm_origin = _normalize_origin(raw_origin) if raw_origin else None
+    allowed_origins = _allowed_same_origin_set_for_confirm(http_request)
+    if not norm_origin or norm_origin not in allowed_origins:
+        raise HTTPException(
+            status_code=403,
+            detail="缺少有效本站 Origin 请求头，拒绝签发或预检定时报告外发确认凭据。",
+        )
+
+
+async def _load_automation_view_for_confirm_request(
+    *,
+    actor_user_id: str,
+    body: ReportDeliveryConfirmRequest,
+) -> tuple[str, dict[str, Any]]:
+    from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID
+    from src.dalton.services.report_delivery import (
+        ReportDeliveryError,
+        _load_automation_for_actor,
+        get_user_tier,
+    )
+    from src.server.database import automation as auto_db
+
+    act = str(body.action or "").strip().lower()
+    if act not in ("create", "update"):
+        raise ReportDeliveryError(f"不支持的 action={body.action!r}，仅支持 create / update。", code="invalid_request")
+    if act == "create":
+        return (
+            "create",
+            {
+                "user_id": actor_user_id,
+                "name": str(body.name or "").strip() or "新定时任务",
+                "instruction": str(body.instruction or ""),
+                "metadata": {},
+            },
+        )
+
+    aid = str(body.automation_id or "").strip()
+    if not aid:
+        raise ReportDeliveryError("更新任务确认必须提供 automation_id。", code="invalid_request")
+    existing = await auto_db.get_automation(aid, actor_user_id)
+    if existing is None:
+        existing = await auto_db.get_automation(aid, COMPANY_SYSTEM_USER_ID)
+    if existing is None:
+        tier = await get_user_tier(actor_user_id)
+        existing = await _load_automation_for_actor(aid, actor_user_id, tier)
+    target_view = dict(existing)
+    if body.name is not None and str(body.name).strip():
+        target_view["name"] = str(body.name).strip()
+    if body.instruction is not None:
+        target_view["instruction"] = body.instruction
+    return "update", target_view
+
+
+@router.post(
+    "/report-delivery/precheck",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CHANNEL_GATEWAY))],
+)
+@handle_api_exceptions("precheck report delivery confirmation", logger)
+async def report_delivery_precheck_endpoint(
+    body: ReportDeliveryConfirmRequest,
+    principal: CurrentPrincipal,
+    http_request: Request,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    require_capability(CapabilityId.CHANNEL_GATEWAY)
+    _require_web_session_for_report_delivery_confirm(principal, http_request)
+    from src.dalton.services.report_delivery import (
+        ReportDeliveryError,
+        precheck_report_profile_change,
+    )
+    from src.server.app.automations import _report_delivery_http_error
+
+    try:
+        act, target_view = await _load_automation_view_for_confirm_request(
+            actor_user_id=principal.user_id,
+            body=body,
+        )
+        precheck = await precheck_report_profile_change(
+            principal.user_id,
+            target_view,
+            body.report_profile,
+            via_rest=True,
+            action=act,
+        )
+    except ReportDeliveryError as exc:
+        raise _report_delivery_http_error(exc) from None
+
+    return {
+        "needs_confirmation": precheck.needs_confirmation,
+        "action": act,
+        "automation_id": precheck.automation_id if act == "update" else None,
+        "automation_name": precheck.automation_name,
+        "config_version": precheck.config_version if act == "update" else None,
+        "profile": precheck.profile,
+        "report_targets": precheck.report_targets,
+        "text_targets": precheck.text_targets,
+        "failure_targets": precheck.failure_targets,
+        "group_targets": precheck.group_targets,
+        "non_caller_dm_targets": precheck.non_caller_dm_targets,
+        "target_labels": precheck.target_labels,
+    }
+
+
+@router.post(
+    "/report-delivery/confirmations",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CHANNEL_GATEWAY))],
+)
+@handle_api_exceptions("issue report delivery confirmation", logger)
+async def issue_report_delivery_confirmation_endpoint(
+    body: ReportDeliveryConfirmRequest,
+    principal: CurrentPrincipal,
+    http_request: Request,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    require_capability(CapabilityId.CHANNEL_GATEWAY)
+    _require_web_session_for_report_delivery_confirm(principal, http_request)
+    from src.dalton.services.report_delivery import (
+        ReportDeliveryError,
+        issue_report_delivery_confirmation,
+        precheck_report_profile_change,
+    )
+    from src.server.app.automations import _report_delivery_http_error
+
+    try:
+        act, target_view = await _load_automation_view_for_confirm_request(
+            actor_user_id=principal.user_id,
+            body=body,
+        )
+        precheck = await precheck_report_profile_change(
+            principal.user_id,
+            target_view,
+            body.report_profile,
+            via_rest=True,
+            action=act,
+        )
+        if (
+            act == "update"
+            and body.expected_config_version is not None
+            and precheck.config_version is not None
+            and body.expected_config_version != precheck.config_version
+        ):
+            raise ReportDeliveryError(
+                "确认期间任务配置版本已变更，请刷新后重新确认。",
+                code="conflict",
+            )
+        if not precheck.needs_confirmation:
+            return {
+                "needs_confirmation": False,
+                "confirmation_token": None,
+                "expires_at": None,
+                "action": act,
+                "automation_id": precheck.automation_id if act == "update" else None,
+                "automation_name": precheck.automation_name,
+                "config_version": precheck.config_version if act == "update" else None,
+                "profile": precheck.profile,
+                "report_targets": precheck.report_targets,
+                "text_targets": precheck.text_targets,
+                "failure_targets": precheck.failure_targets,
+                "target_labels": precheck.target_labels,
+            }
+        issued = await issue_report_delivery_confirmation(
+            actor_user_id=principal.user_id,
+            action=act,
+            automation_id=precheck.automation_id if act == "update" else None,
+            config_version=precheck.config_version if act == "update" else None,
+            profile=str(precheck.profile or ""),
+            report_targets=precheck.report_targets,
+            text_targets=precheck.text_targets,
+            failure_targets=precheck.failure_targets,
+        )
+    except ReportDeliveryError as exc:
+        raise _report_delivery_http_error(exc) from None
+
+    return {
+        "needs_confirmation": True,
+        "confirmation_id": issued["confirmation_id"],
+        "confirmation_token": issued["confirmation_token"],
+        "expires_at": issued["expires_at"],
+        "action": act,
+        "automation_id": precheck.automation_id if act == "update" else None,
+        "automation_name": precheck.automation_name,
+        "config_version": precheck.config_version if act == "update" else None,
+        "profile": precheck.profile,
+        "report_targets": precheck.report_targets,
+        "text_targets": precheck.text_targets,
+        "failure_targets": precheck.failure_targets,
+        "target_labels": precheck.target_labels,
     }
 
 

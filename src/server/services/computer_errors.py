@@ -203,7 +203,64 @@ class ComputerArchivingError(RuntimeError):
 
 class ApprovalScopeChangedError(RuntimeError):
     """The confirmed target computer or workspace scope changed before execution."""
+
+
+class ArchiveScopeChangedError(ApprovalScopeChangedError):
+    """The computer or workspaces on it changed since the archive confirmation snapshot."""
+
+
+class ArchiveUnsupportedError(RuntimeError):
+    """The computer's sandbox provider does not support cold archiving."""
+
+
+class ComputerNotStoppedError(RuntimeError):
+    """The computer must be stopped before it can be archived."""
+
+
+class ArchiveProviderError(RuntimeError):
+    """Sanitized domain error when a sandbox provider fails during archive.
+
+    Carries only a fixed error category and safe message — raised ``from None``
+    inside the archive service so raw provider errors never reach tracing spans
+    or external callers.
+    """
+
+    def __init__(
+        self,
+        category: str,
+        *,
+        http_status: int = 503,
+        message: str | None = None,
+    ) -> None:
+        self.category = category
+        self.http_status = http_status
+        self.user_message = message
+        super().__init__(category)
+
+
+class ArchivePostSubmitGoneError(RuntimeError):
+    """Raised when an archive request was accepted by the provider and the immediate post-submit refresh returned 404."""
+
+    def __init__(self, sandbox_id: str, detail: str = "") -> None:
+        self.sandbox_id = sandbox_id
+        self.detail = detail
+        super().__init__(f"Sandbox {sandbox_id} gone after archive submission")
 # --- DALTON-HOOK(cos-settings-tools): end ---
+
+
+# --- DALTON-HOOK(workspace-dedup): begin ---
+class DuplicateWorkspaceConflictError(RuntimeError):
+    """Locked duplicate recheck detected a matching workspace or candidate drift."""
+
+    def __init__(
+        self,
+        message: str = "Workspace duplicate state changed before creation",
+        *,
+        conflicting_workspace_id: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.conflicting_workspace_id = conflicting_workspace_id
+# --- DALTON-HOOK(workspace-dedup): end ---
 
 
 class ComputerRemovalRefused(RuntimeError):

@@ -337,10 +337,25 @@ def safe_span(name: str, attributes: dict | None = None):
 @contextlib.asynccontextmanager
 async def safe_aspan(name: str, attributes: dict | None = None):
     """Async equivalent of ``safe_span``."""
-    with tracer.start_as_current_span(name, attributes=attributes or {}) as span:
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    # Disable auto record_exception/status on exit so sanitized provider errors
+    # record only fixed error.category/error.type without raw exception bodies.
+    with tracer.start_as_current_span(
+        name,
+        attributes=attributes or {},
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as span:
         try:
             yield span
         except Exception as exc:
+            sanitized_category = getattr(exc, "_dalton_sanitized_error_category", None)
+            if sanitized_category is not None:
+                span.set_attribute("error.category", str(sanitized_category))
+                span.set_attribute("error.type", type(exc).__name__)
+                span.set_status(Status(StatusCode.ERROR))
+                raise
+            # --- DALTON-HOOK(cos-settings-tools): end ---
             span.record_exception(exc)
             span.set_status(Status(StatusCode.ERROR))
             raise

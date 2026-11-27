@@ -1614,16 +1614,20 @@ class TestAnalystOutboundGuardAndKeepUpdated:
 
         # 3) dalton_report_delivery (including DM target!) blocked on set/clear
         rd_tool = report_delivery_mod.create_report_delivery_tools()[0]
-        rd_out = json.loads(
-            await rd_tool.ainvoke(
-                {
+        rd_cmd = await rd_tool.ainvoke(
+            {
+                "name": rd_tool.name,
+                "args": {
                     "action": "set",
                     "automation_id": "auto-1",
                     "report_targets": ["feishu:user:ou_123"],
                 },
-                config=analyst_cfg,
-            )
+                "id": "tc-rd-block",
+                "type": "tool_call",
+            },
+            config=analyst_cfg,
         )
+        rd_out = json.loads(rd_cmd.update["messages"][0].content)
         assert rd_out["ok"] is False and rd_out["error"] == "colleague_outbound_blocked"
 
         # 4) automation_report(action="submit") blocked
@@ -4731,16 +4735,26 @@ class TestR6SharingAuthGating:
 
         # 3) dalton_report_delivery set & clear skip is_run_outbound_blocked
         rd_tool = report_delivery_mod.create_report_delivery_tools()[0]
-        r_rd_set = json.loads(
-            await rd_tool.ainvoke(
-                {"action": "set", "automation_id": ""}, config=cfg
-            )
+        r_rd_set_cmd = await rd_tool.ainvoke(
+            {
+                "name": rd_tool.name,
+                "args": {"action": "set", "automation_id": ""},
+                "id": "tc-rd-set",
+                "type": "tool_call",
+            },
+            config=cfg,
         )
-        r_rd_clear = json.loads(
-            await rd_tool.ainvoke(
-                {"action": "clear", "automation_id": ""}, config=cfg
-            )
+        r_rd_clear_cmd = await rd_tool.ainvoke(
+            {
+                "name": rd_tool.name,
+                "args": {"action": "clear", "automation_id": ""},
+                "id": "tc-rd-clear",
+                "type": "tool_call",
+            },
+            config=cfg,
         )
+        r_rd_set = json.loads(r_rd_set_cmd.update["messages"][0].content)
+        r_rd_clear = json.loads(r_rd_clear_cmd.update["messages"][0].content)
         assert r_rd_set["error"] == "invalid_request"
         assert r_rd_clear["error"] == "invalid_request"
 

@@ -41,6 +41,9 @@ export interface MessageActionSources {
   onRejectPTCAgent: Action<'onRejectPTCAgent'>;
   onApproveSecretaryAction: Action<'onApproveSecretaryAction'>;
   onRejectSecretaryAction: Action<'onRejectSecretaryAction'>;
+  // DALTON-HOOK(watchlist): optional watchlist confirmation handlers
+  onApproveWatchlistAction?: Action<'onApproveWatchlistAction'>;
+  onRejectWatchlistAction?: Action<'onRejectWatchlistAction'>;
   onResumeCreditPause: Action<'onResumeCreditPause'>;
   onApproveToolCall: Action<'onApproveToolCall'>;
   onRejectToolCall: Action<'onRejectToolCall'>;
@@ -97,6 +100,11 @@ export function useMessageActionBundles(src: MessageActionSources): {
   const stableRejectPTCAgent = useStableHandler(src.onRejectPTCAgent);
   const stableApproveSecretaryAction = useStableHandler(src.onApproveSecretaryAction);
   const stableRejectSecretaryAction = useStableHandler(src.onRejectSecretaryAction);
+  // DALTON-HOOK(watchlist): pin watchlist confirmation callbacks
+  const stableApproveWatchlistAction = useStableHandler((proposalData: Record<string, unknown>) =>
+    src.onApproveWatchlistAction?.(proposalData));
+  const stableRejectWatchlistAction = useStableHandler((proposalData: Record<string, unknown>) =>
+    src.onRejectWatchlistAction?.(proposalData));
   const stableResumeCreditPause = useStableHandler(src.onResumeCreditPause);
   const stableApproveToolCall = useStableHandler(src.onApproveToolCall);
   const stableRejectToolCall = useStableHandler(src.onRejectToolCall);
@@ -162,6 +170,9 @@ export function useMessageActionBundles(src: MessageActionSources): {
           onRejectPTCAgent: stableRejectPTCAgent,
           onApproveSecretaryAction: stableApproveSecretaryAction,
           onRejectSecretaryAction: stableRejectSecretaryAction,
+          // DALTON-HOOK(watchlist): expose watchlist confirmation handlers when provided
+          ...(src.onApproveWatchlistAction ? { onApproveWatchlistAction: stableApproveWatchlistAction } : {}),
+          ...(src.onRejectWatchlistAction ? { onRejectWatchlistAction: stableRejectWatchlistAction } : {}),
           onResumeCreditPause: stableResumeCreditPause,
           onApproveToolCall: stableApproveToolCall,
           onRejectToolCall: stableRejectToolCall,
@@ -183,7 +194,9 @@ export function useMessageActionBundles(src: MessageActionSources): {
     stableOpenChart, stableOpenArtifactComment, stableOpenSubagentTask, stableOpenDispatcher, stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
     stableRejectCreateWorkspace, stableApproveStartQuestion, stableRejectStartQuestion,
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
-    stableRejectSecretaryAction, stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
+    stableRejectSecretaryAction, stableApproveWatchlistAction, stableRejectWatchlistAction,
+    src.onApproveWatchlistAction, src.onRejectWatchlistAction, // DALTON-HOOK(watchlist)
+    stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
     stableEditMessage, stableRegenerate, stableRetry, stableForkFromTurn, editDrafts,
     stableThumbUp, stableThumbDown, stableThumbDownFollowUp, stableSendMessage, publishAllowed, src.reportThreadId, src.feedbackLoading, // DALTON-HOOK(external-share-guard)
   ]);

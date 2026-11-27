@@ -130,49 +130,54 @@ export function collectReportSourceChartLayers(
 /**
  * Extract charts (from `artifact`, `tool_call_result.artifact.chart_layers`, and
  * `user_message.metadata.report_source.chart_layers`), persisted `chart_snapshots`, and
- * `html_widget` artifacts for `targetRunId` from a `/messages/replay` SSE stream.
+ * `html_widget` artifacts for `targetRunId` via direct run-scoped replay (`replayThreadRun`,
+ * avoiding any 50-page / 500-turn ceiling) with paginated `/messages/replay` fallback when
+ * `replayThreadRun` is unavailable.
  */
 export async function extractRunChartsAndWidgetsFromReplay(params: {
-  backend: Pick<BackendClient, "replayThreadMessages">;
+  backend: Pick<BackendClient, "replayThreadMessages"> &
+    Partial<Pick<BackendClient, "replayThreadRun">>;
   userId: string;
   threadId: string;
   targetRunId: string;
+  executionId?: string | null;
   pageSize?: number;
   maxPages?: number;
 }): Promise<{
+  found: boolean;
   charts: CollectedChartLayerRef[];
   snapshots: ChartSnapshotItem[];
   widgets: CollectedHtmlWidgetRef[];
   outboundBlocked?: boolean;
+  retryable?: boolean;
+  httpStatus?: number | null;
 }> {
   const chartsMap = new Map<string, CollectedChartLayerRef>();
   const widgetsMap = new Map<string, CollectedHtmlWidgetRef>();
   let snapshots: ChartSnapshotItem[] = [];
   let outboundBlocked: boolean | undefined;
 
-  const pageSize = Math.max(1, params.pageSize ?? 10);
-  const maxPages = Math.max(1, params.maxPages ?? 50);
-  let beforeTurn: number | undefined;
-
-  for (let page = 0; page < maxPages; page += 1) {
-    const resp = await params.backend.replayThreadMessages(
-      params.userId,
-      params.threadId,
-      beforeTurn !== undefined
-        ? { limit: pageSize, beforeTurn }
-        : { limit: pageSize },
-    );
-    if (!resp.isSse || !resp.events) {
-      break;
-    }
-
+  const consumeSseStream = async (
+    events: AsyncIterable<{ event: string; data: string }>,
+  ): Promise<{
+    foundTargetRunInPage: boolean;
+    sawReplayDone: boolean;
+    sawTargetPlaceholderOnly: boolean;
+    pageHasMore: boolean;
+    pageFirstTurnIndex: number | null;
+    earliestTurnInPage: number | null;
+  }> => {
     let currentRunId: string | null = null;
-    let foundTargetRunInPage = false;
+    let sawTargetStubHeader = false;
+    let sawTargetPageEvent = false;
+    let sawTargetReplayUnavailable = false;
+    let sawTargetActiveInSnapshot = false;
+    let sawReplayDone = false;
     let pageHasMore = false;
     let pageFirstTurnIndex: number | null = null;
     let earliestTurnInPage: number | null = null;
 
-    for await (const sse of resp.events) {
+    for await (const sse of events) {
       if (sse.event === ":comment") continue;
       let data: Record<string, unknown>;
       try {
@@ -206,19 +211,30 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
         sse.event === "turn_separator" ||
         sse.event === "turn_start"
       ) {
-        const evtRunId =
+        const terminalEvtRunId =
           typeof data.response_id === "string" && data.response_id.trim()
             ? data.response_id.trim()
             : typeof data.run_id === "string" && data.run_id.trim()
               ? data.run_id.trim()
-              : typeof data.report_run_id === "string" && data.report_run_id.trim()
-                ? data.report_run_id.trim()
-                : null;
+              : null;
+        const stubReportRunId =
+          typeof data.report_run_id === "string" && data.report_run_id.trim()
+            ? data.report_run_id.trim()
+            : null;
+        const evtRunId = terminalEvtRunId ?? stubReportRunId;
         if (evtRunId) {
           currentRunId = evtRunId;
         }
-        if (currentRunId === params.targetRunId) {
-          foundTargetRunInPage = true;
+        if (terminalEvtRunId === params.targetRunId) {
+          // `items.py:_user_message_item` stamps `run_id` only once the turn is terminal.
+          sawTargetPageEvent = true;
+          if (sse.event === "user_message") {
+            collectReportSourceChartLayers(data.metadata, chartsMap);
+          }
+        } else if (stubReportRunId === params.targetRunId) {
+          // `report_run_id` alone marks a system/in-progress stub header; wait for
+          // actual non-placeholder turn events before considering the turn found.
+          sawTargetStubHeader = true;
           if (sse.event === "user_message") {
             collectReportSourceChartLayers(data.metadata, chartsMap);
           }
@@ -226,15 +242,89 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
         continue;
       }
 
-      const rId =
+      if (sse.event === "snapshot") {
+        const activeRuns = Array.isArray(data.active_runs) ? data.active_runs : [];
+        for (const item of activeRuns) {
+          if (
+            item &&
+            typeof item === "object" &&
+            !Array.isArray(item) &&
+            typeof (item as Record<string, unknown>).run_id === "string" &&
+            ((item as Record<string, unknown>).run_id as string).trim() ===
+              params.targetRunId
+          ) {
+            sawTargetActiveInSnapshot = true;
+          }
+        }
+        continue;
+      }
+
+      const ownRunId =
         typeof data.response_id === "string" && data.response_id.trim()
           ? data.response_id.trim()
           : typeof data.run_id === "string" && data.run_id.trim()
             ? data.run_id.trim()
-            : currentRunId;
+            : null;
+      const rId = ownRunId ?? currentRunId;
 
-      if (rId === params.targetRunId && sse.event !== "replay_done") {
-        foundTargetRunInPage = true;
+      if (sse.event === "error") {
+        const errType =
+          typeof data.type === "string" ? data.type.trim().toLowerCase() : "";
+        if (
+          errType === "replay_unavailable" &&
+          (rId === params.targetRunId || rId === null)
+        ) {
+          sawTargetReplayUnavailable = true;
+        }
+        continue;
+      }
+
+      if (sse.event === "replay_done") {
+        sawReplayDone = true;
+        // BW2: NEVER derive `found` from `replay_done.run_id`; `found` requires
+        // actual target turn events in the page AND this complete closing frame.
+        if (typeof data.has_more === "boolean") {
+          pageHasMore = data.has_more;
+        }
+        if (pageFirstTurnIndex === null) {
+          if (typeof data.oldest_turn_index === "number") {
+            pageFirstTurnIndex = data.oldest_turn_index;
+          } else if (typeof data.first_turn_index === "number") {
+            pageFirstTurnIndex = data.first_turn_index;
+          }
+        }
+        const rawSnapsByRun = data.chart_snapshots_by_run;
+        if (
+          rawSnapsByRun &&
+          typeof rawSnapsByRun === "object" &&
+          !Array.isArray(rawSnapsByRun)
+        ) {
+          const runSnaps = (rawSnapsByRun as Record<string, unknown>)[
+            params.targetRunId
+          ];
+          const parsedSnaps = parseChartSnapshotsList(runSnaps);
+          if (parsedSnaps.length > 0) {
+            snapshots = parsedSnaps;
+          }
+        }
+        const rawBlockedByRun = data.outbound_blocked_by_run;
+        if (
+          rawBlockedByRun &&
+          typeof rawBlockedByRun === "object" &&
+          !Array.isArray(rawBlockedByRun)
+        ) {
+          const rawBlocked = (rawBlockedByRun as Record<string, unknown>)[
+            params.targetRunId
+          ];
+          if (typeof rawBlocked === "boolean") {
+            outboundBlocked = rawBlocked;
+          }
+        }
+        continue;
+      }
+
+      if (rId === params.targetRunId) {
+        sawTargetPageEvent = true;
       }
 
       if (sse.event === "tool_call_result" && rId === params.targetRunId) {
@@ -295,49 +385,113 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
         }
         continue;
       }
-
-      if (sse.event === "replay_done") {
-        if (typeof data.has_more === "boolean") {
-          pageHasMore = data.has_more;
-        }
-        if (pageFirstTurnIndex === null) {
-          if (typeof data.oldest_turn_index === "number") {
-            pageFirstTurnIndex = data.oldest_turn_index;
-          } else if (typeof data.first_turn_index === "number") {
-            pageFirstTurnIndex = data.first_turn_index;
-          }
-        }
-        const rawSnapsByRun = data.chart_snapshots_by_run;
-        if (
-          rawSnapsByRun &&
-          typeof rawSnapsByRun === "object" &&
-          !Array.isArray(rawSnapsByRun)
-        ) {
-          const runSnaps = (rawSnapsByRun as Record<string, unknown>)[
-            params.targetRunId
-          ];
-          const parsedSnaps = parseChartSnapshotsList(runSnaps);
-          if (parsedSnaps.length > 0) {
-            snapshots = parsedSnaps;
-          }
-        }
-        const rawBlockedByRun = data.outbound_blocked_by_run;
-        if (
-          rawBlockedByRun &&
-          typeof rawBlockedByRun === "object" &&
-          !Array.isArray(rawBlockedByRun)
-        ) {
-          const rawBlocked = (rawBlockedByRun as Record<string, unknown>)[
-            params.targetRunId
-          ];
-          if (typeof rawBlocked === "boolean") {
-            outboundBlocked = rawBlocked;
-          }
-        }
-      }
     }
 
-    if (foundTargetRunInPage || !pageHasMore) {
+    const sawTargetPlaceholderOnly =
+      (sawTargetStubHeader && !sawTargetPageEvent) ||
+      sawTargetReplayUnavailable ||
+      sawTargetActiveInSnapshot;
+    const foundTargetRunInPage =
+      sawReplayDone &&
+      !sawTargetReplayUnavailable &&
+      !sawTargetActiveInSnapshot &&
+      sawTargetPageEvent;
+
+    return {
+      foundTargetRunInPage,
+      sawReplayDone,
+      sawTargetPlaceholderOnly,
+      pageHasMore,
+      pageFirstTurnIndex,
+      earliestTurnInPage,
+    };
+  };
+
+  // BW2: Prefer direct run-scoped replay by run_id (no page ceiling).
+  if (typeof params.backend.replayThreadRun === "function") {
+    const execId = params.executionId?.trim();
+    const resp = execId
+      ? await params.backend.replayThreadRun(
+          params.userId,
+          params.threadId,
+          params.targetRunId,
+          { executionId: execId },
+        )
+      : await params.backend.replayThreadRun(
+          params.userId,
+          params.threadId,
+          params.targetRunId,
+        );
+    if (!resp.isSse || !resp.events) {
+      const retryable =
+        resp.status === 0 || resp.status === 429 || resp.status >= 500;
+      return {
+        found: false,
+        charts: [],
+        snapshots: [],
+        widgets: [],
+        outboundBlocked: undefined,
+        retryable,
+        httpStatus: resp.status,
+      };
+    }
+    const { foundTargetRunInPage, sawReplayDone, sawTargetPlaceholderOnly } =
+      await consumeSseStream(resp.events);
+    return {
+      found: foundTargetRunInPage,
+      charts: [...chartsMap.values()],
+      snapshots,
+      widgets: [...widgetsMap.values()],
+      outboundBlocked,
+      retryable: !foundTargetRunInPage && (!sawReplayDone || sawTargetPlaceholderOnly),
+      httpStatus: resp.status,
+    };
+  }
+
+  // Fallback for older backends / unit stubs that only implement paginated replayThreadMessages.
+  const pageSize = Math.max(1, params.pageSize ?? 10);
+  const maxPages = Math.max(1, params.maxPages ?? 50);
+  let beforeTurn: number | undefined;
+  let foundTargetRun = false;
+  let sawRetryableFailure = false;
+  let lastHttpStatus: number | null = null;
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const resp = await params.backend.replayThreadMessages(
+      params.userId,
+      params.threadId,
+      beforeTurn !== undefined
+        ? { limit: pageSize, beforeTurn }
+        : { limit: pageSize },
+    );
+    lastHttpStatus = resp.status;
+    if (!resp.isSse || !resp.events) {
+      if (resp.status === 0 || resp.status === 429 || resp.status >= 500) {
+        sawRetryableFailure = true;
+      }
+      break;
+    }
+
+    const {
+      foundTargetRunInPage,
+      sawReplayDone,
+      sawTargetPlaceholderOnly,
+      pageHasMore,
+      pageFirstTurnIndex,
+      earliestTurnInPage,
+    } = await consumeSseStream(resp.events);
+
+    if (foundTargetRunInPage) {
+      foundTargetRun = true;
+      break;
+    }
+    if (!sawReplayDone || sawTargetPlaceholderOnly) {
+      sawRetryableFailure = true;
+      if (!sawReplayDone) {
+        break;
+      }
+    }
+    if (!pageHasMore) {
       break;
     }
     const nextBeforeTurn = pageFirstTurnIndex ?? earliestTurnInPage;
@@ -352,10 +506,13 @@ export async function extractRunChartsAndWidgetsFromReplay(params: {
   }
 
   return {
+    found: foundTargetRun,
     charts: [...chartsMap.values()],
     snapshots,
     widgets: [...widgetsMap.values()],
     outboundBlocked,
+    retryable: !foundTargetRun && sawRetryableFailure,
+    httpStatus: lastHttpStatus,
   };
 }
 
@@ -749,6 +906,39 @@ async function resolveWeixinPreflightForChart(
   return null;
 }
 
+export interface PendingChartDeliveryReceipt {
+  deliveryKey: string;
+  platform: ChannelPlatform;
+  deliveryAttempt?: number;
+  sentImages: number;
+  sentLinks: number;
+  totalItems: number;
+  platformMessageIds: string[];
+  finalStatus: "sent" | "partial" | "failed";
+  timedOutPending: boolean;
+}
+
+const MAX_PENDING_CHART_RECEIPTS = 500;
+const DEFAULT_PENDING_CHART_RECEIPTS = new Map<
+  string,
+  PendingChartDeliveryReceipt
+>();
+
+function rememberPendingChartReceipt(
+  store: Map<string, PendingChartDeliveryReceipt>,
+  receipt: PendingChartDeliveryReceipt,
+): void {
+  if (store.has(receipt.deliveryKey)) {
+    store.delete(receipt.deliveryKey);
+  } else if (store.size >= MAX_PENDING_CHART_RECEIPTS) {
+    const oldest = store.keys().next().value;
+    if (oldest !== undefined) {
+      store.delete(oldest);
+    }
+  }
+  store.set(receipt.deliveryKey, receipt);
+}
+
 export interface DeliverChartsAndWidgetsParams {
   backend: BackendClient;
   adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
@@ -770,6 +960,8 @@ export interface DeliverChartsAndWidgetsParams {
   charts: CollectedChartLayerRef[];
   initialSnapshots?: ChartSnapshotItem[];
   widgets?: CollectedHtmlWidgetRef[];
+  /** Process-local pending I-7 receipts awaiting settlement without resending to the platform. */
+  pendingReceipts?: Map<string, PendingChartDeliveryReceipt>;
   waitTimeoutMs?: number;
   pollIntervalMs?: number;
   nowFn?: () => number;
@@ -778,6 +970,10 @@ export interface DeliverChartsAndWidgetsParams {
 
 export interface DeliverChartsAndWidgetsResult {
   settled: boolean;
+  /** True when at least one chart/widget was delivered in this call or an earlier settled delivery. */
+  delivered?: boolean;
+  /** True when another worker holds an active `in_flight` claim or an I-7 receipt is still pending settlement. */
+  inFlight?: boolean;
   sentImages: number;
   sentLinks: number;
   timedOutPending: boolean;
@@ -836,17 +1032,31 @@ export async function deliverTurnChartsAndWidgets(
     .map((ck) => chartByKey.get(ck)!);
 
   if (orderedCharts.length === 0 && uniqueWidgets.length === 0) {
-    return { settled: true, sentImages: 0, sentLinks: 0, timedOutPending: false };
+    return {
+      settled: true,
+      delivered: false,
+      sentImages: 0,
+      sentLinks: 0,
+      timedOutPending: false,
+    };
   }
 
   const adapter = params.adapters.get(params.platform);
   if (!adapter) {
-    return { settled: false, sentImages: 0, sentLinks: 0, timedOutPending: false };
+    return {
+      settled: false,
+      delivered: false,
+      sentImages: 0,
+      sentLinks: 0,
+      timedOutPending: false,
+    };
   }
 
   const deliveryKey = params.deliveryKey ?? `charts:${params.runId}`;
   const deliveryKind = params.deliveryKind ?? "fallback";
   const totalItems = orderedCharts.length + uniqueWidgets.length;
+  const pendingReceipts =
+    params.pendingReceipts ?? DEFAULT_PENDING_CHART_RECEIPTS;
 
   let claim: I6AuthorizeAndClaimResponse;
   try {
@@ -875,20 +1085,106 @@ export async function deliverTurnChartsAndWidgets(
     });
   } catch (err) {
     if (isStaleGatewayEpochError(err)) throw err;
-    return { settled: false, sentImages: 0, sentLinks: 0, timedOutPending: false };
-  }
-
-  if (claim.claim_status === "already_completed") {
-    return { settled: true, sentImages: 0, sentLinks: 0, timedOutPending: false };
-  }
-  if (claim.claim_status !== "claimed") {
     return {
-      settled: claim.claim_status === "denied",
+      settled: false,
+      delivered: false,
+      inFlight: pendingReceipts.has(deliveryKey),
       sentImages: 0,
       sentLinks: 0,
       timedOutPending: false,
     };
   }
+
+  if (claim.claim_status === "already_completed") {
+    pendingReceipts.delete(deliveryKey);
+    const completedStatus =
+      claim.status ??
+      (typeof claim.first_response_json?.status === "string"
+        ? claim.first_response_json.status
+        : undefined);
+    const alreadyDelivered =
+      completedStatus === undefined
+        ? true
+        : completedStatus === "sent" || completedStatus === "partial";
+    return {
+      settled: true,
+      delivered: alreadyDelivered,
+      inFlight: false,
+      sentImages: 0,
+      sentLinks: 0,
+      timedOutPending: false,
+    };
+  }
+  if (claim.claim_status !== "claimed") {
+    const inFlight =
+      claim.claim_status === "in_flight_or_unknown" &&
+      claim.existing_status !== "unknown";
+    if (inFlight) {
+      const pending = pendingReceipts.get(deliveryKey);
+      const attemptMatches =
+        pending !== undefined &&
+        (pending.deliveryAttempt === undefined ||
+          claim.delivery_attempt === undefined ||
+          pending.deliveryAttempt === claim.delivery_attempt);
+      if (attemptMatches) {
+        const retryAttempt =
+          pending.deliveryAttempt ??
+          (typeof claim.delivery_attempt === "number"
+            ? claim.delivery_attempt
+            : undefined);
+        try {
+          await params.backend.updateDeliveryProgress(
+            {
+              delivery_key: pending.deliveryKey,
+              sent_chunks: pending.sentImages + pending.sentLinks,
+              total_chunks: pending.totalItems,
+              platform_message_ids: pending.platformMessageIds,
+              status: pending.finalStatus,
+              outcome: pending.finalStatus,
+              delivery_attempt: retryAttempt,
+            },
+            { platform: pending.platform },
+          );
+          pendingReceipts.delete(deliveryKey);
+          const settled =
+            pending.finalStatus === "sent" || pending.finalStatus === "partial";
+          return {
+            settled,
+            delivered: settled && pending.sentImages + pending.sentLinks > 0,
+            inFlight: false,
+            sentImages: pending.sentImages,
+            sentLinks: pending.sentLinks,
+            timedOutPending: pending.timedOutPending,
+          };
+        } catch (err) {
+          if (isStaleGatewayEpochError(err)) throw err;
+          if (err instanceof BackendHttpError && err.status === 409) {
+            pendingReceipts.delete(deliveryKey);
+          }
+          return {
+            settled: false,
+            delivered: false,
+            inFlight: true,
+            sentImages: pending.sentImages,
+            sentLinks: pending.sentLinks,
+            timedOutPending: pending.timedOutPending,
+          };
+        }
+      }
+    } else {
+      pendingReceipts.delete(deliveryKey);
+    }
+    return {
+      settled: claim.claim_status === "denied",
+      delivered: false,
+      inFlight,
+      sentImages: 0,
+      sentLinks: 0,
+      timedOutPending: false,
+    };
+  }
+
+  pendingReceipts.delete(deliveryKey);
 
   const effectiveTarget = claim.target_address ?? params.targetAddress;
   const recipientId = claim.recipient_id ?? claim.dm_recipient_platform_user_id ?? null;
@@ -1257,21 +1553,46 @@ export async function deliverTurnChartsAndWidgets(
     failures === 0 ? "sent" : sentImages + sentLinks > 0 ? "partial" : "failed";
 
   try {
-    await params.backend.updateDeliveryProgress({
-      delivery_key: deliveryKey,
-      sent_chunks: sentImages + sentLinks,
-      total_chunks: totalItems,
-      platform_message_ids: sentMessageIds,
-      status: finalStatus,
-      outcome: finalStatus,
-      delivery_attempt: deliveryAttempt,
-    });
+    await params.backend.updateDeliveryProgress(
+      {
+        delivery_key: deliveryKey,
+        sent_chunks: sentImages + sentLinks,
+        total_chunks: totalItems,
+        platform_message_ids: sentMessageIds,
+        status: finalStatus,
+        outcome: finalStatus,
+        delivery_attempt: deliveryAttempt,
+      },
+      { platform: params.platform },
+    );
   } catch (err) {
     if (isStaleGatewayEpochError(err)) throw err;
+    rememberPendingChartReceipt(pendingReceipts, {
+      deliveryKey,
+      platform: params.platform,
+      deliveryAttempt,
+      sentImages,
+      sentLinks,
+      totalItems,
+      platformMessageIds: sentMessageIds,
+      finalStatus,
+      timedOutPending: waited.timedOut,
+    });
+    return {
+      settled: false,
+      delivered: false,
+      inFlight: true,
+      sentImages,
+      sentLinks,
+      timedOutPending: waited.timedOut,
+    };
   }
 
+  const settled = finalStatus === "sent" || finalStatus === "partial";
   return {
-    settled: finalStatus === "sent" || finalStatus === "partial",
+    settled,
+    delivered: settled && sentImages + sentLinks > 0,
+    inFlight: false,
     sentImages,
     sentLinks,
     timedOutPending: waited.timedOut,

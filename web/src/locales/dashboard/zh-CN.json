@@ -511,9 +511,17 @@
     },
     "portfolioWatchlist": {
       "title": "投资组合 + 自选股",
-      "description": "持仓与自选合并展示，附自选 / 持仓切换。",
+      "description": "持仓与自选合并展示，附关注列表 / 自选 / 持仓切换。",
+      "headerCoverage": "关注列表",
       "headerWatchlist": "自选股",
       "headerHoldings": "持仓",
+      "tierAll": "全部",
+      "tierCore": "核心",
+      "tierWatch": "跟踪",
+      "tierRadar": "雷达",
+      "unlisted": "未上市",
+      "coverageTruncated": "已展示前 {{shown}} / 共 {{total}} 只",
+      "viewAllCoverage": "查看全部",
       "addSymbol": "添加标的",
       "addTransaction": "添加交易",
       "cardTitle": "投资组合"

@@ -366,7 +366,8 @@ export function PortfolioNavSummary({ rows, valuesHidden, onToggleHidden }: Port
   );
 }
 
-const SKELETON_ROWS = { watchlist: 5, portfolio: 3 } as const;
+// DALTON-HOOK(watchlist): add 'coverage' skeleton row default alongside watchlist and portfolio
+const SKELETON_ROWS = { coverage: 5, watchlist: 5, portfolio: 3 } as const;
 const MAX_SKELETON_ROWS = 10;
 
 /** How many skeleton rows a list should show: as many as it held the last

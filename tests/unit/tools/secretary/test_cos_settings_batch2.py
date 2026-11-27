@@ -1430,7 +1430,7 @@ async def test_real_langgraph_approve_two_phase_dedup_matches_expected_workspace
     )
     assert len(recheck_results) == 1
     assert recheck_results[0].status == "clear"
-    assert recheck_results[0].checked_candidates == ((dup_ws_id, "BABA", None),)
+    assert recheck_results[0].checked_candidates == ((dup_ws_id, "BABA", None, None),)
     assert all(call["lock_held"] is False for call in llm_calls)
     assert lock_state["lock_acquires"] == 1
     assert lock_state["inserts"] == 1
@@ -3382,7 +3382,7 @@ async def test_find_existing_company_workspace_keeps_downgraded_hit_when_rejudge
         raise TimeoutError("rejudge timed out")
 
     monkeypatch.setattr(dedup_mod, "dalton_complete", _llm_hit_then_fail)
-    dup = await find_existing_company_workspace(USER_ID, "700.HK", channel="cos")
+    dup = await find_existing_company_workspace(USER_ID, "腾讯控股", channel="cos")
     assert dup is not None
     assert call_count["n"] == 2
     assert ws_live in dup.matched_workspace_ids
@@ -3761,21 +3761,21 @@ async def test_daytona_archive_claim_blocks_workspace_create_across_precheck_man
         "config": {"archiving": True},
     }
 
-    # 1. _claim_machine_for_archive writes status='stopping' + merge_config={'archiving': True}.
-    claim_status_mock = create_autospec(
-        update_computer_status,
+    # 1. _claim_machine_for_archive delegates to transactional claim_computer_for_archive.
+    from src.server.database.computer import claim_computer_for_archive
+
+    claim_mock = create_autospec(
+        claim_computer_for_archive,
         return_value=archiving_daytona,
     )
-    monkeypatch.setattr(_machines, "get_computer", create_autospec(get_computer, return_value=stopped_daytona))
-    monkeypatch.setattr(_machines, "update_computer_status", claim_status_mock)
+    monkeypatch.setattr(_machines, "claim_computer_for_archive", claim_mock)
     cm = object.__new__(ComputerManager)
     claimed = await cm._claim_machine_for_archive(CLOUD_1)
     assert claimed["config"]["archiving"] is True
-    claim_status_mock.assert_awaited_once_with(
+    claim_mock.assert_awaited_once_with(
         CLOUD_1,
-        "stopping",
-        expected="stopped",
-        merge_config={"archiving": True},
+        expected_workspaces=None,
+        expected_workspace_id=None,
     )
 
     # 2. Precheck (build_create_workspace_snapshot) rejects the archiving computer.
@@ -3851,7 +3851,8 @@ async def test_daytona_archive_claim_blocks_workspace_create_across_precheck_man
     insert_sql = [s for s in executed_sql if "INSERT INTO workspaces" in s]
     assert insert_sql and FENCE_TAKES_WORKSPACES in insert_sql[0]
 
-    # 5. _settle_machine_stop clears config.archiving atomically when leaving 'stopping'.
+    # 5. _settle_machine_stop clears config.archiving by default on terminal
+    #    settlement and preserves it only when clear_archiving=False (still archiving).
     settle_status_mock = create_autospec(
         update_computer_status,
         return_value=stopped_daytona,
@@ -3859,6 +3860,13 @@ async def test_daytona_archive_claim_blocks_workspace_create_across_precheck_man
     monkeypatch.setattr(_machines, "update_computer_status", settle_status_mock)
     cm._revoke_computer_tokens = create_autospec(cm._revoke_computer_tokens, return_value=None)
     cm._revoke_livefs = create_autospec(cm._revoke_livefs, return_value=None)
+    await cm._settle_machine_stop(CLOUD_1, "stopped", clear_archiving=False)
+    settle_status_mock.assert_awaited_once_with(
+        CLOUD_1,
+        "stopped",
+        expected="stopping",
+    )
+    settle_status_mock.reset_mock()
     await cm._settle_machine_stop(CLOUD_1, "stopped")
     settle_status_mock.assert_awaited_once_with(
         CLOUD_1,

@@ -1314,7 +1314,9 @@ class TestWriteEndpointsRejectColleagues:
 
         with pytest.raises(HTTPException) as exc_arch:
             await workspaces_app.archive_workspace(
-                ws["workspace_id"], x_user_id="u-chao"
+                ws["workspace_id"],
+                Request({"type": "http", "headers": []}),
+                Principal(user_id="u-chao", auth="session"),
             )
         assert exc_arch.value.status_code == 403
 

@@ -703,6 +703,8 @@ bash scripts/standalone/upgrade.sh \
 
 使用企业自有证书（`custom`）模式时，可附加 `--ca-file <企业CA.pem>` 完成升级后 HTTPS 探测。如需显式指定目标实例的 Docker Compose 项目名，可附加 `--project-name <项目名>`（优先级高于 `.env` 中的 `COMPOSE_PROJECT_NAME` 与部署目录名，并会透传给升级前调用的 `backup.sh`）。
 
+> **研究总监设置工具（归档与栅栏）发布说明**：核心安装不含渠道网关容器，经 `scripts/standalone/upgrade.sh` 一并更新 `backend` 与 `edge`（前端静态资源）即可完成发布，无新增数据库迁移；后端重启时启动钩子会自动将遗留在归档过渡态的电脑写回 `stopped`，并保留 `config.archiving` 栅栏直至提供商确认终态。若部署额外启用了渠道网关（`channel_gateway` 能力），请同步更新后端、前端与 `integrations/dalton-channel-gateway`。
+
 #### 升级失败回滚与双链迁移条件
 
 当任意步骤失败或升级后需主动回退时，脚本输出的所有 `docker compose` 命令均显式携带 `-p <项目名> -f <文件>... --env-file <.env>`，**所有回退动作均以两条迁移链（上游 `alembic_version` 与 Dalton `alembic_version_dalton`）的实际执行结果为条件**：

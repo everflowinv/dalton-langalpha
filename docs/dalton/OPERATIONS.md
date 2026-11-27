@@ -83,6 +83,8 @@ bash scripts/dalton/ops/prod/deploy_main.sh --reuse-backup-minutes 60
     - **复位代码前先设定 `RESET_SHA` 并运行 `target_migration_heads "$RESET_SHA"` 打印所选提交的双链 head，核对与数据库双链版本完全一致后再执行 `git reset --keep "$RESET_SHA"`**、通过 `manual_switch_frontend_release` 切回对应 `web/releases/` 版本（或用 `manual_build_frontend_release` 新建版本目录并原子切换；若目标提交为旧版 `web/dist` 挂载则跑 `build_frontend_prod.sh --require-supabase`）、强制重建容器、恢复宿主机服务（含 `--bridge` 桥接）与健康/公网验证，全部通过后用 `launchctl bootstrap` 恢复看门狗。脚本以非零状态码退出。
   - **多账号微信迁移（`d049`）部署后外键校验**：`d049` 热表外键以 `NOT VALID` 建约束避免停机长锁；部署恢复服务后，执行 `bash scripts/dalton/ops/prod/validate_d049_fks.sh` 在独立短事务中逐条执行 `VALIDATE CONSTRAINT` 并验证 `pg_constraint.convalidated = true`。
 - **边缘代理（`edge`）重载**：快进合并后通过 `deploy/dalton/Caddyfile` 差异、`docker compose config` 解析后的 `edge` 服务配置对比以及 `docker inspect` 运行中容器实际挂载比对，检测到任一变化或挂载漂移时，先确认 `web/releases/current` 存在且可服务，再在健康检查前执行 `docker compose up -d --no-deps --force-recreate edge`，随后以 60 秒统一截止时间循环探测独立于前端静态文件的 `http://127.0.0.1:8088/__edge_health`（端口由 `DALTON_EDGE_PORT` 控制，校验 HTTP `200` 与专用响应正文 `dalton-edge-ok releases-v1`）；超时直接触发回滚并以非零退出，就绪并原子切换 `web/releases/current` 后再运行 `check_public_edge.sh` 核对 HTTP `/version.json` 的 `build`、`help_hash` 与 `release` 标识。
+- **边缘代理（`edge`）重载**：快进合并后通过 `deploy/dalton/Caddyfile` 差异及 `docker compose config` 解析后的 `edge` 服务配置对比，检测到任一变化时会在健康检查前执行 `docker compose up -d --no-deps --force-recreate edge`，随后以 60 秒统一截止时间循环探测 `http://127.0.0.1:8088/`（端口由 `DALTON_EDGE_PORT` 控制，要求 `curl` 成功且返回 `200`）；超时直接触发回滚并以非零退出，就绪后再运行 `check_public_edge.sh`。
+- **启用渠道网关部署的同步发布（含研究总监归档确认卡片）**：本批归档与栅栏改动无新增数据库迁移；启用了 `channel_gateway` 能力的部署（如 Everflow）发布时，须通过 `scripts/dalton/ops/prod/deploy_main.sh` 同步更新后端、前端静态包与 `integrations/dalton-channel-gateway`（确保新增的 `archive_workspace` 仅网页确认文案与前后端快照协议一致）；后端启动钩子会在重启时自动将遗留在归档过渡态的电脑写回 `stopped`，待提供商确认终态后再清除 `config.archiving` 栅栏。独立核心安装（无渠道网关）按 [STANDALONE-DEPLOY.md](./dev-guide/STANDALONE-DEPLOY.md) 通过 `scripts/standalone/upgrade.sh` 同步更新 `backend` 与 `edge` 即可。
 - **配套宿主机脚本与 `launchd` 模板**：`scripts/dalton/ops/prod/` 下同时收拢了 `wait_backend_idle.sh`、`backup.sh`、`watchdog.sh`、`colima_launch.sh` 以及 `launchd/` 下的三份模板（`com.dalton.backend-watchdog.plist.template`、`com.dalton.colima.plist.template`、`com.dalton.pg-backup.plist.template`）。
 
 ## 2. `.env` 与叠加配置文件改动生效规则
@@ -153,7 +155,7 @@ docker compose -f docker-compose.yml -f docker-compose.dalton.yml exec -T \
   3. 电脑 CLI 凭据（`computer_cli_tokens`）的 Drive 权限与真实调用者绑定（或在允许跨用户执行的计算机上隔离其 Drive API 权限），防止跨用户回合经公开 Drive API 读写属主 Drive。
 - **对象存储分片清理与启动告警说明**：后端启动时会调用 `has_multipart_cleanup_rule(min_days=7, prefix="uploads/")` 检查主存储桶（`STORAGE_BUCKET_NAME`）是否配置了「中止未完成分片上传且 `DaysAfterInitiation >= 7`」的清理规则。
   - 当存储桶缺少该规则或天数为 6 天及以下时，后端会输出一条 `WARNING` 日志提醒运维配置，该检查仅作告警提示，正常放行启动。
-  - 独立核心安装自带的 `scripts/standalone/minio_init.py` 仅负责创建私有桶并清理匿名桶策略；后续启用 Drive 前，S3 / R2 环境配置 `AbortIncompleteMultipartUpload`（`DaysAfterInitiation >= 7`），内置 MinIO 环境通过 MinIO 原生的 `stale_uploads_expiry` 配置分片清理。
+  - 独立核心安装自带的 `scripts/standalone/minio_init.py` 仅负责创建私有桶并清理匿名桶策略；后续启用 Drive 前，S3 / R2 环境配置 `AbortIncompleteMultipartUpload`（`DaysAfterInitiation >= 7`），内置 MinIO 环境通过 MinIO 原生的 `stale_uploads_expiry` 配置分片清理（环境变量 `MINIO_API_STALE_UPLOADS_EXPIRY`，`docker-compose.core.yml` 默认 `24h`；启用 Drive 时设为 `168h` 及以上，因为 Drive 分片上传最长保持打开 6 天）。MinIO 经 S3 生命周期接口查不到这项设置，所以在内置 MinIO 上该启动告警每次都会出现，启动日志同时写明这两种配置方式。
 
 ## 3. 宿主机 `launchd` 服务运维
 

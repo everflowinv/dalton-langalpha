@@ -377,22 +377,69 @@ _ALL_TABLES = [
 ]
 
 
-def _build_db_uri() -> str:
-    """Build PostgreSQL connection string from env vars (CI-compatible defaults).
+def _validate_test_db_dsn(dsn: str, *, source: str) -> str:
+    """Validate effective libpq dbname via conninfo_to_dict() before returning any test URI."""
+    from psycopg.conninfo import conninfo_to_dict
 
-    Uses TEST_DB_* env vars so the app's .env (which sets DB_HOST to
-    host.docker.internal for Docker networking) does not bleed into tests
-    that run on the host machine.
+    try:
+        conn_params = conninfo_to_dict(dsn)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Refusing to run integration DB tests with invalid DSN from {source}: {exc}"
+        ) from exc
+    if conn_params.get("service"):
+        raise RuntimeError(
+            f"Refusing to run integration DB tests with libpq service={conn_params.get('service')!r} from {source}"
+        )
+    db_name = str(conn_params.get("dbname") or "").strip()
+    if not db_name or not db_name.endswith("_test"):
+        raise RuntimeError(
+            f"Refusing to run integration DB setup against non-test database: {db_name!r} "
+            f"from {source} (must end with '_test')"
+        )
+    return dsn
+
+
+def _build_db_uri() -> str:
+    """Build PostgreSQL connection string from explicit env vars.
+
+    Uses TEST_DB_* env vars (or explicit DSN) so the app's .env (which sets
+    DB_HOST to host.docker.internal for Docker networking) does not bleed into
+    tests and so integration tests never silently fall back to localhost:5432.
     """
-    host = os.getenv("TEST_DB_HOST", "localhost")
-    port = os.getenv("TEST_DB_PORT", "5432")
-    name = os.getenv("TEST_DB_NAME", "langalpha_test")
+    # DALTON-HOOK(budget): require explicit test DB DSN or TEST_DB_HOST/PORT/NAME; refuse localhost:5432 fallback.
+    for dsn_var in ("TEST_DB_DSN", "DALTON_TEST_DB_DSN", "TEST_DATABASE_URL"):
+        dsn_val = (os.getenv(dsn_var) or "").strip()
+        if dsn_val:
+            return _validate_test_db_dsn(dsn_val, source=dsn_var)
+
+    host = (os.getenv("TEST_DB_HOST") or "").strip()
+    port = (os.getenv("TEST_DB_PORT") or "").strip()
+    name = (os.getenv("TEST_DB_NAME") or "").strip().lstrip("/")
+    missing = [
+        k
+        for k, v in (
+            ("TEST_DB_HOST", host),
+            ("TEST_DB_PORT", port),
+            ("TEST_DB_NAME", name),
+        )
+        if not v
+    ]
+    if missing:
+        raise RuntimeError(
+            "Refusing to run integration DB tests without explicit TEST_DB_HOST / "
+            "TEST_DB_PORT / TEST_DB_NAME (or TEST_DB_DSN / DALTON_TEST_DB_DSN / "
+            f"TEST_DATABASE_URL). Missing: {', '.join(missing)}. "
+            "Falling back to localhost:5432 is disabled to protect local/production PostgreSQL."
+        )
     user = os.getenv("TEST_DB_USER", "postgres")
     password = os.getenv("TEST_DB_PASSWORD", "postgres")
     # Deliberately not DB_SSLMODE — reading it would let a production-shaped .env
     # dictate test TLS policy, which is what TEST_DB_* exists to prevent.
     sslmode = os.getenv("TEST_DB_SSLMODE", "prefer")
-    return f"postgresql://{user}:{password}@{host}:{port}/{name}?sslmode={sslmode}"
+    # DALTON-HOOK(budget): validate constructed test URI via conninfo_to_dict() before returning.
+    uri = f"postgresql://{user}:{password}@{host}:{port}/{name}?sslmode={sslmode}"
+    return _validate_test_db_dsn(uri, source="TEST_DB_NAME")
 
 
 async def _run_alembic_upgrade(db_uri: str) -> None:

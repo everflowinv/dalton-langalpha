@@ -432,6 +432,7 @@ async def workspaces_create(
     raw_coverage_kind = str(coverage_kind or "").strip().lower()
     requested_coverage = raw_coverage_kind not in ("", "none", "other")
     coverage_active: bool | None = None
+    early_suggestion: Any = None
 
     async def _ensure_coverage_active() -> bool:
         nonlocal coverage_active
@@ -440,12 +441,18 @@ async def workspaces_create(
         return bool(coverage_active)
 
     async def _check_company_dedup() -> Command | None:
+        nonlocal early_suggestion
         if allow_duplicate_company:
             return None
         dup = None
         try:
+            dedup_kwargs: dict[str, Any] = {"channel": "cos"}
+            if snapshot is not None and snapshot.get("duplicate_workspace_id") is not None:
+                dedup_kwargs["exclude_workspace_id"] = str(
+                    snapshot["duplicate_workspace_id"]
+                )
             dup = await find_existing_company_workspace(
-                user_id, name, channel="cos"
+                user_id, name, **dedup_kwargs
             )
         except Exception as exc:
             logger.warning(
@@ -497,6 +504,8 @@ async def workspaces_create(
                     suggestion=suggestion,
                     **preapproved_meta,
                 )
+        if dup is not None and dup.suggestion is not None:
+            early_suggestion = dup.suggestion
         return None
 
     # DALTON-HOOK(cos-settings-tools): on interrupt resume, read the interrupt
@@ -611,11 +620,39 @@ async def workspaces_create(
         ComputerArchivingError,  # DALTON-HOOK(cos-settings-tools)
         ComputerNotFoundError,  # DALTON-HOOK(cos-settings-tools)
         ComputerPreparingError,
+        DuplicateWorkspaceConflictError,  # DALTON-HOOK(workspace-dedup)
         ProviderNotOffered,  # DALTON-HOOK(cos-settings-tools)
     )
 
     try:
         from src.server.services.workspace_manager import WorkspaceManager
+        # --- DALTON-HOOK(workspace-dedup): begin ---
+        from src.dalton.coverage.workspace_create import (
+            build_in_tx_identity_hook,
+            format_cos_duplicate_conflict_error,
+            resolve_cos_colleague_dedup,
+            resolve_coverage_registration_result,
+            resolve_effective_company_ticker,
+        )
+
+        effective_ticker, effective_ticker_key = resolve_effective_company_ticker(
+            raw_coverage_kind=raw_coverage_kind,
+            explicit_ticker=ticker,
+            suggestion=early_suggestion,
+        )
+        registration_state: dict[str, Any] = {"ran": False, "result": (None, None, None)}
+        in_tx_hook = build_in_tx_identity_hook(
+            user_id=user_id,
+            workspace_name=name,
+            coverage_kind=coverage_kind,
+            ticker=ticker,
+            display_name=display_name,
+            wants_coverage=wants_coverage,
+            raw_coverage_kind=raw_coverage_kind,
+            effective_ticker_key=effective_ticker_key,
+            registration_state=registration_state,
+        )
+        # --- DALTON-HOOK(workspace-dedup): end ---
 
         workspace_manager = WorkspaceManager.get_instance()
         # --- DALTON-HOOK(cos-settings-tools): begin ---
@@ -654,6 +691,9 @@ async def workspaces_create(
                 if recheck.active:
                     verified_company_candidates = recheck.checked_candidates
                     check_colleague_duplicate = recheck.check_colleague_workspaces
+            # DALTON-HOOK(workspace-dedup): preapproved CoS creates also enforce colleague dedup + ws_ticker lock
+            elif preapproved and not allow_duplicate_company:
+                check_colleague_duplicate = await resolve_cos_colleague_dedup(user_id)
 
             create_kwargs: dict[str, Any] = {
                 "user_id": user_id,
@@ -666,6 +706,11 @@ async def workspaces_create(
                 create_kwargs["verified_company_candidates"] = verified_company_candidates
             if check_colleague_duplicate:
                 create_kwargs["check_colleague_duplicate"] = True
+            # DALTON-HOOK(workspace-dedup): forward target_ticker & same-tx company identity hook
+            if effective_ticker and not allow_duplicate_company:
+                create_kwargs["target_ticker"] = effective_ticker
+            if in_tx_hook is not None:
+                create_kwargs["on_workspace_inserted"] = in_tx_hook
             if snapshot.get("duplicate_workspace_id") is not None:
                 create_kwargs["expected_duplicate_workspace_id"] = str(
                     snapshot["duplicate_workspace_id"]
@@ -694,11 +739,27 @@ async def workspaces_create(
                 )
             workspace = await workspace_manager.create_workspace(**create_kwargs)
         else:
-            workspace = await workspace_manager.create_workspace(
-                user_id=user_id,
-                name=name,
-                description=description,
-            )
+            # DALTON-HOOK(workspace-dedup): enforce ticker lock + same-tx company identity even without a snapshot
+            fallback_kwargs: dict[str, Any] = {
+                "user_id": user_id,
+                "name": name,
+                "description": description,
+            }
+            if not allow_duplicate_company and await resolve_cos_colleague_dedup(user_id):
+                fallback_kwargs["check_duplicate_snapshot"] = True
+                fallback_kwargs["check_colleague_duplicate"] = True
+                if effective_ticker:
+                    fallback_kwargs["target_ticker"] = effective_ticker
+            elif not allow_duplicate_company and effective_ticker:
+                from src.dalton.company_identity import is_company_system_user
+                from src.dalton.coverage.dedup import is_company_dedup_active
+
+                if is_company_dedup_active() and not is_company_system_user(user_id):
+                    fallback_kwargs["check_duplicate_snapshot"] = True
+                    fallback_kwargs["target_ticker"] = effective_ticker
+            if in_tx_hook is not None:
+                fallback_kwargs["on_workspace_inserted"] = in_tx_hook
+            workspace = await workspace_manager.create_workspace(**fallback_kwargs)
         # --- DALTON-HOOK(cos-settings-tools): end ---
 
         result = {
@@ -717,15 +778,17 @@ async def workspaces_create(
         # --- DALTON-HOOK(cos-settings-tools): end ---
         # --- DALTON-HOOK(workspace-dedup): begin ---
         if wants_coverage:
-            from src.dalton.coverage.units import auto_register_workspace_coverage_unit
-
-            unit_row, unit_warning, unit_warning_detail = await auto_register_workspace_coverage_unit(
-                user_id,
-                workspace_id=str(workspace["workspace_id"]),
-                workspace_name=str(workspace.get("name") or name),
-                coverage_kind=coverage_kind,
-                ticker=ticker,
-                display_name=display_name,
+            unit_row, unit_warning, unit_warning_detail = (
+                await resolve_coverage_registration_result(
+                    user_id=user_id,
+                    workspace_id=str(workspace["workspace_id"]),
+                    workspace_name=str(workspace.get("name") or name),
+                    coverage_kind=coverage_kind,
+                    ticker=ticker,
+                    display_name=display_name,
+                    wants_coverage=wants_coverage,
+                    registration_state=registration_state,
+                )
             )
             if unit_row is not None:
                 result["coverage_unit"] = unit_row
@@ -769,6 +832,18 @@ async def workspaces_create(
             tool_call_id,
             code="scope_changed",
             message_status="error",
+            **preapproved_meta,
+        )
+    # DALTON-HOOK(workspace-dedup): handle locked-recheck duplicate conflict on non-snapshot create
+    except DuplicateWorkspaceConflictError as conflict:
+        err_msg, err_code, err_extra = await format_cos_duplicate_conflict_error(
+            user_id, name, conflict
+        )
+        return error_command(
+            err_msg,
+            tool_call_id,
+            code=err_code,
+            **err_extra,
             **preapproved_meta,
         )
     except (ComputerNotFoundError, ComputerArchivingError):
@@ -939,6 +1014,199 @@ async def workspaces_update(
             type(e).__name__,
         )
         return error_command("failed to update workspace", tool_call_id)
+
+
+async def workspaces_archive(
+    user_id: str,
+    workspace_id: str | None,
+    tool_call_id: str,
+    *,
+    snapshot: dict[str, Any] | None = None,
+) -> Command:
+    """Archive a stopped Daytona workspace's computer with whole-computer HITL confirmation."""
+    if not workspace_id:
+        return error_command(
+            "workspace_id is required for archive action", tool_call_id
+        )
+
+    if snapshot is None:
+        return error_command(
+            "情况已变化，请重新发起",
+            tool_call_id,
+            code="scope_changed",
+            message_status="error",
+        )
+
+    if snapshot.get("precheck_error"):
+        return error_command(
+            str(snapshot["precheck_error"]),
+            tool_call_id,
+            code=str(snapshot.get("precheck_error_code") or "precheck_failed"),
+            message_status="error",
+        )
+
+    snap_ws_id = snapshot.get("workspace_id")
+    snap_comp_id = snapshot.get("computer_id")
+    snap_comp_name = snapshot.get("computer_name")
+    snap_ws_name = snapshot.get("workspace_name") or ""
+    snap_expected = snapshot.get("expected_workspaces")
+    if (
+        not isinstance(snap_ws_id, str)
+        or not snap_ws_id
+        or not isinstance(snap_comp_id, str)
+        or not snap_comp_id
+        or not isinstance(snap_expected, list)
+    ):
+        return error_command(
+            "情况已变化，请重新发起",
+            tool_call_id,
+            code="scope_changed",
+            message_status="error",
+        )
+
+    payload: dict[str, Any] = {
+        "tool_call_id": tool_call_id,
+        "workspace_id": snap_ws_id,
+        "workspace_name": snap_ws_name,
+        "computer_id": snap_comp_id,
+        "computer_name": snap_comp_name or "",
+        "expected_workspaces": snap_expected,
+    }
+    approved, response = hitl_confirm("archive_workspace", payload)
+    if isinstance(response, dict) and response.get("scope_changed"):
+        return error_command(
+            "情况已变化，请重新发起",
+            tool_call_id,
+            code="scope_changed",
+            message_status="error",
+        )
+    if not approved:
+        return decline_command(
+            "User declined workspace archive.", tool_call_id
+        )
+
+    from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
+    from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
+    from src.server.services.computer_errors import (
+        ApprovalScopeChangedError,
+        ArchiveProviderError,
+        ArchiveScopeChangedError,
+        ArchiveUnsupportedError,
+        ComputerArchivingError,
+        ComputerBusyError,
+        ComputerNotStoppedError,
+    )
+    from src.server.services.workspace_manager import WorkspaceManager
+    from src.server.utils.error_sanitization import sandbox_unreachable_detail
+
+    try:
+        workspace_manager = WorkspaceManager.get_instance()
+        result = await workspace_manager.archive_workspace(
+            snap_ws_id,
+            expected_computer_id=snap_comp_id,
+            expected_workspaces=snap_expected,
+        )
+        visible_count = sum(
+            1 for w in snap_expected if not bool(w.get("is_stand_in"))
+        )
+        archive_state = (
+            "archiving"
+            if isinstance(result, dict) and result.get("archive_state") == "archiving"
+            else "archived"
+        )
+        in_progress = archive_state == "archiving"
+        return success_command(
+            {
+                "success": True,
+                "in_progress": in_progress,
+                "archive_state": archive_state,
+                "message": (
+                    "归档进行中，后台将在归档完成后自动收尾。"
+                    if in_progress
+                    else "归档已完成。"
+                ),
+                "workspace_id": snap_ws_id,
+                "workspace_name": snap_ws_name,
+                "computer_id": snap_comp_id,
+                "computer_name": snap_comp_name or "",
+                "archived_workspace_count": visible_count,
+            },
+            tool_call_id,
+        )
+    except (ArchiveScopeChangedError, ApprovalScopeChangedError):
+        return error_command(
+            "情况已变化，请重新发起",
+            tool_call_id,
+            code="scope_changed",
+            message_status="error",
+        )
+    except ArchiveUnsupportedError:
+        return error_command(
+            "当前电脑提供商不支持冷归档（只有 Daytona 云端电脑支持冷归档，停止电脑即可释放计算资源）。",
+            tool_call_id,
+            code="archive_unsupported",
+            message_status="error",
+        )
+    except ComputerNotStoppedError:
+        return error_command(
+            "仅已停止的电脑可执行归档，请先在网页端停止电脑后再重新发起。",
+            tool_call_id,
+            code="not_stopped",
+            message_status="error",
+        )
+    except ComputerArchivingError:
+        return error_command(
+            "该电脑正在归档中，无需重复发起。",
+            tool_call_id,
+            code="computer_archiving",
+            message_status="error",
+        )
+    except ComputerBusyError:
+        return error_command(
+            "该电脑当前有活跃任务或迁移进行中，请稍后再试。",
+            tool_call_id,
+            code="busy",
+            message_status="error",
+        )
+    except ArchiveProviderError as exc:
+        logger.warning(
+            "workspace_archive_failed stage=archive category=%s workspace_id=%s computer_id=%s exc_type=%s",
+            exc.category,
+            snap_ws_id,
+            snap_comp_id,
+            type(exc).__name__,
+        )
+        return error_command(
+            "沙箱提供商暂时不可用或归档未完成，请稍后重试。",
+            tool_call_id,
+            code=exc.category,
+            message_status="error",
+        )
+    except (SandboxGoneError, SandboxTransientError, SSHConnectError) as exc:
+        logger.warning(
+            "workspace_archive_failed stage=archive workspace_id=%s computer_id=%s exc_type=%s",
+            snap_ws_id,
+            snap_comp_id,
+            type(exc).__name__,
+        )
+        return error_command(
+            sandbox_unreachable_detail(exc),
+            tool_call_id,
+            code="sandbox_unreachable",
+            message_status="error",
+        )
+    except Exception as exc:
+        logger.error(
+            "workspace_archive_failed stage=archive workspace_id=%s computer_id=%s exc_type=%s",
+            snap_ws_id,
+            snap_comp_id,
+            type(exc).__name__,
+        )
+        return error_command(
+            "failed to archive workspace",
+            tool_call_id,
+            message_status="error",
+        )
 # --- DALTON-HOOK(cos-settings-tools): end ---
 
 

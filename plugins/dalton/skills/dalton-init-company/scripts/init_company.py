@@ -284,7 +284,11 @@ def render(
 
     name = str(entry.get("name") or norm_ticker)
     tier_raw = str(entry.get("tier") or "watch").lower()
-    tier_display = "Core" if tier_raw == "core" else ("Watch" if tier_raw == "watch" else tier_raw)
+    tier_display = (
+        "Core"
+        if tier_raw == "core"
+        else ("Watch" if tier_raw == "watch" else ("Radar" if tier_raw == "radar" else tier_raw))
+    )
     market = infer_market(norm_ticker, entry)
     coverage_stage = str(entry.get("coverage_stage") or "none")
     as_of = str(entry.get("as_of") or "2026-10-09")
@@ -332,7 +336,7 @@ def render(
         "ticker": norm_ticker,
         "exchange": exchange,
         "name": name,
-        "coverage_tier": "core" if tier_raw == "core" else "watch",
+        "coverage_tier": tier_raw if tier_raw in ("core", "watch", "radar") else "watch",
         "coverage_stage": stage_schema,
         "identifiers": identifiers,
         "peers": peers_list,
@@ -517,7 +521,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to coverage.yaml",
     )
     parser.add_argument("--name", help="Override company display name")
-    parser.add_argument("--tier", help="Override tier (core|watch)")
+    parser.add_argument("--tier", help="Override tier (core|watch|radar)")
     parser.add_argument("--market", help="Override market (US|HK|CN)")
     parser.add_argument("--cik", help="Override 10-digit SEC CIK")
     parser.add_argument("--peers", help="Comma-separated peer tickers override")

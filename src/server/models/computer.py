@@ -1175,6 +1175,11 @@ class ComputerActionResponse(BaseModel):
     computer_id: str = Field(description="Computer identifier")
     status: str = Field(description="New computer status")
     message: str = Field(description="Action result message")
+    # DALTON-HOOK(stop-backup-attach): surface skipped workspace count from stop-time backup
+    backup_skipped_workspaces: Optional[int] = Field(
+        default=None,
+        description="Number of workspaces skipped during stop-time file backup, if known",
+    )
 
 
 KeyRemovalOutcome = Literal["removed", "kept", "skipped", "unreached"]
@@ -1327,3 +1332,33 @@ class ComputerSessionResponse(BaseModel):
         None,
         description="What this worker's session is bound to, if it holds one",
     )
+
+
+# --- DALTON-HOOK(cos-settings-tools): begin ---
+class ArchiveWorkspaceSnapshotItem(BaseModel):
+    """One live workspace on a computer in an archive confirmation snapshot."""
+
+    workspace_id: str
+    name: str = ""
+    dir_name: str = ""
+    status: str = ""
+    is_stand_in: bool = False
+
+
+class ArchiveRequest(BaseModel):
+    """Optional confirmation snapshot passed to archive endpoints."""
+
+    expected_computer_id: Optional[str] = None
+    expected_workspaces: Optional[List[ArchiveWorkspaceSnapshotItem]] = None
+
+
+class ArchivePreviewResponse(BaseModel):
+    """Whole-computer archive preview snapshot shown before confirming archive."""
+
+    computer_id: str
+    computer_name: str
+    computer_kind: str
+    computer_status: str
+    archivable: bool
+    expected_workspaces: List[ArchiveWorkspaceSnapshotItem]
+# --- DALTON-HOOK(cos-settings-tools): end ---

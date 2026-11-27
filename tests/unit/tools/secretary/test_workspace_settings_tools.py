@@ -325,7 +325,8 @@ def test_manage_workspaces_docstring_and_cos_prompt_cover_update_and_delete():
     desc = chief_of_staff_workspaces.description or ""
     assert "DALTON-HOOK" not in desc
     assert '"update"' in desc
-    assert '"archive"' not in desc
+    # DALTON-HOOK(cos-settings-tools): Batch 3 enables manage_workspaces(action="archive")
+    assert '"archive"' in desc
     assert "computer_id" not in desc
     assert "folder name" in desc.lower()
     returns_block = desc.split("Returns:", 1)[1].strip()
@@ -338,8 +339,8 @@ def test_manage_workspaces_docstring_and_cos_prompt_cover_update_and_delete():
     text = prompt_path.read_text(encoding="utf-8")
     section = text.split("## Choosing the workspace", 1)[1].split("## After a hand-off", 1)[0]
     assert 'manage_workspaces(action="update"' in section
+    assert 'manage_workspaces(action="archive"' in section
     assert 'manage_workspaces(action="delete"' in section
-    assert "archive" not in section
     assert "computer_id" not in section
     assert "explicitly asks" in section
     assert "confirmation" in section

@@ -1,8 +1,12 @@
 # The Drive
 
-The Drive feature is currently feature-gated. A user turns it on among the experiments in their settings.
+<!-- DALTON-HOOK(drive-guidance): name the active overlay config files, startup guard, and gate: none since Settings has no Experiments page -->
+To turn the Drive on, an administrator edits the overlay file for the deployment's `APP_ENV` (`config.dalton.yaml` when `APP_ENV=dalton`, `config.core.yaml` when `APP_ENV=core`):
 
-It is on for you when your prompt has a `<drive_system>` section. Without one, or in a shared workspace, a call naming `.agents/drive` is refused as not available. Tell the user where to turn it on, and keep the file in the workspace until they do.
+1. Set `features.drive.enabled: true` and `features.drive.gate: none` in that overlay file to open the Drive for everyone. Because this deployment's Settings omits the Experiments page, `gate: none` activates the Drive directly once the backend picks up the file: on `APP_ENV=dalton` restart the backend; on `APP_ENV=core` the file is baked into the image, so rebuild the backend image (or mount the edited file) and recreate the container.
+2. Keep colleague access (`colleague_sharing` / `colleague_dispatch`) and computer CLI tokens (`computer_cli_tokens`) off before restarting; when either is on, startup turns the Drive off.
+
+The Drive is active for you when your prompt includes a `<drive_system>` section. Outside that case, or in a shared workspace, a call targeting `.agents/drive` reports unavailable; share the administrator steps above and keep the file in the workspace until the Drive is active.
 
 ## What it is
 

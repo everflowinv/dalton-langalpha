@@ -9,7 +9,18 @@ from typing import Any, Mapping
 
 import yaml
 
-VALID_TIERS = frozenset({"core", "watch"})
+VALID_TIERS = frozenset({"core", "watch", "radar"})
+TIER_ORDER: dict[str, int] = {"core": 0, "watch": 1, "radar": 2}
+TIER_SHEET_SECTIONS: dict[str, str] = {
+    "core": "Core",
+    "watch": "Watch",
+    "radar": "Radar",
+}
+TIER_EARNINGS_GROUPS: dict[str, str] = {
+    "core": "A",
+    "watch": "B",
+    "radar": "C",
+}
 VALID_SOURCES = frozenset({"seed", "chat", "ui", "group"})
 MAX_MIRROR_LEDGER_BYTES = 1024 * 1024  # 1 MB
 
@@ -22,6 +33,18 @@ DEDICATED_COMPANY_KEYS: tuple[str, ...] = (
     "peers",
     "aliases",
     "earnings",
+)
+
+WATCHLIST_DEDICATED_KEYS: tuple[str, ...] = (
+    "tags",
+    "sort_order",
+    "is_pinned",
+    "is_private",
+    "task_overrides",
+)
+
+_ALL_DEDICATED_COMPANY_KEYS: frozenset[str] = frozenset(
+    DEDICATED_COMPANY_KEYS + WATCHLIST_DEDICATED_KEYS
 )
 
 CANONICAL_COMPANY_KEY_ORDER: tuple[str, ...] = (
@@ -38,12 +61,26 @@ CANONICAL_COMPANY_KEY_ORDER: tuple[str, ...] = (
     "workspace",
     "coverage_stage",
     "note",
+    "tags",
+    "sort_order",
+    "is_pinned",
+    "is_private",
+    "task_overrides",
 )
 
 DEFAULT_TIER_MEANINGS: dict[str, str] = {
     "core": "每周五源复盘、每日跟踪、财报前瞻和点评全链",
     "watch": "只看异动；财报只做快讯",
+    "radar": "仅观察与财报日历，默认不跑后台盯盘与写稿任务",
 }
+
+VALID_EARNINGS_STAGES: tuple[str, ...] = ("tm3", "t0", "tp1")
+_TASK_OVERRIDE_BOOL_KEYS: tuple[str, ...] = (
+    "watch_enabled",
+    "delta_enabled",
+    "move_enabled",
+)
+PRIVATE_TICKERS: frozenset[str] = frozenset({"OPENAI"})
 
 
 def infer_market(ticker: str) -> str:
@@ -131,6 +168,51 @@ def extract_row_stale_group_ids(row: Mapping[str, Any]) -> list[str]:
     return out
 
 
+def normalize_tags(raw: Any) -> list[str]:
+    """Return deduplicated, stripped string tags."""
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    out: list[str] = []
+    for item in raw:
+        tag = str(item or "").strip()
+        if tag and tag not in out:
+            out.append(tag)
+    return out
+
+
+def normalize_task_overrides(raw: Any) -> dict[str, Any] | None:
+    """Validate and normalize per-company ``task_overrides`` JSONB payload (or None)."""
+    if raw is None:
+        return None
+    obj = _ensure_json_obj(raw, None)
+    if not isinstance(obj, Mapping):
+        raise ValueError("task_overrides must be a JSON object or null")
+    if not obj:
+        return None
+    allowed = set(_TASK_OVERRIDE_BOOL_KEYS) | {"earnings_stages"}
+    unknown = sorted(set(obj.keys()) - allowed)
+    if unknown:
+        raise ValueError(f"Unsupported task_overrides keys: {', '.join(unknown)}")
+    cleaned: dict[str, Any] = {}
+    for key in _TASK_OVERRIDE_BOOL_KEYS:
+        if key in obj and obj[key] is not None:
+            if not isinstance(obj[key], bool):
+                raise ValueError(f"task_overrides.{key} must be a boolean")
+            cleaned[key] = obj[key]
+    if "earnings_stages" in obj and obj["earnings_stages"] is not None:
+        stages_raw = obj["earnings_stages"]
+        if not isinstance(stages_raw, (list, tuple)):
+            raise ValueError("task_overrides.earnings_stages must be a list")
+        stages_set = {str(s or "").strip().lower() for s in stages_raw if str(s or "").strip()}
+        invalid_stages = sorted(stages_set - set(VALID_EARNINGS_STAGES))
+        if invalid_stages:
+            raise ValueError(
+                f"Invalid earnings_stages {invalid_stages}; expected subset of {list(VALID_EARNINGS_STAGES)}"
+            )
+        cleaned["earnings_stages"] = [s for s in VALID_EARNINGS_STAGES if s in stages_set]
+    return cleaned or None
+
+
 def company_to_row(
     company: Mapping[str, Any],
     *,
@@ -163,8 +245,15 @@ def company_to_row(
     raw_earnings = company.get("earnings")
     earnings = dict(raw_earnings) if isinstance(raw_earnings, Mapping) else {}
 
+    tags = normalize_tags(company.get("tags"))
+    raw_sort_order = company.get("sort_order")
+    sort_order = int(raw_sort_order) if isinstance(raw_sort_order, int) and not isinstance(raw_sort_order, bool) else 0
+    is_pinned = bool(company.get("is_pinned", False))
+    is_private = bool(company.get("is_private", False))
+    task_overrides = normalize_task_overrides(company.get("task_overrides"))
+
     extra: dict[str, Any] = {
-        k: v for k, v in company.items() if k not in DEDICATED_COMPANY_KEYS
+        k: v for k, v in company.items() if k not in _ALL_DEDICATED_COMPANY_KEYS
     }
 
     merged_gids: list[str] = []
@@ -223,6 +312,11 @@ def company_to_row(
         "aliases": aliases,
         "earnings": earnings,
         "extra": extra,
+        "tags": tags,
+        "sort_order": sort_order,
+        "is_pinned": is_pinned,
+        "is_private": is_private,
+        "task_overrides": task_overrides,
         "source": src,
         "group_id": eff_group_id,
     }
@@ -257,6 +351,17 @@ def row_to_company(row: Mapping[str, Any]) -> dict[str, Any]:
     aliases = dict(_ensure_json_obj(row.get("aliases"), {}))
     earnings = dict(_ensure_json_obj(row.get("earnings"), {}))
     extra = dict(_ensure_json_obj(row.get("extra"), {}))
+    tags = normalize_tags(_ensure_json_obj(row.get("tags"), []))
+    raw_sort_order = row.get("sort_order")
+    sort_order = (
+        int(raw_sort_order)
+        if isinstance(raw_sort_order, int) and not isinstance(raw_sort_order, bool)
+        else 0
+    )
+    is_pinned = bool(row.get("is_pinned", False))
+    is_private = bool(row.get("is_private", False))
+    raw_overrides = _ensure_json_obj(row.get("task_overrides"), None)
+    task_overrides = dict(raw_overrides) if isinstance(raw_overrides, Mapping) and raw_overrides else None
 
     dedicated_map: dict[str, Any] = {
         "ticker": ticker,
@@ -268,18 +373,29 @@ def row_to_company(row: Mapping[str, Any]) -> dict[str, Any]:
         "aliases": aliases,
         "earnings": earnings,
     }
+    if tags:
+        dedicated_map["tags"] = tags
+    if sort_order != 0:
+        dedicated_map["sort_order"] = sort_order
+    if is_pinned:
+        dedicated_map["is_pinned"] = True
+    if is_private:
+        dedicated_map["is_private"] = True
+    if task_overrides is not None:
+        dedicated_map["task_overrides"] = task_overrides
 
     result: dict[str, Any] = {}
     for key in CANONICAL_COMPANY_KEY_ORDER:
         if key in dedicated_map:
             result[key] = dedicated_map[key]
-        elif key in extra:
+        elif key in extra and key not in WATCHLIST_DEDICATED_KEYS:
             result[key] = extra[key]
 
     for key, val in extra.items():
         if (
             key not in result
             and key not in dedicated_map
+            and key not in WATCHLIST_DEDICATED_KEYS
             and key not in ("group_ids", "group_stale_ids", "group_stale")
             and not key.startswith("_")
         ):
@@ -316,7 +432,7 @@ def make_new_company_dict(
         "tier": norm_tier,
         "market": resolved_market,
         "peer_group": peer_group,
-        "sheet_section": "Core" if norm_tier == "core" else "Watch",
+        "sheet_section": TIER_SHEET_SECTIONS[norm_tier],
         "peers": [],
         "etfs": [],
         "aliases": {
@@ -325,7 +441,7 @@ def make_new_company_dict(
             "earnings_tracker": sym,
         },
         "earnings": {
-            "group": "A" if norm_tier == "core" else "B",
+            "group": TIER_EARNINGS_GROUPS[norm_tier],
             "ir_url": None,
         },
         "workspace": {
@@ -335,6 +451,8 @@ def make_new_company_dict(
         "coverage_stage": "none",
         "note": None,
     }
+    if sym in PRIVATE_TICKERS or resolved_market.upper() == "PRIVATE":
+        company["is_private"] = True
     if extra_fields:
         for k, v in extra_fields.items():
             if k not in DEDICATED_COMPANY_KEYS:
@@ -348,27 +466,39 @@ def build_coverage_doc(
     as_of: str | None = None,
     generated_at: str | None = None,
     sources: list[dict[str, Any]] | None = None,
+    include_radar: bool = False,
+    tier_policies: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble a full `coverage.yaml` document dictionary from a list of company dicts."""
     core_count = sum(1 for c in companies if str(c.get("tier") or "").lower() == "core")
     watch_count = sum(1 for c in companies if str(c.get("tier") or "").lower() == "watch")
-    return {
+    radar_count = sum(1 for c in companies if str(c.get("tier") or "").lower() == "radar")
+    tiers: dict[str, Any] = {
+        "core": {
+            "meaning": DEFAULT_TIER_MEANINGS["core"],
+            "count": core_count,
+        },
+        "watch": {
+            "meaning": DEFAULT_TIER_MEANINGS["watch"],
+            "count": watch_count,
+        },
+    }
+    if include_radar or radar_count > 0 or tier_policies is not None:
+        tiers["radar"] = {
+            "meaning": DEFAULT_TIER_MEANINGS["radar"],
+            "count": radar_count,
+        }
+    doc: dict[str, Any] = {
         "schema_version": 1,
         "as_of": as_of or date.today().isoformat(),
         "generated_at": generated_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "sources": list(sources) if sources is not None else [],
-        "tiers": {
-            "core": {
-                "meaning": DEFAULT_TIER_MEANINGS["core"],
-                "count": core_count,
-            },
-            "watch": {
-                "meaning": DEFAULT_TIER_MEANINGS["watch"],
-                "count": watch_count,
-            },
-        },
-        "companies": companies,
+        "tiers": tiers,
     }
+    if tier_policies is not None:
+        doc["tier_policies"] = dict(tier_policies)
+    doc["companies"] = companies
+    return doc
 
 
 def dump_coverage_yaml(doc: dict[str, Any]) -> str:

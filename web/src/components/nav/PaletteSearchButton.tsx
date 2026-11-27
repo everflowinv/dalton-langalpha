@@ -17,7 +17,8 @@ export type PaletteTriggerProps = Omit<ButtonHTMLAttributes<HTMLButtonElement>, 
 export function PaletteTrigger({ start, ...props }: PaletteTriggerProps) {
   const palette = useCommandPalette();
   if (!palette) return null;
-  return <button type="button" onClick={() => palette.open(start)} onPointerDown={palette.preload} aria-haspopup="dialog" {...props} />;
+  // DALTON-HOOK(dialog-focus-return): hand the trigger to the palette so a dialog opened from it returns focus here
+  return <button type="button" onClick={(e) => palette.open(start, { returnFocusTo: e.currentTarget })} onPointerDown={palette.preload} aria-haspopup="dialog" {...props} />;
 }
 
 /**

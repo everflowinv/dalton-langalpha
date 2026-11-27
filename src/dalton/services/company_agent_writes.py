@@ -426,6 +426,7 @@ async def pause_company_agent(
     if current is None:
         return None
     update_kwargs = lifecycle.pause_update_fields(current)
+    update_kwargs.pop("metadata", None)
 
     async def _reconcile(
         locked_row: Mapping[str, Any],

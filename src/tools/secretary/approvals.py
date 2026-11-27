@@ -102,9 +102,21 @@ async def duplicate_workspace(user_id: str, name: str) -> tuple[dict | None, boo
             type(exc).__name__,
         )
         return None, False
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    from src.dalton.coverage.identity import (
+        canonical_workspace_ticker_key,
+        normalize_ticker_key,
+    )
+
+    target_ticker_key = canonical_workspace_ticker_key(name)
     for holder in holders:
         if is_duplicate_name(name, holder.get("name") or ""):
             return holder, True
+        if target_ticker_key is not None:
+            holder_unit_key = normalize_ticker_key(holder.get("unit_ticker"))
+            if holder_unit_key is not None and holder_unit_key == target_ticker_key:
+                return holder, True
+    # --- DALTON-HOOK(cos-settings-tools): end ---
     return None, True
 
 
@@ -320,7 +332,295 @@ def _snapshot_allows_standing_create(snapshot: dict[str, Any] | None) -> bool:
     if snapshot.get("duplicate_check_unavailable"):
         return False
     return True
+
+
+def _is_archive_workspace_call(call: dict[str, Any]) -> bool:
+    """Whether ``call`` is a ``manage_workspaces(action="archive")`` proposal."""
+    if call.get("name") != "manage_workspaces":
+        return False
+    args = call.get("args")
+    return isinstance(args, dict) and args.get("action") == "archive"
+
+
+async def build_archive_workspace_snapshot(
+    user_id: str,
+    call: dict[str, Any],
+    *,
+    current_computer_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Read-only precheck and whole-computer snapshot for ``manage_workspaces(action="archive")``.
+
+    Runs once in ``StandingApprovalMiddleware.aafter_model`` before the tool
+    node executes. Never calls ``resolve_binding`` so it has zero side effects.
+    """
+    from ptc_agent.core.sandbox.providers import provider_supports_archive
+    from src.server.database.computer import (
+        computer_has_blocking_archive_move,
+        get_computer_for_workspace,
+        get_live_workspaces_for_archive_snapshot,
+    )
+    from src.server.database.home_workspace import is_reserved_row
+    from src.server.database.pool import get_db_connection
+    from src.server.database.workspace import get_workspace
+    from src.server.database.workspace_folders import (
+        computer_command_running,
+        computer_run_in_progress,
+    )
+    from src.server.models.computer import ComputerStatus
+    from src.server.services.home_placement import home_turn_computer
+    from src.tools.secretary.utils import spoken_computer_name
+
+    args = call.get("args")
+    if not isinstance(args, dict):
+        return None
+    raw_ws_id = args.get("workspace_id")
+    if not isinstance(raw_ws_id, str) or not raw_ws_id.strip():
+        return None
+
+    workspace_id = raw_ws_id.strip()
+    call_id = str(call.get("id") or "")
+    snapshot: dict[str, Any] = {
+        "action": "archive_workspace",
+        "tool_call_id": call_id,
+        "workspace_id": workspace_id,
+        "workspace_name": "",
+        "computer_id": None,
+        "computer_name": None,
+        "computer_kind": None,
+        "expected_workspaces": [],
+        "precheck_error": None,
+        "precheck_error_code": None,
+    }
+
+    try:
+        ws = await get_workspace(workspace_id)
+        if not ws or str(ws.get("user_id")) != str(user_id):
+            snapshot["precheck_error"] = "workspace not found"
+            snapshot["precheck_error_code"] = "workspace_not_found"
+            return snapshot
+        if is_reserved_row(ws):
+            snapshot["precheck_error"] = "Home cannot be archived."
+            snapshot["precheck_error_code"] = "home_protected"
+            return snapshot
+
+        snapshot["workspace_id"] = str(ws["workspace_id"])
+        snapshot["workspace_name"] = str(ws.get("name") or "")
+
+        computer = await get_computer_for_workspace(workspace_id)
+        if computer is None:
+            snapshot["precheck_error"] = "workspace not found"
+            snapshot["precheck_error_code"] = "workspace_not_found"
+            return snapshot
+
+        computer_id = str(computer["computer_id"])
+        computer_name = spoken_computer_name(computer.get("name"))
+        computer_kind = str(computer.get("kind") or "")
+        computer_status = str(computer.get("status") or "")
+        snapshot["computer_id"] = computer_id
+        snapshot["computer_name"] = computer_name
+        snapshot["computer_kind"] = computer_kind
+
+        if not provider_supports_archive(computer_kind):
+            snapshot["precheck_error"] = (
+                f'电脑「{computer_name}」（提供商：{computer_kind or "unknown"}）不支持冷归档；'
+                "只有 Daytona 云端电脑支持冷归档，当前电脑停止即可释放计算资源。"
+            )
+            snapshot["precheck_error_code"] = "archive_unsupported"
+            return snapshot
+
+        active_cos_computer_id = current_computer_id
+        if active_cos_computer_id is None:
+            try:
+                cos_comp, _ = await home_turn_computer(user_id)
+                if cos_comp is not None and cos_comp.get("computer_id"):
+                    active_cos_computer_id = str(cos_comp["computer_id"])
+            except Exception as exc:
+                logger.warning(
+                    "archive_snapshot_home_turn_lookup_failed exc_type=%s",
+                    type(exc).__name__,
+                )
+
+        if (
+            computer_status == ComputerStatus.RUNNING
+            and active_cos_computer_id is not None
+            and computer_id == active_cos_computer_id
+        ):
+            snapshot["precheck_error"] = (
+                f'电脑「{computer_name}」正是当前研究总监对话运行所在的电脑，无法在对话中直接归档。'
+                "请前往网页端沙箱设置面板（概览页）先停止该电脑，再执行整机归档。"
+            )
+            snapshot["precheck_error_code"] = "running_cos_computer"
+            return snapshot
+
+        cfg = computer.get("config") or {}
+        if cfg.get("archiving"):
+            snapshot["precheck_error"] = (
+                f'电脑「{computer_name}」正在归档中，无需重复发起。'
+            )
+            snapshot["precheck_error_code"] = "computer_archiving"
+            return snapshot
+        if cfg.get("retire_when_empty"):
+            snapshot["precheck_error"] = (
+                f'电脑「{computer_name}」正在清理退役，暂不可归档。'
+            )
+            snapshot["precheck_error_code"] = "computer_busy"
+            return snapshot
+        spec_change = computer.get("spec_change")
+        if (
+            isinstance(spec_change, dict)
+            and spec_change.get("state") == "in_progress"
+            and not computer.get("spec_change_stale")
+        ):
+            snapshot["precheck_error"] = (
+                f'电脑「{computer_name}」正在变更配置，暂不可归档。'
+            )
+            snapshot["precheck_error_code"] = "computer_busy"
+            return snapshot
+
+        if computer_status != ComputerStatus.STOPPED:
+            snapshot["precheck_error"] = (
+                f'电脑「{computer_name}」当前状态为 {computer_status}，只有已停止的电脑才能归档。'
+                "请先在网页端沙箱设置面板（概览页）停止该电脑后再发起归档。"
+            )
+            snapshot["precheck_error_code"] = "not_stopped"
+            return snapshot
+
+        if not computer.get("provider_ref"):
+            snapshot["precheck_error"] = (
+                f'电脑「{computer_name}」尚未创建云端沙箱，无法归档。'
+            )
+            snapshot["precheck_error_code"] = "no_sandbox"
+            return snapshot
+
+        has_blocking_move = await computer_has_blocking_archive_move(computer_id)
+        if has_blocking_move:
+            snapshot["precheck_error"] = (
+                f'电脑「{computer_name}」上有工作区正在迁移，请等待迁移完成后再发起归档。'
+            )
+            snapshot["precheck_error_code"] = "move_in_progress"
+            return snapshot
+
+        has_active_work = False
+        async with get_db_connection() as conn, conn.cursor() as cur:
+            if await computer_run_in_progress(cur, computer_id) or await computer_command_running(
+                cur, computer_id
+            ):
+                has_active_work = True
+        if has_active_work:
+            snapshot["precheck_error"] = (
+                f'电脑「{computer_name}」仍有活跃运行或后台命令，暂不可归档。'
+            )
+            snapshot["precheck_error_code"] = "computer_busy"
+            return snapshot
+
+        snapshot["expected_workspaces"] = await get_live_workspaces_for_archive_snapshot(
+            computer_id
+        )
+        return snapshot
+    except Exception as exc:
+        logger.warning(
+            "archive_snapshot_precheck_failed workspace_id=%s exc_type=%s",
+            workspace_id,
+            type(exc).__name__,
+        )
+        snapshot["precheck_error"] = "Failed to inspect target computer; please try again."
+        snapshot["precheck_error_code"] = "archive_precheck_failed"
+        return snapshot
 # --- DALTON-HOOK(cos-settings-tools): end ---
+
+
+# --- DALTON-HOOK(watchlist): begin ---
+_WATCHLIST_CONFIRMABLE_ACTIONS: frozenset[str] = frozenset(
+    {
+        "add",
+        "set_tier",
+        "remove",
+        "add_group",
+        "remove_group",
+        "set_tier_policy",
+        "reset_tier_policy",
+    }
+)
+
+
+async def build_watchlist_confirmation_snapshot(
+    user_id: str, call: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Build and freeze the read-only confirmation snapshot for ``dalton_coverage``.
+
+    Runs once in ``StandingApprovalMiddleware.aafter_model`` before the tool
+    runs or pauses on ``interrupt()``. Returns ``None`` when the proposed call
+    is exempt from confirmation (e.g. ``add`` of ≤5 net-new tickers).
+    """
+    from src.dalton.coverage.service import CoverageDataSourceError
+    from src.dalton.watchlist.service import WatchlistMutationService
+
+    args = call.get("args")
+    if not isinstance(args, dict):
+        return None
+    raw_action = str(args.get("action") or "").strip().lower()
+    if raw_action not in _WATCHLIST_CONFIRMABLE_ACTIONS:
+        return None
+    call_id = str(call.get("id") or "")
+
+    try:
+        preview = await WatchlistMutationService().preview_mutation(
+            user_id,
+            action=raw_action,
+            tickers=args.get("tickers"),
+            tier=args.get("tier"),
+            label=args.get("label"),
+            criteria=args.get("criteria") if isinstance(args.get("criteria"), dict) else None,
+            default_tier=args.get("default_tier"),
+            auto_refresh=bool(args.get("auto_refresh", True)),
+            group_id=args.get("group_id"),
+            tags=args.get("tags") if isinstance(args.get("tags"), list) else None,
+            override_user_pause=bool(args.get("override_user_pause", False)),
+            tool_call_id=call_id,
+        )
+    except CoverageDataSourceError as exc:
+        return {
+            "action": None,
+            "raw_action": raw_action,
+            "tool_call_id": call_id,
+            "owner_user_id": str(user_id),
+            "requires_confirmation": False,
+            "precheck_error": str(exc),
+            "precheck_error_code": "MarketDataUnavailable",
+            "precheck_error_payload": exc.to_dict(),
+        }
+    except ValueError as exc:
+        return {
+            "action": None,
+            "raw_action": raw_action,
+            "tool_call_id": call_id,
+            "owner_user_id": str(user_id),
+            "requires_confirmation": False,
+            "precheck_error": str(exc),
+            "precheck_error_code": "invalid_arguments",
+        }
+    except Exception as exc:
+        logger.warning(
+            "watchlist_snapshot_preview_failed action=%s exc_type=%s",
+            raw_action,
+            type(exc).__name__,
+        )
+        return {
+            "action": None,
+            "raw_action": raw_action,
+            "tool_call_id": call_id,
+            "owner_user_id": str(user_id),
+            "requires_confirmation": False,
+            "precheck_error": "预览观察名单变更失败，请稍后重试。",
+            "precheck_error_code": "watchlist_preview_failed",
+        }
+
+    if preview.get("precheck_error"):
+        return preview
+    if not preview.get("requires_confirmation"):
+        return None
+    return preview
+# --- DALTON-HOOK(watchlist): end ---
 
 
 async def _standing_create_withheld(user_id: str, call: dict[str, Any]) -> bool:
@@ -423,12 +723,27 @@ class StandingApprovalMiddleware(AgentMiddleware):
             for call in calls
             if (needed := _settings_for(call))
         }
-        if not wanted:
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        archive_calls = {
+            call["id"]: call
+            for call in calls
+            if _is_archive_workspace_call(call) and call.get("id")
+        }
+        # DALTON-HOOK(watchlist): collect confirmable dalton_coverage calls for snapshot freezing
+        watchlist_calls = {
+            call["id"]: call
+            for call in calls
+            if call.get("name") == "dalton_coverage"
+            and isinstance(call.get("args"), dict)
+            and str(call["args"].get("action") or "").strip().lower()
+            in _WATCHLIST_CONFIRMABLE_ACTIONS
+            and call.get("id")
+        }
+        if not wanted and not archive_calls and not watchlist_calls:
             return None
-        granted = await _granted(self._user_id)
+        granted = await _granted(self._user_id) if wanted else set()
         # DALTON-HOOK(workspace-duplicate-guard): the duplicate check reads the proposed call
         by_id = {call["id"]: call for call in calls}
-        # --- DALTON-HOOK(cos-settings-tools): begin ---
         existing_snapshots = state.get("approval_snapshots")
         if not isinstance(existing_snapshots, dict):
             existing_snapshots = {}
@@ -452,10 +767,31 @@ class StandingApprovalMiddleware(AgentMiddleware):
             if needed not in granted:
                 continue
             preapproved_calls.append(call_id)
-        update: dict[str, Any] = {"preapproved_calls": preapproved_calls}
+        for call_id, call in archive_calls.items():
+            prev_snap = existing_snapshots.get(call_id)
+            snapshot = (
+                dict(prev_snap)
+                if isinstance(prev_snap, dict)
+                else await build_archive_workspace_snapshot(self._user_id, call)
+            )
+            if snapshot is not None:
+                approval_snapshots[call_id] = snapshot
+        # DALTON-HOOK(watchlist): freeze confirmation snapshots for personal watchlist mutations
+        for call_id, call in watchlist_calls.items():
+            prev_snap = existing_snapshots.get(call_id)
+            snapshot = (
+                dict(prev_snap)
+                if isinstance(prev_snap, dict)
+                else await build_watchlist_confirmation_snapshot(self._user_id, call)
+            )
+            if snapshot is not None:
+                approval_snapshots[call_id] = snapshot
+        update: dict[str, Any] = {}
+        if wanted or archive_calls:
+            update["preapproved_calls"] = preapproved_calls
         if approval_snapshots:
             update["approval_snapshots"] = approval_snapshots
-        return update
+        return update or None
         # --- DALTON-HOOK(cos-settings-tools): end ---
 
 

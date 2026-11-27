@@ -1295,6 +1295,72 @@ async def republish_data_job_monitor(
     }
 
 
+def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
+    try:
+        if not path.is_file():
+            return None
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        return loaded if isinstance(loaded, dict) else None
+    except Exception:
+        return None
+
+
+def _enrich_monitor_publish_failure_message(
+    *,
+    job_key: str,
+    terminal_status: str,
+    failure_reason: str | None,
+    data_root: Path | None,
+) -> str:
+    """Enrich bare failure codes (e.g. ``exit_code_1``) with monitor state details
+    such as per-index actual data dates and missing-constituent failure reasons."""
+    raw = str(failure_reason or "").strip()
+    is_bare_exit = not raw or raw.startswith("exit_code_")
+    if job_key != "hk-momentum" or data_root is None:
+        return raw or terminal_status
+
+    st_dir = Path(data_root) / "state" / "monitor-feeds" / "hk_momentum"
+    meta = _read_json_if_exists(st_dir / "index_meta.json") or {}
+    status_doc = _read_json_if_exists(st_dir / "status.json") or {}
+
+    index_dates_raw = meta.get("index_dates")
+    date_parts: list[str] = []
+    if isinstance(index_dates_raw, dict):
+        for k, v in index_dates_raw.items():
+            if v is not None and str(v).strip():
+                date_parts.append(f"{k}={v}")
+    elif meta.get("last_date"):
+        date_parts.append(f"last_date={meta['last_date']}")
+
+    detail_parts: list[str] = []
+    if not is_bare_exit:
+        detail_parts.append(raw)
+    else:
+        meta_summary = str(meta.get("failure_summary") or "").strip()
+        if meta_summary:
+            return meta_summary
+        stale_reason = str(meta.get("stale_reason") or "").strip()
+        if stale_reason:
+            detail_parts.append(stale_reason)
+        overall = status_doc.get("overall") if isinstance(status_doc.get("overall"), dict) else {}
+        overall_reason = str(overall.get("reason") or "").strip()
+        if overall_reason and overall_reason not in detail_parts:
+            detail_parts.append(overall_reason)
+        missing_by_idx = meta.get("missing_held_by_index")
+        if isinstance(missing_by_idx, dict) and not detail_parts:
+            for idx_key, codes in missing_by_idx.items():
+                if isinstance(codes, list) and codes:
+                    preview = ", ".join(str(c) for c in codes[:5])
+                    detail_parts.append(
+                        f"{idx_key} 持有成分缺少必要价格 {len(codes)} 只 (如 {preview})"
+                    )
+
+    headline = "；".join(detail_parts) if detail_parts else (raw or terminal_status)
+    if date_parts and "数据日期:" not in headline:
+        return f"{headline} | 数据日期: {', '.join(date_parts)}"
+    return headline
+
+
 async def maybe_publish_data_job_monitor(
     *,
     job_key: str,
@@ -1329,10 +1395,16 @@ async def maybe_publish_data_job_monitor(
             for row in await monitor_db.list_monitors_by_data_job(job_key)
             if any(row.slug == b.slug for b in bindings)
         ]
+    enriched_error = _enrich_monitor_publish_failure_message(
+        job_key=job_key,
+        terminal_status=terminal_status,
+        failure_reason=failure_reason,
+        data_root=data_root,
+    )
     for existing in existing_rows:
         await monitor_db.record_monitor_publish_failure(
             existing.monitor_id,
-            error_message=failure_reason or terminal_status,
+            error_message=enriched_error,
         )
 
 

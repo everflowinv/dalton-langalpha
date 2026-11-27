@@ -23,6 +23,7 @@ import { parseWeixinInboundMessage } from "./inbound.js";
 
 const MIN_POLL_TIMEOUT_MS = 1_000;
 const MAX_POLL_TIMEOUT_MS = 60_000;
+export const MIN_EMPTY_POLL_INTERVAL_MS = 1_000;
 const BASE_RETRY_DELAY_MS = 2_000;
 const MAX_RETRY_DELAY_MS = 30_000;
 
@@ -53,6 +54,7 @@ export interface WeixinMonitorOptions {
   botGeneration: number;
   initialGetUpdatesBuf?: string;
   pollTimeoutMs?: number;
+  minEmptyPollIntervalMs?: number;
   retryDelayMs?: number;
   allowedApiDomains?: readonly string[];
   resolveHostIps?: HostIpResolver;
@@ -88,6 +90,7 @@ export class WeixinMonitor {
   private readonly logger: SubsystemLogger;
   private currentCursor: string;
   private pollTimeoutMs: number;
+  private readonly minEmptyPollIntervalMs: number;
   private runningPromise: Promise<void> | null = null;
 
   constructor(opts: WeixinMonitorOptions) {
@@ -95,6 +98,10 @@ export class WeixinMonitor {
     this.logger = opts.logger ?? createSubsystemLogger("weixin/monitor");
     this.currentCursor = opts.initialGetUpdatesBuf ?? "";
     this.pollTimeoutMs = opts.pollTimeoutMs ?? DEFAULT_LONG_POLL_TIMEOUT_MS;
+    this.minEmptyPollIntervalMs = Math.max(
+      0,
+      opts.minEmptyPollIntervalMs ?? MIN_EMPTY_POLL_INTERVAL_MS,
+    );
   }
 
   getCursor(): string {
@@ -276,6 +283,7 @@ export class WeixinMonitor {
       }
 
       try {
+        const pollStartedAt = Date.now();
         const resp = await getWeixinUpdates({
           baseUrl,
           botToken,
@@ -376,6 +384,17 @@ export class WeixinMonitor {
         // Decision #13: reset failure counter only after the entire batch succeeded
         // (and cursor committed), so sustained I-1 503 errors back off exponentially.
         consecutiveFailures = 0;
+
+        // BE2: enforce a per-account minimum interval when getupdates returns an empty batch
+        // immediately so tight server responses cannot spin-poll; abort promptly on stop.
+        if (msgs.length === 0 && !signal.aborted && this.minEmptyPollIntervalMs > 0) {
+          const elapsedMs = Math.max(0, Date.now() - pollStartedAt);
+          const remainingMs = this.minEmptyPollIntervalMs - elapsedMs;
+          if (remainingMs > 0) {
+            const ok = await sleepWithAbort(remainingMs, signal);
+            if (!ok) break;
+          }
+        }
       } catch (err) {
         if (signal.aborted) break;
         if (isLeaseSafetyMarginPauseError(err)) {

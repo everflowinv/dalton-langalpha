@@ -21,7 +21,7 @@ Endpoints:
 import asyncio
 import contextlib
 import logging
-from typing import Any, Literal, Optional  # DALTON-HOOK(workspace-dedup): Any for 409 detail dict
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
@@ -85,11 +85,17 @@ from src.server.models.workspace import (
     WorkspaceSpecRequest,
     WorkspaceUpdate,
 )
-from src.server.models.computer import CLAIMABLE_FOR_START
+from src.server.models.computer import (
+    # DALTON-HOOK(cos-settings-tools): archive snapshot models
+    ArchivePreviewResponse,
+    ArchiveRequest,
+    CLAIMABLE_FOR_START,
+)
 from src.server.models.workspace_move import WorkspaceMoveOut, WorkspaceMoveRequest
 from src.server.app.computers import accept_workspace_move
 from src.server.services.workspace_move import move_error_detail, move_from_row
 from src.server.services.computer_errors import (
+    ArchiveProviderError,  # DALTON-HOOK(cos-settings-tools)
     ComputerArchivingError,  # DALTON-HOOK(cos-settings-tools)
     ComputerNotFoundError,
     ComputerPreparingError,
@@ -150,12 +156,39 @@ async def _workspace_action_errors(action: str, workspace_id: str):
         # except an owner's SSH machine, which answers as its computer's start.
         if connect_failure(e) is not None:
             raise sandbox_failure_http(e) from None
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        sanitized_category = getattr(e, "_dalton_sanitized_error_category", None)
+        if sanitized_category is not None:
+            logger.warning(
+                "workspace_action_sandbox_unreachable action=%s category=%s workspace_id=%s exc_type=%s",
+                action,
+                sanitized_category,
+                workspace_id,
+                type(e).__name__,
+            )
+            raise sandbox_failure_http(e) from None
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         raise
     except (WorkspaceNameTaken, WorkspaceNameInvalid) as e:
         # Before the ValueError arm: an unusable name is not a missing workspace.
         raise _name_error(e) from None
     except UnknownResourceTier as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    except ComputerArchivingError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "computer_archiving", "message": str(e)},
+        ) from None
+    except ArchiveProviderError as e:
+        raise HTTPException(
+            status_code=e.http_status,
+            detail={
+                "code": e.category,
+                "message": e.user_message or "Sandbox provider reconciliation failed.",
+            },
+        ) from None
+    # --- DALTON-HOOK(cos-settings-tools): end ---
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except BackupIncomplete as e:
@@ -167,6 +200,20 @@ async def _workspace_action_errors(action: str, workspace_id: str):
             raise sandbox_failure_http(e) from None
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        sanitized_category = getattr(e, "_dalton_sanitized_error_category", None)
+        if sanitized_category is not None:
+            logger.error(
+                "workspace_action_failed action=%s category=%s workspace_id=%s exc_type=%s",
+                action,
+                sanitized_category,
+                workspace_id,
+                type(e).__name__,
+            )
+            raise HTTPException(
+                status_code=500, detail=f"Failed to {action} workspace"
+            ) from None
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         logger.exception(f"Error {action} workspace {workspace_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to {action} workspace")
 
@@ -240,10 +287,12 @@ def workspace_response(workspace: dict) -> WorkspaceResponse:
         # DALTON-HOOK(colleague-access): expose read-only auto-publish pause fields for web UI confirmation.
         auto_publish_paused=auto_publish_paused,
         auto_publish_pause_token=auto_publish_pause_token,
-        # DALTON-HOOK(workspace-dedup): pass optional coverage unit registration outcome on create.
+        # DALTON-HOOK(workspace-dedup): pass optional coverage unit registration outcome and dedup warning on create.
         coverage_unit=workspace.get("coverage_unit"),
         coverage_unit_warning=workspace.get("coverage_unit_warning"),
         coverage_unit_warning_detail=workspace.get("coverage_unit_warning_detail"),
+        dedup_warning=workspace.get("dedup_warning"),
+        dedup_warning_code=workspace.get("dedup_warning_code"),
     )
 
 
@@ -280,127 +329,12 @@ async def create_workspace(
             await cli_approval.workspace_create(http_request, principal, request)
             or computer_id
         )
-        # --- DALTON-HOOK(workspace-dedup): begin ---
-        from src.dalton.coverage.dedup import find_existing_company_workspace
-        from src.dalton.coverage.units import is_workspace_coverage_registration_active
-
-        raw_coverage_kind = str(request.coverage_kind or "").strip().lower()
-        requested_coverage = raw_coverage_kind not in ("", "none", "other")
-        coverage_active: bool | None = None
-        if requested_coverage:
-            coverage_active = await is_workspace_coverage_registration_active(x_user_id)
-        wants_coverage = bool(requested_coverage and coverage_active)
-        if request.allow_duplicate_company:
-            matched_ids: list[str] = []
-            try:
-                dup_for_log = await find_existing_company_workspace(
-                    x_user_id, request.name, channel="web"
-                )
-                if dup_for_log is not None and dup_for_log.matches:
-                    matched_ids = list(
-                        dup_for_log.matched_workspace_ids
-                        or [
-                            m.workspace_id
-                            for m in dup_for_log.matches
-                            if m.workspace_id
-                        ]
-                    )
-            except Exception:
-                matched_ids = []
-            logger.info(
-                "Skipping company workspace dedup check (allow_duplicate_company=True, user_id=%s, name=%r, matched_workspace_ids=%s)",
-                x_user_id,
-                request.name,
-                matched_ids,
-            )
-        else:
-            dup = None
-            try:
-                dup = await find_existing_company_workspace(
-                    x_user_id, request.name, channel="web"
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Company workspace dedup check failed (%s); proceeding",
-                    type(exc).__name__,
-                )
-            if dup is not None and dup.matches:
-                detail: dict[str, Any] = {
-                    "code": "company_workspace_exists",
-                    "message": dup.message,
-                    "matches": dup.matches_payload(),
-                }
-                suggestion = dup.suggestion_payload()
-                if suggestion is not None:
-                    detail["suggestion"] = suggestion
-                raise HTTPException(
-                    status_code=409,
-                    detail=detail,
-                )
-            if (
-                dup is not None
-                and dup.suggestion is not None
-                and not wants_coverage
-                and not request.skip_coverage_suggestion
-                and principal.unlimited
-            ):
-                if coverage_active is None:
-                    coverage_active = await is_workspace_coverage_registration_active(x_user_id)
-                if coverage_active:
-                    suggestion = dup.suggestion_payload()
-                    kind_label = (
-                        "公司" if dup.suggestion.coverage_kind == "company" else "行业"
-                    )
-                    ticker_note = (
-                        f"（代码 {dup.suggestion.ticker}）"
-                        if dup.suggestion.ticker
-                        else ""
-                    )
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "code": "coverage_suggestion",
-                            "message": f"「{request.name}」识别为{kind_label}{ticker_note}，是否自动登记覆盖单元并创建工作区？",
-                            "suggestion": suggestion,
-                        },
-                    )
-        # --- DALTON-HOOK(workspace-dedup): end ---
-        manager = WorkspaceManager.get_instance()
-        with computer_cause("create"):
-            workspace = await manager.create_workspace(
-                user_id=x_user_id,
-                name=request.name,
-                description=request.description,
-                config=request.config,
-                computer_id=computer_id,
-            )
-
-        # --- DALTON-HOOK(workspace-dedup): begin ---
-        if wants_coverage:
-            from src.dalton.coverage.units import auto_register_workspace_coverage_unit
-
-            unit_row, unit_warning, unit_warning_detail = await auto_register_workspace_coverage_unit(
-                x_user_id,
-                workspace_id=str(workspace["workspace_id"]),
-                workspace_name=str(workspace.get("name") or request.name),
-                coverage_kind=request.coverage_kind,
-                ticker=request.ticker,
-                display_name=request.display_name,
-                principal=principal,
-            )
-            if (
-                unit_row is not None
-                or unit_warning is not None
-                or unit_warning_detail is not None
-            ):
-                workspace = dict(workspace)
-                if unit_row is not None:
-                    workspace["coverage_unit"] = unit_row
-                if unit_warning is not None:
-                    workspace["coverage_unit_warning"] = unit_warning
-                if unit_warning_detail is not None:
-                    workspace["coverage_unit_warning_detail"] = unit_warning_detail
-        # --- DALTON-HOOK(workspace-dedup): end ---
+        # DALTON-HOOK(workspace-dedup): delegate company dedup, locked recheck retry, 409 handling, and same-tx coverage registration to src/dalton
+        from src.dalton.coverage.workspace_create import create_workspace_for_web
+        workspace = await create_workspace_for_web(
+            request=request, principal=principal, computer_id=computer_id,
+            get_manager=WorkspaceManager.get_instance, cause_factory=computer_cause,
+        )
 
         logger.info(
             f"Created workspace {workspace['workspace_id']} for user {x_user_id}"
@@ -867,6 +801,18 @@ async def start_workspace(
             workspace = await db_get_workspace(warm_id)
             await workspace_access(workspace, x_user_id)
 
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        # Share the same archive-fence reconciliation with _acquire_session and
+        # _start_machine so /workspaces/{id}/start refuses archiving computers.
+        if workspace.get("computer_id"):
+            reconciled_archiving = await manager.ensure_computer_not_archiving(
+                str(workspace["computer_id"])
+            )
+            if reconciled_archiving is True:
+                workspace = await db_get_workspace(warm_id)
+                await workspace_access(workspace, x_user_id)
+        # --- DALTON-HOOK(cos-settings-tools): end ---
+
         if lazy and workspace["status"] in {"stopped", "running"}:
             # A warm opens a workspace; nobody asked for a start. On a machine
             # that is asleep or offline it could only fail, show a start beside
@@ -948,36 +894,55 @@ async def start_workspace(
         )
 
 
+# --- DALTON-HOOK(cos-settings-tools): begin ---
+@router.get("/{workspace_id}/archive-preview", response_model=ArchivePreviewResponse)
+async def archive_workspace_preview(
+    workspace_id: str,
+    x_user_id: WorkspaceWriteUserId,
+):
+    """Read-only whole-computer snapshot shown before confirming archive."""
+    from ptc_agent.core.sandbox.providers import provider_supports_archive
+    from src.server.database.computer import (
+        get_computer_for_workspace,
+        get_live_workspaces_for_archive_snapshot,
+    )
+
+    workspace = await db_get_workspace(workspace_id)
+    await workspace_access(workspace, x_user_id, manage=True)
+    computer = await get_computer_for_workspace(workspace_id)
+    if computer is None:
+        raise HTTPException(status_code=404, detail="Computer not found")
+    computer_id = str(computer["computer_id"])
+    workspaces = await get_live_workspaces_for_archive_snapshot(computer_id)
+    return ArchivePreviewResponse(
+        computer_id=computer_id,
+        computer_name=computer.get("name") or "",
+        computer_kind=str(computer.get("kind") or ""),
+        computer_status=str(computer.get("status") or ""),
+        archivable=provider_supports_archive(computer.get("kind")),
+        expected_workspaces=workspaces,
+    )
+# --- DALTON-HOOK(cos-settings-tools): end ---
+
+
+# --- DALTON-HOOK(cos-settings-tools): begin ---
 @router.post("/{workspace_id}/archive", response_model=WorkspaceActionResponse)
 async def archive_workspace(
     workspace_id: str,
-    x_user_id: WorkspaceWriteUserId,
+    request: Request,
+    principal: WorkspaceWritePrincipal,
+    body: Optional[ArchiveRequest] = None,
 ):
     """
     Archive a stopped workspace (moves sandbox to object storage).
 
     The workspace must be in 'stopped' state. Archived sandboxes take longer
     to start (~60-300s) but use no compute resources.
-
-    Args:
-        workspace_id: Workspace UUID
-
-    Returns:
-        Action result
     """
-    async with _workspace_action_errors("archive", workspace_id):
-        workspace = await db_get_workspace(workspace_id)
-        await workspace_access(workspace, x_user_id, manage=True)
+    from src.dalton.services.archive_http import execute_workspace_archive_route
 
-        with computer_cause("archive"):
-            await WorkspaceManager.get_instance().archive_workspace(workspace_id)
-
-        logger.info(f"Archived workspace {workspace_id}")
-        return WorkspaceActionResponse(
-            workspace_id=workspace_id,
-            status="stopped",
-            message="Workspace archived successfully",
-        )
+    return await execute_workspace_archive_route(workspace_id, request, body, principal)
+# --- DALTON-HOOK(cos-settings-tools): end ---
 
 
 @router.post("/{workspace_id}/spec", response_model=WorkspaceResponse)

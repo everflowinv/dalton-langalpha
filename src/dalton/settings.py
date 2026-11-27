@@ -467,6 +467,9 @@ class DaltonConfig(BaseModel):
     )
     network: DaltonNetworkConfig = Field(default_factory=DaltonNetworkConfig)
     weixin: DaltonWeixinConfig = Field(default_factory=DaltonWeixinConfig)
+    stop_backup_attach_timeout_s: float = Field(default=60.0, gt=0)
+    stop_backup_total_timeout_s: float = Field(default=120.0, gt=0)
+    stop_backup_close_timeout_s: float = Field(default=10.0, gt=0)
 
 
 def _parse_env_pm_user_ids() -> list[str] | None:
@@ -655,6 +658,10 @@ def is_problem_reports_enabled() -> bool:
 
 def is_coverage_units_enabled() -> bool:
     """Whether the coverage-unit registry (`dalton_coverage_units`, d023) takes part in identity resolution."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.COLLEAGUE_SHARING):
+        return False
     env_flag = os.getenv("DALTON_COVERAGE_UNITS_ENABLED")
     if env_flag is not None:
         return env_flag.strip().lower() in ("1", "true", "yes")
@@ -2016,6 +2023,33 @@ def is_chat_upload_cleanup_enabled() -> bool:
     if raw is None or not raw.strip():
         return True
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def get_stop_backup_attach_timeout_s() -> float:
+    """Timeout in seconds for temporary sandbox attach during stop-time backup."""
+    cfg = get_dalton_config()
+    return _positive_float_env(
+        "DALTON_STOP_BACKUP_ATTACH_TIMEOUT_S",
+        cfg.stop_backup_attach_timeout_s,
+    )
+
+
+def get_stop_backup_total_timeout_s() -> float:
+    """Shared wall-clock deadline in seconds for one whole stop-time backup round."""
+    cfg = get_dalton_config()
+    return _positive_float_env(
+        "DALTON_STOP_BACKUP_TOTAL_TIMEOUT_S",
+        cfg.stop_backup_total_timeout_s,
+    )
+
+
+def get_stop_backup_close_timeout_s() -> float:
+    """Independent short timeout in seconds for closing temporary stop-backup clients."""
+    cfg = get_dalton_config()
+    return _positive_float_env(
+        "DALTON_STOP_BACKUP_CLOSE_TIMEOUT_S",
+        cfg.stop_backup_close_timeout_s,
+    )
 
 
 

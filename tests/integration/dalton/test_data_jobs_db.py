@@ -60,15 +60,23 @@ def cleanup_dalton_tables():
     yield
 
 
+from tests.integration.dalton._db_guard import extract_effective_test_db_name
+
+
 def _get_test_dsn() -> str:
     dsn = os.environ.get("DALTON_DATA_JOBS_TEST_DSN", "").strip()
     if not dsn:
         pytest.skip("DALTON_DATA_JOBS_TEST_DSN is not set; skipping real Postgres integration tests")
+    try:
+        extract_effective_test_db_name(dsn, source="DALTON_DATA_JOBS_TEST_DSN")
+    except ValueError as exc:
+        pytest.fail(str(exc))
     return dsn
 
 
 def _ensure_alembic_upgraded_to_head(dsn: str) -> None:
     """Run real upstream (`alembic.ini`) and Dalton (`src/dalton/alembic.ini`) Alembic migrations to head, skipping any chain already at head."""
+    extract_effective_test_db_name(dsn, source="DALTON_DATA_JOBS_TEST_DSN")
     from alembic import command
     from alembic.config import Config
     from alembic.runtime.migration import MigrationContext
@@ -127,6 +135,17 @@ async def _reset_data_task_tables(conn: psycopg.AsyncConnection) -> None:
     """Reset `dalton_data_task_runs`, `dalton_data_task_defs`, and `dalton_data_task_slot` between integration tests."""
     async with conn.transaction():
         async with conn.cursor() as cur:
+            await cur.execute("SELECT current_database()")
+            row = await cur.fetchone()
+            actual_db = (
+                row["current_database"]
+                if isinstance(row, dict)
+                else (row[0] if row else None)
+            )
+            if not isinstance(actual_db, str) or not actual_db.endswith("_test"):
+                raise RuntimeError(
+                    f"Refusing to TRUNCATE data_jobs tables against non-test database: {actual_db!r}"
+                )
             await cur.execute(
                 "TRUNCATE TABLE dalton_data_task_runs, dalton_data_task_defs CASCADE"
             )

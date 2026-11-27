@@ -67,6 +67,9 @@ export interface MessageActions {
   onRejectPTCAgent?: (proposal: PTCAgentProposalState, proposalId: string, interruptId: string) => void;
   onApproveSecretaryAction?: (proposalData: Record<string, unknown>) => void;
   onRejectSecretaryAction?: (proposalData: Record<string, unknown>) => void;
+  // DALTON-HOOK(watchlist): personal watchlist confirmation card actions
+  onApproveWatchlistAction?: (proposalData: Record<string, unknown>) => void;
+  onRejectWatchlistAction?: (proposalData: Record<string, unknown>) => void;
   onResumeCreditPause?: (pauseId: string, interruptId: string) => void;
   /** `position` is the card's slot among its interrupt's action requests. The
    *  resume must answer all of them in order, and only the card knows where it

@@ -186,6 +186,8 @@ async def test_a_config_replace_keeps_the_rows_server_owned_keys():
         "sandbox_working_dir",
         # DALTON-HOOK(historical-duplicate-marker): keep duplicate marker in server-owned config keys
         "dalton_historical_duplicate_of",
+        # DALTON-HOOK(workspace-dedup): keep company ticker in server-owned config keys
+        "dalton_company_ticker",
     ]
     assert params[1] == params[2] == owned
 
@@ -207,6 +209,25 @@ async def test_config_replace_preserves_historical_duplicate_marker():
     assert "(%s::jsonb - %s::text[]) || COALESCE(" in sql
     assert "dalton_historical_duplicate_of" in params[1]
     assert "dalton_historical_duplicate_of" in params[2]
+
+
+@pytest.mark.asyncio
+async def test_config_replace_preserves_dalton_company_ticker():
+    """DALTON-HOOK(workspace-dedup): whole-config replacement keeps
+    ``dalton_company_ticker`` on the row and refuses caller overrides."""
+    from src.server.database.workspace import SERVER_OWNED_CONFIG_KEYS, update_workspace
+
+    assert "dalton_company_ticker" in SERVER_OWNED_CONFIG_KEYS
+    cur = _Cursor()
+    await update_workspace(
+        A,
+        config={"dalton_company_ticker": "forged", "theme": "dark"},
+        conn=_Conn(cur),
+    )
+    [(sql, params)] = cur.updates()
+    assert "(%s::jsonb - %s::text[]) || COALESCE(" in sql
+    assert "dalton_company_ticker" in params[1]
+    assert "dalton_company_ticker" in params[2]
 
 
 @pytest.mark.asyncio

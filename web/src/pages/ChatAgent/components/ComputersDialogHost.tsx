@@ -50,21 +50,28 @@ import { WorkspaceMoveOutcomes } from './WorkspaceMoveOutcomes';
  * steps back for them.
  * `planInPlace`: the page holds nothing a new tab would save, so the plan
  * page opens in this tab and the way back is one tab.
+ * `statusFanout`: the page mounts no status fan-out above this host, so the
+ * host runs one. The list polls only a spec change, so a machine that
+ * finishes being prepared while such a page is shown would be announced at
+ * the list's next read instead of when its status frame arrives. ChatAgent
+ * brings its own above; the fallback host always runs one.
  *
  * A page that mounts it also takes `RESIZE_PARAM` off its address
  * (`useResizeParam`).
  */
 // DALTON-HOOK(settings-reorg): subscribe to transitional computer SSE streams while acting as the fallback host
-function FallbackStatusFanout() {
+// DALTON-HOOK(page-host-status-fanout): and for a page whose own host is the only one listening
+function StatusFanout() {
   useComputerStatusFanout();
   return null;
 }
 
-function ComputersDialogHost({ currentWorkspaceId = null, overSheet = false, planInPlace = false, fallback = false }: {
+function ComputersDialogHost({ currentWorkspaceId = null, overSheet = false, planInPlace = false, fallback = false, statusFanout = false }: {
   currentWorkspaceId?: string | null;
   overSheet?: boolean;
   planInPlace?: boolean;
   fallback?: boolean;
+  statusFanout?: boolean;
 }) {
   const { t } = useTranslation();
   const locale = useLocale();
@@ -195,7 +202,7 @@ function ComputersDialogHost({ currentWorkspaceId = null, overSheet = false, pla
   return (
     <>
       {/* DALTON-HOOK(settings-reorg): keep transitional preparation/start streams alive on pages without ChatAgent */}
-      {fallback && <FallbackStatusFanout />}
+      {(fallback || statusFanout) && <StatusFanout />} {/* DALTON-HOOK(page-host-status-fanout) */}
       <ComputersDialog
         panel={panel}
         opening={opening}

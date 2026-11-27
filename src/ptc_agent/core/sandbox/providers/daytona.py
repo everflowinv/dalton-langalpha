@@ -370,7 +370,14 @@ class DaytonaProvider(SandboxProvider):
         raise AssertionError("unreachable")
 
     async def get(self, sandbox_id: str) -> DaytonaRuntime:
-        sdk_sandbox = await self._client.get(sandbox_id)
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        try:
+            sdk_sandbox = await self._client.get(sandbox_id)
+        except Exception as exc:
+            if self.classify_error(exc) is SandboxFailureKind.SANDBOX_GONE:
+                raise SandboxGoneError(sandbox_id, "Daytona sandbox not found") from None
+            raise
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         return DaytonaRuntime(
             sdk_sandbox,
             default_working_dir=self._working_dir,

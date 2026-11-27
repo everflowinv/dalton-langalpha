@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import pytest
 import pytest_asyncio
 from alembic import command
 from alembic.config import Config
+
+from tests.integration.dalton._db_guard import (
+    ALL_DALTON_DSN_ENV_VARS as _DSN_ENV_VARS,
+    extract_effective_test_db_name,
+)
 
 _DALTON_TABLES = [
     "dalton_conversation_cards",
@@ -23,11 +27,46 @@ _DALTON_TABLES = [
 
 
 def _ensure_safe_test_db_name() -> str:
-    """Abort the entire pytest session before any DB connection or SQL if `TEST_DB_NAME` does not end with `_test`."""
-    db_name = (os.getenv("TEST_DB_NAME", "langalpha_test") or "").strip().lstrip("/")
-    if not db_name.endswith("_test"):
+    """Abort the entire pytest session before any DB connection or SQL if no explicit
+    test DB config (DSN or TEST_DB_HOST/TEST_DB_PORT/TEST_DB_NAME) is set or if any
+    configured test DB's effective libpq ``dbname`` does not end with ``_test``."""
+    db_name_env = (os.getenv("TEST_DB_NAME") or "").strip().lstrip("/")
+    if db_name_env and not db_name_env.endswith("_test"):
         pytest.exit(
-            f"Refusing to run Dalton integration session against non-test database TEST_DB_NAME={db_name!r} (must end with '_test')",
+            f"Refusing to run Dalton integration session against non-test database TEST_DB_NAME={db_name_env!r} (must end with '_test')",
+            returncode=2,
+        )
+
+    found_db_name: str | None = None
+    for var in _DSN_ENV_VARS:
+        dsn = (os.getenv(var) or "").strip()
+        if dsn:
+            try:
+                db_name = extract_effective_test_db_name(dsn, source=var)
+            except ValueError as exc:
+                pytest.exit(str(exc), returncode=2)
+            if found_db_name is None:
+                found_db_name = db_name
+    if found_db_name is not None:
+        return found_db_name
+
+    host = (os.getenv("TEST_DB_HOST") or "").strip()
+    port = (os.getenv("TEST_DB_PORT") or "").strip()
+    db_name = db_name_env
+    missing = [
+        k
+        for k, v in (
+            ("TEST_DB_HOST", host),
+            ("TEST_DB_PORT", port),
+            ("TEST_DB_NAME", db_name),
+        )
+        if not v
+    ]
+    if missing:
+        pytest.exit(
+            "Refusing to run Dalton integration session without explicit test DB configuration "
+            f"(missing {', '.join(missing)}; or set one of {', '.join(_DSN_ENV_VARS)}). "
+            "Falling back to localhost:5432 is disabled to protect local/production PostgreSQL.",
             returncode=2,
         )
     return db_name
@@ -49,10 +88,7 @@ def pytest_collection_modifyitems(
 def dalton_schema(test_db_pool, test_db_uri: str):
     """Upgrade Dalton Alembic chain (`src/dalton/alembic.ini`) to head on the test database."""
     _ensure_safe_test_db_name()
-    db_name = urlsplit(test_db_uri).path.lstrip("/")
-    assert db_name.endswith("_test"), (
-        f"Refusing to run Dalton integration migrations against non-test database: {db_name!r}"
-    )
+    extract_effective_test_db_name(test_db_uri, source="test_db_uri")
 
     project_root = Path(__file__).resolve().parents[3]
     alembic_cfg = Config(str(project_root / "src" / "dalton" / "alembic.ini"))

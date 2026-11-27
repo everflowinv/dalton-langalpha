@@ -169,6 +169,13 @@ def validate_automation_name(name: str, ticker: str | None = None) -> tuple[bool
     return True, None
 
 
+def _format_move_pct_label(pct: float) -> str:
+    val = float(pct)
+    if val.is_integer():
+        return str(int(val))
+    return f"{val:g}"
+
+
 def build_company_watch_specs(
     *,
     ticker: str,
@@ -176,14 +183,42 @@ def build_company_watch_specs(
     tier: str = "Core",
     timezone_name: str | None = None,
     unit_id: str | None = None,
+    policy: Mapping[str, Any] | Any | None = None,
+    is_private: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return the standard automation definitions for a covered company (PK.15 / A13)."""
+    """Return the standard automation definitions for a covered company (PK.15 / A13).
+
+    ``radar`` and any unknown tier default to an all-disabled policy (empty list
+    ``[]``), and unlisted private companies (``is_private=True``) also return
+    ``[]``. When an explicit ``policy`` is supplied, only tasks enabled by that
+    policy are built using its cron/timezone/threshold parameters.
+    """
+    if is_private:
+        return []
+
+    from src.dalton.watchlist.policies import (
+        TierPolicy,
+        get_default_tier_policy,
+        policy_from_mapping,
+    )
+
+    norm_tier = str(tier or "").strip().lower()
+    if isinstance(policy, TierPolicy):
+        eff_policy = policy
+    elif isinstance(policy, Mapping):
+        eff_policy = policy_from_mapping(norm_tier, policy)
+    else:
+        eff_policy = get_default_tier_policy(norm_tier)
+
     t_upper = ticker.upper()
     t_lower = ticker.lower()
     is_cnhk = t_upper.endswith((".HK", ".SS", ".SZ", ".SH"))
     tz = timezone_name or ("Asia/Shanghai" if is_cnhk else "America/New_York")
-    watch_cron = "*/30 6-20 * * 1-5" if tier.lower() == "core" else "30 7 * * 1-5"
-    delta_cron, delta_tz = resolve_delta_schedule(tier)
+    watch_cron = eff_policy.watch_cron
+    delta_cron = eff_policy.delta_cron
+    delta_tz = eff_policy.delta_timezone or DELTA_TIMEZONE
+    move_pct = float(eff_policy.move_threshold_pct)
+    move_pct_label = _format_move_pct_label(move_pct)
     clean_unit_id = str(unit_id or "").strip()
 
     def _with_unit(meta: dict[str, Any]) -> dict[str, Any]:
@@ -191,120 +226,131 @@ def build_company_watch_specs(
             meta["unit_id"] = clean_unit_id
         return meta
 
-    return [
-        {
-            "name": f"dalton-{t_lower}-watch",
-            "description": f"{t_upper} 日常信号巡检（零 token 预检通过后唤醒分析师）",
-            "trigger_type": "cron",
-            "cron_expression": watch_cron,
-            "timezone": tz,
-            "workspace_id": workspace_id,
-            "thread_strategy": "new",
-            "instruction": (
-                f"请阅读本轮 `<dalton_wake>` 中的触发信号，使用 `.agents/skills/dalton-agenda/SKILL.md` 与相关分析技能处理 {t_upper} 的最新事项，"
-                "更新公司知识层并在收盘前写入 `knowledge_append_verdict`。"
-            ),
-            "metadata": _with_unit(
-                {
-                    "dalton_managed": True,
-                    "dalton_kind": "company_watch",
-                    "ticker": t_upper,
-                    "tier": tier,
-                }
-            ),
-        },
-        {
-            "name": f"dalton-{t_lower}-delta",
-            "description": f"{t_upper} 盘后 Thesis Delta 复盘",
-            "trigger_type": "cron",
-            "cron_expression": delta_cron,
-            "timezone": delta_tz,
-            "workspace_id": workspace_id,
-            "thread_strategy": "new",
-            "instruction": (
-                f"请按 `.agents/skills/dalton-thesis-delta/SKILL.md` 对 {t_upper} 最新证据、预期变化与催化剂进展做复盘，"
-                "必要时更新 `thesis` / `debate` / `agenda` 并追加一条 `knowledge_append_verdict`。"
-            ),
-            "metadata": _with_unit(
-                {
-                    "dalton_managed": True,
-                    "dalton_kind": "weekly_delta",
-                    "ticker": t_upper,
-                    "tier": tier,
-                }
-            ),
-        },
-        {
-            "name": f"dalton-{t_lower}-move-up",
-            "description": f"{t_upper} 单日涨幅 ≥ 4% 异动归因",
-            "trigger_type": "price",
-            "timezone": tz,
-            "workspace_id": workspace_id,
-            "thread_strategy": "new",
-            "trigger_config": {
-                "symbol": t_upper,
-                "market": "stock",
-                "conditions": [
+    specs: list[dict[str, Any]] = []
+    if eff_policy.watch_enabled:
+        specs.append(
+            {
+                "name": f"dalton-{t_lower}-watch",
+                "description": f"{t_upper} 日常信号巡检（零 token 预检通过后唤醒分析师）",
+                "trigger_type": "cron",
+                "cron_expression": watch_cron,
+                "timezone": tz,
+                "workspace_id": workspace_id,
+                "thread_strategy": "new",
+                "instruction": (
+                    f"请阅读本轮 `<dalton_wake>` 中的触发信号，使用 `.agents/skills/dalton-agenda/SKILL.md` 与相关分析技能处理 {t_upper} 的最新事项，"
+                    "更新公司知识层并在收盘前写入 `knowledge_append_verdict`。"
+                ),
+                "metadata": _with_unit(
                     {
-                        "type": "pct_change_above",
-                        "value": 4.0,
-                        "reference": "previous_close",
+                        "dalton_managed": True,
+                        "dalton_kind": "company_watch",
+                        "ticker": t_upper,
+                        "tier": tier,
                     }
-                ],
-                "retrigger": {
-                    "mode": "recurring",
-                    "cooldown_seconds": 86400,
-                },
-            },
-            "instruction": (
-                f"{t_upper} 日内涨幅达到或超过 +4%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 第一步先用 `WebSearch` 与 `x_search` 搜最新新闻和 X（当天与前一天）拿到“今天发生了什么”，再去查基本面、卖方预期与同行联动原因，"
-                "并追加 `knowledge_append_verdict`。"
-            ),
-            "metadata": _with_unit(
-                {
-                    "dalton_managed": True,
-                    "dalton_kind": "price_move",
-                    "ticker": t_upper,
-                    "direction": "up",
-                }
-            ),
-        },
-        {
-            "name": f"dalton-{t_lower}-move-down",
-            "description": f"{t_upper} 单日跌幅 ≥ 4% 异动归因",
-            "trigger_type": "price",
-            "timezone": tz,
-            "workspace_id": workspace_id,
-            "thread_strategy": "new",
-            "trigger_config": {
-                "symbol": t_upper,
-                "market": "stock",
-                "conditions": [
+                ),
+            }
+        )
+    if eff_policy.delta_enabled:
+        specs.append(
+            {
+                "name": f"dalton-{t_lower}-delta",
+                "description": f"{t_upper} 盘后 Thesis Delta 复盘",
+                "trigger_type": "cron",
+                "cron_expression": delta_cron,
+                "timezone": delta_tz,
+                "workspace_id": workspace_id,
+                "thread_strategy": "new",
+                "instruction": (
+                    f"请按 `.agents/skills/dalton-thesis-delta/SKILL.md` 对 {t_upper} 最新证据、预期变化与催化剂进展做复盘，"
+                    "必要时更新 `thesis` / `debate` / `agenda` 并追加一条 `knowledge_append_verdict`。"
+                ),
+                "metadata": _with_unit(
                     {
-                        "type": "pct_change_below",
-                        "value": 4.0,
-                        "reference": "previous_close",
+                        "dalton_managed": True,
+                        "dalton_kind": "weekly_delta",
+                        "ticker": t_upper,
+                        "tier": tier,
                     }
-                ],
-                "retrigger": {
-                    "mode": "recurring",
-                    "cooldown_seconds": 86400,
-                },
-            },
-            "instruction": (
-                f"{t_upper} 日内跌幅达到或超过 -4%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 第一步先用 `WebSearch` 与 `x_search` 搜最新新闻和 X（当天与前一天）拿到“今天发生了什么”，再去查基本面、卖方预期与同行联动原因，"
-                "并追加 `knowledge_append_verdict`。"
-            ),
-            "metadata": _with_unit(
+                ),
+            }
+        )
+    if eff_policy.move_enabled:
+        specs.extend(
+            [
                 {
-                    "dalton_managed": True,
-                    "dalton_kind": "price_move",
-                    "ticker": t_upper,
-                    "direction": "down",
-                }
-            ),
-        },
-    ]
+                    "name": f"dalton-{t_lower}-move-up",
+                    "description": f"{t_upper} 单日涨幅 ≥ {move_pct_label}% 异动归因",
+                    "trigger_type": "price",
+                    "timezone": tz,
+                    "workspace_id": workspace_id,
+                    "thread_strategy": "new",
+                    "trigger_config": {
+                        "symbol": t_upper,
+                        "market": "stock",
+                        "conditions": [
+                            {
+                                "type": "pct_change_above",
+                                "value": move_pct,
+                                "reference": "previous_close",
+                            }
+                        ],
+                        "retrigger": {
+                            "mode": "recurring",
+                            "cooldown_seconds": 86400,
+                        },
+                    },
+                    "instruction": (
+                        f"{t_upper} 日内涨幅达到或超过 +{move_pct_label}%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 第一步先用 `WebSearch` 与 `x_search` 搜最新新闻和 X（当天与前一天）拿到“今天发生了什么”，再去查基本面、卖方预期与同行联动原因，"
+                        "并追加 `knowledge_append_verdict`。"
+                    ),
+                    "metadata": _with_unit(
+                        {
+                            "dalton_managed": True,
+                            "dalton_kind": "price_move",
+                            "ticker": t_upper,
+                            "direction": "up",
+                        }
+                    ),
+                },
+                {
+                    "name": f"dalton-{t_lower}-move-down",
+                    "description": f"{t_upper} 单日跌幅 ≥ {move_pct_label}% 异动归因",
+                    "trigger_type": "price",
+                    "timezone": tz,
+                    "workspace_id": workspace_id,
+                    "thread_strategy": "new",
+                    "trigger_config": {
+                        "symbol": t_upper,
+                        "market": "stock",
+                        "conditions": [
+                            {
+                                "type": "pct_change_below",
+                                "value": move_pct,
+                                "reference": "previous_close",
+                            }
+                        ],
+                        "retrigger": {
+                            "mode": "recurring",
+                            "cooldown_seconds": 86400,
+                        },
+                    },
+                    "instruction": (
+                        f"{t_upper} 日内跌幅达到或超过 -{move_pct_label}%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 第一步先用 `WebSearch` 与 `x_search` 搜最新新闻和 X（当天与前一天）拿到“今天发生了什么”，再去查基本面、卖方预期与同行联动原因，"
+                        "并追加 `knowledge_append_verdict`。"
+                    ),
+                    "metadata": _with_unit(
+                        {
+                            "dalton_managed": True,
+                            "dalton_kind": "price_move",
+                            "ticker": t_upper,
+                            "direction": "down",
+                        }
+                    ),
+                },
+            ]
+        )
+    return specs
 
 
 def build_sector_watch_specs(
@@ -1153,6 +1199,7 @@ async def schedule_dalton_automation_helper(
         merged_spec["metadata"] = sanitized_spec_meta
 
     from src.dalton.services.company_automations import (
+        AutomationVersionConflictError,
         automation_history_context,
         get_current_history_context,
     )
@@ -1661,6 +1708,29 @@ async def schedule_dalton_automation_helper(
                         "message": "只有 PM 用户可以修改或启停 Home 全局任务。",
                     }
 
+        if resolved_action in ("upsert", "resume") and not is_home_target:
+            from src.dalton.watchlist.pause_guards import (
+                extract_automation_ticker,
+                validate_earnings_stage_allowed_for_user,
+            )
+
+            earn_target_name = str(
+                (existing.get("name") if isinstance(existing, Mapping) and existing.get("name") else None)
+                or resolved_name
+            )
+            earn_target_ticker = (
+                extract_automation_ticker(existing)
+                or (str(resolved_ticker) if resolved_ticker else None)
+            )
+            earn_guard_err = await validate_earnings_stage_allowed_for_user(
+                task_owner,
+                earn_target_name,
+                ticker=earn_target_ticker,
+                conn=active_conn,
+            )
+            if earn_guard_err is not None:
+                return earn_guard_err
+
         if resolved_action in ("pause", "resume"):
             if not existing:
                 return {"ok": False, "error": f"未找到任务 `{resolved_name}`"}
@@ -1681,6 +1751,7 @@ async def schedule_dalton_automation_helper(
                 if resolved_action == "pause":
                     new_status = "paused"
                     update_fields = pause_update_fields(candidate_row)
+                    update_fields.pop("metadata", None)
                 else:
                     new_status = "active"
                     update_fields = resume_update_fields(candidate_row)
@@ -1688,10 +1759,12 @@ async def schedule_dalton_automation_helper(
                     if isinstance(existing_meta, Mapping) and (
                         "handoff_paused_reason" in existing_meta
                         or "paused_by_user" in existing_meta
+                        or "paused_by_policy" in existing_meta
                     ):
                         cleaned_meta = dict(existing_meta)
                         cleaned_meta.pop("handoff_paused_reason", None)
                         cleaned_meta.pop("paused_by_user", None)
+                        cleaned_meta.pop("paused_by_policy", None)
                         update_fields["metadata"] = cleaned_meta
             except AutomationRefusal as exc:
                 return {
@@ -1783,6 +1856,18 @@ async def schedule_dalton_automation_helper(
                     apply_locked_pause_schedule(locked_view, effective_kwargs)
                 else:
                     apply_locked_resume_schedule(locked_view, effective_kwargs)
+                    if not locked_is_home:
+                        from src.dalton.watchlist.pause_guards import (
+                            assert_locked_earnings_resume_allowed,
+                        )
+
+                        await assert_locked_earnings_resume_allowed(
+                            task_owner,
+                            locked_view,
+                            effective_kwargs,
+                            conn=_locked_conn,
+                            ticker=str(resolved_ticker) if resolved_ticker else None,
+                        )
                     locked_meta = locked_view.get("metadata")
                     if isinstance(locked_meta, Mapping) and (
                         "handoff_paused_reason" in locked_meta
@@ -1792,6 +1877,8 @@ async def schedule_dalton_automation_helper(
                         cleaned_locked_meta.pop("handoff_paused_reason", None)
                         cleaned_locked_meta.pop("paused_by_user", None)
                         effective_kwargs["metadata"] = cleaned_locked_meta
+                    else:
+                        effective_kwargs.pop("metadata", None)
 
             try:
                 with automation_history_context(
@@ -1863,7 +1950,9 @@ async def schedule_dalton_automation_helper(
         cron_expression = merged_spec.get("cron_expression") or merged_spec.get("cron")
         trigger_type = str(merged_spec.get("trigger_type") or ("cron" if cron_expression else "once"))
         trigger_config = merged_spec.get("trigger_config")
-        meta = dict(merged_spec.get("metadata") or {})
+        raw_spec_meta = merged_spec.get("metadata")
+        meta = dict(raw_spec_meta or {})
+        rp_explicit = isinstance(raw_spec_meta, Mapping) and "report_profile" in raw_spec_meta
         meta.setdefault("dalton_managed", True)
         if resolved_ticker and not meta.get("ticker"):
             meta["ticker"] = str(resolved_ticker).upper()
@@ -1970,9 +2059,42 @@ async def schedule_dalton_automation_helper(
             old_rp = existing_meta.get("report_profile")
             new_rp = merged_meta.get("report_profile")
             rp_changed = (
-                "report_profile" in meta
+                rp_explicit
                 or ("report_profile" in existing_meta and new_rp != old_rp)
             ) and new_rp != old_rp
+            rp_expected_cv: int | None = None
+            if rp_explicit:
+                raw_existing_cv = existing.get("config_version")
+                observed_cv = (
+                    raw_existing_cv
+                    if isinstance(raw_existing_cv, int)
+                    and not isinstance(raw_existing_cv, bool)
+                    else None
+                )
+                outer_cv = (
+                    outer_hist_ctx.expected_config_version
+                    if outer_hist_ctx is not None
+                    else None
+                )
+                if (
+                    outer_cv is not None
+                    and observed_cv is not None
+                    and outer_cv != observed_cv
+                ):
+                    from src.dalton.services.report_delivery import ReportDeliveryError
+
+                    conflict_exc = ReportDeliveryError(
+                        "任务配置版本已变更，请刷新后重试。",
+                        code="conflict",
+                    )
+                    if via_rest:
+                        raise conflict_exc
+                    return {
+                        "ok": False,
+                        "error": conflict_exc.code,
+                        "message": conflict_exc.message,
+                    }
+                rp_expected_cv = observed_cv if observed_cv is not None else outer_cv
             report_profile_change = None
             if rp_changed:
                 from src.dalton.services.report_delivery import (
@@ -1989,7 +2111,7 @@ async def schedule_dalton_automation_helper(
                         target_view,
                         new_rp,
                         via_rest=via_rest,
-                        user_confirmed=False,
+                        confirmed=False,
                         action="update",
                         after_metadata=merged_meta,
                         conn=active_conn,
@@ -2023,7 +2145,7 @@ async def schedule_dalton_automation_helper(
                     cross_user=cross_user,
                     existing_meta=existing_meta,
                 )
-            if merged_meta or rp_changed or merged_meta != existing_meta:
+            if rp_changed or merged_meta != existing_meta:
                 patch["metadata"] = merged_meta
             if explicit_status:
                 patch["status"] = explicit_status
@@ -2167,11 +2289,39 @@ async def schedule_dalton_automation_helper(
                     if isinstance(locked_row.get("metadata"), Mapping)
                     else {}
                 )
-                base_meta = (
-                    effective_kwargs["metadata"]
-                    if isinstance(effective_kwargs.get("metadata"), Mapping)
-                    else locked_existing_meta
-                )
+                if rp_explicit:
+                    locked_cv = locked_row.get("config_version")
+                    if (
+                        rp_expected_cv is not None
+                        and isinstance(locked_cv, int)
+                        and not isinstance(locked_cv, bool)
+                        and locked_cv != rp_expected_cv
+                    ):
+                        raise AutomationVersionConflictError(
+                            f"Configuration version conflict: expected {rp_expected_cv}, current is {locked_cv}"
+                        )
+                    if locked_existing_meta.get("report_profile") != old_rp:
+                        raise AutomationVersionConflictError(
+                            "Configuration version conflict: report_profile changed concurrently"
+                        )
+                    base_meta = (
+                        dict(effective_kwargs["metadata"])
+                        if isinstance(effective_kwargs.get("metadata"), Mapping)
+                        else dict(locked_existing_meta)
+                    )
+                else:
+                    # Only merge this call's metadata delta onto the locked row so
+                    # concurrent report_profile (or other metadata) updates committed
+                    # before the row lock are preserved.
+                    base_meta = dict(locked_existing_meta)
+                    for mk, mv in meta.items():
+                        if mk == "report_profile":
+                            continue
+                        if mv is None:
+                            if mk != "replaced_by_tracker":
+                                base_meta.pop(mk, None)
+                        else:
+                            base_meta[mk] = mv
                 final_meta = _apply_system_only_metadata(
                     base_meta,
                     model_in_spec=model_in_spec,
@@ -2179,8 +2329,10 @@ async def schedule_dalton_automation_helper(
                     cross_user=cross_user,
                     existing_meta=locked_existing_meta,
                 )
-                if "metadata" in effective_kwargs or final_meta != locked_existing_meta:
+                if rp_changed or final_meta != locked_existing_meta:
                     effective_kwargs["metadata"] = final_meta
+                else:
+                    effective_kwargs.pop("metadata", None)
                 final_system_only = bool(final_meta.get(_LLM_MODEL_SYSTEM_ONLY_KEY))
                 locked_failure_ctx["model"] = final_model
                 locked_failure_ctx["system_only"] = final_system_only
@@ -2277,6 +2429,7 @@ async def schedule_dalton_automation_helper(
                 with automation_history_context(
                     actor_user_id=effective_actor_id,
                     action=effective_update_action,
+                    expected_config_version=rp_expected_cv,
                     skip_if_unchanged=True,
                     locked_row_reconciler=_reconcile_locked_upsert,
                     report_delivery_audit=report_audit_payload,
@@ -2293,6 +2446,20 @@ async def schedule_dalton_automation_helper(
                     model_name=locked_failure_ctx["model"],
                     system_only=bool(locked_failure_ctx["system_only"]),
                 )
+            except AutomationVersionConflictError:
+                from src.dalton.services.report_delivery import ReportDeliveryError
+
+                conflict_exc = ReportDeliveryError(
+                    "任务配置版本已变更，请刷新后重试。",
+                    code="conflict",
+                )
+                if via_rest:
+                    raise conflict_exc from None
+                return {
+                    "ok": False,
+                    "error": conflict_exc.code,
+                    "message": conflict_exc.message,
+                }
             updated_row = updated or existing
             sync_failed_warning: str | None = None
             if report_profile_change is not None:
@@ -2371,7 +2538,7 @@ async def schedule_dalton_automation_helper(
                         },
                         clean_meta.get("report_profile"),
                         via_rest=via_rest,
-                        user_confirmed=False,
+                        confirmed=False,
                         action="create",
                         after_metadata=clean_meta,
                         conn=active_conn,

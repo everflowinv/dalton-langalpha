@@ -225,6 +225,8 @@ class SandboxStatsResponse(BaseModel):
     # Which provider answered. The UI needs it because disk_usage is a df(1) read
     # inside the sandbox, and docker sets no disk quota, so its totals are the host's.
     provider: str | None = None
+    # DALTON-HOOK(cos-settings-tools): whether this computer's provider supports cold archive
+    archivable: bool | None = None
     created_at: str | None = None
     auto_stop_interval: int | None = None
     resources: SandboxResources
@@ -365,11 +367,16 @@ async def _get_offline_sandbox_stats(
     """Get sandbox metadata for stopped/archived workspaces via Daytona API (no start)."""
     sandbox_id = workspace.get("sandbox_id")
     provider_kind = await _provider_kind(workspace_id)
+    # DALTON-HOOK(cos-settings-tools): expose provider cold-archive capability for OverviewTab
+    from ptc_agent.core.sandbox.providers import provider_supports_archive
+
+    archivable = provider_supports_archive(provider_kind)
     if not sandbox_id:
         return SandboxStatsResponse(
             workspace_id=workspace_id,
             state=workspace.get("status", "unknown"),
             provider=provider_kind,
+            archivable=archivable,  # DALTON-HOOK(cos-settings-tools): surface provider archive capability on fallback stats
             created_at=str(workspace.get("created_at", "")),
             resources=SandboxResources(),
         )
@@ -385,6 +392,7 @@ async def _get_offline_sandbox_stats(
             sandbox_id=sandbox_id,
             state=_offline_display_state(meta.get("state"), workspace.get("status")),
             provider=provider_kind,
+            archivable=archivable,
             created_at=str(meta["created_at"]) if meta.get("created_at") else None,
             auto_stop_interval=meta.get("auto_stop_interval"),
             resources=SandboxResources(
@@ -401,6 +409,7 @@ async def _get_offline_sandbox_stats(
             sandbox_id=sandbox_id,
             state=workspace.get("status", "unknown"),
             provider=provider_kind,
+            archivable=archivable,  # DALTON-HOOK(cos-settings-tools): surface provider archive capability on fallback stats
             created_at=str(workspace.get("created_at", "")),
             resources=SandboxResources(),
         )
@@ -514,11 +523,15 @@ async def _get_full_sandbox_stats(
 
     default_packages = list(PTCSandbox.DEFAULT_DEPENDENCIES)
 
+    # DALTON-HOOK(cos-settings-tools): expose provider cold-archive capability for OverviewTab
+    from ptc_agent.core.sandbox.providers import provider_supports_archive
+
     return SandboxStatsResponse(
         workspace_id=workspace_id,
         sandbox_id=sandbox_id,
         state=state,
         provider=provider_kind,
+        archivable=provider_supports_archive(provider_kind),
         created_at=created_at,
         auto_stop_interval=auto_stop_interval,
         resources=resources,

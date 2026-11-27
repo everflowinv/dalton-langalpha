@@ -2879,3 +2879,209 @@ def test_r10_automation_notifications_load_delivery_row_guards_uuid_casts_with_c
     assert "THEN d.automation_id::uuid" in src
     assert "AND ae.automation_execution_id = d.execution_id::uuid" not in src
     assert "AND a.automation_id = d.automation_id::uuid" not in src
+
+
+@pytest.mark.asyncio
+async def test_bt1_feishu_pending_topics_initiator_first_cap_warning_and_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BT1: pending Feishu topic lookup must not silently drop topics past 5;
+    must prioritize initiator's pending topics before group-wide pending topics,
+    support pagination, and warn when total pending topics exceed the configured cap.
+    """
+    import logging
+
+    monkeypatch.setattr(
+        cg_db,
+        "require_channel_platform_capability",
+        create_autospec(cg_db.require_channel_platform_capability, return_value=None),
+    )
+
+    # Seed 7 pending topics (topic 1 is oldest, belonging to ou_oldest; topics 2..7 are newer by other users).
+    pending_rows: list[dict[str, Any]] = []
+    for idx in range(1, 8):
+        pending_rows.append(
+            {
+                "platform": "feishu",
+                "chat_address": "feishu:oc_grp_bt1",
+                "canonical_scope_key": f"chat:oc_grp_bt1:topic:om_root_{idx}",
+                "external_topic_id": None,
+                "root_message_id": f"om_root_{idx}",
+                "first_reply_message_id": f"om_reply_{idx}",
+                "initiator_dalton_user_id": f"user-{idx}",
+                "initiator_platform_user_id": "ou_oldest" if idx == 1 else f"ou_other_{idx}",
+                "status": "pending",
+                "last_active_at": idx,  # higher = newer
+            }
+        )
+
+    class _Bt1Cur:
+        def __init__(self, rows: list[dict[str, Any]]) -> None:
+            self._rows = rows
+            self._one: dict[str, Any] | None = None
+            self._all: list[dict[str, Any]] = []
+
+        async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+            norm = " ".join(sql.split()).upper()
+            self._one = None
+            self._all = []
+            if "STATUS = 'CONFIRMED'" in norm:
+                return
+            if "STATUS = 'PENDING'" in norm and "FIRST_REPLY_MESSAGE_ID IS NOT NULL" in norm:
+                plat, addr = params[0], params[1]
+                matched = [
+                    dict(r)
+                    for r in self._rows
+                    if r["platform"] == plat
+                    and r["chat_address"] == addr
+                    and r["status"] == "pending"
+                    and r.get("first_reply_message_id")
+                ]
+                # Emulate ORDER BY root_mid match, initiator_puid match (if present), last_active_at DESC
+                root_mid = params[2] if len(params) >= 4 else None
+                init_puid = params[4] if "INITIATOR_PLATFORM_USER_ID = %S" in norm and len(params) >= 6 else None
+                matched.sort(
+                    key=lambda r: (
+                        0 if (root_mid is not None and r.get("root_message_id") == root_mid) else 1,
+                        0 if (init_puid is not None and r.get("initiator_platform_user_id") == init_puid) else 1,
+                        -int(r["last_active_at"]),
+                        str(r["canonical_scope_key"]),
+                    )
+                )
+                # Respect LIMIT / OFFSET in SQL
+                import re
+
+                limit_val: int | None = None
+                offset_val = 0
+                lit_limit = re.search(r"\bLIMIT\s+(\d+)\b", norm)
+                if lit_limit:
+                    limit_val = int(lit_limit.group(1))
+                elif "LIMIT %S" in norm:
+                    if "OFFSET %S" in norm:
+                        limit_val = int(params[-2])
+                        offset_val = int(params[-1])
+                    else:
+                        limit_val = int(params[-1])
+                sliced = matched[offset_val:]
+                if limit_val is not None:
+                    sliced = sliced[:limit_val]
+                self._all = sliced
+
+        async def fetchone(self) -> dict[str, Any] | None:
+            return self._one
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(self._all)
+
+    class _Bt1Conn:
+        def __init__(self, cur: _Bt1Cur) -> None:
+            self._cur = cur
+
+        @asynccontextmanager
+        async def cursor(self, **_kwargs: Any):
+            yield self._cur
+
+    conn = _Bt1Conn(_Bt1Cur(pending_rows))
+
+    # 1. Without initiator filter, all 7 pending topics are returned (including oldest #1).
+    res_all = await cg_db.lookup_bot_topic(
+        platform="feishu",
+        chat_address="feishu:oc_grp_bt1",
+        match_mode="inbound_followup",
+        external_topic_id="omt_bt1_7",
+        conn=conn,
+    )
+    assert res_all["found"] is False
+    scopes_all = [c["canonical_scope_key"] for c in res_all.get("pending_candidates", [])]
+    assert len(scopes_all) == 7
+    assert "chat:oc_grp_bt1:topic:om_root_1" in scopes_all
+
+    # 2. With initiator_platform_user_id='ou_oldest', the oldest topic owned by ou_oldest is prioritized first.
+    res_init = await cg_db.lookup_bot_topic(
+        platform="feishu",
+        chat_address="feishu:oc_grp_bt1",
+        match_mode="inbound_followup",
+        external_topic_id="omt_bt1_7",
+        initiator_platform_user_id="ou_oldest",
+        conn=conn,
+    )
+    scopes_init = [c["canonical_scope_key"] for c in res_init.get("pending_candidates", [])]
+    assert scopes_init[0] == "chat:oc_grp_bt1:topic:om_root_1"
+    assert len(scopes_init) == 7
+
+    # 3. Pagination traverses all 7 pending topics without dropping any.
+    page1 = await cg_db.lookup_bot_topic(
+        platform="feishu",
+        chat_address="feishu:oc_grp_bt1",
+        match_mode="inbound_followup",
+        external_topic_id="omt_bt1_7",
+        pending_limit=3,
+        pending_offset=0,
+        conn=conn,
+    )
+    assert len(page1["pending_candidates"]) == 3
+    assert page1.get("pending_candidates_has_more") is True
+
+    page2 = await cg_db.lookup_bot_topic(
+        platform="feishu",
+        chat_address="feishu:oc_grp_bt1",
+        match_mode="inbound_followup",
+        external_topic_id="omt_bt1_7",
+        pending_limit=3,
+        pending_offset=3,
+        conn=conn,
+    )
+    assert len(page2["pending_candidates"]) == 3
+    assert page2.get("pending_candidates_has_more") is True
+
+    page3 = await cg_db.lookup_bot_topic(
+        platform="feishu",
+        chat_address="feishu:oc_grp_bt1",
+        match_mode="inbound_followup",
+        external_topic_id="omt_bt1_7",
+        pending_limit=3,
+        pending_offset=6,
+        conn=conn,
+    )
+    assert len(page3["pending_candidates"]) == 1
+    assert page3.get("pending_candidates_has_more") is not True
+    combined_pages = [
+        c["canonical_scope_key"]
+        for p in (page1, page2, page3)
+        for c in p["pending_candidates"]
+    ]
+    assert combined_pages == scopes_all
+
+    # 4. Exceeding MAX_PENDING_BOT_TOPIC_CANDIDATES logs a warning instead of silently dropping.
+    cap = cg_db.MAX_PENDING_BOT_TOPIC_CANDIDATES
+    assert isinstance(cap, int) and cap >= 7
+    overflow_rows = [
+        {
+            "platform": "feishu",
+            "chat_address": "feishu:oc_grp_overflow",
+            "canonical_scope_key": f"chat:oc_grp_overflow:topic:om_root_{idx}",
+            "external_topic_id": None,
+            "root_message_id": f"om_root_{idx}",
+            "first_reply_message_id": f"om_reply_{idx}",
+            "initiator_dalton_user_id": f"user-{idx}",
+            "initiator_platform_user_id": f"ou_user_{idx}",
+            "status": "pending",
+            "last_active_at": idx,
+        }
+        for idx in range(1, cap + 3)
+    ]
+    overflow_conn = _Bt1Conn(_Bt1Cur(overflow_rows))
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=cg_db.__name__):
+        res_overflow = await cg_db.lookup_bot_topic(
+            platform="feishu",
+            chat_address="feishu:oc_grp_overflow",
+            match_mode="inbound_followup",
+            external_topic_id="omt_overflow",
+            conn=overflow_conn,
+        )
+    assert len(res_overflow["pending_candidates"]) == cap
+    assert res_overflow.get("pending_candidates_truncated") is True
+    assert res_overflow.get("pending_candidates_has_more") is True
+    assert any("pending" in rec.message.lower() and "oc_grp_overflow" in rec.message for rec in caplog.records)

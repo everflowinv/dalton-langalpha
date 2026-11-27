@@ -1015,6 +1015,7 @@ BACKGROUND_LOOP_REGISTRY: Mapping[str, CapabilityId | None] = MappingProxyType(
         "dalton-data-task-scheduler": CapabilityId.DATA_JOBS,
         "dalton-chat-upload-cleanup": CORE_CAPABILITY,
         "dalton-team-model-catalog-follow": CORE_CAPABILITY,
+        "dalton-startup-watchlist-reconcile": CORE_CAPABILITY,
         # Filtered by filter_reconnectable_builtin_mcp (skips disabled servers like researchdata)
         "mcp-builtin-reconnect": CORE_CAPABILITY,
         # Upstream core platform background tasks & services
@@ -1138,6 +1139,8 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("router.py", "dalton_notify_feishu_groups_endpoint"): CapabilityId.CHANNEL_FEISHU,
         ("router.py", "dalton_notify_discord_channel_verify_endpoint"): CapabilityId.CHANNEL_DISCORD,
         ("router.py", "dalton_notify_test_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("router.py", "report_delivery_precheck_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("router.py", "issue_report_delivery_confirmation_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("router.py", "global_search_endpoint"): CORE_CAPABILITY,
         # --- channels_router.py ---
         ("channels_router.py", "internal_gateway_lease_acquire_endpoint"): CapabilityId.CHANNEL_GATEWAY,
@@ -1156,6 +1159,7 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("channels_router.py", "internal_deliverables_download_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_snapshots_status_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_snapshots_download_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_thread_run_replay_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_inbound_progress_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_steers_reconcile_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_recover_endpoint"): CapabilityId.CHANNEL_GATEWAY,
@@ -1273,6 +1277,13 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("chat_uploads.py", "download_sandbox_chat_upload_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "get_chat_upload_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "cancel_chat_upload_endpoint"): CORE_CAPABILITY,
+        # --- watchlist.py (Personal Watchlist three-tier & outbox reconciler) ---
+        ("watchlist.py", "get_watchlist_endpoint"): CORE_CAPABILITY,
+        ("watchlist.py", "get_watchlist_metrics_endpoint"): CORE_CAPABILITY,
+        ("watchlist.py", "get_watchlist_tier_policies_endpoint"): CORE_CAPABILITY,
+        ("watchlist.py", "preview_watchlist_mutation_endpoint"): CORE_CAPABILITY,
+        ("watchlist.py", "mutate_watchlist_endpoint"): CORE_CAPABILITY,
+        ("watchlist.py", "reconcile_watchlist_endpoint"): CORE_CAPABILITY,
         # --- research_host/app.py (standalone research-host service) ---
         ("research_host/app.py", "healthz"): CORE_CAPABILITY,
         ("research_host/app.py", "get_drain"): CORE_CAPABILITY,

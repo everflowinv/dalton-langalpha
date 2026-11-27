@@ -630,6 +630,9 @@ export class FeishuChannelAdapter implements ChannelAdapter {
         match_mode: "inbound_followup",
         external_topic_id: extTopicId,
         ...(event.rootMessageId ? { root_message_id: event.rootMessageId } : {}),
+        ...(event.platformUserId
+          ? { initiator_platform_user_id: event.platformUserId }
+          : {}),
       });
       if (
         res.found &&
@@ -730,7 +733,16 @@ export class FeishuChannelAdapter implements ChannelAdapter {
           }
         }
       }
-      if (!res.found && !hadUnresolvedPending) {
+      if (res.pending_candidates_truncated) {
+        this.logger.warn(
+          "Feishu pending bot topic candidates were truncated; skipping negative cache",
+          {
+            chatAddress: event.chatAddress,
+            externalTopicId: extTopicId,
+          },
+        );
+      }
+      if (!res.found && !hadUnresolvedPending && !res.pending_candidates_truncated) {
         this.setNegativeTopicCache(key);
       }
       return false;
