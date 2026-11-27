@@ -153,6 +153,11 @@ def purge_thread_lock_key(thread_id: str | UUID) -> int:
     return advisory_key("dalton_integration_purge_thread", str(thread_id))
 
 
+def health_sweep_lock_key() -> int:
+    """Cluster-wide advisory lock key ensuring only one worker runs the 12-hour health patrol (§4.5(3))."""
+    return advisory_key("dalton_integration_health_sweep", "global")
+
+
 # ---------------------------------------------------------------------------
 # Safe row dataclasses (token fields excluded from repr)
 # ---------------------------------------------------------------------------
@@ -1368,3 +1373,385 @@ async def delete_approvals_for_disconnect(
                 )
                 deleted += int(cur.rowcount or 0)
     return deleted
+
+
+# ---------------------------------------------------------------------------
+# Step 2 additive query & CAS helpers (OAuth, refresh, webhook, 12h sweep)
+# ---------------------------------------------------------------------------
+
+
+async def list_connections_by_account(
+    user_id: str,
+    provider: str,
+    oauth_client_id: str,
+    provider_account_id: str,
+    *,
+    decrypt_tokens: bool = False,
+    for_update: bool = False,
+    conn: Any = None,
+) -> list[IntegrationRow]:
+    """List all connection rows for ``(user_id, provider, oauth_client_id, provider_account_id)``
+    in ascending ``service`` order (deterministic PK lock ordering for Google shared tokens).
+    """
+    lock_clause = " FOR UPDATE" if for_update else ""
+    if decrypt_tokens:
+        enc_key = get_encryption_key()
+        select_cols = (
+            f"{_INTEGRATION_META_COLS}, "
+            "CASE WHEN access_token IS NULL THEN NULL "
+            "     ELSE pgp_sym_decrypt(access_token, %(enc_key)s) END AS decrypted_access_token, "
+            "CASE WHEN refresh_token IS NULL THEN NULL "
+            "     ELSE pgp_sym_decrypt(refresh_token, %(enc_key)s) END AS decrypted_refresh_token"
+        )
+        params: dict[str, Any] = {
+            "user_id": user_id,
+            "provider": provider,
+            "oauth_client_id": oauth_client_id,
+            "provider_account_id": provider_account_id,
+            "enc_key": enc_key,
+        }
+    else:
+        select_cols = _INTEGRATION_META_COLS
+        params = {
+            "user_id": user_id,
+            "provider": provider,
+            "oauth_client_id": oauth_client_id,
+            "provider_account_id": provider_account_id,
+        }
+
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT {select_cols}
+                FROM dalton_user_integrations
+                WHERE user_id = %(user_id)s
+                  AND provider = %(provider)s
+                  AND oauth_client_id = %(oauth_client_id)s
+                  AND provider_account_id = %(provider_account_id)s
+                ORDER BY service ASC
+                {lock_clause}
+                """,
+                params,
+            )
+            rows = await cur.fetchall()
+    return [_row_to_integration(dict(r)) for r in rows]
+
+
+async def list_connections_by_provider_account(
+    provider: str,
+    oauth_client_id: str,
+    *,
+    provider_account_id: str | None = None,
+    provider_union_id: str | None = None,
+    conn: Any = None,
+) -> list[IntegrationRow]:
+    """Find connections matching ``(provider, oauth_client_id)`` and ``open_id`` / ``union_id``."""
+    match_clauses: list[str] = []
+    params: dict[str, Any] = {
+        "provider": provider,
+        "oauth_client_id": oauth_client_id,
+    }
+    if provider_account_id:
+        match_clauses.append("provider_account_id = %(provider_account_id)s")
+        params["provider_account_id"] = provider_account_id
+    if provider_union_id:
+        match_clauses.append("provider_union_id = %(provider_union_id)s")
+        params["provider_union_id"] = provider_union_id
+    if not match_clauses:
+        return []
+
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT {_INTEGRATION_META_COLS}
+                FROM dalton_user_integrations
+                WHERE provider = %(provider)s
+                  AND oauth_client_id = %(oauth_client_id)s
+                  AND ({' OR '.join(match_clauses)})
+                ORDER BY user_id ASC, service ASC
+                """,
+                params,
+            )
+            rows = await cur.fetchall()
+    return [_row_to_integration(dict(r)) for r in rows]
+
+
+async def list_connections_for_health_sweep(
+    *,
+    limit: int = 500,
+    conn: Any = None,
+) -> list[IntegrationRow]:
+    """List ``connected`` and ``refresh_ambiguous`` connections for the 12-hour health patrol."""
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT {_INTEGRATION_META_COLS}
+                FROM dalton_user_integrations
+                WHERE status IN ('connected', 'refresh_ambiguous')
+                ORDER BY COALESCE(last_refresh_at, created_at) ASC, user_id ASC, provider ASC, service ASC
+                LIMIT %s
+                """,
+                (int(limit),),
+            )
+            rows = await cur.fetchall()
+    return [_row_to_integration(dict(r)) for r in rows]
+
+
+async def list_user_purge_ledgers(
+    user_id: str,
+    *,
+    active_only: bool = False,
+    limit: int = 50,
+    conn: Any = None,
+) -> list[PurgeLedgerRow]:
+    """List purge/revoke ledger entries for ``user_id`` without decrypting revoke tokens."""
+    extra = (
+        " AND (local_purge_status = 'running' OR remote_revoke_status IN ('pending', 'failed_retryable'))"
+        if active_only
+        else ""
+    )
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT {_PURGE_LEDGER_META_COLS}
+                FROM dalton_integration_purge_ledger
+                WHERE user_id = %s
+                  {extra}
+                ORDER BY disconnected_at DESC
+                LIMIT %s
+                """,
+                (user_id, int(limit)),
+            )
+            rows = await cur.fetchall()
+    return [_row_to_purge_ledger(dict(r)) for r in rows]
+
+
+async def has_user_any_integration_records(
+    user_id: str,
+    *,
+    conn: Any = None,
+) -> bool:
+    """Return True if ``user_id`` has any stored integration row or active purge/revoke ledger."""
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM dalton_user_integrations WHERE user_id = %s
+                    UNION ALL
+                    SELECT 1 FROM dalton_integration_purge_ledger
+                    WHERE user_id = %s
+                      AND (
+                          local_purge_status = 'running'
+                          OR remote_revoke_status IN ('pending', 'failed_retryable')
+                      )
+                )
+                """,
+                (user_id, user_id),
+            )
+            row = await cur.fetchone()
+    return bool(row and row[0])
+
+
+async def has_running_local_purge_for_service(
+    user_id: str,
+    provider: str,
+    service: str,
+    *,
+    conn: Any = None,
+) -> list[str]:
+    """Return ``purge_id`` values with ``local_purge_status = 'running'`` for ``(user_id, provider, service)``."""
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT purge_id::text
+                FROM dalton_integration_purge_ledger
+                WHERE user_id = %s
+                  AND provider = %s
+                  AND (service = %s OR service IS NULL)
+                  AND local_purge_status = 'running'
+                ORDER BY disconnected_at ASC
+                """,
+                (user_id, provider, service),
+            )
+            rows = await cur.fetchall()
+    return [str(r[0]) for r in rows]
+
+
+async def peek_pending_confirmation(
+    confirmation_hash: str,
+    user_id: str,
+    *,
+    conn: Any = None,
+) -> PendingConfirmationRow | None:
+    """Non-destructively read a pending confirmation owned by ``user_id`` (no token decryption)."""
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT
+                    confirmation_hash, user_id, provider, service,
+                    oauth_client_id, provider_account_id, provider_union_id,
+                    provider_email, granted_scopes,
+                    expires_at, intent, preferences, confirm_expires_at, created_at
+                FROM dalton_user_integration_pending_confirmations
+                WHERE confirmation_hash = %(confirmation_hash)s
+                  AND user_id = %(user_id)s
+                  AND confirm_expires_at > clock_timestamp()
+                """,
+                {"confirmation_hash": confirmation_hash, "user_id": user_id},
+            )
+            row = await cur.fetchone()
+    if row is None:
+        return None
+    r = dict(row)
+    return PendingConfirmationRow(
+        confirmation_hash=str(r["confirmation_hash"]),
+        user_id=str(r["user_id"]),
+        provider=str(r["provider"]),
+        service=str(r["service"]),
+        oauth_client_id=str(r["oauth_client_id"]),
+        provider_account_id=str(r["provider_account_id"]),
+        provider_union_id=r.get("provider_union_id"),
+        provider_email=r.get("provider_email"),
+        granted_scopes=str(r["granted_scopes"]),
+        expires_at=r.get("expires_at"),
+        intent=str(r["intent"]),
+        preferences=dict(r.get("preferences") or {}),
+        confirm_expires_at=r["confirm_expires_at"],
+        created_at=r["created_at"],
+        access_token=None,
+        refresh_token=None,
+    )
+
+
+async def update_connection_preferences(
+    user_id: str,
+    provider: str,
+    service: str,
+    *,
+    preferences: dict[str, Any],
+    conn: Any = None,
+) -> IntegrationRow | None:
+    """Replace ``preferences`` on an existing integration row."""
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                UPDATE dalton_user_integrations
+                SET preferences = %s,
+                    updated_at = NOW()
+                WHERE user_id = %s
+                  AND provider = %s
+                  AND service = %s
+                RETURNING {_INTEGRATION_META_COLS}
+                """,
+                (Jsonb(preferences), user_id, provider, service),
+            )
+            row = await cur.fetchone()
+    return _row_to_integration(dict(row)) if row is not None else None
+
+
+async def delete_expired_oauth_states_and_confirmations(
+    *,
+    conn: Any = None,
+) -> tuple[int, int]:
+    """Delete expired OAuth state and pending confirmation rows; returns ``(states_deleted, confirms_deleted)``."""
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM dalton_user_integration_oauth_states WHERE expires_at <= clock_timestamp()"
+            )
+            states_deleted = int(cur.rowcount or 0)
+            await cur.execute(
+                "DELETE FROM dalton_user_integration_pending_confirmations WHERE confirm_expires_at <= clock_timestamp()"
+            )
+            confirms_deleted = int(cur.rowcount or 0)
+    return states_deleted, confirms_deleted
+
+
+async def get_channel_feishu_open_id(
+    user_id: str,
+    *,
+    conn: Any = None,
+) -> str | None:
+    """Look up ``user_id``'s bound Feishu ``open_id`` in ``dalton_channel_identities``, if any (§4.3 item 2)."""
+    try:
+        async with get_db_connection(conn) as db_conn:
+            async with db_conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT platform_user_id
+                    FROM dalton_channel_identities
+                    WHERE user_id = %s
+                      AND platform = 'feishu'
+                    LIMIT 1
+                    """,
+                    (user_id,),
+                )
+                row = await cur.fetchone()
+        if row and row[0]:
+            return str(row[0]).strip() or None
+        return None
+    except Exception:
+        # Standalone core or stripped schemas without channel_gateway tables bind independently.
+        return None
+
+
+async def read_health_sweep_state(
+    *,
+    conn: Any = None,
+) -> dict[str, Any] | None:
+    """Read the singleton 12-hour health sweep coordination row."""
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT last_started_at, last_completed_at, last_worker_id, clock_timestamp() AS db_now
+                FROM dalton_integration_health_sweep_state
+                WHERE singleton = TRUE
+                """
+            )
+            row = await cur.fetchone()
+    return dict(row) if row is not None else None
+
+
+async def update_health_sweep_state(
+    *,
+    started: bool = False,
+    completed: bool = False,
+    worker_id: str | None = None,
+    conn: Any = None,
+) -> None:
+    """Update ``last_started_at`` / ``last_completed_at`` on the singleton sweep coordination row."""
+    sets = ["updated_at = NOW()"]
+    params: dict[str, Any] = {}
+    if started:
+        sets.append("last_started_at = NOW()")
+    if completed:
+        sets.append("last_completed_at = NOW()")
+    if worker_id is not None:
+        sets.append("last_worker_id = %(worker_id)s")
+        params["worker_id"] = worker_id
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                INSERT INTO dalton_integration_health_sweep_state (singleton)
+                VALUES (TRUE)
+                ON CONFLICT DO NOTHING
+                """
+            )
+            await cur.execute(
+                f"""
+                UPDATE dalton_integration_health_sweep_state
+                SET {', '.join(sets)}
+                WHERE singleton = TRUE
+                """,
+                params,
+            )

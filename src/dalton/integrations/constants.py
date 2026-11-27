@@ -1,10 +1,14 @@
-"""Authoritative OAuth callback and event route constants for personal integrations.
+"""Authoritative OAuth callback, event route, scope, and connector constants for personal integrations.
 
-Shared between personal integration OAuth flows and the deployment credentials
-management API so displayed callback URLs always match mounted routes.
+Shared between personal integration OAuth flows, capability gating, and the
+deployment credentials management API so displayed callback URLs and connector
+metadata always match mounted routes (§4.3, §6).
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
 
 from src.dalton.settings import get_dalton_public_app_url
 
@@ -16,6 +20,169 @@ _PROVIDER_CALLBACK_PATHS: dict[str, str] = {
     "google": GOOGLE_OAUTH_CALLBACK_PATH,
     "feishu": FEISHU_OAUTH_CALLBACK_PATH,
 }
+
+# ---------------------------------------------------------------------------
+# Least-privilege OAuth scopes (§3.3)
+# ---------------------------------------------------------------------------
+
+GOOGLE_SCOPE_OPENID = "openid"
+GOOGLE_SCOPE_EMAIL = "email"
+GOOGLE_SCOPE_CALENDAR_LIST_RO = (
+    "https://www.googleapis.com/auth/calendar.calendarlist.readonly"
+)
+GOOGLE_SCOPE_CALENDAR_EVENTS = "https://www.googleapis.com/auth/calendar.events"
+GOOGLE_SCOPE_GMAIL_READONLY = "https://www.googleapis.com/auth/gmail.readonly"
+GOOGLE_SCOPE_GMAIL_DRAFTS_CREATE = "https://www.googleapis.com/auth/gmail.drafts.create"
+GOOGLE_SCOPE_GMAIL_COMPOSE = "https://www.googleapis.com/auth/gmail.compose"
+
+GOOGLE_IDENTITY_SCOPES: tuple[str, ...] = (
+    GOOGLE_SCOPE_OPENID,
+    GOOGLE_SCOPE_EMAIL,
+)
+GOOGLE_CALENDAR_MIN_SCOPES: tuple[str, ...] = (
+    GOOGLE_SCOPE_CALENDAR_LIST_RO,
+    GOOGLE_SCOPE_CALENDAR_EVENTS,
+)
+GOOGLE_GMAIL_MIN_SCOPES: tuple[str, ...] = (GOOGLE_SCOPE_GMAIL_READONLY,)
+GOOGLE_GMAIL_DRAFT_SCOPES: tuple[str, ...] = (
+    GOOGLE_SCOPE_GMAIL_DRAFTS_CREATE,
+    GOOGLE_SCOPE_GMAIL_COMPOSE,
+)
+
+FEISHU_SCOPE_OFFLINE_ACCESS = "offline_access"
+FEISHU_CALENDAR_SCOPES: tuple[str, ...] = (
+    FEISHU_SCOPE_OFFLINE_ACCESS,
+    "calendar:calendar:readonly",
+    "calendar:calendar.event:read",
+    "calendar:calendar.event:create",
+    "calendar:calendar.event:update",
+    "calendar:calendar.event:delete",
+)
+FEISHU_MAIL_READONLY_SCOPES: tuple[str, ...] = (
+    FEISHU_SCOPE_OFFLINE_ACCESS,
+    "mail:user_mailbox.folder:read",
+    "mail:user_mailbox.message:readonly",
+    "mail:user_mailbox.message.address:read",
+    "mail:user_mailbox.message.subject:read",
+    "mail:user_mailbox.message.body:read",
+)
+FEISHU_MAIL_SEND_SCOPE = "mail:user_mailbox.message:send"
+
+# Feishu refresh error code classification (§4.2(2) item 5)
+# Routine credential/token failures always transition to needs_reauth (keep online history).
+FEISHU_NEEDS_REAUTH_CODES: frozenset[int] = frozenset(
+    {20024, 20063, 20037, 20005, 20064}
+)
+# Strict allowlist of Feishu error codes officially documented as user-initiated revocation.
+# Only codes in this set may trigger Scheme 2A purge from the token-refresh path.
+FEISHU_CONFIRMED_REVOKED_CODES: frozenset[int] = frozenset({20071})
+
+# Feishu webhook event type for user-initiated OAuth grant revocation (§3.2, §4.5(3))
+FEISHU_REVOKED_EVENT_TYPE = "auth.user_access_token.revoked_v4"
+
+# OAuth state and confirmation TTLs (§4.2(1))
+OAUTH_STATE_TTL_SECONDS = 600  # strict 10 minutes
+PENDING_CONFIRMATION_TTL_SECONDS = 300  # 5 minutes
+HEALTH_SWEEP_INTERVAL_SECONDS = 12 * 3600  # 12 hours
+
+DEFAULT_INTEGRATIONS_RETURN_TO = "/settings?tab=integrations"
+
+
+@dataclass(frozen=True, slots=True)
+class PersonalIntegrationConnectorSpec:
+    """Authoritative metadata for one personal calendar or mail connector (§6)."""
+
+    provider: Literal["google", "feishu"]
+    service: Literal["calendar", "mail"]
+    capability_id: str
+    env_var: str
+    credential_group: Literal["google_oauth", "feishu_app"]
+    everflow_default: bool
+    core_default: bool
+    batch: Literal[1, 2, 3]
+    callback_path: str
+    min_required_scopes: tuple[str, ...]
+    default_scopes: tuple[str, ...]
+    optional_scopes: tuple[str, ...] = ()
+    events_path: str | None = None
+
+
+PERSONAL_INTEGRATION_CONNECTOR_SPECS: tuple[PersonalIntegrationConnectorSpec, ...] = (
+    PersonalIntegrationConnectorSpec(
+        provider="google",
+        service="calendar",
+        capability_id="google_calendar",
+        env_var="DALTON_CAP_GOOGLE_CALENDAR",
+        credential_group="google_oauth",
+        everflow_default=True,
+        core_default=False,
+        batch=1,
+        callback_path=GOOGLE_OAUTH_CALLBACK_PATH,
+        min_required_scopes=GOOGLE_CALENDAR_MIN_SCOPES,
+        default_scopes=GOOGLE_IDENTITY_SCOPES + GOOGLE_CALENDAR_MIN_SCOPES,
+        optional_scopes=(),
+        events_path=None,
+    ),
+    PersonalIntegrationConnectorSpec(
+        provider="feishu",
+        service="calendar",
+        capability_id="feishu_calendar",
+        env_var="DALTON_CAP_FEISHU_CALENDAR",
+        credential_group="feishu_app",
+        everflow_default=True,
+        core_default=False,
+        batch=1,
+        callback_path=FEISHU_OAUTH_CALLBACK_PATH,
+        min_required_scopes=FEISHU_CALENDAR_SCOPES,
+        default_scopes=FEISHU_CALENDAR_SCOPES,
+        optional_scopes=(),
+        events_path=FEISHU_INTEGRATION_EVENTS_PATH,
+    ),
+    PersonalIntegrationConnectorSpec(
+        provider="feishu",
+        service="mail",
+        capability_id="feishu_mail",
+        env_var="DALTON_CAP_FEISHU_MAIL",
+        credential_group="feishu_app",
+        everflow_default=True,
+        core_default=False,
+        batch=2,
+        callback_path=FEISHU_OAUTH_CALLBACK_PATH,
+        min_required_scopes=FEISHU_MAIL_READONLY_SCOPES,
+        default_scopes=FEISHU_MAIL_READONLY_SCOPES,
+        optional_scopes=(FEISHU_MAIL_SEND_SCOPE,),
+        events_path=FEISHU_INTEGRATION_EVENTS_PATH,
+    ),
+    PersonalIntegrationConnectorSpec(
+        provider="google",
+        service="mail",
+        capability_id="google_gmail",
+        env_var="DALTON_CAP_GOOGLE_GMAIL",
+        credential_group="google_oauth",
+        everflow_default=True,
+        core_default=False,
+        batch=3,
+        callback_path=GOOGLE_OAUTH_CALLBACK_PATH,
+        min_required_scopes=GOOGLE_GMAIL_MIN_SCOPES,
+        default_scopes=GOOGLE_IDENTITY_SCOPES + GOOGLE_GMAIL_MIN_SCOPES,
+        optional_scopes=GOOGLE_GMAIL_DRAFT_SCOPES,
+        events_path=None,
+    ),
+)
+
+_CONNECTOR_BY_PAIR: dict[tuple[str, str], PersonalIntegrationConnectorSpec] = {
+    (spec.provider, spec.service): spec
+    for spec in PERSONAL_INTEGRATION_CONNECTOR_SPECS
+}
+
+
+def get_connector_spec(
+    provider: str, service: str
+) -> PersonalIntegrationConnectorSpec | None:
+    """Look up the authoritative connector spec for ``(provider, service)``."""
+    return _CONNECTOR_BY_PAIR.get(
+        (str(provider or "").strip().lower(), str(service or "").strip().lower())
+    )
 
 
 def build_integration_redirect_uri(provider: str) -> str:
@@ -39,9 +206,34 @@ def build_feishu_integration_events_url() -> str:
 
 
 __all__ = [
+    "DEFAULT_INTEGRATIONS_RETURN_TO",
+    "FEISHU_CALENDAR_SCOPES",
+    "FEISHU_CONFIRMED_REVOKED_CODES",
     "FEISHU_INTEGRATION_EVENTS_PATH",
+    "FEISHU_MAIL_READONLY_SCOPES",
+    "FEISHU_MAIL_SEND_SCOPE",
+    "FEISHU_NEEDS_REAUTH_CODES",
     "FEISHU_OAUTH_CALLBACK_PATH",
+    "FEISHU_REVOKED_EVENT_TYPE",
+    "FEISHU_SCOPE_OFFLINE_ACCESS",
+    "GOOGLE_CALENDAR_MIN_SCOPES",
+    "GOOGLE_GMAIL_DRAFT_SCOPES",
+    "GOOGLE_GMAIL_MIN_SCOPES",
+    "GOOGLE_IDENTITY_SCOPES",
     "GOOGLE_OAUTH_CALLBACK_PATH",
+    "GOOGLE_SCOPE_CALENDAR_EVENTS",
+    "GOOGLE_SCOPE_CALENDAR_LIST_RO",
+    "GOOGLE_SCOPE_EMAIL",
+    "GOOGLE_SCOPE_GMAIL_COMPOSE",
+    "GOOGLE_SCOPE_GMAIL_DRAFTS_CREATE",
+    "GOOGLE_SCOPE_GMAIL_READONLY",
+    "GOOGLE_SCOPE_OPENID",
+    "HEALTH_SWEEP_INTERVAL_SECONDS",
+    "OAUTH_STATE_TTL_SECONDS",
+    "PENDING_CONFIRMATION_TTL_SECONDS",
+    "PERSONAL_INTEGRATION_CONNECTOR_SPECS",
+    "PersonalIntegrationConnectorSpec",
     "build_feishu_integration_events_url",
     "build_integration_redirect_uri",
+    "get_connector_spec",
 ]

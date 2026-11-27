@@ -18,6 +18,8 @@ from src.dalton.deployment_credentials.router import (
 )
 # DALTON-HOOK(monitors): mount monitor panel endpoints under /api/v1/dalton/monitors
 from src.dalton.monitors.router import router as _monitors_router
+# DALTON-HOOK(personal-integrations): mount personal calendar/mail OAuth & revocation endpoints
+from src.dalton.app.integrations_router import router as _integrations_router
 from src.dalton.profile import is_core_profile
 from src.dalton.settings import log_dalton_startup_warnings
 
@@ -34,6 +36,8 @@ dalton_router.include_router(_chat_uploads_router)
 # DALTON-HOOK(monitors): include monitor panel router on dalton_router
 dalton_router.include_router(_monitors_router)
 dalton_router.include_router(_deployment_credentials_router)
+# DALTON-HOOK(personal-integrations): include personal integrations router on dalton_router
+dalton_router.include_router(_integrations_router)
 register_local_auth_routers(dalton_router)
 
 __all__ = ["dalton_router"]

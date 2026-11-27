@@ -108,6 +108,10 @@ class CapabilityId(StrEnum):
     PROBLEM_REPORTS = "problem_reports"  # 内部运行问题工单上报工具（report_issue）
     NATIVE_OAUTH_SYNC = "native_oauth_sync"  # 私有订阅 OAuth 模型目录与同步面板
     COLLEAGUE_SHARING = "colleague_sharing"  # 同事工作区共享与智能体跨区访问
+    GOOGLE_CALENDAR = "google_calendar"  # 个人 Google 日历 OAuth 连接与对话工具
+    FEISHU_CALENDAR = "feishu_calendar"  # 个人飞书日历 OAuth 连接与对话工具
+    FEISHU_MAIL = "feishu_mail"  # 个人飞书邮箱 OAuth 连接与对话工具
+    GOOGLE_GMAIL = "google_gmail"  # 个人 Gmail OAuth 连接与对话工具
 
 
 @dataclass(frozen=True)
@@ -275,6 +279,38 @@ _RAW_CAPABILITY_SPECS: tuple[CapabilitySpec, ...] = (
         everflow_default=True,
         core_default=False,
         yaml_keys=("capabilities.colleague_sharing",),
+    ),
+    CapabilitySpec(
+        id=CapabilityId.GOOGLE_CALENDAR,
+        description="个人 Google 日历连接与日程读写",
+        depends_on=(),
+        everflow_default=True,
+        core_default=False,
+        yaml_keys=("capabilities.google_calendar",),
+    ),
+    CapabilitySpec(
+        id=CapabilityId.FEISHU_CALENDAR,
+        description="个人飞书日历连接与日程读写",
+        depends_on=(),
+        everflow_default=True,
+        core_default=False,
+        yaml_keys=("capabilities.feishu_calendar",),
+    ),
+    CapabilitySpec(
+        id=CapabilityId.FEISHU_MAIL,
+        description="个人飞书邮箱连接与邮件检索收发",
+        depends_on=(),
+        everflow_default=True,
+        core_default=False,
+        yaml_keys=("capabilities.feishu_mail",),
+    ),
+    CapabilitySpec(
+        id=CapabilityId.GOOGLE_GMAIL,
+        description="个人 Gmail 连接与读信建草稿",
+        depends_on=(),
+        everflow_default=True,
+        core_default=False,
+        yaml_keys=("capabilities.google_gmail",),
     ),
 )
 
@@ -503,12 +539,82 @@ def has_capability(
     return cap_id in active
 
 
+PERSONAL_INTEGRATION_CAPABILITIES: tuple[CapabilityId, ...] = (
+    CapabilityId.GOOGLE_CALENDAR,
+    CapabilityId.FEISHU_CALENDAR,
+    CapabilityId.FEISHU_MAIL,
+    CapabilityId.GOOGLE_GMAIL,
+)
+
+_PERSONAL_INTEGRATION_CAP_MAP: Mapping[tuple[str, str], CapabilityId] = MappingProxyType(
+    {
+        ("google", "calendar"): CapabilityId.GOOGLE_CALENDAR,
+        ("feishu", "calendar"): CapabilityId.FEISHU_CALENDAR,
+        ("feishu", "mail"): CapabilityId.FEISHU_MAIL,
+        ("google", "mail"): CapabilityId.GOOGLE_GMAIL,
+    }
+)
+
+
+def personal_integration_capability(provider: str, service: str) -> CapabilityId | None:
+    """Map ``(provider, service)`` to its single personal integration ``CapabilityId`` (§6)."""
+    return _PERSONAL_INTEGRATION_CAP_MAP.get(
+        (str(provider or "").strip().lower(), str(service or "").strip().lower())
+    )
+
+
+def get_connector_providers_summary() -> dict[str, dict[str, Any]]:
+    """Return a redacted readiness summary for personal integration providers (§6).
+
+    Reads deployment credentials exclusively via ``get_credential_group(...)`` and
+    never includes secret values or client secrets.
+    """
+    from src.dalton.deployment_credentials.redirect_uri import (
+        google_redirect_uri_eligible,
+    )
+    from src.dalton.deployment_credentials.snapshot import get_credential_group
+    from src.dalton.settings import get_dalton_public_app_url
+    from src.server.database.encryption import encryption_configured
+
+    public_url = get_dalton_public_app_url().strip()
+    enc_ok = bool(encryption_configured())
+    g_group = get_credential_group("google_oauth")
+    g_uri_ok, g_uri_reason = google_redirect_uri_eligible(public_url)
+    f_group = get_credential_group("feishu_app")
+    f_event = get_credential_group("feishu_event")
+
+    return {
+        "google": {
+            "credentials_ready": bool(g_group.ready),
+            "source": g_group.source,
+            "redirect_uri_eligible": bool(g_uri_ok),
+            "redirect_uri_reason": g_uri_reason,
+            "encryption_configured": enc_ok,
+            "ready": bool(g_group.ready and g_uri_ok and enc_ok),
+        },
+        "feishu": {
+            "credentials_ready": bool(f_group.ready),
+            "source": f_group.source,
+            "event_credentials_ready": bool(f_event.ready),
+            "public_url_configured": bool(public_url),
+            "encryption_configured": enc_ok,
+            "ready": bool(f_group.ready and bool(public_url) and enc_ok),
+        },
+    }
+
+
 def capabilities_fingerprint(
     capabilities: frozenset[CapabilityId] | None = None,
 ) -> str:
-    """Return a deterministic 16-char hex digest of the enabled capability set."""
+    """Return a deterministic 16-char hex digest of enabled capabilities and connector provider readiness (§6)."""
     active = effective_capabilities() if capabilities is None else capabilities
-    canonical = ",".join(sorted(cap.value for cap in active))
+    canonical_caps = ",".join(sorted(cap.value for cap in active))
+    providers = get_connector_providers_summary()
+    canonical_providers = ",".join(
+        f"{name}:{int(bool(info.get('ready')))}:{int(bool(info.get('event_credentials_ready', False)))}"
+        for name, info in sorted(providers.items())
+    )
+    canonical = f"{canonical_caps}|connectors={canonical_providers}"
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
@@ -520,9 +626,11 @@ def get_capabilities_payload() -> dict[str, Any]:
     profile = resolve_profile()
     caps = effective_capabilities(profile=profile)
     brand_name = get_brand_name()
+    connector_providers = get_connector_providers_summary()
     return {
         "profile": profile.value,
         "capabilities": sorted(cap.value for cap in caps),
+        "connector_providers": connector_providers,
         "fingerprint": capabilities_fingerprint(caps),
         "brand_name": brand_name,
         "brand": {
@@ -530,6 +638,102 @@ def get_capabilities_payload() -> dict[str, Any]:
         },
         "ticker_logos": bool(GINLIX_DATA_ENABLED),
     }
+
+
+def require_personal_integration_capability(
+    provider: str | None,
+    service: str | None,
+    *,
+    mode: str = "connect",
+    has_existing_records: bool = False,
+    allow_feishu_event_configured: bool = False,
+) -> CapabilityId | None:
+    """Enforce per-service personal integration capability & runtime readiness (§6 item 1).
+
+    - ``mode == "connect"``: requires the exact single ``CapabilityId`` for
+      ``(provider, service)`` to be enabled (404 if disabled) AND runtime
+      credentials / public origin / encryption to be ready (503
+      ``personal_integrations_not_ready`` with explicit admin-configuration
+      guidance when not ready).
+    - ``mode == "manage"``: requires Dalton enabled (404 otherwise); always
+      allows access when any personal integration capability is enabled, when
+      ``has_existing_records`` is True (so users can disconnect/retry revokes
+      even after an admin disables a capability), or when
+      ``allow_feishu_event_configured`` is True and ``feishu_event`` credentials
+      are ready.
+    """
+    from fastapi import HTTPException
+    from src.dalton.settings import is_dalton_enabled
+
+    if not is_dalton_enabled():
+        raise HTTPException(status_code=404, detail="Dalton mode disabled")
+
+    active = effective_capabilities()
+    if mode == "manage":
+        if any(cap in active for cap in PERSONAL_INTEGRATION_CAPABILITIES):
+            return (
+                personal_integration_capability(provider, service)
+                if provider and service
+                else None
+            )
+        if has_existing_records:
+            return (
+                personal_integration_capability(provider, service)
+                if provider and service
+                else None
+            )
+        if allow_feishu_event_configured:
+            providers = get_connector_providers_summary()
+            if providers["feishu"]["event_credentials_ready"]:
+                return None
+        raise HTTPException(
+            status_code=404,
+            detail="Personal integration capabilities are not enabled",
+        )
+
+    if mode != "connect":
+        raise ValueError(f"Unsupported mode for require_personal_integration_capability: {mode!r}")
+
+    if not provider or not service:
+        raise HTTPException(status_code=400, detail="Provider and service are required")
+
+    cap = personal_integration_capability(provider, service)
+    if cap is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unsupported personal integration '{provider}/{service}'",
+        )
+    if cap not in active:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Capability '{cap.value}' is not enabled",
+        )
+
+    norm_provider = str(provider).strip().lower()
+    summary = get_connector_providers_summary().get(norm_provider)
+    if not summary or not summary.get("ready"):
+        missing: list[str] = []
+        if not summary or not summary.get("credentials_ready"):
+            missing.append("oauth_credentials")
+        if norm_provider == "google" and (not summary or not summary.get("redirect_uri_eligible")):
+            missing.append(
+                f"redirect_uri:{(summary or {}).get('redirect_uri_reason') or 'https_required'}"
+            )
+        if norm_provider == "feishu" and (not summary or not summary.get("public_url_configured")):
+            missing.append("public_app_url")
+        if not summary or not summary.get("encryption_configured"):
+            missing.append("encryption_key")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "personal_integrations_not_ready",
+                "message": "管理员尚未完成该个人集成的 OAuth 凭据或加密环境配置，请先在「部署设置 → 集成凭据」配置后再连接。",
+                "provider": norm_provider,
+                "service": str(service).strip().lower(),
+                "missing": missing,
+            },
+        )
+    return cap
 
 
 def require_capability(*caps: CapabilityId) -> None:
@@ -1016,6 +1220,9 @@ BACKGROUND_LOOP_REGISTRY: Mapping[str, CapabilityId | None] = MappingProxyType(
         "dalton-chat-upload-cleanup": CORE_CAPABILITY,
         "dalton-team-model-catalog-follow": CORE_CAPABILITY,
         "dalton-startup-watchlist-reconcile": CORE_CAPABILITY,
+        "dalton-personal-purge-resume": CORE_CAPABILITY,
+        "dalton-integration-revoke-retry": CORE_CAPABILITY,
+        "dalton-integration-health-sweep": CORE_CAPABILITY,
         # Filtered by filter_reconnectable_builtin_mcp (skips disabled servers like researchdata)
         "mcp-builtin-reconnect": CORE_CAPABILITY,
         # Upstream core platform background tasks & services
@@ -1298,6 +1505,16 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         # --- deployment_credentials/router.py (shared Core & Everflow admin settings) ---
         ("deployment_credentials/router.py", "get_deployment_settings_endpoint"): CORE_CAPABILITY,
         ("deployment_credentials/router.py", "put_deployment_settings_endpoint"): CORE_CAPABILITY,
+        # --- integrations_router.py (per-service single-capability gating in handlers, §6 item 1) ---
+        ("integrations_router.py", "list_personal_integrations_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "authorize_personal_integration_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "oauth_callback_personal_integration_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "confirm_personal_integration_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "update_personal_integration_preferences_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "disconnect_personal_integration_service_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "disconnect_personal_integration_provider_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "retry_personal_integration_revoke_endpoint"): CORE_CAPABILITY,
+        ("integrations_router.py", "feishu_integration_events_endpoint"): CORE_CAPABILITY,
     }
 )
 

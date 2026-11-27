@@ -14,7 +14,7 @@ Creates:
   ``personal_purge_generation``, ``personal_purged_turn_ranges``
 
 Revision ID: d06X
-Revises: d057
+Revises: d06W
 Create Date: 2026-11-26
 """
 
@@ -25,7 +25,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "d06X"
-down_revision: str | None = "d057"
+down_revision: str | None = "d06W"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -342,9 +342,31 @@ def upgrade() -> None:
         """
     )
 
+    # 8. Singleton multi-worker 12-hour health sweep coordination row
+    op.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dalton_integration_health_sweep_state (
+            singleton         BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+            last_started_at   TIMESTAMPTZ NULL,
+            last_completed_at TIMESTAMPTZ NULL,
+            last_worker_id    TEXT NULL,
+            updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+    op.execute(
+        """
+        INSERT INTO dalton_integration_health_sweep_state (singleton)
+        VALUES (TRUE)
+        ON CONFLICT DO NOTHING
+        """
+    )
+
 
 def downgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '5s'")
+
+    op.execute("DROP TABLE IF EXISTS dalton_integration_health_sweep_state")
 
     op.execute(
         """
