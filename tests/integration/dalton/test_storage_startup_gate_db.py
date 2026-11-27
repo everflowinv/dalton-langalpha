@@ -201,6 +201,8 @@ async def test_startup_warning_and_strict_check_real_pg(
                         (ptr_file_id, ws_id, digest, digest),
                     )
                 caplog.clear()
+                # App logging config may disable loggers created before it ran (dictConfig).
+                logging.getLogger("src.dalton.storage_refs").disabled = False
                 with caplog.at_level(logging.WARNING, logger="src.dalton.storage_refs"):
                     startup_warn = await storage_refs.warn_main_bucket_references_on_startup()
                 ws_out = next(o for o in startup_warn if o.name == "workspace_files")
@@ -263,6 +265,8 @@ async def test_startup_warning_and_strict_check_real_pg(
                         (f"https://app.example.com/storage/staging/avatars/{uid}.png", uid),
                     )
                 caplog.clear()
+                # App logging config may disable loggers created before it ran (dictConfig).
+                logging.getLogger("src.dalton.storage_refs").disabled = False
                 with caplog.at_level(logging.WARNING, logger="src.dalton.storage_refs"):
                     strict_avatar = await storage_refs.run_strict_main_bucket_check(
                         conn=conn, batch_size=50, env=site_env
