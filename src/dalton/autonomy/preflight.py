@@ -1617,6 +1617,7 @@ async def _conclude_preflight(
                 if not s.get("signal_id") or str(s["signal_id"]) in claimed_ids
             ]
             if not woke_signals:
+                log_signals = [{"degraded_sources": degraded_sources}] if degraded_sources else []
                 if persist and not _wake_already_committed(probe_progress):
                     try:
                         await watch_db.insert_preflight_log(
@@ -1625,7 +1626,7 @@ async def _conclude_preflight(
                             workspace_id=workspace_id,
                             decision="skip",
                             reason="already_claimed_by_concurrent_run",
-                            signals=[],
+                            signals=log_signals,
                         )
                     except Exception as e:
                         logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
@@ -1635,9 +1636,11 @@ async def _conclude_preflight(
                     reason="already_claimed_by_concurrent_run",
                     signals=[],
                     wake_context=None,
+                    degraded_sources=degraded_sources,
                 )
         except Exception as e:
             logger.warning("[DALTON_PREFLIGHT] claim_signals_woken failed: %s", e)
+            log_signals = [{"degraded_sources": degraded_sources}] if degraded_sources else []
             if persist and not _wake_already_committed(probe_progress):
                 try:
                     await watch_db.insert_preflight_log(
@@ -1646,7 +1649,7 @@ async def _conclude_preflight(
                         workspace_id=workspace_id,
                         decision="skip",
                         reason="claim_failed",
-                        signals=[],
+                        signals=log_signals,
                     )
                 except Exception as log_err:
                     logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", log_err)
@@ -1656,6 +1659,7 @@ async def _conclude_preflight(
                 reason="claim_failed",
                 signals=[],
                 wake_context=None,
+                degraded_sources=degraded_sources,
             )
 
     # A real wake happened: the stale-todo sweep-up rides along, and only then
@@ -2205,6 +2209,7 @@ async def _preflight_check_inner(
                     or state.get("cnhk_probe_truncated_this_run") is True
                     or bool(state.get("cnhk_probe_unresolved_truncated_dates"))
                     or bool(state.get("cnhk_probe_resume_pages"))
+                    or bool(state.get("cnhk_probe_page_backoff"))
                 ):
                     _note_probe_not_succeeded(probe_progress)
                     _note_probe_degraded(probe_progress, probe_name)

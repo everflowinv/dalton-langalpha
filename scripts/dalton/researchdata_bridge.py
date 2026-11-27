@@ -2411,7 +2411,7 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "search": "ask",
         },
         "accepted_params": ["ticker", "query", "start", "end", "limit", "params"],
-        "accepted_nested_params": ["max_pages", "start_page", "deadline_s"],
+        "accepted_nested_params": ["max_pages", "start_page", "deadline_at", "deadline_s"],
         "required_params": {
             "filings": ["ticker", "start", "end"],
             "ask": ["query"],
@@ -4438,7 +4438,7 @@ def _normalize_and_validate_call_args(
                 "unsupported_parameters": cn_hk_refused,
                 "error": (
                     f"[参数错误] cn-hk operation='{eff_op}' 不接受 {cn_hk_refused}："
-                    "filings 用 ticker/start/end（可选 params.max_pages/start_page/deadline_s）；quote 只用 ticker（当前报价，没有历史日期）；"
+                    "filings 用 ticker/start/end（可选 params.max_pages/start_page/deadline_at/deadline_s）；quote 只用 ticker（当前报价，没有历史日期）；"
                     "自然语言问题用 operation='ask'，公司和日期写进 query。"
                 ),
                 "normalized_params": norm_view,
@@ -4458,6 +4458,25 @@ def _normalize_and_validate_call_args(
                         "error_category": "参数错误",
                         "error": f"[参数错误] cn-hk filings 的 params.{cn_pk} 须为 1–{cn_max} 的正整数（当前为 {cn_pv!r}）。",
                         "hint": f"请将 params.{cn_pk} 设为 1–{cn_max} 的整数，或省略该参数。",
+                        "normalized_params": norm_view,
+                    }
+            cn_da = normalized["params"].get("deadline_at")
+            if cn_da is not None:
+                if (
+                    isinstance(cn_da, bool)
+                    or not isinstance(cn_da, (int, float))
+                    or not math.isfinite(float(cn_da))
+                    or not 0 < float(cn_da) < 1e11
+                ):
+                    return normalized, norm_view, {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "invalid_nested_param_value",
+                        "error_category": "参数错误",
+                        "error": f"[参数错误] cn-hk filings 的 params.deadline_at 须为有效的 Unix 时间戳（秒）（当前为 {cn_da!r}）。",
+                        "hint": "请将 params.deadline_at 设为正的 Unix 时间戳（秒），或省略该参数。",
                         "normalized_params": norm_view,
                     }
             cn_dl = normalized["params"].get("deadline_s")
@@ -8271,7 +8290,47 @@ class ResearchDataBridge:
                 "x-search",
             }
 
-    def compute_timeout(self, tool_name: str, arguments: dict[str, Any]) -> int:
+    @staticmethod
+    def _extract_cnhk_deadline_remaining_s(
+        arguments: Mapping[str, Any],
+        *,
+        now_ts: float | None = None,
+    ) -> float | None:
+        """Return remaining seconds until cn-hk filings deadline_at (or legacy deadline_s)."""
+        route = str(arguments.get("route") or "").strip()
+        if route != "cn-hk":
+            return None
+        params = arguments.get("params")
+        if not isinstance(params, Mapping):
+            return None
+        raw_at = params.get("deadline_at")
+        if (
+            raw_at is not None
+            and not isinstance(raw_at, bool)
+            and isinstance(raw_at, (int, float))
+            and math.isfinite(float(raw_at))
+            and 0 < float(raw_at) < 1e11
+        ):
+            cur = time.time() if now_ts is None else float(now_ts)
+            return max(0.0, float(raw_at) - cur)
+        raw_s = params.get("deadline_s")
+        if (
+            raw_s is not None
+            and not isinstance(raw_s, bool)
+            and isinstance(raw_s, (int, float))
+            and math.isfinite(float(raw_s))
+            and float(raw_s) > 0
+        ):
+            return min(float(raw_s), 600.0)
+        return None
+
+    def compute_timeout(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        now_ts: float | None = None,
+    ) -> int:
         """Compute clamped timeout in seconds for a tool call."""
         ceiling = max(10, self.cfg.caller_budget_s - 25)
         if tool_name == "catalog":
@@ -8297,7 +8356,11 @@ class ResearchDataBridge:
             chosen = min(req_timeout, max_s)
         else:
             chosen = default_s
-        return max(5, min(chosen, max_s, ceiling))
+        orig_timeout = max(5, min(chosen, max_s, ceiling))
+        cnhk_rem_s = self._extract_cnhk_deadline_remaining_s(arguments, now_ts=now_ts)
+        if cnhk_rem_s is not None:
+            return min(orig_timeout, max(1, int(math.ceil(cnhk_rem_s + 5.0))))
+        return orig_timeout
 
     def _research_code_root(self) -> Path:
         """Resolve active research_runtime code directory."""
@@ -14557,6 +14620,25 @@ class ResearchDataBridge:
                     remaining_budget_s = max(
                         5.0, float(eff_timeout) - elapsed_so_far + 5.0
                     )
+                    if tool_name != "catalog" and route == "cn-hk":
+                        cnhk_rem_after_q = self._extract_cnhk_deadline_remaining_s(call_args)
+                        if cnhk_rem_after_q is not None:
+                            params_map = call_args.get("params")
+                            if (
+                                isinstance(params_map, Mapping)
+                                and params_map.get("deadline_at") is None
+                                and params_map.get("deadline_s") is not None
+                            ):
+                                cnhk_rem_after_q = max(0.0, cnhk_rem_after_q - elapsed_so_far)
+                            subproc_cap_s = min(float(eff_timeout), cnhk_rem_after_q + 5.0)
+                            remaining_budget_s = min(remaining_budget_s, max(1.0, subproc_cap_s))
+                            call_args["timeout"] = max(
+                                1,
+                                min(
+                                    int(call_args.get("timeout") or eff_timeout),
+                                    int(math.ceil(cnhk_rem_after_q + 5.0)),
+                                ),
+                            )
                     rpc_req = {
                         "jsonrpc": "2.0",
                         "id": req_id if req_id is not None else 1,

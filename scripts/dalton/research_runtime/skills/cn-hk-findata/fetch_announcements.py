@@ -88,7 +88,8 @@ CNINFO_MAX_PAGE_SIZE = 30
 DEFAULT_SINGLE_DAY_MAX_PAGES = 5
 CNINFO_PAGE_TIMEOUT_S = 20.0
 CNINFO_ORG_ID_TIMEOUT_S = 15.0
-CNINFO_DEADLINE_MARGIN_S = 0.5
+CNINFO_RETURN_MARGIN_S = 1.5
+CNINFO_DEADLINE_MARGIN_S = CNINFO_RETURN_MARGIN_S
 
 
 def _summarize_page_error(exc: Exception) -> str:
@@ -114,8 +115,9 @@ def fetch_announcements(
     date_from: str = "",
     date_to: str = "",
     start_page: int = 1,
+    deadline_at: float | None = None,
     deadline_s: float | None = None,
-    clock=time.monotonic,
+    clock=None,
 ):
     stock_code = normalize_ticker(ticker)
     market = resolve_market(stock_code)
@@ -125,20 +127,28 @@ def fetch_announcements(
         "X-Requested-With": "XMLHttpRequest",
     }
 
-    deadline_at = None
+    now_fn = clock if clock is not None else (time.time if deadline_at is not None else time.monotonic)
+    eff_deadline_at = None
     stop_margin_s = 0.0
-    if deadline_s is not None and not isinstance(deadline_s, bool):
+    if deadline_at is not None and not isinstance(deadline_at, bool):
+        cand_at = float(deadline_at)
+        if math.isfinite(cand_at) and cand_at > 0:
+            eff_deadline_at = cand_at
+            stop_margin_s = CNINFO_RETURN_MARGIN_S
+    elif deadline_s is not None and not isinstance(deadline_s, bool):
         eff_deadline_s = float(deadline_s)
         if math.isfinite(eff_deadline_s) and eff_deadline_s > 0:
-            deadline_at = clock() + eff_deadline_s
-            stop_margin_s = min(CNINFO_DEADLINE_MARGIN_S, eff_deadline_s * 0.1)
+            eff_deadline_at = now_fn() + eff_deadline_s
+            stop_margin_s = min(CNINFO_RETURN_MARGIN_S, eff_deadline_s * 0.3)
+
+    stop_at = (eff_deadline_at - stop_margin_s) if eff_deadline_at is not None else None
 
     org_id = ""
     try:
-        if deadline_at is None:
+        if stop_at is None:
             org_id = get_org_id(stock_code, headers, timeout=CNINFO_ORG_ID_TIMEOUT_S)
         else:
-            rem_for_org = deadline_at - clock()
+            rem_for_org = stop_at - now_fn()
             if rem_for_org > 0:
                 org_timeout = min(CNINFO_ORG_ID_TIMEOUT_S, min(5.0, rem_for_org * 0.4))
                 org_id = get_org_id(stock_code, headers, timeout=org_timeout)
@@ -166,18 +176,14 @@ def fetch_announcements(
     deadline_reached = False
 
     for page in range(start_page, end_page + 1):
-        if deadline_at is not None:
-            remaining = deadline_at - clock()
-            if pages_fetched > 0 and remaining <= stop_margin_s:
-                has_more = True
-                next_page = page
-                deadline_reached = True
-                break
+        if stop_at is not None:
+            remaining = stop_at - now_fn()
             if remaining <= 0:
                 has_more = True
                 next_page = page
                 deadline_reached = True
-                page_error = "deadline_exceeded"
+                if pages_fetched == 0:
+                    page_error = "deadline_exceeded"
                 break
             req_timeout = min(CNINFO_PAGE_TIMEOUT_S, remaining)
         else:
@@ -524,7 +530,8 @@ def main():
     parser.add_argument("--limit", type=int, default=10, help="Number of filings to return")
     parser.add_argument("--max-pages", type=int, default=None, help="How many pages to crawl from Cninfo (default: 5 for single-day, 1 otherwise)")
     parser.add_argument("--start-page", type=int, default=1, help="1-based start page for Cninfo pagination")
-    parser.add_argument("--deadline-s", type=float, default=None, help="Total time budget in seconds for paginated announcement fetch")
+    parser.add_argument("--deadline-at", type=float, default=None, help="Absolute Unix timestamp (seconds) cutoff for paginated announcement fetch")
+    parser.add_argument("--deadline-s", type=float, default=None, help="Total time budget in seconds for paginated announcement fetch (legacy compat)")
     parser.add_argument("--date-from", type=str, default="", help="Start date YYYY-MM-DD (optional)")
     parser.add_argument("--date-to", type=str, default="", help="End date YYYY-MM-DD (optional)")
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
@@ -582,6 +589,7 @@ def main():
             date_from=args.date_from,
             date_to=args.date_to,
             start_page=args.start_page,
+            deadline_at=args.deadline_at,
             deadline_s=args.deadline_s,
         )
 

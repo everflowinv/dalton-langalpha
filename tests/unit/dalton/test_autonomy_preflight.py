@@ -1957,7 +1957,9 @@ async def test_probe_cnhk_filings_full_contract(
         end: str,
         limit: int = 50,
         timeout_s: Optional[float] = None,
+        deadline_at: Optional[float] = None,
         deadline_s: Optional[float] = None,
+        wall_clock: Any = None,
     ) -> dict[str, Any]:
         queried_windows.append((start, end))
         if (start, end) == ("2026-10-19", "2026-10-22"):
@@ -2036,7 +2038,9 @@ async def test_probe_cnhk_filings_full_contract(
         end: str,
         limit: int = 50,
         timeout_s: Optional[float] = None,
+        deadline_at: Optional[float] = None,
         deadline_s: Optional[float] = None,
+        wall_clock: Any = None,
     ) -> dict[str, Any]:
         if (start, end) == ("2026-10-19", "2026-10-22"):
             return {
@@ -2079,7 +2083,9 @@ async def test_probe_cnhk_filings_full_contract(
         end: str,
         limit: int = 50,
         timeout_s: Optional[float] = None,
+        deadline_at: Optional[float] = None,
         deadline_s: Optional[float] = None,
+        wall_clock: Any = None,
     ) -> dict[str, Any]:
         nonlocal fake_now_s
         budget_queried_windows.append((start, end))
@@ -2142,7 +2148,9 @@ async def test_probe_cnhk_filings_full_contract(
         end: str,
         limit: int = 50,
         timeout_s: Optional[float] = None,
+        deadline_at: Optional[float] = None,
         deadline_s: Optional[float] = None,
+        wall_clock: Any = None,
     ) -> dict[str, Any]:
         nonlocal fake_now_s
         fake_now_s += 26.0  # Exceeds 25s budget on the initial parent query
@@ -7144,7 +7152,8 @@ async def test_cnhk_page2_error_preserves_page1_resumes_and_backoffs_on_repeat(
     assert persisted_state["cnhk_probe_resume_pages"] == {"2026-10-22": 2}
     assert persisted_state["cnhk_probe_degraded"] is False
 
-    # Round 2: page 2 fails AGAIN -> triggers backoff, preserves resume_pages={2026-10-22: 2}, watermark stays 2026-10-21
+    # Round 2: page 2 fails AGAIN -> triggers per-page backoff (NOT whole-probe backoff),
+    # preserves resume_pages={2026-10-22: 2}, watermark stays 2026-10-21
     page2_mode["state"] = "fail_r2"
     r2_state_in = copy.deepcopy(doubles["states"][-1])
     res_r2 = await preflight_check(
@@ -7157,16 +7166,21 @@ async def test_cnhk_page2_error_preserves_page1_resumes_and_backoffs_on_repeat(
     assert res_r2.should_wake is False
     assert res_r2.degraded_sources == ["cnhk"]
     saved_after_r2 = copy.deepcopy(doubles["states"][-1])
-    assert saved_after_r2["cnhk_probe_degraded"] is True
+    assert saved_after_r2["cnhk_probe_degraded"] is False
+    assert saved_after_r2["cnhk_probe_partial"] is True
     assert saved_after_r2["cnhk_probe_resume_pages"] == {"2026-10-22": 2}
     assert saved_after_r2["last_cnhk_check_date"] == "2026-10-21"
-    in_bo, _ = is_in_backoff(saved_after_r2, "cnhk")
-    assert in_bo is True
+    # Same-page backoff is scoped to (2026-10-22, page=2); whole cnhk probe is NOT put into backoff
+    in_whole_bo, _ = is_in_backoff(saved_after_r2, "cnhk")
+    assert in_whole_bo is False
+    assert saved_after_r2["cnhk_probe_page_backoff"]["2026-10-22"]["page"] == 2
+    assert saved_after_r2["cnhk_probe_page_backoff"]["2026-10-22"]["attempt"] == 1
 
-    # Round 3: expire backoff, page 2 recovers -> wakes ONLY on page 2 P1, advances watermark, clears backoff & resume
+    # Round 3: expire per-page backoff, page 2 recovers -> wakes ONLY on page 2 P1,
+    # advances watermark, clears per-page backoff & resume
     page2_mode["state"] = "ok"
     r3_state_in = copy.deepcopy(saved_after_r2)
-    r3_state_in["probe_backoff"]["cnhk"]["not_before"] = "2020-01-01T00:00:00+00:00"
+    r3_state_in["cnhk_probe_page_backoff"]["2026-10-22"]["not_before"] = "2020-01-01T00:00:00+00:00"
     res_r3 = await preflight_check(
         _company_watch_automation(),
         "exec-cnhk-p2err-r3",
@@ -7180,6 +7194,7 @@ async def test_cnhk_page2_error_preserves_page1_resumes_and_backoffs_on_repeat(
     saved_after_r3 = copy.deepcopy(doubles["states"][-1])
     assert saved_after_r3["last_cnhk_check_date"] == "2026-10-22"
     assert "cnhk_probe_resume_pages" not in saved_after_r3
+    assert "cnhk_probe_page_backoff" not in saved_after_r3
     assert "cnhk_probe_partial" not in saved_after_r3
     assert "cnhk" not in saved_after_r3.get("probe_backoff", {})
 
@@ -7214,7 +7229,7 @@ async def test_cnhk_deadline_propagates_and_stops_after_one_page_then_resumes(
     cn_hk_route = next(r for r in dg_mod.catalog()["routes"] if r["id"] == "cn-hk")
     ts_ms = int(datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
 
-    # 1. Verify _fetch_bridge_route_sync sends params.deadline_s and sets HTTP timeout = deadline_s + headroom
+    # 1. Verify _fetch_bridge_route_sync sends params.deadline_at and sets HTTP timeout = (deadline_at - now) + headroom
     captured_urlopen: dict[str, Any] = {}
 
     def _fake_urlopen(req: Any, timeout: float = 0.0) -> Any:
@@ -7238,19 +7253,22 @@ async def test_cnhk_deadline_propagates_and_stops_after_one_page_then_resumes(
         "urlopen",
         create_autospec(urllib.request.urlopen, side_effect=_fake_urlopen),
     )
+    base_wall = 1_795_000_000.0
     sync_out = cnhk_mod._fetch_bridge_route_sync(
         bridge_url="http://127.0.0.1:8960/mcp/tok",
         ticker="00700",
         start="2026-10-22",
         end="2026-10-22",
         limit=50,
-        deadline_s=5.0,
+        deadline_at=base_wall + 5.0,
+        wall_clock=lambda: base_wall,
     )
     assert sync_out["ok"] is True
-    assert captured_urlopen["body"]["params"]["arguments"]["params"]["deadline_s"] == 5.0
+    assert captured_urlopen["body"]["params"]["arguments"]["params"]["deadline_at"] == pytest.approx(base_wall + 5.0)
+    assert "deadline_s" not in captured_urlopen["body"]["params"]["arguments"]["params"]
     assert captured_urlopen["timeout"] == pytest.approx(5.0 + cnhk_mod.CNHK_PROBE_HTTP_TIMEOUT_MARGIN_S)
 
-    # 2. Verify data_gateway.build_command forwards --deadline-s and rejects invalid values
+    # 2. Verify data_gateway.build_command forwards --deadline-at (and legacy --deadline-s) and rejects invalid values
     def _ns(params_obj: Any = None, timeout: int = 60) -> argparse.Namespace:
         return argparse.Namespace(
             operation="filings",
@@ -7271,14 +7289,21 @@ async def test_cnhk_deadline_propagates_and_stops_after_one_page_then_resumes(
             params_json=json.dumps(params_obj) if params_obj is not None else None,
         )
 
+    monkeypatch.setattr(dg_mod.time, "time", create_autospec(dg_mod.time.time, return_value=base_wall))
+    cmd_da = dg_mod.build_command(cn_hk_route, _ns({"deadline_at": base_wall + 5.0}))
+    assert float(cmd_da[cmd_da.index("--deadline-at") + 1]) == pytest.approx(base_wall + 5.0)
     cmd_dl = dg_mod.build_command(cn_hk_route, _ns({"deadline_s": 5.0}))
     assert cmd_dl[cmd_dl.index("--deadline-s") + 1] == "5"
+    with pytest.raises(ValueError, match="deadline_at"):
+        dg_mod.build_command(cn_hk_route, _ns({"deadline_at": 0}))
+    with pytest.raises(ValueError, match="deadline_at"):
+        dg_mod.build_command(cn_hk_route, _ns({"deadline_at": True}))
     with pytest.raises(ValueError, match="deadline_s"):
         dg_mod.build_command(cn_hk_route, _ns({"deadline_s": 0}))
     with pytest.raises(ValueError, match="deadline_s"):
         dg_mod.build_command(cn_hk_route, _ns({"deadline_s": True}))
 
-    # 3. Single day with 35 filings and a deadline allowing only 1 page (5.0s; page 1 takes 4.8s -> stops before page 2)
+    # 3. Single day with 35 filings and a deadline allowing only 1 page (5.0s; page 1 takes 3.5s -> stops before page 2)
     all_35 = [
         {
             "announcementTitle": f"例行公告-{i:03d}",
@@ -7292,22 +7317,22 @@ async def test_cnhk_deadline_propagates_and_stops_after_one_page_then_resumes(
     pages_requested_per_round: list[list[int]] = []
 
     async def _bridge_with_deadline(**kwargs: Any) -> dict[str, Any]:
-        req_dl = kwargs.get("deadline_s")
-        assert req_dl is not None and req_dl > 0
+        req_da = kwargs.get("deadline_at")
+        assert req_da is not None and req_da > 0
         cmd = dg_mod.build_command(
             cn_hk_route,
             _ns(
                 {
                     **({"start_page": kwargs["start_page"]} if kwargs.get("start_page") else {}),
-                    "deadline_s": req_dl,
+                    "deadline_at": req_da,
                 }
             ),
         )
-        cmd_dl_val = float(cmd[cmd.index("--deadline-s") + 1])
+        cmd_da_val = float(cmd[cmd.index("--deadline-at") + 1])
         cmd_start_page = int(cmd[cmd.index("--start-page") + 1]) if "--start-page" in cmd else 1
         cmd_max_pages = int(cmd[cmd.index("--max-pages") + 1])
 
-        fake_t = [100.0]
+        fake_t = [base_wall]
         round_pages: list[int] = []
 
         def _script_clock() -> float:
@@ -7326,8 +7351,8 @@ async def test_cnhk_deadline_propagates_and_stops_after_one_page_then_resumes(
             page_num = int(req_data.get("pageNum", 1))
             round_pages.append(page_num)
             page_timeouts_seen.append(float(timeout))
-            # Each page takes 4.8s; with 5.0s deadline, 0.2s remains (<= 0.5s margin) -> stops after 1 page.
-            fake_t[0] += 4.8
+            # Each page takes 3.6s; with 5.0s deadline and 1.5s return margin (stop at +3.5s) -> stops after 1 page.
+            fake_t[0] += 3.6
             off = (page_num - 1) * 30
             chunk = all_35[off : off + 30]
             resp.json.return_value = {
@@ -7345,7 +7370,7 @@ async def test_cnhk_deadline_propagates_and_stops_after_one_page_then_resumes(
             date_from=kwargs["start"],
             date_to=kwargs["end"],
             start_page=cmd_start_page,
-            deadline_s=cmd_dl_val,
+            deadline_at=cmd_da_val,
             clock=_script_clock,
         )
         if kwargs["start"] == kwargs["end"] == "2026-10-22":
@@ -7371,6 +7396,7 @@ async def test_cnhk_deadline_propagates_and_stops_after_one_page_then_resumes(
         today=date(2026, 10, 22),
         now=now_et,
         limit=50,
+        wall_clock=lambda: base_wall,
         request_deadline_s=5.0,
     )
     assert len(s1) == 30
@@ -7378,8 +7404,8 @@ async def test_cnhk_deadline_propagates_and_stops_after_one_page_then_resumes(
     assert st["cnhk_probe_degraded"] is False
     assert st["cnhk_probe_resume_pages"] == {"2026-10-22": 2}
     assert st["last_cnhk_check_date"] == "2026-10-21"
-    # Verify per-page timeout was clamped to min(20, remaining) <= 5.0
-    assert page_timeouts_seen and all(0 < t <= 5.0 for t in page_timeouts_seen)
+    # Verify per-page timeout was clamped to min(20, stop_at - now) <= 3.5
+    assert page_timeouts_seen and all(0 < t <= 3.5 + 1e-6 for t in page_timeouts_seen)
 
     s2, st = await probe_cnhk_filings(
         ticker="0700.HK",
@@ -7388,6 +7414,7 @@ async def test_cnhk_deadline_propagates_and_stops_after_one_page_then_resumes(
         today=date(2026, 10, 22),
         now=now_et,
         limit=50,
+        wall_clock=lambda: base_wall,
         request_deadline_s=5.0,
     )
     assert len(s2) == 5
@@ -7631,3 +7658,475 @@ async def test_preflight_cnhk_incomplete_pagination_carries_degraded_sources_on_
     assert res_p1_wake.degraded_sources == ["cnhk"]
     assert doubles["logs"][-1]["decision"] == "wake"
     assert {"degraded_sources": ["cnhk"]} in doubles["logs"][-1]["signals"]
+
+
+@pytest.mark.asyncio
+async def test_cnhk_absolute_deadline_survives_bridge_queue_and_slow_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """桥排队与起进程耗时 3 秒 + 慢页时，共享绝对 deadline_at 让脚本在回传余量前停止，探针仍收到第 1 页与 next_page。"""
+    import argparse
+    import importlib.util
+    import io
+    import subprocess
+    import urllib.request
+    from pathlib import Path
+
+    fa_mod, dg_mod = _load_cnhk_runtime_modules(monkeypatch)
+    real_requests_post = fa_mod.requests.post
+    real_resp_cls = fa_mod.requests.Response
+    real_popen = subprocess.Popen
+    cn_hk_route = next(r for r in dg_mod.catalog()["routes"] if r["id"] == "cn-hk")
+
+    repo_root = Path(__file__).resolve().parents[3]
+    bridge_spec = importlib.util.spec_from_file_location(
+        "test_cnhk_r3_bridge",
+        repo_root / "scripts" / "dalton" / "researchdata_bridge.py",
+    )
+    assert bridge_spec is not None and bridge_spec.loader is not None
+    bridge_mod = importlib.util.module_from_spec(bridge_spec)
+    bridge_spec.loader.exec_module(bridge_mod)
+
+    ts_ms = int(datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    all_35 = [
+        {
+            "announcementTitle": f"例行公告-{i:03d}",
+            "announcementTime": ts_ms - i * 1000,
+            "adjunctUrl": f"finalpage/2026-10-22/{i:03d}.PDF",
+        }
+        for i in range(1, 36)
+    ]
+
+    # Shared fake wall clock across probe -> bridge -> gateway -> fetch_announcements
+    fake_now = [1_795_000_000.0]
+
+    def _wall_clock() -> float:
+        return fake_now[0]
+
+    monkeypatch.setattr(dg_mod.time, "time", create_autospec(dg_mod.time.time, side_effect=_wall_clock))
+    monkeypatch.setenv("DALTON_BRIDGE_MCP_URL", "http://127.0.0.1:8960/mcp/test-tok")
+    from src.dalton import capabilities as cap_mod
+    monkeypatch.setattr(
+        cap_mod,
+        "has_capability",
+        create_autospec(cap_mod.has_capability, return_value=True),
+    )
+
+    bridge_timeouts_seen: list[int] = []
+    http_timeouts_seen: list[float] = []
+    page_timeouts_seen: list[float] = []
+    pages_called: list[int] = []
+
+    bridge_cfg = bridge_mod.BridgeConfig()
+    bridge_svc = bridge_mod.ResearchDataBridge(bridge_cfg)
+
+    def _simulated_urlopen(req: Any, timeout: float = 0.0) -> Any:
+        t_start = fake_now[0]
+        http_timeouts_seen.append(float(timeout))
+        rpc_body = json.loads(req.data.decode("utf-8"))
+        tool_name = rpc_body["params"]["name"]
+        arguments = rpc_body["params"]["arguments"]
+
+        # 1. Bridge validates args and clamps cn-hk timeout to min(orig_timeout, remaining + 5)
+        _, _, val_err = bridge_mod._normalize_and_validate_call_args(tool_name, dict(arguments))
+        assert val_err is None
+        bridge_to = bridge_svc.compute_timeout(tool_name, dict(arguments), now_ts=fake_now[0])
+        bridge_timeouts_seen.append(bridge_to)
+        assert bridge_to == 13  # min(240, ceil(8.0 + 5.0))
+
+        # 2. Simulate 3.0s bridge queue + MCP/gateway/adapter process startup + heavy imports
+        fake_now[0] += 3.0
+
+        # Post-queue bridge cap drops with elapsed queue time (remaining=5.0 -> cap=10)
+        rem_after_q = bridge_svc._extract_cnhk_deadline_remaining_s(arguments, now_ts=fake_now[0])
+        assert rem_after_q == pytest.approx(5.0)
+        gw_timeout = min(bridge_to, int(rem_after_q + 5.0))
+        assert gw_timeout == 10
+
+        # 3. data_gateway builds command forwarding --deadline-at
+        params_dict = arguments.get("params") or {}
+        ns = argparse.Namespace(
+            operation=arguments["operation"],
+            ticker=arguments["ticker"],
+            query=None,
+            series=None,
+            concept=None,
+            item=None,
+            document=None,
+            form=None,
+            dataset=None,
+            start=arguments["start"],
+            end=arguments["end"],
+            as_of=None,
+            vintage=None,
+            limit=arguments["limit"],
+            timeout=gw_timeout,
+            params_json=json.dumps(params_dict),
+        )
+        cmd = dg_mod.build_command(cn_hk_route, ns)
+        cmd_deadline_at = float(cmd[cmd.index("--deadline-at") + 1])
+        assert cmd_deadline_at == pytest.approx(t_start + 8.0)
+
+        # 4. fetch_announcements runs with shared wall clock; orgId takes 0.2s, slow page 1 takes 3.3s
+        #    leaving 0.0s before (deadline_at - 1.5s) -> stops cleanly after page 1 with next_page=2.
+        def _slow_cninfo_post(
+            url: str,
+            data: dict[str, Any] | None = None,
+            headers: Any = None,
+            timeout: float = 20,
+        ) -> Any:
+            resp = create_autospec(real_resp_cls, instance=True)
+            resp.raise_for_status.return_value = None
+            if "topSearch" in url:
+                fake_now[0] += 0.2
+                resp.json.return_value = [{"orgId": "9900000700"}]
+                return resp
+            req_data = data or {}
+            page_num = int(req_data.get("pageNum", 1))
+            pages_called.append(page_num)
+            page_timeouts_seen.append(float(timeout))
+            if "2026-10-22" not in str(req_data.get("seDate") or ""):
+                fake_now[0] += 0.1
+                resp.json.return_value = {"announcements": [], "hasMore": False, "totalAnnouncement": 0}
+                return resp
+            # Slow page takes 3.3s (matching the remaining work window before deadline_at - 1.5s)
+            fake_now[0] += 3.3
+            off = (page_num - 1) * 30
+            chunk = all_35[off : off + 30]
+            resp.json.return_value = {
+                "announcements": chunk,
+                "hasMore": (off + len(chunk)) < len(all_35),
+                "totalAnnouncement": len(all_35),
+            }
+            return resp
+
+        monkeypatch.setattr(fa_mod.requests, "post", create_autospec(real_requests_post, side_effect=_slow_cninfo_post))
+        script_out = fa_mod.fetch_announcements(
+            arguments["ticker"],
+            limit=arguments["limit"],
+            max_pages=int(cmd[cmd.index("--max-pages") + 1]),
+            date_from=arguments["start"],
+            date_to=arguments["end"],
+            start_page=int(cmd[cmd.index("--start-page") + 1]) if "--start-page" in cmd else 1,
+            deadline_at=cmd_deadline_at,
+            clock=_wall_clock,
+        )
+
+        # 5. Simulate 0.8s JSON flush + subprocess unwind + bridge HTTP response return
+        fake_now[0] += 0.8
+        total_elapsed = fake_now[0] - t_start
+        # If elapsed exceeded probe HTTP timeout, fail exactly like real urllib socket timeout!
+        if total_elapsed > timeout:
+            raise TimeoutError(f"probe HTTP timeout exceeded: {total_elapsed:.2f}s > {timeout:.2f}s")
+
+        fake_proc = create_autospec(real_popen, instance=True)
+        fake_proc.returncode = 0
+        fake_proc.communicate.return_value = (json.dumps(script_out, ensure_ascii=False), "")
+        monkeypatch.setattr(dg_mod.subprocess, "Popen", create_autospec(real_popen, return_value=fake_proc))
+        gw_out = dg_mod.execute(cmd, timeout=gw_timeout)
+
+        resp_body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": rpc_body["id"],
+                "result": {"content": [{"type": "text", "text": json.dumps(gw_out, ensure_ascii=False)}]},
+            }
+        ).encode("utf-8")
+        cm = create_autospec(io.BytesIO, instance=True)
+        cm.__enter__.return_value = cm
+        cm.__exit__.return_value = False
+        cm.read.return_value = resp_body
+        return cm
+
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        create_autospec(urllib.request.urlopen, side_effect=_simulated_urlopen),
+    )
+
+    sigs, st = await probe_cnhk_filings(
+        ticker="0700.HK",
+        watch_state={"last_cnhk_check_date": "2026-10-22"},
+        allow_network=True,
+        today=date(2026, 10, 22),
+        now=datetime(2026, 10, 22, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+        limit=50,
+        clock=_wall_clock,
+        wall_clock=_wall_clock,
+        request_deadline_s=8.0,
+    )
+    assert len(sigs) == 30
+    assert pages_called == [1]
+    assert st["cnhk_probe_resume_pages"] == {"2026-10-22": 2}
+    assert st["cnhk_probe_partial"] is True
+    assert st["cnhk_probe_degraded"] is False
+    # Probe HTTP timeout = (deadline_at - now) + 2.0 = 10.0s; page 1 timeout clamped to 3.3s (<= deadline_at - 1.5s)
+    assert http_timeouts_seen == [pytest.approx(10.0)]
+    assert page_timeouts_seen == [pytest.approx(3.3)]
+    assert bridge_timeouts_seen == [13]
+
+
+@pytest.mark.asyncio
+async def test_cnhk_old_gap_8_4s_per_call_still_scans_new_dates_and_page_backoff_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧日期每次调用耗时 8.4 秒（假时钟）时，同一轮仍为新日期保留预算并请求新日期；同页退避只跳过失败页不跳过新日期。"""
+    from src.dalton.autonomy.probes import cnhk as cnhk_mod
+
+    real_query_bridge = cnhk_mod._query_bridge_cnhk_filings
+    fake_mono = [0.0]
+    fake_wall = [1_795_000_000.0]
+
+    def _fake_clock() -> float:
+        return fake_mono[0]
+
+    def _fake_wall() -> float:
+        return fake_wall[0]
+
+    requested_windows: list[tuple[str, str, int]] = []
+
+    async def _slow_old_gap_bridge(**kwargs: Any) -> dict[str, Any]:
+        s, e = kwargs["start"], kwargs["end"]
+        sp = int(kwargs.get("start_page") or 1)
+        requested_windows.append((s, e, sp))
+        if s >= "2026-10-20":
+            # New dates after the 2026-10-19 gap
+            fake_mono[0] += 1.0
+            fake_wall[0] += 1.0
+            return {
+                "ok": True,
+                "rows": [
+                    {
+                        "date": "2026-10-22",
+                        "title": "2026年第三季度业绩公告",
+                        "pdf_link": "http://cninfo/2026-10-22/p1.pdf",
+                    }
+                ],
+                "pagination_complete": True,
+                "has_more": False,
+            }
+        # Every call on old dates takes 8.4s (would exhaust 25s budget in 3 calls if run first)
+        fake_mono[0] += 8.4
+        fake_wall[0] += 8.4
+        return {
+            "ok": True,
+            "rows": [
+                {
+                    "date": s,
+                    "title": f"{s}例行公告-p{sp}",
+                    "pdf_link": f"http://cninfo/{s}/p{sp}.pdf",
+                }
+            ],
+            "pagination_complete": False,
+            "has_more": True,
+            "truncated": True,
+            "next_page": sp + 1,
+        }
+
+    monkeypatch.setattr(
+        cnhk_mod,
+        "_query_bridge_cnhk_filings",
+        create_autospec(real_query_bridge, side_effect=_slow_old_gap_bridge),
+    )
+
+    now_et = datetime(2026, 10, 22, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+    sigs, st = await probe_cnhk_filings(
+        ticker="0700.HK",
+        watch_state={
+            "last_cnhk_check_date": "2026-10-17",
+            "cnhk_probe_resume_pages": {"2026-10-19": 2},
+            "cnhk_probe_unresolved_truncated_dates": ["2026-10-19"],
+        },
+        allow_network=True,
+        today=date(2026, 10, 22),
+        now=now_et,
+        limit=50,
+        clock=_fake_clock,
+        wall_clock=_fake_wall,
+        total_budget_s=25.0,
+        request_deadline_s=8.0,
+    )
+    # New dates [2026-10-20..2026-10-22] MUST be requested in the same round despite 8.4s old-date calls
+    assert any(s >= "2026-10-20" and e == "2026-10-22" for s, e, _ in requested_windows)
+    assert any(sig.payload["title"] == "2026年第三季度业绩公告" and sig.priority == "P1" for sig in sigs)
+    # Old gap 2026-10-19 was also resumed with remaining budget
+    assert any(s == "2026-10-19" and e == "2026-10-19" and sp == 2 for s, e, sp in requested_windows)
+    assert st["cnhk_probe_partial"] is True
+    assert st["last_cnhk_check_date"] == "2026-10-17"
+
+    # Part 2: When old date (2026-10-19, page=3) is in per-page backoff, preflight still runs
+    # cnhk probe on the next round: skips (2026-10-19, page=3) and scans new date 2026-10-23!
+    doubles = _install_company_preflight_doubles(monkeypatch)
+    r2_windows: list[tuple[str, str, int]] = []
+
+    async def _page_bo_bridge(**kwargs: Any) -> dict[str, Any]:
+        s, e = kwargs["start"], kwargs["end"]
+        sp = int(kwargs.get("start_page") or 1)
+        r2_windows.append((s, e, sp))
+        if s >= "2026-10-20":
+            return {
+                "ok": True,
+                "rows": [
+                    {
+                        "date": "2026-10-23",
+                        "title": "正面盈利预告",
+                        "pdf_link": "http://cninfo/2026-10-23/p1.pdf",
+                    }
+                ],
+                "pagination_complete": True,
+                "has_more": False,
+            }
+        return {"ok": True, "rows": [], "pagination_complete": True, "has_more": False}
+
+    monkeypatch.setattr(
+        cnhk_mod,
+        "_query_bridge_cnhk_filings",
+        create_autospec(real_query_bridge, side_effect=_page_bo_bridge),
+    )
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    now_r2 = datetime(2026, 10, 23, 10, 1, tzinfo=ZoneInfo("America/New_York"))
+
+    async def _cnhk_r2(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return await cnhk_mod.probe_cnhk_filings(
+            ticker="0700.HK",
+            watch_state=dict(kwargs.get("watch_state") or {}),
+            allow_network=True,
+            today=date(2026, 10, 23),
+            now=now_r2,
+            limit=50,
+        )
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_cnhk_r2)
+
+    state_with_page_bo = {
+        "last_cnhk_check_date": "2026-10-18",
+        "cnhk_probe_resume_pages": {"2026-10-19": 3},
+        "cnhk_probe_page_backoff": {
+            "2026-10-19": {
+                "page": 3,
+                "attempt": 1,
+                "wait_minutes": 2,
+                "not_before": (now_r2.astimezone(timezone.utc) + timedelta(minutes=2)).isoformat(),
+                "last_error": "Timeout: read timed out",
+            }
+        },
+    }
+    res_next = await preflight_check(
+        _company_watch_automation(),
+        "exec-cnhk-page-bo-allows-new-dates",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override=state_with_page_bo,
+    )
+    # Whole cnhk probe was NOT skipped; 2026-10-23 P1 woke while backed-off (2026-10-19, page=3) was skipped
+    assert res_next.should_wake is True
+    assert [s["payload"]["title"] for s in res_next.signals] == ["正面盈利预告"]
+    assert res_next.degraded_sources == ["cnhk"]
+    assert not any(s == "2026-10-19" and e == "2026-10-19" for s, e, _ in r2_windows)
+    assert any(s >= "2026-10-20" and e == "2026-10-23" for s, e, _ in r2_windows)
+    assert {"degraded_sources": ["cnhk"]} in doubles["logs"][-1]["signals"]
+
+
+@pytest.mark.asyncio
+async def test_preflight_cnhk_incomplete_pagination_claim_skip_branches_preserve_degraded_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """分页未完且有 P1 时，若信号已被并发领取或领取写库抛错，结果和日志都保留原跳过原因并带上 degraded_sources=['cnhk']。"""
+    from src.dalton.autonomy.probes import cnhk as cnhk_mod
+    from src.dalton.database import watch as watch_db_mod
+
+    real_query_bridge = cnhk_mod._query_bridge_cnhk_filings
+    real_claim = watch_db_mod.claim_signals_woken
+
+    async def _partial_p1_bridge(**kwargs: Any) -> dict[str, Any]:
+        if kwargs["start"] == kwargs["end"] == "2026-10-21":
+            return {"ok": True, "rows": [], "pagination_complete": True, "has_more": False}
+        return {
+            "ok": True,
+            "rows": [
+                {
+                    "date": "2026-10-22",
+                    "title": "2026年第三季度业绩公告",
+                    "pdf_link": "http://cninfo/p1-claim-err",
+                }
+            ],
+            "pagination_complete": False,
+            "has_more": True,
+            "truncated": True,
+            "next_page": 2,
+        }
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    async def _cnhk_runner(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return await cnhk_mod.probe_cnhk_filings(
+            ticker="0700.HK",
+            watch_state=dict(kwargs.get("watch_state") or {}),
+            allow_network=True,
+            today=date(2026, 10, 22),
+            now=datetime(2026, 10, 22, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+            limit=50,
+        )
+
+    monkeypatch.setattr(
+        cnhk_mod,
+        "_query_bridge_cnhk_filings",
+        create_autospec(real_query_bridge, side_effect=_partial_p1_bridge),
+    )
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_cnhk_runner)
+
+    # Branch A: already claimed by concurrent run
+    doubles_a = _install_company_preflight_doubles(monkeypatch)
+
+    async def _empty_claim(signal_ids: list[str], execution_id: str, **kwargs: Any) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr(
+        watch_db_mod,
+        "claim_signals_woken",
+        create_autospec(real_claim, side_effect=_empty_claim),
+    )
+    res_concurrent = await preflight_check(
+        _company_watch_automation(),
+        "exec-cnhk-claim-concurrent",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override={"last_cnhk_check_date": "2026-10-21"},
+    )
+    assert res_concurrent.should_wake is False
+    assert res_concurrent.decision == "skip"
+    assert res_concurrent.reason == "already_claimed_by_concurrent_run"
+    assert res_concurrent.degraded_sources == ["cnhk"]
+    assert doubles_a["logs"][-1]["decision"] == "skip"
+    assert doubles_a["logs"][-1]["reason"] == "already_claimed_by_concurrent_run"
+    assert {"degraded_sources": ["cnhk"]} in doubles_a["logs"][-1]["signals"]
+
+    # Branch B: claim DB write raises exception
+    doubles_b = _install_company_preflight_doubles(monkeypatch)
+
+    async def _failing_claim(signal_ids: list[str], execution_id: str, **kwargs: Any) -> list[dict[str, Any]]:
+        raise RuntimeError("simulated claim write error")
+
+    monkeypatch.setattr(
+        watch_db_mod,
+        "claim_signals_woken",
+        create_autospec(real_claim, side_effect=_failing_claim),
+    )
+    res_claim_err = await preflight_check(
+        _company_watch_automation(),
+        "exec-cnhk-claim-failed",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override={"last_cnhk_check_date": "2026-10-21"},
+    )
+    assert res_claim_err.should_wake is False
+    assert res_claim_err.decision == "skip"
+    assert res_claim_err.reason == "claim_failed"
+    assert res_claim_err.degraded_sources == ["cnhk"]
+    assert doubles_b["logs"][-1]["decision"] == "skip"
+    assert doubles_b["logs"][-1]["reason"] == "claim_failed"
+    assert {"degraded_sources": ["cnhk"]} in doubles_b["logs"][-1]["signals"]

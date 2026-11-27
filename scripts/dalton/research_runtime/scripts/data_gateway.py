@@ -5,11 +5,13 @@ No LLM, daemon, credentials store, implicit fan-out, or provider substitution.
 """
 import argparse
 import json
+import math
 import os
 import re
 import signal
 import subprocess
 import sys
+import time
 import urllib.request
 import urllib.error
 from datetime import date, datetime, timezone
@@ -247,17 +249,25 @@ def build_command(route, args):
             require(args, "ticker", "start", "end")
             if args.query:
                 raise ValueError("cn-hk filings 不接受 query；使用 ticker/start/end")
-            allowed_filings_params = {"max_pages", "start_page", "deadline_s"}
+            allowed_filings_params = {"max_pages", "start_page", "deadline_at", "deadline_s"}
             if set(extra) - allowed_filings_params:
-                raise ValueError("cn-hk filings params 仅支持 ['max_pages', 'start_page', 'deadline_s']")
+                raise ValueError("cn-hk filings params 仅支持 ['max_pages', 'start_page', 'deadline_at', 'deadline_s']")
             for key, max_val in (("max_pages", CN_HK_MAX_PAGES_LIMIT), ("start_page", CN_HK_MAX_START_PAGE)):
                 if key in extra and extra[key] is not None:
                     val = extra[key]
                     if type(val) is not int or not 1 <= val <= max_val:
                         raise ValueError(f"{key} 须为范围内的正整数")
+            deadline_at = extra.get("deadline_at")
+            if deadline_at is not None:
+                if (
+                    isinstance(deadline_at, bool)
+                    or not isinstance(deadline_at, (int, float))
+                    or not math.isfinite(float(deadline_at))
+                    or not 0 < float(deadline_at) < 1e11
+                ):
+                    raise ValueError("deadline_at 须为有效的 Unix 时间戳（秒）")
             deadline_s = extra.get("deadline_s")
             if deadline_s is not None:
-                import math
                 if (
                     isinstance(deadline_s, bool)
                     or not isinstance(deadline_s, (int, float))
@@ -282,7 +292,12 @@ def build_command(route, args):
             ]
             if start_page > 1:
                 filings_cmd += ["--start-page", str(start_page)]
-            if deadline_s is not None:
+            if deadline_at is not None:
+                eff_deadline_at = float(deadline_at)
+                if getattr(args, "timeout", None):
+                    eff_deadline_at = min(eff_deadline_at, time.time() + float(args.timeout))
+                filings_cmd += ["--deadline-at", f"{eff_deadline_at:.3f}"]
+            elif deadline_s is not None:
                 eff_deadline = float(deadline_s)
                 if getattr(args, "timeout", None):
                     eff_deadline = min(eff_deadline, float(args.timeout))
@@ -309,7 +324,6 @@ def build_command(route, args):
         extra = json.loads(args.params_json or "{}")
         if not isinstance(extra, dict) or set(extra) - {"shares_bn", "tax"}:
             raise ValueError("estimates params 仅支持 shares_bn 和 tax")
-        import math
         for key, value in extra.items():
             if type(value) not in (int, float) or not math.isfinite(value) or not (value > 0 if key == "shares_bn" else 0 <= value < 1):
                 raise ValueError("shares_bn 须为正数，tax 须为 0≤税率<1")
@@ -698,7 +712,16 @@ def main(argv=None):
             if args.command == "fetch" and route["id"] == "transcript":
                 result.update(fetch_transcripts(reg, args, cmd), executed=True)
             elif args.command == "fetch" and cmd:
-                result.update(execute(cmd, args.timeout), executed=True)
+                exec_timeout = float(args.timeout)
+                if route["id"] == "cn-hk" and (args.operation or "filings") == "filings" and args.params_json:
+                    extra_p = json.loads(args.params_json or "{}")
+                    if isinstance(extra_p, dict):
+                        if extra_p.get("deadline_at") is not None:
+                            rem_s = max(0.0, float(extra_p["deadline_at"]) - time.time())
+                            exec_timeout = min(exec_timeout, rem_s + 5.0)
+                        elif extra_p.get("deadline_s") is not None:
+                            exec_timeout = min(exec_timeout, float(extra_p["deadline_s"]) + 5.0)
+                result.update(execute(cmd, exec_timeout), executed=True)
             elif route["id"] in NATIVE_SOURCES:
                 result.update(native_request(route, args, args.command == "fetch"), executed=args.command == "fetch")
             elif not cmd and route["id"] != "transcript":

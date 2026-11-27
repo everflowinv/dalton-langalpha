@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -15,15 +16,18 @@ from typing import Any, Callable, Optional
 import urllib.request
 from zoneinfo import ZoneInfo
 
+from src.dalton.autonomy.backoff import next_backoff_minutes
 from src.dalton.autonomy.probes import ProbeSignal
 
 logger = logging.getLogger(__name__)
 
 ET_TZ = ZoneInfo("America/New_York")
 CNHK_PROBE_REQUEST_DEADLINE_S: float = 8.0
+CNHK_PROBE_RETURN_MARGIN_S: float = 1.5
 CNHK_PROBE_HTTP_TIMEOUT_MARGIN_S: float = 2.0
 CNHK_PROBE_STEP_TIMEOUT_S: float = CNHK_PROBE_REQUEST_DEADLINE_S + CNHK_PROBE_HTTP_TIMEOUT_MARGIN_S + 1.0
 CNHK_PROBE_TOTAL_BUDGET_S: float = 25.0
+CNHK_PROBE_NEW_DATES_BUDGET_RATIO: float = 0.4
 DEFAULT_INITIAL_LOOKBACK_DAYS: int = 3
 CNHK_FILINGS_QUERY_LIMIT: int = 50
 MAX_SEEN_CNHK_FILINGS: int = 200
@@ -206,6 +210,7 @@ def build_cnhk_filings_request(
     *,
     start_page: Optional[int] = None,
     max_pages: Optional[int] = None,
+    deadline_at: Optional[float] = None,
     deadline_s: Optional[float] = None,
 ) -> tuple[str, dict[str, Any]]:
     """Build the bridge tool name and arguments for CN/HK CNINFO filings probe."""
@@ -222,11 +227,49 @@ def build_cnhk_filings_request(
         params["start_page"] = int(start_page)
     if max_pages is not None and int(max_pages) >= 1:
         params["max_pages"] = int(max_pages)
-    if deadline_s is not None and not isinstance(deadline_s, bool) and float(deadline_s) > 0:
+    if (
+        deadline_at is not None
+        and not isinstance(deadline_at, bool)
+        and math.isfinite(float(deadline_at))
+        and 0 < float(deadline_at) < 1e11
+    ):
+        params["deadline_at"] = round(float(deadline_at), 3)
+    elif (
+        deadline_s is not None
+        and not isinstance(deadline_s, bool)
+        and math.isfinite(float(deadline_s))
+        and float(deadline_s) > 0
+    ):
         params["deadline_s"] = round(min(float(deadline_s), 600.0), 3)
     if params:
         arguments["params"] = params
     return ("finance", arguments)
+
+
+def _resolve_request_deadline_at(
+    *,
+    deadline_at: Optional[float],
+    deadline_s: Optional[float],
+    now_ts: float,
+) -> float:
+    if (
+        deadline_at is not None
+        and not isinstance(deadline_at, bool)
+        and math.isfinite(float(deadline_at))
+        and 0 < float(deadline_at) < 1e11
+    ):
+        return round(float(deadline_at), 3)
+    eff_deadline_s = (
+        float(deadline_s)
+        if (
+            deadline_s is not None
+            and not isinstance(deadline_s, bool)
+            and math.isfinite(float(deadline_s))
+            and float(deadline_s) > 0
+        )
+        else CNHK_PROBE_REQUEST_DEADLINE_S
+    )
+    return round(now_ts + eff_deadline_s, 3)
 
 
 def _fetch_bridge_route_sync(
@@ -239,7 +282,9 @@ def _fetch_bridge_route_sync(
     timeout_s: Optional[float] = None,
     start_page: Optional[int] = None,
     max_pages: Optional[int] = None,
+    deadline_at: Optional[float] = None,
     deadline_s: Optional[float] = None,
+    wall_clock: Callable[[], float] = time.time,
 ) -> dict[str, Any]:
     """Call local researchdata bridge ``finance(route='cn-hk', operation='filings')`` synchronously."""
     global _LAST_UNCONFIGURED_WARN_AT
@@ -254,15 +299,16 @@ def _fetch_bridge_route_sync(
             )
         return {"ok": False, "error": "bridge_unconfigured"}
 
-    eff_deadline_s = (
-        float(deadline_s)
-        if (deadline_s is not None and not isinstance(deadline_s, bool) and float(deadline_s) > 0)
-        else CNHK_PROBE_REQUEST_DEADLINE_S
+    now_ts = float(wall_clock())
+    eff_deadline_at = _resolve_request_deadline_at(
+        deadline_at=deadline_at,
+        deadline_s=deadline_s,
+        now_ts=now_ts,
     )
-    min_http_timeout_s = eff_deadline_s + CNHK_PROBE_HTTP_TIMEOUT_MARGIN_S
+    min_http_timeout_s = max(0.5, (eff_deadline_at - now_ts) + CNHK_PROBE_HTTP_TIMEOUT_MARGIN_S)
     if timeout_s is None:
         eff_timeout_s = min_http_timeout_s
-    elif deadline_s is not None:
+    elif deadline_at is not None or deadline_s is not None:
         eff_timeout_s = max(float(timeout_s), min_http_timeout_s)
     else:
         eff_timeout_s = float(timeout_s)
@@ -274,7 +320,7 @@ def _fetch_bridge_route_sync(
         limit=limit,
         start_page=start_page,
         max_pages=max_pages,
-        deadline_s=eff_deadline_s,
+        deadline_at=eff_deadline_at,
     )
     payload = {
         "jsonrpc": "2.0",
@@ -333,18 +379,21 @@ async def _query_bridge_cnhk_filings(
     allow_network: bool = True,
     start_page: Optional[int] = None,
     max_pages: Optional[int] = None,
+    deadline_at: Optional[float] = None,
     deadline_s: Optional[float] = None,
+    wall_clock: Callable[[], float] = time.time,
 ) -> dict[str, Any]:
     """Query CNINFO filings for A-share and HK ``ticker`` via researchdata bridge in a worker thread."""
     if not allow_network:
         return {"ok": True, "rows": []}
     bridge_url = _resolve_bridge_url()
-    eff_deadline_s = (
-        float(deadline_s)
-        if (deadline_s is not None and not isinstance(deadline_s, bool) and float(deadline_s) > 0)
-        else CNHK_PROBE_REQUEST_DEADLINE_S
+    now_ts = float(wall_clock())
+    eff_deadline_at = _resolve_request_deadline_at(
+        deadline_at=deadline_at,
+        deadline_s=deadline_s,
+        now_ts=now_ts,
     )
-    http_timeout_s = eff_deadline_s + CNHK_PROBE_HTTP_TIMEOUT_MARGIN_S
+    http_timeout_s = max(0.5, (eff_deadline_at - now_ts) + CNHK_PROBE_HTTP_TIMEOUT_MARGIN_S)
     step_timeout_s = http_timeout_s + 1.0
     fetch_kwargs: dict[str, Any] = {
         "bridge_url": bridge_url,
@@ -353,7 +402,8 @@ async def _query_bridge_cnhk_filings(
         "end": end,
         "limit": limit,
         "timeout_s": http_timeout_s,
-        "deadline_s": round(eff_deadline_s, 3),
+        "deadline_at": eff_deadline_at,
+        "wall_clock": wall_clock,
     }
     if start_page is not None and int(start_page) > 1:
         fetch_kwargs["start_page"] = int(start_page)
@@ -565,6 +615,60 @@ def _parse_iso_date(val: Any) -> Optional[date]:
         return None
 
 
+def _is_page_in_backoff(
+    page_backoff: Optional[dict[str, dict[str, Any]]],
+    date_str: str,
+    page: int,
+    now_utc: datetime,
+) -> tuple[bool, Optional[str]]:
+    """Return ``(True, not_before_iso)`` when ``(date_str, page)`` is inside its time-backoff window."""
+    if not page_backoff:
+        return False, None
+    entry = page_backoff.get(date_str)
+    if not isinstance(entry, dict):
+        return False, None
+    entry_page = _parse_positive_int(entry.get("page"))
+    if entry_page is not None and entry_page != page:
+        return False, None
+    not_before_raw = entry.get("not_before")
+    if not not_before_raw:
+        return False, None
+    try:
+        nb = datetime.fromisoformat(str(not_before_raw).replace("Z", "+00:00"))
+        if nb.tzinfo is None:
+            nb = nb.replace(tzinfo=timezone.utc)
+        if now_utc < nb:
+            return True, nb.isoformat()
+    except ValueError:
+        return False, None
+    return False, None
+
+
+def _record_page_backoff(
+    page_backoff: dict[str, dict[str, Any]],
+    date_str: str,
+    page: int,
+    error: str,
+    now_utc: datetime,
+) -> None:
+    """Increment time-based backoff strictly for ``(date_str, page)``."""
+    prev = page_backoff.get(date_str)
+    prev_attempt = 0
+    if isinstance(prev, dict) and _parse_positive_int(prev.get("page")) == page:
+        prev_attempt = _parse_non_negative_int(prev.get("attempt")) or 0
+    attempt = prev_attempt + 1
+    wait_mins = next_backoff_minutes(attempt)
+    not_before = now_utc + timedelta(minutes=wait_mins)
+    page_backoff[date_str] = {
+        "page": page,
+        "attempt": attempt,
+        "wait_minutes": wait_mins,
+        "not_before": not_before.isoformat(),
+        "last_error": str(error)[:240],
+        "updated_at": now_utc.isoformat(),
+    }
+
+
 async def _fetch_window_filings_recursive(
     *,
     cn_code: str,
@@ -580,27 +684,102 @@ async def _fetch_window_filings_recursive(
     deadline: float,
     max_pages: Optional[int] = None,
     request_deadline_s: float = CNHK_PROBE_REQUEST_DEADLINE_S,
+    wall_clock: Callable[[], float] = time.time,
+    page_backoff: Optional[dict[str, dict[str, Any]]] = None,
+    gap_dates: Optional[set[date]] = None,
+    now_utc: Optional[datetime] = None,
 ) -> tuple[bool, bool, Optional[date], list[dict[str, Any]]]:
     """Fetch filings for ``[win_start, win_end]``, recursively halving the window when saturated or truncated.
 
     Returns ``(had_error, is_complete, contiguous_completed_end, rows)``.
-    A single day that reports incomplete pagination (budget/deadline exhausted or a mid-pagination
-    page error) records its resume page in ``resume_pages`` and preserves all fetched rows.
-    If the same page fails with zero forward progress (or a sub-window fails outright), ``had_error``
-    is set so backoff runs, while the sibling half of a date split still keeps its rows and resume
-    state and contiguous watermarks stop strictly before the gap.
+    When an existing gap sits before ``win_end``, reserves ~40% of remaining budget to scan newer
+    dates after the gap first so old gaps cannot starve new filings, then resumes the old gap with
+    whatever budget remains. Same-page failures record per-(day, page) backoff in ``page_backoff``
+    so only the failing page waits while newer dates continue scanning normally.
     """
     start_s = win_start.isoformat()
     end_s = win_end.isoformat()
-    remaining_s = deadline - clock()
-    if remaining_s <= 0:
+    now_mono = clock()
+    remaining_s = deadline - now_mono
+    min_usable_budget_s = (
+        CNHK_PROBE_RETURN_MARGIN_S if request_deadline_s > CNHK_PROBE_RETURN_MARGIN_S else 0.0
+    )
+    if remaining_s <= min_usable_budget_s:
         return False, False, None, []
 
+    eff_now_utc = now_utc if now_utc is not None else datetime.now(timezone.utc)
     is_single_day = win_start >= win_end
-    has_pending_resume = (not is_single_day) and any(
-        (parsed := _parse_iso_date(ds)) is not None and win_start <= parsed <= win_end
-        for ds in resume_pages
-    )
+
+    # Collect known gap dates inside this window (resume pages, unresolved dates, per-page backoffs).
+    in_window_gaps: set[date] = set()
+    for ds in resume_pages:
+        parsed = _parse_iso_date(ds)
+        if parsed is not None and win_start <= parsed <= win_end:
+            in_window_gaps.add(parsed)
+    if page_backoff:
+        for ds in page_backoff:
+            parsed = _parse_iso_date(ds)
+            if parsed is not None and win_start <= parsed <= win_end:
+                in_window_gaps.add(parsed)
+    if gap_dates:
+        for gd in gap_dates:
+            if win_start <= gd <= win_end:
+                in_window_gaps.add(gd)
+
+    # Reserve ~40% of remaining budget for newer dates strictly after the latest known gap first,
+    # then spend the remaining total budget resuming the old gap region.
+    if (not is_single_day) and in_window_gaps:
+        latest_gap = max(in_window_gaps)
+        if latest_gap < win_end:
+            new_budget_s = remaining_s * CNHK_PROBE_NEW_DATES_BUDGET_RATIO
+            new_deadline = min(deadline, now_mono + new_budget_s)
+            err_new, comp_new, end_new, new_rows = await _fetch_window_filings_recursive(
+                cn_code=cn_code,
+                norm_ticker=norm_ticker,
+                win_start=latest_gap + timedelta(days=1),
+                win_end=win_end,
+                limit=limit,
+                allow_network=allow_network,
+                truncated_dates=truncated_dates,
+                failed_dates=failed_dates,
+                resume_pages=resume_pages,
+                clock=clock,
+                deadline=new_deadline,
+                max_pages=max_pages,
+                request_deadline_s=request_deadline_s,
+                wall_clock=wall_clock,
+                page_backoff=page_backoff,
+                gap_dates=gap_dates,
+                now_utc=eff_now_utc,
+            )
+            err_old, comp_old, end_old, old_rows = await _fetch_window_filings_recursive(
+                cn_code=cn_code,
+                norm_ticker=norm_ticker,
+                win_start=win_start,
+                win_end=latest_gap,
+                limit=limit,
+                allow_network=allow_network,
+                truncated_dates=truncated_dates,
+                failed_dates=failed_dates,
+                resume_pages=resume_pages,
+                clock=clock,
+                deadline=deadline,
+                max_pages=max_pages,
+                request_deadline_s=request_deadline_s,
+                wall_clock=wall_clock,
+                page_backoff=page_backoff,
+                gap_dates=gap_dates,
+                now_utc=eff_now_utc,
+            )
+            had_error = err_old or err_new
+            combined_rows = [*old_rows, *new_rows]
+            if not comp_old:
+                return had_error, False, end_old, combined_rows
+            if not comp_new:
+                return had_error, False, (end_new if end_new is not None else latest_gap), combined_rows
+            return had_error, True, win_end, combined_rows
+
+    has_pending_resume = (not is_single_day) and bool(in_window_gaps)
 
     if has_pending_resume:
         rows: list[dict[str, Any]] = []
@@ -609,15 +788,29 @@ async def _fetch_window_filings_recursive(
         start_page = resume_pages.get(start_s, 1) if is_single_day else 1
         if not isinstance(start_page, int) or isinstance(start_page, bool) or start_page < 1:
             start_page = 1
-        req_deadline_s = round(min(request_deadline_s, remaining_s), 3)
+        if is_single_day:
+            in_page_bo, page_nb_iso = _is_page_in_backoff(page_backoff, start_s, start_page, eff_now_utc)
+            if in_page_bo:
+                logger.info(
+                    "[DALTON_CNHK_PROBE] skipping backed-off page for %s on %s page=%d until %s",
+                    norm_ticker,
+                    start_s,
+                    start_page,
+                    page_nb_iso,
+                )
+                return False, False, None, []
+        req_budget_s = min(request_deadline_s, remaining_s)
+        req_deadline_at = round(float(wall_clock()) + req_budget_s, 3)
         query_kwargs: dict[str, Any] = {
             "ticker": cn_code,
             "start": start_s,
             "end": end_s,
             "limit": limit,
             "allow_network": allow_network,
-            "deadline_s": req_deadline_s,
+            "deadline_at": req_deadline_at,
         }
+        if wall_clock is not time.time:
+            query_kwargs["wall_clock"] = wall_clock
         if is_single_day and start_page > 1:
             query_kwargs["start_page"] = start_page
         if max_pages is not None and int(max_pages) >= 1:
@@ -634,12 +827,24 @@ async def _fetch_window_filings_recursive(
             )
             if start_s not in failed_dates:
                 failed_dates.append(start_s)
+            if is_single_day and page_backoff is not None and (start_page > 1 or start_s in resume_pages):
+                _record_page_backoff(page_backoff, start_s, start_page, str(exc), eff_now_utc)
+                return False, False, None, []
             return True, False, None, []
 
         page_info = _extract_filings_page_info(raw_resp)
         if not page_info.is_ok:
             if start_s not in failed_dates:
                 failed_dates.append(start_s)
+            if is_single_day and page_backoff is not None and (start_page > 1 or start_s in resume_pages):
+                _record_page_backoff(
+                    page_backoff,
+                    start_s,
+                    start_page,
+                    page_info.page_error or "bridge_error",
+                    eff_now_utc,
+                )
+                return False, False, None, []
             return True, False, None, []
 
         rows = page_info.rows
@@ -655,6 +860,8 @@ async def _fetch_window_filings_recursive(
         if not is_incomplete:
             if is_single_day:
                 resume_pages.pop(start_s, None)
+                if page_backoff is not None:
+                    page_backoff.pop(start_s, None)
             return False, True, win_end, rows
 
         if is_single_day:
@@ -681,9 +888,22 @@ async def _fetch_window_filings_recursive(
             )
             if start_s not in truncated_dates:
                 truncated_dates.append(start_s)
-            if no_progress_error and start_s not in failed_dates:
-                failed_dates.append(start_s)
-            return no_progress_error, False, None, rows
+            if no_progress_error:
+                if start_s not in failed_dates:
+                    failed_dates.append(start_s)
+                if page_backoff is not None:
+                    _record_page_backoff(
+                        page_backoff,
+                        start_s,
+                        start_page,
+                        page_info.page_error or "page_error",
+                        eff_now_utc,
+                    )
+                    return False, False, None, rows
+                return True, False, None, rows
+            if page_backoff is not None:
+                page_backoff.pop(start_s, None)
+            return False, False, None, rows
 
         # Multi-day query that failed on its very first page with zero rows: do not hammer with splits.
         if page_info.page_error and (
@@ -699,6 +919,16 @@ async def _fetch_window_filings_recursive(
     if should_split:
         mid_days = (win_end - win_start).days // 2
         mid_date = win_start + timedelta(days=mid_days)
+        now_for_split = clock()
+        rem_for_split = deadline - now_for_split
+        right_reserve_s = rem_for_split * CNHK_PROBE_NEW_DATES_BUDGET_RATIO
+        if (
+            right_reserve_s > min_usable_budget_s
+            and (rem_for_split - right_reserve_s) > min_usable_budget_s
+        ):
+            left_deadline = now_for_split + (rem_for_split - right_reserve_s)
+        else:
+            left_deadline = deadline
         err_left, comp_left, end_left, left_rows = await _fetch_window_filings_recursive(
             cn_code=cn_code,
             norm_ticker=norm_ticker,
@@ -710,11 +940,15 @@ async def _fetch_window_filings_recursive(
             failed_dates=failed_dates,
             resume_pages=resume_pages,
             clock=clock,
-            deadline=deadline,
+            deadline=left_deadline,
             max_pages=max_pages,
             request_deadline_s=request_deadline_s,
+            wall_clock=wall_clock,
+            page_backoff=page_backoff,
+            gap_dates=gap_dates,
+            now_utc=eff_now_utc,
         )
-        if not comp_left and clock() >= deadline:
+        if not comp_left and (deadline - clock()) <= min_usable_budget_s:
             # Keep the parent window's rows too: they are real filings already fetched, and the
             # seen-hash dedupe downstream drops any overlap. The watermark still stops at end_left.
             return err_left, False, end_left, [*rows, *left_rows]
@@ -733,9 +967,13 @@ async def _fetch_window_filings_recursive(
             deadline=deadline,
             max_pages=max_pages,
             request_deadline_s=request_deadline_s,
+            wall_clock=wall_clock,
+            page_backoff=page_backoff,
+            gap_dates=gap_dates,
+            now_utc=eff_now_utc,
         )
         had_error = err_left or err_right
-        keep_parent = had_error or (not comp_right and clock() >= deadline)
+        keep_parent = had_error or (not comp_right and (deadline - clock()) <= min_usable_budget_s)
         combined_rows = [*rows, *left_rows, *right_rows] if keep_parent else [*left_rows, *right_rows]
         if not comp_left:
             # Left half had a gap (truncation, budget exhaustion, or failure); still return right
@@ -761,6 +999,7 @@ async def probe_cnhk_filings(
     limit: int = CNHK_FILINGS_QUERY_LIMIT,
     max_pages: Optional[int] = None,
     clock: Callable[[], float] = time.monotonic,
+    wall_clock: Callable[[], float] = time.time,
     total_budget_s: float = CNHK_PROBE_TOTAL_BUDGET_S,
     request_deadline_s: float = CNHK_PROBE_REQUEST_DEADLINE_S,
 ) -> tuple[list[ProbeSignal], dict[str, Any]]:
@@ -775,8 +1014,14 @@ async def probe_cnhk_filings(
 
     if now is not None:
         et_today = now.astimezone(ET_TZ).date() if now.tzinfo is not None else now.date()
+        now_utc = (
+            now.astimezone(timezone.utc)
+            if now.tzinfo is not None
+            else now.replace(tzinfo=timezone.utc)
+        )
     else:
         et_today = datetime.now(ET_TZ).date()
+        now_utc = datetime.now(timezone.utc)
 
     end_date = min(today, et_today) if today is not None else et_today
     last_check_date = _parse_iso_date(
@@ -799,6 +1044,14 @@ async def probe_cnhk_filings(
             if parsed_d is not None and parsed_p is not None and parsed_p >= 2:
                 working_resume_pages[parsed_d.isoformat()] = parsed_p
 
+    raw_page_bo = state.get("cnhk_probe_page_backoff")
+    working_page_backoff: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_page_bo, dict):
+        for raw_d, raw_entry in raw_page_bo.items():
+            parsed_d = _parse_iso_date(raw_d)
+            if parsed_d is not None and isinstance(raw_entry, dict):
+                working_page_backoff[parsed_d.isoformat()] = dict(raw_entry)
+
     if last_check_date is not None:
         start_date = min(last_check_date, end_date)
     else:
@@ -811,6 +1064,12 @@ async def probe_cnhk_filings(
     ]
     if eligible_resume_dates:
         start_date = min(start_date, min(eligible_resume_dates))
+    eligible_page_bo_dates = [
+        d for ds in working_page_backoff if (d := _parse_iso_date(ds)) is not None and d <= end_date
+    ]
+    if eligible_page_bo_dates:
+        start_date = min(start_date, min(eligible_page_bo_dates))
+    gap_dates_set: set[date] = set(eligible_unresolved) | set(eligible_resume_dates) | set(eligible_page_bo_dates)
 
     end_str = end_date.isoformat()
     truncated_dates: list[str] = []
@@ -850,9 +1109,16 @@ async def probe_cnhk_filings(
                     (page_info.pages_fetched is not None and page_info.pages_fetched == 0)
                     or (page_info.next_page is not None and page_info.next_page <= cur_start)
                 ):
-                    had_error = True
+                    _record_page_backoff(
+                        working_page_backoff,
+                        end_str,
+                        cur_start,
+                        page_info.page_error,
+                        now_utc,
+                    )
             else:
                 working_resume_pages.pop(end_str, None)
+                working_page_backoff.pop(end_str, None)
     else:
         if not allow_network:
             return [], state
@@ -871,9 +1137,13 @@ async def probe_cnhk_filings(
             deadline=deadline,
             max_pages=max_pages,
             request_deadline_s=request_deadline_s,
+            wall_clock=wall_clock,
+            page_backoff=working_page_backoff,
+            gap_dates=gap_dates_set,
+            now_utc=now_utc,
         )
 
-    # Pure total failure (no rows, no completed prefix, no truncated/resume progress):
+    # Pure total failure (no rows, no completed prefix, no truncated/resume/page-backoff progress):
     # keep existing watch_state untouched except marking cnhk_probe_degraded=True.
     if (
         had_error
@@ -881,6 +1151,7 @@ async def probe_cnhk_filings(
         and completed_end_date is None
         and not truncated_dates
         and not working_resume_pages
+        and not working_page_backoff
     ):
         state["cnhk_probe_degraded"] = True
         return [], state
@@ -896,6 +1167,7 @@ async def probe_cnhk_filings(
             and ds not in truncated_dates
             and ds not in failed_dates
             and ds not in working_resume_pages
+            and ds not in working_page_backoff
         ):
             continue
         if ds not in next_unresolved:
@@ -909,19 +1181,23 @@ async def probe_cnhk_filings(
     for ds in sorted(working_resume_pages):
         if ds not in next_unresolved:
             next_unresolved.append(ds)
+    for ds in sorted(working_page_backoff):
+        if ds not in next_unresolved:
+            next_unresolved.append(ds)
 
     if not is_complete:
         state["cnhk_probe_partial"] = True
         if truncated_dates or failed_dates:
             logger.warning(
                 "[DALTON_CNHK_PROBE] filings window incomplete for %s (%s..%s); "
-                "truncated_dates=%s failed_dates=%s resume_pages=%s contiguous_end=%s, marking cnhk_probe_partial=True.",
+                "truncated_dates=%s failed_dates=%s resume_pages=%s page_backoff=%s contiguous_end=%s, marking cnhk_probe_partial=True.",
                 norm_ticker,
                 start_date.isoformat(),
                 end_str,
                 truncated_dates,
                 failed_dates,
                 working_resume_pages,
+                sorted(working_page_backoff.keys()),
                 completed_end_date.isoformat() if completed_end_date else None,
             )
         else:
@@ -946,6 +1222,11 @@ async def probe_cnhk_filings(
         state["cnhk_probe_partial"] = True
     else:
         state.pop("cnhk_probe_resume_pages", None)
+    if working_page_backoff:
+        state["cnhk_probe_page_backoff"] = dict(sorted(working_page_backoff.items()))
+        state["cnhk_probe_partial"] = True
+    else:
+        state.pop("cnhk_probe_page_backoff", None)
     if next_unresolved:
         state["cnhk_probe_unresolved_truncated_dates"] = next_unresolved
         state["cnhk_probe_partial"] = True
