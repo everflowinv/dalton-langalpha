@@ -2151,22 +2151,12 @@ def is_channel_bt2_link_recovery_enabled() -> bool:
 def is_redis_diagnostics_enabled() -> bool:
     """Runtime switch for Redis write-timeout diagnostics & sampling (``DALTON_REDIS_DIAG_ENABLED``).
 
-    Defaults to ``True`` so diagnostic telemetry is active unless explicitly disabled
-    via ``DALTON_REDIS_DIAG_ENABLED=0`` or YAML ``observability.redis_diagnostics_enabled: false``.
-    Kept outside ``DaltonConfig`` so ``DaltonConfig.model_dump()`` stays byte-identical.
+    Defaults to ``True``; disable via ``DALTON_REDIS_DIAG_ENABLED=0`` or YAML
+    ``observability.redis_diagnostics_enabled: false``.
     """
-    raw = os.getenv("DALTON_REDIS_DIAG_ENABLED")
-    if raw is not None and raw.strip():
-        cleaned = raw.strip().lower()
-        if cleaned in ("0", "false", "no", "off"):
-            return False
-        if cleaned in ("1", "true", "yes", "on"):
-            return True
-    raw_yaml = _load_profile_dalton_raw(resolve_profile())
-    obs_cfg = raw_yaml.get("observability")
-    if isinstance(obs_cfg, Mapping) and isinstance(obs_cfg.get("redis_diagnostics_enabled"), bool):
-        return bool(obs_cfg["redis_diagnostics_enabled"])
-    return True
+    return _parse_bool_env_or_section_yaml(
+        "DALTON_REDIS_DIAG_ENABLED", "observability", "redis_diagnostics_enabled", default=True
+    )
 
 
 def get_redis_diag_ops_dir() -> Path:
@@ -2175,3 +2165,56 @@ def get_redis_diag_ops_dir() -> Path:
     if raw:
         return Path(raw).expanduser()
     return REPO_ROOT / "var" / "dalton" / "ops"
+
+
+def _parse_bool_env_or_section_yaml(
+    env_var: str, section: str, yaml_key: str, default: bool = True
+) -> bool:
+    """Resolve a boolean switch from ``env_var`` -> merged YAML ``<section>.<yaml_key>`` -> ``default``.
+
+    Kept outside ``DaltonConfig`` so ``DaltonConfig.model_dump()`` stays byte-identical
+    for Everflow parity snapshots while honoring both ``dalton.yaml`` and ``dalton.core.yaml``.
+    """
+    raw = os.getenv(env_var)
+    if raw is not None and raw.strip():
+        cleaned = raw.strip().lower()
+        if cleaned in ("0", "false", "no", "off"):
+            return False
+        if cleaned in ("1", "true", "yes", "on"):
+            return True
+    raw_yaml = _load_profile_dalton_raw(resolve_profile())
+    sec_cfg = raw_yaml.get(section)
+    if isinstance(sec_cfg, Mapping) and isinstance(sec_cfg.get(yaml_key), bool):
+        return bool(sec_cfg[yaml_key])
+    return bool(default)
+
+
+def is_monitor_verify_readback_enabled() -> bool:
+    """Switch for 3-stage monitor publish verification & readback (``DALTON_MONITOR_VERIFY_READBACK_ENABLED``)."""
+    return _parse_bool_env_or_section_yaml(
+        "DALTON_MONITOR_VERIFY_READBACK_ENABLED",
+        "monitors",
+        "verify_readback_enabled",
+        default=True,
+    )
+
+
+def get_monitor_multi_binding_publish_mode() -> Literal["per_panel", "all_or_nothing"]:
+    """Return multi-panel data-job cut strategy: ``'per_panel'`` (default) or ``'all_or_nothing'``."""
+    raw = os.getenv("DALTON_MONITOR_MULTI_BINDING_PUBLISH_MODE")
+    if raw is not None and raw.strip():
+        cleaned = raw.strip().lower()
+        if cleaned in ("per_panel", "all_or_nothing"):
+            return cleaned  # type: ignore[return-value]
+        logger.warning(
+            "Ignoring invalid DALTON_MONITOR_MULTI_BINDING_PUBLISH_MODE=%r; using 'per_panel'",
+            raw,
+        )
+    raw_yaml = _load_profile_dalton_raw(resolve_profile())
+    mon_cfg = raw_yaml.get("monitors")
+    if isinstance(mon_cfg, Mapping):
+        val = str(mon_cfg.get("multi_binding_publish_mode") or "").strip().lower()
+        if val in ("per_panel", "all_or_nothing"):
+            return val  # type: ignore[return-value]
+    return "per_panel"
+

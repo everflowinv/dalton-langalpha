@@ -29,6 +29,16 @@ T1_JOB_KEY = "bbg-data-pull-asia"
 T5_JOB_KEY = "cn-leverage-daily"
 T18_JOB_KEY = "megacap-relative-signal-monitor"
 T29_JOB_KEY = "bbg-data-pull-us"
+SENTIMENT_DASHBOARD_JOB_KEY = "sentiment-dashboard-refresh"
+SENTIMENT_DASHBOARD_PANEL_SLUGS: tuple[str, ...] = (
+    "market-overview",
+    "us-market",
+    "cn-market",
+    "hk-market",
+    "asia-leverage",
+    "stocks",
+)
+SENTIMENT_SIGNALS_MAX_STALE_DAYS = 5
 
 
 def previous_weekday(ref_date: date) -> date:
@@ -469,6 +479,121 @@ def evaluate_t1_t29_bbg_data_pull(
             "source": payload.get("source"),
             "path": payload.get("path"),
             "timestamp": payload.get("timestamp"),
+        },
+    )
+
+
+@register_evaluator(SENTIMENT_DASHBOARD_JOB_KEY)
+def evaluate_sentiment_dashboard_refresh(
+    ctx: TaskEvaluationContext,
+) -> TaskEvaluationResult:
+    """Output completeness and freshness evaluator for ``sentiment-dashboard-refresh``."""
+    warnings: list[str] = []
+    payload = extract_last_json_object(ctx.stdout)
+    if isinstance(payload, dict) and payload.get("ok") is False:
+        return TaskEvaluationResult(
+            ok=False,
+            status="failed",
+            failure_reason=f"sentiment_cli_error:{payload.get('error') or 'ok_false'}",
+            warnings=warnings,
+        )
+
+    base_dir = ctx.data_root / "research-outputs" / "sentiment-dashboard"
+    panels_dir = base_dir / "panels"
+    shared_dir = panels_dir / "_shared"
+    for shared_name in ("panel.css", "panel.js"):
+        shared_file = shared_dir / shared_name
+        if not shared_file.is_file() or shared_file.stat().st_size == 0:
+            return TaskEvaluationResult(
+                ok=False,
+                status="failed",
+                failure_reason=f"sentiment_missing_shared_asset:{shared_name}",
+                warnings=warnings,
+            )
+
+    started_ts = ctx.started_at.timestamp() if ctx.started_at is not None else None
+    for slug in SENTIMENT_DASHBOARD_PANEL_SLUGS:
+        panel_html = panels_dir / slug / "index.html"
+        if not panel_html.is_file() or panel_html.stat().st_size == 0:
+            return TaskEvaluationResult(
+                ok=False,
+                status="failed",
+                failure_reason=f"sentiment_missing_or_empty_panel:{slug}",
+                warnings=warnings,
+            )
+        if started_ts is not None and panel_html.stat().st_mtime < started_ts - 1.0:
+            return TaskEvaluationResult(
+                ok=False,
+                status="failed",
+                failure_reason=f"sentiment_stale_panel_not_updated:{slug}",
+                warnings=warnings,
+            )
+
+    signals_path = base_dir / "signals.json"
+    if not signals_path.is_file() or signals_path.stat().st_size == 0:
+        return TaskEvaluationResult(
+            ok=False,
+            status="failed",
+            failure_reason="sentiment_missing_signals_json",
+            warnings=warnings,
+        )
+    try:
+        signals_doc = json.loads(signals_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return TaskEvaluationResult(
+            ok=False,
+            status="failed",
+            failure_reason=f"sentiment_invalid_signals_json:{exc}",
+            warnings=warnings,
+        )
+    if not isinstance(signals_doc, dict):
+        return TaskEvaluationResult(
+            ok=False,
+            status="failed",
+            failure_reason="sentiment_signals_not_dict",
+            warnings=warnings,
+        )
+    raw_date = str(signals_doc.get("date") or "").strip()
+    if not raw_date:
+        return TaskEvaluationResult(
+            ok=False,
+            status="failed",
+            failure_reason="sentiment_signals_missing_date",
+            warnings=warnings,
+        )
+    try:
+        sig_date = date.fromisoformat(raw_date[:10])
+    except ValueError:
+        return TaskEvaluationResult(
+            ok=False,
+            status="failed",
+            failure_reason=f"sentiment_signals_invalid_date:{raw_date}",
+            warnings=warnings,
+        )
+    ref_date = ctx.reference_date
+    if ref_date is None:
+        base_dt = ctx.started_at or datetime.now(timezone.utc)
+        if base_dt.tzinfo is None:
+            base_dt = base_dt.replace(tzinfo=timezone.utc)
+        ref_date = base_dt.astimezone(ZoneInfo("Asia/Shanghai")).date()
+    age_days = (ref_date - sig_date).days
+    if age_days > SENTIMENT_SIGNALS_MAX_STALE_DAYS or sig_date > ref_date + timedelta(days=1):
+        return TaskEvaluationResult(
+            ok=False,
+            status="failed",
+            failure_reason=(
+                f"sentiment_signals_stale:{raw_date}:ref={ref_date.isoformat()}:age_days={age_days}"
+            ),
+            warnings=warnings,
+        )
+
+    return TaskEvaluationResult(
+        ok=True,
+        status="succeeded",
+        warnings=warnings,
+        details={
+            "signals_date": raw_date,
+            "panels": list(SENTIMENT_DASHBOARD_PANEL_SLUGS),
         },
     )
 

@@ -1759,13 +1759,14 @@ def deploy(
         errors = [str(e).strip() for e in etf.get("errors", []) if str(e).strip()]
         issue = "ETF 看板有取数问题：" + ("；".join(errors) if errors else "未知错误")
         result["etf_error"] = issue
-        if not no_upload:
-            result["ok"] = False
-            if result["uploaded"]:
-                result["error"] = "页面已上传，但" + issue
-            else:
-                upload_error = (result.get("upload") or {}).get("error", "上传失败")
-                result["error"] = f"上传失败：{upload_error}；另外{issue}"
+        result["ok"] = False
+        if no_upload:
+            result["error"] = issue
+        elif result["uploaded"]:
+            result["error"] = "页面已上传，但" + issue
+        else:
+            upload_error = (result.get("upload") or {}).get("error", "上传失败")
+            result["error"] = f"上传失败：{upload_error}；另外{issue}"
     return result
 
 

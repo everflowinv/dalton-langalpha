@@ -20,6 +20,8 @@ from src.dalton.data_jobs.manifest import load_data_task_manifest
 logger = logging.getLogger(__name__)
 
 FREEZE_DIR_NAME = ".dalton-freeze"
+MONITOR_FREEZE_DIR_NAME = ".freeze"
+MONITOR_FREEZE_KEEP_RUNS = 5
 DONE_FILENAME = "done.json"
 # Parity only compares matching slots, while some tasks freeze hundreds of MB per run
 # on the host's internal disk; older slots are pruned after each successful freeze.
@@ -579,3 +581,189 @@ def prune_old_freeze_slots(job_dir: Path, *, keep: int, current_slot: str) -> li
         shutil.rmtree(child)
         removed.append(child.name)
     return removed
+
+
+def _copy_tree_contained(
+    src_root: Path,
+    src_rel_dir: str,
+    dst_root: Path,
+    root_real: Path,
+) -> list[str]:
+    """Copy regular non-symlink files from ``src_root / src_rel_dir`` into ``dst_root / src_rel_dir``."""
+    rel_clean = str(src_rel_dir or "").strip().strip("/")
+    if not rel_clean or ".." in Path(rel_clean).parts:
+        return []
+    src_dir = src_root / rel_clean
+    if not src_dir.is_dir() or _has_symlink_below(src_root, src_dir):
+        return []
+    try:
+        src_dir_real = src_dir.resolve()
+    except OSError:
+        return []
+    if not _is_strictly_within(src_dir_real, root_real):
+        return []
+
+    copied: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(src_dir, followlinks=False):
+        cur_dir = Path(dirpath)
+        # Skip hidden dirs and symlinks
+        dirnames[:] = [
+            d
+            for d in sorted(dirnames)
+            if not d.startswith(".") and not (cur_dir / d).is_symlink()
+        ]
+        for fname in sorted(filenames):
+            if fname.startswith("."):
+                continue
+            src_file = cur_dir / fname
+            if src_file.is_symlink() or not src_file.is_file():
+                continue
+            try:
+                src_real = src_file.resolve()
+            except OSError:
+                continue
+            if not _is_strictly_within(src_real, root_real):
+                continue
+            rel_file = src_real.relative_to(root_real).as_posix()
+            dst_file = dst_root / rel_file
+            dst_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_file, dst_file, follow_symlinks=False)
+            copied.append(rel_file)
+    return copied
+
+
+def _prune_old_monitor_freeze_runs(
+    runs_dir: Path, *, keep: int, current_run_id: str
+) -> list[str]:
+    if keep < 1 or runs_dir.is_symlink() or not runs_dir.is_dir():
+        return []
+    children = [
+        c for c in runs_dir.iterdir() if c.is_dir() and not c.is_symlink()
+    ]
+    children.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    removed: list[str] = []
+    for child in children[keep:]:
+        if child.name == current_run_id:
+            continue
+        shutil.rmtree(child, ignore_errors=True)
+        removed.append(child.name)
+    return removed
+
+
+def freeze_monitor_publish_artifacts(
+    *,
+    data_root: Path | str,
+    job_key: str,
+    run_id: str,
+    keep_runs: int = MONITOR_FREEZE_KEEP_RUNS,
+) -> Path | None:
+    """Freeze all bound monitor panel outputs for ``(job_key, run_id)`` into an immutable directory.
+
+    Target layout: ``{data_root}/.freeze/{job_key}/runs/{run_id}/`` preserving relative paths
+    so ``HostDirFileSource.open_registered(frozen_dir, binding)`` and ``check_binding_source_health``
+    read strictly from this run's frozen snapshot even after subsequent runs overwrite ``data_root``.
+    """
+    from src.dalton.monitors.data_job_registry import get_registered_monitor_bindings
+
+    clean_job_key = str(job_key or "").strip()
+    clean_run_id = str(run_id or "").strip()
+    bindings = get_registered_monitor_bindings(clean_job_key)
+    if not bindings or not clean_run_id:
+        return None
+    if (
+        Path(clean_job_key).parts != (clean_job_key,)
+        or clean_job_key in (".", "..")
+        or Path(clean_run_id).parts != (clean_run_id,)
+        or clean_run_id in (".", "..")
+    ):
+        logger.warning(
+            "Aborting monitor freeze: invalid job_key=%r or run_id=%r",
+            clean_job_key,
+            clean_run_id,
+        )
+        return None
+
+    root_path = Path(data_root)
+    if root_path.is_symlink() or not root_path.exists():
+        return None
+    root_real = root_path.resolve()
+
+    freeze_root = root_path / MONITOR_FREEZE_DIR_NAME
+    runs_dir = freeze_root / clean_job_key / "runs"
+    run_dir = runs_dir / clean_run_id
+    for ancestor in (freeze_root, freeze_root / clean_job_key, runs_dir, run_dir):
+        if ancestor.is_symlink():
+            logger.warning("Aborting monitor freeze: %s is a symlink", ancestor)
+            return None
+
+    stage_dir = runs_dir / f".{clean_run_id}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    copied_files: list[str] = []
+    seen_dirs: set[str] = set()
+    seen_files: set[str] = set()
+    try:
+        for binding in bindings:
+            if binding.rel_dir not in seen_dirs:
+                seen_dirs.add(binding.rel_dir)
+                copied_files.extend(
+                    _copy_tree_contained(root_path, binding.rel_dir, stage_dir, root_real)
+                )
+            if binding.shared_rel_dir and binding.shared_rel_dir not in seen_dirs:
+                seen_dirs.add(binding.shared_rel_dir)
+                copied_files.extend(
+                    _copy_tree_contained(
+                        root_path, binding.shared_rel_dir, stage_dir, root_real
+                    )
+                )
+            if binding.status_rel_path and binding.status_rel_path not in seen_files:
+                seen_files.add(binding.status_rel_path)
+                st_clean = binding.status_rel_path.strip().strip("/")
+                if st_clean and ".." not in Path(st_clean).parts:
+                    src_st = root_path / st_clean
+                    if (
+                        src_st.is_file()
+                        and not src_st.is_symlink()
+                        and not _has_symlink_below(root_path, src_st)
+                        and _is_strictly_within(src_st.resolve(), root_real)
+                    ):
+                        dst_st = stage_dir / st_clean
+                        dst_st.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_st, dst_st, follow_symlinks=False)
+                        copied_files.append(st_clean)
+
+        if not copied_files:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            logger.warning(
+                "Aborting monitor freeze for %s (%s): no regular panel files found under %s",
+                clean_job_key,
+                clean_run_id,
+                root_path,
+            )
+            return None
+
+        meta = {
+            "job_key": clean_job_key,
+            "run_id": clean_run_id,
+            "frozen_at": datetime.now(timezone.utc).isoformat(),
+            "files": sorted(dict.fromkeys(copied_files)),
+        }
+        (stage_dir / ".freeze_complete.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        if run_dir.exists():
+            shutil.rmtree(run_dir, ignore_errors=True)
+        os.replace(stage_dir, run_dir)
+    except Exception:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        raise
+
+    try:
+        _prune_old_monitor_freeze_runs(
+            runs_dir, keep=keep_runs, current_run_id=clean_run_id
+        )
+    except OSError as exc:
+        logger.warning(
+            "Failed pruning old monitor freeze runs for %s: %s", clean_job_key, exc
+        )
+    return run_dir

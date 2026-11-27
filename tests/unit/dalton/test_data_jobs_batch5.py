@@ -816,7 +816,9 @@ def test_kweb_etf_failure_renders_stale_banner_on_page_without_outbox(
     last_ok_file = tmp_path / "state" / "kweb-dashboard" / "etf_last_success.json"
     assert json.loads(last_ok_file.read_text(encoding="utf-8"))["as_of"] == "2026-11-16"
 
-    # 2) Partial ETF fetch failure: page builds & deploy succeeds, ETF section top shows stale banner.
+    # 2) Partial ETF fetch failure: page builds with stale banner on ETF tab,
+    #    AND Batch 2 §1 requires deploy(--no-upload) to return non-zero + ok=False
+    #    so the data-job scheduler does not silently republish a degraded dashboard as succeeded.
     fake_etf_board.analyse_board = create_autospec(  # type: ignore[attr-defined]
         lambda _cfg, _ws, _rsi: {},
         return_value={
@@ -825,10 +827,11 @@ def test_kweb_etf_failure_renders_stale_banner_on_page_without_outbox(
         },
     )
     rc_partial = cli.main(["deploy", "--no-upload", "--output", str(out_html), "--json"])
-    assert rc_partial == 0
+    assert rc_partial == 1
     partial_payload = json.loads(capsys.readouterr().out)
-    assert partial_payload["ok"] is True
+    assert partial_payload["ok"] is False
     assert partial_payload["upload_skipped"] is True
+    assert "SOXX 没取到行情" in (partial_payload.get("error") or "")
     assert not outbox_file.exists()
     html_partial = out_html.read_text(encoding="utf-8")
     etf_block = html_partial.split('<main id="tab-etf"', 1)[1]
@@ -836,16 +839,16 @@ def test_kweb_etf_failure_renders_stale_banner_on_page_without_outbox(
     assert "ETF 数据未更新（上次成功：2026-11-16，原因：SOXX 没取到行情；周期/防御缺失）" in etf_block
     assert etf_block.index("stale-banner") < etf_block.index('class="stats"')
 
-    # 3) Full ETF failure (exception) without prior state: falls back to "未知", still succeeds.
+    # 3) Full ETF failure (exception) without prior state: falls back to "未知", reports failure.
     last_ok_file.unlink()
     fake_etf_board.analyse_board = create_autospec(  # type: ignore[attr-defined]
         lambda _cfg, _ws, _rsi: {},
         side_effect=RuntimeError("yfinance timeout"),
     )
     rc_exc = cli.main(["deploy", "--no-upload", "--output", str(out_html), "--json"])
-    assert rc_exc == 0
+    assert rc_exc == 1
     exc_payload = json.loads(capsys.readouterr().out)
-    assert exc_payload["ok"] is True
+    assert exc_payload["ok"] is False
     assert not outbox_file.exists()
     html_exc = out_html.read_text(encoding="utf-8")
     etf_exc_block = html_exc.split('<main id="tab-etf"', 1)[1]

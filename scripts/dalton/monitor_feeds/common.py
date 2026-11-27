@@ -381,6 +381,8 @@ HK_MONTH_END_REQUIRED_SOURCES: tuple[str, ...] = (
 )
 PM_REQUIRED_L1_SOURCES: tuple[str, ...] = ("us",)
 PM_REQUIRED_L2_MARKET_SOURCES: tuple[str, ...] = ("us", "cn")
+PM_US_PANEL_REQUIRED_SOURCES: tuple[str, ...] = ("us",)
+PM_CN_PANEL_REQUIRED_SOURCES: tuple[str, ...] = ("cn", "cn_valuation")
 
 
 # ---------------------------------------------------------------------------
@@ -697,23 +699,42 @@ class MonitorPushHttpError(RuntimeError):
 def push_monitor_data(
     slug: str,
     data_key: str,
-    payload: Any,
+    payload: Any = None,
     *,
     as_of: str | None = None,
+    attempt_seq: int | None = None,
+    is_stale: bool = False,
+    error: str | None = None,
+    last_attempt_at: str | None = None,
     backend_url: str | None = None,
     token: str | None = None,
     timeout: float = 15.0,
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
-    """Write realtime payload to ``PUT /api/v1/dalton/monitors/internal/{slug}/data/{key}``."""
+    """Write realtime payload or health status to ``PUT /api/v1/dalton/monitors/internal/{slug}/data/{key}``."""
     base = (backend_url or os.environ.get("DALTON_BACKEND_URL") or "http://127.0.0.1:8000").rstrip("/")
     tok = token if token is not None else os.environ.get("INTERNAL_SERVICE_TOKEN", "").strip()
     if not tok:
         raise RuntimeError("INTERNAL_SERVICE_TOKEN 未配置，无法写入监控实时数据")
     url = f"{base}/api/v1/dalton/monitors/internal/{slug}/data/{data_key}"
-    body: dict[str, Any] = {"data": payload}
-    if as_of is not None:
-        body["as_of"] = as_of
+    body: dict[str, Any] = {}
+    if is_stale:
+        body["is_stale"] = True
+        if error is not None:
+            body["error"] = error
+        if last_attempt_at is not None:
+            body["last_attempt_at"] = last_attempt_at
+        if attempt_seq is not None:
+            body["attempt_seq"] = int(attempt_seq)
+    else:
+        body["data"] = payload
+        if as_of is not None:
+            body["as_of"] = as_of
+        if attempt_seq is not None:
+            body["attempt_seq"] = int(attempt_seq)
+            body["is_stale"] = False
+        if last_attempt_at is not None:
+            body["last_attempt_at"] = last_attempt_at
     headers = {
         "X-Service-Token": tok,
         "Content-Type": "application/json",
@@ -885,6 +906,7 @@ def build_grant_poller_js(
   var dataBase = null;
   var lastDataTsMs = NaN;
   var lastReceivedTsMs = NaN;
+  var serverStaleMsg = null;
 
   function formatBjTime(ms) {{
     if (!Number.isFinite(ms)) return '';
@@ -965,6 +987,10 @@ def build_grant_poller_js(
     }}
     var refTsMs = Number.isFinite(lastReceivedTsMs) ? lastReceivedTsMs : lastDataTsMs;
     window.__DALTON_LAST_RECEIVED_MS__ = refTsMs;
+    if (serverStaleMsg) {{
+      if (typeof window[{json.dumps(on_stale_fn)}] === 'function') window[{json.dumps(on_stale_fn)}](serverStaleMsg);
+      return true;
+    }}
     if (!Number.isFinite(refTsMs)) return false;
     if (!isNowInTradingSession(curPayload)) {{
       if (typeof window[{json.dumps(on_stale_fn)}] === 'function') window[{json.dumps(on_stale_fn)}](null);
@@ -1009,10 +1035,22 @@ def build_grant_poller_js(
       etag = resp.headers.get('ETag') || etag;
       var body = await resp.json();
       if (body && body.data) window.__DALTON_LAST_PAYLOAD__ = body.data;
-      checkDataFreshness(
-        body && body.data ? body.data : null,
-        body ? {{ updated_at: body.updated_at, as_of: body.as_of }} : null
-      );
+      if (body && body.is_stale) {{
+        var errMsg = body.last_error
+          ? ('实时行情采集异常（' + body.last_error + '），当前展示上一可用快照')
+          : '实时行情采集异常，当前展示上一可用快照';
+        serverStaleMsg = errMsg;
+        checkDataFreshness(
+          body && body.data ? body.data : null,
+          body ? {{ updated_at: body.updated_at, as_of: body.as_of }} : null
+        );
+      }} else {{
+        serverStaleMsg = null;
+        checkDataFreshness(
+          body && body.data ? body.data : null,
+          body ? {{ updated_at: body.updated_at, as_of: body.as_of }} : null
+        );
+      }}
       {on_data_fn}(body);
     }} catch (err) {{
       var msg = (err && err.name === 'AbortError')

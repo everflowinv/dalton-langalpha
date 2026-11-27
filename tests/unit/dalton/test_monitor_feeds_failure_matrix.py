@@ -481,10 +481,12 @@ def test_hkmom_month_end_success_e2e_real_compute_and_freeze(
 @pytest.mark.parametrize(
     ("source", "mode", "expected_exit", "expect_advance"),
     [
-        ("us", "exception", 1, False),
-        ("us", "empty", 1, False),
-        ("us", "partial", 1, False),
-        ("us", "duplicate_or_meta", 1, False),
+        # Under per_panel publishing, isolated US source failures exit 0 while CN succeeds
+        # so the healthy CN panel still publishes; US panel is blocked via status.json.
+        ("us", "exception", 0, False),
+        ("us", "empty", 0, False),
+        ("us", "partial", 0, False),
+        ("us", "duplicate_or_meta", 0, False),
         ("us", "success", 0, True),
         ("cn", "exception", 0, False),
         ("cn", "empty", 0, False),

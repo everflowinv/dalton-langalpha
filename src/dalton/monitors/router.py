@@ -234,6 +234,9 @@ async def serve_public_monitor_entry_endpoint(
     request: Request,
     rel: str | None = None,
     if_none_match: Annotated[str | None, Header()] = None,
+    x_dalton_candidate_probe: Annotated[
+        str | None, Header(alias="X-Dalton-Candidate-Probe")
+    ] = None,
 ) -> Response:
     try:
         served = await monitor_service.serve_public_monitor_file(
@@ -243,6 +246,7 @@ async def serve_public_monitor_entry_endpoint(
             rel=rel,
             if_none_match=if_none_match,
             head=request.method == "HEAD",
+            candidate_probe=x_dalton_candidate_probe,
         )
     except ArtifactFileUnavailable as exc:
         logger.warning("Public monitor file could not be served: %s", exc)
@@ -257,6 +261,9 @@ async def serve_public_monitor_file_endpoint(
     path: str,
     request: Request,
     if_none_match: Annotated[str | None, Header()] = None,
+    x_dalton_candidate_probe: Annotated[
+        str | None, Header(alias="X-Dalton-Candidate-Probe")
+    ] = None,
 ) -> Response:
     try:
         served = await monitor_service.serve_public_monitor_file(
@@ -265,6 +272,7 @@ async def serve_public_monitor_file_endpoint(
             path,
             if_none_match=if_none_match,
             head=request.method == "HEAD",
+            candidate_probe=x_dalton_candidate_probe,
         )
     except ArtifactFileUnavailable as exc:
         logger.warning("Public monitor file could not be served: %s", exc)
@@ -288,8 +296,20 @@ async def read_public_monitor_data_endpoint(
 
 @router.get("/public/{slug}")
 @handle_api_exceptions("get public monitor detail", logger)
-async def get_public_monitor_detail_endpoint(slug: str) -> dict[str, Any]:
-    return await monitor_service.get_public_monitor_detail(slug)
+async def get_public_monitor_detail_endpoint(
+    slug: str,
+    x_dalton_candidate_probe: Annotated[
+        str | None, Header(alias="X-Dalton-Candidate-Probe")
+    ] = None,
+) -> Response:
+    payload = await monitor_service.get_public_monitor_detail(
+        slug, candidate_probe=x_dalton_candidate_probe
+    )
+    return JSONResponse(
+        status_code=200,
+        content=payload,
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +333,14 @@ async def put_monitor_data_internal_endpoint(
             status_code=400, detail="Caller user identity override is not permitted."
         )
     return await monitor_service.write_monitor_data_internal(
-        slug, key, body.data, as_of=body.as_of
+        slug,
+        key,
+        body.data,
+        as_of=body.as_of,
+        attempt_seq=body.attempt_seq,
+        is_stale=body.is_stale,
+        error=body.error,
+        last_attempt_at=body.last_attempt_at,
     )
 
 
@@ -346,8 +373,13 @@ async def republish_data_job_monitor_endpoint(
 @handle_api_exceptions("get monitor detail", logger)
 async def get_monitor_detail_endpoint(
     slug: str, user_id: CurrentUserId
-) -> dict[str, Any]:
-    return await monitor_service.get_monitor_detail(slug, viewer_id=user_id)
+) -> Response:
+    payload = await monitor_service.get_monitor_detail(slug, viewer_id=user_id)
+    return JSONResponse(
+        status_code=200,
+        content=payload,
+        headers={"Cache-Control": "private, no-cache"},
+    )
 
 
 @router.patch("/{slug}")

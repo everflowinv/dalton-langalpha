@@ -15,6 +15,7 @@ const ALERT_CODES = new Set([
   "backup_failed",
   "model_unavailable",
   "model_released",
+  "monitor_publish_failed",
   "alphaengine_login_required",
   "alphaengine_module_page_required",
   "alphaengine_token_expiring",
@@ -26,6 +27,7 @@ const DETAIL_ALERT_CODES = new Set([
   "backup_failed",
   "model_unavailable",
   "model_released",
+  "monitor_publish_failed",
   "alphaengine_token_expiring",
   "redis_diag_p1",
   "redis_diag_p2",
@@ -39,6 +41,7 @@ const ALLOWED_MESSAGE_KEYS = new Set([
   "backup_failed",
   "model_unavailable",
   "model_released",
+  "monitor_publish_failed",
   "alphaengine_login_required",
   "alphaengine_module_page_required",
   "alphaengine_token_expiring",
@@ -55,6 +58,7 @@ const DEFAULT_DETAIL_TEMPLATES: Record<string, string> = {
   backup_failed: "Dalton 备份失败：{detail}",
   model_unavailable: "Dalton 模型可用性告警：{detail}",
   model_released: "订阅已开放 {provider} 的 {models}，核对档位后将其设为可见并去掉 awaiting_release 标记",
+  monitor_publish_failed: "Dalton 看板发布告警：{detail}",
   alphaengine_token_expiring: "请在 AlphaEngine App 里登录账号 {detail}",
   redis_diag_p1: "Dalton Redis P1 告警：{detail}",
   redis_diag_p2: "Dalton Redis P2 退化告警：{detail}",
@@ -261,7 +265,7 @@ export async function handleOpsAlert(options: {
         ok: false,
         code: "invalid_request",
         message:
-          "code must be backend_down, backend_recovered, backup_failed, model_unavailable, model_released, alphaengine_login_required, alphaengine_module_page_required, alphaengine_token_expiring, redis_diag_p1, redis_diag_p2, or redis_diag_p3.",
+          "code must be backend_down, backend_recovered, backup_failed, model_unavailable, model_released, monitor_publish_failed, alphaengine_login_required, alphaengine_module_page_required, alphaengine_token_expiring, redis_diag_p1, redis_diag_p2, or redis_diag_p3.",
       },
     };
   }
@@ -272,7 +276,7 @@ export async function handleOpsAlert(options: {
         ok: false,
         code: "invalid_request",
         message:
-          "detail is only supported for backup_failed, model_unavailable, model_released, alphaengine_token_expiring, redis_diag_p1, redis_diag_p2, or redis_diag_p3.",
+          "detail is only supported for backup_failed, model_unavailable, model_released, monitor_publish_failed, alphaengine_token_expiring, redis_diag_p1, redis_diag_p2, or redis_diag_p3.",
       },
     };
   }
@@ -335,7 +339,7 @@ export async function handleOpsAlert(options: {
     );
   } else if (DETAIL_ALERT_CODES.has(code)) {
     const maxChars =
-      code === "model_unavailable"
+      code === "model_unavailable" || code === "monitor_publish_failed"
         ? MAX_MODEL_UNAVAILABLE_DETAIL_CHARS
         : code.startsWith("redis_diag_")
           ? MAX_REDIS_DIAG_DETAIL_CHARS

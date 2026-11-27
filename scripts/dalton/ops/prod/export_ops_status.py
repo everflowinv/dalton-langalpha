@@ -393,6 +393,121 @@ def inspect_backend_watchdog_job(
     return job
 
 
+MONITOR_PUBLISH_ISSUE_STATUSES: tuple[str, ...] = (
+    "failed",
+    "partial_failed",
+    "disabled",
+)
+
+
+def query_monitor_publish_issue_rows(
+    pg_dsn: str,
+    *,
+    psql_bin: str | None = None,
+    lookback_hours: int = 24,
+) -> list[dict[str, Any]]:
+    """Query recent terminal monitor publish issues from ``dalton_data_task_runs`` via ``psql`` (excluding ``superseded``)."""
+    clean_dsn = str(pg_dsn or "").strip()
+    if not clean_dsn:
+        return []
+    bin_path = psql_bin or os.environ.get("PSQL_BIN", "").strip() or "psql"
+    hours = max(1, int(lookback_hours))
+    sql_query = (
+        "SELECT COALESCE(json_agg(t), '[]'::json) FROM ("
+        "SELECT run_id::text AS run_id, job_key, monitor_publish_status, "
+        "completed_at, monitor_publish_detail->>'last_error' AS last_error "
+        "FROM dalton_data_task_runs "
+        "WHERE monitor_publish_status IN ('failed', 'partial_failed', 'disabled') "
+        f"AND COALESCE(completed_at, updated_at) >= NOW() - INTERVAL '{hours} hours' "
+        "ORDER BY COALESCE(completed_at, updated_at) DESC LIMIT 20"
+        ") t;"
+    )
+    res = subprocess.run(
+        [bin_path, clean_dsn, "-At", "-c", sql_query],
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+        check=False,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(res.stderr.strip() or f"psql exited {res.returncode}")
+    raw = res.stdout.strip()
+    if not raw:
+        return []
+    parsed = json.loads(raw)
+    return [row for row in parsed if isinstance(row, dict)] if isinstance(parsed, list) else []
+
+
+def inspect_monitor_publish_job(
+    *,
+    pg_dsn: str | None = None,
+    issue_rows: list[dict[str, Any]] | None = None,
+    psql_bin: str | None = None,
+    lookback_hours: int = 24,
+) -> dict[str, Any]:
+    """Summarize ``dalton_data_task_runs.monitor_publish_status IN ('failed','partial_failed','disabled')`` (excluding ``superseded``)."""
+    job: dict[str, Any] = {
+        "key": "ops-monitor-publish",
+        "kind": "ops_monitor_publish",
+        "scope": "ops",
+        "title": "看板发布核验",
+        "description": "汇总数据任务看板发布终态失败或禁用记录（排除正常取代 superseded）",
+        "status": "unknown",
+        "last_run_at": None,
+        "last_result": None,
+        "next_run_at": None,
+        "can_toggle": False,
+        "can_run_now": False,
+        "issue_count": 0,
+        "issues": [],
+    }
+    try:
+        rows = (
+            issue_rows
+            if issue_rows is not None
+            else query_monitor_publish_issue_rows(
+                pg_dsn or "",
+                psql_bin=psql_bin,
+                lookback_hours=lookback_hours,
+            )
+        )
+    except Exception as exc:
+        job["status"] = "unknown"
+        job["last_result"] = _scrub_local_paths(f"查询失败：{exc}")
+        return job
+
+    filtered = [
+        r
+        for r in rows
+        if str(r.get("monitor_publish_status") or "").strip() in MONITOR_PUBLISH_ISSUE_STATUSES
+    ]
+    job["issue_count"] = len(filtered)
+    job["issues"] = [
+        {
+            "run_id": str(r.get("run_id") or ""),
+            "job_key": str(r.get("job_key") or ""),
+            "monitor_publish_status": str(r.get("monitor_publish_status") or ""),
+            "completed_at": r.get("completed_at"),
+            "last_error": _scrub_local_paths(r.get("last_error")) or None,
+        }
+        for r in filtered[:10]
+    ]
+    if not filtered:
+        job["status"] = "on"
+        job["last_result"] = "健康（无终态发布失败）"
+    else:
+        job["status"] = "partial"
+        job["last_run_at"] = filtered[0].get("completed_at")
+        summary_items = [
+            f"{r.get('job_key')}({r.get('monitor_publish_status')})"
+            for r in filtered[:5]
+        ]
+        job["last_result"] = _scrub_local_paths(
+            f"近 {lookback_hours}h 异常 {len(filtered)} 条：" + "，".join(summary_items)
+        )
+    return job
+
+
 def collect_ops_jobs(
     *,
     pg_backup_log_file: Path,
@@ -403,9 +518,11 @@ def collect_ops_jobs(
     launchctl_bin: str | None = None,
     uid: int | None = None,
     localtime_path: Path = Path("/etc/localtime"),
+    monitor_pg_dsn: str | None = None,
+    monitor_issue_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Collect read-only operational job snapshots."""
-    return [
+    jobs = [
         inspect_pg_backup_job(
             pg_backup_log_file=pg_backup_log_file,
             pg_backup_plist_file=pg_backup_plist_file,
@@ -421,6 +538,18 @@ def collect_ops_jobs(
             uid=uid,
         ),
     ]
+    # Production backend reads ``ops-monitor-publish`` directly from its existing
+    # PostgreSQL pool (``src/dalton/autonomy/system_jobs.py``) without extra DSN config.
+    # The exporter only appends it when an explicit caller passes rows or a DSN.
+    eff_dsn = (monitor_pg_dsn or "").strip()
+    if monitor_issue_rows is not None or eff_dsn:
+        jobs.append(
+            inspect_monitor_publish_job(
+                pg_dsn=eff_dsn,
+                issue_rows=monitor_issue_rows,
+            )
+        )
+    return jobs
 
 
 def build_ops_status_payload(

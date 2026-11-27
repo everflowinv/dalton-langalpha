@@ -824,7 +824,18 @@ async def test_write_monitor_data_internal_allows_registered_feed_keys(
     async def _get_by_slug(slug: str):
         return by_slug.get(slug)
 
-    async def _upsert(monitor_id: str, data_key: str, payload: Any, *, as_of=None):
+    async def _upsert(
+        monitor_id: str,
+        data_key: str,
+        payload: Any,
+        *,
+        as_of=None,
+        attempt_seq=None,
+        is_stale=False,
+        error=None,
+        last_attempt_at=None,
+    ):
+        del attempt_seq, is_stale, error, last_attempt_at
         return MonitorDataEntry(
             monitor_id=monitor_id,
             data_key=data_key,

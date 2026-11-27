@@ -493,6 +493,86 @@ describe('Monitors page (Checklist 8)', () => {
     expect(errBanner.querySelector('.truncate')).toBeNull();
   });
 
+  it('pins public and authenticated viewers to detail.monitor.last_verified_seq and shows has_recent_publish_issue notice', async () => {
+    const publicMonitor = makeSummary({
+      slug: 'public-verified-pin',
+      title: 'Public Verified Pin',
+      visibility: 'public',
+      published_seq: 5,
+      last_verified_seq: 4,
+      last_publish_error: null,
+      last_publish_failed_at: null,
+      has_recent_publish_issue: true,
+    });
+    delete publicMonitor.workspace_id;
+    delete publicMonitor.artifact_id;
+    delete publicMonitor.owner_user_id;
+    delete publicMonitor.entry_path;
+
+    mockGetPublicMonitorDetail.mockResolvedValue(
+      makeDetail({
+        monitor: publicMonitor,
+        frame_base: '/api/v1/dalton/monitors/public/public-verified-pin/',
+        data_base: '/api/v1/dalton/monitors/public/public-verified-pin/data',
+        monitor_grant: '',
+        expires_in: 0,
+        versions: [],
+      }),
+    );
+
+    const { unmount } = renderWithProviders(
+      <Routes>
+        <Route path="/m/:slug" element={<PublicMonitorPage />} />
+      </Routes>,
+      { route: '/m/public-verified-pin' },
+    );
+
+    const publicFrame = await screen.findByTestId('bridged-frame');
+    expect(publicFrame.getAttribute('data-src')).toContain(
+      '/api/v1/dalton/monitors/public/public-verified-pin/v/4/',
+    );
+    const issueBanner = screen.getByTestId('monitor-publish-issue');
+    expect(issueBanner).toBeInTheDocument();
+    unmount();
+
+    // Authenticated mode also prefers last_verified_seq over published_seq until user selects another version.
+    mockGetMonitorDetail.mockResolvedValue(
+      makeDetail({
+        monitor: makeSummary({
+          slug: 'auth-verified-pin',
+          title: 'Auth Verified Pin',
+          entry_path: 'index.html',
+          published_seq: 6,
+          last_verified_seq: 5,
+          has_recent_publish_issue: true,
+          last_publish_error: null,
+          last_publish_failed_at: null,
+        }),
+        versions: [
+          {
+            seq: 5,
+            entry_path: 'index.html',
+            origin: 'owner',
+            title: 'Auth Verified Pin',
+            label: 'Verified',
+            byte_len: 1000,
+            published_at: '2026-11-27T10:00:00Z',
+          },
+        ],
+      }),
+    );
+
+    renderWithProviders(
+      <Routes>
+        <Route path="/monitors/:slug" element={<Monitors />} />
+      </Routes>,
+      { route: '/monitors/auth-verified-pin' },
+    );
+
+    const authFrame = await screen.findByTestId('bridged-frame');
+    expect(authFrame.getAttribute('data-src')).toContain('/v/5/index.html');
+  });
+
   it('excludes non-HTML entries from monitor cards, groups shared documents into Shared by me and Shared with me, revokes own doc after confirmation, and hides Stop sharing on others', async () => {
     const user = userEvent.setup();
     mockListMonitors.mockResolvedValue([

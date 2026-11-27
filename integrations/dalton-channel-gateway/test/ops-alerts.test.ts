@@ -709,3 +709,39 @@ describe("ops-alerts redis diagnostics aggregation & dedup", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe("ops-alerts monitor_publish_failed", () => {
+  it("renders default and configured templates with up to 600 chars detail", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dalton-ops-mon-pub-"));
+    const configPath = join(dir, "ops-alerts.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        targets: ["feishu:user:ou_ops_a"],
+        messages: {
+          backend_down: "Dalton 后端不可用",
+          backend_recovered: "Dalton 后端已恢复",
+        },
+      }),
+    );
+
+    const sender = vi.fn(async () => ({ messageId: "om_mon_1" }));
+    const longDetail = "x".repeat(700);
+    const resDefault = await handleOpsAlert({
+      body: {
+        code: "monitor_publish_failed",
+        detail: longDetail,
+      },
+      remoteAddress: "127.0.0.1",
+      configPath,
+      sendPlainText: sender,
+    });
+    expect(resDefault.status).toBe(200);
+    const sentText = sender.mock.calls[0][1];
+    expect(sentText).toContain("Dalton 看板发布告警");
+    expect(sentText).toContain("x".repeat(600));
+    expect(sentText).not.toContain("x".repeat(601));
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
