@@ -245,9 +245,9 @@ async def dispatch(
     """
     import aiohttp
 
-    # DALTON-HOOK(cos-verbatim-forward): attach latest user verbatim request when not already quoted.
+    # DALTON-HOOK(cos-verbatim-forward): attach this turn's raw user verbatim request when not already quoted.
     from src.dalton.cos_verbatim import append_verbatim_user_request
-    question = append_verbatim_user_request(question, state)
+    question = append_verbatim_user_request(question, state, config=config)
 
     model = (model or "").strip() or None
 

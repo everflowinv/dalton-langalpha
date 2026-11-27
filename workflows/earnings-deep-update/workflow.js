@@ -112,6 +112,8 @@ let modelStatus = modelResult ? modelResult.status : args.model_path ? 'failed_u
 let modelPath = modelResult && modelResult.candidate_path ? normPath(modelResult.candidate_path) : null
 let modelSha = (modelResult && modelResult.model_sha256) || null
 let modelRunId = (modelResult && modelResult.run_id) || null
+let modelConsensusPath = (modelResult && modelResult.consensus_path) || null
+let modelFailedStages = modelResult && Array.isArray(modelResult.failed_stages) ? modelResult.failed_stages.slice() : []
 let modelArtifacts = modelResult && Array.isArray(modelResult.artifacts) ? modelResult.artifacts.slice() : []
 let hasMapping = hasArtifact(modelArtifacts, `${R}/mapping.md`)
 let hasModelDelta = hasArtifact(modelArtifacts, `${R}/model-delta.md`)
@@ -220,6 +222,9 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
       currentModelSha256: modelSha,
       currentStatus: modelStatus,
       currentArtifacts: modelArtifacts,
+      consensusPath: modelConsensusPath,
+      consensusThresholds: args.consensus_thresholds || null,
+      priorFailedStages: modelFailedStages,
       runId: modelRunId,
       reportPath,
       reviewFeedback: finalReview,
@@ -230,7 +235,9 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
     modelSha = revModel.modelSha256 || modelSha
     modelStatus = revModel.status
     modelRunId = revModel.runId || modelRunId
+    modelFailedStages = Array.isArray(revModel.failedStages) ? revModel.failedStages.slice() : modelFailedStages
     modelArtifacts = Array.isArray(revModel.artifacts) ? revModel.artifacts : modelArtifacts
+    if (revModel.reportSha256) currentSha = revModel.reportSha256
     modelCheckPath = hasArtifact(modelArtifacts, `${R}/model_dump/model-check.md`)
       ? `${R}/model_dump/model-check.md`
       : null
@@ -238,7 +245,7 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
       modelStatus === 'delivered_with_open_issues'
         ? revModel.remainingIssuesPath || `${R}/model_dump/remaining-issues.md`
         : null
-    if (modelStatus === 'failed_unusable' || !modelPath) {
+    if (revModel.ok === false || modelStatus === 'failed_unusable' || !modelPath) {
       incomplete.push(`第 ${rounds} 轮报告联动改模未能维持可读候选模型，未复审，流程终止`)
       return finish()
     }

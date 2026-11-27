@@ -17,7 +17,7 @@
       ],
       "validators": [
         {
-          "command": "python3 .agents/skills/dalton-model/scripts/model_check.py verify-done --workspace {workspace_dir} --ticker {ticker} --research-dir research/{as_of}-model-{ticker}",
+          "command": "python3 .agents/skills/dalton-model/scripts/model_check.py verify-done --workspace {workspace_dir} --ticker {ticker} --research-dir research/{as_of}-model-{ticker} --expected-workflow company-model",
           "pass_when": "exit_zero",
           "description": "按终态账本核对候选模型可读性、哈希、已完成阶段证据与失败阶段记录（pass 与 delivered_with_open_issues 均放行）"
         }

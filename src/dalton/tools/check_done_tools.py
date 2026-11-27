@@ -1753,6 +1753,76 @@ async def _check_initial_coverage_structure(
         )
 
 
+async def _verify_explicit_run_dir(
+    backend: Any,
+    workflow: str,
+    run_id: str,
+    thread_id: str | None,
+) -> tuple[str | None, str | None]:
+    """Locate an explicitly named ``run_id`` on this thread and verify its terminal ``status.json``.
+
+    Returns ``(run_dir, None)`` when the named run exists, belongs to ``workflow``,
+    and finished with a terminal completed status; otherwise ``(None, error_message)``.
+    Never falls back to the manual window.
+    """
+    rid = run_id.strip()
+    if not rid or "/" in rid or "\\" in rid or ".." in rid:
+        return None, f"指定 run_id（{run_id!r}）格式非法，无法定位本线程运行目录。"
+
+    prefix = _thread_prefix(thread_id)
+    if thread_id:
+        run_dir = f"{prefix}{rid}"
+        status_path = f"{run_dir}/status.json"
+    else:
+        matches = await _glob(backend, f"{prefix}{rid}/status.json")
+        if matches is None:
+            return None, f"无法扫描指定 run_id（{rid}）的运行目录（status.json），请重试。"
+        if not matches:
+            return (
+                None,
+                f"找不到指定 run_id（{rid}）对应的已结束运行目录或 status.json；"
+                f"请确认 run_id 来自已完成的 {workflow} 运行，不得退回手动窗口。",
+            )
+        if len(matches) > 1:
+            return (
+                None,
+                f"缺少 thread_id 且存在多个同名 run_id（{rid}）运行目录，无法唯一确定本次运行。",
+            )
+        status_path = matches[0]
+        run_dir = status_path.rsplit("/status.json", 1)[0]
+
+    status, text = await _read_text_diagnosed(backend, status_path)
+    if status == "error":
+        return None, f"无法读取指定 run_id（{rid}）的状态文件（{status_path}），请重试。"
+    if status == "missing" or text is None:
+        return (
+            None,
+            f"本线程找不到指定 run_id（{rid}）的运行目录或最终状态文件（{status_path}）；"
+            f"请确认 run_id 来自本线程已完成的 {workflow} 运行，不得退回手动窗口。",
+        )
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return None, f"指定 run_id（{rid}）的运行状态文件已损坏（{status_path}），无法核对。"
+    if not isinstance(doc, dict):
+        return None, f"指定 run_id（{rid}）的运行状态文件结构异常（{status_path}），无法核对。"
+
+    rec_name = doc.get("name")
+    if rec_name != workflow:
+        return (
+            None,
+            f"指定 run_id（{rid}）对应的工作流为 {rec_name!r}，与当前核对的 {workflow!r} 不一致。",
+        )
+    rec_status = str(doc.get("status") or "").strip().lower()
+    if rec_status not in ("completed", "finished", "ok"):
+        return (
+            None,
+            f"指定 run_id（{rid}）的最终状态为 {rec_status or '未知'!r}（非 completed），"
+            "无法作为已完成的运行通过核对。",
+        )
+    return run_dir, None
+
+
 async def _resolve_model_ledger_run_context(
     backend: Any,
     workflow: str,
@@ -1762,7 +1832,11 @@ async def _resolve_model_ledger_run_context(
 ) -> tuple[str | None, bool, list[str]]:
     """Resolve ``(expected_run_id, is_manual_path, errors)`` for ``model-verification.json`` (§3.2)."""
     if isinstance(run_id, str) and run_id.strip():
-        return run_id.strip(), False, []
+        rid = run_id.strip()
+        _run_dir, err = await _verify_explicit_run_dir(backend, workflow, rid, thread_id)
+        if err:
+            return rid, False, [err]
+        return rid, False, []
 
     manual = _is_manual(params)
     if thread_id:
@@ -1935,6 +2009,8 @@ async def _check_stages(
                 )
                 continue
             if "model_check.py verify-done" in command:
+                if "--expected-workflow" not in command:
+                    command = f"{command} --expected-workflow {shlex.quote(contract['name'])}"
                 if ledger_expected_run_id and "--expected-run-id" not in command:
                     command = f"{command} --expected-run-id {shlex.quote(ledger_expected_run_id)}"
                 elif ledger_is_manual and "--manual" not in command:
@@ -2437,16 +2513,25 @@ async def _locate_run_journals(
     thread_id: str | None,
 ) -> list[str] | None:
     """This workflow's run journal files; ``None`` when no same-name run
-    exists (the manual path). Locating never consults the review check's
-    "any unfinished run on the thread" rule — only runs of the same workflow
-    count. Raises ``_CannotVerify`` when a located run cannot be scanned."""
+    exists (the manual path). An explicit ``run_id`` MUST locate this thread's
+    completed run directory and its journals — never silently returning empty
+    to fall back to the manual window. Raises ``_CannotVerify`` when a located
+    or explicitly named run cannot be verified."""
     if not run_id and not thread_id:
         return None
-    prefix = _thread_prefix(thread_id)
-    if run_id:
-        journals = await _glob(backend, f"{prefix}{run_id}/journal/*.json")
+    if isinstance(run_id, str) and run_id.strip():
+        run_dir, err = await _verify_explicit_run_dir(
+            backend, workflow, run_id.strip(), thread_id
+        )
+        if err or run_dir is None:
+            raise _CannotVerify(err or f"找不到指定 run_id（{run_id}）的运行目录")
+        journals = await _glob(backend, f"{run_dir}/journal/*.json")
         if journals is None:
             raise _CannotVerify("无法扫描本次 run 的运行日志（journal）")
+        if not journals:
+            raise _CannotVerify(
+                f"指定 run_id（{run_id.strip()}）的运行目录（{run_dir}）缺少运行日志（journal），不得退回手动窗口"
+            )
         return journals
     run_dir = await _latest_run_dir(backend, workflow, thread_id)
     if run_dir is None:
@@ -3959,23 +4044,50 @@ async def run_check_done(
         # may omit as_of or say "latest") still find the run's artifacts —
         # never recomputed here, the run's record is the truth.
         if backend is not None and isinstance(params, dict):
+            run_args = await _run_args_doc(backend, workflow, run_id, thread_id)
             current = params.get("as_of")
             if not (
                 isinstance(current, str)
                 and current.strip()
                 and current.strip() != "latest"
             ):
-                inherited = await _run_args_as_of(backend, workflow, run_id, thread_id)
+                inherited = None
+                if isinstance(run_args, dict):
+                    raw_as_of = run_args.get("as_of")
+                    if isinstance(raw_as_of, str) and raw_as_of.strip() and raw_as_of.strip() != "latest":
+                        inherited = raw_as_of.strip()
                 if inherited:
                     params = {**params, "as_of": inherited}
-            if workflow == "company-model":
-                cur_mp = params.get("model_path")
-                if not (isinstance(cur_mp, str) and cur_mp.strip()):
-                    inherited_mp = await _run_args_model_path(
-                        backend, workflow, run_id, thread_id
+            if workflow in ("company-model", "earnings-deep-update") and isinstance(run_args, dict):
+                raw_launched_mp = run_args.get("model_path")
+                launched_mp = (
+                    raw_launched_mp.strip()
+                    if isinstance(raw_launched_mp, str) and raw_launched_mp.strip()
+                    else None
+                )
+                has_mp_key = "model_path" in params
+                raw_caller_mp = params.get("model_path")
+                caller_mp = (
+                    raw_caller_mp.strip()
+                    if isinstance(raw_caller_mp, str) and raw_caller_mp.strip()
+                    else None
+                )
+                if launched_mp is not None:
+                    if has_mp_key and caller_mp is None:
+                        missing.append(
+                            f"收尾参数 model_path 与本次运行启动记录（args.json）冲突："
+                            f"启动时传了 model_path={launched_mp!r}，收尾不能传空跳过模型核对。"
+                        )
+                    elif caller_mp is not None and posixpath.normpath(caller_mp) != posixpath.normpath(launched_mp):
+                        missing.append(
+                            f"收尾参数 model_path（{caller_mp!r}）与本次运行启动记录（args.json 中的 {launched_mp!r}）冲突。"
+                        )
+                    # Authoritative branch decision comes from this run's args.json.
+                    params = {**params, "model_path": launched_mp}
+                elif workflow == "earnings-deep-update" and caller_mp is not None:
+                    missing.append(
+                        f"收尾参数 model_path（{caller_mp!r}）与本次运行启动记录（args.json 未传 model_path）冲突。"
                     )
-                    if inherited_mp:
-                        params = {**params, "model_path": inherited_mp}
         gap_params = missing_params(contract, params)
         if gap_params:
             return {
@@ -4006,6 +4118,7 @@ async def run_check_done(
             workspace_id,
             workflow=workflow,
             workspace_root=getattr(backend, "workspace_dir", None),
+            backend=backend,
         )
         if routing_hint:
             missing.append(routing_hint)

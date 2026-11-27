@@ -271,7 +271,11 @@ let modelStatus = modelResult ? modelResult.status : 'failed_unusable'
 let modelPath = modelResult && modelResult.candidate_path ? normPath(modelResult.candidate_path) : null
 let modelSha = (modelResult && modelResult.model_sha256) || null
 let modelRunId = (modelResult && modelResult.run_id) || null
+let modelConsensusPath = (modelResult && modelResult.consensus_path) || null
+let modelFailedStages = modelResult && Array.isArray(modelResult.failed_stages) ? modelResult.failed_stages.slice() : []
 let modelArtifacts = modelResult && Array.isArray(modelResult.artifacts) ? modelResult.artifacts.slice() : []
+const missingRequiredSheets =
+  modelResult && Array.isArray(modelResult.missing_required_sheets) ? modelResult.missing_required_sheets : []
 let modelCheckPath = hasArtifact(modelArtifacts, `${R}/model_dump/model-check.md`)
   ? `${R}/model_dump/model-check.md`
   : null
@@ -281,11 +285,26 @@ let remainingIssuesPath =
     : null
 const modelVerificationPath = `${R}/model_dump/model-verification.json`
 
-if (modelStatus === 'failed_unusable' || !modelPath) {
+if ((modelResult && modelResult.ok === false) || modelStatus === 'failed_unusable' || !modelPath) {
   return gateBlock(
     `建模失败（${(modelResult && modelResult.failure_reason) || '未产出可读候选模型'}），已停在成稿之前`,
     '建模未产出可读候选模型，已停在成稿之前；补齐可读模型后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
   )
+}
+if (missingRequiredSheets.length > 0) {
+  const missList = missingRequiredSheets.join('、')
+  const remHint = remainingIssuesPath || `${R}/model_dump/remaining-issues.md`
+  return {
+    ...gateBlock(
+      `完整覆盖模型缺少必需工作表（${missList}），已写入未决清单 ${remHint} 并停在成稿之前`,
+      `完整覆盖模型缺少必需工作表（${missList}），详见 ${remHint}；补齐所需工作表后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑`
+    ),
+    model: modelPath,
+    model_status: modelStatus,
+    model_verification: modelVerificationPath,
+    remaining_issues: remHint,
+    missing_required_sheets: missingRequiredSheets,
+  }
 }
 if (modelStatus === 'delivered_with_open_issues') {
   log(`建模已按「带问题交付」完成（${modelPath}），未决清单见 ${remainingIssuesPath}，工作流继续进入成稿`)
@@ -413,6 +432,9 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 1) {
     currentModelSha256: modelSha,
     currentStatus: modelStatus,
     currentArtifacts: modelArtifacts,
+    consensusPath: modelConsensusPath,
+    consensusThresholds: args.consensus_thresholds || null,
+    priorFailedStages: modelFailedStages,
     runId: modelRunId,
     reportPath: memoPath,
     reviewFeedback: finalReview,
@@ -423,7 +445,9 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 1) {
   modelSha = revModel.modelSha256 || modelSha
   modelStatus = revModel.status
   modelRunId = revModel.runId || modelRunId
+  modelFailedStages = Array.isArray(revModel.failedStages) ? revModel.failedStages.slice() : modelFailedStages
   modelArtifacts = Array.isArray(revModel.artifacts) ? revModel.artifacts : modelArtifacts
+  if (revModel.reportSha256) currentMemoSha = revModel.reportSha256
   modelCheckPath = hasArtifact(modelArtifacts, `${R}/model_dump/model-check.md`)
     ? `${R}/model_dump/model-check.md`
     : null
@@ -431,7 +455,7 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 1) {
     modelStatus === 'delivered_with_open_issues'
       ? revModel.remainingIssuesPath || `${R}/model_dump/remaining-issues.md`
       : null
-  if (modelStatus === 'failed_unusable' || !modelPath) {
+  if (revModel.ok === false || modelStatus === 'failed_unusable' || !modelPath) {
     incomplete.push(`第 ${rounds} 轮报告联动改模未能维持可读候选模型，未复审，流程终止`)
     return finish()
   }

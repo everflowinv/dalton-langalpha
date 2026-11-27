@@ -6179,8 +6179,18 @@ class _FcRunHost:
                 "consensus_path": "data/consensus/2026-10-23_0900.json",
                 "baseline_health_warning": None,
             }
-        if label == "建模与一致预期对照":
+        if label == "读取运行ID":
+            return {"run_id": "task-run-1"}
+        if label == "模型构建与落盘":
             self.files["model/META-model-v01.xlsx"] = "x" * 1200
+            return {
+                "files": ["model/META-model-v01.xlsx"],
+                "summary": "模型构建与落盘完成",
+                "candidate_path": "model/META-model-v01.xlsx",
+                "model_sha256": _draft_hash(self.files["model/META-model-v01.xlsx"]),
+                "recalc_status": "ok",
+            }
+        if label == "一致预期对照":
             self.files[f"{R}/model_dump/consensus-diff.md"] = "# consensus diff\n"
             self.files[f"{R}/model_dump/consensus-diff.json"] = "{}"
             return {
@@ -6189,10 +6199,9 @@ class _FcRunHost:
                     f"{R}/model_dump/consensus-diff.md",
                     f"{R}/model_dump/consensus-diff.json",
                 ],
-                "summary": "建模与一致预期对照完成",
+                "summary": "一致预期对照完成",
                 "candidate_path": "model/META-model-v01.xlsx",
                 "model_sha256": _draft_hash(self.files["model/META-model-v01.xlsx"]),
-                "run_id": "task-run-1",
                 "recalc_status": "ok",
                 "consensus_status": "ok",
                 "consensus_diff_generated": True,
@@ -6629,6 +6638,194 @@ async def test_model_readability_validator_rejects_missing_or_corrupt_and_passes
         workspace_id=WS,
     )
     assert not any("校验未通过" in item for item in res_valid_cd["missing"]), res_valid_cd["missing"]
+
+    # R2 #6a: Tampering ledger workflow to "company-model" on earnings-deep-update is caught by --expected-workflow
+    tampered_doc = json.loads(lp.read_text(encoding="utf-8"))
+    tampered_doc["workflow"] = "company-model"
+    tampered_text = json.dumps(tampered_doc, ensure_ascii=False)
+    lp.write_text(tampered_text, encoding="utf-8")
+    res_tampered_wf = await run_check_done(
+        workflow="earnings-deep-update",
+        params=deep_params,
+        backend=_build_check_backend(tampered_text),
+        workspace_id=WS,
+    )
+    assert not res_tampered_wf["done"]
+    assert any("校验未通过" in item and "workflow mismatch" in item for item in res_tampered_wf["missing"]), res_tampered_wf["missing"]
+
+
+@pytest.mark.asyncio
+async def test_p0b_r2_check_done_anti_bypass_args_model_path_and_nonexistent_run_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2 #6b & #6c:
+    - earnings-deep-update modeling branch is decided by args.json; omitting model_path
+      still enforces modeling + models doc, passing null or conflicting model_path fails.
+    - explicit run_id MUST locate this thread's completed run dir + status.json; missing
+      directory or non-terminal status fails without falling back to manual window."""
+    _patch_knowledge(monkeypatch, ["thesis", "debate", "drivers", "management"])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
+
+    r_rel = "research/2026-10-28-deep-FY26Q3"
+    run_dir = ".agents/threads/short-de/workflows/run-deep-args"
+    draft_path = "drafts/2026-10-28-deep-FY26Q3.md"
+    draft_text = "# META 深度点评\n" + ("正文内容" * 200)
+    base_files = _with_full_language_sidecars(
+        {
+            draft_path: draft_text,
+            f"{r_rel}/thesis-calibration.md": "校准结论" * 40,
+            f"{r_rel}/management-delta.md": "指引兑现" * 25,
+            f"{r_rel}/reconcile.md": "对账说明" * 25,
+            f"{r_rel}/reconcile.json": json.dumps({"wrong": 0, "partial": 0}),
+            f"{r_rel}/knowledge-revision.json": json.dumps({"thesis": {"ops": []}, "pad": "x" * 40}),
+            "research/push/2026-10-28-earnings-deep-FY26Q3.md": "推送稿" * 40,
+            f"{run_dir}/status.json": json.dumps(
+                {"run_id": "run-deep-args", "name": "earnings-deep-update", "status": "completed", "updated_at": 100.0}
+            ),
+            f"{run_dir}/args.json": json.dumps(
+                {
+                    "ticker": "META",
+                    "quarter": "FY26Q3",
+                    "workspace_dir": ".",
+                    "release_date": "2026-10-28",
+                    "model_path": "model/META-model-v01.xlsx",
+                }
+            ),
+            f"{run_dir}/journal/审稿.json": json.dumps(
+                {
+                    "label": "审稿",
+                    "dispatches": [
+                        {
+                            "label": "审稿",
+                            "status": "ok",
+                            "seq": 1,
+                            "recorded_at": 50.0,
+                            "draft_sha256": _draft_hash(draft_text),
+                            "result": {"verdict": "pass", "summary": "ok", "items": _nine_items(), "must_fix": []},
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        }
+    )
+
+    # 1a. Omitting model_path at closing STILL enforces modeling stage + models doc from args.json
+    res_omit = await run_check_done(
+        workflow="earnings-deep-update",
+        params={"ticker": "META", "quarter": "FY26Q3", "workspace_dir": ".", "release_date": "2026-10-28"},
+        backend=_make_backend(base_files),
+        workspace_id=WS,
+        run_id="run-deep-args",
+        thread_id="short-deep-uuid",
+    )
+    assert not res_omit["done"]
+    assert any("model-verification.json" in m for m in res_omit["missing"]), res_omit["missing"]
+    assert any("models" in m for m in res_omit["missing"]), res_omit["missing"]
+
+    # 1b. Explicitly passing model_path=None conflicts with args.json
+    res_null = await run_check_done(
+        workflow="earnings-deep-update",
+        params={
+            "ticker": "META",
+            "quarter": "FY26Q3",
+            "workspace_dir": ".",
+            "release_date": "2026-10-28",
+            "model_path": None,
+        },
+        backend=_make_backend(base_files),
+        workspace_id=WS,
+        run_id="run-deep-args",
+        thread_id="short-deep-uuid",
+    )
+    assert not res_null["done"]
+    assert any("args.json" in m and "冲突" in m for m in res_null["missing"]), res_null["missing"]
+
+    # 1c. Passing a different model_path conflicts with args.json
+    res_diff = await run_check_done(
+        workflow="earnings-deep-update",
+        params={
+            "ticker": "META",
+            "quarter": "FY26Q3",
+            "workspace_dir": ".",
+            "release_date": "2026-10-28",
+            "model_path": "model/OTHER-model-v01.xlsx",
+        },
+        backend=_make_backend(base_files),
+        workspace_id=WS,
+        run_id="run-deep-args",
+        thread_id="short-deep-uuid",
+    )
+    assert not res_diff["done"]
+    assert any("args.json" in m and "冲突" in m for m in res_diff["missing"]), res_diff["missing"]
+
+    # 1d. Launch had NO model_path, caller passes model_path -> conflict
+    no_model_files = dict(base_files)
+    no_model_files[f"{run_dir}/args.json"] = json.dumps(
+        {"ticker": "META", "quarter": "FY26Q3", "workspace_dir": ".", "release_date": "2026-10-28"}
+    )
+    res_extra = await run_check_done(
+        workflow="earnings-deep-update",
+        params={
+            "ticker": "META",
+            "quarter": "FY26Q3",
+            "workspace_dir": ".",
+            "release_date": "2026-10-28",
+            "model_path": "model/META-model-v01.xlsx",
+        },
+        backend=_make_backend(no_model_files),
+        workspace_id=WS,
+        run_id="run-deep-args",
+        thread_id="short-deep-uuid",
+    )
+    assert not res_extra["done"]
+    assert any("args.json" in m and "冲突" in m for m in res_extra["missing"]), res_extra["missing"]
+
+    # 2. Explicit run_id whose run directory does NOT exist must fail (never fall back to manual window!)
+    _patch_knowledge(monkeypatch, ["models"])
+    forged_files = {
+        "research/2026-10-28-model-META/model_dump/model-verification.json": json.dumps(
+            {
+                "schema_version": 2,
+                "workflow": "company-model",
+                "ticker": "META",
+                "run_id": "run-ghost-404",
+                "final_status": "delivered_with_open_issues",
+                "fix_rounds": 0,
+                "failed_stages": ["check", "consensus"],
+                "final_model_path": "model/META-model-v01.xlsx",
+                "final_model_sha256": "a" * 64,
+                "rounds": [],
+            }
+        )
+    }
+    res_ghost = await run_check_done(
+        workflow="company-model",
+        params={"ticker": "META", "workspace_dir": ".", "as_of": "2026-10-28"},
+        backend=_make_backend(forged_files),
+        workspace_id=WS,
+        run_id="run-ghost-404",
+        thread_id="short-ghost",
+    )
+    assert not res_ghost["done"]
+    assert any("run-ghost-404" in m and "不得退回手动窗口" in m for m in res_ghost["missing"]), res_ghost["missing"]
+
+    # 3. Explicit run_id whose status.json is non-terminal ("running" or "failed") also fails
+    unfinished_files = dict(forged_files)
+    unfinished_files[".agents/threads/short-gh/workflows/run-ghost-404/status.json"] = json.dumps(
+        {"run_id": "run-ghost-404", "name": "company-model", "status": "failed", "updated_at": 100.0}
+    )
+    res_failed_status = await run_check_done(
+        workflow="company-model",
+        params={"ticker": "META", "workspace_dir": ".", "as_of": "2026-10-28"},
+        backend=_make_backend(unfinished_files),
+        workspace_id=WS,
+        run_id="run-ghost-404",
+        thread_id="short-ghost",
+    )
+    assert not res_failed_status["done"]
+    assert any("非 completed" in m for m in res_failed_status["missing"]), res_failed_status["missing"]
 
 
 # --- Batch 5b: two freshness metrics on coverage board & 3 completion checks ---

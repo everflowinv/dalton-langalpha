@@ -175,21 +175,42 @@ class ScriptedHost:
                 "consensus_path": "data/consensus/2026-10-23_0900.json",
                 "baseline_health_warning": None,
             }
-        if label == "建模与一致预期对照":
+        if label == "读取运行ID":
+            return {"run_id": "run-test-1"}
+        if label == "模型构建与落盘":
             cand = "model/META-model-v02.xlsx" if "模式：update" in prompt else "model/META-model-v01.xlsx"
+            m_cm = re.search(r'--coord-map-out "([^"]+)"', prompt)
+            files = [cand]
+            if m_cm:
+                files.append(m_cm.group(1))
             return {
-                "files": [cand],
+                "files": files,
                 "summary": "model ok",
                 "candidate_path": cand,
                 "model_sha256": "a" * 64,
-                "run_id": "run-test-1",
+                "recalc_status": "ok",
+            }
+        if label == "一致预期对照":
+            m_cand = re.search(r"候选模型 (\S+?\.xlsx)", prompt)
+            cand = m_cand.group(1) if m_cand else "model/META-model-v01.xlsx"
+            m_cm = re.search(r"生成 (\S*consensus-diff\.md) 与 (\S*consensus-diff\.json)", prompt)
+            files = [cand]
+            if m_cm:
+                files.extend([m_cm.group(1), m_cm.group(2)])
+            return {
+                "files": files,
+                "summary": "consensus ok",
+                "candidate_path": cand,
+                "model_sha256": "a" * 64,
                 "recalc_status": "ok",
                 "consensus_status": "ok",
                 "consensus_diff_generated": True,
             }
-        if label == "模型本轮范围检查" or label.startswith("模型本轮范围复查 "):
+        if label in ("模型本轮范围检查", "模型联动修订检查") or label.startswith("模型本轮范围复查 "):
+            m_rd = re.search(r'--research-dir "([^"]+)"', prompt)
+            rdir = m_rd.group(1) if m_rd else "."
             return {
-                "files": ["model_dump/model-check.md", "model_dump/model-verification.json"],
+                "files": [f"{rdir}/model_dump/model-check.md", f"{rdir}/model_dump/model-verification.json"],
                 "summary": "check pass",
                 "readable": True,
                 "final_status": "pass",
@@ -199,6 +220,7 @@ class ScriptedHost:
                 "baseline_legacy_issues": [],
                 "missing_evidence_issues": [],
                 "not_applicable_issues": [],
+                "missing_required_sheets": [],
                 "remaining_issues_path": None,
                 "summary_10lines": "summary",
             }
@@ -218,8 +240,8 @@ class ScriptedHost:
                 "summary": "delta ok",
             }
         if label == "写入降级账本":
-            m_led = re.search(r"(\S*model_dump/model-verification\.json)", prompt)
-            m_rem = re.search(r"(\S*model_dump/remaining-issues\.md)", prompt)
+            m_led = re.search(r'"([^"]*model_dump/model-verification\.json)"', prompt)
+            m_rem = re.search(r'"([^"]*model_dump/remaining-issues\.md)"', prompt)
             return {
                 "files": [
                     m_led.group(1) if m_led else "model_dump/model-verification.json",
@@ -239,12 +261,9 @@ class ScriptedHost:
                 "changed": False,
                 "model_path": cur,
                 "model_sha256": "a" * 64,
-                "status": "pass",
-                "open_issues": [],
-                "check_generated": True,
-                "consensus_generated": True,
+                "report_sha256": None,
                 "recalc_status": "ok",
-                "run_id": "run-test-1",
+                "consensus_diff_generated": True,
             }
         if label == "memo 探测":
             m = re.search(r"f='([^']+)'", prompt)
@@ -694,20 +713,35 @@ class CapturingHost:
                 "consensus_path": "data/consensus/2026-10-23_0900.json",
                 "baseline_health_warning": None,
             }
-        if label == "建模与一致预期对照":
+        if label == "读取运行ID":
+            return {"run_id": "run-cap-1"}
+        if label == "模型构建与落盘":
             return {
                 "files": ["model/META-model-v01.xlsx"],
                 "summary": "model ok",
                 "candidate_path": "model/META-model-v01.xlsx",
                 "model_sha256": "a" * 64,
-                "run_id": "run-cap-1",
+                "recalc_status": "ok",
+            }
+        if label == "一致预期对照":
+            m_cm = re.search(r"生成 (\S*consensus-diff\.md) 与 (\S*consensus-diff\.json)", prompt)
+            files = ["model/META-model-v01.xlsx"]
+            if m_cm:
+                files.extend([m_cm.group(1), m_cm.group(2)])
+            return {
+                "files": files,
+                "summary": "consensus ok",
+                "candidate_path": "model/META-model-v01.xlsx",
+                "model_sha256": "a" * 64,
                 "recalc_status": "ok",
                 "consensus_status": "ok",
                 "consensus_diff_generated": True,
             }
-        if label == "模型本轮范围检查" or label.startswith("模型本轮范围复查 "):
+        if label in ("模型本轮范围检查", "模型联动修订检查") or label.startswith("模型本轮范围复查 "):
+            m_rd = re.search(r'--research-dir "([^"]+)"', prompt)
+            rdir = m_rd.group(1) if m_rd else "."
             return {
-                "files": ["model_dump/model-check.md", "model_dump/model-verification.json"],
+                "files": [f"{rdir}/model_dump/model-check.md", f"{rdir}/model_dump/model-verification.json"],
                 "summary": "check pass",
                 "readable": True,
                 "final_status": "pass",
@@ -717,6 +751,7 @@ class CapturingHost:
                 "baseline_legacy_issues": [],
                 "missing_evidence_issues": [],
                 "not_applicable_issues": [],
+                "missing_required_sheets": [],
                 "remaining_issues_path": None,
                 "summary_10lines": "summary",
             }
@@ -733,12 +768,9 @@ class CapturingHost:
                 "changed": False,
                 "model_path": "model/META-model-v01.xlsx",
                 "model_sha256": "a" * 64,
-                "status": "pass",
-                "open_issues": [],
-                "check_generated": True,
-                "consensus_generated": True,
+                "report_sha256": None,
                 "recalc_status": "ok",
-                "run_id": "run-cap-1",
+                "consensus_diff_generated": True,
             }
         if label == "memo 探测":
             m = re.search(r"f='([^']+)'", prompt)
@@ -1096,22 +1128,41 @@ class DiskHost(ScriptedHost):
             self.touch(rel)
         if label in self.fail_labels:
             return None
-        if label == "建模与一致预期对照" and label not in self.by_label:
+        if label == "读取运行ID" and label not in self.by_label:
+            return {"run_id": "run-disk-1"}
+        if label == "模型构建与落盘" and label not in self.by_label:
             cand, sha = self._latest_disk_model()
             return {
                 "files": [cand],
                 "summary": "model ok",
                 "candidate_path": cand,
                 "model_sha256": sha,
-                "run_id": "run-disk-1",
+                "recalc_status": "ok",
+            }
+        if label == "一致预期对照" and label not in self.by_label:
+            cand, sha = self._latest_disk_model()
+            m_cm = re.search(r"生成 (\S*consensus-diff\.md) 与 (\S*consensus-diff\.json)", prompt)
+            files = [cand]
+            if m_cm:
+                files.extend([m_cm.group(1), m_cm.group(2)])
+            return {
+                "files": files,
+                "summary": "consensus ok",
+                "candidate_path": cand,
+                "model_sha256": sha,
                 "recalc_status": "ok",
                 "consensus_status": "ok",
                 "consensus_diff_generated": True,
             }
-        if (label == "模型本轮范围检查" or label.startswith("模型本轮范围复查 ")) and label not in self.by_label:
+        if (
+            label in ("模型本轮范围检查", "模型联动修订检查")
+            or label.startswith("模型本轮范围复查 ")
+        ) and label not in self.by_label:
             cand, sha = self._latest_disk_model()
+            m_rd = re.search(r'--research-dir "([^"]+)"', prompt)
+            rdir = m_rd.group(1) if m_rd else "."
             return {
-                "files": ["model_dump/model-check.md", "model_dump/model-verification.json"],
+                "files": [f"{rdir}/model_dump/model-check.md", f"{rdir}/model_dump/model-verification.json"],
                 "summary": "check pass",
                 "readable": True,
                 "final_status": "pass",
@@ -1121,6 +1172,7 @@ class DiskHost(ScriptedHost):
                 "baseline_legacy_issues": [],
                 "missing_evidence_issues": [],
                 "not_applicable_issues": [],
+                "missing_required_sheets": [],
                 "remaining_issues_path": None,
                 "summary_10lines": f"{cand} pass",
             }
@@ -1129,22 +1181,23 @@ class DiskHost(ScriptedHost):
             mode = self.revise_modes.get(f"修订 {self._rev_model_count}") or self.revise_modes.get(label) or "keep"
             m_cur = re.search(r"当前模型 (\S+?\.xlsx)", prompt)
             cur = m_cur.group(1) if m_cur else self._latest_disk_model()[0]
+            m_cm = re.search(r"刷新一致预期差异表 (\S*consensus-diff\.md) 与 (\S*consensus-diff\.json)", prompt)
             if mode == "save":
                 nxt = self._next_model_version(cur)
                 self.touch(nxt)
                 sha = hashlib.sha256((self.workspace / nxt).read_bytes()).hexdigest()
+                files = [nxt]
+                if m_cm:
+                    files.extend([m_cm.group(1), m_cm.group(2)])
                 return {
-                    "files": [nxt],
+                    "files": files,
                     "summary": f"saved {nxt}",
                     "changed": True,
                     "model_path": nxt,
                     "model_sha256": sha,
-                    "status": "pass",
-                    "open_issues": [],
-                    "check_generated": True,
-                    "consensus_generated": True,
+                    "report_sha256": None,
                     "recalc_status": "ok",
-                    "run_id": "run-disk-1",
+                    "consensus_diff_generated": True,
                 }
             if mode == "unusable":
                 return {
@@ -1153,12 +1206,9 @@ class DiskHost(ScriptedHost):
                     "changed": True,
                     "model_path": None,
                     "model_sha256": None,
-                    "status": "failed_unusable",
-                    "open_issues": ["unusable"],
-                    "check_generated": False,
-                    "consensus_generated": False,
+                    "report_sha256": None,
                     "recalc_status": "recalc_failed",
-                    "run_id": "run-disk-1",
+                    "consensus_diff_generated": False,
                 }
             sha = hashlib.sha256((self.workspace / cur).read_bytes()).hexdigest() if (self.workspace / cur).exists() else "a" * 64
             return {
@@ -1167,12 +1217,9 @@ class DiskHost(ScriptedHost):
                 "changed": False,
                 "model_path": cur,
                 "model_sha256": sha,
-                "status": "pass",
-                "open_issues": [],
-                "check_generated": True,
-                "consensus_generated": True,
+                "report_sha256": None,
                 "recalc_status": "ok",
-                "run_id": "run-disk-1",
+                "consensus_diff_generated": True,
             }
         if label == "memo 探测":
             m = re.search(r"f='([^']+)'", prompt)
@@ -1371,7 +1418,7 @@ def _deep_host(tmp_path: Path, by_label: dict[str, Any], **kw: Any) -> DiskHost:
     host = DiskHost(
         workspace=tmp_path,
         by_label=by_label,
-        writes={"建模与一致预期对照": ["model/META-model-v02.xlsx"], **kw.pop("writes", {})},
+        writes={"模型构建与落盘": ["model/META-model-v02.xlsx"], **kw.pop("writes", {})},
         **kw,
     )
     host.touch("model/META-model-v01.xlsx")
@@ -1385,7 +1432,7 @@ async def test_deep_model_update_mismatch_stops_before_calibration(tmp_path: Pat
     host = _deep_host(
         tmp_path,
         {},
-        fail_labels={"建模与一致预期对照"},
+        fail_labels={"模型构建与落盘"},
     )
     result = await _run("earnings-deep-update", DEEP_PARAMS, host)
 
@@ -1964,8 +2011,8 @@ async def test_full_model_failure_blocks_before_the_draft() -> None:
     assert "成稿" not in host.labels()
     assert "独立审稿" not in host.labels() and "产物核验" not in host.labels()
 
-    # 2. Stage 2 modeling returns null
-    host = ScriptedHost(fail_labels={"建模与一致预期对照"})
+    # 2. Stage 2a modeling build returns null
+    host = ScriptedHost(fail_labels={"模型构建与落盘"})
     result = await _run("full-coverage", params, host)
     assert result["ok"] is False
     assert "建模失败" in result["blocked"]
@@ -2666,15 +2713,12 @@ async def test_full_model_scan_failure_or_non_ok_checks_continues_to_draft(
     host2 = _fc_host(
         ws2,
         by_label={
-            "建模与一致预期对照": {
+            "模型构建与落盘": {
                 "files": ["model/META-model-v01.xlsx"],
                 "summary": "recalc failed",
                 "candidate_path": "model/META-model-v01.xlsx",
                 "model_sha256": "a" * 64,
-                "run_id": "run-disk-2",
                 "recalc_status": "recalc_failed",
-                "consensus_status": "ok",
-                "consensus_diff_generated": True,
             },
             "模型本轮范围检查": {
                 "files": [
@@ -2688,6 +2732,7 @@ async def test_full_model_scan_failure_or_non_ok_checks_continues_to_draft(
                 "model_sha256": "a" * 64,
                 "actionable_count": 0,
                 "actionable_issues": [],
+                "missing_required_sheets": [],
                 "remaining_issues_path": "research/2026-10-23-fc/model_dump/remaining-issues.md",
             },
             "独立审稿": PASS,
@@ -2720,16 +2765,20 @@ async def test_modeling_batch2_workflows_and_contracts_route_to_dalton_model(
     assert ".agents/skills/dalton-model/SKILL.md" in prep_prompt
     assert "model_fingerprint.py" in prep_prompt
     assert "mapping.md" in prep_prompt
-    s2_prompt = deep_host.prompts[deep_labels.index("建模与一致预期对照")]
-    assert "model_edit.py apply" in s2_prompt
-    assert "model_consensus.py" in s2_prompt
-    assert ".progress.json" in s2_prompt
+    rid_prompt = deep_host.prompts[deep_labels.index("读取运行ID")]
+    assert ".progress.json" in rid_prompt
+    s2a_prompt = deep_host.prompts[deep_labels.index("模型构建与落盘")]
+    assert "model_edit.py apply" in s2a_prompt
+    s2b_prompt = deep_host.prompts[deep_labels.index("一致预期对照")]
+    assert "model_consensus.py" in s2b_prompt
     chk_prompt = deep_host.prompts[deep_labels.index("模型本轮范围检查")]
     assert "model_check.py check" in chk_prompt
     rev_model_prompt = deep_host.prompts[deep_labels.index("模型联动修订")]
+    assert "model_fingerprint.py" in rev_model_prompt
     assert "model_edit.py apply" in rev_model_prompt
-    assert "--append-revision" in rev_model_prompt
     assert "model-update/SKILL.md" not in rev_model_prompt
+    rev_chk_prompt = deep_host.prompts[deep_labels.index("模型联动修订检查")]
+    assert "--append-revision" in rev_chk_prompt
 
     # 2. full-coverage: shared pipeline + no legacy 只读审模型 + shared report revision entry
     fc_dir = tmp_path / "fc"
@@ -2744,8 +2793,14 @@ async def test_modeling_batch2_workflows_and_contracts_route_to_dalton_model(
     fc_labels = fc_host.labels()
 
     assert "只读审模型" not in fc_labels
-    assert "建模准备" in fc_labels and "建模与一致预期对照" in fc_labels and "模型本轮范围检查" in fc_labels
-    assert "模型联动修订" in fc_labels
+    assert (
+        "建模准备" in fc_labels
+        and "读取运行ID" in fc_labels
+        and "模型构建与落盘" in fc_labels
+        and "一致预期对照" in fc_labels
+        and "模型本轮范围检查" in fc_labels
+    )
+    assert "模型联动修订" in fc_labels and "模型联动修订检查" in fc_labels
     draft_prompt = fc_host.prompts[fc_labels.index("成稿")]
     assert "原模型未设情景页" in draft_prompt and "模型里没有对应计算" in draft_prompt
     fc_notes_prompt = fc_host.prompts[fc_labels.index("笔记语言审查")]

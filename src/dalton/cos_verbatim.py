@@ -2,32 +2,45 @@
 
 When Home's Chief of Staff hands a task off to a workspace analyst, paraphrasing
 can drop exact user formatting, file-scope, or metric requirements. This module
-extracts the latest user message from the LangGraph state and appends a
+captures the raw pre-injection user text (preserving original characters and
+whitespace) plus attachment basenames for the current turn, and appends a
 ``<user_verbatim_request>...</user_verbatim_request>`` block when the dispatch
 ``question`` does not already contain the verbatim text.
 """
 
 from __future__ import annotations
 
+import os
+import posixpath
+import re
 from typing import Any
 
+COS_TURN_VERBATIM_CONFIG_KEY = "cos_turn_verbatim_request"
 
-def _message_text(content: Any) -> str:
-    """Extract plain UTF-8 text from a LangChain message ``content`` field."""
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str) and item.strip():
-                parts.append(item.strip())
-            elif isinstance(item, dict):
-                if item.get("type") in (None, "text", "input_text"):
-                    text = item.get("text")
-                    if isinstance(text, str) and text.strip():
-                        parts.append(text.strip())
-        return "\n".join(parts).strip()
-    return ""
+_CLOSING_TAG_RE = re.compile(r"</\s*user_verbatim_request\s*>", re.IGNORECASE)
+_SYSTEM_REMINDER_RE = re.compile(
+    r"\s*<system-reminder>.*?</system-reminder>\s*",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _escape_closing_tag(text: str) -> str:
+    """Escape any closing ``</user_verbatim_request>`` tag inside verbatim text."""
+    return _CLOSING_TAG_RE.sub("&lt;/user_verbatim_request&gt;", text)
+
+
+def _basename_only(raw_name: Any) -> str | None:
+    """Return ONLY the filename component (no directory/URL), or None."""
+    if not isinstance(raw_name, str):
+        return None
+    cleaned = raw_name.strip()
+    if not cleaned:
+        return None
+    # Strip query/fragment if a URL slipped through, then take basename across POSIX & Windows separators.
+    no_query = cleaned.split("?", 1)[0].split("#", 1)[0].rstrip("/\\")
+    base = posixpath.basename(no_query.replace("\\", "/"))
+    base = os.path.basename(base)
+    return base or None
 
 
 def _is_user_message(msg: Any) -> bool:
@@ -42,34 +55,250 @@ def _is_user_message(msg: Any) -> bool:
     return role in ("human", "user")
 
 
-def extract_latest_user_message(state: dict[str, Any] | None) -> str | None:
-    """Return the latest non-empty human/user message text from ``state``, or None."""
-    if not isinstance(state, dict):
+def _extract_raw_text_parts(content: Any) -> list[str]:
+    """Extract raw text fragments in original order WITHOUT stripping whitespace."""
+    if isinstance(content, str):
+        return [content] if content != "" else []
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                if item != "":
+                    parts.append(item)
+            elif isinstance(item, dict):
+                if item.get("type") in (None, "text", "input_text"):
+                    text = item.get("text")
+                    if isinstance(text, str) and text != "":
+                        parts.append(text)
+            elif hasattr(item, "type"):
+                if getattr(item, "type", None) in (None, "text", "input_text"):
+                    text = getattr(item, "text", None)
+                    if isinstance(text, str) and text != "":
+                        parts.append(text)
+        return parts
+    return []
+
+
+def _join_raw_parts(parts: list[str]) -> str:
+    """Join multiple raw text blocks in order without stripping any leading/trailing whitespace."""
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    return "\n".join(parts)
+
+
+def _is_system_triggered_request(
+    request: Any,
+    *,
+    from_server: bool = False,
+    is_checkpoint_replay: bool = False,
+) -> bool:
+    """Return True when the turn was NOT initiated by fresh user input."""
+    if from_server or is_checkpoint_replay:
+        return True
+    if getattr(request, "hitl_response", None):
+        return True
+    for attr in ("report_source", "wakeup", "market_target"):
+        if getattr(request, attr, None):
+            return True
+    origin = getattr(request, "origin", None)
+    if origin is not None:
+        origin_type = (
+            origin.get("type")
+            if isinstance(origin, dict)
+            else getattr(origin, "type", None)
+        )
+        if origin_type and str(origin_type).strip().lower() != "user":
+            return True
+    return False
+
+
+def _collect_attachment_filenames(
+    request: Any,
+    turn_attachments: Any = None,
+) -> list[str]:
+    """Collect attachment basenames in order without paths, URLs, or payloads."""
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: Any) -> None:
+        base = _basename_only(raw)
+        if base and base not in seen:
+            seen.add(base)
+            names.append(base)
+
+    if turn_attachments is not None:
+        for att in getattr(turn_attachments, "files", None) or ():
+            _add(getattr(att, "name", None) or getattr(att, "filename", None))
+
+    additional = getattr(request, "additional_context", None) or ()
+    for ctx in additional:
+        if isinstance(ctx, dict):
+            ctx_type = str(ctx.get("type") or "").strip().lower()
+            if ctx_type in ("chat_upload", "file", "image", "pdf", "attachment"):
+                _add(ctx.get("name") or ctx.get("filename"))
+        else:
+            ctx_type = str(getattr(ctx, "type", "") or "").strip().lower()
+            if ctx_type in ("chat_upload", "file", "image", "pdf", "attachment"):
+                _add(getattr(ctx, "name", None) or getattr(ctx, "filename", None))
+    return names
+
+
+def capture_turn_verbatim_request(
+    *,
+    request: Any,
+    raw_messages: list[dict[str, Any]] | None,
+    turn_attachments: Any = None,
+    from_server: bool = False,
+    is_checkpoint_replay: bool = False,
+) -> dict[str, Any] | None:
+    """Capture this turn's raw pre-injection user text and attachment basenames.
+
+    Must be called BEFORE ``prepare_skill_contexts``, ``attach_request_files``,
+    and ``inject_inline_reminders`` mutate ``messages``. Returns ``None`` when
+    the turn is system/notification-triggered or carries no user text (e.g.
+    image-only input).
+    """
+    if _is_system_triggered_request(
+        request,
+        from_server=from_server,
+        is_checkpoint_replay=is_checkpoint_replay,
+    ):
         return None
+
+    source_msgs = raw_messages if raw_messages is not None else (getattr(request, "messages", None) or [])
+    if not source_msgs:
+        return None
+    last_msg = source_msgs[-1]
+    if not _is_user_message(last_msg):
+        return None
+
+    raw_content = (
+        last_msg.get("content")
+        if isinstance(last_msg, dict)
+        else getattr(last_msg, "content", None)
+    )
+    parts = _extract_raw_text_parts(raw_content)
+    text = _join_raw_parts(parts)
+    if not text or not text.strip():
+        return None
+
+    attachments = _collect_attachment_filenames(request, turn_attachments)
+    return {"text": text, "attachments": attachments}
+
+
+def _extract_from_state_current_turn(state: dict[str, Any] | None) -> tuple[str | None, list[str]]:
+    """Fallback when no pre-injection payload was passed via ``config``.
+
+    Inspects ONLY the most recent human/user message in ``state["messages"]``
+    (never walking back to an earlier turn when the current turn's human
+    message has no user text), strips server-injected ``<system-reminder>``
+    blocks if present, and preserves the user's original characters & whitespace.
+    """
+    if not isinstance(state, dict):
+        return None, []
     messages = state.get("messages")
     if not isinstance(messages, (list, tuple)):
-        return None
+        return None, []
     for msg in reversed(messages):
         if not _is_user_message(msg):
             continue
+        # Stop at the latest human/user message — never fall back to an older turn!
+        extra_kw = (
+            msg.get("additional_kwargs")
+            if isinstance(msg, dict)
+            else getattr(msg, "additional_kwargs", None)
+        )
+        if isinstance(extra_kw, dict):
+            if extra_kw.get("is_system") or extra_kw.get("system_notification"):
+                return None, []
+            origin = extra_kw.get("origin")
+            if isinstance(origin, dict) and str(origin.get("type") or "").strip().lower() not in ("", "user"):
+                return None, []
+
         raw_content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
-        text = _message_text(raw_content)
-        if text:
-            return text
-    return None
+        parts = _extract_raw_text_parts(raw_content)
+        cleaned_parts: list[str] = []
+        for p in parts:
+            if "<system-reminder>" in p.lower():
+                stripped = _SYSTEM_REMINDER_RE.sub("", p)
+                if stripped and stripped.strip():
+                    cleaned_parts.append(stripped)
+            else:
+                cleaned_parts.append(p)
+        text = _join_raw_parts(cleaned_parts)
+        if not text or not text.strip():
+            return None, []
+
+        att_names: list[str] = []
+        seen: set[str] = set()
+        if isinstance(extra_kw, dict):
+            for att in extra_kw.get("attachments") or ():
+                raw_n = att.get("name") if isinstance(att, dict) else att
+                base = _basename_only(raw_n)
+                if base and base not in seen:
+                    seen.add(base)
+                    att_names.append(base)
+        return text, att_names
+    return None, []
+
+
+def _resolve_turn_verbatim(
+    state: dict[str, Any] | None,
+    config: Any = None,
+) -> tuple[str | None, list[str]]:
+    """Resolve ``(verbatim_text, attachment_filenames)`` for the current turn."""
+    if isinstance(config, dict):
+        configurable = config.get("configurable")
+        if isinstance(configurable, dict) and COS_TURN_VERBATIM_CONFIG_KEY in configurable:
+            payload = configurable[COS_TURN_VERBATIM_CONFIG_KEY]
+            if not isinstance(payload, dict):
+                return None, []
+            text = payload.get("text")
+            if not isinstance(text, str) or not text.strip():
+                return None, []
+            atts: list[str] = []
+            seen: set[str] = set()
+            for raw in payload.get("attachments") or ():
+                base = _basename_only(raw)
+                if base and base not in seen:
+                    seen.add(base)
+                    atts.append(base)
+            return text, atts
+    return _extract_from_state_current_turn(state)
+
+
+def extract_latest_user_message(
+    state: dict[str, Any] | None,
+    *,
+    config: Any = None,
+) -> str | None:
+    """Return this turn's raw user message text (pre-injection when ``config`` carries it), or None."""
+    text, _atts = _resolve_turn_verbatim(state, config=config)
+    return text
 
 
 def append_verbatim_user_request(
-    question: str, state: dict[str, Any] | None
+    question: str,
+    state: dict[str, Any] | None = None,
+    *,
+    config: Any = None,
 ) -> str:
     """Append ``<user_verbatim_request>`` to ``question`` unless already quoted verbatim."""
     if not isinstance(question, str):
         return question
-    verbatim = extract_latest_user_message(state)
+    verbatim, attachments = _resolve_turn_verbatim(state, config=config)
     if not verbatim:
         return question
-    if verbatim in question:
+    if verbatim in question and all(name in question for name in attachments):
         return question
+    safe_text = _escape_closing_tag(verbatim)
+    if attachments:
+        safe_atts = ", ".join(_escape_closing_tag(name) for name in attachments)
+        body = f"{safe_text}\nAttachments: {safe_atts}"
+    else:
+        body = safe_text
     base = question.rstrip()
-    block = f"<user_verbatim_request>\n{verbatim}\n</user_verbatim_request>"
+    block = f"<user_verbatim_request>\n{body}\n</user_verbatim_request>"
     return f"{base}\n\n{block}" if base else block

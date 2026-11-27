@@ -77,7 +77,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ### 工作流关闭时的手动降级路径
 
-若当前环境关闭了 `workflow.enabled`（工具列表原本无 `RunWorkflow`），主智能体按上述 1–4 步顺序手动执行各脚本（最多两轮修改；若检查或复算异常，运行 `model_check.py write-ledger` 落盘降级账本），并在收尾调用 `dalton_check_done` 时传 `"manual": true`。若 `workflow.enabled` 开启但工具列表暂未出现 `RunWorkflow`，先用 Read 工具读取 `.agents/skills/run-workflow/SKILL.md` 后重试。
+若当前环境关闭了 `workflow.enabled`（工具列表原本无 `RunWorkflow`），主智能体按上述 1–4 步顺序手动执行各脚本（最多两轮修改；若检查或复算异常，运行 `python3 .agents/skills/dalton-model/scripts/model_check.py write-ledger --workspace . --ticker <TICKER> --research-dir <R> --candidate <候选路径> --kind modeling --failed-stages <失败阶段列表，如 check,consensus> --workflow company-model`〔可按需补充 `--baseline <起点模型>`、`--reason "<原因>"`；手动路径省略 `--run-id` 使账本 `run_id` 保持 `null`〕落盘降级账本与未决清单），并在收尾调用 `dalton_check_done` 时传 `"manual": true`。若 `workflow.enabled` 开启但工具列表暂未出现 `RunWorkflow`，先用 Read 工具读取 `.agents/skills/run-workflow/SKILL.md` 后重试。
 
 ## 三、收尾登记、完成核对与回复格式
 

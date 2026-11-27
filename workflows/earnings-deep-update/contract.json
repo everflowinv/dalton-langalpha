@@ -29,7 +29,7 @@
       ],
       "validators": [
         {
-          "command": "python3 .agents/skills/dalton-model/scripts/model_check.py verify-done --workspace {workspace_dir} --ticker {ticker} --research-dir research/{release_date}-deep-{quarter}",
+          "command": "python3 .agents/skills/dalton-model/scripts/model_check.py verify-done --workspace {workspace_dir} --ticker {ticker} --research-dir research/{release_date}-deep-{quarter} --expected-workflow earnings-deep-update",
           "pass_when": "exit_zero",
           "description": "按终态账本核对最终模型可读性、哈希、已完成阶段证据、失败阶段记录及 mapping.md / model-delta.md 状态"
         }

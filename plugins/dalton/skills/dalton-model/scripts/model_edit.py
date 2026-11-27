@@ -584,6 +584,103 @@ def _build_keep_cache_spec(
     }
 
 
+def _merge_coord_maps(prior_cm: dict[str, Any], delta_cm: dict[str, Any]) -> dict[str, Any]:
+    """Merge an incremental fix round's ``delta_cm`` onto a prior ``coord_map``."""
+    delta_ops = list(delta_cm.get("ops") or [])
+
+    def _map_cell_sets(prior_map: dict[str, list[str]], delta_map: dict[str, list[str]]) -> dict[str, set[str]]:
+        out: dict[str, set[str]] = defaultdict(set)
+        for sh, coords in (prior_map or {}).items():
+            for c in coords or ():
+                nc = map_coord_str(delta_cm, sh, str(c)) if delta_ops else str(c).upper()
+                if nc:
+                    out[sh].add(nc.upper())
+        for sh, coords in (delta_map or {}).items():
+            for c in coords or ():
+                out[sh].add(str(c).upper())
+        return out
+
+    def _map_col_sets(prior_map: dict[str, list[str]], delta_map: dict[str, list[str]]) -> dict[str, list[str]]:
+        out: dict[str, set[str]] = defaultdict(set)
+        for sh, cols in (prior_map or {}).items():
+            for col_l in cols or ():
+                if delta_ops:
+                    ci = column_index_from_string(str(col_l).upper())
+                    mapped = map_coord(delta_cm, sh, 1, ci)
+                    if mapped is not None:
+                        out[sh].add(get_column_letter(mapped[1]))
+                else:
+                    out[sh].add(str(col_l).upper())
+        for sh, cols in (delta_map or {}).items():
+            for col_l in cols or ():
+                out[sh].add(str(col_l).upper())
+        return {sh: sorted(cs, key=column_index_from_string) for sh, cs in sorted(out.items()) if cs}
+
+    def _map_row_sets(prior_map: dict[str, list[int]], delta_map: dict[str, list[int]]) -> dict[str, list[int]]:
+        out: dict[str, set[int]] = defaultdict(set)
+        for sh, rows in (prior_map or {}).items():
+            for r in rows or ():
+                if delta_ops:
+                    mapped = map_coord(delta_cm, sh, int(r), 1)
+                    if mapped is not None:
+                        out[sh].add(mapped[0])
+                else:
+                    out[sh].add(int(r))
+        for sh, rows in (delta_map or {}).items():
+            for r in rows or ():
+                out[sh].add(int(r))
+        return {sh: sorted(rs) for sh, rs in sorted(out.items()) if rs}
+
+    touched = _map_cell_sets(prior_cm.get("touched_cells") or {}, delta_cm.get("touched_cells") or {})
+    touched_f = _map_cell_sets(prior_cm.get("touched_formula_cells") or {}, delta_cm.get("touched_formula_cells") or {})
+    rollover = _map_cell_sets(prior_cm.get("rollover_actual_cells") or {}, delta_cm.get("rollover_actual_cells") or {})
+    consensus = _map_cell_sets(
+        prior_cm.get("consensus_snapshot_cells") or {},
+        delta_cm.get("consensus_snapshot_cells") or {},
+    )
+
+    # Cells overwritten in this incremental round update their formula vs rollover classification
+    for sh, d_cells in (delta_cm.get("touched_cells") or {}).items():
+        d_formulas = {str(c).upper() for c in (delta_cm.get("touched_formula_cells") or {}).get(sh, ())}
+        d_rollover = {str(c).upper() for c in (delta_cm.get("rollover_actual_cells") or {}).get(sh, ())}
+        for raw_c in d_cells or ():
+            cu = str(raw_c).upper()
+            if cu in d_formulas:
+                rollover[sh].discard(cu)
+            else:
+                touched_f[sh].discard(cu)
+                if cu not in d_rollover:
+                    rollover[sh].discard(cu)
+
+    prior_donor = prior_cm.get("cache_donor_path")
+    keep_prior_donor = bool(not delta_ops and prior_donor and Path(str(prior_donor)).is_file())
+
+    merged = dict(delta_cm)
+    merged["baseline_path"] = prior_cm.get("baseline_path") or delta_cm.get("baseline_path")
+    merged["baseline_sha256"] = prior_cm.get("baseline_sha256") or delta_cm.get("baseline_sha256")
+    merged["cache_donor_path"] = str(prior_donor) if keep_prior_donor else delta_cm.get("cache_donor_path")
+    merged["ops"] = list(prior_cm.get("ops") or []) + delta_ops
+    merged["touched_cells"] = {sh: sorted(cs) for sh, cs in sorted(touched.items()) if cs}
+    merged["touched_formula_cells"] = {sh: sorted(cs) for sh, cs in sorted(touched_f.items()) if cs}
+    merged["rollover_actual_cells"] = {sh: sorted(cs) for sh, cs in sorted(rollover.items()) if cs}
+    merged["consensus_snapshot_cells"] = {sh: sorted(cs) for sh, cs in sorted(consensus.items()) if cs}
+    merged["added_period_cols"] = _map_col_sets(
+        prior_cm.get("added_period_cols") or {}, delta_cm.get("added_period_cols") or {}
+    )
+    merged["rollover_actual_cols"] = _map_col_sets(
+        prior_cm.get("rollover_actual_cols") or {}, delta_cm.get("rollover_actual_cols") or {}
+    )
+    merged["added_rows"] = _map_row_sets(
+        prior_cm.get("added_rows") or {}, delta_cm.get("added_rows") or {}
+    )
+    merged["from_default_template"] = bool(prior_cm.get("from_default_template")) or bool(
+        delta_cm.get("from_default_template")
+    )
+    if prior_cm.get("mode"):
+        merged["mode"] = prior_cm["mode"]
+    return merged
+
+
 def apply_edit_plan(
     *,
     baseline_path: str | Path,
@@ -600,6 +697,8 @@ def apply_edit_plan(
     recalc_timeout: int = 120,
     recalc_mod_override: Any | None = None,
     mode: str = "auto",
+    in_place: bool = False,
+    prior_coord_map: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute P0 controlled edit plan and return structured result with ``coord_map``."""
     base = Path(baseline_path).expanduser().resolve()
@@ -636,6 +735,8 @@ def apply_edit_plan(
 
     if output_path is not None:
         cand = Path(output_path).expanduser().resolve()
+    elif in_place:
+        cand = base
     else:
         ws_root = Path(workspace_dir).expanduser().resolve() if workspace_dir else base.parent.parent
         cand = next_model_output_path(
@@ -644,8 +745,12 @@ def apply_edit_plan(
             baseline_path=base,
             naming_mode=fp.get("naming_mode", "auto"),
         )
-    if cand == base:
+    if cand == base and not in_place:
         raise ValueError("Refusing to overwrite read-only baseline workbook in place")
+    if prior_coord_map is not None:
+        orig_base_raw = prior_coord_map.get("baseline_path")
+        if orig_base_raw and Path(str(orig_base_raw)).expanduser().resolve() == cand:
+            raise ValueError("Refusing to overwrite original read-only baseline workbook in place")
     cand.parent.mkdir(parents=True, exist_ok=True)
 
     tk = ticker.strip().upper()
@@ -688,7 +793,11 @@ def apply_edit_plan(
     donor_path = (
         Path(donor_out).expanduser().resolve()
         if donor_out
-        else cand.parent / f".{tk}-pre-openpyxl-{cand.stem}.xlsx"
+        else cand.parent / (
+            f".{tk}-pre-openpyxl-{cand.stem}-inc.xlsx"
+            if (in_place or prior_coord_map is not None)
+            else f".{tk}-pre-openpyxl-{cand.stem}.xlsx"
+        )
     )
     donor_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(base, donor_path)
@@ -978,6 +1087,9 @@ def apply_edit_plan(
     )
     coord_map["recalc_result"] = recalc_res
 
+    if prior_coord_map is not None:
+        coord_map = _merge_coord_maps(prior_coord_map, coord_map)
+
     if coord_map_out is not None:
         cp = Path(coord_map_out).expanduser().resolve()
         cp.parent.mkdir(parents=True, exist_ok=True)
@@ -987,9 +1099,9 @@ def apply_edit_plan(
         "status": "ok",
         "candidate_path": str(cand),
         "candidate_sha256": cand_sha,
-        "baseline_path": str(base),
-        "baseline_sha256": base_sha,
-        "cache_donor_path": str(donor_path),
+        "baseline_path": str(coord_map.get("baseline_path") or base),
+        "baseline_sha256": str(coord_map.get("baseline_sha256") or base_sha),
+        "cache_donor_path": str(coord_map.get("cache_donor_path") or donor_path),
         "donor_cache_restored": True,
         "recalc_status": recalc_res.get("status"),
         "recalc_result": recalc_res,
@@ -1018,6 +1130,8 @@ def main(argv: list[str] | None = None) -> int:
     p_apply.add_argument("--workspace-dir", default=None)
     p_apply.add_argument("--fingerprint", default=None)
     p_apply.add_argument("--coord-map-out", default=None)
+    p_apply.add_argument("--prior-coord-map", default=None)
+    p_apply.add_argument("--in-place", action="store_true")
     p_apply.add_argument("--donor-out", default=None)
     p_apply.add_argument("--spec-out", default=None)
     p_apply.add_argument("--expected-baseline-sha256", default=None)
@@ -1039,6 +1153,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "apply":
         plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
         fp = json.loads(Path(args.fingerprint).read_text(encoding="utf-8")) if args.fingerprint else None
+        prior_cm = (
+            json.loads(Path(args.prior_coord_map).read_text(encoding="utf-8"))
+            if args.prior_coord_map and Path(args.prior_coord_map).is_file()
+            else None
+        )
         try:
             res = apply_edit_plan(
                 baseline_path=args.baseline,
@@ -1054,6 +1173,8 @@ def main(argv: list[str] | None = None) -> int:
                 skip_recalc=args.skip_recalc,
                 recalc_timeout=args.recalc_timeout,
                 mode=args.mode,
+                in_place=args.in_place,
+                prior_coord_map=prior_cm,
             )
         except ValueError as exc:
             print(json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False), file=sys.stderr)

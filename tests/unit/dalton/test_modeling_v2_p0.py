@@ -36,6 +36,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -4996,6 +4997,34 @@ async def test_p0b_content_assembly_js_include_confinement_cycles_and_prebuilt_r
     assert resumed_dir == source_dir
 
 
+def _stamp_formula_caches(xlsx_path: Path, caches: dict[str, dict[str, str]]) -> str:
+    """Write ``<v>`` cached values onto formula cells in an OOXML workbook so it mimics a saved Excel baseline."""
+    from lxml import etree
+
+    sml = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    infos, payload = mhooks._read_package(xlsx_path)
+    parts = mhooks._sheet_parts(payload)
+    for sh_name, cell_vals in caches.items():
+        part = parts.get(sh_name)
+        if not part or part not in payload:
+            continue
+        root = etree.fromstring(payload[part])
+        for c_el in root.iter(f"{{{sml}}}c"):
+            coord = (c_el.get("r") or "").upper()
+            if coord in cell_vals:
+                v_el = c_el.find(f"{{{sml}}}v")
+                if v_el is None:
+                    v_el = etree.SubElement(c_el, f"{{{sml}}}v")
+                v_el.text = str(cell_vals[coord])
+        payload[part] = etree.tostring(root, encoding="UTF-8", xml_declaration=True)
+    tmp = xlsx_path.with_suffix(".cached.tmp.xlsx")
+    with zipfile.ZipFile(tmp, "w") as zout:
+        for info in infos:
+            zout.writestr(info, payload[info.filename], compress_type=info.compress_type)
+    os.replace(tmp, xlsx_path)
+    return mfp.file_sha256(xlsx_path)
+
+
 def _write_simple_valid_model(path: Path) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     wb = openpyxl.Workbook()
@@ -5008,7 +5037,7 @@ def _write_simple_valid_model(path: Path) -> str:
     ws["E2"] = 1000
     ws["F2"] = "=E2*1.1"
     wb.save(path)
-    return mfp.file_sha256(path)
+    return _stamp_formula_caches(path, {"Model - PDD": {"F2": "1100"}})
 
 
 @pytest.mark.asyncio
@@ -5058,7 +5087,7 @@ async def test_p0b_company_model_workflow_pass_two_fix_rounds_and_timeout_fallba
         assert outcome.status == "completed", outcome.error
         return outcome.result, calls
 
-    # Case 1: Clean pass (0 fix rounds) + progress_path run_id propagation
+    # Case 1: Clean pass (0 fix rounds) + separate live run_id probe
     def _h_pass(label: str, prompt: str, _opts: dict[str, Any]) -> Any:
         if label == "建模准备":
             return {
@@ -5071,14 +5100,27 @@ async def test_p0b_company_model_workflow_pass_two_fix_rounds_and_timeout_fallba
                 "consensus_path": "data/consensus/2026-11-27_1000.json",
                 "baseline_health_warning": None,
             }
-        if label == "建模与一致预期对照":
+        if label == "读取运行ID":
             assert f"{r_rel}/.progress.json" in prompt
+            return {"run_id": "run-cm-pass"}
+        if label == "模型构建与落盘":
             return {
-                "files": ["model/PDD-model-v01.xlsx"],
+                "files": ["model/PDD-model-v01.xlsx", f"{r_rel}/model_dump/coord_map.json"],
                 "summary": "built",
                 "candidate_path": "model/PDD-model-v01.xlsx",
                 "model_sha256": "a" * 64,
-                "run_id": "run-cm-pass",
+                "recalc_status": "ok",
+            }
+        if label == "一致预期对照":
+            return {
+                "files": [
+                    "model/PDD-model-v01.xlsx",
+                    f"{r_rel}/model_dump/consensus-diff.md",
+                    f"{r_rel}/model_dump/consensus-diff.json",
+                ],
+                "summary": "consensus ok",
+                "candidate_path": "model/PDD-model-v01.xlsx",
+                "model_sha256": "a" * 64,
                 "recalc_status": "ok",
                 "consensus_status": "ok",
                 "consensus_diff_generated": True,
@@ -5099,6 +5141,7 @@ async def test_p0b_company_model_workflow_pass_two_fix_rounds_and_timeout_fallba
                 "baseline_legacy_issues": [],
                 "missing_evidence_issues": [],
                 "not_applicable_issues": [],
+                "missing_required_sheets": [],
                 "remaining_issues_path": None,
                 "summary_10lines": "PDD v01 pass",
             }
@@ -5107,14 +5150,36 @@ async def test_p0b_company_model_workflow_pass_two_fix_rounds_and_timeout_fallba
     res_pass, calls_pass = await _exec_case(_h_pass)
     assert res_pass["ok"] is True and res_pass["status"] == "pass"
     assert res_pass["fix_rounds"] == 0 and res_pass["run_id"] == "run-cm-pass"
-    assert [lbl for lbl, _ in calls_pass] == ["建模准备", "建模与一致预期对照", "模型本轮范围检查"]
+    assert [lbl for lbl, _ in calls_pass] == [
+        "建模准备",
+        "读取运行ID",
+        "模型构建与落盘",
+        "一致预期对照",
+        "模型本轮范围检查",
+    ]
 
     # Case 2: Persistent actionable issues -> strictly capped at 2 fix rounds -> delivered_with_open_issues
-    def _h_two_rounds(label: str, _prompt: str, _opts: dict[str, Any]) -> Any:
+    def _h_two_rounds(label: str, prompt: str, _opts: dict[str, Any]) -> Any:
         if label == "建模准备":
             return {"files": ["fp.json"], "summary": "prep", "mode": "update", "baseline_path": "model/PDD-model-v01.xlsx", "baseline_sha256": "1" * 64}
-        if label == "建模与一致预期对照":
-            return {"files": ["model/PDD-model-v02.xlsx"], "summary": "v02", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": "2" * 64, "run_id": "run-cm-2r", "recalc_status": "ok", "consensus_diff_generated": True}
+        if label == "读取运行ID":
+            return {"run_id": "run-cm-2r"}
+        if label == "模型构建与落盘":
+            return {"files": ["model/PDD-model-v02.xlsx"], "summary": "v02", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": "2" * 64, "recalc_status": "ok"}
+        if label == "一致预期对照":
+            return {
+                "files": [
+                    "model/PDD-model-v02.xlsx",
+                    f"{r_rel}/model_dump/consensus-diff.md",
+                    f"{r_rel}/model_dump/consensus-diff.json",
+                ],
+                "summary": "cons ok",
+                "candidate_path": "model/PDD-model-v02.xlsx",
+                "model_sha256": "2" * 64,
+                "recalc_status": "ok",
+                "consensus_status": "ok",
+                "consensus_diff_generated": True,
+            }
         if label == "模型本轮范围检查" or label.startswith("模型本轮范围复查 "):
             return {
                 "files": [f"{r_rel}/model_dump/model-check.md", f"{r_rel}/model_dump/model-verification.json", f"{r_rel}/model_dump/remaining-issues.md"],
@@ -5124,9 +5189,14 @@ async def test_p0b_company_model_workflow_pass_two_fix_rounds_and_timeout_fallba
                 "model_sha256": "2" * 64,
                 "actionable_count": 1,
                 "actionable_issues": ["[C11] 集团与分部营业利润差额 -312 RMB MM"],
+                "missing_required_sheets": [],
                 "remaining_issues_path": f"{r_rel}/model_dump/remaining-issues.md",
             }
         if label.startswith("模型修改 "):
+            # R2 #1: Fix round MUST target current candidate v02 (never v01), re-extract fingerprint, and pass --in-place --prior-coord-map!
+            assert '--baseline "model/PDD-model-v02.xlsx"' in prompt
+            assert '--baseline "model/PDD-model-v01.xlsx"' not in prompt
+            assert "model_fingerprint.py" in prompt and "--in-place" in prompt and "--prior-coord-map" in prompt
             return {"files": ["model/PDD-model-v02.xlsx"], "summary": "fixed", "candidate_path": "model/PDD-model-v02.xlsx", "model_sha256": "2" * 64, "recalc_status": "ok", "consensus_diff_generated": True}
         raise AssertionError(f"unexpected label: {label}")
 
@@ -5137,7 +5207,7 @@ async def test_p0b_company_model_workflow_pass_two_fix_rounds_and_timeout_fallba
     assert "模型修改 1" in labels_2r and "模型修改 2" in labels_2r and "模型修改 3" not in labels_2r
     assert labels_2r.count("模型本轮范围复查 1") == 1 and labels_2r.count("模型本轮范围复查 2") == 1
 
-    # Case 3: Check times out BEFORE model-check.md is ever created -> short writeFallbackLedger writes real ledger -> passes verify-done
+    # Case 3: Check times out BEFORE model-check.md is ever created -> short writeFallbackLedger executes real CLI from prompt -> passes verify-done
     ws_to = tmp_path / "ws_timeout"
     cand_path = ws_to / "model" / "PDD-model-v01.xlsx"
     cand_sha = _write_simple_valid_model(cand_path)
@@ -5145,40 +5215,61 @@ async def test_p0b_company_model_workflow_pass_two_fix_rounds_and_timeout_fallba
     def _h_timeout(label: str, prompt: str, _opts: dict[str, Any]) -> Any:
         if label == "建模准备":
             return {"files": ["fp.json"], "summary": "prep", "mode": "build"}
-        if label == "建模与一致预期对照":
+        if label == "读取运行ID":
+            return {"run_id": "run-cm-to"}
+        if label == "模型构建与落盘":
             return {
                 "files": ["model/PDD-model-v01.xlsx"],
                 "summary": "v01",
                 "candidate_path": "model/PDD-model-v01.xlsx",
                 "model_sha256": cand_sha,
-                "run_id": "run-cm-to",
                 "recalc_status": "ok",
+            }
+        if label == "一致预期对照":
+            return {
+                "files": ["model/PDD-model-v01.xlsx"],
+                "summary": "cons skipped",
+                "candidate_path": "model/PDD-model-v01.xlsx",
+                "model_sha256": cand_sha,
+                "recalc_status": "ok",
+                "consensus_status": "missing",
                 "consensus_diff_generated": False,
             }
         if label == "模型本轮范围检查":
             return None  # Simulated timeout before model-check.md was written!
         if label == "写入降级账本":
-            # Verify prompt constrains declared files to ONLY ledger + remaining-issues.md
+            import shlex as _shlex
+
             assert "model-verification.json" in prompt and "remaining-issues.md" in prompt
             assert "不要把未生成的阶段报告放进 files" in prompt
-            wl = mchk.write_fallback_ledger(
-                workspace_dir=ws_to,
-                ticker="PDD",
-                research_dir=ws_to / r_rel,
-                candidate_path=cand_path,
-                kind="modeling",
-                failed_stages=["consensus", "check"],
-                run_id="run-cm-to",
-                workflow="company-model",
-                fix_rounds=0,
-                reason="模型本轮范围检查超时",
-            )
+            # Parse & run the REAL write-ledger CLI from the prompt!
+            m_cmd = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_check\.py write-ledger [^`]+)`", prompt)
+            assert m_cmd, f"write-ledger CLI missing in prompt: {prompt}"
+            argv = _shlex.split(m_cmd.group(1))[2:]
+            # Rewrite --workspace to ws_to and --research-dir / --candidate relative to ws_to
+            patched_argv = []
+            i = 0
+            while i < len(argv):
+                tok = argv[i]
+                if tok == "--workspace" and i + 1 < len(argv):
+                    patched_argv.extend([tok, str(ws_to)])
+                    i += 2
+                elif tok in ("--research-dir", "--candidate", "--baseline") and i + 1 < len(argv):
+                    val = argv[i + 1]
+                    patched_argv.extend([tok, str((ws_to / val) if not Path(val).is_absolute() else Path(val))])
+                    i += 2
+                else:
+                    patched_argv.append(tok)
+                    i += 1
+            rc = mchk.main(patched_argv)
+            assert rc == 0
+            led = json.loads((ws_to / r_rel / "model_dump" / "model-verification.json").read_text(encoding="utf-8"))
             return {
                 "files": [f"{r_rel}/model_dump/model-verification.json", f"{r_rel}/model_dump/remaining-issues.md"],
                 "summary": "fallback written",
-                "final_status": wl["final_status"],
-                "model_sha256": wl["model_sha256"],
-                "run_id": "run-cm-to",
+                "final_status": led["final_status"],
+                "model_sha256": led["final_model_sha256"],
+                "run_id": led["run_id"],
             }
         raise AssertionError(f"unexpected label: {label}")
 
@@ -5191,6 +5282,7 @@ async def test_p0b_company_model_workflow_pass_two_fix_rounds_and_timeout_fallba
         ticker="PDD",
         research_dir=ws_to / r_rel,
         expected_run_id="run-cm-to",
+        expected_workflow="company-model",
     )
     assert vd["ok"] is True, vd["errors"]
 
@@ -5230,10 +5322,19 @@ async def test_p0b_earnings_deep_update_timeout_before_model_delta_and_report_re
     }
 
     ws = tmp_path / "deep_ws"
-    cand_path = ws / "model" / "PDD-model-v02.xlsx"
-    cand_sha = _write_simple_valid_model(cand_path)
+    base_v1 = ws / "model" / "PDD-model-v01.xlsx"
+    v1_sha = _write_simple_valid_model(base_v1)
+    # Do NOT pre-create v02 or v03! Let real CLI commands extracted from prompts build them!
     (ws / r_rel).mkdir(parents=True, exist_ok=True)
     (ws / r_rel / "mapping.md").write_text("财报披露与模型行项映射表：" + "映射条目" * 20, encoding="utf-8")
+    report_file = ws / "drafts" / "2026-11-27-deep-FY26Q3.md"
+    report_file.parent.mkdir(parents=True, exist_ok=True)
+    report_file.write_text("# PDD 深度点评\nmodel:model/PDD-model-v02.xlsx!Model - PDD!F2\n" + "内容" * 100, encoding="utf-8")
+    cons_snap = ws / "data" / "consensus" / "2026-11-27_1000.json"
+    cons_snap.parent.mkdir(parents=True, exist_ok=True)
+    cons_snap.write_text(json.dumps({"ticker": "PDD", "as_of": "2026-11-27", "items": []}), encoding="utf-8")
+
+    params["consensus_thresholds"] = {"revenue": 0.04}
 
     nine_pass = {
         "verdict": "pass",
@@ -5248,70 +5349,166 @@ async def test_p0b_earnings_deep_update_timeout_before_model_delta_and_report_re
         "items": [{"check": i, "result": "pass" if i > 1 else "revise", "reason": "ok"} for i in range(1, 10)],
     }
 
+    def _run_prompt_script(script_name: str, cmd_line: str) -> tuple[int, str]:
+        import shlex as _shlex
+        import subprocess as _sp
+
+        tokens = _shlex.split(cmd_line)
+        # Replace python3 .agents/skills/dalton-model/scripts/<script> with real repo script path
+        real_script = str(REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-model" / "scripts" / script_name)
+        proc = _sp.run(
+            [sys.executable, real_script, *tokens[2:]],
+            cwd=ws,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return proc.returncode, proc.stdout + proc.stderr
+
     calls: list[tuple[str, str]] = []
     spec_host = create_autospec(WorkflowHost, instance=True)
+    report_sha_after_rev: dict[str, str] = {}
 
     async def _agent(prompt: str, opts: dict[str, Any]) -> Any:
         label = str(opts.get("label") or "")
         calls.append((label, prompt))
         if label == "建模准备":
+            fp_out = ws / r_rel / "model_dump" / "PDD-fingerprint.json"
+            fp_out.parent.mkdir(parents=True, exist_ok=True)
+            fp = mfp.build_fingerprint(base_v1, ticker="PDD")
+            fp_out.write_text(json.dumps(fp, ensure_ascii=False), encoding="utf-8")
             return {
                 "files": [f"{r_rel}/model_dump/PDD-fingerprint.json", f"{r_rel}/mapping.md"],
                 "summary": "prep",
                 "mode": "update",
                 "baseline_path": "model/PDD-model-v01.xlsx",
-                "baseline_sha256": "1" * 64,
+                "baseline_sha256": v1_sha,
+                "fingerprint_path": f"{r_rel}/model_dump/PDD-fingerprint.json",
+                "consensus_path": "data/consensus/2026-11-27_1000.json",
             }
-        if label == "建模与一致预期对照":
+        if label == "读取运行ID":
+            return {"run_id": "run-deep-1"}
+        if label == "模型构建与落盘":
+            plan_p = ws / r_rel / "model_dump" / "stage2_plan.json"
+            plan_p.write_text(
+                json.dumps(
+                    {
+                        "cell_edits": [{"sheet": "Model - PDD", "cell": "E2", "value": 1050}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            m_apply = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_edit\.py apply [^`]+)`", prompt)
+            assert m_apply
+            cmd = m_apply.group(1).replace("<edit_plan.json>", str(plan_p)) + " --skip-recalc"
+            rc, out = _run_prompt_script("model_edit.py", cmd)
+            assert rc == 0, out
+            v2_p = ws / "model" / "PDD-model-v02.xlsx"
+            assert v2_p.is_file()
+            return {
+                "files": ["model/PDD-model-v02.xlsx", f"{r_rel}/model_dump/coord_map.json"],
+                "summary": "v02 built",
+                "candidate_path": "model/PDD-model-v02.xlsx",
+                "model_sha256": mfp.file_sha256(v2_p),
+                "recalc_status": "ok",
+            }
+        if label == "一致预期对照":
             return {
                 "files": ["model/PDD-model-v02.xlsx"],
-                "summary": "v02",
+                "summary": "cons skipped",
                 "candidate_path": "model/PDD-model-v02.xlsx",
-                "model_sha256": cand_sha,
-                "run_id": "run-deep-1",
+                "model_sha256": mfp.file_sha256(ws / "model" / "PDD-model-v02.xlsx"),
                 "recalc_status": "ok",
+                "consensus_status": "missing",
                 "consensus_diff_generated": False,
             }
         if label == "模型本轮范围检查":
+            m_chk = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_check\.py check [^`]+)`", prompt)
+            assert m_chk
+            rc, out = _run_prompt_script("model_check.py", m_chk.group(1))
+            assert rc == 0, out
+            led = json.loads((ws / r_rel / "model_dump" / "model-verification.json").read_text(encoding="utf-8"))
             return {
-                "files": [f"{r_rel}/model_dump/model-check.md", f"{r_rel}/model_dump/model-verification.json"],
+                "files": [
+                    f"{r_rel}/model_dump/model-check.md",
+                    f"{r_rel}/model_dump/model-verification.json",
+                    f"{r_rel}/model_dump/remaining-issues.md",
+                ],
                 "summary": "check ok",
                 "readable": True,
-                "final_status": "delivered_with_open_issues",
-                "model_sha256": cand_sha,
+                "final_status": led["final_status"],
+                "model_sha256": led["final_model_sha256"],
                 "actionable_count": 0,
                 "actionable_issues": [],
+                "missing_required_sheets": [],
                 "remaining_issues_path": f"{r_rel}/model_dump/remaining-issues.md",
             }
         if label == "模型变动拆解":
             return None  # Timeout before model-delta.md is written!
         if label == "写入降级账本":
-            kind = "report_revision" if '--kind "report_revision"' in prompt else "modeling"
-            f_stages = ["check", "consensus", "model_delta"]
-            wl = mchk.write_fallback_ledger(
-                workspace_dir=ws,
-                ticker="PDD",
-                research_dir=ws / r_rel,
-                candidate_path=cand_path,
-                kind=kind,
-                failed_stages=f_stages,
-                run_id="run-deep-1",
-                workflow="earnings-deep-update",
-                fix_rounds=0,
-                reason=f"timeout ({kind})",
-            )
+            # Parse & run the REAL write-ledger CLI directly from the prompt (reads --candidate & --failed-stages from prompt!)
+            m_wl = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_check\.py write-ledger [^`]+)`", prompt)
+            assert m_wl, f"missing write-ledger CLI in prompt: {prompt}"
+            rc, out = _run_prompt_script("model_check.py", m_wl.group(1))
+            assert rc == 0, out
+            led = json.loads((ws / r_rel / "model_dump" / "model-verification.json").read_text(encoding="utf-8"))
             return {
                 "files": [f"{r_rel}/model_dump/model-verification.json", f"{r_rel}/model_dump/remaining-issues.md"],
                 "summary": "fallback ledger written",
-                "final_status": wl["final_status"],
-                "model_sha256": wl["model_sha256"],
-                "run_id": "run-deep-1",
+                "final_status": led["final_status"],
+                "model_sha256": led["final_model_sha256"],
+                "run_id": led["run_id"],
             }
         if label == "审稿":
             return nine_revise
         if label == "模型联动修订":
             assert not _REVIEW_LABEL_RE.search(label), "reviseModelForReport label must not match review regex"
-            return None  # Simulate timeout during report_revision too!
+            # Verify R2 #2: prompt re-extracts fingerprint of current candidate (v02) and carries consensus + thresholds!
+            assert "model_fingerprint.py" in prompt and "model/PDD-model-v02.xlsx" in prompt
+            assert '--consensus "data/consensus/2026-11-27_1000.json"' in prompt
+            assert "--thresholds" in prompt
+            m_fp = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_fingerprint\.py [^`]+)`", prompt)
+            assert m_fp
+            rc_fp, out_fp = _run_prompt_script("model_fingerprint.py", m_fp.group(1))
+            assert rc_fp == 0, out_fp
+            rev_plan = ws / r_rel / "model_dump" / "rev_plan.json"
+            rev_plan.write_text(
+                json.dumps({"cell_edits": [{"sheet": "Model - PDD", "cell": "E2", "value": 1088}]}),
+                encoding="utf-8",
+            )
+            m_edit = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_edit\.py apply [^`]+)`", prompt)
+            assert m_edit
+            rc_e, out_e = _run_prompt_script(
+                "model_edit.py",
+                m_edit.group(1).replace("<report_rev_plan.json>", str(rev_plan)) + " --skip-recalc",
+            )
+            assert rc_e == 0, out_e
+            v3_p = ws / "model" / "PDD-model-v03.xlsx"
+            assert v3_p.is_file()
+            # Update report model: ref and measure real new report sha256 (R2 #5)
+            report_file.write_text(
+                "# PDD 深度点评\nmodel:model/PDD-model-v03.xlsx!Model - PDD!F2\n" + "内容" * 100,
+                encoding="utf-8",
+            )
+            new_r_sha = mfp.file_sha256(report_file)
+            report_sha_after_rev["sha"] = new_r_sha
+            return {
+                "files": ["model/PDD-model-v03.xlsx", "drafts/2026-11-27-deep-FY26Q3.md"],
+                "summary": "revised to v03",
+                "changed": True,
+                "model_path": "model/PDD-model-v03.xlsx",
+                "model_sha256": mfp.file_sha256(v3_p),
+                "report_sha256": new_r_sha,
+                "recalc_status": "ok",
+                "consensus_diff_generated": False,
+            }
+        if label == "模型联动修订检查":
+            assert not _REVIEW_LABEL_RE.search(label)
+            return None  # R2 #3: Check times out AFTER v03 was persisted!
+        if label == "修订 1":
+            # R2 #5: outer report revision prompt MUST check the NEW measured post-sync report hash!
+            assert report_sha_after_rev["sha"] in prompt
+            return {"files": ["drafts/2026-11-27-deep-FY26Q3.md"], "summary": label, "sha256": report_sha_after_rev["sha"]}
         if label == "复审 1" or label == "终稿审稿":
             return nine_pass
         if label == "产物核验":
@@ -5331,6 +5528,15 @@ async def test_p0b_earnings_deep_update_timeout_before_model_delta_and_report_re
     assert res["ok"] is True, res["incomplete"]
     assert res["model_status"] == "delivered_with_open_issues"
     assert res["model_delta"] is None
+    assert res["model_file"] == "model/PDD-model-v03.xlsx"
+
+    # R2 #3 & #5: Verify fallback ledger recorded the NEW v03 candidate AND preserved model_delta!
+    final_led = json.loads((ws / r_rel / "model_dump" / "model-verification.json").read_text(encoding="utf-8"))
+    assert final_led["final_model_path"] == "model/PDD-model-v03.xlsx"
+    assert final_led["final_model_sha256"] == mfp.file_sha256(ws / "model" / "PDD-model-v03.xlsx")
+    assert final_led["rounds"][-1]["kind"] == "report_revision"
+    assert "model_delta" in final_led["failed_stages"]
+    assert "check" in final_led["failed_stages"]
 
     notes_prompt = next(p for lbl, p in calls if lbl == "笔记语言审查")
     assert f"{r_rel}/mapping.md" in notes_prompt
@@ -5348,6 +5554,7 @@ async def test_p0b_earnings_deep_update_timeout_before_model_delta_and_report_re
         ticker="PDD",
         research_dir=ws / r_rel,
         expected_run_id="run-deep-1",
+        expected_workflow="earnings-deep-update",
     )
     assert vd["ok"] is True, vd["errors"]
 
@@ -5382,7 +5589,13 @@ async def test_p0b_check_done_company_model_run_id_manual_exempt_dump_and_sector
     scripts_dst.mkdir(parents=True, exist_ok=True)
     for src in (REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-model" / "scripts").glob("*.py"):
         shutil.copyfile(src, scripts_dst / src.name)
+    xlsx_dst = ws / ".agents" / "skills" / "xlsx" / "scripts"
+    xlsx_dst.mkdir(parents=True, exist_ok=True)
+    for src in (REPO_ROOT / "plugins" / "langalpha_deliverables" / "skills" / "xlsx" / "scripts").glob("*.py"):
+        shutil.copyfile(src, xlsx_dst / src.name)
 
+    model_v1 = ws / "model" / "China_Ecommerce_v01.xlsx"
+    _write_simple_valid_model(model_v1)
     model_v2 = ws / "model" / "China_Ecommerce_v02.xlsx"
     _write_simple_valid_model(model_v2)
     r_rel = "research/2026-11-27-model-JD"
@@ -5682,3 +5895,989 @@ def test_p0b_skill_docs_v2_conventions_and_core_assembly() -> None:
     assert "先独立建模" in model_skill
     assert "remaining-issues.md" in model_skill
     assert "model_edit.py" in model_skill and "model_check.py" in model_skill and "model_consensus.py" in model_skill
+    # R2 #11: Manual downgrade documents the full write-ledger command with all required arguments
+    for req_arg in ("write-ledger", "--workspace", "--ticker", "--research-dir", "--candidate", "--failed-stages"):
+        assert req_arg in model_skill, f"SKILL.md missing {req_arg}"
+
+
+# ===========================================================================
+# P0-b Round 2 regression & real-CLI acceptance tests (Items 1-12)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_p0b_r2_fix_round_incremental_preserves_stage2_values_and_expanded_columns(
+    tmp_path: Path,
+) -> None:
+    """R2 #1 & #12: Fix round targets current candidate v02 (NOT original v01),
+    re-extracts fingerprint of v02, checks --expected-baseline-sha256, applies
+    incremental fix via real model_edit.py --in-place --prior-coord-map, and
+    preserves Stage 2 actuals and expanded columns in the real workbook."""
+    import shlex as _shlex
+    import subprocess as _sp
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
+        WorkflowHost,
+        WorkflowLimits,
+        run_workflow_script,
+    )
+    from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
+        read_assembled_workflow_file,
+    )
+
+    ws = tmp_path / "ws_fix_inc"
+    base_v1 = ws / "model" / "PDD-model-v01.xlsx"
+    base_v1.parent.mkdir(parents=True, exist_ok=True)
+    wb = openpyxl.Workbook()
+    ws_rm = wb.active
+    ws_rm.title = "README & Changelog"
+    ws_rm["A1"] = "Version"
+    ws_rm["B1"] = "Date"
+    ws_rm["A2"] = "v01"
+    ws_rm["B2"] = "2026-08-01"
+    ws_m = wb.create_sheet("Model - PDD")
+    ws_m["A1"] = "(RMB MM)"
+    ws_m["E1"] = "2024"
+    ws_m["F1"] = "2025"
+    ws_m["G1"] = "2026E"
+    ws_m["H1"] = "2027E"
+    ws_m["D2"] = "Core Revenue"
+    ws_m["E2"] = 800
+    ws_m["F2"] = 1000
+    ws_m["G2"] = "=F2*1.1"
+    ws_m["H2"] = "=G2*1.1"
+    ws_m["D3"] = "Total Revenue"
+    ws_m["E3"] = "=E2"
+    ws_m["F3"] = "=F2"
+    ws_m["G3"] = "=G2"
+    ws_m["H3"] = "=H2"
+    wb.save(base_v1)
+    v1_sha = _stamp_formula_caches(
+        base_v1,
+        {
+            "Model - PDD": {
+                "G2": "1100",
+                "H2": "1210",
+                "E3": "800",
+                "F3": "1000",
+                "G3": "1100",
+                "H3": "1210",
+            }
+        },
+    )
+
+    r_rel = "research/2026-11-27-model-PDD"
+    (ws / r_rel / "model_dump").mkdir(parents=True, exist_ok=True)
+    cons_p = ws / "data" / "consensus" / "2026-11-27_1000.json"
+    cons_p.parent.mkdir(parents=True, exist_ok=True)
+    cons_p.write_text(json.dumps({"ticker": "PDD", "as_of": "2026-11-27", "items": []}), encoding="utf-8")
+
+    def _run_cli(script_name: str, cmd_line: str) -> tuple[int, str]:
+        toks = _shlex.split(cmd_line)
+        real_s = str(REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-model" / "scripts" / script_name)
+        proc = _sp.run([sys.executable, real_s, *toks[2:]], cwd=ws, capture_output=True, text=True, check=False)
+        return proc.returncode, proc.stdout + proc.stderr
+
+    script = read_assembled_workflow_file(REPO_ROOT / "workflows" / "company-model" / "workflow.js")
+    params = {
+        "ticker": "PDD",
+        "company": "PDD Holdings",
+        "workspace_dir": ".",
+        "as_of": "2026-11-27",
+        "model_path": "model/PDD-model-v01.xlsx",
+        "progress_path": f"{r_rel}/.progress.json",
+    }
+
+    spec_host = create_autospec(WorkflowHost, instance=True)
+    fix_called = []
+
+    async def _agent(prompt: str, opts: dict[str, Any]) -> Any:
+        label = str(opts.get("label") or "")
+        if label == "建模准备":
+            fp_out = ws / r_rel / "model_dump" / "PDD-fingerprint.json"
+            fp = mfp.build_fingerprint(base_v1, ticker="PDD")
+            fp_out.write_text(json.dumps(fp, ensure_ascii=False), encoding="utf-8")
+            return {
+                "files": [f"{r_rel}/model_dump/PDD-fingerprint.json"],
+                "summary": "prep",
+                "mode": "update",
+                "baseline_path": "model/PDD-model-v01.xlsx",
+                "baseline_sha256": v1_sha,
+                "fingerprint_path": f"{r_rel}/model_dump/PDD-fingerprint.json",
+                "consensus_path": "data/consensus/2026-11-27_1000.json",
+            }
+        if label == "读取运行ID":
+            return {"run_id": "run-fix-inc"}
+        if label == "模型构建与落盘":
+            # Expand a new forecast column I (2028E), update actual F2=1234, and intentionally hardcode G3=1357 (actionable C03!)
+            s2_plan = ws / r_rel / "model_dump" / "s2_plan.json"
+            s2_plan.write_text(
+                json.dumps(
+                    {
+                        "ops": [{"op": "insert_columns", "sheet": "Model - PDD", "at": "I", "count": 1}],
+                        "added_period_cols": {"Model - PDD": ["I"]},
+                        "cell_edits": [
+                            {"sheet": "Model - PDD", "cell": "I1", "value": "2028E"},
+                            {"sheet": "Model - PDD", "cell": "F2", "value": 1234},
+                            {"sheet": "Model - PDD", "cell": "G3", "value": 1357},
+                            {"sheet": "Model - PDD", "cell": "I2", "value": "=H2*1.1"},
+                            {"sheet": "Model - PDD", "cell": "I3", "value": "=I2"},
+                        ],
+                        "changelog_entry": {"version": "v02", "date": "2026-11-27", "summary": "Stage 2 update"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            m_e = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_edit\.py apply [^`]+)`", prompt)
+            assert m_e
+            rc, out = _run_cli("model_edit.py", m_e.group(1).replace("<edit_plan.json>", str(s2_plan)) + " --skip-recalc")
+            assert rc == 0, out
+            v2_p = ws / "model" / "PDD-model-v02.xlsx"
+            return {
+                "files": ["model/PDD-model-v02.xlsx", f"{r_rel}/model_dump/coord_map.json"],
+                "summary": "v02 built",
+                "candidate_path": "model/PDD-model-v02.xlsx",
+                "model_sha256": mfp.file_sha256(v2_p),
+                "recalc_status": "ok",
+            }
+        if label == "一致预期对照":
+            m_d = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_consensus\.py diff [^`]+)`", prompt)
+            assert m_d
+            rc, out = _run_cli("model_consensus.py", m_d.group(1))
+            assert rc == 0, out
+            return {
+                "files": [
+                    "model/PDD-model-v02.xlsx",
+                    f"{r_rel}/model_dump/consensus-diff.md",
+                    f"{r_rel}/model_dump/consensus-diff.json",
+                ],
+                "summary": "cons ok",
+                "candidate_path": "model/PDD-model-v02.xlsx",
+                "model_sha256": mfp.file_sha256(ws / "model" / "PDD-model-v02.xlsx"),
+                "recalc_status": "ok",
+                "consensus_status": "ok",
+                "consensus_diff_generated": True,
+            }
+        if label == "模型本轮范围检查" or label.startswith("模型本轮范围复查 "):
+            m_c = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_check\.py check [^`]+)`", prompt)
+            assert m_c
+            rc, out = _run_cli("model_check.py", m_c.group(1))
+            assert rc == 0, out
+            payload = json.loads(out)
+            files = [f"{r_rel}/model_dump/model-check.md", f"{r_rel}/model_dump/model-verification.json"]
+            if payload.get("remaining_issues_path"):
+                files.append(f"{r_rel}/model_dump/remaining-issues.md")
+            act = [f["message"] for f in payload["findings"] if f["severity_class"] == "actionable"]
+            return {
+                "files": files,
+                "summary": f"actionable={len(act)}",
+                "readable": payload["readable"],
+                "final_status": payload["final_status"],
+                "model_sha256": payload["candidate_sha256"],
+                "actionable_count": len(act),
+                "actionable_issues": act,
+                "missing_required_sheets": payload.get("missing_required_sheets") or [],
+                "remaining_issues_path": f"{r_rel}/model_dump/remaining-issues.md" if payload.get("remaining_issues_path") else None,
+                "summary_10lines": payload.get("summary_10lines") or "",
+            }
+        if label == "模型修改 1":
+            fix_called.append(prompt)
+            # Execute the REAL fingerprint + incremental apply + consensus diff from prompt!
+            m_fp = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_fingerprint\.py [^`]+)`", prompt)
+            assert m_fp
+            rc_fp, out_fp = _run_cli("model_fingerprint.py", m_fp.group(1))
+            assert rc_fp == 0, out_fp
+
+            fix_plan = ws / r_rel / "model_dump" / "fix_plan_1.json"
+            # Fix ONLY G3 back to formula "=G2" — do NOT re-specify F2=1234 or expanded col H!
+            fix_plan.write_text(
+                json.dumps({"cell_edits": [{"sheet": "Model - PDD", "cell": "G3", "value": "=G2"}]}),
+                encoding="utf-8",
+            )
+            m_e = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_edit\.py apply [^`]+)`", prompt)
+            assert m_e
+            rc_e, out_e = _run_cli("model_edit.py", m_e.group(1).replace("<fix_plan_1.json>", str(fix_plan)) + " --skip-recalc")
+            assert rc_e == 0, out_e
+
+            m_d = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_consensus\.py diff [^`]+)`", prompt)
+            assert m_d
+            rc_d, out_d = _run_cli("model_consensus.py", m_d.group(1).replace("<最新候选路径>", "model/PDD-model-v02.xlsx"))
+            assert rc_d == 0, out_d
+            return {
+                "files": [
+                    "model/PDD-model-v02.xlsx",
+                    f"{r_rel}/model_dump/consensus-diff.md",
+                    f"{r_rel}/model_dump/consensus-diff.json",
+                ],
+                "summary": "fixed G3 formula",
+                "candidate_path": "model/PDD-model-v02.xlsx",
+                "model_sha256": mfp.file_sha256(ws / "model" / "PDD-model-v02.xlsx"),
+                "recalc_status": "ok",
+                "consensus_diff_generated": True,
+            }
+        raise AssertionError(f"unexpected label: {label}")
+
+    spec_host.agent.side_effect = _agent
+    spec_host.phase.side_effect = lambda _t: None
+    spec_host.log.side_effect = lambda _m: None
+
+    outcome = await run_workflow_script(
+        script, params, spec_host, WorkflowLimits(memory_limit_mb=64, cpu_budget_s=15.0)
+    )
+    assert outcome.status == "completed", outcome.error
+    assert len(fix_called) == 1
+    assert outcome.result["ok"] is True
+
+    # Open the REAL workbook and assert Stage 2 actual (F2=1234), expanded col (I1="2028E", I2="=H2*1.1"),
+    # AND Fix Round 1 formula (G3="=G2") ALL survived!
+    wb_final = openpyxl.load_workbook(ws / "model" / "PDD-model-v02.xlsx", data_only=False)
+    try:
+        ws_final = wb_final["Model - PDD"]
+        assert ws_final["F2"].value == 1234, "Stage 2 actual value was lost in fix round!"
+        assert ws_final["I1"].value == "2028E", "Stage 2 expanded column header was lost in fix round!"
+        assert ws_final["I2"].value == "=H2*1.1", "Stage 2 expanded column formula was lost in fix round!"
+        assert ws_final["G3"].value == "=G2", "Fix round 1 edit was not applied!"
+    finally:
+        wb_final.close()
+
+    # Original read-only baseline v01 was never modified
+    assert mfp.file_sha256(base_v1) == v1_sha
+
+    vd = mchk.verify_done(
+        workspace_dir=ws,
+        ticker="PDD",
+        research_dir=ws / r_rel,
+        expected_run_id="run-fix-inc",
+        expected_workflow="company-model",
+    )
+    assert vd["ok"] is True, vd["errors"]
+
+
+@pytest.mark.asyncio
+async def test_p0b_r2_downgrade_misjudgment_guards(tmp_path: Path) -> None:
+    """R2 #4:
+    (a) Stage 2a persists candidate, Stage 2b (consensus) times out -> NOT failed_unusable;
+        delivers delivered_with_open_issues.
+    (b) Fallback ledger child returns None -> ok=False, status=failed_unusable, unconfirmed
+        paths excluded from artifacts.
+    (c) No readable candidate -> writeFallbackLedger never called (no --candidate 'null')."""
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
+        WorkflowHost,
+        WorkflowLimits,
+        run_workflow_script,
+    )
+    from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
+        read_assembled_workflow_file,
+    )
+
+    script = read_assembled_workflow_file(REPO_ROOT / "workflows" / "company-model" / "workflow.js")
+    r_rel = "research/2026-11-27-model-PDD"
+    params = {
+        "ticker": "PDD",
+        "company": "PDD Holdings",
+        "workspace_dir": ".",
+        "as_of": "2026-11-27",
+        "progress_path": f"{r_rel}/.progress.json",
+    }
+
+    async def _run_with(handler: Any) -> tuple[Any, list[tuple[str, str]]]:
+        calls: list[tuple[str, str]] = []
+        spec_host = create_autospec(WorkflowHost, instance=True)
+
+        async def _agent(prompt: str, opts: dict[str, Any]) -> Any:
+            lbl = str(opts.get("label") or "")
+            calls.append((lbl, prompt))
+            return handler(lbl, prompt)
+
+        spec_host.agent.side_effect = _agent
+        spec_host.phase.side_effect = lambda _t: None
+        spec_host.log.side_effect = lambda _m: None
+        out = await run_workflow_script(script, params, spec_host, WorkflowLimits(memory_limit_mb=64, cpu_budget_s=10.0))
+        assert out.status == "completed", out.error
+        return out.result, calls
+
+    # (a) Stage 2a succeeds, Stage 2b times out -> candidate is preserved, NOT failed_unusable!
+    def _h_2b_timeout(label: str, prompt: str) -> Any:
+        if label == "建模准备":
+            return {"files": ["fp.json"], "summary": "prep", "mode": "build"}
+        if label == "读取运行ID":
+            return {"run_id": "run-2b-to"}
+        if label == "模型构建与落盘":
+            return {"files": ["model/PDD-model-v01.xlsx"], "summary": "v01", "candidate_path": "model/PDD-model-v01.xlsx", "model_sha256": "a" * 64, "recalc_status": "ok"}
+        if label == "一致预期对照":
+            return None  # Consensus step timed out after candidate was already persisted!
+        if label == "模型本轮范围检查":
+            assert '--failed-stages "consensus"' in prompt
+            return {
+                "files": [
+                    f"{r_rel}/model_dump/model-check.md",
+                    f"{r_rel}/model_dump/model-verification.json",
+                    f"{r_rel}/model_dump/remaining-issues.md",
+                ],
+                "summary": "delivered open",
+                "readable": True,
+                "final_status": "delivered_with_open_issues",
+                "model_sha256": "a" * 64,
+                "actionable_count": 0,
+                "actionable_issues": [],
+                "missing_required_sheets": [],
+                "remaining_issues_path": f"{r_rel}/model_dump/remaining-issues.md",
+            }
+        raise AssertionError(label)
+
+    res_a, _ = await _run_with(_h_2b_timeout)
+    assert res_a["ok"] is True and res_a["status"] == "delivered_with_open_issues"
+    assert res_a["candidate_path"] == "model/PDD-model-v01.xlsx"
+    assert "consensus" in res_a["failed_stages"]
+    assert f"{r_rel}/model_dump/consensus-diff.md" not in res_a["artifacts"]
+
+    # (b) Check times out AND fallback ledger child returns None -> ok=False, failed_unusable, no unconfirmed paths!
+    def _h_fb_empty(label: str, _prompt: str) -> Any:
+        if label == "建模准备":
+            return {"files": ["fp.json"], "summary": "prep", "mode": "build"}
+        if label == "读取运行ID":
+            return {"run_id": "run-fb-empty"}
+        if label == "模型构建与落盘":
+            return {"files": ["model/PDD-model-v01.xlsx"], "summary": "v01", "candidate_path": "model/PDD-model-v01.xlsx", "model_sha256": "a" * 64, "recalc_status": "ok"}
+        if label == "一致预期对照":
+            return {"files": ["model/PDD-model-v01.xlsx"], "summary": "ok", "candidate_path": "model/PDD-model-v01.xlsx", "model_sha256": "a" * 64, "consensus_diff_generated": False}
+        if label in ("模型本轮范围检查", "写入降级账本"):
+            return None
+        raise AssertionError(label)
+
+    res_b, calls_b = await _run_with(_h_fb_empty)
+    assert res_b["ok"] is False
+    assert res_b["status"] == "failed_unusable"
+    assert f"{r_rel}/model_dump/model-verification.json" not in res_b["artifacts"]
+    assert f"{r_rel}/model_dump/remaining-issues.md" not in res_b["artifacts"]
+    assert all('--candidate "null"' not in p for _, p in calls_b)
+
+    # (c) Stage 2a returns no candidate -> writeFallbackLedger is NEVER called (no --candidate "null")
+    def _h_no_cand(label: str, _prompt: str) -> Any:
+        if label == "建模准备":
+            return {"files": ["fp.json"], "summary": "prep", "mode": "build"}
+        if label == "读取运行ID":
+            return {"run_id": "run-no-cand"}
+        if label == "模型构建与落盘":
+            return None
+        raise AssertionError(label)
+
+    res_c, calls_c = await _run_with(_h_no_cand)
+    assert res_c["ok"] is False and res_c["status"] == "failed_unusable"
+    assert "写入降级账本" not in [lbl for lbl, _ in calls_c]
+
+
+@pytest.mark.asyncio
+async def test_p0b_r2_resume_rebinds_new_run_id_without_replaying_old_run_id(
+    tmp_path: Path,
+) -> None:
+    """R2 #7: Live run_id probe is never replayed by WorkflowJournal, and a prior
+    run's model-verification.json ledger is never replayed under a new run_id so
+    resume re-binds the terminal ledger to the new run_id."""
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from src.dalton.workflows.journal import WorkflowJournal, artifact_records, prompt_digest
+
+    ws = tmp_path / "ws_resume"
+    r_rel = "research/2026-11-27-model-PDD"
+    cand_p = ws / "model" / "PDD-model-v01.xlsx"
+    _write_simple_valid_model(cand_p)
+
+    # Run 1 writes a ledger bound to run-old-1
+    mchk.write_fallback_ledger(
+        workspace_dir=ws,
+        ticker="PDD",
+        research_dir=ws / r_rel,
+        candidate_path=cand_p,
+        kind="modeling",
+        failed_stages=["check", "consensus"],
+        run_id="run-old-1",
+        workflow="company-model",
+        fix_rounds=0,
+        reason="initial run",
+    )
+    ledger_rel = f"{r_rel}/model_dump/model-verification.json"
+    rem_rel = f"{r_rel}/model_dump/remaining-issues.md"
+    led_sha = mfp.file_sha256(ws / ledger_rel)
+    rem_sha = mfp.file_sha256(ws / rem_rel)
+
+    backend = create_autospec(SandboxBackend, instance=True)
+    backend.workspace_dir = str(ws)
+    fs_extra: dict[str, str] = {}
+
+    async def _aread(path: str) -> str | None:
+        if path in fs_extra:
+            return fs_extra[path]
+        p = ws / path
+        return p.read_text(encoding="utf-8") if p.is_file() else None
+
+    async def _awrite(path: str, text: str) -> bool:
+        fs_extra[path] = text
+        return True
+
+    async def _aglob(pattern: str, root: str = ".") -> list[str]:
+        from fnmatch import fnmatch
+
+        return sorted(k for k in fs_extra if fnmatch(k, pattern))
+
+    backend.aread_text.side_effect = _aread
+    backend.awrite_text.side_effect = _awrite
+    backend.aglob_paths.side_effect = _aglob
+    backend.aexecute = None
+
+    # 1. artifact_records refuses to mark {run_id}-only live query as replayable
+    assert await artifact_records(backend, {"run_id": "run-old-1"}) is None
+
+    # 2. Seed Run 1's journal with: (a) live run_id probe, (b) stale ledger dispatch, (c) legacy stage with run_id
+    src_dir = ".agents/threads/12345678/workflows/run-old-1"
+    rid_prompt = "read run_id"
+    chk_prompt = "run model_check"
+    s2_prompt = "build model"
+    fs_extra[f"{src_dir}/journal/01.json"] = json.dumps(
+        {
+            "label": "读取运行ID",
+            "dispatches": [
+                {
+                    "label": "读取运行ID",
+                    "prompt_sha256": prompt_digest(rid_prompt),
+                    "status": "ok",
+                    "replayable": True,
+                    "result": {"run_id": "run-old-1"},
+                    "artifacts": [],
+                }
+            ],
+        }
+    )
+    fs_extra[f"{src_dir}/journal/02.json"] = json.dumps(
+        {
+            "label": "模型本轮范围检查",
+            "dispatches": [
+                {
+                    "label": "模型本轮范围检查",
+                    "prompt_sha256": prompt_digest(chk_prompt),
+                    "status": "ok",
+                    "replayable": True,
+                    "result": {"files": [ledger_rel, rem_rel], "summary": "ok"},
+                    "artifacts": [
+                        {"path": ledger_rel, "sha256": led_sha},
+                        {"path": rem_rel, "sha256": rem_sha},
+                    ],
+                }
+            ],
+        }
+    )
+    cand_sha_txt = hashlib.sha256((ws / rem_rel).read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+    fs_extra[f"{src_dir}/journal/03.json"] = json.dumps(
+        {
+            "label": "模型构建与落盘",
+            "dispatches": [
+                {
+                    "label": "模型构建与落盘",
+                    "prompt_sha256": prompt_digest(s2_prompt),
+                    "status": "ok",
+                    "replayable": True,
+                    "result": {"files": [rem_rel], "summary": "ok", "run_id": "run-old-1"},
+                    "artifacts": [{"path": rem_rel, "sha256": cand_sha_txt}],
+                }
+            ],
+        }
+    )
+
+    journal_new = WorkflowJournal(
+        backend,
+        base_rel=".agents/threads/12345678/workflows/run-new-2",
+        workflow="company-model",
+        run_id="run-new-2",
+        progress_path=f"{r_rel}/.progress.json",
+        journal_source=src_dir,
+    )
+
+    # Live run_id probe MUST NOT replay
+    assert await journal_new.find_replayable("读取运行ID", rid_prompt) is None
+    # Terminal ledger bound to run-old-1 MUST NOT replay under run-new-2
+    assert await journal_new.find_replayable("模型本轮范围检查", chk_prompt) is None
+    # Legacy replayable stage carrying old run_id gets rebound to run-new-2
+    replayed_s2 = await journal_new.find_replayable("模型构建与落盘", s2_prompt)
+    assert replayed_s2 is not None
+    assert replayed_s2["result"]["run_id"] == "run-new-2"
+
+
+@pytest.mark.asyncio
+async def test_p0b_r2_full_coverage_missing_required_sheets_blocks_before_draft(
+    tmp_path: Path,
+) -> None:
+    """R2 #8: Full-coverage validates required sheets per model-spec.md before memo
+    drafting; missing sheets are recorded in C01 actionable + remaining-issues.md
+    and full-coverage/workflow.js blocks via gateBlock instead of silently drafting."""
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
+        WorkflowHost,
+        WorkflowLimits,
+        run_workflow_script,
+    )
+    from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
+        read_assembled_workflow_file,
+    )
+
+    ws = tmp_path / "ws_fc_sheets"
+    r_rel = "research/2026-11-27-fc"
+    cand = ws / "model" / "PDD-model-v01.xlsx"
+    _write_simple_valid_model(cand)
+
+    # 1. Direct model_check.py check on full-coverage (update mode) catches missing 4 Dalton sheets
+    chk_upd = mchk.write_check_and_ledger(
+        workspace_dir=ws,
+        ticker="PDD",
+        research_dir=ws / r_rel,
+        candidate_path=cand,
+        workflow="full-coverage",
+        mode="update",
+        run_id="run-fc-sheets",
+    )
+    assert set(chk_upd["missing_required_sheets"]) == {"Facts", "Guidance vs Actual", "Street vs House", "Checks"}
+    rem_txt = (ws / r_rel / "model_dump" / "remaining-issues.md").read_text(encoding="utf-8")
+    assert "Facts" in rem_txt and "Checks" in rem_txt
+
+    # 2. Direct model_check.py check on full-coverage (build mode) catches missing 15-sheet spec sheets
+    chk_bld = mchk.write_check_and_ledger(
+        workspace_dir=ws,
+        ticker="PDD",
+        research_dir=ws / r_rel,
+        candidate_path=cand,
+        workflow="full-coverage",
+        mode="build",
+        run_id="run-fc-sheets",
+    )
+    assert "Cover" in chk_bld["missing_required_sheets"] and "DCF" in chk_bld["missing_required_sheets"]
+    assert "Valuation Summary" in chk_bld["missing_required_sheets"]
+
+    # 3. full-coverage/workflow.js blocks BEFORE 成稿 when required sheets are missing
+    script = read_assembled_workflow_file(REPO_ROOT / "workflows" / "full-coverage" / "workflow.js")
+    params = {
+        "ticker": "PDD",
+        "company": "PDD Holdings",
+        "workspace_dir": ".",
+        "as_of": "2026-11-27",
+        "progress_path": f"{r_rel}/.progress.json",
+    }
+    labels_seen: list[str] = []
+    spec_host = create_autospec(WorkflowHost, instance=True)
+
+    async def _agent(prompt: str, opts: dict[str, Any]) -> Any:
+        label = str(opts.get("label") or "")
+        labels_seen.append(label)
+        if label == "支线核验":
+            ps = [ln[2:].split("（")[0].strip() for ln in prompt.splitlines() if ln.startswith("- ")]
+            return {"files": [f"{p}|ok" for p in ps]}
+        if label in ("数字底表", "frame") or label.startswith("支线 "):
+            return {"files": [f"{r_rel}/facts.md"], "summary": "ok"}
+        if label == "建模准备":
+            return {"files": [f"{r_rel}/model_dump/PDD-fingerprint.json"], "summary": "prep", "mode": "update", "baseline_path": "model/PDD-model-v01.xlsx"}
+        if label == "读取运行ID":
+            return {"run_id": "run-fc-sheets"}
+        if label == "模型构建与落盘":
+            return {"files": ["model/PDD-model-v01.xlsx"], "summary": "v01", "candidate_path": "model/PDD-model-v01.xlsx", "model_sha256": chk_upd["candidate_sha256"], "recalc_status": "ok"}
+        if label == "一致预期对照":
+            return {"files": ["model/PDD-model-v01.xlsx"], "summary": "cons", "candidate_path": "model/PDD-model-v01.xlsx", "model_sha256": chk_upd["candidate_sha256"], "consensus_diff_generated": False}
+        if label == "模型本轮范围检查" or label.startswith("模型本轮范围复查 "):
+            return {
+                "files": [
+                    f"{r_rel}/model_dump/model-check.md",
+                    f"{r_rel}/model_dump/model-verification.json",
+                    f"{r_rel}/model_dump/remaining-issues.md",
+                ],
+                "summary": "missing required sheets",
+                "readable": True,
+                "final_status": "delivered_with_open_issues",
+                "model_sha256": chk_upd["candidate_sha256"],
+                "actionable_count": 1,
+                "actionable_issues": ["full-coverage missing required sheets"],
+                "missing_required_sheets": chk_upd["missing_required_sheets"],
+                "remaining_issues_path": f"{r_rel}/model_dump/remaining-issues.md",
+            }
+        raise AssertionError(f"unexpected label (must not reach drafting): {label}")
+
+    spec_host.agent.side_effect = _agent
+    spec_host.phase.side_effect = lambda _t: None
+    spec_host.log.side_effect = lambda _m: None
+
+    outcome = await run_workflow_script(script, params, spec_host, WorkflowLimits(memory_limit_mb=64, cpu_budget_s=10.0))
+    assert outcome.status == "completed", outcome.error
+    res = outcome.result
+    assert res["ok"] is False
+    assert "缺少必需工作表" in res["blocked"]
+    assert "Facts" in res["blocked"] and "Checks" in res["blocked"]
+    assert "remaining-issues.md" in res["blocked"]
+    assert "成稿" not in labels_seen
+
+
+@pytest.mark.asyncio
+async def test_p0b_r2_sector_two_companies_serial_pdd_then_jd_real_cli_and_check_done(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2 #12: Real two-company serial update (PDD -> JD) on a multi-company sector
+    workbook executing prompt-generated CLI commands, verifying version chain
+    v01 -> v02 -> v03 preserves PDD's edits when JD updates, and passing both
+    real verify-done and dalton_check_done."""
+    import shlex as _shlex
+    import shutil
+    import subprocess as _sp
+    from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
+        WorkflowHost,
+        WorkflowLimits,
+        run_workflow_script,
+    )
+    from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
+        read_assembled_workflow_file,
+    )
+    import src.dalton.tools.check_done_tools as cd_mod
+    import src.dalton.workflows.company_routing as cr_mod
+    from src.dalton.coverage.identity import KIND_SECTOR, SOURCE_COMPAT, WorkspaceCoverageIdentity
+
+    ws = tmp_path / "sector_serial"
+    scripts_dst = ws / ".agents" / "skills" / "dalton-model" / "scripts"
+    scripts_dst.mkdir(parents=True, exist_ok=True)
+    for src in (REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-model" / "scripts").glob("*.py"):
+        shutil.copyfile(src, scripts_dst / src.name)
+    xlsx_dst = ws / ".agents" / "skills" / "xlsx" / "scripts"
+    xlsx_dst.mkdir(parents=True, exist_ok=True)
+    for src in (REPO_ROOT / "plugins" / "langalpha_deliverables" / "skills" / "xlsx" / "scripts").glob("*.py"):
+        shutil.copyfile(src, xlsx_dst / src.name)
+
+    v1 = ws / "model" / "China_Ecommerce_v01.xlsx"
+    v1.parent.mkdir(parents=True, exist_ok=True)
+    wb = openpyxl.Workbook()
+    ws_rm = wb.active
+    ws_rm.title = "README & Changelog"
+    ws_rm["A1"] = "Version"
+    ws_rm["A2"] = "v01"
+    for tk, val in (("PDD", 1000), ("JD", 2000)):
+        w = wb.create_sheet(f"Model - {tk}")
+        w["A1"] = "(RMB MM)"
+        w["E1"] = "2025"
+        w["F1"] = "2026E"
+        w["G1"] = "2027E"
+        w["H1"] = "2028E"
+        w["D2"] = "Total Revenue"
+        w["E2"] = val
+        w["F2"] = "=E2*1.1"
+        w["G2"] = "=F2*1.1"
+        w["H2"] = "=G2*1.1"
+    wb.save(v1)
+    _stamp_formula_caches(
+        v1,
+        {
+            "Model - PDD": {"F2": "1100", "G2": "1210", "H2": "1331"},
+            "Model - JD": {"F2": "2200", "G2": "2420", "H2": "2662"},
+        },
+    )
+
+    cons_p = ws / "data" / "consensus" / "2026-11-27_1000.json"
+    cons_p.parent.mkdir(parents=True, exist_ok=True)
+    cons_p.write_text(json.dumps({"as_of": "2026-11-27", "items": []}), encoding="utf-8")
+
+    run_env = {**os.environ, "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}"}
+
+    def _run_cli(script_name: str, cmd_line: str) -> tuple[int, str]:
+        toks = _shlex.split(cmd_line)
+        real_s = str(scripts_dst / script_name)
+        proc = _sp.run([sys.executable, real_s, *toks[2:]], cwd=ws, env=run_env, capture_output=True, text=True, check=False)
+        return proc.returncode, proc.stdout + proc.stderr
+
+    wf_script = read_assembled_workflow_file(REPO_ROOT / "workflows" / "company-model" / "workflow.js")
+
+    async def _run_company(ticker: str, start_rel: str, expected_sha: str | None, new_rev: int, run_id: str) -> dict[str, Any]:
+        r_rel = f"research/2026-11-27-model-{ticker}"
+        (ws / r_rel / "model_dump").mkdir(parents=True, exist_ok=True)
+        params = {
+            "ticker": ticker,
+            "company": ticker,
+            "workspace_dir": ".",
+            "as_of": "2026-11-27",
+            "model_path": start_rel,
+            "expected_baseline_sha256": expected_sha,
+            "progress_path": f"{r_rel}/.progress.json",
+        }
+        spec_host = create_autospec(WorkflowHost, instance=True)
+        cand_rel_box: dict[str, str] = {}
+
+        async def _agent(prompt: str, opts: dict[str, Any]) -> Any:
+            label = str(opts.get("label") or "")
+            if label == "建模准备":
+                m_fp = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_fingerprint\.py [^`]+)`", prompt)
+                assert m_fp
+                cmd = m_fp.group(1).replace("<起点模型>", start_rel)
+                rc, out = _run_cli("model_fingerprint.py", cmd)
+                assert rc == 0, out
+                return {
+                    "files": [f"{r_rel}/model_dump/{ticker}-fingerprint.json"],
+                    "summary": "prep",
+                    "mode": "update",
+                    "baseline_path": start_rel,
+                    "baseline_sha256": mfp.file_sha256(ws / start_rel),
+                    "fingerprint_path": f"{r_rel}/model_dump/{ticker}-fingerprint.json",
+                    "consensus_path": "data/consensus/2026-11-27_1000.json",
+                }
+            if label == "读取运行ID":
+                return {"run_id": run_id}
+            if label == "模型构建与落盘":
+                plan_p = ws / r_rel / "model_dump" / "plan.json"
+                plan_p.write_text(
+                    json.dumps(
+                        {
+                            "cell_edits": [{"sheet": f"Model - {ticker}", "cell": "E2", "value": new_rev}],
+                            "changelog_entry": {"version": f"{ticker}-upd", "date": "2026-11-27", "summary": f"Update {ticker}"},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                m_e = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_edit\.py apply [^`]+)`", prompt)
+                assert m_e
+                rc, out = _run_cli("model_edit.py", m_e.group(1).replace("<edit_plan.json>", str(plan_p)) + " --skip-recalc")
+                assert rc == 0, out
+                res_e = json.loads(out)
+                cand_rel = Path(res_e["candidate_path"]).resolve().relative_to(ws.resolve()).as_posix()
+                cand_rel_box["path"] = cand_rel
+                return {
+                    "files": [cand_rel, f"{r_rel}/model_dump/coord_map.json"],
+                    "summary": f"saved {cand_rel}",
+                    "candidate_path": cand_rel,
+                    "model_sha256": res_e["candidate_sha256"],
+                    "recalc_status": "ok",
+                }
+            if label == "一致预期对照":
+                m_d = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_consensus\.py diff [^`]+)`", prompt)
+                assert m_d
+                rc, out = _run_cli("model_consensus.py", m_d.group(1))
+                assert rc == 0, out
+                cand_rel = cand_rel_box["path"]
+                return {
+                    "files": [cand_rel, f"{r_rel}/model_dump/consensus-diff.md", f"{r_rel}/model_dump/consensus-diff.json"],
+                    "summary": "cons ok",
+                    "candidate_path": cand_rel,
+                    "model_sha256": mfp.file_sha256(ws / cand_rel),
+                    "recalc_status": "ok",
+                    "consensus_status": "ok",
+                    "consensus_diff_generated": True,
+                }
+            if label == "模型本轮范围检查":
+                m_c = re.search(r"`(python3 \.agents/skills/dalton-model/scripts/model_check\.py check [^`]+)`", prompt)
+                assert m_c
+                rc, out = _run_cli("model_check.py", m_c.group(1))
+                assert rc == 0, out
+                res_c = json.loads(out)
+                files = [f"{r_rel}/model_dump/model-check.md", f"{r_rel}/model_dump/model-verification.json"]
+                if res_c.get("remaining_issues_path"):
+                    files.append(f"{r_rel}/model_dump/remaining-issues.md")
+                return {
+                    "files": files,
+                    "summary": "checked",
+                    "readable": res_c["readable"],
+                    "final_status": res_c["final_status"],
+                    "model_sha256": res_c["candidate_sha256"],
+                    "actionable_count": res_c["counts"]["actionable"],
+                    "actionable_issues": [],
+                    "missing_required_sheets": [],
+                    "remaining_issues_path": f"{r_rel}/model_dump/remaining-issues.md" if res_c.get("remaining_issues_path") else None,
+                    "summary_10lines": res_c.get("summary_10lines") or "",
+                }
+            raise AssertionError(label)
+
+        spec_host.agent.side_effect = _agent
+        spec_host.phase.side_effect = lambda _t: None
+        spec_host.log.side_effect = lambda _m: None
+        out = await run_workflow_script(wf_script, params, spec_host, WorkflowLimits(memory_limit_mb=64, cpu_budget_s=15.0))
+        assert out.status == "completed", out.error
+        assert out.result["ok"] is True
+
+        # Record workflow run dir so real dalton_check_done verifies everything end-to-end
+        run_dir = ws / ".agents" / "threads" / "33333333" / "workflows" / run_id
+        (run_dir / "journal").mkdir(parents=True, exist_ok=True)
+        (run_dir / "status.json").write_text(
+            json.dumps({"run_id": run_id, "name": "company-model", "status": "completed", "updated_at": 100.0}),
+            encoding="utf-8",
+        )
+        (run_dir / "args.json").write_text(
+            json.dumps({"ticker": ticker, "workspace_dir": ".", "as_of": "2026-11-27", "model_path": start_rel}),
+            encoding="utf-8",
+        )
+        (run_dir / "journal" / "01.json").write_text(
+            json.dumps({"label": "建模准备", "dispatches": [{"recorded_at": 50.0, "result": {"files": []}}]}),
+            encoding="utf-8",
+        )
+        return out.result
+
+    # 1) PDD updates v01 -> v02 (E2: 1000 -> 1555)
+    res_pdd = await _run_company("PDD", "model/China_Ecommerce_v01.xlsx", mfp.file_sha256(v1), 1555, "run-serial-pdd")
+    assert res_pdd["candidate_path"] == "model/China_Ecommerce_v02.xlsx"
+    # 2) JD updates v02 -> v03 (E2: 2000 -> 2666), passing v02 path + sha256
+    res_jd = await _run_company("JD", res_pdd["candidate_path"], res_pdd["model_sha256"], 2666, "run-serial-jd")
+    assert res_jd["candidate_path"] == "model/China_Ecommerce_v03.xlsx"
+
+    # Assert v03 preserves BOTH PDD's v02 update AND JD's v03 update!
+    wb_v3 = openpyxl.load_workbook(ws / "model" / "China_Ecommerce_v03.xlsx", data_only=False)
+    try:
+        assert wb_v3["Model - PDD"]["E2"].value == 1555, "JD update overwrote PDD's v02 edit!"
+        assert wb_v3["Model - JD"]["E2"].value == 2666
+    finally:
+        wb_v3.close()
+
+    # Run real dalton_check_done (including real verify-done + real sector symlink routing) for BOTH companies!
+    backend = create_autospec(SandboxBackend, instance=True)
+    backend.workspace_dir = str(ws)
+
+    async def _aread(path: str) -> str | None:
+        p = (ws / path) if not Path(path).is_absolute() else Path(path)
+        return p.read_text(encoding="utf-8") if p.is_file() else None
+
+    async def _aglob(pattern: str, root: str = ".") -> list[str]:
+        return sorted(p.relative_to(ws).as_posix() for p in ws.glob(pattern))
+
+    async def _aexec(command: str, *, timeout: int | None = None) -> Any:
+        proc = _sp.run(["bash", "-c", command], cwd=ws, env=run_env, capture_output=True, text=True, check=False)
+
+        class _R:
+            output = proc.stdout + proc.stderr
+            exit_code = proc.returncode
+
+        return _R()
+
+    backend.aread_text.side_effect = _aread
+    backend.aglob_paths.side_effect = _aglob
+    backend.aexecute.side_effect = _aexec
+
+    monkeypatch.setattr(
+        cr_mod,
+        "_resolve_workspace_company",
+        create_autospec(
+            cr_mod._resolve_workspace_company,
+            return_value=(WorkspaceCoverageIdentity(KIND_SECTOR, SOURCE_COMPAT), True),
+        ),
+    )
+    monkeypatch.setattr(
+        cr_mod,
+        "find_company_workspaces",
+        create_autospec(
+            cr_mod.find_company_workspaces,
+            return_value=[{"workspace_id": "ws-member", "user_id": "u1", "name": "成员工作区", "status": "running", "delegatable": True}],
+        ),
+    )
+    monkeypatch.setattr(
+        cd_mod,
+        "_check_knowledge_versions",
+        create_autospec(cd_mod._check_knowledge_versions, return_value={"models": True}),
+    )
+
+    for tk, rid in (("PDD", "run-serial-pdd"), ("JD", "run-serial-jd")):
+        cd_res = await cd_mod.run_check_done(
+            workflow="company-model",
+            params={"ticker": tk, "workspace_dir": ".", "as_of": "2026-11-27"},
+            backend=backend,
+            workspace_id="ws-sector",
+            user_id="u1",
+            run_id=rid,
+            thread_id="33333333-4444-5555-6666-777777777777",
+        )
+        assert cd_res["done"] is True, (tk, cd_res["missing"])
+
+
+def test_p0b_r2_cos_verbatim_pre_injection_whitespace_system_image_tag_escape_and_attachments() -> None:
+    """R2 #10:
+    - Captures raw pre-injection user text preserving leading/trailing whitespace & order.
+    - Ignores server-injected <system-reminder> (directive / widget / watchlist).
+    - System/notification turns and image-only turns do NOT append or leak older turns.
+    - Escapes closing </user_verbatim_request> tags inside verbatim text.
+    - Includes ONLY attachment filenames (basenames), never paths or URLs."""
+    from types import SimpleNamespace
+    from langchain_core.messages import AIMessage, HumanMessage
+    from src.dalton.cos_verbatim import (
+        COS_TURN_VERBATIM_CONFIG_KEY,
+        append_verbatim_user_request,
+        capture_turn_verbatim_request,
+    )
+    from src.server.handlers.chat.request_prep import inject_inline_reminders
+
+    # 1. Pre-injection capture preserves exact leading/trailing spaces & excludes later <system-reminder>
+    raw_text = "  请更新 PDD 模型，保留 </user_verbatim_request> 与 </USER_VERBATIM_REQUEST> 原样。  "
+    raw_msgs = [{"role": "user", "content": raw_text}]
+    req = SimpleNamespace(
+        hitl_response=None,
+        report_source=None,
+        wakeup=None,
+        market_target=None,
+        origin=None,
+        additional_context=[
+            SimpleNamespace(type="chat_upload", name="/tmp/uploads/China_Ecommerce_v01.xlsx"),
+            SimpleNamespace(type="file", name="https://cdn.example.com/path/Q3_Release.pdf?token=secret"),
+        ],
+    )
+    turn_atts = SimpleNamespace(files=[SimpleNamespace(name="work/uploads/notes.csv")])
+
+    captured = capture_turn_verbatim_request(
+        request=req,
+        raw_messages=raw_msgs,
+        turn_attachments=turn_atts,
+        from_server=False,
+        is_checkpoint_replay=False,
+    )
+    assert captured is not None
+    assert captured["text"] == raw_text  # exact leading/trailing spaces preserved!
+    assert captured["attachments"] == ["notes.csv", "China_Ecommerce_v01.xlsx", "Q3_Release.pdf"]
+
+    # Now mutate raw_msgs with server inline reminder (watchlist / directive) — captured payload must stay clean!
+    inject_inline_reminders(raw_msgs, ["\n<system-reminder>PRIVATE WATCHLIST: SECRET</system-reminder>"])
+    assert "PRIVATE WATCHLIST" in raw_msgs[-1]["content"]
+
+    cfg = {"configurable": {COS_TURN_VERBATIM_CONFIG_KEY: captured}}
+    out = append_verbatim_user_request("更新 PDD 模型", state={"messages": [HumanMessage(content="old")]}, config=cfg)
+    assert out.count("</user_verbatim_request>") == 1
+    assert "&lt;/user_verbatim_request&gt;" in out
+    assert "  请更新 PDD 模型" in out
+    assert "原样。  " in out
+    assert "PRIVATE WATCHLIST" not in out
+    assert "China_Ecommerce_v01.xlsx" in out and "/tmp/uploads/" not in out
+    assert "Q3_Release.pdf" in out and "token=secret" not in out and "https://" not in out
+    assert "notes.csv" in out and "work/uploads/" not in out
+
+    # 2. System notification trigger (from_server=True / wakeup / report_source) -> None, no append, no old-turn leak!
+    older_state = {"messages": [HumanMessage(content="上一轮用户原话"), AIMessage(content="收到")]}
+    for sys_req, srv_flag in (
+        (SimpleNamespace(hitl_response=None, report_source=None, wakeup=None, market_target=None, origin=None, additional_context=[]), True),
+        (SimpleNamespace(hitl_response=None, report_source={"id": "r1"}, wakeup=None, market_target=None, origin=None, additional_context=[]), False),
+        (SimpleNamespace(hitl_response=None, report_source=None, wakeup={"id": "w1"}, market_target=None, origin=None, additional_context=[]), False),
+        (SimpleNamespace(hitl_response=None, report_source=None, wakeup=None, market_target=None, origin={"type": "automation"}, additional_context=[]), False),
+    ):
+        cap_sys = capture_turn_verbatim_request(
+            request=sys_req,
+            raw_messages=[{"role": "user", "content": "系统唤醒通知正文"}],
+            from_server=srv_flag,
+        )
+        assert cap_sys is None
+        res_sys = append_verbatim_user_request(
+            "派发任务",
+            state=older_state,
+            config={"configurable": {COS_TURN_VERBATIM_CONFIG_KEY: cap_sys}},
+        )
+        assert res_sys == "派发任务"
+
+    # 3. Image-only user turn -> None, no append, no fallback to earlier turn's text!
+    img_only_msgs = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}]}]
+    cap_img = capture_turn_verbatim_request(request=req, raw_messages=img_only_msgs)
+    assert cap_img is None
+    assert (
+        append_verbatim_user_request(
+            "派发任务",
+            state=older_state,
+            config={"configurable": {COS_TURN_VERBATIM_CONFIG_KEY: cap_img}},
+        )
+        == "派发任务"
+    )
+    # Even without config (state-only fallback), an image-only latest HumanMessage must NOT walk back to earlier turns!
+    img_state = {
+        "messages": [
+            HumanMessage(content="旧轮消息不应泄露"),
+            AIMessage(content="好"),
+            HumanMessage(content=[{"type": "image_url", "image_url": {"url": "x"}}]),
+            AIMessage(content="calling tool"),
+        ]
+    }
+    assert append_verbatim_user_request("派发任务", state=img_state) == "派发任务"

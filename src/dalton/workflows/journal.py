@@ -179,6 +179,22 @@ def declares_artifact_field(result: Any) -> bool:
     return "files" in result or "file" in result
 
 
+def _is_live_state_query_result(result: Any) -> bool:
+    """Return True for non-replayable live workspace probes (``{path, sha256}`` or ``{run_id}``)."""
+    if not isinstance(result, dict):
+        return False
+    if "files" in result or "file" in result:
+        return False
+    return isinstance(result.get("path"), str) or "run_id" in result
+
+
+def _is_model_ledger_artifact(path: str) -> bool:
+    norm = path.strip().replace("\\", "/")
+    return norm == "model_dump/model-verification.json" or norm.endswith(
+        "/model_dump/model-verification.json"
+    )
+
+
 async def artifact_records(
     backend: Any, result: Any
 ) -> list[dict[str, Any]] | None:
@@ -192,15 +208,10 @@ async def artifact_records(
     replaying it would keep that branch "successfully empty" through every
     resume, so the dispatch has to run again.
     """
-    if (
-        isinstance(result, dict)
-        and isinstance(result.get("path"), str)
-        and "files" not in result
-        and "file" not in result
-    ):
-        # A state query (the final-model resolver's {path, sha256}) reports
-        # what is on disk now; a resume must ask again, since a version saved
-        # after the interruption would not change the old answer's pin.
+    if _is_live_state_query_result(result):
+        # A live state query (final-model resolver {path, sha256}, or run_id
+        # probe {run_id}) reports current run/disk state; a resume must ask
+        # again instead of replaying stale answers from the prior run.
         return None
     paths = declared_artifact_paths(result)
     if not paths:
@@ -428,11 +439,12 @@ class WorkflowJournal:
 
                 if reviewer_reply_error(result) is not None:
                     continue
-            # The same empty-artifact guard as ``artifact_records``, applied
-            # at read time: journals written before that guard carry
-            # ``replayable: true`` with no artifacts for a child that
-            # declared a files/file field and wrote nothing.
+            # The same empty-artifact & live-state-query guards as ``artifact_records``,
+            # applied at read time so journals written before those guards never replay
+            # stale live queries (such as old ``run_id`` readings).
             result = entry.get("result")
+            if _is_live_state_query_result(result):
+                continue
             if declares_artifact_field(result) and not declared_artifact_paths(
                 result
             ):
@@ -443,6 +455,21 @@ class WorkflowJournal:
                     self.backend, [a["path"] for a in artifacts]
                 )
                 if any(current.get(a["path"]) != a.get("sha256") for a in artifacts):
+                    continue
+                # A terminal model verification ledger is bound to a specific run_id:
+                # never replay a prior run's ledger entry on resume so the stage re-runs
+                # and re-binds model-verification.json to THIS run's run_id.
+                stale_ledger = False
+                for a in artifacts:
+                    if _is_model_ledger_artifact(str(a.get("path") or "")):
+                        try:
+                            ledger_doc = await _read_json(self.backend, a["path"])
+                        except Exception:
+                            ledger_doc = None
+                        if not isinstance(ledger_doc, dict) or ledger_doc.get("run_id") != self.run_id:
+                            stale_ledger = True
+                            break
+                if stale_ledger:
                     continue
             # A reviewer dispatch names the draft it reviewed (reviewDraft):
             # replaying it against a CHANGED draft would resurrect a review of
@@ -457,6 +484,8 @@ class WorkflowJournal:
                 ).get(str(review_draft))
                 if not isinstance(recorded_sha, str) or current_sha != recorded_sha:
                     continue
+            if isinstance(result, dict) and "run_id" in result and result.get("run_id") not in (None, self.run_id):
+                return {**entry, "result": {**result, "run_id": self.run_id}}
             return entry
         return None
 
@@ -464,6 +493,13 @@ class WorkflowJournal:
         self, entry: dict[str, Any], *, seq: int, label: str, phase: str | None
     ) -> None:
         """Journal a replayed dispatch into this run, marked with its origin."""
+        replayed_result = entry.get("result")
+        if (
+            isinstance(replayed_result, dict)
+            and "run_id" in replayed_result
+            and replayed_result.get("run_id") not in (None, self.run_id)
+        ):
+            replayed_result = {**replayed_result, "run_id": self.run_id}
         await self.append(
             {
                 "seq": seq,
@@ -471,7 +507,7 @@ class WorkflowJournal:
                 "phase": phase,
                 "prompt_sha256": entry["prompt_sha256"],
                 "status": "ok",
-                "result": entry.get("result"),
+                "result": replayed_result,
                 "result_kind": entry.get("result_kind", "parsed"),
                 "artifacts": entry.get("artifacts") or [],
                 # The caller-computed draft hash of a reviewer dispatch rides

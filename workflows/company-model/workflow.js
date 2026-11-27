@@ -26,6 +26,6 @@ const result = await runModelingPipeline({
 })
 
 return {
-  ok: result.status === 'pass' || result.status === 'delivered_with_open_issues',
+  ok: result.ok !== false && (result.status === 'pass' || result.status === 'delivered_with_open_issues'),
   ...result,
 }

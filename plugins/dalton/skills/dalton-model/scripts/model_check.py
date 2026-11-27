@@ -643,6 +643,47 @@ def _detect_scope_changes(
     return touched_cells, touched_cols, rollover_cells
 
 
+_FC_BUILD_REQUIRED_SHEETS: tuple[str, ...] = (
+    "Cover",
+    "Facts",
+    "Revenue Model",
+    "Income Statement",
+    "Cash Flow Statement",
+    "Balance Sheet",
+    "Scenarios",
+    "Guidance vs Actual",
+    "Street vs House",
+    "DCF Inputs",
+    "DCF",
+    "Sensitivity Analysis",
+    "Comparable Companies",
+    "Valuation Summary",
+    "Checks",
+)
+_FC_UPDATE_REQUIRED_SHEETS: tuple[str, ...] = (
+    "Facts",
+    "Guidance vs Actual",
+    "Street vs House",
+    "Checks",
+)
+
+
+def _missing_full_coverage_sheets(sheet_names: list[str], mode: str) -> list[str]:
+    """Return required full-coverage sheets missing from ``sheet_names`` per ``model-spec.md``."""
+    lowered = {s.strip().lower() for s in sheet_names}
+    missing: list[str] = []
+    if str(mode).strip().lower() == "build":
+        if not any("readme" in s or "change" in s for s in lowered):
+            missing.append("README & Changelog")
+        required = _FC_BUILD_REQUIRED_SHEETS
+    else:
+        required = _FC_UPDATE_REQUIRED_SHEETS
+    for req in required:
+        if req.lower() not in lowered:
+            missing.append(req)
+    return missing
+
+
 def run_checks(
     *,
     candidate_path: str | Path,
@@ -653,6 +694,7 @@ def run_checks(
     consensus_diff: dict[str, Any] | None = None,
     mode: str = "update",
     failed_stages: list[str] | None = None,
+    workflow: str = "company-model",
 ) -> dict[str, Any]:
     """Execute deterministic C01-C14 checks and return structured 4-class findings."""
     cand = Path(candidate_path).expanduser().resolve()
@@ -671,6 +713,7 @@ def run_checks(
             "findings": findings,
             "optional_notices": optional_notices,
             "dynamic_refs": [],
+            "missing_required_sheets": [],
             "counts": {"actionable": 1, "baseline_legacy": 0, "missing_evidence": 0, "not_applicable": 0},
         }
 
@@ -712,6 +755,17 @@ def run_checks(
                 "C01",
                 "actionable",
                 f"Sheet relative order changed: expected {base_order}, got {common_in_cand}",
+            )
+
+    missing_required_sheets: list[str] = []
+    if str(workflow or "").strip() == "full-coverage":
+        missing_required_sheets = _missing_full_coverage_sheets(cand_order, mode)
+        if missing_required_sheets:
+            _add_finding(
+                findings,
+                "C01",
+                "actionable",
+                f"full-coverage ({mode}) missing required worksheets per model-spec.md: {', '.join(missing_required_sheets)}",
             )
 
     if not is_unchanged:
@@ -2560,6 +2614,7 @@ def run_checks(
         "counts": counts,
         "optional_notices": optional_notices,
         "dynamic_refs": dynamic_ref_list,
+        "missing_required_sheets": missing_required_sheets,
     }
 
 
@@ -2765,6 +2820,36 @@ def _rel_or_str(path: Path, workspace: Path) -> str:
         return str(path)
 
 
+def _carry_unrecovered_deep_note_failures(
+    workflow: str,
+    rdir: Path,
+    existing: dict[str, Any] | None,
+    f_stages: list[str],
+) -> list[str]:
+    """Preserve still-unrecovered ``mapping`` / ``model_delta`` failures across revision ledgers."""
+    eff_wf = str(workflow or (existing or {}).get("workflow") or "").strip()
+    if eff_wf != "earnings-deep-update" or not existing:
+        return f_stages
+    prior_failed: set[str] = set()
+    for st in existing.get("failed_stages") or []:
+        if isinstance(st, str) and st.strip():
+            prior_failed.add(st.strip())
+    prior_rounds = existing.get("rounds") or []
+    if prior_rounds and isinstance(prior_rounds[-1], dict):
+        for st in prior_rounds[-1].get("failed_stages") or []:
+            if isinstance(st, str) and st.strip():
+                prior_failed.add(st.strip())
+    out = list(f_stages)
+    for note_stage, fname in (("mapping", "mapping.md"), ("model_delta", "model-delta.md")):
+        if note_stage not in prior_failed:
+            continue
+        np = rdir / fname
+        recovered = np.is_file() and np.stat().st_size >= 50
+        if not recovered and note_stage not in out:
+            out.append(note_stage)
+    return out
+
+
 def write_check_and_ledger(
     *,
     workspace_dir: str | Path,
@@ -2809,6 +2894,7 @@ def write_check_and_ledger(
         consensus_diff=cons_diff,
         mode=mode,
         failed_stages=failed_stages,
+        workflow=workflow,
     )
 
     f_stages = [s.strip() for s in (failed_stages or []) if s.strip()]
@@ -2835,6 +2921,8 @@ def write_check_and_ledger(
     ledger_path = dump_dir / "model-verification.json"
 
     existing = _load_existing_ledger(ledger_path) if (append_revision or kind == "report_revision") else None
+    if existing is not None:
+        f_stages = _carry_unrecovered_deep_note_failures(workflow, rdir, existing, f_stages)
     eff_run_id = run_id if run_id is not None else (existing or {}).get("run_id")
 
     check_md_path.write_text(_render_check_md(res, ticker, f_stages, run_id=eff_run_id), encoding="utf-8")
@@ -2969,6 +3057,7 @@ def write_fallback_ledger(
     ledger_path = dump_dir / "model-verification.json"
     rem_path = dump_dir / "remaining-issues.md"
     existing = _load_existing_ledger(ledger_path)
+    f_stages = _carry_unrecovered_deep_note_failures(workflow, rdir, existing, f_stages)
 
     rounds = list((existing or {}).get("rounds") or [])
     prev_fix = int((existing or {}).get("fix_rounds") or 0)
@@ -3101,6 +3190,7 @@ def verify_done(
     ticker: str,
     research_dir: str | Path,
     expected_run_id: str | None = None,
+    expected_workflow: str | None = None,
     manual: bool = False,
 ) -> dict[str, Any]:
     """Authoritative 4-point closure verifier reading ``<R>/model_dump/model-verification.json`` (§3.2)."""
@@ -3117,6 +3207,20 @@ def verify_done(
         ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     except Exception as exc:
         return {"ok": False, "errors": [f"corrupt model-verification.json: {exc}"]}
+
+    # 0. Caller workflow & ticker alignment (cannot bypass workflow-specific gates via ledger spoofing)
+    ledger_wf = str(ledger.get("workflow") or "").strip()
+    want_wf = str(expected_workflow or "").strip()
+    if want_wf and ledger_wf != want_wf:
+        errors.append(
+            f"workflow mismatch: expected {want_wf!r}, ledger has {ledger_wf!r}"
+        )
+    want_tk = ticker.strip().upper()
+    ledger_tk = str(ledger.get("ticker") or "").strip().upper()
+    if want_tk and ledger_tk != want_tk:
+        errors.append(
+            f"ticker mismatch: expected {want_tk!r}, ledger has {ledger_tk!r}"
+        )
 
     # 1. run_id & manual downgrade check
     ledger_run_id = ledger.get("run_id")
@@ -3176,16 +3280,35 @@ def verify_done(
         errors.append("ledger rounds[] is empty")
     else:
         last_round = rounds[-1]
+        last_cand_p = _resolve_ws_path(ws, last_round.get("candidate_path"))
+        if final_model_p is not None and (last_cand_p is None or last_cand_p != final_model_p):
+            errors.append(
+                f"last round candidate_path ({last_round.get('candidate_path')!r}) != final_model_path ({final_model_raw!r})"
+            )
+        last_sha = str(last_round.get("model_sha256") or "").strip().lower()
+        if final_model_sha and last_sha != final_model_sha:
+            errors.append(
+                f"last round model_sha256 ({last_sha}) != final_model_sha256 ({final_model_sha})"
+            )
+
         round_failed = list(last_round.get("failed_stages") or [])
         top_failed = list(ledger.get("failed_stages") or [])
-        enabled_stages = list(ledger.get("enabled_stages") or ["check", "consensus"])
+        raw_enabled = ledger.get("enabled_stages")
+        enabled_stages = list(raw_enabled) if isinstance(raw_enabled, list) else []
+        required_stages = ["check", "consensus"]
+        for req_st in required_stages:
+            if req_st not in enabled_stages:
+                errors.append(f"ledger enabled_stages missing required stage {req_st!r}")
+        stages_to_verify = list(dict.fromkeys([*required_stages, *enabled_stages]))
         evidence = last_round.get("evidence") or {}
 
         for st in round_failed:
             if st not in top_failed:
                 errors.append(f"failed stage {st!r} missing from top-level failed_stages")
+        all_failed = list(dict.fromkeys([*round_failed, *top_failed]))
+        for st in all_failed:
             if final_status != "delivered_with_open_issues":
-                errors.append(f"round has failed stage {st!r} but final_status is {final_status!r}")
+                errors.append(f"ledger has failed stage {st!r} but final_status is {final_status!r}")
             if rem_text:
                 if st not in rem_text:
                     errors.append(f"failed stage {st!r} not recorded in remaining-issues.md")
@@ -3193,7 +3316,7 @@ def verify_done(
                     errors.append("candidate model SHA-256 not recorded in remaining-issues.md")
 
         # Verify each completed enabled stage has real on-disk artifact + self-recorded hash & counts match!
-        for st in enabled_stages:
+        for st in stages_to_verify:
             if st in round_failed or st in top_failed:
                 continue
             if st == "check":
@@ -3273,7 +3396,8 @@ def verify_done(
                     errors.append(f"consensus evidence sha {ev_c_sha} != final_model_sha256 {final_model_sha}")
 
         # Deep-update note rules (§3.2 item 3)
-        if str(ledger.get("workflow") or "") == "earnings-deep-update":
+        effective_wf = want_wf or ledger_wf
+        if effective_wf == "earnings-deep-update":
             for note_stage, fname in (("mapping", "mapping.md"), ("model_delta", "model-delta.md")):
                 np = rdir / fname
                 exists_ok = np.is_file() and np.stat().st_size >= 50
@@ -3337,6 +3461,7 @@ def main(argv: list[str] | None = None) -> int:
     p_vd.add_argument("--ticker", required=True)
     p_vd.add_argument("--research-dir", required=True)
     p_vd.add_argument("--expected-run-id", default=None)
+    p_vd.add_argument("--expected-workflow", default=None)
     p_vd.add_argument("--manual", action="store_true")
 
     args = parser.parse_args(argv)
@@ -3391,6 +3516,7 @@ def main(argv: list[str] | None = None) -> int:
             ticker=args.ticker,
             research_dir=args.research_dir,
             expected_run_id=args.expected_run_id,
+            expected_workflow=args.expected_workflow,
             manual=args.manual,
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))

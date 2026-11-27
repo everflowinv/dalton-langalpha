@@ -602,6 +602,7 @@ def create_run_workflow_tool(
                     # absolute sandbox root anchors the workspace_dir escape
                     # check the same way check_done's path checks anchor it.
                     workspace_root=getattr(backend, "workspace_dir", None),
+                    backend=backend,
                 )
             except CompanyRoutingRefused as error:
                 raise _Refused(str(error)) from error

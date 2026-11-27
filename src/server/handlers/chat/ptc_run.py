@@ -1200,6 +1200,16 @@ async def astream_ptc_workflow(
             sandbox_id = getattr(session.sandbox, "sandbox_id", None)
 
         messages = normalize_request_messages(request)
+        # DALTON-HOOK(cos-verbatim-forward): capture pre-injection raw user text and attachment filenames before context reminders
+        from src.dalton.cos_verbatim import capture_turn_verbatim_request
+
+        turn_verbatim_request = capture_turn_verbatim_request(
+            request=request,
+            raw_messages=messages,
+            turn_attachments=turn_attachments,
+            from_server=from_server,
+            is_checkpoint_replay=is_checkpoint_replay,
+        )
 
         # =====================================================================
         # Skill Context Resolution (body injection happens in SkillsMiddleware)
@@ -1355,6 +1365,8 @@ async def astream_ptc_workflow(
             **({"retried_origin": retried_origin} if retried_origin else {}),
             # DALTON-HOOK(colleague-access): forward agent_role and initial cross-user analyst outbound guard flag
             "agent_role": route.role,
+            # DALTON-HOOK(cos-verbatim-forward): forward pre-injection raw user request (None when turn has no user text)
+            "cos_turn_verbatim_request": turn_verbatim_request,
             **(
                 {"colleague_outbound_blocked": True}
                 if _is_colleague_sharing_auth_enabled()
