@@ -214,16 +214,50 @@ def build_command(route, args):
     if args.vintage and rid != "fred":
         raise ValueError("--vintage 只支持 FRED/ALFRED")
     if rid in LIBRARY_SOURCES or rid == "sales-mail":
-        from research_library import validate_request
+        from research_library import _enabled_library_sources, validate_request
         params = json.loads(args.params_json or "{}")
         if not isinstance(params, dict):
             raise ValueError("params-json 须为对象")
-        target = ("sales-notes" if operation == "read" else "all") if rid == "sales-mail" else rid
-        if rid == "sales-mail" and operation == "search":
-            eff_sources = params.get("sources") if isinstance(params.get("sources"), list) else ["sales-notes", "tmtb"]
-            default_layer = "all" if "sales-notes" in eff_sources else "raw"
-            params={"sources":["sales-notes","tmtb"],"layer":default_layer,"media":"text",**params}
         allowed_sources = getattr(args, "allowed_sources", None)
+        if allowed_sources is None and os.environ.get("DALTON_ENABLED_LIBRARY_SOURCES") is None:
+            # Host-direct invocation: resolve deployment allowlist once (source names only,
+            # without loading shared .env into process/child env) and pass only names.
+            enabled_sources = _enabled_library_sources(None)
+            allowed_sources = ",".join(enabled_sources)
+        else:
+            enabled_sources = _enabled_library_sources(allowed_sources)
+        target = "all" if rid == "sales-mail" else rid
+        if rid == "sales-mail":
+            sm_valid = ("sales-notes", "tmtb")
+            if "sources" in params:
+                raw_sm = params["sources"]
+                if (
+                    not isinstance(raw_sm, list)
+                    or not raw_sm
+                    or any(not isinstance(s, str) or s.strip() not in sm_valid for s in raw_sm)
+                ):
+                    raise ValueError("sales-mail 的 sources 仅支持 sales-notes、tmtb")
+                eff_sources = list(dict.fromkeys(s.strip() for s in raw_sm))
+                params = {**params, "sources": eff_sources}
+            elif operation in ("search", "list"):
+                eff_sources = [s for s in sm_valid if s in enabled_sources] or list(sm_valid)
+                params = {**params, "sources": eff_sources}
+            elif operation == "read":
+                doc_str = str(args.document or "").strip()
+                prefix = doc_str.split(":", 1)[0].lower() if ":" in doc_str else ""
+                if prefix == "tmtb":
+                    eff_sources = ["tmtb"]
+                elif prefix in ("mail", "digest"):
+                    eff_sources = ["sales-notes"]
+                elif prefix == "image":
+                    eff_sources = [s for s in sm_valid if s in enabled_sources] or list(sm_valid)
+                else:
+                    eff_sources = list(sm_valid)
+                params = {**params, "sources": eff_sources}
+            if operation in ("search", "list"):
+                eff_sources = params["sources"]
+                default_layer = "all" if "sales-notes" in eff_sources else "raw"
+                params = {"layer": default_layer, "media": "text", **params}
         validate_request(target, operation, args.query, args.document, params, allowed_sources=allowed_sources)
         if operation == "read" and (args.start or args.end):
             raise ValueError("read 不接受日期筛选")

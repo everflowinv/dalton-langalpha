@@ -3483,6 +3483,10 @@ def test_r4_item2_proxy_8943_deadline_on_slow_headers_split_chunks_and_blocked_d
         assert headers_dripped < 15
         assert b"504" in bytes(rec_a)
         assert b"upstream_timeout" in bytes(rec_a)
+        # Wait briefly for mocked-urlopen worker thread to observe stop_a and run its in_flight release callback
+        dl_a = time.monotonic() + 1.0
+        while proxy_mod.health_payload()["in_flight"] != 0 and time.monotonic() < dl_a:
+            time.sleep(0.01)
         assert proxy_mod.health_payload()["in_flight"] == 0
 
         # Case B: Split chunk boundaries arriving in sub-chunk pieces every 0.2s
@@ -3568,6 +3572,9 @@ def test_r4_item2_proxy_8943_deadline_on_slow_headers_split_chunks_and_blocked_d
         tb.join(timeout=2.0)
         assert elapsed_b < 2.2, f"Split chunk boundaries exceeded 1s deadline: {elapsed_b:.2f}s"
         assert pieces_sent < 25
+        dl_b = time.monotonic() + 1.0
+        while proxy_mod.health_payload()["in_flight"] != 0 and time.monotonic() < dl_b:
+            time.sleep(0.01)
         assert proxy_mod.health_payload()["in_flight"] == 0
 
         # Case C: Downstream write blocked (client never reads, kernel buffer fills)
@@ -3638,6 +3645,9 @@ def test_r4_item2_proxy_8943_deadline_on_slow_headers_split_chunks_and_blocked_d
                 pass
         elapsed_c = time.monotonic() - t0_c
         assert elapsed_c < 2.2, f"Blocked downstream write exceeded 1s deadline: {elapsed_c:.2f}s"
+        dl_c = time.monotonic() + 1.0
+        while proxy_mod.health_payload()["in_flight"] != 0 and time.monotonic() < dl_c:
+            time.sleep(0.01)
         assert proxy_mod.health_payload()["in_flight"] == 0
     finally:
         proxy_mod.release_owner_lock()
@@ -4087,3 +4097,991 @@ async def test_r4_item4_steer_executor_defers_on_503_maintenance(
     assert ack_mock.await_count == 0
     assert finish_mock.await_count == 0
     assert settle_mock.await_count == 0
+
+
+# ---------------------------------------------------------------------------
+# r5 Review Fixes: proxy normal EOF > queue capacity, real connect/TLS timeout
+# & worker-gated in_flight, host-direct allowlist fail-closed, sales-mail
+# real gateway list/read contract, task_steer effective_attempts backoff
+# ---------------------------------------------------------------------------
+
+
+def _loopback_tcp_connect_allowed() -> bool:
+    """Return True when 127.0.0.1 TCP connect is permitted (False inside network-isolated sandboxes)."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    cli = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        cli.settimeout(0.5)
+        cli.connect(("127.0.0.1", port))
+        return True
+    except PermissionError:
+        return False
+    except OSError:
+        return False
+    finally:
+        for s in (cli, srv):
+            try:
+                s.close()
+            except OSError:
+                pass
+
+
+@pytest.mark.enable_socket
+def test_r5_item1_proxy_8943_normal_response_larger_than_queue_completes_before_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r5 Item 1: upstream response larger than chunk_queue capacity finishes immediately on normal EOF without stalling to deadline."""
+    import http.server
+    import threading
+
+    _clean_cap_env(monkeypatch)
+    gp_lock_mod = _load_script_module(
+        "_test_r5_gp_lock_item1", RESEARCH_RUNTIME_DIR / "guidepoint_lock.py"
+    )
+    proxy_mod = _load_script_module(
+        "_test_r5_gp_proxy_item1", RESEARCH_RUNTIME_DIR / "scripts" / "guidepoint_mcp_proxy.py"
+    )
+
+    journal_file = tmp_path / "handoff-journal.json"
+    token_file = tmp_path / "config" / "guidepoint_mcp_tokens.json"
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_text(
+        json.dumps(
+            {
+                "access_token": "tok-r5-eof",
+                "refresh_token": "ref-r5-eof",
+                "obtained_at": time.time(),
+                "expires_in": 600,
+            }
+        ),
+        encoding="utf-8",
+    )
+    gp_lock_mod.set_target_owner(gp_lock_mod.OWNER_LEGACY_PROXY, ownership_file=journal_file)
+    monkeypatch.setenv("DALTON_GUIDEPOINT_OWNERSHIP_FILE", str(journal_file))
+    monkeypatch.setenv("GUIDEPOINT_TOKENS_FILE", str(token_file))
+
+    # 80 KiB payload (> 20 x 4 KiB chunks, 5x the 4-slot queue capacity)
+    big_payload = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"content": [{"type": "text", "text": "G" * 81920}]},
+        }
+    ).encode("utf-8")
+
+    class _UpstreamHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if length:
+                self.rfile.read(length)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(big_payload)))
+            self.end_headers()
+            self.wfile.write(big_payload)
+            self.wfile.flush()
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            _ = (fmt, args)
+
+    use_tcp = _loopback_tcp_connect_allowed()
+    upstream_srv = None
+    if use_tcp:
+        upstream_srv = proxy_mod.ThreadingHTTPServer(("127.0.0.1", 0), _UpstreamHandler)
+        up_port = upstream_srv.server_address[1]
+        threading.Thread(target=upstream_srv.serve_forever, daemon=True).start()
+    else:
+        # Sandbox blocks AF_INET connect(): subclass socket.socket so _TrackedHTTPConnection's
+        # socket connects over a real OS socketpair whose server end runs _UpstreamHandler
+        # (still exercises the real urllib opener, timeouts, and _close_resource_forcefully!).
+        up_port = 58943
+        orig_socket_cls = proxy_mod.socket.socket
+
+        class _PairBridgedSocket(orig_socket_cls):
+            def __init__(
+                self,
+                family: int = socket.AF_INET,
+                stype: int = socket.SOCK_STREAM,
+                proto: int = 0,
+                fileno: Any = None,
+            ) -> None:
+                if fileno is None and family == socket.AF_INET and stype == socket.SOCK_STREAM:
+                    cli_pair, srv_pair = socket.socketpair()
+                    self._srv_pair: socket.socket | None = srv_pair
+                    orig_socket_cls.__init__(self, fileno=cli_pair.detach())
+                else:
+                    self._srv_pair = None
+                    orig_socket_cls.__init__(self, family, stype, proto, fileno)
+
+            def connect(self, address: Any) -> None:
+                if self._srv_pair is not None:
+                    srv_pair = self._srv_pair
+                    threading.Thread(
+                        target=lambda: _UpstreamHandler(srv_pair, ("127.0.0.1", 0), None),
+                        daemon=True,
+                    ).start()
+                    return
+                super().connect(address)
+
+        monkeypatch.setattr(proxy_mod.socket, "socket", _PairBridgedSocket)
+
+    monkeypatch.setattr(proxy_mod, "UPSTREAM", f"http://127.0.0.1:{up_port}/mcp")
+    proxy_mod.initialize_runtime(ownership_file=journal_file, token_store=token_file)
+    try:
+        req_body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_library",
+                    "arguments": {"query": "cloud", "size": 5, "timeout": 10},
+                },
+            }
+        ).encode("utf-8")
+        raw_http_req = (
+            b"POST /mcp HTTP/1.1\r\n"
+            b"Host: 127.0.0.1:8943\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(req_body)}\r\n\r\n".encode("ascii")
+            + req_body
+        )
+
+        cli, srv = socket.socketpair()
+        cli.settimeout(5.0)
+        cli.sendall(raw_http_req)
+        cli.shutdown(socket.SHUT_WR)
+        received = bytearray()
+
+        def _client_reader() -> None:
+            # Brief initial pause lets upstream fill all 4 queue slots and hit EOF before consumer drains
+            time.sleep(0.08)
+            try:
+                while True:
+                    chunk = cli.recv(8192)
+                    if not chunk:
+                        break
+                    received.extend(chunk)
+            finally:
+                cli.close()
+
+        reader = threading.Thread(target=_client_reader, daemon=True)
+        reader.start()
+        t0 = time.monotonic()
+        try:
+            proxy_mod.ProxyHandler(srv, ("127.0.0.1", 0), None)
+        finally:
+            try:
+                srv.close()
+            except OSError:
+                pass
+        elapsed = time.monotonic() - t0
+        reader.join(timeout=3.0)
+
+        assert elapsed < 2.0, f"Normal >64KiB response stalled toward 10s deadline: {elapsed:.2f}s"
+        raw_resp = bytes(received)
+        head, _, body_out = raw_resp.partition(b"\r\n\r\n")
+        assert b"200 OK" in head, f"Unexpected status head: {head!r} body={body_out[:200]!r}"
+        assert body_out == big_payload
+        deadline_wait = time.monotonic() + 1.0
+        while proxy_mod.health_payload()["in_flight"] != 0 and time.monotonic() < deadline_wait:
+            time.sleep(0.01)
+        assert proxy_mod.health_payload()["in_flight"] == 0
+    finally:
+        if upstream_srv is not None:
+            upstream_srv.shutdown()
+            upstream_srv.server_close()
+        proxy_mod.release_owner_lock()
+
+
+@pytest.mark.enable_socket
+def test_r5_item2_proxy_8943_slow_connect_and_delayed_tls_handshake_reap_thread_and_zero_inflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r5 Item 2: real opener enforces min(timeout, remaining) during connect & TLS handshake, terminates worker & socket at deadline, and decrements in_flight only after worker exits."""
+    import threading
+
+    _clean_cap_env(monkeypatch)
+    gp_lock_mod = _load_script_module(
+        "_test_r5_gp_lock_item2", RESEARCH_RUNTIME_DIR / "guidepoint_lock.py"
+    )
+    proxy_mod = _load_script_module(
+        "_test_r5_gp_proxy_item2", RESEARCH_RUNTIME_DIR / "scripts" / "guidepoint_mcp_proxy.py"
+    )
+
+    journal_file = tmp_path / "handoff-journal.json"
+    token_file = tmp_path / "config" / "guidepoint_mcp_tokens.json"
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_text(
+        json.dumps(
+            {
+                "access_token": "tok-r5-hs",
+                "refresh_token": "ref-r5-hs",
+                "obtained_at": time.time(),
+                "expires_in": 600,
+            }
+        ),
+        encoding="utf-8",
+    )
+    gp_lock_mod.set_target_owner(gp_lock_mod.OWNER_LEGACY_PROXY, ownership_file=journal_file)
+    monkeypatch.setenv("DALTON_GUIDEPOINT_OWNERSHIP_FILE", str(journal_file))
+    monkeypatch.setenv("GUIDEPOINT_TOKENS_FILE", str(token_file))
+
+    req_body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "search_library",
+                "arguments": {"query": "semis", "size": 1, "timeout": 0.5},
+            },
+        }
+    ).encode("utf-8")
+    raw_http_req = (
+        b"POST /mcp HTTP/1.1\r\n"
+        b"Host: 127.0.0.1:8943\r\n"
+        b"X-Dalton-Request-Timeout-Ms: 500\r\n"
+        b"Content-Type: application/json\r\n"
+        + f"Content-Length: {len(req_body)}\r\n\r\n".encode("ascii")
+        + req_body
+    )
+
+    # Track upstream worker threads spawned by ProxyHandler without altering production opener
+    spawned_workers: list[threading.Thread] = []
+    orig_thread_cls = proxy_mod.threading.Thread
+
+    class _ObservingThread(orig_thread_cls):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            target = kwargs.get("target") or (args[1] if len(args) > 1 else None)
+            if getattr(target, "__name__", "") == "_upstream_worker":
+                spawned_workers.append(self)
+
+    monkeypatch.setattr(proxy_mod.threading, "Thread", _ObservingThread)
+    proxy_mod.initialize_runtime(ownership_file=journal_file, token_store=token_file)
+    use_tcp = _loopback_tcp_connect_allowed()
+    orig_socket_cls = proxy_mod.socket.socket
+    try:
+        # Case A: Delayed TLS handshake on real HTTPS opener (NO urlopen mock!)
+        peer_accepted = threading.Event()
+        peer_closed = threading.Event()
+        stop_tls = threading.Event()
+        tls_listener = None
+        tls_srv_thread = None
+
+        def _hold_silent_tls_peer(conn: socket.socket) -> None:
+            try:
+                peer_accepted.set()
+                conn.settimeout(3.0)
+                while not stop_tls.is_set():
+                    try:
+                        data = conn.recv(4096)
+                        if not data:
+                            peer_closed.set()
+                            break
+                    except (TimeoutError, socket.timeout):
+                        continue
+                    except OSError:
+                        peer_closed.set()
+                        break
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+        if use_tcp:
+            tls_listener = orig_socket_cls(socket.AF_INET, socket.SOCK_STREAM)
+            tls_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            tls_listener.bind(("127.0.0.1", 0))
+            tls_listener.listen(4)
+            tls_listener.settimeout(4.0)
+            tls_port = tls_listener.getsockname()[1]
+
+            def _accept_and_stall() -> None:
+                try:
+                    conn, _addr = tls_listener.accept()
+                except OSError:
+                    return
+                _hold_silent_tls_peer(conn)
+
+            tls_srv_thread = orig_thread_cls(target=_accept_and_stall, daemon=True)
+            tls_srv_thread.start()
+        else:
+            tls_port = 58944
+
+            class _TlsPairBridgedSocket(orig_socket_cls):
+                def __init__(
+                    self,
+                    family: int = socket.AF_INET,
+                    stype: int = socket.SOCK_STREAM,
+                    proto: int = 0,
+                    fileno: Any = None,
+                ) -> None:
+                    if fileno is None and family == socket.AF_INET and stype == socket.SOCK_STREAM:
+                        cli_pair, srv_pair = socket.socketpair()
+                        self._srv_pair: socket.socket | None = srv_pair
+                        orig_socket_cls.__init__(self, fileno=cli_pair.detach())
+                    else:
+                        self._srv_pair = None
+                        orig_socket_cls.__init__(self, family, stype, proto, fileno)
+
+                def connect(self, address: Any) -> None:
+                    if self._srv_pair is not None:
+                        srv_pair = self._srv_pair
+                        orig_thread_cls(
+                            target=_hold_silent_tls_peer, args=(srv_pair,), daemon=True
+                        ).start()
+                        return
+                    super().connect(address)
+
+            monkeypatch.setattr(proxy_mod.socket, "socket", _TlsPairBridgedSocket)
+
+        monkeypatch.setattr(proxy_mod, "UPSTREAM", f"https://127.0.0.1:{tls_port}/mcp")
+
+        cli_a, srv_a = socket.socketpair()
+        cli_a.settimeout(4.0)
+        cli_a.sendall(raw_http_req)
+        cli_a.shutdown(socket.SHUT_WR)
+        rec_a = bytearray()
+
+        def _drain_a() -> None:
+            try:
+                while True:
+                    part = cli_a.recv(4096)
+                    if not part:
+                        break
+                    rec_a.extend(part)
+            finally:
+                cli_a.close()
+
+        ta = orig_thread_cls(target=_drain_a, daemon=True)
+        ta.start()
+        t0_a = time.monotonic()
+        try:
+            proxy_mod.ProxyHandler(srv_a, ("127.0.0.1", 0), None)
+        finally:
+            try:
+                srv_a.close()
+            except OSError:
+                pass
+        elapsed_a = time.monotonic() - t0_a
+        ta.join(timeout=2.0)
+
+        assert peer_accepted.wait(timeout=1.0), "Proxy never connected to TLS peer"
+        assert elapsed_a < 2.0, f"Delayed TLS handshake exceeded 0.5s deadline: {elapsed_a:.2f}s"
+        assert b"504" in bytes(rec_a)
+        assert b"upstream_timeout" in bytes(rec_a)
+        assert len(spawned_workers) == 1
+        spawned_workers[0].join(timeout=2.0)
+        assert not spawned_workers[0].is_alive(), "Upstream worker thread survived past TLS handshake deadline"
+        assert peer_closed.wait(timeout=2.0), "Upstream socket was not closed at TLS handshake deadline"
+        assert proxy_mod.health_payload()["in_flight"] == 0
+        stop_tls.set()
+        if tls_listener is not None:
+            tls_listener.close()
+        if tls_srv_thread is not None:
+            tls_srv_thread.join(timeout=1.0)
+
+        # Case B: Non-accepting local listener + slow TCP connect timeout, verifying socket timeout
+        # uses min(orig, remaining) and in_flight stays >= 1 until the upstream worker truly exits.
+        no_accept_sock = orig_socket_cls(socket.AF_INET, socket.SOCK_STREAM)
+        no_accept_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        no_accept_sock.bind(("127.0.0.1", 0))
+        no_accept_sock.listen(1)
+        no_accept_port = no_accept_sock.getsockname()[1]
+
+        recorded_connect_timeouts: list[float] = []
+        worker_hold = threading.Event()
+        worker_exiting = threading.Event()
+
+        class _SlowConnectSocket(orig_socket_cls):
+            def connect(self, address: Any) -> None:
+                if isinstance(address, tuple) and len(address) >= 2 and address[1] == no_accept_port:
+                    t_val = self.gettimeout()
+                    assert isinstance(t_val, float) and 0.0 < t_val <= 0.6
+                    recorded_connect_timeouts.append(t_val)
+                    time.sleep(t_val)
+                    worker_exiting.set()
+                    worker_hold.wait(timeout=2.0)
+                    raise TimeoutError("simulated slow connect timeout")
+                return super().connect(address)
+
+        monkeypatch.setattr(proxy_mod.socket, "socket", _SlowConnectSocket)
+        monkeypatch.setattr(proxy_mod, "UPSTREAM", f"http://127.0.0.1:{no_accept_port}/mcp")
+
+        cli_b, srv_b = socket.socketpair()
+        cli_b.settimeout(4.0)
+        cli_b.sendall(raw_http_req)
+        cli_b.shutdown(socket.SHUT_WR)
+        rec_b = bytearray()
+
+        def _drain_b() -> None:
+            try:
+                while True:
+                    part = cli_b.recv(4096)
+                    if not part:
+                        break
+                    rec_b.extend(part)
+            finally:
+                cli_b.close()
+
+        tb = orig_thread_cls(target=_drain_b, daemon=True)
+        tb.start()
+        t0_b = time.monotonic()
+        try:
+            proxy_mod.ProxyHandler(srv_b, ("127.0.0.1", 0), None)
+        finally:
+            try:
+                srv_b.close()
+            except OSError:
+                pass
+        elapsed_b = time.monotonic() - t0_b
+        tb.join(timeout=2.0)
+
+        assert elapsed_b < 2.0, f"Slow connect exceeded 0.5s deadline: {elapsed_b:.2f}s"
+        assert b"504" in bytes(rec_b)
+        assert recorded_connect_timeouts and recorded_connect_timeouts[0] <= 0.55
+        assert len(spawned_workers) == 2
+        worker_b = spawned_workers[1]
+        # Main handler already returned 504, while worker_b is still blocked before releasing:
+        # in_flight MUST stay 1 until worker_b actually exits its cleanup callback!
+        assert worker_exiting.wait(timeout=1.5)
+        assert worker_b.is_alive()
+        assert proxy_mod.health_payload()["in_flight"] == 1
+        worker_hold.set()
+        worker_b.join(timeout=2.0)
+        assert not worker_b.is_alive()
+        assert proxy_mod.health_payload()["in_flight"] == 0
+        no_accept_sock.close()
+    finally:
+        proxy_mod.release_owner_lock()
+
+
+def test_r5_item3_host_direct_resolves_deployment_allowlist_and_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r5 Item 3: host-direct data_gateway/research_library resolve deployment allowlist (names only, no .env secrets into child env), reject disabled sales-notes, and fail closed when config is unresolvable."""
+    import sqlite3
+
+    _clean_cap_env(monkeypatch)
+    shared_env = tmp_path / "shared.env"
+    shared_env.write_text(
+        "\n".join(
+            [
+                "APP_ENV=dalton",
+                "DALTON_PROFILE=everflow",
+                "DALTON_CAP_SALES_NOTES=false",
+                "SUPABASE_SECRET_KEY=r5-supa-secret-no-leak",
+                "DB_PASSWORD=r5-db-pass-no-leak",
+                "POSTGRES_PASSWORD=r5-pg-pass-no-leak",
+                "DALTON_RESEARCH_ADMIN_TOKEN=r5-admin-tok-no-leak",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    dg_script = RESEARCH_RUNTIME_DIR / "scripts" / "data_gateway.py"
+    rl_script = RESEARCH_RUNTIME_DIR / "scripts" / "research_library.py"
+
+    base_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "DALTON_DOTENV_PATH": str(shared_env),
+    }
+
+    # 1. Host-direct data_gateway plan for disabled sales-notes -> REJECTED
+    res_plan_sn = subprocess.run(
+        [sys.executable, str(dg_script), "plan", "sales-notes", "--operation=search", "--query=NVDA"],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert res_plan_sn.returncode != 0
+    out_sn = json.loads(res_plan_sn.stdout)
+    assert out_sn["ok"] is False
+    assert "capability_disabled" in str(out_sn.get("error") or "")
+
+    # 2. Host-direct research_library.py for disabled sales-notes -> REJECTED
+    res_rl_sn = subprocess.run(
+        [sys.executable, str(rl_script), "sales-notes", "--operation=list"],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert res_rl_sn.returncode != 0
+    out_rl_sn = json.loads(res_rl_sn.stdout)
+    assert out_rl_sn["ok"] is False
+    assert "capability_disabled" in str(out_rl_sn.get("error") or "")
+
+    # 3. Host-direct data_gateway plan for enabled company-wiki -> passes ONLY source names via --allowed-sources
+    res_plan_wiki = subprocess.run(
+        [sys.executable, str(dg_script), "plan", "company-wiki", "--operation=list"],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert res_plan_wiki.returncode == 0, res_plan_wiki.stdout + res_plan_wiki.stderr
+    out_wiki = json.loads(res_plan_wiki.stdout)
+    assert out_wiki["ok"] is True
+    assert "--allowed-sources=company-wiki,tmtb,funda-ai" in out_wiki["argv"]
+
+    # 4. Host-direct data_gateway fetch executes real research_library.sh child and NEVER leaks .env secrets into child env
+    rt_code = tmp_path / "rt_code"
+    rt_home = tmp_path / "rt_home"
+    (rt_code / "scripts").mkdir(parents=True)
+    (rt_code / "config").mkdir(parents=True)
+    (rt_code / "skills" / "company-wiki" / "scripts").mkdir(parents=True)
+    (rt_home / "wiki").mkdir(parents=True)
+    venv_bin = rt_home / "venvs" / "market-digest" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").symlink_to(Path(sys.executable).resolve())
+    for fname in ("research_library.py", "research_library.sh", "research_images.py"):
+        dst = rt_code / "scripts" / fname
+        shutil.copy2(RESEARCH_RUNTIME_DIR / "scripts" / fname, dst)
+        if fname.endswith(".sh"):
+            dst.chmod(0o755)
+    shutil.copy2(
+        RESEARCH_RUNTIME_DIR / "config" / "data_sources.json",
+        rt_code / "config" / "data_sources.json",
+    )
+    env_dump_path = tmp_path / "host_direct_child_env.json"
+    (rt_code / "skills" / "company-wiki" / "config.json").write_text("{}", encoding="utf-8")
+    (rt_code / "skills" / "company-wiki" / "scripts" / "company_wiki_cli.py").write_text(
+        f"""
+import json, os, sys
+from pathlib import Path
+
+def build_doc_filters(_ct, _cn, _start, _end, _tag):
+    Path({str(env_dump_path)!r}).write_text(
+        json.dumps(
+            {{
+                "env": dict(os.environ),
+                "loaded_src_config": "src.config" in sys.modules,
+            }},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return [], []
+""".lstrip(),
+        encoding="utf-8",
+    )
+    with sqlite3.connect(rt_home / "wiki" / "vectors.db") as conn:
+        conn.execute(
+            "CREATE TABLE documents ("
+            "id INTEGER PRIMARY KEY, filepath TEXT, filename TEXT, date TEXT, "
+            "created_at TEXT, category_type TEXT, category_name TEXT, tags TEXT)"
+        )
+        conn.commit()
+
+    res_fetch_wiki = subprocess.run(
+        [
+            sys.executable,
+            str(dg_script),
+            "fetch",
+            "company-wiki",
+            "--operation=list",
+            "--params-json={\"media\":\"text\"}",
+        ],
+        env={
+            **base_env,
+            "DALTON_RESEARCH_CODE": str(rt_code),
+            "DALTON_RESEARCH_HOME": str(rt_home),
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert res_fetch_wiki.returncode == 0, res_fetch_wiki.stdout + res_fetch_wiki.stderr
+    assert env_dump_path.is_file()
+    dumped = json.loads(env_dump_path.read_text(encoding="utf-8"))
+    assert dumped["loaded_src_config"] is False
+    for secret_key in (
+        "SUPABASE_SECRET_KEY",
+        "DB_PASSWORD",
+        "POSTGRES_PASSWORD",
+        "DALTON_RESEARCH_ADMIN_TOKEN",
+    ):
+        assert secret_key not in dumped["env"], f"Host-direct leaked {secret_key} into child env"
+
+    # 5. Unresolvable deployment config fails closed (refuses instead of allowing all)
+    # 5a. Conflicting profile env
+    res_conflict = subprocess.run(
+        [sys.executable, str(dg_script), "plan", "company-wiki", "--operation=list"],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(tmp_path),
+            "APP_ENV": "dalton",
+            "DALTON_PROFILE": "core",
+            "PYTHON_DOTENV_DISABLED": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert res_conflict.returncode != 0
+    assert "capability_disabled" in str(json.loads(res_conflict.stdout).get("error") or "")
+
+    # 5b. Isolated research_library.py without repo src/dalton ancestor -> fails closed
+    res_isolated = subprocess.run(
+        [sys.executable, str(rt_code / "scripts" / "research_library.py"), "company-wiki", "--operation=list"],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(tmp_path),
+            "DALTON_RESEARCH_CODE": str(rt_code),
+            "DALTON_RESEARCH_HOME": str(rt_home),
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert res_isolated.returncode != 0
+    assert "capability_disabled" in str(json.loads(res_isolated.stdout).get("error") or "")
+
+
+@pytest.mark.asyncio
+async def test_r5_item4_sales_mail_list_and_read_with_sources_via_real_gateway(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r5 Item 4: sales-mail list and read with legal single source (e.g. ['sales-notes'], ['tmtb']) succeed through real data_gateway + research_library + bridge /mcp."""
+    import sqlite3
+
+    _clean_cap_env(monkeypatch)
+    bridge_mod = _load_script_module(
+        "_test_r5_bridge_item4", SCRIPTS_DALTON_DIR / "researchdata_bridge.py"
+    )
+
+    rt_code = tmp_path / "rt_code"
+    rt_home = tmp_path / "rt_home"
+    (rt_code / "scripts").mkdir(parents=True)
+    (rt_code / "config").mkdir(parents=True)
+    (rt_home / "skills" / "market-digest").mkdir(parents=True)
+    venv_bin = rt_home / "venvs" / "market-digest" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").symlink_to(Path(sys.executable).resolve())
+
+    for fname in (
+        "researchdata_mcp.py",
+        "data_gateway.py",
+        "research_library.py",
+        "research_library.sh",
+        "research_images.py",
+    ):
+        dst = rt_code / "scripts" / fname
+        shutil.copy2(RESEARCH_RUNTIME_DIR / "scripts" / fname, dst)
+        if fname.endswith(".sh"):
+            dst.chmod(0o755)
+    shutil.copy2(
+        RESEARCH_RUNTIME_DIR / "config" / "data_sources.json",
+        rt_code / "config" / "data_sources.json",
+    )
+
+    mail_db = rt_home / "skills" / "market-digest" / "vectors.db"
+    with sqlite3.connect(mail_db) as conn:
+        conn.execute(
+            "CREATE TABLE email_chunks ("
+            "id INTEGER PRIMARY KEY, date TEXT, email_id TEXT, message_id TEXT, "
+            "sender TEXT, subject TEXT, chunk_index INTEGER, content TEXT, "
+            "created_at TEXT, embedding BLOB)"
+        )
+        conn.execute(
+            "CREATE TABLE chunks ("
+            "id INTEGER PRIMARY KEY, date TEXT, period TEXT, section_id TEXT, "
+            "section_label TEXT, content TEXT, source_emails TEXT, "
+            "created_at TEXT, embedding BLOB)"
+        )
+        conn.execute(
+            "INSERT INTO email_chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                101,
+                "2026-11-20",
+                "em-101",
+                "msg-101",
+                "Goldman Sales",
+                "NVDA Blackwell Checks",
+                0,
+                "NVDA Blackwell rack shipments accelerating into Q1.",
+                "2026-11-20T08:00:00Z",
+                None,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO email_chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                102,
+                "2026-11-21",
+                "em-102",
+                "alphaengine:tmtb_doc_9",
+                "TMT Breakout",
+                "TMTB Semicap Note",
+                0,
+                "TMTB semicap order visibility improving across memory.",
+                "2026-11-21T08:00:00Z",
+                None,
+            ),
+        )
+        conn.commit()
+
+    repo_env = tmp_path / "repo.env"
+    repo_env.write_text(
+        "APP_ENV=dalton\nDALTON_PROFILE=everflow\nDALTON_CAP_SALES_NOTES=true\nDALTON_CAP_TMTB=true\n",
+        encoding="utf-8",
+    )
+    bridge_env = tmp_path / "bridge.env"
+    bridge_env.write_text("DALTON_BRIDGE_TOKEN=r5-sm-tok\n", encoding="utf-8")
+    monkeypatch.setenv("DALTON_DOTENV_PATH", str(repo_env))
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(bridge_env))
+    monkeypatch.setenv("DALTON_RESEARCH_CODE", str(rt_code))
+    monkeypatch.setenv("DALTON_RESEARCH_HOME", str(rt_home))
+
+    gw_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "DALTON_DOTENV_PATH": str(repo_env),
+        "DALTON_RESEARCH_CODE": str(rt_code),
+        "DALTON_RESEARCH_HOME": str(rt_home),
+        "DALTON_ENABLED_LIBRARY_SOURCES": "company-wiki,sales-notes,tmtb,funda-ai",
+    }
+    dg_script = rt_code / "scripts" / "data_gateway.py"
+
+    # 1. Real data_gateway plan + fetch for sales-mail list
+    plan_list = subprocess.run(
+        [sys.executable, str(dg_script), "plan", "sales-mail", "--operation=list"],
+        env=gw_env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert plan_list.returncode == 0, plan_list.stdout + plan_list.stderr
+    assert json.loads(plan_list.stdout)["ok"] is True
+
+    fetch_list = subprocess.run(
+        [
+            sys.executable,
+            str(dg_script),
+            "fetch",
+            "sales-mail",
+            "--operation=list",
+            '--params-json={"sources":["tmtb"],"media":"text"}',
+        ],
+        env=gw_env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert fetch_list.returncode == 0, fetch_list.stdout + fetch_list.stderr
+    list_out = json.loads(fetch_list.stdout)
+    assert list_out["ok"] is True
+    assert list_out["data"]["results"]
+    assert all(r["source"] == "tmtb" for r in list_out["data"]["results"])
+
+    # 2. Real data_gateway plan + fetch for sales-mail read with legal single source ["sales-notes"]
+    plan_read = subprocess.run(
+        [
+            sys.executable,
+            str(dg_script),
+            "plan",
+            "sales-mail",
+            "--operation=read",
+            "--document=mail:101",
+            '--params-json={"sources":["sales-notes"]}',
+        ],
+        env=gw_env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert plan_read.returncode == 0, plan_read.stdout + plan_read.stderr
+    assert json.loads(plan_read.stdout)["ok"] is True
+
+    fetch_read = subprocess.run(
+        [
+            sys.executable,
+            str(dg_script),
+            "fetch",
+            "sales-mail",
+            "--operation=read",
+            "--document=mail:101",
+            '--params-json={"sources":["sales-notes"]}',
+        ],
+        env=gw_env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert fetch_read.returncode == 0, fetch_read.stdout + fetch_read.stderr
+    read_out = json.loads(fetch_read.stdout)
+    assert read_out["ok"] is True
+    assert "NVDA Blackwell rack shipments" in read_out["data"]["document"]["content"]
+
+    # 3. End-to-end real bridge /mcp -> researchdata_mcp -> data_gateway -> research_library (NO _run_stdio_rpc mock!)
+    cfg = bridge_mod.BridgeConfig()
+    cfg.python_bin = sys.executable
+    cfg.mcp_script = rt_code / "scripts" / "researchdata_mcp.py"
+    cfg.research_code = rt_code
+    cfg.research_home = rt_home
+    bridge = bridge_mod.ResearchDataBridge(cfg)
+
+    code_list, body_list = await _send_real_bridge_mcp_request(
+        bridge_mod,
+        bridge,
+        token="r5-sm-tok",
+        rpc_body={
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "research",
+                "arguments": {
+                    "route": "sales-mail",
+                    "operation": "list",
+                    "params": {"sources": ["tmtb"], "media": "text"},
+                },
+            },
+        },
+    )
+    assert code_list == 200
+    assert body_list["result"]["isError"] is False
+    list_mcp_payload = json.loads(body_list["result"]["content"][0]["text"])
+    assert list_mcp_payload["ok"] is True
+    assert any(r["document_id"] == "tmtb:tmtb_doc_9" for r in list_mcp_payload["data"]["results"])
+
+    code_read_sn, body_read_sn = await _send_real_bridge_mcp_request(
+        bridge_mod,
+        bridge,
+        token="r5-sm-tok",
+        rpc_body={
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "research",
+                "arguments": {
+                    "route": "sales-mail",
+                    "operation": "read",
+                    "document": "mail:101",
+                    "params": {"sources": ["sales-notes"]},
+                },
+            },
+        },
+    )
+    assert code_read_sn == 200
+    assert body_read_sn["result"]["isError"] is False
+    read_sn_payload = json.loads(body_read_sn["result"]["content"][0]["text"])
+    assert read_sn_payload["ok"] is True
+    assert "NVDA Blackwell rack shipments" in read_sn_payload["data"]["document"]["content"]
+
+    code_read_tmtb, body_read_tmtb = await _send_real_bridge_mcp_request(
+        bridge_mod,
+        bridge,
+        token="r5-sm-tok",
+        rpc_body={
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "research",
+                "arguments": {
+                    "route": "sales-mail",
+                    "operation": "read",
+                    "document": "tmtb:tmtb_doc_9",
+                    "params": {"sources": ["tmtb"]},
+                },
+            },
+        },
+    )
+    assert code_read_tmtb == 200
+    assert body_read_tmtb["result"]["isError"] is False
+    read_tmtb_payload = json.loads(body_read_tmtb["result"]["content"][0]["text"])
+    assert read_tmtb_payload["ok"] is True
+    assert "TMTB semicap order visibility" in read_tmtb_payload["data"]["document"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_r5_item5_task_steer_full_computer_backoff_uses_effective_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r5 Item 5: after 6 maintenance reschedules, first full-computer repark computes backoff from effective_attempts() (1x _ROOM_WAIT_S, not 64x)."""
+    from src.server.database.runs import outbox as outbox_db
+    from src.server.services.report_back import notify_turn, task_steer
+
+    orig_get_steer_job = outbox_db.get_steer_job
+    orig_defer_claimed_job = outbox_db.defer_claimed_job
+    orig_divert = task_steer._divert
+    orig_turn_owner = task_steer.turn_owner
+    orig_computer_full = task_steer._computer_full
+    orig_park_unless_ready = notify_turn.park_unless_ready
+    orig_post_notification_turn = notify_turn.post_notification_turn
+
+    async def _run_case(*, attempts: int, reschedules: int, waited: int = 0) -> int:
+        payload: dict[str, Any] = {
+            "target": "task",
+            "task_id": "k7Xm2p",
+            "content": "continue after maintenance",
+            "user_id": "u-r5-ts",
+            "workspace_id": "ws-r5-ts",
+            "reschedules": reschedules,
+        }
+        if waited:
+            payload["waited"] = waited
+        row = {
+            "id": "job-r5-ts-full",
+            "status": "claimed",
+            "attempts": attempts,
+            "payload": payload,
+        }
+        defer_mock = create_autospec(orig_defer_claimed_job, return_value="pending")
+        post_mock = create_autospec(orig_post_notification_turn, return_value=("posted", "run-1"))
+
+        monkeypatch.setattr(outbox_db, "get_steer_job", create_autospec(orig_get_steer_job, return_value=row))
+        monkeypatch.setattr(outbox_db, "defer_claimed_job", defer_mock)
+        monkeypatch.setattr(task_steer, "_divert", create_autospec(orig_divert, return_value=False))
+        monkeypatch.setattr(task_steer, "turn_owner", create_autospec(orig_turn_owner, return_value=("u-r5-ts", "ws-r5-ts")))
+        monkeypatch.setattr(task_steer, "_computer_full", create_autospec(orig_computer_full, return_value=True))
+        monkeypatch.setattr(notify_turn, "park_unless_ready", create_autospec(orig_park_unless_ready, return_value=False))
+        monkeypatch.setattr(notify_turn, "post_notification_turn", post_mock)
+
+        job = {
+            "hook_outbox_id": "job-r5-ts-full",
+            "hook_type": "steer",
+            "idempotency_key": "steer:r5-ts-full",
+            "ordering_key": "thr-r5-ts",
+            "conversation_thread_id": "thr-r5-ts",
+            "attempts": attempts,
+            "payload": payload,
+        }
+        await task_steer.execute_task_steer(job)
+        assert post_mock.await_count == 0
+        assert defer_mock.await_count == 1
+        return int(defer_mock.await_args.kwargs["wait_s"])
+
+    # 6 maintenance reschedules, then 1st full-computer encounter (claim #7):
+    # effective_attempts(7, {reschedules: 6}) == 1 -> 2**0 * _ROOM_WAIT_S (NOT 2**6 * _ROOM_WAIT_S)
+    assert await _run_case(attempts=7, reschedules=6) == task_steer._ROOM_WAIT_S
+    # Next full-computer encounter (claim #8): effective_attempts == 2 -> 2 * _ROOM_WAIT_S
+    assert await _run_case(attempts=8, reschedules=6) == 2 * task_steer._ROOM_WAIT_S
+    # Combined maintenance reschedules (6) + waited (2) at claim #9: effective_attempts == 1 -> 1 * _ROOM_WAIT_S
+    assert await _run_case(attempts=9, reschedules=6, waited=2) == task_steer._ROOM_WAIT_S

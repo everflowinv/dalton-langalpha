@@ -560,7 +560,9 @@ async def execute_task_steer(job: dict) -> None:
         await settle(f"{lap} turns posted for it never took it in")
         return
     if await _computer_full(thread_id, task_id, user_id, workspace_id):
-        await repark(wait_s=_ROOM_WAIT_S * 2 ** max(attempts - int(payload.get("waited") or 0) - 1, 0))
+        # DALTON-HOOK(maintenance-gate): exclude maintenance reschedules from full-computer backoff via effective_attempts()
+        eff_attempts = outbox_db.effective_attempts(attempts, payload)
+        await repark(wait_s=_ROOM_WAIT_S * 2 ** max(eff_attempts - 1, 0))
         return
 
     async def fence() -> bool:

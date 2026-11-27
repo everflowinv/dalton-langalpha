@@ -262,18 +262,129 @@ def _open_upstream_tracked(
     timeout_s: float,
     active_resources: list,
     active_lock: threading.Lock,
+    deadline_mono: float | None = None,
+    cancelled: threading.Event | None = None,
 ):
-    """Open an upstream request while tracking the HTTP(S) connection for hard deadline abort."""
-    eff_t = max(0.01, float(timeout_s))
+    """Open an upstream request while enforcing `min(timeout_s, remaining)` across connect, TLS handshake, and reads."""
+    orig_timeout = max(0.01, float(timeout_s))
+    if deadline_mono is not None:
+        rem_now = deadline_mono - time.monotonic()
+        if rem_now <= 0.0:
+            raise TimeoutError("Guidepoint upstream deadline exceeded")
+        eff_t = max(0.01, min(orig_timeout, rem_now))
+    else:
+        eff_t = orig_timeout
     if urllib.request.urlopen is not _ORIG_URLOPEN:
-        return urllib.request.urlopen(req, timeout=eff_t)
+        return urllib.request.urlopen(req, timeout=orig_timeout)
+
+    def _remaining_timeout(fallback: float = orig_timeout) -> float:
+        if cancelled is not None and cancelled.is_set():
+            raise TimeoutError("Guidepoint upstream request cancelled")
+        cap = max(0.01, float(fallback))
+        if deadline_mono is not None:
+            rem = deadline_mono - time.monotonic()
+            if rem <= 0.0:
+                raise TimeoutError("Guidepoint upstream deadline exceeded")
+            return max(0.01, min(cap, rem))
+        return cap
+
+    def _register_resource(res) -> None:
+        with active_lock:
+            active_resources.append(res)
+        if cancelled is not None and cancelled.is_set():
+            _close_resource_forcefully(res)
+            raise TimeoutError("Guidepoint upstream request cancelled")
+
+    class _DeadlineSocketMixin:
+        def _connect_tcp_with_deadline(self) -> None:
+            rem_dns = _remaining_timeout(
+                self.timeout if isinstance(self.timeout, (int, float)) else orig_timeout
+            )
+            _ = rem_dns
+            err: BaseException | None = None
+            infos = socket.getaddrinfo(self.host, self.port, 0, socket.SOCK_STREAM)
+            if not infos:
+                raise OSError("getaddrinfo returns an empty list")
+            for af, socktype, proto, _canonname, sa in infos:
+                rem_conn = _remaining_timeout(
+                    self.timeout if isinstance(self.timeout, (int, float)) else orig_timeout
+                )
+                sock = None
+                try:
+                    sock = socket.socket(af, socktype, proto)
+                    sock.settimeout(rem_conn)
+                    _register_resource(sock)
+                    if self.source_address:
+                        sock.bind(self.source_address)
+                    sock.connect(sa)
+                    self.sock = sock
+                    if self._tunnel_host:
+                        sock.settimeout(
+                            _remaining_timeout(
+                                self.timeout if isinstance(self.timeout, (int, float)) else orig_timeout
+                            )
+                        )
+                        self._tunnel()
+                    return
+                except BaseException as exc:
+                    err = exc
+                    if sock is not None:
+                        _close_resource_forcefully(sock)
+                    if isinstance(exc, (TimeoutError, socket.timeout)):
+                        if cancelled is not None and cancelled.is_set():
+                            raise TimeoutError("Guidepoint upstream request cancelled") from exc
+                        if deadline_mono is not None and time.monotonic() >= deadline_mono:
+                            raise TimeoutError("Guidepoint upstream connect deadline exceeded") from exc
+            if err is not None:
+                raise err
+            raise OSError("Failed to connect to upstream")
+
+        def send(self, data):
+            sock = getattr(self, "sock", None)
+            if sock is not None and hasattr(sock, "settimeout"):
+                sock.settimeout(
+                    _remaining_timeout(
+                        self.timeout if isinstance(self.timeout, (int, float)) else orig_timeout
+                    )
+                )
+            return super().send(data)
+
+        def getresponse(self):
+            sock = getattr(self, "sock", None)
+            if sock is not None and hasattr(sock, "settimeout"):
+                sock.settimeout(
+                    _remaining_timeout(
+                        self.timeout if isinstance(self.timeout, (int, float)) else orig_timeout
+                    )
+                )
+            return super().getresponse()
+
+    class _TrackedHTTPConnection(_DeadlineSocketMixin, http.client.HTTPConnection):
+        def connect(self):
+            self._connect_tcp_with_deadline()
+
+    class _TrackedHTTPSConnection(_DeadlineSocketMixin, http.client.HTTPSConnection):
+        def connect(self):
+            self._connect_tcp_with_deadline()
+            if self._tunnel_host:
+                server_hostname = self._tunnel_host
+            else:
+                server_hostname = self.host
+            rem_tls = _remaining_timeout(
+                self.timeout if isinstance(self.timeout, (int, float)) else orig_timeout
+            )
+            self.sock.settimeout(rem_tls)
+            self.sock = self._context.wrap_socket(
+                self.sock,
+                server_hostname=server_hostname,
+            )
+            _register_resource(self.sock)
 
     class _TrackedHTTPHandler(urllib.request.HTTPHandler):
         def http_open(self, request):
             def _factory(host, **kwargs):
-                conn = http.client.HTTPConnection(host, **kwargs)
-                with active_lock:
-                    active_resources.append(conn)
+                conn = _TrackedHTTPConnection(host, **kwargs)
+                _register_resource(conn)
                 return conn
 
             return self.do_open(_factory, request)
@@ -281,9 +392,8 @@ def _open_upstream_tracked(
     class _TrackedHTTPSHandler(urllib.request.HTTPSHandler):
         def https_open(self, request):
             def _factory(host, **kwargs):
-                conn = http.client.HTTPSConnection(host, **kwargs)
-                with active_lock:
-                    active_resources.append(conn)
+                conn = _TrackedHTTPSConnection(host, **kwargs)
+                _register_resource(conn)
                 return conn
 
             return self.do_open(_factory, request, context=self._context)
@@ -298,6 +408,8 @@ def _fetch_body_with_hard_deadline(
     deadline_mono: float,
     timeout_message: str,
     open_timeout_s: float | None = None,
+    on_worker_start=None,
+    on_worker_done=None,
 ) -> bytes:
     """Run an HTTP request + body read in a worker thread under a single absolute deadline."""
     rem = deadline_mono - time.monotonic()
@@ -327,6 +439,8 @@ def _fetch_body_with_hard_deadline(
                 timeout_s=eff_open_t,
                 active_resources=active_resources,
                 active_lock=active_lock,
+                deadline_mono=deadline_mono,
+                cancelled=cancelled,
             )
             with active_lock:
                 active_resources.append(resp)
@@ -338,10 +452,20 @@ def _fetch_body_with_hard_deadline(
         finally:
             if resp is not None:
                 _close_resource_forcefully(resp)
+            _abort_active_resources(active_resources, active_lock)
             done.set()
+            if callable(on_worker_done):
+                on_worker_done()
 
     worker = threading.Thread(target=_worker, daemon=True)
-    worker.start()
+    if callable(on_worker_start):
+        on_worker_start()
+    try:
+        worker.start()
+    except Exception:
+        if callable(on_worker_done):
+            on_worker_done()
+        raise
 
     wait_rem = max(0.0, deadline_mono - time.monotonic())
     if not done.wait(timeout=wait_rem):
@@ -353,7 +477,13 @@ def _fetch_body_with_hard_deadline(
     return outcome.get("body", b"")
 
 
-def do_refresh(*, timeout_s: float = 30.0, deadline_mono: float | None = None) -> None:
+def do_refresh(
+    *,
+    timeout_s: float = 30.0,
+    deadline_mono: float | None = None,
+    on_worker_start=None,
+    on_worker_done=None,
+) -> None:
     client_id = os.environ["GUIDEPOINT_CLIENT_ID"]
     client_secret = os.environ["GUIDEPOINT_CLIENT_SECRET"]
     explicit_open_timeout: float | None = None
@@ -384,6 +514,8 @@ def do_refresh(*, timeout_s: float = 30.0, deadline_mono: float | None = None) -
         deadline_mono=eff_deadline,
         timeout_message="Guidepoint token refresh deadline exceeded",
         open_timeout_s=explicit_open_timeout,
+        on_worker_start=on_worker_start,
+        on_worker_done=on_worker_done,
     )
     new_tokens = json.loads(raw_body.decode("utf-8"))
     new_tokens.setdefault("refresh_token", _tokens["refresh_token"])
@@ -393,7 +525,13 @@ def do_refresh(*, timeout_s: float = 30.0, deadline_mono: float | None = None) -
     print(f"[guidepoint-proxy] refreshed access_token, expires_in={_tokens.get('expires_in')}s")
 
 
-def ensure_fresh_token(*, timeout_s: float = 30.0, deadline_mono: float | None = None) -> str:
+def ensure_fresh_token(
+    *,
+    timeout_s: float = 30.0,
+    deadline_mono: float | None = None,
+    on_worker_start=None,
+    on_worker_done=None,
+) -> str:
     if _standby or not _owner_lock_held():
         raise GuidepointStandbyError("lock_not_acquired")
     t_start = time.monotonic()
@@ -419,9 +557,18 @@ def ensure_fresh_token(*, timeout_s: float = 30.0, deadline_mono: float | None =
         expires_in = _tokens.get("expires_in", 600)
         if time.time() > obtained_at + expires_in - REFRESH_SKEW_SECONDS:
             if deadline_mono is None and (now_after_lock - t_start) < 0.01:
-                do_refresh(timeout_s=float(timeout_s))
+                do_refresh(
+                    timeout_s=float(timeout_s),
+                    on_worker_start=on_worker_start,
+                    on_worker_done=on_worker_done,
+                )
             else:
-                do_refresh(timeout_s=rem_after_lock, deadline_mono=eff_deadline)
+                do_refresh(
+                    timeout_s=rem_after_lock,
+                    deadline_mono=eff_deadline,
+                    on_worker_start=on_worker_start,
+                    on_worker_done=on_worker_done,
+                )
         return _tokens["access_token"]
     finally:
         _lock.release()
@@ -633,6 +780,29 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 return
             _in_flight += 1
 
+        # Both the main handler and any spawned upstream/refresh worker must exit
+        # before `_in_flight` decrements (prevents premature drain=0 while a worker
+        # thread is still unwinding a timed-out connect/handshake/read).
+        pending_owners = 1
+        owners_lock = threading.Lock()
+
+        def _acquire_owner() -> None:
+            nonlocal pending_owners
+            with owners_lock:
+                pending_owners += 1
+
+        def _release_owner() -> None:
+            nonlocal pending_owners
+            global _in_flight
+            should_dec = False
+            with owners_lock:
+                pending_owners -= 1
+                if pending_owners == 0:
+                    should_dec = True
+            if should_dec:
+                with _state_lock:
+                    _in_flight = max(0, _in_flight - 1)
+
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(length) if length else None
@@ -640,7 +810,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             deadline_mono = time.monotonic() + eff_timeout_s
 
             try:
-                access_token = ensure_fresh_token(deadline_mono=deadline_mono)
+                access_token = ensure_fresh_token(
+                    deadline_mono=deadline_mono,
+                    on_worker_start=_acquire_owner,
+                    on_worker_done=_release_owner,
+                )
             except GuidepointStandbyError:
                 self._send_json(
                     503,
@@ -699,6 +873,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             req = urllib.request.Request(UPSTREAM, data=fwd_body, method=self.command, headers=headers)
             cancelled = threading.Event()
             headers_ready = threading.Event()
+            upstream_done = threading.Event()
             active_lock = threading.Lock()
             active_resources: list = []
             chunk_queue: queue.Queue = queue.Queue(maxsize=4)
@@ -731,9 +906,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     try:
                         resp = _open_upstream_tracked(
                             req,
-                            timeout_s=rem_open,
+                            timeout_s=min(eff_timeout_s, rem_open),
                             active_resources=active_resources,
                             active_lock=active_lock,
+                            deadline_mono=deadline_mono,
+                            cancelled=cancelled,
                         )
                         status = resp.status
                         resp_headers = list(resp.headers.items())
@@ -791,13 +968,21 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 finally:
                     if stream is not None:
                         _close_resource_forcefully(stream)
+                    _abort_active_resources(active_resources, active_lock)
+                    upstream_done.set()
                     try:
                         chunk_queue.put_nowait(("eof", None))
                     except queue.Full:
                         pass
+                    _release_owner()
 
             worker = threading.Thread(target=_upstream_worker, daemon=True)
-            worker.start()
+            _acquire_owner()
+            try:
+                worker.start()
+            except Exception:
+                _release_owner()
+                raise
             try:
                 wait_hdr = max(0.0, deadline_mono - time.monotonic())
                 if not headers_ready.wait(timeout=wait_hdr):
@@ -834,6 +1019,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     meta["status"],
                     meta["headers"],
                     chunk_queue,
+                    upstream_done=upstream_done,
                     deadline_mono=deadline_mono,
                     abort_upstream=_abort_upstream,
                     eff_timeout_s=eff_timeout_s,
@@ -841,8 +1027,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             finally:
                 _abort_upstream()
         finally:
-            with _state_lock:
-                _in_flight = max(0, _in_flight - 1)
+            _release_owner()
 
     def _relay_from_queue(
         self,
@@ -850,6 +1035,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         headers,
         chunk_queue: queue.Queue,
         *,
+        upstream_done: threading.Event,
         deadline_mono: float,
         abort_upstream,
         eff_timeout_s: float,
@@ -888,17 +1074,24 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         while True:
-            rem = deadline_mono - time.monotonic()
-            if rem <= 0.0:
-                abort_upstream()
-                self._close_downstream_forcefully()
-                break
             try:
-                kind, payload = chunk_queue.get(timeout=rem)
+                kind, payload = chunk_queue.get_nowait()
             except queue.Empty:
-                abort_upstream()
-                self._close_downstream_forcefully()
-                break
+                if upstream_done.is_set():
+                    try:
+                        kind, payload = chunk_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                else:
+                    rem = deadline_mono - time.monotonic()
+                    if rem <= 0.0:
+                        abort_upstream()
+                        self._close_downstream_forcefully()
+                        break
+                    try:
+                        kind, payload = chunk_queue.get(timeout=min(0.05, rem))
+                    except queue.Empty:
+                        continue
             if kind != "data":
                 break
             if time.monotonic() >= deadline_mono:

@@ -39,11 +39,209 @@ SOURCES = ('company-wiki', 'sales-notes', 'tmtb', 'funda-ai')
 KEY_SQL = "COALESCE(NULLIF(message_id,''),NULLIF(email_id,''),'row:' || id)"
 
 
-def _enabled_library_sources(allowed_sources=None):
-    """Resolve enabled local library sources from explicit allowlist or bridge-supplied env.
+_DOTENV_DISABLED_VALUES = frozenset({"1", "true", "t", "yes", "y"})
 
-    Never imports app config or ``effective_capabilities()`` so child processes cannot
-    reload shared ``.env`` credentials into their environment.
+
+def _parse_dotenv_stdlib(path: Path, base_env: dict[str, str]) -> dict[str, str]:
+    """Pure-stdlib .env reader used only when python-dotenv is absent; never mutates os.environ."""
+    resolved: dict[str, str] = {}
+    var_re = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, raw_val = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        val = raw_val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            quote = val[0]
+            val = val[1:-1]
+            if quote == "'":
+                resolved[key] = val
+                continue
+        else:
+            val = re.sub(r"\s+#.*$", "", val).strip()
+        lookup = {**resolved, **base_env}
+        resolved[key] = var_re.sub(lambda m: lookup.get(m.group(1), ""), val)
+    return resolved
+
+
+def _read_yaml_top_and_capabilities(path: Path) -> tuple[bool | None, dict[str, bool]]:
+    """Read optional top-level `enabled:` and `capabilities:` booleans without importing src.config."""
+    if not path.is_file():
+        return None, {}
+    text = path.read_text(encoding="utf-8")
+    try:
+        import yaml  # type: ignore[import-untyped]
+
+        data = yaml.safe_load(text)
+        if not isinstance(data, dict):
+            return None, {}
+        enabled = data.get("enabled") if isinstance(data.get("enabled"), bool) else None
+        caps_raw = data.get("capabilities")
+        caps: dict[str, bool] = {}
+        if isinstance(caps_raw, dict):
+            for k, v in caps_raw.items():
+                if isinstance(k, str) and isinstance(v, bool):
+                    caps[k.strip().lower()] = v
+        return enabled, caps
+    except ImportError:
+        pass
+    enabled_val: bool | None = None
+    caps_out: dict[str, bool] = {}
+    in_caps = False
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        if indent == 0:
+            in_caps = stripped == "capabilities:"
+            if stripped.startswith("enabled:"):
+                raw_v = stripped.split(":", 1)[1].split("#", 1)[0].strip().lower()
+                if raw_v == "true":
+                    enabled_val = True
+                elif raw_v == "false":
+                    enabled_val = False
+        elif in_caps and indent >= 2 and ":" in stripped:
+            k, v = stripped.split(":", 1)
+            v_norm = v.split("#", 1)[0].strip().lower()
+            if v_norm == "true":
+                caps_out[k.strip().lower()] = True
+            elif v_norm == "false":
+                caps_out[k.strip().lower()] = False
+    return enabled_val, caps_out
+
+
+def _resolve_host_direct_library_sources() -> list[str]:
+    """Resolve deployment-enabled local library source names for host-direct calls.
+
+    Reads only profile & capability control keys from process env, deployment `.env`,
+    and `dalton.yaml` / `dalton.core.yaml` using `src.dalton.profile` and
+    `src.dalton.capabilities` (never importing `src.config` / `src.dalton.settings`
+    and never mutating `os.environ`). Fails closed (`[]`) if deployment config
+    cannot be resolved.
+    """
+    try:
+        repo_root = Path(__file__).resolve().parents[4]
+        if not (
+            (repo_root / "src" / "dalton" / "profile.py").is_file()
+            and (repo_root / "src" / "dalton" / "capabilities.py").is_file()
+        ):
+            return []
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+
+        from src.dalton.capabilities import (
+            CAPABILITY_SPECS,
+            CapabilityId,
+            _parse_explicit_cap_env,
+            is_capability_control_env_key,
+        )
+        from src.dalton.profile import DeploymentProfile, resolve_profile
+
+        proc_env = dict(os.environ)
+        cap_env: dict[str, str] = {
+            k: v for k, v in proc_env.items() if is_capability_control_env_key(k)
+        }
+
+        dotenv_disabled_raw = proc_env.get("PYTHON_DOTENV_DISABLED")
+        dotenv_disabled = (
+            dotenv_disabled_raw is not None
+            and str(dotenv_disabled_raw).strip().casefold() in _DOTENV_DISABLED_VALUES
+        )
+        if not dotenv_disabled:
+            explicit_dotenv = (
+                str(proc_env.get("DALTON_DOTENV_PATH") or "").strip()
+                or str(proc_env.get("DALTON_REPO_ENV_FILE") or "").strip()
+            )
+            env_path: Path | None = None
+            if explicit_dotenv:
+                cand = Path(explicit_dotenv).expanduser()
+                if not cand.is_file():
+                    return []
+                env_path = cand.resolve()
+            else:
+                repo_dotenv = repo_root / ".env"
+                if repo_dotenv.is_file():
+                    env_path = repo_dotenv.resolve()
+            if env_path is not None:
+                try:
+                    from src.dalton.config_env import parse_and_resolve_dotenv
+
+                    parsed_dotenv = parse_and_resolve_dotenv(
+                        env_path, base_env=proc_env, override=False
+                    )
+                except ImportError:
+                    parsed_dotenv = _parse_dotenv_stdlib(env_path, proc_env)
+                for k, v in parsed_dotenv.items():
+                    if is_capability_control_env_key(k) and k not in cap_env:
+                        cap_env[k] = v
+
+        active_profile = resolve_profile(
+            app_env=cap_env.get("APP_ENV", ""),
+            dalton_profile=cap_env.get("DALTON_PROFILE", ""),
+        )
+
+        yaml_enabled, yaml_caps = _read_yaml_top_and_capabilities(
+            repo_root / "src" / "dalton" / "dalton.yaml"
+        )
+        if active_profile is DeploymentProfile.CORE:
+            core_enabled, core_caps = _read_yaml_top_and_capabilities(
+                repo_root / "src" / "dalton" / "dalton.core.yaml"
+            )
+            if core_enabled is not None:
+                yaml_enabled = core_enabled
+            yaml_caps.update(core_caps)
+
+        if "DALTON_ENABLED" in cap_env:
+            dalton_on = cap_env["DALTON_ENABLED"].strip().lower() in ("1", "true", "yes")
+        else:
+            dalton_on = True if yaml_enabled is None else bool(yaml_enabled)
+        if not dalton_on:
+            return []
+
+        source_caps = (
+            ("company-wiki", CapabilityId.COMPANY_WIKI),
+            ("sales-notes", CapabilityId.SALES_NOTES),
+            ("tmtb", CapabilityId.TMTB),
+            ("funda-ai", CapabilityId.FUNDA_AI),
+        )
+        enabled: list[str] = []
+        for source_name, cap_id in source_caps:
+            spec = CAPABILITY_SPECS[cap_id]
+            explicit = _parse_explicit_cap_env(spec.env_var, cap_env.get(spec.env_var))
+            if explicit is not None:
+                is_on = explicit
+            elif cap_id.value in yaml_caps:
+                is_on = bool(yaml_caps[cap_id.value])
+            else:
+                is_on = (
+                    spec.core_default
+                    if active_profile is DeploymentProfile.CORE
+                    else spec.everflow_default
+                )
+            if is_on:
+                enabled.append(source_name)
+        return enabled
+    except Exception:
+        return []
+
+
+def _enabled_library_sources(allowed_sources=None):
+    """Resolve enabled local library sources from explicit allowlist, bridge env, or deployment config.
+
+    When called through the bridge (`DALTON_ENABLED_LIBRARY_SOURCES` or `--allowed-sources`),
+    uses only the supplied source names and never reads deployment files or imports `src.*`.
+    When called host-directly without an allowlist, resolves source names once from deployment
+    profile/capabilities without loading `.env` into `os.environ`, failing closed (`[]`) if
+    deployment config cannot be resolved.
     """
     if allowed_sources is not None:
         if isinstance(allowed_sources, str):
@@ -55,7 +253,7 @@ def _enabled_library_sources(allowed_sources=None):
     if raw_env is not None:
         allowed = {part.strip() for part in raw_env.split(",") if part.strip()}
         return [s for s in SOURCES if s in allowed]
-    return list(SOURCES)
+    return _resolve_host_direct_library_sources()
 
 
 def validate_request(route, operation, query=None, document=None, params=None, allowed_sources=None):
@@ -411,11 +609,12 @@ class Library:
         warnings=[]; results=[]
         with readonly(self.mail_db) as conn:
             if op=='read':return self.mail_read(conn,source,document,p)
-            import numpy as np
             terms=words(query or '')
             vec=None
+            np=None
             if op=='search' and p.get('search_mode')!='keyword':
                 try:
+                    import numpy as np
                     vec=np.asarray(self.embed(source,query),dtype=np.float32)
                     norm=np.linalg.norm(vec)
                     if not norm or not np.isfinite(norm):raise ValueError('invalid query vector')
