@@ -101,7 +101,7 @@ describe('SharedFileView', () => {
     const web = screen.getByText('docs');
     expect(web.closest('a')).toHaveAttribute('href', 'https://example.com/docs');
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock).toHaveBeenNthCalledWith(1, buildServeUrl(FRAME_BASE, 'notes/index.md'));
+    expect(fetchMock).toHaveBeenNthCalledWith(1, buildServeUrl(FRAME_BASE, 'notes/index.md'), { cache: 'no-store' });
     expect(fetchMock).toHaveBeenNthCalledWith(2, buildServeUrl(FRAME_BASE, 'notes/other.md'), { method: 'HEAD' });
   });
 
